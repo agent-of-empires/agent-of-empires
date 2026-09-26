@@ -35,64 +35,23 @@ fn rename_theme(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
-
-    fn write(content: &str) -> (tempfile::TempDir, std::path::PathBuf) {
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("config.toml");
-        fs::write(&path, content).unwrap();
-        (dir, path)
-    }
+    use crate::migrations::test_cases::assert_rewrites;
 
     #[test]
-    fn renames_default_to_zinc() {
-        let (_dir, path) = write(
-            r#"
-[theme]
-name = "default"
-idle_decay_minutes = 5
-"#,
+    fn renames_only_the_default_theme() {
+        let unchanged = |toml: &'static str| (Some(toml), Some(toml));
+        assert_rewrites(
+            "config.toml",
+            rename_theme,
+            &[
+                (
+                    Some("[theme]\nname = \"default\"\nidle_decay_minutes = 5\n"),
+                    Some("[theme]\nname = \"zinc\"\nidle_decay_minutes = 5\n"),
+                ),
+                unchanged("[theme]\nname = \"empire\"\n"),
+                unchanged("[session]\ndefault_tool = \"claude\"\n"),
+                (None, None),
+            ],
         );
-        rename_theme(&path).unwrap();
-        let result: toml::Table = fs::read_to_string(&path).unwrap().parse().unwrap();
-        let theme = result.get("theme").and_then(|t| t.as_table()).unwrap();
-        assert_eq!(theme.get("name").and_then(|v| v.as_str()), Some("zinc"));
-        assert_eq!(
-            theme.get("idle_decay_minutes").and_then(|v| v.as_integer()),
-            Some(5),
-            "unrelated keys are preserved"
-        );
-    }
-
-    #[test]
-    fn leaves_other_themes_untouched() {
-        let (_dir, path) = write(
-            r#"
-[theme]
-name = "empire"
-"#,
-        );
-        let before = fs::read_to_string(&path).unwrap();
-        rename_theme(&path).unwrap();
-        assert_eq!(before, fs::read_to_string(&path).unwrap());
-    }
-
-    #[test]
-    fn idempotent_when_no_theme_pinned() {
-        let (_dir, path) = write(
-            r#"
-[session]
-default_tool = "claude"
-"#,
-        );
-        let before = fs::read_to_string(&path).unwrap();
-        rename_theme(&path).unwrap();
-        assert_eq!(before, fs::read_to_string(&path).unwrap());
-    }
-
-    #[test]
-    fn missing_file_is_a_noop() {
-        let dir = tempfile::TempDir::new().unwrap();
-        assert!(rename_theme(&dir.path().join("nope.toml")).is_ok());
     }
 }

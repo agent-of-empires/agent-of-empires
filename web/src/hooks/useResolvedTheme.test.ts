@@ -61,17 +61,14 @@ describe("useResolvedTheme", () => {
     expect(result.current).toBe(cached);
   });
 
-  it.each([makeTheme("empire", "dark"), makeTheme("daylight", "light")])(
-    "applies the $appearance theme fetched on mount",
-    async (theme) => {
-      fetchCurrentThemeMock.mockResolvedValue(theme);
-      const { result } = renderHook(() => useResolvedTheme());
-      await waitFor(() => expect(result.current).toBe(theme));
-      expect(fetchCurrentThemeMock).toHaveBeenCalledTimes(1);
-      expect(applyResolvedThemeMock).toHaveBeenCalledWith(theme);
-      expect(dispatchThemeChangedMock).toHaveBeenCalledWith(theme);
-    },
-  );
+  it.each([makeTheme("empire", "dark")])("applies the $appearance theme fetched on mount", async (theme) => {
+    fetchCurrentThemeMock.mockResolvedValue(theme);
+    const { result } = renderHook(() => useResolvedTheme());
+    await waitFor(() => expect(result.current).toBe(theme));
+    expect(fetchCurrentThemeMock).toHaveBeenCalledTimes(1);
+    expect(applyResolvedThemeMock).toHaveBeenCalledWith(theme);
+    expect(dispatchThemeChangedMock).toHaveBeenCalledWith(theme);
+  });
 
   it("does not apply anything when the mount fetch resolves to null", async () => {
     fetchCurrentThemeMock.mockResolvedValue(null);

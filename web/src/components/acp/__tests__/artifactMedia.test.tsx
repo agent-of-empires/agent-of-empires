@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 //
-// ArtifactImage + openArtifactInNewTab fetch session artifacts through the
+// ArtifactImage + openInNewTab fetch session files through the
 // authed global fetch and hand back blob object URLs (see #2587). Pin the
 // load path, the failure fallback, and the new-tab open.
 
@@ -8,7 +8,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, render, waitFor } from "@testing-library/react";
 
 import { ArtifactImage } from "../artifactMedia";
-import { openArtifactInNewTab } from "../../../lib/artifacts";
+import { openInNewTab } from "../../../lib/openInNewTab";
 
 const URL_ANY = "/api/sessions/s1/artifacts/shot.png";
 
@@ -21,6 +21,7 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
+  vi.useRealTimers();
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
 });
@@ -50,7 +51,7 @@ describe("ArtifactImage", () => {
   });
 });
 
-describe("openArtifactInNewTab", () => {
+describe("openInNewTab", () => {
   it("opens the tab synchronously, then points it at the blob URL", async () => {
     let resolveFetch!: (response: Response) => void;
     const pendingFetch = new Promise<Response>((resolve) => {
@@ -60,7 +61,7 @@ describe("openArtifactInNewTab", () => {
     const tab = { location: { href: "" }, close: vi.fn() };
     const open = vi.fn(() => tab);
     vi.stubGlobal("open", open);
-    const opening = openArtifactInNewTab(URL_ANY);
+    const opening = openInNewTab(URL_ANY);
     try {
       expect(open).toHaveBeenCalledWith("about:blank", "_blank");
       expect(fetch).toHaveBeenCalledWith(URL_ANY);
@@ -78,21 +79,44 @@ describe("openArtifactInNewTab", () => {
     const tab = { location: { href: "" }, close: vi.fn() };
     const open = vi.fn(() => tab);
     vi.stubGlobal("open", open);
-    await openArtifactInNewTab(URL_ANY);
+    await openInNewTab(URL_ANY);
     expect(tab.close).toHaveBeenCalled();
     expect(tab.location.href).toBe("");
   });
 
   it("falls back to a direct blob open when the sync tab is popup-blocked", async () => {
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, blob: async () => new Blob(["x"]) }));
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response("x")));
     // Popup blocked: the initial about:blank open returns null.
     const open = vi
       .fn()
       .mockReturnValueOnce(null)
       .mockReturnValue({ location: { href: "" }, close: vi.fn() });
     vi.stubGlobal("open", open);
-    await openArtifactInNewTab(URL_ANY);
+    await openInNewTab(URL_ANY);
     expect(open).toHaveBeenNthCalledWith(1, "about:blank", "_blank");
     expect(open).toHaveBeenNthCalledWith(2, "blob:mock-url", "_blank", "noopener,noreferrer");
+  });
+
+  it.each([
+    ["the given name", "report.html", "report.html"],
+    ["the URL's file name", undefined, "status page.html"],
+  ])("saves an attachment under %s and closes the pre-opened tab", async (_, name, expected) => {
+    vi.useFakeTimers({ toFake: ["setTimeout"] });
+    const response = new Response("<h1>hi</h1>", { headers: { "Content-Disposition": "attachment" } });
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(response));
+    const tab = { location: { href: "" }, close: vi.fn() };
+    const open = vi.fn(() => tab);
+    vi.stubGlobal("open", open);
+    const click = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => {});
+    expect(await openInNewTab("/api/sessions/s1/artifacts/sub/status%20page.html", name)).toEqual({ ok: true });
+    expect(tab.close).toHaveBeenCalled();
+    expect(tab.location.href).toBe("");
+    const link = click.mock.contexts[0] as HTMLAnchorElement;
+    expect(link.href).toBe("blob:mock-url");
+    expect(link.download).toBe(expected);
+    // Revoked later, so the browser can still read the blob for the download.
+    expect(URL.revokeObjectURL).not.toHaveBeenCalled();
+    vi.runAllTimers();
+    expect(URL.revokeObjectURL).toHaveBeenCalledWith("blob:mock-url");
   });
 });

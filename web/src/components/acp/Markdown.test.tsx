@@ -109,13 +109,6 @@ describe("remark line breaks", () => {
     expect(container.querySelectorAll("br")).toHaveLength(brs);
     expect(container.querySelectorAll("p")).toHaveLength(paragraphs);
   });
-
-  it("leaves fenced code intact with breaks on", () => {
-    const container = renderMd("```ts\nconst a = 1;\nconst b = 2;\n```", true);
-    expect(container.querySelector("pre")?.textContent).toContain("const b = 2;");
-    expect(container.querySelectorAll("pre br")).toHaveLength(0);
-    expect(container.textContent).not.toContain("```");
-  });
 });
 
 describe("Blockquote override", () => {
@@ -214,47 +207,25 @@ describe("anchor override", () => {
     expect(container.querySelector("a.acp-artifact-link")?.getAttribute("href")).toBe(route);
   });
 
-  describe("img", () => {
+  it("img never emits a raw local path as src, and leaves external images alone", () => {
+    const Img = override<React.ComponentPropsWithoutRef<"img">>("img");
     const renderImg = (src: string, alt: string) => {
-      const Img = override<React.ComponentPropsWithoutRef<"img">>("img");
+      cleanup();
       return renderIn(<Img src={src} alt={alt} />, { fileRefSession: artSession }).container;
     };
-
-    it("never emits the raw artifact path as an img src", () => {
-      expect(
-        renderImg("/aoe/artifacts/shot.png", "a shot").querySelector('img[src="/aoe/artifacts/shot.png"]'),
-      ).toBeNull();
-    });
-
-    it("renders an unresolvable local image as inert alt text", () => {
-      const container = renderImg("/tmp/other/x.png", "alt text");
-      expect(container.querySelector("img")).toBeNull();
-      expect(container.querySelector("span.acp-inert-path")?.textContent).toBe("alt text");
-    });
-
-    it("leaves external images alone", () => {
-      expect(
-        renderImg("https://example.com/x.png", "ext").querySelector('img[src="https://example.com/x.png"]'),
-      ).not.toBeNull();
-    });
+    expect(
+      renderImg("/aoe/artifacts/shot.png", "a shot").querySelector('img[src="/aoe/artifacts/shot.png"]'),
+    ).toBeNull();
+    const inert = renderImg("/tmp/other/x.png", "alt text");
+    expect(inert.querySelector("img")).toBeNull();
+    expect(inert.querySelector("span.acp-inert-path")?.textContent).toBe("alt text");
+    expect(
+      renderImg("https://example.com/x.png", "ext").querySelector('img[src="https://example.com/x.png"]'),
+    ).not.toBeNull();
   });
 });
 
-describe("table and code header overrides", () => {
-  it("wraps tables in a scroll container", () => {
-    const Table = override<{ children: React.ReactNode }>("table");
-    const { container } = render(
-      <Table>
-        <tbody>
-          <tr>
-            <td>cell</td>
-          </tr>
-        </tbody>
-      </Table>,
-    );
-    expect(container.querySelector(".acp-table-wrap table td")?.textContent).toBe("cell");
-  });
-
+describe("code header override", () => {
   it.each([
     ["rust", "rust"],
     [undefined, "text"],

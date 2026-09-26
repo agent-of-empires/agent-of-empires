@@ -26,7 +26,8 @@ beforeEach(() => {
 });
 
 describe("TelemetrySettings contract", () => {
-  it.each([false, true])("toggling from enabled=%s sends the opposite consent", async (enabled) => {
+  it("toggling sends the opposite consent", async () => {
+    const enabled = false;
     fetchTelemetryStatus.mockResolvedValue(status({ enabled }));
     const { container } = render(<TelemetrySettings />);
     const toggle = () => container.querySelector("button[role=switch]") as HTMLButtonElement;

@@ -134,10 +134,8 @@ mod tests {
             other => panic!("expected http, got {other:?}"),
         }
         assert!(matches!(&servers[2], McpServer::Sse(_)));
-    }
 
-    #[test]
-    fn capability_filter_keeps_stdio_drops_unadvertised_remotes() {
+        // The capability filter keeps stdio and drops unadvertised remotes.
         let servers = to_acp(
             r#"{ "mcpServers": {
                 "stdio":  { "command": "c" },

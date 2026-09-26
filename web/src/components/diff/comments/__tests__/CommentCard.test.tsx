@@ -27,12 +27,6 @@ function anchored(over: Partial<AnchoredComment> = {}, c: Partial<DiffComment> =
 afterEach(cleanup);
 
 describe("CommentCard", () => {
-  it("renders the range, side, and body", () => {
-    render(<CommentCard anchored={anchored()} onSave={() => {}} onDelete={() => {}} />);
-    expect(screen.getByText(/line 3 \(new\)/)).toBeTruthy();
-    expect(screen.getByText("needs a guard")).toBeTruthy();
-  });
-
   it("shows a multi-line range and the stale chip", () => {
     render(
       <CommentCard

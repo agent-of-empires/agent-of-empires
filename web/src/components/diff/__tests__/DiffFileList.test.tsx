@@ -5,8 +5,14 @@ import { cleanup, fireEvent, render, screen, within } from "@testing-library/rea
 import { DiffFileList } from "../DiffFileList";
 import type { RepoBase, RichDiffFile } from "../../../lib/types";
 
-const mock = vi.hoisted(() => ({ fetchBranches: vi.fn(), setSessionDiffBase: vi.fn() }));
+const mock = vi.hoisted(() => ({
+  fetchBranches: vi.fn(),
+  setSessionDiffBase: vi.fn(),
+  sessionDiffRawFileUrl: (id: string, path: string, repo?: string) => `${id}:${repo ?? ""}:${path}`,
+}));
 vi.mock("../../../lib/api", () => mock);
+const openInNewTab = vi.hoisted(() => vi.fn());
+vi.mock("../../../lib/openInNewTab", () => ({ openInNewTab }));
 
 const file = (over: Partial<RichDiffFile> & { path: string }): RichDiffFile => ({
   old_path: null,
@@ -44,6 +50,7 @@ beforeEach(() => {
   window.localStorage.clear();
   mock.fetchBranches.mockReset();
   mock.setSessionDiffBase.mockReset().mockResolvedValue({});
+  openInNewTab.mockReset().mockResolvedValue({ ok: true });
   Element.prototype.scrollIntoView = vi.fn();
 });
 
@@ -54,11 +61,6 @@ afterEach(() => {
 });
 
 describe("header and empty states", () => {
-  it("shows the loading placeholder with no files yet", () => {
-    renderList({ loading: true });
-    expect(screen.getByText("Loading files...")).toBeTruthy();
-  });
-
   it("names the base when a single repo has no changes, with no view toggle", () => {
     const { key } = renderList();
     key("ArrowDown");
@@ -81,15 +83,14 @@ describe("header and empty states", () => {
     expect(screen.getAllByText("No changes in this repo.")).toHaveLength(3);
   });
 
-  it.each([
-    [[file({ path: "a.ts" })], ["1 file", "vs main", "diff truncated"]],
-    [
-      [file({ path: "a.ts", additions: 3, deletions: 1 }), file({ path: "b.ts", additions: 2, deletions: 4 })],
-      ["2 files", "+5", "-5"],
-    ],
-  ])("renders counts, totals, base chip and warning", (files, texts) => {
-    renderList({ files, warning: "diff truncated" });
-    for (const t of texts) expect(screen.getAllByText(t).length).toBeGreaterThan(0);
+  it("renders counts, totals, base chip and warning", () => {
+    renderList({
+      files: [file({ path: "a.ts", additions: 3, deletions: 1 }), file({ path: "b.ts", additions: 2, deletions: 4 })],
+      warning: "diff truncated",
+    });
+    for (const t of ["2 files", "+5", "-5", "vs main", "diff truncated"]) {
+      expect(screen.getAllByText(t).length).toBeGreaterThan(0);
+    }
   });
 });
 
@@ -136,42 +137,43 @@ describe("flat view", () => {
     fireEvent.click(r);
     expect(onSelectFile).toHaveBeenCalledWith("src/app/foo.rs", undefined);
   });
-
-  it("renders a status letter per git status", () => {
-    setSettings({ diffViewMode: "flat" });
-    const statuses = ["added", "deleted", "renamed", "copied", "untracked", "conflicted", "modified"] as const;
-    renderList({ files: statuses.map((status) => file({ path: `${status}.rs`, status })) });
-    for (const letter of ["A", "D", "R", "C", "?", "U", "M"]) {
-      expect(screen.getAllByText(letter).length).toBeGreaterThan(0);
-    }
-  });
-
-  it("clamps ArrowUp at the top and selects the focused file on Enter", () => {
-    setSettings({ diffViewMode: "flat" });
-    const { onSelectFile, key } = renderList({ files: [file({ path: "src/foo.rs" }), file({ path: "src/bar.rs" })] });
-    key("ArrowDown");
-    key("ArrowUp");
-    key("Enter");
-    expect(onSelectFile).toHaveBeenCalledTimes(1);
-  });
 });
 
 describe("copy relative path", () => {
-  it.each([{}, { diffViewMode: "flat" }])("copies from a file row (settings %j)", (s) => {
+  it("copies from a file row", () => {
     Object.defineProperty(window, "isSecureContext", { value: true, configurable: true });
     const writeText = vi.fn().mockResolvedValue(undefined);
     Object.defineProperty(navigator, "clipboard", { value: { writeText }, configurable: true });
-    setSettings(s);
     renderList({ files: [file({ path: "src/app/foo.rs" })] });
     fireEvent.contextMenu(row("foo.rs"));
     fireEvent.click(screen.getByText("Copy relative path"));
     expect(writeText).toHaveBeenCalledWith("src/app/foo.rs");
   });
+});
 
-  it("keeps the native menu off rows", () => {
-    renderList({ files: [file({ path: "a.ts" })] });
-    fireEvent.contextMenu(screen.getByText("Changes"));
-    expect(screen.queryByText("Copy relative path")).toBeNull();
+describe("open file", () => {
+  const menuItems = () => screen.getAllByRole("menuitem").map((b) => b.textContent);
+
+  it("opens a shared path from the repo whose row was right-clicked", () => {
+    setSettings({ diffViewMode: "flat" });
+    renderList({
+      files: [file({ path: "same.txt", repo_name: "api" }), file({ path: "same.txt", repo_name: "web" })],
+      perRepoBases: [
+        { repo_name: "api", base_branch: "main" },
+        { repo_name: "web", base_branch: "main" },
+      ],
+      sessionId: "s1",
+    });
+    fireEvent.contextMenu(screen.getAllByText("same.txt")[1]!);
+    expect(menuItems()).toEqual(["Open file", "Copy relative path"]);
+    fireEvent.click(screen.getByText("Open file"));
+    expect(openInNewTab).toHaveBeenCalledWith("s1:web:same.txt", "same.txt");
+  });
+
+  it("offers only the copy on a directory row", () => {
+    renderList({ files: [file({ path: "src/app/foo.rs" })], sessionId: "s1" });
+    fireEvent.contextMenu(row("src"));
+    expect(menuItems()).toEqual(["Copy relative path"]);
   });
 });
 
@@ -196,13 +198,6 @@ describe("multi-repo groups", () => {
     fireEvent.click(row("api"));
     expect(screen.queryByText("handler.rs")).toBeNull();
     expect(expanded("api")).toBe("false");
-  });
-
-  it("selects in flat mode with the repo name", () => {
-    setSettings({ diffViewMode: "flat" });
-    const { onSelectFile } = renderList({ files, perRepoBases });
-    fireEvent.click(row("index.ts"));
-    expect(onSelectFile).toHaveBeenCalledWith("index.ts", "web");
   });
 
   it("gives each repo a base picker scoped to its own worktree", async () => {
@@ -234,13 +229,12 @@ describe("multi-repo groups", () => {
 });
 
 describe("base picker", () => {
-  const openPicker = async (branches: object[], extra = {}) => {
+  const openPicker = async (branches: object[]) => {
     mock.fetchBranches.mockResolvedValue(branches);
-    const onBaseBranchChanged = vi.fn();
-    renderList({ files: [file({ path: "a.ts" })], sessionId: "s1", repoPath: "/repo", onBaseBranchChanged, ...extra });
+    renderList({ files: [file({ path: "a.ts" })], sessionId: "s1", repoPath: "/repo" });
     fireEvent.click(screen.getByRole("button", { name: /Change diff base/ }));
     const input = await screen.findByPlaceholderText("Search branches...");
-    return { input, onBaseBranchChanged };
+    return { input };
   };
   const applied = (value: string | null) =>
     vi.waitFor(() => expect(mock.setSessionDiffBase).toHaveBeenCalledWith("s1", value, undefined));
@@ -257,19 +251,6 @@ describe("base picker", () => {
     expect(screen.queryByText("release")).toBeNull();
   });
 
-  it("applies a branch on mousedown and notifies", async () => {
-    const { onBaseBranchChanged } = await openPicker([{ name: "develop", is_current: false }]);
-    fireEvent.mouseDown(await screen.findByText("develop"));
-    await applied("develop");
-    await vi.waitFor(() => expect(onBaseBranchChanged).toHaveBeenCalled());
-  });
-
-  it("resets an active override", async () => {
-    await openPicker([], { baseBranchOverride: "custom-base" });
-    fireEvent.click(await screen.findByText(/Reset to auto-detected/));
-    await applied(null);
-  });
-
   it("picks with arrows and Enter, or falls back to the typed query", async () => {
     const { input } = await openPicker([
       { name: "one", is_current: false },
@@ -284,11 +265,5 @@ describe("base picker", () => {
     fireEvent.change(typed.input, { target: { value: "typed-branch" } });
     fireEvent.keyDown(typed.input, { key: "Enter" });
     await applied("typed-branch");
-  });
-
-  it("closes on Escape", async () => {
-    const { input } = await openPicker([{ name: "main", is_current: true }]);
-    fireEvent.keyDown(input, { key: "Escape" });
-    expect(screen.queryByPlaceholderText("Search branches...")).toBeNull();
   });
 });

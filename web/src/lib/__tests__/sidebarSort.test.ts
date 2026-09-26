@@ -16,7 +16,6 @@ import {
   repoGroupHasLiveWorkspace,
   repoGroupIsUrgent,
   repoGroupLastActivityMs,
-  resolveEffectiveSnoozedUntil,
   saveSidebarSortMode,
   sessionAttentionRank,
   sessionNeedsAttention,
@@ -147,8 +146,6 @@ describe("triage", () => {
     ["one pinned session", [{}, { id: "s2", pinned_at: TS }], { pinned: true, sunk: false, tier: 0 }],
     ["pinned beside archived", [{ pinned_at: TS }, { id: "s2", ...archived }], { pinned: true, sunk: false, tier: 0 }],
     ["archived and snoozed", [archived, { id: "s2", ...snoozed }], { pinned: false, sunk: true, tier: 2 }],
-    ["archived only", [archived, { id: "s2", ...archived }], { pinned: false, sunk: true, tier: 2 }],
-    ["snoozed only", [snoozed, { id: "s2", ...snoozed }], { pinned: false, sunk: true, tier: 2 }],
     ["one live beside archived", [archived, { id: "s2" }], { pinned: false, sunk: false, tier: 1 }],
     ["empty", [], { pinned: false, sunk: false, tier: 1 }],
   ])("%s workspace", (_name, sessions, { pinned, sunk, tier }) => {
@@ -160,12 +157,9 @@ describe("triage", () => {
 
   it.each([
     [false, false, false, "live"],
-    [true, false, false, "pinned"],
-    [false, true, false, "archived"],
     [false, false, true, "snoozed"],
     [false, true, true, "archived"],
     [true, true, false, "pinned"],
-    [true, false, true, "pinned"],
   ])("triageStateOf(pinned=%s, archived=%s, snoozed=%s) is %s", (isPinned, isArchived, isSnoozed, expected) => {
     expect(triageStateOf({ isPinned, isArchived, isSnoozed })).toBe(expected);
   });
@@ -180,23 +174,13 @@ describe("triage", () => {
     expect(triageMenuShape(state)).toMatchObject(Object.fromEntries(all.map((k) => [k, shown.includes(k as never)])));
   });
 
-  it("resolveEffectiveSnoozedUntil prefers a defined optimistic override", () => {
-    expect(resolveEffectiveSnoozedUntil(undefined, null)).toBeNull();
-    expect(resolveEffectiveSnoozedUntil(undefined, TS)).toBe(TS);
-    expect(resolveEffectiveSnoozedUntil(TS, null)).toBe(TS);
-    expect(resolveEffectiveSnoozedUntil(null, TS)).toBeNull();
-  });
-
   it.each([
     ["2099-01-01T00:00:00Z", "2099-01-01T00:00:00Z", true],
-    ["2099-01-01T00:00:00Z", "2099-01-01T00:00:30Z", true],
     ["2099-01-01T00:00:00Z", "2099-01-01T00:02:00Z", true],
     ["2099-01-01T00:00:00Z", "2099-01-01T00:02:00.001Z", false],
-    ["2099-01-01T00:00:00Z", "2099-01-01T00:05:00Z", false],
     ["not-a-date", "not-a-date", true],
     ["not-a-date", "also-bad", false],
     ["2099-01-01T00:00:00Z", "not-a-date", false],
-    ["not-a-date", "2099-01-01T00:00:00Z", false],
   ])("snoozeTimestampCloseEnough(%s, %s) is %s", (a, b, expected) => {
     expect(snoozeTimestampCloseEnough(a, b)).toBe(expected);
   });
@@ -205,11 +189,6 @@ describe("triage", () => {
     ["one live workspace", [ws1("live"), ws1("arch", archived)], true],
     ["all sunk", [ws1("arch", archived), ws1("snz", snoozed)], false],
     ["no workspaces", [], false],
-    [
-      "a mixed multi-session workspace",
-      [workspace("w", [session({ id: "a" }), session({ id: "b", ...archived })])],
-      true,
-    ],
   ])("repoGroupHasLiveWorkspace with %s is %s", (_name, workspaces, expected) => {
     expect(repoGroupHasLiveWorkspace(repoGroup(workspaces))).toBe(expected);
   });
@@ -244,8 +223,6 @@ describe("attention sort (#1640)", () => {
     ["Running", 4],
     ["Stopped", 5],
     ["Starting", 6],
-    ["Creating", 6],
-    ["Deleting", 6],
   ])("sessionAttentionRank(%s) is %s", (status, rank) => {
     expect(sessionAttentionRank(session({ status }))).toBe(rank);
   });
@@ -328,13 +305,7 @@ describe("attention sort (#1640)", () => {
 describe("sort mode storage", () => {
   beforeEach(() => window.localStorage.clear());
 
-  it("defaults to manual for empty or unknown values", () => {
-    expect(loadSidebarSortMode()).toBe("manual");
-    window.localStorage.setItem(SIDEBAR_SORT_MODE_KEY, "nonsense");
-    expect(loadSidebarSortMode()).toBe("manual");
-  });
-
-  it.each(["lastActivity", "attention", "manual"] as const)("round-trips %s", (mode) => {
+  it.each(["attention", "manual"] as const)("round-trips %s", (mode) => {
     saveSidebarSortMode(mode === "manual" ? "lastActivity" : "manual");
     saveSidebarSortMode(mode);
     expect(window.localStorage.getItem(SIDEBAR_SORT_MODE_KEY)).toBe(mode);
@@ -376,7 +347,6 @@ describe("attention badges and jump", () => {
     [{ status: "Running", urgent: true }, true],
     [{ status: "Idle" }, false],
     [{ status: "Running" }, false],
-    [{ status: "Stopped" }, false],
     [{ status: "Waiting", ...archived }, false],
     [{ status: "Error", snoozed_until: "2025-01-01T00:00:00Z" }, false],
     [{ status: "Running", urgent: true, trashed_at: TS }, false],

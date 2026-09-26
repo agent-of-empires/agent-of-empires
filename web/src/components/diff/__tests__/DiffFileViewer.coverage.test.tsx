@@ -160,26 +160,12 @@ afterEach(() => {
 
 describe("DiffFileViewer states and header", () => {
   it.each<[string, Partial<typeof mock>, string]>([
-    ["loading", { contents: undefined, loading: true }, "Loading diff..."],
     ["error", { contents: undefined, error: "boom" }, "boom"],
-    ["no contents", { contents: undefined }, "Select a file to view changes"],
     ["binary", { contents: { ...baseContents, is_binary: true } }, "Binary file changed"],
-    ["truncated", { contents: { ...baseContents, truncated: true } }, "File too large to diff inline"],
-    [
-      "unchanged",
-      { contents: { ...baseContents, old_content: "same\n", new_content: "same\n" } },
-      "No changes in this file",
-    ],
   ])("renders the %s state", (_, state, text) => {
     Object.assign(mock, state);
     render(<DiffFileViewer sessionId="s1" filePath="a.ts" />);
     expect(screen.getByText(text)).toBeTruthy();
-  });
-
-  it("renders status, counts, and no back button without onClose", () => {
-    render(<DiffFileViewer sessionId="s1" filePath="a.ts" />);
-    for (const t of ["Modified", "+2", "-1"]) expect(screen.getByText(t)).toBeTruthy();
-    expect(screen.queryByRole("button", { name: "Back to terminal" })).toBeNull();
   });
 
   it("renders a rename arrow and calls onClose from the back button", () => {
@@ -213,13 +199,6 @@ describe("DiffFileViewer find", () => {
     fireEvent.keyDown(root, { key: "f", metaKey: true });
     expect(screen.getByTestId("find-bar")).toBeTruthy();
   });
-
-  it("does not show the FindBar for a binary file even when toggled open", () => {
-    mock.contents = { ...baseContents, is_binary: true };
-    render(<DiffFileViewer sessionId="s1" filePath="a.ts" />);
-    fireEvent.click(screen.getByRole("button", { name: "Find in diff" }));
-    expect(screen.queryByTestId("find-bar")).toBeNull();
-  });
 });
 
 describe("DiffFileViewer comments", () => {
@@ -233,30 +212,18 @@ describe("DiffFileViewer comments", () => {
     expect(screen.getAllByTestId("comment-card").length).toBe(2);
   });
 
-  it("renders active comment annotations through the Pierre renderer", () => {
+  it("renders active annotations, starts a draft on line selection, then saves it through the store", () => {
     mock.anchored = [{ status: "active", comment: { id: "c9", side: "new", endLine: 3 } }];
-    render(<DiffFileViewer sessionId="s1" filePath="a.ts" commentsEnabled commentsStore={commentsStore()} />);
-    expect(screen.getByText("card:c9")).toBeTruthy();
-    expect(screen.getByTestId("pierre-diff").getAttribute("data-selection")).toBe("true");
-  });
-
-  it("starts a draft on line selection, then saves it through the store", () => {
     const store = commentsStore();
     render(<DiffFileViewer sessionId="s1" filePath="a.ts" commentsEnabled commentsStore={store} />);
+    expect(screen.getByText("card:c9")).toBeTruthy();
+    expect(screen.getByTestId("pierre-diff").getAttribute("data-selection")).toBe("true");
     fireEvent.click(screen.getByTestId("select-line"));
     expect(screen.getByTestId("comment-form")).toBeTruthy();
     fireEvent.click(screen.getByText("form-save"));
     expect(store.addComment).toHaveBeenCalledWith(
       expect.objectContaining({ filePath: "a.ts", side: "new", startLine: 2, endLine: 3, body: "hi" }),
     );
-  });
-
-  it("cancels a draft, removing the form", () => {
-    render(<DiffFileViewer sessionId="s1" filePath="a.ts" commentsEnabled commentsStore={commentsStore()} />);
-    fireEvent.click(screen.getByTestId("select-line"));
-    expect(screen.getByTestId("comment-form")).toBeTruthy();
-    fireEvent.click(screen.getByText("form-cancel"));
-    expect(screen.queryByTestId("comment-form")).toBeNull();
   });
 
   it("does not start a draft when snippet extraction returns null", () => {

@@ -173,15 +173,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn nonce_is_hex_and_unique() {
-        let a = Nonce::new();
-        let b = Nonce::new();
-        assert_ne!(a, b);
-        assert_eq!(a.0.len(), NONCE_BYTES * 2);
-        assert!(a.0.chars().all(|c| c.is_ascii_hexdigit()));
-    }
-
-    #[test]
     fn choice_list_needs_every_option_to_share_one_kind() {
         let option = |id: &str, kind| ApprovalOption {
             option_id: id.into(),
@@ -247,8 +238,39 @@ mod tests {
     }
 
     #[test]
-    fn approval_without_options_field_deserializes() {
-        // Event logs written before carry no options.
+    fn nonce_heuristics_target_summary_and_legacy_decode() {
+        assert!(is_destructive("Bash", r#"{"command":"rm -rf /tmp/foo"}"#));
+        assert!(is_destructive(
+            "Bash",
+            r#"{"command":"git push --force origin main"}"#
+        ));
+        assert!(!is_destructive("Bash", r#"{"command":"ls -la"}"#));
+        assert!(is_destructive("Write", r#"{"path":"/etc/hosts"}"#));
+        assert!(!is_destructive("Read", r#"{"path":"/etc/hosts"}"#));
+
+        let cases = [
+            // kind, args_preview, expected
+            ("read", r#"{"path":"src/foo.rs"}"#, "src/foo.rs"),
+            ("edit", r#"{"file_path":"a/b.rs"}"#, "a/b.rs"),
+            ("write", r#"{"filePath":"c.txt"}"#, "c.txt"),
+            // execute keeps only the first command line
+            ("execute", "{\"command\":\"ls -la\\nrm x\"}", "ls -la"),
+            // unknown kind and non-object args yield no target
+            ("think", r#"{"path":"x"}"#, ""),
+            ("read", "not json", ""),
+            ("read", "{}", ""),
+        ];
+        for (kind, args, expected) in cases {
+            assert_eq!(summarize_target(kind, args), expected, "{kind}/{args}");
+        }
+
+        let a = Nonce::new();
+        let b = Nonce::new();
+        assert_ne!(a, b);
+        assert_eq!(a.0.len(), NONCE_BYTES * 2);
+        assert!(a.0.chars().all(|c| c.is_ascii_hexdigit()));
+
+        // Event logs written before options existed still decode (#3779).
         let legacy = serde_json::json!({
             "nonce": "abc",
             "tool_call": {
@@ -265,36 +287,5 @@ mod tests {
         let approval: Approval = serde_json::from_value(legacy).expect("legacy approval");
         assert!(approval.options.is_empty());
         assert!(!approval.choice);
-    }
-
-    #[test]
-    fn destructive_heuristic_catches_classics() {
-        assert!(is_destructive("Bash", r#"{"command":"rm -rf /tmp/foo"}"#));
-        assert!(is_destructive(
-            "Bash",
-            r#"{"command":"git push --force origin main"}"#
-        ));
-        assert!(!is_destructive("Bash", r#"{"command":"ls -la"}"#));
-        assert!(is_destructive("Write", r#"{"path":"/etc/hosts"}"#));
-        assert!(!is_destructive("Read", r#"{"path":"/etc/hosts"}"#));
-    }
-
-    #[test]
-    fn summarize_target_maps_kind_to_path_or_command() {
-        let cases = [
-            // kind, args_preview, expected
-            ("read", r#"{"path":"src/foo.rs"}"#, "src/foo.rs"),
-            ("edit", r#"{"file_path":"a/b.rs"}"#, "a/b.rs"),
-            ("write", r#"{"filePath":"c.txt"}"#, "c.txt"),
-            // execute keeps only the first command line
-            ("execute", "{\"command\":\"ls -la\\nrm x\"}", "ls -la"),
-            // unknown kind and non-object args yield no target
-            ("think", r#"{"path":"x"}"#, ""),
-            ("read", "not json", ""),
-            ("read", "{}", ""),
-        ];
-        for (kind, args, expected) in cases {
-            assert_eq!(summarize_target(kind, args), expected, "{kind}/{args}");
-        }
     }
 }

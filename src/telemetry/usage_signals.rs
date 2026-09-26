@@ -90,82 +90,54 @@ mod tests {
     use super::*;
 
     #[test]
-    fn record_rejects_unregistered_names() {
+    fn record_counts_only_allowlisted_names_and_snapshot_reports_every_key() {
         let counters = UsageSeenCounters::new();
-        assert!(counters.record("web"));
-        assert!(counters.record("structured_view"));
-        assert!(!counters.record("bogus"));
-        let snap = counters.snapshot();
-        assert!(!snap.contains_key("bogus"));
-    }
-
-    #[test]
-    fn feature_signals_are_registered_and_reported() {
-        let counters = UsageSeenCounters::new();
-        for name in ["diff_panel", "diff_comments", "web_terminal"] {
+        for name in ["web", "web", "diff_panel", "diff_comments", "web_terminal"] {
             assert!(counters.record(name), "{name} should be allowlisted");
         }
+        assert!(!counters.record("bogus"));
         let snap = counters.snapshot();
-        assert_eq!(snap.get("diff_panel"), Some(&1));
-        assert_eq!(snap.get("diff_comments"), Some(&1));
-        assert_eq!(snap.get("web_terminal"), Some(&1));
-        for name in ["diff_panel", "diff_comments", "web_terminal"] {
-            assert_eq!(zeroed().get(name), Some(&0));
-        }
-    }
-
-    #[test]
-    fn snapshot_emits_the_full_allowlisted_key_set_with_zeros() {
-        let counters = UsageSeenCounters::new();
-        counters.record("web");
-        counters.record("web");
-        let snap = counters.snapshot();
-        let keys: Vec<&str> = snap.keys().map(String::as_str).collect();
         let mut expected: Vec<&str> = USAGE_SIGNALS.to_vec();
         expected.sort_unstable();
-        assert_eq!(keys, expected);
-        assert_eq!(snap.get("web"), Some(&2));
-        assert_eq!(snap.get("structured_view"), Some(&0));
+        assert_eq!(
+            snap.keys().map(String::as_str).collect::<Vec<_>>(),
+            expected
+        );
         assert_eq!(
             zeroed().keys().collect::<Vec<_>>(),
             snap.keys().collect::<Vec<_>>()
         );
+        assert!(zeroed().values().all(|n| *n == 0));
+        for (name, count) in [
+            ("web", 2),
+            ("diff_panel", 1),
+            ("diff_comments", 1),
+            ("web_terminal", 1),
+            ("structured_view", 0),
+        ] {
+            assert_eq!(snap.get(name), Some(&count), "{name}");
+        }
     }
 
     #[test]
-    fn decrement_subtracts_exactly_reported_known_keys() {
+    fn decrement_subtracts_reported_known_keys_and_saturates() {
         let counters = UsageSeenCounters::new();
         for _ in 0..5 {
             counters.record("web");
         }
         counters.record("structured_view");
+        counters.record("diff_panel");
 
-        let reported = counters.snapshot();
+        let mut reported = counters.snapshot();
         counters.record("web");
+        reported.insert("phantom".to_string(), 99);
+        reported.insert("diff_panel".to_string(), 100);
 
         counters.decrement(&reported);
         let after = counters.snapshot();
         assert_eq!(after.get("web"), Some(&1));
         assert_eq!(after.get("structured_view"), Some(&0));
-    }
-
-    #[test]
-    fn decrement_ignores_unknown_reported_keys() {
-        let counters = UsageSeenCounters::new();
-        counters.record("web");
-        let mut reported = counters.snapshot();
-        reported.insert("phantom".to_string(), 99);
-        counters.decrement(&reported);
-        assert_eq!(counters.snapshot().get("web"), Some(&0));
-    }
-
-    #[test]
-    fn decrement_saturates_instead_of_underflowing() {
-        let counters = UsageSeenCounters::new();
-        counters.record("web");
-        let mut reported = BTreeMap::new();
-        reported.insert("web".to_string(), 100);
-        counters.decrement(&reported);
-        assert_eq!(counters.snapshot().get("web"), Some(&0));
+        assert_eq!(after.get("diff_panel"), Some(&0), "saturates at zero");
+        assert!(!after.contains_key("phantom"));
     }
 }

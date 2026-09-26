@@ -389,30 +389,11 @@ mod tests {
         PermissionOption::new(PermissionOptionId::new(id), name, kind)
     }
 
-    /// Without a picked id the decision selects by kind, falling back to a
-    /// kind the agent did offer.
-    #[test]
-    fn pick_option_id_selects_by_kind() {
-        let both = vec![
-            option("yes", "Allow this once", PermissionOptionKind::AllowOnce),
-            option("no", "Reject", PermissionOptionKind::RejectOnce),
-        ];
-        let always_only = vec![option(
-            "always",
-            "Always",
-            PermissionOptionKind::AllowAlways,
-        )];
-        for (options, want) in [(&both, "yes"), (&always_only, "always")] {
-            let id = pick_option_id(options, ApprovalDecision::Allow, None).unwrap();
-            assert_eq!(id.0.as_ref(), want);
-        }
-    }
-
     /// In a question list every option is `allow_once`, so answering by kind
     /// would always send the first. The client's picked id wins, and an id
     /// belonging to no option resolves to nothing rather than a guess (#3741).
     #[test]
-    fn requested_option_id_wins_over_kind_order() {
+    fn picked_option_drives_id_and_decision() {
         let options: Vec<_> = ["Alpha", "Bravo", "Charlie", "Delta"]
             .iter()
             .enumerate()
@@ -432,6 +413,70 @@ mod tests {
         // The kind-order fallback picks the first allow_once, the bug above.
         let fallback = pick_option_id(&options, ApprovalDecision::Allow, None).expect("fallback");
         assert_eq!(fallback.0.as_ref(), "choice-0");
+
+        // Without a picked id the decision selects by kind, falling back to a
+        // kind the agent did offer.
+        let both = vec![
+            option("yes", "Allow this once", PermissionOptionKind::AllowOnce),
+            option("no", "Reject", PermissionOptionKind::RejectOnce),
+        ];
+        let always_only = vec![option(
+            "always",
+            "Always",
+            PermissionOptionKind::AllowAlways,
+        )];
+        for (options, want) in [(&both, "yes"), (&always_only, "always")] {
+            let id = pick_option_id(options, ApprovalDecision::Allow, None).unwrap();
+            assert_eq!(id.0.as_ref(), want);
+        }
+
+        // The card sends an allow-shaped decision beside the option id, so the
+        // recorded decision has to come from the option itself.
+        {
+            let options = vec![
+                option("yes", "Yes", PermissionOptionKind::AllowOnce),
+                option("forever", "Always", PermissionOptionKind::AllowAlways),
+                option("no", "No", PermissionOptionKind::RejectOnce),
+            ];
+            for (id, expected) in [
+                ("yes", ApprovalDecision::Allow),
+                ("forever", ApprovalDecision::AllowAlways),
+                ("no", ApprovalDecision::Deny),
+            ] {
+                let picked = PermissionOptionId::new(id);
+                assert_eq!(
+                    decision_for_option(&options, &picked),
+                    Some(expected),
+                    "{id}"
+                );
+            }
+            let missing = PermissionOptionId::new("gone");
+            assert_eq!(decision_for_option(&options, &missing), None);
+
+            assert_eq!(
+                approval_options(&options)
+                    .into_iter()
+                    .map(|o| (o.option_id, o.name, o.kind))
+                    .collect::<Vec<_>>(),
+                [
+                    (
+                        "yes".to_string(),
+                        "Yes".to_string(),
+                        ApprovalOptionKind::AllowOnce
+                    ),
+                    (
+                        "forever".to_string(),
+                        "Always".to_string(),
+                        ApprovalOptionKind::AllowAlways
+                    ),
+                    (
+                        "no".to_string(),
+                        "No".to_string(),
+                        ApprovalOptionKind::RejectOnce
+                    ),
+                ]
+            );
+        }
     }
 
     /// The generic allow/deny flow sends no option id, so a choice list must
@@ -497,53 +542,5 @@ mod tests {
                 break;
             }
         }
-    }
-
-    /// The card sends an allow-shaped decision beside the option id, so the
-    /// recorded decision has to come from the option itself.
-    #[test]
-    fn decision_follows_the_picked_option_not_the_sent_decision() {
-        let options = vec![
-            option("yes", "Yes", PermissionOptionKind::AllowOnce),
-            option("forever", "Always", PermissionOptionKind::AllowAlways),
-            option("no", "No", PermissionOptionKind::RejectOnce),
-        ];
-        for (id, expected) in [
-            ("yes", ApprovalDecision::Allow),
-            ("forever", ApprovalDecision::AllowAlways),
-            ("no", ApprovalDecision::Deny),
-        ] {
-            let picked = PermissionOptionId::new(id);
-            assert_eq!(
-                decision_for_option(&options, &picked),
-                Some(expected),
-                "{id}"
-            );
-        }
-        let missing = PermissionOptionId::new("gone");
-        assert_eq!(decision_for_option(&options, &missing), None);
-    }
-
-    #[test]
-    fn approval_options_normalize_kinds_in_order() {
-        let options = vec![
-            option("yes", "Yes", PermissionOptionKind::AllowOnce),
-            option("no", "No", PermissionOptionKind::RejectOnce),
-        ];
-        assert_eq!(
-            approval_options(&options),
-            vec![
-                ApprovalOption {
-                    option_id: "yes".into(),
-                    name: "Yes".into(),
-                    kind: ApprovalOptionKind::AllowOnce,
-                },
-                ApprovalOption {
-                    option_id: "no".into(),
-                    name: "No".into(),
-                    kind: ApprovalOptionKind::RejectOnce,
-                },
-            ]
-        );
     }
 }

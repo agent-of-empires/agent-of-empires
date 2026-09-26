@@ -543,10 +543,14 @@ mod tests {
     /// Every checkbox present, over a config that turns both auto-cleanups on
     /// and branch deletion off.
     fn full_dialog() -> UnifiedDeleteDialog {
+        dialog_with_auto_cleanup(true)
+    }
+
+    fn dialog_with_auto_cleanup(auto_cleanup: bool) -> UnifiedDeleteDialog {
         let _home = crate::session::test_support::isolate_app_dir();
         std::fs::write(
             crate::session::config::config_path().unwrap(),
-            "[worktree]\nauto_cleanup = true\ndelete_branch_on_cleanup = false\n[sandbox]\nauto_cleanup = true\n",
+            format!("[worktree]\nauto_cleanup = {auto_cleanup}\ndelete_branch_on_cleanup = false\n[sandbox]\nauto_cleanup = {auto_cleanup}\n"),
         )
         .unwrap();
         UnifiedDeleteDialog::new(
@@ -608,6 +612,11 @@ mod tests {
         assert!(dialog.options.delete_worktree, "worktree.auto_cleanup");
         assert!(!dialog.options.delete_branch, "delete_branch_on_cleanup");
         assert!(dialog.options.delete_sandbox, "sandbox.auto_cleanup");
+        let off = dialog_with_auto_cleanup(false).options;
+        assert!(
+            !off.delete_worktree && !off.delete_sandbox,
+            "auto_cleanup = false"
+        );
 
         let dialog = scratch_dialog();
         assert_eq!(dialog.focus, FocusElement::KeepScratchCheckbox);

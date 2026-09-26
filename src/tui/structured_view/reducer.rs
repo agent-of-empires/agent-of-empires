@@ -762,14 +762,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn set_lagged_flags_without_touching_rows() {
-        let mut t = AcpTranscript::new("s-1");
-        t.set_lagged();
-        assert!(t.lagged);
-        assert!(t.server_rows.is_empty());
-    }
-
     /// A lag rebuilds the rows but leaves control state alone: every frame is
     /// a whole-state snapshot, so a gap in the event stream cannot stale it.
     #[test]
@@ -784,6 +776,9 @@ mod tests {
         }]));
         assert!(!t.server_rows.is_empty());
 
+        t.set_lagged();
+        assert!(t.lagged);
+        assert!(!t.server_rows.is_empty(), "flagging a lag keeps the rows");
         t.drop_rows();
         assert!(t.server_rows.is_empty());
         assert!(t.turn_active, "a lag does not end the running turn");

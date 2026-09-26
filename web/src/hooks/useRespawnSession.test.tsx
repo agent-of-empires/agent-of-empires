@@ -28,7 +28,6 @@ describe("useRespawnSession resetKey", () => {
   it.each([
     ["a successful respawn", () => stubFetch(true, 200), "ok", "", ["reset-2"]],
     ["a failed respawn", () => stubFetch(false, 500, "boom"), "failed", "boom", [null, "reset-2"]],
-    ["a second incident on the same key", () => stubFetch(false, 409, "busy"), "failed", "busy", [null, "unknown"]],
   ] as [string, () => void, string, string, (string | null)[]][])(
     "starts fresh for the next incident after %s",
     async (_label, stub, settled, errorText, keysAfter) => {

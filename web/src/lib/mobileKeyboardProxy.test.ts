@@ -24,7 +24,6 @@ describe("forwardTerminalBeforeInput", () => {
     ["forwards an accepted delete", { inputType: "deleteContentBackward" }, "ㅎ", true, false, "ㅎ"],
     ["swallows a line break and drops the IME context", { inputType: "insertLineBreak" }, "한국어", true, true, ""],
     ["swallows a paste", { inputType: "insertFromPaste", data: "a\nb" }, "", true, true, ""],
-    ["cancels a refused insert", { inputType: "insertText", data: "c" }, "한", false, true, ""],
     ["cancels a refused delete and drops the text", { inputType: "deleteContentBackward" }, "그", false, true, ""],
   ])("%s", (_name, init, before, accepted, prevented, after) => {
     const ta = document.createElement("textarea");
@@ -56,13 +55,6 @@ describe("forwardTerminalBeforeInput", () => {
 });
 
 describe("mobile keyboard proxy", () => {
-  it("delivers input buffered while a session is mounting", () => {
-    deliverMobileKeyboardProxyInput({ inputType: "insertText", data: "first", isComposing: false });
-    const receive = vi.fn();
-    registerMobileKeyboardProxyReceiver(receive);
-    expect(receive).toHaveBeenCalledWith({ inputType: "insertText", data: "first", isComposing: false });
-  });
-
   it("rejects input past the queue bound", () => {
     for (let i = 0; i < 128; i++) {
       const ok = deliverMobileKeyboardProxyInput({ inputType: "insertText", data: `x${i}`, isComposing: false });

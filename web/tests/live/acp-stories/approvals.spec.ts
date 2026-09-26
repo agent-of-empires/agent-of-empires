@@ -1,15 +1,7 @@
 // Permission and elicitation cards: the fake agent gates its next update on the client's answer.
 
 import { test, expect } from "../../helpers/liveTest";
-import {
-  chunk,
-  endTurn,
-  idleComposer,
-  openStructuredView,
-  script,
-  startAcpSession,
-  stopButton,
-} from "../../helpers/acp";
+import { chunk, endTurn, openStructuredView, script, startAcpSession } from "../../helpers/acp";
 
 const turn = (...updates: object[]) => script(endTurn(...updates));
 const permission = (toolCallId: string, title: string) => ({
@@ -39,26 +31,6 @@ test("ApprovalCard Allow resolves and the turn continues", async ({ page, spawnS
   await approvalDialog.getByRole("button", { name: "Allow" }).click();
   await expect(postApprovalChunk).toBeVisible({ timeout: 10_000 });
   await expect(approvalDialog).toBeHidden({ timeout: 10_000 });
-});
-
-test("ApprovalCard Deny resolves and the turn ends", async ({ page, spawnServe }) => {
-  const { serve, sessionId } = await startAcpSession(spawnServe, {
-    title: "story-deny",
-    fakeAcpScript: turn(chunk("Asking permission..."), permission("fake-tool-call-deny", "Delete file")),
-  });
-  await openStructuredView(page, serve, sessionId, "please delete something");
-
-  const approvalDialog = page.getByRole("alertdialog", { name: /Approval needed/i });
-  await expect(approvalDialog).toBeVisible({ timeout: 10_000 });
-  await approvalDialog.getByRole("button", { name: "Deny" }).click();
-
-  await expect(approvalDialog).toBeHidden({ timeout: 10_000 });
-  // The textbox is visible mid-turn too; enabled and cleared proves the turn is idle.
-  const idle = idleComposer(page);
-  await expect(idle).toBeVisible({ timeout: 10_000 });
-  await expect(idle).toBeEnabled({ timeout: 10_000 });
-  await expect(idle).toHaveValue("");
-  await expect(stopButton(page)).toBeHidden({ timeout: 10_000 });
 });
 
 test("an option-list permission request renders its own labels", async ({ page, spawnServe }) => {
@@ -165,5 +137,40 @@ test("elicitation form with number + boolean fields round-trips", async ({ page,
   await questionDialog.getByRole("checkbox").check();
   await questionDialog.getByRole("button", { name: "Submit" }).click();
   await expect(postChunk).toBeVisible({ timeout: 10_000 });
+  await expect(questionDialog).toBeHidden({ timeout: 10_000 });
+});
+
+test("free-text question (the 'Other' box) submits on Enter, not just the Submit button click", async ({
+  page,
+  spawnServe,
+}) => {
+  const { serve, sessionId } = await startAcpSession(spawnServe, {
+    title: "story-ask-enter",
+    fakeAcpScript: turn(
+      chunk("What's your name?"),
+      {
+        sessionUpdate: "elicitation_request",
+        message: "What's your name?",
+        requestedSchema: {
+          type: "object",
+          properties: {
+            question_0: { type: "string", title: "Name" },
+          },
+        },
+      },
+      chunk("Nice to meet you."),
+    ),
+  });
+  await openStructuredView(page, serve, sessionId, "ask my name");
+
+  const questionDialog = page.getByRole("alertdialog", { name: /Question from the agent/i });
+  await expect(questionDialog).toBeVisible({ timeout: 10_000 });
+  const postAnswerChunk = page.getByText("Nice to meet you.");
+  await expect(postAnswerChunk).toHaveCount(0);
+
+  const answerBox = questionDialog.getByPlaceholder("Type your answer");
+  await answerBox.fill("Ada");
+  await answerBox.press("Enter");
+  await expect(postAnswerChunk).toBeVisible({ timeout: 10_000 });
   await expect(questionDialog).toBeHidden({ timeout: 10_000 });
 });

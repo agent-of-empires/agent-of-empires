@@ -201,17 +201,13 @@ mod tests {
     }
 
     #[test]
-    fn worker_round_trips_requests_through_handler() {
+    fn worker_round_trips_requests_in_order() {
         let worker: Worker<u32, u32> = Worker::spawn("aoe-test-worker", |n| n * 2);
-        worker.request(21);
-        let result = recv_with_retries(&worker).expect("timed out waiting for worker result");
-        assert_eq!(result, 42);
-    }
-
-    #[test]
-    fn worker_try_recv_returns_empty_when_idle() {
-        let worker: Worker<u32, u32> = Worker::spawn("aoe-test-worker-idle", |n| n);
         assert!(matches!(worker.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        worker.request(21);
+        worker.request(2);
+        assert_eq!(recv_with_retries(&worker).expect("first result"), 42);
+        assert_eq!(recv_with_retries(&worker).expect("second result"), 4);
     }
 
     #[test]
@@ -223,14 +219,5 @@ mod tests {
         worker.request(1);
         let outcome = recv_with_retries(&worker);
         assert!(matches!(outcome, Err(mpsc::TryRecvError::Disconnected)));
-    }
-
-    #[test]
-    fn worker_processes_requests_in_order() {
-        let worker: Worker<u32, u32> = Worker::spawn("aoe-test-worker-order", |n| n + 1);
-        worker.request(1);
-        worker.request(2);
-        assert_eq!(recv_with_retries(&worker).expect("first result"), 2);
-        assert_eq!(recv_with_retries(&worker).expect("second result"), 3);
     }
 }

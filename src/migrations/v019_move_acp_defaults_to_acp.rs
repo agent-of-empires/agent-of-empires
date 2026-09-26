@@ -49,76 +49,35 @@ fn migrate_config_file(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
+    use crate::migrations::test_cases::assert_rewrites;
 
     #[test]
-    fn moves_acp_defaults_and_is_idempotent() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.toml");
-        fs::write(
-            &path,
-            "[session]\nsmart_rename = true\n\n[session.acp_defaults.opencode]\nmodel = \"openai/gpt-5.5\"\neffort = \"high\"\n",
-        )
-        .unwrap();
-
-        migrate_config_file(&path).unwrap();
-
-        let doc: toml::Table = fs::read_to_string(&path).unwrap().parse().unwrap();
-        // Moved under [acp], removed from [session], other session keys kept.
-        let acp = doc["acp"].as_table().unwrap();
-        let defaults = acp["acp_defaults"].as_table().unwrap();
-        assert_eq!(
-            defaults["opencode"].as_table().unwrap()["model"].as_str(),
-            Some("openai/gpt-5.5")
+    fn moves_session_acp_defaults_under_acp() {
+        let untouched = "[session]\nsmart_rename = true\n";
+        assert_rewrites(
+            "config.toml",
+            migrate_config_file,
+            &[
+                (
+                    Some(
+                        "[session]\nsmart_rename = true\n\n[session.acp_defaults.opencode]\n\
+                         model = \"openai/gpt-5.5\"\neffort = \"high\"\n",
+                    ),
+                    Some(
+                        "[session]\nsmart_rename = true\n\n[acp.acp_defaults.opencode]\n\
+                         model = \"openai/gpt-5.5\"\neffort = \"high\"\n",
+                    ),
+                ),
+                // An existing [acp] copy wins over the stale session one.
+                (
+                    Some(
+                        "[session.acp_defaults.opencode]\nmodel = \"stale\"\n\n\
+                         [acp.acp_defaults.opencode]\nmodel = \"fresh\"\n",
+                    ),
+                    Some("[session]\n\n[acp.acp_defaults.opencode]\nmodel = \"fresh\"\n"),
+                ),
+                (Some(untouched), Some(untouched)),
+            ],
         );
-        assert!(!doc["session"]
-            .as_table()
-            .unwrap()
-            .contains_key("acp_defaults"));
-        assert_eq!(
-            doc["session"].as_table().unwrap()["smart_rename"].as_bool(),
-            Some(true)
-        );
-
-        // Idempotent: a second run leaves the file unchanged.
-        let before = fs::read_to_string(&path).unwrap();
-        migrate_config_file(&path).unwrap();
-        assert_eq!(before, fs::read_to_string(&path).unwrap());
-    }
-
-    #[test]
-    fn no_session_acp_defaults_is_a_noop() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.toml");
-        fs::write(&path, "[session]\nsmart_rename = true\n").unwrap();
-        let before = fs::read_to_string(&path).unwrap();
-        migrate_config_file(&path).unwrap();
-        assert_eq!(before, fs::read_to_string(&path).unwrap());
-    }
-
-    #[test]
-    fn existing_acp_copy_wins() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.toml");
-        fs::write(
-            &path,
-            "[session.acp_defaults.opencode]\nmodel = \"stale\"\n\n[acp.acp_defaults.opencode]\nmodel = \"fresh\"\n",
-        )
-        .unwrap();
-
-        migrate_config_file(&path).unwrap();
-
-        let doc: toml::Table = fs::read_to_string(&path).unwrap().parse().unwrap();
-        let defaults = doc["acp"].as_table().unwrap()["acp_defaults"]
-            .as_table()
-            .unwrap();
-        assert_eq!(
-            defaults["opencode"].as_table().unwrap()["model"].as_str(),
-            Some("fresh")
-        );
-        assert!(!doc["session"]
-            .as_table()
-            .unwrap()
-            .contains_key("acp_defaults"));
     }
 }

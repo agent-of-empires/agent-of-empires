@@ -1015,6 +1015,20 @@ last_seen_version = "{}"
         String::from_utf8_lossy(&out.stderr).into_owned()
     }
 
+    /// Like [`Self::run_cli`], but spawns `aoe <args>` in the background
+    /// instead of blocking for exit. For a long-running command like `acp
+    /// tail`, which streams until killed rather than returning.
+    pub fn spawn_cli(&self, args: &[&str]) -> std::process::Child {
+        self.cli_command(args)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("failed to spawn aoe CLI")
+    }
+
+    /// Like [`Self::run_cli`], but writes `stdin` to the child before
+    /// collecting output. Used by the plugin-worker tests, which speak
+    /// ndjson JSON-RPC on stdio and exit on EOF.
     pub fn run_cli_with_stdin(&self, args: &[&str], stdin: &str) -> Output {
         use std::io::Write;
         use std::process::Stdio;

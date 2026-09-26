@@ -1,9 +1,11 @@
-// Structured view worker endpoints: view switch, mode and config options, shutdown, files, worker log, custom agents.
+// Structured view worker endpoints: view switch, mode and config options, shutdown, worker log, custom agents.
+// File listing skip rules, log-tail windowing and config-option rejection are pinned by Rust unit and
+// integration tests (list_files_sorts_skips_and_caps, read_log_tail_windows_and_partial_lines, acp_model_respawn).
 
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { test, expect } from "../helpers/liveTest";
-import { appDirFor, listSessions, resolveAoeBinary, seedSessionViaAoeAdd, waitForView } from "../helpers/aoeServe";
+import { appDirFor, listSessions, resolveAoeBinary, waitForView } from "../helpers/aoeServe";
 import {
   postAcp,
   replayJson,
@@ -119,51 +121,6 @@ test.describe("config options", () => {
       (json) => json.includes("ConfigOptionsUpdated") && /"effort"[^}]*"current_value"\s*:\s*"high"/.test(json),
     );
   });
-
-  test("rejected set_config_option surfaces as ConfigOptionSwitchFailed", async ({ spawnServe }) => {
-    const { serve, sessionId } = await start(spawnServe, "config-pickers-reject", {
-      FAKE_ACP_REJECT_CONFIG_OPTION: "rate limited (test)",
-    });
-    // The request itself succeeds; the rejection arrives as an async event.
-    expect2xx(
-      await postAcp(serve.baseUrl, sessionId, "/config-option", { config_id: "model", value: "claude-sonnet-4-6" }),
-    );
-    await replayMatches(
-      serve.baseUrl,
-      sessionId,
-      (json) => json.includes("ConfigOptionSwitchFailed") && json.includes("rate limited"),
-    );
-  });
-});
-
-test("structured view/files lists workspace files and honors the skip rules", async ({ spawnServe }) => {
-  const serve = await spawnServe({
-    acp: true,
-    seedFn: (env) => {
-      seedSessionViaAoeAdd({ title: "acp-files" })(env);
-      const projectDir = join(env.home, "project");
-      mkdirSync(join(projectDir, "src", "nested"), { recursive: true });
-      mkdirSync(join(projectDir, "node_modules", "junk"), { recursive: true });
-      writeFileSync(join(projectDir, "main.rs"), "fn main() {}\n");
-      writeFileSync(join(projectDir, "src", "lib.rs"), "// lib\n");
-      writeFileSync(join(projectDir, "src", "nested", "deep.rs"), "// deep\n");
-      writeFileSync(join(projectDir, "node_modules", "junk", "ignore.js"), "// ignore\n");
-      writeFileSync(join(projectDir, ".secret"), "should be hidden\n");
-    },
-  });
-  const [session] = await listSessions(serve.baseUrl);
-  expect(session).toBeDefined();
-
-  const res = await fetch(`${serve.baseUrl}/api/sessions/${session!.id}/acp/files`);
-  expect(res.ok).toBeTruthy();
-  const body = (await res.json()) as { files: string[]; truncated: boolean };
-  expect(Array.isArray(body.files)).toBe(true);
-  expect(body.truncated).toBe(false);
-  for (const file of ["main.rs", "src/lib.rs", "src/nested/deep.rs"]) expect(body.files).toContain(file);
-  expect(body.files.some((f) => f.startsWith("node_modules/"))).toBe(false);
-  expect(body.files).not.toContain(".secret");
-
-  expect((await fetch(`${serve.baseUrl}/api/sessions/does-not-exist/acp/files`)).status).toBe(404);
 });
 
 // #1449: the runner stderr drain, readable without host terminal access.
@@ -174,18 +131,6 @@ test.describe("worker log", () => {
     expect(res.status).toBe(200);
     return (await res.json()) as WorkerLog;
   };
-
-  test("worker-log is empty before the runner writes and 404s for an unknown session", async ({ spawnServe }) => {
-    const { serve, sessionId } = await seedAcpSession(spawnServe, { title: "worker-log-empty" });
-    const body = await workerLog(serve.baseUrl, sessionId, 200);
-    expect(body.exists).toBe(false);
-    expect(body.tail).toBe("");
-    expect(body.lines_returned).toBe(0);
-    expect(body.truncated).toBe(false);
-    expect(body.path).toMatch(/acp-workers/);
-
-    expect((await fetch(`${serve.baseUrl}/api/sessions/does-not-exist-9d34/acp/worker-log`)).status).toBe(404);
-  });
 
   test("worker-log returns the runner tail after spawn and clamps oversized requests", async ({ spawnServe }) => {
     const { serve, sessionId } = await startAcpSession(spawnServe, { title: "worker-log-populated" });

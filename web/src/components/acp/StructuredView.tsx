@@ -1,4 +1,3 @@
-/* eslint-disable react-refresh/only-export-components */
 // Structured view conversation surface. assistant-ui renders the thread shell;
 // state lives in AcpRuntime and is only fed to assistant-ui, never owned by it.
 
@@ -106,7 +105,7 @@ export function StructuredView(props: Props) {
 
 /** Bottom padding reserving the soft keyboard where the layout viewport does
  *  not shrink for it (iOS regular Safari); 0 elsewhere. */
-export function structuredViewRootStyle(keyboardHeight: number): React.CSSProperties | undefined {
+function structuredViewRootStyle(keyboardHeight: number): React.CSSProperties | undefined {
   return keyboardHeight > 0 ? { paddingBottom: keyboardHeight } : undefined;
 }
 

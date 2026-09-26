@@ -157,7 +157,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn create_runs_and_captures_output() {
+    async fn create_captures_output_and_release_is_idempotent() {
         let _env = crate::session::test_support::EnvGuard::read_lock();
         let mgr = TerminalManager::new();
         let cwd = std::env::temp_dir();
@@ -168,16 +168,7 @@ mod tests {
         let out = mgr.output(&id).await.unwrap();
         assert!(out.stdout.contains("hello"));
         assert_eq!(out.exit_code, Some(0));
-    }
 
-    #[tokio::test]
-    async fn release_is_idempotent_cleanup() {
-        let _env = crate::session::test_support::EnvGuard::read_lock();
-        let mgr = TerminalManager::new();
-        let id = mgr
-            .create_and_run("s-1", "true", vec![], std::env::temp_dir(), None)
-            .await
-            .unwrap();
         mgr.release(&id).await;
         mgr.release(&id).await;
         mgr.release("never-existed").await;

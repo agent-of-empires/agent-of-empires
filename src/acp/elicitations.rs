@@ -710,7 +710,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_selects_with_options_and_descriptions() {
+    fn parses_questions_in_order_with_constraints_and_defaults() {
         let e = parse(
             ElicitationSchema::new()
                 .title("Profile")
@@ -772,35 +772,7 @@ mod tests {
         assert_eq!(descriptions(3), [None, None]);
         assert_eq!(e.questions[1].options[0].label, "Apple");
         assert_eq!(e.questions[2].options[0].label, "Yes");
-    }
 
-    #[test]
-    fn orders_questions_numerically_with_custom_boxes_beside_them() {
-        let other = || StringPropertySchema::new().title("Other");
-        let e = parse(
-            ElicitationSchema::new()
-                .property("question_10", MultiSelectPropertySchema::new(vec![]), false)
-                .property("customAnswer", other(), false)
-                .string("question_2", false)
-                .property("question_2_custom", other(), false)
-                .string("question_0", false),
-        );
-        let keys: Vec<&str> = e.questions.iter().map(|q| q.field_key.as_str()).collect();
-        assert_eq!(
-            keys,
-            [
-                "question_0",
-                "question_2",
-                "question_2_custom",
-                "question_10",
-                "customAnswer"
-            ]
-        );
-        assert_eq!(e.questions[1].kind, Kind::FreeText);
-    }
-
-    #[test]
-    fn parses_scalar_constraints_formats_and_defaults() {
         let e = parse(
             ElicitationSchema::new()
                 .property(
@@ -856,6 +828,29 @@ mod tests {
         assert_eq!(email.pattern.as_deref(), Some("^.+@.+$"));
         assert_eq!(email.format.as_deref(), Some("email"));
         assert_eq!(email.default, Some(text("a@b.co")));
+
+        // Questions order numerically with custom boxes beside them.
+        let other = || StringPropertySchema::new().title("Other");
+        let e = parse(
+            ElicitationSchema::new()
+                .property("question_10", MultiSelectPropertySchema::new(vec![]), false)
+                .property("customAnswer", other(), false)
+                .string("question_2", false)
+                .property("question_2_custom", other(), false)
+                .string("question_0", false),
+        );
+        let keys: Vec<&str> = e.questions.iter().map(|q| q.field_key.as_str()).collect();
+        assert_eq!(
+            keys,
+            [
+                "question_0",
+                "question_2",
+                "question_2_custom",
+                "question_10",
+                "customAnswer"
+            ]
+        );
+        assert_eq!(e.questions[1].kind, Kind::FreeText);
     }
 
     #[test]
@@ -917,7 +912,7 @@ mod tests {
     }
 
     #[test]
-    fn build_response_maps_decisions_and_validates_selects() {
+    fn build_response_maps_decisions_and_validates_answers() {
         let e = sample_form();
         for (resolution, want) in [
             (ElicitationResolution::Decline, "Decline"),
@@ -980,10 +975,7 @@ mod tests {
         e.questions[1].min_items = Some(2);
         let content = respond(&e, vec![("question_0", text("Yes"))]).unwrap();
         assert!(!content.contains_key("tags"));
-    }
 
-    #[test]
-    fn build_response_validates_scalar_answers() {
         let bounded = |kind| {
             form(vec![ElicitationQuestion {
                 minimum: Some(0.0),

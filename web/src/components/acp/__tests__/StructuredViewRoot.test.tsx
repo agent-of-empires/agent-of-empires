@@ -9,7 +9,7 @@ vi.mock("../../../hooks/useMobileKeyboard", () => ({
   useMobileKeyboard: () => mockKeyboard.current,
 }));
 
-import { StructuredViewRoot, structuredViewRootStyle } from "../StructuredView";
+import { StructuredViewRoot } from "../StructuredView";
 
 afterEach(() => {
   cleanup();
@@ -27,41 +27,31 @@ function renderRoot(keyboardHeight: number) {
   return screen.getByTestId("structured-view-root");
 }
 
-describe("structuredViewRootStyle", () => {
-  it.each([
-    [280, { paddingBottom: 280 }],
-    [0, undefined],
-    [-12, undefined],
-  ])("keyboardHeight %s -> %o", (height, expected) => {
-    expect(structuredViewRootStyle(height)).toEqual(expected);
-  });
-});
-
 describe("StructuredViewRoot", () => {
   it.each([
     [280, "280px"],
     [0, ""],
+    [-12, ""],
   ])("reserves keyboard height %s as bottom padding", (height, padding) => {
     expect(renderRoot(height).style.paddingBottom).toBe(padding);
   });
 
   // rem, not px, so the transcript still follows the browser's root font size.
-  it("publishes both conversation font sizes as rem without dropping the keyboard reservation", () => {
+  it("publishes both conversation font sizes as rem, defaulting to 14px, without dropping the keyboard reservation", () => {
+    const fontSizes = (root: HTMLElement) => [
+      root.style.getPropertyValue("--acp-conversation-font-size-mobile"),
+      root.style.getPropertyValue("--acp-conversation-font-size-desktop"),
+    ];
+    expect(fontSizes(renderRoot(0))).toEqual(["0.875rem", "0.875rem"]);
+    cleanup();
     window.localStorage.setItem(
       "aoe-web-settings",
       JSON.stringify({ structuredMobileFontSize: 11, structuredDesktopFontSize: 18 }),
     );
     const root = renderRoot(300);
-    expect(root.style.getPropertyValue("--acp-conversation-font-size-mobile")).toBe("0.6875rem");
-    expect(root.style.getPropertyValue("--acp-conversation-font-size-desktop")).toBe("1.125rem");
+    expect(fontSizes(root)).toEqual(["0.6875rem", "1.125rem"]);
     // The CSS rule choosing between them keys off this class.
     expect(root.classList.contains("acp-conversation-scope")).toBe(true);
     expect(root.style.paddingBottom).toBe("300px");
-  });
-
-  it("publishes the 14px default as 0.875rem", () => {
-    const root = renderRoot(0);
-    expect(root.style.getPropertyValue("--acp-conversation-font-size-mobile")).toBe("0.875rem");
-    expect(root.style.getPropertyValue("--acp-conversation-font-size-desktop")).toBe("0.875rem");
   });
 });

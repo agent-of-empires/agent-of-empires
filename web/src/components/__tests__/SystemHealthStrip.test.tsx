@@ -50,16 +50,15 @@ function Strip({ health: value }: { health: SystemHealth }) {
 }
 
 describe("SystemHealthStrip", () => {
-  it("reports CPU, memory and counts, and hides the detail until opened", () => {
+  it("reports CPU, memory and counts, bands memory by status, and hides the detail until opened", () => {
     render(<Strip health={health()} />);
 
     expect(screen.getByText("CPU 42%")).toBeTruthy();
     expect(screen.getByText("Mem 25%")).toBeTruthy();
     expect(screen.getByText("2 agents · 7 procs")).toBeTruthy();
     expect(screen.queryByTestId("system-health-detail")).toBeNull();
-  });
+    cleanup();
 
-  it("bands the memory readout by the server's status", () => {
     const cases: Array<[SystemHealth["status"], string]> = [
       ["ok", "text-status-running"],
       ["warn", "text-status-warning"],
@@ -70,11 +69,9 @@ describe("SystemHealthStrip", () => {
       expect(screen.getByText(/^Mem /).className).toContain(expected);
       unmount();
     }
-  });
 
-  it("reads unknown figures as ? rather than zero", () => {
+    // Unknown figures read as ? rather than zero.
     render(<Strip health={health({ cpu_fraction: null, memory_total_bytes: 0 })} />);
-
     expect(screen.getByText("CPU ?")).toBeTruthy();
     expect(screen.getByText("Mem ?")).toBeTruthy();
   });
@@ -118,12 +115,10 @@ describe("SystemHealthStrip", () => {
     // A sandboxed row is marked, and its missing figures read unknown.
     expect(screen.getByText("[container]")).toBeTruthy();
     expect(screen.getAllByText("?").length).toBe(3);
-  });
+    cleanup();
 
-  it("says so when no agents are running", () => {
     render(<Strip health={health({ agent_count: 0, proc_count: 0 })} />);
     fireEvent.click(screen.getByTitle("System health"));
-
     expect(screen.getByText("No running AoE agents")).toBeTruthy();
   });
 });
@@ -137,11 +132,18 @@ describe("SidebarSystemHealth", () => {
     vi.useRealTimers();
   });
 
-  it("renders nothing and fetches nothing while the setting is off", async () => {
+  it("renders nothing and fetches nothing while the setting is off or the rail is compact", async () => {
     render(
-      <SystemHealthEnabledContext.Provider value={false}>
-        <SidebarSystemHealth />
-      </SystemHealthEnabledContext.Provider>,
+      <>
+        <SystemHealthEnabledContext.Provider value={false}>
+          <SidebarSystemHealth />
+        </SystemHealthEnabledContext.Provider>
+        <SidebarCompactContext.Provider value={true}>
+          <SystemHealthEnabledContext.Provider value={true}>
+            <SidebarSystemHealth />
+          </SystemHealthEnabledContext.Provider>
+        </SidebarCompactContext.Provider>
+      </>,
     );
 
     await act(async () => {
@@ -152,7 +154,7 @@ describe("SidebarSystemHealth", () => {
     expect(mockFetch).not.toHaveBeenCalled();
   });
 
-  it("polls and renders while the setting is on", async () => {
+  it("polls slowly while collapsed and at the TUI rate while open", async () => {
     mockFetch.mockResolvedValue(health());
 
     render(
@@ -180,6 +182,17 @@ describe("SidebarSystemHealth", () => {
       await vi.advanceTimersByTimeAsync(12000);
     });
     expect(mockFetch.mock.calls.length).toBeGreaterThan(callsAfterMount);
+
+    // Open, it polls at the TUI's faster rate.
+    fireEvent.click(screen.getByTitle("System health"));
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    const callsAfterOpen = mockFetch.mock.calls.length;
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(600);
+    });
+    expect(mockFetch.mock.calls.length).toBeGreaterThan(callsAfterOpen);
   });
 
   it("does not stack requests when a sample outlives the gap", async () => {
@@ -248,49 +261,6 @@ describe("SidebarSystemHealth", () => {
       await vi.advanceTimersByTimeAsync(0);
     });
     expect(mockFetch.mock.calls.length).toBe(callsWithOneInFlight + 1);
-  });
-
-  it("stands down in the compact rail rather than cramping the readout", async () => {
-    mockFetch.mockResolvedValue(health());
-
-    render(
-      <SidebarCompactContext.Provider value={true}>
-        <SystemHealthEnabledContext.Provider value={true}>
-          <SidebarSystemHealth />
-        </SystemHealthEnabledContext.Provider>
-      </SidebarCompactContext.Provider>,
-    );
-
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(5000);
-    });
-
-    expect(screen.queryByTestId("system-health-strip")).toBeNull();
-    expect(mockFetch).not.toHaveBeenCalled();
-  });
-
-  it("polls at the TUI's rate only while the detail is open", async () => {
-    mockFetch.mockResolvedValue(health());
-
-    render(
-      <SystemHealthEnabledContext.Provider value={true}>
-        <SidebarSystemHealth />
-      </SystemHealthEnabledContext.Provider>,
-    );
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(0);
-    });
-
-    fireEvent.click(screen.getByTitle("System health"));
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(0);
-    });
-
-    const callsAfterOpen = mockFetch.mock.calls.length;
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(600);
-    });
-    expect(mockFetch.mock.calls.length).toBeGreaterThan(callsAfterOpen);
   });
 
   it("stops polling while the tab is hidden and refreshes on return", async () => {

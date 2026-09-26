@@ -523,7 +523,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn do_not_track_recognises_affirmative_values() {
+    fn do_not_track_recognises_affirmative_values_and_blocks_snapshots() {
         let _env = EnvGuard::unset(&["DO_NOT_TRACK"]);
         for v in ["1", "true", "TRUE", "yes", "Yes"] {
             let _value = EnvGuard::set(&[("DO_NOT_TRACK", v)]);
@@ -534,6 +534,26 @@ mod tests {
             assert!(!do_not_track(), "{v} should not suppress");
         }
         assert!(!do_not_track());
+
+        let _home = crate::session::test_support::isolate_app_dir();
+        crate::session::config::update_config(|c| c.telemetry.enabled = true).unwrap();
+        let build = || {
+            build_usage_snapshot(
+                Surface::Tui,
+                &[Instance::new("s", "/tmp/p")],
+                usage_signals::zeroed(),
+                0,
+                None,
+                None,
+                &StructuredInteractionCounts::default(),
+            )
+        };
+        assert!(build().is_some(), "an opted-in install builds a snapshot");
+        let _opt_out = EnvGuard::set(&[("DO_NOT_TRACK", "1")]);
+        assert!(
+            build().is_none(),
+            "DO_NOT_TRACK must veto an opted-in install"
+        );
     }
 
     #[test]
@@ -613,6 +633,8 @@ mod tests {
         let mut trashed_archived = Instance::new("trash-arch", "/tmp/g");
         trashed_archived.archive();
         trashed_archived.trash();
+        let mut expired = Instance::new("expired", "/tmp/h");
+        expired.snoozed_until = Some(chrono::Utc::now() - chrono::Duration::hours(1));
 
         let m = aggregate_instances(&[
             pinned_a,
@@ -622,66 +644,21 @@ mod tests {
             untouched,
             trashed,
             trashed_archived,
+            expired,
         ]);
 
         assert_eq!(m.pinned, 2, "two pinned sessions");
-        assert_eq!(m.snoozed, 1, "one currently snoozed session");
+        assert_eq!(m.snoozed, 1, "an elapsed snooze is not counted");
         assert_eq!(
             m.archived, 1,
             "the trashed-then-archived row must not double-count as archived"
         );
         assert_eq!(m.trashed, 2, "both trashed rows counted separately");
-        assert_eq!(m.total, 5, "session_total excludes the two trashed rows");
+        assert_eq!(m.total, 6, "session_total excludes the two trashed rows");
         assert_eq!(
             m.by_substrate.values().sum::<u32>(),
             m.total,
             "sessions_by_substrate must still sum to session_total"
-        );
-    }
-
-    #[test]
-    fn expired_snooze_is_not_counted() {
-        let mut expired = Instance::new("expired", "/tmp/x");
-        expired.snoozed_until = Some(chrono::Utc::now() - chrono::Duration::hours(1));
-        assert!(
-            !expired.is_snoozed(),
-            "precondition: expired snooze reads false"
-        );
-
-        let m = aggregate_instances(&[expired]);
-        assert_eq!(
-            m.snoozed, 0,
-            "an elapsed snooze must not increment session_snoozed"
-        );
-    }
-
-    #[test]
-    fn triage_counts_are_plain_integers() {
-        let json = serde_json::to_value(sample_snapshot()).unwrap();
-        assert!(json["session_pinned"].is_u64());
-        assert!(json["session_snoozed"].is_u64());
-        assert!(json["session_archived"].is_u64());
-        assert!(json["session_trashed"].is_u64());
-    }
-
-    #[test]
-    #[serial]
-    fn opted_out_build_returns_none() {
-        let _env = EnvGuard::set(&[("DO_NOT_TRACK", "1")]);
-        let mut pinned = Instance::new("pin", "/tmp/p");
-        pinned.pin();
-        assert!(
-            build_usage_snapshot(
-                Surface::Tui,
-                &[pinned],
-                usage_signals::zeroed(),
-                0,
-                None,
-                None,
-                &StructuredInteractionCounts::default()
-            )
-            .is_none(),
-            "opted-out install must not build a snapshot"
         );
     }
 
@@ -713,6 +690,12 @@ mod tests {
         *LAST_SNAPSHOT_FP.lock().unwrap() = None;
 
         let boot = sample_snapshot();
+        for _ in 0..2 {
+            assert!(
+                !snapshot_matches_last(&boot),
+                "peeking an empty cache must not record the fingerprint"
+            );
+        }
         record_snapshot_fp(&boot);
 
         let mut exit = sample_snapshot();
@@ -737,22 +720,6 @@ mod tests {
             "repeating the latest snapshot dedups against it"
         );
 
-        *LAST_SNAPSHOT_FP.lock().unwrap() = None;
-    }
-
-    #[test]
-    #[serial]
-    fn peek_does_not_record_fingerprint() {
-        *LAST_SNAPSHOT_FP.lock().unwrap() = None;
-        let snap = sample_snapshot();
-        assert!(
-            !snapshot_matches_last(&snap),
-            "first peek must not match an empty cache"
-        );
-        assert!(
-            !snapshot_matches_last(&snap),
-            "peeking must not record the fingerprint, so it still does not match"
-        );
         *LAST_SNAPSHOT_FP.lock().unwrap() = None;
     }
 

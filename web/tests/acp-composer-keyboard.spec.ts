@@ -55,27 +55,13 @@ async function rootPaddingBottom(page: Page): Promise<number> {
 }
 
 test.describe("Structured-view composer keyboard reservation (#2011)", () => {
-  test("reserves keyboard height so the composer clears the keyboard on iOS Safari (innerHeight constant)", async ({
+  test("reserves keyboard height on iOS Safari, but not once the layout viewport shrinks (PWA / Android)", async ({
     page,
   }) => {
     await setup(page);
     await openStructuredSession(page);
-
     // No keyboard: the root carries no bottom reservation.
     expect(await rootPaddingBottom(page)).toBe(0);
-
-    // iOS regular Safari: visualViewport shrinks but innerHeight stays full.
-    await simulateKeyboardOpen(page, 300);
-    // The root reserves ~keyboard height so the flex-1 viewport shrinks and the
-    // composer lifts above the keyboard.
-    await expect.poll(() => rootPaddingBottom(page)).toBeGreaterThanOrEqual(250);
-  });
-
-  test("does NOT reserve when the layout viewport already shrinks (PWA / Android, innerHeight shrinks)", async ({
-    page,
-  }) => {
-    await setup(page);
-    await openStructuredSession(page);
 
     const root = await page.getByTestId("structured-view-root").elementHandle();
     expect(root).not.toBeNull();
@@ -84,6 +70,8 @@ test.describe("Structured-view composer keyboard reservation (#2011)", () => {
         connected: element.isConnected,
         padding: parseInt(element.style.paddingBottom || "0") || 0,
       }));
+    // iOS regular Safari: visualViewport shrinks but innerHeight stays full, so the
+    // root reserves ~keyboard height and the composer lifts above the keyboard.
     await simulateKeyboardOpen(page, 300);
     await expect.poll(async () => (await reservation()).padding).toBeGreaterThanOrEqual(250);
     await simulateKeyboardOpen(page, 300, { innerHeightShrinks: true });

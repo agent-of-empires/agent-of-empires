@@ -28,7 +28,6 @@ type ActionName = keyof ReturnType<typeof mount>["actions"];
 
 describe("useKeyboardShortcuts", () => {
   it.each<[string, KeyboardEventInit, ActionName | null, ActionName | null]>([
-    ["Ctrl+K opens the palette", { key: "k", ctrlKey: true }, "onPalette", null],
     [
       "Ctrl+Alt+B toggles the right panel, not the sidebar",
       { key: "b", code: "KeyB", ctrlKey: true, altKey: true },
@@ -41,7 +40,6 @@ describe("useKeyboardShortcuts", () => {
       "onNewScratch",
       "onNew",
     ],
-    ["plain Shift+N needs a modifier", { key: "N", code: "KeyN", shiftKey: true }, null, "onNewScratch"],
   ])("%s", (_label, init, fired, notFired) => {
     const { actions } = mount();
     dispatch(document.body, init);

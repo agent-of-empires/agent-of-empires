@@ -20,20 +20,15 @@ function comment(over: Partial<DiffComment>): DiffComment {
 }
 
 describe("anchorCommentsToContents", () => {
-  it("marks an in-bounds comment active", () => {
-    const out = anchorCommentsToContents([comment({})], "a.ts", undefined, OLD, NEW);
-    expect(out[0]?.status).toBe("active");
-  });
-
-  it("marks an out-of-bounds range stale", () => {
+  it("marks in-bounds comments active and out-of-bounds ranges stale", () => {
     const out = anchorCommentsToContents(
-      [comment({ side: "old", startLine: 3, endLine: 5 })],
+      [comment({ id: "in" }), comment({ id: "out", side: "old", startLine: 3, endLine: 5 })],
       "a.ts",
       undefined,
       OLD,
       NEW,
     );
-    expect(out[0]?.status).toBe("stale");
+    expect(out.map((a) => a.status)).toEqual(["active", "stale"]);
   });
 
   it("filters by filePath and repoName", () => {

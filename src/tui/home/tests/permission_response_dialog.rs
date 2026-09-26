@@ -27,61 +27,35 @@ fn pending(nonce: &str) -> Vec<PendingApproval> {
     }]
 }
 
+/// 'a' opens the permission dialog for any mapped agent, with no Waiting gate and even
+/// without allow-always (omp); an unmapped agent gets an info dialog and nothing is sent,
+/// and no selection is a no-op.
 #[test]
 #[serial]
-fn no_selected_session_is_a_no_op() {
-    let mut env = create_test_env_empty();
-    env.view.selected_session = None;
-    let _ = env.view.handle_key(key(KeyCode::Char('a')), None);
-    assert!(env.view.permission_response_dialog.is_none());
-    assert!(env.view.info_dialog.is_none());
-}
-
-#[test]
-#[serial]
-fn unsupported_agent_shows_info_dialog_no_send() {
-    let mut env = create_test_env_empty();
-    let id = add_session_with_tool(&mut env.view, "session-one", "some-unmapped-tool");
-    env.view.selected_session = Some(id);
-    let _ = env.view.handle_key(key(KeyCode::Char('a')), None);
-    assert!(
-        env.view.permission_response_dialog.is_none(),
-        "unsupported agent must not open the dialog"
-    );
-    assert!(
-        env.view.info_dialog.is_some(),
-        "unsupported agent must surface an info dialog"
-    );
-}
-
-#[test]
-#[serial]
-fn supported_agent_opens_dialog_regardless_of_status() {
-    let mut env = create_test_env_empty();
-    let id = add_session_with_tool(&mut env.view, "session-one", "claude");
-    env.view.selected_session = Some(id.clone());
-    // Prove there's no Status::Waiting gate: explicitly set a
-    // non-Waiting status before pressing the shortcut.
-    env.view
-        .mutate_instance(&id, |inst| inst.status = Status::Idle);
-    let _ = env.view.handle_key(key(KeyCode::Char('a')), None);
-    assert!(
-        env.view.permission_response_dialog.is_some(),
-        "supported agent + valid target must open the dialog even when not Waiting"
-    );
-}
-
-#[test]
-#[serial]
-fn agent_without_allow_always_still_opens_dialog() {
-    let mut env = create_test_env_empty();
-    let id = add_session_with_tool(&mut env.view, "session-one", "omp");
-    env.view.selected_session = Some(id);
-    let _ = env.view.handle_key(key(KeyCode::Char('a')), None);
-    assert!(
-        env.view.permission_response_dialog.is_some(),
-        "an agent with allow_always: None must still support allow/deny"
-    );
+fn a_opens_permission_dialog_only_for_supported_agents() {
+    let cases = [
+        (None, false, false),
+        (Some("some-unmapped-tool"), false, true),
+        (Some("claude"), true, false),
+        (Some("omp"), true, false),
+    ];
+    for (tool, dialog, info) in cases {
+        let mut env = create_test_env_empty();
+        let selected = tool.map(|tool| {
+            let id = add_session_with_tool(&mut env.view, "session-one", tool);
+            env.view
+                .mutate_instance(&id, |inst| inst.status = Status::Idle);
+            id
+        });
+        env.view.selected_session = selected;
+        let _ = env.view.handle_key(key(KeyCode::Char('a')), None);
+        assert_eq!(
+            env.view.permission_response_dialog.is_some(),
+            dialog,
+            "{tool:?}"
+        );
+        assert_eq!(env.view.info_dialog.is_some(), info, "{tool:?}");
+    }
 }
 
 #[test]

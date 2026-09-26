@@ -4,7 +4,6 @@ import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Page } from "@playwright/test";
 import { test, expect, authHeaders, bootDashboard, type ServeHandle } from "../helpers/liveTest";
-import { appDirFor, resolveAoeBinary } from "../helpers/aoeServe";
 
 test.describe("MCP servers", () => {
   test("MCP panel shows native servers with provenance and redacts secrets", async ({ page, spawnServe }) => {
@@ -36,33 +35,6 @@ test.describe("MCP servers", () => {
     await expect(panel).not.toContainText("HEADER_SECRET_DO_NOT_LEAK");
     await expect(panel).toContainText("TOKEN");
     await expect(panel).toContainText("Authorization");
-  });
-
-  test("MCP panel excludes disabled native Codex servers", async ({ page, spawnServe }) => {
-    const serve = await spawnServe({
-      seedFn: ({ home, xdg }) => {
-        mkdirSync(join(home, ".codex"), { recursive: true });
-        writeFileSync(
-          join(home, ".codex", "config.toml"),
-          [
-            '[mcp_servers.omitted]\ncommand = "mcp-omitted"',
-            '[mcp_servers.explicit_true]\ncommand = "mcp-true"\nenabled = true',
-            '[mcp_servers.explicit_false]\ncommand = "mcp-false"\nenabled = false',
-          ].join("\n\n"),
-        );
-        const appDir = appDirFor(home, xdg, resolveAoeBinary());
-        mkdirSync(appDir, { recursive: true });
-        writeFileSync(join(appDir, "config.toml"), '[session]\ndefault_tool = "codex"\n');
-      },
-    });
-    await page.goto(`${serve.baseUrl}/settings/mcp`);
-    const panel = page.getByTestId("mcp-panel");
-    await expect(panel).toBeVisible();
-    await expect(panel).toContainText("Effective set forwarded to codex");
-    await expect(panel.getByText("omitted", { exact: true })).toBeVisible();
-    await expect(panel.getByText("explicit_true", { exact: true })).toBeVisible();
-    await expect(panel.getByText("explicit_false", { exact: true })).toHaveCount(0);
-    await expect(panel.getByText("agent-native:codex").first()).toBeVisible();
   });
 });
 

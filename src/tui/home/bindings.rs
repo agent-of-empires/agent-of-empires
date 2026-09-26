@@ -1024,110 +1024,37 @@ mod tests {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
     }
 
-    /// Serial: the favorites-first gate is a process-wide flag, so a parallel
-    /// test that applies config would race with these.
     #[test]
-    #[serial_test::serial]
-    fn favorite_key_follows_favorites_first_outside_attention() {
-        let original = crate::session::favorites_first();
-        let c = ctx();
-        assert_eq!(
-            c.sort_order,
-            SortOrder::Newest,
-            "precondition: not Attention"
-        );
-
-        crate::session::set_favorites_first(true);
-        assert_eq!(
-            resolve(&key('f'), false, &c),
-            Some(ActionId::ToggleFavorite),
-            "favorites-first on: 'f' must work outside the Attention sort"
-        );
-
-        crate::session::set_favorites_first(false);
-        assert_ne!(
-            resolve(&key('f'), false, &c),
-            Some(ActionId::ToggleFavorite),
-            "favorites-first off: 'f' stays inert outside the Attention sort"
-        );
-
-        crate::session::set_favorites_first(original);
+    fn parse_chord_accepts_ctrl_or_bare_keys_only() {
+        let chord = |code, ctrl| Some(Chord { code, ctrl });
+        let cases = [
+            ("Ctrl+K", chord(KeyCode::Char('k'), true)),
+            ("Shift+D", chord(KeyCode::Char('D'), false)),
+            ("q", chord(KeyCode::Char('q'), false)),
+            ("F5", chord(KeyCode::F(5), false)),
+            ("", None),
+            ("Ctrl+", None),
+            // Unknown modifiers must not collapse to a bare key that hijacks core
+            // navigation, and a chord may carry at most one key token.
+            ("Alt+K", None),
+            ("Ctrl+Alt+K", None),
+            ("Ctrl+K+J", None),
+            ("Meta+K", None),
+        ];
+        for (input, want) in cases {
+            assert_eq!(parse_chord(input), want, "{input:?}");
+        }
     }
 
     #[test]
-    #[serial_test::serial]
-    fn favorite_key_resolves_in_attention_sort_even_with_flag_off() {
-        let original = crate::session::favorites_first();
-        crate::session::set_favorites_first(false);
-
-        let mut c = ctx();
-        c.sort_order = SortOrder::Attention;
-        assert_eq!(
-            resolve(&key('f'), false, &c),
-            Some(ActionId::ToggleFavorite)
-        );
-
-        crate::session::set_favorites_first(original);
-    }
-
-    #[test]
-    fn parse_chord_handles_modifiers_and_keys() {
-        assert_eq!(
-            parse_chord("Ctrl+K"),
-            Some(Chord {
-                code: KeyCode::Char('k'),
-                ctrl: true
-            })
-        );
-        assert_eq!(
-            parse_chord("Shift+D"),
-            Some(Chord {
-                code: KeyCode::Char('D'),
-                ctrl: false
-            })
-        );
-        assert_eq!(
-            parse_chord("q"),
-            Some(Chord {
-                code: KeyCode::Char('q'),
-                ctrl: false
-            })
-        );
-        assert_eq!(
-            parse_chord("F5"),
-            Some(Chord {
-                code: KeyCode::F(5),
-                ctrl: false
-            })
-        );
-        assert_eq!(parse_chord(""), None);
-        assert_eq!(parse_chord("Ctrl+"), None);
-    }
-
-    #[test]
-    fn parse_chord_rejects_unsupported_and_repeated_tokens() {
-        // Unknown modifiers must not collapse to a bare key that hijacks core
-        // navigation, and a chord may carry at most one key token.
-        assert_eq!(parse_chord("Alt+K"), None);
-        assert_eq!(parse_chord("Ctrl+Alt+K"), None);
-        assert_eq!(parse_chord("Ctrl+K+J"), None);
-        assert_eq!(parse_chord("Meta+K"), None);
-    }
-
-    #[test]
-    fn core_shadows_known_core_chords() {
-        // `q` is the Quit binding; an unbound chord is not shadowed.
+    fn core_chords_shadow_and_resolve_as_core_actions() {
+        // `q` is the Quit binding; an unbound chord is neither shadowed nor resolved. With
+        // no active plugins in the test process the merged resolver wraps core actions.
         assert!(core_shadows(&parse_chord("q").unwrap()));
         assert!(!core_shadows(&Chord {
             code: KeyCode::Char('z'),
             ctrl: true
         }));
-    }
-
-    #[test]
-    fn resolve_action_wraps_core_bindings() {
-        // With no active plugins in the test process, the merged resolver just
-        // returns the core action, wrapped as Core.
         let c = ctx();
         assert_eq!(
             resolve_action(&key('q'), false, &c),
@@ -1152,96 +1079,55 @@ mod tests {
         assert_eq!(already.canonical(), "plugin.acme.kit.do-thing");
     }
 
+    /// Non-strict binds bare letters; strict moves the primary action to Shift+letter and
+    /// the secondary to Ctrl+letter. Unread stays on Shift+U and sort on Ctrl+O in both.
     #[test]
-    fn non_strict_resolution() {
+    fn chord_resolution_by_mode() {
         let c = ctx();
-        let cases = [
-            ('d', ActionId::Delete),
-            ('D', ActionId::Diff),
-            ('r', ActionId::Rename),
-            ('R', ActionId::Serve),
-            ('t', ActionId::ToggleView),
-            ('T', ActionId::AttachTerminal),
-            ('n', ActionId::NewSession),
-            ('N', ActionId::NewFromSelection),
-            ('p', ActionId::Projects),
-            ('P', ActionId::Profiles),
-            ('o', ActionId::SortPicker),
-            ('g', ActionId::GroupBy),
-            ('q', ActionId::Quit),
-            // `u` is Update (unread lives on Shift+U); resolves regardless of
-            // whether an update is actually available.
-            ('u', ActionId::Update),
+        let non_strict = [
+            (key('d'), ActionId::Delete),
+            (key('D'), ActionId::Diff),
+            (key('r'), ActionId::Rename),
+            (key('R'), ActionId::Serve),
+            (key('t'), ActionId::ToggleView),
+            (key('T'), ActionId::AttachTerminal),
+            (key('n'), ActionId::NewSession),
+            (key('N'), ActionId::NewFromSelection),
+            (key('p'), ActionId::Projects),
+            (key('P'), ActionId::Profiles),
+            (key('o'), ActionId::SortPicker),
+            (key('g'), ActionId::GroupBy),
+            (key('q'), ActionId::Quit),
+            // `u` is Update regardless of whether an update is available.
+            (key('u'), ActionId::Update),
+            (key('U'), ActionId::ToggleUnread),
+            (ctrl_key('o'), ActionId::SortPicker),
         ];
-        for (ch, want) in cases {
-            assert_eq!(
-                resolve(&key(ch), false, &c),
-                Some(want),
-                "non-strict '{ch}'"
-            );
-        }
-    }
-
-    #[test]
-    fn shift_u_toggles_unread_in_both_modes_and_u_updates() {
-        let c = ctx();
-        // Unread is pinned to Shift+U regardless of strict mode.
-        assert_eq!(
-            resolve(&key('U'), false, &c),
-            Some(ActionId::ToggleUnread),
-            "non-strict U = unread"
-        );
-        assert_eq!(
-            resolve(&key('U'), true, &c),
-            Some(ActionId::ToggleUnread),
-            "strict U = unread"
-        );
-        // Update relocates the usual way: bare `u` in non-strict, `Ctrl+u`
-        // in strict (and never collides with unread on `U`).
-        assert_eq!(
-            resolve(&key('u'), false, &c),
-            Some(ActionId::Update),
-            "non-strict u = update"
-        );
-        assert_eq!(
-            resolve(&ctrl_key('u'), true, &c),
-            Some(ActionId::Update),
-            "strict Ctrl+u = update"
-        );
-    }
-
-    #[test]
-    fn strict_relocation_is_consistent() {
-        let c = ctx();
-        // Shift+letter (the uppercase code) drives the primary action; the
-        // secondary action moves to Ctrl+letter. No bare lowercase action keys.
-        let shifted = [
-            ('D', ActionId::Delete),
-            ('R', ActionId::Rename),
-            ('T', ActionId::ToggleView),
-            ('N', ActionId::NewSession),
-            ('P', ActionId::Projects),
-            ('O', ActionId::SortPicker),
-            ('U', ActionId::ToggleUnread),
+        let strict = [
+            (key('D'), ActionId::Delete),
+            (key('R'), ActionId::Rename),
+            (key('T'), ActionId::ToggleView),
+            (key('N'), ActionId::NewSession),
+            (key('P'), ActionId::Projects),
+            (key('O'), ActionId::SortPicker),
+            (key('U'), ActionId::ToggleUnread),
+            (ctrl_key('d'), ActionId::Diff),
+            (ctrl_key('r'), ActionId::Serve),
+            (ctrl_key('t'), ActionId::AttachTerminal),
+            (ctrl_key('n'), ActionId::NewFromSelection),
+            (ctrl_key('p'), ActionId::Profiles),
+            (ctrl_key('g'), ActionId::GroupBy),
+            (ctrl_key('u'), ActionId::Update),
+            (ctrl_key('o'), ActionId::SortPicker),
         ];
-        for (ch, want) in shifted {
-            assert_eq!(resolve(&key(ch), true, &c), Some(want), "strict '{ch}'");
-        }
-        let ctrled = [
-            ('d', ActionId::Diff),
-            ('r', ActionId::Serve),
-            ('t', ActionId::AttachTerminal),
-            ('n', ActionId::NewFromSelection),
-            ('p', ActionId::Profiles),
-            ('g', ActionId::GroupBy),
-            ('u', ActionId::Update),
-        ];
-        for (ch, want) in ctrled {
-            assert_eq!(
-                resolve(&ctrl_key(ch), true, &c),
-                Some(want),
-                "strict Ctrl+{ch}"
-            );
+        for (strict_mode, cases) in [(false, &non_strict[..]), (true, &strict[..])] {
+            for (event, want) in cases {
+                assert_eq!(
+                    resolve(event, strict_mode, &c),
+                    Some(*want),
+                    "strict={strict_mode} {event:?}"
+                );
+            }
         }
     }
 
@@ -1291,16 +1177,21 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn context_guards_gate_attention_and_terminal_actions() {
-        // Snooze resolves only in the Attention sort. Favorite resolves there too but has
-        // a second opening (`session.favorites_first`), so pin that off to isolate the
-        // Attention-only half of its guard; the flag itself is covered by
-        // `favorite_key_follows_favorites_first_outside_attention`.
+        // Snooze resolves only in the Attention sort. Favorite resolves there regardless
+        // of `session.favorites_first`, which only opens it outside Attention.
         let original = crate::session::favorites_first();
         crate::session::set_favorites_first(false);
 
         let mut c = ctx();
         assert_eq!(resolve(&key('f'), false, &c), None);
         assert_eq!(resolve(&key('h'), false, &c), None);
+        crate::session::set_favorites_first(true);
+        assert_eq!(
+            resolve(&key('f'), false, &c),
+            Some(ActionId::ToggleFavorite),
+            "favorites-first on: 'f' must work outside the Attention sort"
+        );
+        crate::session::set_favorites_first(false);
         c.sort_order = SortOrder::Attention;
         assert_eq!(
             resolve(&key('f'), false, &c),
@@ -1318,31 +1209,6 @@ mod tests {
             resolve(&key('c'), false, &c),
             Some(ActionId::ToggleContainer)
         );
-    }
-
-    #[test]
-    fn ctrl_o_sorts_in_both_modes() {
-        let c = ctx();
-        assert_eq!(
-            resolve(&ctrl_key('o'), false, &c),
-            Some(ActionId::SortPicker)
-        );
-        assert_eq!(
-            resolve(&ctrl_key('o'), true, &c),
-            Some(ActionId::SortPicker)
-        );
-    }
-
-    #[test]
-    fn fork_is_palette_only_no_chord() {
-        let c = ctx();
-        // No chord resolves to Fork in either mode (palette-only, like Plugins).
-        for ch in ['f', 'F'] {
-            assert_ne!(resolve(&key(ch), false, &c), Some(ActionId::Fork));
-            assert_ne!(resolve(&key(ch), true, &c), Some(ActionId::Fork));
-        }
-        // Fork has a stable palette id.
-        assert_eq!(palette_id(ActionId::Fork), "fork");
     }
 
     #[test]

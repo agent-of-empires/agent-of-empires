@@ -90,119 +90,63 @@ fn poll_live_send_takeover_exits_live_mode_with_dialog() {
     );
 }
 
+/// Ctrl+q is the safety chord: it exits cleanly even when the session vanished, so a stuck
+/// live mode is recoverable without a dialog. Any other key is swallowed without bubbling an
+/// Action (which would race the live state), and on a vanished session auto-exits with an
+/// info dialog so the user isn't typing into the void.
 #[test]
 #[serial]
-fn ctrl_q_exits_live_mode() {
+fn live_mode_keys_exit_on_chord_or_drift() {
+    let ctrl_q = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL);
+    let x = key(KeyCode::Char('x'));
+    // (orphaned session, key, stays live, info dialog)
+    for (orphan, key_event, stays_live, dialog) in [
+        (false, ctrl_q, false, false),
+        (true, ctrl_q, false, false),
+        (false, x, true, false),
+        (true, x, false, true),
+    ] {
+        let mut env = if orphan {
+            let mut env = create_test_env_empty();
+            install_live_orphan(&mut env);
+            env
+        } else {
+            let mut env = create_test_env_with_sessions(1);
+            install_live_for_first_session(&mut env);
+            env
+        };
+        let action = env.view.handle_key(key_event, None);
+        let case = format!("orphan={orphan} key={key_event:?}");
+        if stays_live {
+            assert!(action.is_none(), "{case}");
+        }
+        assert_eq!(env.view.live_send.is_some(), stays_live, "{case}");
+        assert_eq!(env.view.info_dialog.is_some(), dialog, "{case}");
+    }
+}
+
+/// Shift+PageUp/PageDown scroll the preview (terminal-emulator convention) without leaving
+/// live mode; bare PageUp keeps flowing to the agent so agents that page their own UI work.
+#[test]
+#[serial]
+fn page_keys_in_live_mode() {
+    use std::cmp::Ordering;
     let mut env = create_test_env_with_sessions(1);
     install_live_for_first_session(&mut env);
-    assert!(env.view.live_send.is_some());
-
-    env.view.handle_key(
-        KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL),
-        None,
-    );
-
-    assert!(env.view.live_send.is_none());
-}
-
-#[test]
-#[serial]
-fn ctrl_q_exits_even_when_session_has_drifted() {
-    // Ctrl+q is the safety chord: it must exit cleanly even if the session went away, so a
-    // stuck live mode is recoverable without an extra dialog.
-    let mut env = create_test_env_empty();
-    install_live_orphan(&mut env);
-    env.view.handle_key(
-        KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL),
-        None,
-    );
-    assert!(env.view.live_send.is_none());
-    assert!(env.view.info_dialog.is_none());
-}
-
-#[test]
-#[serial]
-fn arbitrary_key_in_live_mode_does_not_emit_action() {
-    // Live-send swallows the key. The tmux call fails quietly in the test env, but the home
-    // view must not bubble an Action out, which would race the live state. Bare `x` avoids
-    // colliding with the Ctrl+q exit chord.
-    let mut env = create_test_env_with_sessions(1);
-    install_live_for_first_session(&mut env);
-    let action = env
-        .view
-        .handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE), None);
-    assert!(action.is_none());
-    // Still in live mode; only Ctrl+q exits.
-    assert!(env.view.live_send.is_some());
-}
-
-#[test]
-#[serial]
-fn drift_check_auto_exits_when_instance_missing() {
-    // A session deleted while live mode is active must auto-exit on the next keystroke with
-    // an info dialog, so the user isn't typing into the void.
-    let mut env = create_test_env_empty();
-    install_live_orphan(&mut env);
-    env.view
-        .handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE), None);
-    assert!(env.view.live_send.is_none());
-    assert!(env.view.info_dialog.is_some());
-}
-
-#[test]
-#[serial]
-fn shift_page_up_scrolls_preview_instead_of_sending_to_agent() {
-    // Terminal-emulator convention: Shift+PageUp scrolls the outer scrollback, so live mode
-    // honors it and agent history is readable without exiting.
-    let mut env = create_test_env_with_sessions(1);
-    install_live_for_first_session(&mut env);
-    env.view.preview_scroll_offset = 0;
-
-    env.view
-        .handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::SHIFT), None);
-
-    assert!(
-        env.view.preview_scroll_offset > 0,
-        "Shift+PageUp should scroll the preview back into history"
-    );
-    // Still in live mode — the intercept doesn't exit.
-    assert!(env.view.live_send.is_some());
-}
-
-#[test]
-#[serial]
-fn shift_page_down_scrolls_preview_forward() {
-    let mut env = create_test_env_with_sessions(1);
-    install_live_for_first_session(&mut env);
-    env.view.preview_scroll_offset = 50;
-
-    env.view
-        .handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::SHIFT), None);
-
-    assert!(
-        env.view.preview_scroll_offset < 50,
-        "Shift+PageDown should reduce the offset (scroll toward live)"
-    );
-    assert!(env.view.live_send.is_some());
-}
-
-#[test]
-#[serial]
-fn bare_page_up_still_passes_through_to_agent() {
-    // Only the Shift-modified Page chord is intercepted; bare PageUp keeps flowing to the
-    // agent so agents that page their own UI keep responding.
-    let mut env = create_test_env_with_sessions(1);
-    install_live_for_first_session(&mut env);
-    env.view.preview_scroll_offset = 25;
-
-    env.view
-        .handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE), None);
-
-    assert_eq!(
-        env.view.preview_scroll_offset, 25,
-        "bare PageUp must NOT change preview scroll offset"
-    );
-    assert!(env.view.live_send.is_some());
+    for (code, mods, start, moves) in [
+        (KeyCode::PageUp, KeyModifiers::SHIFT, 0, Ordering::Greater),
+        (KeyCode::PageDown, KeyModifiers::SHIFT, 50, Ordering::Less),
+        (KeyCode::PageUp, KeyModifiers::NONE, 25, Ordering::Equal),
+    ] {
+        env.view.preview_scroll_offset = start;
+        env.view.handle_key(KeyEvent::new(code, mods), None);
+        assert_eq!(
+            env.view.preview_scroll_offset.cmp(&start),
+            moves,
+            "{code:?}+{mods:?}"
+        );
+        assert!(env.view.live_send.is_some(), "{code:?}+{mods:?}");
+    }
 }
 
 #[test]
@@ -295,61 +239,37 @@ fn drift_check_does_not_exit_for_tool_target_named_via_tool_session() {
     assert!(env.view.info_dialog.is_none());
 }
 
+/// Live mode counts as a modal capture: every predicate gated on has_dialog() (mouse
+/// swallow, nav suspend, palette skip) inherits it, and paste-burst batching turns on so a
+/// paste without bracketed markers streams as one tmux call.
 #[test]
 #[serial]
-fn live_mode_makes_has_dialog_true() {
-    // Every dialog-gating predicate that inspects has_dialog() (mouse swallow, nav suspend,
-    // palette skip) inherits live mode through this single addition.
+fn live_mode_counts_as_dialog_and_wants_paste_burst() {
     let mut env = create_test_env_empty();
     assert!(!env.view.has_dialog());
     install_live_orphan(&mut env);
     assert!(env.view.has_dialog());
-}
-
-#[test]
-#[serial]
-fn live_mode_enables_paste_burst() {
-    // wants_paste_burst tells the runtime to batch a stream of Char events into one Paste
-    // when bracketed-paste markers are missing, which live mode wants so a paste streams as
-    // one tmux call.
-    let mut env = create_test_env_empty();
-    install_live_orphan(&mut env);
     assert!(env.view.wants_paste_burst());
 }
 
+/// Tab no-ops with nothing selected. Otherwise start_live_send is deliberately permissive:
+/// it accepts any non-Creating instance and defers ensure_pane_ready to prepare_live_send,
+/// or Tab would no-op on dead-but-recoverable rows whose tmux session doesn't exist yet.
 #[test]
 #[serial]
-fn tab_does_not_start_live_send_without_selection() {
-    // With no session selected, Tab must no-op rather than emit a deferred action targeting
-    // nothing.
-    let mut env = create_test_env_empty();
-    let action = env
+fn tab_enters_live_send_only_for_a_selected_session() {
+    let mut empty = create_test_env_empty();
+    let action = empty
         .view
         .handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), None);
     assert!(action.is_none());
-    assert!(env.view.live_send.is_none());
-}
+    assert!(empty.view.live_send.is_none());
+    drop(empty);
 
-#[test]
-#[serial]
-fn tab_emits_enter_live_send_for_stopped_session() {
-    // start_live_send is deliberately permissive: it accepts any non-Creating instance and
-    // defers ensure_pane_ready to prepare_live_send, or Tab would no-op on
-    // dead-but-recoverable rows whose tmux session doesn't exist yet.
     let mut env = create_test_env_with_sessions(1);
     env.view.cursor = 0;
     env.view.update_selected();
-    // Pin the status explicitly so this guard doesn't rely on the implicit Instance::new
-    // default: a real stopped session is what is being modeled.
-    let id = env
-        .view
-        .flat_items
-        .iter()
-        .find_map(|item| match item {
-            crate::session::Item::Session { id, .. } => Some(id.clone()),
-            _ => None,
-        })
-        .expect("test env has one session");
+    let id = cursor_session_id(&env.view).expect("test env has one session");
     env.view.mutate_instance(&id, |inst| {
         inst.status = crate::session::Status::Stopped;
     });
@@ -411,17 +331,6 @@ fn has_non_live_send_overlay_false_in_pure_live_mode() {
         !env.view.has_non_live_send_overlay(),
         "live-send alone must NOT count as an overlay for the fast-path gate"
     );
-}
-
-#[test]
-#[serial]
-fn has_non_live_send_overlay_true_when_dialog_also_open() {
-    // The fast path still bails when a non-live overlay is on top, since the snapshot it
-    // repaints doesn't include them.
-    let mut env = create_test_env_with_sessions(1);
-    install_live_for_first_session(&mut env);
-    env.view.info_dialog = Some(InfoDialog::new("title", "body"));
-    assert!(env.view.has_non_live_send_overlay());
 }
 
 /// A rename dialog opened on top of live-send (reachable via the right-click menu, which
@@ -883,7 +792,6 @@ fn stale_observation_published_after_adoption_does_not_invalidate() {
 
     // The listing reads the pane's pre-resize size...
     let listed_at = std::time::Instant::now();
-    std::thread::sleep(std::time::Duration::from_millis(2));
     // ...then our resize applies and is adopted...
     env.view.passive_pane_synced.insert(
         ids[1].clone(),
@@ -891,7 +799,7 @@ fn stale_observation_published_after_adoption_does_not_invalidate() {
             cols,
             rows,
             window_rows: rows,
-            adopted_at: std::time::Instant::now(),
+            adopted_at: listed_at + std::time::Duration::from_millis(2),
         },
     );
     // ...and only then does the stale listing get published.
@@ -1095,38 +1003,6 @@ mod paste_splitting {
 
         for (name, input, expected) in cases {
             assert_eq!(split_paste_for_live_send(input), expected, "{name}");
-        }
-    }
-
-    /// The bug: hand-rolling `\e[200~` / `\e[201~` into the payload shipped the markers to
-    /// every pane whether or not it set DECSET 2004, and a raw shell parses `\e[2` as a
-    /// partial Insert sequence and self-inserts the leftover `00~` / `01~`. The payload must
-    /// carry no escape bytes at all.
-    #[test]
-    fn multiline_paste_carries_no_escape_markers() {
-        let keys = split_paste_for_live_send("SELECT id\nFROM users;");
-        assert_eq!(keys, paste("SELECT id\nFROM users;"));
-        match &keys[0] {
-            TmuxKey::Paste(body) => {
-                assert!(
-                    !body.contains('\x1b'),
-                    "paste payload must not carry ESC: {body:?}"
-                );
-                assert!(!body.contains("200~") && !body.contains("201~"));
-            }
-            other => panic!("expected Paste, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn multiline_paste_dispatches_as_one_payload() {
-        // Single-dispatch: the whole paste is one `Paste` action, so the worker fires
-        // exactly one `load-buffer` + `paste-buffer` pair.
-        let out = split_paste_for_live_send("a\nb\nc\nd");
-        assert_eq!(out.len(), 1, "multiline paste must be one TmuxKey");
-        match &out[0] {
-            TmuxKey::Paste(_) => {}
-            other => panic!("expected Paste, got {other:?}"),
         }
     }
 

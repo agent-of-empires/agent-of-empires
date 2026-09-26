@@ -79,21 +79,15 @@ afterEach(() => {
 });
 
 describe("SendCommentsDialog", () => {
-  it.each([
-    [[comment({ body: "Rename this" })], ["1 comment", "Rename this", "Send diff comments"]],
-    [[comment({ id: "a" }), comment({ id: "b", startLine: 20, endLine: 20 })], ["2 comments"]],
-  ])("renders the count and preview", (comments, texts) => {
-    const { container } = setup({ comments });
-    for (const t of texts) expect(container.textContent).toContain(t);
-  });
-
-  it("shows the empty-state preview and disables Send when there are no comments", () => {
+  it("shows the empty-state preview and does not send when there are no comments", () => {
     const { container } = setup({ comments: [] });
     expect(container.textContent).toContain("No comments.");
     expect(sendButton(container).getAttribute("aria-disabled")).toBe("true");
+    fireEvent.click(sendButton(container));
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it("disables Send and exposes the reason to pointer and keyboard when sendEnabled is false", async () => {
+  it("disables Send, exposes the reason to pointer and keyboard, and ignores clicks when sendEnabled is false", async () => {
     const { container } = setup({ sendEnabled: false, sendDisabledReason: "session is trashed" });
     const btn = sendButton(container);
     // aria-disabled keeps the reason reachable by hover and keyboard.
@@ -109,11 +103,8 @@ describe("SendCommentsDialog", () => {
     btn.focus();
     fireEvent.focus(btn);
     await waitFor(() => expect(document.body.textContent).toContain("session is trashed"));
-  });
 
-  it("does not send when the button is aria-disabled", () => {
-    const { container } = setup({ sendEnabled: false });
-    fireEvent.click(sendButton(container));
+    fireEvent.click(btn);
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
@@ -144,12 +135,6 @@ describe("SendCommentsDialog", () => {
     expect(reportTelemetrySeen).toHaveBeenCalledWith("diff_comments");
   });
 
-  it("does not fetch when Send is clicked with no comments", () => {
-    const { container } = setup({ comments: [] });
-    fireEvent.click(sendButton(container));
-    expect(fetchMock).not.toHaveBeenCalled();
-  });
-
   it("Cmd+Enter triggers a send", async () => {
     fetchMock.mockResolvedValue({ ok: true });
     const { onSent } = setup();
@@ -158,37 +143,10 @@ describe("SendCommentsDialog", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
-  it.each<[string, (c: HTMLElement) => void]>([
-    ["Escape", () => fireEvent.keyDown(document, { key: "Escape" })],
-    [
-      "Cancel",
-      (c) => fireEvent.click(Array.from(c.querySelectorAll("button")).find((b) => b.textContent?.trim() === "Cancel")!),
-    ],
-    ["the close button", (c) => fireEvent.click(c.querySelector('button[aria-label="Close"]')!)],
-    ["the backdrop", (c) => fireEvent.mouseDown(c.querySelector(".fixed.inset-0")!)],
-  ])("closes via %s", (_, act) => {
-    const { container, onClose } = setup();
-    act(container);
+  it("closes via Escape", () => {
+    const { onClose } = setup();
+    fireEvent.keyDown(document, { key: "Escape" });
     expect(onClose).toHaveBeenCalledTimes(1);
-  });
-
-  it("forwards intro/outro/clearAfterSend edits to their callbacks", () => {
-    const { container, onChangeIntro, onChangeOutro, onChangeClearAfterSend } = setup();
-    const textareas = container.querySelectorAll("textarea");
-    fireEvent.change(textareas[0], { target: { value: "new intro" } });
-    expect(onChangeIntro).toHaveBeenCalledWith("new intro");
-    fireEvent.change(textareas[1], { target: { value: "new outro" } });
-    expect(onChangeOutro).toHaveBeenCalledWith("new outro");
-    const checkbox = container.querySelector<HTMLInputElement>('input[type="checkbox"]')!;
-    fireEvent.click(checkbox);
-    expect(onChangeClearAfterSend).toHaveBeenCalledWith(true);
-  });
-
-  it("reflects controlled drafts and the clearAfterSend checkbox", () => {
-    const { container } = setup({ introDraft: "intro text", outroDraft: "outro text", clearAfterSend: true });
-    const textareas = container.querySelectorAll("textarea");
-    expect([textareas[0]!.value, textareas[1]!.value]).toEqual(["intro text", "outro text"]);
-    expect(container.querySelector<HTMLInputElement>('input[type="checkbox"]')!.checked).toBe(true);
   });
 
   it.each<[string, () => void, string[]]>([

@@ -260,7 +260,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn record_is_idempotent_per_seq_and_persists_across_reopen() {
+    fn record_is_idempotent_and_persisted_shapes_stay_readable() {
         let (tmp, store) = open_store(1000);
         store.record("s-1", 1, &user_prompt("hi")).unwrap();
         store.record("s-1", 1, &Event::ThinkingStarted).unwrap();
@@ -284,6 +284,63 @@ mod tests {
         assert_eq!(store.highest_seq("s-1"), 0);
         assert_eq!(store.lowest_seq("s-1"), None);
         assert_eq!(store.highest_seq("s-2"), 1, "siblings are untouched");
+
+        // Persisted prompt shapes, legacy and current, stay readable.
+        use crate::acp::state::DiffComment;
+        let legacy: Event =
+            serde_json::from_str(r#"{"UserPromptSent":{"text":"legacy"}}"#).expect("legacy event");
+        assert!(
+            matches!(legacy, Event::UserPromptSent { ref text, ref attachments, .. } if text == "legacy" && attachments.is_empty())
+        );
+
+        let comment = |repo_name: Option<&str>| DiffComment {
+            id: "c-1".into(),
+            repo_name: repo_name.map(Into::into),
+            file_path: "src/main.rs".into(),
+            side: "new".into(),
+            start_line: 42,
+            end_line: 45,
+            body: "rename this".into(),
+            captured_snippet: "fn main() {}".into(),
+            language: Some("rust".into()),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: None,
+        };
+        let prompt = |repo_name| Event::UserDiffCommentsPrompt {
+            intro: "Hey:".into(),
+            outro: "Please address these comments.".into(),
+            is_multi_repo: true,
+            comments: vec![comment(repo_name)],
+            assembled_markdown: "## Diff comments\n\n...".into(),
+        };
+        let json = serde_json::to_string(&prompt(None)).unwrap();
+        for key in [
+            "\"isMultiRepo\"",
+            "\"assembledMarkdown\"",
+            "\"filePath\"",
+            "\"startLine\"",
+        ] {
+            assert!(json.contains(key), "{key} missing from {json}");
+        }
+        assert!(!json.contains("\"repoName\"") && !json.contains("\"updatedAt\""));
+
+        store.record("shapes", 1, &prompt(Some("repoA"))).unwrap();
+        match &store.replay_from("shapes", 0)[0].1 {
+            Event::UserDiffCommentsPrompt {
+                intro,
+                is_multi_repo,
+                comments,
+                assembled_markdown,
+                ..
+            } => {
+                assert_eq!(intro, "Hey:");
+                assert!(*is_multi_repo);
+                assert_eq!(comments[0].repo_name.as_deref(), Some("repoA"));
+                assert_eq!(comments[0].start_line, 42);
+                assert!(assembled_markdown.starts_with("## Diff comments"));
+            }
+            other => panic!("expected UserDiffCommentsPrompt, got {other:?}"),
+        }
     }
 
     #[test]
@@ -330,66 +387,6 @@ mod tests {
         for (event, name) in cases {
             let json = serde_json::to_string(&event).unwrap();
             assert!(json.starts_with(&format!("{{\"{name}\":")), "{json}");
-        }
-    }
-
-    #[test]
-    fn persisted_prompt_shapes_stay_readable() {
-        use crate::acp::state::DiffComment;
-        let legacy: Event =
-            serde_json::from_str(r#"{"UserPromptSent":{"text":"legacy"}}"#).expect("legacy event");
-        assert!(
-            matches!(legacy, Event::UserPromptSent { ref text, ref attachments, .. } if text == "legacy" && attachments.is_empty())
-        );
-
-        let comment = |repo_name: Option<&str>| DiffComment {
-            id: "c-1".into(),
-            repo_name: repo_name.map(Into::into),
-            file_path: "src/main.rs".into(),
-            side: "new".into(),
-            start_line: 42,
-            end_line: 45,
-            body: "rename this".into(),
-            captured_snippet: "fn main() {}".into(),
-            language: Some("rust".into()),
-            created_at: "2026-01-01T00:00:00Z".into(),
-            updated_at: None,
-        };
-        let prompt = |repo_name| Event::UserDiffCommentsPrompt {
-            intro: "Hey:".into(),
-            outro: "Please address these comments.".into(),
-            is_multi_repo: true,
-            comments: vec![comment(repo_name)],
-            assembled_markdown: "## Diff comments\n\n...".into(),
-        };
-        let json = serde_json::to_string(&prompt(None)).unwrap();
-        for key in [
-            "\"isMultiRepo\"",
-            "\"assembledMarkdown\"",
-            "\"filePath\"",
-            "\"startLine\"",
-        ] {
-            assert!(json.contains(key), "{key} missing from {json}");
-        }
-        assert!(!json.contains("\"repoName\"") && !json.contains("\"updatedAt\""));
-
-        let (_tmp, store) = open_store(1000);
-        store.record("s-1", 1, &prompt(Some("repoA"))).unwrap();
-        match &store.replay_from("s-1", 0)[0].1 {
-            Event::UserDiffCommentsPrompt {
-                intro,
-                is_multi_repo,
-                comments,
-                assembled_markdown,
-                ..
-            } => {
-                assert_eq!(intro, "Hey:");
-                assert!(*is_multi_repo);
-                assert_eq!(comments[0].repo_name.as_deref(), Some("repoA"));
-                assert_eq!(comments[0].start_line, 42);
-                assert!(assembled_markdown.starts_with("## Diff comments"));
-            }
-            other => panic!("expected UserDiffCommentsPrompt, got {other:?}"),
         }
     }
 }

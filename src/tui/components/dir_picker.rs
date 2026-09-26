@@ -482,34 +482,29 @@ mod tests {
         assert_eq!(picker.selected, 0);
         assert_eq!(picker.dirs, vec!["alpha", "beta", "gamma"]);
         assert_eq!(picker.filtered_dirs()[..2], ["./", "../"]);
-    }
 
-    #[test]
-    fn activate_with_an_empty_path_still_lands_on_a_real_directory() {
+        // An empty path still lands on a real directory.
         let mut picker = DirPicker::new();
         picker.activate("");
         assert!(picker.is_active());
         assert!(picker.cwd.is_dir());
     }
 
+    /// Case-insensitive order, symlinked directories included, and hidden
+    /// directories only after an explicit Ctrl+H, which toggles both ways.
     #[test]
-    fn listing_sorts_case_insensitively() {
+    fn listing_sorts_follows_symlinks_and_toggles_hidden() {
         let (_tmp, _base, picker) = picker_over(&["Zebra", "apple", "Banana"]);
         assert_eq!(picker.dirs, vec!["apple", "Banana", "Zebra"]);
-    }
 
-    #[cfg(unix)]
-    #[test]
-    fn listing_includes_symlinked_directories() {
-        let (_tmp, base, mut picker) = picker_over(&["real"]);
-        std::os::unix::fs::symlink(base.join("real"), base.join("link")).unwrap();
-        picker.refresh_dirs();
-        assert!(picker.dirs.contains(&"link".to_string()));
-    }
+        #[cfg(unix)]
+        {
+            let (_tmp, base, mut picker) = picker_over(&["real"]);
+            std::os::unix::fs::symlink(base.join("real"), base.join("link")).unwrap();
+            picker.refresh_dirs();
+            assert!(picker.dirs.contains(&"link".to_string()));
+        }
 
-    /// Hidden directories need an explicit Ctrl+H, which toggles both ways.
-    #[test]
-    fn ctrl_h_toggles_hidden_directories() {
         let (_tmp, _base, mut picker) = picker_over(&[".hidden", "visible"]);
         assert_eq!(picker.dirs, vec!["visible"]);
         let ctrl_h = KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL);
@@ -521,21 +516,19 @@ mod tests {
         assert_eq!(picker.dirs, vec!["visible"]);
     }
 
+    /// `Enter` and `Right` both act on the highlighted row: `./` selects the
+    /// current directory and closes, a subdirectory navigates into it and resets
+    /// the filter and selection, after which `./` selects the new directory.
+    /// `Esc` cancels.
     #[test]
-    fn esc_cancels_and_closes() {
+    fn accept_keys_select_the_dot_row_or_navigate_into_a_subdir() {
         let (_tmp, _base, mut picker) = fixture();
         assert!(matches!(
             press(&mut picker, &[KeyCode::Esc]),
             DirPickerResult::Cancelled
         ));
         assert!(!picker.is_active());
-    }
 
-    /// `Enter` and `Right` both act on the highlighted row: `./` selects the
-    /// current directory and closes, a subdirectory navigates into it and resets
-    /// the filter and selection.
-    #[test]
-    fn enter_and_right_select_the_dot_row_or_navigate_into_a_subdir() {
         for accept in [KeyCode::Enter, KeyCode::Right] {
             let (_tmp, base, mut picker) = fixture();
             let path = selected_path(press(&mut picker, &[accept]), "./");
@@ -550,6 +543,8 @@ mod tests {
             assert_eq!(picker.cwd, base.join("alpha"));
             assert_eq!(picker.filter.value(), "");
             assert_eq!(picker.selected, 0);
+            let path = selected_path(press(&mut picker, &[accept]), "./ in alpha");
+            assert_eq!(path, base.join("alpha").to_string_lossy());
         }
     }
 
@@ -572,19 +567,10 @@ mod tests {
         }
     }
 
-    /// After navigating in, `./` selects the directory just entered.
+    /// Up and Down clamp; keys with nothing to act on (Enter on an empty
+    /// match list, Tab) leave the picker as it was.
     #[test]
-    fn entering_a_subdir_then_accepting_dot_selects_it() {
-        let (_tmp, base, mut picker) = fixture();
-        press(&mut picker, &[KeyCode::Down, KeyCode::Down, KeyCode::Enter]);
-        assert_eq!(picker.cwd, base.join("alpha"));
-        let path = selected_path(press(&mut picker, &[KeyCode::Enter]), "./");
-        assert_eq!(path, base.join("alpha").to_string_lossy());
-        assert!(!picker.is_active());
-    }
-
-    #[test]
-    fn up_and_down_clamp_at_both_ends() {
+    fn selection_clamps_and_idle_keys_are_no_ops() {
         let (_tmp, _base, mut picker) = fixture();
         press(&mut picker, &[KeyCode::Up]);
         assert_eq!(picker.selected, 0);
@@ -593,65 +579,7 @@ mod tests {
         // Five rows: ./, ../, alpha, beta, gamma.
         press(&mut picker, &[KeyCode::Down; 10]);
         assert_eq!(picker.selected, 4);
-    }
 
-    /// Filtering matches directory names, drops the `./` and `../` rows unless
-    /// the filter itself looks like them, and resets the highlight.
-    #[test]
-    fn filter_narrows_the_list_and_resets_the_selection() {
-        let (_tmp, _base, mut picker) = fixture();
-        press(&mut picker, &[KeyCode::Down, KeyCode::Down]);
-        assert_eq!(picker.selected, 2);
-
-        typed(&mut picker, "a");
-        assert_eq!(picker.selected, 0);
-        assert_eq!(picker.filtered_dirs(), vec!["alpha", "beta", "gamma"]);
-
-        typed(&mut picker, "l");
-        assert_eq!(picker.filtered_dirs(), vec!["alpha"]);
-
-        // Backspace with a filter edits it rather than navigating up.
-        press(&mut picker, &[KeyCode::Backspace]);
-        assert_eq!(picker.filter.value(), "a");
-    }
-
-    #[test]
-    fn dot_filter_keeps_the_navigation_rows_only_while_it_matches_them() {
-        let (_tmp, _base, mut picker) = fixture();
-        typed(&mut picker, ".");
-        let filtered = picker.filtered_dirs();
-        assert!(filtered.contains(&"./".to_string()));
-        assert!(filtered.contains(&"../".to_string()));
-
-        typed(&mut picker, "/");
-        let filtered = picker.filtered_dirs();
-        assert!(!filtered.contains(&"./".to_string()));
-        assert!(!filtered.contains(&"../".to_string()));
-    }
-
-    /// The filter owns every printable key, so `j`/`k` type rather than move.
-    #[test]
-    fn printable_keys_type_into_the_filter() {
-        let (_tmp, _base, mut picker) = fixture();
-        typed(&mut picker, "jk");
-        assert_eq!(picker.filter.value(), "jk");
-        assert_eq!(picker.selected, 0);
-    }
-
-    #[test]
-    fn enter_on_a_single_filtered_match_navigates_into_it() {
-        let (_tmp, base, mut picker) = fixture();
-        typed(&mut picker, "al");
-        press(&mut picker, &[KeyCode::Enter]);
-        assert_eq!(picker.cwd, base.join("alpha"));
-        assert_eq!(picker.filter.value(), "");
-        assert_eq!(picker.selected, 0);
-        assert!(picker.is_active());
-    }
-
-    /// Keys with nothing to act on leave the picker exactly as it was.
-    #[test]
-    fn enter_on_an_empty_match_list_and_tab_are_no_ops() {
         let (_tmp, _base, mut picker) = fixture();
         typed(&mut picker, "zzz");
         assert!(picker.filtered_dirs().is_empty());
@@ -668,6 +596,54 @@ mod tests {
         ));
         assert_eq!(picker.cwd, base);
         assert_eq!(picker.selected, 0);
+    }
+
+    /// Filtering owns every printable key (`j`/`k` type rather than move),
+    /// matches directory names, and resets the highlight; Enter on a single
+    /// match navigates into it.
+    #[test]
+    fn filter_narrows_the_list_and_resets_the_selection() {
+        let (_tmp, base, mut picker) = fixture();
+        press(&mut picker, &[KeyCode::Down, KeyCode::Down]);
+        assert_eq!(picker.selected, 2);
+
+        typed(&mut picker, "a");
+        assert_eq!(picker.selected, 0);
+        assert_eq!(picker.filtered_dirs(), vec!["alpha", "beta", "gamma"]);
+
+        typed(&mut picker, "l");
+        assert_eq!(picker.filtered_dirs(), vec!["alpha"]);
+
+        // Backspace with a filter edits it rather than navigating up.
+        press(&mut picker, &[KeyCode::Backspace]);
+        assert_eq!(picker.filter.value(), "a");
+
+        typed(&mut picker, "l");
+        press(&mut picker, &[KeyCode::Enter]);
+        assert_eq!(picker.cwd, base.join("alpha"));
+        assert_eq!(picker.filter.value(), "");
+        assert_eq!(picker.selected, 0);
+        assert!(picker.is_active());
+
+        let (_tmp, _base, mut picker) = fixture();
+        typed(&mut picker, "jk");
+        assert_eq!(picker.filter.value(), "jk");
+        assert_eq!(picker.selected, 0);
+    }
+
+    /// The `./` and `../` rows survive a filter only while it looks like them.
+    #[test]
+    fn dot_filter_keeps_the_navigation_rows_only_while_it_matches_them() {
+        let (_tmp, _base, mut picker) = fixture();
+        typed(&mut picker, ".");
+        let filtered = picker.filtered_dirs();
+        assert!(filtered.contains(&"./".to_string()));
+        assert!(filtered.contains(&"../".to_string()));
+
+        typed(&mut picker, "/");
+        let filtered = picker.filtered_dirs();
+        assert!(!filtered.contains(&"./".to_string()));
+        assert!(!filtered.contains(&"../".to_string()));
     }
 
     #[test]

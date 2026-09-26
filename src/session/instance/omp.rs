@@ -614,7 +614,10 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn omp_routing_fingerprint_accepts_matching_live_env_and_rejects_drift() {
-        let _env_read = crate::session::test_support::EnvGuard::read_lock();
+        // The live side reads host routing env; the expected fingerprint sees only HOME.
+        let _env = crate::session::test_support::EnvGuard::unset(
+            &crate::session::capture::OMP_STORE_ENV_KEYS,
+        );
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path().join("home");
         let project = tmp.path().join("project");

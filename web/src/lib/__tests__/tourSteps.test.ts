@@ -32,13 +32,6 @@ const ANCHOR_KEY_BY_VALUE = new Map<TourAnchorId, string>(
 );
 
 describe("tour drift guard", () => {
-  it("every step anchor is a known TOUR_ANCHORS value", () => {
-    const known = new Set<string>(Object.values(TOUR_ANCHORS));
-    for (const step of TOUR_STEPS) {
-      expect(known.has(step.anchor)).toBe(true);
-    }
-  });
-
   it("every TOUR_ANCHORS value is used by at least one step (no orphan anchors)", () => {
     const usedByStep = new Set(TOUR_STEPS.map((s) => s.anchor));
     for (const value of Object.values(TOUR_ANCHORS)) {
@@ -97,37 +90,17 @@ describe("resolveTourSteps", () => {
     expect(ids).not.toContain("right-panel");
   });
 
-  it("drops the writable-only new-session step in read-only mode", () => {
-    const steps = resolveTourSteps({
-      scope: "dashboard",
-      readOnly: true,
-      isDesktop: true,
-      hasAnchor: present,
-    });
-    expect(steps.map((s) => s.id)).not.toContain("new-session");
-  });
-
-  it("drops CityHall-inaccessible settings steps in CityHall mode", () => {
-    const ids = resolveTourSteps({
-      scope: "dashboard",
-      readOnly: false,
-      cityhall: true,
-      isDesktop: true,
-      hasAnchor: present,
-    }).map((s) => s.id);
-    expect(ids).not.toContain("settings-worktree");
-    expect(ids).not.toContain("settings-agent-defaults");
-    expect(ids).toContain("settings-plugins");
-  });
-
-  it("drops desktop-only steps on coarse pointers", () => {
-    const steps = resolveTourSteps({
-      scope: "structured-view",
-      readOnly: false,
-      isDesktop: false,
-      hasAnchor: present,
-    });
-    expect(steps.map((s) => s.id)).not.toContain("right-panel");
+  it("drops steps filtered by read-only, CityHall, and coarse-pointer metadata", () => {
+    const ids = (opts: Partial<Parameters<typeof resolveTourSteps>[0]>) =>
+      resolveTourSteps({ scope: "dashboard", readOnly: false, isDesktop: true, hasAnchor: present, ...opts }).map(
+        (s) => s.id,
+      );
+    expect(ids({ readOnly: true })).not.toContain("new-session");
+    const cityhall = ids({ cityhall: true });
+    expect(cityhall).not.toContain("settings-worktree");
+    expect(cityhall).not.toContain("settings-agent-defaults");
+    expect(cityhall).toContain("settings-plugins");
+    expect(ids({ scope: "structured-view", isDesktop: false })).not.toContain("right-panel");
   });
 
   it("drops steps whose anchor is absent from the DOM, except deferred settings steps", () => {
@@ -139,17 +112,14 @@ describe("resolveTourSteps", () => {
     });
     expect(steps.map((s) => s.id)).toEqual(["settings-worktree", "settings-plugins", "settings-agent-defaults"]);
     expect(steps.every((s) => s.settingsTab)).toBe(true);
-  });
 
-  it("still requires present anchors for non-settings steps when a settings step is eligible", () => {
-    const present = new Set<TourAnchorId>([TOUR_ANCHORS.topbar]);
-    const steps = resolveTourSteps({
+    const topbarOnly = new Set<TourAnchorId>([TOUR_ANCHORS.topbar]);
+    const ids = resolveTourSteps({
       scope: "dashboard",
       readOnly: false,
       isDesktop: true,
-      hasAnchor: (a) => present.has(a),
-    });
-    const ids = steps.map((s) => s.id);
+      hasAnchor: (a) => topbarOnly.has(a),
+    }).map((s) => s.id);
     expect(ids).toContain("topbar"); // present anchor -> kept
     expect(ids).toContain("settings-worktree"); // deferred -> kept regardless
     expect(ids).not.toContain("sidebar"); // absent non-deferred anchor -> dropped

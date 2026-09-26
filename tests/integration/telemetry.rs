@@ -113,11 +113,14 @@ fn with_sandbox(mut inst: Instance) -> Instance {
     inst
 }
 
-/// Default-off holds even with an update cache and deployment modes in play:
-/// no opt-in, no install id, and no event (so no uuid) is ever built.
+/// The opt-in lifecycle. Default-off holds even with an update cache and
+/// deployment modes in play: no opt-in, no install id, and no event (so no
+/// uuid) is ever built. Opting in generates an id and lets events build;
+/// opting back out deletes the id. `DO_NOT_TRACK` is absolute: with the config
+/// flag on, nothing is opted in, no id is generated, and no events build.
 #[test]
 #[serial]
-fn opted_out_builds_nothing() {
+fn opt_in_lifecycle_and_do_not_track() {
     let _tmp = isolate();
     write_update_cache("9999.0.0", &["9999.0.0", "9998.0.0"]);
 
@@ -134,18 +137,12 @@ fn opted_out_builds_nothing() {
         &telemetry::StructuredInteractionCounts::default(),
     )
     .is_none());
-}
 
-/// Opting in generates an install id and lets events build; opting back out
-/// deletes the id.
-#[test]
-#[serial]
-fn opt_in_round_trips_and_opt_out_deletes_id() {
-    let _tmp = opted_in();
+    update_config(|config| config.telemetry.enabled = true).expect("save config");
+    telemetry::apply_opt_in_change(true);
     assert!(telemetry::is_opted_in());
     let id = telemetry::install_id().expect("id generated on opt-in");
     assert!(!id.is_empty());
-
     let event = telemetry::build_process_start(Surface::Tui).expect("event built when opted in");
     assert_eq!(event.surface, Surface::Tui);
     assert_eq!(event.event, "process_start");
@@ -156,26 +153,14 @@ fn opt_in_round_trips_and_opt_out_deletes_id() {
     assert!(!telemetry::is_opted_in());
     assert_eq!(telemetry::install_id(), None);
     assert!(telemetry::build_process_start(Surface::Tui).is_none());
-}
 
-/// `DO_NOT_TRACK` is absolute: with the config flag on, nothing is opted in, no
-/// id is generated, and no events build.
-#[test]
-#[serial]
-fn do_not_track_suppresses_send_and_id() {
-    // Not `opted_in()`: that fixture applies the opt-in before DO_NOT_TRACK is
-    // set, which legitimately mints an id. This test is about suppression from
-    // the start.
-    let _tmp = isolate();
     update_config(|config| config.telemetry.enabled = true).expect("save config");
     unsafe { std::env::set_var("DO_NOT_TRACK", "1") };
-
     assert!(telemetry::do_not_track());
     assert!(!telemetry::is_opted_in());
     telemetry::apply_opt_in_change(true);
     assert_eq!(telemetry::install_id(), None, "suppressed: no id");
     assert!(telemetry::build_process_start(Surface::Cli).is_none());
-
     unsafe { std::env::remove_var("DO_NOT_TRACK") };
 }
 
@@ -505,13 +490,28 @@ fn cli_usage_flush_throttled_but_retries_after_failure() {
     );
 }
 
-/// #1879: `cli_usage` reports the full mix of allowlisted command names with
-/// repeats, drops anything outside the clap vocabulary (so a hand-edited state
-/// file cannot smuggle strings onto the wire), and resets on a confirmed flush.
+/// #1879: for a not-opted-in install the per-command tracker is a true no-op,
+/// checked before any config read since reading the config materializes the
+/// app dir (`track_cli_command` short-circuits on its `app_dir_exists` gate).
+/// Once opted in, `cli_usage` reports the full mix of allowlisted command
+/// names with repeats, drops anything outside the clap vocabulary (so a
+/// hand-edited state file cannot smuggle strings onto the wire), and resets on
+/// a confirmed flush.
 #[test]
 #[serial]
-fn cli_usage_records_allowlisted_subcommands_only() {
-    let _tmp = opted_in();
+fn cli_usage_records_allowlisted_subcommands_only_when_opted_in() {
+    let _tmp = isolate();
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+    rt.block_on(telemetry::track_cli_command("add"));
+    assert!(
+        !agent_of_empires::session::app_dir_exists(),
+        "tracking must not create the app dir when not opted in"
+    );
+    assert!(!telemetry::is_opted_in());
+    assert!(telemetry::build_cli_usage().is_none());
+
+    update_config(|config| config.telemetry.enabled = true).expect("save config");
+    telemetry::apply_opt_in_change(true);
     telemetry::record_cli_command("add");
     telemetry::record_cli_command("session");
     telemetry::record_cli_command("add");
@@ -539,23 +539,6 @@ fn cli_usage_records_allowlisted_subcommands_only() {
         telemetry::build_cli_usage().is_none(),
         "counts must reset after a confirmed flush"
     );
-}
-
-/// #1879: for a not-opted-in install the per-command tracker is a true no-op.
-/// Checked before any config read, since reading the config materializes the
-/// app dir; `track_cli_command` short-circuits on its `app_dir_exists` gate.
-#[test]
-#[serial]
-fn cli_usage_default_off_records_nothing() {
-    let _tmp = isolate();
-    let rt = tokio::runtime::Runtime::new().expect("runtime");
-    rt.block_on(telemetry::track_cli_command("add"));
-    assert!(
-        !agent_of_empires::session::app_dir_exists(),
-        "tracking must not create the app dir when not opted in"
-    );
-    assert!(!telemetry::is_opted_in());
-    assert!(telemetry::build_cli_usage().is_none());
 }
 
 /// #1877: the `telemetry.json` read-modify-write is serialized, so racing

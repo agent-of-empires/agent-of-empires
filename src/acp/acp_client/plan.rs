@@ -99,8 +99,25 @@ pub(super) fn plan_status_to_str(
 mod tests {
     use super::*;
 
+    /// A plan needs bullets; anything else renders as a generic tool card.
     #[test]
-    fn parse_plan_steps_extracts_dash_and_numbered_bullets() {
+    fn plan_extraction_cases() {
+        for raw in [
+            serde_json::json!({}),
+            serde_json::json!({ "plan": 42 }),
+            serde_json::json!({ "plan": "Just a paragraph with no list." }),
+            serde_json::json!({ "plan": "" }),
+        ] {
+            assert!(extract_plan_from_switch_mode(&raw).is_none(), "{raw}");
+        }
+        let plan = extract_plan_from_switch_mode(&serde_json::json!({
+            "plan": "- Step one\n- Step two\n- Step three"
+        }))
+        .expect("plan should parse");
+        assert_eq!(plan.steps.len(), 3);
+        assert_eq!(plan.steps[0].title, "Step one");
+
+        // Dash and numbered bullets both count; surrounding prose does not.
         let md = "Here's the plan:\n\n- First, **read** the file\n- Then patch it\n1. Run tests\n2. Commit\n\nOther prose.";
         let steps = parse_plan_steps(md);
         let titles: Vec<&str> = steps.iter().map(|s| s.title.as_str()).collect();
@@ -116,44 +133,24 @@ mod tests {
         for s in &steps {
             assert!(matches!(s.status, PlanStepStatus::Pending));
         }
-    }
 
-    /// A plan needs bullets; anything else renders as a generic tool card.
-    #[test]
-    fn extract_plan_from_switch_mode_needs_a_bulleted_string() {
-        for raw in [
-            serde_json::json!({}),
-            serde_json::json!({ "plan": 42 }),
-            serde_json::json!({ "plan": "Just a paragraph with no list." }),
-            serde_json::json!({ "plan": "" }),
-        ] {
-            assert!(extract_plan_from_switch_mode(&raw).is_none(), "{raw}");
-        }
-        let plan = extract_plan_from_switch_mode(&serde_json::json!({
-            "plan": "- Step one\n- Step two\n- Step three"
-        }))
-        .expect("plan should parse");
-        assert_eq!(plan.steps.len(), 3);
-        assert_eq!(plan.steps[0].title, "Step one");
-    }
-
-    #[test]
-    fn strip_markdown_emphasis_unwraps_markers_but_keeps_intraword_underscores() {
-        for (input, want) in [
-            ("**bold**", "bold"),
-            ("__bold__", "bold"),
-            ("*italic*", "italic"),
-            ("_italic_", "italic"),
-            ("mix of **bold** and *italic*", "mix of bold and italic"),
-            ("plain", "plain"),
-            ("rename _foo_ now", "rename foo now"),
-            ("foo_bar_baz", "foo_bar_baz"),
-            ("rename foo_bar_baz", "rename foo_bar_baz"),
-            ("call do_thing() then _stop_", "call do_thing() then stop"),
-            // `\b` is zero-width, so adjacent emphasis still unwraps.
-            ("_a_ _b_", "a b"),
-        ] {
-            assert_eq!(strip_markdown_emphasis(input), want, "input: {input}");
+        {
+            for (input, want) in [
+                ("**bold**", "bold"),
+                ("__bold__", "bold"),
+                ("*italic*", "italic"),
+                ("_italic_", "italic"),
+                ("mix of **bold** and *italic*", "mix of bold and italic"),
+                ("plain", "plain"),
+                ("rename _foo_ now", "rename foo now"),
+                ("foo_bar_baz", "foo_bar_baz"),
+                ("rename foo_bar_baz", "rename foo_bar_baz"),
+                ("call do_thing() then _stop_", "call do_thing() then stop"),
+                // `\b` is zero-width, so adjacent emphasis still unwraps.
+                ("_a_ _b_", "a b"),
+            ] {
+                assert_eq!(strip_markdown_emphasis(input), want, "input: {input}");
+            }
         }
     }
 }

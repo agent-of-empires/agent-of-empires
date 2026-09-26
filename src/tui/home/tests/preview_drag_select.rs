@@ -69,20 +69,64 @@ fn stage_live_send(env: &mut TestEnv) {
     });
 }
 
+/// A press on the preview seeds a PreviewSelect at the absolute content line under the
+/// cursor, in or out of live mode, so users can copy from a regular preview too. A modal over
+/// the preview swallows the press instead of seeding a hidden highlight, and a pane with no
+/// captured scrollback has nothing to select.
 #[test]
 #[serial]
-fn drag_start_outside_live_mode_installs_selection() {
-    let mut env = create_test_env_empty();
-    stage_pane(&mut env, Rect::new(40, 0, 60, 20), 0, 100);
-    // No live_send: a press on the preview still seeds a PreviewSelect, so users can copy
-    // from a regular session preview without entering live mode.
-    assert!(env.view.handle_drag_start(50, 10));
-    assert!(matches!(env.view.drag_state, Some(DragKind::PreviewSelect)));
-    let sel = env.view.preview_selection.expect("selection installed");
-    // col offset 50-40=10, content line first_line(0)+10=10.
-    assert_eq!(to_abs(100, sel.anchor), (10, 10));
-    assert_eq!(to_abs(100, sel.extent), (10, 10));
-    assert!(!sel.finalized);
+fn drag_start_seeds_selection_at_the_pressed_content_line() {
+    let pane = Rect::new(40, 0, 60, 20);
+    // (label, live, modal open, first_line, total_lines, expected (col, abs line))
+    let cases = [
+        ("outside live mode", false, false, 0, 100, Some((10, 10))),
+        ("inside live mode", true, false, 0, 100, Some((10, 10))),
+        (
+            "scrolled into history",
+            false,
+            false,
+            100,
+            200,
+            Some((10, 110)),
+        ),
+        ("modal over the preview", false, true, 0, 100, None),
+        ("empty pane", false, false, 0, 0, None),
+    ];
+    for (label, live, modal, first_line, total_lines, expected) in cases {
+        let mut env = create_test_env_empty();
+        if total_lines == 0 {
+            env.view.preview_text_view = PreviewTextView {
+                pane,
+                first_line,
+                total_lines,
+            };
+        } else {
+            stage_pane(&mut env, pane, first_line, total_lines);
+        }
+        if live {
+            stage_live_send(&mut env);
+        }
+        env.view.show_help = modal;
+        assert_eq!(
+            env.view.handle_drag_start(50, 10),
+            expected.is_some(),
+            "{label}"
+        );
+        assert_eq!(
+            matches!(env.view.drag_state, Some(DragKind::PreviewSelect)),
+            expected.is_some(),
+            "{label}"
+        );
+        match expected {
+            Some(cell) => {
+                let sel = env.view.preview_selection.expect("selection installed");
+                assert_eq!(to_abs(total_lines, sel.anchor), cell, "{label}");
+                assert_eq!(to_abs(total_lines, sel.extent), cell, "{label}");
+                assert!(!sel.finalized, "{label}");
+            }
+            None => assert!(env.view.preview_selection.is_none(), "{label}"),
+        }
+    }
 }
 
 /// Moving the preview cancels an unfinished selection without publishing clipboard text.
@@ -106,48 +150,6 @@ fn changing_sidebar_position_cancels_preview_gesture_without_copying() {
     assert!(!env.view.handle_drag_end());
     assert!(!env.view.preview_copy_pending);
     assert!(env.view.take_preview_copy_text().is_none());
-}
-
-#[test]
-#[serial]
-fn drag_start_maps_screen_row_to_scrollback_line() {
-    // With the pane scrolled into history, a press maps to the
-    // absolute content line under the cursor, not the screen row.
-    let mut env = create_test_env_empty();
-    stage_pane(&mut env, Rect::new(40, 0, 60, 20), 100, 200);
-    assert!(env.view.handle_drag_start(50, 10));
-    let sel = env.view.preview_selection.expect("selection installed");
-    // line first_line(100) + (row 10 - pane.y 0) = 110.
-    assert_eq!(to_abs(200, sel.anchor), (10, 110));
-}
-
-#[test]
-#[serial]
-fn drag_start_blocked_by_non_live_overlay() {
-    // A modal sitting over the preview must swallow the press
-    // instead of seeding a hidden highlight behind the dialog.
-    let mut env = create_test_env_empty();
-    stage_pane(&mut env, Rect::new(40, 0, 60, 20), 0, 100);
-    env.view.show_help = true;
-    assert!(!env.view.handle_drag_start(50, 10));
-    assert!(env.view.preview_selection.is_none());
-    assert!(env.view.drag_state.is_none());
-}
-
-#[test]
-#[serial]
-fn drag_start_on_empty_pane_is_noop() {
-    // A pane with no captured scrollback has nothing to select, so a press must not seed a
-    // phantom selection.
-    let mut env = create_test_env_empty();
-    env.view.preview_text_view = PreviewTextView {
-        pane: Rect::new(40, 0, 60, 20),
-        first_line: 0,
-        total_lines: 0,
-    };
-    assert!(!env.view.handle_drag_start(50, 10));
-    assert!(env.view.preview_selection.is_none());
-    assert!(env.view.drag_state.is_none());
 }
 
 #[test]
@@ -202,20 +204,6 @@ fn drag_move_below_painted_content_clamps_to_last_line() {
 
 #[test]
 #[serial]
-fn drag_start_inside_live_mode_installs_selection() {
-    let mut env = create_test_env_empty();
-    stage_pane(&mut env, Rect::new(40, 0, 60, 20), 0, 100);
-    stage_live_send(&mut env);
-    assert!(env.view.handle_drag_start(50, 10));
-    assert!(matches!(env.view.drag_state, Some(DragKind::PreviewSelect)));
-    let sel = env.view.preview_selection.expect("selection installed");
-    assert_eq!(to_abs(100, sel.anchor), (10, 10));
-    assert_eq!(to_abs(100, sel.extent), (10, 10));
-    assert!(!sel.finalized);
-}
-
-#[test]
-#[serial]
 fn drag_move_maps_to_content_and_clamps_to_pane() {
     let mut env = create_test_env_empty();
     // total_lines == pane height so there is no scroll room; a drag
@@ -231,24 +219,16 @@ fn drag_move_maps_to_content_and_clamps_to_pane() {
 
 #[test]
 #[serial]
-fn bare_click_collapses_to_no_selection() {
-    // Down + Up with no movement should not paint a 1x1 highlight
-    // or copy a single character to the clipboard.
-    let mut env = create_test_env_empty();
-    stage_pane(&mut env, Rect::new(40, 0, 60, 20), 0, 100);
-    stage_live_send(&mut env);
-    env.view.handle_drag_start(50, 10);
-    assert!(env.view.handle_drag_end());
-    assert!(env.view.preview_selection.is_none());
-    assert!(!env.view.preview_copy_pending);
-}
-
-#[test]
-#[serial]
 fn drag_end_finalizes_multi_cell_selection_and_arms_copy() {
     let mut env = create_test_env_empty();
     stage_pane(&mut env, Rect::new(40, 0, 60, 20), 0, 100);
     stage_live_send(&mut env);
+    // Down + Up with no movement must not paint a 1x1 highlight or copy one character.
+    env.view.handle_drag_start(50, 10);
+    assert!(env.view.handle_drag_end());
+    assert!(env.view.preview_selection.is_none());
+    assert!(!env.view.preview_copy_pending);
+
     env.view.handle_drag_start(50, 10);
     env.view.handle_drag_move(55, 10);
     assert!(env.view.handle_drag_end());
@@ -258,68 +238,31 @@ fn drag_end_finalizes_multi_cell_selection_and_arms_copy() {
     // captures the text; handle_drag_end just arms the pending flag.
     assert!(env.view.preview_copy_pending);
     assert!(env.view.preview_copy_text.is_none());
+
+    // Dismissing the highlight before the render fires drops the pending capture so it
+    // doesn't leak into the next drag.
+    env.view.clear_preview_selection();
+    assert!(!env.view.preview_copy_pending);
+    assert!(env.view.preview_copy_text.is_none());
 }
 
 #[test]
 #[serial]
-fn keypress_in_live_mode_dismisses_finalized_selection() {
-    // After release, any keystroke clears the highlight so it
-    // doesn't follow agent output as the live pane refreshes.
+fn finalized_selection_survives_scroll_but_not_a_live_keypress() {
     let mut env = create_test_env_empty();
     stage_pane(&mut env, Rect::new(40, 0, 60, 20), 0, 100);
     stage_live_send(&mut env);
     env.view.handle_drag_start(50, 10);
     env.view.handle_drag_move(55, 10);
     env.view.handle_drag_end();
+    // Anchored to scrollback lines, the highlight tracks its text through a scroll, which
+    // is what lets the user scroll to verify a copy.
+    env.view.handle_scroll_up(50, 10);
     assert!(env.view.preview_selection.is_some());
-    // Send a stray key through the live-send path: the session doesn't exist in tmux, but
-    // the dismissal happens before the translate step.
+    // Any keystroke clears it so it doesn't follow agent output as the live pane refreshes.
+    // The session doesn't exist in tmux, but dismissal happens before the translate step.
     env.view.handle_key(key(KeyCode::Char('x')), None);
     assert!(env.view.preview_selection.is_none());
-}
-
-#[test]
-#[serial]
-fn scroll_preserves_selection() {
-    // The selection is anchored to scrollback lines, so a scroll no longer drops it and the
-    // highlight tracks its text, which is what lets the user scroll to verify a copy.
-    let mut env = create_test_env_empty();
-    stage_pane(&mut env, Rect::new(40, 0, 60, 20), 0, 100);
-    stage_live_send(&mut env);
-    env.view.handle_drag_start(50, 10);
-    env.view.handle_drag_move(55, 10);
-    env.view.handle_drag_end();
-    assert!(env.view.preview_selection.is_some());
-    env.view.handle_scroll_up(50, 10);
-    assert!(
-        env.view.preview_selection.is_some(),
-        "scroll must not clear a scrollback-anchored selection"
-    );
-}
-
-#[test]
-#[serial]
-fn drag_move_to_bottom_edge_extends_without_scrolling() {
-    // The drag-move only records the edge position and extends to the last visible line;
-    // scrolling is the ticker's job, so a held-still cursor still advances and mouse
-    // movement doesn't lurch the scroll one line per event.
-    let mut env = create_test_env_empty();
-    // 50 lines, 5 visible, started scrolled 10 back (showing 35..40).
-    stage_pane(&mut env, Rect::new(0, 0, 10, 5), 35, 50);
-    stage_live_send(&mut env);
-    assert_eq!(env.view.preview_scroll_offset, 10);
-    env.view.handle_drag_start(0, 0); // anchor line 35
-                                      // Drag held at the bottom edge (row 4 == pane.bottom()-1).
-    assert!(env.view.handle_drag_move(0, 4));
-    // No scroll yet, extent pinned to the last visible line (39).
-    assert_eq!(env.view.preview_scroll_offset, 10);
-    assert_eq!(
-        to_abs(
-            50,
-            env.view.preview_selection.expect("live selection").extent
-        ),
-        (0, 39)
-    );
 }
 
 #[test]
@@ -332,7 +275,17 @@ fn autoscroll_tick_at_bottom_edge_scrolls_and_extends_without_new_events() {
     stage_live_send(&mut env);
     env.view.handle_drag_start(0, 0); // anchor line 35
     env.view.handle_drag_move(0, 4); // record edge position
+
+    // The move only records the edge and extends to the last visible line (39); scrolling
+    // is the ticker's job, so movement doesn't lurch the scroll one line per event.
     assert_eq!(env.view.preview_scroll_offset, 10);
+    assert_eq!(
+        to_abs(
+            50,
+            env.view.preview_selection.expect("live selection").extent
+        ),
+        (0, 39)
+    );
 
     // First tick: scroll one line, extend to the new bottom (40).
     assert!(env.view.tick_preview_autoscroll());
@@ -442,84 +395,87 @@ fn extract_stays_locked_to_lines_when_capture_window_grows() {
     );
 }
 
+/// Extraction reads the parsed cache, not the frame buffer, so a selection whose start
+/// scrolled off the top still copies it. It flows like tmux (partial first and last rows,
+/// full middles), orders a reverse drag, trims trailing whitespace per row, and yields
+/// nothing for a whitespace-only selection.
 #[test]
 #[serial]
-fn extract_spans_full_scrollback_across_pages() {
-    // The multi-page guarantee: a selection whose start scrolled off the top still copies
-    // the off-screen lines, because extraction reads the parsed cache, not the frame
-    // buffer.
+fn extract_preview_selection_text_cases() {
     let mut env = create_test_env_empty();
-    // Pane shows 3 rows; first visible line is 3, so lines 1 and 2
-    // are above the fold.
-    stage_text(
-        &mut env,
-        Rect::new(0, 0, 10, 3),
-        3,
-        &[
-            "line0aaa", "line1bbb", "line2ccc", "line3ddd", "line4eee", "line5fff",
-        ],
+    // (label, pane width, first_line, lines, anchor (col, abs), extent (col, abs), expected)
+    type Case = (
+        &'static str,
+        u16,
+        usize,
+        &'static [&'static str],
+        (u16, usize),
+        (u16, usize),
+        Option<&'static str>,
     );
-    // Absolute lines 1..4 (col 0 of line 1 through col 6 of line 4).
-    env.view.preview_selection = Some(PreviewSelection {
-        anchor: (0, fb(6, 1)),
-        extent: (6, fb(6, 4)),
-        finalized: true,
-    });
-    let text = env
-        .view
-        .extract_preview_selection_text()
-        .expect("non-empty text");
-    assert_eq!(text, "line1bbb\nline2ccc\nline3ddd\nline4ee");
-}
-
-#[test]
-#[serial]
-fn extract_trims_trailing_whitespace_per_row() {
-    let mut env = create_test_env_empty();
-    stage_text(
-        &mut env,
-        Rect::new(0, 0, 10, 3),
-        0,
-        &["hello     ", "world     ", "          "],
-    );
-    env.view.preview_selection = Some(PreviewSelection {
-        anchor: (0, fb(3, 0)),
-        extent: (9, fb(3, 1)),
-        finalized: true,
-    });
-    let text = env
-        .view
-        .extract_preview_selection_text()
-        .expect("non-empty text");
-    assert_eq!(text, "hello\nworld");
-}
-
-#[test]
-#[serial]
-fn extract_returns_none_for_whitespace_only_selection() {
-    let mut env = create_test_env_empty();
-    stage_text(&mut env, Rect::new(0, 0, 5, 2), 0, &["     ", "     "]);
-    env.view.preview_selection = Some(PreviewSelection {
-        anchor: (0, fb(2, 0)),
-        extent: (4, fb(2, 1)),
-        finalized: true,
-    });
-    assert!(env.view.extract_preview_selection_text().is_none());
-}
-
-#[test]
-#[serial]
-fn take_preview_copy_text_drains_once() {
-    // The app loop reads preview_copy_text after the post-drag draw, so the field must
-    // yield Some once and None thereafter, or a stable highlight would rewrite the clipboard
-    // every frame.
-    let mut env = create_test_env_empty();
-    env.view.preview_copy_text = Some("clip me".to_string());
-    assert_eq!(
-        env.view.take_preview_copy_text().as_deref(),
-        Some("clip me")
-    );
-    assert!(env.view.take_preview_copy_text().is_none());
+    let cases: [Case; 5] = [
+        (
+            "spans lines above the fold",
+            10,
+            3,
+            &[
+                "line0aaa", "line1bbb", "line2ccc", "line3ddd", "line4eee", "line5fff",
+            ],
+            (0, 1),
+            (6, 4),
+            Some("line1bbb\nline2ccc\nline3ddd\nline4ee"),
+        ),
+        (
+            "flow with partial first and last rows",
+            10,
+            0,
+            &["abcdefghij", "klmnopqrst", "uvwxyz0123"],
+            (3, 0),
+            (5, 2),
+            Some("defghij\nklmnopqrst\nuvwxyz"),
+        ),
+        (
+            "reverse drag",
+            5,
+            0,
+            &["abcde", "fghij"],
+            (2, 1),
+            (1, 0),
+            Some("bcde\nfgh"),
+        ),
+        (
+            "trailing whitespace trimmed",
+            10,
+            0,
+            &["hello     ", "world     ", "          "],
+            (0, 0),
+            (9, 1),
+            Some("hello\nworld"),
+        ),
+        (
+            "whitespace only",
+            5,
+            0,
+            &["     ", "     "],
+            (0, 0),
+            (4, 1),
+            None,
+        ),
+    ];
+    for (label, width, first_line, lines, anchor, extent, expected) in cases {
+        let total = lines.len();
+        stage_text(&mut env, Rect::new(0, 0, width, 3), first_line, lines);
+        env.view.preview_selection = Some(PreviewSelection {
+            anchor: (anchor.0, fb(total, anchor.1)),
+            extent: (extent.0, fb(total, extent.1)),
+            finalized: true,
+        });
+        assert_eq!(
+            env.view.extract_preview_selection_text().as_deref(),
+            expected,
+            "{label}"
+        );
+    }
 }
 
 #[test]
@@ -547,151 +503,55 @@ fn real_modal_during_preview_drag_cancels_selection() {
     assert!(!env.view.preview_copy_pending);
 }
 
+/// Per-row flow segments: the first line's tail, full-width middles, the last line's head,
+/// clipped to the visible window (rows whose end line is off screen paint full width).
 #[test]
-#[serial]
-fn clear_preview_selection_drops_pending_copy() {
-    // Dismissing the highlight before the render fires must drop the pending capture so it
-    // doesn't leak into the next drag.
-    let mut env = create_test_env_empty();
-    stage_pane(&mut env, Rect::new(40, 0, 60, 20), 0, 100);
-    stage_live_send(&mut env);
-    env.view.handle_drag_start(50, 10);
-    env.view.handle_drag_move(55, 10);
-    env.view.handle_drag_end();
-    assert!(env.view.preview_copy_pending);
-    env.view.clear_preview_selection();
-    assert!(!env.view.preview_copy_pending);
-    assert!(env.view.preview_copy_text.is_none());
-}
-
-#[test]
-#[serial]
-fn flow_extract_wraps_lines_with_partial_first_and_last_rows() {
-    // Tmux-style flow: anchor partway into line 0, extent partway into line 2, so the middle
-    // line is pulled in full, the first from the anchor col onward, the last up to the
-    // extent col.
-    let mut env = create_test_env_empty();
-    stage_text(
-        &mut env,
-        Rect::new(0, 0, 10, 3),
-        0,
-        &["abcdefghij", "klmnopqrst", "uvwxyz0123"],
-    );
-    env.view.preview_selection = Some(PreviewSelection {
-        anchor: (3, fb(3, 0)),
-        extent: (5, fb(3, 2)),
-        finalized: true,
-    });
-    let text = env
-        .view
-        .extract_preview_selection_text()
-        .expect("non-empty text");
-    assert_eq!(text, "defghij\nklmnopqrst\nuvwxyz");
-}
-
-#[test]
-#[serial]
-fn flow_extract_handles_reverse_drag() {
-    // Drag from a later line up to an earlier one: anchor and extent
-    // are swapped into reading order before the flow shape is built.
-    let mut env = create_test_env_empty();
-    stage_text(&mut env, Rect::new(0, 0, 5, 2), 0, &["abcde", "fghij"]);
-    env.view.preview_selection = Some(PreviewSelection {
-        anchor: (2, fb(2, 1)),
-        extent: (1, fb(2, 0)),
-        finalized: true,
-    });
-    let text = env
-        .view
-        .extract_preview_selection_text()
-        .expect("non-empty text");
-    assert_eq!(text, "bcde\nfgh");
-}
-
-/// Build a text-view snapshot for the screen-rect tests.
-fn view(pane: Rect, first_line: usize, total_lines: usize) -> PreviewTextView {
-    PreviewTextView {
-        pane,
-        first_line,
-        total_lines,
+fn screen_flow_rects_cases() {
+    let row = |x, y, w| Rect::new(x, y, w, 1);
+    let tall = Rect::new(0, 0, 40, 20);
+    let short = Rect::new(0, 0, 40, 5);
+    // (label, pane, first_line, anchor (col, abs), extent (col, abs), expected rects)
+    let cases = [
+        ("single row", tall, 0, (10, 5), (15, 5), vec![row(10, 5, 6)]),
+        (
+            "two rows",
+            tall,
+            0,
+            (10, 5),
+            (3, 6),
+            vec![row(10, 5, 30), row(0, 6, 4)],
+        ),
+        (
+            "full-width middles",
+            tall,
+            0,
+            (10, 5),
+            (3, 8),
+            vec![row(10, 5, 30), row(0, 6, 40), row(0, 7, 40), row(0, 8, 4)],
+        ),
+        (
+            "clipped to the visible window",
+            short,
+            10,
+            (2, 8),
+            (7, 20),
+            (0..5).map(|y| row(0, y, 40)).collect::<Vec<_>>(),
+        ),
+        ("fully offscreen", short, 10, (0, 2), (5, 4), vec![]),
+    ];
+    for (label, pane, first_line, anchor, extent, expected) in cases {
+        let sel = PreviewSelection {
+            anchor: (anchor.0, fb(100, anchor.1)),
+            extent: (extent.0, fb(100, extent.1)),
+            finalized: false,
+        };
+        let rects = sel.screen_flow_rects(PreviewTextView {
+            pane,
+            first_line,
+            total_lines: 100,
+        });
+        assert_eq!(rects, expected, "{label}");
     }
-}
-
-#[test]
-#[serial]
-fn screen_flow_rects_single_row_returns_one_segment() {
-    let sel = PreviewSelection {
-        anchor: (10, fb(100, 5)),
-        extent: (15, fb(100, 5)),
-        finalized: false,
-    };
-    let rects = sel.screen_flow_rects(view(Rect::new(0, 0, 40, 20), 0, 100));
-    assert_eq!(rects.len(), 1);
-    assert_eq!(rects[0], Rect::new(10, 5, 6, 1));
-}
-
-#[test]
-#[serial]
-fn screen_flow_rects_two_rows_returns_two_segments() {
-    let sel = PreviewSelection {
-        anchor: (10, fb(100, 5)),
-        extent: (3, fb(100, 6)),
-        finalized: false,
-    };
-    let rects = sel.screen_flow_rects(view(Rect::new(0, 0, 40, 20), 0, 100));
-    assert_eq!(rects.len(), 2);
-    // First line tail: cols 10..40 on row 5.
-    assert_eq!(rects[0], Rect::new(10, 5, 30, 1));
-    // Last line head: cols 0..=3 on row 6.
-    assert_eq!(rects[1], Rect::new(0, 6, 4, 1));
-}
-
-#[test]
-#[serial]
-fn screen_flow_rects_three_rows_are_per_row_full_width_middles() {
-    let sel = PreviewSelection {
-        anchor: (10, fb(100, 5)),
-        extent: (3, fb(100, 8)),
-        finalized: false,
-    };
-    let rects = sel.screen_flow_rects(view(Rect::new(0, 0, 40, 20), 0, 100));
-    // Per-row segments: tail, two full-width middles, head.
-    assert_eq!(rects.len(), 4);
-    assert_eq!(rects[0], Rect::new(10, 5, 30, 1));
-    assert_eq!(rects[1], Rect::new(0, 6, 40, 1));
-    assert_eq!(rects[2], Rect::new(0, 7, 40, 1));
-    assert_eq!(rects[3], Rect::new(0, 8, 4, 1));
-}
-
-#[test]
-#[serial]
-fn screen_flow_rects_clips_rows_outside_visible_window() {
-    // The selection runs from above the fold to below it, so only the rows inside the
-    // visible window paint, each full width since neither end line is in view.
-    let sel = PreviewSelection {
-        anchor: (2, fb(100, 8)),
-        extent: (7, fb(100, 20)),
-        finalized: false,
-    };
-    // Visible lines are 10..15 (first_line 10, height 5).
-    let rects = sel.screen_flow_rects(view(Rect::new(0, 0, 40, 5), 10, 100));
-    assert_eq!(rects.len(), 5);
-    for (k, rect) in rects.iter().enumerate() {
-        assert_eq!(*rect, Rect::new(0, k as u16, 40, 1));
-    }
-}
-
-#[test]
-#[serial]
-fn screen_flow_rects_fully_offscreen_returns_empty() {
-    let sel = PreviewSelection {
-        anchor: (0, fb(100, 2)),
-        extent: (5, fb(100, 4)),
-        finalized: false,
-    };
-    // Selection lines 2..4 sit above the visible window 10..15.
-    let rects = sel.screen_flow_rects(view(Rect::new(0, 0, 40, 5), 10, 100));
-    assert!(rects.is_empty());
 }
 
 /// Finalizing a rendered selection copies the chosen text with the sidebar on either side.

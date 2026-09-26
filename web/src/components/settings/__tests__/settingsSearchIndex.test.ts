@@ -20,7 +20,7 @@ describe("buildSettingsSearchIndex", () => {
     expect(index.find((h) => h.section === "sandbox")?.tab).toBe("sandbox");
   });
 
-  it("skips local_only fields the server rejects", () => {
+  it("skips local_only fields and sections with no web tab so every hit can jump", () => {
     const index = buildSettingsSearchIndex([
       descriptor({
         section: "sandbox",
@@ -28,12 +28,6 @@ describe("buildSettingsSearchIndex", () => {
         label: "Node path",
         web_write: { policy: "local_only", reason: "host binary" },
       }),
-    ]);
-    expect(index).toHaveLength(0);
-  });
-
-  it("skips sections with no web tab so every hit can jump", () => {
-    const index = buildSettingsSearchIndex([
       descriptor({ section: "diff", field: "context_lines", label: "Context lines" }),
       descriptor({ section: "made_up", field: "x", label: "X" }),
       descriptor({ section: "tmux", field: "prefix", label: "Prefix" }),

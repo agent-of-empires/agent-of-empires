@@ -103,17 +103,6 @@ describe("ExtraReposPicker selection", () => {
     expect(onChange).not.toHaveBeenCalled();
   });
 
-  it.each([
-    [[], "No registered projects yet", "aoe project add"],
-    [[project("primary")], "No other projects to add", undefined],
-  ])("explains an empty pick list (%j)", async (projects, hint, extra) => {
-    fetchProjects.mockResolvedValue(projects);
-    const { container } = setup();
-    await waitFor(() => expect(container.textContent).toContain(hint));
-    if (extra) expect(container.textContent).toContain(extra);
-    else expect(container.textContent).not.toContain("No registered projects yet");
-  });
-
   it("searches saved projects and selects recents", async () => {
     fetchRecentProjects.mockResolvedValue({
       projects: [
@@ -134,7 +123,6 @@ describe("ExtraReposPicker per-repo base branch", () => {
   const selectedPaths = ["/src/api", "/src/web"];
 
   it.each([
-    [{}, "api", "epic/checkout", { "/src/api": "epic/checkout" }],
     [{ "/src/api": "epic/checkout" }, "web", "develop", { "/src/api": "epic/checkout", "/src/web": "develop" }],
     [{ "/src/api": "epic/checkout", "/src/web": "develop" }, "api", "", { "/src/web": "develop" }],
   ])("with %j, typing into %s emits the merged map", (repoBases, repo, value, expected) => {

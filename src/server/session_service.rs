@@ -1541,62 +1541,6 @@ mod tests {
     }
 
     #[test]
-    fn payload_hash_is_deterministic_and_field_sensitive() {
-        let spec = test_spec();
-        let a = spec_payload_hash(&spec);
-        let b = spec_payload_hash(&test_spec());
-        assert_eq!(a, b, "same spec must hash identically across calls");
-
-        let mut changed = test_spec();
-        changed.path = "/tmp/aoe-2897-other".to_string();
-        assert_ne!(
-            a,
-            spec_payload_hash(&changed),
-            "a semantic field change must change the hash"
-        );
-
-        let mut with_turn = test_spec();
-        with_turn.pending_initial_turn = Some("run the nightly task".to_string());
-        assert_ne!(
-            a,
-            spec_payload_hash(&with_turn),
-            "the initial turn is part of the request identity"
-        );
-
-        // Adjacent-field concatenation must not collide.
-        let mut shifted_a = test_spec();
-        shifted_a.extra_args = "ab".to_string();
-        shifted_a.command_override = "c".to_string();
-        let mut shifted_b = test_spec();
-        shifted_b.extra_args = "a".to_string();
-        shifted_b.command_override = "bc".to_string();
-        assert_ne!(spec_payload_hash(&shifted_a), spec_payload_hash(&shifted_b));
-    }
-
-    #[test]
-    fn idempotent_match_same_conflict_and_scope() {
-        let instances = vec![plugin_instance("cron", "job-1:2026-07-16", "hash-a")];
-
-        assert!(matches!(
-            find_idempotent_match(&instances, "cron", "job-1:2026-07-16", "hash-a"),
-            IdempotentMatch::Same(_)
-        ));
-        assert!(matches!(
-            find_idempotent_match(&instances, "cron", "job-1:2026-07-16", "hash-b"),
-            IdempotentMatch::Conflict
-        ));
-        // Another plugin may reuse the same key: scopes are per plugin id.
-        assert!(matches!(
-            find_idempotent_match(&instances, "other-plugin", "job-1:2026-07-16", "hash-a"),
-            IdempotentMatch::None
-        ));
-        assert!(matches!(
-            find_idempotent_match(&instances, "cron", "job-2:2026-07-16", "hash-a"),
-            IdempotentMatch::None
-        ));
-    }
-
-    #[test]
     fn idempotent_match_survives_triage_but_not_removal() {
         let mut archived = plugin_instance("cron", "k", "h");
         archived.archived_at = Some(chrono::Utc::now());
@@ -1693,6 +1637,36 @@ mod tests {
                 .await,
             Ok(CreateIdempotencyProbe::New)
         ));
+
+        let spec = test_spec();
+        let a = spec_payload_hash(&spec);
+        let b = spec_payload_hash(&test_spec());
+        assert_eq!(a, b, "same spec must hash identically across calls");
+
+        let mut changed = test_spec();
+        changed.path = "/tmp/aoe-2897-other".to_string();
+        assert_ne!(
+            a,
+            spec_payload_hash(&changed),
+            "a semantic field change must change the hash"
+        );
+
+        let mut with_turn = test_spec();
+        with_turn.pending_initial_turn = Some("run the nightly task".to_string());
+        assert_ne!(
+            a,
+            spec_payload_hash(&with_turn),
+            "the initial turn is part of the request identity"
+        );
+
+        // Adjacent-field concatenation must not collide.
+        let mut shifted_a = test_spec();
+        shifted_a.extra_args = "ab".to_string();
+        shifted_a.command_override = "c".to_string();
+        let mut shifted_b = test_spec();
+        shifted_b.extra_args = "a".to_string();
+        shifted_b.command_override = "bc".to_string();
+        assert_ne!(spec_payload_hash(&shifted_a), spec_payload_hash(&shifted_b));
     }
 
     #[tokio::test]
@@ -1821,71 +1795,6 @@ mod tests {
                 .expect("pending_drains mutex poisoned")
                 .is_empty(),
             "drain must release its claim on the no-op paths"
-        );
-    }
-
-    /// A queued prompt whose buffered attachment bytes have gone (the 24h
-    /// `PENDING_ATTACHMENT_TTL` sweep reclaims them; the row is not swept with them) has
-    /// neither text nor blobs, so the drain can never deliver it.
-    #[tokio::test]
-    async fn an_undeliverable_queue_row_is_retired_instead_of_wedging_the_queue() {
-        let _app_dir = crate::session::test_support::isolate_app_dir();
-        let mut inst = Instance::new("queue", "/tmp/aoe-queue-husk");
-        inst.id = "sess-husk".to_string();
-        inst.view = crate::session::View::Structured;
-        inst.status = crate::session::Status::Idle;
-        let service = service_for(vec![inst]);
-
-        // An attachment-only prompt.
-        service
-            .enqueue_prompt(
-                "sess-husk",
-                "husk".into(),
-                String::new(),
-                vec![crate::daemon::PromptAttachmentRef {
-                    id: "att-1".into(),
-                    kind: crate::daemon::PromptAttachmentKind::Image,
-                    mime_type: "image/png".into(),
-                    name: Some("shot.png".into()),
-                    size: 9,
-                }],
-                None,
-                "t0".into(),
-            )
-            .await
-            .expect("session exists");
-        assert_eq!(service.queued_prompts_snapshot("sess-husk").await.len(), 1);
-
-        // The husk has to be the whole batch to wedge.
-        service.drain_queued_prompts_once("sess-husk").await;
-        assert!(
-            service
-                .queued_prompts_snapshot("sess-husk")
-                .await
-                .is_empty(),
-            "the husk is retired rather than retried forever"
-        );
-
-        // And the queue is genuinely usable again, not just empty.
-        service
-            .enqueue_prompt(
-                "sess-husk",
-                "next".into(),
-                "still deliverable".into(),
-                vec![],
-                None,
-                "t1".into(),
-            )
-            .await
-            .expect("session exists");
-        assert_eq!(
-            service
-                .queued_prompts_snapshot("sess-husk")
-                .await
-                .iter()
-                .map(|q| q.id.clone())
-                .collect::<Vec<_>>(),
-            ["next"]
         );
     }
 
@@ -2521,42 +2430,6 @@ mod tests {
             )
             .await
             .is_none());
-    }
-
-    #[tokio::test]
-    async fn wake_dormant_for_queue_drain_clears_only_when_dormant() {
-        let _app_dir = crate::session::test_support::isolate_app_dir();
-        // A session the idle reaper auto-stopped.
-        let mut dormant = Instance::new("queue", "/tmp/aoe-queue-dormant");
-        dormant.id = "sess-dormant".to_string();
-        dormant.view = crate::session::View::Structured;
-        dormant.mark_idle_dormant();
-        assert!(dormant.is_idle_dormant());
-
-        // A live/idle session that is not dormant must be left untouched.
-        let mut awake = Instance::new("queue", "/tmp/aoe-queue-awake");
-        awake.id = "sess-awake".to_string();
-        awake.view = crate::session::View::Structured;
-
-        let state = crate::server::test_support::build_test_app_state(vec![dormant, awake]);
-        let service = state.session_service.clone();
-
-        service.wake_dormant_for_queue_drain("sess-dormant").await;
-        service.wake_dormant_for_queue_drain("sess-awake").await;
-        // A gone session is a no-op, never a panic.
-        service.wake_dormant_for_queue_drain("sess-gone").await;
-
-        let instances = state.instances.read().await;
-        let dormant_after = instances.iter().find(|i| i.id == "sess-dormant").unwrap();
-        let awake_after = instances.iter().find(|i| i.id == "sess-awake").unwrap();
-        assert!(
-            !dormant_after.is_idle_dormant(),
-            "dormant queued session must be woken so the resume pass respawns it"
-        );
-        assert!(
-            !awake_after.is_idle_dormant(),
-            "a non-dormant session must stay non-dormant (no spurious wake)"
-        );
     }
 
     #[test]

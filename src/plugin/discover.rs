@@ -506,17 +506,13 @@ mod tests {
             out[0].featured,
             "an installed plugin keeps its featured mark"
         );
-    }
 
-    #[test]
-    fn a_result_row_carries_its_install_command_avatar_and_owner_repo_slug() {
         let out = badge_repos(vec![repo("acme/widget", 1)], &FeaturedIndex::default(), &[]);
         assert_eq!(out[0].install_command, "aoe plugin install gh:acme/widget");
         assert_eq!(
             out[0].source_avatar_url,
             "https://github.com/acme.png?size=64"
         );
-
         let cased = badge_repos(
             vec![repo("Acme/Widget", 1)],
             &FeaturedIndex::default(),
@@ -527,7 +523,6 @@ mod tests {
             DiscoveryBadge::Installed,
             "the installed match is case-insensitive"
         );
-
         let dropped = badge_repos(
             vec![repo("not-a-slug", 1), repo("a/b/c", 1)],
             &FeaturedIndex::default(),
@@ -615,49 +610,7 @@ mod tests {
     }
 
     #[test]
-    fn detail_manifest_parse_tolerates_newer_api_version_and_unknown_keys() {
-        let toml = r#"
-id = "acme.future"
-name = "Future"
-version = "9.9.9"
-api_version = 99
-description = "from the future"
-capabilities = ["net"]
-some_unknown_future_key = true
-
-[[ui]]
-slot = "status-bar"
-id = "s"
-"#;
-        let m: RawManifest = toml::from_str(toml).expect("lenient parse");
-        assert_eq!(m.version, "9.9.9");
-        assert_eq!(m.api_version, 99);
-        assert_eq!(m.capabilities, vec!["net"]);
-        assert_eq!(m.ui.len(), 1);
-        assert_eq!(m.ui[0].slot, "status-bar");
-    }
-
-    #[test]
-    fn screenshots_need_api_version_5_and_drop_bad_entries() {
-        const SHOTS: &str = "[[screenshots]]\npath = \"docs/a.png\"\nalt = \"good\"\n\n\
-             [[screenshots]]\npath = \"https://tracker.example.com/x.png\"\nalt = \"bad url\"\n\n\
-             [[screenshots]]\npath = \"docs/b.png\"\nalt = \"   \"\n";
-        let resolve = |api| {
-            let m = manifest(api, SHOTS);
-            resolve_screenshots(m.api_version, m.screenshots, "acme", "widget", None)
-        };
-
-        let kept = resolve(5);
-        assert_eq!(kept.len(), 1);
-        assert_eq!(
-            kept[0].src,
-            "https://raw.githubusercontent.com/acme/widget/HEAD/docs/a.png"
-        );
-        assert!(resolve(4).is_empty(), "v4 must not expose screenshots");
-    }
-
-    #[test]
-    fn icon_name_and_asset_need_api_version_7_and_are_validated() {
+    fn manifest_media_is_api_gated_and_validated_and_parsing_is_lenient() {
         let icon = |api, extra: &str| {
             let m = manifest(api, extra);
             (
@@ -683,5 +636,29 @@ id = "s"
         );
         assert!(name.is_none(), "a non-kebab-case icon name is dropped");
         assert!(asset.is_none(), "an absolute icon_asset URL is dropped");
+
+        const SHOTS: &str = "[[screenshots]]\npath = \"docs/a.png\"\nalt = \"good\"\n\n\
+             [[screenshots]]\npath = \"https://tracker.example.com/x.png\"\nalt = \"bad url\"\n\n\
+             [[screenshots]]\npath = \"docs/b.png\"\nalt = \"   \"\n";
+        let shots = |api| {
+            let m = manifest(api, SHOTS);
+            resolve_screenshots(m.api_version, m.screenshots, "acme", "widget", None)
+        };
+        let kept = shots(5);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(
+            kept[0].src,
+            "https://raw.githubusercontent.com/acme/widget/HEAD/docs/a.png"
+        );
+        assert!(shots(4).is_empty(), "v4 must not expose screenshots");
+
+        let future = manifest(
+            99,
+            "capabilities = [\"net\"]\nsome_unknown_future_key = true\n\n\
+             [[ui]]\nslot = \"status-bar\"\nid = \"s\"\n",
+        );
+        assert_eq!(future.api_version, 99, "a newer api_version still parses");
+        assert_eq!(future.capabilities, vec!["net"]);
+        assert_eq!(future.ui[0].slot, "status-bar");
     }
 }

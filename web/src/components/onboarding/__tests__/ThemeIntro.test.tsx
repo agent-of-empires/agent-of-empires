@@ -54,12 +54,9 @@ describe("ThemeIntro", () => {
     expect(option("empire").getAttribute("aria-selected")).toBe("false");
   });
 
-  it.each([
-    ["Continue", () => fireEvent.click(screen.getByRole("button", { name: "Continue" }))],
-    ["Escape", () => fireEvent.keyDown(window, { key: "Escape" })],
-  ])("dismisses via %s", async (_, dismiss) => {
+  it("dismisses via Escape", async () => {
     const { onDone } = await mount();
-    dismiss();
+    fireEvent.keyDown(window, { key: "Escape" });
     expect(onDone).toHaveBeenCalledTimes(1);
   });
 });

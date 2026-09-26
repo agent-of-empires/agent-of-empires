@@ -103,57 +103,34 @@ fn fold_pending_initial_turn(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::migrations::test_cases::assert_rewrites;
 
     #[test]
     fn folds_text_and_attachments_into_one_record() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("sessions.json");
-        fs::write(
-            &path,
-            r#"[
+        assert_rewrites(
+            "sessions.json",
+            fold_pending_initial_turn,
+            &[
+                (
+                    Some(
+                        r#"[
                 {"id":"a","pending_initial_turn":"run the nightly task","pending_initial_turn_attachments":[{"id":"att-1","kind":"image","mime_type":"image/png","name":"x.png","size":10}]},
                 {"id":"b","pending_initial_turn":"no attachments"},
                 {"id":"c"}
             ]"#,
-        )
-        .unwrap();
-
-        fold_pending_initial_turn(&path).unwrap();
-
-        let v: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
-        let arr = v.as_array().unwrap();
-        assert_eq!(
-            arr[0]["pending_initial_turn"]["text"],
-            "run the nightly task"
+                    ),
+                    Some(
+                        r#"[
+                {"id":"a","pending_initial_turn":{"text":"run the nightly task","synthesized":false,"attachments":[{"id":"att-1","kind":"image","mime_type":"image/png","name":"x.png","size":10}]}},
+                {"id":"b","pending_initial_turn":{"text":"no attachments","synthesized":false,"attachments":[]}},
+                {"id":"c"}
+            ]"#,
+                    ),
+                ),
+                (Some("not json"), Some("not json")),
+                (None, None),
+            ],
         );
-        assert_eq!(arr[0]["pending_initial_turn"]["synthesized"], false);
-        assert_eq!(
-            arr[0]["pending_initial_turn"]["attachments"][0]["id"],
-            "att-1"
-        );
-        assert!(arr[0].get("pending_initial_turn_attachments").is_none());
-        assert_eq!(arr[1]["pending_initial_turn"]["text"], "no attachments");
-        assert_eq!(
-            arr[1]["pending_initial_turn"]["attachments"],
-            serde_json::json!([])
-        );
-        assert!(arr[2].get("pending_initial_turn").is_none());
-    }
-
-    #[test]
-    fn missing_file_is_ok() {
-        let dir = tempfile::tempdir().unwrap();
-        fold_pending_initial_turn(&dir.path().join("does-not-exist.json")).unwrap();
-    }
-
-    #[test]
-    fn unparseable_file_is_skipped() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("sessions.json");
-        fs::write(&path, "not json").unwrap();
-        fold_pending_initial_turn(&path).unwrap();
-        assert_eq!(fs::read_to_string(&path).unwrap(), "not json");
     }
 
     #[test]

@@ -76,7 +76,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_github_with_and_without_ref() {
+    fn parses_github_and_local_sources_and_rejects_malformed_github() {
         let s = PluginSource::parse("gh:acme/widget").unwrap();
         assert_eq!(
             s,
@@ -96,10 +96,12 @@ mod tests {
             s.github_clone_url().as_deref(),
             Some("https://github.com/acme/widget.git")
         );
-    }
 
-    #[test]
-    fn rejects_malformed_github() {
+        let s = PluginSource::parse("/tmp/my-plugin").unwrap();
+        assert_eq!(s, PluginSource::Local(PathBuf::from("/tmp/my-plugin")));
+        assert_eq!(s.reference(), None);
+        assert_eq!(s.github_clone_url(), None);
+
         for bad in [
             "gh:",
             "gh:acme",
@@ -113,13 +115,5 @@ mod tests {
                 "{bad} should be rejected"
             );
         }
-    }
-
-    #[test]
-    fn treats_non_gh_as_local_path() {
-        let s = PluginSource::parse("/tmp/my-plugin").unwrap();
-        assert_eq!(s, PluginSource::Local(PathBuf::from("/tmp/my-plugin")));
-        assert_eq!(s.reference(), None);
-        assert_eq!(s.github_clone_url(), None);
     }
 }

@@ -3,6 +3,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { ProfileSelector } from "../ProfileSelector";
+import { validateProfileName } from "../../profiles/profileName";
 
 vi.mock("../../../lib/api", () => ({
   fetchProfiles: vi.fn(),
@@ -46,21 +47,26 @@ const INVALID = "Only letters, digits, hyphens, and underscores";
 describe("ProfileSelector create", () => {
   it.each([
     ["", "Name is required"],
-    ["   ", "Name is required"],
     ...["bad name", "bad;name", "bad$name", "bad|name", "bad&name", "bad`name", "bad/name", "..", ".hidden"].map(
       (n) => [n, INVALID],
     ),
-  ])("rejects %j without calling createProfile", async (name, message) => {
-    const { container, submit } = await openPanel("+ New");
-    submit(name);
-    expect(container.textContent).toContain(message);
-    expect(createProfile).not.toHaveBeenCalled();
+  ])("validateProfileName rejects %j", (name, message) => {
+    expect(validateProfileName(name)).toBe(message);
   });
 
-  it.each(["work", "work-2", "work_2", "A", "my-profile_42"])("creates trimmed %s", async (good) => {
-    const { submit } = await openPanel("+ New");
-    submit(`  ${good}  `);
-    await waitFor(() => expect(createProfile).toHaveBeenCalledWith(good));
+  it.each(["work", "work-2", "work_2", "A", "my-profile_42"])("validateProfileName accepts %s", (good) => {
+    expect(validateProfileName(good)).toBeNull();
+  });
+
+  it("rejects blank and unsafe names without calling createProfile, then creates a trimmed name", async () => {
+    const { container, submit } = await openPanel("+ New");
+    submit("   ");
+    expect(container.textContent).toContain("Name is required");
+    submit("../x");
+    expect(container.textContent).toContain(INVALID);
+    expect(createProfile).not.toHaveBeenCalled();
+    submit("  work-2  ");
+    await waitFor(() => expect(createProfile).toHaveBeenCalledWith("work-2"));
   });
 
   it("surfaces a create failure", async () => {
@@ -80,15 +86,11 @@ describe("ProfileSelector rename", () => {
     expect(screen.queryByPlaceholderText("New name")).toBeNull();
   });
 
-  it("rejects an invalid name", async () => {
-    const { container, submit } = await openPanel("Rename");
-    submit("bad name");
+  it("rejects an invalid name, then renames and selects a valid one", async () => {
+    const { container, submit, onSelect } = await openPanel("Rename");
+    submit("bad/name");
     expect(container.textContent).toContain(INVALID);
     expect(renameProfile).not.toHaveBeenCalled();
-  });
-
-  it("renames and selects the new name", async () => {
-    const { submit, onSelect } = await openPanel("Rename");
     submit("clients");
     await waitFor(() => expect(renameProfile).toHaveBeenCalledWith("work", "clients"));
     expect(onSelect).toHaveBeenCalledWith("clients");

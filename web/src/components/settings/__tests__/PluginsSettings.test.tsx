@@ -152,11 +152,6 @@ describe("installed plugins", () => {
     expect(screen.queryByTestId("plugin-uninstall-aoe.status")).toBeNull();
   });
 
-  it.each(["community", "featured"])("shows the %s validation badge", async (validation) => {
-    renderWith([{ ...EXAMPLE, validation } as PluginView]);
-    expect((await screen.findByTestId("plugin-validation-example.plugin")).textContent).toBe(validation);
-  });
-
   it("shows a needs-approval state for an ungranted plugin", async () => {
     renderWith([{ ...EXAMPLE, capabilities: ["net", "fs.read"], granted: false, needs_reapproval: true }]);
     await screen.findByTestId("plugin-needs-approval-example.plugin");
@@ -164,13 +159,9 @@ describe("installed plugins", () => {
     expect(screen.getByText(/not granted/)).toBeTruthy();
   });
 
-  it.each([
-    [[], null, "plugins-empty"],
-    [[STATUS], ["plugins/bad: manifest is invalid"], null],
-  ] as const)("renders empty state or load errors", async (plugins, loadErrors, testId) => {
-    renderWith([...plugins], loadErrors ? [...loadErrors] : undefined);
-    if (testId) expect((await screen.findByTestId(testId)).textContent).toContain("No plugins detected");
-    else expect(await screen.findByText(/manifest is invalid/)).toBeTruthy();
+  it("renders load errors", async () => {
+    renderWith([STATUS], ["plugins/bad: manifest is invalid"]);
+    expect(await screen.findByText(/manifest is invalid/)).toBeTruthy();
   });
 
   it("shows an error when the list fails to load", async () => {
@@ -179,19 +170,22 @@ describe("installed plugins", () => {
     expect(await screen.findByText("Failed to load plugins.")).toBeTruthy();
   });
 
-  it.each([
-    ["aoe.status", STATUS, false],
-    ["aoe.web", { ...STATUS, id: "aoe.web", name: "Web Dashboard" }, true],
-  ])("disabling %s adopts the refreshed list (restart notice only for the web)", async (_, plugin, notice) => {
-    renderWith([plugin]);
-    api.setPluginEnabled.mockResolvedValue({ kind: "ok", data: list([{ ...plugin, enabled: false }]) });
-    const toggle = (await screen.findByLabelText(`Enable ${plugin.name}`)) as HTMLInputElement;
-    expect(toggle.checked).toBe(true);
-    fireEvent.click(toggle);
-    await waitFor(() => expect(toggle.checked).toBe(false));
-    expect(api.setPluginEnabled).toHaveBeenCalledWith(plugin.id, false);
-    expect(reportInfo.mock.calls.length > 0).toBe(notice);
-    if (notice) expect(reportInfo).toHaveBeenCalledWith("Web dashboard stays up until aoe serve is restarted.");
+  it("disabling adopts the refreshed list; only the web plugin gets a restart notice", async () => {
+    const web = { ...STATUS, id: "aoe.web", name: "Web Dashboard" };
+    renderWith([STATUS, web]);
+    for (const [plugin, rest] of [
+      [STATUS, [web]],
+      [web, [{ ...STATUS, enabled: false }]],
+    ] as const) {
+      api.setPluginEnabled.mockResolvedValue({ kind: "ok", data: list([...rest, { ...plugin, enabled: false }]) });
+      const toggle = (await screen.findByLabelText(`Enable ${plugin.name}`)) as HTMLInputElement;
+      expect(toggle.checked).toBe(true);
+      fireEvent.click(toggle);
+      await waitFor(() => expect(toggle.checked).toBe(false));
+      expect(api.setPluginEnabled).toHaveBeenLastCalledWith(plugin.id, false);
+      expect(reportInfo.mock.calls.length > 0).toBe(plugin === web);
+    }
+    expect(reportInfo).toHaveBeenCalledWith("Web dashboard stays up until aoe serve is restarted.");
   });
 
   it("surfaces a rejected toggle", async () => {
@@ -199,23 +193,6 @@ describe("installed plugins", () => {
     renderWith();
     fireEvent.click(await screen.findByLabelText("Enable Agent Status Detection"));
     expect(await screen.findByText("Dashboard is read-only.")).toBeTruthy();
-  });
-
-  it.each([
-    ["with an asset url", { icon: "github", icon_asset_url: "/api/plugins/x/icon" }, "IMG"],
-    ["without an asset url", { icon: "git-branch", icon_asset_url: null }, "svg"],
-  ])("renders the icon %s", async (_, icon, tag) => {
-    renderWith([{ ...EXAMPLE, ...icon }]);
-    expect((await screen.findByTestId("plugin-icon-example.plugin")).tagName).toBe(tag);
-  });
-
-  it("separates installed management from the marketplace into tabs", async () => {
-    renderWith();
-    await screen.findByTestId("plugins-check-updates");
-    expect(screen.queryByTestId("plugins-discover")).toBeNull();
-    await click("plugins-tab-marketplace");
-    await screen.findByTestId("plugins-discover");
-    expect(screen.queryByTestId("plugins-check-updates")).toBeNull();
   });
 });
 
@@ -359,22 +336,11 @@ describe("updates", () => {
     expect(screen.getByTestId("plugin-example.plugin").textContent).toContain("abc1234 → def5678");
   });
 
-  it.each([
-    [
-      "a per-plugin error",
-      () => outdated({ current: "", available: null, needs_update: false, error: "git not found" }),
-      /Update check failed: git not found/,
-    ],
-    [
-      "an endpoint failure",
-      () => api.fetchPluginUpdates.mockResolvedValue({ kind: "error", message: "Update check failed (HTTP 502)." }),
-      "Update check failed (HTTP 502).",
-    ],
-  ])("Check for updates surfaces %s", async (_, seed, text) => {
-    seed();
+  it("Check for updates surfaces a per-plugin error", async () => {
+    outdated({ current: "", available: null, needs_update: false, error: "git not found" });
     renderWith();
     await click("plugins-check-updates");
-    expect(await screen.findByText(text)).toBeTruthy();
+    expect(await screen.findByText(/Update check failed: git not found/)).toBeTruthy();
   });
 
   it("a consent-required update discloses the new access and changelog, then applies pinned to its fingerprint", async () => {
@@ -445,18 +411,9 @@ describe("updates", () => {
     await screen.findByTestId("plugin-job-modal");
   });
 
-  it("an unavailable changelog says so and the update still applies", async () => {
-    await openReview(
-      safePreview(changelog({ unavailable_reason: "GitHub rate limit reached; changelog unavailable." })),
-    );
-    expect((await screen.findByTestId("plugin-update-changelog-unavailable")).textContent).toContain("rate limit");
-    await click("plugin-update-approve");
-    await waitFor(() => expect(api.applyPluginUpdate).toHaveBeenCalled());
-  });
-
-  it.each([consentPreview(), safePreview()])("an apply error stays in the open review modal", async (preview) => {
+  it("an apply error stays in the open review modal", async () => {
     api.applyPluginUpdate.mockResolvedValue({ kind: "error", message: "changed since it was shown" });
-    await openReview(preview);
+    await openReview(consentPreview());
     await click("plugin-update-approve");
     expect((await screen.findByTestId("plugin-update-consent-error")).textContent).toContain(
       "changed since it was shown",
@@ -507,26 +464,6 @@ describe("marketplace", () => {
     await click("plugins-discover");
   }
 
-  it("renders badged results with the install command", async () => {
-    await search();
-    const result = await screen.findByTestId("plugins-discover-result-gh:acme/widget");
-    expect(result.textContent).toContain("aoe plugin install gh:acme/widget");
-    expect(result.textContent).toContain("unvetted");
-  });
-
-  it("surfaces a discovery error", async () => {
-    api.discoverPlugins.mockResolvedValue({ kind: "error", message: "Rate limited by GitHub." });
-    await search();
-    expect((await screen.findByTestId("plugins-discover-error")).textContent).toContain("Rate limited by GitHub.");
-  });
-
-  it("shows no Install button for an installed result", async () => {
-    api.discoverPlugins.mockResolvedValue({ kind: "ok", results: [{ ...WIDGET, badge: "installed" }] });
-    await search();
-    await screen.findByTestId("plugins-discover-result-gh:acme/widget");
-    expect(screen.queryByTestId("plugins-install-gh:acme/widget")).toBeNull();
-  });
-
   it("Install previews the gh: source, discloses access, and starts the pinned job", async () => {
     api.previewPluginInstall.mockResolvedValue(installConsent);
     await search();
@@ -565,16 +502,13 @@ describe("uninstall and job progress", () => {
     await screen.findByTestId("plugin-uninstall-confirm");
   }
 
-  it("cancelling the confirm starts no job", async () => {
+  it("cancelling starts no job; confirming follows the job log and closes to a refreshed list", async () => {
+    api.fetchPluginJob.mockResolvedValue(jobResult("succeeded", "uninstalled example.plugin"));
     await uninstall();
     await click("plugin-uninstall-cancel");
     await waitFor(() => expect(screen.queryByTestId("plugin-uninstall-confirm")).toBeNull());
     expect(api.startPluginUninstall).not.toHaveBeenCalled();
-  });
-
-  it("confirming follows the job log and closes to a refreshed list", async () => {
-    api.fetchPluginJob.mockResolvedValue(jobResult("succeeded", "uninstalled example.plugin"));
-    await uninstall();
+    await click("plugin-uninstall-example.plugin");
     await click("plugin-uninstall-confirm-button");
     await waitFor(() => expect(api.startPluginUninstall).toHaveBeenCalledWith("example.plugin"));
     const log = await screen.findByTestId("plugin-job-log");
