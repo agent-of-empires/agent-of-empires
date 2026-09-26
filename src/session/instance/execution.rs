@@ -2465,6 +2465,10 @@ mod tests {
         let mut exported = legacy.clone();
         exported.exported_default_store = Some(true);
         assert_eq!(legacy, exported);
+        // The predicate handoff, validation and carry compare on is its own
+        // thing: it ignores the routing marker, so a legacy row and its
+        // attested counterpart stay the same execution.
+        assert!(Instance::execution_identity_matches(&legacy, &exported));
 
         let digest = |binding: &ExecutionBinding| {
             let mut hasher = std::collections::hash_map::DefaultHasher::new();

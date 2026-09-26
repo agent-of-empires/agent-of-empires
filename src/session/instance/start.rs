@@ -739,4 +739,94 @@ mod tests {
             None
         );
     }
+
+    /// #4127: the route the launch attests is the one the agent will actually
+    /// see. A containerised launch routes to the container's own store, so the
+    /// host's Claude namespace says nothing about it and the launch attests
+    /// nothing at all — even though the very same binding, launched on the
+    /// host, is stamped.
+    #[test]
+    fn attested_claude_store_route_refuses_a_container_launch() {
+        use crate::containers::{ContainerExecutionSnapshot, RuntimeExecutionSnapshot};
+        use crate::session::instance::execution::{NativeExecution, NativeLaunchInputs};
+        use crate::session::ContainerRuntimeName;
+
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let store = home.join(".claude");
+        std::fs::create_dir_all(&store).unwrap();
+        let mut instance = Instance::new("attested-route", temp.path().to_str().unwrap());
+        // The launched agent's HOME, so the route is read off a known home
+        // rather than the one running the tests.
+        instance.pending_host_env = vec![("HOME".into(), home.display().to_string())];
+
+        let container = ContainerExecutionSnapshot {
+            runtime: RuntimeExecutionSnapshot {
+                kind: ContainerRuntimeName::Docker,
+                program: std::path::PathBuf::from("/usr/bin/docker"),
+                cwd: temp.path().to_path_buf(),
+                endpoint: "local://docker".into(),
+                local_mounts: true,
+                routing: Vec::new(),
+                global_arguments: Vec::new(),
+            },
+            name: "aoe-attested-route".into(),
+            id: "0123456789ab".into(),
+            mounts: Vec::new(),
+            shadow_mounts: Vec::new(),
+        };
+        let launch = |inputs_container: Option<ContainerExecutionSnapshot>| NativeExecution {
+            agent: crate::agents::get_agent("claude").expect("claude is a known agent"),
+            binding: ExecutionBinding {
+                agent: "claude".into(),
+                stores: vec![store.clone()],
+                configuration: Vec::new(),
+                cwd: home.clone(),
+                cwd_filesystem: "host".into(),
+                filesystem: "host".into(),
+                exported_default_store: Some(false),
+            },
+            routing: vec![("CLAUDE_CONFIG_DIR".to_string(), None)],
+            case_insensitive_routing: &[],
+            omp: None,
+            inputs: NativeLaunchInputs {
+                launch_id: "launch-attested-route".into(),
+                environment: Default::default(),
+                cwd: temp.path().to_path_buf(),
+                profile: "default".into(),
+                container: inputs_container,
+                docker_env: None,
+                pane_env: Vec::new(),
+                identity_extension: None,
+            },
+            program: std::path::PathBuf::new(),
+            capture: None,
+            pi_transcript_path: None,
+            namespace_arguments: Vec::new(),
+            target_session_id: None,
+            resolved_target_session_id: None,
+            pi_pinnable: false,
+            opencode_preassign: false,
+        };
+
+        // The host launch stamps the binding it actually applied...
+        let host = launch(None);
+        let attested = instance
+            .attested_claude_store_route(&host)
+            .expect("a host launch attests the route it applied");
+        assert_eq!(attested.exported_default_store, Some(false));
+        // ...and stamps nothing else about it.
+        assert_eq!(attested.agent, host.binding.agent);
+        assert_eq!(attested.stores, host.binding.stores);
+        assert_eq!(attested.cwd, host.binding.cwd);
+
+        // The containerised launch attests no route at all, so the caller
+        // keeps the unstamped binding rather than one that claims the host's
+        // Claude namespace described the container's store.
+        let container_launch = launch(Some(container));
+        assert_eq!(
+            instance.attested_claude_store_route(&container_launch),
+            None
+        );
+    }
 }
