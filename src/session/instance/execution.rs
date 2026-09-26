@@ -1166,6 +1166,7 @@ impl Instance {
     pub(crate) fn fork_parent_ref(&self) -> Option<ForkParentRef<'_>> {
         let (sid, binding) = match &self.resume_intent {
             ResumeIntent::Fork { .. } => return Some(ForkParentRef::Unlaunched),
+            ResumeIntent::Use(sid) => (Some(sid), self.resume_binding.as_ref()),
             _ => (
                 self.agent_session_id.as_ref(),
                 self.agent_session_binding.as_ref(),
