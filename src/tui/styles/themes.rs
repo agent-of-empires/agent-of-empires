@@ -414,7 +414,7 @@ mod tests {
     }
 
     #[test]
-    fn test_hex_color_parse() {
+    fn hex_color_parse() {
         assert_eq!(
             hex_color::parse_hex_color("#ff0000").unwrap(),
             Color::Rgb(255, 0, 0)
@@ -436,10 +436,6 @@ mod tests {
             hex_color::parse_hex_color("fbbf24").unwrap(),
             Color::Rgb(251, 191, 36)
         );
-    }
-
-    #[test]
-    fn test_hex_color_parse_invalid() {
         assert!(hex_color::parse_hex_color("#fff").is_err());
         assert!(hex_color::parse_hex_color("#gggggg").is_err());
         assert!(hex_color::parse_hex_color("").is_err());
@@ -471,13 +467,8 @@ mod tests {
             theme.idle_color_at_age(Some(window + Duration::from_secs(60)), window),
             theme.idle
         );
-    }
-
-    #[test]
-    fn idle_color_at_age_zero_window_disables_freshness() {
         // window = 0 is the documented opt-out: every Idle row renders
-        // as fully decayed regardless of age. No pulse, no fresh tint.
-        let theme = load_theme("empire");
+        // as fully decayed regardless of age.
         assert_eq!(
             theme.idle_color_at_age(Some(Duration::from_secs(1)), Duration::ZERO),
             theme.idle

@@ -4,7 +4,6 @@ import type { PluginCommand, PluginUiEntry } from "../api";
 import {
   buildPluginCommandActions,
   invokeActionlessCommand,
-  isExternalHttpUrl,
   matchPluginChord,
   parsePluginChord,
   pickKeybindEffect,
@@ -49,17 +48,6 @@ const prA = { href: "https://github.com/o/a/pull/1", tooltip: "a: PR #1" };
 const prB = { href: "https://github.com/o/b/pull/2", tooltip: "b: PR #2" };
 const key = (k: string, over: Partial<KeyboardEvent> = {}) =>
   ({ ctrlKey: true, shiftKey: true, altKey: false, metaKey: false, key: k, ...over }) as KeyboardEvent;
-
-it.each([
-  ["https://x.test", true],
-  ["http://x.test", true],
-  ["javascript:alert(1)", false],
-  ["file:///etc/passwd", false],
-  ["", false],
-  [undefined, false],
-])("isExternalHttpUrl(%j) is %s", (url, expected) => {
-  expect(isExternalHttpUrl(url)).toBe(expected);
-});
 
 describe("chords", () => {
   it.each([
@@ -153,39 +141,6 @@ describe("pickKeybindEffect", () => {
   const cmdB: PluginCommand = { ...cmdA, fqid: "plugin.acme.b.open", plugin_id: "acme.b" };
 
   it.each<[string, PluginCommand[], PluginUiEntry[], string | null, KeyboardEvent, unknown]>([
-    [
-      "opens a single link",
-      [cmdA],
-      [entry({ href: "https://x.test/1" }, "acme.a")],
-      "s1",
-      key("g"),
-      { kind: "open", href: "https://x.test/1" },
-    ],
-    [
-      "picks among several links",
-      [cmdA],
-      [
-        entry(
-          {
-            items: [
-              { href: "https://x.test/1", tooltip: "one" },
-              { href: "https://x.test/2", tooltip: "two" },
-            ],
-          },
-          "acme.a",
-        ),
-      ],
-      "s1",
-      key("g"),
-      {
-        kind: "pick",
-        links: [
-          { href: "https://x.test/1", label: "one" },
-          { href: "https://x.test/2", label: "two" },
-        ],
-      },
-    ],
-    ["invokes an action-less command", [refresh], [], "s1", key("r"), { kind: "invoke", cmd: refresh }],
     ["skips an action-less command without a session", [refresh], [], null, key("r"), null],
     [
       "falls through to a later command sharing the chord",

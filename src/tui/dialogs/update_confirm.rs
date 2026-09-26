@@ -134,41 +134,18 @@ mod tests {
     }
 
     #[test]
-    fn default_selection_is_no() {
+    fn keys_decide_the_update() {
+        // Default selection is No, so a reflexive Enter cancels.
         assert!(!dialog().selected);
-    }
-
-    #[test]
-    fn esc_cancels() {
-        assert!(matches!(
-            dialog().handle_key(k(KeyCode::Esc)),
-            DialogResult::Cancel
-        ));
-    }
-
-    #[test]
-    fn y_submits() {
-        assert!(matches!(
-            dialog().handle_key(k(KeyCode::Char('y'))),
-            DialogResult::Submit(())
-        ));
-    }
-
-    #[test]
-    fn enter_with_no_selected_cancels() {
-        assert!(matches!(
-            dialog().handle_key(k(KeyCode::Enter)),
-            DialogResult::Cancel
-        ));
-    }
-
-    #[test]
-    fn enter_with_yes_selected_submits() {
-        let mut d = dialog();
-        d.selected = true;
-        assert!(matches!(
-            d.handle_key(k(KeyCode::Enter)),
-            DialogResult::Submit(())
-        ));
+        for (selected, code, want) in [
+            (false, KeyCode::Esc, DialogResult::Cancel),
+            (false, KeyCode::Char('y'), DialogResult::Submit(())),
+            (false, KeyCode::Enter, DialogResult::Cancel),
+            (true, KeyCode::Enter, DialogResult::Submit(())),
+        ] {
+            let mut d = dialog();
+            d.selected = selected;
+            assert_eq!(d.handle_key(k(code)), want, "{selected} {code:?}");
+        }
     }
 }

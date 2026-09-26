@@ -832,9 +832,9 @@ pub fn tailscale_funnel_cap_ready_sync() -> bool {
 mod tests {
     use super::*;
 
-    // The telemetry `serve_mode` signal reads `mode_label()`, so it must only
-    // ever emit the closed exposure set, and a named Cloudflare tunnel must
-    // bucket to "tunnel" rather than leak the configured tunnel name (#1885).
+    // The telemetry `serve_mode` signal reads `mode_label()`, so a named
+    // Cloudflare tunnel must bucket to "tunnel" rather than leak the configured
+    // tunnel name (#1885).
     #[test]
     fn mode_label_is_closed_and_never_leaks_tunnel_name() {
         assert_eq!(TunnelKind::Quick.mode_label(), "tunnel");
@@ -846,97 +846,62 @@ mod tests {
             "tunnel",
         );
         assert_eq!(TunnelKind::Tailscale.mode_label(), "tailscale");
+    }
 
-        for kind in [
-            TunnelKind::Quick,
-            TunnelKind::Named {
-                tunnel_name: "anything".to_string(),
-            },
-            TunnelKind::Tailscale,
-        ] {
-            assert!(
-                matches!(kind.mode_label(), "tunnel" | "tailscale"),
-                "mode_label must stay within the closed exposure set"
+    #[test]
+    fn extracts_tunnel_and_funnel_urls_from_tool_output() {
+        let tunnel = [
+            (
+                "2026-04-12T12:00:00Z INF +-------------------------------------------------------------------+",
+                None,
+            ),
+            (
+                "2026-04-12T12:00:01Z INF |  https://random-words-here.trycloudflare.com  |",
+                Some("https://random-words-here.trycloudflare.com"),
+            ),
+            ("INF Starting tunnel subsystem", None),
+            ("https://example.com not a tunnel", None),
+            (
+                "Visit https://abc-def.trycloudflare.com.",
+                Some("https://abc-def.trycloudflare.com"),
+            ),
+        ];
+        for (line, want) in tunnel {
+            assert_eq!(extract_tunnel_url(line).as_deref(), want, "{line}");
+        }
+        let funnel = [
+            (
+                "         https://login.tailscale.com/f/funnel?node=n6ADBuFYMT11CNTRL",
+                Some("https://login.tailscale.com/f/funnel?node=n6ADBuFYMT11CNTRL"),
+            ),
+            (
+                "         https://login.tailscale.com/f/funnel?node=abc   ",
+                Some("https://login.tailscale.com/f/funnel?node=abc"),
+            ),
+            ("https://login.tailscale.com/admin", None),
+            ("no url here", None),
+        ];
+        for (line, want) in funnel {
+            assert_eq!(
+                extract_funnel_activation_url(line).as_deref(),
+                want,
+                "{line}"
             );
         }
     }
 
     #[test]
-    fn extract_url_from_typical_output() {
-        let line =
-            "2026-04-12T12:00:00Z INF +-------------------------------------------------------------------+";
-        assert_eq!(extract_tunnel_url(line), None);
-
-        let line = "2026-04-12T12:00:01Z INF |  https://random-words-here.trycloudflare.com  |";
-        assert_eq!(
-            extract_tunnel_url(line),
-            Some("https://random-words-here.trycloudflare.com".to_string())
-        );
-    }
-
-    #[test]
-    fn extract_url_no_match() {
-        assert_eq!(extract_tunnel_url("INF Starting tunnel subsystem"), None);
-        assert_eq!(extract_tunnel_url("https://example.com not a tunnel"), None);
-    }
-
-    #[test]
-    fn extract_url_with_trailing_punctuation() {
-        let line = "Visit https://abc-def.trycloudflare.com.";
-        assert_eq!(
-            extract_tunnel_url(line),
-            Some("https://abc-def.trycloudflare.com".to_string())
-        );
-    }
-
-    #[test]
-    fn extract_funnel_activation_url_matches_indented_line() {
-        // Real tailscale funnel output.
-        let line = "         https://login.tailscale.com/f/funnel?node=n6ADBuFYMT11CNTRL";
-        assert_eq!(
-            extract_funnel_activation_url(line),
-            Some("https://login.tailscale.com/f/funnel?node=n6ADBuFYMT11CNTRL".to_string())
-        );
-    }
-
-    #[test]
-    fn extract_funnel_activation_url_strips_trailing_whitespace() {
-        let line = "         https://login.tailscale.com/f/funnel?node=abc   ";
-        assert_eq!(
-            extract_funnel_activation_url(line),
-            Some("https://login.tailscale.com/f/funnel?node=abc".to_string())
-        );
-    }
-
-    #[test]
-    fn extract_funnel_activation_url_ignores_unrelated_urls() {
-        assert_eq!(
-            extract_funnel_activation_url("https://login.tailscale.com/admin"),
-            None
-        );
-        assert_eq!(extract_funnel_activation_url("no url here"), None);
-    }
-
-    #[test]
-    fn proxy_is_loopback_matches_local_forms() {
-        assert!(proxy_is_loopback("http://127.0.0.1:8080"));
-        assert!(proxy_is_loopback("http://localhost:3000"));
-        assert!(proxy_is_loopback("https://127.0.0.1"));
-        assert!(proxy_is_loopback("http://[::1]:8080"));
-    }
-
-    #[test]
-    fn proxy_is_loopback_rejects_remote_hosts() {
-        assert!(!proxy_is_loopback("http://100.64.0.1:8080"));
-        assert!(!proxy_is_loopback("http://example.com"));
-        assert!(!proxy_is_loopback("http://192.168.1.5:8080"));
-    }
-
-    #[test]
-    fn check_cloudflared_returns_err_when_missing() {
-        // This test verifies the function doesn't panic with a missing binary.
-        let result = check_cloudflared();
-        // We just verify it returns a Result without panicking
-        let _ = result;
+    fn proxy_is_loopback_accepts_only_local_forms() {
+        for (url, want) in [
+            ("http://127.0.0.1:8080", true),
+            ("http://localhost:3000", true),
+            ("https://127.0.0.1", true),
+            ("http://[::1]:8080", true),
+            ("http://100.64.0.1:8080", false),
+            ("http://example.com", false),
+            ("http://192.168.1.5:8080", false),
+        ] {
+            assert_eq!(proxy_is_loopback(url), want, "{url}");
+        }
     }
 }

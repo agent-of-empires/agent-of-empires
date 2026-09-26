@@ -2073,37 +2073,22 @@ mod wrapped_rows_tests {
     }
 
     #[test]
-    fn short_and_empty_lines_take_one_row() {
-        assert_eq!(wrapped_rows(&line(""), 20), 1);
-        assert_eq!(wrapped_rows(&line("hello"), 20), 1);
-        assert_eq!(wrapped_rows(&line("fits the row width"), 18), 1);
-    }
-
-    #[test]
-    fn word_wrap_counts_continuation_rows() {
-        // "alpha bravo" (11) into width 7: "alpha" / "bravo".
-        assert_eq!(wrapped_rows(&line("alpha bravo"), 7), 2);
-        assert_eq!(wrapped_rows(&line("alpha bravo charlie"), 7), 3);
-    }
-
-    #[test]
-    fn indentation_counts_toward_the_first_row() {
-        // Two leading spaces + "abcdef" into width 6 needs a wrap that the
-        // unindented text would not.
-        assert_eq!(wrapped_rows(&line("abcdef"), 6), 1);
-        assert_eq!(wrapped_rows(&line("  abcdef"), 6), 2);
-    }
-
-    #[test]
-    fn over_wide_word_splits_across_rows() {
-        // A 20-wide token into width 8 needs three rows on its own.
-        assert_eq!(wrapped_rows(&line("aaaaaaaaaaaaaaaaaaaa"), 8), 3);
-        // After a word already on the row, the split starts on a fresh row.
-        assert_eq!(wrapped_rows(&line("hi aaaaaaaaaaaaaaaaaaaa"), 8), 4);
-    }
-
-    #[test]
-    fn totals_sum_per_line() {
+    fn wrapped_rows_cases() {
+        for (text, width, rows) in [
+            ("", 20, 1),
+            ("hello", 20, 1),
+            ("fits the row width", 18, 1),
+            ("alpha bravo", 7, 2),
+            ("alpha bravo charlie", 7, 3),
+            // Indentation counts toward the first row.
+            ("abcdef", 6, 1),
+            ("  abcdef", 6, 2),
+            // An over-wide word splits; after another word it starts fresh.
+            ("aaaaaaaaaaaaaaaaaaaa", 8, 3),
+            ("hi aaaaaaaaaaaaaaaaaaaa", 8, 4),
+        ] {
+            assert_eq!(wrapped_rows(&line(text), width), rows, "{text:?} @ {width}");
+        }
         let lines = [line("alpha bravo"), line(""), line("x")];
         assert_eq!(wrapped_rows_total(&lines, 7), 4);
     }

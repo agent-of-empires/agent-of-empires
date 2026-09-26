@@ -405,38 +405,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn snapshot_recently_restarted_includes_fresh_excludes_missing() {
+    fn recently_restarted_snapshot_and_gc_drop_expired_marks() {
         let map = new_recently_restarted();
-        mark_recently_restarted(&map, "abc");
-        let snap = snapshot_recently_restarted(&map);
-        assert!(snap.contains("abc"));
-        assert!(!snap.contains("other"));
-    }
-
-    #[test]
-    fn snapshot_recently_restarted_excludes_expired() {
-        let map = new_recently_restarted();
-        let stale = Instant::now() - RECENTLY_RESTARTED_TTL * 2;
-        {
-            let mut g = map.write().unwrap();
-            g.insert("stale".into(), stale);
-        }
+        map.write()
+            .unwrap()
+            .insert("stale".into(), Instant::now() - RECENTLY_RESTARTED_TTL * 2);
         mark_recently_restarted(&map, "fresh");
         let snap = snapshot_recently_restarted(&map);
-        assert!(!snap.contains("stale"));
         assert!(snap.contains("fresh"));
-    }
-
-    #[test]
-    fn recently_restarted_gc_removes_stale_entries() {
-        let map = new_recently_restarted();
-        let stale = Instant::now() - RECENTLY_RESTARTED_TTL * 3;
-        let fresh = Instant::now();
-        {
-            let mut g = map.write().unwrap();
-            g.insert("stale".into(), stale);
-            g.insert("fresh".into(), fresh);
-        }
+        assert!(!snap.contains("stale") && !snap.contains("other"));
+        assert!(
+            map.read().unwrap().contains_key("stale"),
+            "snapshot is read-only"
+        );
         gc_recently_restarted(&map);
         let g = map.read().unwrap();
         assert!(!g.contains_key("stale"));
@@ -529,76 +510,56 @@ mod tests {
         );
     }
 
+    /// Parked sessions (archive, stop, live snooze), an ambiguously failed resume sid, and a
+    /// wrapper without native resume identity (#3678) are never startup-recovery candidates;
+    /// clearing the state restores eligibility. Archive and stop both kill the pane, so a
+    /// dead pane alone must not trigger recovery.
     #[test]
-    fn custom_direct_alias_is_recoverable_but_wrapper_is_not() {
-        let mut inst = Instance::new("custom", "/tmp/test");
-        inst.tool = "custom-agent".to_string();
-        inst.detect_as = "claude".to_string();
-        inst.agent_session_id = Some("11111111-1111-4111-8111-111111111111".into());
-        inst.command = "claude --model opus".to_string();
-        assert!(is_recovery_candidate(&inst));
-
-        inst.command = "/opt/wrappers/claude".to_string();
-        assert!(!is_recovery_candidate(&inst));
-    }
-    // Regression: archiving a session kills its tmux pane, so the next startup observes a dead pane
-    // on a resume-capable agent.
-    #[test]
-    fn archived_instance_is_not_recovery_candidate() {
-        let mut inst = Instance::new("archived", "/tmp/test");
-        inst.agent_session_id = Some("11111111-1111-4111-8111-111111111111".into());
-        assert!(
-            is_recovery_candidate(&inst),
-            "baseline: claude + valid sid is a recovery candidate"
-        );
-        inst.archive();
-        assert!(
-            !is_recovery_candidate(&inst),
-            "archived sessions must be excluded from startup recovery"
-        );
-        inst.unarchive();
-        assert!(
-            is_recovery_candidate(&inst),
-            "unarchive must restore recovery eligibility"
-        );
-    }
-
-    // Regression for: pressing `x` in the session picker stops a session, which sets
-    // `Status::Stopped` and kills the tmux pane.
-    #[test]
-    fn stopped_instance_is_not_recovery_candidate() {
-        let mut inst = Instance::new("stopped", "/tmp/test");
-        inst.agent_session_id = Some("33333333-3333-4333-8333-333333333333".into());
-        assert!(
-            is_recovery_candidate(&inst),
-            "baseline: claude + valid sid is a recovery candidate"
-        );
-        inst.status = super::super::Status::Stopped;
-        assert!(
-            !is_recovery_candidate(&inst),
-            "stopped sessions must be excluded from startup recovery"
-        );
-        inst.status = super::super::Status::Starting;
-        assert!(
-            is_recovery_candidate(&inst),
-            "transitioning off Stopped (e.g. user reopens) must restore recovery eligibility"
-        );
-    }
-
-    #[test]
-    fn snoozed_instance_is_not_recovery_candidate_until_expiry() {
-        let mut inst = Instance::new("snoozed", "/tmp/test");
-        inst.agent_session_id = Some("22222222-2222-4222-8222-222222222222".into());
-        inst.snooze(30);
-        assert!(
-            !is_recovery_candidate(&inst),
-            "snoozed sessions must be excluded while the timer is live"
-        );
-        inst.snoozed_until = Some(chrono::Utc::now() - chrono::Duration::minutes(1));
-        assert!(
-            is_recovery_candidate(&inst),
-            "expired snooze must restore recovery eligibility"
-        );
+    fn recovery_candidacy_follows_parked_state_and_resume_identity() {
+        let sid = "11111111-1111-4111-8111-111111111111";
+        type Set = fn(&mut Instance);
+        let cases: [(&str, Set, Set); 5] = [
+            ("archived", |i| i.archive(), |i| i.unarchive()),
+            (
+                "stopped",
+                |i| i.status = super::super::Status::Stopped,
+                |i| i.status = super::super::Status::Starting,
+            ),
+            (
+                "snoozed",
+                |i| i.snooze(30),
+                |i| i.snoozed_until = Some(chrono::Utc::now() - chrono::Duration::minutes(1)),
+            ),
+            (
+                "probe-failed",
+                |i| i.resume_probe_failed_sid = i.agent_session_id.clone(),
+                |i| i.resume_probe_failed_sid = None,
+            ),
+            (
+                "wrapper",
+                |i| i.command = "/opt/wrappers/claude".to_string(),
+                |i| i.command = "claude --model opus".to_string(),
+            ),
+        ];
+        let mut failures = Vec::new();
+        for (case, park, clear) in cases {
+            let mut inst = Instance::new(case, "/tmp/test");
+            inst.tool = "custom-agent".to_string();
+            inst.detect_as = "claude".to_string();
+            inst.command = "claude --model opus".to_string();
+            inst.agent_session_id = Some(sid.into());
+            let baseline = is_recovery_candidate(&inst);
+            park(&mut inst);
+            let parked = is_recovery_candidate(&inst);
+            clear(&mut inst);
+            let observed = (baseline, parked, is_recovery_candidate(&inst));
+            if observed != (true, false, true) {
+                failures.push(format!(
+                    "{case}: (baseline, parked, cleared) = {observed:?}"
+                ));
+            }
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
     }
 
     #[test]
@@ -625,41 +586,66 @@ mod tests {
         }
     }
 
+    /// A live agent is detected by its sid in argv (#2994), or for a hook agent by the instance
+    /// marker plus its executable rather than the captured sid (#3678).
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
-    fn orphaned_agent_process_alive_detects_live_agent_by_sid() {
-        let sid = format!("22222222-2222-4222-8222-{:012}", std::process::id());
-        let mut inst = Instance::new("orphan-sid", "/tmp/test");
-        inst.id = format!("orphansid{:012}", std::process::id());
-        inst.tool = "opencode".to_string();
-        inst.agent_session_id = Some(sid.clone());
-
-        let mut child = std::process::Command::new("/bin/sh")
-            .arg("-c")
-            .arg("sleep 30; true")
-            .arg(&sid)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("spawn orphan-agent stand-in");
-
-        let mut detected = false;
-        for _ in 0..100 {
-            if orphaned_agent_process_alive(&inst) {
-                detected = true;
-                break;
+    fn orphaned_agent_process_alive_detects_a_live_agent() {
+        let bin = tempfile::tempdir().unwrap();
+        let agent = bin.path().join("claude");
+        std::fs::write(&agent, "#!/bin/sh\nsleep 10\n").unwrap();
+        // (tool, sid, found by the sid in argv rather than marker plus executable)
+        for (tool, sid, by_sid) in [
+            (
+                "opencode",
+                format!("22222222-2222-4222-8222-{:012}", std::process::id()),
+                true,
+            ),
+            (
+                "claude",
+                "66666666-7777-4888-8999-000000000000".to_string(),
+                false,
+            ),
+        ] {
+            // Reading another process's environment needs /proc.
+            if !by_sid && !cfg!(target_os = "linux") {
+                continue;
             }
-            std::thread::sleep(Duration::from_millis(20));
+            let mut inst = Instance::new("orphan", "/tmp/test");
+            inst.id = format!("orphan{tool}{:012}", std::process::id());
+            inst.tool = tool.to_string();
+            inst.agent_session_id = Some(sid.clone());
+            let mut command = std::process::Command::new("/bin/sh");
+            if by_sid {
+                command.arg("-c").arg("sleep 30; true").arg(&sid);
+            } else {
+                command
+                    .arg(&agent)
+                    .env(crate::tmux::env::AOE_INSTANCE_ID_KEY, &inst.id);
+            }
+            let mut child = command
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn orphan-agent stand-in");
+
+            let mut detected = false;
+            for _ in 0..100 {
+                if orphaned_agent_process_alive(&inst) {
+                    detected = true;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+
+            let _ = child.kill();
+            let _ = child.wait();
+            assert!(
+                detected,
+                "{tool}: a live agent must be detected as an orphan"
+            );
         }
-
-        let _ = child.kill();
-        let _ = child.wait();
-
-        assert!(
-            detected,
-            "a live agent carrying the sid in argv must be detected as an orphan",
-        );
     }
 
     #[cfg(target_os = "linux")]
@@ -740,41 +726,6 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn orphaned_hook_agent_requires_env_and_executable_not_captured_sid() {
-        let mut inst = Instance::new("orphan-env-agent", "/tmp/test");
-        inst.id = format!("orphanboth{:012}", std::process::id());
-        inst.agent_session_id = Some("66666666-7777-4888-8999-000000000000".to_string());
-        let bin = tempfile::tempdir().unwrap();
-        let agent = bin.path().join("claude");
-        std::fs::write(&agent, "#!/bin/sh\nsleep 10\n").unwrap();
-        let mut child = std::process::Command::new("/bin/sh")
-            .arg(&agent)
-            .env(crate::tmux::env::AOE_INSTANCE_ID_KEY, &inst.id)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("spawn orphan-agent stand-in");
-
-        let mut detected = false;
-        for _ in 0..100 {
-            if orphaned_agent_process_alive(&inst) {
-                detected = true;
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-
-        let _ = child.kill();
-        let _ = child.wait();
-        assert!(
-            detected,
-            "instance marker and executable must detect the live agent"
-        );
-    }
-
     #[test]
     #[serial_test::serial]
     fn recovery_attempt_ledger_roundtrips() {
@@ -805,42 +756,19 @@ mod tests {
     }
 
     #[test]
-    fn resume_probe_failed_sid_is_not_recovery_candidate_until_user_action_changes_state() {
-        let sid = "44444444-4444-4444-8444-444444444444".to_string();
-        let mut inst = Instance::new("resume-failed", "/tmp/test");
-        inst.agent_session_id = Some(sid.clone());
-        inst.resume_probe_failed_sid = Some(sid.clone());
-
-        assert!(
-            !is_recovery_candidate(&inst),
-            "startup recovery must not loop on an ambiguously failed resume sid"
-        );
-
-        inst.resume_probe_failed_sid = None;
-        assert!(
-            is_recovery_candidate(&inst),
-            "clearing the marker through an explicit path restores recovery eligibility"
-        );
-    }
-
-    #[test]
     fn recovery_lock_acquires_and_releases() {
         let temp = tempfile::TempDir::new().unwrap();
         let path = temp.path().join(".recovery.lock");
 
         let first = try_acquire_recovery_lock_at(&path).unwrap();
         assert!(first.is_some(), "acquisition should succeed");
+        assert!(try_acquire_recovery_lock_at(&path).unwrap().is_none());
         drop(first);
 
-        let mut second = try_acquire_recovery_lock_at(&path).unwrap();
-        for _ in 0..20 {
-            if second.is_some() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-            second = try_acquire_recovery_lock_at(&path).unwrap();
-        }
-        assert!(second.is_some(), "re-acquisition after drop should succeed");
+        assert!(
+            try_acquire_recovery_lock_at(&path).unwrap().is_some(),
+            "re-acquisition after drop should succeed"
+        );
     }
 
     fn hook_timeout(cmd: &str, timeout_secs: u64) -> anyhow::Error {
@@ -851,7 +779,7 @@ mod tests {
     }
 
     #[test]
-    fn format_recovery_last_error_classifies_a_hook_timeout_anywhere_in_the_chain() {
+    fn recovery_error_classifies_a_hook_timeout_anywhere_in_the_chain_and_stamps_it() {
         assert_eq!(
             format_recovery_last_error(&hook_timeout("sleep 60", 30)),
             "on_launch hook timed out after 30s: sleep 60",
@@ -867,15 +795,10 @@ mod tests {
             format_recovery_last_error(&anyhow::anyhow!("tmux session is gone")),
             "recovery cascade: tmux session is gone",
         );
-    }
 
-    #[test]
-    fn stamp_recovery_error_sets_error_status_and_operator_fields() {
         let mut inst = Instance::new("timeout", "/tmp/test");
         let before = std::time::Instant::now();
-
         stamp_recovery_error(&mut inst, &hook_timeout("sleep 60", 30));
-
         assert_eq!(inst.status, super::super::Status::Error);
         assert_eq!(
             inst.last_error.as_deref(),

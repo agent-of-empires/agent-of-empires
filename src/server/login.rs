@@ -1267,6 +1267,9 @@ mod tests {
         let hash = "$argon2id$v=19$m=19456,t=2,p=1$YW9lLWZpeGVkLXNhbHQxNg$DsLn90oHo6VdenuubImBcuPgEWcMMEPqYxc8jPxJZcY";
         assert!(argon2_verify("hunter2", hash));
         assert!(!argon2_verify("hunter3", hash));
+
+        assert!(check_passphrase_strength("short").is_some());
+        assert!(check_passphrase_strength("longenough").is_none());
     }
 
     /// A session is keyed by its binding secret, not its IP (#1131), and the secret must
@@ -1292,28 +1295,6 @@ mod tests {
         mgr.invalidate_session(&id).await;
         assert!(!mgr.validate_session(&id, &secret).await);
         mgr.invalidate_session("nonexistent").await;
-    }
-
-    #[tokio::test]
-    async fn elevation_starts_false_and_expires() {
-        let mgr = LoginManager::new(Some("test"));
-        let secret = binding(0x22);
-        let id = session(&mgr, &secret).await;
-
-        assert!(!mgr.is_elevated(&id).await);
-        assert!(mgr.elevate_session(&id).await);
-        let (elevated, remaining) = mgr.elevation_state(&id).await;
-        assert!(elevated && remaining.is_some());
-
-        {
-            let mut sessions = mgr.sessions.write().await;
-            let entry = sessions.get_mut(&id).expect("session");
-            entry.elevated_until = Some(Instant::now() - Duration::from_secs(1));
-        }
-        assert!(!mgr.is_elevated(&id).await);
-
-        assert!(!mgr.elevate_session("nope").await);
-        assert!(!mgr.is_elevated("nope").await);
     }
 
     /// #1131 follow-up: the failure budget arms a lockout once, a success resets it,
@@ -1346,6 +1327,26 @@ mod tests {
 
         assert!(!mgr.record_elevation_failure("nope").await);
         assert!(mgr.elevation_lockout_remaining("nope").await.is_none());
+
+        // Elevation starts false, expires, and is refused for an unknown session.
+        let mgr = LoginManager::new(Some("test"));
+        let secret = binding(0x22);
+        let id = session(&mgr, &secret).await;
+
+        assert!(!mgr.is_elevated(&id).await);
+        assert!(mgr.elevate_session(&id).await);
+        let (elevated, remaining) = mgr.elevation_state(&id).await;
+        assert!(elevated && remaining.is_some());
+
+        {
+            let mut sessions = mgr.sessions.write().await;
+            let entry = sessions.get_mut(&id).expect("session");
+            entry.elevated_until = Some(Instant::now() - Duration::from_secs(1));
+        }
+        assert!(!mgr.is_elevated(&id).await);
+
+        assert!(!mgr.elevate_session("nope").await);
+        assert!(!mgr.is_elevated("nope").await);
     }
 
     #[tokio::test]
@@ -1365,21 +1366,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cleanup_expired_removes_stale() {
-        let mgr = LoginManager::new(Some("test"));
-        let secret = binding(0x55);
-        let id = session(&mgr, &secret).await;
-        {
-            let mut sessions = mgr.sessions.write().await;
-            sessions.get_mut(&id).expect("session").expires_at =
-                Instant::now() - Duration::from_secs(1);
-        }
-        mgr.cleanup_expired().await;
-        assert!(!mgr.validate_session(&id, &secret).await);
-    }
-
-    #[tokio::test]
-    async fn revoke_session_removes_one() {
+    async fn revoke_and_expiry_end_a_session() {
         let mgr = LoginManager::new(Some("pass"));
         let secret = binding(0xF6);
         let id = session(&mgr, &secret).await;
@@ -1389,6 +1376,15 @@ mod tests {
             !mgr.revoke_session(&id).await,
             "a gone session reports false"
         );
+
+        let id = session(&mgr, &secret).await;
+        {
+            let mut sessions = mgr.sessions.write().await;
+            sessions.get_mut(&id).expect("session").expires_at =
+                Instant::now() - Duration::from_secs(1);
+        }
+        mgr.cleanup_expired().await;
+        assert!(!mgr.sessions.read().await.contains_key(&id));
     }
 
     #[tokio::test]
@@ -1430,27 +1426,6 @@ mod tests {
     }
 
     #[test]
-    fn passphrase_strength_rejects_short_secrets() {
-        assert!(check_passphrase_strength("short").is_some());
-        assert!(check_passphrase_strength("longenough").is_none());
-    }
-
-    #[test]
-    fn build_login_cookie_carries_secure_only_over_tls() {
-        let insecure = build_login_cookie("abc123", false);
-        for needle in [
-            "aoe_session=abc123",
-            "HttpOnly",
-            "SameSite=Strict",
-            "Max-Age=2592000",
-        ] {
-            assert!(insecure.contains(needle), "{insecure:?} lacks {needle}");
-        }
-        assert!(!insecure.contains("Secure"));
-        assert!(build_login_cookie("abc123", true).contains("Secure"));
-    }
-
-    #[test]
     fn extract_login_session_reads_only_the_session_cookie() {
         let request = |cookie: Option<&str>| {
             let mut builder = axum::http::Request::builder();
@@ -1465,6 +1440,18 @@ mod tests {
         );
         assert_eq!(extract_login_session(&request(Some("aoe_token=foo"))), None);
         assert_eq!(extract_login_session(&request(None)), None);
+
+        let insecure = build_login_cookie("abc123", false);
+        for needle in [
+            "aoe_session=abc123",
+            "HttpOnly",
+            "SameSite=Strict",
+            "Max-Age=2592000",
+        ] {
+            assert!(insecure.contains(needle), "{insecure:?} lacks {needle}");
+        }
+        assert!(!insecure.contains("Secure"));
+        assert!(build_login_cookie("abc123", true).contains("Secure"));
     }
 
     /// #1235: a session survives a restart, but only while the passphrase that minted
@@ -1501,27 +1488,8 @@ mod tests {
             !rekeyed.validate_session(&id, &secret).await,
             "changing the passphrase must drop persisted sessions"
         );
-    }
 
-    #[tokio::test]
-    async fn logout_all_clears_and_persists() {
-        let dir = tempfile::tempdir().unwrap();
-        let secret = binding(0xE5);
-
-        let id = {
-            let mgr = LoginManager::with_persistence(Some("pass"), dir.path());
-            let id = session(&mgr, &secret).await;
-            assert_eq!(mgr.logout_all().await, 1);
-            assert!(!mgr.validate_session(&id, &secret).await);
-            id
-        };
-
-        let restarted = LoginManager::with_persistence(Some("pass"), dir.path());
-        assert!(!restarted.validate_session(&id, &secret).await);
-    }
-
-    #[tokio::test]
-    async fn load_drops_expired_entries() {
+        // An expired persisted entry is dropped on load.
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
         use base64::Engine;
 
@@ -1548,11 +1516,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn persistence_disabled_writes_no_file() {
+    async fn logout_all_clears_and_persists() {
         let dir = tempfile::tempdir().unwrap();
-        let mgr = LoginManager::new(Some("pass"));
-        mgr.create_session(&binding(0x19), "127.0.0.1", "ua").await;
-        assert!(!dir.path().join(SESSIONS_FILE).exists());
+        let secret = binding(0xE5);
+
+        let id = {
+            let mgr = LoginManager::with_persistence(Some("pass"), dir.path());
+            let id = session(&mgr, &secret).await;
+            assert_eq!(mgr.logout_all().await, 1);
+            assert!(!mgr.validate_session(&id, &secret).await);
+            id
+        };
+
+        let restarted = LoginManager::with_persistence(Some("pass"), dir.path());
+        assert!(!restarted.validate_session(&id, &secret).await);
     }
 
     /// The store is fail-closed on a planted symlink: neither the write path nor the

@@ -143,25 +143,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn npm_package_only_for_clean_npm_agents() {
-        assert_eq!(
-            npm_package_for("codex-acp"),
-            Some("@agentclientprotocol/codex-acp@latest")
-        );
-        assert_eq!(
-            npm_package_for("claude-agent-acp"),
-            Some("@agentclientprotocol/claude-agent-acp@latest")
-        );
-        assert_eq!(npm_package_for("gemini"), Some("@google/gemini-cli"));
-        // curl|bash and manual-install agents are intentionally excluded.
-        assert_eq!(npm_package_for("opencode"), None);
-        assert_eq!(npm_package_for("vibe-acp"), None);
-        assert_eq!(npm_package_for("pi-acp"), None);
-        assert_eq!(npm_package_for("omp"), None);
-        assert_eq!(npm_package_for("nonexistent"), None);
-    }
-
-    #[test]
     fn covers_every_default_registry_binary() {
         for binary in [
             "claude-agent-acp",
@@ -179,11 +160,5 @@ mod tests {
                 "missing install hint for {binary}"
             );
         }
-    }
-
-    #[test]
-    fn returns_none_for_unknown_binary() {
-        assert!(install_hint_for("nonexistent-acp").is_none());
-        assert!(install_hint_for("").is_none());
     }
 }

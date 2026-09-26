@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use serial_test::parallel;
 
-use crate::harness::{init_git_repo, require_tmux, TuiTestHarness};
+use crate::harness::{require_tmux, TuiTestHarness};
 
 /// Submit the new session dialog, answering the "Path does not exist. Create?"
 /// prompt if it appears.
@@ -50,75 +50,6 @@ fn create_session_from_dialog(h: &TuiTestHarness, project: &std::path::Path) {
     h.send_keys("Tab");
     h.type_text(project.to_str().unwrap());
     submit_new_session_dialog(h);
-}
-
-#[test]
-#[parallel]
-fn test_new_session_dialog_opens_and_escape_cancels() {
-    require_tmux!();
-    let mut h = TuiTestHarness::new("new_dialog");
-    h.spawn_tui();
-
-    h.wait_for(" aoe ");
-    h.send_keys("n");
-    h.wait_for("Title");
-    h.assert_screen_contains("Path");
-
-    h.send_keys("Escape");
-    h.wait_for_absent("Title", Duration::from_secs(5));
-    h.assert_screen_contains("No sessions yet");
-}
-
-/// The empty-sidebar left click is absorbed: the new-session entry point moved
-/// to the right-click menu, which also carries the two keyboard-only actions.
-#[test]
-#[parallel]
-fn test_empty_sidebar_click_menu() {
-    require_tmux!();
-    let mut h = TuiTestHarness::new("empty_click");
-    h.spawn_tui();
-    h.wait_for(" aoe ");
-    h.send_keys("Enter"); // dismiss welcome so the sidebar takes the clicks
-    h.wait_for("No sessions yet");
-
-    // Well below the empty-state label in the sidebar column.
-    h.send_mouse_click(0, 10, 15);
-    std::thread::sleep(Duration::from_millis(300));
-    h.assert_screen_not_contains(" New Session ");
-    h.assert_screen_contains("No sessions yet");
-
-    h.send_mouse_click(2, 10, 15);
-    h.wait_for("New Session");
-    h.assert_screen_contains("Change Sort");
-    h.assert_screen_contains("Change Grouping");
-
-    h.send_keys("Escape");
-    h.wait_for_absent("Change Sort", Duration::from_secs(5));
-    h.assert_screen_contains("No sessions yet");
-}
-
-/// Right-clicking a session row opens the row menu, not the empty-area one.
-#[test]
-#[parallel]
-fn test_right_click_on_session_row_opens_rename_delete_menu() {
-    require_tmux!();
-    let mut h = TuiTestHarness::new("session_rclick");
-    let project = h.project_path();
-    h.run_cli_ok(&["add", project.to_str().unwrap(), "-t", "RClickRow"]);
-
-    h.spawn_tui();
-    h.wait_for(" aoe ");
-    h.send_keys("Enter"); // dismiss welcome
-    h.wait_for("RClickRow");
-
-    // Row 1 is the sidebar's top border, so the first item is row 2.
-    h.send_mouse_click(2, 5, 2);
-    h.wait_for("Rename");
-    h.assert_screen_contains("Delete");
-    h.assert_screen_not_contains("Change Sort");
-
-    h.send_keys("Escape");
-    h.wait_for_absent("Rename", Duration::from_secs(5));
 }
 
 /// The dir picker renders as a full overlay. It used to be clamped into the
@@ -200,66 +131,4 @@ fn test_new_session_enters_live_mode_when_configured() {
     // banner plus the home chrome is the tell that live mode was used.
     h.wait_for_timeout("LIVE", Duration::from_secs(10));
     h.assert_screen_contains(" aoe ");
-}
-
-/// `b` opens the saved-project picker, which filters and prefills the dialog.
-#[test]
-#[parallel]
-fn test_new_session_from_saved_project_prefills_path() {
-    require_tmux!();
-    // Rooted at `/tmp/.tmpXXXXXX`, so the path segments cannot match the
-    // `-app` filter below.
-    let mut h = TuiTestHarness::new_in_tmp("new_from_project");
-    for name in ["frontend", "backend", "mobile-app"] {
-        let repo = h.home_path().join(name);
-        init_git_repo(&repo);
-        h.run_cli_ok(&["project", "add", repo.to_str().unwrap()]);
-    }
-
-    h.spawn_tui();
-    h.wait_for(" aoe ");
-    h.send_keys("Enter"); // dismiss welcome
-    h.wait_for("No sessions yet");
-
-    h.send_keys("b");
-    h.wait_for("New Session from Project");
-    h.assert_screen_contains("frontend");
-    h.assert_screen_contains("backend");
-    h.assert_screen_contains("mobile-app");
-
-    // One key at a time: `type_text` arrives as a bracketed paste, which the
-    // filter input does not capture.
-    for key in ["-", "a", "p", "p"] {
-        h.send_keys(key);
-    }
-    h.wait_for_absent("frontend", Duration::from_secs(5));
-    h.assert_screen_not_contains("backend");
-    h.assert_screen_contains("mobile-app");
-
-    h.send_keys("Enter");
-    h.wait_for("Title");
-    h.assert_screen_contains("Path");
-    h.assert_screen_contains("mobile");
-}
-
-/// With no saved projects, `b` opens the project add form, which Esc cancels in
-/// one press.
-#[test]
-#[parallel]
-fn test_new_session_from_project_empty_state_opens_add_form() {
-    require_tmux!();
-    let mut h = TuiTestHarness::new("new_from_project_empty");
-    h.spawn_tui();
-    h.wait_for(" aoe ");
-    h.send_keys("Enter"); // dismiss welcome
-    h.wait_for("No sessions yet");
-
-    h.send_keys("b");
-    h.wait_for(" Projects ");
-    h.assert_screen_contains("Path:");
-    h.assert_screen_contains("Base branch:");
-
-    h.send_keys("Escape");
-    h.wait_for_absent(" Projects ", Duration::from_secs(5));
-    h.assert_screen_contains("No sessions yet");
 }

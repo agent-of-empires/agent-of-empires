@@ -326,93 +326,31 @@ pub async fn is_git_repo(
 #[cfg(test)]
 mod tests {
     use super::*;
-    // ── repo_name_from_url tests ─────────────────────────────────────────────
 
     #[test]
-    fn repo_name_from_https_url() {
-        assert_eq!(
-            repo_name_from_url("https://github.com/user/my-repo.git"),
-            Some("my-repo".to_string())
-        );
-    }
-
-    #[test]
-    fn repo_name_from_https_url_no_dotgit() {
-        assert_eq!(
-            repo_name_from_url("https://github.com/user/my-repo"),
-            Some("my-repo".to_string())
-        );
-    }
-
-    #[test]
-    fn repo_name_from_scp_url() {
-        assert_eq!(
-            repo_name_from_url("git@github.com:user/my-repo.git"),
-            Some("my-repo".to_string())
-        );
-    }
-
-    #[test]
-    fn repo_name_from_ssh_url() {
-        assert_eq!(
-            repo_name_from_url("ssh://git@github.com/user/my-repo.git"),
-            Some("my-repo".to_string())
-        );
-    }
-
-    #[test]
-    fn repo_name_from_ssh_url_with_port() {
-        assert_eq!(
-            repo_name_from_url("ssh://git@host:2222/user/my-repo.git"),
-            Some("my-repo".to_string())
-        );
-    }
-
-    // ── looks_like_git_url tests ──────────────────────────────────────────────
-
-    #[test]
-    fn looks_like_git_url_accepts_https() {
-        assert!(looks_like_git_url("https://github.com/u/r.git"));
-    }
-
-    #[test]
-    fn looks_like_git_url_accepts_http() {
-        assert!(looks_like_git_url("http://example.com/r.git"));
-    }
-
-    #[test]
-    fn looks_like_git_url_accepts_git_protocol() {
-        assert!(looks_like_git_url("git://example.com/u/r.git"));
-    }
-
-    #[test]
-    fn looks_like_git_url_accepts_ssh() {
-        assert!(looks_like_git_url("ssh://git@github.com/u/r.git"));
-    }
-
-    #[test]
-    fn looks_like_git_url_accepts_scp_style() {
-        assert!(looks_like_git_url("git@github.com:u/r.git"));
-    }
-
-    #[test]
-    fn looks_like_git_url_accepts_file_scheme() {
-        assert!(looks_like_git_url("file:///tmp/bare.git"));
-    }
-
-    #[test]
-    fn looks_like_git_url_rejects_bare_word() {
-        assert!(!looks_like_git_url("not-a-url"));
-    }
-
-    #[test]
-    fn looks_like_git_url_rejects_empty() {
-        assert!(!looks_like_git_url(""));
-    }
-
-    #[test]
-    fn looks_like_git_url_rejects_scp_style_with_space() {
-        assert!(!looks_like_git_url("git@host: /path"));
+    fn parses_git_urls_and_repo_names() {
+        for url in [
+            "https://github.com/user/my-repo.git",
+            "https://github.com/user/my-repo",
+            "git@github.com:user/my-repo.git",
+            "ssh://git@github.com/user/my-repo.git",
+            "ssh://git@host:2222/user/my-repo.git",
+        ] {
+            assert_eq!(repo_name_from_url(url).as_deref(), Some("my-repo"), "{url}");
+        }
+        for (url, expected) in [
+            ("https://github.com/u/r.git", true),
+            ("http://example.com/r.git", true),
+            ("git://example.com/u/r.git", true),
+            ("ssh://git@github.com/u/r.git", true),
+            ("git@github.com:u/r.git", true),
+            ("file:///tmp/bare.git", true),
+            ("not-a-url", false),
+            ("", false),
+            ("git@host: /path", false),
+        ] {
+            assert_eq!(looks_like_git_url(url), expected, "{url:?}");
+        }
     }
 
     /// Pins `$HOME` so the read inside `expand_tilde` cannot see a value
@@ -421,16 +359,12 @@ mod tests {
     /// go through the guard.
     #[test]
     #[serial_test::serial]
-    fn expand_tilde_expands_home() {
+    fn expand_tilde_expands_only_home_prefixes() {
         let home = tempfile::TempDir::new().expect("temp home");
         let _home = crate::session::test_support::isolate_home(home.path());
 
         assert_eq!(expand_tilde("~/foo"), home.path().join("foo"));
         assert_eq!(expand_tilde("~"), home.path());
-    }
-
-    #[test]
-    fn expand_tilde_leaves_absolute_paths_alone() {
         assert_eq!(
             expand_tilde("/tmp/foo"),
             std::path::PathBuf::from("/tmp/foo")

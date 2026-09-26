@@ -859,7 +859,7 @@ fn apply_filter_file(path: &std::path::Path) {
             "runner filter swap failed"
         ),
     }
-    #[cfg(feature = "test-support")]
+    #[cfg(debug_assertions)]
     if path.with_extension("observe").exists() {
         std::fs::write(path.with_extension("applied"), directive)
             .expect("publish e2e filter application");
@@ -881,123 +881,6 @@ mod tests {
         assert_eq!(LogLevel::parse("bogus"), None);
     }
 
-    /// The returned guard must outlive the controller.
-    fn test_controller(initial: &str) -> (FilterController, tracing::subscriber::DefaultGuard) {
-        let filter = EnvFilter::builder()
-            .with_regex(false)
-            .parse(initial)
-            .expect("valid initial filter");
-        let (layer, handle) = reload::Layer::new(filter);
-        let guard = tracing::subscriber::set_default(Registry::default().with(layer));
-        let controller = FilterController {
-            inner: handle,
-            current: Mutex::new(initial.to_string()),
-        };
-        (controller, guard)
-    }
-
-    #[test]
-    fn swap_reports_changed_then_noop() {
-        let (c, _guard) = test_controller("agent_of_empires=info");
-        let first = c.set_filter("agent_of_empires=debug").expect("swap ok");
-        assert!(
-            first.changed,
-            "first swap to a new directive must report changed"
-        );
-        assert_eq!(first.previous, "agent_of_empires=info");
-        assert_eq!(first.current, "agent_of_empires=debug");
-
-        let second = c.set_filter("agent_of_empires=debug").expect("swap ok");
-        assert!(!second.changed, "identical re-apply must report no-op");
-        assert_eq!(second.previous, second.current);
-        assert_eq!(c.current(), "agent_of_empires=debug");
-    }
-
-    #[test]
-    fn filter_for_level_expands_all_roots() {
-        let s = LogConfig::filter_for_level(LogLevel::Debug);
-        for root in DEFAULT_TARGET_ROOTS {
-            assert!(
-                s.contains(&format!("{root}=debug")),
-                "missing {root} in {s}"
-            );
-        }
-    }
-
-    #[test]
-    fn smart_rename_target_is_captured_by_default_filter() {
-        // The expanded filter has no global default, so each target needs a root entry.
-        let s = LogConfig::filter_for_level(LogLevel::Debug);
-        assert!(
-            s.contains("smart_rename=debug"),
-            "smart_rename root missing from filter: {s}"
-        );
-    }
-
-    #[test]
-    fn filter_string_overlay_acp() {
-        let cfg = LogConfig {
-            level: Some(LogLevel::Info),
-            acp_trace: true,
-            terminal_trace: false,
-        };
-        let s = cfg.filter_string().unwrap();
-        assert!(s.contains("agent_client_protocol=debug"));
-        assert!(s.contains("transport_actor=trace"));
-    }
-
-    #[test]
-    fn filter_string_overlay_terminal() {
-        let cfg = LogConfig {
-            level: Some(LogLevel::Info),
-            acp_trace: false,
-            terminal_trace: true,
-        };
-        let s = cfg.filter_string().unwrap();
-        assert!(s.ends_with(",terminal=trace"));
-    }
-
-    #[test]
-    fn filter_string_none_when_level_unset() {
-        let cfg = LogConfig {
-            level: None,
-            acp_trace: false,
-            terminal_trace: false,
-        };
-        assert!(cfg.filter_string().is_none());
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn from_env_no_vars() {
-        let _env = EnvGuard::unset(&[
-            "AOE_LOG_LEVEL",
-            "AGENT_OF_EMPIRES_DEBUG",
-            "AOE_ACP_TRACE",
-            "AOE_TERMINAL_TRACE",
-        ]);
-        let cfg = LogConfig::from_env();
-        assert_eq!(cfg.level, None);
-        assert!(!cfg.acp_trace);
-        assert!(!cfg.terminal_trace);
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn from_env_aoe_log_level() {
-        let _env = EnvGuard::unset(&["AGENT_OF_EMPIRES_DEBUG"]).and_set("AOE_LOG_LEVEL", "trace");
-        let cfg = LogConfig::from_env();
-        assert_eq!(cfg.level, Some(LogLevel::Trace));
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn from_env_legacy_debug_flag() {
-        let _env = EnvGuard::unset(&["AOE_LOG_LEVEL"]).and_set("AGENT_OF_EMPIRES_DEBUG", "1");
-        let cfg = LogConfig::from_env();
-        assert_eq!(cfg.level, Some(LogLevel::Debug));
-    }
-
     fn with_test_controller<F>(initial: &str, f: F)
     where
         F: FnOnce(&FilterController),
@@ -1016,49 +899,81 @@ mod tests {
     }
 
     #[test]
-    fn controller_swap_returns_previous() {
-        with_test_controller("info", |c| {
-            let r = c.set_level(LogLevel::Debug).unwrap();
-            assert_eq!(r.previous, "info");
-            assert!(r.current.contains("agent_of_empires=debug"));
-            assert_eq!(c.current(), r.current);
+    fn swap_reports_previous_then_noop() {
+        with_test_controller("agent_of_empires=info", |c| {
+            let first = c.set_level(LogLevel::Debug).expect("swap ok");
+            assert!(first.changed, "a new directive must report changed");
+            assert_eq!(first.previous, "agent_of_empires=info");
+            assert!(first.current.contains("agent_of_empires=debug"));
+            assert_eq!(c.current(), first.current);
+
+            let second = c.set_filter(&first.current).expect("swap ok");
+            assert!(!second.changed, "identical re-apply must report no-op");
+            assert_eq!(second.previous, second.current);
         });
     }
 
     #[test]
-    fn controller_rejects_bare_global_level() {
+    fn set_filter_validates_directives() {
         with_test_controller("info", |c| {
-            let err = c.set_filter("debug").unwrap_err();
-            assert!(matches!(err, LogFilterError::BareGlobalLevel));
-        });
-    }
-
-    #[test]
-    fn controller_accepts_targeted_filter() {
-        with_test_controller("info", |c| {
+            assert!(matches!(
+                c.set_filter("debug").unwrap_err(),
+                LogFilterError::BareGlobalLevel
+            ));
+            for bad in ["   ", "acp=notalevel"] {
+                assert!(
+                    matches!(c.set_filter(bad).unwrap_err(), LogFilterError::Invalid(_)),
+                    "{bad:?}"
+                );
+            }
+            assert_eq!(c.current(), "info", "rejected filters must not apply");
             c.set_filter("acp.protocol=trace,info").unwrap();
             assert_eq!(c.current(), "acp.protocol=trace,info");
         });
     }
 
     #[test]
-    fn controller_rejects_empty_filter() {
-        with_test_controller("info", |c| {
-            assert!(matches!(
-                c.set_filter("   ").unwrap_err(),
-                LogFilterError::Invalid(_)
-            ));
-        });
+    fn filter_string_applies_trace_overlays() {
+        let cfg = |level, acp_trace, terminal_trace| LogConfig {
+            level,
+            acp_trace,
+            terminal_trace,
+        };
+        assert!(cfg(None, true, true).filter_string().is_none());
+        let acp = cfg(Some(LogLevel::Info), true, false)
+            .filter_string()
+            .unwrap();
+        assert!(acp.contains("agent_client_protocol=debug"));
+        assert!(acp.contains("transport_actor=trace"));
+        let terminal = cfg(Some(LogLevel::Info), false, true)
+            .filter_string()
+            .unwrap();
+        assert!(terminal.ends_with(",terminal=trace"));
     }
 
     #[test]
-    fn controller_rejects_invalid_level() {
-        with_test_controller("info", |c| {
-            assert!(matches!(
-                c.set_filter("acp=notalevel").unwrap_err(),
-                LogFilterError::Invalid(_)
-            ));
-        });
+    #[serial_test::serial]
+    fn from_env_reads_level_and_legacy_debug_flag() {
+        let vars = [
+            "AOE_LOG_LEVEL",
+            "AGENT_OF_EMPIRES_DEBUG",
+            "AOE_ACP_TRACE",
+            "AOE_TERMINAL_TRACE",
+        ];
+        let cases: [(&[(&str, &str)], Option<LogLevel>); 3] = [
+            (&[], None),
+            (&[("AOE_LOG_LEVEL", "trace")], Some(LogLevel::Trace)),
+            (&[("AGENT_OF_EMPIRES_DEBUG", "1")], Some(LogLevel::Debug)),
+        ];
+        for (set, expected) in cases {
+            let mut env = EnvGuard::unset(&vars);
+            for (key, value) in set {
+                env = env.and_set(key, value);
+            }
+            let cfg = LogConfig::from_env();
+            assert_eq!(cfg.level, expected, "{set:?}");
+            assert!(!cfg.acp_trace && !cfg.terminal_trace);
+        }
     }
 
     fn make_cfg(rotation: RotationKind, max_mib: u64, keep: u8) -> LoggingConfig {
@@ -1075,44 +990,6 @@ mod tests {
     }
 
     #[test]
-    fn resolve_log_path_relative_joins_app_dir() {
-        let cfg = make_cfg(RotationKind::Size, 50, 5);
-        let dir = std::path::PathBuf::from("/tmp/aoe-test");
-        assert_eq!(resolve_log_path(&cfg, &dir), dir.join("debug.log"));
-    }
-
-    #[test]
-    fn resolve_log_path_absolute_used_verbatim() {
-        let mut cfg = make_cfg(RotationKind::Size, 50, 5);
-        cfg.file_path = "/var/log/aoe.log".into();
-        let dir = std::path::PathBuf::from("/tmp/aoe-test");
-        assert_eq!(
-            resolve_log_path(&cfg, &dir),
-            std::path::PathBuf::from("/var/log/aoe.log")
-        );
-    }
-
-    #[test]
-    fn resolve_sink_tui_with_stdout_coerces_to_file_with_warning() {
-        let mut cfg = make_cfg(RotationKind::Size, 50, 5);
-        cfg.output = crate::session::config::SinkKind::Stdout;
-        let dir = std::path::PathBuf::from("/tmp/aoe-test");
-        let r = resolve_sink(&cfg, &dir, ProcessContext::Tui);
-        assert!(matches!(r.target, SubscriberTarget::File(_, _)));
-        assert!(r.warning.is_some(), "coercion should surface a warning");
-    }
-
-    #[test]
-    fn resolve_sink_serve_foreground_honors_stdout() {
-        let mut cfg = make_cfg(RotationKind::Size, 50, 5);
-        cfg.output = crate::session::config::SinkKind::Stdout;
-        let dir = std::path::PathBuf::from("/tmp/aoe-test");
-        let r = resolve_sink(&cfg, &dir, ProcessContext::ServeForeground);
-        assert!(matches!(r.target, SubscriberTarget::Stdout));
-        assert!(r.warning.is_none());
-    }
-
-    #[test]
     fn rotation_writer_rotates_at_threshold() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("debug.log");
@@ -1122,36 +999,43 @@ mod tests {
             keep_count: 3,
         };
         let mut w = SizeRotatingWriter::new(path.clone(), policy).unwrap();
+        w.write_all(b"first half ").unwrap();
+        w.write_all(b"second half\n").unwrap();
+        w.flush().unwrap();
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            contents.contains("first half second half\n"),
+            "split write should re-coalesce in one line, got: {contents:?}"
+        );
         for i in 0..200 {
             writeln!(&mut w, "line {i:050}").unwrap();
         }
         w.flush().unwrap();
         drop(w);
-        let rotated = path.with_extension("log.1");
-        assert!(rotated.exists(), "expected rotated file at {:?}", rotated);
+        assert!(path.with_extension("log.1").exists());
     }
 
     #[test]
-    fn rotation_writer_keeps_at_most_keep_count() {
+    fn rotation_writer_startup_rotates_and_sweeps_past_keep_count() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("debug.log");
-        std::fs::write(path.with_extension("log.1"), b"old 1").unwrap();
-        std::fs::write(path.with_extension("log.2"), b"old 2").unwrap();
-        std::fs::write(path.with_extension("log.3"), b"old 3").unwrap();
+        for n in 1..=5 {
+            std::fs::write(path.with_extension(format!("log.{n}")), b"old").unwrap();
+        }
+        std::fs::write(&path, vec![b'x'; 200]).unwrap();
         let policy = RotationPolicy {
             kind: RotationKind::Size,
             max_size_bytes: 64,
-            keep_count: 3,
+            keep_count: 2,
         };
-        std::fs::write(&path, vec![b'x'; 200]).unwrap();
-        let mut w = SizeRotatingWriter::new(path.clone(), policy).unwrap();
-        writeln!(&mut w, "trigger rotation now padded out to be large enough").unwrap();
-        w.flush().unwrap();
-        drop(w);
-        assert!(
-            !path.with_extension("log.4").exists(),
-            "keep_count=3 must drop .4"
-        );
+        let _w = SizeRotatingWriter::new(path.clone(), policy).unwrap();
+        for n in 1..=5 {
+            assert_eq!(
+                path.with_extension(format!("log.{n}")).exists(),
+                n <= 2,
+                ".{n} with keep_count=2"
+            );
+        }
     }
 
     #[test]
@@ -1178,71 +1062,40 @@ mod tests {
     }
 
     #[test]
-    fn rotation_writer_line_buffers_across_partial_writes() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("debug.log");
-        let policy = RotationPolicy {
-            kind: RotationKind::Size,
-            max_size_bytes: 1024 * 1024,
-            keep_count: 3,
-        };
-        let mut w = SizeRotatingWriter::new(path.clone(), policy).unwrap();
-        w.write_all(b"first half ").unwrap();
-        w.write_all(b"second half\n").unwrap();
-        w.flush().unwrap();
-        drop(w);
-        let contents = std::fs::read_to_string(&path).unwrap();
-        assert!(
-            contents.contains("first half second half\n"),
-            "split write should re-coalesce in one line, got: {:?}",
-            contents
-        );
+    fn resolve_log_path_joins_only_relative_paths() {
+        let dir = std::path::PathBuf::from("/tmp/aoe-test");
+        for (file_path, expected) in [
+            ("debug.log", dir.join("debug.log")),
+            (
+                "/var/log/aoe.log",
+                std::path::PathBuf::from("/var/log/aoe.log"),
+            ),
+        ] {
+            let mut cfg = make_cfg(RotationKind::Size, 50, 5);
+            cfg.file_path = file_path.into();
+            assert_eq!(resolve_log_path(&cfg, &dir), expected);
+        }
     }
 
+    /// Only a foreground serve may log to stdout; the TUI owns the terminal,
+    /// so it is coerced to the file with a warning.
     #[test]
-    fn rotation_writer_startup_rotates_oversize_existing_file() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("debug.log");
-        std::fs::write(&path, vec![b'x'; 200]).unwrap();
-        let policy = RotationPolicy {
-            kind: RotationKind::Size,
-            max_size_bytes: 64,
-            keep_count: 3,
-        };
-        let _w = SizeRotatingWriter::new(path.clone(), policy).unwrap();
-        assert!(path.with_extension("log.1").exists());
-    }
-
-    #[test]
-    fn rotation_writer_sweeps_orphans_when_keep_count_reduced() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("debug.log");
-        std::fs::write(path.with_extension("log.1"), b"old 1").unwrap();
-        std::fs::write(path.with_extension("log.2"), b"old 2").unwrap();
-        std::fs::write(path.with_extension("log.3"), b"old 3").unwrap();
-        std::fs::write(path.with_extension("log.4"), b"old 4").unwrap();
-        std::fs::write(path.with_extension("log.5"), b"old 5").unwrap();
-        let policy = RotationPolicy {
-            kind: RotationKind::Size,
-            max_size_bytes: 64,
-            keep_count: 2,
-        };
-        std::fs::write(&path, vec![b'x'; 200]).unwrap();
-        let _w = SizeRotatingWriter::new(path.clone(), policy).unwrap();
-        assert!(path.with_extension("log.1").exists(), ".1 must exist");
-        assert!(path.with_extension("log.2").exists(), ".2 must exist");
-        assert!(
-            !path.with_extension("log.3").exists(),
-            ".3 must be swept by orphan sweep"
-        );
-        assert!(
-            !path.with_extension("log.4").exists(),
-            ".4 must be swept by orphan sweep"
-        );
-        assert!(
-            !path.with_extension("log.5").exists(),
-            ".5 must be swept by orphan sweep"
-        );
+    fn resolve_sink_honors_stdout_only_outside_the_tui() {
+        let mut cfg = make_cfg(RotationKind::Size, 50, 5);
+        cfg.output = crate::session::config::SinkKind::Stdout;
+        let dir = std::path::PathBuf::from("/tmp/aoe-test");
+        for (context, to_stdout) in [
+            (ProcessContext::Tui, false),
+            (ProcessContext::ServeForeground, true),
+        ] {
+            let r = resolve_sink(&cfg, &dir, context);
+            assert_eq!(matches!(r.target, SubscriberTarget::Stdout), to_stdout);
+            assert_eq!(
+                r.warning.is_some(),
+                !to_stdout,
+                "coercion surfaces a warning"
+            );
+        }
     }
 
     #[test]

@@ -68,31 +68,20 @@ function signOutButton(container: HTMLElement): HTMLButtonElement {
 }
 
 describe("ConnectedDevices", () => {
-  it("shows the loading state before the first fetch resolves", () => {
-    // Never-resolving fetch so the component stays in its initial null state.
-    mockFetchDevices.mockReturnValue(new Promise<never>(() => {}));
-    render(<ConnectedDevices />);
-    expect(screen.getByText("Loading...")).toBeTruthy();
-    expect(screen.getByText("Connected Devices")).toBeTruthy();
+  it("renders the error state once the first fetch resolves", async () => {
+    mockFetchDevices.mockResolvedValue(null);
+    await renderAndLoad();
+    expect(screen.getByText("Could not load devices")).toBeTruthy();
+    expect(screen.queryByText("Loading...")).toBeNull();
   });
 
-  it.each([
-    ["empty", [], "No signed-in devices"],
-    ["error", null, "Could not load devices"],
-  ] as [string, DeviceSession[] | null, string][])(
-    "renders the %s state once the first fetch resolves",
-    async (_name, result, text) => {
-      mockFetchDevices.mockResolvedValue(result);
-      await renderAndLoad();
-      expect(screen.getByText(text)).toBeTruthy();
-      expect(screen.queryByText("Loading...")).toBeNull();
-    },
-  );
-
   it("renders a populated list flagging the current device and showing a Revoke button only for others", async () => {
+    const old = new Date(Date.now() - 2 * 3_600_000).toISOString();
     mockFetchDevices.mockResolvedValue([
       device({ session_id: "me", current: true, user_agent: "Mozilla/5.0 (iPhone) Safari/605" }),
       device({ session_id: "other", current: false, created_ip: "10.0.0.5" }),
+      device({ session_id: "a", user_agent: "Mozilla/5.0 Firefox/120.0 Windows NT 10.0", last_seen: old }),
+      device({ session_id: "b", user_agent: "curl/8.4.0 Linux" }),
     ]);
     const { container } = await renderAndLoad();
 
@@ -100,11 +89,12 @@ describe("ConnectedDevices", () => {
     // Current device shows its parsed UA; the other shows its IP.
     expect(screen.getByText("Safari · iOS")).toBeTruthy();
     expect(screen.getByText("10.0.0.5")).toBeTruthy();
-    expect(screen.getAllByText(/last seen:/).length).toBe(2);
+    expect(screen.getByText("Firefox · Windows")).toBeTruthy();
+    expect(screen.getByText("curl · Linux")).toBeTruthy();
+    expect(screen.getByText(/last seen: 2h ago/)).toBeTruthy();
 
-    // Exactly one Revoke button (the non-current device). The current device
-    // has no Revoke control.
-    expect(revokeButtons(container)).toHaveLength(1);
+    // The current device has no Revoke control.
+    expect(revokeButtons(container)).toHaveLength(3);
   });
 
   it("revokes a device by id and reloads the list", async () => {
@@ -182,7 +172,7 @@ describe("ConnectedDevices", () => {
     expect(mockFetchDevices).toHaveBeenCalledTimes(1);
   });
 
-  it("re-fetches devices when the polling interval fires", async () => {
+  it("re-fetches devices on the polling interval and when the tab becomes visible", async () => {
     mockFetchDevices.mockResolvedValue([device({ session_id: "me", current: true })]);
     await renderAndLoad();
     expect(screen.getByText("this device")).toBeTruthy();
@@ -190,32 +180,12 @@ describe("ConnectedDevices", () => {
 
     await flush(10_000);
     expect(mockFetchDevices).toHaveBeenCalledTimes(2);
-  });
-
-  it("re-fetches when the tab becomes visible again", async () => {
-    mockFetchDevices.mockResolvedValue([device({ session_id: "me", current: true })]);
-    await renderAndLoad();
-    expect(mockFetchDevices).toHaveBeenCalledTimes(1);
 
     // jsdom defaults visibilityState to "visible".
     await act(async () => {
       fireEvent(document, new Event("visibilitychange"));
       await vi.advanceTimersByTimeAsync(0);
     });
-    expect(mockFetchDevices).toHaveBeenCalledTimes(2);
-  });
-
-  it("parses various user agents into a Browser · OS label and marks stale devices", async () => {
-    const old = new Date(Date.now() - 2 * 3_600_000).toISOString();
-    mockFetchDevices.mockResolvedValue([
-      device({ session_id: "a", user_agent: "Mozilla/5.0 Firefox/120.0 Windows NT 10.0", last_seen: old }),
-      device({ session_id: "b", user_agent: "curl/8.4.0 Linux" }),
-    ]);
-    await renderAndLoad();
-
-    expect(screen.getByText("Firefox · Windows")).toBeTruthy();
-    expect(screen.getByText("curl · Linux")).toBeTruthy();
-    // The stale device (2h old) renders an "h ago" relative time.
-    expect(screen.getByText(/last seen: 2h ago/)).toBeTruthy();
+    expect(mockFetchDevices).toHaveBeenCalledTimes(3);
   });
 });

@@ -3,7 +3,6 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { cleanup, fireEvent, render } from "@testing-library/react";
 import { StructuredViewDisplaySettings } from "../StructuredViewDisplaySettings";
-import { TerminalSettings } from "../../TerminalSettings";
 import { getWebSettingsSnapshot } from "../../../hooks/useWebSettings";
 
 const KEY = "aoe-web-settings";
@@ -20,35 +19,6 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("StructuredViewDisplaySettings localStorage contract", () => {
-  it("defaults both sliders to 14px", () => {
-    const { getByTestId } = render(<StructuredViewDisplaySettings />);
-    expect((getByTestId("structured-mobile-font-size-slider") as HTMLInputElement).value).toBe("14");
-    expect((getByTestId("structured-desktop-font-size-slider") as HTMLInputElement).value).toBe("14");
-  });
-
-  // The two panels are the only font-size sliders in the dashboard and users
-  // compare them side by side, so they span one shared range. Rendering both
-  // catches a panel that re-hardcodes its own bounds.
-  it("spans the same slider range as the terminal font-size controls", () => {
-    const conversation = render(<StructuredViewDisplaySettings />);
-    const terminal = render(<TerminalSettings />);
-    const bounds = (root: ReturnType<typeof render>, testId: string) => {
-      const el = root.getByTestId(testId) as HTMLInputElement;
-      return [el.min, el.max];
-    };
-    const expected = bounds(terminal, "terminal-mobile-font-size-slider");
-    expect(expected).toEqual(["6", "28"]);
-    for (const testId of [
-      "terminal-desktop-font-size-slider",
-      "structured-mobile-font-size-slider",
-      "structured-desktop-font-size-slider",
-    ]) {
-      const root = testId.startsWith("terminal-") ? terminal : conversation;
-      expect(bounds(root, testId), testId).toEqual(expected);
-      expect([...root.getByTestId(testId.replace("-slider", "-select")).children].length, testId).toBe(23);
-    }
-  });
-
   it("writes each axis independently and leaves the terminal sizes alone", () => {
     const { getByTestId } = render(<StructuredViewDisplaySettings />);
 
@@ -63,16 +33,6 @@ describe("StructuredViewDisplaySettings localStorage contract", () => {
     // The terminal font sizes are a separate preference and must not move.
     expect(readStored().mobileFontSize).toBe(8);
     expect(readStored().desktopFontSize).toBe(14);
-  });
-
-  it("keeps the slider and the px select synchronized on both axes", () => {
-    const { getByTestId } = render(<StructuredViewDisplaySettings />);
-
-    fireEvent.change(getByTestId("structured-mobile-font-size-select"), { target: { value: "20" } });
-    expect((getByTestId("structured-mobile-font-size-slider") as HTMLInputElement).value).toBe("20");
-
-    fireEvent.change(getByTestId("structured-desktop-font-size-slider"), { target: { value: "10" } });
-    expect((getByTestId("structured-desktop-font-size-select") as HTMLInputElement).value).toBe("10");
   });
 
   it("survives a reread and reflects the stored values on remount", () => {

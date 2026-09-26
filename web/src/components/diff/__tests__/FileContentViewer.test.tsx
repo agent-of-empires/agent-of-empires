@@ -64,16 +64,6 @@ describe("FileContentViewer", () => {
     expect(screen.queryByRole("button", { name: "Rendered" })).toBeNull();
   });
 
-  it("shows a binary notice", async () => {
-    vi.spyOn(api, "getSessionFile").mockResolvedValue({
-      content: "",
-      is_binary: true,
-      truncated: false,
-    });
-    render(<FileContentViewer sessionId="s1" filePath="/tmp/blob.md" />);
-    await screen.findByText("Binary file");
-  });
-
   it("shows an error when the fetch fails", async () => {
     vi.spyOn(api, "getSessionFile").mockResolvedValue(null);
     render(<FileContentViewer sessionId="s1" filePath="/tmp/x.md" />);

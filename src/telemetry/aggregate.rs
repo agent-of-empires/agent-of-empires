@@ -68,44 +68,30 @@ mod tests {
     }
 
     #[test]
-    fn folds_distinct_sessions_across_samples() {
+    fn folds_distinct_sessions_and_peak_across_samples() {
         let mut agg = UsageAggregator::default();
+        assert_eq!(agg.peak_concurrent_sessions(), 0);
+        assert!(agg.distinct_by_agent().is_empty());
+        assert!(agg.distinct_by_model().is_empty());
+
         agg.sample(&[
             inst("a", "claude", Status::Running),
             inst("b", "claude", Status::Idle),
+            inst("d", "claude", Status::Running),
         ]);
         agg.sample(&[inst("c", "codex", Status::Running)]);
+        // A session seen again under another agent counts once, in its latest bucket.
+        agg.sample(&[inst("d", "codex", Status::Running)]);
 
         let by_agent = agg.distinct_by_agent();
         assert_eq!(by_agent.get("claude"), Some(&2));
-        assert_eq!(by_agent.get("codex"), Some(&1));
-        let distinct_total: u32 = by_agent.values().sum();
-        assert_eq!(distinct_total, 3);
-    }
-
-    #[test]
-    fn tracks_peak_concurrency_not_the_last_sample() {
-        let mut agg = UsageAggregator::default();
-        agg.sample(&[inst("a", "claude", Status::Running)]); // 1
-        agg.sample(&[
-            inst("a", "claude", Status::Running),
-            inst("b", "claude", Status::Running),
-            inst("c", "claude", Status::Running),
-        ]); // 3
-        agg.sample(&[inst("a", "claude", Status::Idle)]); // 1
-        assert_eq!(agg.peak_concurrent_sessions(), 3);
-    }
-
-    #[test]
-    fn same_session_counts_once_with_latest_bucket() {
-        let mut agg = UsageAggregator::default();
-        agg.sample(&[inst("a", "claude", Status::Running)]);
-        agg.sample(&[inst("a", "codex", Status::Running)]);
-
-        let by_agent = agg.distinct_by_agent();
-        assert_eq!(by_agent.get("claude"), None);
-        assert_eq!(by_agent.get("codex"), Some(&1));
-        assert_eq!(by_agent.values().sum::<u32>(), 1);
+        assert_eq!(by_agent.get("codex"), Some(&2));
+        assert_eq!(by_agent.values().sum::<u32>(), 4);
+        assert_eq!(
+            agg.peak_concurrent_sessions(),
+            3,
+            "the window peak, not the last sample"
+        );
     }
 
     #[test]
@@ -153,13 +139,5 @@ mod tests {
         agg.sample(&[later_trashed]);
         assert_eq!(agg.distinct_by_agent().get("claude"), Some(&1));
         assert_eq!(agg.peak_concurrent_sessions(), 1);
-    }
-
-    #[test]
-    fn empty_window_reports_zero() {
-        let agg = UsageAggregator::default();
-        assert_eq!(agg.peak_concurrent_sessions(), 0);
-        assert!(agg.distinct_by_agent().is_empty());
-        assert!(agg.distinct_by_model().is_empty());
     }
 }

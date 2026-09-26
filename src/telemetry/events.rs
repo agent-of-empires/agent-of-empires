@@ -176,7 +176,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn approvals_resolved_sums_the_three_real_decisions() {
+    fn approvals_resolved_sums_decisions_and_the_map_omits_zero_keys() {
+        let empty = StructuredInteractionCounts::default();
+        assert_eq!(empty.approvals_resolved(), 0);
+        assert!(empty.approvals_by_decision().is_empty());
+
         let counts = StructuredInteractionCounts {
             approvals_allow: 2,
             approvals_allow_always: 1,
@@ -184,26 +188,13 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(counts.approvals_resolved(), 4);
-    }
-
-    #[test]
-    fn approvals_by_decision_omits_zero_keys() {
         let counts = StructuredInteractionCounts {
-            approvals_allow: 2,
-            approvals_deny: 1,
-            ..Default::default()
+            approvals_allow_always: 0,
+            ..counts
         };
         let map = counts.approvals_by_decision();
         assert_eq!(map.get("allow"), Some(&2));
         assert_eq!(map.get("deny"), Some(&1));
-        assert!(!map.contains_key("allow_always"));
-        assert_eq!(map.len(), 2);
-    }
-
-    #[test]
-    fn empty_counts_produce_an_empty_decision_map() {
-        let counts = StructuredInteractionCounts::default();
-        assert_eq!(counts.approvals_resolved(), 0);
-        assert!(counts.approvals_by_decision().is_empty());
+        assert_eq!(map.len(), 2, "{map:?}");
     }
 }

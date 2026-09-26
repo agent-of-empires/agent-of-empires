@@ -710,6 +710,14 @@ mod tests {
             !result,
             "sandbox fallback must bail when allow_container_removal=false"
         );
+
+        let instance = Instance::new("Test", "/tmp/aoe-cleanup-test-nonexistent");
+        // No sandbox_info set.
+
+        // Even with allow_container_removal=true, a non-sandboxed
+        // instance must early-return.
+        let result = try_sandbox_dir_cleanup(&worktree, &main_repo, &instance, true);
+        assert!(!result);
     }
 
     /// Anonymous-volume mount-point cruft: when a sandboxed session's
@@ -846,20 +854,6 @@ mod tests {
             worktree_path.exists(),
             "worktree dir should still exist after strict failure"
         );
-    }
-
-    #[test]
-    fn test_try_sandbox_dir_cleanup_returns_false_for_non_sandboxed() {
-        use crate::session::Instance;
-        let instance = Instance::new("Test", "/tmp/aoe-cleanup-test-nonexistent");
-        // No sandbox_info set.
-        let worktree = std::path::PathBuf::from("/tmp/aoe-cleanup-test-nonexistent");
-        let main_repo = std::path::PathBuf::from("/tmp/aoe-cleanup-test-main-nonexistent");
-
-        // Even with allow_container_removal=true, a non-sandboxed
-        // instance must early-return.
-        let result = try_sandbox_dir_cleanup(&worktree, &main_repo, &instance, true);
-        assert!(!result);
     }
 
     /// Each stderr classifier fires on the wording git uses, including the
@@ -1126,18 +1120,13 @@ mod tests {
             enrich_worktree_remove_error(unrelated, &repo_path),
             unrelated
         );
-    }
 
-    #[test]
-    fn test_enrich_worktree_remove_error_caps_long_lists() {
-        let (_dir, repo_path) = init_repo_with_commit();
-        for i in 0..(MAX_DIRTY_FILES_LISTED + 5) {
+        // With scratch.log, this leaves five files past the cap.
+        for i in 0..(MAX_DIRTY_FILES_LISTED + 4) {
             std::fs::write(repo_path.join(format!("f{}.txt", i)), "x").unwrap();
         }
-        let stderr =
-            "fatal: '/some/path' contains modified or untracked files, use --force to delete it";
-        let enriched = enrich_worktree_remove_error(stderr, &repo_path);
-        assert!(enriched.contains("and 5 more"));
+        let capped = enrich_worktree_remove_error(stderr, &repo_path);
+        assert!(capped.contains("and 5 more"));
     }
 
     /// Lay out `dirs` and `files` under a fresh tempdir, remove `leaf` as

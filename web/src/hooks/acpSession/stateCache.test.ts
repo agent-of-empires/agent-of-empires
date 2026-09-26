@@ -117,7 +117,7 @@ describe("persistState (#1833)", () => {
 });
 
 describe("clearAcpCache", () => {
-  it("drops one entry or every acp-state entry, leaving unrelated keys", () => {
+  it("drops one entry or every acp-state entry, leaving unrelated keys and swallowing storage errors", () => {
     writeEntry("sess-a");
     writeEntry("sess-b");
     localStorage.setItem("unrelated:key", "x");
@@ -127,9 +127,7 @@ describe("clearAcpCache", () => {
     clearAcpCache();
     expect(localStorage.getItem(key("sess-b"))).toBeNull();
     expect(localStorage.getItem("unrelated:key")).toBe("x");
-  });
 
-  it("swallows storage errors", () => {
     vi.spyOn(localStorage, "removeItem").mockImplementation(() => {
       throw new Error("denied");
     });

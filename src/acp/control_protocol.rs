@@ -203,7 +203,7 @@ pub(crate) async fn read_frame_with_size<R: AsyncRead + Unpin>(
     r: &mut R,
 ) -> Result<Option<(ControlBody, usize)>> {
     let mut len_buf = [0u8; 4];
-    #[cfg(feature = "test-support")]
+    #[cfg(debug_assertions)]
     let length_read = async {
         let mut consumed = 0;
         while consumed < len_buf.len() {
@@ -221,7 +221,7 @@ pub(crate) async fn read_frame_with_size<R: AsyncRead + Unpin>(
         Ok(consumed)
     }
     .await;
-    #[cfg(not(feature = "test-support"))]
+    #[cfg(not(debug_assertions))]
     let length_read = r.read_exact(&mut len_buf).await;
     match length_read {
         Ok(_) => {}
@@ -346,17 +346,29 @@ mod tests {
         }
     }
 
-    #[test]
-    fn json_rpc_error_omits_absent_data() {
-        let encoded = serde_json::to_value(JsonRpcError::new(DAEMON_GONE, "gone")).unwrap();
-        assert_eq!(
-            encoded,
-            serde_json::json!({"code": -32001, "message": "gone"})
-        );
-    }
-
     #[tokio::test]
-    async fn frames_read_back_in_order_until_a_clean_eof() {
+    async fn frames_read_in_order_within_bounds() {
+        let body = ControlBody::AgentCall {
+            call_id: 1,
+            method: "session/prompt".into(),
+            params: serde_json::json!({"blob": "x".repeat(17 * 1024 * 1024)}),
+        };
+        let encoded = encode_frame(&body).expect("17 MiB agent payload fits the shared cap");
+        assert!(encoded.len() > 17 * 1024 * 1024);
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&(MAX_CONTROL_FRAME_BYTES + 1).to_be_bytes());
+        let mut cursor = Cursor::new(buf);
+        assert!(read_frame(&mut cursor).await.is_err());
+
+        // A truncated body is an error, not a clean EOF.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&16u32.to_be_bytes());
+        buf.extend_from_slice(b"only-4");
+        let mut cursor = Cursor::new(buf);
+        assert!(read_frame(&mut cursor).await.is_err());
+
+        // Frames read back in order until a clean EOF.
         let a = ControlBody::Hello {
             control_protocol_version: CONTROL_PROTOCOL_VERSION,
             session_id: "s".into(),
@@ -374,30 +386,5 @@ mod tests {
         assert_eq!(read_frame(&mut cursor).await.unwrap(), Some(a));
         assert_eq!(read_frame(&mut cursor).await.unwrap(), Some(b));
         assert_eq!(read_frame(&mut cursor).await.unwrap(), None);
-    }
-
-    #[tokio::test]
-    async fn frame_bounds_accept_large_agent_payload_and_reject_excess_prefix() {
-        let body = ControlBody::AgentCall {
-            call_id: 1,
-            method: "session/prompt".into(),
-            params: serde_json::json!({"blob": "x".repeat(17 * 1024 * 1024)}),
-        };
-        let encoded = encode_frame(&body).expect("17 MiB agent payload fits the shared cap");
-        assert!(encoded.len() > 17 * 1024 * 1024);
-
-        let mut buf = Vec::new();
-        buf.extend_from_slice(&(MAX_CONTROL_FRAME_BYTES + 1).to_be_bytes());
-        let mut cursor = Cursor::new(buf);
-        assert!(read_frame(&mut cursor).await.is_err());
-    }
-
-    #[tokio::test]
-    async fn truncated_body_is_error_not_eof() {
-        let mut buf = Vec::new();
-        buf.extend_from_slice(&16u32.to_be_bytes());
-        buf.extend_from_slice(b"only-4"); // fewer than 16 bytes
-        let mut cursor = Cursor::new(buf);
-        assert!(read_frame(&mut cursor).await.is_err());
     }
 }

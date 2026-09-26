@@ -47,6 +47,18 @@ fn resume_idle_grace() -> Duration {
     RESUME_IDLE_GRACE_DEFAULT
 }
 
+/// Debug builds honor `AOE_RESUME_IDLE_CHECK_INTERVAL_MS`, clamped to at least 10ms.
+fn resume_idle_check_interval() -> Duration {
+    #[cfg(debug_assertions)]
+    if let Some(ms) = std::env::var("AOE_RESUME_IDLE_CHECK_INTERVAL_MS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+    {
+        return Duration::from_millis(ms.max(10));
+    }
+    Duration::from_millis(500)
+}
+
 pub(super) struct EstablishCtx {
     pub(super) shared: Arc<Shared>,
     pub(super) control: Option<Arc<DaemonControlClient>>,
@@ -207,9 +219,10 @@ pub(super) async fn establish(
 /// belongs to the between-prompt watchdog.
 fn spawn_resume_idle_watchdog(shared: Arc<Shared>) {
     let grace_ms = resume_idle_grace().as_millis() as i64;
+    let interval = resume_idle_check_interval();
     tokio::spawn(async move {
         loop {
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            tokio::time::sleep(interval).await;
             if shared.terminal_claim.claimed()
                 || shared.prompt_sent_since_attach.load(Ordering::Relaxed)
             {

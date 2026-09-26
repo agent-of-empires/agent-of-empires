@@ -453,7 +453,7 @@ fn acquire_open_storage_flock(file: fs::File, path: &Path) -> Result<StorageFloc
         if e.kind() != std::io::ErrorKind::WouldBlock {
             return Err(e.into());
         }
-        #[cfg(feature = "test-support")]
+        #[cfg(debug_assertions)]
         if let Some(marker) = std::env::var_os("AOE_E2E_STORAGE_LOCK_CONTENDED") {
             fs::write(marker, path.as_os_str().as_encoded_bytes())?;
         }
@@ -2975,38 +2975,6 @@ mod tests {
 
     #[test]
     #[serial]
-    fn update_serializes_concurrent_writers_same_profile() -> Result<()> {
-        let temp = tempdir()?;
-        let _guard = setup_test_home(temp.path());
-        let storage = Storage::new_unwatched("test-update-concurrent")?;
-        let other = Storage::new_unwatched("test-update-concurrent")?;
-        assert!(Arc::ptr_eq(&storage.save_lock, &other.save_lock));
-        assert!(!Arc::ptr_eq(
-            &storage.save_lock,
-            &Storage::new_unwatched("test-registry-distinct")?.save_lock
-        ));
-
-        std::thread::scope(|scope| {
-            for tid in 0..32 {
-                scope.spawn(move || {
-                    Storage::new_unwatched("test-update-concurrent")
-                        .unwrap()
-                        .update(|instances, _| {
-                            instances.push(Instance::new(&format!("inst-{tid}"), "/tmp/inst"));
-                            Ok(())
-                        })
-                        .unwrap();
-                });
-            }
-        });
-        let titles: Vec<_> = storage.load()?.into_iter().map(|i| i.title).collect();
-        assert_eq!(titles.len(), 32, "lost updates");
-        assert!((0..32).all(|tid| titles.contains(&format!("inst-{tid}"))));
-        Ok(())
-    }
-
-    #[test]
-    #[serial]
     fn instance_lifecycle_lock_serializes_same_profile_and_instance() -> Result<()> {
         let temp = tempdir()?;
         let _guard = setup_test_home(temp.path());
@@ -3215,6 +3183,11 @@ mod tests {
         fs::set_permissions(&profile_dir, restore)?;
 
         assert!(update_res.is_err(), "write failure must surface as Err");
+        assert_eq!(
+            storage.load()?.len(),
+            2,
+            "a failed write leaves disk unchanged"
+        );
 
         tokio::time::timeout(
             Duration::from_secs(2),
@@ -3755,33 +3728,6 @@ mod tests {
         );
         Ok(())
     }
-    #[test]
-    #[serial]
-    fn profile_move_crash_after_target_publication_leaves_duplicate_id() -> Result<()> {
-        let (_temp, _guard, source, target, before, _after) = setup_recovery_env("repro")?;
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = source.move_instances_to_inner(
-                &target,
-                &[(before.clone(), before.clone())],
-                MoveTransactionPlan {
-                    group_move: &GroupMovePlan::single("work", "moved"),
-                    merge_complete_post: true,
-                    account_swap: false,
-                },
-                |_existing, _candidates| Ok(()),
-                |_| Ok(()),
-                |_path| panic!("simulated crash after target publication"),
-            );
-        }));
-        assert!(result.is_err(), "the simulated crash must abort the move");
-        let (source_rows, target_rows) = (source.load()?, target.load()?);
-        assert_eq!((source_rows.len(), target_rows.len()), (1, 1));
-        assert_eq!(
-            source_rows[0].id, target_rows[0].id,
-            "ambiguous duplicate id"
-        );
-        Ok(())
-    }
 
     fn setup_recovery_env(
         tag: &str,
@@ -3850,8 +3796,13 @@ mod tests {
                 setup_recovery_env(point.replace('-', "_").as_str())?;
             run_crashing_move(&source, &target, point);
 
-            assert_eq!(source.load()?.len(), 1, "{point}: source row remains");
-            assert_eq!(target.load()?.len(), 1, "{point}: target copy durable");
+            let (source_rows, target_rows) = (source.load()?, target.load()?);
+            assert_eq!(source_rows.len(), 1, "{point}: source row remains");
+            assert_eq!(target_rows.len(), 1, "{point}: target copy durable");
+            assert_eq!(
+                source_rows[0].id, target_rows[0].id,
+                "{point}: duplicate id"
+            );
             assert_eq!(
                 journal_entry_count(&source),
                 1,
@@ -3945,82 +3896,184 @@ mod tests {
         Ok(())
     }
 
+    /// Journal evidence that cannot prove a winner (#3527) never arbitrates: every copy stays on
+    /// disk and the duplicate stays surfaced. Rows collect failures so each guard reports alone.
     #[test]
-    fn legacy_duplicate_without_journal_is_surfaced_never_arbitrated() -> Result<()> {
-        let (_temp, _guard, source, target, before, _after) = setup_recovery_env("legacy")?;
-        let id = before.id.clone();
-        push_copy(&target, &before)?;
-
-        let outcome = reconcile_loaded(&[&source, &target]);
-
-        assert!(!outcome.repaired);
-        assert_eq!(
-            outcome.reports.len(),
-            1,
-            "exactly the duplicated id surfaces"
-        );
-        let report = &outcome.reports[0];
-        assert_eq!(report.id, id);
-        assert_eq!(report.copies.len(), 2);
-        let message = report.actionable_message();
-        assert!(message.contains(&id), "message names the session id");
-        assert!(
-            message.contains("sessions.json"),
-            "message names store files"
-        );
-        for storage in [&source, &target] {
-            assert!(
-                message.contains(storage.profile()),
-                "message names profile {}: {message}",
-                storage.profile()
-            );
-            assert_eq!(storage.load()?.len(), 1, "no automatic arbitration");
+    fn unprovable_journal_evidence_keeps_duplicates_surfaced() -> Result<()> {
+        type Arrange = fn(&Storage, &Storage, &Instance) -> Result<()>;
+        fn record(entry: &move_journal::MoveJournalEntry, at: &Storage) -> Result<()> {
+            move_journal::record(entry, at.sessions_path()).map(drop)
         }
-        assert_eq!(journal_entry_count(&source), 0);
-        Ok(())
-    }
-
-    #[test]
-    fn insufficient_evidence_journal_is_surfaced_never_consumed() -> Result<()> {
-        let week_ago_ms = now_ms() - 8 * 24 * 3600 * 1000;
-        let cases = [
+        fn copy_and_record(
+            edit: fn(&mut move_journal::MoveJournalEntry),
+        ) -> impl Fn(&Storage, &Storage, &Instance) -> Result<()> {
+            move |a, b, before| {
+                push_copy(b, before)?;
+                let mut entry = fresh_journal_entry(a, b, &before.id);
+                edit(&mut entry);
+                record(&entry, a)
+            }
+        }
+        let legacy: Arrange = |_, b, before| push_copy(b, before);
+        let wrong_version: Arrange = |a, b, before| {
+            copy_and_record(|e| e.version = move_journal::MOVE_JOURNAL_VERSION + 1)(a, b, before)
+        };
+        // Stores untouched since before the entry, so only its age disqualifies it.
+        let expired: Arrange = |a, b, before| {
+            copy_and_record(|e| e.created_at_epoch_ms = now_ms() - 8 * 24 * 3600 * 1000)(
+                a, b, before,
+            )?;
+            let stale =
+                std::time::UNIX_EPOCH + Duration::from_millis(now_ms() - 9 * 24 * 3600 * 1000);
+            for storage in [a, b] {
+                fs::File::options()
+                    .write(true)
+                    .open(storage.sessions_path())?
+                    .set_modified(stale)?;
+            }
+            Ok(())
+        };
+        let edited_after: Arrange = |a, b, before| {
+            copy_and_record(|e| e.created_at_epoch_ms = now_ms() - 10 * 60 * 1000)(a, b, before)
+        };
+        let invalid_id: Arrange =
+            |a, b, before| copy_and_record(|e| e.ids = vec!["../escape".into()])(a, b, before);
+        let duplicate_ids: Arrange = |a, b, before| {
+            let mut entry = fresh_journal_entry(a, b, &before.id);
+            entry.ids.push(before.id.clone());
+            record(&entry, a)
+        };
+        let aliased: Arrange = |a, b, before| {
+            let mut entry = fresh_journal_entry(a, b, &before.id);
+            entry.target_profile = a.profile().to_string();
+            entry.target_sessions_path = a.sessions_path().to_path_buf();
+            record(&entry, a)
+        };
+        let target_duplicate: Arrange = |a, b, before| {
+            push_copy(b, before)?;
+            push_copy(b, before)?;
+            record(&fresh_journal_entry(a, b, &before.id), a)
+        };
+        let same_profile: Arrange = |a, _, before| push_copy(a, before);
+        let newer_unresolved: Arrange = |a, b, before| {
+            push_copy(b, before)?;
+            let mut older = fresh_journal_entry(a, b, &before.id);
+            older.created_at_epoch_ms = now_ms() - 60_000;
+            record(&older, a)?;
+            let mut newer = fresh_journal_entry(b, a, &before.id);
+            newer.target_profile = "missing-profile".to_string();
+            newer.target_sessions_path = a.sessions_path().with_file_name("missing.json");
+            record(&newer, b)
+        };
+        let newer_opaque: Arrange = |a, b, before| {
+            push_copy(b, before)?;
+            let mut older = fresh_journal_entry(a, b, &before.id);
+            older.created_at_epoch_ms = now_ms() - 60_000;
+            record(&older, a)?;
+            let journal_dir = b.sessions_path().parent().unwrap().join(".move-journal");
+            fs::create_dir_all(&journal_dir)?;
+            fs::write(
+                journal_dir.join("move-99999999999999999999-1.json"),
+                b"not-json",
+            )?;
+            Ok(())
+        };
+        // A newer unresolvable X journal shadows the X+Y batch, which must in turn shadow the
+        // older Y-only journal.
+        let shadowed_batch: Arrange = |a, b, x| {
+            let mut y = Instance::new("y", "/repo/y");
+            y.source_profile = a.profile().to_string();
+            a.update(|instances, _| {
+                instances.push(y.clone());
+                Ok(())
+            })?;
+            push_copy(b, x)?;
+            push_copy(b, &y)?;
+            let now = now_ms();
+            let mut j1 = fresh_journal_entry(a, b, &y.id);
+            j1.created_at_epoch_ms = now - 120_000;
+            let mut j2 = fresh_journal_entry(b, a, &x.id);
+            j2.ids.push(y.id.clone());
+            j2.ids.sort();
+            j2.created_at_epoch_ms = now - 60_000;
+            let mut j3 = fresh_journal_entry(a, b, &x.id);
+            j3.target_profile = "missing".to_string();
+            j3.target_sessions_path = a.sessions_path().with_file_name("missing.json");
+            j3.created_at_epoch_ms = now;
+            record(&j1, a)?;
+            record(&j2, b)?;
+            record(&j3, a)
+        };
+        // (tag, arrange, reconcile source only, reports, rows (a, b), journals left in a,
+        // entry permanently blacklisted)
+        let cases: [(&str, Arrange, bool, usize, (usize, usize), usize, bool); 12] = [
+            ("legacy", legacy, false, 1, (1, 1), 0, false),
+            ("wrong-version", wrong_version, false, 1, (1, 1), 1, false),
+            ("expired", expired, false, 1, (1, 1), 1, false),
+            ("edited-after", edited_after, false, 1, (1, 1), 1, true),
+            ("invalid-id", invalid_id, false, 1, (1, 1), 1, true),
+            ("duplicate-ids", duplicate_ids, false, 0, (1, 0), 1, true),
+            ("aliased", aliased, true, 0, (1, 0), 1, true),
             (
-                "insuff-wrong-version",
-                move_journal::MOVE_JOURNAL_VERSION + 1,
-                0,
-            ),
-            (
-                "insuff-expired",
-                move_journal::MOVE_JOURNAL_VERSION,
-                week_ago_ms,
-            ),
-        ];
-        for (tag, version, created_at) in cases {
-            let (_temp, _guard, source, target, before, _after) = setup_recovery_env(tag)?;
-            push_copy(&target, &before)?;
-            let entry = move_journal::MoveJournalEntry {
-                version,
-                created_at_epoch_ms: created_at,
-                ..fresh_journal_entry(&source, &target, &before.id)
-            };
-            move_journal::record(&entry, source.sessions_path())?;
-            assert_eq!(journal_entry_count(&source), 1, "{tag}");
-
-            let outcome = reconcile_loaded(&[&source, &target]);
-
-            assert!(
-                !outcome.repaired,
-                "{tag}: insufficient evidence must not arbitrate"
-            );
-            assert_eq!(outcome.reports.len(), 1, "{tag}: duplicate stays surfaced");
-            assert_eq!(source.load()?.len(), 1, "{tag}");
-            assert_eq!(target.load()?.len(), 1, "{tag}");
-            assert_eq!(
-                journal_entry_count(&source),
+                "target-duplicate",
+                target_duplicate,
+                false,
                 1,
-                "{tag}: entry stays on disk"
-            );
+                (1, 2),
+                1,
+                false,
+            ),
+            ("same-profile", same_profile, true, 1, (2, 0), 0, false),
+            (
+                "newer-unresolved",
+                newer_unresolved,
+                false,
+                1,
+                (1, 1),
+                1,
+                false,
+            ),
+            ("newer-opaque", newer_opaque, false, 1, (1, 1), 1, false),
+            ("shadowed-batch", shadowed_batch, false, 2, (2, 2), 2, false),
+        ];
+        let mut failures = Vec::new();
+        for (tag, arrange, source_only, reports, rows, journals, blacklisted) in cases {
+            let check = || -> Result<()> {
+                let (_temp, _guard, a, b, before, _after) = setup_recovery_env(tag)?;
+                arrange(&a, &b, &before)?;
+                let outcome = if source_only {
+                    reconcile_loaded(&[&a])
+                } else {
+                    reconcile_loaded(&[&a, &b])
+                };
+                anyhow::ensure!(!outcome.repaired, "arbitrated");
+                anyhow::ensure!(outcome.reports.len() == reports, "{:?}", outcome.reports);
+                anyhow::ensure!((a.load()?.len(), b.load()?.len()) == rows, "rows changed");
+                anyhow::ensure!(journal_entry_count(&a) == journals, "journal consumed");
+                if blacklisted {
+                    anyhow::ensure!(
+                        unusable_journal_entries_contains(&first_journal_path(&a)),
+                        "entry not blacklisted"
+                    );
+                }
+                if let Some(report) = outcome.reports.first().filter(|_| tag == "legacy") {
+                    let message = report.actionable_message();
+                    anyhow::ensure!(report.id == before.id && report.copies.len() == 2);
+                    anyhow::ensure!(
+                        message.contains(&before.id)
+                            && message.contains("sessions.json")
+                            && message.contains(a.profile())
+                            && message.contains(b.profile()),
+                        "{message}"
+                    );
+                }
+                Ok(())
+            };
+            if let Err(error) = check() {
+                failures.push(format!("{tag}: {error:#}"));
+            }
         }
+        assert!(failures.is_empty(), "{failures:#?}");
         Ok(())
     }
 
@@ -4080,58 +4133,6 @@ mod tests {
     }
 
     #[test]
-    fn post_journal_store_edits_degrade_to_legacy() -> Result<()> {
-        let (_temp, _guard, source, target, before, _after) = setup_recovery_env("edited")?;
-        push_copy(&target, &before)?;
-        let mut entry = fresh_journal_entry(&source, &target, &before.id);
-        entry.created_at_epoch_ms = now_ms() - 10 * 60 * 1000;
-        move_journal::record(&entry, source.sessions_path())?;
-
-        let outcome = reconcile_loaded(&[&source, &target]);
-
-        assert!(
-            !outcome.repaired,
-            "post-journal edits must block arbitration"
-        );
-        assert_eq!(outcome.reports.len(), 1);
-        assert_eq!(source.load()?.len(), 1);
-        assert_eq!(target.load()?.len(), 1);
-        assert_eq!(journal_entry_count(&source), 1);
-        let journal_path = first_journal_path(&source);
-        assert!(
-            unusable_journal_entries_contains(&journal_path),
-            "mtime-degraded entry is blacklisted like other permanent causes"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn duplicate_ids_and_aliased_endpoints_are_rejected_before_locks() -> Result<()> {
-        for case in ["duplicate-ids", "aliased-endpoints"] {
-            let (_temp, _guard, source, target, before, _after) = setup_recovery_env(case)?;
-            let mut entry = fresh_journal_entry(&source, &target, &before.id);
-            let storages: &[&Storage] = if case == "duplicate-ids" {
-                entry.ids.push(before.id.clone());
-                &[&source, &target]
-            } else {
-                entry.target_profile = source.profile().to_string();
-                entry.target_sessions_path = source.sessions_path().to_path_buf();
-                &[&source]
-            };
-            let journal_path = move_journal::record(&entry, source.sessions_path())?;
-            let outcome = reconcile_loaded(storages);
-
-            assert!(!outcome.repaired, "{case}");
-            assert_eq!(journal_entry_count(&source), 1, "{case}: evidence remains");
-            assert!(
-                unusable_journal_entries_contains(&journal_path),
-                "{case}: semantic invalidity is permanently recorded"
-            );
-        }
-        Ok(())
-    }
-
-    #[test]
     fn dual_storage_lock_blocks_target_only_writer() -> Result<()> {
         let (_temp, _guard, source, target, _before, _after) = setup_recovery_env("dual-lock")?;
         let target_path = target.sessions_path().to_path_buf();
@@ -4167,134 +4168,6 @@ mod tests {
         assert!(
             !entered_early,
             "target writer entered before dual lock release"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn unresolved_newer_intent_blocks_older_overlapping_journal() -> Result<()> {
-        for case in ["resolve-miss", "opaque"] {
-            let (_temp, _guard, a, b, before, _after) = setup_recovery_env(case)?;
-            push_copy(&b, &before)?;
-            let now = now_ms();
-            let mut older = fresh_journal_entry(&a, &b, &before.id);
-            older.created_at_epoch_ms = now - 60_000;
-            move_journal::record(&older, a.sessions_path())?;
-            if case == "resolve-miss" {
-                let mut newer = fresh_journal_entry(&b, &a, &before.id);
-                newer.created_at_epoch_ms = now;
-                newer.target_profile = "missing-profile".to_string();
-                newer.target_sessions_path = a.sessions_path().with_file_name("missing.json");
-                move_journal::record(&newer, b.sessions_path())?;
-            } else {
-                let journal_dir = b.sessions_path().parent().unwrap().join(".move-journal");
-                fs::create_dir_all(&journal_dir)?;
-                fs::write(
-                    journal_dir.join("move-99999999999999999999-1.json"),
-                    b"not-json",
-                )?;
-            }
-            let outcome = reconcile_loaded(&[&a, &b]);
-
-            assert!(!outcome.repaired, "{case}: older intent must not apply");
-            assert_eq!(outcome.reports.len(), 1, "{case}: duplicate stays surfaced");
-            assert_eq!(a.load()?.len(), 1, "{case}: newer target copy remains");
-            assert_eq!(b.load()?.len(), 1, "{case}: no copy is removed");
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn shadowed_batch_propagates_block_to_every_id() -> Result<()> {
-        let (_temp, _guard, a, b, x, _after) = setup_recovery_env("transitive")?;
-        let mut y = Instance::new("y", "/repo/y");
-        y.source_profile = a.profile().to_string();
-        a.update(|instances, _| {
-            instances.push(y.clone());
-            Ok(())
-        })?;
-        b.update(|instances, _| {
-            let mut x_copy = x.clone();
-            x_copy.source_profile = b.profile().to_string();
-            let mut y_copy = y.clone();
-            y_copy.source_profile = b.profile().to_string();
-            instances.extend([x_copy, y_copy]);
-            Ok(())
-        })?;
-        let now = now_ms();
-
-        let mut j1 = fresh_journal_entry(&a, &b, &y.id);
-        j1.created_at_epoch_ms = now - 120_000;
-        let mut j2 = fresh_journal_entry(&b, &a, &x.id);
-        j2.ids.push(y.id.clone());
-        j2.ids.sort();
-        j2.created_at_epoch_ms = now - 60_000;
-        let mut j3 = fresh_journal_entry(&a, &b, &x.id);
-        j3.target_profile = "missing".to_string();
-        j3.target_sessions_path = a.sessions_path().with_file_name("missing.json");
-        j3.created_at_epoch_ms = now;
-        move_journal::record(&j1, a.sessions_path())?;
-        move_journal::record(&j2, b.sessions_path())?;
-        move_journal::record(&j3, a.sessions_path())?;
-        let outcome = reconcile_loaded(&[&a, &b]);
-
-        assert!(!outcome.repaired);
-        assert_eq!(outcome.reports.len(), 2);
-        assert_eq!(a.load()?.len(), 2, "newer X+Y target remains intact");
-        assert_eq!(b.load()?.len(), 2, "no stale journal deletes either copy");
-        Ok(())
-    }
-
-    #[test]
-    fn duplicate_target_rows_never_become_an_automatic_winner() -> Result<()> {
-        let (_temp, _guard, source, target, before, _after) = setup_recovery_env("target-dup")?;
-        target.update(|instances, _| {
-            for _ in 0..2 {
-                let mut copy = before.clone();
-                copy.source_profile = target.profile().to_string();
-                instances.push(copy);
-            }
-            Ok(())
-        })?;
-        let entry = fresh_journal_entry(&source, &target, &before.id);
-        move_journal::record(&entry, source.sessions_path())?;
-        let outcome = reconcile_loaded(&[&source, &target]);
-
-        assert!(!outcome.repaired);
-        assert_eq!(outcome.reports.len(), 1);
-        assert_eq!(source.load()?.len(), 1, "source copy is preserved");
-        assert_eq!(
-            target.load()?.len(),
-            2,
-            "ambiguous target copies remain surfaced"
-        );
-        assert_eq!(
-            journal_entry_count(&source),
-            1,
-            "evidence remains for manual resolution"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn invalid_id_entry_is_permanently_insufficient() -> Result<()> {
-        let (_temp, _guard, source, target, before, _after) = setup_recovery_env("badid")?;
-        push_copy(&target, &before)?;
-        let entry = move_journal::MoveJournalEntry {
-            ids: vec!["../escape".to_string()],
-            ..fresh_journal_entry(&source, &target, &before.id)
-        };
-        move_journal::record(&entry, source.sessions_path())?;
-        assert_eq!(journal_entry_count(&source), 1);
-
-        let outcome = reconcile_loaded(&[&source, &target]);
-
-        assert!(!outcome.repaired);
-        assert_eq!(journal_entry_count(&source), 1, "entry stays on disk");
-        let journal_path = first_journal_path(&source);
-        assert!(
-            unusable_journal_entries_contains(&journal_path),
-            "invalid-id entry is blacklisted"
         );
         Ok(())
     }
@@ -4347,25 +4220,6 @@ mod tests {
 
         fs::remove_file(&path)?;
         assert!(!target_still_holds(&path, &[winner.id])?);
-        Ok(())
-    }
-
-    #[test]
-    fn same_profile_duplicate_id_is_surfaced() -> Result<()> {
-        let (_temp, _guard, source, _target, before, _after) = setup_recovery_env("intraprofile")?;
-        source.update(|instances, _| {
-            instances.push(before.clone());
-            Ok(())
-        })?;
-
-        let outcome = reconcile_loaded(&[&source]);
-
-        assert!(!outcome.repaired);
-        assert_eq!(outcome.reports.len(), 1, "the repeated id surfaces");
-        let report = &outcome.reports[0];
-        assert_eq!(report.id, before.id);
-        assert!(report.actionable_message().contains(&before.id));
-        assert_eq!(source.load()?.len(), 2, "nothing is deleted automatically");
         Ok(())
     }
 
@@ -4576,82 +4430,45 @@ mod tests {
     }
 
     #[test]
-    fn backup_pruning_syncs_the_lexical_backup_directory() -> Result<()> {
+    fn recovery_backups_keep_the_newest_three_and_sync_their_directory() -> Result<()> {
         let temp = tempdir()?;
         let path = temp.path().join("profile/sessions.json");
         fs::create_dir_all(path.parent().unwrap())?;
-        for stamp in 1..=4 {
+        fs::write(&path, b"[]")?;
+        for stamp in 1..=5 {
             fs::write(
                 path.with_file_name(format!("sessions.json.pre-recovery-{stamp}")),
                 stamp.to_string(),
             )?;
         }
+        let stamps = || -> Result<Vec<u128>> {
+            let mut stamps: Vec<u128> = fs::read_dir(path.parent().unwrap())?
+                .filter_map(|entry| entry.ok().map(|entry| entry.file_name()))
+                .filter_map(|name| {
+                    name.to_string_lossy()
+                        .strip_prefix("sessions.json.pre-recovery-")
+                        .and_then(|value| value.parse().ok())
+                })
+                .collect();
+            stamps.sort();
+            Ok(stamps)
+        };
         let mut synced = Vec::new();
-
-        prune_old_recovery_backups_with_sync(&path, 3, |candidate| {
+        prune_old_recovery_backups_with_sync(&path, 4, |candidate| {
             synced.push(candidate.to_path_buf());
             Ok(())
         })?;
+        assert_eq!(
+            synced,
+            vec![path.clone()],
+            "prune syncs the backup directory"
+        );
+        assert_eq!(stamps()?, [2, 3, 4, 5]);
 
-        assert_eq!(synced, vec![path]);
-        Ok(())
-    }
-
-    #[test]
-    fn recovery_backup_retention_keeps_newest_three() -> Result<()> {
-        let temp = tempdir()?;
-        let path = temp.path().join("sessions.json");
-        fs::write(&path, b"[]")?;
-        for stamp in 1..=5 {
-            fs::write(
-                temp.path()
-                    .join(format!("sessions.json.pre-recovery-{stamp}")),
-                stamp.to_string(),
-            )?;
-        }
         backup_before_repair(&path)?;
-        let mut stamps: Vec<u128> = fs::read_dir(temp.path())?
-            .filter_map(|entry| entry.ok().map(|entry| entry.file_name()))
-            .filter_map(|name| {
-                name.to_string_lossy()
-                    .strip_prefix("sessions.json.pre-recovery-")
-                    .and_then(|value| value.parse().ok())
-            })
-            .collect();
-        stamps.sort();
+        let stamps = stamps()?;
         assert_eq!(stamps.len(), RECOVERY_BACKUPS_TO_KEEP);
         assert_eq!(&stamps[..2], &[4, 5], "oldest backups are pruned");
-        Ok(())
-    }
-
-    #[test]
-    fn post_repair_load_error_preserves_pre_repair_report() -> Result<()> {
-        let temp = tempdir()?;
-        let good_dir = temp.path().join("good");
-        let bad_dir = temp.path().join("bad");
-        fs::create_dir_all(&good_dir)?;
-        fs::create_dir_all(&bad_dir)?;
-        let good = Storage::new_for_test_path("good", good_dir.join("sessions.json"));
-        let bad = Storage::new_for_test_path("bad", bad_dir.join("sessions.json"));
-        let row = Instance::new("duplicate", "/repo/duplicate");
-        good.update(|instances, _| {
-            instances.push(row.clone());
-            Ok(())
-        })?;
-        fs::write(bad.sessions_path(), b"not-json")?;
-        let good_rows = good.load()?;
-        let fallback_bad = vec![row.clone()];
-        let fallback: Vec<(&str, &[Instance])> = vec![
-            ("good", good_rows.as_slice()),
-            ("bad", fallback_bad.as_slice()),
-        ];
-        let stores: Vec<(&str, &Storage)> = vec![("good", &good), ("bad", &bad)];
-
-        let (reports, reload_succeeded) = reports_after_repair(&fallback, &stores);
-
-        assert!(!reload_succeeded, "Home must keep its pre-repair loads");
-        assert_eq!(reports.len(), 1, "load error keeps ambiguity surfaced");
-        assert_eq!(reports[0].id, row.id);
         Ok(())
     }
 

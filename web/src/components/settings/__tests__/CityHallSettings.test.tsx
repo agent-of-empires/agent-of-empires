@@ -26,28 +26,7 @@ afterEach(() => {
 });
 
 describe("CityHallSettings contract", () => {
-  /// Download and Copy would produce an empty file before a bundle is fetched.
-  it("offers nothing to take away until a bundle has been generated", () => {
-    const { queryByText, getByTestId } = render(<CityHallSettings />);
-    expect(getByTestId("cityhall-export").textContent).toBe("Generate bundle");
-    expect(queryByText(/Download/)).toBeNull();
-    expect(queryByText("Copy")).toBeNull();
-  });
-
-  it("renders the fetched bundle and offers it for download", async () => {
-    fetchCityHallBundle.mockResolvedValue(BUNDLE);
-    const { getByTestId, findByText, container } = render(<CityHallSettings />);
-
-    fireEvent.click(getByTestId("cityhall-export"));
-    await findByText(/Download cityhall.toml/);
-    // The document itself is shown, so an admin can see what they are about to
-    // hand over.
-    expect(container.querySelector("pre")?.textContent).toContain('name = "demo"');
-    // A second run replaces rather than appends.
-    expect(getByTestId("cityhall-export").textContent).toBe("Regenerate");
-  });
-
-  it("downloads exactly the fetched bytes", async () => {
+  it("shows and downloads exactly the fetched bytes, only once generated", async () => {
     fetchCityHallBundle.mockResolvedValue(BUNDLE);
     const blobs: Blob[] = [];
     // jsdom implements neither createObjectURL nor an anchor click that
@@ -62,9 +41,14 @@ describe("CityHallSettings contract", () => {
       revokeObjectURL: vi.fn(),
     });
 
-    const { getByTestId, findByText } = render(<CityHallSettings />);
+    const { getByTestId, findByText, queryByText, container } = render(<CityHallSettings />);
+    // Download and Copy would produce an empty file before a bundle is fetched.
+    expect(queryByText(/Download/)).toBeNull();
+    expect(queryByText("Copy")).toBeNull();
     fireEvent.click(getByTestId("cityhall-export"));
     const download = await findByText(/Download cityhall.toml/);
+    expect(container.querySelector("pre")?.textContent).toContain('name = "demo"');
+    expect(getByTestId("cityhall-export").textContent).toBe("Regenerate");
     fireEvent.click(download);
 
     expect(blobs).toHaveLength(1);

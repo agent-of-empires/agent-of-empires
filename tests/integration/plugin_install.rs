@@ -6,7 +6,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use agent_of_empires::plugin::install::{self, UpdateOutcome, UpdatePreview};
+use agent_of_empires::plugin::install::{self, UpdatePreview};
 use agent_of_empires::plugin::lockfile::Lockfile;
 use agent_of_empires::plugin::registry::PluginRegistry;
 use agent_of_empires::plugin::{auto_update, update_check};
@@ -175,86 +175,48 @@ api_version = 2
         locked.tree_hash
     );
 
+    let needs_update = || async {
+        update_check::outdated()
+            .await
+            .into_iter()
+            .find(|s| s.id == "acme.local")
+            .expect("present")
+            .needs_update
+    };
+    assert!(!needs_update().await, "fresh install is current");
+    // Editing the local source tree diverges its re-hash from the lock.
+    std::fs::write(dir.join("added.txt"), "changed").unwrap();
+    assert!(needs_update().await, "local tree change detected");
+
     install::uninstall("acme.local").unwrap();
     assert!(load_registry().get("acme.local").is_none());
     assert!(Lockfile::load().unwrap().get("acme.local").is_none());
 }
 
+/// Install refuses a manifest in the reserved `aoe.` namespace and one that
+/// asks for a capability this build does not support.
 #[tokio::test]
 #[serial]
-async fn reserved_namespace_is_rejected() {
+async fn invalid_manifests_are_rejected() {
     let _home = isolate();
-    let src = tempfile::tempdir().unwrap();
-    let dir = write_plugin_dir(
-        src.path(),
-        r#"
-id = "aoe.evil"
-name = "Evil"
-version = "0.1.0"
-api_version = 2
-"#,
-    );
-    let err = install::install(dir.to_str().unwrap(), true)
-        .await
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("reserved namespace"), "got: {err}");
-}
-
-#[tokio::test]
-#[serial]
-async fn unknown_capability_is_rejected() {
-    let _home = isolate();
-    let src = tempfile::tempdir().unwrap();
-    let dir = write_plugin_dir(
-        src.path(),
-        r#"
-id = "acme.future"
-name = "Future"
-version = "0.1.0"
-api_version = 2
-capabilities = ["totally.unknown"]
-"#,
-    );
-    let err = install::install(dir.to_str().unwrap(), true)
-        .await
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("does not support"), "got: {err}");
-}
-
-#[tokio::test]
-#[serial]
-async fn grant_is_pinned_to_manifest_hash() {
-    let _home = isolate();
-    let src = tempfile::tempdir().unwrap();
-    let dir = write_plugin_dir(
-        src.path(),
-        r#"
-id = "acme.caps"
-name = "Caps"
-version = "0.1.0"
-api_version = 2
-capabilities = ["net"]
-"#,
-    );
-    install::install(dir.to_str().unwrap(), true).await.unwrap();
-    assert!(load_registry().get("acme.caps").unwrap().active());
-
-    // Tamper with the installed manifest so its hash changes; the grant no
-    // longer covers it, so the plugin deactivates and needs re-approval.
-    let installed = agent_of_empires::plugin::plugins_dir()
-        .unwrap()
-        .join("acme.caps")
-        .join("aoe-plugin.toml");
-    let mut text = std::fs::read_to_string(&installed).unwrap();
-    text.push_str("\n# tampered\n");
-    std::fs::write(&installed, text).unwrap();
-
-    let reg = load_registry();
-    let plugin = reg.get("acme.caps").unwrap();
-    assert!(!plugin.active(), "stale grant must deactivate the plugin");
-    assert!(plugin.needs_reapproval());
+    for (manifest, expected) in [
+        (
+            "id = \"aoe.evil\"\nname = \"Evil\"\nversion = \"0.1.0\"\napi_version = 2\n",
+            "reserved namespace",
+        ),
+        (
+            "id = \"acme.future\"\nname = \"Future\"\nversion = \"0.1.0\"\napi_version = 2\ncapabilities = [\"totally.unknown\"]\n",
+            "does not support",
+        ),
+    ] {
+        let src = tempfile::tempdir().unwrap();
+        let dir = write_plugin_dir(src.path(), manifest);
+        let err = install::install(dir.to_str().unwrap(), true)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(expected), "got: {err}");
+    }
 }
 
 /// Re-approval closes the stale-grant loop without a network fetch: the
@@ -277,14 +239,24 @@ capabilities = ["net"]
 "#,
     );
     install::install(dir.to_str().unwrap(), true).await.unwrap();
+    assert!(load_registry().get("acme.regrant").unwrap().active());
 
-    // Grow the capability set on disk so the grant no longer covers the
-    // manifest; reload the process-global registry the install API consults.
+    // The grant pins the manifest bytes: a comment-only edit revokes it.
     let installed = agent_of_empires::plugin::plugins_dir()
         .unwrap()
         .join("acme.regrant")
         .join("aoe-plugin.toml");
-    let text = std::fs::read_to_string(&installed).unwrap().replace(
+    let mut text = std::fs::read_to_string(&installed).unwrap();
+    text.push_str("\n# tampered\n");
+    std::fs::write(&installed, &text).unwrap();
+    assert!(load_registry()
+        .get("acme.regrant")
+        .unwrap()
+        .needs_reapproval());
+
+    // Grow the capability set on disk too; reload the process-global registry
+    // the install API consults.
+    let text = text.replace(
         "capabilities = [\"net\"]",
         "capabilities = [\"net\", \"notifications\"]",
     );
@@ -481,72 +453,44 @@ api_version = 2
     std::env::remove_var("AOE_UPDATE_API_BASE");
 }
 
+/// An unverified GitHub install bails without --yes on a non-terminal stdin
+/// rather than installing un-audited code: a bare repo with no release falls
+/// back to the default branch (the releases API 404s), and an explicit `@ref`
+/// is never verified.
 #[tokio::test]
 #[serial]
-async fn github_no_ref_no_release_bails_without_yes() {
+async fn unverified_github_sources_require_confirmation_without_yes() {
     let _home = isolate();
-    let base = tempfile::tempdir().unwrap();
-    make_bare_repo(
-        base.path(),
-        "acme",
-        "norel",
-        &[(
-            "aoe-plugin.toml",
-            r#"
-id = "acme.norel"
-name = "NoRel"
-version = "1.0.0"
-api_version = 2
-"#,
-        )],
-    );
-    // A releases API with no matching route returns 404 -> no release found ->
-    // default-branch fallback, which is unverified and (non-interactively,
-    // without --yes) must bail rather than silently install.
-    let server = spawn_latest_release("other", "repo", "v9").await;
+    for (repo, source) in [
+        ("norel", "gh:acme/norel"),
+        ("widget", "gh:acme/widget@main"),
+    ] {
+        let base = tempfile::tempdir().unwrap();
+        let id = format!("acme.{repo}");
+        make_bare_repo(
+            base.path(),
+            "acme",
+            repo,
+            &[(
+                "aoe-plugin.toml",
+                &format!(
+                    "id = \"{id}\"\nname = \"{repo}\"\nversion = \"1.0.0\"\napi_version = 2\n"
+                ),
+            )],
+        );
+        let server = spawn_latest_release("other", "repo", "v9").await;
 
-    let err = install::install("gh:acme/norel", false)
-        .await
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("unverified"), "got: {err}");
-    assert!(load_registry().get("acme.norel").is_none());
+        let err = install::install(source, false)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unverified"), "{source}: {err}");
+        assert!(load_registry().get(&id).is_none(), "{source}");
 
-    server.abort();
+        server.abort();
+    }
     std::env::remove_var("AOE_GITHUB_CLONE_BASE");
     std::env::remove_var("AOE_UPDATE_API_BASE");
-}
-
-#[tokio::test]
-#[serial]
-async fn explicit_ref_requires_confirmation_without_yes() {
-    let _home = isolate();
-    let base = tempfile::tempdir().unwrap();
-    make_bare_repo(
-        base.path(),
-        "acme",
-        "widget",
-        &[(
-            "aoe-plugin.toml",
-            r#"
-id = "acme.widget"
-name = "Widget"
-version = "1.0.0"
-api_version = 2
-"#,
-        )],
-    );
-
-    // An explicit `@ref` is unverified; without --yes on a non-terminal stdin it
-    // bails rather than installing un-audited code.
-    let err = install::install("gh:acme/widget@main", false)
-        .await
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("unverified"), "got: {err}");
-    assert!(load_registry().get("acme.widget").is_none());
-
-    std::env::remove_var("AOE_GITHUB_CLONE_BASE");
 }
 
 #[tokio::test]
@@ -660,154 +604,61 @@ fn write_featured(dir: &Path, id: &str, source: &str, tree_hash: &str) -> PathBu
     write_featured_versions(dir, id, source, &[("1.0.0", tree_hash)])
 }
 
+/// Only a vetted featured release lifts the reserved-namespace gate. The same
+/// unvetted pin on a non-reserved id still installs, labelled by its source.
 #[tokio::test]
 #[serial]
-async fn featured_verified_reserved_namespace_installs() {
-    let _home = isolate();
-    let src = tempfile::tempdir().unwrap();
-    // A reserved-namespace id is normally rejected; a matching featured pin
-    // lifts it.
-    let dir = write_plugin_dir(
-        src.path(),
-        r#"
-id = "agent-of-empires.official"
-name = "Official"
-version = "1.0.0"
-api_version = 2
-"#,
-    );
-    let tree_hash = agent_of_empires::plugin::integrity::tree_hash(&dir).unwrap();
-    write_featured(
-        src.path(),
-        "agent-of-empires.official",
-        dir.to_str().unwrap(),
-        &tree_hash,
-    );
+async fn featured_pins_gate_the_reserved_namespace() {
+    const UNVETTED: &str =
+        "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+    // (id, pin the installed tree, expected validation or refusal fragment)
+    let cases: [(&str, bool, Result<&str, &str>); 3] = [
+        ("agent-of-empires.official", true, Ok("featured")),
+        ("acme.featured", false, Ok("local")),
+        ("agent-of-empires.official", false, Err("reserved")),
+    ];
+    for (id, vetted, expected) in cases {
+        let _home = isolate();
+        let src = tempfile::tempdir().unwrap();
+        let dir = write_plugin_dir(
+            src.path(),
+            &format!("id = \"{id}\"\nname = \"Pinned\"\nversion = \"1.0.0\"\napi_version = 2\n"),
+        );
+        let tree_hash = agent_of_empires::plugin::integrity::tree_hash(&dir).unwrap();
+        // The installed tree is the second listed release, so an earlier vetted
+        // release must not un-verify it.
+        let current = if vetted { tree_hash.as_str() } else { UNVETTED };
+        write_featured_versions(
+            src.path(),
+            id,
+            dir.to_str().unwrap(),
+            &[("0.9.0", UNVETTED), ("1.0.0", current)],
+        );
 
-    install::install(dir.to_str().unwrap(), true).await.unwrap();
-
-    let reg = load_registry();
-    let plugin = reg.get("agent-of-empires.official").expect("installed");
-    assert_eq!(plugin.validation.as_str(), "featured");
-    let lock = Lockfile::load().unwrap();
-    let locked = lock.get("agent-of-empires.official").unwrap();
-    assert_eq!(locked.trust, "featured");
-    assert_eq!(locked.tree_hash, tree_hash);
-
-    std::env::remove_var("AOE_FEATURED_INDEX_PATH");
-}
-
-#[tokio::test]
-#[serial]
-async fn featured_unvetted_version_installs_as_community() {
-    let _home = isolate();
-    let src = tempfile::tempdir().unwrap();
-    let dir = write_plugin_dir(
-        src.path(),
-        r#"
-id = "acme.featured"
-name = "Featured"
-version = "1.0.0"
-api_version = 2
-"#,
-    );
-    // The id is featured but pinned to a different (unvetted) hash. For a
-    // non-reserved id this is not tamper-refuse: it installs as an unvetted
-    // version (community).
-    write_featured(
-        src.path(),
-        "acme.featured",
-        dir.to_str().unwrap(),
-        "sha256:0000000000000000000000000000000000000000000000000000000000000000",
-    );
-
-    let report = install::install(dir.to_str().unwrap(), true).await.unwrap();
-    assert_eq!(
-        report.validation.as_str(),
-        "local",
-        "the install report surfaces a local-directory install as local"
-    );
-
-    // It installs (not refused) and is not featured. The non-featured label
-    // ("local" here, since the install source is a local dir; "community" for a
-    // gh: install) is derived from the source, not the hash mismatch.
-    let reg = load_registry();
-    let plugin = reg.get("acme.featured").expect("installed");
-    assert_ne!(plugin.validation.as_str(), "featured");
-    assert_eq!(plugin.validation.as_str(), "local");
-
-    std::env::remove_var("AOE_FEATURED_INDEX_PATH");
-}
-
-#[tokio::test]
-#[serial]
-async fn featured_second_vetted_version_verifies() {
-    let _home = isolate();
-    let src = tempfile::tempdir().unwrap();
-    let dir = write_plugin_dir(
-        src.path(),
-        r#"
-id = "agent-of-empires.official"
-name = "Official"
-version = "1.1.0"
-api_version = 2
-"#,
-    );
-    let tree_hash = agent_of_empires::plugin::integrity::tree_hash(&dir).unwrap();
-    // The actual tree is the second vetted release; an earlier release is also
-    // listed and must not un-verify this one.
-    write_featured_versions(
-        src.path(),
-        "agent-of-empires.official",
-        dir.to_str().unwrap(),
-        &[
-            (
-                "1.0.0",
-                "sha256:0000000000000000000000000000000000000000000000000000000000000000",
-            ),
-            ("1.1.0", &tree_hash),
-        ],
-    );
-
-    install::install(dir.to_str().unwrap(), true).await.unwrap();
-
-    let reg = load_registry();
-    let plugin = reg.get("agent-of-empires.official").expect("installed");
-    assert_eq!(plugin.validation.as_str(), "featured");
-
-    std::env::remove_var("AOE_FEATURED_INDEX_PATH");
-}
-
-#[tokio::test]
-#[serial]
-async fn featured_reserved_namespace_unvetted_is_refused() {
-    let _home = isolate();
-    let src = tempfile::tempdir().unwrap();
-    // A reserved-namespace id at an unvetted hash is still refused: only a
-    // vetted release lifts the reserved-namespace gate.
-    let dir = write_plugin_dir(
-        src.path(),
-        r#"
-id = "agent-of-empires.official"
-name = "Official"
-version = "1.0.0"
-api_version = 2
-"#,
-    );
-    write_featured(
-        src.path(),
-        "agent-of-empires.official",
-        dir.to_str().unwrap(),
-        "sha256:0000000000000000000000000000000000000000000000000000000000000000",
-    );
-
-    let err = install::install(dir.to_str().unwrap(), true)
-        .await
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("reserved"), "got: {err}");
-    assert!(load_registry().get("agent-of-empires.official").is_none());
-
+        let result = install::install(dir.to_str().unwrap(), true).await;
+        match expected {
+            Ok(validation) => {
+                let report = result.unwrap_or_else(|e| panic!("{id} vetted={vetted}: {e}"));
+                assert_eq!(report.validation.as_str(), validation, "{id}");
+                let reg = load_registry();
+                assert_eq!(
+                    reg.get(id).expect("installed").validation.as_str(),
+                    validation
+                );
+                if validation == "featured" {
+                    let lock = Lockfile::load().unwrap();
+                    let locked = lock.get(id).unwrap();
+                    assert_eq!(locked.trust, "featured");
+                    assert_eq!(locked.tree_hash, tree_hash);
+                }
+            }
+            Err(fragment) => {
+                let err = result.expect_err("an unvetted reserved id must be refused");
+                assert!(err.to_string().contains(fragment), "got: {err}");
+                assert!(load_registry().get(id).is_none());
+            }
+        }
+    }
     std::env::remove_var("AOE_FEATURED_INDEX_PATH");
 }
 
@@ -900,13 +751,14 @@ asset = "bin-${os}-${arch}"
 }
 
 /// Build steps run in the FINAL installed directory (not the staging tree that
-/// is renamed away), so a build artifact lands at `<plugins_dir>/<id>`. Uses a
-/// bare `sh` launch command (resolves on PATH) so install's post-build
-/// entrypoint check passes without the build having to produce an executable.
+/// is renamed away), so a build artifact lands at `<plugins_dir>/<id>`, and a
+/// step whose `platforms` excludes the host OS is skipped. Uses a bare `sh`
+/// launch command (resolves on PATH) so install's post-build entrypoint check
+/// passes without the build having to produce an executable.
 #[cfg(unix)]
 #[tokio::test]
 #[serial]
-async fn build_step_runs_in_final_dir() {
+async fn build_steps_run_in_final_dir_for_matching_platforms() {
     let _home = isolate();
     let src = tempfile::tempdir().unwrap();
     let dir = write_plugin_dir(
@@ -924,40 +776,6 @@ system = true
 
 [[runtime.build]]
 command = ["cp", "aoe-plugin.toml", "build-marker"]
-"#,
-    );
-
-    install::install(dir.to_str().unwrap(), true).await.unwrap();
-
-    let installed = agent_of_empires::plugin::plugins_dir()
-        .unwrap()
-        .join("acme.built");
-    assert!(
-        installed.join("build-marker").exists(),
-        "build step ran with cwd = the final plugin dir"
-    );
-}
-
-/// A build step whose `platforms` excludes the host OS is skipped, so its
-/// artifact is never produced and install still succeeds.
-#[cfg(unix)]
-#[tokio::test]
-#[serial]
-async fn build_step_skipped_on_non_matching_platform() {
-    let _home = isolate();
-    let src = tempfile::tempdir().unwrap();
-    let dir = write_plugin_dir(
-        src.path(),
-        r#"
-id = "acme.skip"
-name = "Skip"
-version = "0.1.0"
-api_version = 2
-
-[runtime]
-kind = "command"
-command = ["sh"]
-system = true
 
 [[runtime.build]]
 command = ["cp", "aoe-plugin.toml", "should-not-exist"]
@@ -969,10 +787,10 @@ platforms = ["windows"]
 
     let installed = agent_of_empires::plugin::plugins_dir()
         .unwrap()
-        .join("acme.skip");
+        .join("acme.built");
     assert!(
-        installed.exists(),
-        "install succeeds with all steps skipped"
+        installed.join("build-marker").exists(),
+        "build step ran with cwd = the final plugin dir"
     );
     assert!(
         !installed.join("should-not-exist").exists(),
@@ -1213,59 +1031,6 @@ api_version = 2
 
 #[tokio::test]
 #[serial]
-async fn outdated_detects_new_github_commit() {
-    let _home = isolate();
-    let base = tempfile::tempdir().unwrap();
-    make_bare_repo(
-        base.path(),
-        "acme",
-        "upd",
-        &[("aoe-plugin.toml", PLAIN_MANIFEST)],
-    );
-    // Branch tracking is now an explicit-ref opt-in: `@main` follows the default
-    // branch (no release resolution), which these update-mechanics tests need.
-    install::install("gh:acme/upd@main", true).await.unwrap();
-
-    let before = update_check::outdated().await;
-    let s = before.iter().find(|s| s.id == "acme.upd").expect("present");
-    assert!(!s.needs_update, "fresh install is current: {s:?}");
-    assert!(s.error.is_none(), "no check error: {s:?}");
-
-    // Advance the remote; the same manifest stays so it is a clean update.
-    push_new_commit(base.path(), "acme", "upd", &[("extra.txt", "new")]);
-    let after = update_check::outdated().await;
-    let s = after.iter().find(|s| s.id == "acme.upd").expect("present");
-    assert!(s.needs_update, "new commit detected: {s:?}");
-
-    std::env::remove_var("AOE_GITHUB_CLONE_BASE");
-}
-
-#[tokio::test]
-#[serial]
-async fn outdated_detects_changed_local_tree() {
-    let _home = isolate();
-    let src = tempfile::tempdir().unwrap();
-    let dir = write_plugin_dir(src.path(), PLAIN_MANIFEST);
-    install::install(dir.to_str().unwrap(), true).await.unwrap();
-
-    let before = update_check::outdated().await;
-    assert!(
-        !before
-            .iter()
-            .find(|s| s.id == "acme.upd")
-            .unwrap()
-            .needs_update
-    );
-
-    // Edit the local source tree; the re-hash should diverge from the lock.
-    std::fs::write(dir.join("added.txt"), "changed").unwrap();
-    let after = update_check::outdated().await;
-    let s = after.iter().find(|s| s.id == "acme.upd").expect("present");
-    assert!(s.needs_update, "local tree change detected: {s:?}");
-}
-
-#[tokio::test]
-#[serial]
 async fn auto_update_applies_clean_github_update() {
     let _home = isolate();
     let base = tempfile::tempdir().unwrap();
@@ -1279,9 +1044,18 @@ async fn auto_update_applies_clean_github_update() {
     // Branch tracking is now an explicit-ref opt-in: `@main` follows the default
     // branch (no release resolution), which these update-mechanics tests need.
     install::install("gh:acme/upd@main", true).await.unwrap();
+    let before = update_check::outdated().await;
+    let s = before.iter().find(|s| s.id == "acme.upd").expect("present");
+    assert!(
+        !s.needs_update && s.error.is_none(),
+        "fresh install is current: {s:?}"
+    );
 
     // A clean (no consent change) newer version on the remote.
     push_new_commit(base.path(), "acme", "upd", &[("aoe-plugin.toml", &v2)]);
+    let after = update_check::outdated().await;
+    let s = after.iter().find(|s| s.id == "acme.upd").expect("present");
+    assert!(s.needs_update, "new commit detected: {s:?}");
     let rec = std::sync::Arc::new(RecordingNotifier::default());
     let notifier: std::sync::Arc<dyn auto_update::UpdateNotifier> = rec.clone();
     let summary = auto_update::sweep(Some(&notifier)).await;
@@ -1294,48 +1068,6 @@ async fn auto_update_applies_clean_github_update() {
     assert_eq!(
         Lockfile::load().unwrap().get("acme.upd").unwrap().version,
         "2.0.0",
-    );
-
-    std::env::remove_var("AOE_GITHUB_CLONE_BASE");
-}
-
-#[tokio::test]
-#[serial]
-async fn clean_update_skips_capability_change() {
-    let _home = isolate();
-    let base = tempfile::tempdir().unwrap();
-    // Bump the version too, so the "prior version kept" assertion actually
-    // proves nothing was rewritten (a same-version skip could pass vacuously).
-    let with_cap = PLAIN_MANIFEST.replace("1.0.0", "2.0.0").replace(
-        "api_version = 2",
-        "api_version = 2\ncapabilities = [\"net\"]",
-    );
-    make_bare_repo(
-        base.path(),
-        "acme",
-        "upd",
-        &[("aoe-plugin.toml", PLAIN_MANIFEST)],
-    );
-    // Branch tracking is now an explicit-ref opt-in: `@main` follows the default
-    // branch (no release resolution), which these update-mechanics tests need.
-    install::install("gh:acme/upd@main", true).await.unwrap();
-
-    // The new version adds a capability, so a non-interactive clean update must
-    // skip it and leave the prior version installed.
-    push_new_commit(
-        base.path(),
-        "acme",
-        "upd",
-        &[("aoe-plugin.toml", &with_cap)],
-    );
-    match install::update_clean("acme.upd").await.unwrap() {
-        UpdateOutcome::Skipped { id, .. } => assert_eq!(id, "acme.upd"),
-        other => panic!("expected skip on capability change, got {other:?}"),
-    }
-    assert_eq!(
-        Lockfile::load().unwrap().get("acme.upd").unwrap().version,
-        "1.0.0",
-        "prior version kept",
     );
 
     std::env::remove_var("AOE_GITHUB_CLONE_BASE");
@@ -1526,6 +1258,11 @@ async fn sweep_notifies_then_respects_a_dismissal() {
     assert!(
         rec.applied.lock().unwrap().is_empty(),
         "a skipped update restarts nothing",
+    );
+    assert_eq!(
+        Lockfile::load().unwrap().get("acme.upd").unwrap().version,
+        "1.0.0",
+        "a skipped update keeps the prior version",
     );
 
     // After dismissing this exact version, a later sweep stays silent.

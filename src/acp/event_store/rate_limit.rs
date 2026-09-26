@@ -378,72 +378,7 @@ mod tests {
     }
 
     #[test]
-    fn latest_rate_limit_event_returns_most_recent_with_recorded_at() {
-        let (_tmp, store) = open_store(1000);
-        let before = Utc::now().timestamp_millis();
-        store.record("s-1", 1, &rate_limit_event(3600)).unwrap();
-        let second = rate_limit_event(7200);
-        let Event::RateLimit { info: ref expected } = second else {
-            unreachable!()
-        };
-        let expected_resets = expected.resets_at;
-        store.record("s-1", 2, &second).unwrap();
-        let after = Utc::now().timestamp_millis();
-
-        let (info, recorded_at) = store.latest_rate_limit_event("s-1").expect("stored");
-        assert_eq!(info.resets_at, expected_resets, "latest event wins");
-        assert!((before..=after).contains(&recorded_at));
-        assert!(store.latest_rate_limit_event("s-2").is_none());
-    }
-
-    #[test]
-    fn rate_limited_turn_prompt_returns_only_the_interrupted_latest_prompt() {
-        let (_tmp, store) = open_store(1000);
-        let attachment = crate::daemon::PromptAttachmentRef {
-            id: "att-1".into(),
-            kind: crate::daemon::PromptAttachmentKind::Image,
-            mime_type: "image/png".into(),
-            name: Some("shot.png".into()),
-            size: 42,
-        };
-        let with_attachment = Event::UserPromptSent {
-            prompt_id: None,
-            text: "look at this".into(),
-            attachments: vec![attachment.clone()],
-            synthesized: false,
-        };
-        // (events, expected prompt)
-        let cases = [
-            (
-                vec![user_prompt("keep working"), stopped("rate_limited")],
-                Some(("keep working", vec![])),
-            ),
-            (
-                vec![with_attachment, stopped("rate_limited")],
-                Some(("look at this", vec![attachment])),
-            ),
-            (vec![user_prompt("go"), stopped("prompt_complete")], None),
-            // An agent-initiated turn hit the limit after a completed prompt.
-            (
-                vec![
-                    user_prompt("old"),
-                    stopped("prompt_complete"),
-                    stopped("rate_limited"),
-                ],
-                None,
-            ),
-            (vec![], None),
-        ];
-        for (i, (events, want)) in cases.into_iter().enumerate() {
-            let id = format!("s-{i}");
-            record_from(&store, &id, 1, events);
-            let want = want.map(|(text, attachments)| (text.to_string(), attachments));
-            assert_eq!(store.rate_limited_turn_prompt(&id), want, "case {i}");
-        }
-    }
-
-    #[test]
-    fn rate_limit_park_survives_everything_but_a_real_continuation() {
+    fn rate_limit_park_and_interrupted_prompt_read_back() {
         let (_tmp, store) = open_store(1000);
         let info = RateLimitInfo {
             status: "limited".into(),
@@ -543,6 +478,65 @@ mod tests {
         let cap_only = store.rate_limit_park("s-cap-only").expect("cap park");
         assert!(cap_only.cap_reached && cap_only.info.is_none());
         assert!(store.rate_limit_park("never-limited").is_none());
+
+        // The interrupted prompt, and the latest limit event, are read back.
+        let (_tmp, store) = open_store(1000);
+        let attachment = crate::daemon::PromptAttachmentRef {
+            id: "att-1".into(),
+            kind: crate::daemon::PromptAttachmentKind::Image,
+            mime_type: "image/png".into(),
+            name: Some("shot.png".into()),
+            size: 42,
+        };
+        let with_attachment = Event::UserPromptSent {
+            prompt_id: None,
+            text: "look at this".into(),
+            attachments: vec![attachment.clone()],
+            synthesized: false,
+        };
+        // (events, expected prompt)
+        let cases = [
+            (
+                vec![user_prompt("keep working"), stopped("rate_limited")],
+                Some(("keep working", vec![])),
+            ),
+            (
+                vec![with_attachment, stopped("rate_limited")],
+                Some(("look at this", vec![attachment])),
+            ),
+            (vec![user_prompt("go"), stopped("prompt_complete")], None),
+            // An agent-initiated turn hit the limit after a completed prompt.
+            (
+                vec![
+                    user_prompt("old"),
+                    stopped("prompt_complete"),
+                    stopped("rate_limited"),
+                ],
+                None,
+            ),
+            (vec![], None),
+        ];
+        for (i, (events, want)) in cases.into_iter().enumerate() {
+            let id = format!("s-{i}");
+            record_from(&store, &id, 1, events);
+            let want = want.map(|(text, attachments)| (text.to_string(), attachments));
+            assert_eq!(store.rate_limited_turn_prompt(&id), want, "case {i}");
+        }
+
+        let before = Utc::now().timestamp_millis();
+        store.record("latest", 1, &rate_limit_event(3600)).unwrap();
+        let second = rate_limit_event(7200);
+        let Event::RateLimit { info: ref expected } = second else {
+            unreachable!()
+        };
+        let expected_resets = expected.resets_at;
+        store.record("latest", 2, &second).unwrap();
+        let after = Utc::now().timestamp_millis();
+
+        let (info, recorded_at) = store.latest_rate_limit_event("latest").expect("stored");
+        assert_eq!(info.resets_at, expected_resets, "latest event wins");
+        assert!((before..=after).contains(&recorded_at));
+        assert!(store.latest_rate_limit_event("latest-none").is_none());
     }
 
     #[test]
@@ -665,7 +659,7 @@ mod tests {
     }
 
     #[test]
-    fn rate_limit_redelivery_streak_is_durable_under_small_retention() {
+    fn rate_limit_redelivery_streak_survives_retention_and_budget_loss() {
         for cap in [3, 1] {
             let (_tmp, store) = open_store(cap);
             store
@@ -701,14 +695,12 @@ mod tests {
                 .unwrap();
             assert_eq!(store.rate_limit_redelivery_streak("s-1"), 1, "cap {cap}");
         }
-    }
 
-    #[test]
-    fn rate_limit_redelivery_streak_seeds_from_log_for_upgraded_sessions() {
+        // An upgraded session with no budget row seeds its streak from the log.
         let (_tmp, store) = open_store(1000);
         record_from(
             &store,
-            "s-1",
+            "s-seed",
             1,
             [
                 user_prompt("run the nightly task"),
@@ -719,7 +711,9 @@ mod tests {
                 rate_limit_event(0),
             ],
         );
-        store.record("s-1", 21, &stopped("rate_limited")).unwrap();
+        store
+            .record("s-seed", 21, &stopped("rate_limited"))
+            .unwrap();
         store
             .conn()
             .execute(
@@ -727,19 +721,19 @@ mod tests {
                     "DELETE FROM {} WHERE session_id = ?1",
                     store.schema.rate_limit_budgets_table()
                 ),
-                params!["s-1"],
+                params!["s-seed"],
             )
             .unwrap();
         assert_eq!(
-            store.rate_limit_redelivery_streak("s-1"),
+            store.rate_limit_redelivery_streak("s-seed"),
             1,
             "derived from the log"
         );
-        store.record("s-1", 22, &auto_resume()).unwrap();
-        assert_eq!(store.rate_limit_redelivery_streak("s-1"), 1);
+        store.record("s-seed", 22, &auto_resume()).unwrap();
+        assert_eq!(store.rate_limit_redelivery_streak("s-seed"), 1);
         store
-            .record("s-1", 23, &user_prompt("run the nightly task"))
+            .record("s-seed", 23, &user_prompt("run the nightly task"))
             .unwrap();
-        assert_eq!(store.rate_limit_redelivery_streak("s-1"), 2);
+        assert_eq!(store.rate_limit_redelivery_streak("s-seed"), 2);
     }
 }

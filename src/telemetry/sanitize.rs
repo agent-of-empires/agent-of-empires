@@ -98,93 +98,15 @@ mod tests {
         }
     }
 
+    /// Model names are free text and may be private: every output must come
+    /// from the closed vocabulary, and short tokens must not false-positive.
     #[test]
-    fn model_bucket_maps_families_and_reports_unset_separately_from_other() {
-        for (raw, bucket) in [
-            (Some("claude-opus-4-8"), "claude"),
-            (Some("gpt-5"), "openai"),
-            (Some("o3-mini"), "openai"),
-            (Some("gemini-2.5-pro"), "gemini"),
-            (Some("qwen3-coder"), "qwen"),
-            (None, "unset"),
-            (Some(""), "unset"),
-            (Some("   "), "unset"),
-            (Some("acme-internal-v2"), "other"),
-        ] {
-            assert_eq!(model_bucket(raw), bucket, "{raw:?}");
-        }
-    }
-
-    #[test]
-    fn short_openai_tokens_do_not_false_positive() {
-        for name in [
-            "kilo3",
-            "macro1-7b",
-            "kilo3-experimental",
-            "halo4",
-            "mono1x",
-        ] {
-            assert_eq!(
-                model_bucket(Some(name)),
-                "other",
-                "`{name}` must not bucket as openai"
-            );
-        }
-    }
-
-    #[test]
-    fn unknown_family_is_observable_as_other() {
-        for name in [
-            "acme-internal-v2",
-            "future-model-9000",
-            "kimi-k2",
-            "phi-4",
-            "command-r-plus",
-        ] {
-            assert_eq!(
-                model_bucket(Some(name)),
-                "other",
-                "`{name}` from an unlisted family must surface as the observable `other` bucket"
-            );
-        }
-    }
-
-    #[test]
-    fn output_is_always_from_the_closed_vocabulary() {
+    fn model_bucket_maps_families_into_the_closed_vocabulary() {
         const VOCAB: &[&str] = &[
             "claude", "openai", "gemini", "qwen", "grok", "llama", "mistral", "deepseek", "other",
             "unset",
         ];
-        for input in [
-            None,
-            Some(""),
-            Some("   "),
-            Some("claude-opus-4-8"),
-            Some("gpt-5"),
-            Some("acme-secret-internal-llm-v7"),
-            Some("/opt/models/customer-private-finetune"),
-            Some("name with spaces and / slashes"),
-        ] {
-            let bucket = model_bucket(input);
-            assert!(
-                VOCAB.contains(&bucket),
-                "model_bucket({input:?}) returned `{bucket}`, outside the closed vocabulary"
-            );
-            if let Some(raw) = input {
-                let raw = raw.trim();
-                if !raw.is_empty() && !VOCAB.contains(&raw.to_ascii_lowercase().as_str()) {
-                    assert_ne!(
-                        bucket, raw,
-                        "the raw model string must never be returned verbatim"
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn real_openai_models_still_bucket() {
-        for name in [
+        let openai = [
             "o1",
             "o1-mini",
             "o1-preview",
@@ -194,12 +116,37 @@ mod tests {
             "gpt-5",
             "gpt-4o",
             "codex",
-        ] {
-            assert_eq!(
-                model_bucket(Some(name)),
-                "openai",
-                "`{name}` must bucket as openai"
-            );
+        ];
+        let other = [
+            "kilo3",
+            "macro1-7b",
+            "kilo3-experimental",
+            "halo4",
+            "mono1x",
+            "acme-internal-v2",
+            "future-model-9000",
+            "kimi-k2",
+            "phi-4",
+            "command-r-plus",
+            "acme-secret-internal-llm-v7",
+            "/opt/models/customer-private-finetune",
+            "name with spaces and / slashes",
+        ];
+        let cases = [
+            (Some("claude-opus-4-8"), "claude"),
+            (Some("gemini-2.5-pro"), "gemini"),
+            (Some("qwen3-coder"), "qwen"),
+            (None, "unset"),
+            (Some(""), "unset"),
+            (Some("   "), "unset"),
+        ]
+        .into_iter()
+        .chain(openai.into_iter().map(|name| (Some(name), "openai")))
+        .chain(other.into_iter().map(|name| (Some(name), "other")));
+        for (raw, bucket) in cases {
+            let got = model_bucket(raw);
+            assert_eq!(got, bucket, "{raw:?}");
+            assert!(VOCAB.contains(&got), "{raw:?} -> {got}");
         }
     }
 }

@@ -2873,6 +2873,7 @@ mod tests {
                 agent: "codex".into(),
                 stores: vec![current[0].path.clone()],
                 configuration: Vec::new(),
+                exported_default_store: false,
                 cwd: temporary.path().to_path_buf(),
                 cwd_filesystem: "host".into(),
                 filesystem: "host".into(),

@@ -91,7 +91,7 @@ mod tests {
     }
 
     #[test]
-    fn text_and_id_accessors_bound_check() {
+    fn accessors_edits_and_clear() {
         let q = mirror(&["a", "b"]);
         assert_eq!(q.len(), 2);
         assert_eq!(q.text_at(0), Some("a"));
@@ -100,6 +100,14 @@ mod tests {
         assert_eq!(q.id_at(0), Some("test-0"));
         assert_eq!(q.index_of("test-1"), Some(1));
         assert_eq!(q.index_of("nope"), None);
+
+        let mut q = q;
+        q.set_text("test-1", "B");
+        assert_eq!(q.text_at(1), Some("B"));
+        q.set_text("gone", "x"); // no-op, already drained
+        assert_eq!(q.len(), 2);
+        q.clear();
+        assert!(q.is_empty());
     }
 
     #[test]
@@ -116,21 +124,5 @@ mod tests {
         q.set_snapshot(vec![entry("b", 5, "second"), entry("a", 2, "first")]);
         assert_eq!(q.text_at(0), Some("first"));
         assert_eq!(q.text_at(1), Some("second"));
-    }
-
-    #[test]
-    fn set_text_edits_by_id_or_no_ops() {
-        let mut q = mirror(&["a", "b"]);
-        q.set_text("test-1", "B");
-        assert_eq!(q.text_at(1), Some("B"));
-        q.set_text("gone", "x"); // no-op, already drained
-        assert_eq!(q.len(), 2);
-    }
-
-    #[test]
-    fn clear_empties_the_mirror() {
-        let mut q = mirror(&["x", "y"]);
-        q.clear();
-        assert!(q.is_empty());
     }
 }

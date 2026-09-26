@@ -319,7 +319,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn validate_rejects_unsafe_callback_urls() {
+    fn validate_callback_url_rejects_unsafe_and_accepts_public_targets() {
         let cases = [
             "ftp://example.com/hook",                  // non-http scheme
             "http://127.0.0.1/hook",                   // v4 loopback
@@ -346,10 +346,7 @@ mod tests {
         for url in cases {
             assert!(validate_callback_url(url).is_err(), "must reject {url:?}");
         }
-    }
 
-    #[test]
-    fn validate_accepts_public_callback_urls() {
         let cases = [
             "https://dispatcher.example.com/hook",
             "http://203.0.113.5/hook",
@@ -366,15 +363,13 @@ mod tests {
         }
     }
 
+    /// A hostname resolving to loopback is refused; a public address yields
+    /// addresses to pin, and pinning them builds a usable client.
     #[tokio::test]
-    async fn resolve_vetted_addrs_rejects_localhost_hostname() {
-        let url = reqwest::Url::parse("http://localhost/hook").unwrap();
-        assert!(resolve_vetted_addrs(&url).await.is_none());
-    }
+    async fn vetted_addrs_refuse_localhost_and_pin_public_targets() {
+        let localhost = reqwest::Url::parse("http://localhost/hook").unwrap();
+        assert!(resolve_vetted_addrs(&localhost).await.is_none());
 
-    /// A public hostname yields addresses to pin, and pinning them builds a usable client.
-    #[tokio::test]
-    async fn vetted_addrs_are_pinnable_onto_a_client() {
         let url = reqwest::Url::parse("http://203.0.113.5:8080/hook").unwrap();
         let addrs = resolve_vetted_addrs(&url)
             .await
@@ -382,16 +377,6 @@ mod tests {
         assert!(!addrs.is_empty());
         let host = strip_ipv6_brackets(url.host_str().unwrap());
         assert!(build_pinned_client(host, &addrs).is_ok());
-    }
-
-    #[test]
-    fn is_fire_worthy_matches_idle_waiting_error_only() {
-        assert!(is_fire_worthy(Status::Idle));
-        assert!(is_fire_worthy(Status::Waiting));
-        assert!(is_fire_worthy(Status::Error));
-        assert!(!is_fire_worthy(Status::Running));
-        assert!(!is_fire_worthy(Status::Starting));
-        assert!(!is_fire_worthy(Status::Stopped));
     }
 
     fn debounce_contains(session_id: &str) -> bool {

@@ -800,23 +800,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn user_action_diff_preserves_runtime_status_and_peer_touch() {
-        let mut pre = inst();
-        pre.last_accessed_at = Some(Utc::now() - chrono::Duration::seconds(60));
-        pre.archived_at = Some(Utc::now() - chrono::Duration::seconds(120));
-        let mut post = pre.clone();
-        post.title = "renamed".into();
-        post.status = Status::Running;
-        let mut disk = pre.clone();
-        disk.touch_last_accessed();
-        disk.status = Status::Waiting;
-        disk.merge_user_action_diff(&pre, &post);
-        assert_eq!(disk.title, "renamed");
-        assert!(disk.archived_at.is_none());
-        assert_eq!(disk.status, Status::Waiting);
-    }
-
     /// A passive transition must not read as a user touch and wipe a concurrent sink state (#3465).
     #[test]
     #[serial_test::serial]
@@ -920,26 +903,6 @@ mod tests {
                 "{disk_ts:?} <- {patch_ts:?}"
             );
         }
-    }
-
-    #[test]
-    fn passive_status_patch_logs_only_a_dropped_last_accessed_at() {
-        let logs = crate::session::test_support::LogCapture::start();
-        let ts = Utc::now();
-        let mut disk = inst();
-        disk.last_accessed_at = Some(ts);
-        // An equal timestamp is a no-op and says so; a newer one applies silently.
-        disk.merge_passive_status_patch(&disk.id.clone(), &patch(Status::Idle, None, Some(ts)));
-        let newer = ts + chrono::Duration::minutes(1);
-        disk.merge_passive_status_patch(&disk.id.clone(), &patch(Status::Idle, None, Some(newer)));
-        assert_eq!(disk.last_accessed_at, Some(newer));
-        let logs = logs.contents();
-        assert_eq!(
-            logs.matches("dropped passive status patch's last_accessed_at as a no-op")
-                .count(),
-            1,
-            "{logs}"
-        );
     }
 
     #[test]

@@ -161,7 +161,7 @@ describe("summarizeAnswers (#2209)", () => {
     return { nonce: "n", message: "m", questions, requested_at: "2026-01-01T00:00:00Z" };
   }
 
-  it("renders every answer kind in question order, omitting unanswered fields", () => {
+  it("renders every answer kind in question order, omitting unanswered fields and labelling untitled ones by key", () => {
     const elicitation = form([
       question("sel", "single_select", "Color"),
       question("multi", "multi_select", "Tags"),
@@ -170,6 +170,7 @@ describe("summarizeAnswers (#2209)", () => {
       question("flag_off", "boolean", "Off"),
       question("num", "number", "Score"),
       question("blank", "free_text"), // unanswered -> omitted
+      question("question_0", "free_text"), // untitled -> field key
     ]);
     const out = summarizeAnswers(elicitation, {
       sel: "Blue",
@@ -178,6 +179,7 @@ describe("summarizeAnswers (#2209)", () => {
       flag_on: true,
       flag_off: false,
       num: 4,
+      question_0: "hi",
     });
     expect(out).toEqual([
       { question: "Color", answer: "Blue" },
@@ -186,12 +188,8 @@ describe("summarizeAnswers (#2209)", () => {
       { question: "On", answer: "Yes" },
       { question: "Off", answer: "No" },
       { question: "Score", answer: "4" },
+      { question: "question_0", answer: "hi" },
     ]);
-  });
-
-  it("falls back to the field key when a question has no title", () => {
-    const out = summarizeAnswers(form([question("question_0", "free_text")]), { question_0: "hi" });
-    expect(out).toEqual([{ question: "question_0", answer: "hi" }]);
   });
 
   it("maps select values to option labels (MCP token, and AskUserQuestion desc)", () => {
@@ -211,15 +209,12 @@ describe("summarizeAnswers (#2209)", () => {
 });
 
 describe("appendElicitationAnswerRow (#2209)", () => {
-  it("appends a keyed row and is idempotent by id", () => {
+  it("appends a keyed row, idempotent by id and skipped for empty answers", () => {
     const a = appendElicitationAnswerRow([], "n-1", [{ question: "q", answer: "a" }]);
     expect(a).toHaveLength(1);
     expect(a[0]!.id).toBe("elicitation-n-1");
     const b = appendElicitationAnswerRow(a, "n-1", [{ question: "q", answer: "a" }]);
     expect(b).toBe(a); // same ref, no duplicate
-  });
-
-  it("is a no-op for empty answers", () => {
     expect(appendElicitationAnswerRow([], "n-1", [])).toEqual([]);
   });
 });
@@ -293,15 +288,12 @@ describe("applyEvent / background agents", () => {
     expect(resumed).toMatchObject({ status: "running", endedAt: null });
   });
 
-  it("does not reopen a completed agent on a late progress event", () => {
-    const late = agent(launched, completed, progress("running", 99, "2026-06-27T00:00:20Z"))[0];
-    expect(late).toMatchObject({ status: "completed", toolCount: 0 });
-  });
-
-  it("does not reopen a stalled-terminal agent on a late progress event (#4001)", () => {
+  it("does not reopen a completed or stalled-terminal agent on a late progress event (#4001)", () => {
+    const lateProgress = progress("running", 99, "2026-06-27T00:00:20Z");
+    expect(agent(launched, completed, lateProgress)[0]).toMatchObject({ status: "completed", toolCount: 0 });
     // A terminal BackgroundAgentCompleted can carry status "stalled" (the tailer's
     // own abort timeout), so the endedAt guard, not the status list, has to stop it.
-    const late = agent(launched, stalledTerminal, progress("running", 99, "2026-06-27T00:00:20Z"))[0];
+    const late = agent(launched, stalledTerminal, lateProgress)[0];
     expect(late).toMatchObject({ status: "stalled", toolCount: 0, endedAt: "2026-06-27T00:00:10Z" });
   });
 });
@@ -424,27 +416,5 @@ describe("patchServerRow (Tier 4 delta Patch)", () => {
     expect(patched[0]!.text).toBe("Terminal");
     const appended = patchServerRow(existing, { id: "msg-9", kind: "message", text: "hi", at: "t" });
     expect(appended.map((r) => r.id)).toEqual(["start-a", "msg-9"]);
-  });
-});
-
-describe("applyEvent / UserPromptSent prompt counter (Tier 4)", () => {
-  it("bumps promptSeq for a prompt this client did not dispatch", () => {
-    const next = ev(emptyAcpState(), 1, { UserPromptSent: { text: "hi", prompt_id: "cmp-1" } });
-    expect(next.promptSeq).toBe(1);
-    expect(next.turnActive).toBe(true);
-    expect(next.activity).toHaveLength(0);
-  });
-
-  it("does NOT double-bump when the echoed prompt_id is one we have in flight", () => {
-    const seeded: AcpState = {
-      ...emptyAcpState(),
-      optimisticRows: [{ id: "cmp-1", kind: "user_prompt", text: "hi", at: "t" }],
-      inflightPromptIds: ["cmp-1"],
-      promptSeq: 1,
-      turnActive: true,
-    };
-    const next = ev(seeded, 1, { UserPromptSent: { text: "hi", prompt_id: "cmp-1" } });
-    expect(next.promptSeq).toBe(1);
-    expect(next.inflightPromptIds).toEqual([]);
   });
 });

@@ -4,19 +4,6 @@ use super::*;
 
 #[test]
 #[serial]
-fn test_uppercase_p_picker_esc_closes() {
-    let env = create_test_env_empty();
-    let mut view = env.view;
-
-    view.handle_key(key(KeyCode::Char('P')), None);
-    assert!(view.profile_picker_dialog.is_some());
-
-    view.handle_key(key(KeyCode::Esc), None);
-    assert!(view.profile_picker_dialog.is_none());
-}
-
-#[test]
-#[serial]
 fn test_uppercase_p_picker_switch_profile() {
     let temp = TempDir::new().unwrap();
     let _guard = setup_test_home(&temp);
@@ -39,7 +26,10 @@ fn test_uppercase_p_picker_switch_profile() {
 
     view.handle_key(key(KeyCode::Char('P')), None);
     assert!(view.profile_picker_dialog.is_some());
+    view.handle_key(key(KeyCode::Esc), None);
+    assert!(view.profile_picker_dialog.is_none());
 
+    view.handle_key(key(KeyCode::Char('P')), None);
     // The active profile is selected; a trailing entry prevents end-of-list clamping.
     view.handle_key(key(KeyCode::Down), None);
     let action = view.handle_key(key(KeyCode::Enter), None);
@@ -48,15 +38,11 @@ fn test_uppercase_p_picker_switch_profile() {
     assert!(view.profile_picker_dialog.is_none());
 }
 
-/// Shift+T attaches the paired terminal from either view without changing the view mode,
-/// so it stays the one-key path to the shell whatever the preview is showing.
 /// Every overlay that takes the keyboard registers with `has_dialog`, which the mouse,
 /// scroll and shortcut gates all read.
 #[test]
 #[serial]
 fn test_has_dialog_includes_overlays() {
-    use crate::tui::settings::SettingsView;
-
     let env = create_test_env_empty();
     let mut view = env.view;
     assert!(!view.has_dialog());
@@ -65,17 +51,33 @@ fn test_has_dialog_includes_overlays() {
     assert!(view.has_dialog(), "info dialog");
     view.info_dialog = None;
 
-    view.settings_view = Some(SettingsView::new("test", None).unwrap());
+    view.handle_key(key(KeyCode::Char('s')), None);
+    assert!(view.settings_view.is_some(), "`s` opens settings");
     assert!(view.has_dialog(), "settings view");
 }
 
+/// `t` toggles Structured/Terminal view. Shift+T attaches the paired terminal from either
+/// view without changing the view mode, so it stays the one-key path to the shell; in
+/// Terminal view Enter attaches the terminal and `d` explains instead of deleting.
 #[test]
 #[serial]
-fn test_shift_t_attaches_terminal_from_either_view() {
+fn test_terminal_view_keys() {
+    {
+        let mut empty = create_test_env_empty();
+        assert!(
+            empty
+                .view
+                .handle_key(key(KeyCode::Char('T')), None)
+                .is_none(),
+            "Shift+T with no sessions is a no-op"
+        );
+    }
+
     let env = create_test_env_with_sessions(1);
     let mut view = env.view;
     assert_eq!(view.view_mode, ViewMode::Structured);
-
+    let action = view.handle_key(key(KeyCode::Enter), None);
+    assert!(matches!(action, Some(Action::AttachSession(_))));
     let action = view.handle_key(key(KeyCode::Char('T')), None);
     assert!(matches!(action, Some(Action::AttachTerminal(_, _))));
     assert_eq!(view.view_mode, ViewMode::Structured);
@@ -85,18 +87,14 @@ fn test_shift_t_attaches_terminal_from_either_view() {
     let action = view.handle_key(key(KeyCode::Char('T')), None);
     assert!(matches!(action, Some(Action::AttachTerminal(_, _))));
     assert_eq!(view.view_mode, ViewMode::Terminal);
-}
+    let action = view.handle_key(key(KeyCode::Enter), None);
+    assert!(matches!(action, Some(Action::AttachTerminal(_, _))));
 
-#[test]
-#[serial]
-fn test_t_toggles_view_mode() {
-    let env = create_test_env_empty();
-    let mut view = env.view;
-
-    assert_eq!(view.view_mode, ViewMode::Structured);
-
-    view.handle_key(key(KeyCode::Char('t')), None);
-    assert_eq!(view.view_mode, ViewMode::Terminal);
+    assert!(view.info_dialog.is_none());
+    view.handle_key(key(KeyCode::Char('d')), None);
+    assert!(view.info_dialog.is_some());
+    assert!(view.unified_delete_dialog.is_none());
+    view.info_dialog = None;
 
     view.handle_key(key(KeyCode::Char('t')), None);
     assert_eq!(view.view_mode, ViewMode::Structured);
@@ -157,61 +155,6 @@ fn retarget_same_session_tool_clears_previous_pane_content() {
     assert!(view.tool_preview_cache.capture_target.is_none());
 }
 
-#[test]
-#[serial]
-fn test_enter_returns_attach_terminal_in_terminal_view() {
-    let env = create_test_env_with_sessions(1);
-    let mut view = env.view;
-
-    // In Structured view, Enter returns AttachSession
-    let action = view.handle_key(key(KeyCode::Enter), None);
-    assert!(matches!(action, Some(Action::AttachSession(_))));
-
-    // Switch to Terminal view
-    view.handle_key(key(KeyCode::Char('t')), None);
-    assert_eq!(view.view_mode, ViewMode::Terminal);
-
-    // In Terminal view, Enter returns AttachTerminal
-    let action = view.handle_key(key(KeyCode::Enter), None);
-    assert!(matches!(action, Some(Action::AttachTerminal(_, _))));
-}
-
-#[test]
-#[serial]
-fn test_shift_t_noop_with_no_sessions() {
-    let env = create_test_env_empty();
-    let mut view = env.view;
-
-    let action = view.handle_key(key(KeyCode::Char('T')), None);
-    assert!(action.is_none());
-}
-
-#[test]
-#[serial]
-fn test_d_shows_info_dialog_in_terminal_view() {
-    let env = create_test_env_with_sessions(1);
-    let mut view = env.view;
-
-    // Switch to Terminal view
-    view.handle_key(key(KeyCode::Char('t')), None);
-    assert_eq!(view.view_mode, ViewMode::Terminal);
-
-    // Press 'd' - should show info dialog, not delete dialog
-    assert!(view.info_dialog.is_none());
-    view.handle_key(key(KeyCode::Char('d')), None);
-    assert!(view.info_dialog.is_some());
-    assert!(view.unified_delete_dialog.is_none());
-}
-
-#[test]
-#[serial]
-fn test_s_opens_settings_view() {
-    let mut env = create_test_env_empty();
-    assert!(env.view.settings_view.is_none());
-    env.view.handle_key(key(KeyCode::Char('s')), None);
-    assert!(env.view.settings_view.is_some());
-}
-
 /// Trashing and restoring through the view's own actions keeps the group header count in
 /// step with the rows, since both rebuild from the same predicate.
 #[test]
@@ -260,65 +203,17 @@ fn group_header_count_tracks_trash_and_restore() {
 
 #[test]
 #[serial]
-fn test_group_has_managed_worktrees() {
-    use crate::session::WorktreeInfo;
-    use chrono::Utc;
-
-    let temp = TempDir::new().unwrap();
-    let _guard = setup_test_home(&temp);
-    let storage = Storage::new_unwatched("test").unwrap();
-
-    let mut inst1 = Instance::new("work-session", "/tmp/work");
-    inst1.group_path = "work".to_string();
-    inst1.worktree_info = Some(WorktreeInfo {
+fn test_group_has_managed_worktrees_and_containers() {
+    let mut worktree = instance_in("work-session", "/tmp/work", "work");
+    worktree.worktree_info = Some(crate::session::WorktreeInfo {
         branch: "feature-branch".to_string(),
         main_repo_path: "/tmp/main".to_string(),
         managed_by_aoe: true,
-        created_at: Utc::now(),
+        created_at: chrono::Utc::now(),
         base_branch: None,
     });
-
-    let mut inst2 = Instance::new("other-session", "/tmp/other");
-    inst2.group_path = "other".to_string();
-
-    {
-        let xs: Vec<Instance> = vec![inst1, inst2];
-        storage
-            .update(|i, g| {
-                *i = xs.to_vec();
-                *g = GroupTree::new_with_groups(&xs, &[]).get_all_groups();
-                Ok(())
-            })
-            .unwrap();
-    }
-
-    let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new_for_test(
-        Some("test".to_string()),
-        tools,
-        crate::file_watch::FileWatchService::noop(),
-    )
-    .unwrap();
-    view.group_by = crate::session::config::GroupByMode::Manual;
-    view.flat_items = view.build_flat_items();
-    view.update_selected();
-
-    assert!(view.group_has_managed_worktrees("work", "work/", None));
-    assert!(!view.group_has_managed_worktrees("other", "other/", None));
-}
-
-#[test]
-#[serial]
-fn test_group_has_containers() {
-    use crate::session::SandboxInfo;
-
-    let temp = TempDir::new().unwrap();
-    let _guard = setup_test_home(&temp);
-    let storage = Storage::new_unwatched("test").unwrap();
-
-    let mut inst1 = Instance::new("work-session", "/tmp/work");
-    inst1.group_path = "work".to_string();
-    inst1.sandbox_info = Some(SandboxInfo {
+    let mut sandboxed = instance_in("box-session", "/tmp/box", "box");
+    sandboxed.sandbox_info = Some(crate::session::SandboxInfo {
         enabled: true,
         container_id: None,
         image: "ubuntu:latest".to_string(),
@@ -328,34 +223,12 @@ fn test_group_has_containers() {
         before_start_env: Vec::new(),
         container_workdir: None,
     });
+    let env = seeded_env(test_home(), &[worktree, sandboxed], true);
 
-    let mut inst2 = Instance::new("other-session", "/tmp/other");
-    inst2.group_path = "other".to_string();
-
-    {
-        let xs: Vec<Instance> = vec![inst1, inst2];
-        storage
-            .update(|i, g| {
-                *i = xs.to_vec();
-                *g = GroupTree::new_with_groups(&xs, &[]).get_all_groups();
-                Ok(())
-            })
-            .unwrap();
-    }
-
-    let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new_for_test(
-        Some("test".to_string()),
-        tools,
-        crate::file_watch::FileWatchService::noop(),
-    )
-    .unwrap();
-    view.group_by = crate::session::config::GroupByMode::Manual;
-    view.flat_items = view.build_flat_items();
-    view.update_selected();
-
-    assert!(view.group_has_containers("work", "work/", None));
-    assert!(!view.group_has_containers("other", "other/", None));
+    assert!(env.view.group_has_managed_worktrees("work", "work/", None));
+    assert!(!env.view.group_has_managed_worktrees("box", "box/", None));
+    assert!(env.view.group_has_containers("box", "box/", None));
+    assert!(!env.view.group_has_containers("work", "work/", None));
 }
 
 #[test]
@@ -398,6 +271,25 @@ fn test_delete_selected_group_updates_groups_field() {
     let group_paths: Vec<_> = all_groups.iter().map(|g| g.path.as_str()).collect();
     assert!(!group_paths.contains(&"work"));
     assert!(!group_paths.contains(&"work/projects"));
+
+    // A reload from storage agrees with the in-memory tree.
+    env.view.reload().unwrap();
+    let reloaded_groups: Vec<_> = env
+        .view
+        .all_groups()
+        .iter()
+        .map(|g| g.path.clone())
+        .collect();
+    let tree_groups: Vec<_> = env
+        .view
+        .group_trees
+        .get("test")
+        .unwrap()
+        .get_all_groups()
+        .iter()
+        .map(|g| g.path.clone())
+        .collect();
+    assert_eq!(reloaded_groups, tree_groups);
 }
 
 /// Archiving a manual group archives every session under it, including
@@ -726,304 +618,32 @@ fn test_delete_group_with_sessions_updates_groups_field() {
 
 #[test]
 #[serial]
-fn test_delete_group_with_sessions_respects_worktree_option() {
-    use crate::session::WorktreeInfo;
-    use crate::tui::dialogs::GroupDeleteOptions;
-    use chrono::Utc;
-
-    let temp = TempDir::new().unwrap();
-    let _guard = setup_test_home(&temp);
-    let storage = Storage::new_unwatched("test").unwrap();
-
-    let mut inst1 = Instance::new("work-session", "/tmp/work");
-    inst1.group_path = "work".to_string();
-    inst1.worktree_info = Some(WorktreeInfo {
-        branch: "feature".to_string(),
-        main_repo_path: "/tmp/main".to_string(),
-        managed_by_aoe: true,
-        created_at: Utc::now(),
-        base_branch: None,
-    });
-
-    {
-        let xs: Vec<Instance> = vec![inst1];
-        storage
-            .update(|i, g| {
-                *i = xs.to_vec();
-                *g = GroupTree::new_with_groups(&xs, &[]).get_all_groups();
-                Ok(())
-            })
-            .unwrap();
-    }
-
-    let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new_for_test(
-        Some("test".to_string()),
-        tools,
-        crate::file_watch::FileWatchService::noop(),
-    )
-    .unwrap();
-    view.group_by = crate::session::config::GroupByMode::Manual;
-    view.flat_items = view.build_flat_items();
-    view.update_selected();
-
-    // Select the work group
-    view.cursor = 0;
-    view.update_selected();
-    assert!(view.selected_group.is_some());
-
-    // Delete with worktrees option enabled
-    let options = GroupDeleteOptions {
-        delete_sessions: true,
-        delete_worktrees: true,
-        delete_branches: false,
-        delete_containers: false,
-        force_delete_worktrees: false,
-    };
-    view.delete_group_with_sessions(&options).unwrap();
-
-    // We can't easily verify the deletion request was sent with the right flags
-    // without mocking, but we can verify the group was deleted
-    assert!(!view.group_trees.get("test").unwrap().group_exists("work"));
-}
-
-#[test]
-#[serial]
-fn test_delete_group_with_sessions_respects_container_option() {
-    use crate::session::SandboxInfo;
-    use crate::tui::dialogs::GroupDeleteOptions;
-
-    let temp = TempDir::new().unwrap();
-    let _guard = setup_test_home(&temp);
-    let storage = Storage::new_unwatched("test").unwrap();
-
-    let mut inst1 = Instance::new("work-session", "/tmp/work");
-    inst1.group_path = "work".to_string();
-    inst1.sandbox_info = Some(SandboxInfo {
-        enabled: true,
-        container_id: None,
-        image: "ubuntu:latest".to_string(),
-        container_name: "test-container".to_string(),
-        extra_env: None,
-        custom_instruction: None,
-        before_start_env: Vec::new(),
-        container_workdir: None,
-    });
-
-    {
-        let xs: Vec<Instance> = vec![inst1];
-        storage
-            .update(|i, g| {
-                *i = xs.to_vec();
-                *g = GroupTree::new_with_groups(&xs, &[]).get_all_groups();
-                Ok(())
-            })
-            .unwrap();
-    }
-
-    let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new_for_test(
-        Some("test".to_string()),
-        tools,
-        crate::file_watch::FileWatchService::noop(),
-    )
-    .unwrap();
-    view.group_by = crate::session::config::GroupByMode::Manual;
-    view.flat_items = view.build_flat_items();
-    view.update_selected();
-
-    // Select the work group
-    view.cursor = 0;
-    view.update_selected();
-    assert!(view.selected_group.is_some());
-
-    // Delete with containers option enabled
-    let options = GroupDeleteOptions {
-        delete_sessions: true,
-        delete_worktrees: false,
-        delete_branches: false,
-        delete_containers: true,
-        force_delete_worktrees: false,
-    };
-    view.delete_group_with_sessions(&options).unwrap();
-
-    // Verify the group was deleted
-    assert!(!view.group_trees.get("test").unwrap().group_exists("work"));
-}
-
-#[test]
-#[serial]
-fn test_delete_group_includes_nested_groups() {
-    use crate::tui::dialogs::GroupDeleteOptions;
-
-    let mut env = create_test_env_with_group_sessions();
-
-    // Select the "work" group
-    for (i, item) in env.view.flat_items.iter().enumerate() {
-        if let Item::Group { path, .. } = item {
-            if path == "work" {
-                env.view.cursor = i;
-                env.view.update_selected();
-                break;
-            }
-        }
-    }
-
-    // Verify nested group exists
-    assert!(env
-        .view
-        .group_trees
-        .get("test")
-        .unwrap()
-        .group_exists("work/projects"));
-
-    // Delete the group with all sessions
-    let options = GroupDeleteOptions {
-        delete_sessions: true,
-        delete_worktrees: false,
-        delete_branches: false,
-        delete_containers: false,
-        force_delete_worktrees: false,
-    };
-    env.view.delete_group_with_sessions(&options).unwrap();
-
-    // Verify both parent and nested groups are removed
-    assert!(!env
-        .view
-        .group_trees
-        .get("test")
-        .unwrap()
-        .group_exists("work"));
-    assert!(!env
-        .view
-        .group_trees
-        .get("test")
-        .unwrap()
-        .group_exists("work/projects"));
-}
-
-#[test]
-#[serial]
-fn test_groups_field_stays_in_sync_with_storage() {
-    let mut env = create_test_env_with_group_sessions();
-
-    // Get initial group count
-    let initial_group_count = env.view.all_groups().len();
-    assert!(initial_group_count > 0);
-
-    // Select and delete the work group
-    for (i, item) in env.view.flat_items.iter().enumerate() {
-        if let Item::Group { path, .. } = item {
-            if path == "work" {
-                env.view.cursor = i;
-                env.view.update_selected();
-                break;
-            }
-        }
-    }
-
-    env.view.delete_selected_group().unwrap();
-
-    // After deletion, groups field should be smaller
-    assert!(env.view.all_groups().len() < initial_group_count);
-
-    // Reload from storage and verify groups match
-    env.view.reload().unwrap();
-    let reloaded_groups: Vec<_> = env
-        .view
-        .all_groups()
-        .iter()
-        .map(|g| g.path.clone())
-        .collect();
-    let tree_groups: Vec<_> = env
-        .view
-        .group_trees
-        .get("test")
-        .unwrap()
-        .get_all_groups()
-        .iter()
-        .map(|g| g.path.clone())
-        .collect();
-    assert_eq!(reloaded_groups, tree_groups);
-}
-
-#[test]
-#[serial]
 fn test_group_collapsed_state_persists_across_reload() {
     let mut env = create_test_env_with_groups();
 
-    // Find a group and verify it starts expanded
-    let group_idx = env
+    let (group_idx, group_path) = env
         .view
         .flat_items
         .iter()
-        .position(|item| matches!(item, Item::Group { .. }))
+        .enumerate()
+        .find_map(|(i, item)| match item {
+            Item::Group {
+                path, collapsed, ..
+            } => {
+                assert!(!collapsed, "group should start expanded");
+                Some((i, path.clone()))
+            }
+            _ => None,
+        })
         .expect("should have a group");
 
-    if let Item::Group { collapsed, .. } = &env.view.flat_items[group_idx] {
-        assert!(!collapsed, "group should start expanded");
-    }
-
-    // Move cursor to group and collapse it with Enter
     env.view.cursor = group_idx;
     env.view.update_selected();
     env.view.handle_key(key(KeyCode::Enter), None);
-
-    // Verify it's collapsed
     if let Item::Group { collapsed, .. } = &env.view.flat_items[group_idx] {
         assert!(*collapsed, "group should be collapsed after Enter");
     }
 
-    // Reload (simulates the 5-second periodic refresh)
-    env.view.reload().unwrap();
-
-    // Find the group again (index may change after reload)
-    let group_idx_after = env
-        .view
-        .flat_items
-        .iter()
-        .position(|item| matches!(item, Item::Group { .. }))
-        .expect("should still have a group");
-
-    // Verify it's still collapsed after reload
-    if let Item::Group { collapsed, .. } = &env.view.flat_items[group_idx_after] {
-        assert!(*collapsed, "group should remain collapsed after reload");
-    }
-}
-
-#[test]
-#[serial]
-fn test_group_collapsed_state_saved_to_storage() {
-    use crate::session::GroupTree;
-
-    let mut env = create_test_env_with_groups();
-
-    // Find a group
-    let group_path = env
-        .view
-        .flat_items
-        .iter()
-        .find_map(|item| {
-            if let Item::Group { path, .. } = item {
-                Some(path.clone())
-            } else {
-                None
-            }
-        })
-        .expect("should have a group");
-
-    // Move cursor to group and collapse it
-    let group_idx = env
-        .view
-        .flat_items
-        .iter()
-        .position(|item| matches!(item, Item::Group { path, .. } if path == &group_path))
-        .unwrap();
-    env.view.cursor = group_idx;
-    env.view.update_selected();
-    env.view.handle_key(key(KeyCode::Enter), None);
-
-    // Load fresh from storage to verify persistence
     let (_, groups) = env
         .view
         .storages
@@ -1033,22 +653,36 @@ fn test_group_collapsed_state_saved_to_storage() {
         .unwrap();
     let fresh_tree =
         GroupTree::new_with_groups(&env.view.instances().cloned().collect::<Vec<_>>(), &groups);
-    let all_groups = fresh_tree.get_all_groups();
-
-    let saved_group = all_groups
-        .iter()
-        .find(|g| g.path == group_path)
-        .expect("group should exist in storage");
-
     assert!(
-        saved_group.collapsed,
+        fresh_tree
+            .get_all_groups()
+            .iter()
+            .find(|g| g.path == group_path)
+            .expect("group should exist in storage")
+            .collapsed,
         "collapsed state should be persisted to storage"
+    );
+
+    // Reload (simulates the periodic refresh); the group index may change.
+    env.view.reload().unwrap();
+    let still_collapsed = env.view.flat_items.iter().find_map(|item| match item {
+        Item::Group {
+            path, collapsed, ..
+        } if path == &group_path => Some(*collapsed),
+        _ => None,
+    });
+    assert_eq!(
+        still_collapsed,
+        Some(true),
+        "group should remain collapsed after reload"
     );
 }
 
 /// Project and org folder collapse must survive a restart. Both kinds of header are
 /// auto-derived and have no group record, so their state is written to `app_state` rather
-/// than the per-profile GroupTree, and a fresh `HomeView` restores it.
+/// than the per-profile GroupTree, and a fresh `HomeView` restores it. A collapse entry for
+/// a folder that no longer exists is pruned on save, so the persisted set cannot grow
+/// without bound.
 #[test]
 #[serial]
 fn test_derived_group_collapsed_state_persists_to_config() {
@@ -1075,20 +709,22 @@ fn test_derived_group_collapsed_state_persists_to_config() {
             })
             .expect("a derived folder header");
 
+        let saved_paths = || {
+            let config = crate::session::config::load_config()
+                .unwrap()
+                .expect("config should exist after collapse");
+            match mode {
+                GroupByMode::Project => config.app_state.project_group_collapsed,
+                _ => config.app_state.org_group_collapsed,
+            }
+        };
+
         // Enter routes through toggle_group_collapsed, which persists.
         env.view.cursor = group_idx;
         env.view.update_selected();
         env.view.handle_key(key(KeyCode::Enter), None);
-
-        let config = crate::session::config::load_config()
-            .unwrap()
-            .expect("config should exist after collapse");
-        let saved = match mode {
-            GroupByMode::Project => &config.app_state.project_group_collapsed,
-            _ => &config.app_state.org_group_collapsed,
-        };
         assert!(
-            saved.contains(&group_path),
+            saved_paths().contains(&group_path),
             "{mode:?}: the collapsed folder path should be persisted to app_state"
         );
 
@@ -1107,53 +743,25 @@ fn test_derived_group_collapsed_state_persists_to_config() {
             Some(true),
             "{mode:?}: a relaunched HomeView should restore the collapsed folder"
         );
-    }
-}
-
-/// A collapse entry for a derived folder that no longer exists is pruned on save, so the
-/// persisted set cannot grow without bound; a still-live folder collapsed in the same
-/// session survives.
-#[test]
-#[serial]
-fn test_derived_group_collapsed_prunes_stale_paths() {
-    use crate::session::config::GroupByMode;
-
-    for mode in [GroupByMode::Project, GroupByMode::Org] {
-        let mut env = create_test_env_two_projects_mixed_attention();
-        env.view.group_by = mode;
-        env.view.flat_items = env.view.build_flat_items();
-
-        let live_path = env
-            .view
-            .flat_items
-            .iter()
-            .find_map(|item| match item {
-                Item::Group { path, .. } => Some(path.clone()),
-                _ => None,
-            })
-            .expect("a derived folder header");
-        let collapsed = match mode {
-            GroupByMode::Project => &mut env.view.project_group_collapsed,
-            _ => &mut env.view.org_group_collapsed,
-        };
-        collapsed.insert(live_path.clone(), true);
-        collapsed.insert("/repos/deleted-ghost".to_string(), true);
 
         match mode {
-            GroupByMode::Project => env.view.save_project_group_collapsed(),
-            _ => env.view.save_org_group_collapsed(),
+            GroupByMode::Project => {
+                env.view
+                    .project_group_collapsed
+                    .insert("/repos/deleted-ghost".to_string(), true);
+                env.view.save_project_group_collapsed();
+            }
+            _ => {
+                env.view
+                    .org_group_collapsed
+                    .insert("/repos/deleted-ghost".to_string(), true);
+                env.view.save_org_group_collapsed();
+            }
         }
-
-        let config = crate::session::config::load_config()
-            .unwrap()
-            .expect("config should exist after save");
-        let saved = match mode {
-            GroupByMode::Project => &config.app_state.project_group_collapsed,
-            _ => &config.app_state.org_group_collapsed,
-        };
+        let saved = saved_paths();
         assert!(
-            saved.contains(&live_path),
-            "{mode:?}: a live collapsed folder must be persisted"
+            saved.contains(&group_path),
+            "{mode:?}: a live collapsed folder must stay persisted"
         );
         assert!(
             !saved.iter().any(|p| p == "/repos/deleted-ghost"),
@@ -1162,17 +770,17 @@ fn test_derived_group_collapsed_prunes_stale_paths() {
     }
 }
 
-/// `shrink_list` / `grow_list` step the list width by 5 from its default and clamp at the
-/// 10 / 80 bounds the keyboard `<` and `>` share.
+/// `<` / `>` step the list width by 5 from its default and clamp at the 10 / 80 bounds.
 #[test]
 #[serial]
 fn test_list_width_steps_and_clamps() {
     let mut env = create_test_env_empty();
     assert_eq!(env.view.list_width, 35);
-    env.view.shrink_list();
+    env.view.handle_key(key(KeyCode::Char('<')), None);
     assert_eq!(env.view.list_width, 30);
-    env.view.grow_list();
-    assert_eq!(env.view.list_width, 35);
+    env.view.handle_key(key(KeyCode::Char('>')), None);
+    env.view.handle_key(key(KeyCode::Char('>')), None);
+    assert_eq!(env.view.list_width, 40);
 
     env.view.list_width = 12;
     env.view.shrink_list();
@@ -1185,33 +793,19 @@ fn test_list_width_steps_and_clamps() {
     assert_eq!(env.view.list_width, 80, "grow clamps at the maximum");
 }
 
-#[test]
-#[serial]
-fn test_lt_shrinks_list() {
-    let mut env = create_test_env_empty();
-    assert_eq!(env.view.list_width, 35);
-    env.view.handle_key(key(KeyCode::Char('<')), None);
-    assert_eq!(env.view.list_width, 30);
-}
-
-#[test]
-#[serial]
-fn test_gt_grows_list() {
-    let mut env = create_test_env_empty();
-    assert_eq!(env.view.list_width, 35);
-    env.view.handle_key(key(KeyCode::Char('>')), None);
-    assert_eq!(env.view.list_width, 40);
-}
-
 /// The picker must not offer a repo the session already has, since the attach would be
 /// rejected as a duplicate. With no registry entries there is nothing to offer and the
-/// dialog says so rather than rendering an empty list.
+/// dialog says so rather than rendering an empty list. The picker is a modal, so it must
+/// register in the overlay predicates gating scroll, right-click, footer clicks, drag start
+/// and paste-burst routing; missing from them, the wheel moved the cursor underneath it and
+/// right-click stacked a second menu on top.
 #[test]
 #[serial]
 fn add_project_picker_opens_and_excludes_repos_already_on_the_session() {
     let mut env = create_test_env_with_sessions(1);
     let id = env.view.instance_at(0).id.clone();
     env.view.selected_session = Some(id.clone());
+    assert!(!env.view.has_dialog(), "no dialog open yet");
 
     env.view.open_add_project_for_selected();
     let dialog = env
@@ -1223,10 +817,14 @@ fn add_project_picker_opens_and_excludes_repos_already_on_the_session() {
     // The fixture registers no projects, so every candidate is filtered out or
     // absent; either way the picker reports that rather than showing a list.
     assert!(dialog.is_empty());
+    assert!(env.view.has_dialog());
+    assert!(env.view.has_non_live_send_overlay());
 
     // Esc closes without attaching.
     env.view.handle_key(key(KeyCode::Esc), None);
     assert!(env.view.attach_project_dialog.is_none());
+    assert!(!env.view.has_dialog());
+    assert!(!env.view.has_non_live_send_overlay());
     assert!(
         env.view
             .get_instance(&id)
@@ -1238,7 +836,8 @@ fn add_project_picker_opens_and_excludes_repos_already_on_the_session() {
 /// Attaching bounces the worker and creates a worktree, so the picker refuses the same
 /// lifecycle states every sibling mutator refuses. The context menu offers the row
 /// unconditionally, so this gate is the only thing stopping an archived or mid-turn
-/// session.
+/// session. A scratch session has no repo of its own, so it is refused too rather than
+/// opening a list where every choice would be rejected by `attach_project::plan`.
 #[test]
 #[serial]
 fn add_project_picker_refuses_shelved_and_mid_turn_sessions() {
@@ -1278,8 +877,17 @@ fn add_project_picker_refuses_shelved_and_mid_turn_sessions() {
     assert!(env.view.attach_project_dialog.is_none());
     assert!(env.view.info_dialog.is_some());
 
-    // Idle and unshelved: the picker opens.
-    env.view.mutate_instance(&id, |inst| inst.unarchive());
+    env.view.mutate_instance(&id, |inst| {
+        inst.unarchive();
+        inst.scratch = true;
+    });
+    env.view.info_dialog = None;
+    env.view.open_add_project_for_selected();
+    assert!(env.view.attach_project_dialog.is_none());
+    assert!(env.view.info_dialog.is_some());
+
+    // Idle, unshelved and not scratch: the picker opens.
+    env.view.mutate_instance(&id, |inst| inst.scratch = false);
     env.view.info_dialog = None;
     env.view.open_add_project_for_selected();
     assert!(
@@ -1371,96 +979,6 @@ fn apply_attach_project_results_reports_and_clears_the_marker() {
     }
 }
 
-/// A scratch session has no repo of its own, so there is nothing to widen and deletion
-/// drops its whole directory. The picker refuses it rather than opening a list where every
-/// choice would be rejected by `attach_project::plan`.
-#[test]
-#[serial]
-fn add_project_picker_refuses_a_scratch_session() {
-    let mut env = create_test_env_with_sessions(1);
-    let id = env.view.instance_at(0).id.clone();
-    env.view.selected_session = Some(id.clone());
-
-    env.view.mutate_instance(&id, |inst| inst.scratch = true);
-    env.view.open_add_project_for_selected();
-    assert!(
-        env.view.attach_project_dialog.is_none(),
-        "a scratch session has no repo to attach to"
-    );
-    assert!(
-        env.view.info_dialog.is_some(),
-        "the refusal must be visible, not a silent no-op"
-    );
-
-    // The same session stops being scratch and becomes attachable, so the
-    // refusal is keyed on the flag rather than on some other property of the row.
-    env.view.mutate_instance(&id, |inst| inst.scratch = false);
-    env.view.info_dialog = None;
-    env.view.open_add_project_for_selected();
-    assert!(env.view.attach_project_dialog.is_some());
-}
-
-/// The picker is a modal, so it must register in the overlay predicates gating scroll,
-/// right-click, footer clicks, drag start and paste-burst routing; missing from them, the
-/// wheel moved the cursor underneath it and right-click stacked a second menu on top.
-#[test]
-#[serial]
-fn add_project_picker_registers_as_an_overlay() {
-    let mut env = create_test_env_with_sessions(1);
-    let id = env.view.instance_at(0).id.clone();
-    env.view.selected_session = Some(id.clone());
-
-    assert!(!env.view.has_dialog(), "no dialog open yet");
-
-    env.view.open_add_project_for_selected();
-    assert!(
-        env.view.attach_project_dialog.is_some(),
-        "picker should be open"
-    );
-    assert!(
-        env.view.has_dialog(),
-        "an open picker must count as a dialog, or list keyboard actions fire behind it"
-    );
-    assert!(
-        env.view.has_non_live_send_overlay(),
-        "an open picker must count as an overlay, or scroll and right-click reach the list under it"
-    );
-
-    env.view.handle_key(key(KeyCode::Esc), None);
-    assert!(
-        !env.view.has_dialog(),
-        "closing the picker clears the dialog"
-    );
-    assert!(
-        !env.view.has_non_live_send_overlay(),
-        "closing the picker clears the non-live overlay"
-    );
-}
-
-#[test]
-#[serial]
-fn test_o_key_opens_sort_picker() {
-    use crate::session::config::SortOrder;
-
-    let mut env = create_test_env_with_mixed_sessions();
-    assert_eq!(env.view.sort_order, SortOrder::Newest);
-
-    // 'o' opens the picker; the current sort is unchanged until the user
-    // confirms a selection.
-    env.view.handle_key(key(KeyCode::Char('o')), None);
-    assert!(env.view.sort_picker_dialog.is_some());
-    assert_eq!(env.view.sort_order, SortOrder::Newest);
-
-    // Walk to AZ (Newest -> Attention -> LastActivity -> Oldest -> AZ) and
-    // confirm.
-    for _ in 0..4 {
-        env.view.handle_key(key(KeyCode::Down), None);
-    }
-    env.view.handle_key(key(KeyCode::Enter), None);
-    assert!(env.view.sort_picker_dialog.is_none());
-    assert_eq!(env.view.sort_order, SortOrder::AZ);
-}
-
 #[test]
 #[serial]
 fn test_shift_o_opens_sort_picker_in_strict_mode() {
@@ -1493,33 +1011,17 @@ fn test_shift_o_opens_sort_picker_in_strict_mode() {
     assert!(env.view.sort_picker_dialog.is_some());
     env.view.handle_key(key(KeyCode::Esc), None);
 
+    // Plain lowercase 'o' must not cycle sort in strict mode: it falls through to the
+    // typing-guard per the "no destructive lowercase" rule. A single unguarded
+    // `Char('o') => cycle` arm silently changed the sort whenever the user typed it as text.
+    env.view
+        .handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE), None);
+    assert!(env.view.sort_picker_dialog.is_none());
+
     // Sort order is unchanged because no selection was confirmed.
     assert_eq!(env.view.sort_order, SortOrder::Newest);
     // Sanity: message dialog must NOT have been opened as a side effect.
     assert!(env.view.send_message_dialog.is_none());
-}
-
-#[test]
-#[serial]
-fn test_bare_lowercase_o_does_not_cycle_sort_in_strict_mode() {
-    // In strict mode plain lowercase 'o' must not cycle sort; it falls through to the
-    // typing-guard per the "no destructive lowercase" rule, leaving Shift+O and Ctrl+O as
-    // the sort chords. A single unguarded `Char('o') => cycle` arm fired for bare 'o' too
-    // and silently changed the sort whenever the user typed it as text.
-    use crate::session::config::SortOrder;
-
-    let mut env = create_test_env_with_mixed_sessions();
-    env.view.strict_hotkeys = true;
-    let initial = env.view.sort_order;
-    assert_eq!(initial, SortOrder::Newest);
-
-    env.view
-        .handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE), None);
-
-    assert_eq!(
-        env.view.sort_order, initial,
-        "bare 'o' in strict mode must NOT cycle sort; expected it to stay at Newest"
-    );
 }
 
 #[test]
@@ -2112,28 +1614,6 @@ fn test_o_key_flat_items_follow_sort_order() {
 
 #[test]
 #[serial]
-fn test_ctrl_o_key_opens_sort_picker() {
-    use crate::session::config::SortOrder;
-
-    let mut env = create_test_env_with_mixed_sessions();
-    assert_eq!(env.view.sort_order, SortOrder::Newest);
-
-    // Ctrl+O opens the same modal picker. Pressing it on its own does not
-    // change the current sort.
-    env.view.handle_key(
-        KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
-        None,
-    );
-    assert!(env.view.sort_picker_dialog.is_some());
-    assert_eq!(env.view.sort_order, SortOrder::Newest);
-
-    env.view.handle_key(key(KeyCode::Esc), None);
-    assert!(env.view.sort_picker_dialog.is_none());
-    assert_eq!(env.view.sort_order, SortOrder::Newest);
-}
-
-#[test]
-#[serial]
 fn test_o_key_clamps_cursor_when_list_shrinks() {
     use crate::session::config::SortOrder;
     use tui_input::Input;
@@ -2161,186 +1641,32 @@ fn test_o_key_clamps_cursor_when_list_shrinks() {
     assert!(env.view.cursor <= valid_max);
 }
 
+/// The unified view loads every profile as flat depth-0 rows with no profile headers; a
+/// profile-filtered view loads only its own profile.
 #[test]
 #[serial]
 fn test_all_profiles_view_loads_from_multiple_profiles() {
-    let temp = TempDir::new().unwrap();
-    let _guard = setup_test_home(&temp);
+    let (_temp, _guard) = test_home();
+    seed_profile("alpha", &[Instance::new("Alpha Session", "/tmp/a")]);
+    seed_profile("beta", &[Instance::new("Beta Session", "/tmp/b")]);
 
-    let storage_a = Storage::new_unwatched("alpha").unwrap();
-    {
-        let xs = vec![Instance::new("Alpha Session", "/tmp/a")];
-        storage_a
-            .update(|i, g| {
-                *i = xs.to_vec();
-                *g = GroupTree::new_with_groups(&xs, &[]).get_all_groups();
-                Ok(())
-            })
-            .unwrap();
-    }
-
-    let storage_b = Storage::new_unwatched("beta").unwrap();
-    {
-        let xs = vec![Instance::new("Beta Session", "/tmp/b")];
-        storage_b
-            .update(|i, g| {
-                *i = xs.to_vec();
-                *g = GroupTree::new_with_groups(&xs, &[]).get_all_groups();
-                Ok(())
-            })
-            .unwrap();
-    }
-
-    let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view =
-        HomeView::new_for_test(None, tools, crate::file_watch::FileWatchService::noop()).unwrap();
+    let mut view = test_view(None);
     view.group_by = crate::session::config::GroupByMode::Manual;
     view.flat_items = view.build_flat_items();
-    view.update_selected();
-
-    assert_eq!(view.instances().len(), 2);
-    let profiles: Vec<&str> = view
+    let mut profiles: Vec<&str> = view
         .instances()
         .map(|i| i.source_profile.as_str())
         .collect();
-    assert!(profiles.contains(&"alpha"));
-    assert!(profiles.contains(&"beta"));
-}
+    profiles.sort_unstable();
+    assert_eq!(profiles, ["alpha", "beta"]);
+    assert_eq!(view.flat_items.len(), 2, "no profile headers");
+    assert!(view
+        .flat_items
+        .iter()
+        .all(|item| matches!(item, Item::Session { depth: 0, .. })));
 
-#[test]
-#[serial]
-fn test_filtered_view_loads_single_profile() {
-    let temp = TempDir::new().unwrap();
-    let _guard = setup_test_home(&temp);
-
-    let storage_a = Storage::new_unwatched("alpha").unwrap();
-    {
-        let xs = vec![Instance::new("Alpha Session", "/tmp/a")];
-        storage_a
-            .update(|i, g| {
-                *i = xs.to_vec();
-                *g = GroupTree::new_with_groups(&xs, &[]).get_all_groups();
-                Ok(())
-            })
-            .unwrap();
-    }
-
-    let storage_b = Storage::new_unwatched("beta").unwrap();
-    {
-        let xs = vec![Instance::new("Beta Session", "/tmp/b")];
-        storage_b
-            .update(|i, g| {
-                *i = xs.to_vec();
-                *g = GroupTree::new_with_groups(&xs, &[]).get_all_groups();
-                Ok(())
-            })
-            .unwrap();
-    }
-
-    let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new_for_test(
-        Some("alpha".to_string()),
-        tools,
-        crate::file_watch::FileWatchService::noop(),
-    )
-    .unwrap();
-    view.group_by = crate::session::config::GroupByMode::Manual;
-    view.flat_items = view.build_flat_items();
-    view.update_selected();
-
+    let view = test_view(Some("alpha"));
     assert_eq!(view.instances().len(), 1);
     assert_eq!(view.instance_at(0).title, "Alpha Session");
     assert_eq!(view.instance_at(0).source_profile, "alpha");
-}
-
-#[test]
-#[serial]
-fn test_all_profiles_view_has_no_profile_headers() {
-    let temp = TempDir::new().unwrap();
-    let _guard = setup_test_home(&temp);
-
-    let storage_a = Storage::new_unwatched("alpha").unwrap();
-    {
-        let xs = vec![Instance::new("A1", "/tmp/a")];
-        storage_a
-            .update(|i, g| {
-                *i = xs.to_vec();
-                *g = GroupTree::new_with_groups(&xs, &[]).get_all_groups();
-                Ok(())
-            })
-            .unwrap();
-    }
-
-    let storage_b = Storage::new_unwatched("beta").unwrap();
-    {
-        let xs = vec![Instance::new("B1", "/tmp/b")];
-        storage_b
-            .update(|i, g| {
-                *i = xs.to_vec();
-                *g = GroupTree::new_with_groups(&xs, &[]).get_all_groups();
-                Ok(())
-            })
-            .unwrap();
-    }
-
-    let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view =
-        HomeView::new_for_test(None, tools, crate::file_watch::FileWatchService::noop()).unwrap();
-    view.group_by = crate::session::config::GroupByMode::Manual;
-    view.flat_items = view.build_flat_items();
-    view.update_selected();
-
-    // All items should be sessions (no profile headers)
-    let session_count = view
-        .flat_items
-        .iter()
-        .filter(|i| matches!(i, Item::Session { .. }))
-        .count();
-    assert_eq!(session_count, 2);
-    assert_eq!(view.flat_items.len(), 2);
-}
-
-#[test]
-#[serial]
-fn test_all_profiles_view_shows_all_sessions_flat() {
-    let temp = TempDir::new().unwrap();
-    let _guard = setup_test_home(&temp);
-
-    let storage_a = Storage::new_unwatched("alpha").unwrap();
-    {
-        let xs = vec![Instance::new("A1", "/tmp/a")];
-        storage_a
-            .update(|i, g| {
-                *i = xs.to_vec();
-                *g = GroupTree::new_with_groups(&xs, &[]).get_all_groups();
-                Ok(())
-            })
-            .unwrap();
-    }
-
-    let storage_b = Storage::new_unwatched("beta").unwrap();
-    {
-        let xs = vec![Instance::new("B1", "/tmp/b")];
-        storage_b
-            .update(|i, g| {
-                *i = xs.to_vec();
-                *g = GroupTree::new_with_groups(&xs, &[]).get_all_groups();
-                Ok(())
-            })
-            .unwrap();
-    }
-
-    let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view =
-        HomeView::new_for_test(None, tools, crate::file_watch::FileWatchService::noop()).unwrap();
-    view.group_by = crate::session::config::GroupByMode::Manual;
-    view.flat_items = view.build_flat_items();
-    view.update_selected();
-
-    // All sessions from all profiles should be visible at depth 0
-    for item in &view.flat_items {
-        if let Item::Session { depth, .. } = item {
-            assert_eq!(*depth, 0, "sessions in all view should be at depth 0");
-        }
-    }
 }

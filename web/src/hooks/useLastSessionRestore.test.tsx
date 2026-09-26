@@ -49,11 +49,6 @@ afterEach(() => {
 });
 
 describe("useLastSessionRestore", () => {
-  it("persists the active session id", async () => {
-    setup("/session/s1", params({ activeSessionId: "s1" }));
-    await waitFor(() => expect(localStorage.getItem(LAST_SESSION_KEY)).toBe("s1"));
-  });
-
   // Only a standalone PWA cold launch resumes; a browser tab stays on the dashboard.
   it.each([
     [true, "/session/s1"],

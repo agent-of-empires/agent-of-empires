@@ -635,9 +635,22 @@ mod tests {
 
     #[test]
     fn test_sanitize_session_name() {
-        assert_eq!(sanitize_session_name("my-project"), "my-project");
-        assert_eq!(sanitize_session_name("my project"), "my_project");
+        for (input, expected) in [
+            ("my-project", "my-project"),
+            ("my project", "my_project"),
+            ("test/path", "test_path"),
+            ("test.name", "test_name"),
+            ("test@name", "test_name"),
+            ("test:name", "test_name"),
+            ("test-name_123", "test-name_123"),
+            ("", ""),
+        ] {
+            assert_eq!(sanitize_session_name(input), expected, "{input:?}");
+        }
         assert_eq!(sanitize_session_name("a".repeat(30).as_str()).len(), 20);
+        let unicode = sanitize_session_name("test😀emoji");
+        assert!(unicode.starts_with("test") && unicode.contains('_'));
+        assert!(!unicode.contains('😀'));
     }
 
     #[test]
@@ -662,131 +675,50 @@ mod tests {
     }
 
     #[test]
-    fn test_strip_osc_st_hyperlink() {
-        assert_eq!(
-            strip_osc_st("\x1b]8;;https://example.com\x1b\\Click Here\x1b]8;;\x1b\\"),
-            "Click Here"
-        );
-    }
-
-    #[test]
-    fn test_strip_osc_st_preserves_surrounding_text() {
-        assert_eq!(
-            strip_osc_st("before \x1b]8;;https://github.com\x1b\\link text\x1b]8;;\x1b\\ after"),
-            "before link text after"
-        );
-    }
-
-    #[test]
-    fn test_strip_osc_st_multiple_links() {
-        let input = "\x1b]8;;https://a.com\x1b\\A\x1b]8;;\x1b\\ and \x1b]8;;https://b.com\x1b\\B\x1b]8;;\x1b\\";
-        assert_eq!(strip_osc_st(input), "A and B");
-    }
-
-    #[test]
-    fn test_strip_osc_st_no_osc() {
-        assert_eq!(strip_osc_st("plain text"), "plain text");
-    }
-
-    #[test]
-    fn test_strip_osc_st_preserves_sgr() {
-        assert_eq!(
-            strip_osc_st("\x1b[32m\x1b]8;;url\x1b\\green link\x1b]8;;\x1b\\\x1b[0m"),
-            "\x1b[32mgreen link\x1b[0m"
-        );
-    }
-
-    #[test]
-    fn test_strip_osc_st_unterminated() {
-        assert_eq!(
-            strip_osc_st("\x1b]8;;url without terminator"),
-            "\x1b]8;;url without terminator"
-        );
-    }
-
-    #[test]
-    fn test_strip_osc_st_passes_bel_terminated_through() {
-        let bel_osc = "\x1b]0;Window Title\x07";
-        assert_eq!(strip_osc_st(bel_osc), bel_osc);
-    }
-
-    #[test]
-    fn test_strip_osc_st_mixed_bel_then_st() {
-        let input = "\x1b]0;Title\x07before\x1b]8;;https://x.com\x1b\\link\x1b]8;;\x1b\\after";
-        assert_eq!(strip_osc_st(input), "\x1b]0;Title\x07beforelinkafter");
-    }
-
-    #[test]
-    fn test_sanitize_session_name_special_chars() {
-        assert_eq!(sanitize_session_name("test/path"), "test_path");
-        assert_eq!(sanitize_session_name("test.name"), "test_name");
-        assert_eq!(sanitize_session_name("test@name"), "test_name");
-        assert_eq!(sanitize_session_name("test:name"), "test_name");
-    }
-
-    #[test]
-    fn test_sanitize_session_name_preserves_valid_chars() {
-        assert_eq!(sanitize_session_name("test-name_123"), "test-name_123");
-    }
-
-    #[test]
-    fn test_sanitize_session_name_empty() {
-        assert_eq!(sanitize_session_name(""), "");
-    }
-
-    #[test]
-    fn test_sanitize_session_name_unicode() {
-        let result = sanitize_session_name("test😀emoji");
-        assert!(result.starts_with("test"));
-        assert!(result.contains('_'));
-        assert!(!result.contains('😀'));
-    }
-
-    #[test]
-    fn test_is_shell_command_recognizes_common_shells() {
-        for shell in KNOWN_SHELLS {
-            assert!(
-                is_shell_command(shell),
-                "{shell} should be recognized as a shell"
-            );
+    fn test_strip_osc_st() {
+        let cases = [
+            (
+                "\x1b]8;;https://example.com\x1b\\Click Here\x1b]8;;\x1b\\",
+                "Click Here",
+            ),
+            (
+                "before \x1b]8;;https://github.com\x1b\\link text\x1b]8;;\x1b\\ after",
+                "before link text after",
+            ),
+            (
+                "\x1b]8;;https://a.com\x1b\\A\x1b]8;;\x1b\\ and \x1b]8;;https://b.com\x1b\\B\x1b]8;;\x1b\\",
+                "A and B",
+            ),
+            ("plain text", "plain text"),
+            (
+                "\x1b[32m\x1b]8;;url\x1b\\green link\x1b]8;;\x1b\\\x1b[0m",
+                "\x1b[32mgreen link\x1b[0m",
+            ),
+            (
+                "\x1b]8;;url without terminator",
+                "\x1b]8;;url without terminator",
+            ),
+            ("\x1b]0;Window Title\x07", "\x1b]0;Window Title\x07"),
+            (
+                "\x1b]0;Title\x07before\x1b]8;;https://x.com\x1b\\link\x1b]8;;\x1b\\after",
+                "\x1b]0;Title\x07beforelinkafter",
+            ),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(strip_osc_st(input), expected, "{input:?}");
         }
     }
 
     #[test]
-    fn test_is_shell_command_recognizes_login_shells() {
-        for shell in ["-bash", "-zsh", "-sh", "-fish"] {
-            assert!(
-                is_shell_command(shell),
-                "{shell} should be recognized as a login shell"
-            );
+    fn test_is_shell_command() {
+        let login = ["-bash", "-zsh", "-sh", "-fish"];
+        for shell in KNOWN_SHELLS.iter().copied().chain(login) {
+            assert!(is_shell_command(shell), "{shell} is a shell");
         }
-    }
-
-    #[test]
-    fn test_is_shell_command_rejects_agent_binaries() {
         for cmd in [
             "claude", "opencode", "codex", "gemini", "cursor", "droid", "sleep", "python",
         ] {
-            assert!(
-                !is_shell_command(cmd),
-                "{cmd} should not be recognized as a shell"
-            );
-        }
-    }
-
-    #[test]
-    fn test_is_pane_running_shell_command_accounts_for_protected_wrapper() {
-        let cases = [
-            ("sh", true, false),
-            ("sh", false, true),
-            ("claude", false, false),
-        ];
-        for (current_command, pane_start_command_is_protected, expected) in cases {
-            assert_eq!(
-                is_pane_running_shell_command(current_command, pane_start_command_is_protected),
-                expected,
-                "{current_command:?}, protected={pane_start_command_is_protected}"
-            );
+            assert!(!is_shell_command(cmd), "{cmd} is not a shell");
         }
     }
 
@@ -826,19 +758,7 @@ mod tests {
     }
     #[test]
     #[serial_test::serial]
-    fn kill_session_if_present_swallows_missing_session() {
-        require_tmux!();
-        let name = "aoe_test_kill_if_present_missing";
-        let _ = crate::tmux::tmux_command()
-            .args(["kill-session", "-t", name])
-            .output();
-        assert!(kill_session_if_present(name).is_ok());
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn kill_session_if_present_kills_existing_session() {
-        let _env = crate::session::test_support::EnvGuard::read_lock();
+    fn kill_session_if_present_kills_or_swallows_missing() {
         require_tmux!();
         let guard =
             crate::tmux::test_helpers::TmuxTestSession::new("aoe_test_kill_if_present_alive");
@@ -858,9 +778,10 @@ mod tests {
             .status()
             .map(|s| s.success())
             .unwrap_or(false);
+        assert!(!exists, "session should be gone");
         assert!(
-            !exists,
-            "session should be gone after kill_session_if_present"
+            kill_session_if_present(name).is_ok(),
+            "a missing session is not an error"
         );
     }
 

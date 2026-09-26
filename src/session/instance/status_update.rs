@@ -514,21 +514,31 @@ mod tests {
     }
 
     #[test]
-    fn archived_poll_settles_live_status_and_keeps_resting_ones() {
-        for (status, expected) in [
-            (Status::Running, Status::Idle),
-            (Status::Waiting, Status::Idle),
-            (Status::Starting, Status::Idle),
-            (Status::Idle, Status::Idle),
-            (Status::Stopped, Status::Stopped),
-            (Status::Error, Status::Error),
-            (Status::Unknown, Status::Unknown),
-        ] {
-            let mut inst = Instance::new("test", "/tmp/test");
-            inst.status = status;
-            inst.archived_at = Some(Utc::now());
-            inst.update_status_with_metadata(None, None);
-            assert_eq!(inst.status, expected, "{status:?}");
+    fn archive_and_archived_poll_settle_live_status_and_keep_resting_ones() {
+        type Settle = fn(&mut Instance);
+        let entries: [(&str, Settle); 2] = [
+            ("archive", |inst| inst.archive()),
+            ("archived poll", |inst| {
+                inst.archived_at = Some(Utc::now());
+                inst.update_status_with_metadata(None, None);
+            }),
+        ];
+        for (entry, settle) in entries {
+            for (status, expected) in [
+                (Status::Running, Status::Idle),
+                (Status::Waiting, Status::Idle),
+                (Status::Starting, Status::Idle),
+                (Status::Idle, Status::Idle),
+                (Status::Stopped, Status::Stopped),
+                (Status::Error, Status::Error),
+                (Status::Unknown, Status::Unknown),
+            ] {
+                let mut inst = Instance::new("test", "/tmp/test");
+                inst.status = status;
+                settle(&mut inst);
+                assert!(inst.is_archived());
+                assert_eq!(inst.status, expected, "{entry} {status:?}");
+            }
         }
 
         // Archiving kills tmux on purpose: no Error for the missing session (#2206).

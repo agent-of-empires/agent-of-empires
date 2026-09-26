@@ -2341,13 +2341,19 @@ mod tests {
     }
 
     #[test]
-    fn idle_non_sandbox_is_safe() {
-        // No container, nothing holds the dir; the move proceeds.
-        assert_eq!(worktree_rename_block(Status::Idle, false, false), None);
-    }
-
-    #[test]
-    fn active_status_blocks_as_active_agent() {
+    fn worktree_rename_block_checks_status_before_container() {
+        // (status, sandboxed, container running, expected block)
+        let mut cases = vec![
+            // No container, nothing holds the dir; the move proceeds.
+            (Status::Idle, false, false, None),
+            // A busy agent reports as ActiveAgent even with a live container.
+            (
+                Status::Running,
+                true,
+                true,
+                Some(WorktreeRenameBlock::ActiveAgent),
+            ),
+        ];
         for status in [
             Status::Running,
             Status::Waiting,
@@ -2355,21 +2361,14 @@ mod tests {
             Status::Creating,
             Status::Deleting,
         ] {
+            cases.push((status, false, false, Some(WorktreeRenameBlock::ActiveAgent)));
+        }
+        for (status, sandboxed, running, want) in cases {
             assert_eq!(
-                worktree_rename_block(status, false, false),
-                Some(WorktreeRenameBlock::ActiveAgent),
-                "{status:?} should block as ActiveAgent"
+                worktree_rename_block(status, sandboxed, running),
+                want,
+                "{status:?} sandboxed={sandboxed} running={running}"
             );
         }
-    }
-
-    #[test]
-    fn active_status_takes_precedence_over_container() {
-        // A busy agent reports as ActiveAgent even on a sandbox session with a
-        // live container; status is checked first.
-        assert_eq!(
-            worktree_rename_block(Status::Running, true, true),
-            Some(WorktreeRenameBlock::ActiveAgent)
-        );
     }
 }

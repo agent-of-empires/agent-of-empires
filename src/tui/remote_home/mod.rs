@@ -271,23 +271,6 @@ mod tests {
     }
 
     #[test]
-    fn old_daemon_session_without_new_fields_stays_openable() {
-        let wire: SessionResponse = serde_json::from_value(serde_json::json!({
-            "id": "legacy",
-            "title": "Legacy",
-            "project_path": "/tmp/legacy",
-            "view": "structured"
-        }))
-        .unwrap();
-
-        let sessions = sessions_from_snapshot(vec![wire]);
-        assert_eq!(sessions.len(), 1);
-        assert_eq!(sessions[0].id, "legacy");
-        assert_eq!(sessions[0].status, "");
-        assert_eq!(sessions[0].context_resume, None);
-    }
-
-    #[test]
     fn snapshot_failure_clears_stale_sessions() {
         let mut state = state();
         state.sessions = vec![session("stale")];

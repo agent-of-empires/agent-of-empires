@@ -1819,7 +1819,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_message_renders_markdown_without_markers() {
+    fn message_lines_render_markdown_and_user_turns() {
         let lines = render_agent_message_lines("# Title\n\n**bold** and `code`");
         let text = joined(&lines);
         for marker in ["#", "**", "`"] {
@@ -1881,10 +1881,8 @@ mod tests {
             let lines = render_agent_message_lines(input);
             assert_eq!(joined(&lines), "…", "input {input:?}");
         }
-    }
 
-    #[test]
-    fn user_message_uses_one_chevron_and_no_background() {
+        // A user message takes one chevron and no background.
         let theme = crate::tui::styles::load_theme("empire");
         let lines = user_message_lines("first\nsecond", &theme);
         assert_eq!(joined(&lines), "› first\n  second");
@@ -2039,7 +2037,7 @@ mod tests {
     }
 
     #[test]
-    fn structured_diffs_win_over_args_derived_diff() {
+    fn edit_diffs_prefer_structured_previews_and_cap_at_budget() {
         use crate::acp::state::DiffPreview;
         let mut row = tool_row(
             "edit",
@@ -2067,6 +2065,22 @@ mod tests {
             assert!(out.contains(want), "{out:?}");
         }
         assert!(!out.contains("stale"), "{out:?}");
+
+        // An args-derived edit diff caps at its budget with a "more" footer.
+        let new_body: String = (0..30).map(|i| format!("line {i}\n")).collect();
+        let args =
+            serde_json::json!({ "file_path": "big.txt", "old_string": "", "new_string": new_body });
+        let lines = render_tool_lines(
+            &tool_row("edit", &args.to_string(), None),
+            &Theme::default(),
+            None,
+        );
+        let plus = lines
+            .iter()
+            .filter(|l| line_text(l).trim_start().starts_with("+ "))
+            .count();
+        assert_eq!(plus, TOOL_DIFF_MAX_LINES);
+        assert!(joined(&lines).contains("+10 more diff lines"));
     }
 
     /// (kind, args, completion, must contain, must not contain)
@@ -2151,24 +2165,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    #[test]
-    fn edit_diff_caps_at_budget_with_more_footer() {
-        let new_body: String = (0..30).map(|i| format!("line {i}\n")).collect();
-        let args =
-            serde_json::json!({ "file_path": "big.txt", "old_string": "", "new_string": new_body });
-        let lines = render_tool_lines(
-            &tool_row("edit", &args.to_string(), None),
-            &Theme::default(),
-            None,
-        );
-        let plus = lines
-            .iter()
-            .filter(|l| line_text(l).trim_start().starts_with("+ "))
-            .count();
-        assert_eq!(plus, TOOL_DIFF_MAX_LINES);
-        assert!(joined(&lines).contains("+10 more diff lines"));
     }
 
     #[test]
@@ -2308,7 +2304,7 @@ mod tests {
     }
 
     #[test]
-    fn composer_is_a_prompt_rail_and_preview_stays_calm() {
+    fn full_render_layout() {
         let rows = render_rows(&test_state(), 60, 12, true);
         let prompt = rows
             .iter()
@@ -2320,10 +2316,8 @@ mod tests {
         let rows = render_rows(&test_state(), 60, 12, false);
         assert!(rows[0].contains("○ s-1"), "{rows:?}");
         assert!(rows.iter().any(|row| row.contains("Press Enter to reply")));
-    }
 
-    #[test]
-    fn metadata_card_is_compact_and_transcript_is_unframed() {
+        // The metadata card stays compact and the transcript is unframed.
         let mut state = test_state();
         state.transcript.session_title = Some("virtual-wardrobe".into());
         state.transcript.agent_name = Some("codex".into());

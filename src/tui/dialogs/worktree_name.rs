@@ -170,50 +170,27 @@ mod tests {
     }
 
     #[test]
-    fn empty_name_cancels() {
-        let mut d = WorktreeNameDialog::new("old", "old");
-        assert!(matches!(
-            d.handle_key(key(KeyCode::Enter)),
-            DialogResult::Cancel
-        ));
-    }
-
-    #[test]
-    fn types_name_and_submits() {
-        let mut d = WorktreeNameDialog::new("old", "old");
-        for c in "new-name".chars() {
-            d.handle_key(key(KeyCode::Char(c)));
-        }
-        match d.handle_key(key(KeyCode::Enter)) {
-            DialogResult::Submit(data) => {
-                assert_eq!(data.name, "new-name");
-                assert!(!data.rename_branch);
+    fn typed_name_and_toggle_decide_the_submit() {
+        use KeyCode::{Char, Enter, Tab};
+        // (keys before Enter, Some((name, rename_branch)) or None for cancel).
+        // Space types into the name field; it toggles only once focused.
+        let cases: [(&[KeyCode], Option<(&str, bool)>); 4] = [
+            (&[], None),
+            (&[Char('n'), Char('e'), Char('w')], Some(("new", false))),
+            (&[Char('a'), Char(' '), Char('b')], Some(("a b", false))),
+            (&[Char('x'), Tab, Char(' ')], Some(("x", true))),
+        ];
+        for (keys, want) in cases {
+            let mut d = WorktreeNameDialog::new("old", "old");
+            for code in keys {
+                d.handle_key(key(*code));
             }
-            _ => panic!("expected submit"),
+            let got = match d.handle_key(key(Enter)) {
+                DialogResult::Submit(data) => Some((data.name, data.rename_branch)),
+                DialogResult::Cancel => None,
+                DialogResult::Continue => panic!("{keys:?} did not decide"),
+            };
+            assert_eq!(got, want.map(|(n, r)| (n.to_string(), r)), "{keys:?}");
         }
-    }
-
-    #[test]
-    fn toggle_enables_branch_rename() {
-        let mut d = WorktreeNameDialog::new("old", "old");
-        for c in "x".chars() {
-            d.handle_key(key(KeyCode::Char(c)));
-        }
-        d.handle_key(key(KeyCode::Tab)); // focus toggle
-        d.handle_key(key(KeyCode::Char(' '))); // toggle on
-        match d.handle_key(key(KeyCode::Enter)) {
-            DialogResult::Submit(data) => assert!(data.rename_branch),
-            _ => panic!("expected submit"),
-        }
-    }
-
-    #[test]
-    fn space_on_name_field_types_space_not_toggle() {
-        let mut d = WorktreeNameDialog::new("old", "old");
-        d.handle_key(key(KeyCode::Char('a')));
-        d.handle_key(key(KeyCode::Char(' ')));
-        d.handle_key(key(KeyCode::Char('b')));
-        assert_eq!(d.new_name.value(), "a b");
-        assert!(!d.rename_branch);
     }
 }

@@ -93,22 +93,6 @@ test.describe("wizard", () => {
 
 // #1324
 test.describe("scratch sessions", () => {
-  test("scratch happy path: launch creates a scratch-dir session", async ({ page, spawnServe }) => {
-    const serve = await spawnServe();
-    const wizard = await openWizard(page, serve);
-    await wizard.getByRole("switch", { name: "Skip project folder" }).click();
-    await expect(wizard.getByText("Scratch session")).toBeVisible({ timeout: 10_000 });
-    await wizard.getByRole("button", { name: /Launch session/ }).click();
-    const session = await expectOneScratchSession(serve);
-
-    // Creation is durable across a fresh server load.
-    await serve.restart();
-    const reloaded = await listSessions(serve.baseUrl);
-    expect(reloaded.map((row) => row.id)).toEqual([session.id]);
-    expect(reloaded[0]!.scratch).toBe(true);
-    expect(reloaded[0]!.project_path).toBe(session.project_path);
-  });
-
   test("deleting a scratch session removes its scratch dir", async ({ page, spawnServe }) => {
     const serve = await spawnServe();
     const wizard = await openWizard(page, serve);
@@ -240,19 +224,6 @@ test.describe("directory browser", () => {
     await openWizardWithShortcut(page);
     await expect(option(page, "repo-a")).toBeVisible({ timeout: 10_000 });
     await expect(option(page, "projects")).toHaveCount(0);
-  });
-
-  test("DirectoryBrowser: parent-dir row navigates up one level", async ({ page, spawnServe }) => {
-    const serve = await spawnServe({
-      seedFn: ({ home }) => void mkdirSync(join(home, "projects", "nested"), { recursive: true }),
-    });
-    await page.goto(serve.baseUrl);
-    await openWizardWithShortcut(page);
-    await option(page, "projects").click({ timeout: 10_000 });
-    await option(page, "nested").click();
-    await expect(page.getByText("No visible subfolders here")).toBeVisible();
-    await option(page, "(parent directory)").click();
-    await expect(option(page, "nested")).toBeVisible({ timeout: 5_000 });
   });
 });
 

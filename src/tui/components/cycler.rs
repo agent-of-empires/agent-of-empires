@@ -111,57 +111,56 @@ mod tests {
     }
 
     #[test]
-    fn profile_cycler_shows_brackets_when_multiple() {
+    fn cycler_spans_cases() {
         let theme = Theme::default();
-        let spans = profile_cycler_spans("Profile:", "work", 3, false, &theme);
-        assert_eq!(contents(&spans), ["Profile:", " ", "< ", "work", " >"]);
-    }
-
-    #[test]
-    fn profile_cycler_drops_brackets_when_single() {
-        let theme = Theme::default();
-        let spans = profile_cycler_spans("Profile:", "default", 1, false, &theme);
-        assert_eq!(contents(&spans), ["Profile:", " ", "default"]);
-    }
-
-    #[test]
-    fn profile_cycler_underlines_label_when_focused() {
-        let theme = Theme::default();
-        let spans = profile_cycler_spans("Profile:", "work", 3, true, &theme);
-        assert!(spans[0].style.add_modifier.contains(Modifier::UNDERLINED));
-    }
-
-    #[test]
-    fn tool_cycler_focused_shows_arrows_and_badge() {
-        let theme = Theme::default();
-        let spans = tool_cycler_spans("Tool:", "claude", 0, 3, true, &theme);
-        assert_eq!(
-            contents(&spans),
-            ["Tool:", " ", "← ", "● ", "claude", "  [1/3]", "  →"]
-        );
-    }
-
-    #[test]
-    fn tool_cycler_unfocused_drops_arrows_keeps_badge() {
-        let theme = Theme::default();
-        let spans = tool_cycler_spans("Tool:", "codex", 1, 3, false, &theme);
-        assert_eq!(contents(&spans), ["Tool:", " ", "● ", "codex", "  [2/3]"]);
-    }
-
-    #[test]
-    fn tool_cycler_single_tool_is_plain() {
-        let theme = Theme::default();
-        let spans = tool_cycler_spans("Tool:", "claude", 0, 1, false, &theme);
-        assert_eq!(contents(&spans), ["Tool:", " ", "claude"]);
-    }
-
-    #[test]
-    fn tool_cycler_single_tool_underlines_label_when_focused() {
-        // Single-tool early return must still respect focus so users
-        // can see which row Tab landed on.
-        let theme = Theme::default();
-        let spans = tool_cycler_spans("Tool:", "claude", 0, 1, true, &theme);
-        assert!(spans[0].style.add_modifier.contains(Modifier::UNDERLINED));
+        let profile =
+            |value, count, focused| profile_cycler_spans("Profile:", value, count, focused, &theme);
+        let tool = |value, index, count, focused| {
+            tool_cycler_spans("Tool:", value, index, count, focused, &theme)
+        };
+        let cases: Vec<(Vec<Span<'static>>, &[&str], bool)> = vec![
+            (
+                profile("work", 3, false),
+                &["Profile:", " ", "< ", "work", " >"],
+                false,
+            ),
+            (
+                profile("default", 1, false),
+                &["Profile:", " ", "default"],
+                false,
+            ),
+            (
+                profile("work", 3, true),
+                &["Profile:", " ", "< ", "work", " >"],
+                true,
+            ),
+            (
+                tool("claude", 0, 3, true),
+                &["Tool:", " ", "← ", "● ", "claude", "  [1/3]", "  →"],
+                true,
+            ),
+            (
+                tool("codex", 1, 3, false),
+                &["Tool:", " ", "● ", "codex", "  [2/3]"],
+                false,
+            ),
+            (
+                tool("claude", 0, 1, false),
+                &["Tool:", " ", "claude"],
+                false,
+            ),
+            // The single-tool early return must still show focus so users can
+            // see which row Tab landed on.
+            (tool("claude", 0, 1, true), &["Tool:", " ", "claude"], true),
+        ];
+        for (spans, want, underlined) in cases {
+            assert_eq!(contents(&spans), want);
+            assert_eq!(
+                spans[0].style.add_modifier.contains(Modifier::UNDERLINED),
+                underlined,
+                "{want:?}"
+            );
+        }
     }
 
     #[test]

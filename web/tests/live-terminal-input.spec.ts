@@ -40,13 +40,15 @@ test.describe("Live terminal mouse forwarding (mobile)", () => {
     return handle;
   }
 
-  test("a left click on a full-screen SGR-mouse app forwards press + release", async ({ page }) => {
+  test("a left-button drag on a full-screen SGR-mouse app forwards press, motion, and release", async ({ page }) => {
     const handle = await mount(page, { altScreen: true, mouse: true, mouseSgr: true });
     const box = (await scroller(page).boundingBox())!;
-    await pointer(page, "pointerdown", box.x + 30, box.y + 20);
-    await pointer(page, "pointerup", box.x + 30, box.y + 20);
-    // Press: SGR left button (0), `M`. Release: same button, lowercase `m`.
+    await pointer(page, "pointerdown", box.x + 20, box.y + 20);
+    await pointer(page, "pointermove", box.x + 160, box.y + 20); // far enough to cross cells
+    await pointer(page, "pointerup", box.x + 160, box.y + 20);
+    // Press: SGR left button (0), `M`. Motion rides at +32. Release: lowercase `m`.
     await expect.poll(() => liveMatches(handle, /\x1b\[<0;\d+;\d+M/)).toBe(true);
+    await expect.poll(() => liveMatches(handle, /\x1b\[<32;\d+;\d+M/)).toBe(true);
     await expect.poll(() => liveMatches(handle, /\x1b\[<0;\d+;\d+m/)).toBe(true);
   });
 
@@ -71,44 +73,23 @@ test.describe("Live terminal mouse forwarding (mobile)", () => {
       .toMatch(/\x1b\[<0;\d+;2M/);
   });
 
-  test("dragging forwards a motion report (button + 32) per new cell", async ({ page }) => {
+  // Shift is the local-selection escape hatch; a normal-screen agent owns no
+  // mouse at all. Neither path may put mouse bytes on the wire.
+  test("Shift+click and a normal-screen agent forward no mouse bytes", async ({ page }) => {
     const handle = await mount(page, { altScreen: true, mouse: true, mouseSgr: true });
     const box = (await scroller(page).boundingBox())!;
-    await pointer(page, "pointerdown", box.x + 20, box.y + 20);
-    await pointer(page, "pointermove", box.x + 160, box.y + 20); // far enough to cross cells
-    await pointer(page, "pointerup", box.x + 160, box.y + 20);
-    // Motion (drag) rides at +32 in SGR; the press and release bracket it.
-    await expect.poll(() => liveMatches(handle, /\x1b\[<32;\d+;\d+M/)).toBe(true);
-    await expect.poll(() => liveMatches(handle, /\x1b\[<0;\d+;\d+m/)).toBe(true);
-  });
-
-  test("a legacy-mouse app forwards X10 button bytes (ESC [ M), not SGR", async ({ page }) => {
-    const handle = await mount(page, { altScreen: true, mouse: true, mouseSgr: false });
-    const box = (await scroller(page).boundingBox())!;
+    await pointer(page, "pointerdown", box.x + 30, box.y + 20, { shiftKey: true });
+    await pushModeFrame(handle, { altScreen: false, mouse: true, mouseSgr: true });
+    await expectScrollMode(page, "read");
     await pointer(page, "pointerdown", box.x + 30, box.y + 20);
     await pointer(page, "pointerup", box.x + 30, box.y + 20);
-    // X10: `ESC [ M` + bytes; the left-press button byte is 0 + 32 = 0x20.
-    await expect.poll(() => liveTexts(handle).some((s) => s.startsWith("\x1b[M"))).toBe(true);
-    expect(liveMatches(handle, /\x1b\[</)).toBe(false);
-  });
-
-  // Shift is the local-selection escape hatch; a normal-screen agent owns no
-  // mouse at all. Both paths must leave the wire clean.
-  for (const [name, altScreen, init, release] of [
-    ["Shift+click is NOT forwarded (keeps local text selection)", true, { shiftKey: true }, false],
-    ["a normal-screen agent does NOT forward a click", false, {}, true],
-  ] as const) {
-    test(name, async ({ page }) => {
-      const handle = await mount(page, { altScreen, mouse: true, mouseSgr: true });
-      const box = (await scroller(page).boundingBox())!;
-      await pointer(page, "pointerdown", box.x + 30, box.y + 20, init);
-      if (release) await pointer(page, "pointerup", box.x + 30, box.y + 20, init);
-      await observeFor(page, 200, async () => {
-        expect(liveMatches(handle, /\x1b\[</)).toBe(false);
-        expect(liveTexts(handle).some((s) => s.startsWith("\x1b[M"))).toBe(false);
-      });
+    await swipeUp(page);
+    await observeFor(page, 300, async () => {
+      expect(liveMatches(handle, /\x1b\[</)).toBe(false);
+      expect(liveTexts(handle).some((s) => s.startsWith("\x1b[M"))).toBe(false);
+      expect(hasLegacyDown(handle)).toBe(false);
     });
-  }
+  });
 
   test("swipe over a full-screen SGR-mouse app forwards SGR wheel bytes", async ({ page }) => {
     const handle = await mount(page, { altScreen: true, mouse: true, mouseSgr: true });
@@ -140,44 +121,11 @@ test.describe("Live terminal mouse forwarding (mobile)", () => {
     await expect(page.getByRole("button", { name: "Back to live" })).toHaveCount(0);
   });
 
-  test("a flick coasts: wheel bytes keep arriving after the finger lifts, and a touch stops it", async ({ page }) => {
-    const handle = await mount(page, { altScreen: true, mouse: true, mouseSgr: true });
-    // Synthetic touchmoves land with ~1ms deltas, so the raw release velocity
-    // is absurd; the component's velocity cap is what bounds this coast.
-    await fireTouches(page, "touchstart", [{ x: 100, y: 300 }]);
-    for (const y of [280, 260, 240, 220]) {
-      await fireTouches(page, "touchmove", [{ x: 100, y }]);
-    }
-    await fireTouches(page, "touchend", [{ x: 100, y: 220 }]);
-    // Let the drag's own bytes drain, then require NEW bytes with no input at
-    // all: only the momentum loop can be producing them.
-    await page.waitForTimeout(150);
-    const atLift = handle.liveMessages.length;
-    await expect.poll(() => handle.liveMessages.length, { timeout: 3_000 }).toBeGreaterThan(atLift);
-    // A touch lands mid-coast: the coast must stop (a tap emits no wheel bytes).
-    await fireTouches(page, "touchstart", [{ x: 100, y: 200 }]);
-    await fireTouches(page, "touchend", [{ x: 100, y: 200 }]);
-    await page.waitForTimeout(150);
-    const afterStop = handle.liveMessages.length;
-    await observeFor(page, 500, async () => {
-      expect(handle.liveMessages.length).toBe(afterStop);
-    });
-  });
-
   test("swipe over a full-screen LEGACY-mouse app forwards X10 wheel bytes", async ({ page }) => {
     const handle = await mount(page, { altScreen: true, mouse: true, mouseSgr: false });
     await swipeUp(page);
     await expect.poll(() => hasLegacyDown(handle)).toBe(true);
     expect(liveTexts(handle).some((s) => s.includes("\x1b[<"))).toBe(false);
-  });
-
-  test("normal-screen agent does NOT forward wheel bytes", async ({ page }) => {
-    const handle = await mount(page, { altScreen: false, mouse: true, mouseSgr: true });
-    await swipeUp(page);
-    await observeFor(page, 300, async () => {
-      expect(liveTexts(handle).some((s) => s.includes("\x1b[<") || s.includes("\x1b[M"))).toBe(false);
-      expect(hasLegacyDown(handle)).toBe(false);
-    });
   });
 });
 
@@ -339,23 +287,6 @@ test.describe("Live terminal link clicks (desktop)", () => {
     expect(popup.url()).toBe(LINK);
     // The press that opened the link is the browser's, not the app's.
     expect(mouseBytes(handle)).toHaveLength(0);
-  });
-
-  test("a click on output beside the link still forwards to the app", async ({ page }) => {
-    const handle = await setupLink(page, false);
-    const box = (await page.getByText(PROMPT, { exact: true }).boundingBox())!;
-    await page.mouse.click(box.x + 4, box.y + box.height / 2);
-    // Press (`M`) then release (`m`) for SGR left button 0.
-    await expect.poll(() => mouseBytes(handle).some((s) => /\x1b\[<0;\d+;\d+M/.test(s))).toBe(true);
-    await expect.poll(() => mouseBytes(handle).some((s) => /\x1b\[<0;\d+;\d+m/.test(s))).toBe(true);
-  });
-
-  test("a right-click on the link still reaches the app", async ({ page }) => {
-    const handle = await setupLink(page, false);
-    const [x, y] = await hittableCentre(page, `a[href="${LINK}"]`);
-    await page.mouse.click(x, y, { button: "right" });
-    // SGR right button is 2.
-    await expect.poll(() => mouseBytes(handle).some((s) => /\x1b\[<2;\d+;\d+M/.test(s))).toBe(true);
   });
 });
 

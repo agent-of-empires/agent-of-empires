@@ -13,7 +13,7 @@ import { highlightSnippet } from "../../lib/snippetHighlighter";
 import { useShikiTheme } from "../../hooks/useShikiTheme";
 import { parseFileRef, resolveArtifactUrl, resolveToRepoRelative } from "../../lib/fileRef";
 import { useAcpFileRef } from "./AcpFileRefContext";
-import { openArtifactInNewTab } from "../../lib/artifacts";
+import { openInNewTab } from "../../lib/openInNewTab";
 import { ArtifactImage } from "./artifactMedia";
 
 interface Props {
@@ -66,7 +66,7 @@ function TranscriptLink({ href, onClick, children, ...rest }: React.ComponentPro
         className="acp-artifact-link"
         onClick={(e) => {
           e.preventDefault();
-          void openArtifactInNewTab(artifactUrl);
+          void openInNewTab(artifactUrl);
         }}
       >
         {children}

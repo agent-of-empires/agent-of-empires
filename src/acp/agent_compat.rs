@@ -357,7 +357,7 @@ mod tests {
     const CLAUDE: &str = "@agentclientprotocol/claude-agent-acp";
 
     #[test]
-    fn validate_gates_name_and_version_per_agent() {
+    fn validate_and_steering_gates_per_agent() {
         use ExpectedAgent::*;
         let below_floor = format!("{CLAUDE_AGENT_ACP_MIN_VERSION}-alpha.1");
         // (agent, reported name and version, expected error kind or None for accepted)
@@ -446,6 +446,46 @@ mod tests {
         assert!(legacy_codex
             .user_message()
             .contains("npm install -g @agentclientprotocol/codex-acp@latest"));
+
+        // The steering gate needs both the advert and the version floor.
+        assert!(
+            floor(CLAUDE_AGENT_ACP_STEERING_MIN_VERSION) >= floor(CLAUDE_AGENT_ACP_MIN_VERSION),
+            "the steering floor must not sit below the startup floor",
+        );
+        // (agent, advertised bit, version, expected)
+        let cases = [
+            (
+                ClaudeAgentAcp,
+                Some(true),
+                CLAUDE_AGENT_ACP_STEERING_MIN_VERSION,
+                true,
+            ),
+            (ClaudeAgentAcp, Some(true), "999.0.0", true),
+            // Advertised but pre-opt-in: the case the floor exists for.
+            (ClaudeAgentAcp, Some(true), "0.63.9", false),
+            (ClaudeAgentAcp, Some(true), "0.64.0-alpha.1", false),
+            (ClaudeAgentAcp, Some(false), "999.0.0", false),
+            (ClaudeAgentAcp, None, "999.0.0", false),
+            (ClaudeAgentAcp, Some(true), "nightly", false),
+            // Other adapters have no floor, only the bit.
+            (CodexAcp, Some(true), "0.0.1", true),
+        ];
+        for (agent, advertised, version, expected) in cases {
+            let mut init = init(Some((CLAUDE, version)));
+            if let Some(supported) = advertised {
+                init = init.meta(
+                    serde_json::json!({ "steering": { "supported": supported } })
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                );
+            }
+            assert_eq!(
+                supports_steering(agent, &init),
+                expected,
+                "{agent:?} advertised={advertised:?} version={version}"
+            );
+        }
     }
 
     #[test]
@@ -506,53 +546,8 @@ mod tests {
             [CLAUDE_AGENT_ACP_MIN_VERSION],
             "docker/Dockerfile claude-agent-acp pin must match CLAUDE_AGENT_ACP_MIN_VERSION",
         );
-    }
 
-    #[test]
-    fn steering_gate_requires_advert_and_floor() {
-        use ExpectedAgent::*;
-        assert!(
-            floor(CLAUDE_AGENT_ACP_STEERING_MIN_VERSION) >= floor(CLAUDE_AGENT_ACP_MIN_VERSION),
-            "the steering floor must not sit below the startup floor",
-        );
-        // (agent, advertised bit, version, expected)
-        let cases = [
-            (
-                ClaudeAgentAcp,
-                Some(true),
-                CLAUDE_AGENT_ACP_STEERING_MIN_VERSION,
-                true,
-            ),
-            (ClaudeAgentAcp, Some(true), "999.0.0", true),
-            // Advertised but pre-opt-in: the case the floor exists for.
-            (ClaudeAgentAcp, Some(true), "0.63.9", false),
-            (ClaudeAgentAcp, Some(true), "0.64.0-alpha.1", false),
-            (ClaudeAgentAcp, Some(false), "999.0.0", false),
-            (ClaudeAgentAcp, None, "999.0.0", false),
-            (ClaudeAgentAcp, Some(true), "nightly", false),
-            // Other adapters have no floor, only the bit.
-            (CodexAcp, Some(true), "0.0.1", true),
-        ];
-        for (agent, advertised, version, expected) in cases {
-            let mut init = init(Some((CLAUDE, version)));
-            if let Some(supported) = advertised {
-                init = init.meta(
-                    serde_json::json!({ "steering": { "supported": supported } })
-                        .as_object()
-                        .unwrap()
-                        .clone(),
-                );
-            }
-            assert_eq!(
-                supports_steering(agent, &init),
-                expected,
-                "{agent:?} advertised={advertised:?} version={version}"
-            );
-        }
-    }
-
-    #[test]
-    fn from_command_finds_the_adapter_binary_in_any_launch_shape() {
+        // `from_command` finds the adapter binary in any launch shape.
         for command in [
             "claude-agent-acp",
             "/usr/local/bin/claude-agent-acp",

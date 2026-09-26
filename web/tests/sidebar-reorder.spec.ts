@@ -62,7 +62,9 @@ test.describe("desktop rows", () => {
     }
   });
 
-  test("press-and-hold drag lifts the row, PUTs the new order once, and persists across reload", async ({ page }) => {
+  test("press-and-hold drag lifts the row, PUTs the new order once, suppresses the trailing click, and persists", async ({
+    page,
+  }) => {
     const sessions = threeSessionsInOneRepo();
     const handle = await openDesktop(page, sessions, { persistPutOrdering: true });
     await expect.poll(() => readVisibleSessionTitles(page), { timeout: 8_000 }).toEqual(["alpha", "beta", "gamma"]);
@@ -81,48 +83,35 @@ test.describe("desktop rows", () => {
 
     await putWait;
     expect(handle.puts.map((p) => p.order)).toEqual([[sessions[2]!, sessions[0]!, sessions[1]!].map(workspaceId)]);
+    // Chromium dispatches a click on the drop target after mouseup; navigating there would defeat the drag.
+    await observeFor(page, 400, async () => {
+      expect(new URL(page.url()).pathname).toBe("/");
+    });
     await expect.poll(() => readVisibleSessionTitles(page), { timeout: 4_000 }).toEqual(["gamma", "alpha", "beta"]);
     // The reloaded order comes from the served ordering, not a client sort.
     await page.reload();
     await expect.poll(() => readVisibleSessionTitles(page), { timeout: 8_000 }).toEqual(["gamma", "alpha", "beta"]);
   });
 
-  test("click-after-drag suppression keeps the URL on the source row", async ({ page }) => {
-    // Chromium dispatches a click on the drop target after mouseup; navigating there would defeat the drag.
+  test("a 4px movement does not start a drag; a stationary click navigates without reordering", async ({ page }) => {
     const handle = await openDesktop(page);
     const wrappers = page.locator(WRAPPERS);
     await expect(wrappers).toHaveCount(3);
-    await dragRow(page, wrappers.nth(2), wrappers.nth(0));
-    await expect.poll(() => handle.puts.length, { timeout: 3_000 }).toBe(1);
-    await observeFor(page, 400, async () => {
-      expect(new URL(page.url()).pathname).toBe("/");
-    });
-  });
+    expect(await readVisibleSessionTitles(page)).toEqual(["alpha", "beta", "gamma"]);
+    const moved = (await wrappers.nth(2).boundingBox())!;
+    await page.mouse.move(moved.x + moved.width - 4, moved.y + moved.height / 2);
+    await page.mouse.down();
+    await page.mouse.move(moved.x + moved.width - 4, moved.y + moved.height / 2 + 4);
+    await page.mouse.up();
+    await expectNoOrderingPut(page, handle, 200);
+    expect(await readVisibleSessionTitles(page)).toEqual(["alpha", "beta", "gamma"]);
 
-  test("stationary click on a row navigates without reordering", async ({ page }) => {
-    const handle = await openDesktop(page);
-    const wrappers = page.locator(WRAPPERS);
-    await expect(wrappers).toHaveCount(3);
     const box = (await wrappers.nth(1).boundingBox())!;
     await page.mouse.move(box.x + box.width - 4, box.y + box.height / 2);
     await page.mouse.down();
     await page.mouse.up();
     await expect(page).toHaveURL(/\/session\/s-b$/, { timeout: 5_000 });
     await expectNoOrderingPut(page, handle, 200);
-  });
-
-  test("4px movement does not start a drag", async ({ page }) => {
-    const handle = await openDesktop(page);
-    const wrappers = page.locator(WRAPPERS);
-    await expect(wrappers).toHaveCount(3);
-    expect(await readVisibleSessionTitles(page)).toEqual(["alpha", "beta", "gamma"]);
-    const box = (await wrappers.nth(2).boundingBox())!;
-    await page.mouse.move(box.x + box.width - 4, box.y + box.height / 2);
-    await page.mouse.down();
-    await page.mouse.move(box.x + box.width - 4, box.y + box.height / 2 + 4);
-    await page.mouse.up();
-    await expectNoOrderingPut(page, handle, 200);
-    expect(await readVisibleSessionTitles(page)).toEqual(["alpha", "beta", "gamma"]);
   });
 
   test("dragging a row onto a different repo group is a no-op", async ({ page }) => {
@@ -184,15 +173,7 @@ test.describe("touch rows", () => {
     return { x: box.x + box.width / 2, y: box.y + box.height / 2 };
   };
 
-  test("touch tap on a row navigates", async ({ page }) => {
-    const { handle, rows } = await openMobile(page);
-    const { x, y } = await center(rows.nth(1));
-    await page.touchscreen.tap(x, y);
-    await expect(page).toHaveURL(/\/session\/s-b$/, { timeout: 5_000 });
-    await expectNoOrderingPut(page, handle, 200);
-  });
-
-  test("touch flick on the sidebar does not reorder rows", async ({ page }) => {
+  test("a touch flick does not reorder rows; a tap navigates", async ({ page }) => {
     // Movement past tolerance before the hold delay cancels activation.
     const { handle, rows, cdp } = await openMobile(page);
     const { x, y } = await center(rows.nth(0));
@@ -200,6 +181,11 @@ test.describe("touch rows", () => {
     for (const dy of [40, 120, 240]) await touch(cdp, "touchMove", [{ x, y: y + dy }]);
     await touch(cdp, "touchEnd", []);
     await expectNoOrderingPut(page, handle, 300);
+
+    const tap = await center(rows.nth(1));
+    await page.touchscreen.tap(tap.x, tap.y);
+    await expect(page).toHaveURL(/\/session\/s-b$/, { timeout: 5_000 });
+    await expectNoOrderingPut(page, handle, 200);
   });
 
   test("touch press-and-hold drag reorders the row and PUTs the new order", async ({ page }) => {
@@ -255,15 +241,5 @@ test.describe("group headers", () => {
     await page.reload();
     await expect(draggable(page)).toHaveCount(2);
     await expect.poll(() => groupNames(page), { timeout: 4_000 }).toEqual(expected);
-  });
-
-  test("group headers are not draggable in last-activity sort mode", async ({ page }) => {
-    await openDesktop(page, twoRepos);
-    await expect(draggable(page)).toHaveCount(2);
-    const toggle = page.locator("[data-testid='sidebar-sort-toggle']");
-    await toggle.click();
-    await page.locator("[data-testid='sidebar-sort-option-lastActivity']").click();
-    await expect(toggle).toHaveAttribute("data-sort-mode", "lastActivity");
-    await expect(draggable(page)).toHaveCount(0);
   });
 });

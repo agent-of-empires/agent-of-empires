@@ -42,14 +42,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_every_allowlisted_class_round_trip() {
+    fn parse_accepts_only_the_closed_set() {
         for ff in WebClientFormFactor::ALL {
             assert_eq!(parse(ff.key()), Some(ff), "round-trip failed for {ff:?}");
         }
-    }
-
-    #[test]
-    fn rejects_anything_outside_the_closed_set() {
         for bad in [
             "",
             "tablet",

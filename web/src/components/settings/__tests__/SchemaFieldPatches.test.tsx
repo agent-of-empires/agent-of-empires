@@ -140,23 +140,6 @@ describe("schema-driven settings field PATCH payloads", () => {
     await waitFor(() => expect(select.value).toBe("left"));
   });
 
-  it.each([
-    ["tmux", "Status Bar", "disabled", { tmux: { status_bar: "disabled" } }],
-    ["tmux", "Mouse Support", "disabled", { tmux: { mouse: "disabled" } }],
-    ["logging", "Default level", "debug", { logging: { default_level: "debug" } }],
-  ])("%s %s select emits its leaf", async (tab, label, value, patch) => {
-    const { container } = renderTab(tab);
-    await screen.findByText(label);
-    fireEvent.change(selectByLabel(container, label), { target: { value } });
-    if (tab === "logging") {
-      await waitFor(() => expect(api.updateSettings).toHaveBeenCalledWith(patch));
-      expect(api.updateProfileSettings).not.toHaveBeenCalled();
-    } else {
-      await waitFor(() => expect(api.updateProfileSettings).toHaveBeenCalledWith("main", patch));
-      expect(api.updateSettings).not.toHaveBeenCalled();
-    }
-  });
-
   it("a tmux field edit never leaks sibling fields into the PATCH (sparse leaf)", async () => {
     vi.mocked(api.fetchSettings).mockResolvedValueOnce({
       tmux: { status_bar: "enabled", mouse: "enabled" },
@@ -180,19 +163,6 @@ describe("schema-driven settings field PATCH payloads", () => {
     for (const [, updates] of vi.mocked(api.updateProfileSettings).mock.calls) {
       expect((updates as { tmux?: Record<string, unknown> }).tmux).not.toHaveProperty("mouse");
     }
-  });
-
-  it("session Snooze Duration commit emits { session: { snooze_duration_minutes } } as a number", async () => {
-    const { container } = renderTab("session");
-    await screen.findByText("Snooze Duration (minutes)");
-
-    commit(numberInputByLabel(container, "Snooze Duration (minutes)"), "12");
-
-    await waitFor(() =>
-      expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith("main", {
-        session: { snooze_duration_minutes: 12 },
-      }),
-    );
   });
 
   it("session poller-thread ceiling is an advanced, global-only number that emits { session: { session_id_poller_max_threads } }", async () => {

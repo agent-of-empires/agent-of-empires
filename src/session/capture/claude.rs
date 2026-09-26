@@ -43,6 +43,33 @@ pub(crate) fn claude_home_for_host_environment(
     }
 }
 
+/// Whether `store` is Claude's built-in `<home>/.claude`. Exporting
+/// `CLAUDE_CONFIG_DIR` for it is not a no-op: Claude then reads its global
+/// config from `<home>/.claude/.claude.json` instead of `<home>/.claude.json`.
+pub(crate) fn is_default_claude_store(store: &Path, home: &Path) -> bool {
+    let identity = |path: &Path| {
+        super::canonicalize_allowing_missing_leaf(path).unwrap_or_else(|| path.to_path_buf())
+    };
+    identity(store) == identity(&home.join(".claude"))
+}
+
+/// The store a host Claude worker is pinned to by its selected conversation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaudeStorePin {
+    pub store: PathBuf,
+    /// The conversation's launch exported `CLAUDE_CONFIG_DIR` even for the default store.
+    pub explicit: bool,
+}
+
+impl ClaudeStorePin {
+    pub(crate) fn of(execution: &crate::session::ExecutionBinding) -> Option<Self> {
+        Some(Self {
+            store: execution.stores.first()?.clone(),
+            explicit: execution.exported_default_store,
+        })
+    }
+}
+
 /// True only when Claude's home resolves and `<config>/projects/<cwd>/<id>.jsonl`
 /// is missing, so a never-prompted pinned id can launch fresh instead of failing
 /// `--resume`. The config dir resolves as the launch does (see
@@ -85,16 +112,21 @@ mod tests {
         }
     }
 
+    /// Absence is existence-only (an hour-old transcript still counts), and a declared
+    /// `session.agent_config_dir` wins over the host environment: the wrappers it exists for export
+    /// `CLAUDE_CONFIG_DIR` themselves after launch, so probing the environment's directory would
+    /// report every real conversation absent and downgrade a good `--resume` to a `--session-id`
+    /// the agent rejects.
     #[test]
-    fn transcript_absence_is_existence_only() {
-        let tmp = tempfile::tempdir().unwrap();
-        let project_dir = tmp.path().join("projects").join("-tmp-myproject");
+    fn transcript_absence_is_existence_only_in_the_declared_store() {
+        let store = tempfile::tempdir().unwrap();
+        let empty = tempfile::tempdir().unwrap();
+        let project_dir = store.path().join("projects").join("-tmp-myproject");
         std::fs::create_dir_all(&project_dir).unwrap();
         let present = "11111111-2222-3333-4444-555555555555";
         let missing = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
         let file = project_dir.join(format!("{present}.jsonl"));
         std::fs::write(&file, "data\n").unwrap();
-        // An old transcript must still count as present.
         let hour_ago = std::time::SystemTime::now() - Duration::from_secs(3600);
         std::fs::File::options()
             .write(true)
@@ -102,58 +134,21 @@ mod tests {
             .unwrap()
             .set_times(std::fs::FileTimes::new().set_modified(hour_ago))
             .unwrap();
-        let _env =
-            crate::session::test_support::EnvGuard::set(&[("CLAUDE_CONFIG_DIR", tmp.path())]);
-
-        assert!(!claude_host_transcript_confirmed_absent(
-            "/tmp/myproject",
-            present,
-            &[],
-            None
-        ));
-        assert!(claude_host_transcript_confirmed_absent(
-            "/tmp/myproject",
-            missing,
-            &[],
-            None
-        ));
-        assert!(claude_host_transcript_confirmed_absent(
-            "/tmp/never-opened-project",
-            present,
-            &[],
-            None
-        ));
-    }
-
-    /// Nothing puts `CLAUDE_CONFIG_DIR` in the host environment for a session
-    /// pinned with `session.agent_config_dir`: the wrappers it exists for
-    /// export it themselves, after the launch has its environment. Probing the
-    /// environment's answer would report every real conversation absent and
-    /// downgrade a good `--resume` to a `--session-id` the agent rejects.
-    #[test]
-    fn declared_config_dir_wins_over_the_host_environment() {
-        let declared = tempfile::tempdir().unwrap();
-        let from_env = tempfile::tempdir().unwrap();
-        let sid = "11111111-2222-3333-4444-555555555555";
-        let project_dir = declared.path().join("projects").join("-tmp-myproject");
-        std::fs::create_dir_all(&project_dir).unwrap();
-        std::fs::write(project_dir.join(format!("{sid}.jsonl")), "data\n").unwrap();
-
-        let _env =
-            crate::session::test_support::EnvGuard::set(&[("CLAUDE_CONFIG_DIR", from_env.path())]);
-
-        assert!(
-            claude_host_transcript_confirmed_absent("/tmp/myproject", sid, &[], None),
-            "pre-condition: the environment's directory does not hold it"
-        );
-        assert!(
-            !claude_host_transcript_confirmed_absent(
-                "/tmp/myproject",
-                sid,
-                &[],
-                Some(declared.path())
-            ),
-            "the declared directory is the one the agent actually opens"
-        );
+        // (CLAUDE_CONFIG_DIR, declared dir, project, sid, confirmed absent)
+        for (env, declared, project, sid, absent) in [
+            (&store, None, "/tmp/myproject", present, false),
+            (&store, None, "/tmp/myproject", missing, true),
+            (&store, None, "/tmp/never-opened-project", present, true),
+            (&empty, None, "/tmp/myproject", present, true),
+            (&empty, Some(store.path()), "/tmp/myproject", present, false),
+        ] {
+            let _env =
+                crate::session::test_support::EnvGuard::set(&[("CLAUDE_CONFIG_DIR", env.path())]);
+            assert_eq!(
+                claude_host_transcript_confirmed_absent(project, sid, &[], declared),
+                absent,
+                "{project} {sid} declared={declared:?}"
+            );
+        }
     }
 }

@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use super::errors::AcpError;
 use super::spawn::{
-    allowlisted_env_pairs, is_host_only_path_env, provider_env_denyreason, SpawnConfig,
+    allowlisted_env_pairs, is_host_only_path_env, request_env_denyreason, SpawnConfig,
 };
 
 /// Sandbox handles a connection task needs to route ACP fs/* and
@@ -153,7 +153,7 @@ pub(super) fn build_sandbox_docker_argv(
     let request_auth = config
         .provider_env
         .iter()
-        .filter(|&(key, _)| provider_env_denyreason(key).is_none())
+        .filter(|&(key, _)| request_env_denyreason(key).is_none())
         .cloned();
     let adapter_allowlist = allowlisted_env_pairs(config)
         .into_iter()
@@ -218,7 +218,7 @@ mod tests {
     /// #2414: the create-time pin must beat a live recompute, which collapses
     /// to `/workspace/<basename>` once the worktree's git linkage breaks.
     #[test]
-    fn from_info_prefers_pinned_workdir_over_live_recompute() {
+    fn container_workdir_pin_and_agent_request_cwd() {
         let tmp = tempfile::tempdir().unwrap();
         // Orphaned worktree: a `.git` file whose gitdir points nowhere.
         let worktree = tmp.path().join("repo-worktrees").join("feature");
@@ -246,19 +246,18 @@ mod tests {
         )
         .unwrap();
         assert_eq!(computed, "/workspace/feature");
-    }
 
-    /// #2871: a sandboxed agent runs in-container, so session/new|load|fork
-    /// must carry the container workdir, not the host path.
-    #[test]
-    fn agent_request_cwd_prefers_container_workdir_when_sandboxed() {
-        let host = PathBuf::from("/scm/aoe/../aoe-worktrees/bohemians");
-        let container = PathBuf::from("/workspace/bohemians");
-        assert_eq!(
-            agent_request_cwd(Some(container.as_path()), &host),
-            container
-        );
-        assert_eq!(agent_request_cwd(None, &host), host);
+        // #2871: a sandboxed agent runs in-container, so session/new|load|fork
+        // must carry the container workdir, not the host path.
+        {
+            let host = PathBuf::from("/scm/aoe/../aoe-worktrees/bohemians");
+            let container = PathBuf::from("/workspace/bohemians");
+            assert_eq!(
+                agent_request_cwd(Some(container.as_path()), &host),
+                container
+            );
+            assert_eq!(agent_request_cwd(None, &host), host);
+        }
     }
 
     /// The agent command is wrapped as `docker exec -i -w <workdir> ... <container>
@@ -291,20 +290,6 @@ mod tests {
         );
         assert!(argv.docker_args.iter().any(|a| a == "MY_LITERAL=hello"));
         assert!(!argv.inherit_env.iter().any(|(k, _)| k == "MY_LITERAL"));
-    }
-
-    /// A credential must reach the container as `-e KEY` plus an `inherit_env`
-    /// pair, never as `-e KEY=VALUE`, which would leak the secret into argv.
-    #[test]
-    fn build_sandbox_docker_argv_inherit_env_shape() {
-        let tmp = tempfile::tempdir().unwrap();
-        let info = sandbox("aoe-sandbox-abc12345", None);
-        let mut config = sandbox_config(tmp.path(), &info);
-        config.provider_env = vec![("ANTHROPIC_API_KEY".into(), "sk-test-value".into())];
-
-        let argv = build_sandbox_docker_argv(&config, &info, "/workspace/proj").unwrap();
-
-        assert_named_without_value(&argv, "ANTHROPIC_API_KEY", "sk-test-value");
     }
 
     /// `-e KEY` names the credential, the value rides `inherit_env`, and the
@@ -421,5 +406,7 @@ mod tests {
             vec!["sk-session-request"],
             "the request credential must win and be forwarded exactly once"
         );
+        // Never as `-e KEY=VALUE`, which would leak the secret into argv.
+        assert_named_without_value(&argv, "ANTHROPIC_API_KEY", "sk-session-request");
     }
 }

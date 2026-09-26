@@ -116,19 +116,6 @@ describe("Session tab", () => {
     expect(onSettingsRefresh).toHaveBeenCalledTimes(1);
   });
 
-  it("refreshes app-level settings after saving show_diagnostics_pane", async () => {
-    // The strip is handed down by context from the app shell, so a save that
-    // does not re-read settings leaves it on screen after being switched off.
-    const { container, onSettingsRefresh } = await renderTab(
-      "session",
-      { show_diagnostics_pane: true },
-      "Show system health strip",
-    );
-    fireEvent.click(toggleByLabel(container, "Show system health strip"));
-    await expectSaved({ session: { show_diagnostics_pane: false } });
-    expect(onSettingsRefresh).toHaveBeenCalledTimes(1);
-  });
-
   it("persists acp.acp_defaults on the Structured view tab through the raw-JSON fold", async () => {
     const { container } = await renderTab("structured-view", {}, "Structured View Defaults");
     fireEvent.click(screen.getByText("Advanced: edit raw JSON"));

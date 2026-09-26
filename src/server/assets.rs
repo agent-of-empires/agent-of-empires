@@ -145,17 +145,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn extract_web_build_id_finds_the_entry_bundle_or_nothing() {
-        let html = r#"<head><script type="module" crossorigin src="/assets/index-DKenwdW0.js"></script>
-<link rel="modulepreload" crossorigin href="/assets/vendor-Bx91yz.js"></head>"#;
-        assert_eq!(
-            extract_web_build_id(html).as_deref(),
-            Some("index-DKenwdW0.js")
-        );
-        assert_eq!(extract_web_build_id("<html><body>hi</body></html>"), None);
-    }
-
-    #[test]
     fn cache_control_immutable_only_for_hashed_assets() {
         assert_eq!(
             cache_control_for("assets/index-DKenwdW0.js"),
@@ -181,5 +170,13 @@ mod tests {
         assert_eq!(cache_control_for("assets/logo.svg"), "no-cache");
         assert_eq!(cache_control_for("assets/readme"), "no-cache");
         assert_eq!(cache_control_for("assets/short-a1.js"), "no-cache");
+
+        let html = r#"<head><script type="module" crossorigin src="/assets/index-DKenwdW0.js"></script>
+<link rel="modulepreload" crossorigin href="/assets/vendor-Bx91yz.js"></head>"#;
+        assert_eq!(
+            extract_web_build_id(html).as_deref(),
+            Some("index-DKenwdW0.js")
+        );
+        assert_eq!(extract_web_build_id("<html><body>hi</body></html>"), None);
     }
 }

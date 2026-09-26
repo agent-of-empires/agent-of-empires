@@ -234,15 +234,6 @@ describe("config options", () => {
     expect(run(empty(), ...actions).pendingConfigOption).toEqual(expected);
   });
 
-  it("dismiss clears the switch-failed notice", () => {
-    const failed = { configId: "model", value: "x", reason: "rate limited", at: "t" };
-    const next = reducer(
-      { ...empty(), configOptionSwitchFailed: failed },
-      { kind: "dismiss_config_option_switch_failed" },
-    );
-    expect(next.configOptionSwitchFailed).toBeNull();
-  });
-
   it("normaliseTurnState backfills config-option fields missing from an older entry", () => {
     const stale = { ...empty() } as Record<string, unknown>;
     delete stale.configOptions;

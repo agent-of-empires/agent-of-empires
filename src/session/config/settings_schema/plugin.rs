@@ -326,14 +326,6 @@ mod tests {
     }
 
     #[test]
-    fn section_id_round_trips() {
-        let id = plugin_section_id("acme.kit");
-        assert_eq!(id, "plugin:acme.kit");
-        assert_eq!(section_plugin_id(&id), Some("acme.kit"));
-        assert_eq!(section_plugin_id("acp"), None);
-    }
-
-    #[test]
     fn descriptors_map_types_to_widgets() {
         let mut s_int = contrib("retries", SettingType::Integer);
         s_int.min = Some(0);
@@ -377,95 +369,36 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_folds_plugin_sections_into_storage() {
-        let mut body = json!({
-            "theme": { "idle_decay_minutes": 5 },
-            "plugin:acme.kit": { "retries": 4, "mode": "fast" },
-        });
-        rewrite_plugin_sections(&mut body);
-        assert_eq!(body["theme"]["idle_decay_minutes"], json!(5));
-        assert!(body.get("plugin:acme.kit").is_none());
-        assert_eq!(body["plugins"]["acme.kit"]["settings"]["retries"], json!(4));
-        assert_eq!(
-            body["plugins"]["acme.kit"]["settings"]["mode"],
-            json!("fast")
-        );
-    }
-
-    #[test]
-    fn storage_helpers_round_trip() {
-        let mut cfg = json!({});
-        let leaf = storage_leaf("acme.kit", "retries", json!(7));
-        super::super::merge_json(&mut cfg, &leaf);
-        assert_eq!(storage_value(&cfg, "acme.kit", "retries"), Some(&json!(7)));
-    }
-
-    #[test]
     fn plugin_patch_validates_then_rewrites_to_storage() {
         // A plugin section validates against runtime descriptors through the
         // same gate as core, then folds into its storage path before merge.
         let mut s_int = contrib("retries", SettingType::Integer);
         s_int.min = Some(0);
         s_int.max = Some(5);
-        let descriptors = plugin_field_descriptors("acme.kit", &[s_int]);
+        let select = SettingContribution {
+            options: vec!["fast".into(), "slow".into()],
+            ..contrib("mode", SettingType::Select)
+        };
+        let descriptors = plugin_field_descriptors("acme.kit", &[s_int, select]);
+        let validate = |body: &Value| {
+            super::super::validate_patch_with(&descriptors, body, super::super::Scope::Global, true)
+        };
 
-        let good = json!({ "plugin:acme.kit": { "retries": 4 } });
-        assert!(super::super::validate_patch_with(
-            &descriptors,
-            &good,
-            super::super::Scope::Global,
-            true
-        )
-        .is_ok());
-
-        // Out-of-range is rejected by the derived RangeU64 gate.
-        let bad = json!({ "plugin:acme.kit": { "retries": 9 } });
-        assert!(super::super::validate_patch_with(
-            &descriptors,
-            &bad,
-            super::super::Scope::Global,
-            true
-        )
-        .is_err());
-
-        // Unknown plugin field is rejected.
-        let unknown = json!({ "plugin:acme.kit": { "nope": 1 } });
-        assert!(super::super::validate_patch_with(
-            &descriptors,
-            &unknown,
-            super::super::Scope::Global,
-            true
-        )
-        .is_err());
+        let good = json!({ "plugin:acme.kit": { "retries": 4, "mode": "fast" } });
+        assert!(validate(&good).is_ok());
+        for bad in [
+            // Out of the derived RangeU64 range.
+            json!({ "plugin:acme.kit": { "retries": 9 } }),
+            json!({ "plugin:acme.kit": { "nope": 1 } }),
+            // Off-menu select value.
+            json!({ "plugin:acme.kit": { "mode": "turbo" } }),
+        ] {
+            assert!(validate(&bad).is_err(), "{bad}");
+        }
 
         let mut body = good;
         rewrite_plugin_sections(&mut body);
+        assert!(body.get("plugin:acme.kit").is_none());
         assert_eq!(body["plugins"]["acme.kit"]["settings"]["retries"], json!(4));
-    }
-
-    #[test]
-    fn select_value_is_gated_against_options() {
-        let descriptors = plugin_field_descriptors(
-            "acme.kit",
-            &[SettingContribution {
-                options: vec!["fast".into(), "slow".into()],
-                ..contrib("mode", SettingType::Select)
-            }],
-        );
-        // An on-menu value passes; an off-menu value is rejected.
-        assert!(super::super::validate_patch_with(
-            &descriptors,
-            &json!({ "plugin:acme.kit": { "mode": "fast" } }),
-            super::super::Scope::Global,
-            true
-        )
-        .is_ok());
-        assert!(super::super::validate_patch_with(
-            &descriptors,
-            &json!({ "plugin:acme.kit": { "mode": "turbo" } }),
-            super::super::Scope::Global,
-            true
-        )
-        .is_err());
     }
 }

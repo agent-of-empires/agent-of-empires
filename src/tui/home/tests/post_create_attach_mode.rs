@@ -50,32 +50,20 @@ fn resolves_new_session_mode() {
             "{new_session_mode:?} with {default_attach_mode:?}"
         );
     }
-}
 
-#[test]
-#[serial]
-fn returns_none_for_missing_instance() {
-    // Race: the apply_creation_results return reaches the dispatch after the instance was
-    // deleted, so `None` tells the caller to fall back to the structured-aware attach_session
-    // path rather than attach to a ghost.
-    let env = create_test_env_empty();
-    let mode = env.view.new_session_attach_mode("nonexistent-id");
-    assert!(mode.is_none());
-}
-
-#[test]
-#[serial]
-fn returns_none_for_acp_session() {
-    // Acp sessions aren't tmux-backed, so live mode has no target and tmux attach is a
-    // no-op; the resolver returns None so the dispatch picks the fallback explicitly.
-    let mut env = create_test_env_empty();
+    // None sends the dispatch to the structured-aware attach fallback: the instance was
+    // deleted before the creation result landed, or it is a structured session with no
+    // tmux target.
+    assert!(env.view.new_session_attach_mode("nonexistent-id").is_none());
     write_session_modes(AttachMode::LiveSend, NewSessionMode::MatchDefault);
     let id = add_session(&mut env.view, "acp-one");
     env.view.mutate_instance(&id, |inst| {
         inst.view = crate::session::View::Structured;
     });
-    let mode = env.view.new_session_attach_mode(&id);
-    assert!(mode.is_none(), "structured view sessions must return None");
+    assert!(
+        env.view.new_session_attach_mode(&id).is_none(),
+        "structured view sessions must return None"
+    );
 }
 
 /// A minimal `NewSessionData` for the sync create path: no sandbox, no hooks, no worktree.

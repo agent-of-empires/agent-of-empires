@@ -15,6 +15,22 @@ use std::io::Write;
 /// Unset in normal runs.
 const OPEN_URL_TO_ENV: &str = "AOE_OPEN_URL_TO";
 
+/// Resolve a plugin-supplied href to the absolute URL [`open_url`] needs.
+///
+/// A plugin cannot know aoe's own host, so `href` may be a same-origin
+/// relative path (see `is_allowed_href` in `src/util.rs`) rather than an
+/// `http(s)://` URL. The web dashboard resolves that against its own
+/// browser origin; the TUI has no such origin, so it resolves against
+/// `base_url`, the daemon it is already talking to (`DaemonEndpoint::base_url`:
+/// no trailing slash, and `href` always starts with exactly one `/`).
+pub fn resolve_href(base_url: &str, href: &str) -> String {
+    if crate::util::is_http_url(href) {
+        href.to_string()
+    } else {
+        format!("{base_url}{href}")
+    }
+}
+
 /// Open `url` in the user's browser, or, when `AOE_OPEN_URL_TO` is set, append
 /// it to that file instead. Errors propagate so the caller can toast a failure.
 ///
@@ -155,6 +171,19 @@ mod tests {
         // before reaching `webbrowser`, which would spawn something.
         let err = open_url("https://example.com").expect_err("must not report success");
         assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
+    }
+
+    #[test]
+    fn resolve_href_joins_only_relative_paths() {
+        let base = "http://127.0.0.1:8080";
+        assert_eq!(
+            resolve_href(base, "https://example.com/pr/1"),
+            "https://example.com/pr/1"
+        );
+        assert_eq!(
+            resolve_href(base, "/session/xyz"),
+            "http://127.0.0.1:8080/session/xyz"
+        );
     }
 
     #[test]

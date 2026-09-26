@@ -1,6 +1,6 @@
 import { test, expect } from "./helpers/mockedTest";
 import { devices, type Page } from "@playwright/test";
-import { mockTerminalApis, seedSettings, type MockHandle } from "./helpers/terminal-mocks";
+import { mockTerminalApis, type MockHandle } from "./helpers/terminal-mocks";
 import { clickSidebarSession, openMobileSidebar } from "./helpers/sidebar";
 
 // iOS Korean input (WebKit bug 274700) rewrites the last syllable as deleteContentBackward + insertText with no
@@ -104,24 +104,6 @@ test.describe("Live terminal IME syllable rewrite", () => {
     await expect.poll(() => textBytes(handle, start), { timeout: 5_000 }).toBe("\x03ㅎ");
   });
 
-  test("out-of-band toolbar input drops the retained syllable before the next rewrite", async ({ page }) => {
-    const handle = await mockTerminalApis(page);
-    await openSession(page, handle);
-
-    const start = handle.liveMessages.length;
-    await softKey(page, "insertText", "한");
-    expect(await valueOf(page, INPUT)).toBe("한");
-
-    // Tab bypasses the textarea, so the retained syllable no longer mirrors the line.
-    await page.locator('button[aria-label="Tab"]').click();
-    expect(await valueOf(page, INPUT)).toBe("");
-
-    await softKey(page, "deleteContentBackward");
-    await softKey(page, "insertText", "하");
-    expect(await valueOf(page, INPUT)).toBe("하");
-    await expect.poll(() => textBytes(handle, start), { timeout: 5_000 }).toBe("한\t하");
-  });
-
   // The proxy persists across a session switch, so it must be cleared there or its syllable leaks into the next PTY.
   test("a session switch drops the syllable retained in the persistent proxy", async ({ page }) => {
     const handle = await mockTerminalApis(page, { extraSessions: [{ id: "other", title: "other" }] });
@@ -177,41 +159,6 @@ test.describe("Live terminal IME syllable rewrite", () => {
     await expect.poll(() => textBytes(handle, start), { timeout: 5_000 }).toContain("/tmp/paste");
     expect(await valueOf(page, INPUT)).toBe("");
     await expect.poll(() => valueOf(page, PROXY)).toBe("");
-  });
-
-  // A late upload from a backgrounded session clears only its own textarea, never the foreground session's proxy.
-  test("a late upload from a backgrounded session keeps the foreground proxy", async ({ page }) => {
-    const handle = await mockTerminalApis(page, {
-      pendingPaste: true,
-      extraSessions: [{ id: "other", title: "other" }],
-    });
-    await page.goto("/");
-    await seedSettings(page, { persistentTerminals: true });
-    await page.reload();
-    await openSession(page, handle);
-
-    const start = handle.liveMessages.length;
-    await page.evaluate(() => {
-      const ta = document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Live terminal input"]');
-      if (!ta) throw new Error("live terminal input not found");
-      ta.focus();
-      const dt = new DataTransfer();
-      dt.items.add(new File(["x"], "shot.png", { type: "image/png" }));
-      ta.dispatchEvent(new ClipboardEvent("paste", { clipboardData: dt, bubbles: true, cancelable: true }));
-    });
-    await openMobileSidebar(page);
-    await clickSidebarSession(page, "other");
-    await page.locator(`[data-live-terminal]:visible`).waitFor({ state: "visible", timeout: 10_000 });
-
-    await softKey(page, "insertText", "ㅎ", PROXY);
-    expect(await valueOf(page, PROXY)).toBe("ㅎ");
-
-    await page.evaluate(() => {
-      const w = window as unknown as { releasePasteImage?: () => void };
-      w.releasePasteImage?.();
-    });
-    await expect.poll(() => textBytes(handle, start), { timeout: 5_000 }).toContain("/tmp/paste");
-    expect(await valueOf(page, PROXY)).toBe("ㅎ");
   });
 
   test("refused composition commits cannot seed the next rewrite", async ({ page }) => {

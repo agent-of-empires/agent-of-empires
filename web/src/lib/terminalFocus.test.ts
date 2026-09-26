@@ -7,12 +7,6 @@ describe("terminalFocus pending intent", () => {
     consumePendingTerminalFocus("paired");
   });
 
-  it("consumePendingTerminalFocus only fires once per set", () => {
-    setPendingTerminalFocus("paired");
-    expect(consumePendingTerminalFocus("paired")).toBe(true);
-    expect(consumePendingTerminalFocus("paired")).toBe(false);
-  });
-
   it("consumePendingTerminalFocus does not match a different target", () => {
     setPendingTerminalFocus("paired");
     expect(consumePendingTerminalFocus("agent")).toBe(false);

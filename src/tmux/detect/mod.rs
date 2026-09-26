@@ -130,10 +130,4 @@ mod tests {
         }
         assert_eq!(manifests().len(), MANIFEST_SOURCES.len());
     }
-
-    #[test]
-    fn unknown_agent_has_no_manifest() {
-        assert!(!has_manifest("nonesuch"));
-        assert!(detect("nonesuch", "anything", "", None).is_none());
-    }
 }

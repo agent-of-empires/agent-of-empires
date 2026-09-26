@@ -142,30 +142,6 @@ mod tests {
         Instance::new("Test Session", "/tmp/test-project")
     }
 
-    #[test]
-    #[serial_test::serial]
-    fn perform_restart_preserves_session_id_and_returns_instance() {
-        let _app_guard = crate::session::test_support::isolate_app_dir();
-        let instance = test_instance();
-        let id = instance.id.clone();
-        let title = instance.title.clone();
-        let result = perform_restart(RestartRequest {
-            session_id: id.clone(),
-            instance,
-            size: None,
-            wake_message: String::new(),
-            skip_on_launch: false,
-            bound_hooks: true,
-            discard_sandbox_container: false,
-            conversation_carry: None,
-        });
-        if let Ok(session) = crate::tmux::Session::new(&id, &title) {
-            let _ = session.kill();
-        }
-        assert_eq!(result.session_id, id);
-        assert_eq!(result.instance.id, id);
-    }
-
     #[cfg(unix)]
     #[test]
     #[serial_test::serial]

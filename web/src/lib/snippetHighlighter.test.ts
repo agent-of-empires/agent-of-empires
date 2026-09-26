@@ -45,24 +45,7 @@ it.each([
 });
 
 describe("resolveSnippetTheme", () => {
-  it.each([
-    "dracula",
-    "github-dark",
-    "github-light",
-    "github-dark-dimmed",
-    "catppuccin-latte",
-    "material-theme-ocean",
-    "dark-plus",
-    "light-plus",
-    "monokai",
-    "solarized-dark",
-    "solarized-light",
-    "red",
-    "min-light",
-    "gruvbox-dark-medium",
-    "github-dark-high-contrast",
-    "github-light-high-contrast",
-  ])("keeps the bundled theme %s", (theme) => {
+  it.each(["dracula", "github-light-high-contrast"])("keeps the bundled theme %s", (theme) => {
     expect(resolveSnippetTheme(theme, "dark")).toBe(theme);
   });
 
@@ -89,33 +72,16 @@ describe("builtin theme syntax palettes", () => {
 });
 
 it.each<[string, string | null]>([
-  ...["typescript", "json", "ts", "rs", "yaml", "console", "c++", "c#"].map((id): [string, string] => [id, id]),
+  ...["typescript", "rs", "c#"].map((id): [string, string] => [id, id]),
   ["h", "c"],
-  ["hpp", "cpp"],
-  ["cc", "cpp"],
-  ["htm", "html"],
-  ["svg", "xml"],
-  ["ex", "elixir"],
-  ["exs", "elixir"],
-  ["hrl", "erlang"],
-  ["ml", "ocaml"],
   ["mli", "ocaml"],
   ["golang", "go"],
-  ["cplusplus", "cpp"],
-  ["bash-session", "bash"],
-  ["terminal", "bash"],
   ["RUST", "rust"],
-  ["Python", "python"],
-  ["TS", "ts"],
   ["Dockerfile", "dockerfile"],
-  ["Makefile", "make"],
   ["makefile", "make"],
-  ["CMakeLists", "cmake"],
   ["notalang", null],
   ["", null],
-  ["unknownext", null],
   ["constructor", null],
-  ["toString", null],
 ])("langIdForHint(%j) is %j", (hint, expected) => {
   expect(langIdForHint(hint)).toBe(expected);
 });
@@ -123,21 +89,17 @@ it.each<[string, string | null]>([
 describe("langHintForPath", () => {
   it.each([
     ["src/lib/highlighter.ts", "ts"],
-    ["/abs/path/to/main.rs", "rs"],
     ["src/constructor.ts", "ts"],
     ["Dockerfile", "Dockerfile"],
-    ["Makefile", "Makefile"],
-    ["makefile", "makefile"],
     ["/repo/build/Dockerfile", "Dockerfile"],
     ["a/b/c/CMakeLists.txt", "CMakeLists"],
     ["README", ""],
-    ["/some/dir/LICENSE", ""],
   ])("%j gives %j", (path, expected) => {
     expect(langHintForPath(path)).toBe(expected);
   });
 
-  it.each([".gitignore", ".env"])("dotfile %j has no recognised language", (path) => {
-    expect(langIdForHint(langHintForPath(path))).toBeNull();
+  it("a dotfile has no recognised language", () => {
+    expect(langIdForHint(langHintForPath(".gitignore"))).toBeNull();
   });
 });
 

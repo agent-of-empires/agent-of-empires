@@ -98,40 +98,31 @@ mod tests {
 
     /// #2767: a strict backend rejects an empty client_name/client_version.
     #[test]
-    fn initialize_request_carries_non_empty_client_info() {
+    fn handshake_wire_shapes() {
         let req = build_initialize_request();
         let info = req.client_info.expect("client_info must be set");
         assert_eq!(info.name, "agent-of-empires");
         assert!(!info.version.is_empty());
-    }
 
-    #[test]
-    fn should_fork_requires_capability_and_parent() {
-        assert!(should_fork(Some("parent"), true));
-        assert!(!should_fork(Some("parent"), false)); // adapter can't fork (e.g. aoe-agent)
-        assert!(!should_fork(None, true));
-        assert!(!should_fork(Some(""), true));
-    }
+        // Pins the fork wire keys against upstream serde drift. An upstream
+        // rename would make the capability read absent (a silent `session/new`
+        // downgrade) or fail the response parse, and the fake agent sends these
+        // exact keys, so it would otherwise mask the drift.
+        {
+            use agent_client_protocol::schema::v1::{ForkSessionResponse, SessionCapabilities};
 
-    /// Pins the fork wire keys against upstream serde drift. An upstream
-    /// rename would make the capability read absent (a silent `session/new`
-    /// downgrade) or fail the response parse, and the fake agent sends these
-    /// exact keys, so it would otherwise mask the drift.
-    #[test]
-    fn acp_fork_capability_and_response_wire_keys_are_stable() {
-        use agent_client_protocol::schema::v1::{ForkSessionResponse, SessionCapabilities};
+            let caps: SessionCapabilities =
+                serde_json::from_value(serde_json::json!({ "fork": {} })).expect("caps parse");
+            assert!(caps.fork.is_some());
+            // Absent fork must read as not-forkable, the resume-only shape.
+            let no_fork: SessionCapabilities =
+                serde_json::from_value(serde_json::json!({})).expect("empty caps parse");
+            assert!(no_fork.fork.is_none());
 
-        let caps: SessionCapabilities =
-            serde_json::from_value(serde_json::json!({ "fork": {} })).expect("caps parse");
-        assert!(caps.fork.is_some());
-        // Absent fork must read as not-forkable, the resume-only shape.
-        let no_fork: SessionCapabilities =
-            serde_json::from_value(serde_json::json!({})).expect("empty caps parse");
-        assert!(no_fork.fork.is_none());
-
-        let resp: ForkSessionResponse =
-            serde_json::from_value(serde_json::json!({ "sessionId": "child-123" }))
-                .expect("fork response parse");
-        assert_eq!(resp.session_id.0.as_ref(), "child-123");
+            let resp: ForkSessionResponse =
+                serde_json::from_value(serde_json::json!({ "sessionId": "child-123" }))
+                    .expect("fork response parse");
+            assert_eq!(resp.session_id.0.as_ref(), "child-123");
+        }
     }
 }

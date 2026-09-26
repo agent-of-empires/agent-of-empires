@@ -20,10 +20,15 @@ fn right_click_on_session_opens_session_menu_and_moves_cursor() {
     setup_inner(&mut env);
     env.view.cursor = 0;
     env.view.update_selected();
+    assert!(!env.view.has_dialog());
 
     // Click the third visible row (inner.y + 2 == 3) -> flat_items[2].
     assert!(env.view.handle_right_click(5, 3));
     assert_eq!(env.view.cursor, 2, "cursor should move to clicked row");
+    assert!(
+        env.view.has_dialog(),
+        "an open context menu counts as a dialog"
+    );
     let menu = env
         .view
         .context_menu
@@ -35,16 +40,6 @@ fn right_click_on_session_opens_session_menu_and_moves_cursor() {
         env.view.flat_items[env.view.cursor],
         Item::Session { .. }
     ));
-}
-
-#[test]
-#[serial]
-fn right_click_off_list_is_noop() {
-    let mut env = create_test_env_with_sessions(3);
-    setup_inner(&mut env);
-    // Row 50 is well past list_inner_area.bottom.
-    assert!(!env.view.handle_right_click(5, 50));
-    assert!(env.view.context_menu.is_none());
 }
 
 #[test]
@@ -70,83 +65,47 @@ fn right_click_on_group_uses_group_menu() {
     ));
 }
 
+/// Session-menu entries route through the same helpers as their keys: Rename like `r`,
+/// Archive like `z` (immediate, no dialog), Delete like `d`. Esc cancels without a dialog.
+/// Attention sort shows the full menu: New Session / Rename / Archive / Snooze / Mark unread
+/// / Add project / Delete.
 #[test]
 #[serial]
-fn enter_rename_in_menu_opens_rename_dialog() {
-    let mut env = create_test_env_with_sessions(2);
-    setup_inner(&mut env);
-    env.view.handle_right_click(5, 1);
-    assert!(env.view.context_menu.is_some());
-    // First item is New Session; Rename is one Down away. Enter submits it.
-    env.view.handle_key(key(KeyCode::Down), None);
-    env.view.handle_key(key(KeyCode::Enter), None);
-    assert!(
-        env.view.context_menu.is_none(),
-        "menu should close on submit"
-    );
-    assert!(
-        env.view.rename_dialog.is_some(),
-        "Rename should route to rename_dialog like the 'r' key"
-    );
-}
-
-#[test]
-#[serial]
-fn down_then_enter_in_menu_opens_delete_dialog() {
-    let mut env = create_test_env_with_sessions(2);
-    disable_delete_to_trash();
-    setup_inner(&mut env);
-    // Attention sort surfaces the full session menu (New Session / Rename / Archive /
-    // Snooze / Mark unread / Add project / Delete), so Delete is six Downs away.
-    env.view.sort_order = SortOrder::Attention;
-    env.view.flat_items = env.view.build_flat_items();
-    env.view.handle_right_click(5, 1);
-    for _ in 0..6 {
-        env.view.handle_key(key(KeyCode::Down), None);
+fn session_menu_entries_route_like_their_keys() {
+    type Check = fn(&HomeView, &str) -> bool;
+    let cases: [(&str, usize, KeyCode, Check); 4] = [
+        ("rename", 1, KeyCode::Enter, |v, _| {
+            v.rename_dialog.is_some()
+        }),
+        ("archive", 2, KeyCode::Enter, |v, id| {
+            v.get_instance(id).unwrap().is_archived()
+        }),
+        ("delete", 6, KeyCode::Enter, |v, _| {
+            v.unified_delete_dialog.is_some()
+        }),
+        ("esc", 0, KeyCode::Esc, |v, _| {
+            v.rename_dialog.is_none() && v.unified_delete_dialog.is_none()
+        }),
+    ];
+    for (label, downs, submit, check) in cases {
+        let mut env = create_test_env_with_sessions(2);
+        disable_delete_to_trash();
+        setup_inner(&mut env);
+        env.view.sort_order = SortOrder::Attention;
+        env.view.flat_items = env.view.build_flat_items();
+        assert!(env.view.handle_right_click(5, 1), "{label}");
+        let id = env.view.selected_session.clone().unwrap();
+        assert!(
+            !env.view.get_instance(&id).unwrap().is_archived(),
+            "{label}"
+        );
+        for _ in 0..downs {
+            env.view.handle_key(key(KeyCode::Down), None);
+        }
+        env.view.handle_key(key(submit), None);
+        assert!(env.view.context_menu.is_none(), "{label}: menu closes");
+        assert!(check(&env.view, &id), "{label}");
     }
-    env.view.handle_key(key(KeyCode::Enter), None);
-    assert!(env.view.context_menu.is_none());
-    assert!(
-        env.view.unified_delete_dialog.is_some(),
-        "Delete should route to unified_delete_dialog like the 'd' key"
-    );
-}
-
-#[test]
-#[serial]
-fn esc_in_menu_cancels_without_dialog() {
-    let mut env = create_test_env_with_sessions(2);
-    setup_inner(&mut env);
-    env.view.handle_right_click(5, 1);
-    env.view.handle_key(key(KeyCode::Esc), None);
-    assert!(env.view.context_menu.is_none());
-    assert!(env.view.rename_dialog.is_none());
-    assert!(env.view.unified_delete_dialog.is_none());
-}
-
-/// Right-click a session and pick Archive (two Downs) to archive the row through the same
-/// `z` codepath. No follow-up dialog: archiving is immediate.
-#[test]
-#[serial]
-fn right_click_archive_action_archives_session() {
-    let mut env = create_test_env_with_sessions(2);
-    setup_inner(&mut env);
-    env.view.handle_right_click(5, 1);
-    let id = env.view.selected_session.clone().unwrap();
-    assert!(
-        !env.view.get_instance(&id).unwrap().is_archived(),
-        "precondition: session starts unarchived"
-    );
-
-    env.view.handle_key(key(KeyCode::Down), None); // New Session -> Rename
-    env.view.handle_key(key(KeyCode::Down), None); // Rename -> Archive
-    env.view.handle_key(key(KeyCode::Enter), None);
-
-    assert!(env.view.context_menu.is_none(), "menu closes after archive");
-    assert!(
-        env.view.get_instance(&id).unwrap().is_archived(),
-        "context-menu Archive must archive the session"
-    );
 }
 
 /// An archived row's context menu offers Unarchive, and picking it restores
@@ -261,11 +220,13 @@ fn right_click_session_menu_hides_fork_for_unforkable_agent() {
 }
 
 /// The Snooze row mirrors the `'h'` keybinding, which fires only in Attention sort, so the
-/// menu omits it in every other sort.
+/// menu omits it in every other sort. For a forkable agent the Fork row is sort-independent.
 #[test]
 #[serial]
 fn right_click_session_menu_gates_snooze_to_attention_sort() {
-    let mut env = create_test_env_with_sessions(2);
+    let mut env = create_test_env_empty();
+    env.view.add_instance(observed_fork_parent("claude"));
+    env.view.add_instance(observed_fork_parent("claude"));
     setup_inner(&mut env);
 
     let menu_actions = |env: &TestEnv| -> Vec<ContextMenuAction> {
@@ -287,6 +248,7 @@ fn right_click_session_menu_gates_snooze_to_attention_sort() {
         !menu_actions(&env).contains(&ContextMenuAction::ToggleSnooze),
         "Snooze must be hidden outside Attention sort"
     );
+    assert!(menu_actions(&env).contains(&ContextMenuAction::Fork));
     env.view.context_menu = None;
 
     // Attention sort: Snooze row present.
@@ -297,62 +259,7 @@ fn right_click_session_menu_gates_snooze_to_attention_sort() {
         menu_actions(&env).contains(&ContextMenuAction::ToggleSnooze),
         "Snooze must appear in Attention sort"
     );
-}
-
-/// For a forkable agent the Fork row is sort-independent, unlike Snooze: whether it shows
-/// at all is gated on fork capability, covered by the shows/hides pair, and this pins that
-/// the gate does not couple to sort order.
-#[test]
-#[serial]
-fn right_click_session_menu_offers_fork_in_every_sort_for_forkable_agent() {
-    let mut env = create_test_env_empty();
-    env.view.add_instance(observed_fork_parent("claude"));
-    env.view.add_instance(observed_fork_parent("claude"));
-    setup_inner(&mut env);
-
-    let has_fork = |env: &TestEnv| -> bool {
-        env.view
-            .context_menu
-            .as_ref()
-            .unwrap()
-            .items_for_test()
-            .iter()
-            .any(|(a, _)| *a == ContextMenuAction::Fork)
-    };
-
-    for sort in [SortOrder::Newest, SortOrder::Attention] {
-        env.view.sort_order = sort;
-        env.view.flat_items = env.view.build_flat_items();
-        assert!(env.view.handle_right_click(5, 1));
-        assert!(
-            has_fork(&env),
-            "Fork must be offered for a forkable agent in {sort:?} sort"
-        );
-        env.view.context_menu = None;
-    }
-}
-
-#[test]
-#[serial]
-fn right_click_is_gated_when_other_dialog_is_open() {
-    let mut env = create_test_env_with_sessions(2);
-    setup_inner(&mut env);
-    env.view.show_help = true;
-    assert!(env.view.has_dialog());
-    // resolve_row_to_index short-circuits on any non-live-send overlay,
-    // so the right-click handler should bail without opening the menu.
-    assert!(!env.view.handle_right_click(5, 1));
-    assert!(env.view.context_menu.is_none());
-}
-
-#[test]
-#[serial]
-fn context_menu_counts_as_dialog() {
-    let mut env = create_test_env_with_sessions(2);
-    setup_inner(&mut env);
-    assert!(!env.view.has_dialog());
-    env.view.handle_right_click(5, 1);
-    assert!(env.view.has_dialog());
+    assert!(menu_actions(&env).contains(&ContextMenuAction::Fork));
 }
 
 #[test]
@@ -373,28 +280,43 @@ fn left_click_outside_menu_dismisses_it() {
     );
 }
 
+/// Clicks that open neither a menu nor a dialog. Left-click on empty sidebar space is
+/// deliberately low-stakes outside live mode (right-click owns New Session), a real row
+/// defers to the regular click path, and any non-live overlay gates both handlers.
 #[test]
 #[serial]
-fn handle_context_menu_click_returns_false_when_no_menu() {
+fn sidebar_clicks_that_open_nothing() {
+    type Click = fn(&mut HomeView) -> bool;
+    // Sessions occupy inner rows 0 and 1 (y=1, y=2); y=5 is empty list space, y=50 is
+    // past the list.
+    let cases: [(&str, bool, Click); 6] = [
+        ("right-click past the list", false, |v| {
+            v.handle_right_click(5, 50)
+        }),
+        ("right-click under an overlay", true, |v| {
+            v.handle_right_click(5, 1)
+        }),
+        ("empty-space click", false, |v| {
+            v.handle_empty_list_click(5, 5)
+        }),
+        ("empty-list click on a real row", false, |v| {
+            v.handle_empty_list_click(5, 1)
+        }),
+        ("empty-space click under an overlay", true, |v| {
+            v.handle_empty_list_click(5, 5)
+        }),
+        ("menu click with no menu open", false, |v| {
+            v.handle_context_menu_click(5, 5)
+        }),
+    ];
     let mut env = create_test_env_with_sessions(2);
     setup_inner(&mut env);
-    assert!(env.view.context_menu.is_none());
-    assert!(!env.view.handle_context_menu_click(5, 5));
-}
-
-#[test]
-#[serial]
-fn left_click_on_empty_sidebar_outside_live_mode_is_noop() {
-    // Left-click on empty sidebar space is deliberately low-stakes: it no longer opens the
-    // new-session dialog (right-click owns that) and does not move selection, so the user
-    // can dismiss preview selections without summoning modals.
-    let mut env = create_test_env_with_sessions(2);
-    setup_inner(&mut env);
-    // Sessions occupy inner rows 0 and 1 (y=1, y=2). Row 5 is well
-    // past the last item but still inside list_inner_area.
-    assert!(!env.view.handle_empty_list_click(5, 5));
-    assert!(env.view.new_dialog.is_none());
-    assert!(env.view.context_menu.is_none());
+    for (label, overlay, click) in cases {
+        env.view.show_help = overlay;
+        assert!(!click(&mut env.view), "{label}");
+        assert!(env.view.context_menu.is_none(), "{label}");
+        assert!(env.view.new_dialog.is_none(), "{label}");
+    }
 }
 
 #[test]
@@ -419,27 +341,6 @@ fn left_click_on_empty_sidebar_in_live_mode_exits_live_mode() {
         env.view.live_send.is_none(),
         "click on empty sidebar should exit live mode"
     );
-    assert!(env.view.new_dialog.is_none());
-}
-
-#[test]
-#[serial]
-fn click_on_a_real_row_does_not_change_empty_click_state() {
-    let mut env = create_test_env_with_sessions(2);
-    setup_inner(&mut env);
-    // Row 1 resolves to flat_items[0], a real session row, so the empty-list handler must
-    // defer to the regular click path.
-    assert!(!env.view.handle_empty_list_click(5, 1));
-    assert!(env.view.new_dialog.is_none());
-}
-
-#[test]
-#[serial]
-fn empty_sidebar_click_is_gated_when_overlay_is_open() {
-    let mut env = create_test_env_with_sessions(2);
-    setup_inner(&mut env);
-    env.view.show_help = true;
-    assert!(!env.view.handle_empty_list_click(5, 5));
     assert!(env.view.new_dialog.is_none());
 }
 
@@ -473,42 +374,27 @@ fn send_key(env: &mut crate::tui::home::tests::TestEnv, code: crossterm::event::
     );
 }
 
+/// Each empty-sidebar entry submits through the shared dispatcher and opens its dialog.
 #[test]
 #[serial]
-fn empty_sidebar_menu_new_session_dispatches() {
-    // First item (New Session) submits through the shared
-    // dispatcher and opens the new-session dialog.
-    let mut env = create_test_env_with_sessions(2);
-    setup_inner(&mut env);
-    env.view.handle_right_click(5, 5);
-    send_key(&mut env, crossterm::event::KeyCode::Enter);
-    assert!(env.view.context_menu.is_none());
-    assert!(env.view.new_dialog.is_some());
-}
-
-#[test]
-#[serial]
-fn empty_sidebar_menu_sort_dispatches() {
-    let mut env = create_test_env_with_sessions(2);
-    setup_inner(&mut env);
-    env.view.handle_right_click(5, 5);
-    send_key(&mut env, crossterm::event::KeyCode::Down); // highlight "Change Sort"
-    send_key(&mut env, crossterm::event::KeyCode::Enter);
-    assert!(env.view.context_menu.is_none());
-    assert!(env.view.sort_picker_dialog.is_some());
-}
-
-#[test]
-#[serial]
-fn empty_sidebar_menu_grouping_dispatches() {
-    let mut env = create_test_env_with_sessions(2);
-    setup_inner(&mut env);
-    env.view.handle_right_click(5, 5);
-    send_key(&mut env, crossterm::event::KeyCode::Down);
-    send_key(&mut env, crossterm::event::KeyCode::Down); // highlight "Change Grouping"
-    send_key(&mut env, crossterm::event::KeyCode::Enter);
-    assert!(env.view.context_menu.is_none());
-    assert!(env.view.group_picker_dialog.is_some());
+fn empty_sidebar_menu_entries_dispatch() {
+    type Opened = fn(&HomeView) -> bool;
+    let cases: [(&str, usize, Opened); 3] = [
+        ("New Session", 0, |v| v.new_dialog.is_some()),
+        ("Change Sort", 1, |v| v.sort_picker_dialog.is_some()),
+        ("Change Grouping", 2, |v| v.group_picker_dialog.is_some()),
+    ];
+    for (label, downs, opened) in cases {
+        let mut env = create_test_env_with_sessions(2);
+        setup_inner(&mut env);
+        env.view.handle_right_click(5, 5);
+        for _ in 0..downs {
+            send_key(&mut env, crossterm::event::KeyCode::Down);
+        }
+        send_key(&mut env, crossterm::event::KeyCode::Enter);
+        assert!(env.view.context_menu.is_none(), "{label}");
+        assert!(opened(&env.view), "{label}");
+    }
 }
 
 #[test]

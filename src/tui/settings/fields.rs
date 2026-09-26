@@ -1239,7 +1239,7 @@ mod tests {
         }
     }
     #[test]
-    fn map_list_fields_round_trip_as_objects() {
+    fn map_widgets_round_trip_and_degrade_to_an_empty_map() {
         for field in ["agent_config_dir", "agent_execution_as"] {
             let leaf = schema_value_to_json(
                 &WidgetKind::List,
@@ -1253,10 +1253,8 @@ mod tests {
                 "{field}"
             );
         }
-    }
-    #[test]
-    fn raw_json_map_widgets_round_trip_and_degrade_to_an_empty_map() {
-        // (widget id, a representative value, a non-object that validation
+
+        // Raw-JSON map widgets: (widget id, a representative value, a non-object that validation
         // rejects before commit)
         let cases = [
             (
@@ -1381,10 +1379,7 @@ mod tests {
             field(&fields, "worktree.enabled").value,
             FieldValue::Bool(true)
         ));
-    }
 
-    #[test]
-    fn applying_a_profile_field_keeps_the_override_even_when_it_matches_global() {
         // Only the `r` key clears an override, so re-applying a field that
         // happens to equal the global value must not start inheriting.
         let mut global = Config::default();
@@ -1459,7 +1454,7 @@ mod tests {
     }
 
     #[test]
-    fn acp_fields_split_around_the_advanced_section_marker() {
+    fn fields_land_on_their_tabs_and_sections() {
         let fields = build(
             SettingsCategory::Acp,
             SettingsScope::Global,
@@ -1481,10 +1476,7 @@ mod tests {
             let pos = fields.iter().position(|f| f.ident() == ident).unwrap();
             assert_eq!(pos < header, before, "{ident}");
         }
-    }
 
-    #[test]
-    fn each_session_field_lands_on_its_own_tab() {
         let profile = ProfileConfig::default();
         let tab = |cat| idents(&build(cat, SettingsScope::Global, &profile));
 
