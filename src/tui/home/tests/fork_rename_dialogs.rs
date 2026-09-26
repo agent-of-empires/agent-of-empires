@@ -50,6 +50,98 @@ fn fork_from_selection_seeds_terminal_fork_and_inherits_parent_context() {
     assert_eq!(dialog.path_value(), "/tmp/repo-worktrees/feature");
 }
 
+/// A launch that pre-pins a child id still records the execution it resolved,
+/// so the Fork row shows before any conversation is captured.
+#[test]
+#[serial]
+fn fork_row_offers_a_preallocated_parent() {
+    let mut env = create_test_env_empty();
+    let mut inst = observed_fork_parent("claude");
+    inst.agent_session_binding.as_mut().unwrap().provenance =
+        crate::session::ConversationProvenance::Preallocated;
+    let id = inst.id.clone();
+    env.view.add_instance(inst);
+    env.view.selected_session = Some(id.clone());
+
+    assert!(
+        env.view.session_can_fork(&id),
+        "a preallocated parent records its launch execution, so the row must show"
+    );
+}
+
+/// A recorded conversation AoE cannot fork is refused three ways, and the
+/// dialog carries the shared wording, so each state shows the remedy its own
+/// evidence admits: a pre-pinned id has no conversation to qualify, a
+/// never-qualified one can be re-asserted, and a binding-less one names no
+/// conversation to assert.
+#[test]
+#[serial]
+fn fork_from_selection_reports_why_the_conversation_cannot_be_forked() {
+    /// The three ways a recorded conversation fails to qualify.
+    enum Binding {
+        /// Recorded by a launch that pre-pinned the id, which never ran.
+        Preallocated,
+        /// A binding that never got qualified.
+        Unknown,
+        /// No binding at all.
+        Absent,
+    }
+    let recorded = "parent-1111-2222-3333-444444444444".to_string();
+    let cases = [
+        (
+            Binding::Preallocated,
+            crate::session::ForkDenied::UnqualifiedParent {
+                provenance: Some(crate::session::ConversationProvenance::Preallocated),
+                recorded: recorded.clone(),
+            },
+        ),
+        (
+            Binding::Unknown,
+            crate::session::ForkDenied::UnqualifiedParent {
+                provenance: Some(crate::session::ConversationProvenance::Unknown),
+                recorded: recorded.clone(),
+            },
+        ),
+        (
+            Binding::Absent,
+            crate::session::ForkDenied::UnqualifiedParent {
+                provenance: None,
+                recorded: recorded.clone(),
+            },
+        ),
+    ];
+    for (binding, denied) in cases {
+        let mut env = create_test_env_empty();
+        let mut inst = observed_fork_parent("claude");
+        match binding {
+            Binding::Preallocated => {
+                inst.agent_session_binding.as_mut().unwrap().provenance =
+                    crate::session::ConversationProvenance::Preallocated;
+            }
+            Binding::Unknown => {
+                inst.agent_session_binding = Some(crate::session::ConversationBinding::unknown(
+                    recorded.as_str(),
+                ));
+            }
+            Binding::Absent => inst.agent_session_binding = None,
+        }
+        let title = inst.title.clone();
+        let id = inst.id.clone();
+        env.view.add_instance(inst);
+        env.view.selected_session = Some(id);
+
+        env.view.open_fork_from_selection();
+
+        assert!(
+            env.view.new_dialog.is_none(),
+            "an unqualified parent must not open a fork dialog"
+        );
+        let dialog = env.view.info_dialog.as_ref().expect("info dialog");
+        assert_eq!(dialog.title(), "Conversation not qualified");
+        assert_eq!(dialog.message(), denied.user_message(&title));
+    }
+}
+
 /// Unforkable parents get an explanatory info dialog instead of the fork form: a resume-only
 /// terminal agent, a structured parent with no captured ACP session, and a structured parent
 /// whose agent has no fork strategy even with an ACP id (the capability gate runs first,

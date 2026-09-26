@@ -241,6 +241,7 @@ pub(crate) enum CaptureContext {
 
 use super::{Instance, ResumeIntent};
 use crate::agents::{AgentDef, AGENTS};
+use crate::session::fork::ForkParentRef;
 use anyhow::{bail, Context, Result};
 
 #[cfg(test)]
@@ -1157,7 +1158,11 @@ impl Instance {
 }
 
 impl Instance {
-    pub(crate) fn fork_parent_binding(&self) -> Option<&ConversationBinding> {
+    /// The conversation an explicit fork would carry, with the evidence for it:
+    /// `Bound` when a binding qualifies the recorded id, `Recorded` when the id
+    /// stands alone, so an unqualified parent reaches `terminal_fork_seed` and is
+    /// refused as such rather than as a session with no conversation.
+    pub(crate) fn fork_parent_ref(&self) -> Option<ForkParentRef<'_>> {
         let (sid, binding) = match &self.resume_intent {
             ResumeIntent::Fork { .. } => return None,
             ResumeIntent::Use(sid) => (Some(sid), self.resume_binding.as_ref()),
@@ -1166,7 +1171,14 @@ impl Instance {
                 self.agent_session_binding.as_ref(),
             ),
         };
-        binding.filter(|binding| Some(&binding.session_id) == sid && binding.is_known())
+        let sid = sid?;
+        match binding {
+            Some(binding) if binding.session_id == *sid => Some(ForkParentRef::Bound(binding)),
+            // A binding naming a different conversation is an inconsistency,
+            // not a recorded id awaiting proof.
+            Some(_) => None,
+            None => Some(ForkParentRef::Recorded(sid)),
+        }
     }
 
     pub(super) fn execution_agent(&self) -> Result<&'static AgentDef> {
@@ -1394,11 +1406,13 @@ impl Instance {
                     configuration.push(file);
                 }
                 let auth_file = root.join("auth.json");
-                let bytes = inputs.read_native_file(&auth_file)?.context("Codex login may select cloud-managed requirements; a local API-key authentication contract is required")?;
+                let Some(bytes) = inputs.read_native_file(&auth_file)? else {
+                    bail!("Codex has no auth.json in its resolved configuration directory (session.agent_config_dir on a host launch, else CODEX_HOME, else ~/.codex); sign in with an OpenAI API key and re-run");
+                };
                 let auth: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(&bytes)?;
                 anyhow::ensure!(["tokens", "agent_identity", "personal_access_token"].iter().all(|key| auth.get(*key).is_none_or(serde_json::Value::is_null))
                     && auth.get("auth_mode").is_none_or(|mode| mode.is_null() || mode.as_str() == Some("apikey"))
-                    && auth.get("OPENAI_API_KEY").and_then(serde_json::Value::as_str).is_some_and(|key| !key.trim().is_empty()), "Codex authentication may select cloud-managed requirements; its namespace is unproven");
+                    && auth.get("OPENAI_API_KEY").and_then(serde_json::Value::as_str).is_some_and(|key| !key.trim().is_empty()), "Codex is not authenticated with a local OpenAI API key; set OPENAI_API_KEY in the auth.json of its resolved configuration directory (session.agent_config_dir on a host launch, else CODEX_HOME, else ~/.codex) and re-run");
                 configuration.push(auth_file);
                 let sqlite = inputs.canonical_path(&sqlite)?;
                 routing.push(("CODEX_HOME".into(), Some(root.to_str().context("Codex home is not UTF-8")?.into())));
@@ -2292,6 +2306,7 @@ impl Instance {
         .unwrap_or_else(|| {
             self.resolve_native_execution(None)
                 .map(|execution| execution.binding)
+                .context("aoe session set-session-id cannot resolve the native execution identity for this context")
         })?;
         anyhow::ensure!(
             crate::agents::get_agent(&execution.agent)
@@ -2779,6 +2794,80 @@ mod tests {
                 "{name} must refuse a valued verbosity override"
             );
         }
+    }
+
+    /// A recorded id must reach `terminal_fork_seed` even unqualified, so the
+    /// fork can say which state it is in instead of claiming nothing to fork.
+    #[test]
+    fn fork_parent_ref_keeps_a_recorded_but_unqualified_conversation() {
+        let mut instance = Instance::new("parent", "/tmp");
+        instance.agent_session_id = Some("legacy-uuid".into());
+        instance.agent_session_binding = Some(ConversationBinding::unknown("legacy-uuid"));
+
+        assert_eq!(
+            crate::session::fork::terminal_fork_seed(
+                instance.fork_parent_ref(),
+                "child-uuid".into()
+            ),
+            Err(crate::session::ForkDenied::UnqualifiedParent {
+                provenance: Some(ConversationProvenance::Unknown),
+                recorded: "legacy-uuid".into(),
+            })
+        );
+    }
+
+    /// A degraded launch drops the binding and leaves the id, so the fork must
+    /// still name that conversation, and must not read a provenance off a
+    /// binding that no longer exists.
+    #[test]
+    fn fork_parent_ref_reports_a_dropped_binding_for_a_recorded_id() {
+        let mut instance = Instance::new("parent", "/tmp");
+        instance.agent_session_id = Some("legacy-uuid".into());
+        instance.agent_session_binding = None;
+
+        assert_eq!(
+            crate::session::fork::terminal_fork_seed(
+                instance.fork_parent_ref(),
+                "child-uuid".into()
+            ),
+            Err(crate::session::ForkDenied::UnqualifiedParent {
+                provenance: None,
+                recorded: "legacy-uuid".into(),
+            })
+        );
+    }
+
+    /// A row whose own fork intent has not launched yet holds the parent's
+    /// conversation, not one of its own, so it has nothing to fork from.
+    #[test]
+    fn fork_parent_ref_excludes_a_child_whose_fork_has_not_launched() {
+        let mut instance = Instance::new("child", "/tmp");
+        instance.agent_session_id = Some("parent-uuid".into());
+        instance.agent_session_binding = Some(ConversationBinding {
+            session_id: "parent-uuid".into(),
+            execution: Some(ExecutionBinding {
+                agent: "claude".into(),
+                stores: vec!["/store".into()],
+                configuration: Vec::new(),
+                cwd: "/work".into(),
+                cwd_filesystem: "host".into(),
+                filesystem: "host".into(),
+                exported_default_store: None,
+            }),
+            provenance: ConversationProvenance::Observed,
+            transcript_path: None,
+        });
+        instance.resume_intent = ResumeIntent::Fork {
+            from: "parent-uuid".into(),
+        };
+
+        assert_eq!(
+            crate::session::fork::terminal_fork_seed(
+                instance.fork_parent_ref(),
+                "child-uuid".into()
+            ),
+            Err(crate::session::ForkDenied::NoParentSession)
+        );
     }
 
     /// The exported `CLAUDE_CONFIG_DIR` and the store recorded on the binding

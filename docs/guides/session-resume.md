@@ -46,6 +46,18 @@ Disabling `agent_status_hooks` removes status writers only; identity hooks decla
 
 **Prime Agent** captures depth-zero roots, not the child sessions its recursive runtime spawns, and requires `-e <extension>` plus a numeric `rlmDepth: 0` in native root headers. If a root publishes a conversation whose transcript is confirmed absent, a restart starts an empty conversation rather than resuming. Capture also needs a session directory mapped into its writable managed store, with bounded regular settings files: symlinked settings are refused, since their container-visible target cannot be inferred from the host path, and the refusal is logged under `session.capture` and retried after 30 seconds. Pass an explicit `--session-dir` inside `/root/.prime/agent` to select a verified directory.
 
+## Common explicit resume and fork refusals
+
+Every row below refuses the explicit operation only: a plain, unpinned start or restart in the same context is degraded, not refused. Each column is the verdict the operation reports when you run it, not a state the interface shows. `set-session-id` resolves the launch context in effect when the command runs rather than reading a recorded one, so it keeps refusing until that context can attest a native execution identity, and fixing the context clears the refusal at the next attempt. Fork also requires the parent's recorded binding, which no re-resolution refreshes, so a degraded launch that drops a binding it cannot attest keeps the fork refused until a capture from an attested launch or a `set-session-id` assertion qualifies the id again. A parent in that state hides **Fork session** on its context menu, so the command palette's **Fork session (resume context, diverge)** is where the refusal and its remedy are shown.
+
+| Context | `set-session-id` | Fork | Remedy |
+|---------|------------------|------|--------|
+| Unsandboxed Codex on a macOS host | Refused | Refused | None yet; run Codex in a managed container |
+| Codex signed in with a ChatGPT login | Refused | Refused | A local OpenAI API key, per [Codex](#supported-managed-contexts) |
+| OpenCode with no provable durable database | Refused | Refused | Point `OPENCODE_DB` at a durable database (`opencode db path` prints the current one); otherwise `OPENCODE_DISABLE_CHANNEL_DB` must be exactly `1` or `true`, and `:memory:` never qualifies, per [OpenCode](#supported-managed-contexts) |
+| Any agent in an Apple Container sandbox | Refused | Refused | Set `sandbox.container_runtime` to Docker or Podman, per [Configuration](sandbox.md#configuration) |
+| An opaque wrapper missing `session.agent_execution_as` or `session.agent_config_dir` | Refused | Refused | Declare the wrapper contract, per [Execution identity and wrappers](#execution-identity-and-wrappers) |
+
 ## Pinning or resetting a conversation
 
 Pin a terminal session to a specific native conversation:

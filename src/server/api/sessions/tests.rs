@@ -761,23 +761,52 @@ fn find_by_idempotency_key_matches_trashed_but_not_missing() {
     assert!(find_by_idempotency_key(&instances, "never-seen").is_none());
 }
 
+/// A parent whose conversation is qualified, as a capture leaves it.
+fn qualified_parent_binding() -> crate::session::ConversationBinding {
+    crate::session::ConversationBinding {
+        session_id: "parent-uuid".into(),
+        execution: Some(crate::session::ExecutionBinding {
+            agent: "claude".into(),
+            stores: vec!["/tmp/claude-store".into()],
+            configuration: Vec::new(),
+            exported_default_store: None,
+            cwd: "/tmp".into(),
+            cwd_filesystem: "host".into(),
+            filesystem: "host".into(),
+        }),
+        provenance: crate::session::ConversationProvenance::Observed,
+        transcript_path: None,
+    }
+}
+
+/// A parent binding that records the id without qualifying it: no execution
+/// stands behind it, so `is_known()` is false whatever the provenance claims.
+fn unqualified_parent_binding(
+    provenance: crate::session::ConversationProvenance,
+) -> crate::session::ConversationBinding {
+    crate::session::ConversationBinding {
+        execution: None,
+        provenance,
+        ..qualified_parent_binding()
+    }
+}
+
+/// A parent row labelled `label`, recording `parent-uuid` and still carrying
+/// `binding` when the row has one left.
+fn parent_row(
+    label: &str,
+    binding: Option<crate::session::ConversationBinding>,
+) -> crate::session::Instance {
+    let mut row = crate::session::Instance::new(label, "/tmp");
+    row.agent_session_id = Some("parent-uuid".into());
+    row.agent_session_binding = binding;
+    row
+}
+
 #[test]
 fn fork_seed_and_structured_fork_guard_agree_per_agent() {
     {
-        let parent_binding = crate::session::ConversationBinding {
-            session_id: "parent-uuid".into(),
-            execution: Some(crate::session::ExecutionBinding {
-                agent: "claude".into(),
-                stores: vec!["/tmp/claude-store".into()],
-                configuration: Vec::new(),
-                exported_default_store: None,
-                cwd: "/tmp".into(),
-                cwd_filesystem: "host".into(),
-                filesystem: "host".into(),
-            }),
-            provenance: crate::session::ConversationProvenance::Observed,
-            transcript_path: None,
-        };
+        let parent_binding = qualified_parent_binding();
         let mut parent = crate::session::Instance::new("parent", "/tmp");
         parent.agent_session_id = Some(parent_binding.session_id.clone());
         parent.agent_session_binding = Some(parent_binding.clone());
@@ -848,6 +877,184 @@ fn fork_seed_and_structured_fork_guard_agree_per_agent() {
             );
         }
     }
+}
+
+#[test]
+fn fork_from_an_unqualified_parent_is_refused_as_unqualified() {
+    let mut parent = crate::session::Instance::new("parent", "/tmp");
+    parent.agent_session_id = Some("parent-uuid".into());
+    parent.agent_session_binding =
+        Some(crate::session::ConversationBinding::unknown("parent-uuid"));
+
+    assert_eq!(
+        resolve_create_fork_seed("parent-uuid", false, &[parent]),
+        Err(crate::session::ForkDenied::UnqualifiedParent {
+            provenance: Some(crate::session::ConversationProvenance::Unknown),
+            recorded: "parent-uuid".into(),
+        })
+    );
+}
+
+/// A degraded launch leaves the id with no binding, and no provenance can be
+/// read off what is gone, so the refusal must not claim one.
+#[test]
+fn fork_from_a_parent_with_no_binding_is_refused_without_provenance() {
+    let mut parent = crate::session::Instance::new("parent", "/tmp");
+    parent.agent_session_id = Some("parent-uuid".into());
+
+    assert_eq!(
+        resolve_create_fork_seed("parent-uuid", false, &[parent]),
+        Err(crate::session::ForkDenied::UnqualifiedParent {
+            provenance: None,
+            recorded: "parent-uuid".into(),
+        })
+    );
+}
+
+/// A pinned row carries the id it was pinned to, so the fork resolves on the
+/// conversation the row names, not the one `agent_session_id` still holds.
+#[test]
+fn fork_from_resolves_the_conversation_the_parent_carries() {
+    let carried = qualified_parent_binding();
+    let mut parent = crate::session::Instance::new("parent", "/tmp");
+    parent.agent_session_id = Some("pre-pin-uuid".into());
+    parent.resume_intent = crate::session::ResumeIntent::Use("parent-uuid".into());
+    parent.resume_binding = Some(carried.clone());
+
+    match resolve_create_fork_seed("parent-uuid", false, &[parent.clone()])
+        .expect("the pinned conversation is the one to fork")
+    {
+        crate::session::ForkSeed::Terminal { parent: seeded, .. } => assert_eq!(*seeded, carried),
+        crate::session::ForkSeed::Structured { .. } => panic!("expected Terminal seed"),
+    }
+    // The superseded id names no conversation the row carries, so it resolves
+    // nothing rather than a fork of the pinned one.
+    assert_eq!(
+        resolve_create_fork_seed("pre-pin-uuid", false, &[parent]),
+        Err(crate::session::ForkDenied::NoParentSession)
+    );
+}
+
+/// When every row carrying the id is unqualified, the refusal names the state
+/// the rows can still prove, whichever order the load returned them in.
+#[test]
+fn fork_from_unqualified_rows_is_refused_the_same_way_in_either_order() {
+    let mut bare = crate::session::Instance::new("bare", "/tmp");
+    bare.agent_session_id = Some("parent-uuid".into());
+    let mut stale = crate::session::Instance::new("stale", "/tmp");
+    stale.agent_session_id = Some("parent-uuid".into());
+    stale.agent_session_binding = Some(crate::session::ConversationBinding::unknown("parent-uuid"));
+
+    for parents in [vec![bare.clone(), stale.clone()], vec![stale, bare]] {
+        assert_eq!(
+            resolve_create_fork_seed("parent-uuid", false, &parents),
+            Err(crate::session::ForkDenied::UnqualifiedParent {
+                provenance: Some(crate::session::ConversationProvenance::Unknown),
+                recorded: "parent-uuid".into(),
+            })
+        );
+    }
+}
+
+/// Resolution reads a qualified row first whatever the load order, so the one
+/// unqualified row sharing its id cannot steal the seed.
+#[test]
+fn fork_from_rows_carrying_one_id_resolves_the_qualified_row_in_either_order() {
+    let qualified = qualified_parent_binding();
+    let unqualified = parent_row(
+        "stale",
+        Some(unqualified_parent_binding(
+            crate::session::ConversationProvenance::Unknown,
+        )),
+    );
+    for parents in [
+        vec![
+            unqualified.clone(),
+            parent_row("qualified", Some(qualified.clone())),
+        ],
+        vec![
+            parent_row("qualified", Some(qualified.clone())),
+            unqualified,
+        ],
+    ] {
+        match resolve_create_fork_seed("parent-uuid", false, &parents)
+            .expect("the qualified row is the one to fork")
+        {
+            crate::session::ForkSeed::Terminal { parent, .. } => assert_eq!(*parent, qualified),
+            crate::session::ForkSeed::Structured { .. } => panic!("expected Terminal seed"),
+        }
+    }
+}
+
+/// Two rows disagreeing on provenance have no ranked winner, so the refusal
+/// follows the load order. Each state is true of its own row and admits its own
+/// remedy, which is why neither is reported above the other.
+#[test]
+fn fork_from_rows_disagreeing_on_provenance_refuses_with_the_first_bound_row() {
+    use crate::session::ConversationProvenance;
+    let preallocated = unqualified_parent_binding(ConversationProvenance::Preallocated);
+    let unknown = unqualified_parent_binding(ConversationProvenance::Unknown);
+    for (first, second, expected) in [
+        (
+            &preallocated,
+            &unknown,
+            ConversationProvenance::Preallocated,
+        ),
+        (&unknown, &preallocated, ConversationProvenance::Unknown),
+    ] {
+        assert_eq!(
+            resolve_create_fork_seed(
+                "parent-uuid",
+                false,
+                &[
+                    parent_row("first", Some(first.clone())),
+                    parent_row("second", Some(second.clone())),
+                ]
+            ),
+            Err(crate::session::ForkDenied::UnqualifiedParent {
+                provenance: Some(expected),
+                recorded: "parent-uuid".into(),
+            })
+        );
+    }
+}
+
+/// The ambiguity scan is a qualified-row question: two qualified rows naming
+/// different conversations refuse whichever loaded first, and a row recording
+/// the same id with no binding to compare never makes agreeing rows ambiguous.
+#[test]
+fn fork_from_contradictory_qualified_rows_is_refused_in_either_order() {
+    let mut other_agent = qualified_parent_binding();
+    other_agent.execution.as_mut().unwrap().agent = "codex".into();
+    let qualified = qualified_parent_binding();
+    for parents in [
+        vec![
+            parent_row("claude", Some(qualified.clone())),
+            parent_row("codex", Some(other_agent.clone())),
+        ],
+        vec![
+            parent_row("codex", Some(other_agent)),
+            parent_row("claude", Some(qualified)),
+        ],
+    ] {
+        assert_eq!(
+            resolve_create_fork_seed("parent-uuid", false, &parents),
+            Err(crate::session::ForkDenied::NoParentSession)
+        );
+    }
+    assert!(
+        resolve_create_fork_seed(
+            "parent-uuid",
+            false,
+            &[
+                parent_row("first", Some(qualified_parent_binding())),
+                parent_row("second", Some(qualified_parent_binding())),
+                parent_row("bare", None),
+            ]
+        )
+        .is_ok(),
+        "a row with no binding records the same id and must not make the scan ambiguous"
+    );
 }
 
 #[test]

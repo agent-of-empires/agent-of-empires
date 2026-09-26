@@ -133,16 +133,51 @@ pub(super) fn resolve_create_fork_seed(
             parent_acp_session_id: parent_id.to_string(),
         });
     }
-    let mut candidates = parents
+    // The candidate is the conversation the row carries, which for a pinned row
+    // is the pinned id, not the one `agent_session_id` still names, so the id is
+    // read off the candidate. Lazy: a row carrying another id is dropped without
+    // materialising anything.
+    let candidates = parents
         .iter()
-        .filter_map(|parent| parent.fork_parent_binding())
-        .filter(|binding| binding.session_id == parent_id);
-    let parent = candidates
-        .next()
-        .ok_or(crate::session::ForkDenied::NoParentSession)?;
-    if candidates.any(|candidate| candidate.key() != parent.key()) {
+        .filter_map(|parent| parent.fork_parent_ref())
+        .filter(|candidate| candidate.session_id() == parent_id);
+    // A qualified row wins over an unqualified one carrying the same id, and the
+    // ambiguity scan compares only qualified rows, so the seed and the scan do
+    // not depend on the order `Storage::load()` returned the rows in. The refusal
+    // does: it describes the first row that carries a binding, so two rows
+    // disagreeing on provenance get whichever loaded first. Both are true of a
+    // row and each admits its own remedy, so none is ranked above another here.
+    let mut first = None;
+    let mut bound = None;
+    let mut chosen = None;
+    let mut ambiguous = false;
+    for candidate in candidates {
+        if first.is_none() {
+            first = Some(candidate);
+        }
+        if bound.is_none() && candidate.binding().is_some() {
+            bound = Some(candidate);
+        }
+        if !candidate.is_known() {
+            continue;
+        }
+        let Some(previous) = chosen else {
+            chosen = Some(candidate);
+            continue;
+        };
+        if candidate.binding().and_then(|binding| binding.key())
+            != previous.binding().and_then(|binding| binding.key())
+        {
+            ambiguous = true;
+        }
+    }
+    if ambiguous {
         return Err(crate::session::ForkDenied::NoParentSession);
     }
+    let parent = chosen
+        .or(bound)
+        .or(first)
+        .ok_or(crate::session::ForkDenied::NoParentSession)?;
     crate::session::fork::terminal_fork_seed(
         Some(parent),
         crate::session::capture::generate_session_uuid(),
@@ -848,11 +883,21 @@ pub async fn create_session(
             };
             match resolve_create_fork_seed(parent_id, structured, &parents) {
                 Ok(seed) => Some(seed),
-                Err(_) => {
+                Err(denied) => {
+                    // The remedy names the row the request asked to fork, so it
+                    // runs as printed. The fallback can only reach a refusal
+                    // that admits no remedy, which needs no row.
+                    let parent = parents
+                        .iter()
+                        .find(|row| {
+                            row.fork_parent_ref()
+                                .is_some_and(|candidate| candidate.session_id() == parent_id)
+                        })
+                        .map_or(parent_id, |row| row.title.as_str());
                     return api_error(
                         StatusCode::BAD_REQUEST,
                         "fork_unsupported",
-                        "This agent or session cannot be forked",
+                        denied.user_message(parent),
                     );
                 }
             }
