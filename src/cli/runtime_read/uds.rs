@@ -5,6 +5,7 @@ use std::mem::MaybeUninit;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::Deserialize;
 use tokio::net::UnixStream;
@@ -18,6 +19,11 @@ const PREBIND_FILE: &str = "runtime.prebind.json";
 const POSTBIND_FILE: &str = "runtime.postbind.json";
 const SOCKET_FILE: &str = "runtime.sock";
 const MARKER_LIMIT: u64 = 64 * 1024;
+/// How long the client waits before re-admitting after a republication it
+/// caught mid-flight. Short enough that a read which raced a publication is
+/// indistinguishable from one that did not, long enough not to spin on a
+/// namespace that is genuinely being rewritten.
+const RETRY_INTERVAL: Duration = Duration::from_millis(50);
 
 #[derive(Debug)]
 pub(crate) enum TrustedPathError {
@@ -61,7 +67,6 @@ struct PostbindMarker {
     owner_uid: u32,
     socket_device: u64,
     socket_inode: u64,
-    #[cfg(target_os = "linux")]
     socket_creator_pid: u32,
 }
 
@@ -118,18 +123,51 @@ pub(crate) struct Admission {
     _lock: File,
 }
 
+/// Admit the local read, retrying for as long as the establishment budget
+/// lasts.
+///
+/// A single attempt turns a publication race into a refusal: a daemon that
+/// republishes between the client's walk and its marker read leaves the
+/// markers describing a process that is no longer the one holding the socket,
+/// which is `marker_identity` — a true statement about a state that lasts
+/// microseconds. So that code alone is re-admitted rather than returned, and
+/// only an exhausted budget turns the last refusal into the answer. Every
+/// other code is final, including the `marker_invalid` that says the artifacts
+/// are present but not trustworthy, and including `marker_missing`, which is
+/// the one refusal the local command path is allowed to take over.
 pub(crate) async fn connect(establishment_deadline: Instant) -> Result<UdsConnection, ReadFailure> {
-    let namespace = tokio::time::timeout_at(
-        establishment_deadline,
-        tokio::task::spawn_blocking(existing_app_namespace),
-    )
-    .await
-    .map_err(|_| ReadFailure::pre("establishment_timeout"))?
-    .map_err(|_| ReadFailure::post("unavailable"))?
-    .map_err(trusted_path_failure)?;
-    tokio::time::timeout_at(establishment_deadline, connect_admission(namespace))
+    loop {
+        let namespace = tokio::time::timeout_at(
+            establishment_deadline,
+            tokio::task::spawn_blocking(existing_app_namespace),
+        )
         .await
         .map_err(|_| ReadFailure::pre("establishment_timeout"))?
+        .map_err(|_| ReadFailure::post("unavailable"))?
+        .map_err(trusted_path_failure)?;
+        let attempt =
+            tokio::time::timeout_at(establishment_deadline, connect_admission(namespace)).await;
+        match attempt {
+            Ok(Ok(connection)) => return Ok(connection),
+            Ok(Err(error)) if error.code() == "marker_identity" => {
+                if wait_for_retry(establishment_deadline).await.is_err() {
+                    return Err(ReadFailure::pre("establishment_timeout"));
+                }
+            }
+            Ok(Err(error)) => return Err(error),
+            Err(_) => return Err(ReadFailure::pre("establishment_timeout")),
+        }
+    }
+}
+
+/// Sleep until the next admission attempt, or report that the budget is spent.
+async fn wait_for_retry(establishment_deadline: Instant) -> Result<(), ()> {
+    let now = Instant::now();
+    if now >= establishment_deadline {
+        return Err(());
+    }
+    tokio::time::sleep(RETRY_INTERVAL.min(establishment_deadline - now)).await;
+    Ok(())
 }
 
 fn trusted_path_failure(error: TrustedPathError) -> ReadFailure {
@@ -144,35 +182,11 @@ fn app_path_and_home() -> Result<(PathBuf, PathBuf), TrustedPathError> {
     if !home.is_absolute() {
         return Err(TrustedPathError::Invalid);
     }
-    #[cfg(target_os = "linux")]
-    let path = {
-        let base = std::env::var_os("XDG_CONFIG_HOME")
-            .map(PathBuf::from)
-            .filter(|path| path.is_absolute())
-            .unwrap_or_else(|| home.join(".config"));
-        (base.join(crate::session::APP_DIR_NAME_XDG), home)
-    };
-    #[cfg(target_os = "macos")]
-    let path = {
-        let xdg_base = std::env::var_os("XDG_CONFIG_HOME")
-            .map(PathBuf::from)
-            .filter(|path| path.is_absolute());
-        let xdg = xdg_base
-            .as_ref()
-            .map(|base| base.join(crate::session::APP_DIR_NAME_XDG));
-        let legacy = home.join(crate::session::APP_DIR_NAME_OTHER);
-        let xdg_absolute_set = xdg_base.is_some();
-        let selected = match (xdg.as_ref().filter(|path| path.exists()), legacy.exists()) {
-            (Some(path), _) => path.clone(),
-            (None, true) => legacy,
-            (None, false) if xdg_absolute_set => xdg.expect("absolute XDG base"),
-            (None, false) => legacy,
-        };
-        (selected, home)
-    };
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    let path = (home.join(crate::session::APP_DIR_NAME_OTHER), home);
-    Ok(path)
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .unwrap_or_else(|| home.join(".config"));
+    Ok((base.join(crate::session::APP_DIR_NAME_XDG), home))
 }
 
 pub(crate) fn existing_app_namespace() -> Result<OwnedNamespace, TrustedPathError> {
@@ -212,19 +226,26 @@ fn open_trusted_directory(path: &Path, euid: u32) -> Result<OwnedFd, TrustedPath
     let mut current = root;
     let count = components.len();
     for (index, component) in components.into_iter().enumerate() {
+        let final_component = index + 1 == count;
         // A component that does not exist means the app directory does not
         // exist, wherever in the chain it is: a fresh home has no
         // `~/.local` to hold one. Every other errno keeps its own class, so
-        // a symlinked, unreadable or non-directory component is still a
-        // refusal rather than an absence.
-        let next = open_dir_at(current.as_raw_fd(), &component).map_err(|error| {
-            if error.raw_os_error() == Some(libc::ENOENT) {
-                TrustedPathError::Missing
-            } else {
-                TrustedPathError::Invalid
-            }
-        })?;
-        validate_directory_stat(&next, euid, index + 1 == count, true)?;
+        // an unreadable or non-directory component is still a refusal rather
+        // than an absence.
+        let next =
+            open_dir_at(current.as_raw_fd(), &component, final_component).map_err(|error| {
+                if error.raw_os_error() == Some(libc::ENOENT) {
+                    TrustedPathError::Missing
+                } else {
+                    TrustedPathError::Invalid
+                }
+            })?;
+        // Every component that resolves is verified by descriptor, whichever
+        // component of the path it was reached through: ownership, the
+        // group/other-write allowance, the sticky-root ancestor rule and the
+        // POSIX ACL are all read off the opened directory, never off the
+        // path.
+        validate_directory_stat(&next, euid, final_component, true)?;
         current = next;
     }
     Ok(current)
@@ -241,14 +262,25 @@ fn open_dir(path: &Path, _euid: u32) -> Result<OwnedFd, TrustedPathError> {
     fd_to_owned(fd).map_err(|_| TrustedPathError::Invalid)
 }
 
-fn open_dir_at(parent: RawFd, component: &CString) -> std::io::Result<OwnedFd> {
-    let fd = unsafe {
-        libc::openat(
-            parent,
-            component.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
-    };
+/// Open one component of the walk.
+///
+/// `O_NOFOLLOW` guards the final component only, the same convention the hook
+/// guard uses (`src/hooks/dir_guard.rs`): a prefix symlink — a home reached
+/// through one, or macOS `/tmp` → `/private/tmp` — is followed and the
+/// directory it resolves to is verified by descriptor, which is where the
+/// ownership, mode, sticky-root and ACL checks are read from. A symlinked
+/// *final* component stays a refusal, because that would let the app directory
+/// itself be swapped for an attacker-chosen inode.
+fn open_dir_at(
+    parent: RawFd,
+    component: &CString,
+    final_component: bool,
+) -> std::io::Result<OwnedFd> {
+    let mut flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC;
+    if final_component {
+        flags |= libc::O_NOFOLLOW;
+    }
+    let fd = unsafe { libc::openat(parent, component.as_ptr(), flags) };
     fd_to_owned(fd)
 }
 
@@ -280,7 +312,6 @@ fn validate_directory_stat(
             return Err(TrustedPathError::Invalid);
         }
     }
-    #[cfg(target_os = "linux")]
     validate_posix_acl(file.as_raw_fd(), stat.st_uid, euid, stat.st_mode)?;
     Ok(())
 }
@@ -296,7 +327,6 @@ fn group_other_writes_allowed(stat: &libc::stat, final_component: bool) -> bool 
         || (!final_component && stat.st_uid == 0 && stat.st_mode & libc::S_ISVTX != 0)
 }
 
-#[cfg(target_os = "linux")]
 fn validate_posix_acl(fd: RawFd, owner: u32, euid: u32, mode: u32) -> Result<(), TrustedPathError> {
     let names = xattr_names(fd)?;
     let Some(name) = names
@@ -309,7 +339,6 @@ fn validate_posix_acl(fd: RawFd, owner: u32, euid: u32, mode: u32) -> Result<(),
     validate_acl_value(&value, owner, euid, mode)
 }
 
-#[cfg(target_os = "linux")]
 fn xattr_names(fd: RawFd) -> Result<Vec<Vec<u8>>, TrustedPathError> {
     let needed = unsafe { libc::flistxattr(fd, std::ptr::null_mut(), 0) };
     if needed < 0 {
@@ -336,7 +365,6 @@ fn xattr_names(fd: RawFd) -> Result<Vec<Vec<u8>>, TrustedPathError> {
         .collect())
 }
 
-#[cfg(target_os = "linux")]
 fn xattr_value(fd: RawFd, name: &[u8]) -> Result<Vec<u8>, TrustedPathError> {
     let c_name = CString::new(name).map_err(|_| TrustedPathError::Invalid)?;
     let needed = unsafe { libc::fgetxattr(fd, c_name.as_ptr(), std::ptr::null_mut(), 0) };
@@ -353,7 +381,6 @@ fn xattr_value(fd: RawFd, name: &[u8]) -> Result<Vec<u8>, TrustedPathError> {
     Ok(value)
 }
 
-#[cfg(target_os = "linux")]
 fn validate_acl_value(
     value: &[u8],
     _owner: u32,
@@ -714,7 +741,6 @@ fn validate_connected_socket(
     peer_credentials(stream, marker, euid)
 }
 
-#[cfg(target_os = "linux")]
 fn peer_credentials(stream: RawFd, marker: &PostbindMarker, euid: u32) -> Result<(), ReadFailure> {
     let mut credentials = std::mem::MaybeUninit::<libc::ucred>::uninit();
     let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
@@ -741,56 +767,7 @@ fn peer_credentials(stream: RawFd, marker: &PostbindMarker, euid: u32) -> Result
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
-fn peer_credentials(stream: RawFd, marker: &PostbindMarker, euid: u32) -> Result<(), ReadFailure> {
-    let mut credentials = std::mem::MaybeUninit::<libc::xucred>::uninit();
-    let mut length = std::mem::size_of::<libc::xucred>() as libc::socklen_t;
-    let result = unsafe {
-        libc::getsockopt(
-            stream,
-            libc::SOL_LOCAL,
-            libc::LOCAL_PEERCRED,
-            credentials.as_mut_ptr().cast(),
-            &mut length,
-        )
-    };
-    if result != 0 || length < std::mem::size_of::<libc::xucred>() as libc::socklen_t {
-        return Err(ReadFailure::post("peer_identity"));
-    }
-    let credentials = unsafe { credentials.assume_init() };
-    let mut pid: libc::pid_t = 0;
-    let mut pid_len = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
-    let result = unsafe {
-        libc::getsockopt(
-            stream,
-            libc::SOL_LOCAL,
-            libc::LOCAL_PEEREPID,
-            (&mut pid as *mut libc::pid_t).cast(),
-            &mut pid_len,
-        )
-    };
-    if result != 0
-        || pid_len != std::mem::size_of::<libc::pid_t>() as libc::socklen_t
-        || credentials.cr_uid as u32 != marker.owner_uid
-        || credentials.cr_uid as u32 != euid
-        || pid as u32 != marker.pid
-    {
-        return Err(ReadFailure::post("peer_identity"));
-    }
-    Ok(())
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn peer_credentials(_: RawFd, _: &PostbindMarker, _: u32) -> Result<(), ReadFailure> {
-    Err(ReadFailure::post("peer_identity"))
-}
-
 fn anchored_child_path(dir: RawFd, child: &str) -> Result<PathBuf, ReadFailure> {
-    #[cfg(target_os = "linux")]
-    let base = PathBuf::from(format!("/proc/self/fd/{dir}"));
-    #[cfg(target_os = "macos")]
-    let base = PathBuf::from(format!("/dev/fd/{dir}"));
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     let base = PathBuf::from(format!("/proc/self/fd/{dir}"));
     if !base.exists() {
         return Err(ReadFailure::pre("anchored_alias_unavailable"));
@@ -910,45 +887,18 @@ fn socket_stat(stat: &libc::stat) -> bool {
 }
 
 fn socket_mode_allowed(stat: &libc::stat, euid: u32) -> bool {
-    if stat.st_uid != euid {
-        return false;
-    }
-    #[cfg(target_os = "linux")]
-    {
-        stat.st_mode & 0o777 == 0o600
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let primary_group = unsafe { libc::getegid() };
-        stat.st_mode & 0o777 == 0o600
-            || (stat.st_mode & 0o777 == 0o660 && stat.st_gid == primary_group)
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        false
-    }
+    stat.st_uid == euid && stat.st_mode & 0o777 == 0o600
 }
 
 fn valid_process_identity(value: &str) -> bool {
     let Some((platform, version, boot, start)) = parse_process_identity(value) else {
         return false;
     };
-    if version != "v1" || !valid_uuid(boot) {
-        return false;
-    }
-    match platform {
-        "linux" => !start.is_empty() && start.bytes().all(|byte| byte.is_ascii_digit()),
-        "macos" => {
-            let Some((seconds, micros)) = start.rsplit_once('.') else {
-                return false;
-            };
-            !seconds.is_empty()
-                && seconds.bytes().all(|byte| byte.is_ascii_digit())
-                && micros.len() == 6
-                && micros.bytes().all(|byte| byte.is_ascii_digit())
-        }
-        _ => false,
-    }
+    platform == "linux"
+        && version == "v1"
+        && valid_uuid(boot)
+        && !start.is_empty()
+        && start.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 fn parse_process_identity(value: &str) -> Option<(&str, &str, &str, &str)> {
@@ -968,9 +918,7 @@ fn process_state(pid: u32, recorded: &str) -> Result<ProcessState, ReadFailure> 
     let Some((platform, _, boot, start)) = parse_process_identity(recorded) else {
         return Err(ReadFailure::pre("marker_identity"));
     };
-    if (cfg!(target_os = "linux") && platform != "linux")
-        || (cfg!(target_os = "macos") && platform != "macos")
-    {
+    if platform != "linux" {
         return Err(ReadFailure::pre("marker_identity"));
     }
     let current_boot = current_boot_id().ok_or_else(|| ReadFailure::pre("marker_identity"))?;
@@ -1064,6 +1012,64 @@ mod tests {
         ));
     }
 
+    /// A home reached through a symlink is not a tampered home, and macOS
+    /// `/tmp` is a symlink on every machine, so a prefix component is followed
+    /// and the directory it resolves to is verified by descriptor. What must
+    /// not change is the verification: a symlinked prefix whose target is
+    /// world-writable is still refused, and a symlinked *final* component is
+    /// still a refusal, because that would swap the app directory itself.
+    #[test]
+    fn a_symlinked_prefix_is_followed_but_every_check_still_applies() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let euid = unsafe { libc::geteuid() };
+        let base = tempfile::tempdir().expect("temp base");
+        let real = base.path().join("real");
+        std::fs::create_dir(&real).expect("real dir");
+        let link = base.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).expect("prefix symlink");
+
+        // The app directory reached through the symlink is admitted.
+        let app = real.join("app-dir");
+        std::fs::create_dir(&app).expect("app dir");
+        assert!(
+            open_trusted_directory(&link.join("app-dir"), euid).is_ok(),
+            "a symlinked prefix must not refuse the walk"
+        );
+
+        // The checks are read off the resolved directory, not the link.
+        let mut permissions = std::fs::metadata(&app).expect("stat").permissions();
+        permissions.set_mode(0o777);
+        std::fs::set_permissions(&app, permissions).expect("chmod");
+        assert!(
+            matches!(
+                open_trusted_directory(&link.join("app-dir"), euid),
+                Err(TrustedPathError::Invalid)
+            ),
+            "a world-writable directory behind a symlink is still refused"
+        );
+        std::fs::set_permissions(&app, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+
+        // A prefix that is a symlink to a regular file is a non-directory
+        // component, not an absence.
+        let file_link = base.path().join("file-link");
+        let target = base.path().join("not-a-dir");
+        std::fs::write(&target, b"x").expect("file");
+        std::os::unix::fs::symlink(&target, &file_link).expect("file symlink");
+        assert!(matches!(
+            open_trusted_directory(&file_link.join("app-dir"), euid),
+            Err(TrustedPathError::Invalid)
+        ));
+
+        // And the final component is still pinned by O_NOFOLLOW.
+        let app_link = base.path().join("app-link");
+        std::os::unix::fs::symlink(&app, &app_link).expect("app symlink");
+        assert!(matches!(
+            open_trusted_directory(&app_link, euid),
+            Err(TrustedPathError::Invalid)
+        ));
+    }
+
     /// `/tmp` is world-writable and sticky, and the walk must still pass
     /// through it: a test namespace and a crash artifact both live there. A
     /// sticky directory that is not root-owned, and the final component in any
@@ -1095,6 +1101,28 @@ mod tests {
         assert!(temporary_kind(name).is_some());
         assert!(valid_uuid(name.rsplit_once(".tmp.").unwrap().1));
         assert!(!valid_uuid("AAAAAAAA-bbbb-cccc-dddd-eeeeeeeeeeee"));
+    }
+
+    /// A crash between the publisher's exclusive create and its rename leaves a
+    /// temporary marker whose body does not parse. The client refuses that file
+    /// until the publisher reaps it, and accepts the directory the reap leaves
+    /// behind: the two halves agree on which directory is trustworthy.
+    #[test]
+    fn a_directory_whose_temporary_was_reaped_is_admitted() {
+        let dir = tempfile::tempdir().expect("namespace");
+        let torn = dir
+            .path()
+            .join("runtime.prebind.json.tmp.aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
+        std::fs::write(&torn, b"").expect("torn temporary");
+        let namespace = File::open(dir.path()).expect("open namespace");
+
+        assert!(
+            inspect_temporary_markers(namespace.as_raw_fd()).is_err(),
+            "an unparsable temporary is not admitted"
+        );
+
+        std::fs::remove_file(&torn).expect("the publisher reaps it");
+        inspect_temporary_markers(namespace.as_raw_fd()).expect("the reaped directory is admitted");
     }
 
     #[test]

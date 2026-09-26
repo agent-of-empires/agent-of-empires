@@ -7,6 +7,7 @@
 
 use std::ffi::OsString;
 use std::net::SocketAddr;
+use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -255,4 +256,95 @@ async fn the_route_rejects_a_valid_dashboard_cookie() {
         !response.contains("101 Switching Protocols"),
         "cookie must not upgrade: {response}"
     );
+}
+
+/// A read a daemon already answered is still a CLI invocation, so the steps
+/// every command shares have to run for it too. They used not to: the served
+/// answer was printed and the process exited from inside the read, so a
+/// daemon-served `aoe list` was the only command in the tool that reported no
+/// unknown-config warning, counted no telemetry and ran no migrations.
+///
+/// The observable here is the warning a config with an unrecognized key
+/// produces, because it is printed by the preflight and nothing else. Telemetry
+/// is not asserted here: `record_cli_usage_flush` clears the per-command counts
+/// once a send is confirmed, so a count is not a durable observation, and the
+/// namespace-drift warning cannot be witnessed from a subprocess at all — the
+/// debug app directory is created before `main` samples for drift, so its
+/// "absent" condition does not survive to the sample.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_served_read_still_runs_the_shared_preflight() {
+    use agent_of_empires::session::APP_DIR_NAME_XDG;
+
+    // The in-process daemon builds its snapshot from the app directory this
+    // test points the environment at, so the child and the daemon have to be
+    // looking at one home or the read would answer from the developer's store.
+    let base = TempAppDir::new();
+    let home = std::path::PathBuf::from(base._dir.path());
+    let xdg = home.join(".config");
+    let app_dir = xdg.join(APP_DIR_NAME_XDG);
+    std::fs::create_dir_all(&app_dir).expect("app dir");
+    std::fs::write(
+        app_dir.join("config.toml"),
+        // The key is unrecognized on purpose; the update check is off so the
+        // one preflight step that reaches the network stays out of it.
+        "not_a_real_key = 3\n\n[updates]\nupdate_check_mode = \"off\"\n",
+    )
+    .expect("config");
+
+    let state =
+        build_test_app_state_with_policy(Vec::new(), hosts(), Vec::new(), Some(TOKEN.to_string()));
+    let address = serve(state).await;
+
+    // The daemon lives in this process, so the child runs off the runtime's
+    // worker threads: a synchronous child would keep the task that answers the
+    // connection from ever being polled.
+    let served = tokio::task::spawn_blocking({
+        let (home, xdg) = (home.clone(), xdg.clone());
+        move || run_cli(&home, &xdg, address, &["profile"])
+    })
+    .await
+    .expect("the command task joins");
+
+    assert_eq!(
+        served.stdout, "No profiles found.\nRun 'aoe' to create the first profile automatically.\n",
+        "the read must have been served by the daemon, not run locally"
+    );
+    assert!(
+        served.stderr.contains("not_a_real_key"),
+        "a served read must still report an unrecognized config key: {:?}",
+        served.stderr
+    );
+}
+
+struct CliRun {
+    stdout: String,
+    stderr: String,
+}
+
+/// The real binary, pointed at a named endpoint so the read is served and the
+/// home carries nothing else.
+fn run_cli(
+    home: &std::path::Path,
+    xdg: &std::path::Path,
+    address: SocketAddr,
+    args: &[&str],
+) -> CliRun {
+    let output = Command::new(env!("CARGO_BIN_EXE_aoe"))
+        .current_dir(home)
+        .env("HOME", home)
+        .env("XDG_CONFIG_HOME", xdg)
+        .env("XDG_DATA_HOME", home.join(".local/share"))
+        .env("AOE_DAEMON_TOKEN", TOKEN)
+        .env_remove("AOE_DAEMON_URL")
+        .env_remove("DO_NOT_TRACK")
+        .env_remove("AGENT_OF_EMPIRES_PROFILE")
+        .arg(format!("--daemon-url=http://{address}"))
+        .args(args)
+        .output()
+        .expect("the aoe binary runs");
+    CliRun {
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    }
 }

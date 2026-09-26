@@ -232,3 +232,45 @@ async fn shutdown_retracts_the_socket_and_closes_admission() {
         "a retracted publication must not serve a read"
     );
 }
+
+/// A daemon that republishes while the client is admitting it leaves the
+/// markers describing a process that is no longer the one holding the socket.
+/// That is `marker_identity` — true for a state that lasts microseconds — so
+/// the client re-admits inside the establishment budget instead of refusing a
+/// read that a daemon restart or a fresh publication raced.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_republication_raced_mid_admission_still_serves_the_read() {
+    let state = build_test_app_state_with_policy(Vec::new(), Vec::new(), Vec::new(), None);
+    let server = RuntimeUdsTestServer::start(state.clone())
+        .unwrap_or_else(|reason| panic!("the local read must be publishable: {reason}"));
+    let marker = server.app_dir().join("runtime.postbind.json");
+    let published = std::fs::read(&marker).expect("the live postbind marker");
+
+    // A marker naming a pid that no longer exists: what the client reads in the
+    // window between a republication's unlink and its rename.
+    let mut stale: serde_json::Value =
+        serde_json::from_slice(&published).expect("the marker is json");
+    stale["pid"] = serde_json::json!(4_194_303);
+    std::fs::write(&marker, serde_json::to_vec(&stale).expect("stale marker")).expect("rewrite");
+
+    let restore = {
+        let marker = marker.clone();
+        let published = published.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(120)).await;
+            std::fs::write(&marker, published).expect("the republication lands");
+        })
+    };
+    let outcome = read(ScopedCommand::Profile).await;
+    restore.await.expect("the restore task joins");
+
+    assert_eq!(
+        outcome.exit, 0,
+        "a raced republication must not fail the read: {:?}",
+        outcome.stderr
+    );
+    assert!(outcome.stdout.is_some());
+    state.shutdown.cancel();
+    server.join().await;
+}
