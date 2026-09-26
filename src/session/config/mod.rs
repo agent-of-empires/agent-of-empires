@@ -1207,10 +1207,14 @@ pub struct SessionConfig {
 
     /// Config directory read by the session's agent instead of its built-in
     /// default. Host sessions use the directory directly. Sandboxed sessions
-    /// use its `sandbox` subdirectory, which AoE mounts at the resolved
-    /// built-in config path and uses for hooks, credentials, and native-session
-    /// capture. Native MCP discovery reads it too, so AoE reconciles the
-    /// servers the agent loads.
+    /// use a per-session `sandbox-v2/<instance id>` child of it, which AoE
+    /// mounts at the resolved built-in config path and uses for hooks,
+    /// credentials, and native-session capture. Native MCP discovery reads it
+    /// too, so AoE reconciles the servers the agent loads, and a session's
+    /// forwarded set follows the store its agent resumes from. Every agent
+    /// reads this entry on the next launch, so repointing it moves a running
+    /// session. Claude alone keeps a store its own conversation recorded, in
+    /// the host and structured views alike, and resumes there.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[setting(
         label = "Agent Config Dir",

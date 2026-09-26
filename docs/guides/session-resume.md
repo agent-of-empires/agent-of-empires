@@ -98,6 +98,12 @@ The carry applies only when the new tool resolves to the same built-in agent, th
 
 The outgoing account keeps its own copy, so swapping accounts back and forth stays continuous: the account you swap away from is the one that was just running, so on the way back its transcript replaces the older copy the earlier swap left behind. A copy the incoming account wrote more recently than the outgoing one is left alone.
 
+Editing one tool's `agent_config_dir` entry in place is not that swap. A Claude conversation on the host resumes in the store its own binding recorded, and that store outranks the entry, so repointing or removing it leaves the session on the account it recorded and only new sessions follow the entry. A structured session resuming the same conversation pins that store without logging, and a sandboxed Claude session follows the entry instead, because its store is a per-session child of the entry ([Per-session agent stores](sandbox.md#per-session-agent-stores)).
+
+A host launch records a `session.store` warning when the two stores differ, naming the store the launch used as `launch_store`, the store a new session would take as `new_session_store`, and where that one comes from as `new_session_store_source`: `agent_config_dir`, `environment`, or `default`. The line goes to the log the TUI and the daemon write, which `aoe logs` opens, and the default level passes it. A one-shot `aoe session restart` has no log of its own, so the line appears there only with `AOE_LOG_LEVEL` or `AGENT_OF_EMPIRES_DEBUG` set, and a level of `error` filters it away. See [Environment variables](configuration.md#environment-variables) for both.
+
+Rebinding the record with `aoe session set-session-id --store` copies nothing, so it only resumes if the target account already holds the conversation; swapping tool names as above is what has AoE copy the transcript.
+
 ## Picking up an upgraded agent CLI
 
 Upgrading the agent binary from inside a session does not replace the process in the pane. Restart the session instead of creating a new one: press `e` (`E` with strict hotkeys) or `F5`, or run `aoe session restart <session>` (`--all` for every session in the profile). A restart runs only `on_launch`, whose failures are warnings, and resumes the conversation while `session.auto_resume_on_restart` is on (the default). A new session runs `on_create`, whose failure [aborts creation](repo-config.md#hooks).
