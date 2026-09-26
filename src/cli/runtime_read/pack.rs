@@ -80,11 +80,6 @@ impl WireRecord {
         out.extend_from_slice(&self.bytes);
         out
     }
-
-    /// The endpoint whose records this case compares (`replay_role`).
-    pub fn is_compared_role(&self, replay_role: &str) -> bool {
-        self.role == role_for(replay_role)
-    }
 }
 
 /// A case that passed every gate, ready to replay.

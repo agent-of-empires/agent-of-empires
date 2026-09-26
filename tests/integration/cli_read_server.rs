@@ -10,7 +10,9 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use agent_of_empires::cli::runtime_read::{execute, ReadOutcome, ReadRequestSource, ScopedCommand};
+use agent_of_empires::cli::runtime_read::{
+    attempt, ReadOutcome, ReadRequestSource, ScopedCommand, ScopedRead,
+};
 use agent_of_empires::server::test_support::{
     build_router_for_test, build_test_app_state_cityhall, build_test_app_state_with_policy,
 };
@@ -77,6 +79,15 @@ fn read_source(address: SocketAddr, token: Option<&str>) -> ReadRequestSource {
         token: token.map(OsString::from),
         explicit_profile: None,
         env_profile: None,
+    }
+}
+
+/// Every read here names its endpoint, so a daemon always answers and the
+/// local fallback never comes into play.
+async fn execute(command: ScopedCommand<'_>, source: &ReadRequestSource) -> ReadOutcome {
+    match attempt(command, source).await {
+        ScopedRead::Answered(outcome) => outcome,
+        ScopedRead::NoLocalPublication => panic!("a named endpoint must answer"),
     }
 }
 

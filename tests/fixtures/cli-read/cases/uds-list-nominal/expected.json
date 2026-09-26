@@ -1,1 +1,1 @@
-{"artifact_revision":"v151","case_id":"uds-list-nominal","code":null,"exit":0,"phase":"renderer","stderr_sha256":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855","stdout_sha256":"68a3677d20ca9b03f70af1a46d800027895703b97a24e430c5010483736b881b","wire_frames":2}
+{"artifact_revision":"v151","case_id":"uds-list-nominal","code":null,"exit":0,"phase":"renderer","stderr_sha256":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855","stdout_sha256":"59da4004230dc294b2f88b155bee9e112a0acb03b527988b933b204d3b827cfa","wire_frames":2}
