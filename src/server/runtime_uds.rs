@@ -34,6 +34,10 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 
 use super::runtime_ws;
+/// The budget both transports spend on one read, declared once beside the read
+/// it bounds: a stalled reader must not hold a connection slot — or a full
+/// disk rescan — open indefinitely on either route.
+use super::runtime_ws::CONNECTION_BUDGET;
 use super::AppState;
 
 pub(crate) const LOCK_FILE: &str = "lifetime.lock";
@@ -43,8 +47,6 @@ pub(crate) const SOCKET_FILE: &str = "runtime.sock";
 
 /// Marker schema version. The client refuses anything else.
 const SCHEMA: u8 = 1;
-/// A stalled reader must not hold a connection slot open indefinitely.
-const CONNECTION_BUDGET: Duration = Duration::from_secs(15);
 /// Backoff after an accept error, so a failing accept cannot spin the loop.
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(50);
 /// The client's frame ceiling, applied here so a snapshot the client would
@@ -433,9 +435,23 @@ fn peer_uid(_: &UnixStream) -> Option<u32> {
 /// while something in the namespace is still owned by a live process.
 fn reap_retained_state(dir: RawFd) -> Result<(), PublishError> {
     let retained = retained_names(dir)?;
+    // A retained temporary name is a half-written marker. One whose writer is
+    // still running is publication in progress and is left alone; anything else
+    // — including the body a crash between the exclusive create and the rename
+    // leaves behind, which does not parse — is unlinked before any final name
+    // is judged, so a torn temporary cannot refuse publication forever.
+    for name in retained.iter().filter(|name| is_temporary_name(name)) {
+        if temporary_is_live(dir, name)? {
+            return Err(PublishError::new(
+                "namespace_busy",
+                format!("{name} belongs to a process still publishing"),
+            ));
+        }
+        unlink_entry(dir, name)?;
+    }
     // A marker a live process wrote means that process is publishing right
     // now, so nothing here is touched.
-    for name in &retained {
+    for name in retained.iter().filter(|name| !is_temporary_name(name)) {
         // The socket carries no identity of its own: a live daemon always has a
         // postbind marker beside it, so an unmarked socket is retained state.
         if name == SOCKET_FILE {
@@ -461,6 +477,43 @@ fn reap_retained_state(dir: RawFd) -> Result<(), PublishError> {
         unlink_entry(dir, name)?;
     }
     Ok(())
+}
+
+/// A create-then-rename marker's temporary name.
+fn is_temporary_name(name: &str) -> bool {
+    name.starts_with(&format!("{PREBIND_FILE}.tmp."))
+        || name.starts_with(&format!("{POSTBIND_FILE}.tmp."))
+}
+
+/// Whether a retained temporary marker still has a live writer. A body that
+/// does not parse is not in flight: a writer that is still running has not
+/// finished its write, and only a finished write can be refused. A body that
+/// cannot even be read proves nothing about a writer either, so it reads as
+/// not in flight and the caller reaps it.
+fn temporary_is_live(dir: RawFd, name: &str) -> Result<bool, PublishError> {
+    let Some(stat) = entry_stat(dir, name)? else {
+        return Ok(false);
+    };
+    if stat.st_mode & libc::S_IFMT != libc::S_IFREG || stat.st_nlink != 1 {
+        return Ok(false);
+    }
+    let entry = CString::new(name).expect("derived name");
+    let fd = unsafe {
+        libc::openat(
+            dir,
+            entry.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Ok(false);
+    }
+    let mut file = unsafe { File::from_raw_fd(fd) };
+    let mut bytes = Vec::new();
+    if file.read_to_end(&mut bytes).is_err() {
+        return Ok(false);
+    }
+    Ok(serde_json::from_slice::<MarkerProbe>(&bytes).is_ok_and(|probe| process_is_live(&probe)))
 }
 
 /// Every runtime artifact in the directory, temporary names included.

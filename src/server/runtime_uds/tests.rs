@@ -172,7 +172,10 @@ async fn a_live_publication_is_never_replaced() {
 }
 
 /// Retained crash state from a dead process is reaped, so the new publication
-/// lands where the client would otherwise fail closed.
+/// lands where the client would otherwise fail closed. A crash between the
+/// exclusive create and the rename leaves a body that does not parse, and that
+/// body must not decide whether this publication may happen: the client refuses
+/// the very file, so the publisher has to remove it first.
 #[tokio::test]
 #[serial_test::serial]
 async fn retained_dead_artifacts_are_reaped_before_publishing() {
@@ -185,8 +188,21 @@ async fn retained_dead_artifacts_are_reaped_before_publishing() {
     let stale = format!("{PREBIND_FILE}.tmp.11111111-2222-3333-4444-555555555555");
     retained_marker(&dir, &stale);
 
+    // Torn: the marker a crash between the exclusive create and the rename
+    // leaves, empty and therefore unparsable.
+    let torn = format!("{POSTBIND_FILE}.tmp.99999999-8888-7777-6666-555555555555");
+    std::fs::write(dir.join(&torn), b"").expect("torn temporary");
+    // Half-written: a prefix of a real body, which does not parse either.
+    let partial = format!("{PREBIND_FILE}.tmp.88888888-7777-6666-5555-444444444444");
+    std::fs::write(dir.join(&partial), br#"{"schema":1,"pid":1"#).expect("partial temporary");
+
     let published = publish().expect("retained state is reapable");
     assert!(!dir.join(&stale).exists());
+    assert!(!dir.join(&torn).exists(), "the torn temporary is reaped");
+    assert!(
+        !dir.join(&partial).exists(),
+        "the partial temporary is reaped"
+    );
     assert_eq!(
         read_json(&dir, POSTBIND_FILE)["prebind_instance_id"],
         runtime_ws::identity().prebind_instance_id
