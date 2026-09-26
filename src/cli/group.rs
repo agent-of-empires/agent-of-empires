@@ -26,7 +26,13 @@ pub enum GroupCommands {
 pub struct GroupListArgs {
     /// Output as JSON
     #[arg(long)]
-    json: bool,
+    pub(crate) json: bool,
+}
+
+impl GroupListArgs {
+    pub(crate) fn json(&self) -> bool {
+        self.json
+    }
 }
 
 #[derive(Args)]

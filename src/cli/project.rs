@@ -22,8 +22,8 @@ pub enum ProjectCommands {
     Remove(ProjectRemoveArgs),
 }
 
-#[derive(Copy, Clone, Debug, ValueEnum)]
-pub enum ScopeFilter {
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+pub(crate) enum ScopeFilter {
     All,
     Global,
     Profile,
@@ -33,11 +33,21 @@ pub enum ScopeFilter {
 pub struct ProjectListArgs {
     /// Output as JSON
     #[arg(long)]
-    json: bool,
+    pub(crate) json: bool,
 
     /// Filter by scope (default: all)
-    #[arg(long, value_enum, default_value_t = ScopeFilter::All)]
-    scope: ScopeFilter,
+    #[arg(long, value_enum, default_value = "all")]
+    pub(crate) scope: ScopeFilter,
+}
+
+impl ProjectListArgs {
+    pub(crate) fn json(&self) -> bool {
+        self.json
+    }
+
+    pub(crate) fn scope(&self) -> ScopeFilter {
+        self.scope
+    }
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]

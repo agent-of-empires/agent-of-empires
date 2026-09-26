@@ -995,6 +995,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        assert!(!supervisor.workers.lock().await.contains_key(id));
         let events = sink.frames.lock().unwrap();
         assert!(events
             .iter()
@@ -1004,7 +1005,6 @@ mod tests {
             .iter()
             .any(|(_, _, event)| matches!(event, Event::AcpSessionAssigned { .. })));
         assert_eq!(supervisor.take_startup_failures(), vec![id.to_string()]);
-        assert!(!supervisor.workers.lock().await.contains_key(id));
     }
 
     #[tokio::test]

@@ -7,6 +7,7 @@ use agent_of_empires::tui;
 use anyhow::Result;
 use clap::{CommandFactory, FromArgMatches, Parser};
 use clap_complete::generate;
+use std::io::Write;
 
 fn is_serve_command(cli: &Cli) -> bool {
     matches!(cli.command, Some(Commands::Serve(_)))
@@ -76,7 +77,7 @@ async fn main() -> Result<()> {
     }
 
     // Only a parse failure loads the plugin registry to graft plugin commands.
-    let cli = match Cli::try_parse() {
+    let mut cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(_) => {
             let matches = cli::graft::augmented_command().get_matches();
@@ -86,6 +87,39 @@ async fn main() -> Result<()> {
             }
         }
     };
+
+    let read_source = cli::runtime_read::read_request_source(&cli);
+    // A scoped read is served by a daemon when one is reachable: the default
+    // transport is the daemon's own UNIX socket, and an explicit endpoint
+    // replaces it. With no daemon publishing, the command runs locally as it
+    // always has.
+    //
+    // A served read is still a CLI invocation, so its answer is carried into
+    // `run` rather than printed here: the preflight below — the namespace
+    // warning, telemetry, migrations, the unknown-config warnings — is what
+    // every other command gets, and skipping it would make a daemon-served
+    // `aoe list` the only command in the tool that reports neither.
+    let answered = match cli::runtime_read::classify(cli.command.as_ref()) {
+        Some(command) => match cli::runtime_read::attempt(command, &read_source).await {
+            cli::runtime_read::ScopedRead::Answered(outcome) => Some(outcome),
+            cli::runtime_read::ScopedRead::NoLocalPublication => None,
+        },
+        None => None,
+    };
+
+    if cli.profile.is_none() {
+        if let Some(profile) = read_source.env_profile.as_deref() {
+            match profile.to_str() {
+                Some(profile) => cli.profile = Some(profile.to_string()),
+                None => Cli::command()
+                    .error(
+                        clap::error::ErrorKind::InvalidValue,
+                        "AGENT_OF_EMPIRES_PROFILE must be valid UTF-8",
+                    )
+                    .exit(),
+            }
+        }
+    }
 
     if let Some(err) = serve_unavailable_error(&cli) {
         err.exit();
@@ -213,32 +247,67 @@ async fn main() -> Result<()> {
 
     // `{e:#}` keeps the cause chain on one line for the line-oriented sink. The detached
     // daemon child skips `eprintln!` because its stderr already goes to the log.
-    if let Err(e) = run(
+    let exit = match run(
         cli,
         is_daemon_child,
         should_init,
         debug_namespace_drift,
         debug_log_warning,
+        answered,
     )
     .await
     {
-        tracing::error!(target: "log.runtime", "fatal: {e:#}");
-        if !is_daemon_child {
-            eprintln!("Error: {e:#}");
+        Ok(exit) => exit,
+        Err(e) => {
+            tracing::error!(target: "log.runtime", "fatal: {e:#}");
+            if !is_daemon_child {
+                eprintln!("Error: {e:#}");
+            }
+            std::process::exit(1);
         }
-        std::process::exit(1);
+    };
+    // The one exit a served read takes, once the preflight has run. Every
+    // other command exits from inside its own handler.
+    if exit != 0 {
+        std::process::exit(exit);
     }
 
     Ok(())
 }
 
+/// Print a served read's answer and name the exit code to leave with. Writing
+/// the streams before returning is what lets `run` finish the shared
+/// post-command steps first, so the daemon's bytes and the CLI's own warnings
+/// reach the user in the order they are read.
+fn emit_read_outcome(outcome: cli::runtime_read::ReadOutcome) -> i32 {
+    if let Some(stdout) = outcome.stdout {
+        if std::io::stdout()
+            .lock()
+            .write_all(stdout.as_bytes())
+            .and_then(|()| std::io::stdout().lock().flush())
+            .is_err()
+        {
+            eprintln!("daemon read: renderer_internal");
+            return 1;
+        }
+    }
+    if let Some(stderr) = outcome.stderr {
+        let _ = std::io::stderr().lock().write_all(stderr.as_bytes());
+    }
+    outcome.exit
+}
+
+/// Runs the command and returns the process exit code, which is 0 for every
+/// command that exits from its own handler and the served read's own code when
+/// a daemon already answered.
 async fn run(
     cli: Cli,
     is_daemon_child: bool,
     should_init: bool,
     debug_namespace_drift: Option<(std::path::PathBuf, std::path::PathBuf)>,
     debug_log_warning: Option<String>,
-) -> Result<()> {
+    answered: Option<cli::runtime_read::ReadOutcome>,
+) -> Result<i32> {
     if cli.command.is_some() {
         if let Some((release, dev)) = debug_namespace_drift.as_ref() {
             eprintln!(
@@ -259,23 +328,25 @@ async fn run(
     match cli.command {
         Some(Commands::Completion { shell }) => {
             generate(shell, &mut Cli::command(), "aoe", &mut std::io::stdout());
-            return Ok(());
+            return Ok(0);
         }
-        Some(Commands::Init(args)) => return cli::init::run(args).await,
-        Some(Commands::ExtractSessionId(args)) => return cli::extract_session_id::run(args).await,
+        Some(Commands::Init(args)) => return exit_zero(cli::init::run(args).await),
+        Some(Commands::ExtractSessionId(args)) => {
+            return exit_zero(cli::extract_session_id::run(args).await)
+        }
         Some(Commands::Tmux { command }) => {
             use cli::tmux::TmuxCommands;
-            return match command {
+            return exit_zero(match command {
                 TmuxCommands::Status(args) => cli::tmux::run_status(args),
-            };
+            });
         }
-        Some(Commands::Agents) => return cli::agents::run(),
-        Some(Commands::Logs(args)) => return cli::logs::run(args).await,
-        Some(Commands::LogLevel(args)) => return cli::log_level::run(args).await,
-        Some(Commands::Sounds { command }) => return cli::sounds::run(command).await,
+        Some(Commands::Agents) => return exit_zero(cli::agents::run()),
+        Some(Commands::Logs(args)) => return exit_zero(cli::logs::run(args).await),
+        Some(Commands::LogLevel(args)) => return exit_zero(cli::log_level::run(args).await),
+        Some(Commands::Sounds { command }) => return exit_zero(cli::sounds::run(command).await),
         Some(Commands::Theme { command }) => {
             use cli::theme::ThemeCommands;
-            return match command {
+            return exit_zero(match command {
                 ThemeCommands::List => {
                     cli::theme::run_list();
                     Ok(())
@@ -284,19 +355,19 @@ async fn run(
                     cli::theme::run_export(&name, output.as_deref())
                 }
                 ThemeCommands::Dir => cli::theme::run_dir(),
-            };
+            });
         }
-        Some(Commands::Settings { command }) => return cli::settings::run(command),
-        Some(Commands::Telemetry { command }) => return cli::telemetry::run(command),
+        Some(Commands::Settings { command }) => return exit_zero(cli::settings::run(command)),
+        Some(Commands::Telemetry { command }) => return exit_zero(cli::telemetry::run(command)),
         Some(Commands::Mcp { command }) => {
             let profile = cli.profile.clone().unwrap_or_default();
-            return cli::mcp::run(&profile, command).await;
+            return exit_zero(cli::mcp::run(&profile, command).await);
         }
-        Some(Commands::Skill { command }) => return cli::skill::run(command),
-        Some(Commands::Uninstall(args)) => return cli::uninstall::run(args).await,
-        Some(Commands::Update(args)) => return cli::update::run(args).await,
-        Some(Commands::Migrate) => return cli::migrate::run(),
-        Some(Commands::Stop { .. }) => return cli::killall::stop_trap(),
+        Some(Commands::Skill { command }) => return exit_zero(cli::skill::run(command)),
+        Some(Commands::Uninstall(args)) => return exit_zero(cli::uninstall::run(args).await),
+        Some(Commands::Update(args)) => return exit_zero(cli::update::run(args).await),
+        Some(Commands::Migrate) => return exit_zero(cli::migrate::run()),
+        Some(Commands::Stop { .. }) => return exit_zero(cli::killall::stop_trap()),
         _ => {}
     }
 
@@ -327,6 +398,11 @@ async fn run(
         if let Some(w) = warning {
             eprintln!("{w}");
         }
+    }
+    // A served read is finished at this point, with every shared step above
+    // already run: the command's own handler is not entered a second time.
+    if let Some(outcome) = answered {
+        return Ok(emit_read_outcome(outcome));
     }
 
     let result = match cli.command {
@@ -366,6 +442,11 @@ async fn run(
         }
         _ => unreachable!(),
     };
+    exit_zero(result)
+}
 
-    result
+/// Every command above exits from inside its own handler, so completing one
+/// leaves the process with the ordinary success code.
+fn exit_zero(result: Result<()>) -> Result<i32> {
+    result.map(|()| 0)
 }

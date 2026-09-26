@@ -232,11 +232,17 @@ pub struct SetWorktreeNameArgs {
 #[derive(Args)]
 pub struct ShowArgs {
     /// Session ID or title (optional, auto-detects in tmux)
-    identifier: Option<String>,
+    pub(crate) identifier: Option<String>,
 
     /// Output as JSON
     #[arg(long)]
-    json: bool,
+    pub(crate) json: bool,
+}
+
+impl ShowArgs {
+    pub(crate) fn identifier(&self) -> Option<&str> {
+        self.identifier.as_deref()
+    }
 }
 
 #[derive(Args)]
@@ -586,7 +592,7 @@ async fn list_trash(profile: &str) -> Result<()> {
     for inst in trashed {
         let when = inst
             .trashed_at
-            .map(|t| t.to_rfc3339())
+            .map(super::list::display_timestamp)
             .unwrap_or_else(|| "?".to_string());
         println!("  {}  {}  (trashed {})", inst.id, inst.title, when);
     }
@@ -1410,7 +1416,7 @@ async fn show_session(profile: &str, args: ShowArgs) -> Result<()> {
             println!(
                 "  State:   {} ({})",
                 super::list::state_tag(&inst),
-                at.to_rfc3339()
+                super::list::display_timestamp(at)
             );
         }
         println!("  Profile: {}", storage.profile());

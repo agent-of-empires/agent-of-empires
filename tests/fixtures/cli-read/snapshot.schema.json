@@ -1,0 +1,311 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://aoe.invalid/schemas/cli-read/v151/snapshot.schema.json",
+  "title": "cli-read v151 Snapshot data",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "namespace",
+    "cursor",
+    "health",
+    "default_profile",
+    "profiles",
+    "sessions",
+    "global_projects",
+    "status_freshness"
+  ],
+  "properties": {
+    "namespace": { "$ref": "#/$defs/namespace" },
+    "cursor": { "$ref": "#/$defs/cursor" },
+    "health": { "$ref": "#/$defs/snapshot_health" },
+    "default_profile": {
+      "oneOf": [{ "$ref": "#/$defs/safe_text" }, { "type": "null" }]
+    },
+    "profiles": { "type": "array", "items": { "$ref": "#/$defs/profile_read" } },
+    "sessions": { "type": "array", "items": { "$ref": "#/$defs/session_read" } },
+    "global_projects": { "type": "array", "items": { "$ref": "#/$defs/project_read" } },
+    "status_freshness": { "$ref": "#/$defs/status_freshness" }
+  },
+  "$defs": {
+    "uuid": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    "namespace": { "type": "string", "pattern": "^(debug|release):[a-z0-9._-]{1,200}$" },
+    "timestamp": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+    },
+    "safe_text": {
+      "type": "string",
+      "pattern": "^[^\\u0000-\\u001f\\u007f-\\u009f\\u2028\\u2029\\u202a-\\u202e\\u2066-\\u2069]*$"
+    },
+    "absolute_path": {
+      "type": "string",
+      "pattern": "^/([^/\\u0000-\\u001f\\u007f-\\u009f]+(/[^/\\u0000-\\u001f\\u007f-\\u009f]+)*)?$"
+    },
+    "group_path": {
+      "type": "string",
+      "pattern": "^[^/\\u0000-\\u001f\\u007f-\\u009f]+(/[^/\\u0000-\\u001f\\u007f-\\u009f]+)*$"
+    },
+    "health_code": {
+      "type": "string",
+      "enum": ["enumeration", "profile_enumeration", "metadata", "profile_data"]
+    },
+    "component_health": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind"],
+      "properties": {
+        "kind": { "type": "string", "enum": ["healthy", "degraded"] },
+        "code": { "$ref": "#/$defs/health_code" }
+      },
+      "oneOf": [
+        {
+          "properties": { "kind": { "const": "healthy" } },
+          "required": ["kind"],
+          "not": { "required": ["code"] }
+        },
+        {
+          "properties": { "kind": { "const": "degraded" } },
+          "required": ["kind", "code"]
+        }
+      ]
+    },
+    "profile_health": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["profile_enumeration", "metadata", "profile_data"],
+      "properties": {
+        "profile_enumeration": { "$ref": "#/$defs/component_health" },
+        "metadata": { "$ref": "#/$defs/component_health" },
+        "profile_data": { "$ref": "#/$defs/component_health" }
+      }
+    },
+    "snapshot_health": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["global_enumeration", "global_metadata", "profiles"],
+      "properties": {
+        "global_enumeration": { "$ref": "#/$defs/component_health" },
+        "global_metadata": { "$ref": "#/$defs/component_health" },
+        "profiles": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/profile_health" }
+        }
+      }
+    },
+    "status_freshness": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "revision", "observed_at"],
+      "properties": {
+        "kind": { "type": "string", "enum": ["unobserved", "observed", "unavailable"] },
+        "revision": { "type": ["integer", "null"], "minimum": 0 },
+        "observed_at": {
+          "oneOf": [{ "$ref": "#/$defs/timestamp" }, { "type": "null" }]
+        }
+      },
+      "oneOf": [
+        {
+          "properties": {
+            "kind": { "const": "unobserved" },
+            "revision": { "const": 0 },
+            "observed_at": { "type": "null" }
+          }
+        },
+        {
+          "properties": {
+            "kind": { "const": "observed" },
+            "revision": { "type": "integer", "minimum": 1 },
+            "observed_at": { "$ref": "#/$defs/timestamp" }
+          }
+        },
+        {
+          "properties": {
+            "kind": { "const": "unavailable" },
+            "revision": { "type": "null" },
+            "observed_at": { "type": "null" }
+          }
+        }
+      ]
+    },
+    "cursor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["epoch", "revision"],
+      "properties": {
+        "epoch": { "$ref": "#/$defs/uuid" },
+        "revision": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "group_read": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "path", "children"],
+      "properties": {
+        "name": { "$ref": "#/$defs/safe_text" },
+        "path": { "$ref": "#/$defs/group_path" },
+        "children": { "type": "array", "items": { "$ref": "#/$defs/safe_text" } }
+      }
+    },
+    "project_read": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "path", "scope", "default_base_branch"],
+      "properties": {
+        "name": { "$ref": "#/$defs/safe_text" },
+        "path": { "$ref": "#/$defs/absolute_path" },
+        "scope": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind"],
+          "properties": { "kind": { "type": "string", "enum": ["global", "profile"] } }
+        },
+        "default_base_branch": {
+          "oneOf": [{ "$ref": "#/$defs/safe_text" }, { "type": "null" }]
+        }
+      }
+    },
+    "profile_read": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "groups", "projects", "health"],
+      "properties": {
+        "name": { "$ref": "#/$defs/safe_text" },
+        "groups": { "type": "array", "items": { "$ref": "#/$defs/group_read" } },
+        "projects": { "type": "array", "items": { "$ref": "#/$defs/project_read" } },
+        "health": { "$ref": "#/$defs/profile_health" }
+      }
+    },
+    "worktree_read": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["branch", "main_repo_path", "managed_by_aoe", "base_branch"],
+      "properties": {
+        "branch": { "$ref": "#/$defs/safe_text" },
+        "main_repo_path": { "$ref": "#/$defs/absolute_path" },
+        "managed_by_aoe": { "type": "boolean" },
+        "base_branch": {
+          "oneOf": [{ "$ref": "#/$defs/safe_text" }, { "type": "null" }]
+        }
+      }
+    },
+    "workspace_repo": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "source_path", "branch"],
+      "properties": {
+        "name": { "$ref": "#/$defs/safe_text" },
+        "source_path": { "$ref": "#/$defs/absolute_path" },
+        "branch": { "$ref": "#/$defs/safe_text" }
+      }
+    },
+    "cleanup_defaults": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["delete_worktree", "delete_branch", "delete_sandbox", "delete_to_trash"],
+      "properties": {
+        "delete_worktree": { "type": "boolean" },
+        "delete_branch": { "type": "boolean" },
+        "delete_sandbox": { "type": "boolean" },
+        "delete_to_trash": { "type": "boolean" }
+      }
+    },
+    "session_read": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "title",
+        "project_path",
+        "group_path",
+        "tool",
+        "command",
+        "profile",
+        "status",
+        "state",
+        "created_at",
+        "last_accessed_at",
+        "idle_entered_at",
+        "last_error",
+        "archived_at",
+        "trashed_at",
+        "active_snoozed_until",
+        "pinned_at",
+        "agent_session_id",
+        "parent_session_id",
+        "has_terminal",
+        "has_worktree_info",
+        "has_managed_worktree",
+        "has_cleanable_worktree",
+        "worktree",
+        "workspace_repos",
+        "cleanup_defaults"
+      ],
+      "properties": {
+        "id": { "$ref": "#/$defs/safe_text" },
+        "title": { "$ref": "#/$defs/safe_text" },
+        "project_path": { "$ref": "#/$defs/absolute_path" },
+        "group_path": {
+          "oneOf": [{ "$ref": "#/$defs/group_path" }, { "const": "" }]
+        },
+        "tool": { "$ref": "#/$defs/safe_text" },
+        "command": { "$ref": "#/$defs/safe_text" },
+        "profile": { "$ref": "#/$defs/safe_text" },
+        "status": {
+          "type": "string",
+          "enum": [
+            "Running",
+            "Waiting",
+            "Idle",
+            "Unknown",
+            "Stopped",
+            "Error",
+            "Starting",
+            "Deleting",
+            "Creating"
+          ]
+        },
+        "state": { "type": "string", "enum": ["live", "archived", "trashed"] },
+        "created_at": { "$ref": "#/$defs/timestamp" },
+        "last_accessed_at": {
+          "oneOf": [{ "$ref": "#/$defs/timestamp" }, { "type": "null" }]
+        },
+        "idle_entered_at": {
+          "oneOf": [{ "$ref": "#/$defs/timestamp" }, { "type": "null" }]
+        },
+        "last_error": {
+          "oneOf": [{ "$ref": "#/$defs/safe_text" }, { "type": "null" }]
+        },
+        "archived_at": {
+          "oneOf": [{ "$ref": "#/$defs/timestamp" }, { "type": "null" }]
+        },
+        "trashed_at": {
+          "oneOf": [{ "$ref": "#/$defs/timestamp" }, { "type": "null" }]
+        },
+        "active_snoozed_until": {
+          "oneOf": [{ "$ref": "#/$defs/timestamp" }, { "type": "null" }]
+        },
+        "pinned_at": {
+          "oneOf": [{ "$ref": "#/$defs/timestamp" }, { "type": "null" }]
+        },
+        "agent_session_id": {
+          "oneOf": [{ "$ref": "#/$defs/safe_text" }, { "type": "null" }]
+        },
+        "parent_session_id": {
+          "oneOf": [{ "$ref": "#/$defs/safe_text" }, { "type": "null" }]
+        },
+        "has_terminal": { "type": "boolean" },
+        "has_worktree_info": { "type": "boolean" },
+        "has_managed_worktree": { "type": "boolean" },
+        "has_cleanable_worktree": { "type": "boolean" },
+        "worktree": {
+          "oneOf": [{ "$ref": "#/$defs/worktree_read" }, { "type": "null" }]
+        },
+        "workspace_repos": { "type": "array", "items": { "$ref": "#/$defs/workspace_repo" } },
+        "cleanup_defaults": { "$ref": "#/$defs/cleanup_defaults" }
+      }
+    }
+  }
+}

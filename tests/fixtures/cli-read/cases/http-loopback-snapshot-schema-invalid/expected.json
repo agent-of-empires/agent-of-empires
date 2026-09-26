@@ -1,0 +1,1 @@
+{"artifact_revision":"v151","case_id":"http-loopback-snapshot-schema-invalid","code":"schema_invalid","exit":4,"phase":"snapshot","stderr_sha256":"f1f255b9941a78a6ccaa1e73bd82accbcc909eb21e85aa044d82148934df174f","stdout_sha256":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855","wire_frames":2}

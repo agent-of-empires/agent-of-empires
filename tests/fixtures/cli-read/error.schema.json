@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://aoe.invalid/schemas/cli-read/v151/error.schema.json",
+  "title": "cli-read v151 per-case error metadata",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["artifact_revision", "phase", "code", "message"],
+  "properties": {
+    "artifact_revision": { "const": "v151" },
+    "phase": {
+      "type": "string",
+      "enum": [
+        "parser",
+        "handshake",
+        "pre_transport",
+        "transport",
+        "snapshot",
+        "semantic",
+        "close",
+        "renderer"
+      ]
+    },
+    "code": { "$ref": "#/$defs/code" },
+    "message": { "type": "string" }
+  },
+  "$defs": {
+    "code": {
+      "type": "string",
+      "enum": [
+        "parser_error",
+        "schema_invalid",
+        "invalid_endpoint",
+        "invalid_token",
+        "establishment_timeout",
+        "marker_missing",
+        "marker_invalid",
+        "marker_identity",
+        "anchored_alias_unavailable",
+        "unauthorized",
+        "unavailable",
+        "socket_identity",
+        "peer_identity",
+        "protocol_mismatch",
+        "frame_limit",
+        "connection_closed",
+        "health_degraded",
+        "freshness_unavailable",
+        "default_missing",
+        "profile_missing",
+        "session_missing",
+        "session_ambiguous",
+        "close_timeout",
+        "renderer_internal"
+      ]
+    }
+  }
+}
