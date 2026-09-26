@@ -57,24 +57,14 @@ const SCHEMA: SettingsFieldDescriptor[] = [
 ];
 
 describe("PluginSettingsSections", () => {
-  it("renders nothing when no plugin sections exist", () => {
-    const { container } = render(
-      <PluginSettingsSections schema={SCHEMA.slice(0, 1)} settings={{}} onSaved={() => {}} />,
+  it("renders only plugin sections, seeding the manifest default until a value is stored", () => {
+    const { rerender } = render(
+      <PluginSettingsSections schema={SCHEMA} settings={{ plugins: {} }} onSaved={() => {}} />,
     );
-    expect(container.textContent).toBe("");
-  });
-
-  it("renders plugin fields, seeding the manifest default when unstored", () => {
-    render(<PluginSettingsSections schema={SCHEMA} settings={{ plugins: {} }} onSaved={() => {}} />);
     expect(screen.getByText("acme.kit")).toBeTruthy();
-    expect(screen.getByText("Retries")).toBeTruthy();
-    // The number field shows the seeded default of 3.
-    const retries = screen.getByDisplayValue("3");
-    expect(retries).toBeTruthy();
-  });
-
-  it("prefers the stored value over the default", () => {
-    render(
+    expect(screen.queryByText("Idle Decay")).toBeNull();
+    expect(screen.getByDisplayValue("3")).toBeTruthy();
+    rerender(
       <PluginSettingsSections
         schema={SCHEMA}
         settings={{ plugins: { "acme.kit": { settings: { retries: 4 } } } }}

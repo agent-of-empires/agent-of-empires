@@ -251,28 +251,21 @@ mod tests {
     }
 
     #[test]
-    fn redact_strips_basic_userinfo() {
-        assert_eq!(
-            redact(&OsString::from("https://user:pat@github.com/x/y.git")),
-            "https://***@github.com/x/y.git"
-        );
-    }
-
-    #[test]
-    fn redact_passes_clean_urls_through() {
-        assert_eq!(
-            redact(&OsString::from("git@github.com:foo/bar.git")),
-            "git@github.com:foo/bar.git"
-        );
-        assert_eq!(
-            redact(&OsString::from("https://github.com/foo/bar.git")),
-            "https://github.com/foo/bar.git"
-        );
-    }
-
-    #[test]
-    fn redact_passes_non_url_args_through() {
-        assert_eq!(redact(&OsString::from("--prune")), "--prune");
-        assert_eq!(redact(&OsString::from("main")), "main");
+    fn redact_hides_only_url_userinfo() {
+        for (arg, expected) in [
+            (
+                "https://user:pat@github.com/x/y.git",
+                "https://***@github.com/x/y.git",
+            ),
+            ("git@github.com:foo/bar.git", "git@github.com:foo/bar.git"),
+            (
+                "https://github.com/foo/bar.git",
+                "https://github.com/foo/bar.git",
+            ),
+            ("--prune", "--prune"),
+            ("main", "main"),
+        ] {
+            assert_eq!(redact(&OsString::from(arg)), expected, "{arg}");
+        }
     }
 }

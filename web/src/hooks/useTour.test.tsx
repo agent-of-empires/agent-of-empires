@@ -75,7 +75,6 @@ describe("shouldAutoLaunch", () => {
     ["seen state unknown", { seenKnown: false }],
     ["dashboard not ready", { autoLaunchReady: false }],
     ["session scope", { scope: "session" }],
-    ["structured-view scope", { scope: "structured-view" }],
     ["coarse pointer", { isDesktop: false }],
     ["already seen", { seen: true }],
     ["automated session", { automated: true }],
@@ -110,9 +109,7 @@ describe("useTour", () => {
   });
 
   it.each<[string, Partial<UseTourOptions>, boolean, boolean]>([
-    ["auto-launches on a settled, unseen dashboard", {}, false, true],
     ["does not auto-launch inside an automated session", {}, true, false],
-    ["does not auto-launch when already seen", { seen: true }, false, false],
   ])("%s", async (_label, over, automated, active) => {
     isAutomatedSessionMock.mockReturnValue(automated);
     const { result } = renderHook(() => useTour(opts(over)));

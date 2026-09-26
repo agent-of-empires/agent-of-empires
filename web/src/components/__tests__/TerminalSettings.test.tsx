@@ -24,29 +24,26 @@ beforeEach(() => {
 });
 
 describe("TerminalSettings localStorage contract", () => {
-  it("labels font-size controls as applying to web tmux sessions", () => {
-    const { getByText } = render(<TerminalSettings />);
-
-    expect(getByText(/web terminal sessions on mobile devices, including tmux-backed sessions/i)).toBeTruthy();
-    expect(getByText(/web terminal sessions on desktop, including tmux-backed sessions/i)).toBeTruthy();
-  });
-
   it.each([
     ["mobile font slider", "input[type=range]", 0, "10", "mobileFontSize", 10],
     ["mobile font select", "select", 0, "16", "mobileFontSize", 16],
     ["desktop font slider", "input[type=range]", 1, "18", "desktopFontSize", 18],
     ["desktop font select", "select", 1, "20", "desktopFontSize", 20],
-  ] as [string, string, number, string, string, number][])("%s writes %s", (_n, selector, i, value, key, expected) => {
+    ["font family input", "#terminal-font-family", 0, "MesloLGS NF", "terminalFontFamily", "MesloLGS NF"],
+    ["sidebar side select", "#sidebar-side", 0, "right", "sidebarSide", "right"],
+  ] as [string, string, number, string, string, unknown][])("%s writes %s", (_n, selector, i, value, key, expected) => {
     const { container } = render(<TerminalSettings />);
     fireEvent.change(container.querySelectorAll(selector)[i]!, { target: { value } });
     expect(readStored()[key]).toBe(expected);
   });
 
-  it("font family input writes terminalFontFamily", () => {
+  it("checkboxes write the keyboard and persistent-terminal flags", () => {
     const { container } = render(<TerminalSettings />);
-    const input = container.querySelector("#terminal-font-family") as HTMLInputElement;
-    fireEvent.change(input, { target: { value: "MesloLGS NF" } });
-    expect(readStored().terminalFontFamily).toBe("MesloLGS NF");
+    const checkboxes = container.querySelectorAll("input[type=checkbox]");
+    fireEvent.click(checkboxes[0]!);
+    expect(readStored().autoOpenKeyboard).toBe(false);
+    fireEvent.click(checkboxes[1]!);
+    expect(readStored().persistentTerminals).toBe(true);
   });
 
   it("lists detected fonts as datalist suggestions", () => {
@@ -55,42 +52,6 @@ describe("TerminalSettings localStorage contract", () => {
       (o) => (o as HTMLOptionElement).value,
     );
     expect(options).toEqual(["JetBrains Mono", "MesloLGS NF"]);
-  });
-
-  it("reflects a stored terminalFontFamily on mount", () => {
-    seed({ terminalFontFamily: "Fira Code" });
-    const { container } = render(<TerminalSettings />);
-    const input = container.querySelector("#terminal-font-family") as HTMLInputElement;
-    expect(input.value).toBe("Fira Code");
-  });
-
-  it("autoOpenKeyboard checkbox writes the boolean flag", () => {
-    const { container } = render(<TerminalSettings />);
-    const checkbox = container.querySelectorAll("input[type=checkbox]")[0] as HTMLInputElement;
-    fireEvent.click(checkbox);
-    expect(readStored().autoOpenKeyboard).toBe(false);
-  });
-
-  it("sidebar side select writes sidebarSide into aoe-web-settings", () => {
-    const { container } = render(<TerminalSettings />);
-    const select = container.querySelector("#sidebar-side") as HTMLSelectElement;
-    expect(select.value).toBe("left");
-    fireEvent.change(select, { target: { value: "right" } });
-    expect(readStored().sidebarSide).toBe("right");
-  });
-
-  it("reflects a stored sidebarSide on mount", () => {
-    seed({ sidebarSide: "right" });
-    const { container } = render(<TerminalSettings />);
-    const select = container.querySelector("#sidebar-side") as HTMLSelectElement;
-    expect(select.value).toBe("right");
-  });
-
-  it("persistent terminals checkbox writes the beta flag", () => {
-    const { container } = render(<TerminalSettings />);
-    const checkbox = container.querySelectorAll("input[type=checkbox]")[1] as HTMLInputElement;
-    fireEvent.click(checkbox);
-    expect(readStored().persistentTerminals).toBe(true);
   });
 
   it("persistent terminal limit input writes a clamped number", () => {
@@ -105,7 +66,7 @@ describe("TerminalSettings localStorage contract", () => {
   });
 
   it("preserves unrelated keys when persisting an update", () => {
-    seed({
+    const seeded = {
       mobileFontSize: 8,
       desktopFontSize: 14,
       autoOpenKeyboard: true,
@@ -113,66 +74,44 @@ describe("TerminalSettings localStorage contract", () => {
       maxPersistentTerminals: 5,
       diffViewMode: "tree",
       collapsedDiffDirs: ["a/b"],
-    });
+    };
+    seed(seeded);
     const { container } = render(<TerminalSettings />);
-    const slider = container.querySelectorAll("input[type=range]")[0] as HTMLInputElement;
-    fireEvent.change(slider, { target: { value: "12" } });
-    const stored = readStored();
-    expect(stored).toMatchObject({
-      mobileFontSize: 12,
-      desktopFontSize: 14,
-      autoOpenKeyboard: true,
-      persistentTerminals: false,
-      maxPersistentTerminals: 5,
-      diffViewMode: "tree",
-      collapsedDiffDirs: ["a/b"],
-    });
+    fireEvent.change(container.querySelectorAll("input[type=range]")[0]!, { target: { value: "12" } });
+    expect(readStored()).toMatchObject({ ...seeded, mobileFontSize: 12 });
   });
 
-  it("reflects the stored value on initial mount", () => {
+  it("reflects stored values on mount", () => {
     seed({
       mobileFontSize: 22,
       desktopFontSize: 16,
       autoOpenKeyboard: false,
       persistentTerminals: true,
       maxPersistentTerminals: 42,
+      terminalFontFamily: "Fira Code",
+      sidebarSide: "right",
     });
     const { container } = render(<TerminalSettings />);
-    const mobileSelect = container.querySelectorAll("select")[0] as HTMLSelectElement;
-    const desktopSelect = container.querySelectorAll("select")[1] as HTMLSelectElement;
+    const selects = container.querySelectorAll("select");
     const checkboxes = container.querySelectorAll("input[type=checkbox]");
-    const checkbox = checkboxes[0] as HTMLInputElement;
-    const persistentCheckbox = checkboxes[1] as HTMLInputElement;
-    const persistentLimit = container.querySelector("input[type=number]") as HTMLInputElement;
-    expect(mobileSelect.value).toBe("22");
-    expect(desktopSelect.value).toBe("16");
-    expect(checkbox.checked).toBe(false);
-    expect(persistentCheckbox.checked).toBe(true);
-    expect(persistentLimit.value).toBe("42");
+    expect((selects[0] as HTMLSelectElement).value).toBe("22");
+    expect((selects[1] as HTMLSelectElement).value).toBe("16");
+    expect((checkboxes[0] as HTMLInputElement).checked).toBe(false);
+    expect((checkboxes[1] as HTMLInputElement).checked).toBe(true);
+    expect((container.querySelector("input[type=number]") as HTMLInputElement).value).toBe("42");
+    expect((container.querySelector("#terminal-font-family") as HTMLInputElement).value).toBe("Fira Code");
+    expect((container.querySelector("#sidebar-side") as HTMLSelectElement).value).toBe("right");
   });
 
-  it("normalizes malformed persistent terminal settings on read", () => {
-    seed({
-      persistentTerminals: "yes",
-      maxPersistentTerminals: 1000,
-    });
+  it("normalizes malformed or out-of-range persistent terminal settings on read", () => {
+    seed({ persistentTerminals: "yes", maxPersistentTerminals: 1000 });
+    const first = render(<TerminalSettings />);
+    expect((first.container.querySelectorAll("input[type=checkbox]")[1] as HTMLInputElement).checked).toBe(false);
+    expect(first.container.querySelector("input[type=number]")).toBeNull();
+    first.unmount();
+
+    seed({ persistentTerminals: true, maxPersistentTerminals: 1000 });
     const { container } = render(<TerminalSettings />);
-    const checkboxes = container.querySelectorAll("input[type=checkbox]");
-    const persistentCheckbox = checkboxes[1] as HTMLInputElement;
-    const persistentLimit = container.querySelector("input[type=number]") as HTMLInputElement | null;
-
-    expect(persistentCheckbox.checked).toBe(false);
-    expect(persistentLimit).toBeNull();
-  });
-
-  it("clamps a persisted terminal keep-alive limit on read", () => {
-    seed({
-      persistentTerminals: true,
-      maxPersistentTerminals: 1000,
-    });
-    const { container } = render(<TerminalSettings />);
-    const persistentLimit = container.querySelector("input[type=number]") as HTMLInputElement;
-
-    expect(persistentLimit.value).toBe("50");
+    expect((container.querySelector("input[type=number]") as HTMLInputElement).value).toBe("50");
   });
 });

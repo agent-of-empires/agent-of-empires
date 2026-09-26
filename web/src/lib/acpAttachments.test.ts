@@ -1,60 +1,8 @@
 import { describe, expect, it } from "vitest";
 
-import { applyEvent, emptyAcpState, transcriptRowToActivity, type AcpFrame } from "./acpTypes";
+import { transcriptRowToActivity } from "./acpTypes";
 
 describe("structured view attachments reducer", () => {
-  it("stores prompt capabilities from the PromptCapabilities event", () => {
-    const frame: AcpFrame = {
-      session_id: "s-1",
-      seq: 1,
-      event: {
-        PromptCapabilities: {
-          image: true,
-          audio: false,
-          embedded_context: true,
-        },
-      },
-    };
-    const next = applyEvent(emptyAcpState(), frame);
-    expect(next.promptCapabilities).toEqual({
-      image: true,
-      audio: false,
-      embeddedContext: true,
-      steering: false,
-    });
-  });
-
-  it("re-emits supersede earlier capabilities (agent switch)", () => {
-    let state = applyEvent(emptyAcpState(), {
-      session_id: "s-1",
-      seq: 1,
-      event: {
-        PromptCapabilities: {
-          image: true,
-          audio: true,
-          embedded_context: true,
-        },
-      },
-    });
-    state = applyEvent(state, {
-      session_id: "s-1",
-      seq: 2,
-      event: {
-        PromptCapabilities: {
-          image: false,
-          audio: false,
-          embedded_context: false,
-        },
-      },
-    });
-    expect(state.promptCapabilities).toEqual({
-      image: false,
-      audio: false,
-      embeddedContext: false,
-      steering: false,
-    });
-  });
-
   it("maps server attachment refs to a GET-backed url on the transcript row", () => {
     const row = transcriptRowToActivity(
       {

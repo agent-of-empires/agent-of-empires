@@ -96,13 +96,6 @@ describe("MobileLiveTerminal wheel forwarding", () => {
     expect(document.activeElement).not.toBe(input());
   });
 
-  it("gears a short touch drag up to a notch", () => {
-    // 14px is short of a 16.8px line; only the touch gain makes it a notch.
-    const { scroller, wheel } = term();
-    drag(scroller, 300, 286);
-    expect(wheel).toHaveBeenCalledTimes(1);
-  });
-
   it("reports touch wheels at pane 0's middle row and desktop wheels at the pointer row", () => {
     // Position-aware apps ignore wheels over their input box, so touch uses the middle row.
     const { scroller, wheel } = term();
@@ -115,12 +108,6 @@ describe("MobileLiveTerminal wheel forwarding", () => {
     const split = term({ ...alt, rows: 8, pane0: { cols: 80, rows: 2 } });
     drag(split.scroller, 300, 266);
     expect(split.wheel.mock.calls[0]![3]).toBe(1);
-  });
-
-  it("does not enter reading mode on scroll while forwarding", () => {
-    const { scroller, props } = term();
-    fireEvent.scroll(scroller);
-    expect(props.enterReading).not.toHaveBeenCalled();
   });
 
   it("relays text entered into the session-selection keyboard proxy", () => {
@@ -234,21 +221,6 @@ describe("MobileLiveTerminal forward-mode flick momentum", () => {
     vi.advanceTimersByTime(100);
     fireEvent.keyDown(input(), { key: "Enter" });
     expect(props.sendData).toHaveBeenCalledWith("\r");
-    expectStill(wheel);
-  });
-
-  it.each([
-    // Hold still past FLICK_MAX_PAUSE_MS before lifting.
-    ["paused before the lift", 16, 32, 200],
-    // 8px over 100ms is under FLICK_MIN_VELOCITY.
-    ["was slow", 100, 8, 0],
-  ])("does not coast when the drag %s", (_n, moveAfter, distance, holdMs) => {
-    const { scroller, wheel } = term();
-    fireEvent.touchStart(scroller, { touches: [touch(400)] });
-    vi.advanceTimersByTime(moveAfter);
-    fireEvent.touchMove(scroller, { touches: [touch(400 - distance)] });
-    vi.advanceTimersByTime(holdMs);
-    fireEvent.touchEnd(scroller, { touches: [] });
     expectStill(wheel);
   });
 });

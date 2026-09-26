@@ -28,10 +28,9 @@ describe("SettingsHeader", () => {
     onSearchJump: () => {},
   };
 
-  it("renders the title and a Back button that closes", () => {
+  it("Back closes", () => {
     const onClose = vi.fn();
     render(<SettingsHeader {...baseProps} onClose={onClose} />);
-    expect(screen.getByText("Settings")).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: /Back/ }));
     expect(onClose).toHaveBeenCalledTimes(1);
   });

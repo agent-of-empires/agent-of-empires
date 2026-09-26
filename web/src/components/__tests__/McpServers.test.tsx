@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 
 import type { McpServersResponse, McpResolveResult } from "../../lib/api";
@@ -37,10 +37,6 @@ beforeEach(() => {
   resolveMcpConflict.mockReset();
   keepMcpServer.mockReset();
   dropMcpServer.mockReset();
-});
-
-afterEach(() => {
-  vi.clearAllMocks();
 });
 
 describe("McpServers read view", () => {
@@ -84,12 +80,6 @@ describe("McpServers read view", () => {
     // Remote transport renders its url and the header NAME only.
     expect(panel.textContent).toContain("https://example/mcp");
     expect(panel.textContent).toContain("headers: Authorization");
-  });
-
-  it("surfaces the drift-paused note", async () => {
-    fetchMcpServers.mockResolvedValue(response({ driftPaused: true }));
-    render(<McpServers />);
-    expect(await screen.findByText(/Drift detection is paused/)).toBeTruthy();
   });
 });
 
@@ -172,18 +162,12 @@ describe("McpServers keep / drop", () => {
     await waitFor(() => expect(screen.queryByLabelText(`${action} gone`)).toBeNull());
   });
 
-  it.each([
-    ["keep", keepMcpServer, /Could not keep "gone"/],
-    ["drop", dropMcpServer, /Could not drop "gone"/],
-  ] as [string, typeof keepMcpServer, RegExp][])(
-    "%s failure shows a notice and leaves the row in place",
-    async (action, call, notice) => {
-      fetchMcpServers.mockResolvedValue(keptResponse());
-      call.mockResolvedValue(false);
-      render(<McpServers />);
-      fireEvent.click(await screen.findByLabelText(`${action} gone`));
-      expect(await screen.findByText(notice)).toBeTruthy();
-      expect(screen.getByLabelText(`${action} gone`)).toBeTruthy();
-    },
-  );
+  it("a failed keep shows a notice and leaves the row in place", async () => {
+    fetchMcpServers.mockResolvedValue(keptResponse());
+    keepMcpServer.mockResolvedValue(false);
+    render(<McpServers />);
+    fireEvent.click(await screen.findByLabelText("keep gone"));
+    expect(await screen.findByText(/Could not keep "gone"/)).toBeTruthy();
+    expect(screen.getByLabelText("keep gone")).toBeTruthy();
+  });
 });

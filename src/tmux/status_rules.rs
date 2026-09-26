@@ -263,70 +263,51 @@ mod tests {
         config
     }
 
+    /// The first matching rule wins, no match is idle, and no rules at all is
+    /// no answer. `contains` ignores case; `regex` is matched as written.
     #[serial]
     #[test]
-    fn no_rules_returns_none() {
+    fn first_matching_rule_decides_the_status() {
         let _registry = ProfileRegistryGuard::take("default");
-        install_from_config("default", &crate::session::Config::default());
-        assert_eq!(detect("default", "anything", "some pane text"), None);
-        assert!(!has_rules("default", "anything"));
-    }
-
-    #[serial]
-    #[test]
-    fn first_match_wins_and_no_match_is_idle() {
-        let _registry = ProfileRegistryGuard::take("default");
-        install_from_config(
-            "default",
-            &config_with_rules(
-                "rules-agent",
-                vec![
-                    rule(HookStatus::Waiting, Some("(y/n)"), None),
-                    rule(HookStatus::Running, Some("esc to interrupt"), None),
-                ],
+        let ordered = vec![
+            rule(HookStatus::Waiting, Some("(y/n)"), None),
+            rule(HookStatus::Running, Some("esc to interrupt"), None),
+        ];
+        let mixed = vec![
+            rule(HookStatus::Running, Some("Thinking"), None),
+            rule(
+                HookStatus::Waiting,
+                None,
+                Some(r"waiting for [0-9]+ approvals?"),
             ),
-        );
-        assert_eq!(
-            detect("default", "rules-agent", "approve? (y/n)\nesc to interrupt"),
-            Some(Status::Waiting)
-        );
-        assert_eq!(
-            detect("default", "rules-agent", "working... esc to interrupt"),
-            Some(Status::Running)
-        );
-        assert_eq!(detect("default", "rules-agent", "$ "), Some(Status::Idle));
-    }
-
-    #[serial]
-    #[test]
-    fn contains_is_case_insensitive_and_regex_is_as_written() {
-        let _registry = ProfileRegistryGuard::take("default");
-        install_from_config(
-            "default",
-            &config_with_rules(
-                "rules-agent",
-                vec![
-                    rule(HookStatus::Running, Some("Thinking"), None),
-                    rule(
-                        HookStatus::Waiting,
-                        None,
-                        Some(r"waiting for [0-9]+ approvals?"),
-                    ),
-                ],
+        ];
+        let cases = [
+            (vec![], "some pane text", None),
+            (
+                ordered.clone(),
+                "approve? (y/n)\nesc to interrupt",
+                Some(Status::Waiting),
             ),
-        );
-        assert_eq!(
-            detect("default", "rules-agent", "THINKING hard"),
-            Some(Status::Running)
-        );
-        assert_eq!(
-            detect("default", "rules-agent", "waiting for 2 approvals"),
-            Some(Status::Waiting)
-        );
-        assert_eq!(
-            detect("default", "rules-agent", "WAITING FOR 2 APPROVALS"),
-            Some(Status::Idle)
-        );
+            (
+                ordered.clone(),
+                "working... esc to interrupt",
+                Some(Status::Running),
+            ),
+            (ordered, "$ ", Some(Status::Idle)),
+            (mixed.clone(), "THINKING hard", Some(Status::Running)),
+            (
+                mixed.clone(),
+                "waiting for 2 approvals",
+                Some(Status::Waiting),
+            ),
+            (mixed, "WAITING FOR 2 APPROVALS", Some(Status::Idle)),
+        ];
+        for (rules, pane, expected) in cases {
+            let has = !rules.is_empty();
+            install_from_config("default", &config_with_rules("rules-agent", rules));
+            assert_eq!(has_rules("default", "rules-agent"), has);
+            assert_eq!(detect("default", "rules-agent", pane), expected, "{pane:?}");
+        }
     }
 
     #[serial]

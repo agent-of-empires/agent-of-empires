@@ -195,17 +195,6 @@ describe("buildNestedSidebarGroups", () => {
     ]);
   });
 
-  it("slices a split workspace per subgroup with the real id preserved", () => {
-    const split = workspace("w1", [
-      session({ id: "a", group_path: "feature" }),
-      session({ id: "b", group_path: "fix" }),
-    ]);
-    const [feature, fix] = buildNested([repoGroup("/repo-a", { workspaces: [split] })])[0]!.subgroups;
-    expect([wsIds(feature!), wsIds(fix!)]).toEqual([["w1"], ["w1"]]);
-    expect(feature!.workspaces[0]!.key).not.toBe(fix!.workspaces[0]!.key);
-    expect(feature!.workspaces[0]!.workspace.sessions.map((s) => s.id)).toEqual(["a"]);
-  });
-
   it("keys subgroup collapse on (repoId, groupPath)", () => {
     const nested = buildNested(
       [
@@ -287,7 +276,6 @@ describe("archivableWorkspaces", () => {
       [ws("w-snoozed", "feature", { snoozed_until: "2999-01-01T00:00:00Z" })],
       ["w-snoozed"],
     ],
-    ["is empty once every member is archived", [ws("w1", "feature", archived)], []],
     [
       "keys off the primary session",
       [

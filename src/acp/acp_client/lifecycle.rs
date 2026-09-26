@@ -319,7 +319,7 @@ mod tests {
     }
 
     #[test]
-    fn classify_lifecycle_signal_routes_compaction_markers() {
+    fn classify_lifecycle_signal_cases() {
         let cases = [
             ("Compacting...", "CompactionStarted"),
             ("Compacting completed.", "CompactionCompleted"),
@@ -338,6 +338,95 @@ mod tests {
         for (text, expected) in cases {
             let sig = classify_lifecycle_signal(&text_chunk(text, Some("m"))).unwrap();
             assert_eq!(format!("{sig:?}"), expected, "{text:?}");
+        }
+
+        let tool_cases = [
+            (
+                ToolCallStatus::Completed,
+                "Async agent launched successfully. agentId: a1",
+                true,
+                Some(OffProtocolWorkKind::AsyncAgent),
+            ),
+            (
+                ToolCallStatus::Completed,
+                "Command running in background with ID: bg. Output: /tmp/x",
+                true,
+                Some(OffProtocolWorkKind::BackgroundCommand),
+            ),
+            (ToolCallStatus::Completed, "ls /tmp/foo done", true, None),
+            (
+                ToolCallStatus::Failed,
+                "Async agent launched successfully. agentId: not-real",
+                false,
+                None,
+            ),
+        ];
+        for (status, text, want_ok, want_work) in tool_cases {
+            match classify_lifecycle_signal(&tool_update(status, text)) {
+                Some(LifecycleSignal::ToolCompleted {
+                    id,
+                    succeeded,
+                    off_protocol_work,
+                }) => {
+                    assert_eq!(id, "tc-1");
+                    assert_eq!(succeeded, want_ok, "{text}");
+                    assert_eq!(off_protocol_work, want_work, "{text}");
+                }
+                other => panic!("expected ToolCompleted, got {other:?}"),
+            }
+        }
+
+        for (input, expected) in [
+            (
+                serde_json::json!({ "command": "npm i", "run_in_background": true }),
+                true,
+            ),
+            (serde_json::json!({ "command": "ls" }), false),
+        ] {
+            let mut tc = ToolCall::new("tc-bg", "Bash");
+            tc.raw_input = Some(input);
+            match classify_lifecycle_signal(&SessionUpdate::ToolCall(tc)) {
+                Some(LifecycleSignal::ToolStarted {
+                    id,
+                    is_background_task,
+                }) => {
+                    assert_eq!(id, "tc-bg");
+                    assert_eq!(is_background_task, expected);
+                }
+                other => panic!("expected ToolStarted, got {other:?}"),
+            }
+        }
+
+        {
+            let wake = |status| {
+                SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                    "tc-wake",
+                    ToolCallUpdateFields::new()
+                        .status(status)
+                        .title("ScheduleWakeup".to_string())
+                        .raw_input(serde_json::json!({ "delaySeconds": 60 })),
+                ))
+            };
+            for (status, expected) in [
+                (ToolCallStatus::Completed, true),
+                (ToolCallStatus::InProgress, true),
+                (ToolCallStatus::Failed, false),
+            ] {
+                let sig =
+                    wakeup_lifecycle_signal_from_update(&wake(status), &agent_profiles::CLAUDE);
+                assert_eq!(
+                    matches!(sig, Some(LifecycleSignal::WakeupPending { .. })),
+                    expected,
+                    "{status:?}"
+                );
+            }
+            let mut tc = ToolCall::new("tc-wake-2", "ScheduleWakeup");
+            tc.raw_input = Some(serde_json::json!({ "delaySeconds": 60 }));
+            assert!(wakeup_lifecycle_signal_from_update(
+                &SessionUpdate::ToolCall(tc),
+                &agent_profiles::CLAUDE
+            )
+            .is_none());
         }
     }
 
@@ -376,101 +465,6 @@ mod tests {
             );
         }
         assert!(detect_off_protocol_work_completed(&Some(vec![])).is_none());
-    }
-
-    #[test]
-    fn wakeup_signal_requires_non_failed_tool_call_update() {
-        let wake = |status| {
-            SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
-                "tc-wake",
-                ToolCallUpdateFields::new()
-                    .status(status)
-                    .title("ScheduleWakeup".to_string())
-                    .raw_input(serde_json::json!({ "delaySeconds": 60 })),
-            ))
-        };
-        for (status, expected) in [
-            (ToolCallStatus::Completed, true),
-            (ToolCallStatus::InProgress, true),
-            (ToolCallStatus::Failed, false),
-        ] {
-            let sig = wakeup_lifecycle_signal_from_update(&wake(status), &agent_profiles::CLAUDE);
-            assert_eq!(
-                matches!(sig, Some(LifecycleSignal::WakeupPending { .. })),
-                expected,
-                "{status:?}"
-            );
-        }
-        let mut tc = ToolCall::new("tc-wake-2", "ScheduleWakeup");
-        tc.raw_input = Some(serde_json::json!({ "delaySeconds": 60 }));
-        assert!(wakeup_lifecycle_signal_from_update(
-            &SessionUpdate::ToolCall(tc),
-            &agent_profiles::CLAUDE
-        )
-        .is_none());
-    }
-
-    #[test]
-    fn classify_tool_completion_off_protocol_work() {
-        let cases = [
-            (
-                ToolCallStatus::Completed,
-                "Async agent launched successfully. agentId: a1",
-                true,
-                Some(OffProtocolWorkKind::AsyncAgent),
-            ),
-            (
-                ToolCallStatus::Completed,
-                "Command running in background with ID: bg. Output: /tmp/x",
-                true,
-                Some(OffProtocolWorkKind::BackgroundCommand),
-            ),
-            (ToolCallStatus::Completed, "ls /tmp/foo done", true, None),
-            (
-                ToolCallStatus::Failed,
-                "Async agent launched successfully. agentId: not-real",
-                false,
-                None,
-            ),
-        ];
-        for (status, text, want_ok, want_work) in cases {
-            match classify_lifecycle_signal(&tool_update(status, text)) {
-                Some(LifecycleSignal::ToolCompleted {
-                    id,
-                    succeeded,
-                    off_protocol_work,
-                }) => {
-                    assert_eq!(id, "tc-1");
-                    assert_eq!(succeeded, want_ok, "{text}");
-                    assert_eq!(off_protocol_work, want_work, "{text}");
-                }
-                other => panic!("expected ToolCompleted, got {other:?}"),
-            }
-        }
-    }
-
-    #[test]
-    fn classify_tool_call_carries_run_in_background_flag() {
-        for (input, expected) in [
-            (
-                serde_json::json!({ "command": "npm i", "run_in_background": true }),
-                true,
-            ),
-            (serde_json::json!({ "command": "ls" }), false),
-        ] {
-            let mut tc = ToolCall::new("tc-bg", "Bash");
-            tc.raw_input = Some(input);
-            match classify_lifecycle_signal(&SessionUpdate::ToolCall(tc)) {
-                Some(LifecycleSignal::ToolStarted {
-                    id,
-                    is_background_task,
-                }) => {
-                    assert_eq!(id, "tc-bg");
-                    assert_eq!(is_background_task, expected);
-                }
-                other => panic!("expected ToolStarted, got {other:?}"),
-            }
-        }
     }
 
     /// #3190: a per-connection claim left a second turn with no terminal.

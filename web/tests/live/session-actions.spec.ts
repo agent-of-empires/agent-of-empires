@@ -39,44 +39,46 @@ const firstSession = async (serve: ServeHandle) => (await listSessions(serve.bas
 
 test.describe("rename (#1220)", () => {
   // #2624: real Claude titles with shell metacharacters used to break.
-  for (const updated of ["rename-target", "Goal: I've fixed the parser, right?"]) {
-    test(`Enter commits "${updated}" through PATCH /api/sessions/:id`, async ({ page, spawnServe }) => {
-      const { serve, sessionId, row } = await openWithSession(page, spawnServe, "rename-source");
+  test("Enter commits a title with shell metacharacters through PATCH /api/sessions/:id", async ({
+    page,
+    spawnServe,
+  }) => {
+    const updated = "Goal: I've fixed the parser, right?";
+    const { serve, sessionId, row } = await openWithSession(page, spawnServe, "rename-source");
+    await row.click({ button: "right" });
+    const patch = page.waitForResponse(
+      (res) => res.url().endsWith(`/api/sessions/${sessionId}`) && res.request().method() === "PATCH",
+    );
+    await menuItem(page, "rename").click();
+    const input = page.locator("[data-testid='sidebar-rename-input']");
+    await expect(input).toBeVisible();
+    await input.fill(updated);
+    await input.press("Enter");
+
+    const patchRes = await patch;
+    expect(patchRes.ok(), `rename should succeed, got ${patchRes.status()}`).toBe(true);
+    expect(patchRes.request().postDataJSON()).toEqual({ title: updated });
+    await expect(page.getByText(updated)).toBeVisible({ timeout: 5_000 });
+    await expect.poll(async () => (await firstSession(serve))?.title, { timeout: 5_000 }).toBe(updated);
+  });
+
+  test("Escape mid-edit and a blank title both close the editor without a PATCH", async ({ page, spawnServe }) => {
+    const { row } = await openWithSession(page, spawnServe, "rename-kept");
+    const patches = await countFetches(page, "PATCH");
+    for (const [value, key] of [
+      ["should-not-stick", "Escape"],
+      ["   ", "Enter"],
+    ]) {
       await row.click({ button: "right" });
-      const patch = page.waitForResponse(
-        (res) => res.url().endsWith(`/api/sessions/${sessionId}`) && res.request().method() === "PATCH",
-      );
       await menuItem(page, "rename").click();
       const input = page.locator("[data-testid='sidebar-rename-input']");
-      await expect(input).toBeVisible();
-      await input.fill(updated);
-      await input.press("Enter");
-
-      const patchRes = await patch;
-      expect(patchRes.ok(), `rename should succeed, got ${patchRes.status()}`).toBe(true);
-      expect(patchRes.request().postDataJSON()).toEqual({ title: updated });
-      await expect(page.getByText(updated)).toBeVisible({ timeout: 5_000 });
-      await expect.poll(async () => (await firstSession(serve))?.title, { timeout: 5_000 }).toBe(updated);
-    });
-  }
-
-  for (const c of [
-    { name: "Escape cancels mid-edit, no PATCH fires", value: "should-not-stick", key: "Escape" },
-    { name: "blank title is rejected by commitRename without firing PATCH", value: "   ", key: "Enter" },
-  ]) {
-    test(c.name, async ({ page, spawnServe }) => {
-      const { row } = await openWithSession(page, spawnServe, "rename-kept");
-      const patches = await countFetches(page, "PATCH");
-      await row.click({ button: "right" });
-      await menuItem(page, "rename").click();
-      const input = page.locator("[data-testid='sidebar-rename-input']");
-      await input.fill(c.value);
-      await input.press(c.key);
+      await input.fill(value!);
+      await input.press(key!);
       await expect(input).toBeHidden();
       await expect(row).toContainText("rename-kept");
-      expect(await patches()).toBe(0);
-    });
-  }
+    }
+    expect(await patches()).toBe(0);
+  });
 });
 
 test.describe("group edit (#1726)", () => {
@@ -98,33 +100,24 @@ test.describe("group edit (#1726)", () => {
   }
 
   // #2624: apostrophes in group paths are accepted.
-  for (const group of ["team/alpha", "Sam's Team/imports"]) {
-    test(`Save commits new group "${group}", creating the group`, async ({ page, spawnServe }) => {
-      const { serve, sessionId, row } = await openWithSession(page, spawnServe, "group-edit-new");
-      expect((await firstSession(serve))?.group_path).toBe("");
-      await row.click({ button: "right" });
-      await saveGroup(page, sessionId, group);
-      await expect.poll(async () => (await firstSession(serve))?.group_path, { timeout: 5_000 }).toBe(group);
-      const groups = (await fetch(`${serve.baseUrl}/api/groups`).then((r) => r.json())) as Array<{ path: string }>;
-      expect(groups.map((g) => g.path)).toContain(group);
-    });
-  }
-
-  test("clearing the field commits an empty group, ungrouping the session", async ({ page, spawnServe }) => {
-    const serve = await spawnServe({ seedFn: seedSessionViaAoeAdd({ title: "group-edit-clear" }) });
-    const sessionId = (await firstSession(serve))!.id;
-    const setRes = await fetch(`${serve.baseUrl}/api/sessions/${sessionId}/group`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ group: "team/beta" }),
-    });
-    expect(setRes.ok).toBe(true);
-
-    await page.goto(`${serve.baseUrl}/`);
-    const row = page.locator("[data-testid='sidebar-session-row']");
-    await expect(row).toContainText("group-edit-clear", { timeout: 10_000 });
+  test("Save commits a new group, creating it; clearing the field ungroups the session", async ({
+    page,
+    spawnServe,
+  }) => {
+    const group = "Sam's Team/imports";
+    const { serve, sessionId, row } = await openWithSession(page, spawnServe, "group-edit-new");
+    expect((await firstSession(serve))?.group_path).toBe("");
     await row.click({ button: "right" });
-    await saveGroup(page, sessionId, "", "team/beta");
+    await saveGroup(page, sessionId, group);
+    await expect.poll(async () => (await firstSession(serve))?.group_path, { timeout: 5_000 }).toBe(group);
+    const groups = (await fetch(`${serve.baseUrl}/api/groups`).then((r) => r.json())) as Array<{ path: string }>;
+    expect(groups.map((g) => g.path)).toContain(group);
+
+    // The modal prefills from the session row, which a reload refreshes.
+    await page.reload();
+    await expect(row).toContainText("group-edit-new", { timeout: 10_000 });
+    await row.click({ button: "right" });
+    await saveGroup(page, sessionId, "", group);
     await expect.poll(async () => (await firstSession(serve))?.group_path, { timeout: 5_000 }).toBe("");
   });
 });
@@ -162,21 +155,6 @@ test.describe("delete and trash (#1220, #2489)", () => {
     await expect(row).toHaveCount(0, { timeout: 10_000 });
   });
 
-  for (const dismiss of ["Cancel", "Escape"]) {
-    test(`${dismiss} closes the dialog without firing DELETE`, async ({ page, spawnServe }) => {
-      const { serve, row } = await openWithSession(page, spawnServe, "keeps-me");
-      const deletes = await countFetches(page, "DELETE");
-      const dialog = await openDeleteDialog(page, row);
-      if (dismiss === "Cancel") await dialog.getByRole("button", { name: "Cancel" }).click();
-      else await page.keyboard.press("Escape");
-      await expect(dialog).toBeHidden();
-      expect(await deletes()).toBe(0);
-      const sessions = await listSessions(serve.baseUrl);
-      expect(sessions).toHaveLength(1);
-      expect(sessions[0]!.title).toBe("keeps-me");
-    });
-  }
-
   test("Move to Trash hides the row, Restore brings it back", async ({ page, spawnServe }) => {
     const { serve, sessionId, row } = await openWithSession(page, spawnServe, "trash-me");
     const dialog = await openDeleteDialog(page, row);
@@ -207,16 +185,9 @@ test.describe("delete and trash (#1220, #2489)", () => {
   });
 });
 
-// Fork is gated on the server's `acp_can_fork`; the session/fork handshake is covered by tests/e2e.
+// Fork is gated on the server's `acp_can_fork` (Rust acp_can_fork_tracks_acp_capable_and_fork_strategy);
+// the session/fork handshake is covered by tests/e2e.
 test.describe("fork", () => {
-  test("Fork action is hidden until the session has a captured ACP session id", async ({ page, spawnServe }) => {
-    const { row } = await openWithSession(page, (opts) => spawnServe({ acp: true, ...opts }), "fork-hidden-source");
-    await row.click({ button: "right" });
-    const menu = page.locator("[data-testid='sidebar-context-menu']");
-    await expect(menu).toBeVisible();
-    await expect(menu.locator("[data-testid='sidebar-context-menu-fork']")).toHaveCount(0);
-  });
-
   test("forks a structured session into a distinct child, parent untouched", async ({ page, spawnServe }) => {
     const title = "fork-source";
     const { serve, sessionId: parentId } = await startAcpSession(spawnServe, { title, tool: "claude" });

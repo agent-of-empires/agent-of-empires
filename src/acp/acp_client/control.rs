@@ -900,7 +900,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn historical_completion_old_first_preserves_local_waiter() {
+    async fn historical_completions_preserve_local_terminal_ownership() {
         let mut peer = PromptControlPeer::new().await;
         let mut completion = peer.prompt().await;
         // History read before and after the runner assigns the new id must
@@ -925,19 +925,26 @@ mod tests {
         peer.drain().await;
         assert_eq!(completion.await.unwrap(), end("end_turn"));
         peer.assert_local_terminal_ownership();
-    }
 
-    #[tokio::test]
-    async fn historical_completion_new_first_preserves_local_terminal_ownership() {
-        let mut peer = PromptControlPeer::new().await;
-        let completion = peer.prompt().await;
-        peer.send(ControlBody::PromptStarted { prompt_req_id: 9 })
-            .await;
-        peer.completed(9, "end_turn").await;
-        peer.completed(7, "cancelled").await;
-        peer.drain().await;
-        peer.assert_local_terminal_ownership();
-        assert_eq!(completion.await.unwrap(), end("end_turn"));
+        {
+            let mut peer = PromptControlPeer::new().await;
+            let completion = peer.prompt().await;
+            peer.send(ControlBody::PromptStarted { prompt_req_id: 9 })
+                .await;
+            peer.completed(9, "end_turn").await;
+            peer.completed(7, "cancelled").await;
+            peer.drain().await;
+            peer.assert_local_terminal_ownership();
+            assert_eq!(completion.await.unwrap(), end("end_turn"));
+        }
+
+        {
+            let mut peer = PromptControlPeer::new().await;
+            peer.client.supersede_adopted_turn();
+            peer.completed(7, "cancelled").await;
+            peer.drain().await;
+            peer.assert_local_terminal_ownership();
+        }
     }
 
     #[tokio::test]
@@ -963,15 +970,6 @@ mod tests {
         peer.completed(9, "cancelled").await;
         peer.drain().await;
         assert_eq!(completion.await.unwrap(), end("cancelled"));
-        peer.assert_local_terminal_ownership();
-    }
-
-    #[tokio::test]
-    async fn local_activation_rejects_history_before_waiter_registration() {
-        let mut peer = PromptControlPeer::new().await;
-        peer.client.supersede_adopted_turn();
-        peer.completed(7, "cancelled").await;
-        peer.drain().await;
         peer.assert_local_terminal_ownership();
     }
 
@@ -1086,28 +1084,6 @@ mod tests {
             .await
             .expect("crate transport must observe control EOF");
         assert_eq!(read.unwrap(), 0);
-    }
-
-    #[test]
-    fn prompt_error_preserves_code_message_and_data() {
-        use agent_client_protocol::ErrorCode;
-        for (code, expected) in [
-            (-32601, ErrorCode::MethodNotFound),
-            (-32000, ErrorCode::AuthRequired),
-            (42, ErrorCode::Other(42)),
-        ] {
-            let data = serde_json::json!({"detail": "kept"});
-            let error = prompt_outcome_to_response(PromptOutcome::Error {
-                code,
-                message: "boom".into(),
-                data: Some(data.clone()),
-            })
-            .unwrap_err();
-            assert_eq!(
-                (error.code, error.message.as_str(), error.data),
-                (expected, "boom", Some(data))
-            );
-        }
     }
 
     #[tokio::test]

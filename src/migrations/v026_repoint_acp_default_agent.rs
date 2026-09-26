@@ -42,103 +42,30 @@ pub(crate) fn run_in(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
+    use crate::migrations::test_cases::assert_rewrites;
 
-    fn write(content: &str) -> (tempfile::TempDir, std::path::PathBuf) {
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("config.toml");
-        fs::write(&path, content).unwrap();
-        (dir, path)
-    }
-
-    fn default_agent_after(content: &str) -> Option<String> {
-        let (_dir, path) = write(content);
-        run_in(&path).unwrap();
-        let doc: toml::Table = fs::read_to_string(&path).unwrap().parse().unwrap();
-        Some(
-            doc.get("acp")?
-                .as_table()?
-                .get("default_agent")?
-                .as_str()?
-                .to_string(),
-        )
-    }
-
+    /// A missing or unparsable config is skipped: this migration corrects a
+    /// default, so it must never abort startup.
     #[test]
     fn rewrites_only_the_seeded_aoe_agent() {
-        let cases = [
-            // The serialized old default: the case this migration exists for.
-            (
-                "[acp]\ndefault_agent = \"aoe-agent\"\n",
-                Some("claude-code"),
-            ),
-            // A deliberate choice of any other agent survives.
-            ("[acp]\ndefault_agent = \"codex\"\n", Some("codex")),
-            // Already repointed, by an earlier run or a fresh install.
-            (
-                "[acp]\ndefault_agent = \"claude-code\"\n",
-                Some("claude-code"),
-            ),
-            // An absent key already resolves to the new default.
-            ("[acp]\nreplay_events = 0\n", None),
-            // No [acp] table at all.
-            ("[theme]\nname = \"empire\"\n", None),
-        ];
-        for (content, expected) in cases {
-            assert_eq!(
-                default_agent_after(content).as_deref(),
-                expected,
-                "{content:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn preserves_other_settings_and_is_idempotent() {
-        let (_dir, path) = write(
-            "[acp]\ndefault_agent = \"aoe-agent\"\nmax_concurrent_workers = 5\n\n\
-             [theme]\nname = \"rose-pine\"\n",
+        let unchanged = |toml: &'static str| (Some(toml), Some(toml));
+        assert_rewrites(
+            "config.toml",
+            run_in,
+            &[
+                (
+                    Some("[acp]\ndefault_agent = \"aoe-agent\"\nmax_concurrent_workers = 5\n\n[theme]\nname = \"rose-pine\"\n"),
+                    Some("[acp]\ndefault_agent = \"claude-code\"\nmax_concurrent_workers = 5\n\n[theme]\nname = \"rose-pine\"\n"),
+                ),
+                // A deliberate choice of any other agent survives.
+                unchanged("[acp]\ndefault_agent = \"codex\"\n"),
+                unchanged("[acp]\ndefault_agent = \"claude-code\"\n"),
+                // An absent key already resolves to the new default.
+                unchanged("[acp]\nreplay_events = 0\n"),
+                unchanged("[theme]\nname = \"empire\"\n"),
+                unchanged("this is not = = toml"),
+                (None, None),
+            ],
         );
-
-        run_in(&path).unwrap();
-        let first = fs::read_to_string(&path).unwrap();
-        let doc: toml::Table = first.parse().unwrap();
-        let acp = doc.get("acp").unwrap().as_table().unwrap();
-        assert_eq!(
-            acp.get("default_agent").and_then(|v| v.as_str()),
-            Some("claude-code")
-        );
-        assert_eq!(
-            acp.get("max_concurrent_workers")
-                .and_then(|v| v.as_integer()),
-            Some(5),
-            "sibling acp settings must survive the rewrite"
-        );
-        assert_eq!(
-            doc.get("theme")
-                .and_then(|t| t.as_table())
-                .and_then(|t| t.get("name"))
-                .and_then(|v| v.as_str()),
-            Some("rose-pine"),
-            "unrelated sections must survive the rewrite"
-        );
-
-        run_in(&path).unwrap();
-        assert_eq!(
-            first,
-            fs::read_to_string(&path).unwrap(),
-            "a second run must not rewrite the file"
-        );
-    }
-
-    /// A missing or unparsable config is skipped, never a startup-aborting
-    /// error: this migration corrects a default, so it must not brick boot.
-    #[test]
-    fn unusable_config_is_a_noop() {
-        let dir = tempfile::TempDir::new().unwrap();
-        assert!(run_in(&dir.path().join("nope.toml")).is_ok());
-
-        let (_dir, path) = write("this is not = = toml");
-        assert!(run_in(&path).is_ok());
     }
 }

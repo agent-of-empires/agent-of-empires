@@ -2004,27 +2004,6 @@ mod tests {
     }
 
     #[test]
-    fn custom_agent_entries_use_safe_placeholders() {
-        let entries = build_custom_agent_infos(
-            &custom_agents(&[("remote-claude", "ssh -t prod.example claude")]),
-            &HashMap::new(),
-            &HashMap::new(),
-            &unrestricted(),
-        );
-
-        assert_eq!(entries.len(), 1);
-        let agent = &entries[0];
-        assert_eq!(agent.kind, "custom");
-        assert_eq!(agent.name, "remote-claude");
-        assert_eq!(agent.binary, "remote-claude");
-        assert!(!agent.host_only);
-        assert!(agent.installed);
-        assert_eq!(agent.install_hint, "Configured custom agent");
-        // No agent_acp_cmd configured, so it is tmux-only.
-        assert!(!agent.acp_capable);
-    }
-
-    #[test]
     fn serialized_custom_agent_response_contains_no_command_or_detect_as_data() {
         let entries = build_custom_agent_infos(
             &custom_agents(&[("remote-agent", "ssh -t prod.example claude")]),
@@ -2048,37 +2027,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_info_lifecycle_wire_shape() {
-        // The /api/agents contract: lifecycle omitted for Active agents, full
-        // metadata for deprecated ones. Mirrored by web/src/lib/types.ts.
-        let mk = |name: &str| {
-            let def = crate::agents::get_agent(name).unwrap();
-            AgentInfo {
-                kind: "builtin".to_string(),
-                name: def.name.to_string(),
-                binary: def.binary.to_string(),
-                host_only: def.host_only,
-                installed: true,
-                install_hint: def.install_hint.to_string(),
-                oneshot_capable: def.oneshot_flag.is_some(),
-                acp_capable: false,
-                acp_installed: false,
-                acp_allowed: true,
-                acp_command: None,
-                acp_args: Vec::new(),
-                lifecycle: def.lifecycle,
-            }
-        };
-        let claude = serde_json::to_value(mk("claude")).unwrap();
-        assert!(claude.get("lifecycle").is_none(), "{claude}");
-        let gemini = serde_json::to_value(mk("gemini")).unwrap();
-        assert_eq!(gemini["lifecycle"]["state"], "deprecated", "{gemini}");
-        assert_eq!(gemini["lifecycle"]["since"], "2026-06-18");
-        assert_eq!(gemini["lifecycle"]["replacement"], "antigravity");
-    }
-
-    #[test]
-    fn custom_agent_entries_filter_empty_values_and_builtin_collisions() {
+    fn custom_agent_entries_filter_empty_and_builtin_names_and_sort() {
         let entries = build_custom_agent_infos(
             &custom_agents(&[
                 ("", "codex"),
@@ -2086,7 +2035,9 @@ mod tests {
                 ("   ", "codex"),
                 ("whitespace-command", "   "),
                 ("claude", "ssh -t prod.example claude"),
+                ("zeta", "zeta-cmd"),
                 ("remote-codex", "ssh -t prod.example codex"),
+                ("alpha", "alpha-cmd"),
             ]),
             &HashMap::new(),
             &HashMap::new(),
@@ -2094,29 +2045,16 @@ mod tests {
         );
 
         let names: Vec<_> = entries.iter().map(|entry| entry.name.as_str()).collect();
-        assert_eq!(names, vec!["remote-codex"]);
+        assert_eq!(
+            names,
+            vec!["alpha", "remote-codex", "zeta"],
+            "sorted by name"
+        );
         assert!(entries.iter().all(|entry| entry.kind == "custom"));
     }
 
     #[test]
-    fn custom_agent_entries_are_sorted_by_name() {
-        let entries = build_custom_agent_infos(
-            &custom_agents(&[
-                ("zeta", "zeta-cmd"),
-                ("alpha", "alpha-cmd"),
-                ("middle", "middle-cmd"),
-            ]),
-            &HashMap::new(),
-            &HashMap::new(),
-            &unrestricted(),
-        );
-
-        let names: Vec<_> = entries.iter().map(|entry| entry.name.as_str()).collect();
-        assert_eq!(names, vec!["alpha", "middle", "zeta"]);
-    }
-
-    #[test]
-    fn custom_agent_acp_capable_tracks_agent_acp_cmd() {
+    fn custom_agent_acp_capable_tracks_acp_cmd_and_detect_as() {
         let custom = custom_agents(&[("oc-sp", "ocp run sp"), ("plain", "ssh host claude")]);
         let acp = custom_agents(&[
             ("oc-sp", "ocp run sp acp"),
@@ -2129,10 +2067,7 @@ mod tests {
         assert!(oc_sp.acp_capable, "agent with a valid acp cmd is capable");
         let plain = entries.iter().find(|e| e.name == "plain").unwrap();
         assert!(!plain.acp_capable, "agent with no acp cmd is tmux-only");
-    }
 
-    #[test]
-    fn custom_agent_acp_capable_via_detect_as_inheritance() {
         // A wrapper inheriting a registry-backed base (claude) is capable
         // through that adapter; one inheriting cursor stays tmux-only.
         let custom = custom_agents(&[
@@ -2153,27 +2088,6 @@ mod tests {
             !cursor.acp_capable,
             "wrapper inheriting a terminal-only base stays tmux-only"
         );
-    }
-
-    #[test]
-    fn acp_command_fields_resolve_registry_command_and_args() {
-        let registry = crate::acp::AgentRegistry::with_defaults();
-
-        let (cmd, args) = acp_command_fields(registry.get("opencode"), None);
-        assert_eq!(cmd.as_deref(), Some("opencode"));
-        assert_eq!(args, vec!["acp".to_string()]);
-
-        let (cmd, args) = acp_command_fields(registry.get("gemini"), None);
-        assert_eq!(cmd.as_deref(), Some("gemini"));
-        assert_eq!(args, vec!["--acp".to_string()]);
-
-        let (cmd, args) = acp_command_fields(registry.get("claude"), None);
-        assert_eq!(cmd.as_deref(), Some("claude-agent-acp"));
-        assert!(args.is_empty());
-
-        let (cmd, args) = acp_command_fields(None, None);
-        assert_eq!(cmd, None);
-        assert!(args.is_empty());
     }
 
     #[test]

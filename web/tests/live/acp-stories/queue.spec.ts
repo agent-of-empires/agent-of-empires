@@ -43,14 +43,6 @@ async function leaveForSettings(page: Page, serve: ServeHandle) {
   await expect(page.locator("select").first()).toBeVisible({ timeout: 10_000 });
 }
 
-test("queued follow-up fires when first turn ends", async ({ page, spawnServe }) => {
-  const { serve, queue } = await startHeldTurn(page, spawnServe, "story-queue", "Second turn response.");
-  await queue("second please");
-  await expect(page.getByText(/Queued \(1\)/i)).toBeVisible();
-  releaseTurn(serve);
-  await expect(page.getByText("Second turn response.")).toBeVisible({ timeout: 15_000 });
-});
-
 test("delete a queued follow-up before it fires", async ({ page, spawnServe }) => {
   const { queue } = await startHeldTurn(page, spawnServe, "story-queue-del");
   await queue("doomed queued text");

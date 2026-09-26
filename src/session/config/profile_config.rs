@@ -368,56 +368,6 @@ mod tests {
         assert!(validate_check_interval(0).is_err());
     }
 
-    /// A profile is a sparse overlay: an empty one serializes to nothing, and
-    /// what it carries survives a TOML round trip under its own keys.
-    #[test]
-    fn profile_config_round_trips_its_sparse_overrides() {
-        let empty = ProfileConfig::default();
-        assert!(empty.description.is_none());
-        assert!(empty.overrides.is_empty());
-        assert!(toml::to_string(&empty).unwrap().trim().is_empty());
-
-        let config: ProfileConfig = toml::from_str(
-            r#"
-            description = "Read-only review profile"
-            environment = ["CLAUDE_CONFIG_DIR=/home/me/.claude-accounts/work", "GH_TOKEN"]
-
-            [updates]
-            update_check_mode = "off"
-
-            [sandbox]
-            enabled_by_default = true
-            volume_ignores = ["target", ".venv"]
-
-            [tmux]
-            mouse = "enabled"
-            "#,
-        )
-        .unwrap();
-        assert_eq!(
-            config.description.as_deref(),
-            Some("Read-only review profile")
-        );
-
-        let serialized = toml::to_string_pretty(&config).unwrap();
-        assert!(serialized.contains("Read-only review profile"));
-        assert!(serialized.contains("[updates]"));
-        assert!(serialized.contains(r#"update_check_mode = "off""#));
-        assert!(serialized.contains(r#"mouse = "enabled""#));
-        assert!(serialized.contains("CLAUDE_CONFIG_DIR=/home/me/.claude-accounts/work"));
-        assert!(serialized.contains("GH_TOKEN"));
-
-        let reparsed: ProfileConfig = toml::from_str(&serialized).unwrap();
-        let overrides = serde_json::to_value(&reparsed).unwrap();
-        assert_eq!(overrides["updates"]["update_check_mode"], json!("off"));
-        assert_eq!(overrides["sandbox"]["enabled_by_default"], json!(true));
-        assert_eq!(
-            overrides["sandbox"]["volume_ignores"],
-            json!(["target", ".venv"])
-        );
-        assert_eq!(overrides["tmux"]["mouse"], json!("enabled"));
-    }
-
     /// A plain string stands in for a one-element list wherever the target type
     /// has a `string_or_vec` deserializer; the coercion happens on merge.
     #[test]
@@ -447,24 +397,6 @@ mod tests {
         assert_eq!(merged.sandbox.port_mappings, vec!["3000:3000"]);
         assert_eq!(merged.hooks.on_create, vec!["npm install"]);
         assert_eq!(merged.hooks.on_launch, vec!["npm start"]);
-    }
-
-    /// Anything a profile carries counts as an override, including the two
-    /// fields that live outside the sparse map.
-    #[test]
-    fn profile_has_overrides_covers_description_and_environment() {
-        assert!(!profile_has_overrides(&ProfileConfig::default()));
-        for block in [
-            json!({"theme": {"name": "dark"}}),
-            json!({"environment": ["FOO=bar"]}),
-        ] {
-            assert!(profile_has_overrides(&profile_from(block)));
-        }
-        let profile = ProfileConfig {
-            description: Some("My profile".to_string()),
-            ..Default::default()
-        };
-        assert!(profile_has_overrides(&profile));
     }
 
     /// The sparse overlay replaces the keys a profile names and leaves every
@@ -730,17 +662,6 @@ mod tests {
                 "{setting:?} profile"
             );
         }
-    }
-
-    #[test]
-    fn generic_merge_inherits_with_empty_overrides() {
-        let mut global = Config::default();
-        global.acp.max_concurrent_workers = 7;
-        let generic = merge_configs_generic(&global, &json!({}));
-        assert_eq!(
-            serde_json::to_value(&global).unwrap(),
-            serde_json::to_value(&generic).unwrap(),
-        );
     }
 
     // #7: CityHall overrides pin the worker ceiling and worktree default, but

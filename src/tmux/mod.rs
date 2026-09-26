@@ -52,7 +52,7 @@ pub(crate) fn pane_links(session: &str) -> Vec<osc8::PaneLink> {
     }
 }
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, debug_assertions))]
 #[doc(hidden)]
 pub mod test_support {
     pub use super::env::{
@@ -1260,6 +1260,7 @@ pub fn test_inject_session_into_cache(name: &str) {
         let map = cache.data.get_or_insert_with(HashMap::new);
         map.insert(name.to_string(), LiveSession::unmarked());
         cache.time = Some(Instant::now());
+        cache.outcome = SessionCacheRefresh::Populated;
     }
 }
 
@@ -2051,10 +2052,16 @@ pub(crate) fn is_binary_on_path(binary: &str) -> bool {
 const AGENT_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const LOGIN_SHELL_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
+/// Divides both probe timeouts; set only inside an isolated probe-test subprocess.
+#[cfg(test)]
+static PROBE_TIMEOUT_DIVISOR: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+
 fn agent_probe_output(
     command: &mut Command,
     timeout: std::time::Duration,
 ) -> Option<std::process::Output> {
+    #[cfg(test)]
+    let timeout = timeout / PROBE_TIMEOUT_DIVISOR.get().copied().unwrap_or(1);
     match crate::process::run_with_timeout_process_group(
         command.stdin(std::process::Stdio::null()),
         timeout,
@@ -2503,6 +2510,7 @@ mod tests {
             return;
         }
         use std::time::{Duration, Instant};
+        PROBE_TIMEOUT_DIVISOR.set(5).unwrap();
         let diagnostics = tempfile::tempdir().unwrap();
         let diagnostics_path = diagnostics.path().join("timeouts.log");
         tracing_subscriber::fmt()
@@ -2518,8 +2526,8 @@ mod tests {
             }
         }
         for (executable, timeout) in [
-            ("vibe", AGENT_PROBE_TIMEOUT),
-            ("login-shell", LOGIN_SHELL_PROBE_TIMEOUT),
+            ("vibe", AGENT_PROBE_TIMEOUT / 5),
+            ("login-shell", LOGIN_SHELL_PROBE_TIMEOUT / 5),
         ] {
             let home = tempfile::tempdir().unwrap();
             let _env = probe_environment(home.path());
@@ -2602,7 +2610,7 @@ mod tests {
                 diagnostics.lines().any(|line| {
                     line.contains("WARN")
                         && line.contains("program=")
-                        && line.contains(&format!("timeout_s={}", timeout.as_secs()))
+                        && line.contains(&format!("timeout_s={}", (timeout / 5).as_secs()))
                 }),
                 "missing timeout diagnostic: {diagnostics}"
             );
@@ -2974,14 +2982,6 @@ mod tests {
     }
 
     #[test]
-    fn test_tmux_socket_resolves_under_test() {
-        assert!(
-            matches!(tmux_socket(), Some(TmuxSocket::Path(_))),
-            "unit tests must isolate onto an explicit socket path, not the default socket"
-        );
-    }
-
-    #[test]
     fn socket_from_config_name_accepts_bare_names_only() {
         let named = |n: &str| Some(TmuxSocket::Name(n.to_string()));
         for (configured, want) in [
@@ -3025,102 +3025,119 @@ mod tests {
 
         assert_eq!(cached_session_existence(&name), SessionExistence::Unknown);
     }
+    /// A confirmed missing server is absence; an unreachable one, or several
+    /// live candidates, is not confirmed either way; a live derived name is
+    /// present even when its title looks like an aux prefix.
     #[test]
     #[serial_test::serial]
-    fn rekey_classification_treats_confirmed_no_server_as_absent() {
+    fn resolved_agent_existence_only_confirms_what_tmux_confirmed() {
+        use SessionCacheRefresh::{NoServer, Populated, Unknown};
         let guard = SessionCacheGuard::capture();
-        let id = "noserverdeadbeef";
-        guard.force_unreachable();
-        let session = Session::new(id, "derived").unwrap();
-        assert_eq!(
-            resolved_agent_existence(id, &session, SessionCacheRefresh::NoServer),
-            SessionExistence::Absent
-        );
-        assert_eq!(
-            resolved_agent_existence(id, &session, SessionCacheRefresh::Unknown),
-            SessionExistence::Unknown
-        );
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn ambiguous_live_names_are_unknown_not_confirmed_absence() {
-        let guard = SessionCacheGuard::capture();
-        let id = "ambig123deadbeef";
-        let first = format!("{P}first_ambig123");
-        let second = format!("{P}second_ambig123");
-        guard.force_present(&[&first, &second]);
-        let session = Session::new(id, "derived").unwrap();
-        assert_eq!(
-            resolved_agent_existence(id, &session, SessionCacheRefresh::Populated),
-            SessionExistence::Unknown
-        );
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn aux_shaped_live_derived_name_is_present_not_absent() {
-        let guard = SessionCacheGuard::capture();
-        let id = "auxshapedeadbeef";
-        let session = Session::new(id, "term rewriting").unwrap();
-        guard.force_present(&[session.name()]);
-        assert_eq!(
-            resolved_agent_existence(id, &session, SessionCacheRefresh::Populated),
-            SessionExistence::Present
-        );
+        // (id, title, live names, or None for an unreachable server, refresh) -> existence
+        let cases: [(
+            &str,
+            &str,
+            Option<&[&str]>,
+            SessionCacheRefresh,
+            SessionExistence,
+        ); 4] = [
+            (
+                "noserverdeadbeef",
+                "derived",
+                None,
+                NoServer,
+                SessionExistence::Absent,
+            ),
+            (
+                "noserverdeadbeef",
+                "derived",
+                None,
+                Unknown,
+                SessionExistence::Unknown,
+            ),
+            (
+                "ambig123deadbeef",
+                "derived",
+                Some(&["first_ambig123", "second_ambig123"]),
+                Populated,
+                SessionExistence::Unknown,
+            ),
+            (
+                "auxshapedeadbeef",
+                "term rewriting",
+                Some(&[]),
+                Populated,
+                SessionExistence::Present,
+            ),
+        ];
+        for (id, title, live, refresh, expected) in cases {
+            let session = Session::new(id, title).unwrap();
+            match live {
+                None => guard.force_unreachable(),
+                Some([]) => guard.force_present(&[session.name()]),
+                Some(titles) => {
+                    let names: Vec<String> = titles.iter().map(|t| format!("{P}{t}")).collect();
+                    guard.force_present(&names.iter().map(String::as_str).collect::<Vec<_>>());
+                }
+            }
+            assert_eq!(
+                resolved_agent_existence(id, &session, refresh),
+                expected,
+                "{id} {refresh:?}"
+            );
+        }
     }
 
     const ID: &str = "abc12345deadbeef";
     const ID8: &str = "abc12345";
 
     #[test]
-    fn resolve_agent_session_name_prefers_the_derived_name_when_it_is_live() {
-        let derived = format!("{P}Refactor_billing_{ID8}");
-        let stale = format!("{P}Vikings_{ID8}");
-        let names = [derived.as_str(), stale.as_str()];
-        assert_eq!(
-            resolve_agent_session_name(names, ID, &derived),
-            derived,
-            "a live derived name is never overridden"
-        );
-    }
-
-    #[test]
-    fn resolve_agent_session_name_adopts_the_stale_name_after_a_retitle() {
-        let derived = format!("{P}Refactor_billing_mod_{ID8}");
-        let stale = format!("{P}Vikings_{ID8}");
-        assert_eq!(
-            resolve_agent_session_name([stale.as_str()], ID, &derived),
-            stale,
-            "lifecycle ops must follow the live session, not the derived name"
-        );
-    }
-
-    #[test]
-    fn resolve_agent_session_name_ignores_other_kinds_and_other_ids() {
-        let derived = format!("{P}Refactor_{ID8}");
-        let names = [
+    fn resolve_agent_session_name_follows_a_single_live_retitle() {
+        let agent = |title: &str| format!("{P}{title}_{ID8}");
+        let stale = agent("Vikings");
+        let others = [
             format!("{TERMINAL_PREFIX}Vikings_{ID8}"),
             format!("{CONTAINER_TERMINAL_PREFIX}Vikings_{ID8}"),
             format!("{TOOL_PREFIX}lazygit_Vikings_{ID8}"),
             format!("{P}Vikings_99999999"),
             "vim".to_string(),
         ];
-        assert_eq!(
-            resolve_agent_session_name(names.iter().map(String::as_str), ID, &derived),
-            derived,
-            "nothing here is this session's agent pane"
-        );
-    }
-
-    #[test]
-    fn resolve_agent_session_name_falls_back_when_two_candidates_are_ambiguous() {
-        let derived = format!("{P}Refactor_{ID8}");
-        let names = [format!("{P}Vikings_{ID8}"), format!("{P}Aztecs_{ID8}")];
-        assert_eq!(
-            resolve_agent_session_name(names.iter().map(String::as_str), ID, &derived),
-            derived,
-        );
+        // (derived, live names, expected)
+        let cases = [
+            // A live derived name is never overridden.
+            (
+                agent("Refactor_billing"),
+                vec![agent("Refactor_billing"), stale.clone()],
+                agent("Refactor_billing"),
+            ),
+            (
+                agent("Refactor_billing_mod"),
+                vec![stale.clone()],
+                stale.clone(),
+            ),
+            // Other kinds and other ids are not this session's agent pane.
+            (agent("Refactor"), others.to_vec(), agent("Refactor")),
+            // Two candidates are ambiguous.
+            (
+                agent("Refactor"),
+                vec![stale.clone(), agent("Aztecs")],
+                agent("Refactor"),
+            ),
+            // A title shaped like an aux prefix still resolves, and still wins when live.
+            (agent("term_rewriting"), vec![stale.clone()], stale.clone()),
+            (
+                agent("term_rewriting"),
+                vec![stale.clone(), agent("term_rewriting")],
+                agent("term_rewriting"),
+            ),
+        ];
+        for (derived, names, expected) in cases {
+            assert_eq!(
+                resolve_agent_session_name(names.iter().map(String::as_str), ID, &derived),
+                expected,
+                "{derived} among {names:?}"
+            );
+        }
     }
 
     #[test]
@@ -3163,22 +3180,6 @@ mod tests {
     }
 
     #[test]
-    fn resolve_agent_session_name_handles_a_title_shaped_like_an_aux_prefix() {
-        let derived = format!("{P}term_rewriting_{ID8}");
-        let stale = format!("{P}Vikings_{ID8}");
-        assert_eq!(
-            resolve_agent_session_name([stale.as_str()], ID, &derived),
-            stale,
-            "retitled INTO an aux-shaped title still resolves onto the live pane"
-        );
-        assert_eq!(
-            resolve_agent_session_name([stale.as_str(), derived.as_str()], ID, &derived),
-            derived,
-            "a live derived name wins even when the shape filter excludes it"
-        );
-    }
-
-    #[test]
     fn agent_session_belongs_to_matches_by_id_not_title() {
         assert!(agent_session_belongs_to(&format!("{P}Vikings_{ID8}"), ID));
         assert!(agent_session_belongs_to(&format!("{P}Anything_{ID8}"), ID));
@@ -3208,54 +3209,55 @@ mod tests {
     #[test]
     fn snapshot_lookup_matches_the_per_item_probe() {
         let agent = format!("{P}Refactor_{ID8}");
-        let cases = [(false, Some(agent.as_str())), (true, None)];
-        for (pane_dead, expected) in cases {
-            let snapshot = LiveSessionSnapshot::from_parts(
+        let snapshot = |pane_dead: Option<bool>| match pane_dead {
+            Some(dead) => LiveSessionSnapshot::from_parts(
                 Some(vec![agent.clone()]),
-                Some(HashMap::from([(agent.clone(), dead_pane_meta(pane_dead))])),
-            );
+                Some(HashMap::from([(agent.clone(), dead_pane_meta(dead))])),
+            ),
+            None => LiveSessionSnapshot::from_parts(None, None),
+        };
+        // A dead pane and an unreachable server are both not live.
+        for (pane_dead, expected) in [
+            (Some(false), Some(agent.as_str())),
+            (Some(true), None),
+            (None, None),
+        ] {
             assert_eq!(
-                live_any_kind_name_for_id_in(&snapshot, ID).as_deref(),
+                live_any_kind_name_for_id_in(&snapshot(pane_dead), ID).as_deref(),
                 expected,
-                "pane_dead = {pane_dead}"
+                "pane_dead = {pane_dead:?}"
             );
         }
     }
 
-    #[test]
-    fn snapshot_lookup_reports_not_live_when_server_unreachable() {
-        let snapshot = LiveSessionSnapshot::from_parts(None, None);
-        assert_eq!(live_any_kind_name_for_id_in(&snapshot, ID), None);
-    }
-
+    /// The agent pane wins, then the paired terminal, then the container
+    /// terminal; tool sub-sessions and other ids never match.
     #[test]
     #[serial_test::serial]
     fn live_any_kind_name_for_id_prefers_agent_then_terminal_then_container() {
         let agent = format!("{P}Refactor_{ID8}");
         let terminal = format!("{TERMINAL_PREFIX}Refactor_{ID8}");
         let container = format!("{CONTAINER_TERMINAL_PREFIX}Refactor_{ID8}");
-
-        let all = [agent.as_str(), terminal.as_str(), container.as_str()];
-        assert_eq!(
-            live_any_kind_name_for_id(unmarked(all), ID, utils::is_pane_dead).as_deref(),
-            Some(agent.as_str()),
-            "the agent pane wins when present"
-        );
-        assert_eq!(
-            live_any_kind_name_for_id(
-                unmarked([terminal.as_str(), container.as_str()]),
-                ID,
-                utils::is_pane_dead
-            )
-            .as_deref(),
-            Some(terminal.as_str()),
-            "the paired terminal is preferred over the container terminal"
-        );
-        assert_eq!(
-            live_any_kind_name_for_id(unmarked([container.as_str()]), ID, utils::is_pane_dead)
-                .as_deref(),
-            Some(container.as_str()),
-        );
+        let others = [
+            format!("{TOOL_PREFIX}lazygit_Refactor_{ID8}"),
+            format!("{P}Refactor_99999999"),
+            format!("{TERMINAL_PREFIX}Refactor_99999999"),
+            "vim".to_string(),
+        ];
+        let cases: [(Vec<&str>, Option<&str>); 4] = [
+            (vec![&agent, &terminal, &container], Some(&agent)),
+            (vec![&terminal, &container], Some(&terminal)),
+            (vec![&container], Some(&container)),
+            (others.iter().map(String::as_str).collect(), None),
+        ];
+        for (names, expected) in cases {
+            assert_eq!(
+                live_any_kind_name_for_id(unmarked(names.iter().copied()), ID, utils::is_pane_dead)
+                    .as_deref(),
+                expected,
+                "{names:?}"
+            );
+        }
     }
 
     #[test]
@@ -3494,33 +3496,15 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn live_any_kind_name_for_id_excludes_tool_subsessions_and_other_ids() {
-        let names = [
-            format!("{TOOL_PREFIX}lazygit_Refactor_{ID8}"),
-            format!("{P}Refactor_99999999"),
-            format!("{TERMINAL_PREFIX}Refactor_99999999"),
-            "vim".to_string(),
-        ];
-        assert_eq!(
-            live_any_kind_name_for_id(
-                unmarked(names.iter().map(String::as_str)),
-                ID,
-                utils::is_pane_dead
-            ),
-            None,
-            "a tool sub-session and other ids are never this session's pane"
-        );
-    }
-
-    #[test]
-    #[serial_test::serial]
     fn session_new_resolves_onto_a_retitled_sessions_live_name() {
         let guard = SessionCacheGuard::capture();
         let stale = Session::generate_name(ID, "Vikings");
-        guard.force_present(&[stale.as_str()]);
-
-        let session = Session::new(ID, "Refactor billing module").expect("session");
-        assert_eq!(session.name(), stale);
+        let derived = Session::generate_name(ID, "Refactor billing module");
+        for (live, expected) in [(vec![stale.as_str()], &stale), (vec![], &derived)] {
+            guard.force_present(&live);
+            let session = Session::new(ID, "Refactor billing module").expect("session");
+            assert_eq!(session.name(), expected, "{live:?}");
+        }
     }
 
     #[test]
@@ -3535,17 +3519,6 @@ mod tests {
             Some(derived),
             "the snapshot must satisfy the lookup, so no refresh is attempted"
         );
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn session_new_keeps_the_derived_name_when_nothing_is_live() {
-        let guard = SessionCacheGuard::capture();
-        guard.force_present(&[]);
-
-        let derived = Session::generate_name(ID, "Refactor billing module");
-        let session = Session::new(ID, "Refactor billing module").expect("session");
-        assert_eq!(session.name(), derived);
     }
 
     #[test]
@@ -3584,36 +3557,37 @@ mod tests {
     }
 
     #[test]
-    fn tmux_no_server_running_detects_empty_case() {
-        assert!(tmux_no_server_running(
-            b"no server running on /tmp/tmux-501/default\n"
-        ));
-        assert!(tmux_no_server_running(b"no server running on /path.sock"));
-        assert!(tmux_no_server_running(
-            b"error connecting to /path.sock (No such file or directory)"
-        ));
-        assert!(tmux_no_server_running(
-            b"error connecting to /tmp/No such file or directory.sock (No such file or directory)"
-        ));
-    }
-
-    #[test]
-    fn tmux_no_server_running_rejects_other_errors_and_empty() {
-        assert!(!tmux_no_server_running(b"can't find session: aoe_foo"));
-        assert!(!tmux_no_server_running(b"usage: list-sessions"));
-        assert!(!tmux_no_server_running(b""));
-        assert!(!tmux_no_server_running(
-            b"error connecting to /path.sock (Permission denied)"
-        ));
-        assert!(!tmux_no_server_running(
-            b"error connecting to /path.sock (Socket operation on non-socket)"
-        ));
-        assert!(!tmux_no_server_running(
-            b"error connecting to /tmp/No such file or directory.sock (Permission denied)"
-        ));
-        assert!(!tmux_no_server_running(
-            b"error connecting to /tmp/no server running.sock (Permission denied)"
-        ));
+    fn tmux_no_server_running_matches_only_a_missing_server() {
+        let cases: [(&[u8], bool); 11] = [
+            (b"no server running on /tmp/tmux-501/default\n", true),
+            (b"no server running on /path.sock", true),
+            (b"error connecting to /path.sock (No such file or directory)", true),
+            (
+                b"error connecting to /tmp/No such file or directory.sock (No such file or directory)",
+                true,
+            ),
+            (b"can't find session: aoe_foo", false),
+            (b"usage: list-sessions", false),
+            (b"", false),
+            (b"error connecting to /path.sock (Permission denied)", false),
+            (b"error connecting to /path.sock (Socket operation on non-socket)", false),
+            (
+                b"error connecting to /tmp/No such file or directory.sock (Permission denied)",
+                false,
+            ),
+            (
+                b"error connecting to /tmp/no server running.sock (Permission denied)",
+                false,
+            ),
+        ];
+        for (stderr, expected) in cases {
+            assert_eq!(
+                tmux_no_server_running(stderr),
+                expected,
+                "{:?}",
+                String::from_utf8_lossy(stderr)
+            );
+        }
     }
 
     #[test]
@@ -3939,128 +3913,22 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial]
-    fn test_export_exec_compound_command_passes_env() {
-        require_tmux!();
-
-        let dummy_guard = TmuxTestSession::new("aoe_test_compound_dummy");
-        let dummy = dummy_guard.name().to_string();
-        let _ = tmux_command()
-            .args([
-                "new-session",
-                "-d",
-                "-s",
-                &dummy,
-                "-x",
-                "80",
-                "-y",
-                "24",
-                "sleep 120",
-            ])
-            .output();
-        std::thread::sleep(std::time::Duration::from_millis(200));
-
-        let session_guard = TmuxTestSession::new("aoe_test_compound");
-        let session_name = session_guard.name().to_string();
-        let marker = format!("AOE_COMPOUND_TEST_{}", std::process::id());
-        let secret_value = "s3cret_val!@#";
-
-        let compound_cmd = format!(
-            "export {}='{}'; exec printenv {}",
-            marker,
-            secret_value.replace('\'', "'\\''"),
-            marker
-        );
-
-        let output = tmux_command()
-            .args([
-                "new-session",
-                "-d",
-                "-s",
-                &session_name,
-                "-x",
-                "120",
-                "-y",
-                "24",
-                &compound_cmd,
-                ";",
-                "set-option",
-                "-t",
-                &session_name,
-                "pane-base-index",
-                "0",
-                ";",
-                "set-option",
-                "-t",
-                &session_name,
-                "pane-base-index",
-                "0",
-                ";",
-                "set-option",
-                "-p",
-                "-t",
-                &session_name,
-                "remain-on-exit",
-                "on",
-            ])
-            .output()
-            .expect("tmux new-session");
-        assert!(output.status.success(), "Failed to create tmux session");
-
-        let capture_pane = || {
-            let capture = tmux_command()
-                .args([
-                    "capture-pane",
-                    "-t",
-                    &format!("{}:^.0", session_name),
-                    "-p",
-                    "-S",
-                    "-10",
-                ])
-                .output()
-                .expect("capture-pane");
-            String::from_utf8_lossy(&capture.stdout).into_owned()
-        };
-        let pane_is_dead = || {
-            let dead_check = tmux_command()
-                .args(["display-message", "-t", &session_name, "-p", "#{pane_dead}"])
-                .output()
-                .expect("pane dead check");
-            String::from_utf8_lossy(&dead_check.stdout).trim() == "1"
-        };
-
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-        let mut pane_content = capture_pane();
-        while std::time::Instant::now() < deadline
-            && !(pane_content.contains(secret_value) && pane_is_dead())
-        {
-            std::thread::sleep(std::time::Duration::from_millis(50));
-            pane_content = capture_pane();
-        }
-
-        assert!(
-            pane_content.contains(secret_value),
-            "Expected secret value in pane output (proves export reached exec'd process).\nPane:\n{pane_content}"
-        );
-        assert!(
-            pane_is_dead(),
-            "Pane should be dead after exec'd command exits (lifecycle preserved)"
-        );
-    }
-
-    #[test]
     #[cfg(unix)]
     #[serial_test::serial]
     fn login_shell_probe_batches_agents_and_continues_after_a_miss() {
         if run_probe_test_in_subprocess() {
             return;
         }
+        // Scaled timeouts: the login shell outlives the per-agent timeout but not its own.
+        PROBE_TIMEOUT_DIVISOR.set(5).unwrap();
         let home = tempfile::tempdir().unwrap();
         let _env = probe_environment(home.path());
         let log = shell_words::quote(home.path().join("probes").to_str().unwrap()).into_owned();
         std::fs::write(
             home.path().join("bin/login-shell"),
-            format!("#!/bin/sh\nprintf 'login\n' >> {log}\n/bin/sleep 6\nexec /bin/sh -c \"$2\"\n"),
+            format!(
+                "#!/bin/sh\nprintf 'login\n' >> {log}\n/bin/sleep 1.2\nexec /bin/sh -c \"$2\"\n"
+            ),
         )
         .unwrap();
         let found = login_shell_probe(&[

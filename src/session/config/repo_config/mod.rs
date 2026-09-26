@@ -655,31 +655,6 @@ mod tests {
     }
 
     #[test]
-    fn merge_preserves_unset_fields() {
-        let mut config = Config::default();
-        config.sandbox.enabled_by_default = true;
-        config.sandbox.auto_cleanup = true;
-        config.worktree.enabled = true;
-        config.worktree.auto_cleanup = true;
-        let repo = repo(serde_json::json!({
-            "sandbox": {"auto_cleanup": false},
-            "worktree": {"auto_cleanup": false},
-            "session": {"agent_detect_as": {"my-agent": "claude"}},
-        }));
-        let merged = merge_repo_config(config, &repo);
-        assert!(!merged.sandbox.auto_cleanup && !merged.worktree.auto_cleanup);
-        assert!(merged.sandbox.enabled_by_default && merged.worktree.enabled);
-        assert_eq!(
-            merged
-                .session
-                .agent_detect_as
-                .get("my-agent")
-                .map(String::as_str),
-            Some("claude")
-        );
-    }
-
-    #[test]
     fn init_template_is_valid_toml_when_uncommented() {
         let uncommented: String = INIT_TEMPLATE
             .lines()

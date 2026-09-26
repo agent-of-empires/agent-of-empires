@@ -37,24 +37,16 @@ function metaDeletionOnly(firstOldLine: number, count: number): Meta {
 }
 
 describe("targetScrollFraction", () => {
-  it("maps an exact changed new line to its rank among changed rows", () => {
+  it("ranks changed new lines, snaps unchanged targets to the nearest, and returns 0 for a single row", () => {
     const meta = metaWithNewLines(10, 3); // changed new lines 10, 11, 12
     expect(targetScrollFraction(meta, 10, 100)).toBe(0);
     expect(targetScrollFraction(meta, 11, 100)).toBe(0.5);
     expect(targetScrollFraction(meta, 12, 100)).toBe(1);
-  });
-
-  it("snaps to the nearest changed new line when the target is unchanged", () => {
-    const meta = metaWithNewLines(10, 3);
-    expect(targetScrollFraction(meta, 11, 100)).toBe(0.5); // closest to 11
     expect(targetScrollFraction(meta, 500, 100)).toBe(1); // beyond last changed -> last row
     expect(targetScrollFraction(meta, 1, 100)).toBe(0); // before first changed -> first row
-  });
-
-  it("returns 0 when there is a single changed row", () => {
-    const meta = metaWithNewLines(42, 1);
-    expect(targetScrollFraction(meta, 42, 100)).toBe(0);
-    expect(targetScrollFraction(meta, 9, 100)).toBe(0);
+    const single = metaWithNewLines(42, 1);
+    expect(targetScrollFraction(single, 42, 100)).toBe(0);
+    expect(targetScrollFraction(single, 9, 100)).toBe(0);
   });
 
   it("falls back to a clamped file-line fraction with no changed new rows", () => {

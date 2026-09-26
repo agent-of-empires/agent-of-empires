@@ -76,59 +76,64 @@ mod tests {
     use super::*;
 
     #[test]
-    fn formats_session_title_with_aoe_prefix() {
-        assert_eq!(format_tab_title(Some("fix auth")), "aoe: fix auth");
-    }
-
-    #[test]
-    fn empty_or_missing_title_is_bare_aoe() {
-        assert_eq!(format_tab_title(None), "aoe");
-        assert_eq!(format_tab_title(Some("")), "aoe");
-        assert_eq!(format_tab_title(Some("   ")), "aoe");
-    }
-
-    #[test]
-    fn strips_control_bytes_from_titles() {
+    fn format_tab_title_prefixes_and_strips_control_bytes() {
+        for (title, want) in [
+            (Some("fix auth"), "aoe: fix auth"),
+            (None, "aoe"),
+            (Some(""), "aoe"),
+            (Some("   "), "aoe"),
+            (Some("ok\nline"), "aoe: okline"),
+        ] {
+            assert_eq!(format_tab_title(title), want, "{title:?}");
+        }
         assert_eq!(sanitize_title("fix\x1b]0;pwn\x07 auth"), "fix]0;pwn auth");
-        assert_eq!(format_tab_title(Some("ok\nline")), "aoe: okline");
     }
 
     #[test]
-    fn tracker_skips_unchanged_titles() {
-        let mut t = HostTitleTracker::default();
-        assert_eq!(t.sync(true, Some("one")), Some("aoe: one".to_string()));
-        assert_eq!(t.sync(true, Some("one")), None);
-        assert_eq!(t.sync(true, Some("two")), Some("aoe: two".to_string()));
-    }
-
-    #[test]
-    fn tracker_stays_quiet_when_disabled_from_the_start() {
-        let mut t = HostTitleTracker::default();
-        assert_eq!(t.sync(false, Some("one")), None);
-        assert_eq!(t.sync(false, Some("two")), None);
-    }
-
-    #[test]
-    fn tracker_restores_fallback_once_when_toggled_off() {
-        let mut t = HostTitleTracker::default();
-        assert_eq!(t.sync(true, Some("one")), Some("aoe: one".to_string()));
-        assert_eq!(t.sync(false, Some("one")), Some("aoe".to_string()));
-        assert_eq!(t.sync(false, Some("one")), None);
-    }
-
-    #[test]
-    fn invalidate_forces_a_rewrite() {
+    fn tracker_writes_only_changes() {
+        // Each step: (enabled, selected title, expected write). `None` as the
+        // title is a group row or no selection, which uses the fallback.
+        type Step<'a> = (bool, Option<&'a str>, Option<&'a str>);
+        let cases: &[(&str, &[Step])] = &[
+            (
+                "skips unchanged titles",
+                &[
+                    (true, Some("one"), Some("aoe: one")),
+                    (true, Some("one"), None),
+                    (true, Some("two"), Some("aoe: two")),
+                ],
+            ),
+            (
+                "quiet when disabled from the start",
+                &[(false, Some("one"), None), (false, Some("two"), None)],
+            ),
+            (
+                "restores the fallback once when toggled off",
+                &[
+                    (true, Some("one"), Some("aoe: one")),
+                    (false, Some("one"), Some("aoe")),
+                    (false, Some("one"), None),
+                ],
+            ),
+            (
+                "no selection uses the fallback while enabled",
+                &[(true, None, Some("aoe")), (true, None, None)],
+            ),
+        ];
+        for (name, steps) in cases {
+            let mut t = HostTitleTracker::default();
+            for (enabled, title, want) in *steps {
+                assert_eq!(t.sync(*enabled, *title), want.map(str::to_string), "{name}");
+            }
+        }
         let mut t = HostTitleTracker::default();
         assert_eq!(t.sync(true, Some("one")), Some("aoe: one".to_string()));
         t.invalidate();
-        assert_eq!(t.sync(true, Some("one")), Some("aoe: one".to_string()));
-    }
-
-    #[test]
-    fn group_or_no_selection_uses_fallback_while_enabled() {
-        let mut t = HostTitleTracker::default();
-        assert_eq!(t.sync(true, None), Some("aoe".to_string()));
-        assert_eq!(t.sync(true, None), None);
+        assert_eq!(
+            t.sync(true, Some("one")),
+            Some("aoe: one".to_string()),
+            "invalidate forces a rewrite"
+        );
     }
 
     #[test]

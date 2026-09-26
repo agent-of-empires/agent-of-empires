@@ -1081,89 +1081,50 @@ mod tests {
         assert_eq!(loaded[0].resume_probe_failed_sid, None);
     }
 
+    /// Invalid, excluded, stopped-session and pin-contradicting observations (#2709) are
+    /// filtered without touching the row.
     #[test]
     #[serial]
-    fn drain_filters_invalid_sid_and_leaves_state_unchanged() {
+    fn drain_filters_rejected_observations_and_leaves_state_unchanged() {
         let temp = tempdir().unwrap();
         let _guard = storage_home_guard(&temp);
-
-        let profile = "sync-filtered-validation";
-        let mut inst = Instance::new("sync-validation-title", "/tmp/x");
-        inst.source_profile = profile.to_string();
-        inst.agent_session_id = Some("original-sid".to_string());
-        seed_instance_on_disk(profile, &inst);
-
-        attach_poller_with_update(&mut inst, "bad sid!");
-
-        let file_watch = FileWatchService::noop();
-        let mut instances = vec![inst];
-        let outcome = drain_and_persist_session_ids(&mut instances, &file_watch);
-
-        assert_eq!(outcome.filtered, vec![instances[0].id.clone()]);
-        assert!(outcome.applied.is_empty());
-        assert!(outcome.rolled_back.is_empty());
-        assert_eq!(
-            instances[0].agent_session_id.as_deref(),
-            Some("original-sid")
-        );
-    }
-
-    #[test]
-    #[serial]
-    fn drain_filters_sid_present_in_retroactive_capture_excludes() {
-        let temp = tempdir().unwrap();
-        let _guard = storage_home_guard(&temp);
-
-        let profile = "sync-filtered-excludes";
-        let excluded = "019342ab-1234-7def-8901-abcdef012345";
-
-        let mut inst = Instance::new("sync-excludes-title", "/tmp/x");
-        inst.source_profile = profile.to_string();
-        inst.agent_session_id = Some("original-sid".to_string());
-        inst.retroactive_capture_excludes
-            .insert(crate::session::ConversationBinding::unknown(
-                excluded.to_string(),
-            ));
-        seed_instance_on_disk(profile, &inst);
-
-        attach_poller_with_update(&mut inst, excluded);
-
-        let file_watch = FileWatchService::noop();
-        let mut instances = vec![inst];
-        let outcome = drain_and_persist_session_ids(&mut instances, &file_watch);
-
-        assert_eq!(outcome.filtered, vec![instances[0].id.clone()]);
-        assert!(outcome.applied.is_empty());
-        assert!(outcome.rolled_back.is_empty());
-        assert_eq!(
-            instances[0].agent_session_id.as_deref(),
-            Some("original-sid")
-        );
-    }
-
-    #[test]
-    #[serial]
-    fn drain_rejects_observed_sid_for_stopped_session() {
-        let temp = tempdir().unwrap();
-        let _guard = storage_home_guard(&temp);
-
         let own = "019342ab-1234-7def-8901-aaaaaaaaaaaa";
         let peer = "019342ab-1234-7def-8901-bbbbbbbbbbbb";
-        let mut inst = Instance::new("stopped-title", "/tmp/x");
-        inst.source_profile = "sync-stopped".to_string();
-        inst.agent_session_id = Some(own.to_string());
-        inst.status = Status::Stopped;
-        seed_instances_on_disk("sync-stopped", &[&inst]);
+        let excluded = "019342ab-1234-7def-8901-abcdef012345";
+        let cases: [(&str, &str, fn(&mut Instance)); 4] = [
+            ("validation", "bad sid!", |_| {}),
+            ("excludes", excluded, |_| {}),
+            ("stopped", peer, |inst| inst.status = Status::Stopped),
+            ("use-pin", peer, |inst| {
+                inst.resume_intent = ResumeIntent::Use(inst.agent_session_id.clone().unwrap())
+            }),
+        ];
+        for (case, observed, configure) in cases {
+            let profile = format!("sync-filtered-{case}");
+            let mut inst = Instance::new("sync-filtered-title", "/tmp/x");
+            inst.source_profile = profile.clone();
+            inst.agent_session_id = Some(own.to_string());
+            inst.retroactive_capture_excludes
+                .insert(crate::session::ConversationBinding::unknown(
+                    excluded.to_string(),
+                ));
+            configure(&mut inst);
+            seed_instance_on_disk(&profile, &inst);
+            attach_poller_with_update(&mut inst, observed);
 
-        attach_poller_with_update(&mut inst, peer);
+            let file_watch = FileWatchService::noop();
+            let mut instances = vec![inst];
+            let outcome = drain_and_persist_session_ids(&mut instances, &file_watch);
 
-        let file_watch = FileWatchService::noop();
-        let mut instances = vec![inst];
-        let outcome = drain_and_persist_session_ids(&mut instances, &file_watch);
-
-        assert_eq!(outcome.filtered, vec![instances[0].id.clone()]);
-        assert!(outcome.applied.is_empty());
-        assert_eq!(instances[0].agent_session_id.as_deref(), Some(own));
+            assert_eq!(outcome.filtered, vec![instances[0].id.clone()], "{case}");
+            assert!(outcome.applied.is_empty(), "{case}");
+            assert!(outcome.rolled_back.is_empty(), "{case}");
+            assert_eq!(
+                instances[0].agent_session_id.as_deref(),
+                Some(own),
+                "{case}"
+            );
+        }
     }
 
     #[test]
@@ -1201,31 +1162,6 @@ mod tests {
             Some(crate::session::LifecycleOperation::Trash)
         );
         assert_eq!(stored[0].lifecycle_generation, 1);
-    }
-
-    #[test]
-    #[serial]
-    fn drain_rejects_observed_sid_contradicting_use_pin() {
-        let temp = tempdir().unwrap();
-        let _guard = storage_home_guard(&temp);
-
-        let pin = "019342ab-1234-7def-8901-aaaaaaaaaaaa";
-        let peer = "019342ab-1234-7def-8901-bbbbbbbbbbbb";
-        let mut inst = Instance::new("pinned-title", "/tmp/x");
-        inst.source_profile = "sync-pinned".to_string();
-        inst.agent_session_id = Some(pin.to_string());
-        inst.resume_intent = ResumeIntent::Use(pin.to_string());
-        seed_instances_on_disk("sync-pinned", &[&inst]);
-
-        attach_poller_with_update(&mut inst, peer);
-
-        let file_watch = FileWatchService::noop();
-        let mut instances = vec![inst];
-        let outcome = drain_and_persist_session_ids(&mut instances, &file_watch);
-
-        assert_eq!(outcome.filtered, vec![instances[0].id.clone()]);
-        assert!(outcome.applied.is_empty());
-        assert_eq!(instances[0].agent_session_id.as_deref(), Some(pin));
     }
 
     #[test]
@@ -1326,27 +1262,47 @@ mod tests {
         assert_eq!(instances[1].agent_session_id, None);
     }
 
+    /// A queued observation (fresh or a correction) is persisted without waiting out the
+    /// timeout, and a launch without a poller returns at once (#3169).
     #[test]
     #[serial]
-    fn cli_capture_persists_poller_observation_to_disk() {
-        let temp = tempdir().unwrap();
-        let _guard = storage_home_guard(&temp);
-
-        let profile = "sync-cli-capture";
-        let mut inst = Instance::new("cli-capture-title", "/tmp/x");
-        inst.source_profile = profile.to_string();
-        inst.agent_session_id = None;
-        seed_instance_on_disk(profile, &inst);
-
+    fn cli_capture_drains_queued_observations_without_waiting() {
         let fresh = "019342ab-1234-7def-8901-abcdef012345";
-        attach_poller_with_update(&mut inst, fresh);
+        let corrected = "019342ab-1234-7def-8901-cccccccccccc";
+        // (initial sid, poller observation, expected sid)
+        for (initial, observed, expected) in [
+            (None, Some(fresh), Some(fresh)),
+            (Some("already-here"), Some(corrected), Some(corrected)),
+            (None, None, None),
+        ] {
+            let temp = tempdir().unwrap();
+            let _guard = storage_home_guard(&temp);
+            let profile = "sync-cli-capture";
+            let mut inst = Instance::new("cli-capture-title", "/tmp/x");
+            inst.source_profile = profile.to_string();
+            inst.agent_session_id = initial.map(str::to_string);
+            seed_instance_on_disk(profile, &inst);
+            if let Some(observed) = observed {
+                attach_poller_with_update(&mut inst, observed);
+            }
 
-        let file_watch = FileWatchService::noop();
-        capture_launched_session_id_blocking(&mut inst, &file_watch, Duration::from_secs(2), false);
+            let start = Instant::now();
+            capture_launched_session_id_blocking(
+                &mut inst,
+                &FileWatchService::noop(),
+                Duration::from_secs(30),
+                false,
+            );
 
-        assert_eq!(inst.agent_session_id.as_deref(), Some(fresh));
-        let loaded = Storage::new_unwatched(profile).unwrap().load().unwrap();
-        assert_eq!(loaded[0].agent_session_id.as_deref(), Some(fresh));
+            assert!(start.elapsed() < Duration::from_secs(1), "{observed:?}");
+            assert_eq!(inst.agent_session_id.as_deref(), expected);
+            let loaded = Storage::new_unwatched(profile).unwrap().load().unwrap();
+            assert_eq!(
+                loaded[0].agent_session_id.as_deref(),
+                expected.or(initial),
+                "{observed:?}"
+            );
+        }
     }
 
     // The sidecar names the pane, so a conversation started inside it with `/new` is this session's
@@ -1730,58 +1686,6 @@ mod tests {
             Some(published),
             "the transcript path must be durable before any teardown runs"
         );
-    }
-
-    #[test]
-    #[serial]
-    fn cli_capture_drains_a_queued_correction_before_returning() {
-        let temp = tempdir().unwrap();
-        let _guard = storage_home_guard(&temp);
-
-        let profile = "sync-cli-noop";
-        let mut inst = Instance::new("cli-capture-noop-title", "/tmp/x");
-        inst.source_profile = profile.to_string();
-        inst.agent_session_id = Some("already-here".to_string());
-        seed_instance_on_disk(profile, &inst);
-        let corrected = "019342ab-1234-7def-8901-cccccccccccc";
-        attach_poller_with_update(&mut inst, corrected);
-
-        let file_watch = FileWatchService::noop();
-        let start = Instant::now();
-        capture_launched_session_id_blocking(
-            &mut inst,
-            &file_watch,
-            Duration::from_secs(30),
-            false,
-        );
-
-        assert!(start.elapsed() < Duration::from_secs(1));
-        assert_eq!(inst.agent_session_id.as_deref(), Some(corrected));
-        let loaded = Storage::new_unwatched(profile).unwrap().load().unwrap();
-        assert_eq!(loaded[0].agent_session_id.as_deref(), Some(corrected));
-    }
-
-    #[test]
-    #[serial]
-    fn cli_capture_returns_immediately_without_a_poller() {
-        let temp = tempdir().unwrap();
-        let _guard = storage_home_guard(&temp);
-
-        let mut inst = Instance::new("cli-capture-nopoller-title", "/tmp/x");
-        inst.source_profile = "sync-cli-nopoller".to_string();
-        inst.agent_session_id = None;
-
-        let file_watch = FileWatchService::noop();
-        let start = Instant::now();
-        capture_launched_session_id_blocking(
-            &mut inst,
-            &file_watch,
-            Duration::from_secs(30),
-            false,
-        );
-
-        assert!(start.elapsed() < Duration::from_secs(1));
-        assert_eq!(inst.agent_session_id, None);
     }
 
     #[test]

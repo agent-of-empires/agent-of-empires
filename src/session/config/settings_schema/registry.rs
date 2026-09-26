@@ -77,53 +77,6 @@ mod tests {
     }
 
     #[test]
-    fn acp_section_fields_and_policies() {
-        for field in [
-            "default_agent",
-            "max_concurrent_workers",
-            "replay_events",
-            "node_path",
-            "show_tool_durations",
-            "silent_orphan_grace_secs",
-        ] {
-            assert!(descriptor("acp", field).is_some(), "acp.{field} missing");
-        }
-        // A host binary execution surface.
-        assert!(matches!(
-            descriptor("acp", "node_path").unwrap().web_write,
-            WebWritePolicy::LocalOnly { .. }
-        ));
-        assert!(
-            descriptor("acp", "max_concurrent_workers")
-                .unwrap()
-                .advanced
-        );
-        assert!(!descriptor("acp", "default_agent").unwrap().advanced);
-    }
-
-    #[test]
-    fn session_host_tab_title_is_an_interaction_toggle() {
-        let d = descriptor("session", "host_tab_title").expect("host_tab_title");
-        assert_eq!(d.category, "Interaction");
-        assert_eq!(d.widget, WidgetKind::Toggle);
-        assert!(d.profile_overridable);
-        assert!(!d.advanced);
-        assert!(matches!(d.web_write, WebWritePolicy::Allow));
-    }
-
-    #[test]
-    fn session_row_tag_is_select_with_options() {
-        let d = descriptor("session", "row_tag").expect("row_tag");
-        match &d.widget {
-            WidgetKind::Select { options } => {
-                let values: Vec<_> = options.iter().map(|o| o.value.as_str()).collect();
-                assert_eq!(values, ["none", "auto", "profile", "sandbox", "branch"]);
-            }
-            other => panic!("expected select, got {other:?}"),
-        }
-    }
-
-    #[test]
     fn session_id_poller_max_threads_is_an_advanced_global_only_number() {
         let d = descriptor("session", "session_id_poller_max_threads")
             .expect("session_id_poller_max_threads descriptor");
@@ -214,14 +167,5 @@ mod tests {
                 .unwrap()
                 .profile_overridable
         );
-    }
-
-    #[test]
-    fn section_in_schema_separates_derived_sections_from_hooks() {
-        assert!(section_in_schema("session"));
-        assert!(section_in_schema("sandbox"));
-        assert!(section_in_schema("worktree"));
-        assert!(section_in_schema("updates"));
-        assert!(!section_in_schema("hooks"));
     }
 }

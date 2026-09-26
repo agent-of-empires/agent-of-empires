@@ -293,30 +293,18 @@ mod tests {
             bracket_releases(&releases, "v1.0.0", "v9.9.9").is_none(),
             "an absent target has no bracket"
         );
-    }
 
-    #[test]
-    fn bracket_truncates_when_prior_is_older_than_the_page() {
         let releases = vec![
-            release("v2.0.0", Some("a"), false, false),
+            release("v2.0.0", Some("   "), false, false),
             release("v1.9.0", Some("b"), false, false),
         ];
         let (entries, truncated) = bracket_releases(&releases, "v1.0.0", "v2.0.0").unwrap();
         assert_eq!(release_tags(&entries), vec!["v2.0.0", "v1.9.0"]);
         assert!(truncated, "prior tag not in page should flag truncation");
-    }
-
-    #[test]
-    fn bracket_empty_body_becomes_none() {
-        let releases = vec![
-            release("v1.1.0", Some("   "), false, false),
-            release("v1.0.0", None, false, false),
-        ];
-        let (entries, _) = bracket_releases(&releases, "v1.0.0", "v1.1.0").unwrap();
-        match &entries[0] {
-            ChangelogEntry::Release { body, .. } => assert!(body.is_none()),
-            _ => panic!("expected release"),
-        }
+        assert!(
+            matches!(&entries[0], ChangelogEntry::Release { body: None, .. }),
+            "a blank body becomes None"
+        );
     }
 
     fn commit(sha: &str, message: &str, url: &str) -> GitHubCompareCommit {
@@ -357,12 +345,9 @@ mod tests {
             _ => panic!("expected commit entries"),
         }
         assert!(!truncated);
-    }
-
-    #[test]
-    fn map_commits_flags_truncation_when_total_exceeds_returned() {
-        let commits = vec![commit("aaa", "x", "")];
-        let (_, truncated) = map_commits(&commits, 300);
-        assert!(truncated, "total_commits > returned must flag truncation");
+        assert!(
+            map_commits(&commits, 300).1,
+            "total_commits > returned must flag truncation"
+        );
     }
 }

@@ -274,25 +274,42 @@ mod tests {
     }
 
     #[test]
-    fn no_default_focus() {
-        assert_eq!(TelemetryConsentDialog::new().selected, None);
-    }
-
-    #[test]
     #[serial]
-    fn enter_with_no_focus_is_inert() {
-        // The whole point of no default focus: a reflexive Enter must not
-        // dismiss the prompt until the user has chosen a side.
+    fn keys_focus_a_side_before_enter_decides() {
         let _env = crate::session::test_support::EnvGuard::unset(&["DO_NOT_TRACK"]);
-        let mut d = TelemetryConsentDialog::new();
-        assert!(matches!(
-            d.handle_key(k(KeyCode::Enter)),
-            DialogResult::Continue
-        ));
-        assert!(matches!(
-            d.handle_key(k(KeyCode::Char(' '))),
-            DialogResult::Continue
-        ));
+        assert_eq!(TelemetryConsentDialog::new().selected, None);
+        // (keys, focus after, outcome of the last key). With no default focus a
+        // reflexive Enter or Space must not dismiss the prompt.
+        let cases = [
+            (&[KeyCode::Enter][..], None, DialogResult::Continue),
+            (&[KeyCode::Char(' ')], None, DialogResult::Continue),
+            (&[KeyCode::Esc], None, DialogResult::Submit(false)),
+            (&[KeyCode::Tab], Some(true), DialogResult::Continue),
+            (
+                &[KeyCode::Tab, KeyCode::Tab],
+                Some(false),
+                DialogResult::Continue,
+            ),
+            (
+                &[KeyCode::Left, KeyCode::Enter],
+                Some(true),
+                DialogResult::Submit(true),
+            ),
+            (
+                &[KeyCode::Right, KeyCode::Enter],
+                Some(false),
+                DialogResult::Submit(false),
+            ),
+        ];
+        for (keys, selected, want) in cases {
+            let mut d = TelemetryConsentDialog::new();
+            let mut last = DialogResult::Continue;
+            for code in keys {
+                last = d.handle_key(k(*code));
+            }
+            assert_eq!(d.selected, selected, "{keys:?}");
+            assert_eq!(last, want, "{keys:?}");
+        }
     }
 
     #[test]
@@ -302,59 +319,6 @@ mod tests {
         // or Esc to dismiss", so Enter with no selection must decline-dismiss.
         let _env = crate::session::test_support::EnvGuard::set(&[("DO_NOT_TRACK", "1")]);
         let mut d = TelemetryConsentDialog::new();
-        let result = d.handle_key(k(KeyCode::Enter));
-        assert!(matches!(result, DialogResult::Submit(false)));
-    }
-
-    #[test]
-    fn tab_focuses_then_enter_confirms() {
-        let mut d = TelemetryConsentDialog::new();
-        // Tab from no focus lands on Enable; a second Tab flips to Decline.
-        assert!(matches!(
-            d.handle_key(k(KeyCode::Tab)),
-            DialogResult::Continue
-        ));
-        assert_eq!(d.selected, Some(true));
-        assert!(matches!(
-            d.handle_key(k(KeyCode::Tab)),
-            DialogResult::Continue
-        ));
-        assert_eq!(d.selected, Some(false));
-    }
-
-    #[test]
-    fn esc_declines() {
-        assert!(matches!(
-            TelemetryConsentDialog::new().handle_key(k(KeyCode::Esc)),
-            DialogResult::Submit(false)
-        ));
-    }
-
-    #[test]
-    fn left_focuses_enable_then_enter_opts_in() {
-        let mut d = TelemetryConsentDialog::new();
-        assert!(matches!(
-            d.handle_key(k(KeyCode::Left)),
-            DialogResult::Continue
-        ));
-        assert_eq!(d.selected, Some(true));
-        assert!(matches!(
-            d.handle_key(k(KeyCode::Enter)),
-            DialogResult::Submit(true)
-        ));
-    }
-
-    #[test]
-    fn right_focuses_decline_then_enter_declines() {
-        let mut d = TelemetryConsentDialog::new();
-        assert!(matches!(
-            d.handle_key(k(KeyCode::Right)),
-            DialogResult::Continue
-        ));
-        assert_eq!(d.selected, Some(false));
-        assert!(matches!(
-            d.handle_key(k(KeyCode::Enter)),
-            DialogResult::Submit(false)
-        ));
+        assert_eq!(d.handle_key(k(KeyCode::Enter)), DialogResult::Submit(false));
     }
 }

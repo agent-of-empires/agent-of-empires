@@ -1025,8 +1025,8 @@ mod tests {
 
     // Every arm of the mode -> gate mapping, including the two that were never the reported
     // bug.
-    #[test]
-    fn check_auth_gate_requires_the_gate_each_mode_names() {
+    #[tokio::test]
+    async fn check_auth_gate_requires_the_gate_each_mode_names() {
         let cases = [
             (AuthMode::Token, true, false, true),
             (AuthMode::Token, true, true, true),
@@ -1044,23 +1044,7 @@ mod tests {
                 "mode={mode:?} token_gate={token_gate} wall={wall} gave {got:?}"
             );
         }
-    }
 
-    #[test]
-    fn remote_serve_url_contents_pairs_the_public_url_with_a_loopback_alternate() {
-        assert_eq!(
-            remote_serve_url_contents("https://aoe.example.test", 8080, Some("secret")),
-            "https://aoe.example.test/?token=secret\n\
-             localhost\thttp://127.0.0.1:8080/?token=secret\n"
-        );
-        assert_eq!(
-            remote_serve_url_contents("https://aoe.example.test/", 8080, None),
-            "https://aoe.example.test/\nlocalhost\thttp://127.0.0.1:8080/\n"
-        );
-    }
-
-    #[tokio::test]
-    async fn resolve_auth_mode_matches_about_precedence() {
         let token = TokenManager::new(Some("abc123".to_string()), Duration::from_secs(3600));
         let no_token = TokenManager::new(None, Duration::from_secs(3600));
         let passphrase = login::LoginManager::new(Some("hunter2"));
@@ -1076,6 +1060,19 @@ mod tests {
         );
         // Neither configured is the security-relevant fully-open mode.
         assert_eq!(resolve_auth_mode(&no_token, &no_passphrase).await, "none");
+    }
+
+    #[test]
+    fn remote_serve_url_contents_pairs_the_public_url_with_a_loopback_alternate() {
+        assert_eq!(
+            remote_serve_url_contents("https://aoe.example.test", 8080, Some("secret")),
+            "https://aoe.example.test/?token=secret\n\
+             localhost\thttp://127.0.0.1:8080/?token=secret\n"
+        );
+        assert_eq!(
+            remote_serve_url_contents("https://aoe.example.test/", 8080, None),
+            "https://aoe.example.test/\nlocalhost\thttp://127.0.0.1:8080/\n"
+        );
     }
 
     /// Post-rotation cleanup runs at the deadline `rotate()` set, the one `validate`

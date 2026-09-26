@@ -319,12 +319,6 @@ export function toolCallStarted(tc: { id: string; name: string; kind: string; ar
   };
 }
 
-export function toolCallCompleted(fields: { tool_call_id: string; is_error: boolean; content: string }) {
-  return {
-    ToolCallCompleted: { ...fields, completed_at: new Date().toISOString() },
-  };
-}
-
 export function backgroundAgentLaunched(fields: {
   agent_id: string;
   tool_call_id: string;
@@ -339,10 +333,6 @@ export function backgroundAgentLaunched(fields: {
 
 export function configOptionsUpdated(options: unknown[]) {
   return { ConfigOptionsUpdated: { options } };
-}
-
-export function configOptionSwitchFailed(config_id: string, value: string, reason: string) {
-  return { ConfigOptionSwitchFailed: { config_id, value, reason } };
 }
 
 export function usageUpdated(usage: { used: number; size: number; cost: { amount: number; currency: string } | null }) {

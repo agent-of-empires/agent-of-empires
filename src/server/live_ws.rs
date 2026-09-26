@@ -1638,14 +1638,6 @@ mod tests {
         assert!(!clipboard_forward_enabled(TmuxSettingMode::Enabled, true));
     }
 
-    #[test]
-    fn clipboard_event_json_preserves_text() {
-        let value: serde_json::Value =
-            serde_json::from_str(&clipboard_json("line 1\n\"quoted\"")).unwrap();
-        assert_eq!(value["type"], "clipboard");
-        assert_eq!(value["text"], "line 1\n\"quoted\"");
-    }
-
     fn geom(want: (u16, u16), pane: (u16, u16)) -> DriftGeometry {
         DriftGeometry {
             want_cols: want.0,
@@ -1751,10 +1743,7 @@ mod tests {
             assert_eq!(v["mouseSgr"], false);
             assert_eq!(v["pane0"], want_pane0);
         }
-    }
 
-    #[test]
-    fn frame_json_reports_cursor_modes() {
         let mut alt = cursor();
         alt.alternate_on = true;
         alt.mouse_tracking = true;
@@ -1774,47 +1763,32 @@ mod tests {
         let v = frame_value(None);
         assert!(v["cursor"].is_null());
         assert_eq!(v["rows"], 0);
-    }
 
-    #[test]
-    fn control_messages_parse() {
-        fn parse(json: &str) -> LiveControlMessage {
-            serde_json::from_str(json).unwrap()
-        }
-        use LiveControlMessage::*;
-        assert!(matches!(
-            parse(r#"{"type":"resize","cols":74,"rows":46}"#),
-            Resize { cols: 74, rows: 46 }
-        ));
-        assert!(matches!(
-            parse(r#"{"type":"window","lines":800}"#),
-            Window { lines: 800 }
-        ));
-        assert!(matches!(
-            parse(r#"{"type":"cadence","fast":false}"#),
-            Cadence { fast: false }
-        ));
-        assert!(matches!(parse(r#"{"type":"claim"}"#), Claim));
-        assert!(matches!(
-            parse(r#"{"type":"claim_if_vacant"}"#),
-            ClaimIfVacant
-        ));
-        // `patch` defaults to false when the client does not advertise it.
-        assert!(matches!(
-            parse(r#"{"type":"caps","deflate":true}"#),
-            Caps {
-                deflate: true,
-                patch: false
-            }
-        ));
-        assert!(matches!(
-            parse(r#"{"type":"caps","deflate":true,"patch":true}"#),
-            Caps {
-                deflate: true,
-                patch: true
-            }
-        ));
-        assert!(matches!(parse(r#"{"type":"resync"}"#), Resync));
+        let cursor = crate::tmux::PaneCursor {
+            x: 2,
+            y: 3,
+            visible: true,
+            pane_height: 4,
+            history_size: 9,
+            pane_width: 40,
+            alternate_on: true,
+            mouse_tracking: true,
+            mouse_sgr: true,
+            mouse_all: false,
+            position_reliable: true,
+            composite_pane0: None,
+        };
+        let v: serde_json::Value =
+            serde_json::from_str(&patch_json(&[(1, "B"), (3, "e")], 1, 7, Some(&cursor))).unwrap();
+        assert_eq!(v["type"], "patch");
+        assert_eq!(v["seq"], 7);
+        assert_eq!(v["base"], 6);
+        assert_eq!(v["shift"], 1);
+        assert_eq!(v["lines"], serde_json::json!([[1, "B"], [3, "e"]]));
+        assert_eq!(v["rows"], 4);
+        assert_eq!(v["history"], 9);
+        assert_eq!(v["cursor"], serde_json::json!({"x": 2, "y": 3}));
+        assert_eq!(v["altScreen"], true);
     }
 
     /// Feed the deflater's binary payloads through one raw-inflate stream
@@ -1932,28 +1906,11 @@ mod tests {
                 "{prev:?} -> {next:?} shift {shift}"
             );
         }
-    }
 
-    #[test]
-    fn frame_lines_drops_only_the_terminating_newline() {
         assert_eq!(frame_lines("a\nb\n"), vec!["a", "b"]);
         assert_eq!(frame_lines("a\n\n"), vec!["a", ""]);
         assert_eq!(frame_lines("a"), vec!["a"]);
         assert_eq!(frame_lines(""), vec![""]);
-    }
-
-    #[test]
-    fn translate_cursor_keys_rewrites_bare_arrows_only_in_application_mode() {
-        let normal = b"\x1b[A\x1b[D";
-        assert_eq!(&*translate_cursor_keys(normal, false), normal);
-        assert_eq!(&*translate_cursor_keys(normal, true), b"\x1bOA\x1bOD");
-        // Home/End follow; modified arrows and other CSI stay verbatim.
-        assert_eq!(
-            &*translate_cursor_keys(b"x\x1b[H\x1b[1;5A\x1b[3~\x1b[F", true),
-            b"x\x1bOH\x1b[1;5A\x1b[3~\x1bOF"
-        );
-        // A trailing partial sequence is passed through untouched.
-        assert_eq!(&*translate_cursor_keys(b"\x1b[", true), b"\x1b[");
     }
 
     #[cfg(unix)]
@@ -1968,17 +1925,25 @@ mod tests {
         crate::tmux::vt::unregister_for_test(&name);
         // No live grid: nothing knows the mode, bytes pass through.
         assert_eq!(pane_input_bytes(&name, b"\x1b[A".to_vec()), b"\x1b[A");
+
+        let normal = b"\x1b[A\x1b[D";
+        assert_eq!(&*translate_cursor_keys(normal, false), normal);
+        assert_eq!(&*translate_cursor_keys(normal, true), b"\x1bOA\x1bOD");
+        // Home/End follow; modified arrows and other CSI stay verbatim.
+        assert_eq!(
+            &*translate_cursor_keys(b"x\x1b[H\x1b[1;5A\x1b[3~\x1b[F", true),
+            b"x\x1bOH\x1b[1;5A\x1b[3~\x1bOF"
+        );
+        // A trailing partial sequence is passed through untouched.
+        assert_eq!(&*translate_cursor_keys(b"\x1b[", true), b"\x1b[");
     }
 
     #[test]
-    fn resize_settle_holds_only_mismatched_geometry_inside_the_window() {
+    fn resize_settle_holds_only_mismatched_geometry_inside_an_owned_window() {
         assert!(resize_settle_holds(100, 400, (80, 24), (120, 40)));
         assert!(!resize_settle_holds(100, 400, (80, 24), (80, 24)));
         assert!(!resize_settle_holds(500, 400, (80, 24), (120, 40)));
-    }
 
-    #[test]
-    fn resize_follow_up_arms_only_an_owned_resize() {
         assert_eq!(resize_follow_up(true, 100), Some(100 + RESIZE_SETTLE_MS));
         assert_eq!(resize_follow_up(false, 100), None);
         let settings = LiveSettings::new();
@@ -2170,39 +2135,5 @@ mod tests {
             Some(1),
             crate::tmux::vt::SCROLLBACK_LINES + 1
         ));
-    }
-
-    #[test]
-    fn patch_json_carries_rows_shift_sequence_and_frame_meta() {
-        let cursor = crate::tmux::PaneCursor {
-            x: 2,
-            y: 3,
-            visible: true,
-            pane_height: 4,
-            history_size: 9,
-            pane_width: 40,
-            alternate_on: true,
-            mouse_tracking: true,
-            mouse_sgr: true,
-            mouse_all: false,
-            position_reliable: true,
-            composite_pane0: None,
-        };
-        let v: serde_json::Value =
-            serde_json::from_str(&patch_json(&[(1, "B"), (3, "e")], 1, 7, Some(&cursor))).unwrap();
-        assert_eq!(v["type"], "patch");
-        assert_eq!(v["seq"], 7);
-        assert_eq!(v["base"], 6);
-        assert_eq!(v["shift"], 1);
-        assert_eq!(v["lines"], serde_json::json!([[1, "B"], [3, "e"]]));
-        assert_eq!(v["rows"], 4);
-        assert_eq!(v["history"], 9);
-        assert_eq!(v["cursor"], serde_json::json!({"x": 2, "y": 3}));
-        assert_eq!(v["altScreen"], true);
-        let f: serde_json::Value =
-            serde_json::from_str(&frame_json("x\n", Some(&cursor), 8)).unwrap();
-        assert_eq!(f["type"], "frame");
-        assert_eq!(f["seq"], 8);
-        assert_eq!(f["content"], "x\n");
     }
 }

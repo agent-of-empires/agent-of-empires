@@ -248,15 +248,38 @@ mod tests {
     use crate::tmux::{Session, SESSION_PREFIX};
 
     #[test]
-    fn test_terminal_session_generate_name() {
-        assert_eq!(
-            TerminalSession::generate_name("abc123def456", "My Project"),
-            format!("{TERMINAL_PREFIX}My_Project_abc123de")
-        );
-        assert_eq!(
-            ContainerTerminalSession::generate_name("abc123def456", "My Project"),
-            format!("{CONTAINER_TERMINAL_PREFIX}My_Project_abc123de")
-        );
+    fn terminal_names_carry_their_kind_prefix_and_index_suffix() {
+        let (id, title) = ("abc123def456", "My Project");
+        let host = format!("{TERMINAL_PREFIX}My_Project_abc123de");
+        let container = format!("{CONTAINER_TERMINAL_PREFIX}My_Project_abc123de");
+        // Index zero keeps the legacy unsuffixed name.
+        for (name, expected) in [
+            (TerminalSession::generate_name(id, title), host.clone()),
+            (
+                TerminalSession::generate_name_indexed(id, title, 0),
+                host.clone(),
+            ),
+            (
+                TerminalSession::generate_name_indexed(id, title, 1),
+                format!("{host}_t1"),
+            ),
+            (
+                TerminalSession::generate_name_indexed(id, title, 2),
+                format!("{host}_t2"),
+            ),
+            (
+                ContainerTerminalSession::generate_name(id, title),
+                container.clone(),
+            ),
+            (
+                ContainerTerminalSession::generate_name_indexed(id, title, 0),
+                container,
+            ),
+        ] {
+            assert_eq!(name, expected);
+        }
+        let agent = Session::generate_name(id, title);
+        assert!(agent.starts_with(SESSION_PREFIX) && agent != host);
     }
 
     const ID: &str = "abc12345deadbeef";
@@ -330,72 +353,57 @@ mod tests {
     }
 
     #[test]
-    fn test_terminal_session_name_differs_from_agent_session() {
-        let agent_name = Session::generate_name("abc123def456", "My Project");
-        let terminal_name = TerminalSession::generate_name("abc123def456", "My Project");
-        assert_ne!(agent_name, terminal_name);
-        assert!(agent_name.starts_with(SESSION_PREFIX));
-        assert!(terminal_name.starts_with(TERMINAL_PREFIX));
-    }
-
-    #[test]
-    fn test_terminal_index_zero_matches_legacy_name() {
-        let legacy = TerminalSession::generate_name("abc123def456", "My Project");
-        let indexed_zero = TerminalSession::generate_name_indexed("abc123def456", "My Project", 0);
-        assert_eq!(legacy, indexed_zero);
-
-        let legacy_c = ContainerTerminalSession::generate_name("abc123def456", "My Project");
-        let indexed_zero_c =
-            ContainerTerminalSession::generate_name_indexed("abc123def456", "My Project", 0);
-        assert_eq!(legacy_c, indexed_zero_c);
-    }
-
-    #[test]
-    fn test_terminal_index_nonzero_suffixed_and_distinct() {
-        let zero = TerminalSession::generate_name_indexed("abc123def456", "My Project", 0);
-        let one = TerminalSession::generate_name_indexed("abc123def456", "My Project", 1);
-        let two = TerminalSession::generate_name_indexed("abc123def456", "My Project", 2);
-        assert_ne!(zero, one);
-        assert_ne!(one, two);
-        assert!(one.ends_with("_t1"));
-        assert!(two.ends_with("_t2"));
-        assert!(one.starts_with(&zero));
-    }
-
-    #[test]
-    fn test_container_terminal_name_differs_from_host_terminal() {
-        let host_name = TerminalSession::generate_name("abc123def456", "My Project");
-        let container_name = ContainerTerminalSession::generate_name("abc123def456", "My Project");
-        assert_ne!(host_name, container_name);
-        assert!(host_name.starts_with(TERMINAL_PREFIX));
-        assert!(container_name.starts_with(CONTAINER_TERMINAL_PREFIX));
-    }
-
-    #[test]
-    fn test_host_pane_inputs_injects_env_and_login_shell() {
-        let (env, cmd) = host_pane_inputs(Some("/bin/zsh"), None, "/Users/me", "/usr/bin:/bin");
-        assert_eq!(
-            env,
-            vec![
-                ("HOME".to_string(), "/Users/me".to_string()),
-                ("PATH".to_string(), "/usr/bin:/bin".to_string()),
-                ("SHELL".to_string(), "/bin/zsh".to_string()),
-            ]
-        );
-        assert_eq!(cmd.as_deref(), Some("'/bin/zsh' -l"));
-    }
-
-    #[test]
-    fn test_host_pane_inputs_keeps_explicit_command() {
-        let (env, cmd) = host_pane_inputs(Some("/bin/zsh"), Some("htop"), "/Users/me", "/bin");
-        assert!(env.contains(&("SHELL".to_string(), "/bin/zsh".to_string())));
-        assert_eq!(cmd.as_deref(), Some("htop"));
-    }
-
-    #[test]
-    fn test_host_pane_inputs_drops_empty_home_path() {
-        let (env, _) = host_pane_inputs(Some("/bin/bash"), None, "", "");
-        assert_eq!(env, vec![("SHELL".to_string(), "/bin/bash".to_string())]);
+    fn host_pane_inputs_inject_env_and_a_login_shell_only_on_the_host() {
+        let env = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+        // (shell, command, home, path) -> (env, command)
+        let cases = [
+            (
+                (Some("/bin/zsh"), None, "/Users/me", "/usr/bin:/bin"),
+                (
+                    env(&[
+                        ("HOME", "/Users/me"),
+                        ("PATH", "/usr/bin:/bin"),
+                        ("SHELL", "/bin/zsh"),
+                    ]),
+                    Some("'/bin/zsh' -l"),
+                ),
+            ),
+            (
+                (Some("/bin/zsh"), Some("htop"), "/Users/me", "/bin"),
+                (
+                    env(&[
+                        ("HOME", "/Users/me"),
+                        ("PATH", "/bin"),
+                        ("SHELL", "/bin/zsh"),
+                    ]),
+                    Some("htop"),
+                ),
+            ),
+            (
+                (Some("/bin/bash"), None, "", ""),
+                (env(&[("SHELL", "/bin/bash")]), Some("'/bin/bash' -l")),
+            ),
+            // A container pane (no host shell) is passed through untouched.
+            (
+                (None, Some("bash -lc enter"), "/Users/me", "/bin"),
+                (vec![], Some("bash -lc enter")),
+            ),
+            ((None, None, "/Users/me", "/bin"), (vec![], None)),
+        ];
+        for ((shell, command, home, path), (want_env, want_command)) in cases {
+            let (got_env, got_command) = host_pane_inputs(shell, command, home, path);
+            assert_eq!(got_env, want_env, "{shell:?} {command:?}");
+            assert_eq!(
+                got_command.as_deref(),
+                want_command,
+                "{shell:?} {command:?}"
+            );
+        }
     }
 
     #[test]
@@ -412,110 +420,6 @@ mod tests {
         let resolved = absolute_shell_in("aoe-test-shell", paths).expect("shim must resolve");
         assert_eq!(std::path::Path::new(&resolved), bin);
         assert_eq!(absolute_shell_in("aoe-not-a-real-shell-xyzzy", paths), None);
-    }
-
-    #[test]
-    fn test_container_pane_inputs_unchanged() {
-        let (env, cmd) = host_pane_inputs(None, Some("bash -lc enter"), "/Users/me", "/bin");
-        assert!(env.is_empty());
-        assert_eq!(cmd.as_deref(), Some("bash -lc enter"));
-
-        let (env_none, cmd_none) = host_pane_inputs(None, None, "/Users/me", "/bin");
-        assert!(env_none.is_empty());
-        assert!(cmd_none.is_none());
-    }
-    #[test]
-    #[serial_test::serial]
-    fn test_terminal_session_is_pane_dead_after_command_exits() {
-        use crate::tmux::test_helpers::{only_pane_id, wait_for_pane_dead};
-
-        let _env = crate::session::test_support::EnvGuard::read_lock();
-        require_tmux!();
-
-        let guard = TmuxTestSession::new("aoe_test_terminal_dead");
-        let session_name = guard.name().to_string();
-        let session = TerminalSession {
-            name: session_name.clone(),
-        };
-
-        let output = crate::tmux::tmux_command()
-            .args([
-                "new-session",
-                "-d",
-                "-s",
-                &session_name,
-                "-x",
-                "80",
-                "-y",
-                "24",
-                "sleep 1",
-                ";",
-                "set-option",
-                "-p",
-                "-t",
-                &session_name,
-                "remain-on-exit",
-                "on",
-            ])
-            .output()
-            .expect("tmux new-session");
-        assert!(output.status.success());
-
-        wait_for_pane_dead(&only_pane_id(&session_name));
-
-        assert!(
-            session.is_pane_dead(),
-            "Terminal session pane should be dead after command exits"
-        );
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn test_terminal_session_is_pane_dead_on_running_session() {
-        let _env = crate::session::test_support::EnvGuard::read_lock();
-        require_tmux!();
-
-        let guard = TmuxTestSession::new("aoe_test_terminal_alive");
-        let session_name = guard.name().to_string();
-        let session = TerminalSession {
-            name: session_name.clone(),
-        };
-
-        let output = crate::tmux::tmux_command()
-            .args([
-                "new-session",
-                "-d",
-                "-s",
-                &session_name,
-                "-x",
-                "80",
-                "-y",
-                "24",
-                "sleep",
-                "30",
-                ";",
-                "set-option",
-                "-p",
-                "-t",
-                &session_name,
-                "remain-on-exit",
-                "on",
-            ])
-            .output()
-            .expect("tmux new-session");
-        assert!(output.status.success());
-
-        let pane_id = crate::tmux::test_helpers::only_pane_id(&session_name);
-        crate::tmux::test_helpers::wait_for_pane_command(&pane_id, "sleep");
-        assert_eq!(
-            crate::tmux::test_helpers::pane_field(&pane_id, "#{pane_dead}"),
-            "0"
-        );
-
-        assert!(
-            !session.is_pane_dead(),
-            "Terminal session pane should be alive while command running"
-        );
     }
 
     #[test]

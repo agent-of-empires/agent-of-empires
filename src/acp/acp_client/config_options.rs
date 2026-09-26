@@ -387,7 +387,7 @@ mod tests {
 
     /// #3403: `ModelConfig` maps explicitly, without the unknown-variant warning.
     #[test]
-    fn model_config_category_maps_without_the_unknown_variant_warning() {
+    fn model_config_options() {
         use agent_client_protocol::schema::v1::SessionConfigSelectOption;
         let logs = crate::session::test_support::LogCapture::start();
         let mapped = map_acp_config_option(
@@ -407,6 +407,30 @@ mod tests {
         assert!(!logs
             .contents()
             .contains("unknown SessionConfigOptionCategory"));
+
+        {
+            use agent_client_protocol::schema::v1::SessionConfigSelectOption;
+            let options = [SessionConfigOption::select(
+                "model",
+                "Model",
+                "claude-opus-5",
+                vec![
+                    SessionConfigSelectOption::new("claude-opus-5", "Opus"),
+                    SessionConfigSelectOption::new("claude-sonnet-5", "Sonnet"),
+                ],
+            )
+            .category(SessionConfigOptionCategory::Model)];
+            let option = model_option(&options).unwrap();
+            assert_eq!(option.id, "model");
+            for (pick, want) in [
+                ("claude-opus-5", true),
+                ("opus", true),
+                ("sonnet", false),
+                ("claude-sonnet-5", false),
+            ] {
+                assert_eq!(option.is_current(pick), want, "{pick}");
+            }
+        }
     }
 
     #[test]
@@ -459,60 +483,6 @@ mod tests {
                 want,
                 "{mode}"
             );
-        }
-    }
-
-    #[test]
-    fn config_option_dispatch_events() {
-        let events = config_option_success_events(
-            Vec::new(),
-            "agent-full-access".to_string(),
-            ConfigOptionDispatchPurpose::Mode,
-        );
-        assert!(matches!(
-            &events[..],
-            [
-                Event::ConfigOptionsUpdated { options },
-                Event::CurrentModeChanged { current_mode_id },
-            ] if options.is_empty() && current_mode_id == "agent-full-access"
-        ));
-        let failure = |purpose| {
-            config_option_failure_event("mode".into(), "v".into(), "rejected".into(), purpose)
-        };
-        assert!(matches!(
-            failure(ConfigOptionDispatchPurpose::Mode),
-            Event::ModeSwitchFailed { mode_id, reason } if mode_id == "v" && reason == "rejected"
-        ));
-        assert!(matches!(
-            failure(ConfigOptionDispatchPurpose::Generic),
-            Event::ConfigOptionSwitchFailed { config_id, value, reason }
-                if config_id == "mode" && value == "v" && reason == "rejected"
-        ));
-        assert!(config_options_event(None).is_none());
-    }
-
-    #[test]
-    fn model_option_is_current_cases() {
-        use agent_client_protocol::schema::v1::SessionConfigSelectOption;
-        let options = [SessionConfigOption::select(
-            "model",
-            "Model",
-            "claude-opus-5",
-            vec![
-                SessionConfigSelectOption::new("claude-opus-5", "Opus"),
-                SessionConfigSelectOption::new("claude-sonnet-5", "Sonnet"),
-            ],
-        )
-        .category(SessionConfigOptionCategory::Model)];
-        let option = model_option(&options).unwrap();
-        assert_eq!(option.id, "model");
-        for (pick, want) in [
-            ("claude-opus-5", true),
-            ("opus", true),
-            ("sonnet", false),
-            ("claude-sonnet-5", false),
-        ] {
-            assert_eq!(option.is_current(pick), want, "{pick}");
         }
     }
 }

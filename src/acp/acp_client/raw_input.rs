@@ -118,7 +118,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn wakeup_from_raw_rejects_unusable_delays() {
+    fn raw_input_parsers() {
         for (label, raw) in [
             ("missing", serde_json::json!({})),
             ("non-numeric", serde_json::json!({ "delaySeconds": "soon" })),
@@ -133,12 +133,8 @@ mod tests {
                 "{label} delaySeconds must not emit WakeupScheduled"
             );
         }
-    }
 
-    /// The JSON-number path is covered end to end in `update_events`; only the
-    /// numeric-string fallback is unique to this layer.
-    #[test]
-    fn wakeup_from_raw_schedules_delay_given_as_string() {
+        // The numeric-string fallback is unique to this layer.
         let before = chrono::Utc::now();
         match wakeup_event_from_raw(&serde_json::json!({ "delaySeconds": "600" })) {
             Some(Event::WakeupScheduled { at, .. }) => {
@@ -147,63 +143,27 @@ mod tests {
             }
             other => panic!("expected WakeupScheduled, got {other:?}"),
         }
-    }
 
-    #[test]
-    fn background_agent_launched_parsed_from_agent_meta() {
-        let payload = serde_json::json!({
-            "_meta": { "claudeCode": {
-                "toolName": "Agent",
-                "toolResponse": {
-                    "agentId": "a3d5ae46a7a0414b1",
-                    "description": "grep tmux mentions repo-wide",
-                    "prompt": "Grep the repo for tmux.",
-                    "resolvedModel": "claude-opus-4-8[1m]",
-                    "outputFile": "/tmp/x/tasks/a3d5ae46a7a0414b1.output",
-                    "status": "async_launched"
-                }
-            }},
-            "toolCallId": "toolu_012yUZykQT2vqFXZTvqWev5e"
-        });
-        match background_agent_launched_from_value(&payload) {
-            Some(Event::BackgroundAgentLaunched {
-                agent_id,
-                tool_call_id,
-                description,
-                model,
-                output_file,
-                ..
-            }) => {
-                assert_eq!(agent_id, "a3d5ae46a7a0414b1");
-                assert_eq!(tool_call_id, "toolu_012yUZykQT2vqFXZTvqWev5e");
-                assert_eq!(description, "grep tmux mentions repo-wide");
-                assert_eq!(model, "claude-opus-4-8[1m]");
-                assert!(output_file.ends_with(".output"));
+        // Another tool, a synchronous Agent call, and an empty payload all stay
+        // `RawAgentUpdate`.
+        {
+            for raw in [
+                serde_json::json!({
+                    "_meta": { "claudeCode": { "toolName": "Bash", "toolResponse": {} } }
+                }),
+                serde_json::json!({
+                    "_meta": { "claudeCode": {
+                        "toolName": "Agent",
+                        "toolResponse": { "agentId": "x" }
+                    }}
+                }),
+                serde_json::json!({}),
+            ] {
+                assert!(
+                    background_agent_launched_from_value(&raw).is_none(),
+                    "{raw}"
+                );
             }
-            other => panic!("expected BackgroundAgentLaunched, got {other:?}"),
-        }
-    }
-
-    /// Another tool, a synchronous Agent call, and an empty payload all stay
-    /// `RawAgentUpdate`.
-    #[test]
-    fn background_agent_launched_ignores_non_agent_meta() {
-        for raw in [
-            serde_json::json!({
-                "_meta": { "claudeCode": { "toolName": "Bash", "toolResponse": {} } }
-            }),
-            serde_json::json!({
-                "_meta": { "claudeCode": {
-                    "toolName": "Agent",
-                    "toolResponse": { "agentId": "x" }
-                }}
-            }),
-            serde_json::json!({}),
-        ] {
-            assert!(
-                background_agent_launched_from_value(&raw).is_none(),
-                "{raw}"
-            );
         }
     }
 }

@@ -438,12 +438,85 @@ mod tests {
         inst
     }
 
-    /// The other half of #2690 / #2697: for a structured row the live ACP status is
-    /// authoritative, so the tmux decision is skipped, the baseline stays in step with
-    /// the carried status, and a tmux error left over from a converted terminal session
-    /// is cleared. A tmux-backed row keeps every field for the poller instead.
+    /// Tick-level status decisions over the structured and tmux halves of
+    /// #2690 / #2697: a structured row whose live status did not move reports no
+    /// transition, a row new since the last snapshot keeps its disk status, a
+    /// recently restarted row is forced to Starting (and that transition is
+    /// reported), and a failed tmux batch probe holds the live statuses.
     #[test]
-    fn skip_tmux_decision_for_structured_carries_the_live_status() {
+    fn apply_tick_status_decisions_cases() {
+        use std::collections::{HashMap, HashSet};
+        let tmux_row = |status| {
+            let mut inst = Instance::new("tmux-session", "/tmp/test");
+            inst.status = status;
+            inst
+        };
+        let probed = HashMap::new();
+        // (name, row, prev status, restarted, metadata, want status, want transitions)
+        let cases = [
+            (
+                "structured phantom",
+                phantom_structured_row("acp-session"),
+                Some(Status::Error),
+                false,
+                Some(&probed),
+                Status::Error,
+                vec![],
+            ),
+            (
+                "new since last snapshot",
+                phantom_structured_row("acp-session"),
+                None,
+                false,
+                Some(&probed),
+                Status::Idle,
+                vec![],
+            ),
+            (
+                "recently restarted",
+                phantom_structured_row("acp-session"),
+                Some(Status::Error),
+                true,
+                Some(&probed),
+                Status::Starting,
+                vec![(0, Status::Error)],
+            ),
+            (
+                "probe failed, idle on disk",
+                tmux_row(Status::Idle),
+                Some(Status::Running),
+                false,
+                None,
+                Status::Running,
+                vec![],
+            ),
+            (
+                "probe failed, unknown on disk",
+                tmux_row(Status::Unknown),
+                Some(Status::Error),
+                false,
+                None,
+                Status::Error,
+                vec![],
+            ),
+        ];
+        for (name, inst, prev_status, restarted, metadata, want, transitions) in cases {
+            let id = inst.id.clone();
+            let prev: HashMap<_, _> = prev_status.map(|s| (id.clone(), s)).into_iter().collect();
+            let suppressed: HashSet<_> = restarted.then_some(id).into_iter().collect();
+            let mut instances = vec![inst];
+            apply_tick_status_decisions(&mut instances, &prev, &suppressed, metadata);
+            assert_eq!(instances[0].status, want, "{name}");
+            assert_eq!(
+                observed_transitions(&instances, &prev),
+                transitions,
+                "{name}"
+            );
+            if prev_status.is_none() {
+                assert_eq!(instances[0].live_status_baseline, None, "{name}");
+            }
+        }
+
         let mut carried = phantom_structured_row("acp-session");
         carried.live_status_baseline = Some(Status::Error);
         assert!(skip_tmux_decision_for_structured(&mut carried));
@@ -476,106 +549,13 @@ mod tests {
     }
 
     #[test]
-    fn tick_reports_no_transition_for_a_structured_phantom() {
-        // The regression at tick level, over the two halves together.
-        let inst = phantom_structured_row("acp-session");
-        let prev = std::collections::HashMap::from([(inst.id.clone(), Status::Error)]);
-        let mut instances = vec![inst];
-
-        apply_tick_status_decisions(
-            &mut instances,
-            &prev,
-            &std::collections::HashSet::new(),
-            Some(&std::collections::HashMap::new()),
-        );
-
-        assert_eq!(
-            observed_transitions(&instances, &prev),
-            vec![],
-            "a structured row whose live status did not move must report no \
-             transition, so status_tx stays silent and nothing is persisted or \
-             marked unread"
-        );
-        // Note this holds for *every* structured row, not just a phantom.
-    }
-
-    #[test]
-    fn tick_skips_a_row_that_is_new_since_the_last_snapshot() {
-        // No `prev` entry means the row was created since the last tick; there
-        // is no previous status to have transitioned from.
-        let mut instances = vec![phantom_structured_row("acp-session")];
-        let prev = std::collections::HashMap::new();
-
-        apply_tick_status_decisions(
-            &mut instances,
-            &prev,
-            &std::collections::HashSet::new(),
-            Some(&std::collections::HashMap::new()),
-        );
-
-        assert_eq!(instances[0].status, Status::Idle, "disk status stands");
-        assert_eq!(instances[0].live_status_baseline, None);
-        assert_eq!(observed_transitions(&instances, &prev), vec![]);
-    }
-
-    #[test]
-    fn tick_forces_a_recently_restarted_row_to_starting() {
-        // Two things at once.
-        let inst = phantom_structured_row("acp-session");
-        let id = inst.id.clone();
-        let prev = std::collections::HashMap::from([(id.clone(), Status::Error)]);
-        let mut instances = vec![inst];
-
-        apply_tick_status_decisions(
-            &mut instances,
-            &prev,
-            &std::collections::HashSet::from([id]),
-            Some(&std::collections::HashMap::new()),
-        );
-
-        assert_eq!(instances[0].status, Status::Starting);
-        assert_eq!(
-            observed_transitions(&instances, &prev),
-            vec![(0, Status::Error)],
-            "a transition the tick does own must still be reported"
-        );
-    }
-
-    #[test]
-    fn tick_holds_tmux_statuses_when_the_batch_probe_fails() {
-        for (disk, live) in [
-            (Status::Idle, Status::Running),
-            (Status::Unknown, Status::Error),
-        ] {
-            let mut inst = Instance::new("tmux-session", "/tmp/test");
-            inst.status = disk;
-            let id = inst.id.clone();
-            let prev = std::collections::HashMap::from([(id, live)]);
-            let mut instances = vec![inst];
-
-            apply_tick_status_decisions(
-                &mut instances,
-                &prev,
-                &std::collections::HashSet::new(),
-                None,
-            );
-
-            assert_eq!(instances[0].status, live, "disk status was {disk:?}");
-            assert_eq!(observed_transitions(&instances, &prev), vec![]);
-        }
-    }
-
-    #[test]
     fn seed_tick_tracking_carries_prior_tick_fields_onto_fresh_instance() {
         // `load_all_instances` always resets these `#[serde(skip)]` fields to
         // their defaults, mimicking status_poll_loop's fresh disk load.
-        let mut fresh = vec![Instance::new("sess-1", "/tmp/seed")];
-        assert!(!fresh[0].ever_confirmed_present);
-        assert_eq!(fresh[0].unknown_since, None);
-        assert_eq!(
-            fresh[0].detection,
-            crate::session::DetectionState::default()
-        );
+        let mut fresh = vec![
+            Instance::new("sess-1", "/tmp/seed"),
+            Instance::new("sess-unseen", "/tmp/seed"),
+        ];
 
         let confirmed_at = std::time::Instant::now() - std::time::Duration::from_secs(3);
         let mut prev = std::collections::HashMap::new();
@@ -611,19 +591,13 @@ mod tests {
             "prior tick's proposal must seed the fresh instance so the poll \
              that agrees with it can publish it (#3642)"
         );
-    }
-
-    #[test]
-    fn seed_tick_tracking_leaves_unknown_ids_untouched() {
-        let mut fresh = vec![Instance::new("sess-unseen", "/tmp/seed")];
-        let prev = std::collections::HashMap::new();
-
-        seed_tick_tracking(&mut fresh, &prev);
-
-        assert!(!fresh[0].ever_confirmed_present);
-        assert_eq!(fresh[0].unknown_since, None);
+        assert!(
+            !fresh[1].ever_confirmed_present,
+            "an unseen id is untouched"
+        );
+        assert_eq!(fresh[1].unknown_since, None);
         assert_eq!(
-            fresh[0].detection,
+            fresh[1].detection,
             crate::session::DetectionState::default()
         );
     }
@@ -757,18 +731,13 @@ mod tests {
         );
         assert_eq!(merged(Status::Error, Status::Idle), None);
         assert_eq!(merged(Status::Idle, Status::Idle), None);
-    }
 
-    #[test]
-    fn merge_runtime_fields_preserves_acp_load_session_capability() {
         let mut prior = Instance::new("seed", "/tmp/seed");
         prior.acp_load_session_capable = Some(true);
-
-        let fresh = Instance::new("seed", "/tmp/seed");
-        let merged = merge_runtime_fields(prior, fresh);
-
+        let merged = merge_runtime_fields(prior, Instance::new("seed", "/tmp/seed"));
         assert_eq!(merged.acp_load_session_capable, Some(true));
     }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn reload_captures_publications_from_a_replaced_execution() {

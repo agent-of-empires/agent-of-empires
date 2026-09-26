@@ -41,60 +41,23 @@ pub(crate) fn run_in(app_dir: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
+    use crate::migrations::test_cases::assert_rewrites;
 
     #[test]
-    fn rewrites_default_seed_value() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("config.toml");
-        fs::write(&path, "[cockpit]\nreplay_events = 500\n").unwrap();
-
-        run_in(temp.path()).unwrap();
-
-        let after: toml::Table = fs::read_to_string(&path).unwrap().parse().unwrap();
-        let cockpit = after.get("cockpit").unwrap().as_table().unwrap();
-        assert_eq!(
-            cockpit.get("replay_events").unwrap().as_integer().unwrap(),
-            0
+    fn rewrites_only_the_default_seed_value() {
+        let unchanged = |toml: &'static str| (Some(toml), Some(toml));
+        assert_rewrites(
+            "config.toml",
+            |path| run_in(path.parent().unwrap()),
+            &[
+                (
+                    Some("[cockpit]\nreplay_events = 500\n"),
+                    Some("[cockpit]\nreplay_events = 0\n"),
+                ),
+                unchanged("[cockpit]\nreplay_events = 1000\n"),
+                unchanged("[cockpit]\nreplay_events = 0\n"),
+                unchanged("[other]\nkey = \"value\"\n"),
+            ],
         );
-    }
-
-    #[test]
-    fn leaves_explicit_user_values_alone() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("config.toml");
-        fs::write(&path, "[cockpit]\nreplay_events = 1000\n").unwrap();
-
-        run_in(temp.path()).unwrap();
-
-        let after: toml::Table = fs::read_to_string(&path).unwrap().parse().unwrap();
-        let cockpit = after.get("cockpit").unwrap().as_table().unwrap();
-        assert_eq!(
-            cockpit.get("replay_events").unwrap().as_integer().unwrap(),
-            1000
-        );
-    }
-
-    #[test]
-    fn is_idempotent_when_already_zero() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("config.toml");
-        fs::write(&path, "[cockpit]\nreplay_events = 0\n").unwrap();
-
-        run_in(temp.path()).unwrap();
-        let first = fs::read_to_string(&path).unwrap();
-        run_in(temp.path()).unwrap();
-        let second = fs::read_to_string(&path).unwrap();
-        assert_eq!(first, second);
-    }
-
-    #[test]
-    fn noop_when_no_cockpit_section() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("config.toml");
-        fs::write(&path, "[other]\nkey = \"value\"\n").unwrap();
-        run_in(temp.path()).unwrap();
-        let after = fs::read_to_string(&path).unwrap();
-        assert_eq!(after, "[other]\nkey = \"value\"\n");
     }
 }

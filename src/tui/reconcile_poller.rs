@@ -89,12 +89,6 @@ mod tests {
     use crate::session::Storage;
     use crate::session::{Instance, WorktreeInfo};
 
-    #[test]
-    fn try_recv_reports_empty_while_no_sweep_has_landed() {
-        let mut poller = ReconcilePoller::new();
-        assert!(matches!(poller.try_recv_result(), Err(TryRecvError::Empty)));
-    }
-
     /// A trashed managed worktree whose recorded dir is gone but whose holding
     /// dir exists needs only a pointer repair, so the sweep heals it without
     /// touching git. Proves the worker path reaches durable state.
@@ -102,6 +96,8 @@ mod tests {
     #[serial_test::serial]
     fn sweep_heals_a_trashed_pointer_and_reports_the_change() {
         let _guard = crate::session::test_support::isolate_app_dir();
+        let mut poller = ReconcilePoller::new();
+        assert!(matches!(poller.try_recv_result(), Err(TryRecvError::Empty)));
         let project = tempfile::tempdir().unwrap();
         let storage = Storage::new_unwatched("default").unwrap();
 

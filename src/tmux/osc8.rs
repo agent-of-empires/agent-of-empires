@@ -187,16 +187,18 @@ mod tests {
     }
 
     #[test]
-    fn extracts_link_whose_text_hides_the_target() {
-        assert_eq!(
-            extract_links(b"\x1b]8;;https://example.com\x1b\\Click Here\x1b]8;;\x1b\\"),
-            vec![link("Click Here", "https://example.com")]
-        );
-    }
-
-    #[test]
     fn extracts_across_forms_and_neighbours() {
         let cases: Vec<(&str, Vec<PaneLink>)> = vec![
+            (
+                "\x1b]8;;https://example.com\x1b\\Click Here\x1b]8;;\x1b\\",
+                vec![link("Click Here", "https://example.com")],
+            ),
+            // A link whose close never arrives is still emitted at the end.
+            (
+                "\x1b]8;;https://example.com\x1b\\Click Here",
+                vec![link("Click Here", "https://example.com")],
+            ),
+            ("\x1b]8;;https://example.com", vec![]),
             (
                 "before \x1b]8;;https://a.com\x1b\\text\x1b]8;;\x1b\\ after",
                 vec![link("text", "https://a.com")],
@@ -276,15 +278,6 @@ mod tests {
                 "split at {split}"
             );
         }
-    }
-
-    #[test]
-    fn finish_emits_a_link_whose_close_never_arrived() {
-        assert_eq!(
-            extract_links(b"\x1b]8;;https://example.com\x1b\\Click Here"),
-            vec![link("Click Here", "https://example.com")]
-        );
-        assert_eq!(extract_links(b"\x1b]8;;https://example.com"), vec![]);
     }
 
     #[test]

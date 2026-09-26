@@ -77,47 +77,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn extract_token_finds_simple_token() {
-        assert_eq!(
-            extract_token("http://localhost:8080/?token=abc123"),
-            Some("abc123")
-        );
+    fn extract_token_reads_a_nonempty_token_param() {
+        for (url, expected) in [
+            ("http://localhost:8080/?token=abc123", Some("abc123")),
+            ("http://localhost:8080/?foo=bar&token=zzz", Some("zzz")),
+            ("http://localhost:8080/", None),
+            ("http://localhost:8080/?foo=bar", None),
+            ("http://localhost:8080/?token=", None),
+        ] {
+            assert_eq!(extract_token(url), expected, "{url}");
+        }
     }
 
     #[test]
-    fn extract_token_returns_none_when_missing() {
-        assert_eq!(extract_token("http://localhost:8080/"), None);
-        assert_eq!(extract_token("http://localhost:8080/?foo=bar"), None);
-    }
-
-    #[test]
-    fn extract_token_returns_none_for_empty_value() {
-        assert_eq!(extract_token("http://localhost:8080/?token="), None);
-    }
-
-    #[test]
-    fn extract_token_handles_multi_param_query() {
-        assert_eq!(
-            extract_token("http://localhost:8080/?foo=bar&token=zzz"),
-            Some("zzz")
-        );
-    }
-
-    #[test]
-    fn format_labeled_uses_primary_for_unlabeled() {
-        let u = ServeUrl {
-            label: None,
-            url: "http://x".into(),
-        };
-        assert_eq!(format_labeled(&u), "primary\thttp://x");
-    }
-
-    #[test]
-    fn format_labeled_uses_label_when_present() {
-        let u = ServeUrl {
-            label: Some("lan".into()),
-            url: "http://x".into(),
-        };
-        assert_eq!(format_labeled(&u), "lan\thttp://x");
+    fn format_labeled_defaults_to_primary() {
+        for (label, expected) in [(None, "primary\thttp://x"), (Some("lan"), "lan\thttp://x")] {
+            let u = ServeUrl {
+                label: label.map(Into::into),
+                url: "http://x".into(),
+            };
+            assert_eq!(format_labeled(&u), expected);
+        }
     }
 }

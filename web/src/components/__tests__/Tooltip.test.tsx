@@ -8,15 +8,6 @@ import { Tooltip } from "../Tooltip";
 afterEach(cleanup);
 
 describe("Tooltip", () => {
-  it("renders no tooltip until hovered", () => {
-    render(
-      <Tooltip text="New session">
-        <button type="button">+</button>
-      </Tooltip>,
-    );
-    expect(screen.queryByRole("tooltip")).toBeNull();
-  });
-
   it("portals the popup to document.body on hover and removes it on leave", () => {
     const { container } = render(
       <Tooltip text="New session">
@@ -24,6 +15,7 @@ describe("Tooltip", () => {
       </Tooltip>,
     );
     const trigger = screen.getByRole("button").parentElement!;
+    expect(screen.queryByRole("tooltip")).toBeNull();
 
     fireEvent.mouseEnter(trigger);
 

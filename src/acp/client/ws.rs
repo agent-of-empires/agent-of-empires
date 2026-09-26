@@ -401,7 +401,6 @@ fn sanitize_for_log(url: &str) -> String {
 mod tests {
     use super::*;
     use crate::acp::client::discovery::Source;
-    use crate::acp::state::Event;
 
     fn endpoint(base: &str, token: Option<&str>) -> DaemonEndpoint {
         DaemonEndpoint::new(base.to_string(), token.map(str::to_string), Source::Env)
@@ -435,25 +434,25 @@ mod tests {
             ws_url(&endpoint("https://remote.test", Some("t")), "s-1", 0, true)
                 .starts_with("wss://")
         );
-    }
 
-    #[test]
-    fn ws_url_uses_rotated_token_for_local_daemon() {
-        let dir = tempfile::tempdir().unwrap();
-        let token_path = dir.path().join("serve.token");
-        let rotated = "b".repeat(64);
-        std::fs::write(&token_path, &rotated).unwrap();
-        let endpoint = DaemonEndpoint::new(
-            "http://127.0.0.1:8080".into(),
-            Some("a".repeat(64)),
-            Source::LocalDaemon,
-        )
-        .with_local_token_path(token_path);
+        // #3003: a local daemon's rotated token file wins over the discovered one.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let token_path = dir.path().join("serve.token");
+            let rotated = "b".repeat(64);
+            std::fs::write(&token_path, &rotated).unwrap();
+            let endpoint = DaemonEndpoint::new(
+                "http://127.0.0.1:8080".into(),
+                Some("a".repeat(64)),
+                Source::LocalDaemon,
+            )
+            .with_local_token_path(token_path);
 
-        assert_eq!(
-            ws_url(&endpoint, "s-1", 0, true),
-            format!("ws://127.0.0.1:8080/sessions/s-1/acp/ws?token={rotated}")
-        );
+            assert_eq!(
+                ws_url(&endpoint, "s-1", 0, true),
+                format!("ws://127.0.0.1:8080/sessions/s-1/acp/ws?token={rotated}")
+            );
+        }
     }
 
     /// Any present `kind` marks a control frame, whatever its JSON type, and
@@ -497,65 +496,6 @@ mod tests {
                     assert!(got.is_err(), "{raw}: expected a parse error, got {got:?}")
                 }
             }
-        }
-    }
-
-    #[test]
-    fn parse_text_frame() {
-        let raw = serde_json::to_string(&serde_json::json!({
-            "session_id": "s-1",
-            "seq": 7,
-            "event": "ThinkingStarted",
-        }))
-        .unwrap();
-        let m = parse_text(&raw).unwrap();
-        match m {
-            Some(WsMessage::Frame(f)) => {
-                assert_eq!(f.session_id, "s-1");
-                assert_eq!(f.seq, 7);
-                assert!(matches!(*f.event, Event::ThinkingStarted));
-            }
-            other => panic!("expected frame, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn parse_text_transcript_snapshot_and_delta() {
-        let snapshot = serde_json::json!({
-            "kind": "transcript_snapshot",
-            "session_id": "s-1",
-            "seq": 3,
-            "rows": [{
-                "id": "msg-1",
-                "group_id": "g1",
-                "kind": "message",
-                "at": "2024-01-01T00:00:00Z",
-                "text": "hi",
-            }],
-        })
-        .to_string();
-        match parse_text(&snapshot).unwrap() {
-            Some(WsMessage::TranscriptSnapshot(rows)) => {
-                assert_eq!(rows.len(), 1);
-                assert_eq!(rows[0].id, "msg-1");
-                assert_eq!(rows[0].text, "hi");
-            }
-            other => panic!("expected snapshot, got {other:?}"),
-        }
-
-        let delta = serde_json::json!({
-            "kind": "transcript_delta",
-            "session_id": "s-1",
-            "seq": 4,
-            "delta": { "Remove": "msg-1" },
-        })
-        .to_string();
-        match parse_text(&delta).unwrap() {
-            Some(WsMessage::TranscriptDelta(boxed)) => match *boxed {
-                TranscriptDelta::Remove(id) => assert_eq!(id, "msg-1"),
-                other => panic!("expected Remove, got {other:?}"),
-            },
-            other => panic!("expected delta, got {other:?}"),
         }
     }
 

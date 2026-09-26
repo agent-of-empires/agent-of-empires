@@ -918,30 +918,29 @@ mod tests {
     }
 
     #[test]
-    fn resolve_plugin_icon_path_serves_a_file_inside_the_install_dir() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("icon.png"), b"fake png bytes").unwrap();
-        let resolved = resolve_plugin_icon_path(dir.path(), "icon.png").expect("resolves");
+    fn resolve_plugin_icon_path_confines_to_the_install_dir() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("plugin");
+        std::fs::create_dir(&dir).unwrap();
+        for file in ["plugin/icon.png", "plugin/icon.svg", "secret.png"] {
+            std::fs::write(root.path().join(file), b"x").unwrap();
+        }
+        std::os::unix::fs::symlink(root.path().join("secret.png"), dir.join("link.png")).unwrap();
         assert_eq!(
-            resolved,
-            dir.path().canonicalize().unwrap().join("icon.png")
+            resolve_plugin_icon_path(&dir, "icon.png"),
+            Some(dir.canonicalize().unwrap().join("icon.png"))
         );
-    }
-
-    #[test]
-    fn resolve_plugin_icon_path_rejects_traversal_and_absolute_paths() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("icon.png"), b"x").unwrap();
-        // screenshot_path_ok's shape check rejects "../secret.png" before any
-        // filesystem access, so no sibling file is needed to prove containment.
+        // `icon.svg` exists inside but fails the shape check; `link.png` passes
+        // it and escapes through a symlink, so each guard is pinned alone.
         for bad in [
             "../secret.png",
             "/etc/passwd.png",
             "icon.svg",
+            "link.png",
             "missing.png",
         ] {
             assert!(
-                resolve_plugin_icon_path(dir.path(), bad).is_none(),
+                resolve_plugin_icon_path(&dir, bad).is_none(),
                 "{bad:?} should not resolve"
             );
         }

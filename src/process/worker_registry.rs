@@ -573,18 +573,11 @@ mod tests {
             assert_eq!(loaded.runner_version, RUNNER_VERSION);
             assert_eq!(loaded.agent_name, "claude-agent-acp");
             assert_eq!(loaded.agent_key, "claude");
-        });
-    }
+            assert_eq!(loaded.source_profile.as_deref(), Some("personal"));
+            assert_eq!(loaded.build_version, crate::build_info::BUILD_VERSION);
+            assert!(is_build_current(&loaded));
 
-    #[test]
-    #[serial]
-    fn build_version_stamped_and_current() {
-        with_temp_home(|| {
-            let rec = new_record("sess-bv", 1, "/tmp/sess-bv.sock");
-            assert_eq!(rec.build_version, crate::build_info::BUILD_VERSION);
-            assert!(is_build_current(&rec));
-
-            let mut stale = rec.clone();
+            let mut stale = loaded;
             stale.build_version = String::new();
             assert!(
                 !is_build_current(&stale),
@@ -644,18 +637,6 @@ mod tests {
 
     #[test]
     #[serial]
-    fn source_profile_roundtrips() {
-        with_temp_home(|| {
-            let mut rec = new_record("sess-sp", 1, "/tmp/sess-sp.sock");
-            rec.source_profile = Some("personal".into());
-            save(&rec).unwrap();
-            let loaded = load("sess-sp").unwrap().unwrap();
-            assert_eq!(loaded.source_profile.as_deref(), Some("personal"));
-        });
-    }
-
-    #[test]
-    #[serial]
     fn empty_stored_acp_session_id_is_rejected_without_data_loss() {
         with_temp_home(|| {
             let mut rec = new_record("sess-empty-acp", 1, "/tmp/sess-empty-acp.sock");
@@ -686,24 +667,6 @@ mod tests {
 
     #[test]
     #[serial]
-    fn delete_removes_json_and_socket() {
-        with_temp_home(|| {
-            let dir = workers_dir().unwrap();
-            let socket = dir.join("sess.sock");
-            touch_live_socket(&socket);
-            let rec = new_record("sess", 1, socket.clone());
-            save(&rec).unwrap();
-            let control = crate::process::worker::control_socket_sibling(&socket);
-            assert!(record_path("sess").unwrap().exists());
-            assert!(control.exists(), "fixture created the live socket");
-            delete("sess").unwrap();
-            assert!(!record_path("sess").unwrap().exists());
-            assert!(!control.exists(), "delete sweeps the control socket too");
-        });
-    }
-
-    #[test]
-    #[serial]
     fn delete_if_owned_preserves_replacement_record_and_socket() {
         with_temp_home(|| {
             let session_id = "replacement";
@@ -721,29 +684,6 @@ mod tests {
             assert!(delete_if_owned(session_id, 222).unwrap());
             assert!(load(session_id).unwrap().is_none());
             assert!(!replacement_control.exists());
-        });
-    }
-
-    #[test]
-    #[serial]
-    fn delete_sweeps_empty_log_but_keeps_nonempty() {
-        with_temp_home(|| {
-            let empty_log = log_path_for("empty").unwrap();
-            std::fs::create_dir_all(empty_log.parent().unwrap()).unwrap();
-            std::fs::write(&empty_log, b"").unwrap();
-            delete("empty").unwrap();
-            assert!(
-                !empty_log.exists(),
-                "0-byte worker log should be swept on delete"
-            );
-
-            let kept_log = log_path_for("kept").unwrap();
-            std::fs::write(&kept_log, b"agent stderr line\n").unwrap();
-            delete("kept").unwrap();
-            assert!(
-                kept_log.exists(),
-                "non-empty worker log should survive delete for post-mortem"
-            );
         });
     }
 
@@ -778,6 +718,98 @@ mod tests {
             assert!(record_path("term-dead").unwrap().exists());
             terminate("term-dead");
             assert!(!record_path("term-dead").unwrap().exists());
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn terminate_missing_entry_is_noop() {
+        with_temp_home(|| {
+            terminate("does-not-exist");
+            assert!(!record_path("does-not-exist").unwrap().exists());
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn pid_source_for_prefers_record_pid_when_load_ok_some() {
+        with_temp_home(|| {
+            let rec = new_record("sess-ok-some", 4242, "/tmp/unused");
+            save(&rec).unwrap();
+            assert_eq!(pid_source_for("sess-ok-some"), Some(4242));
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn pid_source_for_returns_none_when_load_ok_none() {
+        with_temp_home(|| {
+            assert_eq!(pid_source_for("sess-missing"), None);
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn pid_source_for_falls_back_to_control_socket_on_load_err() {
+        with_temp_home(|| {
+            let session_id = "sess-load-err";
+            let rec = new_record(session_id, 4242, socket_path_for(session_id).unwrap());
+            save(&rec).unwrap();
+            let rec_path = record_path(session_id).unwrap();
+            // A directory keeps path.exists() true while std::fs::read fails, even for root.
+            std::fs::remove_file(&rec_path).unwrap();
+            std::fs::create_dir(&rec_path).unwrap();
+            assert!(
+                load(session_id).is_err(),
+                "fixture must force load() to return Err"
+            );
+
+            let raw_socket = socket_path_for(session_id).unwrap();
+            let control_socket = crate::process::worker::control_socket_sibling(&raw_socket);
+            let _listener = std::os::unix::net::UnixListener::bind(&control_socket).unwrap();
+            assert_eq!(pid_source_for(session_id), Some(std::process::id()));
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn delete_removes_json_and_socket() {
+        with_temp_home(|| {
+            let dir = workers_dir().unwrap();
+            let socket = dir.join("sess.sock");
+            touch_live_socket(&socket);
+            let rec = new_record("sess", 1, socket.clone());
+            save(&rec).unwrap();
+            let control = crate::process::worker::control_socket_sibling(&socket);
+            assert!(record_path("sess").unwrap().exists());
+            assert!(control.exists(), "fixture created the live socket");
+            delete("sess").unwrap();
+            assert!(!record_path("sess").unwrap().exists());
+            assert!(!control.exists(), "delete sweeps the control socket too");
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn delete_sweeps_empty_log_but_keeps_nonempty() {
+        with_temp_home(|| {
+            let empty_log = log_path_for("empty").unwrap();
+            std::fs::create_dir_all(empty_log.parent().unwrap()).unwrap();
+            std::fs::write(&empty_log, b"").unwrap();
+            delete("empty").unwrap();
+            assert!(
+                !empty_log.exists(),
+                "0-byte worker log should be swept on delete"
+            );
+
+            let kept_log = log_path_for("kept").unwrap();
+            std::fs::write(&kept_log, b"agent stderr line\n").unwrap();
+            delete("kept").unwrap();
+            assert!(
+                kept_log.exists(),
+                "non-empty worker log should survive delete for post-mortem"
+            );
         });
     }
 
@@ -835,15 +867,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
-    fn terminate_missing_entry_is_noop() {
-        with_temp_home(|| {
-            terminate("does-not-exist");
-            assert!(!record_path("does-not-exist").unwrap().exists());
-        });
-    }
-
-    #[test]
     fn worker_state_ladder() {
         let mut rec = new_record("s", 1, "/tmp/s.sock");
         assert_eq!(worker_state_label(&rec, false), "dead");
@@ -863,48 +886,6 @@ mod tests {
         assert!(socket_path_for("foo/bar").is_err());
         assert!(log_path_for("").is_err());
         assert!(restart_marker_path(".hidden").is_err());
-    }
-
-    #[test]
-    #[serial]
-    fn pid_source_for_prefers_record_pid_when_load_ok_some() {
-        with_temp_home(|| {
-            let rec = new_record("sess-ok-some", 4242, "/tmp/unused");
-            save(&rec).unwrap();
-            assert_eq!(pid_source_for("sess-ok-some"), Some(4242));
-        });
-    }
-
-    #[test]
-    #[serial]
-    fn pid_source_for_returns_none_when_load_ok_none() {
-        with_temp_home(|| {
-            assert_eq!(pid_source_for("sess-missing"), None);
-        });
-    }
-
-    #[cfg(unix)]
-    #[test]
-    #[serial]
-    fn pid_source_for_falls_back_to_control_socket_on_load_err() {
-        with_temp_home(|| {
-            let session_id = "sess-load-err";
-            let rec = new_record(session_id, 4242, socket_path_for(session_id).unwrap());
-            save(&rec).unwrap();
-            let rec_path = record_path(session_id).unwrap();
-            // A directory keeps path.exists() true while std::fs::read fails, even for root.
-            std::fs::remove_file(&rec_path).unwrap();
-            std::fs::create_dir(&rec_path).unwrap();
-            assert!(
-                load(session_id).is_err(),
-                "fixture must force load() to return Err"
-            );
-
-            let raw_socket = socket_path_for(session_id).unwrap();
-            let control_socket = crate::process::worker::control_socket_sibling(&raw_socket);
-            let _listener = std::os::unix::net::UnixListener::bind(&control_socket).unwrap();
-            assert_eq!(pid_source_for(session_id), Some(std::process::id()));
-        });
     }
 
     #[test]

@@ -58,7 +58,7 @@ function mount(schema: SettingsFieldDescriptor[], values: Record<string, unknown
 }
 
 describe("SchemaSection", () => {
-  it("renders this section's web-writable fields and emits (section, field, value)", () => {
+  it("renders this section's web-writable fields, folds advanced ones, and emits (section, field, value)", () => {
     const { onSaveField, container } = mount(SCHEMA, { enabled_by_default: false, default_terminal_mode: "host" });
     expect(screen.queryByText("Node path")).toBeNull();
     expect(screen.queryByText("Worktrees enabled")).toBeNull();
@@ -66,10 +66,6 @@ describe("SchemaSection", () => {
     expect(onSaveField).toHaveBeenCalledWith("sandbox", "enabled_by_default", true);
     fireEvent.change(container.querySelector("select")!, { target: { value: "container" } });
     expect(onSaveField).toHaveBeenCalledWith("sandbox", "default_terminal_mode", "container");
-  });
-
-  it("folds advanced fields under Advanced", () => {
-    mount(SCHEMA);
     expect(screen.queryByText("Extra volumes")).toBeNull();
     fireEvent.click(screen.getByText("Advanced"));
     expect(screen.getByText("Extra volumes")).toBeTruthy();
@@ -108,19 +104,6 @@ describe("SchemaSection", () => {
     await waitFor(() =>
       expect(onAfterSave).toHaveBeenCalledWith(expect.objectContaining({ field: "show_tool_durations" }), true),
     );
-  });
-
-  it("flags global-only fields in their description", () => {
-    mount([
-      descriptor({
-        section: "web",
-        field: "n",
-        label: "Notify",
-        widget: { kind: "toggle" },
-        profile_overridable: false,
-      }),
-    ]);
-    expect(screen.getByText(/Applies to all profiles/)).toBeTruthy();
   });
 
   it("validates env_list entries before saving", () => {

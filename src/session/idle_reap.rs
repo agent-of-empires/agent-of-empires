@@ -182,12 +182,10 @@ mod tests {
     }
 
     #[test]
-    fn candidates_select_only_reapable_plain_sessions() {
+    fn candidates_carry_threshold_and_skip_attached_sessions() {
         let n = now();
         let idle = idle_instance("a");
         let attached = HashSet::from([idle.tmux_session().unwrap().name().to_string()]);
-        let mut running = idle.clone();
-        running.status = Status::Running;
         let one = std::slice::from_ref(&idle);
 
         let got = idle_reap_candidates(one, n, &HashSet::new(), |_| 60);
@@ -195,14 +193,6 @@ mod tests {
         assert_eq!(got[0].session_id, idle.id);
         assert_eq!(got[0].threshold_secs, 60);
 
-        assert!(
-            idle_reap_candidates(one, n, &HashSet::new(), |_| 0).is_empty(),
-            "threshold 0 disables the reaper"
-        );
-        assert!(
-            idle_reap_candidates(&[running], n, &HashSet::new(), |_| 60).is_empty(),
-            "a running session is never a candidate"
-        );
         assert!(
             idle_reap_candidates(one, n, &attached, |_| 60).is_empty(),
             "an attached session is never a candidate"

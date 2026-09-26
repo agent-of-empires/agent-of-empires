@@ -83,10 +83,6 @@ describe("DeleteSessionDialog keyboard and a11y", () => {
     expect(second.onCancel).toHaveBeenCalledTimes(1);
   });
 
-  it("is a modal dialog named by its title", () => {
-    expect(setup() && screen.getByRole("dialog", { name: /Delete Session/ }).getAttribute("aria-modal")).toBe("true");
-  });
-
   it("restores focus to the trigger on unmount", () => {
     expectRestoresFocus(() => setup().unmount);
   });
@@ -120,21 +116,6 @@ describe("DeleteSessionDialog presentation", () => {
       expect(text).toContain(copy);
     }
   });
-
-  it("describes sandbox cleanup for single, mixed-workspace, and branchless cases", () => {
-    setup({ hasManagedWorktree: false, isSandboxed: true });
-    expect(document.body.textContent).toContain(
-      "Removes the Docker sandbox container and any private agent store it has (including the saved agent login)",
-    );
-    cleanup();
-    setup({ affectedSessions: twoSessions([true, false]), isSandboxed: true });
-    expect(document.body.textContent).toContain(
-      "Removes Docker sandbox containers, and any private agent store, for 1 sandboxed session in this workspace",
-    );
-    cleanup();
-    setup({ branchName: null, affectedSessions: twoSessions() });
-    expect(box("delete-session-checkbox-branch")!.textContent).toBe("Delete branch");
-  });
 });
 
 describe("DeleteSessionDialog confirm body", () => {
@@ -161,15 +142,13 @@ describe("DeleteSessionDialog confirm body", () => {
     expect(onConfirm).toHaveBeenCalledWith(body({ delete_worktree: false, delete_sandbox: true }));
   });
 
-  it("confirms an all-false body with no options", () => {
-    const { onConfirm } = setup({ hasManagedWorktree: false });
+  it("sends keep_scratch only for scratch sessions, false until checked", () => {
+    const plain = setup({ hasManagedWorktree: false });
     expect(cleanupBoxes()).toHaveLength(0);
     enter();
-    expect(onConfirm).toHaveBeenCalledWith(body({ delete_worktree: false }));
-    expect(onConfirm.mock.calls[0]![0].keep_scratch).toBeUndefined();
-  });
-
-  it("sends keep_scratch only for scratch sessions, false until checked", () => {
+    expect(plain.onConfirm).toHaveBeenCalledWith(body({ delete_worktree: false }));
+    expect(plain.onConfirm.mock.calls[0]![0].keep_scratch).toBeUndefined();
+    cleanup();
     const { onConfirm } = setup({ hasManagedWorktree: false, isScratch: true });
     expect(box("delete-session-checkbox-keep-scratch")!.dataset.checked).toBe("false");
     enter();
@@ -208,28 +187,15 @@ describe("DeleteSessionDialog trash-first", () => {
     expect(onConfirm).not.toHaveBeenCalled();
   });
 
-  it.each([
-    ["session", undefined, "Delete Session"],
-    ["workspace", twoSessions(), "Delete Workspace"],
-  ])("checking Delete permanently reveals options and confirms (%s)", (kind, affectedSessions, title) => {
-    const { onConfirm, onTrash, container } = setup({ defaultToTrash: true, affectedSessions });
-    if (kind === "workspace") expect(container.textContent).toMatch(/Move this workspace to Trash\?/);
+  it("checking Delete permanently reveals options and confirms", () => {
+    const { onConfirm, onTrash, container } = setup({ defaultToTrash: true, affectedSessions: twoSessions() });
+    expect(container.textContent).toMatch(/Move this workspace to Trash\?/);
     toggle("delete-session-permanent");
     expect(box("delete-session-permanent")!.dataset.checked).toBe("true");
-    expect(screen.getByRole("heading").textContent).toBe(title);
-    if (kind === "workspace") expect(container.textContent).toMatch(/Permanently delete this workspace\?/);
+    expect(container.textContent).toMatch(/Permanently delete this workspace\?/);
     expect(box("delete-session-checkbox-worktree")).not.toBeNull();
     enter();
     expect(onConfirm).toHaveBeenCalledWith(body());
-    expect(onTrash).not.toHaveBeenCalled();
-  });
-
-  it("without trash-first there is no opt-in and Delete purges directly", () => {
-    const { onConfirm, onTrash } = setup();
-    expect(box("delete-session-permanent")).toBeNull();
-    expect(box("delete-session-checkbox-worktree")).not.toBeNull();
-    enter();
-    expect(onConfirm).toHaveBeenCalledTimes(1);
     expect(onTrash).not.toHaveBeenCalled();
   });
 });

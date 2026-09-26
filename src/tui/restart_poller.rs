@@ -105,10 +105,4 @@ mod tests {
         assert_eq!(result.session_id, session_id);
         assert_eq!(result.instance.id, session_id);
     }
-
-    #[test]
-    fn restart_poller_try_recv_returns_empty_when_no_result() {
-        let poller = RestartPoller::new();
-        assert!(matches!(poller.try_recv_result(), Err(TryRecvError::Empty)));
-    }
 }

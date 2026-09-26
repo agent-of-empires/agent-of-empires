@@ -204,10 +204,6 @@ libc = "0.2"
 # dashboard bundle, which is what invokes npm; released binaries are built
 # `--features web`, so every distributed binary ships the dashboard.
 default = ["default-plugins"]
-# Re-exports private tmux env helpers via `crate::tmux::test_support` so that
-# integration tests in `tests/` can poke them. Not enabled by default — only
-# used by `cargo test`.
-test-support = []
 # Compile in the bundled first-party plugins. Build the bare core (acceptance
 # criterion 1 of #268) by opting out with `--no-default-features`.
 default-plugins = []
@@ -246,13 +242,6 @@ cargo-husky = { version = "1", default-features = false, features = ["precommit-
 # Test-only tower dep for `ServiceExt::oneshot`, so the DNS-rebinding gate
 # (#2735) can be driven through the real router without binding a socket.
 tower = { version = "0.5", features = ["util"] }
-# Self-dev-dependency: enables the `test-support` feature when building
-# integration tests so they can reach `crate::tmux::test_support`. This is
-# the standard Cargo pattern for opt-in test-only re-exports; the lib build
-# (and release binaries) never see the feature. `default-features = false`
-# matters: without it this entry re-enables the default features under
-# `cargo test --no-default-features`, making that CI job meaningless.
-agent-of-empires = { path = ".", default-features = false, features = ["test-support"] }
 
 [profile.dev]
 # Full DWARF is cargo's `dev` default and it dominates `target/`: this table and

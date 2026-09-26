@@ -78,10 +78,22 @@ test("Cmd/Ctrl+B toggles the workspace sidebar", async ({ page }) => {
   await expect(sessionRow).toBeVisible();
 });
 
-test("Shift+D toggles the diff pane on a session view", async ({ page }) => {
+test("Cmd/Ctrl+Alt+B toggles the right panel and Shift+D the diff pane on a session view", async ({ page }) => {
   await mockTerminalApis(page);
   await page.setViewportSize({ width: 1280, height: 720 });
   await page.goto(`/session/${SESSION}`);
+
+  const handle = page.locator('[data-testid="content-split-resize-handle"]');
+  await expect(handle).toBeVisible();
+  await expect.poll(() => rightDockState(page)).toEqual({ tabs: ["diff", "terminal:0"], collapsed: false });
+
+  await page.keyboard.press("ControlOrMeta+Alt+b");
+  await expect(handle).toBeHidden();
+  await expect.poll(() => rightDockState(page)).toEqual({ tabs: ["diff", "terminal:0"], collapsed: true });
+
+  await page.keyboard.press("ControlOrMeta+Alt+b");
+  await expect(handle).toBeVisible();
+  await expect.poll(() => rightDockState(page)).toEqual({ tabs: ["diff", "terminal:0"], collapsed: false });
 
   // Shift+D toggles the diff pane specifically (not the whole dock); the
   // activity-bar toggle's pressed state reflects whether diff is open.
@@ -97,22 +109,4 @@ test("Shift+D toggles the diff pane on a session view", async ({ page }) => {
   await blurToBody(page);
   await page.keyboard.press("Shift+D");
   await expect(diffToggle).toHaveAttribute("aria-pressed", "true");
-});
-
-test("Cmd/Ctrl+Alt+B toggles the right panel on a session view", async ({ page }) => {
-  await mockTerminalApis(page);
-  await page.setViewportSize({ width: 1280, height: 720 });
-  await page.goto("/session/pinch-test");
-
-  const handle = page.locator('[data-testid="content-split-resize-handle"]');
-  await expect(handle).toBeVisible();
-  await expect.poll(() => rightDockState(page)).toEqual({ tabs: ["diff", "terminal:0"], collapsed: false });
-
-  await page.keyboard.press("ControlOrMeta+Alt+b");
-  await expect(handle).toBeHidden();
-  await expect.poll(() => rightDockState(page)).toEqual({ tabs: ["diff", "terminal:0"], collapsed: true });
-
-  await page.keyboard.press("ControlOrMeta+Alt+b");
-  await expect(handle).toBeVisible();
-  await expect.poll(() => rightDockState(page)).toEqual({ tabs: ["diff", "terminal:0"], collapsed: false });
 });

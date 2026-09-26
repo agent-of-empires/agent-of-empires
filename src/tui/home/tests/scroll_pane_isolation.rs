@@ -132,99 +132,133 @@ fn wheel_over_alt_screen_without_mouse_forwards_page_keys() {
     assert_eq!(env.view.preview_scroll_offset, 0);
 }
 
-/// Passive preview over a full-screen agent must also forward the wheel: the alternate
-/// screen has no scrollback, so the capture-window scroll is inert and hovering the preview
-/// to scroll did nothing. Forwarding pins the preview to the live edge.
+/// The wheel is forwarded (pinning the preview to the live edge) over any full-screen
+/// mouse-tracking pane, passive or live, SGR or legacy X10. A normal-screen pane keeps the
+/// capture-window scroll, since its scrollback is useful, and scrolling never exits live mode.
 #[test]
 #[serial]
-fn wheel_over_alt_screen_passive_preview_forwards() {
-    let mut env = passive_env_with_cursor(alt_screen_cursor(true, true, true));
-    assert!(
-        env.view.live_send.is_none(),
-        "this exercises passive preview, not live-send"
-    );
-
-    let up = env.view.handle_scroll_up(50, 10);
-    assert!(
-        up,
-        "wheel over a full-screen pane in passive preview is forwarded"
-    );
-    assert_eq!(
-        env.view.preview_scroll_offset, 0,
-        "passive forwarding pins the preview to the live edge"
-    );
-
-    env.view.preview_scroll_offset = 10;
-    let down = env.view.handle_scroll_down(50, 10);
-    assert!(down);
-    assert_eq!(env.view.preview_scroll_offset, 0);
+fn wheel_over_preview_forwards_only_for_alternate_screen() {
+    // (label, passive preview, cursor, forwards)
+    let cases = [
+        (
+            "passive full-screen SGR",
+            true,
+            alt_screen_cursor(true, true, true),
+            true,
+        ),
+        (
+            "live full-screen legacy mouse",
+            false,
+            alt_screen_cursor(true, true, false),
+            true,
+        ),
+        (
+            "live normal screen",
+            false,
+            alt_screen_cursor(false, true, true),
+            false,
+        ),
+    ];
+    for (label, passive, cursor, forwards) in cases {
+        let mut env = if passive {
+            passive_env_with_cursor(cursor)
+        } else {
+            live_env_with_cursor(cursor)
+        };
+        assert_eq!(env.view.live_send.is_none(), passive, "{label}");
+        assert!(env.view.handle_scroll_up(50, 10), "{label}");
+        if forwards {
+            assert_eq!(env.view.preview_scroll_offset, 0, "{label}: pinned");
+        } else {
+            assert!(
+                env.view.preview_scroll_offset > 10,
+                "{label}: capture scroll"
+            );
+            assert!(env.view.live_send.is_some(), "{label}: still live");
+        }
+    }
 }
 
-/// In live-send over a mouse-tracking agent a plain left press/release is forwarded and
-/// consumed, and the held button is tracked so its release can't be stranded.
+/// Over a mouse-tracking agent, live or passive, a press is forwarded and its button tracked
+/// so the drag and release keep forwarding (live: even outside the preview rect) and the
+/// release can't be stranded. Forwarding never starts an aoe text selection.
 #[test]
 #[serial]
-fn forward_mouse_to_preview_left_click_forwards() {
+fn forward_mouse_to_preview_tracks_press_through_release() {
     use crossterm::event::{KeyModifiers, MouseButton, MouseEventKind};
-    let mut env = live_env_with_cursor(alt_screen_cursor(true, true, true));
-    assert!(env.view.forward_mouse_to_preview(
-        MouseEventKind::Down(MouseButton::Left),
-        KeyModifiers::NONE,
-        50,
-        10
-    ));
-    assert_eq!(env.view.mouse_forward_btn, Some(0));
-    assert!(env.view.forward_mouse_to_preview(
-        MouseEventKind::Up(MouseButton::Left),
-        KeyModifiers::NONE,
-        50,
-        10
-    ));
-    assert_eq!(env.view.mouse_forward_btn, None);
-    // Forwarding never starts an aoe text selection.
-    assert!(env.view.drag_state.is_none());
-    assert!(env.view.preview_selection.is_none());
+    // (label, passive preview, drag/release point)
+    for (label, passive, (x, y)) in [("live", false, (1, 1)), ("passive", true, (55, 12))] {
+        let cursor = alt_screen_cursor(true, true, true);
+        let mut env = if passive {
+            passive_env_with_cursor(cursor)
+        } else {
+            live_env_with_cursor(cursor)
+        };
+        let steps = [
+            (MouseEventKind::Down(MouseButton::Left), (50, 10), Some(0)),
+            (MouseEventKind::Drag(MouseButton::Left), (x, y), Some(0)),
+            (MouseEventKind::Up(MouseButton::Left), (x, y), None),
+        ];
+        for (kind, (col, row), held) in steps {
+            assert!(
+                env.view
+                    .forward_mouse_to_preview(kind, KeyModifiers::NONE, col, row),
+                "{label}: {kind:?}"
+            );
+            assert_eq!(env.view.mouse_forward_btn, held, "{label}: {kind:?}");
+        }
+        assert!(env.view.drag_state.is_none(), "{label}");
+        assert!(env.view.preview_selection.is_none(), "{label}");
+    }
 }
 
-/// Passive preview over a mouse-tracking agent also forwards press/drag/release, so
-/// hovering and dragging drives its native selection, like the live-send and passive wheel
-/// paths. The one-shot send carries it with no live worker.
+/// Events fall through to aoe when there is no forwardable press: Shift+press (so aoe's own
+/// drag-to-copy runs), any press to a non-mouse agent, and a drag or release with no
+/// forwarded press in flight (forwarding must not start mid-gesture).
 #[test]
 #[serial]
-fn forward_mouse_to_preview_passive_preview_forwards() {
+fn forward_mouse_to_preview_falls_through_without_a_forwardable_press() {
     use crossterm::event::{KeyModifiers, MouseButton, MouseEventKind};
-    let mut env = passive_env_with_cursor(alt_screen_cursor(true, true, true));
-    assert!(
-        env.view.live_send.is_none(),
-        "this exercises passive preview, not live-send"
-    );
-    assert!(env.view.forward_mouse_to_preview(
-        MouseEventKind::Down(MouseButton::Left),
-        KeyModifiers::NONE,
-        50,
-        10
-    ));
-    assert_eq!(env.view.mouse_forward_btn, Some(0));
-    assert!(env.view.forward_mouse_to_preview(
-        MouseEventKind::Drag(MouseButton::Left),
-        KeyModifiers::NONE,
-        55,
-        12
-    ));
-    assert!(env.view.forward_mouse_to_preview(
-        MouseEventKind::Up(MouseButton::Left),
-        KeyModifiers::NONE,
-        55,
-        12
-    ));
-    assert_eq!(env.view.mouse_forward_btn, None);
-    // Forwarding never starts an aoe text selection, even passively.
-    assert!(env.view.drag_state.is_none());
-    assert!(env.view.preview_selection.is_none());
+    let cases = [
+        (
+            "shift press",
+            alt_screen_cursor(true, true, true),
+            MouseEventKind::Down(MouseButton::Left),
+            KeyModifiers::SHIFT,
+        ),
+        (
+            "non-mouse agent",
+            alt_screen_cursor(true, false, false),
+            MouseEventKind::Down(MouseButton::Left),
+            KeyModifiers::NONE,
+        ),
+        (
+            "orphan drag",
+            alt_screen_cursor(true, true, true),
+            MouseEventKind::Drag(MouseButton::Left),
+            KeyModifiers::NONE,
+        ),
+        (
+            "orphan release",
+            alt_screen_cursor(true, true, true),
+            MouseEventKind::Up(MouseButton::Left),
+            KeyModifiers::NONE,
+        ),
+    ];
+    for (label, cursor, kind, modifiers) in cases {
+        let mut env = live_env_with_cursor(cursor);
+        assert!(
+            !env.view.forward_mouse_to_preview(kind, modifiers, 50, 10),
+            "{label}"
+        );
+        assert_eq!(env.view.mouse_forward_btn, None, "{label}");
+    }
 }
 
 /// Bare motion is forwarded to an any-event-tracking (1003) agent so its hover UI works in
-/// live mode, deduped per pane cell and re-armed when the pointer leaves and returns.
+/// live mode, deduped per pane cell and re-armed when the pointer leaves and returns. A
+/// button-tracking (1000/1002) or non-mouse agent never gets bare motion: it didn't ask for
+/// it and would misparse the report.
 #[test]
 #[serial]
 fn forward_hover_to_preview_reports_once_per_cell() {
@@ -247,103 +281,16 @@ fn forward_hover_to_preview_reports_once_per_cell() {
     assert_eq!(env.view.hover_forward_cell, None);
     // ...so re-entering the same cell reports it to the agent again.
     assert!(env.view.forward_hover_to_preview(51, 10));
-}
 
-/// A button-tracking (1000/1002) agent never gets bare motion: it didn't
-/// ask for it and would misparse the report. Same for a non-mouse agent.
-#[test]
-#[serial]
-fn forward_hover_to_preview_requires_any_event_tracking() {
-    let mut env = live_env_with_cursor(alt_screen_cursor(true, true, true));
-    env.view.preview_text_view.pane = Rect::new(30, 0, 100, 40);
-    assert!(!env.view.forward_hover_to_preview(50, 10));
-    assert_eq!(env.view.hover_forward_cell, None);
-
-    let mut env = live_env_with_cursor(alt_screen_cursor(true, false, false));
-    env.view.preview_text_view.pane = Rect::new(30, 0, 100, 40);
-    assert!(!env.view.forward_hover_to_preview(50, 10));
-}
-
-/// Shift+press is NOT forwarded: it falls through so aoe's own preview
-/// text-selection (drag-to-copy) can run.
-#[test]
-#[serial]
-fn forward_mouse_to_preview_shift_falls_through() {
-    use crossterm::event::{KeyModifiers, MouseButton, MouseEventKind};
-    let mut env = live_env_with_cursor(alt_screen_cursor(true, true, true));
-    assert!(!env.view.forward_mouse_to_preview(
-        MouseEventKind::Down(MouseButton::Left),
-        KeyModifiers::SHIFT,
-        50,
-        10
-    ));
-    assert_eq!(env.view.mouse_forward_btn, None);
-}
-
-/// A non-mouse agent never forwards; the event falls through to aoe.
-#[test]
-#[serial]
-fn forward_mouse_to_preview_non_mouse_agent_falls_through() {
-    use crossterm::event::{KeyModifiers, MouseButton, MouseEventKind};
-    let mut env = live_env_with_cursor(alt_screen_cursor(true, false, false));
-    assert!(!env.view.forward_mouse_to_preview(
-        MouseEventKind::Down(MouseButton::Left),
-        KeyModifiers::NONE,
-        50,
-        10
-    ));
-}
-
-/// Once a press is forwarded, its drag and release keep forwarding after the pointer leaves
-/// the preview rect, so the agent always sees the release.
-#[test]
-#[serial]
-fn forward_mouse_to_preview_drag_and_release_track_button() {
-    use crossterm::event::{KeyModifiers, MouseButton, MouseEventKind};
-    let mut env = live_env_with_cursor(alt_screen_cursor(true, true, true));
-    assert!(env.view.forward_mouse_to_preview(
-        MouseEventKind::Down(MouseButton::Left),
-        KeyModifiers::NONE,
-        50,
-        10
-    ));
-    // (1, 1) is outside the preview rect, but the drag still forwards.
-    assert!(env.view.forward_mouse_to_preview(
-        MouseEventKind::Drag(MouseButton::Left),
-        KeyModifiers::NONE,
-        1,
-        1
-    ));
-    assert_eq!(env.view.mouse_forward_btn, Some(0));
-    assert!(env.view.forward_mouse_to_preview(
-        MouseEventKind::Up(MouseButton::Left),
-        KeyModifiers::NONE,
-        1,
-        1
-    ));
-    assert_eq!(env.view.mouse_forward_btn, None);
-}
-
-/// A drag or release with no forwarded press in flight is ignored (it must
-/// not start forwarding mid-gesture).
-#[test]
-#[serial]
-fn forward_mouse_to_preview_orphan_drag_ignored() {
-    use crossterm::event::{KeyModifiers, MouseButton, MouseEventKind};
-    let mut env = live_env_with_cursor(alt_screen_cursor(true, true, true));
-    assert!(!env.view.forward_mouse_to_preview(
-        MouseEventKind::Drag(MouseButton::Left),
-        KeyModifiers::NONE,
-        50,
-        10
-    ));
-    assert!(!env.view.forward_mouse_to_preview(
-        MouseEventKind::Up(MouseButton::Left),
-        KeyModifiers::NONE,
-        50,
-        10
-    ));
-    assert_eq!(env.view.mouse_forward_btn, None);
+    for cursor in [
+        alt_screen_cursor(true, true, true),
+        alt_screen_cursor(true, false, false),
+    ] {
+        let mut env = live_env_with_cursor(cursor);
+        env.view.preview_text_view.pane = Rect::new(30, 0, 100, 40);
+        assert!(!env.view.forward_hover_to_preview(50, 10));
+        assert_eq!(env.view.hover_forward_cell, None);
+    }
 }
 
 /// Stage an in-flight Shift-selection drag held at the preview's top or bottom edge, plus a
@@ -370,93 +317,47 @@ fn stage_edge_drag_no_scrollback(env: &mut TestEnv, at_top: bool) {
     assert!(env.view.handle_drag_move(40, edge_row));
 }
 
-/// Over a full-screen mouse-tracking agent the capture window has no scrollback, so an
-/// edge-held selection forwards the same input the wheel does (a mouse report, not PageUp,
-/// since the agent owns the mouse) to scroll its own transcript. The byte output per branch
-/// is asserted in `wheel_forward_key_*`; here the tick must forward and pin the offset.
+/// Over a full-screen agent the capture window has no scrollback, so an edge-held selection
+/// forwards the same input the wheel does (a mouse report to a mouse-tracking agent, page
+/// keys otherwise) to scroll its own transcript. The byte output per branch is asserted in
+/// `wheel_forward_key_*`. A normal-buffer pane that merely bottomed out its scrollback never
+/// gets scroll input injected into its shell. The inert capture-window offset never moves.
 #[test]
 #[serial]
-fn autoscroll_forwards_scroll_to_mouse_tracking_agent_at_top_edge() {
-    let mut env = live_env_with_cursor(alt_screen_cursor(true, true, true));
-    stage_edge_drag_no_scrollback(&mut env, true);
-    assert!(
-        env.view.tick_preview_autoscroll(),
-        "top-edge tick forwards a wheel notch to the agent"
-    );
-    // The inert capture-window offset never moved; the agent was scrolled.
-    assert_eq!(env.view.preview_scroll_offset, 0);
-}
-
-/// Same as above at the bottom edge: a wheel-down notch is forwarded.
-#[test]
-#[serial]
-fn autoscroll_forwards_scroll_to_mouse_tracking_agent_at_bottom_edge() {
-    let mut env = live_env_with_cursor(alt_screen_cursor(true, true, true));
-    stage_edge_drag_no_scrollback(&mut env, false);
-    assert!(
-        env.view.tick_preview_autoscroll(),
-        "bottom-edge tick forwards a wheel notch to the agent"
-    );
-    assert_eq!(env.view.preview_scroll_offset, 0);
-}
-
-/// A full-screen agent without mouse tracking gets `PageUp`/`PageDown` from the fallback
-/// instead, matching the wheel path's no-mouse branch.
-#[test]
-#[serial]
-fn autoscroll_forwards_page_keys_to_no_mouse_agent_at_top_edge() {
-    let mut env = live_env_with_cursor(alt_screen_cursor(true, false, false));
-    stage_edge_drag_no_scrollback(&mut env, true);
-    assert!(
-        env.view.tick_preview_autoscroll(),
-        "top-edge tick forwards a page key to the no-mouse agent"
-    );
-    assert_eq!(env.view.preview_scroll_offset, 0);
-}
-
-/// A normal-buffer pane that has merely bottomed out its scrollback must not get scroll
-/// input injected into its shell: the tick is a no-op there.
-#[test]
-#[serial]
-fn autoscroll_does_not_forward_to_normal_pane() {
-    let mut env = live_env_with_cursor(alt_screen_cursor(false, false, false));
-    stage_edge_drag_no_scrollback(&mut env, true);
-    assert!(
-        !env.view.tick_preview_autoscroll(),
-        "a non-alternate-screen pane never gets forwarded scroll input"
-    );
-    assert_eq!(env.view.preview_scroll_offset, 0);
-}
-
-/// A mouse-tracking app in the legacy (non-SGR) encoding is still forwarded, with
-/// X10-encoded bytes (see `wheel_mouse_bytes_legacy_encodes_x10`), pinning the preview to
-/// the live edge like the SGR case.
-#[test]
-#[serial]
-fn wheel_over_alt_screen_legacy_mouse_forwards() {
-    let mut env = live_env_with_cursor(alt_screen_cursor(true, true, false));
-
-    let up = env.view.handle_scroll_up(50, 10);
-    assert!(up, "wheel over a full-screen legacy-mouse pane is handled");
-    assert_eq!(
-        env.view.preview_scroll_offset, 0,
-        "legacy mouse is forwarded too (X10 encoding), not dead-scrolled"
-    );
-}
-
-/// A normal-screen agent keeps the capture scroll even with SGR mouse on: its scrollback is
-/// genuinely useful.
-#[test]
-#[serial]
-fn wheel_over_normal_screen_pane_uses_capture_scroll() {
-    let mut env = live_env_with_cursor(alt_screen_cursor(false, true, true));
-
-    let up = env.view.handle_scroll_up(50, 10);
-    assert!(up);
-    assert!(
-        env.view.preview_scroll_offset > 10,
-        "normal screen: capture-window scroll still drives the preview"
-    );
+fn autoscroll_forwards_edge_drag_only_to_alternate_screen_agents() {
+    // (label, cursor, held at top edge, forwards)
+    let cases = [
+        (
+            "mouse agent, top edge",
+            alt_screen_cursor(true, true, true),
+            true,
+            true,
+        ),
+        (
+            "mouse agent, bottom edge",
+            alt_screen_cursor(true, true, true),
+            false,
+            true,
+        ),
+        (
+            "no-mouse agent, top edge",
+            alt_screen_cursor(true, false, false),
+            true,
+            true,
+        ),
+        (
+            "normal-buffer pane",
+            alt_screen_cursor(false, false, false),
+            true,
+            false,
+        ),
+    ];
+    for (label, cursor, at_top, forwards) in cases {
+        let mut env = live_env_with_cursor(cursor);
+        stage_edge_drag_no_scrollback(&mut env, at_top);
+        assert_eq!(env.view.tick_preview_autoscroll(), forwards, "{label}");
+        assert_eq!(env.view.preview_scroll_offset, 0, "{label}");
+    }
 }
 
 /// Wheel-down over preview when offset is already at the bottom (0)
@@ -574,43 +475,6 @@ fn wheel_over_list_still_moves_list_cursor() {
     assert_eq!(env.view.cursor, 0, "wheel over list should retreat cursor");
 }
 
-/// Live-send is meant to feel like an attach, so the preview still scrolls to read agent
-/// history without exiting; the has_dialog() gate would otherwise swallow these events,
-/// since live_send.is_some() participates in it.
-#[test]
-#[serial]
-fn wheel_over_preview_in_live_mode_scrolls_preview() {
-    use crate::tui::home::live_send::LiveSendState;
-    let mut env = create_test_env_with_sessions(3);
-    setup_panes(&mut env);
-    env.view.cursor = 1;
-    env.view.update_selected();
-    env.view.preview_cache.dimensions = (80, 24);
-    env.view.preview_cache.captured_lines = 200;
-    env.view.preview_scroll_offset = 10;
-    // Install live state directly rather than standing up a tmux session: the scroll
-    // handler only cares that live_send is set.
-    env.view.live_send = Some(LiveSendState {
-        session_id: "fake".to_string(),
-        title: "fake".to_string(),
-        tmux_name: "fake".to_string(),
-        target: crate::tui::home::live_send::LiveSendTarget::Agent,
-        exit_chords: crate::tui::home::live_send::parse_chord_list(
-            crate::tui::home::live_send::DEFAULT_EXIT_CHORD,
-        ),
-        leader: None,
-    });
-
-    let up_handled = env.view.handle_scroll_up(50, 10);
-    assert!(up_handled, "preview scroll should work while in live mode");
-    assert!(
-        env.view.preview_scroll_offset > 10,
-        "preview should scroll back into history"
-    );
-    // And we should still be in live mode (scroll doesn't exit).
-    assert!(env.view.live_send.is_some());
-}
-
 /// List-pane wheel scroll stays suppressed in live mode: changing the selection would
 /// silently aim the next keystroke at a different pane than the preview shows.
 #[test]
@@ -696,82 +560,55 @@ fn live_leader_b_toggles_sidebar() {
     assert!(!env.view.sidebar_collapsed, "leader+b again shows it");
 }
 
-/// Leader + k opens the command palette over live mode.
+/// Leader follow-ups: `k` opens the palette over live mode, `q` exits, and an unbound or
+/// modified key cancels the menu without firing anything (the leader swallowed it). The fast
+/// exit chord (Ctrl+Q) stays a single press. None of them touch the persisted collapse.
 #[test]
 #[serial]
-fn live_leader_k_opens_palette() {
-    let mut env = live_env_with_leader();
-    env.view.handle_key(ctrl('b'), None);
-    env.view.handle_key(key(KeyCode::Char('k')), None);
-    assert!(!env.view.live_send_pending_leader);
-    assert!(
-        env.view.command_palette.is_some(),
-        "leader+k should open the command palette"
-    );
-    // Live mode is still active underneath the palette overlay.
-    assert!(env.view.live_send.is_some());
-}
-
-/// Leader + q exits live mode and disarms the leader menu. The sidebar collapse is
-/// persisted general state, so exiting leaves it as the user set it.
-#[test]
-#[serial]
-fn live_leader_q_exits() {
-    let mut env = live_env_with_leader();
-    env.view.sidebar_collapsed = true;
-    env.view.handle_key(ctrl('b'), None);
-    env.view.handle_key(key(KeyCode::Char('q')), None);
-    assert!(env.view.live_send.is_none(), "leader+q exits live mode");
-    assert!(
-        env.view.sidebar_collapsed,
-        "collapse is persisted, not reset on live exit"
-    );
-    assert!(!env.view.live_send_pending_leader);
-}
-
-/// An unbound key after the leader cancels the menu without exiting, toggling or opening
-/// anything, and does not fall through to the agent: the leader swallowed it.
-#[test]
-#[serial]
-fn live_leader_unknown_key_cancels_menu() {
-    let mut env = live_env_with_leader();
-    env.view.handle_key(ctrl('b'), None);
-    env.view.handle_key(key(KeyCode::Char('z')), None);
-    assert!(!env.view.live_send_pending_leader, "menu disarms");
-    assert!(env.view.live_send.is_some(), "still live");
-    assert!(!env.view.sidebar_collapsed);
-    assert!(env.view.command_palette.is_none());
-}
-
-/// The fast exit chord (Ctrl+Q) stays a single press, independent of
-/// the leader: it must not require arming the menu first.
-#[test]
-#[serial]
-fn live_ctrl_q_still_one_press_exit() {
-    let mut env = live_env_with_leader();
-    env.view.handle_key(ctrl('q'), None);
-    assert!(
-        env.view.live_send.is_none(),
-        "Ctrl+Q exits in a single press"
-    );
-    assert!(!env.view.live_send_pending_leader);
-}
-
-/// A modified key after the leader cancels the menu rather than firing a command: only the
-/// leader-again passthrough claims a modified form, so holding Ctrl can't trigger the
-/// palette by accident.
-#[test]
-#[serial]
-fn live_leader_then_modified_key_cancels() {
-    let mut env = live_env_with_leader();
-    env.view.handle_key(ctrl('b'), None);
-    env.view.handle_key(ctrl('k'), None);
-    assert!(!env.view.live_send_pending_leader, "menu disarms");
-    assert!(
-        env.view.command_palette.is_none(),
-        "leader + Ctrl+K must NOT open the palette"
-    );
-    assert!(env.view.live_send.is_some(), "still live");
+fn live_leader_follow_up_keys() {
+    // (label, keys, sidebar collapsed before, still live, palette open)
+    let cases = [
+        (
+            "leader+k",
+            vec![ctrl('b'), key(KeyCode::Char('k'))],
+            false,
+            true,
+            true,
+        ),
+        (
+            "leader+q",
+            vec![ctrl('b'), key(KeyCode::Char('q'))],
+            true,
+            false,
+            false,
+        ),
+        (
+            "leader+unbound",
+            vec![ctrl('b'), key(KeyCode::Char('z'))],
+            false,
+            true,
+            false,
+        ),
+        (
+            "leader+Ctrl+K",
+            vec![ctrl('b'), ctrl('k')],
+            false,
+            true,
+            false,
+        ),
+        ("Ctrl+Q alone", vec![ctrl('q')], false, false, false),
+    ];
+    for (label, keys, collapsed, live, palette) in cases {
+        let mut env = live_env_with_leader();
+        env.view.sidebar_collapsed = collapsed;
+        for k in keys {
+            env.view.handle_key(k, None);
+        }
+        assert!(!env.view.live_send_pending_leader, "{label}: menu disarms");
+        assert_eq!(env.view.live_send.is_some(), live, "{label}");
+        assert_eq!(env.view.command_palette.is_some(), palette, "{label}");
+        assert_eq!(env.view.sidebar_collapsed, collapsed, "{label}");
+    }
 }
 
 /// Committing a palette command while live exits live mode first, so the preview can never
@@ -910,44 +747,16 @@ fn sidebar_collapse_button_and_strip_toggle() {
         !env.view.sidebar_collapsed,
         "strip click re-expands the sidebar"
     );
-}
 
-/// A takeover view returns early in `render` before the home paths run, so the collapse and
-/// footer hit rects are cleared up front; otherwise a stale rect could swallow a click on
-/// the takeover surface, since the collapse handler runs ahead of `hit_diff`.
-#[test]
-#[serial]
-fn takeover_view_clears_sidebar_hit_rects() {
-    use ratatui::backend::TestBackend;
-    use ratatui::layout::Rect;
-    use ratatui::Terminal;
-
-    let mut env = create_test_env_with_sessions(3);
-    let theme = crate::tui::styles::load_theme("empire");
-    let render = |env: &mut TestEnv| {
-        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
-        terminal
-            .draw(|f| {
-                let area = f.area();
-                env.view.render(f, area, &theme, None, None, None);
-            })
-            .unwrap();
-    };
-
-    // Home view populates the collapse button + footer rects.
+    // A takeover view returns early in `render` before the home paths run, so the collapse
+    // and footer rects are cleared up front; a stale rect could otherwise swallow a click on
+    // the takeover surface, since the collapse handler runs ahead of `hit_diff`.
     render(&mut env);
-    assert!(env.view.collapse_button_area.width > 0);
     assert!(!env.view.footer_buttons.is_empty());
-
-    // Opening settings is a full-screen takeover; the next render must
-    // clear the stale rects so a click can't toggle the hidden sidebar.
     env.view.settings_view = Some(crate::tui::settings::SettingsView::new("test", None).unwrap());
     render(&mut env);
     assert_eq!(env.view.collapse_button_area, Rect::default());
     assert_eq!(env.view.expand_strip_area, Rect::default());
     assert!(env.view.footer_buttons.is_empty());
-    assert!(
-        !env.view.handle_sidebar_collapse_click(0, 0),
-        "no sidebar rect can be hit while a takeover view owns the screen"
-    );
+    assert!(!env.view.handle_sidebar_collapse_click(0, 0));
 }

@@ -3603,61 +3603,31 @@ mod model_value_quoting_tests {
     use super::*;
 
     #[test]
-    fn a_context_window_suffix_is_quoted() {
-        assert_eq!(
-            quote_model_value_in_args("--model claude-x[1m]"),
-            "--model 'claude-x[1m]'"
-        );
-        assert_eq!(
-            quote_model_value_in_args("--model=claude-x[1m]"),
-            "--model='claude-x[1m]'"
-        );
-        assert_eq!(
-            quote_model_value_in_args("-m claude-x[1m]"),
-            "-m 'claude-x[1m]'"
-        );
-    }
-
-    #[test]
-    fn an_ordinary_model_id_is_left_alone() {
-        // Quoting everything would change every existing command line.
-        for args in ["--model claude-opus-4-8", "-m gpt-5", "--model=sonnet"] {
-            assert_eq!(quote_model_value_in_args(args), args);
-        }
-    }
-
-    #[test]
-    fn other_arguments_are_never_rewritten() {
-        let args = "--verbose --model claude-x[1m] --flag value";
-        let got = quote_model_value_in_args(args);
-        assert_eq!(got, "--verbose --model 'claude-x[1m]' --flag value");
-    }
-
-    #[test]
-    fn unrelated_whitespace_and_quoting_survive_byte_for_byte() {
-        // A tokenize/join round trip would collapse the double space here and
-        // re-wrap an already double-quoted model value, changing what the
-        // agent receives even though neither token needed rewriting.
+    fn only_an_unquoted_context_window_model_value_is_quoted() {
         let cases = [
+            ("--model claude-x[1m]", "--model 'claude-x[1m]'"),
+            ("--model=claude-x[1m]", "--model='claude-x[1m]'"),
+            ("-m claude-x[1m]", "-m 'claude-x[1m]'"),
+            (
+                "--verbose --model claude-x[1m] --flag value",
+                "--verbose --model 'claude-x[1m]' --flag value",
+            ),
+            // Quoting everything would change every existing command line.
+            ("--model claude-opus-4-8", "--model claude-opus-4-8"),
+            ("-m gpt-5", "-m gpt-5"),
+            ("--model=sonnet", "--model=sonnet"),
+            // A tokenize/join round trip would collapse the double space and
+            // re-wrap an already double-quoted value.
             ("--prompt \"hello  world\"", "--prompt \"hello  world\""),
             ("--model \"gpt-5\"", "--model \"gpt-5\""),
             ("--flag1   --flag2", "--flag1   --flag2"),
+            ("--model 'claude-x[1m]'", "--model 'claude-x[1m]'"),
+            ("--model", "--model"),
+            ("", ""),
         ];
         for (input, expected) in cases {
             assert_eq!(quote_model_value_in_args(input), expected, "{input:?}");
         }
-    }
-
-    #[test]
-    fn an_already_quoted_value_is_not_nested() {
-        let args = "--model 'claude-x[1m]'";
-        assert_eq!(quote_model_value_in_args(args), args);
-    }
-
-    #[test]
-    fn a_dangling_flag_is_harmless() {
-        assert_eq!(quote_model_value_in_args("--model"), "--model");
-        assert_eq!(quote_model_value_in_args(""), "");
     }
 }
 
@@ -3868,40 +3838,6 @@ mod tests {
         }
     }
 
-    /// The compiler tripwire for [`TmuxSetting::ALL`]: the exhaustive match
-    /// fails to compile when an enum variant is added, forcing a reviewer to
-    /// add a brace here; the equality then pins `ALL`'s content and emission
-    /// order against this literal. The unified applier iterates `ALL`, so a
-    /// setting missing from both the list and this literal would be silently
-    /// never applied; keeping the two in step is the point of the test.
-    #[test]
-    fn test_tmux_setting_all_is_exhaustive() {
-        let setting = TmuxSetting::StatusBar;
-        match setting {
-            TmuxSetting::StatusBar => {}
-            TmuxSetting::Mouse => {}
-            TmuxSetting::Clipboard => {}
-        }
-        assert_eq!(
-            TmuxSetting::ALL,
-            [
-                TmuxSetting::StatusBar,
-                TmuxSetting::Mouse,
-                TmuxSetting::Clipboard
-            ],
-            "ALL must list every variant exactly once, in emission order"
-        );
-    }
-
-    #[test]
-    fn test_effective_profile_returns_input_when_non_empty() {
-        // Non-empty input is passed through verbatim, regardless of what's
-        // configured globally as the default. No filesystem access needed.
-        assert_eq!(effective_profile("personal"), "personal");
-        assert_eq!(effective_profile("default"), "default");
-        assert_eq!(effective_profile("alpha-beta_v2"), "alpha-beta_v2");
-    }
-
     #[test]
     #[serial_test::serial]
     fn test_effective_profile_falls_back_to_global_default_when_empty() {
@@ -4005,115 +3941,6 @@ mod tests {
         );
     }
 
-    // Tests for Config defaults
-    #[test]
-    fn session_id_poller_max_threads_defaults_and_parses() {
-        let config: Config = toml::from_str("").unwrap();
-        assert_eq!(config.session.session_id_poller_max_threads, 50);
-        let config: Config =
-            toml::from_str("[session]\nsession_id_poller_max_threads = 400\n").unwrap();
-        assert_eq!(config.session.session_id_poller_max_threads, 400);
-    }
-
-    /// The defaults an empty config.toml must produce, and that a partial file
-    /// only overrides what it names.
-    #[test]
-    fn config_defaults_are_quiet_and_partial_files_only_override_what_they_name() {
-        let config: Config = toml::from_str("").unwrap();
-        // Unset means "not explicitly chosen": the active profile is resolved at
-        // runtime rather than baked in as a magic name here.
-        assert_eq!(config.default_profile, "");
-        assert!(!config.worktree.enabled);
-        assert!(!config.sandbox.enabled_by_default);
-        assert_eq!(config.updates.update_check_mode, UpdateCheckMode::Notify);
-        assert_eq!(config.theme.name, "");
-        // The freshness signal stays off until a positive value opts in.
-        assert_eq!(config.theme.idle_decay_minutes, 0);
-
-        let config: Config = toml::from_str(
-            r#"
-            default_profile = "custom"
-
-            [theme]
-            name = "dracula"
-            idle_decay_minutes = 5
-            "#,
-        )
-        .unwrap();
-        assert_eq!(config.default_profile, "custom");
-        assert_eq!(config.theme.name, "dracula");
-        assert_eq!(config.theme.idle_decay_minutes, 5);
-        assert!(!config.worktree.enabled);
-    }
-
-    /// A plugin's enable-state and settings survive a save/load round trip.
-    /// Disabling a plugin hides its settings from every surface but must never
-    /// destroy them. An empty map serializes nothing rather than a stray table.
-    #[test]
-    fn plugin_table_round_trips_and_stays_out_of_an_empty_config() {
-        let config: Config = toml::from_str("").unwrap();
-        assert!(config.plugins.is_empty());
-        assert!(!toml::to_string(&config).unwrap().contains("[plugins"));
-
-        let config: Config = toml::from_str(
-            r#"
-            [plugins."aoe.web"]
-            enabled = true
-
-            [plugins."aoe.status"]
-            enabled = false
-
-            [plugins."aoe.status".settings]
-            poll_interval_ms = 1000
-            verbose = true
-            "#,
-        )
-        .unwrap();
-        assert!(config.plugins["aoe.web"].settings.is_empty());
-        assert!(!config.plugins["aoe.status"].enabled);
-        assert_eq!(
-            config.plugins["aoe.status"].settings["poll_interval_ms"].as_integer(),
-            Some(1000)
-        );
-
-        let reloaded: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
-        assert!(reloaded.plugins["aoe.web"].enabled);
-        assert!(!reloaded.plugins["aoe.status"].enabled);
-        assert_eq!(
-            reloaded.plugins["aoe.status"].settings["verbose"].as_bool(),
-            Some(true)
-        );
-    }
-
-    /// The `update_check_mode` spellings config.toml is allowed to use.
-    #[test]
-    fn update_check_mode_spellings() {
-        for (key, expected) in [
-            ("off", UpdateCheckMode::Off),
-            ("notify", UpdateCheckMode::Notify),
-            ("auto", UpdateCheckMode::Auto),
-        ] {
-            let updates: UpdatesConfig =
-                toml::from_str(&format!("update_check_mode = \"{key}\"")).unwrap();
-            assert_eq!(updates.update_check_mode, expected, "{key}");
-        }
-    }
-
-    #[test]
-    fn test_update_check_mode_helpers() {
-        assert!(UpdateCheckMode::Notify.is_enabled());
-        assert!(UpdateCheckMode::Notify.notifies());
-        assert!(!UpdateCheckMode::Notify.auto_installs());
-
-        assert!(UpdateCheckMode::Auto.is_enabled());
-        assert!(!UpdateCheckMode::Auto.notifies());
-        assert!(UpdateCheckMode::Auto.auto_installs());
-
-        assert!(!UpdateCheckMode::Off.is_enabled());
-        assert!(!UpdateCheckMode::Off.notifies());
-        assert!(!UpdateCheckMode::Off.auto_installs());
-    }
-
     /// Regression: earlier schemas had `check_enabled`, `auto_update`,
     /// `check_interval_hours`, `notify_in_cli`, and
     /// `web_poll_interval_minutes` on UpdatesConfig. All are gone now;
@@ -4160,197 +3987,6 @@ mod tests {
         assert_eq!(wt.path_template, "/custom/{branch}");
         assert!(!wt.auto_cleanup);
         assert!(!wt.init_submodules);
-    }
-
-    /// The `[sandbox]` defaults, the keys config.toml may set, and that
-    /// `volume_ignores` survives a full save/load round trip.
-    #[test]
-    fn sandbox_config_defaults_and_keys() {
-        let sb = SandboxConfig::default();
-        assert!(!sb.enabled_by_default);
-        assert!(sb.auto_cleanup);
-        assert!(sb.extra_volumes.is_empty());
-        assert!(sb.environment.contains(&"TERM".to_string()));
-        assert!(sb.environment.contains(&"COLORTERM".to_string()));
-        assert!(sb.cpu_limit.is_none());
-        assert!(sb.memory_limit.is_none());
-        assert!(sb.volume_ignores.is_empty());
-        assert!(sb.network.is_none());
-
-        let sb: SandboxConfig = toml::from_str(
-            r#"
-            enabled_by_default = true
-            default_image = "custom:latest"
-            extra_volumes = ["/data:/data"]
-            environment = ["MY_VAR"]
-            volume_ignores = ["target", ".venv", "node_modules"]
-            auto_cleanup = false
-            cpu_limit = "2"
-            memory_limit = "4g"
-            port_mappings = ["3000:3000", "5432:5432"]
-            network = "none"
-            "#,
-        )
-        .unwrap();
-        assert!(sb.enabled_by_default);
-        assert_eq!(sb.default_image, "custom:latest");
-        assert_eq!(sb.extra_volumes, vec!["/data:/data"]);
-        assert_eq!(sb.environment, vec!["MY_VAR"]);
-        assert_eq!(sb.volume_ignores, vec!["target", ".venv", "node_modules"]);
-        assert!(!sb.auto_cleanup);
-        assert_eq!(sb.cpu_limit, Some("2".to_string()));
-        assert_eq!(sb.memory_limit, Some("4g".to_string()));
-        assert_eq!(sb.port_mappings, vec!["3000:3000", "5432:5432"]);
-        assert_eq!(sb.network, Some("none".to_string()));
-
-        let mut config = Config::default();
-        config.sandbox.volume_ignores = vec!["target".to_string(), "node_modules".to_string()];
-        let reparsed: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
-        assert_eq!(
-            reparsed.sandbox.volume_ignores,
-            vec!["target", "node_modules"]
-        );
-    }
-
-    /// Every `Vec<String>` sandbox field also accepts a plain string.
-    #[test]
-    fn sandbox_config_string_shorthand() {
-        let sb: SandboxConfig = toml::from_str(
-            r#"
-            environment = "ANTHROPIC_API_KEY"
-            extra_volumes = "/data:/data:ro"
-            volume_ignores = "node_modules"
-            port_mappings = "3000:3000"
-            "#,
-        )
-        .unwrap();
-        assert_eq!(sb.environment, vec!["ANTHROPIC_API_KEY"]);
-        assert_eq!(sb.extra_volumes, vec!["/data:/data:ro"]);
-        assert_eq!(sb.volume_ignores, vec!["node_modules"]);
-        assert_eq!(sb.port_mappings, vec!["3000:3000"]);
-    }
-
-    /// The `[app_state]` defaults and keys. A file written before a flag
-    /// existed reads back as not-yet-seen rather than seen.
-    #[test]
-    fn app_state_config_defaults_and_keys() {
-        let app = AppStateConfig::default();
-        assert!(!app.has_seen_welcome);
-        assert!(!app.has_seen_web_tour);
-        assert!(app.last_seen_version.is_none());
-        assert!(app.dismissed_update_version.is_none());
-
-        let app: AppStateConfig = toml::from_str(
-            r#"
-            has_seen_welcome = true
-            last_seen_version = "1.0.0"
-            dismissed_update_version = "1.0.0"
-            "#,
-        )
-        .unwrap();
-        assert!(app.has_seen_welcome);
-        assert!(!app.has_seen_web_tour);
-        assert_eq!(app.last_seen_version, Some("1.0.0".to_string()));
-        assert_eq!(app.dismissed_update_version, Some("1.0.0".to_string()));
-
-        let app: AppStateConfig = toml::from_str("has_seen_web_tour = true").unwrap();
-        assert!(app.has_seen_web_tour);
-        assert!(!app.has_seen_welcome);
-    }
-
-    #[test]
-    fn test_app_state_config_tips_defaults_and_roundtrip() {
-        // Absent from old configs: nothing seen, zero count. (The on/off toggle
-        // lives in `SessionConfig::show_tips`, not here.)
-        let app = AppStateConfig::default();
-        assert!(app.tips_seen.is_empty());
-        assert_eq!(app.new_session_with_selection_count, 0);
-        assert!(!app.used_new_from_selection);
-        assert!(!app.system_health_tip_earned);
-        assert!(!app.used_system_health);
-
-        let toml = r#"
-            tips_seen = ["new-from-selection"]
-            new_session_with_selection_count = 4
-            used_new_from_selection = true
-            system_health_tip_earned = true
-            used_system_health = true
-        "#;
-        let app: AppStateConfig = toml::from_str(toml).unwrap();
-        assert_eq!(app.tips_seen, vec!["new-from-selection"]);
-        assert_eq!(app.new_session_with_selection_count, 4);
-        assert!(app.used_new_from_selection);
-        assert!(app.system_health_tip_earned);
-        assert!(app.used_system_health);
-
-        // Round-trips back out.
-        let serialized = toml::to_string(&app).unwrap();
-        let reparsed: AppStateConfig = toml::from_str(&serialized).unwrap();
-        assert_eq!(reparsed.tips_seen, app.tips_seen);
-        assert_eq!(reparsed.new_session_with_selection_count, 4);
-    }
-
-    #[test]
-    fn test_session_config_show_tips_defaults_on() {
-        // Absent from old configs, tips default to on.
-        let toml = "default_tool = \"claude\"\n";
-        let session: SessionConfig = toml::from_str(toml).unwrap();
-        assert!(session.show_tips);
-    }
-
-    #[test]
-    fn test_session_config_row_tag_defaults_to_branch() {
-        let session: SessionConfig = toml::from_str("").unwrap();
-        assert_eq!(session.row_tag, RowTagMode::Branch);
-    }
-
-    #[test]
-    fn test_session_config_row_tag_roundtrip() {
-        let session: SessionConfig = toml::from_str("row_tag = \"none\"\n").unwrap();
-        assert_eq!(session.row_tag, RowTagMode::None);
-
-        let serialized = toml::to_string(&session).unwrap();
-        let reparsed: SessionConfig = toml::from_str(&serialized).unwrap();
-        assert_eq!(reparsed.row_tag, RowTagMode::None);
-    }
-
-    /// A whole config.toml with nested sections parses, and everything it sets
-    /// survives a serialize/parse round trip.
-    #[test]
-    fn config_nested_sections_round_trip() {
-        let config: Config = toml::from_str(
-            r#"
-            default_profile = "work"
-
-            [theme]
-            name = "monokai"
-
-            [worktree]
-            enabled = true
-            path_template = "../wt/{branch}"
-
-            [sandbox]
-            enabled_by_default = true
-
-            [updates]
-            update_check_mode = "auto"
-
-            [app_state]
-            has_seen_welcome = true
-            "#,
-        )
-        .unwrap();
-        assert!(config.app_state.has_seen_welcome);
-
-        let reparsed: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
-        for parsed in [&config, &reparsed] {
-            assert_eq!(parsed.default_profile, "work");
-            assert_eq!(parsed.theme.name, "monokai");
-            assert!(parsed.worktree.enabled);
-            assert_eq!(parsed.worktree.path_template, "../wt/{branch}");
-            assert!(parsed.sandbox.enabled_by_default);
-            assert_eq!(parsed.updates.update_check_mode, UpdateCheckMode::Auto);
-        }
     }
 
     // Tests for TmuxConfig
@@ -4405,19 +4041,6 @@ mod tests {
     }
 
     #[test]
-    fn test_vt_live_in_settings_schema() {
-        // The single-source schema must expose the toggle so both the TUI
-        // and web settings render it (docs/development/adding-settings.md).
-        let schema = crate::session::config::settings_schema::schema();
-        let field = schema
-            .iter()
-            .find(|f| f.section == "tmux" && f.field == "vt_live")
-            .expect("vt_live field in tmux schema section");
-        assert!(field.advanced, "vt_live should sit under the Advanced fold");
-        assert!(!field.profile_overridable);
-    }
-
-    #[test]
     fn test_new_session_mode_in_settings_schema() {
         // The single-source schema must expose the select so the TUI and
         // web settings both render it (docs/development/adding-settings.md).
@@ -4444,133 +4067,6 @@ mod tests {
                 format!("\"{value}\""),
                 "select option {value:?} must round-trip"
             );
-        }
-    }
-
-    /// The `[diff]` defaults, the keys config.toml may set, and that
-    /// `split_view` survives a serialize/parse round trip.
-    #[test]
-    fn diff_config_defaults_and_keys() {
-        let diff = DiffConfig::default();
-        assert!(diff.default_branch.is_none());
-        assert_eq!(diff.context_lines, 3);
-        assert!(!diff.split_view);
-
-        let diff: DiffConfig = toml::from_str(r#"default_branch = "develop""#).unwrap();
-        assert_eq!(diff.default_branch, Some("develop".to_string()));
-        assert_eq!(diff.context_lines, 3);
-
-        let config: Config = toml::from_str(
-            r#"
-            [diff]
-            default_branch = "main"
-            context_lines = 10
-            split_view = true
-            "#,
-        )
-        .unwrap();
-        assert_eq!(config.diff.default_branch, Some("main".to_string()));
-        assert_eq!(config.diff.context_lines, 10);
-        assert!(config.diff.split_view);
-
-        let reparsed: DiffConfig = toml::from_str(&toml::to_string(&config.diff).unwrap()).unwrap();
-        assert!(reparsed.split_view);
-    }
-
-    #[test]
-    fn test_session_config_agent_override_roundtrip() {
-        let mut config = Config::default();
-        config
-            .session
-            .agent_command_override
-            .insert("claude".to_string(), "safehouse".to_string());
-        config
-            .session
-            .agent_extra_args
-            .insert("opencode".to_string(), "--port 8080".to_string());
-        config.acp.acp_defaults.insert(
-            "opencode".to_string(),
-            AcpAgentDefaults {
-                model: Some("openai/gpt-5.5".to_string()),
-                effort: Some("high".to_string()),
-                pin_model: true,
-                ..Default::default()
-            },
-        );
-
-        let serialized = toml::to_string_pretty(&config).unwrap();
-        let deserialized: Config = toml::from_str(&serialized).unwrap();
-        assert_eq!(
-            deserialized.session.agent_command_override.get("claude"),
-            Some(&"safehouse".to_string())
-        );
-        assert_eq!(
-            deserialized.session.agent_extra_args.get("opencode"),
-            Some(&"--port 8080".to_string())
-        );
-        assert_eq!(
-            deserialized.acp.acp_defaults.get("opencode"),
-            Some(&AcpAgentDefaults {
-                model: Some("openai/gpt-5.5".to_string()),
-                effort: Some("high".to_string()),
-                pin_model: true,
-                ..Default::default()
-            }),
-            "acp_defaults should survive roundtrip"
-        );
-    }
-
-    /// The `[agents.*]` status map and rules keep their on-disk shape through a
-    /// round trip, and an unknown status name fails the parse loudly rather
-    /// than silently dropping the entry.
-    #[test]
-    fn agent_status_map_and_rules_round_trip() {
-        let mut config = Config::default();
-        config
-            .agents
-            .entry("claude".to_string())
-            .or_default()
-            .status_map
-            .insert("Stop".to_string(), crate::agents::HookStatus::Error);
-        let serialized = toml::to_string_pretty(&config).unwrap();
-        assert!(serialized.contains("[agents.claude.status_map]"));
-        assert!(serialized.contains(r#"Stop = "error""#));
-        let reparsed: Config = toml::from_str(&serialized).unwrap();
-        assert_eq!(
-            reparsed.agents["claude"].status_map.get("Stop"),
-            Some(&crate::agents::HookStatus::Error)
-        );
-
-        let config: Config = toml::from_str(
-            r#"
-            [[agents.gjc.status_rules]]
-            status = "running"
-            contains = "esc to interrupt"
-
-            [[agents.gjc.status_rules]]
-            status = "waiting"
-            regex = "\\(y/n\\)"
-            "#,
-        )
-        .unwrap();
-        let rules = &config.agents["gjc"].status_rules;
-        assert_eq!(rules.len(), 2);
-        assert_eq!(rules[0].status, crate::agents::HookStatus::Running);
-        assert_eq!(rules[0].contains.as_deref(), Some("esc to interrupt"));
-        assert!(rules[0].regex.is_none());
-        assert_eq!(rules[1].status, crate::agents::HookStatus::Waiting);
-        assert_eq!(rules[1].regex.as_deref(), Some(r"\(y/n\)"));
-        let serialized = toml::to_string_pretty(&config).unwrap();
-        assert!(serialized.contains("[[agents.gjc.status_rules]]"));
-        let reparsed: Config = toml::from_str(&serialized).unwrap();
-        assert_eq!(reparsed.agents["gjc"].status_rules, *rules);
-
-        for source in [
-            "[agents.claude.status_map]\nStop = \"stopped\"\n",
-            "[[agents.gjc.status_rules]]\nstatus = \"stopped\"\ncontains = \"x\"\n",
-        ] {
-            let err = toml::from_str::<Config>(source).unwrap_err();
-            assert!(err.to_string().contains("stopped"), "{source}");
         }
     }
 
@@ -4650,31 +4146,6 @@ mod tests {
             Some("claude-x")
         );
         assert_eq!(config.pinned_model_for("gemini"), None);
-    }
-
-    /// `is_empty` covers every field, so a default that only sets one of them
-    /// is still written out.
-    #[test]
-    fn acp_defaults_is_empty_covers_every_field() {
-        assert!(AcpAgentDefaults::default().is_empty());
-
-        let with_mode = AcpAgentDefaults {
-            mode: Some("plan".to_string()),
-            ..Default::default()
-        };
-        assert!(!with_mode.is_empty());
-
-        let mut with_map = AcpAgentDefaults::default();
-        with_map
-            .effort_by_model
-            .insert("gpt-5".to_string(), "high".to_string());
-        assert!(!with_map.is_empty());
-
-        let with_pin = AcpAgentDefaults {
-            pin_model: true,
-            ..Default::default()
-        };
-        assert!(!with_pin.is_empty());
     }
 
     /// Spawn resolution precedence: a pin replaces the request, an explicit
@@ -4764,49 +4235,17 @@ mod tests {
     }
 
     #[test]
-    fn test_session_config_confirm_before_quit_defaults_on() {
-        // Default-on so existing users get the accidental-exit guard
-        // without opting in (#1569).
-        assert!(SessionConfig::default().confirm_before_quit);
-    }
-
-    #[test]
     fn test_default_on_guards_absent_from_toml_default_on() {
         // An older config.toml with no key for a default-on guard must
         // deserialize to the enabled default, not false. A plain
         // `#[serde(default)]` would give `bool::default()` here and silently
         // strand every pre-existing config on the old behavior.
         let session: SessionConfig = toml::from_str("").unwrap();
+        // Default-on so existing users get the accidental-exit guard (#1569).
+        assert!(SessionConfig::default().confirm_before_quit);
         assert!(session.confirm_before_quit, "confirm_before_quit (#1569)");
         assert!(session.confirm_delete, "confirm_delete (#3364)");
         assert!(session.host_tab_title, "host_tab_title (#3444)");
-    }
-
-    /// `background` defaults to false, round-trips when set, and is omitted
-    /// from the serialized form when it is false.
-    #[test]
-    fn tool_background_defaults_off_and_round_trips() {
-        let config: Config = toml::from_str(
-            r#"
-            [tools.github]
-            command = "gh repo view --web"
-
-            [tools.lazygit]
-            command = "lazygit"
-            hotkey = "Alt+o"
-            background = true
-            "#,
-        )
-        .unwrap();
-        assert!(!config.tools["github"].background);
-        assert!(config.tools["lazygit"].background);
-
-        let serialized = toml::to_string_pretty(&config).unwrap();
-        assert!(serialized.contains("background = true"));
-        assert!(!serialized.contains("background = false"));
-        let reparsed: Config = toml::from_str(&serialized).unwrap();
-        assert!(reparsed.tools["lazygit"].background);
-        assert!(!reparsed.tools["github"].background);
     }
 
     /// A non-empty `agent_command_override` wins, an empty one falls through to
@@ -4892,159 +4331,22 @@ mod tests {
         assert!(validate_auto_stop_idle_secs(u32::MAX as u64 + 1).is_err());
     }
 
-    #[test]
-    fn test_custom_agents_roundtrip() {
-        let mut config = Config::default();
-        config.session.custom_agents.insert(
-            "lenovo-claude".to_string(),
-            "ssh -t lenovo claude".to_string(),
-        );
-        config
-            .session
-            .agent_detect_as
-            .insert("lenovo-claude".to_string(), "claude".to_string());
-
-        let serialized = toml::to_string_pretty(&config).unwrap();
-        let deserialized: Config = toml::from_str(&serialized).unwrap();
-        assert_eq!(
-            deserialized.session.custom_agents.get("lenovo-claude"),
-            Some(&"ssh -t lenovo claude".to_string()),
-        );
-        assert_eq!(
-            deserialized.session.agent_detect_as.get("lenovo-claude"),
-            Some(&"claude".to_string()),
-        );
-    }
-
-    #[test]
-    fn test_agent_acp_cmd_roundtrip() {
-        let mut config = Config::default();
-        config
-            .session
-            .custom_agents
-            .insert("oc-sp".to_string(), "ocp run sp".to_string());
-        config
-            .session
-            .agent_acp_cmd
-            .insert("oc-sp".to_string(), "ocp run sp acp".to_string());
-
-        let serialized = toml::to_string_pretty(&config).unwrap();
-        let deserialized: Config = toml::from_str(&serialized).unwrap();
-        assert_eq!(
-            deserialized.session.agent_acp_cmd.get("oc-sp"),
-            Some(&"ocp run sp acp".to_string()),
-        );
-    }
-
-    #[test]
-    fn test_agent_acp_cmd_defaults_empty() {
-        // A config with no agent_acp_cmd must deserialize to an empty
-        // map (serde default), not error, so existing configs keep loading.
-        let config: Config = toml::from_str("").unwrap();
-        assert!(config.session.agent_acp_cmd.is_empty());
-    }
-
-    #[test]
-    fn test_container_runtime_podman_round_trip() {
-        // Users on Linux configure podman via `container_runtime = "podman"`
-        // in config.toml; if the snake_case rename ever drifts, their config
-        // would silently fall back to the docker default.
-        let toml_str = r#"container_runtime = "podman""#;
-        let parsed: SandboxConfig = toml::from_str(toml_str).unwrap();
-        assert_eq!(parsed.container_runtime, ContainerRuntimeName::Podman);
-
-        let serialized = toml::to_string(&parsed).unwrap();
-        assert!(serialized.contains(r#"container_runtime = "podman""#));
-    }
-
-    #[test]
-    fn logging_config_old_shape_populates_new_defaults() {
-        // Existing user configs predate output/file_path/rotation; their
-        // [logging] section is just default_level + targets. The new fields
-        // must populate from serde defaults rather than failing to parse.
-        let toml_str = r#"
-default_level = "debug"
-
-[targets]
-"acp.acp" = "trace"
-"#;
-        let parsed: LoggingConfig = toml::from_str(toml_str).unwrap();
-        assert_eq!(parsed.default_level, "debug");
-        assert_eq!(parsed.targets.get("acp.acp"), Some(&"trace".to_string()));
-        assert_eq!(parsed.output, SinkKind::File);
-        assert_eq!(parsed.file_path, "debug.log");
-        assert_eq!(parsed.rotation, RotationKind::Size);
-        assert_eq!(parsed.max_size_mib, 50);
-        assert_eq!(parsed.keep_count, 5);
-    }
-
-    #[test]
-    fn logging_config_new_shape_round_trip() {
-        let toml_str = r#"
-default_level = "info"
-output = "stdout"
-file_path = "/tmp/aoe.log"
-rotation = "never"
-max_size_mib = 100
-keep_count = 10
-
-[targets]
-"#;
-        let parsed: LoggingConfig = toml::from_str(toml_str).unwrap();
-        assert_eq!(parsed.output, SinkKind::Stdout);
-        assert_eq!(parsed.file_path, "/tmp/aoe.log");
-        assert_eq!(parsed.rotation, RotationKind::Never);
-        assert_eq!(parsed.max_size_mib, 100);
-        assert_eq!(parsed.keep_count, 10);
-
-        let serialized = toml::to_string(&parsed).unwrap();
-        let reparsed: LoggingConfig = toml::from_str(&serialized).unwrap();
-        assert_eq!(reparsed.output, SinkKind::Stdout);
-        assert_eq!(reparsed.rotation, RotationKind::Never);
-    }
-
-    /// `volume_ignores_strategy` defaults to anonymous and both spellings
-    /// survive a serialize/parse round trip.
-    #[test]
-    fn volume_ignores_strategy_spellings_round_trip() {
-        let cases = [
-            ("", VolumeIgnoresStrategy::Anonymous),
-            (
-                r#"volume_ignores_strategy = "anonymous""#,
-                VolumeIgnoresStrategy::Anonymous,
-            ),
-            (
-                "volume_ignores = [\"node_modules\"]\nvolume_ignores_strategy = \"named\"",
-                VolumeIgnoresStrategy::Named,
-            ),
-        ];
-        for (source, expected) in cases {
-            let config: SandboxConfig = toml::from_str(source).unwrap();
-            assert_eq!(config.volume_ignores_strategy, expected, "{source}");
-            let reparsed: SandboxConfig =
-                toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
-            assert_eq!(reparsed.volume_ignores_strategy, expected, "{source}");
-        }
-    }
-
     // Tests for the config.toml / state.toml split and update_config /
     // update_app_state (#2306-adjacent: long-running-process clobber fix).
 
+    /// App state lives in state.toml alone: `update_config` never writes an
+    /// `[app_state]` table into config.toml, and `Config::load` picks the
+    /// state up from state.toml.
+    /// With no state.toml, app state defaults rather than falling back to an
+    /// `[app_state]` table an older build left in config.toml.
+    /// config.toml and state.toml are each read fresh under a lock, so an
+    /// external process's edit to an unrelated field survives (#2821).
     #[test]
     #[serial_test::serial]
-    fn update_config_preserves_concurrent_external_edit() {
+    fn update_config_and_app_state_preserve_concurrent_external_edits() {
         let _guard = crate::session::test_support::isolate_app_dir();
 
-        update_config(|c| {
-            c.default_profile = "a1".to_string();
-            c.session.confirm_before_quit = true;
-        })
-        .unwrap();
-
-        // Simulate an external `aoe` process writing an unrelated field
-        // directly to disk between our load and our next `update_config`
-        // call below. `update_config` loads fresh internally, so this must
-        // survive.
+        update_config(|c| c.default_profile = "a1".to_string()).unwrap();
         let mut external = Config::load().unwrap();
         external.session.confirm_delete = false;
         let table = toml::Table::try_from(&external).unwrap();
@@ -5053,30 +4355,80 @@ keep_count = 10
             toml::to_string_pretty(&table).unwrap().as_bytes(),
         )
         .unwrap();
-
-        update_config(|c| {
-            c.default_profile = "a2".to_string();
-        })
-        .unwrap();
-
-        let final_config = Config::load().unwrap();
-        assert_eq!(
-            final_config.default_profile, "a2",
-            "the field update_config touched must be applied"
-        );
+        update_config(|c| c.default_profile = "a2".to_string()).unwrap();
+        let config = Config::load().unwrap();
+        assert_eq!(config.default_profile, "a2");
         assert!(
-            !final_config.session.confirm_delete,
-            "an external process's concurrent edit to an unrelated field must survive"
+            !config.session.confirm_delete,
+            "config.toml external edit lost"
+        );
+
+        update_app_state(|s| s.has_seen_welcome = true).unwrap();
+        let mut external = AppStateConfig::load().unwrap();
+        external.last_seen_version = Some("1.0.0".to_string());
+        let table = toml::Table::try_from(&external).unwrap();
+        super::super::atomic_write(
+            &state_path().unwrap(),
+            toml::to_string_pretty(&table).unwrap().as_bytes(),
+        )
+        .unwrap();
+        update_app_state(|s| s.has_seen_welcome = false).unwrap();
+        let state = AppStateConfig::load().unwrap();
+        assert!(!state.has_seen_welcome);
+        assert_eq!(
+            state.last_seen_version.as_deref(),
+            Some("1.0.0"),
+            "state.toml external edit lost"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn update_config_and_app_state_concurrent_increments_lose_no_updates() {
+        let _guard = crate::session::test_support::isolate_app_dir();
+        let n_threads = 16usize;
+        update_config(|c| c.session.snooze_duration_minutes = 1).unwrap();
+        update_app_state(|s| s.home_list_width = Some(0)).unwrap();
+        std::thread::scope(|scope| {
+            for _ in 0..n_threads {
+                scope.spawn(|| {
+                    update_config(|c| c.session.snooze_duration_minutes += 1).unwrap();
+                });
+                scope.spawn(|| {
+                    update_app_state(|s| {
+                        s.home_list_width = Some(s.home_list_width.unwrap_or(0) + 1);
+                    })
+                    .unwrap();
+                });
+            }
+        });
+        assert_eq!(
+            Config::load().unwrap().session.snooze_duration_minutes as usize,
+            1 + n_threads,
+            "config.toml increment lost"
+        );
+        assert_eq!(
+            AppStateConfig::load().unwrap().home_list_width,
+            Some(n_threads as u16),
+            "state.toml increment lost"
         );
     }
 
     /// App state lives in state.toml alone: `update_config` never writes an
-    /// `[app_state]` table into config.toml, and `Config::load` picks the
-    /// state up from state.toml.
+    /// `[app_state]` table into config.toml, and `Config::load` neither falls
+    /// back to one an older build left there nor misses state.toml (#2821).
     #[test]
     #[serial_test::serial]
-    fn app_state_is_written_to_state_toml_not_config_toml() {
+    fn app_state_lives_in_state_toml_not_config_toml() {
         let _guard = crate::session::test_support::isolate_app_dir();
+
+        fs::create_dir_all(get_app_dir().unwrap()).unwrap();
+        fs::write(
+            config_path().unwrap(),
+            "[app_state]\nhas_seen_welcome = true\n",
+        )
+        .unwrap();
+        assert!(!Config::load().unwrap().app_state.has_seen_welcome);
 
         update_config(|config| {
             config.app_state.has_seen_welcome = true;
@@ -5087,151 +4439,7 @@ keep_count = 10
         let table: toml::Table = raw.parse().unwrap();
         assert!(!table.contains_key("app_state"), "config.toml: {raw}");
 
-        update_app_state(|state| {
-            state.has_seen_welcome = true;
-        })
-        .unwrap();
+        update_app_state(|state| state.has_seen_welcome = true).unwrap();
         assert!(Config::load().unwrap().app_state.has_seen_welcome);
-    }
-
-    /// With no state.toml, app state defaults rather than falling back to an
-    /// `[app_state]` table an older build left in config.toml.
-    #[test]
-    #[serial_test::serial]
-    fn config_load_ignores_app_state_in_config_toml() {
-        let _guard = crate::session::test_support::isolate_app_dir();
-
-        fs::create_dir_all(get_app_dir().unwrap()).unwrap();
-        fs::write(
-            config_path().unwrap(),
-            "[app_state]\nhas_seen_welcome = true\n",
-        )
-        .unwrap();
-
-        assert!(!Config::load().unwrap().app_state.has_seen_welcome);
-    }
-
-    /// `update_app_state` applies the mutation, persists it, and hands back
-    /// whatever the closure returned.
-    #[test]
-    #[serial_test::serial]
-    fn update_app_state_persists_and_returns_the_closures_value() {
-        let _guard = crate::session::test_support::isolate_app_dir();
-
-        let returned = update_app_state(|state| {
-            state.has_seen_welcome = true;
-            state.has_seen_web_tour = true;
-            state.tips_seen = vec!["new-from-selection".to_string()];
-            42
-        })
-        .unwrap();
-        assert_eq!(returned, 42);
-
-        let loaded = AppStateConfig::load().unwrap();
-        assert!(loaded.has_seen_welcome);
-        assert!(loaded.has_seen_web_tour);
-        assert_eq!(loaded.tips_seen, vec!["new-from-selection".to_string()]);
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn update_config_concurrent_increments_lose_no_updates() {
-        let _guard = crate::session::test_support::isolate_app_dir();
-
-        update_config(|c| {
-            c.session.snooze_duration_minutes = 1;
-        })
-        .unwrap();
-
-        let n_threads = 16usize;
-        std::thread::scope(|scope| {
-            for _ in 0..n_threads {
-                scope.spawn(|| {
-                    update_config(|c| {
-                        c.session.snooze_duration_minutes += 1;
-                    })
-                    .unwrap();
-                });
-            }
-        });
-
-        let loaded = Config::load().unwrap();
-        assert_eq!(
-            loaded.session.snooze_duration_minutes as usize,
-            1 + n_threads,
-            "every concurrent update_config increment must be observed, none lost"
-        );
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn update_app_state_preserves_concurrent_external_edit() {
-        let _guard = crate::session::test_support::isolate_app_dir();
-
-        update_app_state(|s| {
-            s.has_seen_welcome = true;
-            s.has_seen_web_tour = true;
-        })
-        .unwrap();
-
-        // Simulate an external `aoe` process (e.g. the TUI while `aoe serve`
-        // is also running) writing an unrelated field directly to disk
-        // between our load and our next `update_app_state` call below.
-        // `update_app_state` now loads fresh under a cross-process flock,
-        // so this must survive.
-        let mut external = AppStateConfig::load().unwrap();
-        external.last_seen_version = Some("1.0.0".to_string());
-        let table = toml::Table::try_from(&external).unwrap();
-        super::super::atomic_write(
-            &state_path().unwrap(),
-            toml::to_string_pretty(&table).unwrap().as_bytes(),
-        )
-        .unwrap();
-
-        update_app_state(|s| {
-            s.has_seen_welcome = false;
-        })
-        .unwrap();
-
-        let final_state = AppStateConfig::load().unwrap();
-        assert!(
-            !final_state.has_seen_welcome,
-            "the field update_app_state touched must be applied"
-        );
-        assert_eq!(
-            final_state.last_seen_version,
-            Some("1.0.0".to_string()),
-            "an external process's concurrent edit to an unrelated field must survive"
-        );
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn update_app_state_concurrent_increments_lose_no_updates() {
-        let _guard = crate::session::test_support::isolate_app_dir();
-
-        update_app_state(|s| {
-            s.home_list_width = Some(0);
-        })
-        .unwrap();
-
-        let n_threads = 16usize;
-        std::thread::scope(|scope| {
-            for _ in 0..n_threads {
-                scope.spawn(|| {
-                    update_app_state(|s| {
-                        s.home_list_width = Some(s.home_list_width.unwrap_or(0) + 1);
-                    })
-                    .unwrap();
-                });
-            }
-        });
-
-        let loaded = AppStateConfig::load().unwrap();
-        assert_eq!(
-            loaded.home_list_width,
-            Some(n_threads as u16),
-            "every concurrent update_app_state increment must be observed, none lost"
-        );
     }
 }

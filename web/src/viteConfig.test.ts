@@ -31,7 +31,7 @@ describe("vite dev server proxy", () => {
     expect(proxy).toBeUndefined();
   });
 
-  it("forwards /api and the /sessions WebSockets to VITE_PROXY", async () => {
+  it("forwards /api and the /sessions WebSockets to VITE_PROXY, defaulting a bare host to http", async () => {
     const proxy = await loadProxy({ VITE_PROXY: "http://127.0.0.1:8081" });
     expect(proxy?.["/api"].target).toBe("http://127.0.0.1:8081");
     const ws = proxy?.[SESSION_WS_PROXY];
@@ -43,11 +43,9 @@ describe("vite dev server proxy", () => {
     expect(new RegExp(SESSION_WS_PROXY).test("/sessions/s1/live-ws")).toBe(true);
     expect(new RegExp(SESSION_WS_PROXY).test("/sessions/s1/terminal/live-ws")).toBe(true);
     expect(new RegExp(SESSION_WS_PROXY).test("/sessions/s1/container-terminal/live-ws")).toBe(true);
-  });
 
-  it("defaults a bare host:port to http and derives the ws target", async () => {
-    const proxy = await loadProxy({ VITE_PROXY: "localhost:50106" });
-    expect(proxy?.["/api"].target).toBe("http://localhost:50106");
-    expect(proxy?.[SESSION_WS_PROXY].target).toBe("ws://localhost:50106");
+    const bare = await loadProxy({ VITE_PROXY: "localhost:50106" });
+    expect(bare?.["/api"].target).toBe("http://localhost:50106");
+    expect(bare?.[SESSION_WS_PROXY].target).toBe("ws://localhost:50106");
   });
 });

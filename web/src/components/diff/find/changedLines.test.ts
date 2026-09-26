@@ -20,20 +20,6 @@ index 83db48f..f7c6dd6 100644
 `;
 
 describe("processFile on a similar-crate patch", () => {
-  it("parses hunks and grafts the full contents", () => {
-    const meta = processFile(PATCH, {
-      oldFile: { name: "test.txt", contents: OLD },
-      newFile: { name: "test.txt", contents: NEW },
-    });
-    expect(meta).toBeTruthy();
-    expect(meta!.hunks).toHaveLength(1);
-    // Full contents grafted: deletion/addition lines cover the whole file,
-    // not just the patch, so hunk expansion and find line numbers are
-    // file-accurate.
-    expect(meta!.deletionLines).toEqual(["line 1\n", "line 2\n", "line 3\n"]);
-    expect(meta!.additionLines).toEqual(["line 1 modified\n", "line 2\n", "line 3\n", "new line 4\n"]);
-  });
-
   it("changedLines maps to file-accurate line numbers", () => {
     const meta = processFile(PATCH, {
       oldFile: { name: "test.txt", contents: OLD },

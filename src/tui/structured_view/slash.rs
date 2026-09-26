@@ -91,61 +91,41 @@ mod tests {
     }
 
     #[test]
-    fn slash_query_extracts_word_after_slash() {
-        assert_eq!(slash_query("/com"), Some("com"));
-        assert_eq!(slash_query("/"), Some(""));
+    fn slash_query_cases() {
+        // A space ends the command name (typing args); multiline is not a query.
+        for (text, want) in [
+            ("/com", Some("com")),
+            ("/", Some("")),
+            ("hello", None),
+            ("", None),
+            ("/compact now", None),
+            ("/multi\nline", None),
+        ] {
+            assert_eq!(slash_query(text), want, "{text:?}");
+        }
     }
 
     #[test]
-    fn slash_query_rejects_non_slash_and_whitespace_and_multiline() {
-        assert_eq!(slash_query("hello"), None);
-        assert_eq!(slash_query(""), None);
-        // Slash followed by a space = command name finished, typing args.
-        assert_eq!(slash_query("/compact now"), None);
-        assert_eq!(slash_query("/multi\nline"), None);
-    }
-
-    #[test]
-    fn filter_empty_query_returns_all_in_order() {
-        let commands = vec![cmd("compact", ""), cmd("clear", "")];
-        let got = filter_commands("", &commands);
-        assert_eq!(got.len(), 2);
-        assert_eq!(got[0].name, "compact");
-        assert_eq!(got[1].name, "clear");
-    }
-
-    #[test]
-    fn filter_prefix_outranks_substring_and_description() {
+    fn filter_commands_ranks_and_drops() {
         let commands = vec![
-            cmd("recompact", "rebuild"),    // substring of "comp"
-            cmd("compact", "shrink"),       // prefix
-            cmd("noop", "compact the log"), // description only
+            cmd("recompact", "rebuild"),
+            cmd("compactor", ""),
+            cmd("Compact", "shrink"),
+            cmd("noop", "compact the log"),
+            cmd("clear", "wipe"),
         ];
-        let got = filter_commands("comp", &commands);
-        assert_eq!(got[0].name, "compact");
-        assert_eq!(got[1].name, "recompact");
-        assert_eq!(got[2].name, "noop");
-    }
-
-    #[test]
-    fn filter_is_case_insensitive() {
-        let commands = vec![cmd("Compact", "")];
-        assert_eq!(filter_commands("comp", &commands).len(), 1);
-        assert_eq!(filter_commands("COMP", &commands).len(), 1);
-    }
-
-    #[test]
-    fn filter_drops_zero_scores() {
-        let commands = vec![cmd("compact", "shrink"), cmd("clear", "wipe")];
-        let got = filter_commands("xyz", &commands);
-        assert!(got.is_empty());
-    }
-
-    #[test]
-    fn filter_ties_break_on_shorter_name() {
-        let commands = vec![cmd("compactor", ""), cmd("compact", "")];
-        let got = filter_commands("compact", &commands);
-        assert_eq!(got[0].name, "compact");
-        assert_eq!(got[1].name, "compactor");
+        let names = |q: &str| -> Vec<String> {
+            filter_commands(q, &commands)
+                .iter()
+                .map(|c| c.name.clone())
+                .collect()
+        };
+        // Empty query keeps everything in order.
+        assert_eq!(names("").len(), commands.len());
+        assert_eq!(names("")[0], "recompact");
+        // Case-insensitive prefix beats substring beats description; ties
+        // break on the shorter name.
+        assert_eq!(names("COMP"), ["Compact", "compactor", "recompact", "noop"]);
+        assert!(names("xyz").is_empty());
     }
 }

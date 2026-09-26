@@ -728,148 +728,185 @@ mod tests {
         Ok(false)
     }
 
-    /// A container still exists for it.
-    fn retained(_: &str) -> Result<bool> {
-        Ok(true)
-    }
-
-    #[test]
-    fn a_store_no_profile_claims_is_an_orphan_and_one_that_is_claimed_is_not() {
-        let dir = tempfile::tempdir().unwrap();
-        let app = dir.path().join("app");
-        let home = dir.path().join("home");
-        fs::create_dir_all(&app).unwrap();
-        app_with_rows(&app, &["1111111111111111"]);
-        owned_store(&app, &home, "1111111111111111", 10);
-        let orphan = owned_store(&app, &home, "2222222222222222", 40);
-
-        let plan = plan_in(&app, &[], &home, NO_GRACE, &gone).unwrap();
-
-        assert_eq!(
-            plan.orphans.iter().map(|o| &o.path).collect::<Vec<_>>(),
-            vec![&orphan]
-        );
-        assert_eq!(plan.bytes(), 40);
-        assert!(plan.preserved.is_empty());
-    }
-
-    #[test]
-    fn a_store_claimed_by_another_profile_is_not_an_orphan() {
-        let dir = tempfile::tempdir().unwrap();
-        let app = dir.path().join("app");
-        let home = dir.path().join("home");
-        let other = app.join("profiles").join("work");
-        fs::create_dir_all(&other).unwrap();
-        app_with_rows(&app, &[]);
-        fs::write(
-            other.join("sessions.json"),
-            r#"[{"id":"2222222222222222"}]"#,
-        )
-        .unwrap();
-        owned_store(&app, &home, "2222222222222222", 40);
-
-        let plan = plan_in(&app, &[], &home, NO_GRACE, &gone).unwrap();
-
-        assert!(plan.orphans.is_empty(), "{:?}", plan.orphans);
-        assert_eq!(plan.owners, 1);
-    }
-
-    #[test]
-    fn an_unreadable_registry_fails_the_pass_instead_of_orphaning_everything() {
-        let dir = tempfile::tempdir().unwrap();
-        let app = dir.path().join("app");
-        let home = dir.path().join("home");
-        let broken = app.join("profiles").join("work");
-        fs::create_dir_all(&broken).unwrap();
-        app_with_rows(&app, &[]);
-        owned_store(&app, &home, "2222222222222222", 40);
-
-        for content in [r#"{"not":"an array"}"#, "{", r#"[{"title":"no id"}]"#] {
-            fs::write(broken.join("sessions.json"), content).unwrap();
-            let error = plan_in(&app, &[], &home, NO_GRACE, &gone).unwrap_err();
-            assert!(
-                error.chain().any(|cause| {
-                    let text = cause.to_string();
-                    text.contains("sessions.json") || text.contains("session array")
-                }),
-                "{content}: {error:#}"
-            );
-        }
-    }
-
-    #[test]
-    fn no_registry_at_all_fails_rather_than_reclaiming_every_store() {
-        let dir = tempfile::tempdir().unwrap();
-        let app = dir.path().join("app");
-        let home = dir.path().join("home");
-        fs::create_dir_all(&app).unwrap();
-        owned_store(&app, &home, "2222222222222222", 40);
-
-        let error = plan_in(&app, &[], &home, NO_GRACE, &gone).unwrap_err();
-
-        assert!(error.to_string().contains("refusing"), "{error:#}");
-    }
-
-    #[test]
-    fn a_live_orphan_is_preserved_and_never_removed() {
-        let dir = tempfile::tempdir().unwrap();
-        let app = dir.path().join("app");
-        let home = dir.path().join("home");
-        fs::create_dir_all(&app).unwrap();
-        app_with_rows(&app, &[]);
-        let path = owned_store(&app, &home, "2222222222222222", 40);
-
-        let outcome = reclaim_in(&app, &[], &home, NO_GRACE, &retained).unwrap();
-
-        assert!(outcome.removed.is_empty());
-        assert_eq!(
-            outcome.plan.preserved,
-            vec![(path.clone(), Preserved::Retained)]
-        );
-        assert!(path.exists());
-    }
-
+    /// One pass over every kind of store (#3820): only the certified, unclaimed,
+    /// containerless directory named like an instance id is removed. Claims count from
+    /// every profile of both build namespaces, and a container under any runtime keeps
+    /// its store.
     #[cfg(unix)]
     #[test]
-    fn a_symlinked_store_is_preserved_and_its_target_is_left_alone() {
+    fn a_pass_removes_only_the_unclaimed_unattached_owned_store() {
+        const MAIN: &str = "1111111111111111";
+        const OTHER_PROFILE: &str = "2222222222222222";
+        const SIBLING_BUILD: &str = "3333333333333333";
+        const ORPHAN: &str = "4444444444444444";
+        const LIVE: &str = "7777777777777777";
+        const LINKED: &str = "8888888888888888";
         let dir = tempfile::tempdir().unwrap();
         let app = dir.path().join("app");
+        let sibling = dir.path().join("app-dev");
         let home = dir.path().join("home");
-        fs::create_dir_all(&app).unwrap();
-        app_with_rows(&app, &[]);
+        let work = app.join("profiles").join("work");
+        fs::create_dir_all(&work).unwrap();
+        fs::create_dir_all(&sibling).unwrap();
+        app_with_rows(&app, &[MAIN]);
+        app_with_rows(&work, &[OTHER_PROFILE]);
+        app_with_rows(&sibling, &[SIBLING_BUILD]);
+        let claimed: Vec<PathBuf> = [MAIN, OTHER_PROFILE, SIBLING_BUILD]
+            .iter()
+            .map(|id| owned_store(&app, &home, id, 10))
+            .collect();
+        let orphan = owned_store(&app, &home, ORPHAN, 40);
+        let live = owned_store(&app, &home, LIVE, 40);
         let target = dir.path().join("elsewhere");
         fs::create_dir_all(&target).unwrap();
         fs::write(target.join("keep"), b"keep").unwrap();
         let root = home.join(".claude").join("sandbox-v2");
-        fs::create_dir_all(&root).unwrap();
-        let link = root.join("2222222222222222");
+        let link = root.join(LINKED);
         std::os::unix::fs::symlink(&target, &link).unwrap();
+        let staging = root.join(".v027-staging");
+        fs::create_dir_all(&staging).unwrap();
+        // LIVE has a container only under a runtime this build does not use.
+        let probes: Vec<Box<v027::RunningProbe<'_>>> =
+            vec![Box::new(|_| Ok(false)), Box::new(|id| Ok(id == LIVE))];
+        let any = move |id: &str| any_retained(&probes, id);
 
-        let outcome = reclaim_in(&app, &[], &home, NO_GRACE, &gone).unwrap();
+        let outcome = reclaim_in(&app, &[sibling], &home, NO_GRACE, &any).unwrap();
 
+        // One comparison, so a regression names every store it changed.
+        let ids = |orphans: &[Orphan]| orphans.iter().map(|o| o.id.clone()).collect::<Vec<_>>();
+        let mut preserved = outcome.plan.preserved.clone();
+        preserved.sort_by(|a, b| a.0.cmp(&b.0));
+        let paths: Vec<PathBuf> = claimed
+            .iter()
+            .chain([&orphan, &live, &link, &staging, &target.join("keep")])
+            .cloned()
+            .collect();
+        let exists = |expect: bool| -> Vec<(PathBuf, bool)> {
+            paths
+                .iter()
+                .map(|path| {
+                    (
+                        path.clone(),
+                        if expect {
+                            path != &orphan
+                        } else {
+                            path.exists()
+                        },
+                    )
+                })
+                .collect()
+        };
         assert_eq!(
-            outcome.plan.preserved,
-            vec![(link.clone(), Preserved::Ambiguous)]
+            (
+                outcome.plan.owners,
+                ids(&outcome.plan.orphans),
+                outcome.plan.bytes(),
+                preserved,
+                ids(&outcome.removed),
+                outcome.freed(),
+                outcome.failures,
+                exists(false),
+            ),
+            (
+                3,
+                vec![ORPHAN.to_string()],
+                40,
+                vec![
+                    (live.clone(), Preserved::Retained),
+                    (link.clone(), Preserved::Ambiguous)
+                ],
+                vec![ORPHAN.to_string()],
+                40,
+                Vec::new(),
+                exists(true),
+            )
         );
-        assert!(target.join("keep").exists());
     }
 
+    /// A registry that cannot be read, parsed, or resolved, or no registry at all, fails
+    /// the pass (#3820): skipping it would make its sessions' stores look like orphans.
+    /// Dangling symlinks stand in for unreadable files because tests may run as root.
+    #[cfg(unix)]
     #[test]
-    fn reclaiming_removes_the_orphan_and_reports_what_it_freed() {
-        let dir = tempfile::tempdir().unwrap();
-        let app = dir.path().join("app");
-        let home = dir.path().join("home");
-        fs::create_dir_all(&app).unwrap();
-        app_with_rows(&app, &["1111111111111111"]);
-        let kept = owned_store(&app, &home, "1111111111111111", 10);
-        let orphan = owned_store(&app, &home, "2222222222222222", 40);
+    fn an_unusable_registry_aborts_the_pass_before_removing_anything() {
+        type Plant = fn(&Path);
+        let cases: &[(&str, Plant, &str)] = &[
+            (
+                "not an array",
+                |app| {
+                    fs::write(
+                        app.join("profiles/work/sessions.json"),
+                        r#"{"not":"an array"}"#,
+                    )
+                    .unwrap()
+                },
+                "session array",
+            ),
+            (
+                "truncated",
+                |app| fs::write(app.join("profiles/work/sessions.json"), "{").unwrap(),
+                "sessions.json",
+            ),
+            (
+                "row without id",
+                |app| {
+                    fs::write(
+                        app.join("profiles/work/sessions.json"),
+                        r#"[{"title":"no id"}]"#,
+                    )
+                    .unwrap()
+                },
+                "sessions.json",
+            ),
+            (
+                "no registry",
+                |app| fs::remove_file(app.join("sessions.json")).unwrap(),
+                "refusing",
+            ),
+            (
+                "dangling profile directory",
+                |app| {
+                    fs::remove_dir(app.join("profiles/work")).unwrap();
+                    std::os::unix::fs::symlink(app.join("nowhere"), app.join("profiles/work"))
+                        .unwrap();
+                },
+                "refusing",
+            ),
+            (
+                "dangling registry file",
+                |app| {
+                    std::os::unix::fs::symlink(
+                        app.join("nowhere"),
+                        app.join("profiles/work/sessions.json"),
+                    )
+                    .unwrap();
+                },
+                "refusing",
+            ),
+        ];
 
-        let outcome = reclaim_in(&app, &[], &home, NO_GRACE, &gone).unwrap();
+        let mut failures = Vec::new();
+        for (name, plant, cause) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let app = dir.path().join("app");
+            let home = dir.path().join("home");
+            fs::create_dir_all(app.join("profiles/work")).unwrap();
+            app_with_rows(&app, &[]);
+            let orphan = owned_store(&app, &home, "2222222222222222", 40);
+            plant(&app);
 
-        assert!(!orphan.exists());
-        assert!(kept.exists());
-        assert_eq!(outcome.freed(), 40);
-        assert!(outcome.failures.is_empty());
+            match reclaim_in(&app, &[], &home, NO_GRACE, &gone) {
+                Ok(_) => failures.push(format!("{name}: the pass succeeded")),
+                Err(error) if !error.chain().any(|c| c.to_string().contains(cause)) => {
+                    failures.push(format!("{name}: {error:#}"))
+                }
+                Err(_) => {}
+            }
+            if !orphan.exists() {
+                failures.push(format!("{name}: a store was removed despite the failure"));
+            }
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
     }
 
     #[test]
@@ -894,31 +931,6 @@ mod tests {
         .unwrap();
 
         assert!(guard(&app).is_err(), "a move in flight must block the pass");
-    }
-
-    /// Debug and release builds keep separate app dirs but share `$HOME`, so
-    /// a pass that read only its own registry would delete the credentials of
-    /// every session belonging to the other build.
-    #[test]
-    fn a_session_of_the_other_build_namespace_is_not_an_orphan() {
-        let dir = tempfile::tempdir().unwrap();
-        let app = dir.path().join("app");
-        let sibling = dir.path().join("app-dev");
-        let home = dir.path().join("home");
-        fs::create_dir_all(&app).unwrap();
-        fs::create_dir_all(&sibling).unwrap();
-        app_with_rows(&app, &[]);
-        fs::write(
-            sibling.join("sessions.json"),
-            r#"[{"id":"2222222222222222"}]"#,
-        )
-        .unwrap();
-        let store = owned_store(&app, &home, "2222222222222222", 40);
-
-        let outcome = reclaim_in(&app, &[sibling], &home, NO_GRACE, &gone).unwrap();
-
-        assert!(outcome.removed.is_empty(), "{:?}", outcome.removed);
-        assert!(store.exists(), "the other build's store was reclaimed");
     }
 
     /// Container preparation seeds the store before the session row is
@@ -1049,28 +1061,6 @@ mod tests {
         );
     }
 
-    /// A store live under a runtime this build does not use must survive.
-    #[test]
-    fn a_store_live_under_another_runtime_is_preserved() {
-        let dir = tempfile::tempdir().unwrap();
-        let app = dir.path().join("app");
-        let home = dir.path().join("home");
-        fs::create_dir_all(&app).unwrap();
-        app_with_rows(&app, &[]);
-        let path = owned_store(&app, &home, "2222222222222222", 40);
-        let probes: Vec<Box<v027::RunningProbe<'_>>> =
-            vec![Box::new(|_| Ok(false)), Box::new(|_| Ok(true))];
-        let any = move |id: &str| any_retained(&probes, id);
-
-        let outcome = reclaim_in(&app, &[], &home, NO_GRACE, &any).unwrap();
-
-        assert!(
-            path.exists(),
-            "a store live under another runtime was removed"
-        );
-        assert_eq!(outcome.plan.preserved, vec![(path, Preserved::Retained)]);
-    }
-
     /// `remove_stores_for` must not follow a symlink out of the store root.
     #[cfg(unix)]
     #[test]
@@ -1114,52 +1104,6 @@ mod tests {
         assert_eq!(fs::read(target.join("keep")).unwrap(), b"keep");
     }
 
-    /// A registry that is there but cannot be resolved must abort the pass.
-    /// Skipping it would drop its sessions from the ownership inventory and
-    /// make their stores, which are perfectly readable, look like orphans.
-    ///
-    /// Dangling symlinks rather than permission bits: tests run as root in
-    /// some environments, where a mode of `000` is not an error at all.
-    #[cfg(unix)]
-    #[test]
-    fn an_unresolvable_registry_aborts_before_removing_anything() {
-        type Plant = fn(&Path);
-        let cases: &[(&str, Plant)] = &[
-            ("profile directory", |app: &Path| {
-                std::os::unix::fs::symlink(app.join("nowhere"), app.join("profiles").join("work"))
-                    .unwrap();
-            }),
-            ("registry file", |app: &Path| {
-                let profile = app.join("profiles").join("work");
-                fs::create_dir_all(&profile).unwrap();
-                std::os::unix::fs::symlink(app.join("nowhere"), profile.join("sessions.json"))
-                    .unwrap();
-            }),
-        ];
-
-        for (name, plant) in cases {
-            let dir = tempfile::tempdir().unwrap();
-            let app = dir.path().join("app");
-            let home = dir.path().join("home");
-            fs::create_dir_all(app.join("profiles")).unwrap();
-            app_with_rows(&app, &[]);
-            let orphan = owned_store(&app, &home, "2222222222222222", 40);
-            plant(&app);
-
-            let outcome = reclaim_in(&app, &[], &home, NO_GRACE, &gone);
-
-            assert!(
-                outcome.is_err(),
-                "{name}: an unresolvable registry must fail the pass, \
-                 not empty the ownership set"
-            );
-            assert!(
-                orphan.exists(),
-                "{name}: a store was removed despite the failure"
-            );
-        }
-    }
-
     /// Removing one store takes time, and a container for a later candidate
     /// can appear while it happens. Evidence has to be re-taken per candidate,
     /// not once for the loop.
@@ -1195,25 +1139,6 @@ mod tests {
     }
 
     #[test]
-    fn a_directory_that_is_not_an_instance_id_is_never_touched() {
-        let dir = tempfile::tempdir().unwrap();
-        let app = dir.path().join("app");
-        let home = dir.path().join("home");
-        fs::create_dir_all(&app).unwrap();
-        app_with_rows(&app, &[]);
-        let staging = home
-            .join(".claude")
-            .join("sandbox-v2")
-            .join(".v027-staging");
-        fs::create_dir_all(&staging).unwrap();
-
-        let outcome = reclaim_in(&app, &[], &home, NO_GRACE, &gone).unwrap();
-
-        assert!(staging.exists());
-        assert!(outcome.plan.orphans.is_empty());
-    }
-
-    #[test]
     #[serial_test::serial]
     fn session_removal_preserves_uncertified_original() {
         let directory = tempfile::tempdir().unwrap();
@@ -1238,25 +1163,35 @@ mod tests {
         );
     }
 
+    /// Neither an unproven store nor an owned one whose ownership was revoked mid-deletion
+    /// may be reclaimed: both hold native context aoe cannot prove it created.
     #[test]
-    fn orphan_cleanup_preserves_uncertified_original() {
-        let directory = tempfile::tempdir().unwrap();
-        let app = directory.path().join("app");
-        let home = directory.path().join("home");
-        fs::create_dir_all(&app).unwrap();
-        app_with_rows(&app, &[]);
-        let root = unproven_store(&home, "4444444444444444", 0);
-        fs::create_dir_all(root.join("projects")).unwrap();
-        fs::write(
-            root.join("projects/original.jsonl"),
-            b"UNCERTIFIED_ORIGINAL_CONTEXT",
-        )
-        .unwrap();
-        reclaim_in(&app, &[], &home, NO_GRACE, &gone).unwrap();
-        assert_eq!(
-            fs::read(root.join("projects/original.jsonl")).unwrap(),
-            b"UNCERTIFIED_ORIGINAL_CONTEXT"
-        );
+    fn a_pass_preserves_stores_without_certified_ownership() {
+        type Setup = fn(&Path, &Path) -> PathBuf;
+        let cases: [(&str, Setup); 2] = [
+            ("projects/original.jsonl", |_, home| {
+                unproven_store(home, "4444444444444444", 0)
+            }),
+            ("new-native-context", |app, home| {
+                let id = "6666666666666666";
+                let root = owned_store(app, home, id, 0);
+                let anchor = AnchoredDir::open(&root).unwrap();
+                content::revoke_content_root(app, id, &anchor).unwrap();
+                root
+            }),
+        ];
+        for (file, setup) in cases {
+            let directory = tempfile::tempdir().unwrap();
+            let app = directory.path().join("app");
+            let home = directory.path().join("home");
+            fs::create_dir_all(&app).unwrap();
+            app_with_rows(&app, &[]);
+            let path = setup(&app, &home).join(file);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, b"UNCERTIFIED_CONTEXT").unwrap();
+            reclaim_in(&app, &[], &home, NO_GRACE, &gone).unwrap();
+            assert_eq!(fs::read(&path).unwrap(), b"UNCERTIFIED_CONTEXT", "{file}");
+        }
     }
 
     #[test]
@@ -1287,28 +1222,5 @@ mod tests {
             b"REPLACEMENT_ORIGINAL"
         );
         assert!(outcome.removed.is_empty());
-    }
-
-    #[test]
-    fn interrupted_deletion_does_not_reuse_revoked_ownership() {
-        let directory = tempfile::tempdir().unwrap();
-        let app = directory.path().join("app");
-        let home = directory.path().join("home");
-        fs::create_dir_all(&app).unwrap();
-        app_with_rows(&app, &[]);
-        let id = "6666666666666666";
-        let root = owned_store(&app, &home, id, 0);
-        let anchor = AnchoredDir::open(&root).unwrap();
-        content::revoke_content_root(&app, id, &anchor).unwrap();
-        fs::write(
-            root.join("new-native-context"),
-            b"UNPROVEN_AFTER_INTERRUPTION",
-        )
-        .unwrap();
-        reclaim_in(&app, &[], &home, NO_GRACE, &gone).unwrap();
-        assert_eq!(
-            fs::read(root.join("new-native-context")).unwrap(),
-            b"UNPROVEN_AFTER_INTERRUPTION"
-        );
     }
 }

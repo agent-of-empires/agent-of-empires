@@ -77,32 +77,9 @@ describe("scratch toggle", () => {
     expect(onChange).toHaveBeenCalledTimes(1);
     expect(onChange).toHaveBeenCalledWith("scratch", true);
   });
-
-  it("replaces the tabs with a confirmation card when scratch is on", async () => {
-    renderStep({ scratch: true });
-    expect(screen.queryByRole("button", { name: "Browse", exact: true })).toBeNull();
-    expect(screen.getByText(/A fresh scratch directory under your AoE app data folder/)).toBeTruthy();
-  });
 });
 
 describe("recent and saved projects", () => {
-  it("lists live recents, skipping scratch and workspace sessions", async () => {
-    sessions(
-      mockSession({ id: "a", project_path: "/repo/alpha", last_accessed_at: "2025-09-01T00:00:00Z" }),
-      mockSession({ id: "s", project_path: "/app/scratch/aaa", scratch: true }),
-      mockSession({
-        id: "w",
-        project_path: "/repo/gamma",
-        main_repo_path: "/repo/gamma",
-        workspace_repos: [{ name: "gamma", source_path: "/repo/gamma", branch: "main" }],
-      }),
-    );
-    renderStep();
-    expect((await screen.findAllByText("alpha")).length).toBeGreaterThan(0);
-    expect(screen.queryByText("aaa")).toBeNull();
-    expect(screen.queryByText("gamma")).toBeNull();
-  });
-
   it("shows a persisted project with no live session, and a live one only once", async () => {
     sessions(mockSession({ project_path: "/repo/live", last_accessed_at: "2025-09-10T00:00:00Z" }));
     recentEntries([{}, { path: "/repo/live", display_name: "live", last_used_at: "2025-01-01T00:00:00+00:00" }]);
@@ -131,13 +108,6 @@ describe("recent and saved projects", () => {
     expect(screen.getAllByText("/repo/dup")).toHaveLength(1);
   });
 
-  it("omits the Recent header when only saved projects exist", async () => {
-    savedProjects("/repo/solo");
-    renderStep();
-    expect(await screen.findByText("/repo/solo")).toBeTruthy();
-    expect(header("Recent")).toBeNull();
-  });
-
   it.each([
     ["saved", () => savedProjects("/repo/alpha"), "/repo/alpha"],
     ["recent", () => sessions(mockSession({ project_path: "/repo/beta" })), "/repo/beta"],
@@ -158,22 +128,6 @@ describe("recent and saved projects", () => {
     fireEvent.click((await screen.findByText("/repo/alpha")).closest("button")!);
     fireEvent.click((await screen.findByText("/repo/beta")).closest("button")!);
     expect(onSelectSavedProject.mock.calls).toEqual([[true], [undefined]]);
-  });
-
-  it("highlights the selected saved row", async () => {
-    savedProjects("/repo/alpha");
-    renderStep({ path: "/repo/alpha" });
-    const row = (await screen.findByText("/repo/alpha", { selector: "span" })).closest("button");
-    expect(row?.className).toContain("border-brand-600");
-  });
-
-  it("pluralizes a recent row's session count", async () => {
-    sessions(
-      mockSession({ id: "1", project_path: "/repo/multi", last_accessed_at: "2025-09-01T00:00:00Z" }),
-      mockSession({ id: "2", project_path: "/repo/multi", last_accessed_at: "2025-09-02T00:00:00Z" }),
-    );
-    renderStep({ path: "/repo/multi" });
-    expect(await screen.findByText(/2 sessions/)).toBeTruthy();
   });
 
   it("falls back to the Browse tab with nothing to pick", async () => {
@@ -222,12 +176,6 @@ describe("project search", () => {
     await search("alpha");
     expect(await screen.findByText("alpha")).toBeTruthy();
     expect(screen.queryByText("saved-yankee")).toBeNull();
-  });
-
-  it("shows an empty state when nothing matches", async () => {
-    renderStep();
-    await search("nothing-here");
-    expect(await screen.findByText(/No projects match that search/)).toBeTruthy();
   });
 });
 

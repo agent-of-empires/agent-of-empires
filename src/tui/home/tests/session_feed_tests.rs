@@ -145,9 +145,12 @@ fn daemon_row(id: &str, status: &str) -> crate::daemon::SessionResponse {
     .unwrap()
 }
 
+/// A snapshot drives structured rows and marks the daemon as the sidebar source; no daemon
+/// is not an error: the local store serves the sidebar and the row keeps the daemon's last
+/// status. Draining either result disarms the in-flight flag.
 #[test]
 #[serial]
-fn session_feed_snapshot_drives_structured_rows_and_marks_the_daemon_source() {
+fn session_feed_result_selects_the_sidebar_source() {
     let mut env = create_test_env_empty();
     let id = structured_row(&mut env, Status::Idle);
     assert_eq!(env.view.sidebar_source, SidebarSource::Storage);
@@ -161,32 +164,17 @@ fn session_feed_snapshot_drives_structured_rows_and_marks_the_daemon_source() {
         env.view.apply_session_feed(),
         "an applied row asks for a redraw"
     );
-
     assert_eq!(
         env.view.get_instance(&id).map(|i| i.status),
         Some(Status::Running)
     );
     assert_eq!(env.view.sidebar_source, SidebarSource::Daemon);
-    assert!(
-        !env.view.pending_session_feed,
-        "draining disarms the in-flight flag"
-    );
-}
+    assert!(!env.view.pending_session_feed);
 
-#[test]
-#[serial]
-fn session_feed_unavailable_falls_back_to_storage_and_keeps_the_last_status() {
-    // No daemon is not an error: the local store serves the sidebar and the
-    // structured row keeps whatever the daemon last said.
-    let mut env = create_test_env_empty();
-    let id = structured_row(&mut env, Status::Running);
-    env.view.sidebar_source = SidebarSource::Daemon;
     env.view.session_feed =
         SessionFeed::seeded_for_test(SessionFeedResult::Unavailable("no daemon".to_string()));
     env.view.pending_session_feed = true;
-
     assert!(!env.view.apply_session_feed());
-
     assert_eq!(
         env.view.get_instance(&id).map(|i| i.status),
         Some(Status::Running)
@@ -195,13 +183,23 @@ fn session_feed_unavailable_falls_back_to_storage_and_keeps_the_last_status() {
     assert!(!env.view.pending_session_feed);
 }
 
+/// No fetch is issued for a terminal-only sidebar (the daemon owns nothing there) or with
+/// the setting off, and a result that raced the toggle is dropped.
 #[test]
 #[serial]
-fn session_feed_setting_off_never_fetches_and_drops_an_in_flight_result() {
+fn session_feed_skips_terminal_only_sidebars_and_the_setting_off() {
     let mut env = create_test_env_empty();
+    let mut terminal = Instance::new("tmux-session", "/tmp/repo");
+    terminal.source_profile = "test".to_string();
+    env.view.add_instance(terminal);
+    env.view.request_session_feed_refresh();
+    assert!(
+        !env.view.pending_session_feed,
+        "no structured rows means no fetch is issued"
+    );
+
     let id = structured_row(&mut env, Status::Idle);
     env.view.daemon_sidebar = false;
-
     env.view.request_session_feed_refresh();
     assert!(
         !env.view.pending_session_feed,
@@ -220,25 +218,6 @@ fn session_feed_setting_off_never_fetches_and_drops_an_in_flight_result() {
         "a result that raced the toggle must not drive the row"
     );
     assert_eq!(env.view.sidebar_source, SidebarSource::Storage);
-}
-
-#[test]
-#[serial]
-fn request_session_feed_refresh_is_a_no_op_without_structured_rows() {
-    // The daemon owns nothing on a terminal-only sidebar, so that view never talks to it;
-    // it would be one HTTP round trip a second for nothing.
-    let mut env = create_test_env_empty();
-    let mut inst = Instance::new("tmux-session", "/tmp/repo");
-    inst.source_profile = "test".to_string();
-    let _ = inst.id.clone();
-    env.view.add_instance(inst);
-
-    env.view.request_session_feed_refresh();
-
-    assert!(
-        !env.view.pending_session_feed,
-        "no structured rows means no fetch is issued"
-    );
 }
 
 /// Only a completed fetch permits a later tick to enqueue another request.

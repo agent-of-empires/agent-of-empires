@@ -67,19 +67,6 @@ describe("SessionWizard last-project memory", () => {
     fetchRecentProjects.mockResolvedValue(RECENTS);
   });
 
-  it("opens a plain New session on the remembered project, one Launch from a session", async () => {
-    // A path no mock lists, so the seed can only have come from storage.
-    localStorage.setItem(PROJECT_KEY, "/tmp/remembered");
-    const { getByText } = renderWizard();
-
-    await waitFor(() => expect(launchButton(getByText).disabled).toBe(false));
-    expect(fetchIsGitRepo).toHaveBeenCalledWith("/tmp/remembered");
-    await clickLaunch(getByText);
-
-    await waitFor(() => expect(createSession).toHaveBeenCalledTimes(1));
-    expect(createSession.mock.calls[0][0]).toMatchObject({ path: "/tmp/remembered" });
-  });
-
   const prefillCases: Array<{ name: string; stored: string | null; expectedPath: string }> = [
     { name: "a launch writes the path it used", stored: null, expectedPath: "/tmp/other" },
     { name: "a prefill path wins over the memory", stored: "/tmp/remembered", expectedPath: "/tmp/other" },

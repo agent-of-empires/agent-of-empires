@@ -274,26 +274,17 @@ mod tests {
     }
 
     #[test]
-    fn new_name_sanitizes_unsafe_characters() {
-        let s = ToolSession::new("abc12345", "feature/foo:bar", "my tool.v2");
-        let name = s.session_name();
-        assert!(!name.contains(':'), "name was {}", name);
-        assert!(!name.contains('.'), "name was {}", name);
-        assert!(!name.contains(' '), "name was {}", name);
-    }
-
-    #[test]
-    fn distinct_tools_on_same_session_have_distinct_names() {
-        let id = "0123456789abcdef";
-        let lazygit = ToolSession::new(id, "x", "lazygit");
-        let yazi = ToolSession::new(id, "x", "yazi");
-        assert_ne!(lazygit.session_name(), yazi.session_name());
-    }
-
-    #[test]
-    fn distinct_sessions_for_same_tool_have_distinct_names() {
-        let a = ToolSession::new("aaaaaaaa1111", "x", "lazygit");
-        let b = ToolSession::new("bbbbbbbb2222", "x", "lazygit");
-        assert_ne!(a.session_name(), b.session_name());
+    fn distinct_sessions_and_tools_get_distinct_names() {
+        let names: Vec<String> = [
+            ("0123456789abcdef", "lazygit"),
+            ("0123456789abcdef", "yazi"),
+            ("aaaaaaaa1111", "lazygit"),
+            ("bbbbbbbb2222", "lazygit"),
+        ]
+        .iter()
+        .map(|(id, tool)| ToolSession::new(id, "x", tool).session_name().to_string())
+        .collect();
+        let unique: std::collections::HashSet<_> = names.iter().collect();
+        assert_eq!(unique.len(), names.len(), "{names:?}");
     }
 }

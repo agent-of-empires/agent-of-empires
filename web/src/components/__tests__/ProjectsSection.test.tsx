@@ -40,33 +40,36 @@ function renderSection(props: Partial<Parameters<typeof ProjectsSection>[0]> = {
   return handlers;
 }
 
-describe("ProjectsSection", () => {
-  it("renders a row and the add button when online and writable", () => {
+function longPress(release: (row: HTMLElement) => void) {
+  vi.useFakeTimers();
+  try {
     renderSection();
-    expect(screen.getByTestId("sidebar-project-row")).toBeTruthy();
-    expect(screen.getByText("alpha")).toBeTruthy();
-    expect(screen.getByTestId("sidebar-projects-add")).toBeTruthy();
-  });
+    const row = screen.getByTestId("sidebar-project-row");
+    fireEvent.touchStart(row, { touches: [{ clientX: 10, clientY: 10 }] });
+    release(row);
+    act(() => {
+      vi.advanceTimersByTime(500);
+    });
+    return screen.queryByTestId("sidebar-project-context-menu");
+  } finally {
+    vi.useRealTimers();
+    cleanup();
+  }
+}
 
-  it("shows the configured base branch on the row", () => {
-    renderSection({
+describe("ProjectsSection", () => {
+  it("renders the row with its base branch, adds a project, and starts a session", () => {
+    const h = renderSection({
       projects: [
         emptyProject("/work/alpha", {
           registeredProjects: [{ name: "alpha", path: "/work/alpha", scope: "global", default_base_branch: "develop" }],
         }),
       ],
     });
+    expect(screen.getByText("alpha")).toBeTruthy();
     expect(screen.getByText(/develop/)).toBeTruthy();
-  });
-
-  it("calls onAddProject from the header button", () => {
-    const h = renderSection();
     fireEvent.click(screen.getByTestId("sidebar-projects-add"));
     expect(h.onAddProject).toHaveBeenCalled();
-  });
-
-  it("starts a session when the row is clicked", () => {
-    const h = renderSection();
     fireEvent.click(screen.getByTitle("New session in alpha"));
     expect(h.onCreateSession).toHaveBeenCalledWith("/work/alpha");
   });
@@ -84,73 +87,17 @@ describe("ProjectsSection", () => {
     fireEvent.click(screen.getByTestId("sidebar-project-context-menu-edit"));
     expect(h.onEditProject).toHaveBeenCalledWith(expect.objectContaining({ path: "/work/alpha" }));
 
-    fireEvent.contextMenu(screen.getByTestId("sidebar-project-row"));
+    fireEvent.keyDown(screen.getByTestId("sidebar-project-row"), { key: "F10", shiftKey: true });
     fireEvent.click(screen.getByTestId("sidebar-project-context-menu-remove"));
     expect(h.onRemoveProject).toHaveBeenCalledWith(expect.objectContaining({ repoPath: "/work/alpha" }));
   });
 
-  it("opens the context menu on a long-press (#3460-style touch support)", () => {
-    vi.useFakeTimers();
-    try {
-      renderSection();
-      const row = screen.getByTestId("sidebar-project-row");
-      fireEvent.touchStart(row, { touches: [{ clientX: 10, clientY: 10 }] });
-      act(() => {
-        vi.advanceTimersByTime(500);
-      });
-      expect(screen.getByTestId("sidebar-project-context-menu")).toBeTruthy();
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  it("cancels the pending long-press once the finger moves past the touch slop", () => {
-    vi.useFakeTimers();
-    try {
-      renderSection();
-      const row = screen.getByTestId("sidebar-project-row");
-      fireEvent.touchStart(row, { touches: [{ clientX: 10, clientY: 10 }] });
-      // Well past LONG_PRESS_SLOP_PX (8px): a deliberate drag, not a jittery hold.
-      fireEvent.touchMove(row, { touches: [{ clientX: 100, clientY: 100 }] });
-      act(() => {
-        vi.advanceTimersByTime(500);
-      });
-      expect(screen.queryByTestId("sidebar-project-context-menu")).toBeNull();
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  it("cancels the pending long-press on touchend before the timer fires", () => {
-    vi.useFakeTimers();
-    try {
-      renderSection();
-      const row = screen.getByTestId("sidebar-project-row");
-      fireEvent.touchStart(row, { touches: [{ clientX: 10, clientY: 10 }] });
-      fireEvent.touchEnd(row, { touches: [] });
-      act(() => {
-        vi.advanceTimersByTime(500);
-      });
-      expect(screen.queryByTestId("sidebar-project-context-menu")).toBeNull();
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  it("cancels the pending long-press on touchcancel (an OS-interrupted gesture)", () => {
-    vi.useFakeTimers();
-    try {
-      renderSection();
-      const row = screen.getByTestId("sidebar-project-row");
-      fireEvent.touchStart(row, { touches: [{ clientX: 10, clientY: 10 }] });
-      fireEvent.touchCancel(row);
-      act(() => {
-        vi.advanceTimersByTime(500);
-      });
-      expect(screen.queryByTestId("sidebar-project-context-menu")).toBeNull();
-    } finally {
-      vi.useRealTimers();
-    }
+  it("opens the context menu on a long-press unless the gesture ends or moves first", () => {
+    expect(longPress(() => {})).not.toBeNull();
+    // Well past LONG_PRESS_SLOP_PX (8px): a deliberate drag, not a jittery hold.
+    expect(longPress((row) => fireEvent.touchMove(row, { touches: [{ clientX: 100, clientY: 100 }] }))).toBeNull();
+    expect(longPress((row) => fireEvent.touchEnd(row, { touches: [] }))).toBeNull();
+    expect(longPress((row) => fireEvent.touchCancel(row))).toBeNull();
   });
 
   it("caps the context menu with the dynamic viewport so its tail scrolls on iOS (#2870)", () => {
@@ -163,38 +110,15 @@ describe("ProjectsSection", () => {
     expect(menu.className).toContain("overflow-y-auto");
   });
 
-  it("opens the context menu via Shift+F10 keyboard path", () => {
-    const h = renderSection();
-    const row = screen.getByTestId("sidebar-project-row");
-    fireEvent.keyDown(row, { key: "F10", shiftKey: true });
-    fireEvent.click(screen.getByTestId("sidebar-project-context-menu-remove"));
-    expect(h.onRemoveProject).toHaveBeenCalled();
-  });
-
-  it("filters rows by query and shows the no-match hint", () => {
+  it("shows the no-match and empty hints, and nothing when there is no way to add", () => {
     renderSection({ query: "zzz" });
     expect(screen.queryByTestId("sidebar-project-row")).toBeNull();
     expect(screen.getByText("No matching projects.")).toBeTruthy();
-  });
-
-  it("shows the empty hint when there are no projects but add is available", () => {
+    cleanup();
     renderSection({ projects: [] });
     expect(screen.getByText(/No saved projects/)).toBeTruthy();
-  });
-
-  it("renders nothing when there are no projects and no way to add", () => {
-    const { container } = render(
-      <ProjectsSection
-        projects={[]}
-        query=""
-        readOnly
-        offline={false}
-        onCreateSession={vi.fn()}
-        onAddProject={vi.fn()}
-        onEditProject={vi.fn()}
-        onRemoveProject={vi.fn()}
-      />,
-    );
-    expect(container.querySelector("[data-testid='sidebar-projects-section']")).toBeNull();
+    cleanup();
+    renderSection({ projects: [], readOnly: true });
+    expect(screen.queryByTestId("sidebar-projects-section")).toBeNull();
   });
 });

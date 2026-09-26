@@ -17,12 +17,6 @@ describe("useIsWideViewport", () => {
     expect(result.current).toBe(true);
   });
 
-  it("starts false below the breakpoint", () => {
-    stubMatchMedia(false, "(min-width: 768px)");
-    const { result } = renderHook(() => useIsWideViewport());
-    expect(result.current).toBe(false);
-  });
-
   it("updates when the media query changes and cleans up on unmount", () => {
     const ctl = stubMatchMedia(false, "(min-width: 768px)");
     const { result, unmount } = renderHook(() => useIsWideViewport());

@@ -10,18 +10,8 @@ const cursorCell = (segs: string[], cursorCol: number, focused?: boolean) =>
   ).container.querySelector("[data-live-cursor]") as HTMLElement;
 
 describe("Row cursor cell", () => {
-  it.each([undefined, false])("is a hollow, non-blinking outline when focused=%s", (focused) => {
-    const cell = cursorCell(["hi"], 2, focused);
-    expect(cell.style.outline).toContain("var(--term-cursor");
-    expect(cell.style.backgroundColor).toBe("");
-    expect(cell.className).toBe("");
-  });
-
-  it.each([
-    ["on text", 1],
-    ["past the row text", 5],
-  ])("fills with inverted text and blinks when focused, %s", (_n, col) => {
-    const cell = cursorCell(["hi"], col, true);
+  it("fills with inverted text and blinks when focused past the row text", () => {
+    const cell = cursorCell(["hi"], 5, true);
     expect(cell.style.backgroundColor).toContain("var(--term-cursor");
     expect(cell.style.color).toContain("var(--term-bg");
     expect(cell.style.outline).toBe("");

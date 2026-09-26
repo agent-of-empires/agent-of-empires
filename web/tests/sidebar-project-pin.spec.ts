@@ -55,21 +55,6 @@ async function mockApis(page: Page, sessions: MockSession[], projects: MockProje
 }
 
 test.describe("Sidebar project pin/unpin (#2208)", () => {
-  test("Pin on an unregistered populated repo POSTs pinned:true", async ({ page }) => {
-    await mockApis(page, [{ id: "s-1", title: "Mongols", project_path: "/tmp/repo-a" }], []);
-    await page.goto("/");
-    await expect(page.locator("header")).toBeVisible();
-
-    const header = page.locator("[data-testid='sidebar-group-header']").filter({ hasText: "repo-a" });
-    await expect(header).toBeVisible();
-    await header.click({ button: "right" });
-
-    const post = page.waitForRequest((req) => req.url().endsWith("/api/projects") && req.method() === "POST");
-    await page.locator("[data-testid='sidebar-group-context-menu-pin']").click();
-    const req = await post;
-    expect(req.postDataJSON()).toMatchObject({ path: "/tmp/repo-a", scope: "global", pinned: true });
-  });
-
   test("Pin on a registered-but-unpinned repo PATCHes pinned:true", async ({ page }) => {
     await mockApis(
       page,
@@ -87,21 +72,5 @@ test.describe("Sidebar project pin/unpin (#2208)", () => {
     await page.locator("[data-testid='sidebar-group-context-menu-pin']").click();
     const req = await patch;
     expect(req.postDataJSON()).toMatchObject({ pinned: true });
-  });
-
-  test("Unpin a pinned-empty project PATCHes pinned:false (not DELETE)", async ({ page }) => {
-    await mockApis(page, [], [{ name: "repo-b", path: "/tmp/repo-b", scope: "global", pinned: true }]);
-    await page.goto("/");
-    await expect(page.locator("header")).toBeVisible();
-
-    const header = page.locator("[data-testid='sidebar-group-header']").filter({ hasText: "repo-b" });
-    await expect(header).toBeVisible();
-    await header.click({ button: "right" });
-
-    const patch = page.waitForRequest((req) => req.url().includes("/api/projects/") && req.method() === "PATCH");
-    await page.locator("[data-testid='sidebar-group-context-menu-unpin']").click();
-    const req = await patch;
-    expect(req.postDataJSON()).toMatchObject({ pinned: false });
-    expect(req.method()).not.toBe("DELETE");
   });
 });

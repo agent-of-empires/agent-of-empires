@@ -57,12 +57,6 @@ describe("ApprovalCard args", () => {
     expect(screen.getByText("Deny")).toBeTruthy();
   });
 
-  it("collapses opencode filepath metadata to a path preview", () => {
-    mount(makeApproval({}, { filepath: "/tmp/opencode", parentDir: "/tmp" }, "external_directory"));
-    expect(screen.getByText("/tmp/opencode")).toBeTruthy();
-    expect(screen.queryByText("filepath")).toBeNull();
-  });
-
   it("toggles a key/value list without _aoe_ bookkeeping keys", () => {
     mount(makeApproval({}, { command: "ls", cwd: "/tmp", _aoe_parent_tool_call_id: "parent-123" }));
     fireEvent.click(header());
@@ -92,14 +86,12 @@ describe("ApprovalCard args", () => {
     expect(screen.getByText("No raw args provided by agent.")).toBeTruthy();
   });
 
-  it.each([
-    ["external_directory", "External directory access"],
-    ["some_future_kind", "some_future_kind"],
-  ])("humanizes permission identifier %s", (raw, shown) => {
-    mount(makeApproval({}, "", raw));
-    expect(screen.getByText(shown)).toBeTruthy();
-    expect(screen.getByRole("alertdialog", { name: `Approval needed: ${shown}` })).toBeTruthy();
-    if (raw !== shown) expect(screen.queryByText(raw)).toBeNull();
+  it("humanizes a known permission identifier and collapses opencode filepath metadata", () => {
+    mount(makeApproval({}, { filepath: "/tmp/opencode", parentDir: "/tmp" }, "external_directory"));
+    expect(screen.getByRole("alertdialog", { name: "Approval needed: External directory access" })).toBeTruthy();
+    expect(screen.queryByText("external_directory")).toBeNull();
+    expect(screen.getByText("/tmp/opencode")).toBeTruthy();
+    expect(screen.queryByText("filepath")).toBeNull();
   });
 });
 

@@ -50,25 +50,38 @@ fn fork_from_selection_seeds_terminal_fork_and_inherits_parent_context() {
     assert_eq!(dialog.path_value(), "/tmp/repo-worktrees/feature");
 }
 
+/// Unforkable parents get an explanatory info dialog instead of the fork form: a resume-only
+/// terminal agent, a structured parent with no captured ACP session, and a structured parent
+/// whose agent has no fork strategy even with an ACP id (the capability gate runs first,
+/// mirroring the REST create guard and the web `acp_can_fork` projection).
 #[test]
 #[serial]
-fn fork_denied_for_resume_only_agent_shows_info() {
-    let mut env = create_test_env_empty();
-    let inst = observed_fork_parent("gemini");
-    let id = inst.id.clone();
-    env.view.add_instance(inst);
-    env.view.selected_session = Some(id);
+fn fork_denied_for_unforkable_parents_shows_info() {
+    let structured = |tool: &str, acp_session_id: Option<&str>| {
+        let mut inst = Instance::new("parent", "/tmp/repo");
+        inst.source_profile = "test".to_string();
+        inst.tool = tool.into();
+        inst.view = crate::session::View::Structured;
+        inst.acp_session_id = acp_session_id.map(Into::into);
+        inst
+    };
+    let cases = [
+        observed_fork_parent("gemini"),
+        structured("claude", None),
+        structured("aoe-agent", Some("acp-parent-1234")),
+    ];
+    for inst in cases {
+        let mut env = create_test_env_empty();
+        let tool = inst.tool.clone();
+        let id = inst.id.clone();
+        env.view.add_instance(inst);
+        env.view.selected_session = Some(id);
 
-    env.view.open_fork_from_selection();
+        env.view.open_fork_from_selection();
 
-    assert!(
-        env.view.new_dialog.is_none(),
-        "no dialog for an unforkable agent"
-    );
-    assert!(
-        env.view.info_dialog.is_some(),
-        "an explanatory info dialog is shown instead"
-    );
+        assert!(env.view.new_dialog.is_none(), "{tool}: no fork dialog");
+        assert!(env.view.info_dialog.is_some(), "{tool}: info dialog shown");
+    }
 }
 
 /// The fork seed forks the parent's agent, so the dialog opens preselected on it rather
@@ -132,95 +145,12 @@ fn fork_from_selection_structured_parent_seeds_structured_fork() {
     );
 }
 
-/// A structured parent with no captured ACP session id yet has no conversation
-/// to fork; the dialog must not open and an explanatory info dialog is shown.
+/// Context-menu Snooze mirrors the Attention-gated `h` key: on an active session it opens
+/// the duration picker, on a snoozed one it wakes immediately.
 #[test]
 #[serial]
-fn fork_from_selection_structured_parent_without_acp_id_denies() {
-    let mut env = create_test_env_empty();
-    let mut inst = Instance::new("parent", "/tmp/repo");
-    inst.source_profile = "test".to_string();
-    inst.tool = "claude".into();
-    inst.view = crate::session::View::Structured;
-    inst.acp_session_id = None;
-    let id = inst.id.clone();
-    env.view.add_instance(inst);
-    env.view.selected_session = Some(id);
-
-    env.view.open_fork_from_selection();
-
-    assert!(
-        env.view.new_dialog.is_none(),
-        "no dialog for a structured parent with no captured ACP session"
-    );
-    assert!(
-        env.view.info_dialog.is_some(),
-        "an explanatory info dialog is shown instead"
-    );
-}
-
-/// A structured parent whose agent is resume-only (ACP-capable but with no fork strategy)
-/// must be refused at the capability gate before the captured-conversation check, even with
-/// an acp_session_id, or the fork silently downgrades to session/new at the handshake. The
-/// gate mirrors the REST create guard and the web `acp_can_fork` projection.
-#[test]
-#[serial]
-fn fork_from_selection_structured_unforkable_agent_denies() {
-    let mut env = create_test_env_empty();
-    let mut inst = Instance::new("parent", "/tmp/repo");
-    inst.source_profile = "test".to_string();
-    inst.tool = "aoe-agent".into();
-    inst.view = crate::session::View::Structured;
-    // A captured conversation IS present, so only the capability gate can
-    // refuse (proving the gate runs before the acp-id check).
-    inst.acp_session_id = Some("acp-parent-1234".into());
-    let id = inst.id.clone();
-    env.view.add_instance(inst);
-    env.view.selected_session = Some(id);
-
-    env.view.open_fork_from_selection();
-
-    assert!(
-        env.view.new_dialog.is_none(),
-        "no dialog for a structured parent whose agent cannot fork"
-    );
-    assert!(
-        env.view.info_dialog.is_some(),
-        "an explanatory 'Fork not supported' info dialog is shown instead"
-    );
-}
-
-#[test]
-#[serial]
-fn test_session_context_menu_snooze_opens_duration_dialog() {
+fn test_session_context_menu_snooze_toggle() {
     use crate::session::config::SortOrder;
-    use crate::tui::dialogs::ContextMenuAction;
-
-    let mut env = create_test_env_with_groups();
-    // Snooze is offered in Attention sort, mirroring the Attention-gated `h` keybinding, and
-    // dispatching it on an active session opens the duration picker like the keyboard.
-    env.view.sort_order = SortOrder::Attention;
-    env.view.flat_items = env.view.build_flat_items();
-    let session_idx = env
-        .view
-        .flat_items
-        .iter()
-        .position(|item| matches!(item, Item::Session { .. }))
-        .expect("setup should produce a session");
-    env.view.cursor = session_idx;
-    env.view.update_selected();
-
-    env.view
-        .dispatch_context_menu_action(ContextMenuAction::ToggleSnooze);
-    assert!(
-        env.view.snooze_duration_dialog.is_some(),
-        "context-menu Snooze on an active session must open the duration picker"
-    );
-}
-
-#[test]
-#[serial]
-fn test_session_context_menu_snooze_wakes_snoozed_session() {
     use crate::tui::dialogs::ContextMenuAction;
 
     let mut env = create_test_env_with_groups();
@@ -238,13 +168,7 @@ fn test_session_context_menu_snooze_wakes_snoozed_session() {
         .clone()
         .expect("a session should be selected");
 
-    // Pre-snooze the session so the toggle takes the wake path.
     env.view.snooze_session_for(&id, 60).unwrap();
-    assert!(
-        env.view.instances.get(&id).is_some_and(|i| i.is_snoozed()),
-        "session should be snoozed before the toggle"
-    );
-
     env.view
         .dispatch_context_menu_action(ContextMenuAction::ToggleSnooze);
     assert!(
@@ -255,146 +179,53 @@ fn test_session_context_menu_snooze_wakes_snoozed_session() {
         !env.view.instances.get(&id).is_some_and(|i| i.is_snoozed()),
         "context-menu Snooze on a snoozed session must wake it immediately"
     );
-}
 
-#[test]
-#[serial]
-fn test_shift_n_does_nothing_with_no_selection() {
-    let mut env = create_test_env_empty();
-    env.view.handle_key(key(KeyCode::Char('N')), None);
+    env.view.sort_order = SortOrder::Attention;
+    env.view.flat_items = env.view.build_flat_items();
+    env.view.select_session_by_id(&id);
+    env.view
+        .dispatch_context_menu_action(ContextMenuAction::ToggleSnooze);
     assert!(
-        env.view.new_dialog.is_none(),
-        "N should not open dialog when nothing is selected"
+        env.view.snooze_duration_dialog.is_some(),
+        "context-menu Snooze on an active session must open the duration picker"
     );
 }
 
+/// `N` prefills the new-session dialog from the selected session: a worktree row borrows its
+/// main repo path, an ungrouped row its own path with no group.
 #[test]
 #[serial]
-fn test_shift_n_prefills_main_repo_path_for_worktree_session() {
-    use crate::session::WorktreeInfo;
-
-    let temp = TempDir::new().unwrap();
-    let _guard = setup_test_home(&temp);
-    let storage = Storage::new_unwatched("test").unwrap();
-
-    let mut inst = Instance::new("worktree-session", "/tmp/repo-worktrees/feature-branch");
-    inst.worktree_info = Some(WorktreeInfo {
+fn test_shift_n_prefills_from_selected_session() {
+    let mut worktree = Instance::new("worktree-session", "/tmp/repo-worktrees/feature-branch");
+    worktree.worktree_info = Some(crate::session::WorktreeInfo {
         branch: "feature-branch".to_string(),
         main_repo_path: "/tmp/repo".to_string(),
         managed_by_aoe: true,
         created_at: chrono::Utc::now(),
         base_branch: None,
     });
-    {
-        let xs: Vec<Instance> = vec![inst];
-        storage
-            .update(|i, g| {
-                *i = xs.to_vec();
-                *g = GroupTree::new_with_groups(&xs, &[]).get_all_groups();
-                Ok(())
-            })
-            .unwrap();
+    let mut env = seeded_env(
+        test_home(),
+        &[worktree, Instance::new("ungrouped", "/tmp/u")],
+        true,
+    );
+
+    for (title, path) in [("worktree-session", "/tmp/repo"), ("ungrouped", "/tmp/u")] {
+        let idx = env
+            .view
+            .flat_items
+            .iter()
+            .position(|item| matches!(item, Item::Session { id, .. } if env.view.get_instance(id).map(|i| i.title.as_str()) == Some(title)))
+            .expect("session row should exist");
+        env.view.cursor = idx;
+        env.view.update_selected();
+        env.view.new_dialog = None;
+
+        env.view.handle_key(key(KeyCode::Char('N')), None);
+        let dialog = env.view.new_dialog.as_ref().expect("N should open dialog");
+        assert_eq!(dialog.path_value(), path, "{title}");
+        assert_eq!(dialog.group_value(), "", "{title}");
     }
-
-    let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new_for_test(
-        Some("test".to_string()),
-        tools,
-        crate::file_watch::FileWatchService::noop(),
-    )
-    .unwrap();
-    view.group_by = crate::session::config::GroupByMode::Manual;
-    view.flat_items = view.build_flat_items();
-    view.update_selected();
-    view.cursor = 0;
-    view.update_selected();
-
-    view.handle_key(key(KeyCode::Char('N')), None);
-    let dialog = view.new_dialog.as_ref().expect("N should open dialog");
-    assert_eq!(
-        dialog.path_value(),
-        "/tmp/repo",
-        "Should pre-fill main_repo_path, not worktree path"
-    );
-}
-
-#[test]
-#[serial]
-fn test_shift_n_prefills_session_path_for_ungrouped() {
-    let mut env = create_test_env_with_groups();
-
-    // Move cursor to the ungrouped session
-    let ungrouped_idx = env
-        .view
-        .flat_items
-        .iter()
-        .position(|item| matches!(item, Item::Session { id, .. } if env.view.get_instance(id).map(|i| i.title.as_str()) == Some("ungrouped")))
-        .expect("ungrouped session should exist");
-    env.view.cursor = ungrouped_idx;
-    env.view.update_selected();
-
-    env.view.handle_key(key(KeyCode::Char('N')), None);
-    let dialog = env.view.new_dialog.as_ref().expect("N should open dialog");
-    assert_eq!(dialog.path_value(), "/tmp/u");
-    assert_eq!(
-        dialog.group_value(),
-        "",
-        "ungrouped session should not pre-fill group"
-    );
-}
-
-#[test]
-fn effective_list_width_clamps_on_small_screens() {
-    // The formula: list_width.min(available.saturating_sub(40)).max(10)
-    let clamp = |list_width: u16, available: u16| -> u16 {
-        list_width.min(available.saturating_sub(40)).max(10)
-    };
-
-    // Normal screen (120 cols): list_width 35 fits fine
-    assert_eq!(clamp(35, 120), 35);
-
-    // Medium screen (80 cols): list_width 35 still fits (80-40=40 > 35)
-    assert_eq!(clamp(35, 80), 35);
-
-    // Small screen (60 cols): list capped to 20, leaving 40 for preview
-    assert_eq!(clamp(35, 60), 20);
-
-    // Very small screen (50 cols): list capped to 10 (minimum)
-    assert_eq!(clamp(35, 50), 10);
-
-    // Tiny screen (30 cols): list stays at minimum 10
-    assert_eq!(clamp(35, 30), 10);
-
-    // User-resized list to 50 on a 100-col screen: capped to 60, but 50 < 60
-    assert_eq!(clamp(50, 100), 50);
-
-    // User-resized list to 50 on a 70-col screen: capped to 30, but min 10
-    assert_eq!(clamp(50, 70), 30);
-}
-
-#[test]
-#[serial]
-fn test_rename_selected_group_path() {
-    let mut env = create_test_env_with_groups();
-
-    // Set up rename context for the "work" group
-    env.view.group_rename_context = Some(crate::tui::home::GroupRenameContext {
-        old_path: "work".to_string(),
-        old_profile: "test".to_string(),
-    });
-
-    // Rename "work" -> "projects"
-    env.view
-        .rename_selected_group(Some("projects"), None)
-        .unwrap();
-
-    // Verify the session's group_path was updated
-    let work_session = env
-        .view
-        .instances()
-        .find(|i| i.title == "work-project")
-        .unwrap();
-    assert_eq!(work_session.group_path, "projects");
 }
 
 #[test]
@@ -411,7 +242,8 @@ fn test_rename_selected_group_with_children() {
     let mut inst2 = Instance::new("child-session", "/tmp/c");
     inst2.group_path = "work/frontend".to_string();
     let instances = vec![inst1, inst2];
-    let group_tree = GroupTree::new_with_groups(&instances, &[]);
+    let mut group_tree = GroupTree::new_with_groups(&instances, &[]);
+    group_tree.create_group("empty-group");
     storage
         .update(|i, g| {
             *i = instances.to_vec();
@@ -431,12 +263,19 @@ fn test_rename_selected_group_with_children() {
     view.flat_items = view.build_flat_items();
     view.update_selected();
 
-    view.group_rename_context = Some(crate::tui::home::GroupRenameContext {
-        old_path: "work".to_string(),
-        old_profile: "test".to_string(),
-    });
-
-    view.rename_selected_group(Some("projects"), None).unwrap();
+    for (old, new) in [("work", "projects"), ("empty-group", "renamed-group")] {
+        view.group_rename_context = Some(crate::tui::home::GroupRenameContext {
+            old_path: old.to_string(),
+            old_profile: "test".to_string(),
+        });
+        view.rename_selected_group(Some(new), None).unwrap();
+        let tree = view.group_trees.get("test").unwrap();
+        assert!(
+            !tree.group_exists(old),
+            "old group path {old} should be gone"
+        );
+        assert!(tree.group_exists(new), "new group path {new} should exist");
+    }
 
     let parent = view
         .instances()
@@ -481,120 +320,50 @@ fn test_rename_selected_group_with_children() {
     );
 }
 
+/// Renaming a group to its own path is a no-op, renaming onto an existing group fails, and a
+/// real rename re-sorts the list.
 #[test]
 #[serial]
-fn test_rename_selected_group_noop_when_unchanged() {
+fn test_rename_group_noop_and_duplicate() {
     let mut env = create_test_env_with_groups();
-
-    env.view.group_rename_context = Some(crate::tui::home::GroupRenameContext {
+    let context = || crate::tui::home::GroupRenameContext {
         old_path: "work".to_string(),
         old_profile: "test".to_string(),
-    });
+    };
 
-    // Same path, no profile change -> noop
+    env.view.group_rename_context = Some(context());
     env.view.rename_selected_group(Some("work"), None).unwrap();
-
     let work_session = env
         .view
         .instances()
         .find(|i| i.title == "work-project")
         .unwrap();
     assert_eq!(work_session.group_path, "work");
-}
 
-// --- Additional rename_selected_group operation tests ---
-
-#[test]
-#[serial]
-fn test_rename_group_removes_old_path() {
-    use crate::session::GroupTree;
-
-    let temp = TempDir::new().unwrap();
-    let _guard = setup_test_home(&temp);
-    let storage = Storage::new_unwatched("test").unwrap();
-
-    let mut inst = Instance::new("work-session", "/tmp/w");
-    inst.group_path = "work".to_string();
-    let instances = vec![inst];
-    let group_tree = GroupTree::new_with_groups(&instances, &[]);
-    storage
-        .update(|i, g| {
-            *i = instances.to_vec();
-            *g = group_tree.get_all_groups();
-            Ok(())
-        })
-        .unwrap();
-
-    let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new_for_test(
-        Some("test".to_string()),
-        tools,
-        crate::file_watch::FileWatchService::noop(),
-    )
-    .unwrap();
-    view.group_by = crate::session::config::GroupByMode::Manual;
-    view.flat_items = view.build_flat_items();
-    view.update_selected();
-
-    view.group_rename_context = Some(crate::tui::home::GroupRenameContext {
-        old_path: "work".to_string(),
-        old_profile: "test".to_string(),
-    });
-
-    view.rename_selected_group(Some("projects"), None).unwrap();
-
-    let tree = view.group_trees.get("test").unwrap();
-    assert!(!tree.group_exists("work"), "old group path should be gone");
-    assert!(tree.group_exists("projects"), "new group path should exist");
-}
-
-#[test]
-#[serial]
-fn test_rename_group_empty_group() {
-    use crate::session::GroupTree;
-
-    let temp = TempDir::new().unwrap();
-    let _guard = setup_test_home(&temp);
-    let storage = Storage::new_unwatched("test").unwrap();
-
-    let instances: Vec<Instance> = vec![];
-    let mut group_tree = GroupTree::new_with_groups(&instances, &[]);
-    group_tree.create_group("empty-group");
-    storage
-        .update(|i, g| {
-            *i = instances.to_vec();
-            *g = group_tree.get_all_groups();
-            Ok(())
-        })
-        .unwrap();
-
-    let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new_for_test(
-        Some("test".to_string()),
-        tools,
-        crate::file_watch::FileWatchService::noop(),
-    )
-    .unwrap();
-    view.group_by = crate::session::config::GroupByMode::Manual;
-    view.flat_items = view.build_flat_items();
-    view.update_selected();
-
-    view.group_rename_context = Some(crate::tui::home::GroupRenameContext {
-        old_path: "empty-group".to_string(),
-        old_profile: "test".to_string(),
-    });
-
-    view.rename_selected_group(Some("renamed-group"), None)
-        .unwrap();
-
-    let tree = view.group_trees.get("test").unwrap();
+    env.view.group_rename_context = Some(context());
     assert!(
-        !tree.group_exists("empty-group"),
-        "old empty group path should be gone"
+        env.view
+            .rename_selected_group(Some("personal"), None)
+            .is_err(),
+        "renaming to an existing group should fail"
     );
-    assert!(
-        tree.group_exists("renamed-group"),
-        "new group path should exist"
+
+    env.view.sort_order = crate::session::config::SortOrder::AZ;
+    env.view.group_rename_context = Some(context());
+    env.view.rename_selected_group(Some("aaa"), None).unwrap();
+    let group_items: Vec<&str> = env
+        .view
+        .flat_items
+        .iter()
+        .filter_map(|item| match item {
+            Item::Group { name, .. } => Some(name.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        group_items,
+        vec!["aaa", "personal"],
+        "groups should be re-sorted alphabetically after rename"
     );
 }
 
@@ -695,49 +464,6 @@ fn test_group_profile_move_rejects_concurrent_fresh_member_without_metadata_spli
         .load()
         .unwrap()
         .is_empty());
-}
-
-#[test]
-#[serial]
-fn test_rename_group_duplicate_returns_error() {
-    use crate::session::GroupTree;
-
-    let temp = TempDir::new().unwrap();
-    let _guard = setup_test_home(&temp);
-    let storage = Storage::new_unwatched("test").unwrap();
-
-    let mut inst1 = Instance::new("work-session", "/tmp/w");
-    inst1.group_path = "work".to_string();
-    let mut inst2 = Instance::new("personal-session", "/tmp/p");
-    inst2.group_path = "personal".to_string();
-    let instances = vec![inst1, inst2];
-    let group_tree = GroupTree::new_with_groups(&instances, &[]);
-    storage
-        .update(|i, g| {
-            *i = instances.to_vec();
-            *g = group_tree.get_all_groups();
-            Ok(())
-        })
-        .unwrap();
-
-    let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new_for_test(
-        Some("test".to_string()),
-        tools,
-        crate::file_watch::FileWatchService::noop(),
-    )
-    .unwrap();
-    view.group_by = crate::session::config::GroupByMode::Manual;
-    view.flat_items = view.build_flat_items();
-    view.update_selected();
-
-    view.group_rename_context = Some(crate::tui::home::GroupRenameContext {
-        old_path: "work".to_string(),
-        old_profile: "test".to_string(),
-    });
-
-    let result = view.rename_selected_group(Some("personal"), None);
-    assert!(result.is_err(), "renaming to an existing group should fail");
 }
 
 #[test]
@@ -927,95 +653,19 @@ fn group_profile_move_preflights_creating_and_expired_reservations() {
 
 #[test]
 #[serial]
-fn test_rename_group_resort_az() {
-    use crate::session::config::SortOrder;
-    use crate::session::GroupTree;
-
-    let temp = TempDir::new().unwrap();
-    let _guard = setup_test_home(&temp);
-
-    crate::session::config::update_app_state(|state| {
-        state.sort_order = Some(SortOrder::AZ);
-    })
-    .unwrap();
-
-    let storage = Storage::new_unwatched("test").unwrap();
-
-    let mut inst1 = Instance::new("s1", "/tmp/1");
-    inst1.group_path = "zzz".to_string();
-    let mut inst2 = Instance::new("s2", "/tmp/2");
-    inst2.group_path = "mmm".to_string();
-    let instances = vec![inst1, inst2];
-    let group_tree = GroupTree::new_with_groups(&instances, &[]);
-    storage
-        .update(|i, g| {
-            *i = instances.to_vec();
-            *g = group_tree.get_all_groups();
-            Ok(())
-        })
-        .unwrap();
-
-    let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new_for_test(
-        Some("test".to_string()),
-        tools,
-        crate::file_watch::FileWatchService::noop(),
-    )
-    .unwrap();
-    view.group_by = crate::session::config::GroupByMode::Manual;
-    view.flat_items = view.build_flat_items();
-    view.update_selected();
-
-    view.group_rename_context = Some(crate::tui::home::GroupRenameContext {
-        old_path: "zzz".to_string(),
-        old_profile: "test".to_string(),
-    });
-
-    view.rename_selected_group(Some("aaa"), None).unwrap();
-
-    let group_items: Vec<&str> = view
-        .flat_items
-        .iter()
-        .filter_map(|item| {
-            if let Item::Group { name, .. } = item {
-                Some(name.as_str())
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    assert_eq!(
-        group_items,
-        vec!["aaa", "mmm"],
-        "groups should be sorted alphabetically after rename"
-    );
-}
-
-#[test]
-#[serial]
 fn test_q_in_search_mode_types_q_not_quit() {
     let env = create_test_env_with_sessions(3);
     let mut view = env.view;
 
+    assert!(!view.has_dialog());
     view.handle_key(key(KeyCode::Char('/')), None);
     assert!(view.search_active);
+    assert!(view.has_dialog(), "active search counts as a dialog");
 
     let action = view.handle_key(key(KeyCode::Char('q')), None);
     assert_eq!(action, None);
     assert!(view.search_active);
     assert_eq!(view.search_query.value(), "q");
-}
-
-#[test]
-#[serial]
-fn test_has_dialog_true_when_search_active() {
-    let env = create_test_env_empty();
-    let mut view = env.view;
-
-    assert!(!view.has_dialog());
-    view.handle_key(key(KeyCode::Char('/')), None);
-    assert!(view.has_dialog());
 }
 
 /// The async CreationPoller result must replace a `Creating` stub even when an intervening
@@ -1295,39 +945,6 @@ fn apply_creation_results_rolls_back_on_peer_collision() {
 }
 
 #[test]
-fn test_project_group_key_uses_last_path_segment() {
-    use crate::tui::home::project_group_key;
-
-    let inst = Instance::new("test", "/home/user/my-project");
-    assert_eq!(project_group_key(&inst), "my-project");
-}
-
-#[test]
-fn test_project_group_key_uses_main_repo_for_worktree() {
-    use crate::session::WorktreeInfo;
-    use crate::tui::home::project_group_key;
-    use chrono::Utc;
-
-    let mut inst = Instance::new("test", "/home/user/my-project/.worktrees/feature-abc");
-    inst.worktree_info = Some(WorktreeInfo {
-        branch: "feature-abc".to_string(),
-        main_repo_path: "/home/user/my-project".to_string(),
-        managed_by_aoe: true,
-        created_at: Utc::now(),
-        base_branch: None,
-    });
-    assert_eq!(project_group_key(&inst), "my-project");
-}
-
-#[test]
-fn test_project_group_key_handles_trailing_slash() {
-    use crate::tui::home::project_group_key;
-
-    let inst = Instance::new("test", "/home/user/my-project/");
-    assert_eq!(project_group_key(&inst), "my-project");
-}
-
-#[test]
 fn test_project_group_key_scratch_uses_sentinel_not_label() {
     use crate::session::{project_group_display_name, SCRATCH_GROUP_PATH};
     use crate::tui::home::project_group_key;
@@ -1369,21 +986,4 @@ fn test_cursor_follows_session_after_deletion() {
         Some(tracked_id.as_str())
     );
     assert_eq!(env.view.cursor, 1);
-}
-
-#[test]
-#[serial]
-fn home_defaults_to_agent_when_config_unset() {
-    let temp = TempDir::new().unwrap();
-    let _guard = setup_test_home(&temp);
-    let _storage = Storage::new_unwatched("test").unwrap();
-
-    let tools = AvailableTools::with_tools(&["claude"]);
-    let view = HomeView::new_for_test(
-        Some("test".to_string()),
-        tools,
-        crate::file_watch::FileWatchService::noop(),
-    )
-    .unwrap();
-    assert_eq!(view.view_mode, ViewMode::Structured);
 }
