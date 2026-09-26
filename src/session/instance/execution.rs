@@ -290,8 +290,9 @@ pub(super) struct NativeLaunchInputs {
 
 /// A host path's identity, whatever its spelling. Total by construction: a
 /// path that cannot be resolved still compares by its nearest existing
-/// ancestor, so a failure never reads as agreement. The launch reports these
-/// identities, so a symlinked spelling never reaches the user split in two.
+/// ancestor, so a failure never reads as agreement. Only the identity
+/// comparison uses it: the launch routes and records the store the arm that
+/// selects it already resolved.
 fn host_identity(path: &std::path::Path) -> PathBuf {
     crate::session::capture::canonicalize_allowing_missing_leaf(path)
         .unwrap_or_else(|| crate::git::template::lexical_normalize(path))

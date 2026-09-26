@@ -1901,7 +1901,7 @@ mod tests {
         drop(env);
         // The session environment baselines on the process environment, so the
         // default tier needs the variable removed, not merely undeclared.
-        let env = EnvGuard::unset(&["CLAUDE_CONFIG_DIR"]);
+        let _env = EnvGuard::unset(&["CLAUDE_CONFIG_DIR"]);
         let (from_default, _) = resumed(&mut instance(), attested.binding.clone());
         assert_eq!(
             from_default
