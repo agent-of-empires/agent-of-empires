@@ -1161,11 +1161,11 @@ impl Instance {
     /// The conversation an explicit fork would carry, with the evidence for it:
     /// `Bound` when a binding qualifies the recorded id, `Recorded` when the id
     /// stands alone, so an unqualified parent reaches `terminal_fork_seed` and is
-    /// refused as such rather than as a session with no conversation.
+    /// refused as such rather than as a session with no conversation, and
+    /// `Unlaunched` for a fork whose launch has not happened.
     pub(crate) fn fork_parent_ref(&self) -> Option<ForkParentRef<'_>> {
         let (sid, binding) = match &self.resume_intent {
-            ResumeIntent::Fork { .. } => return None,
-            ResumeIntent::Use(sid) => (Some(sid), self.resume_binding.as_ref()),
+            ResumeIntent::Fork { .. } => return Some(ForkParentRef::Unlaunched),
             _ => (
                 self.agent_session_id.as_ref(),
                 self.agent_session_binding.as_ref(),

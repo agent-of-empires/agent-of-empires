@@ -276,15 +276,6 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
 
     let fork_seed: Option<crate::session::ForkSeed> = if let Some(fork_ref) = &args.fork_from {
         let source = super::resolve_session(fork_ref, &instances)?;
-        if matches!(
-            source.resume_intent,
-            crate::session::ResumeIntent::Fork { .. }
-        ) {
-            bail!(
-                "Cannot fork from session '{}': its own fork has not launched yet. Start it once, then fork from the child conversation.",
-                source.title
-            );
-        }
         let user_chose_tool = args.tool.is_some() || args.command.is_some();
         if !user_chose_tool {
             resolved_tool = source.tool.clone();
@@ -294,7 +285,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
             parent_ref,
             crate::session::capture::generate_session_uuid(),
         )
-        .map_err(|denied| anyhow::Error::msg(denied.user_message(&source.title)))?;
+        .map_err(|denied| anyhow::Error::msg(denied.user_message(&source.title, &source.id)))?;
         Some(seed)
     } else {
         None

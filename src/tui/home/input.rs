@@ -3045,10 +3045,13 @@ impl HomeView {
                     ));
                 return;
             }
+            // Kept local to the structured path: an ACP parent never reaches
+            // `terminal_fork_seed`, so no `ForkDenied` describes it. Named as
+            // ACP so it cannot read as the terminal pre-pinned refusal.
             let Some(acp_id) = parent_acp_session_id.filter(|s| !s.is_empty()) else {
                 self.info_dialog = Some(InfoDialog::new(
                     "Nothing to fork yet",
-                    "This session has no captured conversation to fork from. Send it at least one message first.",
+                    "This session has no captured ACP conversation to fork from. Send it at least one message first.",
                 ));
                 return;
             };
@@ -3061,14 +3064,17 @@ impl HomeView {
                 Ok(s) => s,
                 Err(denied) => {
                     let dialog_title = match denied {
-                        crate::session::ForkDenied::AgentCannotFork => "Fork not supported",
-                        crate::session::ForkDenied::NoParentSession => "Nothing to fork yet",
+                        crate::session::ForkDenied::AgentCannotFork { .. } => "Fork not supported",
+                        crate::session::ForkDenied::NoParentSession
+                        | crate::session::ForkDenied::UnlaunchedFork => "Nothing to fork yet",
                         crate::session::ForkDenied::UnqualifiedParent { .. } => {
                             "Conversation not qualified"
                         }
                     };
-                    self.info_dialog =
-                        Some(InfoDialog::new(dialog_title, &denied.user_message(&title)));
+                    self.info_dialog = Some(InfoDialog::new(
+                        dialog_title,
+                        &denied.user_message(&title, &parent.id),
+                    ));
                     return;
                 }
             }

@@ -122,12 +122,17 @@ pub(super) fn create_body_combines_scratch_and_worktree(body: &CreateSessionBody
     body.scratch && create_body_uses_worktree(body)
 }
 
+/// A fork refusal plus the index in `parents` of the row it is about, so the
+/// remedy names the row the request asked to fork. `None` when no row carries
+/// the id.
+pub(super) type ForkDenial = (crate::session::ForkDenied, Option<usize>);
+
 /// Resolve a one-shot fork seed from a uniquely identified parent binding.
 pub(super) fn resolve_create_fork_seed(
     parent_id: &str,
     structured: bool,
     parents: &[crate::session::Instance],
-) -> Result<crate::session::ForkSeed, crate::session::ForkDenied> {
+) -> Result<crate::session::ForkSeed, ForkDenial> {
     if structured {
         return Ok(crate::session::ForkSeed::Structured {
             parent_acp_session_id: parent_id.to_string(),
@@ -135,53 +140,51 @@ pub(super) fn resolve_create_fork_seed(
     }
     // The candidate is the conversation the row carries, which for a pinned row
     // is the pinned id, not the one `agent_session_id` still names, so the id is
-    // read off the candidate. Lazy: a row carrying another id is dropped without
-    // materialising anything.
-    let candidates = parents
-        .iter()
-        .filter_map(|parent| parent.fork_parent_ref())
-        .filter(|candidate| candidate.session_id() == parent_id);
-    // A qualified row wins over an unqualified one carrying the same id, and the
-    // ambiguity scan compares only qualified rows, so the seed and the scan do
-    // not depend on the order `Storage::load()` returned the rows in. The refusal
-    // does: it describes the first row that carries a binding, so two rows
-    // disagreeing on provenance get whichever loaded first. Both are true of a
-    // row and each admits its own remedy, so none is ranked above another here.
+    // read off the candidate. Lazy: a row carrying another id, or none of its
+    // own, is dropped without materialising anything.
     let mut first = None;
     let mut bound = None;
     let mut chosen = None;
     let mut ambiguous = false;
-    for candidate in candidates {
+    for (index, parent) in parents.iter().enumerate() {
+        let Some(candidate) = parent
+            .fork_parent_ref()
+            .filter(|candidate| candidate.session_id() == Some(parent_id))
+        else {
+            continue;
+        };
         if first.is_none() {
-            first = Some(candidate);
+            first = Some((index, candidate));
         }
         if bound.is_none() && candidate.binding().is_some() {
-            bound = Some(candidate);
+            bound = Some((index, candidate));
         }
         if !candidate.is_known() {
             continue;
         }
-        let Some(previous) = chosen else {
-            chosen = Some(candidate);
-            continue;
-        };
-        if candidate.binding().and_then(|binding| binding.key())
-            != previous.binding().and_then(|binding| binding.key())
-        {
-            ambiguous = true;
+        match chosen {
+            None => chosen = Some((index, candidate)),
+            Some((_, previous))
+                if candidate.binding().and_then(|binding| binding.key())
+                    != previous.binding().and_then(|binding| binding.key()) =>
+            {
+                ambiguous = true;
+            }
+            Some(_) => {}
         }
     }
-    if ambiguous {
-        return Err(crate::session::ForkDenied::NoParentSession);
-    }
-    let parent = chosen
+    let (index, parent) = chosen
         .or(bound)
         .or(first)
-        .ok_or(crate::session::ForkDenied::NoParentSession)?;
+        .ok_or((crate::session::ForkDenied::NoParentSession, None))?;
+    if ambiguous {
+        return Err((crate::session::ForkDenied::NoParentSession, Some(index)));
+    }
     crate::session::fork::terminal_fork_seed(
         Some(parent),
         crate::session::capture::generate_session_uuid(),
     )
+    .map_err(|denied| (denied, Some(index)))
 }
 
 /// True when a create asks to both import and fork. The two seed from
@@ -883,21 +886,17 @@ pub async fn create_session(
             };
             match resolve_create_fork_seed(parent_id, structured, &parents) {
                 Ok(seed) => Some(seed),
-                Err(denied) => {
-                    // The remedy names the row the request asked to fork, so it
-                    // runs as printed. The fallback can only reach a refusal
-                    // that admits no remedy, which needs no row.
-                    let parent = parents
-                        .iter()
-                        .find(|row| {
-                            row.fork_parent_ref()
-                                .is_some_and(|candidate| candidate.session_id() == parent_id)
-                        })
-                        .map_or(parent_id, |row| row.title.as_str());
+                // The remedy carries the id of the row the refusal is about, so
+                // it runs as printed. A refusal naming no row admits no remedy,
+                // so the requested id stands in for both.
+                Err((denied, index)) => {
+                    let (title, id) = index.map_or((parent_id, parent_id), |index| {
+                        (&parents[index].title, &parents[index].id)
+                    });
                     return api_error(
                         StatusCode::BAD_REQUEST,
                         "fork_unsupported",
-                        denied.user_message(parent),
+                        denied.user_message(title, id),
                     );
                 }
             }
