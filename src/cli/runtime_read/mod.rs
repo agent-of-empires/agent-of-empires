@@ -2,9 +2,10 @@
 /// decoders; the two halves then cannot drift on a field name or member order.
 pub(crate) mod dto;
 mod endpoint;
-/// The Contract Pack verifier and its frozen fixtures. Gated to the test
-/// profile: the pack is fixture governance, never a production input.
-#[cfg(any(test, feature = "test-support"))]
+/// The Contract Pack verifier and its frozen fixtures. Test-only surface, in
+/// the same shape as the other `test_support` modules, so the integration
+/// tests that verify the pack can reach it.
+#[cfg(any(test, debug_assertions))]
 #[doc(hidden)]
 pub mod pack;
 #[cfg(test)]
