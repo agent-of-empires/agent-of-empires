@@ -497,7 +497,7 @@ pub(crate) fn run_create_hooks(
 /// binary via `build_host_command`), destroy it, or edit it. Returns the
 /// canonical CityHall 403 (never a 404, so the mode does not leak which ids
 /// exist); `None` in normal mode or for a genuine structured target. See #7.
-pub(super) async fn cityhall_block_non_structured(
+pub(crate) async fn cityhall_block_non_structured(
     state: &AppState,
     id: &str,
 ) -> Option<axum::response::Response> {

@@ -13,6 +13,7 @@ use crate::acp::protocol::{
 use crate::server::session_service::{PromptTouch, SendTurnError, SendTurnRequest, SessionCaller};
 
 use super::*;
+use crate::server::api::sessions::cityhall_block_non_structured;
 
 /// A cancel that waited this long on the submission guard is logged.
 const CANCEL_SUBMISSION_WAIT_WARN: std::time::Duration = std::time::Duration::from_millis(500);
@@ -61,6 +62,9 @@ pub async fn acp_prompt(
     Path(id): Path<String>,
     req: Result<Json<PromptRequest>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
+    if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
+        return resp;
+    }
     if let Some(resp) = read_only_block(&state) {
         return resp;
     }
@@ -217,6 +221,9 @@ pub async fn acp_prompt_diff_comments(
     Path(id): Path<String>,
     req: Result<Json<DiffCommentsPromptRequest>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
+    if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
+        return resp;
+    }
     if let Some(resp) = read_only_block(&state) {
         return resp;
     }
@@ -292,6 +299,9 @@ pub async fn acp_attachment(
     State(state): State<Arc<AppState>>,
     Path((id, attachment_id)): Path<(String, String)>,
 ) -> impl IntoResponse {
+    if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
+        return resp;
+    }
     use axum::http::header;
     match state.acp_event_store.load_attachment(&id, &attachment_id) {
         Some((mime, bytes)) => (
@@ -317,6 +327,9 @@ pub async fn acp_cancel(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
+    if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
+        return resp;
+    }
     if let Some(resp) = read_only_block(&state) {
         return resp;
     }
@@ -347,6 +360,9 @@ pub async fn acp_force_end_turn(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
+    if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
+        return resp;
+    }
     if let Some(resp) = read_only_block(&state) {
         return resp;
     }
@@ -359,6 +375,9 @@ pub async fn resolve_approval(
     Path((id, nonce_str)): Path<(String, String)>,
     req: Result<Json<ResolveApprovalRequest>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
+    if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
+        return resp;
+    }
     if let Some(resp) = read_only_block(&state) {
         return resp;
     }
@@ -396,6 +415,9 @@ pub async fn resolve_elicitation(
     Path((id, nonce_str)): Path<(String, String)>,
     req: Result<Json<ElicitationResolution>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
+    if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
+        return resp;
+    }
     if let Some(resp) = read_only_block(&state) {
         return resp;
     }

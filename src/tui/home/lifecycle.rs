@@ -274,6 +274,7 @@ impl HomeView {
             changelog_dialog: None,
             info_dialog: None,
             pending_indeterminate_resolution: None,
+            pending_indeterminate_queue: Vec::new(),
             snooze_duration_dialog: None,
             pending_snooze_session: None,
             profile_picker_dialog: None,

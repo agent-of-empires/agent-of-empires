@@ -20,6 +20,7 @@ use super::acp::validate_attachments;
 use super::read_only_block;
 use crate::acp::protocol::PromptAttachmentUpload;
 use crate::daemon::PromptAttachmentRef;
+use crate::server::api::sessions::cityhall_block_non_structured;
 use crate::server::session_service::EditQueuedOutcome;
 use crate::server::AppState;
 
@@ -70,6 +71,9 @@ pub async fn queue_enqueue(
     Path(id): Path<String>,
     req: Result<Json<EnqueueRequest>, JsonRejection>,
 ) -> impl IntoResponse {
+    if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
+        return resp;
+    }
     if let Some(resp) = read_only_block(&state) {
         return resp;
     }
@@ -234,6 +238,9 @@ pub async fn queue_list(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
+    if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
+        return resp;
+    }
     Json(state.session_service.queued_prompts_snapshot(&id).await).into_response()
 }
 
@@ -243,6 +250,9 @@ pub async fn queue_edit(
     Path((id, prompt_id)): Path<(String, String)>,
     req: Result<Json<EditRequest>, JsonRejection>,
 ) -> impl IntoResponse {
+    if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
+        return resp;
+    }
     if let Some(resp) = read_only_block(&state) {
         return resp;
     }
@@ -283,6 +293,9 @@ pub async fn queue_remove(
     State(state): State<Arc<AppState>>,
     Path((id, prompt_id)): Path<(String, String)>,
 ) -> impl IntoResponse {
+    if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
+        return resp;
+    }
     if let Some(resp) = read_only_block(&state) {
         return resp;
     }
@@ -302,6 +315,9 @@ pub async fn queue_clear(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
+    if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
+        return resp;
+    }
     if let Some(resp) = read_only_block(&state) {
         return resp;
     }

@@ -51,12 +51,16 @@ async fn mutation_gate(
 }
 
 /// `GET /api/plugins`: every known plugin plus load errors.
-pub async fn list_plugins() -> Json<serde_json::Value> {
+pub async fn list_plugins(State(state): State<std::sync::Arc<AppState>>) -> Response {
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
+    }
     let registry = plugin::registry();
     Json(json!({
         "plugins": registry.all().iter().map(|p| p.view()).collect::<Vec<_>>(),
         "load_errors": registry.load_errors(),
     }))
+    .into_response()
 }
 
 /// Resolve a plugin's declared `icon_asset` (repository-relative, already
@@ -95,7 +99,13 @@ fn content_type_for_icon(path: &std::path::Path) -> Option<&'static str> {
 /// shape: the manifest path is re-validated and re-joined against the
 /// plugin's own directory rather than trusted from a cached URL. A builtin
 /// (no install directory) or a plugin with no `icon_asset` 404s.
-pub async fn serve_plugin_icon(Path(id): Path<String>) -> Response {
+pub async fn serve_plugin_icon(
+    State(state): State<std::sync::Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Response {
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
+    }
     let registry = plugin::registry();
     let Some(plugin) = registry.all().iter().find(|p| p.id() == id) else {
         return StatusCode::NOT_FOUND.into_response();
@@ -148,7 +158,10 @@ struct PluginCommandView {
 /// `GET /api/plugins/commands`: active plugins' contributed commands, each with
 /// the chords bound to it and its client action. Reads the registry (manifests),
 /// not workers, so it is safe in read-only mode.
-pub async fn plugin_commands() -> Json<serde_json::Value> {
+pub async fn plugin_commands(State(state): State<std::sync::Arc<AppState>>) -> Response {
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
+    }
     let registry = plugin::registry();
     let mut commands = Vec::new();
     for p in registry.active() {
@@ -173,26 +186,28 @@ pub async fn plugin_commands() -> Json<serde_json::Value> {
             });
         }
     }
-    Json(json!({ "commands": commands }))
+    Json(json!({ "commands": commands })).into_response()
 }
 
 /// `GET /api/plugins/ui-state`: the plugin host's aggregated UI-state snapshot
 /// (the slots workers have pushed, plus the notification ring). Empty when no
 /// host is running (read-only mode). The
 /// dashboard polls this alongside `/api/sessions` and renders each slot itself.
-pub async fn plugin_ui_state(
-    State(state): State<std::sync::Arc<AppState>>,
-) -> Json<serde_json::Value> {
+pub async fn plugin_ui_state(State(state): State<std::sync::Arc<AppState>>) -> Response {
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
+    }
     let empty = || json!({ "entries": [], "notifications": [] });
-    match state.plugin_host.as_ref().map(|h| h.ui_snapshot()) {
-        Some(snapshot) => Json(serde_json::to_value(snapshot).unwrap_or_else(|e| {
+    let snapshot = match state.plugin_host.as_ref().map(|h| h.ui_snapshot()) {
+        Some(snapshot) => serde_json::to_value(snapshot).unwrap_or_else(|e| {
             // Serializing the snapshot should never fail; if it somehow does,
             // keep the response shape stable rather than returning JSON null.
             tracing::warn!(target: "serve.api", "failed to serialize plugin UI snapshot: {e}");
             empty()
-        })),
-        None => Json(empty()),
-    }
+        }),
+        None => empty(),
+    };
+    Json(snapshot).into_response()
 }
 
 /// `GET /api/plugins/updates`: which installed external plugins have an update
@@ -200,8 +215,11 @@ pub async fn plugin_ui_state(
 /// updates" button), kept off the always-on `GET /api/plugins` list path so a
 /// settings render never blocks on git/network. Allowed in read-only mode: it
 /// reads remote state and mutates nothing.
-pub async fn plugin_updates() -> Json<serde_json::Value> {
-    Json(json!({ "updates": plugin::update_check::outdated().await }))
+pub async fn plugin_updates(State(state): State<std::sync::Arc<AppState>>) -> Response {
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
+    }
+    Json(json!({ "updates": plugin::update_check::outdated().await })).into_response()
 }
 
 #[derive(Deserialize)]
@@ -216,7 +234,13 @@ pub struct DiscoverQuery {
 /// `install_command` the user copies. On a GitHub failure (notably the
 /// unauthenticated search rate limit) the message is returned for the UI to
 /// show, rather than a generic 500.
-pub async fn plugin_discover(Query(query): Query<DiscoverQuery>) -> Response {
+pub async fn plugin_discover(
+    State(state): State<std::sync::Arc<AppState>>,
+    Query(query): Query<DiscoverQuery>,
+) -> Response {
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
+    }
     match plugin::discover::discover(query.q.as_deref()).await {
         Ok(results) => Json(json!({ "results": results })).into_response(),
         Err(e) => error_response(StatusCode::BAD_GATEWAY, "discover_failed", format!("{e:#}")),
@@ -231,7 +255,13 @@ pub struct DetailsQuery {
 /// `GET /api/plugins/details?source=gh:owner/repo`: the on-demand detail for one
 /// plugin source (manifest fields + release tags) backing the dashboard detail
 /// modal. Allowed in read-only mode; reads remote state and mutates nothing.
-pub async fn plugin_details(Query(query): Query<DetailsQuery>) -> Response {
+pub async fn plugin_details(
+    State(state): State<std::sync::Arc<AppState>>,
+    Query(query): Query<DetailsQuery>,
+) -> Response {
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
+    }
     match plugin::discover::details(&query.source).await {
         Ok(detail) => Json(detail).into_response(),
         // `details()` only hard-errors on an invalid / unsupported `source`; a
@@ -448,6 +478,9 @@ pub async fn plugin_update_preview(
     State(state): State<std::sync::Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Response {
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
+    }
     if state.read_only {
         return super::read_only_response();
     }
@@ -555,7 +588,7 @@ pub async fn set_plugin_enabled(
             if let Some(host) = state.plugin_host.clone() {
                 host.reconcile(&crate::plugin::registry()).await;
             }
-            list_plugins().await.into_response()
+            list_plugins(State(state)).await
         }
         Ok(Err(e)) => error_response(StatusCode::BAD_REQUEST, "plugin_error", format!("{e:#}")),
         Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string()),
@@ -856,6 +889,9 @@ pub async fn plugin_job_status(
     Path(job_id): Path<String>,
     Query(q): Query<JobLogQuery>,
 ) -> Response {
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
+    }
     let Some(job) = state.plugin_jobs.get(&job_id) else {
         return error_response(
             StatusCode::NOT_FOUND,

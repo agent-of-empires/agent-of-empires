@@ -95,7 +95,23 @@ impl RateLimiter {
     ) -> bool {
         let ip = key.0;
         if failures.len() >= MAX_TRACKED_IPS && !failures.contains_key(&key) {
-            return false;
+            // The table is bounded, so a new IP has to displace one. Dropping
+            // the newcomer instead (the previous behavior) left it entirely
+            // untracked: an attacker who filled the table with distinct
+            // source addresses then got unlimited auth attempts from any
+            // address not already in it. Evict instead — a locked record is
+            // chosen only once every other entry is locked too, so an active
+            // lockout is never lifted while there is any other room.
+            let victim = failures
+                .iter()
+                .min_by_key(|(_, record)| (record.locked_until.is_some(), record.last_failure))
+                .map(|(victim, _)| *victim);
+            match victim {
+                Some(victim) => {
+                    failures.remove(&victim);
+                }
+                None => return false,
+            }
         }
 
         let record = failures.entry(key).or_insert(FailureRecord {
@@ -297,5 +313,81 @@ mod tests {
                 "the burst consumes exactly one attempt, not zero or twenty",
             );
         }
+    }
+
+    /// A full table must not turn a new source address into an unlimited one:
+    /// the entry is admitted by displacing the least recently active record.
+    ///
+    /// Driven through `record_failure_at` with synthetic instants so the
+    /// 10 000-entry table costs no wall-clock time.
+    #[test]
+    fn a_full_table_still_tracks_a_new_ip() {
+        let mut failures = HashMap::new();
+        let base = Instant::now();
+        let ip_at = |n: usize| -> IpAddr {
+            format!("10.{}.{}.{}", (n / 65536) % 256, (n / 256) % 256, n % 256)
+                .parse()
+                .unwrap()
+        };
+        for n in 0..MAX_TRACKED_IPS {
+            RateLimiter::record_failure_at(
+                &mut failures,
+                (ip_at(n), TOKEN),
+                base + COALESCE_WINDOW * n as u32,
+            );
+        }
+        let fresh: IpAddr = "203.0.113.9".parse().unwrap();
+        RateLimiter::record_failure_at(&mut failures, (fresh, TOKEN), base);
+
+        assert!(
+            failures.contains_key(&(fresh, TOKEN)),
+            "a new IP must be tracked, not silently dropped"
+        );
+        assert!(
+            failures.len() <= MAX_TRACKED_IPS,
+            "the table must stay bounded, got {}",
+            failures.len()
+        );
+    }
+
+    /// Eviction must not lift an active lockout while any unlocked record can
+    /// be displaced instead.
+    #[test]
+    fn a_saturated_table_evicts_an_idle_record_before_a_locked_one() {
+        let mut failures = HashMap::new();
+        let base = Instant::now();
+        let locked: IpAddr = "198.51.100.7".parse().unwrap();
+        for attempt in 0..MAX_FAILURES {
+            RateLimiter::record_failure_at(
+                &mut failures,
+                (locked, TOKEN),
+                base + COALESCE_WINDOW * attempt,
+            );
+        }
+        assert_eq!(
+            failures.get(&(locked, TOKEN)).and_then(|r| r.locked_until),
+            Some(base + COALESCE_WINDOW * (MAX_FAILURES - 1) + LOCKOUT_DURATION),
+            "the fixture IP must be locked out before the table fills"
+        );
+        for n in 0..MAX_TRACKED_IPS {
+            RateLimiter::record_failure_at(
+                &mut failures,
+                (
+                    format!("10.{}.{}.{}", (n / 65536) % 256, (n / 256) % 256, n % 256)
+                        .parse()
+                        .unwrap(),
+                    TOKEN,
+                ),
+                base + COALESCE_WINDOW * (n as u32 + 1),
+            );
+        }
+        let fresh: IpAddr = "203.0.113.10".parse().unwrap();
+        RateLimiter::record_failure_at(&mut failures, (fresh, TOKEN), base);
+
+        assert!(
+            failures.contains_key(&(locked, TOKEN)),
+            "an active lockout must survive an eviction"
+        );
+        assert!(failures.contains_key(&(fresh, TOKEN)));
     }
 }

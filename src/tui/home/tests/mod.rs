@@ -47,6 +47,7 @@ fn key(code: KeyCode) -> KeyEvent {
 mod apply_session_id_updates;
 mod archive_restart_grouping;
 mod click_to_select;
+mod command_errors;
 mod creation_fence;
 mod default_attach_mode;
 mod divider_drag;

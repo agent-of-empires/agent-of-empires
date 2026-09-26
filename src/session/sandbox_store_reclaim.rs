@@ -773,7 +773,7 @@ mod tests {
             let row = crate::session::Instance::new("retained", home.to_str().unwrap());
             let protected = store(&home, &row.id, 40);
             let unclaimed = store(&home, "2222222222222222", 10);
-            let owner = super::super::purge_owners::PurgeOwner::record(
+            let _owner = super::super::purge_owners::PurgeOwner::record(
                 &storage,
                 &row,
                 super::super::purge_owners::PurgeCapture::new(&row).unwrap(),
@@ -789,24 +789,36 @@ mod tests {
             assert!(unclaimed.exists(), "unproven stores must be retained");
 
             let journal = owner_app.join(super::super::purge_owners::FILE_NAME);
-            let saved = fs::read(&journal).unwrap();
-            for malformed in [true, false] {
-                if malformed {
-                    fs::write(&journal, b"{").unwrap();
-                } else {
-                    fs::remove_file(&journal).unwrap();
-                }
-                let unclaimed = store(&home, "2222222222222222", 10);
-                assert!(reclaim_in(&app, &namespaces, &home, NO_GRACE, &gone).is_err());
-                assert!(protected.join(".credentials.json").exists());
-                assert!(unclaimed.join(".credentials.json").exists());
-                fs::write(&journal, &saved).unwrap();
-            }
-            owner.release().unwrap();
+            // A sibling journal that exists but does not parse is corruption:
+            // the pass must refuse rather than reclaim on a guess.
+            fs::write(&journal, b"{").unwrap();
+            let unclaimed = store(&home, "2222222222222222", 10);
+            assert!(reclaim_in(&app, &namespaces, &home, NO_GRACE, &gone).is_err());
+            assert!(protected.join(".credentials.json").exists());
+            assert!(unclaimed.join(".credentials.json").exists());
+
+            // An absent sibling journal is the pre-v036 shape, not corruption:
+            // that namespace never recorded a pending purge, so it holds none,
+            // and the pass completes instead of failing the whole reclaim.
+            fs::remove_file(&journal).unwrap();
+            let unclaimed = store(&home, "3333333333333333", 10);
+            reclaim_in(&app, &namespaces, &home, NO_GRACE, &gone).unwrap_or_else(|e| {
+                panic!("an absent sibling journal must not fail the pass: {e:#}")
+            });
+            assert!(
+                protected.join(".credentials.json").exists(),
+                "a pass that succeeded must not have destroyed a live store"
+            );
+            assert!(unclaimed.exists(), "unproven stores stay retained");
+
+            // Back to a healthy journal, so the last step still exercises the
+            // retained-owner path on a store that exists.
+            super::super::purge_owners::initialize(&owner_app).unwrap();
+            let protected = store(&home, &row.id, 40);
             reclaim_in(&app, &namespaces, &home, NO_GRACE, &gone).unwrap();
             assert!(
-                protected.exists(),
-                "unproven store must remain after owner release"
+                protected.join(".credentials.json").exists(),
+                "unproven store must remain once the sibling journal is healthy"
             );
         }
     }

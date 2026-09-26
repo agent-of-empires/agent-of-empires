@@ -2967,17 +2967,21 @@ claude = "repo-wrapper"
             None
         };
 
-        storage.set_fail_writes_for_test(true);
-        let error = apply_terminal_title(
-            &storage,
-            &failed_id,
-            Some("Must Not Land".to_owned()),
-            false,
-        )
-        .expect_err("injected persistence failure must abort the title mutation");
-        assert!(error
-            .to_string()
-            .contains("injected sessions write failure"));
+        // Scoped: the injection is process-wide, so the guard must drop before
+        // the assertions that read storage back.
+        {
+            let _failing_writes = storage.fail_writes_for_test();
+            let error = apply_terminal_title(
+                &storage,
+                &failed_id,
+                Some("Must Not Land".to_owned()),
+                false,
+            )
+            .expect_err("injected persistence failure must abort the title mutation");
+            assert!(error
+                .to_string()
+                .contains("injected sessions write failure"));
+        }
 
         let failed = storage
             .load()

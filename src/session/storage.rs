@@ -100,8 +100,30 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
+
+/// Injected `sessions.json` write failure. Global rather than per-`Storage` so
+/// a test can arm it on a handle it still holds while the code under test
+/// writes through a backend it opened itself; every test that arms it runs
+/// serially and disarms it again.
+#[cfg(test)]
+static FAIL_WRITES_FOR_TEST: AtomicBool = AtomicBool::new(false);
+
+/// Disarms [`FAIL_WRITES_FOR_TEST`] on drop, so an armed test can never leak
+/// the injection into the rest of the suite, since a panic unwinds through
+/// `Drop` and a bare `set(false)` after the failing call would not run.
+#[cfg(test)]
+pub(crate) struct WriteFailureGuard;
+
+#[cfg(test)]
+impl Drop for WriteFailureGuard {
+    fn drop(&mut self) {
+        FAIL_WRITES_FOR_TEST.store(false, Ordering::SeqCst);
+    }
+}
 
 use crate::file_watch::FileWatchService;
 
@@ -1033,8 +1055,6 @@ pub struct Storage {
     save_lock: Arc<Mutex<()>>,
     /// Dispatch successful in-process writes to file-watch subscribers.
     file_watch: Arc<FileWatchService>,
-    #[cfg(test)]
-    fail_writes_for_test: bool,
 }
 
 pub(crate) type SessionMutation<'a> =
@@ -1558,8 +1578,6 @@ impl Storage {
             sessions_path,
             save_lock,
             file_watch,
-            #[cfg(test)]
-            fail_writes_for_test: false,
         })
     }
 
@@ -1576,7 +1594,6 @@ impl Storage {
             sessions_path,
             save_lock: save_lock_for(profile),
             file_watch: FileWatchService::noop(),
-            fail_writes_for_test: false,
         }
     }
 
@@ -1593,8 +1610,6 @@ impl Storage {
             sessions_path,
             save_lock,
             file_watch,
-            #[cfg(test)]
-            fail_writes_for_test: false,
         })
     }
 
@@ -1631,9 +1646,15 @@ impl Storage {
         )
     }
 
+    /// Arm the injected `sessions.json` write failure until the returned guard
+    /// drops. Preferred over the raw setter because the flag is process-wide:
+    /// a test that panics (or simply returns early) while it is armed would
+    /// otherwise leave every later test failing with
+    /// "injected sessions write failure".
     #[cfg(test)]
-    pub(crate) fn set_fail_writes_for_test(&mut self, fail: bool) {
-        self.fail_writes_for_test = fail;
+    pub(crate) fn fail_writes_for_test(&mut self) -> crate::session::storage::WriteFailureGuard {
+        FAIL_WRITES_FOR_TEST.store(true, Ordering::SeqCst);
+        crate::session::storage::WriteFailureGuard
     }
 
     pub fn profile(&self) -> &str {
@@ -2055,7 +2076,7 @@ impl Storage {
             self.file_watch.notify_local_change(&groups_path);
         }
         #[cfg(test)]
-        if self.fail_writes_for_test {
+        if FAIL_WRITES_FOR_TEST.load(Ordering::SeqCst) {
             anyhow::bail!("injected sessions write failure");
         }
 

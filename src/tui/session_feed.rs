@@ -1194,6 +1194,14 @@ impl SessionFeed {
         feed.sender.send_replace(Some(result));
         feed
     }
+
+    /// Seed a command error straight into the buffer `drain_command_errors`
+    /// empties, so a caller can prove it presents what it drained without
+    /// standing up a runtime channel.
+    #[cfg(test)]
+    pub(crate) fn queue_error_for_test(&mut self, error: SessionCommandError) {
+        self.bulk_errors.push(error);
+    }
     #[cfg(test)]
     pub(crate) fn next_revision_for_test(&self) -> u64 {
         self.applied

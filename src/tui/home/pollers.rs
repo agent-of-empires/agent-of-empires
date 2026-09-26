@@ -495,12 +495,17 @@ impl HomeView {
     }
 
     /// Settle from the command lane, never from an unrelated status snapshot.
+    ///
+    /// The drain is destructive, so its errors go through the same presenter
+    /// the feed path uses: discarding them here would drop the only trace of a
+    /// failed restart.
     pub fn apply_restart_results(&mut self) -> bool {
         let before = self.restart_in_flight.len();
-        let _ = self.session_feed.drain_command_errors();
+        let drained = self.session_feed.drain_command_errors();
+        let presented = self.present_command_errors(drained);
         self.restart_in_flight
             .retain(|id| self.session_feed.has_pending(id));
-        before != self.restart_in_flight.len()
+        before != self.restart_in_flight.len() || presented
     }
 
     /// Identify recovery candidates and spawn a worker pool. Sets

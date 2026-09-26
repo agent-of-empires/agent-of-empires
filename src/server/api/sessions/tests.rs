@@ -2188,7 +2188,8 @@ mod artifact_route {
         let id = format!("art-{}", uuid::Uuid::new_v4());
         let dir = crate::session::artifacts::session_artifact_dir(&id).unwrap();
         std::fs::write(dir.join("shot.png"), b"\x89PNG\r\n").unwrap();
-        let resp = serve_session_artifact(AxumPath((id, "shot.png".to_string())))
+        let state = crate::server::test_support::build_test_app_state(Vec::new());
+        let resp = serve_session_artifact(State(state), AxumPath((id, "shot.png".to_string())))
             .await
             .into_response();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -2208,9 +2209,13 @@ mod artifact_route {
         let _tmp = isolate_app_dir();
         let id = format!("art-{}", uuid::Uuid::new_v4());
         crate::session::artifacts::session_artifact_dir(&id).unwrap();
-        let resp = serve_session_artifact(AxumPath((id, "../../../../etc/hosts".to_string())))
-            .await
-            .into_response();
+        let state = crate::server::test_support::build_test_app_state(Vec::new());
+        let resp = serve_session_artifact(
+            State(state),
+            AxumPath((id, "../../../../etc/hosts".to_string())),
+        )
+        .await
+        .into_response();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
         let body = to_bytes(resp.into_body(), 1024).await.unwrap();
         assert!(body.is_empty(), "unexpected body: {body:?}");
@@ -2230,7 +2235,8 @@ mod artifact_route {
             b"<svg xmlns='http://www.w3.org/2000/svg'></svg>",
         )
         .unwrap();
-        let resp = serve_session_artifact(AxumPath((id, "d.svg".to_string())))
+        let state = crate::server::test_support::build_test_app_state(Vec::new());
+        let resp = serve_session_artifact(State(state), AxumPath((id, "d.svg".to_string())))
             .await
             .into_response();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -2251,7 +2257,8 @@ mod artifact_route {
         let id = format!("art-{}", uuid::Uuid::new_v4());
         let dir = crate::session::artifacts::session_artifact_dir(&id).unwrap();
         std::fs::write(dir.join("status.html"), b"<h1>hi</h1>").unwrap();
-        let resp = serve_session_artifact(AxumPath((id, "status.html".to_string())))
+        let state = crate::server::test_support::build_test_app_state(Vec::new());
+        let resp = serve_session_artifact(State(state), AxumPath((id, "status.html".to_string())))
             .await
             .into_response();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -2263,6 +2270,95 @@ mod artifact_route {
             resp.headers().get(header::CONTENT_DISPOSITION).unwrap(),
             "attachment"
         );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn serves_javascript_as_attachment() {
+        // A `.js` artifact is a scriptable top-level document: the frontend
+        // opens artifacts through a same-origin blob URL, so it must download
+        // with an opaque type rather than render (or worse, execute) there.
+        let _tmp = isolate_app_dir();
+        let id = format!("art-{}", uuid::Uuid::new_v4());
+        let dir = crate::session::artifacts::session_artifact_dir(&id).unwrap();
+        std::fs::write(dir.join("app.js"), b"alert(1)").unwrap();
+        let state = crate::server::test_support::build_test_app_state(Vec::new());
+        let resp = serve_session_artifact(State(state), AxumPath((id, "app.js".to_string())))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/octet-stream"
+        );
+        assert_eq!(
+            resp.headers().get(header::CONTENT_DISPOSITION).unwrap(),
+            "attachment"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn serves_a_non_inline_type_as_an_attachment() {
+        // Same rule the diff route's "Open file" applies: only a type a browser
+        // renders in a tab stays inline, so a blob URL can never become a
+        // document the dashboard origin interprets for us.
+        let _tmp = isolate_app_dir();
+        let id = format!("art-{}", uuid::Uuid::new_v4());
+        let dir = crate::session::artifacts::session_artifact_dir(&id).unwrap();
+        std::fs::write(dir.join("data.json"), b"{}").unwrap();
+        let state = crate::server::test_support::build_test_app_state(Vec::new());
+        let resp = serve_session_artifact(State(state), AxumPath((id, "data.json".to_string())))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/json"
+        );
+        assert_eq!(
+            resp.headers().get(header::CONTENT_DISPOSITION).unwrap(),
+            "attachment"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn refuses_a_file_over_the_raw_byte_cap() {
+        // The read goes through the shared bounded confined reader, so an
+        // oversized artifact is a 413 rather than an unbounded allocation.
+        // `set_len` makes the file sparse, so the assertion costs no disk.
+        let _tmp = isolate_app_dir();
+        let id = format!("art-{}", uuid::Uuid::new_v4());
+        let dir = crate::session::artifacts::session_artifact_dir(&id).unwrap();
+        let file = std::fs::File::create(dir.join("huge.bin")).unwrap();
+        file.set_len(artifacts::MAX_RAW_FILE_BYTES + 1).unwrap();
+        drop(file);
+        let state = crate::server::test_support::build_test_app_state(Vec::new());
+        let resp = serve_session_artifact(State(state), AxumPath((id, "huge.bin".to_string())))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[test]
+    fn the_scriptable_set_covers_the_javascript_family() {
+        for essence in [
+            "text/html",
+            "image/svg+xml",
+            "application/atom+xml",
+            "text/javascript",
+            "application/javascript",
+            "application/x-javascript",
+            "text/ecmascript",
+            "application/ecmascript",
+            "application/x-ecmascript",
+        ] {
+            assert!(artifacts::is_scriptable(essence), "{essence}");
+        }
+        for essence in ["text/plain", "image/png", "application/json", "text/css"] {
+            assert!(!artifacts::is_scriptable(essence), "{essence}");
+        }
     }
 }
 

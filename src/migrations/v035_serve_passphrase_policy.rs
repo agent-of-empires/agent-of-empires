@@ -1,3 +1,11 @@
+//! Persists the pre-v035 launch record's passphrase policy (and the rollback
+//! credential derived from it).
+//!
+//! Takes the daemon lifecycle transaction, so this migration must only ever run
+//! in a process that does not already hold that lock. The detached daemon
+//! child receives the lock from its parent and therefore never migrates; it
+//! checks the schema instead (`migrations::assert_schema_current`).
+
 use anyhow::{Context, Result};
 
 pub fn run() -> Result<()> {

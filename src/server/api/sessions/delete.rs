@@ -82,14 +82,20 @@ async fn purge_session_artifacts(
             Err(result) => *result,
             Ok(committed) => {
                 // Commit removal before destroying a transcript that cannot be restored.
-                if let Err(error) = finish_structured_purge(state, id).await {
-                    drop(committed);
+                let shutdown = finish_structured_purge(state, id).await;
+                // The row is gone from storage on BOTH paths, so the in-memory
+                // locks it held must be released on both. Skipping them on the
+                // unproven path would leave a prompt lock behind that wedges
+                // every later prompt for this id, with no row left to clear it.
+                release_removed_session_locks(state, id).await;
+                let finished = tokio::task::spawn_blocking(move || committed.finish()).await?;
+                if let Err(error) = shutdown {
                     return Ok(PurgeOutcome::Deleted {
                         messages: Vec::new(),
                         cleanup_errors: vec![format!("Session removed, but resources retained because structured shutdown is unproven: {error}")],
                     });
                 }
-                tokio::task::spawn_blocking(move || committed.finish()).await?
+                finished
             }
         }
     } else {
@@ -118,8 +124,7 @@ async fn purge_session_artifacts(
     } else {
         Vec::new()
     };
-    state.instance_locks.write().await.remove(id);
-    state.session_service.forget_prompt_lock(id).await;
+    release_removed_session_locks(state, id).await;
     if let Some(entry) = recent_entry {
         if let Err(error) = crate::session::record_recent_project(entry) {
             tracing::warn!(target: "http.api.sessions", %error, "recording recent project after delete failed");
@@ -129,6 +134,14 @@ async fn purge_session_artifacts(
         messages,
         cleanup_errors,
     })
+}
+
+/// Drop the in-memory locks a removed session's row held. Called on every path
+/// where the row is gone from storage — including the unproven structured
+/// shutdown — because nothing else will ever clear them for that id.
+async fn release_removed_session_locks(state: &AppState, id: &str) {
+    state.instance_locks.write().await.remove(id);
+    state.session_service.forget_prompt_lock(id).await;
 }
 
 async fn finish_structured_purge(state: &AppState, id: &str) -> anyhow::Result<()> {

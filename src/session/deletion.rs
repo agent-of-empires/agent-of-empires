@@ -531,6 +531,19 @@ impl<S: SessionStore + 'static> PurgeTransaction<S> {
             }
             Ok(())
         }) {
+            // The plan is recorded in the sidecar journal before the row leaves
+            // sessions.json, so a failed commit would leave a ghost owner
+            // behind: recovery would later tear down a session row that is
+            // still there. Release it before reporting the failure.
+            if let Some(owner) = owner {
+                if let Err(release) = owner.release() {
+                    tracing::error!(
+                        target: "session.deletion",
+                        session = %id,
+                        "failed to release the purge owner for an uncommitted purge: {release}"
+                    );
+                }
+            }
             return Err(Box::new(DeletionResult::rejected(
                 id,
                 DeletionDisposition::Failed,
@@ -2600,6 +2613,64 @@ mod tests {
         assert!(retained[0].is_structured());
         assert_eq!(retained[0].status, crate::session::Status::Idle);
         assert!(!retained[0].has_fresh_lifecycle_reservation(Utc::now()));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_failed_commit_releases_the_purge_owner_it_recorded() {
+        // The purge plan is written to the sidecar journal inside the storage
+        // mutation, before sessions.json is rewritten. If that rewrite fails
+        // the row is still there, so a surviving owner is a ghost: recovery
+        // would later tear down a live session's worktree. It must be released.
+        let _home = crate::session::test_support::isolate_app_dir();
+        let root = crate::session::get_app_dir().unwrap();
+        super::super::purge_owners::initialize(&root).unwrap();
+        let profile = "purge-failed-commit-owner";
+        let mut storage = Storage::new_unwatched(profile).unwrap();
+        let mut instance = create_test_instance();
+        instance.source_profile = profile.into();
+        storage
+            .update(|rows, _| {
+                rows.push(instance.clone());
+                Ok(())
+            })
+            .unwrap();
+        let request = DeletionRequest {
+            session_id: instance.id.clone(),
+            instance,
+            delete_worktree: false,
+            delete_branch: false,
+            delete_sandbox: false,
+            force_delete: false,
+            detach_hooks: true,
+            keep_scratch: false,
+        };
+        let transaction = match PurgeTransaction::reserve(
+            Storage::open_unwatched(profile).unwrap(),
+            request,
+            None,
+        )
+        .unwrap()
+        {
+            PurgeReservation::Reserved(transaction) => transaction,
+            PurgeReservation::Rejected(_) => panic!("initial purge rejected"),
+        };
+        // Arm the write failure only now: the reservation itself must commit.
+        // The guard disarms on drop, so the injection cannot outlive this test.
+        let _failing_writes = storage.fail_writes_for_test();
+        let result = match transaction.begin_irreversible() {
+            Err(result) => result,
+            Ok(_) => panic!("a failed sessions.json write must not report a committed purge"),
+        };
+        assert_eq!(result.disposition, DeletionDisposition::Failed);
+        let retained = storage.load().unwrap();
+        assert_eq!(retained.len(), 1, "the row must survive a failed commit");
+        assert!(
+            super::super::purge_owners::protection(&storage, None)
+                .unwrap()
+                .is_empty(),
+            "the uncommitted purge must not leave a ghost owner behind"
+        );
     }
 
     #[test]

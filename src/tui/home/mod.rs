@@ -318,6 +318,11 @@ pub struct HomeView {
     pub(super) info_dialog: Option<InfoDialog>,
     /// Unknown mutation selected for explicit, operator-confirmed resolution.
     pub(super) pending_indeterminate_resolution: Option<String>,
+    /// Every unknown-outcome id awaiting resolution, as `(id, message)`.
+    /// The head is the one `pending_indeterminate_resolution` is showing; a
+    /// batch of failures must unlock every quarantined row, not just the
+    /// first, so the rest wait here instead of being dropped.
+    pub(super) pending_indeterminate_queue: Vec<(String, String)>,
     pub(super) snooze_duration_dialog: Option<SnoozeDurationDialog>,
     /// Session id the snooze duration picker targets. Set when the dialog
     /// opens, consumed on submit.

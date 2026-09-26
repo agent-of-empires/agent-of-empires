@@ -304,13 +304,23 @@ async fn run(
     let profile = cli.profile.unwrap_or_default();
 
     if cli.command.is_some() {
-        let reporter = cli
-            .command
-            .as_ref()
-            .and_then(cli::command_name)
-            .is_some()
-            .then(cli::migrate::stderr_reporter);
-        migrations::run_migrations_with(reporter)?;
+        if is_daemon_child {
+            // The parent `aoe serve` already ran the migrations and is holding
+            // the daemon lifecycle transaction while this child starts. A
+            // migration that re-acquires that lock (v034, v035) would spin out
+            // its 60s deadline and then fail this process before it ever
+            // receives the transaction, so the daemon would never come up.
+            // Verify the schema instead of migrating, and fail closed.
+            migrations::assert_schema_current()?;
+        } else {
+            let reporter = cli
+                .command
+                .as_ref()
+                .and_then(cli::command_name)
+                .is_some()
+                .then(cli::migrate::stderr_reporter);
+            migrations::run_migrations_with(reporter)?;
+        }
         agent_of_empires::session::poller::configure_session_id_poller_max_threads(
             agent_of_empires::session::poller::configured_session_id_poller_max_threads(&profile),
         );

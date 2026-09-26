@@ -222,6 +222,27 @@ fn decode(content: Option<&str>) -> Result<Journal> {
     Ok(journal)
 }
 
+/// Decode the journal for a SIBLING reader that only needs to know which
+/// sessions other namespaces still have in flight, treating an ABSENT file as
+/// an empty one. A namespace created before v036 never had a journal and
+/// genuinely has no pending owners, so its absence is not corruption and must
+/// not fail the whole pass — the store reclaim would otherwise orphan every
+/// store on an install that predates the migration. A journal that exists but
+/// does not parse is still refused, so corruption stays fail-closed.
+///
+/// Deliberately NOT used by [`protection`] or [`recovery_plans`]: those drive
+/// destructive cleanup and recovery, where "the journal is gone" is not proof
+/// that nothing is in flight, so a missing file must keep failing them.
+fn decode_sibling(content: Option<&str>) -> Result<Journal> {
+    match content {
+        Some(_) => decode(content),
+        None => Ok(Journal {
+            version: 2,
+            owners: Vec::new(),
+        }),
+    }
+}
+
 pub(crate) fn validate_serialized(content: &str) -> Result<()> {
     decode(Some(content)).map(|_| ())
 }
@@ -379,7 +400,7 @@ pub(crate) fn protection(
 }
 
 pub(super) fn session_ids(root: &Path) -> Result<impl Iterator<Item = String>> {
-    Ok(decode(open(root)?.read()?.as_deref())?
+    Ok(decode_sibling(open(root)?.read()?.as_deref())?
         .owners
         .into_iter()
         .map(|owner| owner.session_id))
@@ -402,6 +423,23 @@ pub(super) fn recovery_plans() -> Result<Vec<RecoveryPlan>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[serial_test::serial]
+    fn an_absent_journal_is_no_owners_but_a_corrupt_one_is_still_refused() -> Result<()> {
+        // A namespace that predates v036 has no journal at all, and it holds no
+        // pending owners. The store reclaim reads this as a sibling, so an
+        // absent file must not fail the pass and orphan every store.
+        let root = tempfile::tempdir()?;
+        let _home = crate::session::test_support::isolate_app_dir_at(root.path());
+        assert!(session_ids(root.path())?.next().is_none());
+
+        // A journal that exists but does not parse is corruption, not absence:
+        // staying fail-closed is the point.
+        std::fs::write(root.path().join(FILE_NAME), b"{")?;
+        assert!(session_ids(root.path()).is_err());
+        Ok(())
+    }
 
     #[test]
     #[serial_test::serial]

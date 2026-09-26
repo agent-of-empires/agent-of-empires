@@ -1175,6 +1175,12 @@ impl HomeView {
                             Some(InfoDialog::new("Quarantine Retained", &error.to_string()));
                     }
                 }
+                // The rest of the batch keeps its own unlock prompt, so a
+                // second quarantined row is never left with no way out.
+                if !self.pending_indeterminate_queue.is_empty() {
+                    self.pending_indeterminate_queue.remove(0);
+                    self.promote_next_indeterminate();
+                }
                 None
             }
             "trash_session" => {

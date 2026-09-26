@@ -54,7 +54,7 @@ aoe add /path/to/backend \
   --repo-base frontend=epic/checkout
 ```
 
-`<repo>` is the repo's directory name or a path you passed to `--repo`; an unmatched name is an error rather than a silent fallback. The web wizard has the same thing as a base-branch field on each repo in the **Extra repos** picker. The base each repo was forked from is recorded, and it becomes that repo's default diff comparison ref (see [Base override](web/diff.md#base-override)); `aoe session set-base --repo <name>` changes it later, per repo.
+`<repo>` is the repo's directory name or a path you passed to `--repo`; an unmatched name is an error rather than a silent fallback. The web wizard has the same thing as a base-branch field on each repo in the **Extra repos** picker. The base each repo was forked from is recorded, and it becomes that repo's default diff comparison ref (see [Base override](diff-view.md#base-override)); `aoe session set-base --repo <name>` changes it later, per repo.
 
 Worktree creation across the repos in a workspace runs concurrently, so wall-clock time is roughly that of the slowest single repo rather than the sum (network-bound `git fetch` and `git submodule update` dominate). If any repo's post-checkout hook fails after `git worktree add` has already checked out the branch, the workspace is still created and the hook output is surfaced as a warning. See [Post-Checkout Hooks](worktrees.md#post-checkout-hooks) for details.
 

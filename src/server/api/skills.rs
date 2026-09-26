@@ -1,6 +1,8 @@
 //! Skills management REST API.
 
-use axum::extract::{FromRequestParts, Path};
+use std::sync::Arc;
+
+use axum::extract::{FromRequestParts, Path, State};
 use axum::http::{request::Parts, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -96,7 +98,10 @@ fn source_provenance(source: &str) -> Result<SkillProvenance, String> {
 }
 
 /// `GET /api/skills`: discover skills across every supported host root.
-pub async fn list_skills() -> Response {
+pub async fn list_skills(State(state): State<Arc<AppState>>) -> Response {
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
+    }
     match tokio::task::spawn_blocking(skills_model::discover_all).await {
         Ok(Ok(skills)) => Json(json!({
             "skills": skills.into_iter().map(|skill| {
@@ -124,7 +129,13 @@ pub async fn list_skills() -> Response {
 }
 
 /// `GET /api/skills/{source}/{directory}`: read one source-qualified skill.
-pub async fn read_skill(Path((source, directory)): Path<(String, String)>) -> Response {
+pub async fn read_skill(
+    State(state): State<Arc<AppState>>,
+    Path((source, directory)): Path<(String, String)>,
+) -> Response {
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
+    }
     let provenance = match source_provenance(&source) {
         Ok(value) => value,
         Err(message) => {

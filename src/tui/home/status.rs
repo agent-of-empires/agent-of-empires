@@ -244,6 +244,103 @@ impl HomeView {
         })
     }
 
+    /// Surface every command error the feed drained, and return whether there
+    /// was anything to surface.
+    ///
+    /// The single sink for both drain sites (`apply_session_feed` and
+    /// `apply_restart_results`): draining the feed is destructive, so an error
+    /// presented anywhere else would be a diagnostic no one ever saw. Nothing
+    /// is dropped here:
+    ///
+    /// - every error's message is rendered, including the ones whose id drives
+    ///   the indeterminate dialog, so a multi-error batch is fully readable;
+    /// - EVERY unknown-outcome id is queued, not just the first. The row stays
+    ///   quarantined until the user resolves it, so keeping only the head would
+    ///   leave the rest blocked with no dialog left to release them.
+    pub(super) fn present_command_errors(
+        &mut self,
+        errors: Vec<crate::tui::session_feed::SessionCommandError>,
+    ) -> bool {
+        if errors.is_empty() {
+            return false;
+        }
+        for error in &errors {
+            if self
+                .pending_archive_cursor
+                .as_ref()
+                .is_some_and(|pending| pending.id == error.id)
+            {
+                self.pending_archive_cursor = None;
+            }
+            if error.marks_unread && self.manual_unread_hold.as_deref() == Some(&error.id) {
+                self.manual_unread_hold = None;
+            }
+            if !error.outcome_unknown {
+                continue;
+            }
+            let known = self
+                .pending_indeterminate_resolution
+                .as_deref()
+                .is_some_and(|id| id == error.id)
+                || self
+                    .pending_indeterminate_queue
+                    .iter()
+                    .any(|(id, _)| *id == error.id);
+            if !known {
+                self.pending_indeterminate_queue
+                    .push((error.id.clone(), error.message.clone()));
+            }
+        }
+
+        // The full batch, so a diagnostic shown next to the indeterminate
+        // dialog is not the only trace of the other failures in this drain.
+        let diagnostics = errors
+            .iter()
+            .map(|error| format!("{}: {}", error.id, error.message))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        if let Some((id, message)) = self.pending_indeterminate_queue.first().cloned() {
+            self.open_indeterminate_dialog(&id, &message);
+            if errors.len() > 1 {
+                self.info_dialog = Some(crate::tui::dialogs::InfoDialog::new(
+                    "Runtime change",
+                    &diagnostics,
+                ));
+            }
+        } else {
+            self.info_dialog = Some(crate::tui::dialogs::InfoDialog::new(
+                "Runtime change",
+                &diagnostics,
+            ));
+        }
+        true
+    }
+
+    /// Promote the next queued unknown-outcome id to a dialog, if any is
+    /// waiting. Called after one is resolved so a batch of them all get their
+    /// unlock prompt.
+    pub(super) fn promote_next_indeterminate(&mut self) {
+        let Some((id, message)) = self.pending_indeterminate_queue.first().cloned() else {
+            return;
+        };
+        self.open_indeterminate_dialog(&id, &message);
+    }
+
+    fn open_indeterminate_dialog(&mut self, id: &str, message: &str) {
+        self.pending_indeterminate_resolution = Some(id.to_string());
+        self.confirm_dialog = Some(
+            ConfirmDialog::new(
+                "Resolve Unknown Outcome",
+                &format!(
+                    "The previous runtime change for '{id}' has an unknown outcome: {message}\n\nVerify the current canonical state, then unlock this row for a new action. No mutation is submitted by this resolution."
+                ),
+                "resolve_indeterminate",
+            )
+            .buttons("Unlock", "Keep Blocked"),
+        );
+    }
+
     /// Apply a pending session-list result from the daemon. Returns true if
     /// the caller should redraw.
     pub fn apply_session_feed(&mut self) -> bool {
@@ -368,47 +465,8 @@ impl HomeView {
             Err(TryRecvError::Empty) => false,
             Err(TryRecvError::Disconnected) => false,
         };
-        let errors = self.session_feed.drain_command_errors();
-        for error in &errors {
-            if self
-                .pending_archive_cursor
-                .as_ref()
-                .is_some_and(|pending| pending.id == error.id)
-            {
-                self.pending_archive_cursor = None;
-            }
-        }
-        let command_error = !errors.is_empty();
-        if command_error {
-            if errors.iter().any(|error| {
-                error.marks_unread && self.manual_unread_hold.as_deref() == Some(&error.id)
-            }) {
-                self.manual_unread_hold = None;
-            }
-            let unresolved = errors
-                .iter()
-                .find(|error| error.outcome_unknown)
-                .map(|error| (error.id.clone(), error.message.clone()));
-            if let Some((id, message)) = unresolved {
-                self.pending_indeterminate_resolution = Some(id.clone());
-                self.confirm_dialog = Some(ConfirmDialog::new(
-                    "Resolve Unknown Outcome",
-                    &format!(
-                        "The previous runtime change for '{id}' has an unknown outcome: {message}\n\nVerify the current canonical state, then unlock this row for a new action. No mutation is submitted by this resolution."
-                    ),
-                    "resolve_indeterminate",
-                ).buttons("Unlock", "Keep Blocked"));
-            } else {
-                self.info_dialog = Some(crate::tui::dialogs::InfoDialog::new(
-                    "Runtime change",
-                    &errors
-                        .into_iter()
-                        .map(|error| format!("{}: {}", error.id, error.message))
-                        .collect::<Vec<_>>()
-                        .join("\n"),
-                ));
-            }
-        }
+        let drained = self.session_feed.drain_command_errors();
+        let command_error = self.present_command_errors(drained);
         if snapshot_applied {
             if let Some(id) = self
                 .live_send

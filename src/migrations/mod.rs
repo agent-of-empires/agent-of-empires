@@ -305,6 +305,30 @@ pub fn has_pending_migrations() -> bool {
     get_current_version() < CURRENT_VERSION
 }
 
+/// Refuse to run against a schema this build does not own: either pending
+/// migrations, or a version from a newer build.
+///
+/// This is the check the detached daemon child makes instead of migrating.
+/// Its parent `aoe serve` ran the migrations and still holds the daemon
+/// lifecycle transaction, so a migration that re-acquires that lock (v034 and
+/// v035 do) would spin out the full 60s deadline and then fail the child
+/// before it ever receives the transaction — the daemon would simply never
+/// come up. Verifying is the fail-closed alternative.
+pub fn assert_schema_current() -> Result<()> {
+    let current = get_current_version();
+    if current > CURRENT_VERSION {
+        anyhow::bail!(
+            "data schema version {current} is newer than this build supports ({CURRENT_VERSION}); refusing to downgrade"
+        );
+    }
+    anyhow::ensure!(
+        current == CURRENT_VERSION,
+        "data schema version {current} is behind this build ({CURRENT_VERSION}); \
+         the parent `aoe serve` must migrate before launching the daemon child"
+    );
+    Ok(())
+}
+
 /// Move this session's shared sandbox store and isolate its native content,
 /// reporting copy progress to the caller. Unproven content remains pending.
 pub(crate) fn migrate_sandbox_store_for_with(
@@ -456,6 +480,50 @@ mod tests {
         let error = run_migrations().unwrap_err().to_string();
 
         assert!(error.contains("refusing to downgrade"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn the_daemon_child_check_refuses_a_schema_it_would_have_to_migrate() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let app = crate::session::get_app_dir().unwrap();
+        fs::create_dir_all(&app).unwrap();
+        fs::write(app.join(VERSION_FILE), (CURRENT_VERSION - 1).to_string()).unwrap();
+
+        let error = assert_schema_current().unwrap_err().to_string();
+
+        assert!(
+            error.contains("behind this build"),
+            "a behind schema must be refused, not silently migrated: {error}"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn the_daemon_child_check_passes_on_a_migrated_schema() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let app = crate::session::get_app_dir().unwrap();
+        fs::create_dir_all(&app).unwrap();
+        fs::write(app.join(VERSION_FILE), CURRENT_VERSION.to_string()).unwrap();
+
+        assert!(assert_schema_current().is_ok());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn the_daemon_child_check_refuses_a_newer_schema_too() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let app = crate::session::get_app_dir().unwrap();
+        fs::create_dir_all(&app).unwrap();
+        fs::write(app.join(VERSION_FILE), (CURRENT_VERSION + 1).to_string()).unwrap();
+
+        assert!(assert_schema_current()
+            .unwrap_err()
+            .to_string()
+            .contains("refusing to downgrade"));
     }
 
     #[test]

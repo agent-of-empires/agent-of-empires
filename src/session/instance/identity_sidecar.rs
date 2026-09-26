@@ -841,13 +841,13 @@ pi = "~/.pi-personal"
         );
 
         // No sidecar exists to re-read: only the observation carries the path.
-        storage.set_fail_writes_for_test(true);
+        let failing_writes = storage.fail_writes_for_test();
         assert!(!inst.persist_pi_transcript_into(&storage, &observation, &published));
         assert_eq!(
             inst.pi_session_path, None,
             "an unstored path must not look current"
         );
-        storage.set_fail_writes_for_test(false);
+        drop(failing_writes);
         assert_eq!(stored(&storage), None);
 
         assert!(inst.persist_observed_pi_transcript(&observation));

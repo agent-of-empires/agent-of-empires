@@ -379,6 +379,56 @@ pub async fn run(profile: &str, args: ListArgs) -> Result<()> {
     Ok(())
 }
 
+/// Read one profile's rows, naming the failure instead of dropping the profile.
+fn read_profile(profile_name: &str) -> Result<Vec<Instance>, String> {
+    let storage = Storage::open_unwatched(profile_name).map_err(|error| error.to_string())?;
+    storage
+        .load_with_groups()
+        .map(|(instances, _)| instances)
+        .map_err(|error| error.to_string())
+}
+
+/// The `--json` listing across every profile, plus a per-profile note for each
+/// one that could not be read. An unreadable profile must never be silently
+/// skipped: the caller has no other way to tell a partial list from a complete
+/// one.
+fn collect_profile_sessions(
+    profiles: &[String],
+    scope: SessionScope,
+) -> (Vec<SessionJson>, Vec<String>) {
+    let mut all_sessions: Vec<SessionJson> = Vec::new();
+    let mut failures = Vec::new();
+    for profile_name in profiles {
+        match read_profile(profile_name) {
+            Ok(instances) => {
+                for inst in &instances {
+                    if !SessionScope::matches(Some(scope), inst.is_archived(), inst.is_trashed()) {
+                        continue;
+                    }
+                    all_sessions.push(session_json(inst, profile_name));
+                }
+            }
+            Err(error) => failures.push(format!("profile '{profile_name}': {error}")),
+        }
+    }
+    (all_sessions, failures)
+}
+
+/// Report each unreadable profile on stderr and fail the command, leaving
+/// stdout untouched.
+fn report_profile_failures(failures: Vec<String>) -> Result<()> {
+    if failures.is_empty() {
+        return Ok(());
+    }
+    for failure in &failures {
+        eprintln!("warning: {failure}");
+    }
+    anyhow::bail!(
+        "{} profile(s) could not be read; the listing is incomplete",
+        failures.len()
+    )
+}
+
 async fn run_all_profiles(json: bool, scope: SessionScope) -> Result<()> {
     let profiles = crate::session::list_profiles()?;
 
@@ -388,55 +438,41 @@ async fn run_all_profiles(json: bool, scope: SessionScope) -> Result<()> {
     }
 
     if json {
-        let mut all_sessions: Vec<SessionJson> = Vec::new();
-        for profile_name in &profiles {
-            if let Ok(storage) = Storage::open_unwatched(profile_name) {
-                if let Ok((instances, _)) = storage.load_with_groups() {
-                    for inst in &instances {
-                        if !SessionScope::matches(
-                            Some(scope),
-                            (inst).is_archived(),
-                            (inst).is_trashed(),
-                        ) {
-                            continue;
-                        }
-                        all_sessions.push(session_json(inst, profile_name));
-                    }
-                }
-            }
-        }
+        let (all_sessions, failures) = collect_profile_sessions(&profiles, scope);
         super::output::print_json(&all_sessions)?;
-        return Ok(());
+        // stdout stays pure JSON: a profile that could not be read is reported
+        // on stderr and turns the exit code non-zero, so a consumer never
+        // mistakes a partial listing for a complete one.
+        return report_profile_failures(failures);
     }
 
     let show_state = table_shows_state(scope);
     let mut total_sessions = 0;
     for profile_name in &profiles {
-        if let Ok(storage) = Storage::open_unwatched(profile_name) {
-            if let Ok((all_instances, _)) = storage.load_with_groups() {
-                let instances: Vec<&Instance> = all_instances
-                    .iter()
-                    .filter(|inst| {
-                        SessionScope::matches(
-                            Some(scope),
-                            (inst).is_archived(),
-                            (inst).is_trashed(),
-                        )
-                    })
-                    .collect();
-                if instances.is_empty() {
-                    continue;
-                }
-
-                println!("\n═══ Profile: {} ═══\n", profile_name);
-                print_table_header(show_state);
-                for (inst, depth) in nest_children(&instances) {
-                    print_table_row(inst, depth, show_state);
-                }
-                println!("({} sessions)", instances.len());
-                total_sessions += instances.len();
-            }
+        let (all_instances, failure) = match read_profile(profile_name) {
+            Ok(instances) => (instances, None),
+            Err(error) => (Vec::new(), Some(error)),
+        };
+        if let Some(error) = &failure {
+            eprintln!("warning: profile '{profile_name}': {error}");
         }
+        let instances: Vec<&Instance> = all_instances
+            .iter()
+            .filter(|inst| {
+                SessionScope::matches(Some(scope), (inst).is_archived(), (inst).is_trashed())
+            })
+            .collect();
+        if instances.is_empty() {
+            continue;
+        }
+
+        println!("\n═══ Profile: {} ═══\n", profile_name);
+        print_table_header(show_state);
+        for (inst, depth) in nest_children(&instances) {
+            print_table_row(inst, depth, show_state);
+        }
+        println!("({} sessions)", instances.len());
+        total_sessions += instances.len();
     }
 
     println!("\n═══════════════════════════════════════");
@@ -541,6 +577,35 @@ mod tests {
         assert_eq!(json.state, "archived");
         assert!(json.archived_at.is_some());
         assert!(json.trashed_at.is_none());
+    }
+
+    /// An unreadable profile must surface, not vanish: a silent skip makes a
+    /// partial listing indistinguishable from a complete one.
+    #[test]
+    fn an_unreadable_profile_is_reported_rather_than_skipped() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = crate::session::test_support::isolate_app_dir_at(temp.path());
+        // A regular file where the profile directory belongs: the name still
+        // exists, so nothing creates it, and opening it fails deterministically.
+        let profiles = temp.path().join("profiles");
+        std::fs::create_dir_all(&profiles).unwrap();
+        std::fs::write(profiles.join("broken"), b"x").unwrap();
+        let (rows, failures) =
+            collect_profile_sessions(&["broken".to_string()], SessionScope::Live);
+        assert!(rows.is_empty());
+        assert_eq!(failures.len(), 1, "got: {failures:?}");
+        assert!(
+            failures[0].contains("broken"),
+            "the failure must name the profile: {}",
+            failures[0]
+        );
+        assert!(
+            report_profile_failures(failures)
+                .unwrap_err()
+                .to_string()
+                .contains("incomplete"),
+            "an incomplete listing must not exit zero"
+        );
     }
 
     /// The default `state = "live"` and both timestamp fields being

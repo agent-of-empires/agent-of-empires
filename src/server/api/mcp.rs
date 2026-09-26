@@ -42,6 +42,11 @@ pub async fn get_mcp_servers(
     State(state): State<Arc<AppState>>,
     Query(query): Query<AgentQuery>,
 ) -> impl IntoResponse {
+    // The effective MCP surface is read out of the agents' own config files on
+    // this host, so it is admin state this mode has no business seeing.
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
+    }
     let profile = state
         .canonical_metadata
         .read()

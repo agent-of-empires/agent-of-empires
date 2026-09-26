@@ -45,12 +45,22 @@ pub struct AcpWsQuery {
 }
 
 /// Public route handler for the structured view WebSocket.
+///
+/// CityHall client mode is refused for any target that is not a structured
+/// session it owns: the socket streams the whole transcript and the live ACP
+/// event frames, so a foreign or crafted id would hand a locked-down client
+/// the same conversation content the gated REST reads refuse.
 pub async fn acp_ws(
     ws: WebSocketUpgrade,
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
     Query(q): Query<AcpWsQuery>,
-) -> impl IntoResponse {
+) -> axum::response::Response {
+    if let Some(resp) =
+        crate::server::api::sessions::cityhall_block_non_structured(&state, &id).await
+    {
+        return resp;
+    }
     // Logged at DEBUG so we can prove the route was reached even when the upgrade fails.
     let since = q.since.unwrap_or(0);
     let forward_frames = q.frames.unwrap_or(1) != 0;
@@ -67,6 +77,7 @@ pub async fn acp_ws(
             debug!(target: "acp.ws", session = %session_for_handler, "agent ws upgrade complete");
             handle(socket, session_for_handler, state, since, forward_frames).await
         })
+        .into_response()
 }
 
 async fn handle(

@@ -10,8 +10,8 @@ This page covers running the server, access modes, the security model, and PWA i
 
 - **[Dashboard & workspaces](web/dashboard.md)**: layout, status glyphs, session-creation wizard, sidebar sort/grouping, triage (pin / archive / snooze), command palette, first-run tutorial.
 - **[Terminal view](web/terminal.md)**: agent and paired terminals, reconnect behavior, WebSocket close codes, read-only mode.
-- **[Diff view](web/diff.md)**: reviewing changed files, flat / tree file list, per-repo base override, inline review comments.
-- **[Settings & profiles](web/settings.md)**: settings tabs, profile picker, connected-device tracking, step-up elevation.
+- **[Diff view](diff-view.md)**: reviewing changed files, flat / tree file list, per-repo base override, inline review comments.
+- **Settings & profiles**: no separate page — the settings tabs, profile picker, and connected-device tracking are covered under [Security](#security) and in [Configuration](configuration.md).
 
 Mobile and touch behavior is documented inline on each page.
 
@@ -214,7 +214,7 @@ With `--auth=passphrase --behind-proxy` the passphrase wall applies to loopback 
 - **Token rotation**: in `--remote` mode the token rotates every 4 hours with a 5-minute grace period for active sessions.
 - **Device tracking**: connected devices (the signed-in login sessions, with browser, origin IP, and last seen) are visible in Settings > Web Dashboard > Connected Devices, where you can revoke one device or sign every device out.
 - **Session persistence**: login sessions are persisted to an owner-only `login_sessions.toml` in the app dir, so signed-in devices survive an `aoe serve` restart instead of being re-prompted for the passphrase. A passphrase change drops every persisted session; set `auth.persist_sessions = false` to force re-authentication on every restart.
-- **Step-up elevation**: a "Confirm passphrase" prompt appears on writes that can plant code for, or widen what is exposed to, the next session spawn. That covers the `sandbox` and `worktree` sections plus individual fields that carry the same risk, currently `acp.restrict_agents`, `skills.auto_propagate`, `session.smart_rename_model`, and `session.inherit_host_environment`; the gate is per field, so the rest of a section saves without it. Confirmation lasts 15 minutes. User-preference writes (theme, sound, notifications, etc.) save without it. Localhost browsers skip the prompt entirely; the same-host caller already passes the filesystem trust boundary. See [Settings & profiles](web/settings.md#step-up-elevation).
+- **Step-up elevation**: a "Confirm passphrase" prompt appears on writes that can plant code for, or widen what is exposed to, the next session spawn. That covers the `sandbox` and `worktree` sections plus individual fields that carry the same risk, currently `acp.restrict_agents`, `skills.auto_propagate`, `session.smart_rename_model`, and `session.inherit_host_environment`; the gate is per field, so the rest of a section saves without it. Confirmation lasts 15 minutes. User-preference writes (theme, sound, notifications, etc.) save without it. Localhost browsers skip the prompt entirely; the same-host caller already passes the filesystem trust boundary. See [Security](#security) above.
 - **Local-only fields**: the agent-command surface and status-hook shell commands map names to arbitrary host commands, so the server rejects any PATCH touching them; they are editable only in the TUI on the host.
 
 The server also sets `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, and `Referrer-Policy: no-referrer` (the last prevents token leaks via Referer).
