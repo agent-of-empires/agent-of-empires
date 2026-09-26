@@ -258,7 +258,7 @@ fn fork_from_refusals_persist_nothing() {
     }
     struct Case {
         parent: Parent,
-        /// The parent title, which the refused remedy quotes back verbatim.
+        /// The parent title: the refusal quotes it and `--fork-from` names it.
         title: &'static str,
         args: &'static [&'static str],
         expect: String,
