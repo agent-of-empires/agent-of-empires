@@ -462,7 +462,7 @@ impl SessionService {
             }
             (inst.source_profile.clone(), wake, was_idle_dormant)
         };
-        if let Ok(storage) = crate::session::Storage::new(&profile, self.file_watch.clone()) {
+        if let Ok(storage) = crate::session::Storage::open(&profile, self.file_watch.clone()) {
             let id_clone = id.to_string();
             let outcome = tokio::task::spawn_blocking(move || {
                 storage.update(|instances, _groups| {
@@ -684,7 +684,7 @@ impl SessionService {
                 self.invalidate_disk_snapshots();
             }
         }
-        match crate::session::Storage::new(&profile, self.file_watch.clone()) {
+        match crate::session::Storage::open(&profile, self.file_watch.clone()) {
             Ok(storage) => {
                 let id_persist = id.to_string();
                 let persisted = tokio::task::spawn_blocking(move || {
@@ -739,7 +739,7 @@ impl SessionService {
                 _ => return,
             }
         };
-        match crate::session::Storage::new(&profile, self.file_watch.clone()) {
+        match crate::session::Storage::open(&profile, self.file_watch.clone()) {
             Ok(storage) => {
                 let id_persist = id.to_string();
                 let persisted = tokio::task::spawn_blocking(move || {
@@ -783,7 +783,7 @@ impl SessionService {
                 _ => return,
             }
         };
-        match crate::session::Storage::new(&profile, self.file_watch.clone()) {
+        match crate::session::Storage::open(&profile, self.file_watch.clone()) {
             Ok(storage) => {
                 let id_persist = id.to_string();
                 let persisted = tokio::task::spawn_blocking(move || {
@@ -845,7 +845,7 @@ impl SessionService {
                 },
             )
         };
-        match crate::session::Storage::new(&profile, self.file_watch.clone()) {
+        match crate::session::Storage::open(&profile, self.file_watch.clone()) {
             Ok(storage) => {
                 let id_persist = id.to_string();
                 let persisted = tokio::task::spawn_blocking(move || {

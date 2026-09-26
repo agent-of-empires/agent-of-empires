@@ -30,7 +30,7 @@ pub(super) fn load_all_instances(
     };
     let mut all = Vec::new();
     for profile in &profiles {
-        match Storage::new(profile, file_watch.clone()).and_then(|s| s.load()) {
+        match Storage::open(profile, file_watch.clone()).and_then(|s| s.load()) {
             Ok(mut instances) => {
                 for inst in &mut instances {
                     inst.source_profile = profile.clone();

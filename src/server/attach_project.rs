@@ -207,7 +207,7 @@ where
     let profile = profile.to_string();
     let file_watch = state.file_watch.clone();
     tokio::task::spawn_blocking(move || {
-        let storage = Storage::new(&profile, file_watch).map_err(|e| e.to_string())?;
+        let storage = Storage::open(&profile, file_watch).map_err(|e| e.to_string())?;
         f(&storage)
     })
     .await

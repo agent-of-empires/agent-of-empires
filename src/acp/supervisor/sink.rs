@@ -70,7 +70,9 @@ impl BroadcastSink for ChannelSink {
     }
 
     fn clear_session_events(&self, session_id: &str) {
-        self.event_store.delete_session(session_id);
+        if let Err(error) = self.event_store.delete_session(session_id) {
+            tracing::warn!(target: "acp.supervisor", session = %session_id, %error, "failed to clear ACP events");
+        }
         self.control_cache.forget(session_id);
     }
 

@@ -158,7 +158,7 @@ impl Instance {
             profiles.push(current_profile.clone());
         }
         for profile in profiles {
-            let Ok(storage) = crate::session::storage::Storage::new_unwatched(&profile) else {
+            let Ok(storage) = crate::session::storage::Storage::open_unwatched(&profile) else {
                 return false;
             };
             let Ok(instances) = storage.load() else {
@@ -678,7 +678,7 @@ impl Instance {
     /// transition.
     pub(crate) fn stop_and_flush_poller(&mut self) {
         let profile = self.effective_profile();
-        let storage = match crate::session::storage::Storage::new(
+        let storage = match crate::session::storage::Storage::open(
             &profile,
             self.resolve_file_watch(),
         ) {

@@ -322,7 +322,7 @@ pub(crate) async fn spawn_structured_session(
             &hook_plan,
             std::path::Path::new(&original_path),
         ) {
-            builder::cleanup_instance(
+            builder::cleanup_instance_locked(
                 &instance,
                 created_worktree.as_ref(),
                 &created_workspace_worktrees,
@@ -340,7 +340,7 @@ pub(crate) async fn spawn_structured_session(
         let _workspace_claim_lock = match crate::session::acquire_session_workspace_claim_lock() {
             Ok(lock) => lock,
             Err(error) => {
-                builder::cleanup_instance(
+                builder::cleanup_instance_locked(
                     &instance,
                     created_worktree.as_ref(),
                     &created_workspace_worktrees,
@@ -349,10 +349,15 @@ pub(crate) async fn spawn_structured_session(
                 return Err(error);
             }
         };
-        let identity_lock = match crate::session::acquire_session_identity_lock() {
-            Ok(lock) => lock,
+        let ownership_locks = match crate::session::acquire_session_identity_lock() {
+            Ok(lock) => {
+                builder::CleanupOwnershipLocks::from_held(_workspace_claim_lock, lock)
+            }
             Err(error) => {
-                builder::cleanup_instance(
+                // Only the workspace-claim lock is held; release it so the
+                // cleanup path can take the pair itself.
+                drop(_workspace_claim_lock);
+                builder::cleanup_instance_locked(
                     &instance,
                     created_worktree.as_ref(),
                     &created_workspace_worktrees,
@@ -364,21 +369,23 @@ pub(crate) async fn spawn_structured_session(
         let storage = match Storage::open(&profile, file_watch_for_create.clone()) {
             Ok(storage) => storage,
             Err(error) => {
-                builder::cleanup_instance(
+                builder::cleanup_instance_under_locks(
                     &instance,
                     created_worktree.as_ref(),
                     &created_workspace_worktrees,
                     None,
+                    &ownership_locks,
                 );
                 return Err(error);
             }
         };
         if let Err(error) = crate::session::validate_managed_workspace(&instance) {
-            builder::cleanup_instance(
+            builder::cleanup_instance_under_locks(
                 &instance,
                 created_worktree.as_ref(),
                 &created_workspace_worktrees,
                 None,
+                &ownership_locks,
             );
             return Err(anyhow::anyhow!(
                 "Managed workspace validation failed before the session was persisted: {error}"
@@ -401,11 +408,12 @@ pub(crate) async fn spawn_structured_session(
                 &instance.id,
                 &candidate_paths,
             ) {
-                builder::cleanup_instance(
+                builder::cleanup_instance_under_locks(
                     &instance,
                     created_worktree.as_ref(),
                     &created_workspace_worktrees,
                     None,
+                    &ownership_locks,
                 );
                 return Err(anyhow::anyhow!(
                     "Session path is already claimed by another session: {error}"
@@ -422,7 +430,7 @@ pub(crate) async fn spawn_structured_session(
                 all.push(to_persist);
                 Ok(())
             })?;
-            drop(identity_lock);
+            drop(ownership_locks);
 
             // Acp-mode sessions are not backed by tmux; the structured view supervisor
             // spawns the ACP agent on demand.

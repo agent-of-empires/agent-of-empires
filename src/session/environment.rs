@@ -791,6 +791,7 @@ mod tests {
     fn docker_env_args_ignore_repo_host_passthrough() {
         let temp_home = tempfile::TempDir::new().unwrap();
         let _home_guard = isolate_home(temp_home.path());
+        crate::session::create_profile("default").unwrap();
         let _env = EnvGuard::set(&[
             ("AOE_TEST_REPO_SECRET_3710", "repo-secret"),
             ("AOE_TEST_PROFILE_PT_3710", "profile-value"),

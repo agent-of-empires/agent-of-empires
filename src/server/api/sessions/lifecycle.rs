@@ -2,6 +2,7 @@
 //! stop/start/snooze/unread endpoints.
 
 use super::*;
+use std::path::PathBuf;
 
 #[derive(Deserialize)]
 pub struct UpdatePinBody {
@@ -464,9 +465,20 @@ pub async fn trash_session(
         instance.lifecycle_generation = generation;
     }
 
+    // Relocating the worktree out from under a live runner would move a
+    // directory it still has open, so an unproven teardown leaves it in place.
+    let mut relocation_allowed = true;
     if was_structured_view {
-        match state.acp_supervisor.shutdown(&id).await {
+        match state.acp_supervisor.shutdown_and_require_dead(&id).await {
             Ok(()) | Err(crate::acp::supervisor::SupervisorError::UnknownSession(_)) => {}
+            Err(crate::acp::supervisor::SupervisorError::TeardownPending(_)) => {
+                tracing::warn!(
+                    target: "acp.supervisor",
+                    session = %id,
+                    "trash left the worktree in place: the runner is not proven dead"
+                );
+                relocation_allowed = false;
+            }
             Err(error) => tracing::warn!(
                 target: "acp.supervisor",
                 session = %id,
@@ -488,8 +500,8 @@ pub async fn trash_session(
                 instance.kill_all_tmux_sessions_locked();
             }
         }
-        if instance.has_managed_worktree_or_workspace() {
-            let mut candidate_paths = vec![std::path::PathBuf::from(&instance.project_path)];
+        if relocation_allowed && instance.has_managed_worktree_or_workspace() {
+            let mut candidate_paths = vec![PathBuf::from(&instance.project_path)];
             if let Some(workspace) = &instance.workspace_info {
                 candidate_paths.push(std::path::PathBuf::from(&workspace.workspace_dir));
             }
@@ -497,7 +509,7 @@ pub async fn trash_session(
                 instance
                     .all_repos()
                     .iter()
-                    .map(|repo| std::path::PathBuf::from(&repo.worktree_path)),
+                    .map(|repo| PathBuf::from(&repo.worktree_path)),
             );
             if let Err(error) =
                 crate::session::deletion::ensure_unclaimed_paths(&work_id, &candidate_paths)
@@ -520,7 +532,11 @@ pub async fn trash_session(
                 ));
             }
         }
-        let outcome = crate::session::trash::prepare_trashed_worktree(&mut instance);
+        let outcome = if relocation_allowed {
+            crate::session::trash::prepare_trashed_worktree(&mut instance)
+        } else {
+            crate::session::trash::RelocateOutcome::Skipped
+        };
         let relocation = match &outcome {
             crate::session::trash::RelocateOutcome::Relocated { .. } => {
                 Some(crate::session::trash::TrashRelocation {

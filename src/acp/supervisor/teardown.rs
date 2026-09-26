@@ -27,19 +27,37 @@ impl<S: BroadcastSink> Supervisor<S> {
     pub async fn shutdown(&self, session_id: &str) -> Result<(), SupervisorError> {
         self.shutdown_with_reason(session_id, "user_stopped", false)
             .await
+            .map(|_| ())
     }
 
     /// Stop a worker reclaimed for inactivity.
     pub async fn shutdown_idle(&self, session_id: &str) -> Result<(), SupervisorError> {
         self.shutdown_with_reason(session_id, "idle_auto_stop", false)
             .await
+            .map(|_| ())
     }
 
     /// Stop a worker being permanently discarded, releasing agent-side state
     /// via `session/delete`. Reversible stops must not use this.
+    ///
+    /// Refuses with [`SupervisorError::TeardownPending`] while the runner is not
+    /// proven dead: releasing agent-side state then would purge a transcript a
+    /// live process is still writing.
     pub async fn shutdown_and_delete(&self, session_id: &str) -> Result<(), SupervisorError> {
-        self.shutdown_with_reason(session_id, "user_stopped", true)
-            .await
+        let settlement = self
+            .shutdown_with_reason(session_id, "user_stopped", true)
+            .await?;
+        require_proven_settlement(session_id, settlement)
+    }
+
+    /// Stop a worker and refuse to report success while its runner is not
+    /// proven dead. Destructive callers (trash relocation, permanent purge)
+    /// must gate on this rather than on a plain [`Self::shutdown`].
+    pub async fn shutdown_and_require_dead(&self, session_id: &str) -> Result<(), SupervisorError> {
+        let settlement = self
+            .shutdown_with_reason(session_id, "user_stopped", false)
+            .await?;
+        require_proven_settlement(session_id, settlement)
     }
 
     /// `shutdown`, then wait for the resume/teardown to settle and the runner
@@ -91,12 +109,15 @@ impl<S: BroadcastSink> Supervisor<S> {
         Ok(())
     }
 
+    /// `None` when this call established no settlement of its own — the stop
+    /// was a cancel, or a teardown is already parked. Destructive callers must
+    /// treat that as "not proven dead" and leave their work to the retry pass.
     async fn shutdown_with_reason(
         &self,
         session_id: &str,
         stop_reason: &str,
         delete_adapter_state: bool,
-    ) -> Result<(), SupervisorError> {
+    ) -> Result<Option<Settlement>, SupervisorError> {
         // Same lock order as `begin_resume`, so a resume cannot slip between
         // the decision and the handle removal.
         let mut workers = self.workers.lock().await;
@@ -108,7 +129,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                 worker_registry::clear_restart_marker(session_id);
                 let Some(handle) = handle else {
                     self.settle(&lease, Settlement::Proven);
-                    return Ok(());
+                    return Ok(Some(Settlement::Proven));
                 };
                 if delete_adapter_state {
                     try_session_delete(&handle.client, session_id).await;
@@ -146,7 +167,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                         },
                     );
                 }
-                Ok(())
+                Ok(Some(settlement))
             }
             StopDecision::CancelRequested => {
                 drop(workers);
@@ -156,9 +177,9 @@ impl<S: BroadcastSink> Supervisor<S> {
                     session = %session_id,
                     "shutdown: resume in flight; it will tear down what it builds"
                 );
-                Ok(())
+                Ok(None)
             }
-            StopDecision::AlreadyStopping => Ok(()),
+            StopDecision::AlreadyStopping => Ok(None),
             StopDecision::NotOwned => {
                 // A runner from a previous daemon may still be on disk.
                 let Some(record) = worker_registry::load(session_id).ok().flatten() else {
@@ -181,7 +202,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                 if let Some(lease) = lease {
                     self.settle(&lease, settlement);
                 }
-                Ok(())
+                Ok(Some(settlement))
             }
         }
     }
@@ -352,6 +373,27 @@ impl<S: BroadcastSink> Supervisor<S> {
         let _ = handle.client.shutdown().await;
         handle.drain_task.abort();
         Some(is_restart)
+    }
+}
+
+/// A runner is proven dead only when escalation finished and its registry
+/// record was settled. Anything else must block the caller's destructive work.
+fn require_proven_settlement(
+    session_id: &str,
+    settlement: Option<Settlement>,
+) -> Result<(), SupervisorError> {
+    match settlement {
+        Some(Settlement::Proven) => Ok(()),
+        Some(Settlement::Unproven(identity)) => {
+            warn!(
+                target: "acp.supervisor",
+                session = %session_id,
+                pid = identity.pid,
+                "refusing to release agent-side state: the runner is not proven dead"
+            );
+            Err(SupervisorError::TeardownPending(session_id.to_string()))
+        }
+        None => Err(SupervisorError::TeardownPending(session_id.to_string())),
     }
 }
 
@@ -1143,6 +1185,60 @@ mod tests {
             sup.begin_resume("s-imm", ResumeKind::Spawn).await.unwrap(),
             ResumeReservationOutcome::Reserved(_)
         ));
+    }
+
+    /// A runner that survives SIGKILL still owns its worktree and transcript,
+    /// so the destructive stops must report a blocking result instead of Ok.
+    #[tokio::test(start_paused = true)]
+    #[serial_test::serial]
+    async fn a_destructive_stop_blocks_until_the_runner_is_proven_dead() {
+        let _home = isolate_home();
+        let control = Arc::new(FakeProcessControl::default());
+        control.immortal(8181);
+        let sup = Supervisor::new(VecSink::new()).with_process_control(control.clone());
+        save_record("s-live", 8181, 5);
+        let socket = worker_registry::socket_path_for("s-live").unwrap();
+        sup.test_install_runner(
+            "s-live",
+            runner_config(socket),
+            Some(RunnerIdentity {
+                pid: 8181,
+                generation: 5,
+            }),
+        )
+        .await;
+
+        assert!(
+            matches!(
+                sup.shutdown_and_delete("s-live").await,
+                Err(SupervisorError::TeardownPending(_))
+            ),
+            "permanent removal must not report success beside a live runner"
+        );
+        assert!(
+            matches!(
+                sup.shutdown_and_require_dead("s-live").await,
+                Err(SupervisorError::TeardownPending(_))
+            ),
+            "destructive callers must not see a stop as settled either"
+        );
+        assert_eq!(sup.worker_state("s-live").await, AcpWorkerState::Stopping);
+        assert!(
+            worker_registry::load("s-live").unwrap().is_some(),
+            "the unproven runner keeps its record so the retry pass can settle it"
+        );
+
+        control.exit(8181);
+        sup.retry_pending_teardowns().await;
+        assert_eq!(sup.worker_state("s-live").await, AcpWorkerState::Absent);
+        assert!(worker_registry::load("s-live").unwrap().is_none());
+        assert!(
+            matches!(
+                sup.begin_resume("s-live", ResumeKind::Spawn).await.unwrap(),
+                ResumeReservationOutcome::Reserved(_)
+            ),
+            "the retry pass settles the teardown, so the session admits a resume again"
+        );
     }
 
     #[tokio::test]

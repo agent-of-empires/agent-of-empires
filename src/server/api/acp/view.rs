@@ -162,7 +162,7 @@ async fn commit_structured_view(
     let file_watch = state.file_watch.clone();
     let binding_for_transition = selected_binding.cloned();
     let transition = tokio::task::spawn_blocking(move || -> anyhow::Result<u64> {
-        let storage = crate::session::Storage::new(&profile, file_watch)?;
+        let storage = crate::session::Storage::open(&profile, file_watch)?;
         let _lifecycle_lock = storage
             .acquire_instance_lifecycle_lock(&inst_for_transition.id)
             .map_err(|error| {
@@ -429,15 +429,33 @@ pub async fn acp_disable(
     } else {
         state.acp_supervisor.shutdown_and_delete(&id).await
     };
-    match shutdown_result {
-        Ok(()) | Err(SupervisorError::UnknownSession(_)) => {}
+    let acp_teardown_proven = match shutdown_result {
+        Ok(()) | Err(SupervisorError::UnknownSession(_)) => true,
+        Err(SupervisorError::TeardownPending(_)) => false,
         Err(e) => {
             tracing::warn!(target: "acp.switch", session = %id, "shutdown structured view failed: {e}");
+            true
         }
+    };
+    if !acp_teardown_proven {
+        // The ACP transcript and the runner's worktree both outlive an
+        // unproven teardown, so the switch stops here and the retry pass
+        // settles it.
+        return (
+            StatusCode::CONFLICT,
+            format!("Session {id} is still being torn down; the structured view was left in place"),
+        )
+            .into_response();
     }
     // The tmux pane reprints a kept conversation, so the ACP projection goes.
+    if let Err(error) = state.acp_event_store.delete_session(&id) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to delete ACP events: {error}"),
+        )
+            .into_response();
+    }
     state.acp_supervisor.forget_session(&id);
-    state.acp_event_store.delete_session(&id);
 
     match tokio::task::spawn_blocking(move || instance.start()).await {
         Ok(Ok(())) => {}
@@ -460,7 +478,7 @@ async fn load_persisted_instance(
     let profile_for_load = profile.to_string();
     let file_watch = state.file_watch.clone();
     let persisted = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<Instance>> {
-        let storage = crate::session::Storage::new(&profile_for_load, file_watch)?;
+        let storage = crate::session::Storage::open(&profile_for_load, file_watch)?;
         Ok(storage
             .load()?
             .into_iter()
@@ -513,7 +531,7 @@ async fn persist_terminal_view(
     let profile_for_save = profile.to_string();
     let file_watch = state.file_watch.clone();
     let save_result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-        let storage = crate::session::Storage::new(&profile_for_save, file_watch)?;
+        let storage = crate::session::Storage::open(&profile_for_save, file_watch)?;
         storage.update(|all, _groups| {
             let Some(slot) = all.iter_mut().find(|candidate| candidate.id == snapshot.id) else {
                 anyhow::bail!("session disappeared during terminal handoff");

@@ -337,7 +337,7 @@ where
 }
 
 /// Process-wide registry of per-profile save mutexes.
-fn save_lock_for(profile: &str) -> Arc<Mutex<()>> {
+pub(crate) fn save_lock_for(profile: &str) -> Arc<Mutex<()>> {
     static REGISTRY: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
     let registry = REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
     let mut guard = registry

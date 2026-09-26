@@ -16,7 +16,7 @@ impl Instance {
         }
         let profile = self.effective_profile();
         let Ok(storage) =
-            crate::session::storage::Storage::new(&profile, self.resolve_file_watch())
+            crate::session::storage::Storage::open(&profile, self.resolve_file_watch())
         else {
             return;
         };
@@ -132,7 +132,7 @@ impl Instance {
 
     pub(crate) fn kill_clean(&self) -> Result<()> {
         let profile = self.effective_profile();
-        let storage = crate::session::storage::Storage::new(&profile, self.resolve_file_watch())
+        let storage = crate::session::storage::Storage::open(&profile, self.resolve_file_watch())
             .context("failed to open lifecycle lock storage")?;
         let _lifecycle_lock = storage
             .acquire_instance_lifecycle_lock(&self.id)
@@ -167,7 +167,7 @@ impl Instance {
 
     pub fn kill(&self) -> Result<()> {
         let profile = self.effective_profile();
-        let storage = crate::session::storage::Storage::new(&profile, self.resolve_file_watch())
+        let storage = crate::session::storage::Storage::open(&profile, self.resolve_file_watch())
             .context("failed to open lifecycle lock storage")?;
         let _lifecycle_lock = storage
             .acquire_instance_lifecycle_lock(&self.id)
@@ -196,7 +196,7 @@ impl Instance {
     pub fn kill_all_tmux_sessions(&self) {
         let profile = self.effective_profile();
         let storage =
-            match crate::session::storage::Storage::new(&profile, self.resolve_file_watch()) {
+            match crate::session::storage::Storage::open(&profile, self.resolve_file_watch()) {
                 Ok(storage) => storage,
                 Err(error) => {
                     tracing::warn!(
@@ -279,7 +279,7 @@ impl Instance {
     pub fn kill_ancillary_tmux_sessions(&self) {
         let profile = self.effective_profile();
         let storage =
-            match crate::session::storage::Storage::new(&profile, self.resolve_file_watch()) {
+            match crate::session::storage::Storage::open(&profile, self.resolve_file_watch()) {
                 Ok(storage) => storage,
                 Err(error) => {
                     tracing::warn!(
@@ -332,7 +332,7 @@ impl Instance {
     /// lock used by launch/restart.
     pub fn stop(&self) -> Result<()> {
         let profile = self.effective_profile();
-        let storage = crate::session::storage::Storage::new(&profile, self.resolve_file_watch())
+        let storage = crate::session::storage::Storage::open(&profile, self.resolve_file_watch())
             .context("failed to open lifecycle lock storage")?;
         let _lifecycle_lock = storage
             .acquire_instance_lifecycle_lock(&self.id)

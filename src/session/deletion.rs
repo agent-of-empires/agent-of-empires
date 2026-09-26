@@ -461,6 +461,7 @@ impl PurgeTransaction {
         mut self,
         after_teardown: impl FnOnce(&Instance) -> std::result::Result<(), String>,
         commit_on_teardown_failure: bool,
+        teardown: fn(&str) -> crate::containers::Teardown,
     ) -> DeletionResult {
         if let Err(error) = self.ensure_lifecycle_lock() {
             return DeletionResult::rejected(
@@ -489,19 +490,22 @@ impl PurgeTransaction {
             let retained = self.release_reservation().ok().flatten();
             return DeletionResult::rejected(id, DeletionDisposition::Failed, message, retained);
         }
+        let mut result = perform_deletion_core(&self.request, true, true, teardown);
+        if !result.success && !commit_on_teardown_failure {
+            result.retained_instance = self.release_reservation().ok().flatten();
+            result.disposition = DeletionDisposition::Failed;
+            return result;
+        }
         if let Err(error) = after_teardown(&self.request.instance) {
-            return DeletionResult::rejected(
+            let mut failed = DeletionResult::rejected(
                 id,
                 DeletionDisposition::Failed,
                 error,
                 self.release_reservation().ok().flatten(),
             );
-        }
-        let mut result = perform_deletion_teardown_lifecycle_locked(&self.request, true);
-        if !result.success && !commit_on_teardown_failure {
-            result.retained_instance = self.release_reservation().ok().flatten();
-            result.disposition = DeletionDisposition::Failed;
-            return result;
+            failed.teardown_started = result.teardown_started;
+            failed.messages = result.messages;
+            return failed;
         }
 
         let generation = self.generation;
@@ -572,11 +576,19 @@ impl PurgeTransaction {
         self,
         after_teardown: impl FnOnce(&Instance) -> std::result::Result<(), String>,
     ) -> DeletionResult {
-        self.complete_inner(after_teardown, false)
+        self.complete_inner(after_teardown, false, default_teardown)
+    }
+    #[cfg(test)]
+    pub(crate) fn complete_with_test_teardown(
+        self,
+        after_teardown: impl FnOnce(&Instance) -> std::result::Result<(), String>,
+        teardown: fn(&str) -> crate::containers::Teardown,
+    ) -> DeletionResult {
+        self.complete_inner(after_teardown, false, teardown)
     }
 
     pub fn complete(self) -> DeletionResult {
-        self.complete_inner(|_| Ok(()), false)
+        self.complete_inner(|_| Ok(()), false, default_teardown)
     }
 }
 
@@ -868,14 +880,15 @@ pub fn perform_deletion(request: &DeletionRequest) -> DeletionResult {
         DockerContainer::from_session_id(session_id).teardown(session_id)
     })
 }
+fn default_teardown(session_id: &str) -> crate::containers::Teardown {
+    DockerContainer::from_session_id(session_id).teardown(session_id)
+}
 
 fn perform_deletion_teardown_lifecycle_locked(
     request: &DeletionRequest,
     identity_lock_held: bool,
 ) -> DeletionResult {
-    perform_deletion_core(request, true, identity_lock_held, |session_id| {
-        DockerContainer::from_session_id(session_id).teardown(session_id)
-    })
+    perform_deletion_core(request, true, identity_lock_held, default_teardown)
 }
 
 /// Core deletion routine, parameterized over how the sandbox container is torn down so the
@@ -930,7 +943,15 @@ fn perform_deletion_core(
     } else {
         &[]
     };
-    if lifecycle_locked {
+    let needs_path_inventory = (request.delete_worktree
+        && (request
+            .instance
+            .worktree_info
+            .as_ref()
+            .is_some_and(|wt| wt.managed_by_aoe)
+            || request.instance.workspace_info.is_some()))
+        || request.instance.scratch;
+    if lifecycle_locked && needs_path_inventory {
         return with_paths_in_use_locked(&request.session_id, identity_lock_held, |paths| {
             perform_deletion_teardown_under_ownership_guard(request, repos, true, paths, teardown)
         });
@@ -938,7 +959,7 @@ fn perform_deletion_core(
     perform_deletion_teardown_under_ownership_guard(
         request,
         repos,
-        false,
+        lifecycle_locked,
         &PathsInUse::Known(Vec::new()),
         teardown,
     )
@@ -2221,6 +2242,57 @@ mod tests {
                     assert!(store.exists(), "{case:?}: {:?}", result.errors);
                     assert!(case == Case::PreTransition || !result.success, "{case:?}");
                 }
+            }
+        }
+        fn fail(_: &str) -> Teardown {
+            Teardown::Failed(DockerError::RemoveFailed("busy".into()))
+        }
+        fn ok(_: &str) -> Teardown {
+            Teardown::Removed
+        }
+        #[test]
+        #[serial]
+        fn transcript_callback_runs_only_after_successful_teardown() {
+            for (teardown, expect_purged) in [
+                (fail as fn(&str) -> Teardown, false),
+                (ok as fn(&str) -> Teardown, true),
+            ] {
+                let temp = tempfile::TempDir::new().unwrap();
+                let _home = isolate_app_dir_at(temp.path());
+                let profile = "purge-transcript-ordering";
+                let storage = Storage::new_unwatched(profile).unwrap();
+                let mut instance = stored_instance(&storage, profile, "/tmp/test-project");
+                instance.sandbox_info = Some(sandbox_info("aoe-sandbox-ordering"));
+                storage
+                    .update(|instances, _| {
+                        *instances = vec![instance.clone()];
+                        Ok(())
+                    })
+                    .unwrap();
+                let storage = Storage::open_unwatched(profile).unwrap();
+                let transaction = match PurgeTransaction::reserve(
+                    storage,
+                    DeletionRequest {
+                        delete_sandbox: true,
+                        ..request(instance.clone())
+                    },
+                )
+                .unwrap()
+                {
+                    PurgeReservation::Reserved(transaction) => transaction,
+                    PurgeReservation::Rejected(result) => {
+                        panic!("purge reservation was refused: {:?}", result.errors)
+                    }
+                };
+                let purged = std::cell::Cell::new(false);
+                let result = transaction.complete_with_test_teardown(
+                    |_| {
+                        purged.set(true);
+                        Ok(())
+                    },
+                    teardown,
+                );
+                assert_eq!(purged.get(), expect_purged, "result={result:?}");
             }
         }
     }

@@ -127,6 +127,33 @@ async fn purge_session_artifacts(
 
     let transcript_purged = transaction.instance().is_structured();
 
+    // A structured purge destroys state a still-running runner is using, so it
+    // waits for proven settlement. Doing this before the irreversible commit
+    // means an unproven runner leaves the durable row intact instead of
+    // stranding a live session with no record and no transcript.
+    if transcript_purged {
+        match state.acp_supervisor.shutdown_and_delete(id).await {
+            Ok(()) | Err(crate::acp::supervisor::SupervisorError::UnknownSession(_)) => {}
+            Err(crate::acp::supervisor::SupervisorError::TeardownPending(_)) => {
+                return Err(format!(
+                    "Session {id} is still being torn down; the record was kept. Retry after the runner exits."
+                ));
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "acp.supervisor",
+                    session = %id,
+                    "shutdown during purge failed: {e}"
+                );
+            }
+        }
+        if let Err(error) = state.acp_event_store.delete_session(id) {
+            return Err(format!(
+                "Session {id} was kept because ACP event deletion failed: {error}"
+            ));
+        }
+    }
+
     let deletion_result = if transcript_purged {
         // Commit the row removal before deleting the ACP transcript, so a lost
         // restore/generation race leaves both intact and a successful commit
@@ -137,30 +164,18 @@ async fn purge_session_artifacts(
         match committed {
             Err(result) => *result,
             Ok(committed) => {
-                // Remove the local mirror before awaiting ACP so the reconciler
-                // cannot surface a durable row that no longer exists. The epoch
-                // bump is under the same lock: ACP teardown is slow, and a
-                // reload landing inside it would otherwise restore the row.
+                // Drop the local mirror under the same lock as the epoch bump,
+                // so a reload cannot surface a durable row that no longer
+                // exists while the transcript and sidecars are torn down.
                 remove_instance(
                     &mut *state.instances.write().await,
                     id,
                     &state.mutation_epoch,
                 );
 
-                // The worker may still use the worktree, so ACP teardown stays
-                // ahead of sidecar cleanup.
-                match state.acp_supervisor.shutdown_and_delete(id).await {
-                    Ok(()) | Err(crate::acp::supervisor::SupervisorError::UnknownSession(_)) => {}
-                    Err(e) => {
-                        tracing::warn!(
-                            target: "acp.supervisor",
-                            session = %id,
-                            "shutdown during purge failed: {e}"
-                        );
-                    }
-                }
+                // The runner is proven dead by now, so the local mirror and the
+                // ACP transcript can go before the sidecar teardown.
                 state.acp_supervisor.forget_session(id);
-                state.acp_event_store.delete_session(id);
 
                 tokio::task::spawn_blocking(move || committed.finish())
                     .await

@@ -163,9 +163,10 @@ pub fn set_favorites_first(on: bool) {
 
 pub use config::profile_config::{
     load_profile_config, merge_configs, resolve_config, resolve_config_or_warn,
-    save_profile_config, validate_capability_format, validate_check_interval, validate_env_format,
-    validate_memory_limit, validate_network_format, validate_port_mapping_format,
-    validate_security_opt_format, validate_volume_format, ProfileConfig,
+    save_profile_config, update_profile_config, validate_capability_format,
+    validate_check_interval, validate_env_format, validate_memory_limit, validate_network_format,
+    validate_port_mapping_format, validate_security_opt_format, validate_volume_format,
+    ProfileConfig,
 };
 pub use config::repo_config::{
     check_repo_trust, execute_hooks, execute_hooks_in_container, load_repo_config,
@@ -853,9 +854,8 @@ fn collect_startup_warnings(profile: &str, class: WarningClass) -> Option<String
     } else {
         profile.to_string()
     };
-    // Non-creating resolver: `get_profile_config_path` goes through the creating `get_profile_dir`,
-    // so naming an unknown profile (`aoe list -p ghost`) would birth `profiles/ghost/` here, before
-    // the command's own `resolve_existing_profile` gets to reject it.
+    // Non-creating resolver: naming an unknown profile (`aoe list -p ghost`) would otherwise birth
+    // `profiles/ghost/` here, before the command's own `resolve_existing_profile` gets to reject it.
     let profile_path_display = get_profile_dir_path(&effective)
         .map(|p| p.join("config.toml").display().to_string())
         .unwrap_or_else(|_| format!("profiles/{effective}/config.toml"));

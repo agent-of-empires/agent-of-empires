@@ -8,7 +8,6 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 
 use super::Config;
-use crate::session::get_profile_dir;
 
 /// Profile-specific settings, stored as a sparse override tree (#1692).
 ///
@@ -48,10 +47,16 @@ impl ProfileConfig {
 /// not pollute `profiles/` with a stub directory.
 pub fn load_profile_config(profile: &str) -> Result<ProfileConfig> {
     let path = crate::session::get_profile_dir_path(profile)?.join("config.toml");
+    read_profile_config_at(&path)
+}
+
+/// Read and type-check `profiles/<name>/config.toml`. A missing or empty file
+/// is an empty config, not an error.
+fn read_profile_config_at(path: &std::path::Path) -> Result<ProfileConfig> {
     if !path.exists() {
         return Ok(ProfileConfig::default());
     }
-    let content = fs::read_to_string(&path)?;
+    let content = fs::read_to_string(path)?;
     if content.trim().is_empty() {
         return Ok(ProfileConfig::default());
     }
@@ -115,30 +120,71 @@ pub(crate) fn overrides_ignored_keys(overrides: &serde_json::Value) -> Vec<Strin
     ignored
 }
 
-/// Save profile-specific config
-pub fn save_profile_config(profile: &str, config: &ProfileConfig) -> Result<()> {
-    let path = get_profile_dir(profile)?.join("config.toml");
+/// Run `f` with the `config.toml` path of an *existing* profile while holding
+/// that profile's write locks: identity → profile-namespace → profile storage
+/// flock → in-process save mutex, the first three in the same order
+/// [`crate::session::rename_profile`] and [`crate::session::delete_profile`]
+/// take. The profile is resolved only after the namespace lock is held, so a
+/// concurrent rename/delete can neither slip between resolution and the write
+/// nor have its directory resurrected by a stale caller. An unknown profile is
+/// an error; nothing is ever created.
+fn with_profile_config_locked<T>(
+    profile: &str,
+    f: impl FnOnce(&std::path::Path) -> Result<T>,
+) -> Result<T> {
     let _identity_lock = crate::session::acquire_session_identity_lock()?;
     let _namespace_lock = crate::session::storage::acquire_profile_namespace_lock()?;
+    let profile_name = crate::session::resolve_existing_profile(profile)?;
+    let dir = crate::session::get_profile_dir_path(&profile_name)?;
     let _profile_storage_lock = crate::session::storage::acquire_storage_flock(
-        path.parent().expect("profile config path has a parent"),
+        &dir,
         crate::session::storage::STORAGE_LOCK_FILENAME,
     )?;
-    anyhow::ensure!(
-        path.parent().is_some_and(|parent| parent.exists()),
-        "profile '{profile}' does not exist"
-    );
-    let content = toml::to_string_pretty(config)?;
-    crate::session::atomic_write(&path, content.as_bytes())?;
-    Ok(())
+    // The in-process half of the same pair `Storage` uses: threads of this
+    // process serialize on the mutex, other processes on the flock above.
+    let save_lock = crate::session::storage::save_lock_for(&profile_name);
+    let _save_lock = save_lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    f(&dir.join("config.toml"))
 }
 
-/// Get the path to a profile's config file. This goes through the
-/// creating [`get_profile_dir`] because the only remaining caller is
-/// [`save_profile_config`], which needs the directory to exist before
-/// the atomic write.
+/// Write `config` to an existing profile's `config.toml`, replacing it whole.
+/// Never creates the profile directory: naming an unknown profile is an error.
+pub fn save_profile_config(profile: &str, config: &ProfileConfig) -> Result<()> {
+    let content = toml::to_string_pretty(config)?;
+    with_profile_config_locked(profile, |path| {
+        crate::session::atomic_write(path, content.as_bytes())
+    })
+}
+
+/// Locked read-modify-write over a profile's sparse override tree.
+///
+/// `mutate` receives the current on-disk overrides as a JSON object (absent or
+/// empty file ⇒ `{}`) and edits them in place; the result is written back and
+/// returned. The read and the write happen under one profile lock, so
+/// concurrent PATCHes from the web UI, the TUI, and other processes compose
+/// instead of clobbering each other's leaves. `mutate` sees the same JSON shape
+/// [`ProfileConfig`] deserializes from, minus nothing: `description` is a
+/// top-level key like any other.
+pub fn update_profile_config(
+    profile: &str,
+    mutate: impl FnOnce(&mut serde_json::Value) -> Result<()>,
+) -> Result<ProfileConfig> {
+    with_profile_config_locked(profile, |path| {
+        let current = read_profile_config_at(path)?;
+        let mut merged = serde_json::to_value(&current)?;
+        mutate(&mut merged)?;
+        let merged: ProfileConfig = serde_json::from_value(merged)?;
+        let content = toml::to_string_pretty(&merged)?;
+        crate::session::atomic_write(path, content.as_bytes())?;
+        Ok(merged)
+    })
+}
+
+/// Get the path to a profile's config file, without creating the profile.
 pub fn get_profile_config_path(profile: &str) -> Result<std::path::PathBuf> {
-    Ok(get_profile_dir(profile)?.join("config.toml"))
+    Ok(crate::session::get_profile_dir_path(profile)?.join("config.toml"))
 }
 
 /// Check if a profile has any overrides set
@@ -770,5 +816,47 @@ mod tests {
         apply_cityhall_overrides(&mut on);
         assert_eq!(on.acp.max_concurrent_workers, 50);
         assert!(on.worktree.enabled);
+    }
+
+    /// The read and the write of an update share one profile lock, so two
+    /// concurrent writers touching different leaves both land. An unlocked
+    /// load-then-save would let the second writer overwrite the first's leaf.
+    #[test]
+    #[serial_test::serial]
+    fn update_profile_config_keeps_both_concurrent_leaves() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let _guard = crate::session::test_support::isolate_app_dir_at(temp.path());
+        crate::session::create_profile("rmw").unwrap();
+
+        let writers: Vec<_> = ["auto_resume_on_restart", "tie_workdir_to_name"]
+            .into_iter()
+            .map(|leaf| {
+                std::thread::spawn(move || {
+                    update_profile_config("rmw", |current| {
+                        // Widen the read-modify-write window so the interleaving
+                        // this test guards is the one an unlocked
+                        // load-then-save would lose a leaf to.
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                        current
+                            .as_object_mut()
+                            .expect("profile config is a JSON object")
+                            .entry("session".to_string())
+                            .or_insert_with(|| json!({}))
+                            .as_object_mut()
+                            .expect("session section is a JSON object")
+                            .insert(leaf.to_string(), json!(false));
+                        Ok(())
+                    })
+                    .expect("locked update succeeds");
+                })
+            })
+            .collect();
+        for writer in writers {
+            writer.join().expect("writer thread panicked");
+        }
+
+        let overrides = load_profile_config("rmw").expect("reload").overrides;
+        assert_eq!(overrides["session"]["auto_resume_on_restart"], json!(false));
+        assert_eq!(overrides["session"]["tie_workdir_to_name"], json!(false));
     }
 }
