@@ -25,6 +25,34 @@ const INSTANCE_LIFECYCLE_LOCK_PREFIX: &str = ".instance-lifecycle-";
 /// Sidecar lock for every mutation that can create or change a session's `(title,
 /// project_path)` identity.
 const SESSION_IDENTITY_LOCK_FILENAME: &str = ".title-mutation.lock";
+/// Sidecar lock for claims on managed workspace paths.
+const SESSION_WORKSPACE_CLAIM_LOCK_FILENAME: &str = ".workspace-claim.lock";
+/// Sidecar lock for profile namespace rename/delete and storage writes.
+const PROFILE_NAMESPACE_LOCK_FILENAME: &str = ".profile-namespace.lock";
+#[cfg(unix)]
+type DirectoryIdentity = (u64, u64);
+#[cfg(not(unix))]
+type DirectoryIdentity = ();
+
+fn directory_identity(path: &Path) -> Result<DirectoryIdentity> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = fs::metadata(path)
+            .with_context(|| format!("reading profile directory identity {}", path.display()))?;
+        Ok((metadata.dev(), metadata.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = fs::metadata(path)
+            .with_context(|| format!("reading profile directory {}", path.display()))?;
+        Ok(())
+    }
+}
+
+pub(crate) fn acquire_profile_namespace_lock() -> Result<StorageFlock> {
+    acquire_storage_flock(&get_app_dir()?, PROFILE_NAMESPACE_LOCK_FILENAME)
+}
 /// Sidecar lock prefix for one session's title persistence plus tmux rekey.
 const SESSION_TITLE_LOCK_PREFIX: &str = ".session-title-";
 
@@ -309,7 +337,7 @@ where
 }
 
 /// Process-wide registry of per-profile save mutexes.
-fn save_lock_for(profile: &str) -> Arc<Mutex<()>> {
+pub(crate) fn save_lock_for(profile: &str) -> Arc<Mutex<()>> {
     static REGISTRY: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
     let registry = REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
     let mut guard = registry
@@ -536,6 +564,11 @@ pub(crate) fn acquire_session_identity_lock() -> Result<StorageFlock> {
     acquire_storage_flock(&get_app_dir()?, SESSION_IDENTITY_LOCK_FILENAME)
 }
 
+/// Serialize path ownership claims without holding the global identity lock over Git work.
+pub(crate) fn acquire_session_workspace_claim_lock() -> Result<StorageFlock> {
+    acquire_storage_flock(&get_app_dir()?, SESSION_WORKSPACE_CLAIM_LOCK_FILENAME)
+}
+
 /// Serialize one session's title commit and post-commit tmux rekey across profiles and
 /// processes.
 pub(crate) fn acquire_session_title_lock(instance_id: &str) -> Result<StorageFlock> {
@@ -678,6 +711,7 @@ pub struct Storage {
     sessions_path: PathBuf,
     save_lock: Arc<Mutex<()>>,
     file_watch: Arc<FileWatchService>,
+    profile_identity: Option<DirectoryIdentity>,
     #[cfg(test)]
     fail_writes_for_test: bool,
 }
@@ -802,6 +836,7 @@ impl Storage {
             sessions_path,
             save_lock,
             file_watch,
+            profile_identity: Some(directory_identity(&profile_dir)?),
             #[cfg(test)]
             fail_writes_for_test: false,
         })
@@ -819,6 +854,7 @@ impl Storage {
             sessions_path,
             save_lock: save_lock_for(profile),
             file_watch: FileWatchService::noop(),
+            profile_identity: None,
             fail_writes_for_test: false,
         }
     }
@@ -835,6 +871,7 @@ impl Storage {
             sessions_path,
             save_lock,
             file_watch,
+            profile_identity: Some(directory_identity(&profile_dir)?),
             #[cfg(test)]
             fail_writes_for_test: false,
         })
@@ -914,6 +951,46 @@ impl Storage {
             self.quarantine_corrupt_rows(&corrupt);
         }
 
+        Ok(instances)
+    }
+
+    /// Read all rows for a destructive ownership check without lossy quarantine.
+    pub(crate) fn load_strict_for_worktree_ownership_locked(&self) -> Result<Vec<Instance>> {
+        // `sessions.corrupt.jsonl` is a write-only forensic sidecar: nothing ever reads it
+        // back, and no path truncates it, so its mere presence says nothing about the
+        // current inventory. The fail-closed guarantee lives in the row-by-row parse and
+        // duplicate-id check below: while the corrupt row is still in `sessions.json` the
+        // bail comes from that row, and once a later write dropped it the sidecar is stale
+        // and bailing on it would be a false positive.
+        if !self.sessions_path.exists() {
+            return Ok(Vec::new());
+        }
+        let content = fs::read_to_string(&self.sessions_path)
+            .with_context(|| format!("reading {}", self.sessions_path.display()))?;
+        if content.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&content)
+            .with_context(|| format!("parsing {}", self.sessions_path.display()))?;
+        let mut ids = std::collections::HashSet::new();
+        let mut instances = Vec::with_capacity(rows.len());
+        for (idx, row) in rows.into_iter().enumerate() {
+            let mut instance =
+                <Instance as serde::Deserialize>::deserialize(&row).with_context(|| {
+                    format!(
+                        "parsing session row {idx} in {}",
+                        self.sessions_path.display()
+                    )
+                })?;
+            if !ids.insert(instance.id.clone()) {
+                anyhow::bail!(
+                    "duplicate session id {} in ownership inventory",
+                    instance.id
+                );
+            }
+            instance.set_file_watch(self.file_watch.clone());
+            instances.push(instance);
+        }
         Ok(instances)
     }
 
@@ -1006,6 +1083,32 @@ impl Storage {
     where
         F: FnOnce(&mut Vec<Instance>, &mut Vec<Group>) -> Result<R>,
     {
+        self.verify_profile_identity()?;
+        self.update_after_namespace_lock(f)
+    }
+
+    /// Update while the caller already owns the workspace claim lock.
+    pub(crate) fn update_under_workspace_claim_lock<F, R>(&self, f: F) -> Result<R>
+    where
+        F: FnOnce(&mut Vec<Instance>, &mut Vec<Group>) -> Result<R>,
+    {
+        self.verify_profile_identity()?;
+        self.update_after_namespace_lock(f)
+    }
+
+    /// Update while the caller already owns the workspace claim and profile namespace locks.
+    pub(crate) fn update_under_profile_namespace_lock<F, R>(&self, f: F) -> Result<R>
+    where
+        F: FnOnce(&mut Vec<Instance>, &mut Vec<Group>) -> Result<R>,
+    {
+        self.verify_profile_identity()?;
+        self.update_after_namespace_lock(f)
+    }
+
+    fn update_after_namespace_lock<F, R>(&self, f: F) -> Result<R>
+    where
+        F: FnOnce(&mut Vec<Instance>, &mut Vec<Group>) -> Result<R>,
+    {
         #[cfg(test)]
         let _mu = crate::session::test_support::lock_reporting_contention(&self.save_lock, || {
             report_lock_contention_for_test(&self.sessions_path)
@@ -1027,7 +1130,31 @@ impl Storage {
             crate::migrations::v027_isolate_sandbox_stores::LOCK,
         )?;
         let _flock = acquire_storage_flock(profile_dir, STORAGE_LOCK_FILENAME)?;
+        self.verify_profile_identity()?;
         self.update_under_lock(f)
+    }
+
+    fn verify_profile_identity(&self) -> Result<()> {
+        let Some(expected) = self.profile_identity else {
+            return Ok(());
+        };
+        let profile_dir = self.sessions_path.parent().ok_or_else(|| {
+            anyhow!(
+                "sessions_path missing parent: {}",
+                self.sessions_path.display()
+            )
+        })?;
+        let actual = directory_identity(profile_dir).with_context(|| {
+            format!(
+                "profile namespace is no longer available: {}",
+                profile_dir.display()
+            )
+        })?;
+        anyhow::ensure!(
+            actual == expected,
+            "profile namespace changed while this Storage writer was open"
+        );
+        Ok(())
     }
 
     /// Apply one storage mutation while the caller already owns this profile's
@@ -2232,6 +2359,9 @@ where
         }
     }
 
+    let _namespace = acquire_profile_namespace_lock()?;
+    source_storage.verify_profile_identity()?;
+    target_storage.verify_profile_identity()?;
     with_two_storage_locks(source_storage, target_storage, || {
         let (source_instances, _source_groups) = source_storage.load_with_groups()?;
         let (target_instances, _) = target_storage.load_with_groups()?;
@@ -2833,6 +2963,24 @@ mod tests {
 
     #[test]
     #[serial]
+    fn stale_storage_writer_cannot_recreate_renamed_or_deleted_profile() {
+        let temp = tempdir().unwrap();
+        let guard = setup_test_home(temp.path());
+        crate::session::create_profile("old").unwrap();
+        crate::session::create_profile("other").unwrap();
+        let stale = Storage::open_unwatched("old").unwrap();
+        crate::session::rename_profile("old", "renamed").unwrap();
+        assert!(stale.update(|_, _| Ok(())).is_err());
+        assert!(!guard.path().join("profiles/old").exists());
+
+        let stale_delete = Storage::open_unwatched("other").unwrap();
+        crate::session::delete_profile("other").unwrap();
+        assert!(stale_delete.update(|_, _| Ok(())).is_err());
+        assert!(!guard.path().join("profiles/other").exists());
+    }
+
+    #[test]
+    #[serial]
     fn corrupt_rows_are_quarantined_and_top_level_corruption_errors() -> Result<()> {
         let temp = tempdir()?;
         let _guard = setup_test_home(temp.path());
@@ -2884,6 +3032,54 @@ mod tests {
                 assert_eq!(mode(quarantine), 0o600);
             }
         }
+        Ok(())
+    }
+
+    /// A non-empty quarantine sidecar is a write-only forensic artifact, never an
+    /// input: once a later write dropped the corrupt row from `sessions.json`, the
+    /// inventory on disk is fully readable and must be usable for a destructive
+    /// ownership check.
+    #[test]
+    #[serial]
+    fn ownership_inventory_ignores_a_stale_quarantine_sidecar() -> Result<()> {
+        let temp = tempdir()?;
+        let _guard = setup_test_home(temp.path());
+        let storage = Storage::new_unwatched("test-profile")?;
+        fs::create_dir_all(storage.sessions_path.parent().unwrap())?;
+        let sessions = serde_json::json!([
+            Instance::new("alpha", "/tmp/alpha"),
+            Instance::new("beta", "/tmp/beta"),
+        ]);
+        fs::write(&storage.sessions_path, serde_json::to_vec(&sessions)?)?;
+        fs::write(
+            storage
+                .sessions_path
+                .with_file_name("sessions.corrupt.jsonl"),
+            "{\"title\":\"long-gone\"}\n",
+        )?;
+
+        let inventory = storage.load_strict_for_worktree_ownership_locked()?;
+        let titles: Vec<_> = inventory.iter().map(|i| i.title.as_str()).collect();
+        assert_eq!(titles, ["alpha", "beta"]);
+        Ok(())
+    }
+
+    /// The fail-closed guarantee the sidecar check used to imply still holds where it
+    /// counts: a row still sitting in `sessions.json` that will not deserialize.
+    #[test]
+    #[serial]
+    fn ownership_inventory_still_refuses_a_corrupt_row_in_sessions_json() -> Result<()> {
+        let temp = tempdir()?;
+        let _guard = setup_test_home(temp.path());
+        let storage = Storage::new_unwatched("test-profile")?;
+        fs::create_dir_all(storage.sessions_path.parent().unwrap())?;
+        let sessions = serde_json::json!([
+            Instance::new("alpha", "/tmp/alpha"),
+            { "title": "corrupt-no-id" },
+        ]);
+        fs::write(&storage.sessions_path, serde_json::to_vec(&sessions)?)?;
+
+        assert!(storage.load_strict_for_worktree_ownership_locked().is_err());
         Ok(())
     }
 

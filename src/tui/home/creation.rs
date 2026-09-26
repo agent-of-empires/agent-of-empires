@@ -2,6 +2,7 @@
 //! cancel or a quit has to do.
 
 use super::*;
+use std::path::PathBuf;
 
 pub(super) fn cleanup_creation_resources(
     instance: &Instance,
@@ -14,11 +15,35 @@ pub(super) fn cleanup_creation_resources(
         .iter()
         .map(crate::session::builder::CreatedWorktree::from)
         .collect();
-    crate::session::builder::cleanup_instance(
+    crate::session::builder::cleanup_instance_locked(
         instance,
         worktree.as_ref(),
         &workspace_worktrees,
         protected_owner,
+    );
+}
+
+/// [`cleanup_creation_resources`] for a caller that already holds the
+/// workspace-claim and identity flocks, so the ownership snapshot and the
+/// deletions run in the same window.
+pub(super) fn cleanup_creation_resources_under_locks(
+    instance: &Instance,
+    created_worktree: Option<&CreatedWorktreeInfo>,
+    created_workspace_worktrees: &[CreatedWorktreeInfo],
+    protected_owner: Option<&Instance>,
+    locks: &crate::session::builder::CleanupOwnershipLocks,
+) {
+    let worktree = created_worktree.map(crate::session::builder::CreatedWorktree::from);
+    let workspace_worktrees: Vec<_> = created_workspace_worktrees
+        .iter()
+        .map(crate::session::builder::CreatedWorktree::from)
+        .collect();
+    crate::session::builder::cleanup_instance_under_locks(
+        instance,
+        worktree.as_ref(),
+        &workspace_worktrees,
+        protected_owner,
+        locks,
     );
 }
 
@@ -253,24 +278,16 @@ impl HomeView {
                 on_launch_hooks_ran,
                 mut warnings,
             } => {
-                // Remove the stub instance
-                if let Some(id) = &stub_id {
-                    self.remove_instance(id);
-                }
-
                 let mut instance = *instance;
-                let target_profile = self.creation_poller.last_profile().unwrap_or_else(|| {
-                    self.active_profile
-                        .clone()
-                        .unwrap_or_else(crate::session::config::resolve_default_profile)
-                });
-                instance.source_profile = target_profile.clone();
-
-                if !self.storages.contains_key(&target_profile) {
-                    match Storage::new(&target_profile, self.file_watch.clone()) {
-                        Ok(storage) => {
-                            self.storages.insert(target_profile.clone(), storage);
-                        }
+                // Taken here rather than carried over the channel from the
+                // builder thread: the UI thread must be able to take these
+                // flocks itself (save, reload and the publish path all need
+                // them), so a guard owned by the worker would self-deadlock.
+                // Workspace claim before identity, the single order every other
+                // owner uses.
+                let ownership_locks =
+                    match crate::session::builder::CleanupOwnershipLocks::acquire() {
+                        Ok(locks) => locks,
                         Err(error) => {
                             cleanup_creation_resources(
                                 &instance,
@@ -280,7 +297,9 @@ impl HomeView {
                             );
                             self.info_dialog = Some(InfoDialog::sized_to_fit(
                                 "Creation Failed",
-                                &format!("Failed to open profile storage: {error}"),
+                                &format!(
+                                    "Could not lock the session inventory to publish: {error}"
+                                ),
                             ));
                             self.new_dialog = None;
                             self.rebuild_group_trees();
@@ -288,14 +307,128 @@ impl HomeView {
                             self.update_selected();
                             return None;
                         }
-                    }
+                    };
+
+                // Remove the stub instance
+                if let Some(id) = &stub_id {
+                    self.remove_instance(id);
                 }
+
+                let target_profile = self.creation_poller.last_profile().unwrap_or_else(|| {
+                    self.active_profile
+                        .clone()
+                        .unwrap_or_else(crate::session::config::resolve_default_profile)
+                });
+                self.storages.remove(&target_profile);
+                let storage = match Storage::open(&target_profile, self.file_watch.clone()) {
+                    Ok(storage) => storage,
+                    Err(error) => {
+                        cleanup_creation_resources_under_locks(
+                            &instance,
+                            created_worktree.as_ref(),
+                            &created_workspace_worktrees,
+                            None,
+                            &ownership_locks,
+                        );
+                        self.info_dialog = Some(InfoDialog::sized_to_fit(
+                            "Creation Failed",
+                            &format!("Failed to open profile storage: {error}"),
+                        ));
+                        self.new_dialog = None;
+                        self.rebuild_group_trees();
+                        self.rebuild_flat_items();
+                        self.update_selected();
+                        return None;
+                    }
+                };
+                self.storages.insert(target_profile.clone(), storage);
 
                 let Some(storage) = self.storages.get(&target_profile) else {
                     // The block above found or inserted this profile's storage, so this is
                     // unreachable; bail without attaching rather than panicking.
                     return None;
                 };
+                let manages_worktree = instance
+                    .worktree_info
+                    .as_ref()
+                    .is_some_and(|worktree| worktree.managed_by_aoe)
+                    || instance.workspace_info.is_some();
+                let authoritative = match storage.load() {
+                    Ok(authoritative) => authoritative,
+                    Err(error) => {
+                        cleanup_creation_resources_under_locks(
+                            &instance,
+                            created_worktree.as_ref(),
+                            &created_workspace_worktrees,
+                            None,
+                            &ownership_locks,
+                        );
+                        self.info_dialog = Some(InfoDialog::sized_to_fit(
+                            "Creation Failed",
+                            &format!("Failed to read profile storage: {error}"),
+                        ));
+                        self.new_dialog = None;
+                        // `reload()` re-takes the identity lock for duplicate
+                        // reconciliation, so the ownership flocks go first.
+                        drop(ownership_locks);
+                        let _ = self.reload();
+                        return None;
+                    }
+                };
+                if let Err(error) = crate::session::validate_managed_workspace(&instance) {
+                    cleanup_creation_resources_under_locks(
+                        &instance,
+                        created_worktree.as_ref(),
+                        &created_workspace_worktrees,
+                        None,
+                        &ownership_locks,
+                    );
+                    self.info_dialog = Some(InfoDialog::sized_to_fit(
+                        "Creation Failed",
+                        &format!("Managed workspace validation failed: {error}"),
+                    ));
+                    self.new_dialog = None;
+                    drop(ownership_locks);
+                    let _ = self.reload();
+                    return None;
+                }
+                if manages_worktree
+                    && crate::session::find_duplicate_session(
+                        authoritative.iter(),
+                        &instance.title,
+                        &instance.project_path,
+                        None,
+                    )
+                    .is_none()
+                {
+                    let mut candidate_paths = vec![PathBuf::from(&instance.project_path)];
+                    candidate_paths.extend(
+                        instance
+                            .all_repos()
+                            .iter()
+                            .map(|repo| PathBuf::from(&repo.worktree_path)),
+                    );
+                    if let Err(error) = crate::session::deletion::ensure_unclaimed_paths(
+                        &instance.id,
+                        &candidate_paths,
+                    ) {
+                        cleanup_creation_resources_under_locks(
+                            &instance,
+                            created_worktree.as_ref(),
+                            &created_workspace_worktrees,
+                            None,
+                            &ownership_locks,
+                        );
+                        self.info_dialog = Some(InfoDialog::sized_to_fit(
+                            "Creation Failed",
+                            &format!("Session path is already claimed: {error}"),
+                        ));
+                        self.new_dialog = None;
+                        drop(ownership_locks);
+                        let _ = self.reload();
+                        return None;
+                    }
+                }
                 let persist_result = storage.update(|instances, groups| {
                     // `save()` can run while the builder works and persist the
                     // placeholder, so remove that exact row under the same storage lock used
@@ -332,17 +465,19 @@ impl HomeView {
                 match persist_result {
                     Ok(CreationCommit::Inserted) => {}
                     Ok(CreationCommit::Duplicate(owner)) => {
-                        cleanup_creation_resources(
+                        cleanup_creation_resources_under_locks(
                             &instance,
                             created_worktree.as_ref(),
                             &created_workspace_worktrees,
                             Some(&owner),
+                            &ownership_locks,
                         );
                         self.info_dialog = Some(InfoDialog::sized_to_fit(
                             "Creation Failed",
                             &crate::session::duplicate_session_error(&instance.title).to_string(),
                         ));
                         self.new_dialog = None;
+                        drop(ownership_locks);
                         if let Err(error) = self.reload() {
                             tracing::warn!(
                                 target: "tui.home",
@@ -365,17 +500,19 @@ impl HomeView {
                                 None,
                             )
                             .cloned();
-                            cleanup_creation_resources(
+                            cleanup_creation_resources_under_locks(
                                 &instance,
                                 created_worktree.as_ref(),
                                 &created_workspace_worktrees,
                                 owner.as_ref(),
+                                &ownership_locks,
                             );
                             self.info_dialog = Some(InfoDialog::sized_to_fit(
                                 "Creation Failed",
                                 &format!("Failed to save session: {error}"),
                             ));
                             self.new_dialog = None;
+                            drop(ownership_locks);
                             if let Err(reload_error) = self.reload() {
                                 tracing::warn!(
                                     target: "tui.home",
@@ -411,6 +548,7 @@ impl HomeView {
                 if on_launch_hooks_ran {
                     self.on_launch_hooks_ran.insert(session_id.clone());
                 }
+                drop(ownership_locks);
 
                 if let Err(e) = self.reload() {
                     tracing::warn!(target: "tui.home", "Failed to reload session state: {e}");

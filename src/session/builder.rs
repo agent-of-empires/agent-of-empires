@@ -881,13 +881,129 @@ fn cleanup_created_worktree(
     }
 }
 
-/// Clean up resources created during a failed or cancelled instance build.
+/// Proof that the workspace-claim and identity flocks are held, so the
+/// ownership snapshot taken by [`cleanup_instance_under_locks`] cannot race a
+/// peer's claim.
+pub(crate) struct CleanupOwnershipLocks {
+    _workspace_claim: crate::session::StorageFlock,
+    _identity: crate::session::StorageFlock,
+}
+
+impl CleanupOwnershipLocks {
+    /// Acquire in the single order every other owner uses: workspace claim
+    /// before identity. Failing to acquire is an error, never a partial hold,
+    /// so a caller can fail closed and retain the failed create's resources.
+    pub(crate) fn acquire() -> Result<Self> {
+        let workspace_claim = crate::session::acquire_session_workspace_claim_lock()?;
+        let identity = crate::session::acquire_session_identity_lock()?;
+        Ok(Self {
+            _workspace_claim: workspace_claim,
+            _identity: identity,
+        })
+    }
+    /// Adopt flocks the caller already holds for its own persistence step, so
+    /// a create path that took them can still clean up without self-deadlock.
+    pub(crate) fn from_held(
+        workspace_claim: crate::session::StorageFlock,
+        identity: crate::session::StorageFlock,
+    ) -> Self {
+        Self {
+            _workspace_claim: workspace_claim,
+            _identity: identity,
+        }
+    }
+}
+
+/// Clean up resources created during a failed or cancelled instance build,
+/// taking the ownership locks for the whole snapshot-then-delete window.
+///
+/// Fails closed: a lock that cannot be acquired leaves every resource in
+/// place rather than deleting a path a peer may have claimed in the meantime.
+pub(crate) fn cleanup_instance_locked(
+    instance: &Instance,
+    created_worktree: Option<&CreatedWorktree>,
+    created_workspace_worktrees: &[CreatedWorktree],
+    protected_owner: Option<&Instance>,
+) {
+    let locks = match CleanupOwnershipLocks::acquire() {
+        Ok(locks) => locks,
+        Err(error) => {
+            tracing::warn!(
+                target: "session.create",
+                session_id = %instance.id,
+                "Keeping failed-create resources: could not acquire the ownership locks for cleanup: {error}"
+            );
+            return;
+        }
+    };
+    cleanup_instance_under_locks(
+        instance,
+        created_worktree,
+        created_workspace_worktrees,
+        protected_owner,
+        &locks,
+    );
+}
+
+/// Clean up a failed create for a caller that already holds the workspace-claim
+/// and identity flocks. Re-acquiring them here would self-deadlock.
+pub(crate) fn cleanup_instance_under_locks(
+    instance: &Instance,
+    created_worktree: Option<&CreatedWorktree>,
+    created_workspace_worktrees: &[CreatedWorktree],
+    protected_owner: Option<&Instance>,
+    _locks: &CleanupOwnershipLocks,
+) {
+    cleanup_instance_core(
+        instance,
+        created_worktree,
+        created_workspace_worktrees,
+        protected_owner,
+    );
+}
+
+/// Clean up resources created during a failed or cancelled instance build
+/// without taking the ownership flocks.
+///
+/// Only correct for callers that already hold the workspace-claim and session
+/// identity flocks; everyone else must use `cleanup_instance_locked`, whose
+/// snapshot and deletion run under the same lock window.
 pub fn cleanup_instance(
     instance: &Instance,
     created_worktree: Option<&CreatedWorktree>,
     created_workspace_worktrees: &[CreatedWorktree],
     protected_owner: Option<&Instance>,
 ) {
+    cleanup_instance_core(
+        instance,
+        created_worktree,
+        created_workspace_worktrees,
+        protected_owner,
+    );
+}
+
+fn cleanup_instance_core(
+    instance: &Instance,
+    created_worktree: Option<&CreatedWorktree>,
+    created_workspace_worktrees: &[CreatedWorktree],
+    protected_owner: Option<&Instance>,
+) {
+    let mut candidate_paths = vec![std::path::PathBuf::from(&instance.project_path)];
+    if let Some(workspace) = &instance.workspace_info {
+        candidate_paths.push(std::path::PathBuf::from(&workspace.workspace_dir));
+        candidate_paths.extend(
+            workspace
+                .repos
+                .iter()
+                .map(|repo| std::path::PathBuf::from(&repo.worktree_path)),
+        );
+    }
+
+    // Teardown keyed on the session id, not on any path, so it is safe even when
+    // a peer has since claimed a candidate path: no other session can own this
+    // id's tmux sessions or container. Doing it before the ownership check
+    // keeps a failed create from leaking them, and does not weaken the
+    // path-ownership gate that follows.
     // The loser may never have reached storage, so lifecycle-coordinated stop cannot reserve its
     // row.
     instance.kill_all_tmux_sessions_without_lifecycle_row();
@@ -902,32 +1018,37 @@ pub fn cleanup_instance(
         }
     }
 
+    let peer_claimed = match crate::session::deletion::paths_in_use_except(&[instance.id.as_str()])
+    {
+        crate::session::deletion::PathsInUse::Unknown(_) => true,
+        crate::session::deletion::PathsInUse::Known(paths) => {
+            let paths = crate::session::deletion::PathsInUse::Known(paths);
+            candidate_paths.iter().any(|path| paths.covers(path))
+        }
+    };
+    if peer_claimed {
+        return;
+    }
     let protection = CleanupProtection {
         owner: protected_owner,
     };
 
-    // Scratch dirs are provisioned eagerly inside `build_instance` (well before this helper's other
-    // cleanup targets exist), so an abort between provisioning and the caller finishing the session
-    // would otherwise leak the directory on disk.
+    // Scratch dirs are provisioned eagerly inside `build_instance` (well before this helper's
+    // other cleanup targets exist), so an abort between provisioning and the caller finishing the
+    // session would otherwise leak the directory on disk.
     if instance.scratch {
         let scratch_path = PathBuf::from(&instance.project_path);
         if !protection.references_path(&scratch_path)
             && super::scratch::is_scratch_path(&scratch_path)
         {
             if let Err(e) = std::fs::remove_dir_all(&scratch_path) {
-                tracing::warn!(
-                    target: "session.create",
-                    "Failed to clean up scratch dir: {}",
-                    e
-                );
+                tracing::warn!(target: "session.create", "Failed to clean up scratch dir: {}", e);
             }
         }
     }
-
     if let Some(worktree) = created_worktree {
         cleanup_created_worktree(worktree, "worktree", &protection);
     }
-
     for worktree in created_workspace_worktrees {
         cleanup_created_worktree(worktree, "workspace worktree", &protection);
     }
@@ -1768,6 +1889,155 @@ mod tests {
 
         git.remove_worktree(&worktree_path, true).unwrap();
         git.delete_branch("rollback-branch").unwrap();
+    }
+
+    /// The lock-safe cleanup must not take its ownership snapshot, or delete
+    /// anything, while a peer holds the workspace-claim/identity pair.
+    #[test]
+    #[serial_test::serial]
+    fn lock_safe_cleanup_blocks_until_the_ownership_locks_are_released() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::mpsc;
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        let _app_guard = crate::session::test_support::isolate_app_dir();
+        let id = format!("cleanup-barrier-{}", uuid::Uuid::new_v4());
+        let scratch_path = crate::session::scratch::provision_scratch_dir(&id).unwrap();
+        let mut instance = Instance::new("Barrier", &scratch_path.to_string_lossy());
+        instance.id = id;
+        instance.scratch = true;
+
+        let (peer_holds_tx, peer_holds_rx) = mpsc::channel();
+        let (peer_release_tx, peer_release_rx) = mpsc::channel::<()>();
+        let peer = std::thread::spawn(move || {
+            let _claim = crate::session::acquire_session_workspace_claim_lock().unwrap();
+            let _identity = crate::session::acquire_session_identity_lock().unwrap();
+            peer_holds_tx.send(()).unwrap();
+            peer_release_rx.recv().unwrap();
+        });
+        peer_holds_rx.recv().unwrap();
+
+        let (cleaner_entered_tx, cleaner_entered_rx) = mpsc::channel();
+        let done = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&done);
+        let cleaner = std::thread::spawn(move || {
+            cleaner_entered_tx.send(()).unwrap();
+            cleanup_instance_locked(&instance, None, &[], None);
+            flag.store(true, Ordering::SeqCst);
+        });
+        cleaner_entered_rx.recv().unwrap();
+
+        // The cleaner cannot get past the flock while the peer holds it, so a
+        // bounded wait here can only end with the resource still in place.
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while Instant::now() < deadline && !done.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !done.load(Ordering::SeqCst),
+            "cleanup must not proceed while a peer holds the ownership locks"
+        );
+        assert!(
+            scratch_path.exists(),
+            "the scratch dir must survive until the ownership locks are free"
+        );
+
+        peer_release_tx.send(()).unwrap();
+        peer.join().unwrap();
+        cleaner.join().unwrap();
+        assert!(
+            !scratch_path.exists(),
+            "once the locks are free the failed create's scratch dir is removed"
+        );
+    }
+
+    /// An unresolved ownership verdict (`Unknown`) keeps every *path* in place,
+    /// because a peer may have claimed one. The failed create's own tmux
+    /// sessions and container are keyed on the session id instead, so no other
+    /// session can own them: they must still be torn down or they leak for the
+    /// life of the process.
+    #[test]
+    #[serial_test::serial]
+    fn cleanup_tears_down_id_keyed_resources_when_ownership_is_unknown() {
+        crate::tmux::test_helpers::require_tmux!();
+        use std::os::unix::fs::PermissionsExt as _;
+        let _app_guard = crate::session::test_support::isolate_app_dir();
+        let temp = tempfile::TempDir::new().unwrap();
+        let bin = temp.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let log = temp.path().join("docker.log");
+        let docker = bin.join("docker");
+        std::fs::write(
+            &docker,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{}\"\nexit 0\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let _path = crate::session::test_support::path_prepended(&bin);
+
+        let id = format!("cleanup-unknown-{}", uuid::Uuid::new_v4());
+        let scratch_path = crate::session::scratch::provision_scratch_dir(&id).unwrap();
+        let container_name = containers::DockerContainer::generate_name(&id);
+        let mut instance = Instance::new("Unknown", &scratch_path.to_string_lossy());
+        instance.id = id.clone();
+        instance.scratch = true;
+        instance.sandbox_info = Some(SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "alpine".to_string(),
+            container_name: container_name.clone(),
+            extra_env: None,
+            custom_instruction: None,
+            container_workdir: None,
+            before_start_env: Vec::new(),
+        });
+
+        // The agent session is keyed on the same id, so it belongs to the
+        // id-keyed teardown that runs before the ownership verdict.
+        let tmux_session = crate::tmux::Session::generate_name(&id, "Unknown");
+        let tmux_guard =
+            crate::tmux::test_helpers::TmuxTestSession::from_name(tmux_session.clone());
+        let output = crate::tmux::tmux_command()
+            .args(["new-session", "-d", "-s", &tmux_session, "sleep 60"])
+            .output()
+            .expect("tmux new-session");
+        assert!(
+            output.status.success(),
+            "failed to create tmux session {tmux_session}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        crate::tmux::refresh_session_cache();
+        assert!(
+            crate::tmux::Session::from_name(&tmux_session).exists(),
+            "the failed create's tmux session must exist before cleanup"
+        );
+
+        // A failed profile listing is the cheapest way to force the ownership
+        // scan to answer `Unknown`.
+        let _fail_listing = crate::session::FailNextListProfilesGuard::new();
+        cleanup_instance_locked(&instance, None, &[], None);
+
+        let invocations = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(
+            invocations.contains(&format!("rm -f -v {container_name}")),
+            "the failed create's container must be torn down even when path ownership is \
+             unknown; runtime invocations were {invocations:?}"
+        );
+        assert!(
+            !crate::tmux::Session::from_name(&tmux_session).exists(),
+            "the failed create's tmux session must be torn down even when path ownership \
+             is unknown"
+        );
+        assert!(
+            scratch_path.exists(),
+            "an unknown ownership verdict must still leave the candidate paths in place"
+        );
+        drop(tmux_guard);
     }
 
     #[test]

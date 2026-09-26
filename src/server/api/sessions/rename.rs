@@ -254,7 +254,7 @@ pub async fn rename_session(
     let (_session_title_lock, _lifecycle_lock, storage, disk_instances) =
         match tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
             let session_title_lock = crate::session::acquire_session_title_lock(&lock_id)?;
-            let storage = Storage::new(&lock_profile, lock_file_watch)?;
+            let storage = Storage::open(&lock_profile, lock_file_watch)?;
             let lifecycle_lock = storage.acquire_instance_lifecycle_lock(&lock_id)?;
             let instances = storage.load()?;
             Ok((session_title_lock, lifecycle_lock, storage, instances))
@@ -667,9 +667,21 @@ pub async fn set_worktree_name(
     let lock_file_watch = state.file_watch.clone();
     let (_lifecycle_lock, storage, authoritative_instances) = match tokio::task::spawn_blocking(
         move || -> anyhow::Result<_> {
-            let storage = Storage::new(&lock_profile, lock_file_watch)?;
+            let storage = Storage::open(&lock_profile, lock_file_watch)?;
             let lifecycle = storage.acquire_instance_lifecycle_lock(&lock_id)?;
             let instances = storage.load()?;
+            if instances.iter().any(|instance| {
+                instance.id == lock_id
+                    && instance
+                        .lifecycle_reservation
+                        .as_ref()
+                        .is_some_and(|reservation| {
+                            reservation.op == crate::session::LifecycleOperation::Attach
+                                && instance.has_fresh_lifecycle_reservation(chrono::Utc::now())
+                        })
+            }) {
+                anyhow::bail!("session is attaching a project");
+            }
             Ok((lifecycle, storage, instances))
         },
     )

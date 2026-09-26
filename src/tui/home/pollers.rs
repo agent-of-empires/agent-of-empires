@@ -152,6 +152,17 @@ impl HomeView {
         match self.trash_poller.try_recv_result() {
             Ok(result) => {
                 let mut changed = false;
+                let had_authoritative = result.authoritative.is_some();
+                if let Some(durable) = result.authoritative {
+                    if let Some(instance) = self.instances.get_mut(&result.session_id) {
+                        instance.trashed_at = durable.trashed_at;
+                        instance.project_path = durable.project_path;
+                        instance.pre_trash_project_path = durable.pre_trash_project_path;
+                        instance.lifecycle_generation = durable.lifecycle_generation;
+                        instance.lifecycle_reservation = durable.lifecycle_reservation;
+                        changed = true;
+                    }
+                }
                 if let Some(relocation) = result.relocation {
                     let durable = self.load_durable_instance(&result.session_id);
                     if let Some(durable) = durable.filter(|instance| {
@@ -166,6 +177,9 @@ impl HomeView {
                             changed = true;
                         }
                     }
+                }
+                if !had_authoritative && self.reload().is_ok() {
+                    changed = true;
                 }
                 if let Some(reason) = result.relocate_warning {
                     tracing::warn!(

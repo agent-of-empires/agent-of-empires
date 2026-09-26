@@ -137,7 +137,7 @@ impl Instance {
             return Ok(StartOutcome::Fresh);
         }
         let profile = self.effective_profile();
-        let storage = crate::session::storage::Storage::new(&profile, self.resolve_file_watch())
+        let storage = crate::session::storage::Storage::open(&profile, self.resolve_file_watch())
             .context("failed to open lifecycle lock storage")?;
 
         let title_lock = crate::session::storage::acquire_session_title_lock(&self.id)

@@ -4,7 +4,7 @@ use anyhow::Result;
 use chrono::Utc;
 use clap::Args;
 
-use crate::session::{Instance, LifecycleOperation, Storage};
+use crate::session::{acquire_session_identity_lock, Instance, LifecycleOperation, Storage};
 
 #[derive(Args)]
 pub struct RemoveArgs {
@@ -81,9 +81,27 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
     );
 
     if config.session.delete_to_trash && !args.purge {
+        let _workspace_claim_lock = crate::session::acquire_session_workspace_claim_lock()?;
+        let _identity_lock = acquire_session_identity_lock()?;
+        let storage = Storage::open_unwatched(profile)?;
         let _lifecycle_lock = storage
             .acquire_instance_lifecycle_lock(&removed_id)
             .map_err(|error| anyhow::anyhow!("failed to acquire instance trash lock: {error}"))?;
+        if inst.has_managed_worktree_or_workspace() {
+            let mut candidate_paths = vec![std::path::PathBuf::from(&inst.project_path)];
+            if let Some(workspace) = &inst.workspace_info {
+                candidate_paths.push(std::path::PathBuf::from(&workspace.workspace_dir));
+            }
+            candidate_paths.extend(
+                inst.all_repos()
+                    .iter()
+                    .map(|repo| std::path::PathBuf::from(&repo.worktree_path)),
+            );
+            crate::session::deletion::ensure_unclaimed_paths(&removed_id, &candidate_paths)
+                .map_err(|error| anyhow::anyhow!(
+                    "Session {removed_title} was not moved to trash because worktree ownership could not be verified: {error}"
+                ))?;
+        }
         let trash_generation = storage.update(|all_instances, _groups| {
             let stored = all_instances
                 .iter_mut()

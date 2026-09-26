@@ -1,5 +1,6 @@
 //! Domain core for creating a session.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::session::Instance;
@@ -321,7 +322,7 @@ pub(crate) async fn spawn_structured_session(
             &hook_plan,
             std::path::Path::new(&original_path),
         ) {
-            builder::cleanup_instance(
+            builder::cleanup_instance_locked(
                 &instance,
                 created_worktree.as_ref(),
                 &created_workspace_worktrees,
@@ -336,17 +337,100 @@ pub(crate) async fn spawn_structured_session(
             return Err(anyhow::anyhow!("on_create hook failed: {e:#}{hint}"));
         }
 
+        let _workspace_claim_lock = match crate::session::acquire_session_workspace_claim_lock() {
+            Ok(lock) => lock,
+            Err(error) => {
+                builder::cleanup_instance_locked(
+                    &instance,
+                    created_worktree.as_ref(),
+                    &created_workspace_worktrees,
+                    None,
+                );
+                return Err(error);
+            }
+        };
+        let ownership_locks = match crate::session::acquire_session_identity_lock() {
+            Ok(lock) => {
+                builder::CleanupOwnershipLocks::from_held(_workspace_claim_lock, lock)
+            }
+            Err(error) => {
+                // Only the workspace-claim lock is held; release it so the
+                // cleanup path can take the pair itself.
+                drop(_workspace_claim_lock);
+                builder::cleanup_instance_locked(
+                    &instance,
+                    created_worktree.as_ref(),
+                    &created_workspace_worktrees,
+                    None,
+                );
+                return Err(error);
+            }
+        };
+        let storage = match Storage::open(&profile, file_watch_for_create.clone()) {
+            Ok(storage) => storage,
+            Err(error) => {
+                builder::cleanup_instance_under_locks(
+                    &instance,
+                    created_worktree.as_ref(),
+                    &created_workspace_worktrees,
+                    None,
+                    &ownership_locks,
+                );
+                return Err(error);
+            }
+        };
+        if let Err(error) = crate::session::validate_managed_workspace(&instance) {
+            builder::cleanup_instance_under_locks(
+                &instance,
+                created_worktree.as_ref(),
+                &created_workspace_worktrees,
+                None,
+                &ownership_locks,
+            );
+            return Err(anyhow::anyhow!(
+                "Managed workspace validation failed before the session was persisted: {error}"
+            ));
+        }
+        let manages_worktree = instance
+            .worktree_info
+            .as_ref()
+            .is_some_and(|worktree| worktree.managed_by_aoe)
+            || instance.workspace_info.is_some();
+        if manages_worktree {
+            let mut candidate_paths = vec![PathBuf::from(&instance.project_path)];
+            candidate_paths.extend(
+                instance
+                    .all_repos()
+                    .iter()
+                    .map(|repo| PathBuf::from(&repo.worktree_path)),
+            );
+            if let Err(error) = crate::session::deletion::ensure_unclaimed_paths(
+                &instance.id,
+                &candidate_paths,
+            ) {
+                builder::cleanup_instance_under_locks(
+                    &instance,
+                    created_worktree.as_ref(),
+                    &created_workspace_worktrees,
+                    None,
+                    &ownership_locks,
+                );
+                return Err(anyhow::anyhow!(
+                    "Session path is already claimed by another session: {error}"
+                ));
+            }
+        }
         // Anything that fails between here and the final `Ok(..)` would otherwise orphan
         // the scratch directory `build_instance` already provisioned (Storage::new,
         // storage.update, instance.start). Wrap the tail in an IIFE-equivalent closure so
         // we can run cleanup on Err once, regardless of which step tripped.
-        let mut persist_and_start = || -> anyhow::Result<()> {
-            let storage = Storage::new(&profile, file_watch_for_create.clone())?;
+        let persist_and_start = || -> anyhow::Result<()> {
             let to_persist = instance.clone();
             storage.update(|all, _groups| {
                 all.push(to_persist);
                 Ok(())
             })?;
+            drop(ownership_locks);
 
             // Acp-mode sessions are not backed by tmux; the structured view supervisor
             // spawns the ACP agent on demand.

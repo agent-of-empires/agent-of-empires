@@ -1530,6 +1530,9 @@ async fn worktree_edits_quiesce_structured_worker_only_when_its_cwd_moves() {
         // (#2260). The quiesce precedes the git edit, so the assertion holds even
         // though the edit then fails on a fixture with no real worktree.
         let _app_dir = crate::session::test_support::isolate_app_dir();
+        // save_profile_config never creates a profile directory, so the
+        // override below needs one to exist first.
+        crate::session::create_profile("test").unwrap();
         // set_worktree_name refuses a tied managed worktree (tied callers must
         // go through rename_session), so untie the profile to reach the worker
         // gate that this test exercises.

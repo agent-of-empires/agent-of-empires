@@ -151,7 +151,7 @@ mod tests {
         );
         assert!(store.load_attachment("s-1", "nope").is_none());
 
-        store.delete_session("s-1");
+        store.delete_session("s-1").unwrap();
         assert!(store.load_attachment("s-1", "a1").is_none());
         assert!(
             store.load_attachment("s-2", "b1").is_some(),

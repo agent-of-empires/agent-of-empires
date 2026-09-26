@@ -239,6 +239,7 @@ pub struct TrashResult {
     pub session_id: String,
     pub relocation: Option<TrashRelocation>,
     pub relocate_warning: Option<String>,
+    pub authoritative: Option<Instance>,
 }
 
 /// Execute and commit a TUI trash transition under one per-instance flock.
@@ -247,6 +248,15 @@ pub fn perform_trash(request: &TrashRequest) -> TrashResult {
         session_id: request.session_id.clone(),
         relocation: None,
         relocate_warning: Some(reason),
+        authoritative: None,
+    };
+    let _workspace_claim_lock = match crate::session::acquire_session_workspace_claim_lock() {
+        Ok(lock) => lock,
+        Err(error) => return failed(format!("could not acquire workspace claim lock: {error}")),
+    };
+    let _identity_lock = match crate::session::acquire_session_identity_lock() {
+        Ok(lock) => lock,
+        Err(error) => return failed(format!("could not acquire identity lock: {error}")),
     };
     let storage = match crate::session::Storage::open_unwatched(&request.instance.source_profile) {
         Ok(storage) => storage,
@@ -273,6 +283,49 @@ pub fn perform_trash(request: &TrashRequest) -> TrashResult {
         .unwrap_or(false);
     if !owns {
         return failed("trash lifecycle reservation was superseded before teardown".to_string());
+    }
+    if request.instance.has_managed_worktree_or_workspace() {
+        let mut candidate_paths = vec![PathBuf::from(&request.instance.project_path)];
+        if let Some(workspace) = &request.instance.workspace_info {
+            candidate_paths.push(PathBuf::from(&workspace.workspace_dir));
+        }
+        candidate_paths.extend(
+            request
+                .instance
+                .all_repos()
+                .iter()
+                .map(|repo| PathBuf::from(&repo.worktree_path)),
+        );
+        if let Err(error) =
+            crate::session::deletion::ensure_unclaimed_paths(&request.session_id, &candidate_paths)
+        {
+            let _ = storage.update(|instances, _groups| {
+                if let Some(stored) = instances
+                    .iter_mut()
+                    .find(|instance| instance.id == request.session_id)
+                {
+                    stored.untrash();
+                    stored.release_lifecycle_reservation_if_owned(
+                        crate::session::LifecycleOperation::Trash,
+                        request.generation,
+                    );
+                }
+                Ok(())
+            });
+            let authoritative = storage.load().ok().and_then(|instances| {
+                instances
+                    .into_iter()
+                    .find(|instance| instance.id == request.session_id)
+            });
+            return TrashResult {
+                session_id: request.session_id.clone(),
+                relocation: None,
+                relocate_warning: Some(format!(
+                    "trash skipped because worktree ownership is shared or unknown: {error}"
+                )),
+                authoritative,
+            };
+        }
     }
 
     let mut inst = request.instance.clone();
@@ -306,6 +359,11 @@ pub fn perform_trash(request: &TrashRequest) -> TrashResult {
         return failed(format!("could not commit trash transition: {error}"));
     }
 
+    let authoritative = storage.load().ok().and_then(|instances| {
+        instances
+            .into_iter()
+            .find(|instance| instance.id == request.session_id)
+    });
     TrashResult {
         session_id: request.session_id.clone(),
         relocation,
@@ -313,6 +371,7 @@ pub fn perform_trash(request: &TrashRequest) -> TrashResult {
             RelocateOutcome::Failed { reason } => Some(reason),
             RelocateOutcome::Relocated { .. } | RelocateOutcome::Skipped => None,
         },
+        authoritative,
     }
 }
 
@@ -539,6 +598,7 @@ pub fn reconcile_trashed_location(inst: &mut Instance) -> bool {
 
 /// Reconcile every trashed row in one profile, batched.
 pub fn reconcile_trashed_profile(profile: &str) -> anyhow::Result<Vec<Instance>> {
+    let _identity_lock = crate::session::acquire_session_identity_lock()?;
     let storage = crate::session::Storage::open_unwatched(profile)?;
     let mut cache = ProtectedBranchCache::default();
     let mut candidates: Vec<Instance> = storage
@@ -688,6 +748,7 @@ pub fn reconcile_trashed_transition(inst: &mut Instance) -> anyhow::Result<bool>
         !profile.is_empty(),
         "session has no source profile; refusing trash reconciliation"
     );
+    let _identity_lock = crate::session::acquire_session_identity_lock()?;
     let storage = crate::session::Storage::open_unwatched(&profile)?;
     let _lifecycle_lock = storage.acquire_instance_lifecycle_lock(&inst.id)?;
     let id = inst.id.clone();
@@ -1422,6 +1483,65 @@ mod tests {
 
     // Regression (#the-d-key): trashing must run the sandbox container-stop step BEFORE relocating
     // the worktree.
+    #[test]
+    #[serial_test::serial]
+    fn trash_ownership_rejection_untrashes_and_releases_reservation() {
+        let _app_guard = crate::session::test_support::isolate_app_dir();
+        let owner = crate::session::Storage::new_unwatched("owner").unwrap();
+        let other = crate::session::Storage::new_unwatched("other").unwrap();
+        let mut instance = Instance::new("session", "/tmp/session");
+        instance.source_profile = "owner".to_string();
+        instance.worktree_info = Some(crate::session::WorktreeInfo {
+            branch: "feature/shared".to_string(),
+            main_repo_path: "/tmp/main".to_string(),
+            managed_by_aoe: true,
+            created_at: Utc::now(),
+            base_branch: None,
+        });
+        owner
+            .update(|instances, _groups| {
+                instances.push(instance.clone());
+                Ok(())
+            })
+            .unwrap();
+        other
+            .update(|instances, _groups| {
+                instances.push(instance.clone());
+                Ok(())
+            })
+            .unwrap();
+        // The cross-profile inventory is unverifiable because a peer profile
+        // cannot be read at all, which is what makes the ownership verdict
+        // `Unknown` and the trash refuse.
+        std::fs::write(other.sessions_path(), b"{ not json").unwrap();
+        let generation = owner
+            .update(|instances, _groups| {
+                let row = instances
+                    .iter_mut()
+                    .find(|row| row.id == instance.id)
+                    .unwrap();
+                let generation = row
+                    .try_acquire_lifecycle_reservation(
+                        crate::session::LifecycleOperation::Trash,
+                        Instance::LIFECYCLE_RESERVATION_TTL,
+                        Utc::now(),
+                    )
+                    .unwrap();
+                row.trash();
+                Ok(generation)
+            })
+            .unwrap();
+        let result = perform_trash(&TrashRequest {
+            session_id: instance.id.clone(),
+            instance: instance.clone(),
+            generation,
+        });
+        assert!(result.relocate_warning.is_some());
+        let stored = owner.load().unwrap().into_iter().next().unwrap();
+        assert!(!stored.is_trashed());
+        assert!(stored.lifecycle_reservation.is_none());
+    }
+
     #[test]
     fn trash_prep_stops_container_before_relocating() {
         if !git_available() {

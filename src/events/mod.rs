@@ -715,48 +715,42 @@ pub fn prune_pending_attachments_older_than(
     }
 }
 
-pub fn delete_topic(conn: &Connection, schema: &Schema, topic: &str) -> usize {
-    let deleted = match conn.execute(
+pub fn delete_topic(conn: &Connection, schema: &Schema, topic: &str) -> Result<usize> {
+    let tx = conn.unchecked_transaction()?;
+    let deleted = tx.execute(
         &format!(
             "DELETE FROM {} WHERE session_id = ?1",
             schema.events_table()
         ),
         params![topic],
-    ) {
-        Ok(n) => n,
-        Err(e) => {
-            warn!(target: "events", "delete {topic}: {e}");
-            0
-        }
-    };
-    if let Err(e) = conn.execute(
+    )?;
+    tx.execute(
         &format!(
             "DELETE FROM {} WHERE session_id = ?1",
             schema.attachments_table()
         ),
         params![topic],
-    ) {
-        warn!(target: "events", "delete attachments {topic}: {e}");
-    }
-    if let Err(e) = conn.execute(
+    )?;
+    tx.execute(
         &format!(
             "DELETE FROM {} WHERE session_id = ?1",
             schema.pending_attachments_table()
         ),
         params![topic],
-    ) {
-        warn!(target: "events", "delete pending attachments {topic}: {e}");
-    }
-    if let Err(e) = conn.execute(
+    )?;
+    if let Err(error) = tx.execute(
         &format!(
             "DELETE FROM {} WHERE session_id = ?1",
             schema.rate_limit_budgets_table()
         ),
         params![topic],
     ) {
-        warn!(target: "events", "delete rate-limit budget {topic}: {e}");
+        if !error.to_string().contains("no such table") {
+            return Err(error.into());
+        }
     }
-    deleted
+    tx.commit()?;
+    Ok(deleted)
 }
 
 #[cfg(test)]
@@ -834,7 +828,7 @@ mod tests {
         seqs.sort();
         assert_eq!(seqs, vec![("a".into(), 3), ("b".into(), 1)]);
 
-        assert_eq!(delete_topic(&conn, &schema, "a"), 3);
+        assert_eq!(delete_topic(&conn, &schema, "a").unwrap(), 3);
         assert_eq!(highest_seq(&conn, &schema, "a"), 0);
         assert_eq!(highest_seq(&conn, &schema, "b"), 1);
     }
@@ -1061,7 +1055,7 @@ mod tests {
         assert_eq!(prune_pending_attachments_older_than(&conn, &schema, 100), 1);
         assert_eq!(pending_attachment_bytes_for_session(&conn, &schema, "t"), 3);
 
-        delete_topic(&conn, &schema, "t");
+        delete_topic(&conn, &schema, "t").unwrap();
         assert_eq!(pending_attachment_bytes_for_session(&conn, &schema, "t"), 0);
     }
 }

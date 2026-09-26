@@ -165,14 +165,15 @@ impl EventStore {
     }
 
     /// Drop every event for a session, cascading to its attachment blobs.
-    pub fn delete_session(&self, session_id: &str) {
-        let deleted = events::delete_topic(&self.conn(), &self.schema, session_id);
+    pub fn delete_session(&self, session_id: &str) -> anyhow::Result<usize> {
+        let deleted = events::delete_topic(&self.conn(), &self.schema, session_id)?;
         debug!(
             target: "acp.event_store",
             session = %session_id,
             deleted,
             "deleted session events"
         );
+        Ok(deleted)
     }
 }
 
@@ -280,7 +281,7 @@ mod tests {
         assert_eq!(listed, [("s-1".to_string(), 2), ("s-2".to_string(), 1)]);
         assert_eq!(store.lowest_seq("s-1"), Some(1));
 
-        store.delete_session("s-1");
+        store.delete_session("s-1").unwrap();
         assert_eq!(store.highest_seq("s-1"), 0);
         assert_eq!(store.lowest_seq("s-1"), None);
         assert_eq!(store.highest_seq("s-2"), 1, "siblings are untouched");

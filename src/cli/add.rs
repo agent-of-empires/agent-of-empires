@@ -896,7 +896,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         return Err(e);
     }
 
-    let _identity_lock = match acquire_session_identity_lock() {
+    let _workspace_claim_lock = match crate::session::acquire_session_workspace_claim_lock() {
         Ok(lock) => lock,
         Err(error) => {
             cleanup_partial_session(
@@ -914,6 +914,92 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
             return Err(error);
         }
     };
+    let ownership_locks = match acquire_session_identity_lock() {
+        Ok(lock) => {
+            crate::session::builder::CleanupOwnershipLocks::from_held(_workspace_claim_lock, lock)
+        }
+        Err(error) => {
+            // Only the workspace-claim lock is held; release it so the cleanup
+            // path can take the pair itself.
+            drop(_workspace_claim_lock);
+            cleanup_partial_session(
+                &path,
+                instance.worktree_info.as_ref(),
+                instance.workspace_info.as_ref(),
+                args.create_branch,
+                if instance.scratch {
+                    Some(std::path::Path::new(&instance.project_path))
+                } else {
+                    None
+                },
+                instance.sandbox_info.as_ref().map(|_| instance.id.as_str()),
+            );
+            return Err(error);
+        }
+    };
+    let storage = match Storage::open_unwatched(profile) {
+        Ok(storage) => storage,
+        Err(error) => {
+            cleanup_partial_session_under_locks(
+                &path,
+                instance.worktree_info.as_ref(),
+                instance.workspace_info.as_ref(),
+                args.create_branch,
+                if instance.scratch {
+                    Some(std::path::Path::new(&instance.project_path))
+                } else {
+                    None
+                },
+                instance.sandbox_info.as_ref().map(|_| instance.id.as_str()),
+                &ownership_locks,
+            );
+            return Err(error);
+        }
+    };
+    if let Err(error) = crate::session::validate_managed_workspace(&instance) {
+        cleanup_partial_session_under_locks(
+            &path,
+            instance.worktree_info.as_ref(),
+            instance.workspace_info.as_ref(),
+            args.create_branch,
+            None,
+            instance.sandbox_info.as_ref().map(|_| instance.id.as_str()),
+            &ownership_locks,
+        );
+        bail!("Managed workspace validation failed before the session was persisted: {error}");
+    }
+    let manages_worktree = instance
+        .worktree_info
+        .as_ref()
+        .is_some_and(|worktree| worktree.managed_by_aoe)
+        || instance.workspace_info.is_some();
+    if manages_worktree {
+        let mut candidate_paths = vec![PathBuf::from(&instance.project_path)];
+        candidate_paths.extend(
+            instance
+                .all_repos()
+                .iter()
+                .map(|repo| PathBuf::from(&repo.worktree_path)),
+        );
+        if let Err(error) =
+            crate::session::deletion::ensure_unclaimed_paths(&instance.id, &candidate_paths)
+        {
+            cleanup_partial_session_under_locks(
+                &path,
+                instance.worktree_info.as_ref(),
+                instance.workspace_info.as_ref(),
+                args.create_branch,
+                if instance.scratch {
+                    Some(std::path::Path::new(&instance.project_path))
+                } else {
+                    None
+                },
+                instance.sandbox_info.as_ref().map(|_| instance.id.as_str()),
+                &ownership_locks,
+            );
+            bail!("Session path is already claimed by another session: {error}");
+        }
+    }
 
     let persist_result = storage.update(|all_instances, groups| {
         if is_duplicate_session(
@@ -935,7 +1021,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
     match persist_result {
         Ok(true) => {}
         Ok(false) => {
-            cleanup_partial_session(
+            cleanup_partial_session_under_locks(
                 &path,
                 instance.worktree_info.as_ref(),
                 instance.workspace_info.as_ref(),
@@ -946,11 +1032,12 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                     None
                 },
                 instance.sandbox_info.as_ref().map(|_| instance.id.as_str()),
+                &ownership_locks,
             );
             return Err(duplicate_session_error(&instance.title));
         }
         Err(e) => {
-            cleanup_partial_session(
+            cleanup_partial_session_under_locks(
                 &path,
                 instance.worktree_info.as_ref(),
                 instance.workspace_info.as_ref(),
@@ -961,11 +1048,12 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                     None
                 },
                 instance.sandbox_info.as_ref().map(|_| instance.id.as_str()),
+                &ownership_locks,
             );
             return Err(e);
         }
     }
-    drop(_identity_lock);
+    drop(ownership_locks);
 
     println!("✓ Added session: {}", final_title);
     println!("  Profile: {}", storage.profile());
@@ -1130,6 +1218,9 @@ fn prompt_session_title(default_title: &str) -> Result<String> {
     })
 }
 
+/// Clean up a partially created session, taking the ownership locks for the
+/// whole snapshot-then-delete window. Fails closed: a lock that cannot be
+/// acquired leaves every resource in place.
 fn cleanup_partial_session(
     path: &std::path::Path,
     worktree_info: Option<&crate::session::WorktreeInfo>,
@@ -1138,6 +1229,52 @@ fn cleanup_partial_session(
     scratch_dir: Option<&std::path::Path>,
     container_session_id: Option<&str>,
 ) {
+    let locks = match crate::session::builder::CleanupOwnershipLocks::acquire() {
+        Ok(locks) => locks,
+        Err(error) => {
+            tracing::warn!(
+                target: "cli.add",
+                "keeping partially created session resources: could not acquire the ownership locks for cleanup: {error}"
+            );
+            return;
+        }
+    };
+    cleanup_partial_session_under_locks(
+        path,
+        worktree_info,
+        workspace_info,
+        created_branch,
+        scratch_dir,
+        container_session_id,
+        &locks,
+    );
+}
+
+/// Clean up a partially created session for a caller that already holds the
+/// workspace-claim and identity flocks. Re-acquiring them would self-deadlock.
+fn cleanup_partial_session_under_locks(
+    path: &std::path::Path,
+    worktree_info: Option<&crate::session::WorktreeInfo>,
+    workspace_info: Option<&crate::session::WorkspaceInfo>,
+    created_branch: bool,
+    scratch_dir: Option<&std::path::Path>,
+    container_session_id: Option<&str>,
+    _locks: &crate::session::builder::CleanupOwnershipLocks,
+) {
+    let mut candidate_paths = vec![path.to_path_buf()];
+    if let Some(ws) = workspace_info {
+        candidate_paths.push(std::path::PathBuf::from(&ws.workspace_dir));
+        candidate_paths.extend(
+            ws.repos
+                .iter()
+                .map(|repo| std::path::PathBuf::from(&repo.worktree_path)),
+        );
+    }
+
+    // Teardown keyed on the session id, not on any path, so it is safe even when
+    // a peer has since claimed a candidate path. Done before the ownership
+    // check so a partially created session never leaks its container; the
+    // path-ownership gate below is unchanged.
     if let Some(session_id) = container_session_id {
         let container = crate::containers::DockerContainer::from_session_id(session_id);
         if let crate::containers::Teardown::Failed(e) = container.teardown(session_id) {
@@ -1148,6 +1285,18 @@ fn cleanup_partial_session(
                 e
             );
         }
+    }
+    let peer_claimed = match crate::session::deletion::paths_in_use_except(&[]) {
+        crate::session::deletion::PathsInUse::Unknown(_) => true,
+        crate::session::deletion::PathsInUse::Known(paths) => {
+            let paths = crate::session::deletion::PathsInUse::Known(paths);
+            candidate_paths
+                .iter()
+                .any(|candidate| paths.covers(candidate))
+        }
+    };
+    if peer_claimed {
+        return;
     }
     if let Some(wt) = worktree_info {
         if wt.managed_by_aoe {

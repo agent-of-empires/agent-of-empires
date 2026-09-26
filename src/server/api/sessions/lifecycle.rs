@@ -2,6 +2,7 @@
 //! stop/start/snooze/unread endpoints.
 
 use super::*;
+use std::path::PathBuf;
 
 #[derive(Deserialize)]
 pub struct UpdatePinBody {
@@ -390,14 +391,37 @@ pub async fn trash_session(
         };
         (instance.source_profile.clone(), instance.clone())
     };
+    let recovery_profile = profile.clone();
 
     let reserve_profile = profile.clone();
     let reserve_id = id.clone();
     let file_watch = state.file_watch.clone();
-    let (storage, lifecycle_lock, generation) = match tokio::task::spawn_blocking(
+    let reservation_snapshot = snapshot.clone();
+    let (storage, identity_lock, lifecycle_lock, generation) = match tokio::task::spawn_blocking(
         move || -> anyhow::Result<_> {
-            let storage = Storage::new(&reserve_profile, file_watch)?;
+            let _workspace_claim_lock = crate::session::acquire_session_workspace_claim_lock()?;
+            let identity_lock = crate::session::acquire_session_identity_lock()?;
+            let storage = Storage::open(&reserve_profile, file_watch)?;
             let lifecycle_lock = storage.acquire_instance_lifecycle_lock(&reserve_id)?;
+            if reservation_snapshot.has_managed_worktree_or_workspace() {
+                let mut candidate_paths =
+                    vec![std::path::PathBuf::from(&reservation_snapshot.project_path)];
+                if let Some(workspace) = &reservation_snapshot.workspace_info {
+                    candidate_paths.push(std::path::PathBuf::from(&workspace.workspace_dir));
+                }
+                candidate_paths.extend(
+                    reservation_snapshot
+                        .all_repos()
+                        .iter()
+                        .map(|repo| std::path::PathBuf::from(&repo.worktree_path)),
+                );
+                crate::session::deletion::ensure_unclaimed_paths(&reserve_id, &candidate_paths)
+                    .map_err(|error| {
+                        anyhow::anyhow!(
+                        "trash skipped because worktree ownership is shared or unknown: {error}"
+                    )
+                    })?;
+            }
             let generation = storage.update(|instances, _groups| {
                 let Some(instance) = instances
                     .iter_mut()
@@ -415,7 +439,7 @@ pub async fn trash_session(
                 instance.trash();
                 Ok(instance.lifecycle_generation)
             })?;
-            Ok((storage, lifecycle_lock, generation))
+            Ok((storage, identity_lock, lifecycle_lock, generation))
         },
     )
     .await
@@ -441,9 +465,20 @@ pub async fn trash_session(
         instance.lifecycle_generation = generation;
     }
 
+    // Relocating the worktree out from under a live runner would move a
+    // directory it still has open, so an unproven teardown leaves it in place.
+    let mut relocation_allowed = true;
     if was_structured_view {
-        match state.acp_supervisor.shutdown(&id).await {
+        match state.acp_supervisor.shutdown_and_require_dead(&id).await {
             Ok(()) | Err(crate::acp::supervisor::SupervisorError::UnknownSession(_)) => {}
+            Err(crate::acp::supervisor::SupervisorError::TeardownPending(_)) => {
+                tracing::warn!(
+                    target: "acp.supervisor",
+                    session = %id,
+                    "trash left the worktree in place: the runner is not proven dead"
+                );
+                relocation_allowed = false;
+            }
             Err(error) => tracing::warn!(
                 target: "acp.supervisor",
                 session = %id,
@@ -455,6 +490,7 @@ pub async fn trash_session(
     let work_id = id.clone();
     let kill_pane = body.kill_pane;
     let transition = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let _identity_lock = identity_lock;
         let _lifecycle_lock = lifecycle_lock;
         let mut instance = snapshot;
         if kill_pane {
@@ -464,7 +500,43 @@ pub async fn trash_session(
                 instance.kill_all_tmux_sessions_locked();
             }
         }
-        let outcome = crate::session::trash::prepare_trashed_worktree(&mut instance);
+        if relocation_allowed && instance.has_managed_worktree_or_workspace() {
+            let mut candidate_paths = vec![PathBuf::from(&instance.project_path)];
+            if let Some(workspace) = &instance.workspace_info {
+                candidate_paths.push(std::path::PathBuf::from(&workspace.workspace_dir));
+            }
+            candidate_paths.extend(
+                instance
+                    .all_repos()
+                    .iter()
+                    .map(|repo| PathBuf::from(&repo.worktree_path)),
+            );
+            if let Err(error) =
+                crate::session::deletion::ensure_unclaimed_paths(&work_id, &candidate_paths)
+            {
+                storage.update(|instances, _groups| {
+                    if let Some(stored) = instances
+                        .iter_mut()
+                        .find(|candidate| candidate.id == work_id)
+                    {
+                        stored.untrash();
+                        stored.release_lifecycle_reservation_if_owned(
+                            LifecycleOperation::Trash,
+                            generation,
+                        );
+                    }
+                    Ok(())
+                })?;
+                return Err(anyhow::anyhow!(
+                    "trash skipped because worktree ownership is shared or unknown: {error}"
+                ));
+            }
+        }
+        let outcome = if relocation_allowed {
+            crate::session::trash::prepare_trashed_worktree(&mut instance)
+        } else {
+            crate::session::trash::RelocateOutcome::Skipped
+        };
         let relocation = match &outcome {
             crate::session::trash::RelocateOutcome::Relocated { .. } => {
                 Some(crate::session::trash::TrashRelocation {
@@ -505,6 +577,31 @@ pub async fn trash_session(
         Ok(Ok(result)) => result,
         Ok(Err(error)) => {
             tracing::warn!(target: "http.api.sessions", session = %id, "trash transition failed: {error}");
+            let durable = tokio::task::spawn_blocking({
+                let profile = recovery_profile.clone();
+                let id = id.clone();
+                move || {
+                    Storage::open_unwatched(&profile)
+                        .ok()?
+                        .load()
+                        .ok()?
+                        .into_iter()
+                        .find(|instance| instance.id == id)
+                }
+            })
+            .await
+            .ok()
+            .flatten();
+            if let Some(durable) = durable {
+                let mut instances = state.instances.write().await;
+                if let Some(instance) = instances.iter_mut().find(|instance| instance.id == id) {
+                    instance.trashed_at = durable.trashed_at;
+                    instance.project_path = durable.project_path;
+                    instance.pre_trash_project_path = durable.pre_trash_project_path;
+                    instance.lifecycle_generation = durable.lifecycle_generation;
+                    instance.lifecycle_reservation = durable.lifecycle_reservation;
+                }
+            }
             return persist_failed_response();
         }
         Err(error) => {
@@ -572,7 +669,9 @@ pub async fn restore_session(
     let file_watch = state.file_watch.clone();
     let restored = tokio::task::spawn_blocking(move || {
         let run = || -> Result<Instance, RestoreTransitionError> {
-            let storage = Storage::new(&restore_profile, file_watch)
+            let _identity_lock = crate::session::acquire_session_identity_lock()
+                .map_err(|error| RestoreTransitionError::Persist(error.to_string()))?;
+            let storage = Storage::open(&restore_profile, file_watch)
                 .map_err(|error| RestoreTransitionError::Persist(error.to_string()))?;
             let _lifecycle_lock = storage
                 .acquire_instance_lifecycle_lock(&restore_id)

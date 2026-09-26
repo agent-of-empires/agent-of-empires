@@ -944,6 +944,70 @@ fn apply_creation_results_rolls_back_on_peer_collision() {
     git.delete_branch(branch).unwrap();
 }
 
+/// A delivered creation result must not still own the global ownership flocks.
+/// `apply_creation_results` takes the workspace-claim and identity pair itself
+/// while it publishes, and any other path needing them — `save`, a peer
+/// duplicate repair during `reload` — would block forever behind flocks the
+/// builder thread still held across the channel.
+#[test]
+#[serial]
+fn creation_result_does_not_carry_the_ownership_flocks() {
+    use std::sync::mpsc;
+    let CreationTestEnv {
+        mut view,
+        storage: _storage,
+        project_dir,
+        _guard,
+        _temp,
+    } = setup_creation_test_env();
+
+    view.request_creation(
+        creation_data(&project_dir, "Lock Test", "async-locks"),
+        None,
+    );
+    let start = std::time::Instant::now();
+    let result = loop {
+        if let Some(result) = view.creation_poller.try_recv_result() {
+            break result;
+        }
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(10),
+            "background creation timed out"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    assert!(
+        matches!(
+            result,
+            crate::tui::creation_poller::CreationResult::Success { .. }
+        ),
+        "the builder should have delivered a successful result"
+    );
+
+    // Probe from another thread while the result is still held, exactly as
+    // `apply_creation_results` holds it. The probe blocks on the flock, so the
+    // handle is kept and joined once the assertion has passed; on the failing
+    // path the thread is still parked in the flock wait and must be left
+    // detached rather than joined, or the test would hang instead of fail.
+    let (tx, rx) = mpsc::channel();
+    let probe = std::thread::spawn(move || {
+        let acquired = crate::session::acquire_session_workspace_claim_lock()
+            .and_then(|claim| {
+                crate::session::acquire_session_identity_lock().map(|identity| (claim, identity))
+            })
+            .is_ok();
+        let _ = tx.send(acquired);
+    });
+    assert!(
+        rx.recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap_or(false),
+        "a delivered creation result must not hold the workspace-claim or identity flock"
+    );
+    if probe.is_finished() {
+        probe.join().unwrap();
+    }
+}
+
 #[test]
 fn test_project_group_key_scratch_uses_sentinel_not_label() {
     use crate::session::{project_group_display_name, SCRATCH_GROUP_PATH};
