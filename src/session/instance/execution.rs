@@ -234,6 +234,8 @@ pub(crate) enum CaptureContext {
     },
     Pi {
         source: super::SessionSidecarSource,
+        /// Canonical, as the launch builds it: readers compare the published transcript path
+        /// against it, and a differently spelled root silently drops every observation.
         root: PathBuf,
     },
     Omp(super::OmpCaptureMetadata),
