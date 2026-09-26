@@ -37,11 +37,10 @@ impl Instance {
         ) {
             return None;
         }
-        let exclusion = HashSet::new();
-        match backend {
-            // Guarded first so a context-dependent backend (Codex on a host pane) reads the
-            // sidecar rather than its store-backed arm.
-            _ if capture.reads_hook_sidecar(context) => super::execution::hook_session_observation(
+        // Decided by context before the backend, so a host Codex pane reads its sidecar rather
+        // than a store-backed arm.
+        if capture.reads_hook_sidecar(context) {
+            return super::execution::hook_session_observation(
                 &self.id,
                 self.active_execution.as_ref(),
                 None,
@@ -50,20 +49,10 @@ impl Instance {
                 !self
                     .retroactive_capture_exclusion_set(observation.source.as_ref())
                     .contains(&observation.sid)
-            }),
-            crate::agents::SessionCaptureBackend::Claude
-            | crate::agents::SessionCaptureBackend::HookSidecar => {
-                super::execution::hook_session_observation(
-                    &self.id,
-                    self.active_execution.as_ref(),
-                    None,
-                )
-                .filter(|observation| {
-                    !self
-                        .retroactive_capture_exclusion_set(observation.source.as_ref())
-                        .contains(&observation.sid)
-                })
-            }
+            });
+        }
+        let exclusion = HashSet::new();
+        match backend {
             crate::agents::SessionCaptureBackend::Pi => {
                 self.pi_published_conversation(true).filter(|observation| {
                     !self
@@ -124,7 +113,10 @@ impl Instance {
                         .contains(&observation.sid)
                 })
             }
-            crate::agents::SessionCaptureBackend::Codex
+            // Sidecar publishers returned above.
+            crate::agents::SessionCaptureBackend::Claude
+            | crate::agents::SessionCaptureBackend::HookSidecar
+            | crate::agents::SessionCaptureBackend::Codex
             | crate::agents::SessionCaptureBackend::Gemini
             | crate::agents::SessionCaptureBackend::Hermes
             | crate::agents::SessionCaptureBackend::Kimi

@@ -406,13 +406,6 @@ impl Instance {
             )?,
             SessionCaptureBackend::Pi => self.pi_published_conversation(false)?,
             SessionCaptureBackend::PrimeAgent => self.prime_published_conversation()?,
-            SessionCaptureBackend::Claude | SessionCaptureBackend::HookSidecar => {
-                super::execution::hook_session_observation(
-                    &self.id,
-                    self.active_execution.as_ref(),
-                    None,
-                )?
-            }
             _ => self.try_retroactive_capture()?,
         };
         if self.is_capture_excluded(&observation.sid, observation.source.as_ref()) {
