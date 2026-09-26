@@ -212,8 +212,13 @@ fn open_trusted_directory(path: &Path, euid: u32) -> Result<OwnedFd, TrustedPath
     let mut current = root;
     let count = components.len();
     for (index, component) in components.into_iter().enumerate() {
+        // A component that does not exist means the app directory does not
+        // exist, wherever in the chain it is: a fresh home has no
+        // `~/.local` to hold one. Every other errno keeps its own class, so
+        // a symlinked, unreadable or non-directory component is still a
+        // refusal rather than an absence.
         let next = open_dir_at(current.as_raw_fd(), &component).map_err(|error| {
-            if error.raw_os_error() == Some(libc::ENOENT) && index + 1 == count {
+            if error.raw_os_error() == Some(libc::ENOENT) {
                 TrustedPathError::Missing
             } else {
                 TrustedPathError::Invalid
@@ -261,7 +266,7 @@ fn validate_directory_stat(
     root_check: bool,
 ) -> Result<(), TrustedPathError> {
     let stat = fstat(file.as_raw_fd())?;
-    if !directory_stat(&stat) || stat.st_mode & 0o022 != 0 {
+    if !directory_stat(&stat) || !group_other_writes_allowed(&stat, final_component) {
         return Err(TrustedPathError::Invalid);
     }
     if root_check {
@@ -278,6 +283,17 @@ fn validate_directory_stat(
     #[cfg(target_os = "linux")]
     validate_posix_acl(file.as_raw_fd(), stat.st_uid, euid, stat.st_mode)?;
     Ok(())
+}
+
+/// Whether group or other write bits are tolerable on this component of the
+/// walk. A non-final ancestor is tolerable when it is root-owned and sticky:
+/// a stranger may create entries but may not rename or replace one that
+/// belongs to somebody else, which is what `/tmp` offers and what a test
+/// namespace lives under. The final component has no such protection, and a
+/// sticky one would let its own owner be replaced, so it stays private.
+fn group_other_writes_allowed(stat: &libc::stat, final_component: bool) -> bool {
+    stat.st_mode & 0o022 == 0
+        || (!final_component && stat.st_uid == 0 && stat.st_mode & libc::S_ISVTX != 0)
 }
 
 #[cfg(target_os = "linux")]
@@ -1011,6 +1027,66 @@ mod tests {
         assert!(valid_process_identity(&format!("linux:v1:{boot}:123")));
         assert!(!valid_process_identity(&format!("linux:v1:{boot}:123 ")));
         assert!(!valid_process_identity(&format!("linux:v2:{boot}:123")));
+    }
+
+    /// A fresh home has no `~/.local` to hold the app directory, so the walk
+    /// ends on an absent intermediate component. That is an absence, not a
+    /// refusal, and it is what lets the caller run the command locally. A
+    /// component that exists but is untrustworthy still refuses.
+    #[test]
+    fn an_absent_ancestor_is_an_absence_and_an_untrustworthy_one_is_not() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let euid = unsafe { libc::geteuid() };
+        let base = tempfile::tempdir().expect("temp base");
+        let absent = base.path().join("never-created").join("app-dir");
+        assert!(matches!(
+            open_trusted_directory(&absent, euid),
+            Err(TrustedPathError::Missing)
+        ));
+
+        let present = base.path().join("app-dir");
+        std::fs::create_dir(&present).expect("create");
+        assert!(open_trusted_directory(&present, euid).is_ok());
+
+        // Sticky and world-writable is what /tmp looks like, but the allowance
+        // is for a root-owned ancestor only, so this one still refuses.
+        let world = base.path().join("world");
+        std::fs::create_dir(&world).expect("create");
+        let mut permissions = std::fs::metadata(&world).expect("stat").permissions();
+        permissions.set_mode(0o777 | libc::S_ISVTX);
+        std::fs::set_permissions(&world, permissions).expect("chmod");
+        let world_child = world.join("app-dir");
+        std::fs::create_dir(&world_child).expect("create");
+        assert!(matches!(
+            open_trusted_directory(&world_child, euid),
+            Err(TrustedPathError::Invalid)
+        ));
+    }
+
+    /// `/tmp` is world-writable and sticky, and the walk must still pass
+    /// through it: a test namespace and a crash artifact both live there. A
+    /// sticky directory that is not root-owned, and the final component in any
+    /// case, stay refused.
+    #[test]
+    fn a_sticky_root_ancestor_is_walkable_and_nothing_else_is() {
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        stat.st_mode = libc::S_IFDIR | 0o777;
+
+        stat.st_uid = 0;
+        assert!(!group_other_writes_allowed(&stat, true));
+        stat.st_mode |= libc::S_ISVTX;
+        assert!(group_other_writes_allowed(&stat, false));
+        assert!(!group_other_writes_allowed(&stat, true));
+
+        stat.st_uid = unsafe { libc::geteuid() };
+        assert!(!group_other_writes_allowed(&stat, false));
+
+        stat.st_uid = 0;
+        stat.st_mode = libc::S_IFDIR | 0o755;
+        assert!(group_other_writes_allowed(&stat, false));
+        stat.st_mode = libc::S_IFDIR | 0o757;
+        assert!(!group_other_writes_allowed(&stat, false));
     }
 
     #[test]

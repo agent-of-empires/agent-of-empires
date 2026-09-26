@@ -535,8 +535,10 @@ fn open_trusted_app_dir(path: &Path) -> Result<OwnedFd, PublishError> {
 }
 
 /// The same ancestor rule the client's trusted walk applies: every component
-/// must be searchable, owned by root or this uid, and writable by neither the
-/// group nor others.
+/// must be searchable and owned by root or this uid. A non-final component is
+/// additionally tolerated when it is writable by group or others only if it is
+/// root-owned and sticky, which is what `/tmp` and a test namespace under it
+/// offer.
 fn trusted_chain(path: &Path) -> bool {
     let euid = unsafe { libc::geteuid() };
     let components: Vec<CString> = path
@@ -559,21 +561,29 @@ fn trusted_chain(path: &Path) -> bool {
         let Ok(Some(stat)) = file_stat(next.as_raw_fd()) else {
             return false;
         };
-        let owner_ok = if index + 1 == components.len() {
+        let final_component = index + 1 == components.len();
+        let owner_ok = if final_component {
             stat.st_uid == euid
         } else {
             stat.st_uid == 0 || stat.st_uid == euid
         };
         if stat.st_mode & libc::S_IFMT != libc::S_IFDIR
-            || stat.st_mode & 0o022 != 0
             || stat.st_mode & 0o111 == 0
             || !owner_ok
+            || !(stat.st_mode & 0o022 == 0 || (!final_component && sticky_root_directory(&stat)))
         {
             return false;
         }
         current = next;
     }
     true
+}
+
+/// A root-owned sticky directory: a stranger may create entries there but
+/// cannot rename or replace an entry somebody else owns, so the walk through
+/// it is no less safe than through a private one.
+fn sticky_root_directory(stat: &libc::stat) -> bool {
+    stat.st_uid == 0 && stat.st_mode & libc::S_ISVTX != 0
 }
 
 fn open_dir(path: &Path) -> Result<OwnedFd, PublishError> {
