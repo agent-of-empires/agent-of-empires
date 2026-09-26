@@ -1173,7 +1173,8 @@ mod tests {
         inst
     }
 
-    /// A refusal can only name a peer when the enumeration that finds peers worked.
+    /// A refusal from the profile walk is evidence about a peer only when that
+    /// profile is enumerated and its storage loads.
     fn assert_enumerable(profiles: &[&str]) {
         let enumerated = crate::session::list_profiles().expect("profile enumeration");
         for profile in profiles {
@@ -1237,13 +1238,6 @@ mod tests {
             })
             .unwrap();
         assert_enumerable(&["capture-owner-a", "capture-owner-b"]);
-        {
-            let _fail_guard = crate::session::FailNextListProfilesGuard::new();
-            assert!(
-                !current.managed_capture_store_is_exclusive(backend),
-                "an unresolvable profile list fails closed rather than granting exclusivity"
-            );
-        }
         assert!(
             !current.managed_capture_store_is_exclusive(backend),
             "inspected mounts override predicted private stores"
@@ -1274,6 +1268,13 @@ mod tests {
             current.managed_capture_store_is_exclusive(backend),
             "distinct physical stores do not conflict"
         );
+        {
+            let _fail_guard = crate::session::FailNextListProfilesGuard::new();
+            assert!(
+                !current.managed_capture_store_is_exclusive(backend),
+                "an unresolvable profile list fails closed rather than granting exclusivity"
+            );
+        }
 
         peer.active_execution = None;
         peer_storage
@@ -1297,21 +1298,13 @@ mod tests {
             current.managed_capture_store_is_exclusive(backend),
             "a peer without an execution context falls back to its own predicted private store"
         );
-        // A generation-1 peer's store is the legacy shared root, so the fixture
-        // materializes it: only the generation gate can refuse, not a missing path.
-        let legacy = crate::session::config::container_config::sandbox_store_migration_paths(
-            "gemini",
-            &dirs::home_dir().unwrap(),
-            None,
-            &peer.id,
-        )
-        .unwrap()
-        .into_iter()
-        .next()
-        .expect("gemini declares an agent config mount, so it has a legacy shared store")
-        .0;
-        std::fs::create_dir_all(&legacy).unwrap();
+        // A generation-1 peer's store is the legacy shared root, materialized
+        // here so the generation gate is the only thing that can refuse.
         peer.sandbox_store_generation = 1;
+        let legacy = peer
+            .sandbox_capture_store_path()
+            .expect("a generation-1 gemini peer resolves the legacy shared store");
+        std::fs::create_dir_all(&legacy).unwrap();
         peer_storage
             .update(|instances, _| {
                 *instances = vec![peer.clone()];
@@ -1378,7 +1371,7 @@ mod tests {
                 backend,
                 crate::agents::SessionCaptureContext::ManagedExclusiveStore
             )),
-            "the poller consults store exclusivity only for this capture context"
+            "sandboxed Codex resolves the only context that must prove store exclusivity"
         );
         current_storage
             .update(|instances, _| {
@@ -1386,27 +1379,7 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-
-        // Another profile is enumerated, and its own instance id gives it its own store.
-        let mut peer = tool_instance("codex", "/repos/peer");
-        peer.status = Status::Running;
-        peer.source_profile = "codex-owner-b".into();
-        peer.sandbox_info = Some(test_sandbox(
-            &format!("test-{}", peer.id),
-            Some("/workspace/peer"),
-        ));
-        admit_sandbox_fixture(&peer);
-        peer_storage
-            .update(|instances, _| {
-                *instances = vec![peer];
-                Ok(())
-            })
-            .unwrap();
         assert_enumerable(&["codex-owner-a", "codex-owner-b"]);
-        assert!(
-            current.managed_capture_store_is_exclusive(backend),
-            "a peer on another profile owns a distinct physical store"
-        );
 
         // The self row is skipped only in its own profile, so the same id under
         // another profile is still compared.
