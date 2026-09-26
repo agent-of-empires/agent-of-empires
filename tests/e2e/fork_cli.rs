@@ -312,8 +312,7 @@ fn fork_from_refusals_persist_nothing() {
         },
         Case {
             parent: Parent::LegacyUnqualified,
-            // A space in the title, so both remedy arguments must be quoted
-            // for the pasted command to run.
+            // The title holds a space, so the remedy must quote it.
             title: "Legacy Parent",
             args: &[],
             expect: format!(

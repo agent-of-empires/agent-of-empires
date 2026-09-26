@@ -1726,7 +1726,7 @@ mod tests {
             ("HOME", root.path().to_str().unwrap()),
             ("CODEX_HOME", codex_home.to_str().unwrap()),
         ]);
-        // No auth.json, so the native execution identity never resolves.
+        // Nothing here can attest a Codex execution identity.
         let _codex = crate::session::test_support::install_login_shell_path_command(
             root.path(),
             "codex",
