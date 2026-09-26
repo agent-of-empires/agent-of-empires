@@ -1407,12 +1407,12 @@ impl Instance {
                 }
                 let auth_file = root.join("auth.json");
                 let Some(bytes) = inputs.read_native_file(&auth_file)? else {
-                    bail!("Codex has no auth.json in CODEX_HOME (default ~/.codex); sign in with an OpenAI API key and re-run");
+                    bail!("Codex has no auth.json in its resolved configuration directory (session.agent_config_dir on a host launch, else CODEX_HOME, else ~/.codex); sign in with an OpenAI API key and re-run");
                 };
                 let auth: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(&bytes)?;
                 anyhow::ensure!(["tokens", "agent_identity", "personal_access_token"].iter().all(|key| auth.get(*key).is_none_or(serde_json::Value::is_null))
                     && auth.get("auth_mode").is_none_or(|mode| mode.is_null() || mode.as_str() == Some("apikey"))
-                    && auth.get("OPENAI_API_KEY").and_then(serde_json::Value::as_str).is_some_and(|key| !key.trim().is_empty()), "Codex is not authenticated with a local OpenAI API key; set OPENAI_API_KEY in CODEX_HOME/auth.json (default ~/.codex/auth.json) and re-run");
+                    && auth.get("OPENAI_API_KEY").and_then(serde_json::Value::as_str).is_some_and(|key| !key.trim().is_empty()), "Codex is not authenticated with a local OpenAI API key; set OPENAI_API_KEY in the auth.json of its resolved configuration directory (session.agent_config_dir on a host launch, else CODEX_HOME, else ~/.codex) and re-run");
                 configuration.push(auth_file);
                 let sqlite = inputs.canonical_path(&sqlite)?;
                 routing.push(("CODEX_HOME".into(), Some(root.to_str().context("Codex home is not UTF-8")?.into())));
@@ -2835,8 +2835,39 @@ mod tests {
                 recorded: "legacy-uuid".into(),
             })
         );
-        instance.agent_session_id = None;
-        assert!(instance.fork_parent_ref().is_none());
+    }
+
+    /// A row whose own fork intent has not launched yet holds the parent's
+    /// conversation, not one of its own, so it has nothing to fork from.
+    #[test]
+    fn fork_parent_ref_excludes_a_child_whose_fork_has_not_launched() {
+        let mut instance = Instance::new("child", "/tmp");
+        instance.agent_session_id = Some("parent-uuid".into());
+        instance.agent_session_binding = Some(ConversationBinding {
+            session_id: "parent-uuid".into(),
+            execution: Some(ExecutionBinding {
+                agent: "claude".into(),
+                stores: vec!["/store".into()],
+                configuration: Vec::new(),
+                cwd: "/work".into(),
+                cwd_filesystem: "host".into(),
+                filesystem: "host".into(),
+                exported_default_store: None,
+            }),
+            provenance: ConversationProvenance::Observed,
+            transcript_path: None,
+        });
+        instance.resume_intent = ResumeIntent::Fork {
+            from: "parent-uuid".into(),
+        };
+
+        assert_eq!(
+            crate::session::fork::terminal_fork_seed(
+                instance.fork_parent_ref(),
+                "child-uuid".into()
+            ),
+            Err(crate::session::ForkDenied::NoParentSession)
+        );
     }
 
     /// The exported `CLAUDE_CONFIG_DIR` and the store recorded on the binding
