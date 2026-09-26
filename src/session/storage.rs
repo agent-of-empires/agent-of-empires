@@ -2346,48 +2346,103 @@ fn resolve_journal_store<'a>(
     }
 }
 
-const RECOVERY_BACKUPS_TO_KEEP: usize = 3;
+/// Ring budget per marker, counting the copy the call just made.
+const BACKUPS_TO_KEEP: usize = 3;
 
-/// Back up one repaired file and keep only the newest bounded set for that filename.
+/// Marker of the copies the move-journal repair takes. The name on disk is
+/// older than the constant named after it and cannot change.
+const REPAIR_BACKUP_MARKER: &str = ".pre-recovery-";
+
+/// Marker of the copies a retype migration takes. A downgrade is served from
+/// these and from nothing else, so they keep a ring of their own: a repair's
+/// own copies are interchangeable with each other, these are not.
+const MIGRATION_BACKUP_MARKER: &str = ".pre-migration-";
+
+/// Back up a file the move-journal repair is about to rewrite. `Err` means no
+/// durable copy landed, and the caller is mid-repair, so it must stop. A `path`
+/// holding nothing to copy is not a failure: the repair backs up a
+/// `groups.json` that many profiles never had.
 fn backup_before_repair(path: &Path) -> Result<()> {
+    let Some(backup) = backup_beside(path, REPAIR_BACKUP_MARKER)? else {
+        return Ok(());
+    };
+    sync_parent_directory(&backup)
+        .with_context(|| format!("backup {} was not made durable", backup.display()))
+}
+
+/// Back up a file a retype migration is about to rewrite, so a build that
+/// predates the new shape still has bytes it can read. `Err` means no copy
+/// landed; a copy that landed without its directory entry made durable is
+/// logged instead, because the migration cannot unwind. Nothing at `path` is
+/// not a failure either: there is no rewrite to protect.
+pub(crate) fn backup_before_migration(path: &Path) -> Result<()> {
+    let Some(backup) = backup_beside(path, MIGRATION_BACKUP_MARKER)? else {
+        return Ok(());
+    };
+    if let Err(error) = sync_parent_directory(&backup)
+        .with_context(|| format!("backup {} was not made durable", backup.display()))
+    {
+        tracing::warn!(target: "session.store", %error, path = %backup.display(), "migration backup not synced into its directory");
+    }
+    Ok(())
+}
+
+/// Write one copy beside `path` under `marker`, then prune the set that was
+/// there before, never the copy just made. `None` means `path` held nothing to
+/// copy.
+fn backup_beside(path: &Path, marker: &str) -> Result<Option<PathBuf>> {
+    let file_name = path.file_name().expect("a path that read is a file path");
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => {
             return Err(error).context(format!("failed reading {} for backup", path.display()))
         }
     };
-    let stamp = std::time::SystemTime::now()
+    let backups = backups_beside(path, marker)
+        .with_context(|| format!("failed listing backups beside {}", path.display()))?;
+    // Above every sibling while the stamp space leaves room, so a copy taken in
+    // the same millisecond as the last one cannot land on it. Only `u128::MAX`
+    // leaves no room above; the search then takes a free stamp at the clock,
+    // which sorts below that sibling.
+    let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or_default();
-    let mut name = path
-        .file_name()
-        .expect("sessions path has a file name")
-        .to_os_string();
-    name.push(format!(".pre-recovery-{stamp}"));
+    let newest = backups.last().map_or(0, |(stamp, _)| *stamp);
+    let mut stamp = now.max(newest.saturating_add(1));
+    if stamp <= newest {
+        stamp = now;
+        // `backups.len()` taken stamps cannot cover `backups.len()` consecutive
+        // candidates, so the search always ends on a name nobody holds.
+        for _ in 0..backups.len() {
+            if !backups.iter().any(|(taken, _)| *taken == stamp) {
+                break;
+            }
+            stamp = stamp.saturating_add(1);
+        }
+    }
+    let mut name = file_name.to_os_string();
+    name.push(format!("{marker}{stamp}"));
     let backup = path.with_file_name(name);
     atomic_write_verified(&backup, &bytes)?;
-    sync_parent_directory(&backup)
-        .context(format!("backup {} was not made durable", backup.display()))?;
-    prune_old_recovery_backups(path, RECOVERY_BACKUPS_TO_KEEP)
+    // The copy is on disk, so what remains only tidies the siblings. A prune
+    // that cannot run is worth a line, not a failed backup.
+    if let Err(error) = prune_backups_beside(path, &backups, sync_resolved_parent_directory) {
+        tracing::warn!(target: "session.store", %error, path = %path.display(), "backups not pruned");
+    }
+    Ok(Some(backup))
 }
 
-fn prune_old_recovery_backups(path: &Path, keep: usize) -> Result<()> {
-    prune_old_recovery_backups_with_sync(path, keep, sync_resolved_parent_directory)
-}
-
-fn prune_old_recovery_backups_with_sync<S>(path: &Path, keep: usize, mut sync: S) -> Result<()>
-where
-    S: FnMut(&Path) -> Result<()>,
-{
-    let Some(parent) = path.parent() else {
-        return Ok(());
-    };
+/// The timestamped backups `backup_beside` would write beside `path`, oldest
+/// first. Entries that are not regular files stay in: their name must stay
+/// unchoosable, and the prune skips what it cannot remove.
+fn backups_beside(path: &Path, marker: &str) -> Result<Vec<(u128, PathBuf)>> {
+    let parent = path.parent().expect("a path that read is a file path");
     let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
-        return Ok(());
+        return Ok(Vec::new());
     };
-    let prefix = format!("{file_name}.pre-recovery-");
+    let prefix = format!("{file_name}{marker}");
     let mut backups: Vec<(u128, PathBuf)> = fs::read_dir(parent)?
         .filter_map(|entry| entry.ok().map(|entry| entry.path()))
         .filter_map(|candidate| {
@@ -2400,16 +2455,35 @@ where
         })
         .collect();
     backups.sort_by_key(|(timestamp, _)| *timestamp);
-    let remove_count = backups.len().saturating_sub(keep);
-    if remove_count == 0 {
-        return Ok(());
-    }
-    for (_, old) in backups.into_iter().take(remove_count) {
-        fs::remove_file(&old)
-            .with_context(|| format!("failed pruning old recovery backup {}", old.display()))?;
+    Ok(backups)
+}
+
+/// Drop the oldest of `backups` that do not fit [`BACKUPS_TO_KEEP`] counting
+/// the copy the caller is about to make, which is why `backups` must be the
+/// pre-write scan. One entry that cannot be removed does not stop the rest.
+fn prune_backups_beside<S>(path: &Path, backups: &[(u128, PathBuf)], mut sync: S) -> Result<()>
+where
+    S: FnMut(&Path) -> Result<()>,
+{
+    let old_to_keep = BACKUPS_TO_KEEP.saturating_sub(1);
+    let remove_count = backups.len().saturating_sub(old_to_keep);
+    for (_, old) in backups.iter().take(remove_count) {
+        if let Err(error) = fs::remove_file(old) {
+            tracing::warn!(target: "session.store", %error, path = %old.display(), "old backup not pruned");
+        }
     }
     // Backup files are lexical siblings of path even when path itself is a symlink.
-    sync(path).context("recovery backup pruning was not made durable")
+    sync(path).context("backup pruning was not made durable")
+}
+
+#[cfg(test)]
+fn repair_backups(path: &Path) -> Result<Vec<(u128, PathBuf)>> {
+    backups_beside(path, REPAIR_BACKUP_MARKER)
+}
+
+#[cfg(test)]
+pub(crate) fn migration_backups(path: &Path) -> Result<Vec<(u128, PathBuf)>> {
+    backups_beside(path, MIGRATION_BACKUP_MARKER)
 }
 
 /// Keep the repaired profile's groups sidecar consistent with what an uninterrupted
@@ -4454,7 +4528,9 @@ mod tests {
             Ok(stamps)
         };
         let mut synced = Vec::new();
-        prune_old_recovery_backups_with_sync(&path, 4, |candidate| {
+        let backups = repair_backups(&path)?;
+
+        prune_backups_beside(&path, &backups, |candidate| {
             synced.push(candidate.to_path_buf());
             Ok(())
         })?;
@@ -4463,12 +4539,178 @@ mod tests {
             vec![path.clone()],
             "prune syncs the backup directory"
         );
-        assert_eq!(stamps()?, [2, 3, 4, 5]);
+        assert_eq!(
+            stamps()?,
+            [4, 5],
+            "the prune leaves room for the caller's own copy"
+        );
 
         backup_before_repair(&path)?;
         let stamps = stamps()?;
-        assert_eq!(stamps.len(), RECOVERY_BACKUPS_TO_KEEP);
+        assert_eq!(stamps.len(), BACKUPS_TO_KEEP);
         assert_eq!(&stamps[..2], &[4, 5], "oldest backups are pruned");
+        Ok(())
+    }
+
+    /// A migration backup is named strictly newer than every sibling, so a
+    /// second one can never land on the first. The planted sibling carries a
+    /// far-future stamp, so this fails against a `SystemTime::now()` naming rule
+    /// whatever the clock and the filesystem do.
+    /// The created copy is also checked for owner-only mode, the one property a
+    /// reader would not infer from the name.
+    #[test]
+    fn a_backup_is_named_newer_than_every_sibling() -> Result<()> {
+        let temp = tempdir()?;
+        let path = temp.path().join("sessions.json");
+        let planted = u128::MAX / 2;
+        fs::write(
+            path.with_file_name(format!("sessions.json.pre-migration-{planted}")),
+            b"planted",
+        )?;
+        fs::write(&path, b"live")?;
+
+        backup_before_migration(&path)?;
+
+        let backups = migration_backups(&path)?;
+        assert_eq!(backups.len(), 2, "the planted sibling must survive");
+        assert_eq!(backups[0].0, planted);
+        assert!(
+            backups[1].0 > planted,
+            "new copy must sort last: {backups:?}"
+        );
+        assert_eq!(fs::read(&backups[1].1)?, b"live");
+        fs::write(&path, b"later")?;
+        backup_before_migration(&path)?;
+        let backups = migration_backups(&path)?;
+        assert_eq!(backups.len(), 3, "an earlier copy must never be reused");
+        assert_eq!(fs::read(&backups[1].1)?, b"live");
+        assert_eq!(fs::read(&backups[2].1)?, b"later");
+        #[cfg(unix)]
+        assert_eq!(
+            mode(&backups[1].1),
+            0o600,
+            "migration backup must stay owner-only"
+        );
+        Ok(())
+    }
+
+    /// A prune that cannot run is not a failed backup: the copy is already on
+    /// disk, and reporting otherwise would send a user looking for a restore
+    /// point that is there. A directory sitting where the oldest backup name
+    /// belongs cannot be removed, and skipping it must not stop the rest.
+    #[test]
+    fn a_prune_that_cannot_remove_the_oldest_still_leaves_the_copy() -> Result<()> {
+        let temp = tempdir()?;
+        let path = temp.path().join("sessions.json");
+        fs::create_dir(path.with_file_name("sessions.json.pre-migration-1"))?;
+        fs::write(path.with_file_name("sessions.json.pre-migration-2"), b"two")?;
+        fs::write(
+            path.with_file_name(format!("sessions.json.pre-migration-{}", u128::MAX)),
+            b"top",
+        )?;
+        fs::write(&path, b"live")?;
+
+        backup_before_migration(&path)?;
+
+        assert!(
+            migration_backups(&path)?
+                .iter()
+                .any(|(_, candidate)| fs::read(candidate).is_ok_and(|bytes| bytes == b"live")),
+            "the copy this call made must survive a prune that cannot run"
+        );
+        Ok(())
+    }
+
+    /// Foreign entries past any clock this build can read fill the retention
+    /// window. The copy this call makes must survive the prune it triggers, so
+    /// the test plants enough of them that the prune has work to do.
+    #[test]
+    fn a_saturated_stamp_space_keeps_the_copy_its_own_prune_would_take() -> Result<()> {
+        let temp = tempdir()?;
+        let path = temp.path().join("sessions.json");
+        for planted in [
+            1_000_000_000_000_000_000_000_000_000_000u128,
+            2_000_000_000_000_000_000_000_000_000_000u128,
+            u128::MAX,
+        ] {
+            fs::write(
+                path.with_file_name(format!("sessions.json.pre-migration-{planted}")),
+                format!("planted-{planted}"),
+            )?;
+        }
+        fs::write(&path, b"first")?;
+
+        backup_before_migration(&path)?;
+
+        let backups = migration_backups(&path)?;
+        assert_eq!(
+            backups.len(),
+            BACKUPS_TO_KEEP,
+            "the window stays bounded: {backups:?}"
+        );
+        assert_eq!(
+            fs::read(&backups[0].1)?,
+            b"first",
+            "the copy this call made must outlive its own prune"
+        );
+        Ok(())
+    }
+
+    /// Two copies in a row against one saturated sibling: each call must keep
+    /// its own copy and neither may reuse a name already on disk.
+    #[test]
+    fn a_saturated_stamp_space_never_reuses_a_taken_name() -> Result<()> {
+        let temp = tempdir()?;
+        let path = temp.path().join("sessions.json");
+        fs::write(
+            path.with_file_name(format!("sessions.json.pre-migration-{}", u128::MAX)),
+            b"planted",
+        )?;
+
+        fs::write(&path, b"first")?;
+        backup_before_migration(&path)?;
+        fs::write(&path, b"second")?;
+        backup_before_migration(&path)?;
+
+        let backups = migration_backups(&path)?;
+        assert_eq!(backups.len(), 3, "both copies must land: {backups:?}");
+        let landed: Vec<Vec<u8>> = backups
+            .iter()
+            .map(|(_, candidate)| fs::read(candidate).unwrap())
+            .collect();
+        assert!(landed.contains(&b"planted".to_vec()));
+        assert!(landed.contains(&b"first".to_vec()));
+        assert!(landed.contains(&b"second".to_vec()));
+        Ok(())
+    }
+
+    /// A downgrade is served from the migration ring, and a repair's own copies
+    /// are interchangeable while these are not, so the two must not share a
+    /// budget: two repairs used to evict the one copy an older build can read.
+    #[test]
+    fn repairs_never_evict_the_migration_ring() -> Result<()> {
+        let temp = tempdir()?;
+        let path = temp.path().join("sessions.json");
+        for content in [b"pre-v029".as_slice(), b"post-v029"] {
+            fs::write(&path, content)?;
+            backup_before_migration(&path)?;
+        }
+        let downgrade_copy = fs::read(&migration_backups(&path)?[0].1)?;
+
+        for _ in 0..4 {
+            backup_before_repair(&path)?;
+        }
+
+        assert_eq!(
+            migration_backups(&path)?.len(),
+            2,
+            "the migration ring must be untouched by repairs"
+        );
+        assert_eq!(
+            fs::read(&migration_backups(&path)?[0].1)?,
+            downgrade_copy,
+            "the copy an older build can read must still be the oldest"
+        );
         Ok(())
     }
 

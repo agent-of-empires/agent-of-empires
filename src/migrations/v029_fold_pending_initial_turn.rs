@@ -11,10 +11,11 @@
 //! Every pre-existing row predates the `synthesized` flag, so it folds to
 //! `false` (the field only ever meant a create-time initial turn until now).
 
+use super::progress;
 use anyhow::{anyhow, Result};
 use std::fs;
 use std::path::Path;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// Migration entry point: fold `pending_initial_turn` under the app dir.
 pub fn run() -> Result<()> {
@@ -91,6 +92,10 @@ fn fold_pending_initial_turn(path: &Path) -> Result<()> {
     }
 
     if folded > 0 {
+        if let Err(error) = crate::session::backup_before_migration(path) {
+            warn!(%error, path = %path.display(), "v029: no migration backup for the fold");
+            progress::notice("could not back up sessions.json before folding pending_initial_turn");
+        }
         crate::session::atomic_write(path, serde_json::to_string_pretty(&value)?.as_bytes())?;
         info!(
             "v029: folded pending_initial_turn on {folded} session(s) in {}",
@@ -157,5 +162,31 @@ mod tests {
                 p.display()
             );
         }
+    }
+
+    #[test]
+    fn folding_leaves_a_migration_backup_the_previous_release_can_read() {
+        // v1.16.1 typed this field as `Option<String>`.
+        #[derive(serde::Deserialize)]
+        struct Pre116 {
+            pending_initial_turn: Option<String>,
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessions.json");
+        fs::write(&path, r#"[{"id":"a","pending_initial_turn":"go"}]"#).unwrap();
+
+        fold_pending_initial_turn(&path).unwrap();
+        fold_pending_initial_turn(&path).unwrap();
+
+        let backups = crate::session::migration_backups(&path).unwrap();
+        assert_eq!(
+            backups.len(),
+            1,
+            "re-entry must not add another migration backup: {backups:?}"
+        );
+        let before: Vec<Pre116> =
+            serde_json::from_slice(&fs::read(&backups[0].1).unwrap()).unwrap();
+        assert_eq!(before[0].pending_initial_turn.as_deref(), Some("go"));
     }
 }

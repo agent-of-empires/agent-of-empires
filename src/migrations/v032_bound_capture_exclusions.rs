@@ -1,5 +1,6 @@
 //! Preserve legacy SID exclusions without inventing their namespace.
 
+use super::progress;
 use anyhow::{Context, Result};
 use serde_json::Value;
 use std::{fs, path::Path};
@@ -54,6 +55,10 @@ fn migrate_file(path: &Path) -> Result<()> {
         }
     }
     if changed {
+        if let Err(error) = crate::session::backup_before_migration(path) {
+            tracing::warn!(%error, path = %path.display(), "v032: no migration backup for the retype");
+            progress::notice("could not back up sessions.json before binding capture exclusions");
+        }
         crate::session::atomic_write(path, serde_json::to_string_pretty(&value)?.as_bytes())?;
         tracing::info!(
             "v032: bound legacy capture exclusions in {}",
@@ -98,5 +103,39 @@ mod tests {
         assert!(!exclusions
             .iter()
             .any(|binding| binding.excludes_capture("new-sid", Some(&source))));
+    }
+
+    #[test]
+    fn retyping_leaves_a_migration_backup_the_previous_release_can_read() {
+        // v1.16.1 typed this field as `HashSet<String>`.
+        #[derive(serde::Deserialize)]
+        struct Pre116 {
+            #[serde(default)]
+            retroactive_capture_excludes: std::collections::HashSet<String>,
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("profiles/default/sessions.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            r#"[{"retroactive_capture_excludes":["legacy-sid"]}]"#,
+        )
+        .unwrap();
+
+        run_in(temp.path()).unwrap();
+        run_in(temp.path()).unwrap();
+
+        let backups = crate::session::migration_backups(&path).unwrap();
+        assert_eq!(
+            backups.len(),
+            1,
+            "re-entry must not add another migration backup: {backups:?}"
+        );
+        let before: Vec<Pre116> =
+            serde_json::from_slice(&fs::read(&backups[0].1).unwrap()).unwrap();
+        assert!(before[0]
+            .retroactive_capture_excludes
+            .contains("legacy-sid"));
     }
 }
