@@ -715,7 +715,9 @@ mod tests {
             let (_hooks, _base, _hooks_tmp) = crate::hooks::test_support::BaseGuard::ready();
             let profile = format!("sid-pi-{case}");
             let root = tempdir().unwrap();
-            let root = root.path().to_path_buf();
+            // The reader canonicalizes the published path, so the capture root must be canonical
+            // too: a symlinked TMPDIR otherwise fails the containment check.
+            let root = crate::session::capture::canonicalize_or_raw(root.path().to_str().unwrap());
             let transcript_parent = root.join("sessions/project");
             let transcript =
                 transcript_parent.join(format!("2026-01-01T00-00-00-000Z_{sid}.jsonl"));
