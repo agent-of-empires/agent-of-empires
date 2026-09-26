@@ -111,6 +111,10 @@ impl ConversationBinding {
             )
     }
 
+    pub fn is_unattributed(&self) -> bool {
+        self.execution.is_none() && self.provenance == ConversationProvenance::Unknown
+    }
+
     pub(crate) fn excludes_capture(&self, sid: &str, source: Option<&ExecutionBinding>) -> bool {
         if self.session_id != sid {
             return false;
@@ -1927,10 +1931,9 @@ impl Instance {
         );
         let binding = binding.filter(|binding| binding.session_id == sid)
             .context("conversation provenance is unknown; use aoe session set-session-id with an explicitly configured execution identity and store before resuming or forking")?;
-        anyhow::ensure!(binding.is_known() || (!explicit && binding.provenance == ConversationProvenance::Preallocated),
+        anyhow::ensure!(binding.is_known() || binding.is_unattributed() || (!explicit && binding.provenance == ConversationProvenance::Preallocated),
             "conversation has not been observed or explicitly asserted; a preallocated ID is not a forkable conversation");
-        // Default may try a known ID after an external context move; only a qualified
-        // observation can rebind its historical execution identity. Explicit operations stay strict.
+        // Default may adopt a known ID after a context move when agent and filesystem agree.
         anyhow::ensure!(
             binding
                 .execution
