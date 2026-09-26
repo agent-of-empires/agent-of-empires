@@ -120,20 +120,20 @@ pub(crate) fn overrides_ignored_keys(overrides: &serde_json::Value) -> Vec<Strin
     ignored
 }
 
-/// Run `f` with the `config.toml` path of an *existing* profile while holding
-/// that profile's write locks: identity, profile-namespace, in-process save
-/// mutex, then the profile storage flock. The profile is resolved only after
-/// the namespace lock is held, so a concurrent rename/delete can neither slip
-/// between resolution and the write nor resurrect a deleted directory. An
-/// unknown profile is an error; nothing is ever created.
+/// Run `f` with the `config.toml` path of a profile while holding that
+/// profile's write locks: identity, profile-namespace, in-process save mutex,
+/// then the profile storage flock. The profile is materialised only after the
+/// namespace lock is held, and the lock every rename and delete also takes, so
+/// a config write can neither slip between resolution and the write nor
+/// resurrect a directory outside that window.
 fn with_profile_config_locked<T>(
     profile: &str,
     f: impl FnOnce(&std::path::Path) -> Result<T>,
 ) -> Result<T> {
     let _identity_lock = crate::session::acquire_session_identity_lock()?;
     let _namespace_lock = crate::session::storage::acquire_profile_namespace_lock()?;
-    let profile_name = crate::session::resolve_existing_profile(profile)?;
-    let dir = crate::session::get_profile_dir_path(&profile_name)?;
+    let profile_name = crate::session::resolve_profile_name(profile)?;
+    let dir = crate::session::get_profile_dir_locked(&profile_name)?;
     // Match Storage::update: in-process save mutex first, then the cross-process flock.
     let save_lock = crate::session::storage::save_lock_for(&profile_name);
     let _save_lock = save_lock
@@ -146,8 +146,8 @@ fn with_profile_config_locked<T>(
     f(&dir.join("config.toml"))
 }
 
-/// Write `config` to an existing profile's `config.toml`, replacing it whole.
-/// Never creates the profile directory: naming an unknown profile is an error.
+/// Write `config` to a profile's `config.toml`, replacing it whole. The
+/// profile directory is created under the profile locks when absent.
 pub fn save_profile_config(profile: &str, config: &ProfileConfig) -> Result<()> {
     let content = toml::to_string_pretty(config)?;
     with_profile_config_locked(profile, |path| {

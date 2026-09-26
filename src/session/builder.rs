@@ -965,10 +965,9 @@ pub(crate) fn cleanup_instance_under_locks(
 /// Clean up resources created during a failed or cancelled instance build
 /// without taking the ownership flocks.
 ///
-/// Only correct for callers that already hold
-/// [`CleanupOwnershipLocks`]; everyone else must use
-/// [`cleanup_instance_locked`], whose snapshot and deletion run under the
-/// same lock window.
+/// Only correct for callers that already hold the workspace-claim and session
+/// identity flocks; everyone else must use `cleanup_instance_locked`, whose
+/// snapshot and deletion run under the same lock window.
 pub fn cleanup_instance(
     instance: &Instance,
     created_worktree: Option<&CreatedWorktree>,

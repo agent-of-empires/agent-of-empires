@@ -346,7 +346,26 @@ pub fn format_debug_namespace_warning(release: &Path, dev: &Path) -> String {
     )
 }
 
+/// Resolve a profile directory, creating it when absent.
+///
+/// Creation runs under the session identity lock, which every profile rename
+/// and delete also takes, so a config write can never resurrect a directory
+/// outside that lock window.
 pub fn get_profile_dir(profile: &str) -> Result<PathBuf> {
+    if let Ok(dir) = get_profile_dir_path(profile) {
+        if dir.exists() {
+            return Ok(dir);
+        }
+    }
+    let _identity_lock = acquire_session_identity_lock()?;
+    get_profile_dir_locked(profile)
+}
+
+/// [`get_profile_dir`] for callers that already hold the session identity
+/// lock. Taking it again here would deadlock: `flock` is bound to the open
+/// file description, so a second acquisition on a fresh descriptor waits
+/// against the one this thread is holding.
+pub(crate) fn get_profile_dir_locked(profile: &str) -> Result<PathBuf> {
     let base = get_app_dir()?;
     let resolved;
     let profile_name = if profile.is_empty() {
@@ -357,12 +376,9 @@ pub fn get_profile_dir(profile: &str) -> Result<PathBuf> {
     };
     let dir = base.join("profiles").join(profile_name);
     if !dir.exists() {
-        let _identity_lock = acquire_session_identity_lock()?;
-        if dir.exists() {
-            return Ok(dir);
-        }
-        // Only a name about to be created runs the strict grammar; an existing directory still
-        // opens, so older malformed profiles stay listable and deletable.
+        // Only a name about to be created runs the strict grammar; an existing
+        // directory still opens, so older malformed profiles stay listable and
+        // deletable.
         validate_new_profile_name(profile_name)?;
         fs::create_dir_all(&dir)?;
     }
@@ -382,14 +398,22 @@ pub fn get_profile_dir_path(profile: &str) -> Result<PathBuf> {
     Ok(base.join("profiles").join(profile_name))
 }
 
-/// Resolve the effective profile name for a read/reference operation.
-pub fn resolve_existing_profile(profile: &str) -> Result<String> {
+/// Resolve the effective profile name and check its grammar, without
+/// requiring the directory to exist. Callers that materialise the profile must
+/// do so under the session identity lock.
+pub fn resolve_profile_name(profile: &str) -> Result<String> {
     let name = if profile.is_empty() {
         config::resolve_default_profile()
     } else {
         profile.to_string()
     };
     validate_profile_name(&name)?;
+    Ok(name)
+}
+
+/// Resolve the effective profile name for a read/reference operation.
+pub fn resolve_existing_profile(profile: &str) -> Result<String> {
+    let name = resolve_profile_name(profile)?;
     let dir = get_profile_dir_path(&name)?;
     if !dir.exists() {
         anyhow::bail!("Profile '{name}' does not exist. Create it with: aoe profile create {name}");

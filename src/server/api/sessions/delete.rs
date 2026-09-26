@@ -31,6 +31,34 @@ async fn mark_delete_error(state: &AppState, id: &str, message: String) {
     }
 }
 
+/// Why a purge could not complete. `Retryable` is a transient conflict the
+/// client can retry (a runner that is still being torn down); `Fatal` is a
+/// hard failure. Collapsing the two would report a live runner as a server
+/// error and leave the row marked failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PurgeRefusal {
+    Retryable(String),
+    Fatal(String),
+}
+
+impl PurgeRefusal {
+    fn message(&self) -> &str {
+        match self {
+            Self::Retryable(message) | Self::Fatal(message) => message,
+        }
+    }
+
+    fn is_retryable(&self) -> bool {
+        matches!(self, Self::Retryable(_))
+    }
+}
+
+impl From<String> for PurgeRefusal {
+    fn from(message: String) -> Self {
+        Self::Fatal(message)
+    }
+}
+
 /// Permanently purge a session: irreversible ACP teardown, optional sidecar
 /// cleanup per `body`, and removal from both `sessions.json` and the in-memory
 /// list. Shared by `DELETE /api/sessions/{id}` and the retention auto-purge
@@ -47,13 +75,13 @@ async fn purge_session_artifacts(
     instance: Instance,
     body: &DeleteSessionBody,
     recent_entry: Option<crate::session::RecentProjectEntry>,
-) -> Result<(bool, Vec<String>), String> {
+) -> Result<(bool, Vec<String>), PurgeRefusal> {
     let profile = instance.source_profile.clone();
     if profile.is_empty() {
-        return Err(
+        return Err(PurgeRefusal::Fatal(
             "Session has no source profile; refusing to acquire a default-profile purge lock"
                 .to_string(),
-        );
+        ));
     }
     let delete_request = crate::session::deletion::DeletionRequest {
         session_id: id.to_string(),
@@ -106,17 +134,19 @@ async fn purge_session_artifacts(
                     Ok((true, result.messages))
                 }
                 crate::session::deletion::DeletionDisposition::KeptRestored => {
-                    Err("Session is being restored, so it was not purged".to_string())
+                    Err(PurgeRefusal::Fatal(
+                        "Session is being restored, so it was not purged".to_string(),
+                    ))
                 }
-                crate::session::deletion::DeletionDisposition::Busy => {
-                    Err(result.errors.first().cloned().unwrap_or_else(|| {
+                crate::session::deletion::DeletionDisposition::Busy => Err(PurgeRefusal::Fatal(
+                    result.errors.first().cloned().unwrap_or_else(|| {
                         "Session is busy with another lifecycle operation, so it was not purged"
                             .to_string()
-                    }))
-                }
+                    }),
+                )),
                 crate::session::deletion::DeletionDisposition::Failed
                 | crate::session::deletion::DeletionDisposition::Removed => {
-                    Err(result.errors.join("; "))
+                    Err(PurgeRefusal::Fatal(result.errors.join("; ")))
                 }
             };
         }
@@ -135,9 +165,9 @@ async fn purge_session_artifacts(
         match state.acp_supervisor.shutdown_and_delete(id).await {
             Ok(()) | Err(crate::acp::supervisor::SupervisorError::UnknownSession(_)) => {}
             Err(crate::acp::supervisor::SupervisorError::TeardownPending(_)) => {
-                return Err(format!(
+                return Err(PurgeRefusal::Retryable(format!(
                     "Session {id} is still being torn down; the record was kept. Retry after the runner exits."
-                ));
+                )));
             }
             Err(e) => {
                 tracing::warn!(
@@ -208,7 +238,7 @@ async fn purge_session_artifacts(
             } else {
                 deletion_result.errors.join("; ")
             };
-            return Err(errs);
+            return Err(PurgeRefusal::Fatal(errs));
         }
         crate::session::deletion::DeletionDisposition::Removed
         | crate::session::deletion::DeletionDisposition::AlreadyGone => {}
@@ -220,7 +250,7 @@ async fn purge_session_artifacts(
             deletion_result.errors.join("; ")
         };
         if !transcript_purged {
-            return Err(errs);
+            return Err(PurgeRefusal::Fatal(errs));
         }
         tracing::warn!(
             target: "http.api.sessions",
@@ -251,7 +281,9 @@ async fn purge_session_artifacts(
         }
     }
     if let Some(error) = post_commit_error {
-        return Err(format!("Session {id} was purged but {error}"));
+        return Err(PurgeRefusal::Fatal(format!(
+            "Session {id} was purged but {error}"
+        )));
     }
     Ok((true, messages))
 }
@@ -465,7 +497,7 @@ pub(crate) async fn purge_expired_trash(state: &Arc<AppState>) {
             Err(e) => tracing::warn!(
                 target: "http.api.sessions",
                 session = %id,
-                "auto-purge of expired trash failed: {e}"
+                "auto-purge of expired trash failed: {e:?}"
             ),
         }
     }
@@ -539,7 +571,20 @@ pub async fn delete_session(
                     "messages": messages,
                 })),
             ),
-            Err(msg) => {
+            Err(refusal) if refusal.is_retryable() => {
+                // A runner that is still tearing down is a transient conflict,
+                // not a server error: the row is intact and healthy, so it must
+                // not be marked failed either.
+                (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({
+                        "error": "teardown_pending",
+                        "message": refusal.message(),
+                    })),
+                )
+            }
+            Err(refusal) => {
+                let msg = refusal.message().to_string();
                 mark_delete_error(&state, &id, msg.clone()).await;
                 tracing::error!(target: "http.api.sessions", "delete failed: {msg}");
                 (
@@ -594,6 +639,8 @@ pub struct DeleteWorkspaceBody {
 pub(super) struct WorkspaceDeleteFailure {
     pub(super) id: String,
     pub(super) error: String,
+    /// The runner is still tearing down, so the client can retry unchanged.
+    pub(super) retryable: bool,
 }
 
 /// Drop duplicate session ids, preserving first-seen order. With
@@ -731,6 +778,8 @@ pub(super) async fn purge_workspace_artifacts(
                 failed.push(WorkspaceDeleteFailure {
                     id: owner_id,
                     error: format!("Workspace: {msg}"),
+                    // A dirty worktree is the user's call, not a transient race.
+                    retryable: false,
                 });
                 return (deleted, failed, messages);
             }
@@ -776,11 +825,17 @@ pub(super) async fn purge_workspace_artifacts(
                     deleted.push(id.clone());
                 }
             }
-            Err(msg) => {
-                mark_delete_error(state, &id, msg.clone()).await;
+            Err(refusal) => {
+                let msg = refusal.message().to_string();
+                // A retryable refusal leaves the row intact and healthy; marking
+                // it failed would be a lie the user has to undo.
+                if !refusal.is_retryable() {
+                    mark_delete_error(state, &id, msg.clone()).await;
+                }
                 failed.push(WorkspaceDeleteFailure {
                     id: id.clone(),
                     error: msg,
+                    retryable: refusal.is_retryable(),
                 });
                 // Stop before the remaining plan entries. The owner is last, so
                 // a sibling failure leaves the shared worktree intact with its
@@ -869,6 +924,20 @@ pub async fn delete_workspace(
                     .map(|f| f.error.clone())
                     .collect::<Vec<_>>()
                     .join("; ");
+                // Nothing was removed and every refusal is transient, so this
+                // is a retryable conflict rather than a server error.
+                if failed.iter().all(|f| f.retryable) {
+                    tracing::warn!(target: "http.api.sessions", "workspace delete still settling: {msg}");
+                    return (
+                        StatusCode::CONFLICT,
+                        Json(serde_json::json!({
+                            "error": "teardown_pending",
+                            "message": msg,
+                            "failed": failed,
+                        })),
+                    )
+                        .into_response();
+                }
                 tracing::error!(target: "http.api.sessions", "workspace delete failed: {msg}");
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
