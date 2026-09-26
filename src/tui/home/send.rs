@@ -2,8 +2,9 @@
 
 use super::*;
 
-/// Map a decision to its agent-defined keystroke sequence. Pure and tmux-free so the
-/// mapping is unit-testable; `execute_permission_response` is the only caller.
+/// Map a decision to its agent-defined keystroke sequence. Pure and
+/// tmux-free so the choice-to-field mapping is unit-testable without a
+/// real pane; `execute_permission_response` is the only caller.
 pub(super) fn permission_response_tokens(
     response: &crate::agents::PermissionResponse,
     choice: crate::tui::dialogs::PermissionResponseChoice,
@@ -18,144 +19,70 @@ pub(super) fn permission_response_tokens(
 
 impl HomeView {
     pub fn set_instance_status(&mut self, id: &str, status: crate::session::Status) {
-        let old_status = self.get_instance(id).map(|inst| inst.status);
         self.mutate_instance(id, |inst| inst.status = status);
-        if let Some(old) = old_status {
-            if old != status {
-                if let Some(inst) = self.get_instance(id).cloned() {
-                    self.handle_status_transition(&inst, old, status, false, true);
-                }
-            }
-        }
     }
 
-    /// Stamp `last_accessed_at` on a session (a user-initiated interaction).
-    ///
-    /// Sunk rows take the heavier `apply_user_action` path so the auto-unarchive side effect
-    /// in `touch_last_accessed` is persisted (merge_from_tui doesn't carry those fields, so
-    /// a reload would resurrect the sink) and the row leaves the Archived section on the same
-    /// frame. Non-sunk rows stay on the cheap mutate_instance path, since save() already
-    /// mirrors the timestamp.
+    /// Mark a user interaction. The daemon owns archive and snooze transitions;
+    /// ordinary activity only updates the local timestamp.
     pub fn stamp_last_accessed(&mut self, id: &str) {
         let was_sunk = self
             .instances
             .get(id)
-            .map(|i| i.is_archived() || i.snoozed_until.is_some())
-            .unwrap_or(false);
+            .is_some_and(|i| i.is_archived() || i.snoozed_until.is_some());
         if was_sunk {
-            if let Err(e) = self.apply_user_action(id, |inst| inst.touch_last_accessed()) {
-                tracing::warn!(
-                    target: "tui.home",
-                    session_id = %id,
-                    error = %e,
-                    "stamp_last_accessed: failed to persist auto-unsink"
-                );
+            if !self.session_feed.has_pending(id) && !self.session_feed.has_queued(id) {
+                if let Err(error) = self
+                    .session_feed
+                    .submit(id.to_owned(), crate::daemon::SessionMutation::Access)
+                {
+                    tracing::warn!(target: "tui.home", session_id = %id, %error, "access request refused");
+                }
             }
-            self.rebuild_flat_items();
         } else {
             self.mutate_instance(id, |inst| inst.touch_last_accessed());
         }
     }
 
-    /// Run the send-message work after the dialog is dismissed: `ensure_pane_ready` (which
-    /// may auto-start or respawn), then deliver the keystrokes. Errors surface via
-    /// `info_dialog`, so the caller only has to clear its transient status.
-    ///
-    pub fn execute_send_message(&mut self, session_id: &str, message: &str) {
-        let target = std::mem::replace(
+    /// Take the target the next message should be delivered to.
+    pub(in crate::tui) fn take_send_target(&mut self) -> live_send::LiveSendTarget {
+        std::mem::replace(
             &mut self.pending_send_target,
             live_send::LiveSendTarget::Agent,
-        );
-        // Same pane-readiness cascades as live-send: the agent runs the full
-        // `ensure_pane_ready` while terminals just need a live pane. Every cold target starts
-        // at the visible preview size, avoiding an immediate resize and its SIGWINCH
-        // repaint.
-        let boot_size = self.live_send_boot_size();
-        match &target {
-            live_send::LiveSendTarget::Agent => {
-                let outcome = self.try_mutate_instance_writeback_on_err(session_id, |inst| {
-                    inst.ensure_pane_ready_with_size(boot_size)
-                        .map_err(Into::into)
-                });
-                match outcome {
-                    Ok(Some(EnsureReadyOutcome::ResumeFailed { sid })) => {
-                        self.info_dialog = Some(InfoDialog::new(
-                            "Send Failed",
-                            &format!("Resume failed for sid {sid}; preserved for explicit retry"),
-                        ));
-                        return;
-                    }
-                    Ok(_) => {}
-                    Err(err) => {
-                        self.info_dialog = Some(InfoDialog::new(
-                            "Send Failed",
-                            &format!("Cannot prepare session: {}", err),
-                        ));
-                        return;
-                    }
-                }
-            }
-            live_send::LiveSendTarget::Terminal => {
-                if let Err(e) = self.ensure_terminal_pane_ready(session_id, boot_size) {
-                    self.info_dialog = Some(InfoDialog::new(
-                        "Send Failed",
-                        &format!("Cannot prepare terminal: {}", e),
-                    ));
-                    return;
-                }
-            }
-            live_send::LiveSendTarget::ContainerTerminal => {
-                if let Err(e) = self.ensure_container_terminal_pane_ready(session_id, boot_size) {
-                    self.info_dialog = Some(InfoDialog::new(
-                        "Send Failed",
-                        &format!("Cannot prepare container terminal: {}", e),
-                    ));
-                    return;
-                }
-            }
-            live_send::LiveSendTarget::Tool(name) => {
-                let name = name.clone();
-                if let Err(e) = self.ensure_tool_pane_ready(session_id, &name, boot_size) {
-                    self.info_dialog = Some(InfoDialog::new(
-                        "Send Failed",
-                        &format!("Cannot prepare tool '{}': {}", name, e),
-                    ));
-                    return;
-                }
-            }
-        };
-        let Some(inst) = self.get_instance(session_id) else {
+        )
+    }
+
+    /// Deliver a queued message to a pane the daemon has confirmed ready.
+    pub(in crate::tui) fn finish_send(
+        &mut self,
+        session_id: &str,
+        tmux_name: &str,
+        target: live_send::LiveSendTarget,
+        message: &str,
+        lease: &crate::tui::session_feed::NativeLease,
+    ) {
+        if !lease.is_valid() {
+            return;
+        }
+        if !self.session_feed.native_interaction_available() {
+            self.info_dialog = Some(InfoDialog::new(
+                "Send Failed",
+                "Native interaction is unavailable.",
+            ));
+            return;
+        }
+        let Some(inst) = self.get_instance(session_id).cloned() else {
             self.info_dialog = Some(InfoDialog::new(
                 "Send Failed",
                 "Session disappeared before the message could be sent.",
             ));
             return;
         };
-        let tmux_session = match &target {
-            live_send::LiveSendTarget::Agent => {
-                match crate::tmux::Session::new(&inst.id, &inst.title) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        self.info_dialog = Some(InfoDialog::new(
-                            "Send Failed",
-                            &format!("Failed to resolve session: {}", e),
-                        ));
-                        return;
-                    }
-                }
-            }
-            live_send::LiveSendTarget::Terminal => crate::tmux::Session::from_name(
-                &crate::tmux::TerminalSession::resolve_name(&inst.id, &inst.title),
-            ),
-            live_send::LiveSendTarget::ContainerTerminal => crate::tmux::Session::from_name(
-                &crate::tmux::ContainerTerminalSession::resolve_name(&inst.id, &inst.title),
-            ),
-            live_send::LiveSendTarget::Tool(name) => crate::tmux::Session::from_name(
-                crate::tmux::ToolSession::new(&inst.id, &inst.title, name).session_name(),
-            ),
-        };
-        // The agent gets a tool-specific Enter delay so paste-burst-aware agents don't
-        // swallow the final Enter; shells in the terminal panes don't need it.
+        // The receipt named the pane the daemon confirmed, so nothing is
+        // resolved locally and a stale name cannot be sent to.
+        let tmux_session = crate::tmux::Session::from_name(tmux_name);
+        // Agent gets a tool-specific Enter delay so paste-burst-aware
+        // agents (e.g. Codex) don't swallow the final Enter. Shells in
+        // the paired terminal panes don't need the delay.
         let delay = match &target {
             live_send::LiveSendTarget::Agent => crate::agents::send_keys_enter_delay(&inst.tool),
             live_send::LiveSendTarget::Terminal
@@ -179,14 +106,23 @@ impl HomeView {
         }
     }
 
-    /// Send the tmux keystrokes for a permission-prompt decision to the selected session's
-    /// agent pane. No pane-readiness wait: this only makes sense against a live pane already
-    /// showing a prompt.
+    /// Send the tmux keystrokes for a permission-prompt decision straight
+    /// to the selected session's agent pane. No pane-readiness wait like
+    /// `execute_send_message` performs: this action only makes sense
+    /// against an already-live pane showing a prompt, so there is nothing
+    /// to revive.
     pub fn execute_permission_response(
         &mut self,
         session_id: &str,
         choice: crate::tui::dialogs::PermissionResponseChoice,
     ) {
+        if !self.session_feed.native_interaction_available() {
+            self.info_dialog = Some(InfoDialog::new(
+                "Respond Failed",
+                "Native interaction is unavailable.",
+            ));
+            return;
+        }
         let Some(inst) = self.get_instance(session_id) else {
             return;
         };

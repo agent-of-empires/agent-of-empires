@@ -1,5 +1,15 @@
 #![allow(clippy::result_large_err)]
 //! Web Push notifications for the dashboard PWA.
+//!
+//! Sends VAPID-signed pushes to subscribed browsers when session status
+//! transitions require user attention (v1: Running -> Waiting only).
+//! Consumed via a broadcast channel on `AppState.status_tx`, so the
+//! transition-detection logic is decoupled from tmux polling and can be
+//! unit-tested by feeding events directly.
+//!
+//! Wire format for subscriptions and the security model (per-token hash
+//! ownership, rotate-invalidation) are documented in
+//! `docs/plans/web-push-notifications.md`.
 
 use crate::session::Status;
 use chrono::{DateTime, Utc};
@@ -8,7 +18,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tokio::sync::RwLock;
 
-/// Emitted when an instance's status changes.
+/// Emitted when an instance's status changes. The broadcast channel on
+/// `AppState.status_tx` carries these; `push.rs` is the only consumer in
+/// v1, but future features (UI realtime, webhooks) can subscribe too.
 #[derive(Clone, Debug)]
 pub struct StatusChange {
     pub instance_id: String,
@@ -18,25 +30,39 @@ pub struct StatusChange {
     pub at: DateTime<Utc>,
 }
 
-/// Capacity of the broadcast channel.
+/// Capacity of the broadcast channel. Large enough that short bursts of
+/// concurrent transitions (e.g., `/api/sessions` bulk refresh) don't drop
+/// events even if the consumer is momentarily behind. If a receiver lags
+/// past this, broadcast surfaces `RecvError::Lagged` and the consumer
+/// logs and continues; push delivery is best-effort anyway.
 pub const STATUS_CHANNEL_CAPACITY: usize = 64;
 
-/// Dwell requirement for Waiting.
+/// Dwell requirement for Waiting: Claude sometimes pauses briefly in
+/// Waiting before resolving, and tmux scrape results flicker. Require
+/// 5s of continuous Waiting before firing.
 pub const DWELL_WAITING_MS: u64 = 5_000;
 
-/// Dwell for Idle and Error is shorter because these are terminal states and far less
-/// flicker-prone.
+/// Dwell for Idle and Error is shorter because these are terminal
+/// states and far less flicker-prone. Still non-zero to absorb the
+/// 2s poll-loop update boundary.
 pub const DWELL_TERMINAL_MS: u64 = 2_000;
 
-/// Post-send cooldown per session.
+/// Post-send cooldown per session. After a push fires for a session,
+/// suppress further pushes until the session leaves the firing state
+/// OR this long has passed, whichever comes second.
 pub const COOLDOWN_MS: u64 = 60_000;
 
-/// Delay between hitting "Send test notification" and the server actually firing the push.
+/// Delay between hitting "Send test notification" and the server actually
+/// firing the push. Gives the user time to lock their phone so the
+/// notification lands on the Lock Screen instead of in the foreground
+/// app, which is what they actually want to verify.
 const TEST_DELAY_MS: u64 = 3_000;
 
 // ── VAPID keypair ───────────────────────────────────────────────────────────
 
-/// Persisted form of the VAPID keypair.
+/// Persisted form of the VAPID keypair. PKCS#8 PEM for the private key,
+/// base64url for the uncompressed public key (which is what the browser's
+/// `applicationServerKey` expects after base64url decoding).
 #[derive(Serialize, Deserialize)]
 pub struct VapidKeypairFile {
     pub private_pem: String,
@@ -51,7 +77,9 @@ pub struct VapidKeypair {
 }
 
 impl VapidKeypair {
-    /// Load from disk, or generate and persist a new keypair.
+    /// Load from disk, or generate and persist a new keypair. Uses an
+    /// exclusive file lock on `<path>.lock` to prevent two concurrent
+    /// `aoe serve` invocations from racing and producing two keypairs.
     pub fn load_or_generate(path: &Path) -> anyhow::Result<Self> {
         use fs2::FileExt;
         use std::fs::OpenOptions;
@@ -70,7 +98,8 @@ impl VapidKeypair {
             .open(&lock_path)?;
         lock_file.lock_exclusive()?;
 
-        // Re-check.
+        // Re-check: another process may have generated while we were
+        // waiting for the lock.
         if path.exists() {
             if let Err(e) = FileExt::unlock(&lock_file) {
                 tracing::debug!(target: "http.middleware", "Failed to release lock file: {e}");
@@ -103,7 +132,8 @@ impl VapidKeypair {
             .to_pkcs8_pem(p256::pkcs8::LineEnding::LF)?
             .to_string();
 
-        // Public key in uncompressed SEC1 form, base64url encoded.
+        // Public key in uncompressed SEC1 form, base64url encoded. This
+        // is the shape browsers expect for applicationServerKey.
         let public_bytes = verifying_key.to_encoded_point(false);
         let public_b64url = base64_url_encode(public_bytes.as_bytes());
 
@@ -151,20 +181,30 @@ impl VapidKeypair {
 
 // ── Subscription store ──────────────────────────────────────────────────────
 
-/// A browser push subscription.
+/// A browser push subscription. Fields mirror the browser-side
+/// `PushSubscription.toJSON()` with added ownership and bookkeeping.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Subscription {
     pub endpoint: String,
     pub p256dh: String,
     pub auth: String,
-    /// SHA-256 of the bearer token at the time of subscribe.
+    /// SHA-256 of the bearer token at the time of subscribe. Pushes and
+    /// mutations only fire for subscriptions whose hash matches the
+    /// current (or grace-period) token.
     pub owner_token_hash: [u8; 32],
     pub user_agent: String,
     pub created_at: DateTime<Utc>,
-    /// Monotonic counter for optimistic-lock GC.
+    /// Monotonic counter for optimistic-lock GC: the send path snapshots
+    /// the generation before sending; the GC path removes only if the
+    /// counter still matches. Prevents wiping a freshly re-subscribed
+    /// entry when a concurrent send returns 410.
     pub generation: u64,
-    /// Origin (scheme + host + optional port) the subscriber registered from, e.g.
-    /// `http://localhost:42041` or `https://aoe.example.com`.
+    /// Origin (scheme + host + optional port) the subscriber registered
+    /// from, e.g. `http://localhost:42041` or `https://aoe.example.com`.
+    /// Used to build absolute URLs in push payloads so the SW's
+    /// `clients.openWindow` resolves to the right deployment regardless
+    /// of its registration scope. Empty on legacy entries that predate
+    /// #1188; the send path skips those with a one-time info log.
     #[serde(default)]
     pub origin: String,
 }
@@ -231,8 +271,9 @@ impl SubscriptionStore {
         Ok(removed)
     }
 
-    /// GC a subscription following a push-endpoint 410/404, gated on the generation counter
-    /// so we don't wipe an entry that was re-subscribed while the send was in flight.
+    /// GC a subscription following a push-endpoint 410/404, gated on the
+    /// generation counter so we don't wipe an entry that was re-subscribed
+    /// while the send was in flight.
     pub async fn gc_stale(&self, endpoint: &str, observed_generation: u64) -> anyhow::Result<bool> {
         let removed = {
             let mut guard = self.subs.write().await;
@@ -251,6 +292,8 @@ impl SubscriptionStore {
     }
 
     /// Drop any subscriptions whose owner hash is not in `valid`.
+    /// Called on token rotation once we know which hashes are
+    /// current-or-grace-period.
     pub async fn retain_owners(&self, valid: &[[u8; 32]]) -> anyhow::Result<usize> {
         let removed = {
             let mut guard = self.subs.write().await;
@@ -264,7 +307,8 @@ impl SubscriptionStore {
         Ok(removed)
     }
 
-    /// Hold the store's lock, stalling every store operation until the guard drops.
+    /// Hold the store's lock, stalling every store operation until the guard
+    /// drops.
     #[cfg(test)]
     pub(crate) async fn hold_for_test(
         &self,
@@ -293,15 +337,23 @@ impl SubscriptionStore {
 pub struct PushState {
     pub vapid: VapidKeypair,
     pub store: SubscriptionStore,
-    /// VAPID `sub:` claim identifying the sending application.
+    /// VAPID `sub:` claim identifying the sending application. Must be
+    /// either `mailto:` or an `https://` URL per the spec. Not strongly
+    /// validated by push endpoints in practice.
     pub subject: String,
-    /// Shared `SEND_CONCURRENCY` budget across the consumer-driven (`fire_due_pushes`) and
-    /// wake-fire (`fire_wake_fired_push`) fan-out paths, so a session with many subscribers
-    /// cannot fan out beyond the gateway concurrency the consumer pipeline expects.
+    /// Shared `SEND_CONCURRENCY` budget across the consumer-driven
+    /// (`fire_due_pushes`) and wake-fire (`fire_wake_fired_push`) fan-out
+    /// paths, so a session with many subscribers cannot fan out beyond
+    /// the gateway concurrency the consumer pipeline expects. The admin
+    /// test-push handler (`send_one` in the `/api/push/test` route) is
+    /// intentionally ungated since it is a one-shot user-triggered send.
     pub send_semaphore: std::sync::Arc<tokio::sync::Semaphore>,
 }
 
-/// VAPID `sub` claim (RFC 8292).
+/// VAPID `sub` claim (RFC 8292). Spec requires a `mailto:` or `https://`
+/// URL but does not require deliverability; major push services do not
+/// validate this for reachability in practice. We use the project's
+/// public URL so providers that do care have somewhere real to reach.
 pub const VAPID_SUBJECT: &str = "https://github.com/agent-of-empires/agent-of-empires";
 
 impl PushState {
@@ -331,7 +383,10 @@ pub fn base64_url_decode(s: &str) -> Result<Vec<u8>, base64::DecodeError> {
 
 // ── Consumer task ───────────────────────────────────────────────────────────
 
-/// Push-notification event types that the consumer can fire.
+/// Push-notification event types that the consumer can fire. Each
+/// has its own server-wide default (in WebConfig) and a per-session
+/// override (in Instance). The dwell requirement also varies by kind:
+/// Waiting uses a longer dwell since Claude often pauses briefly.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum NotificationEvent {
     Waiting,
@@ -352,28 +407,34 @@ impl NotificationEvent {
 /// requirement and the post-send cooldown per event type.
 #[derive(Default)]
 struct DwellState {
-    /// When the session most recently entered Waiting.
+    /// When the session most recently entered Waiting. None if not
+    /// currently waiting.
     waiting_since: Option<std::time::Instant>,
     /// When the session most recently entered Idle.
     idle_since: Option<std::time::Instant>,
     /// When the session most recently entered Error.
     error_since: Option<std::time::Instant>,
-    /// Last time a push fired for this session (any event type).
+    /// Last time a push fired for this session (any event type). Used
+    /// for a shared per-session cooldown: rapid-fire events like
+    /// Error → brief Running → Error don't double-buzz.
     last_notified: Option<std::time::Instant>,
     /// Cached title for the payload body.
     title: String,
 }
 
-/// Max concurrent push sends.
+/// Max concurrent push sends. Caps the number of parallel outbound
+/// HTTP requests the consumer will hold open; above this, sends queue
+/// behind the semaphore and are processed in FIFO order.
 pub const SEND_CONCURRENCY: usize = 8;
 
-/// Spawn the consumer task.
-pub fn spawn_consumer(state: std::sync::Arc<super::AppState>) {
+/// Apply status dwell and cooldown before dispatching push notifications.
+pub async fn spawn_consumer(state: std::sync::Arc<super::AppState>) {
     if state.push.is_none() {
         return; // feature disabled, nothing to spawn
     }
 
-    tokio::spawn(async move {
+    let work = state.runtime.work.clone();
+    work.spawn("server.push_consumer", async move {
         let client = match super::push_send::build_client() {
             Ok(c) => c,
             Err(e) => {
@@ -393,13 +454,16 @@ pub fn spawn_consumer(state: std::sync::Arc<super::AppState>) {
         // instead of every 500ms tick while the dashboard is open.
         let mut last_suppress_reason: Option<&'static str> = None;
 
-        // Interleave receiving status changes with polling the dwell map for sessions whose
-        // dwell window has elapsed.
+        // Interleave receiving status changes with polling the dwell
+        // map for sessions whose dwell window has elapsed. A simple
+        // 500ms tick is precise enough and cheap.
         let mut tick = tokio::time::interval(std::time::Duration::from_millis(500));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
             tokio::select! {
+                biased;
+                _ = state.shutdown.cancelled() => return,
                 recv = rx.recv() => {
                     match recv {
                         Ok(change) => handle_status_change(&mut dwell, change),
@@ -416,10 +480,6 @@ pub fn spawn_consumer(state: std::sync::Arc<super::AppState>) {
                 _ = tick.tick() => {
                     fire_due_pushes(state.clone(), &client, &semaphore, &mut dwell, &mut last_suppress_reason).await;
                 }
-                _ = state.shutdown.cancelled() => {
-                    tracing::info!(target: "http.middleware", "push: shutdown signaled, consumer exiting");
-                    return;
-                }
             }
         }
     });
@@ -429,7 +489,10 @@ fn handle_status_change(dwell: &mut HashMap<String, DwellState>, change: StatusC
     let entry = dwell.entry(change.instance_id.clone()).or_default();
     entry.title = change.instance_title;
     let now = std::time::Instant::now();
-    // Exactly one `*_since` is set at a time.
+    // Exactly one `*_since` is set at a time: the current state's timer.
+    // Transitioning clears the others. Each fresh entry into a fire-worthy
+    // state resets that state's dwell timer (a flicker Waiting → Running →
+    // Waiting restarts the 5s clock, which is what we want).
     entry.waiting_since = None;
     entry.idle_since = None;
     entry.error_since = None;
@@ -439,8 +502,9 @@ fn handle_status_change(dwell: &mut HashMap<String, DwellState>, change: StatusC
         Status::Error => entry.error_since = Some(now),
         _ => {}
     }
-    // Drop entries for transitions into Stopped/Deleting so the map doesn't grow forever in
-    // long-running servers that create and destroy many sessions.
+    // Drop entries for transitions into Stopped/Deleting so the map
+    // doesn't grow forever in long-running servers that create and
+    // destroy many sessions.
     if matches!(change.new, Status::Stopped | Status::Deleting) {
         dwell.remove(&change.instance_id);
     }
@@ -467,8 +531,10 @@ fn should_fire(
     override_val.unwrap_or(global)
 }
 
-/// A status event can sit in the dwell map while a concurrent user action trashes its
-/// session.
+/// A status event can sit in the dwell map while a concurrent user action
+/// trashes its session. The status poller also sees a deliberately torn-down
+/// tmux pane briefly. Check the current row before delivery so neither race
+/// can turn a trashed session into a false "errored" notification.
 fn notification_matches_live_instance(
     event: NotificationEvent,
     instance: &crate::session::Instance,
@@ -496,7 +562,12 @@ async fn fire_due_pushes(
     };
     let push = push.clone();
 
-    // Suppress pushes when the user is actively using aoe (TUI or web dashboard).
+    // Suppress pushes when the user is actively using aoe (TUI or web
+    // dashboard). They can already see session state changes in real
+    // time, so OS-level push notifications are noise. Checked BEFORE
+    // the dwell collection loop so that dwell timers are preserved:
+    // when the user stops using aoe, any session that has been waiting
+    // past the dwell threshold fires on the next tick.
     let suppress_reason = if crate::session::is_tui_active(std::time::Duration::from_secs(30)) {
         Some("TUI is active")
     } else if app_state.web_active_within(std::time::Duration::from_secs(30)) {
@@ -504,7 +575,8 @@ async fn fire_due_pushes(
     } else {
         None
     };
-    // Only log on transitions.
+    // Only log on transitions: entering a new suppression reason or
+    // resuming after suppression ends. Otherwise this fires every 500ms.
     if suppress_reason != *last_suppress_reason {
         match (*last_suppress_reason, suppress_reason) {
             (None, Some(reason)) => {
@@ -525,18 +597,23 @@ async fn fire_due_pushes(
     }
 
     let now = std::time::Instant::now();
-    // Collect (instance_id, title, event) tuples to fire.
+    // Collect (instance_id, title, event) tuples to fire. Firing mutates
+    // the dwell map (clear `*_since`, set `last_notified`) so we collect
+    // before sending to avoid holding a borrow across the await boundary.
     let mut to_fire: Vec<(String, String, NotificationEvent)> = Vec::new();
 
     for (id, state) in dwell.iter_mut() {
-        // Cooldown gates ALL event types for this session.
+        // Cooldown gates ALL event types for this session. Rapid
+        // oscillation Error → Running → Error shouldn't double-buzz.
         if let Some(last) = state.last_notified {
             if now.duration_since(last).as_millis() < COOLDOWN_MS as u128 {
                 continue;
             }
         }
 
-        // Evaluate each event in priority order.
+        // Evaluate each event in priority order. At most one *_since is
+        // set at any time (handle_status_change maintains this), so this
+        // loop terminates early with a single fire or zero fires.
         let checks = [
             (NotificationEvent::Waiting, state.waiting_since),
             (NotificationEvent::Error, state.error_since),
@@ -566,9 +643,11 @@ async fn fire_due_pushes(
     let web_config = app_state.web_config.clone();
 
     for (instance_id, instance_title, event) in to_fire {
-        // If the instance vanished (externally deleted, tmux killed, storage file
-        // hand-edited) between the dwell timer starting and firing, skip rather than
-        // sending a notification that deep-links to a 404.
+        // If the instance vanished (externally deleted, tmux killed,
+        // storage file hand-edited) between the dwell timer starting
+        // and firing, skip rather than sending a notification that
+        // deep-links to a 404. Also drop the dwell entry so we don't
+        // keep retrying every tick forever.
         let Some(instance) = instances.iter().find(|i| i.id == instance_id) else {
             dwell.remove(&instance_id);
             continue;
@@ -581,8 +660,12 @@ async fn fire_due_pushes(
         }
 
         // Acp approval and question pushes are dispatched immediately from
-        // `acp_event_listener` with their own tags and bypass the TUI/web active-session
-        // suppression.
+        // `acp_event_listener` with their own tags and bypass the
+        // TUI/web active-session suppression. If the session has any
+        // unresolved structured view approval or elicitation, the user has
+        // already been notified through that channel; a second
+        // status-change push five seconds later for the same underlying
+        // event would just be noise. See #1038, #2146.
         if event == NotificationEvent::Waiting
             && (!app_state
                 .acp_event_store
@@ -628,7 +711,7 @@ async fn fire_due_pushes(
                 tag: tag.clone(),
                 session_id: instance_id.clone(),
             };
-            tokio::spawn(async move {
+            app_state.runtime.work.spawn("server.push_send", async move {
                 let Ok(_permit) = permit_sem.acquire_owned().await else {
                     return;
                 };
@@ -645,7 +728,15 @@ async fn fire_due_pushes(
 }
 
 /// Fire a one-shot push notification when a structured view session's pending
-/// `ScheduleWakeup` actually triggers.
+/// `ScheduleWakeup` actually triggers. Called from the structured view event
+/// listener when a `UserPromptSent` arrives while a `WakeupScheduled`
+/// is the most recent un-fired wakeup for the session. Bypasses the
+/// dwell/cooldown machinery the status-change consumer uses because
+/// the wake fire is already a discrete event, not a sticky state.
+///
+/// Respects the same active-use suppression as `fire_due_pushes` (TUI
+/// open within the last 30s OR the web dashboard active within 30s),
+/// and the server-wide `web.notify_on_wake_fire` opt-out. See #1091.
 pub async fn fire_wake_fired_push(
     state: std::sync::Arc<super::AppState>,
     session_id: &str,
@@ -717,10 +808,7 @@ pub async fn fire_wake_fired_push(
             tag: tag.clone(),
             session_id: session_id.to_string(),
         };
-        tokio::spawn(async move {
-            // Acquire from the same SEND_CONCURRENCY budget that `spawn_consumer`'s
-            // fire_due_pushes uses, so a wake fire with many subscribers cannot outrun the
-            // gateway concurrency cap the rest of the pipeline expects.
+        state.runtime.work.spawn("server.wake_push", async move {
             let Ok(_permit) = permit_sem.acquire_owned().await else {
                 return;
             };
@@ -735,8 +823,14 @@ pub async fn fire_wake_fired_push(
     }
 }
 
-/// Build an absolute URL for a push payload by joining the subscription's recorded origin
-/// with a leading-slash path.
+/// Build an absolute URL for a push payload by joining the
+/// subscription's recorded origin with a leading-slash path. Returns
+/// `None` for legacy subscriptions with no origin recorded (predate
+/// #1188): the caller should skip those entries and rely on the
+/// re-subscribe affordance in the UI to refresh the entry.
+///
+/// One info log per call site fires once we hit an empty-origin
+/// subscription so the operator can see why pushes are being dropped.
 pub fn build_push_url(sub: &Subscription, path: &str) -> Option<String> {
     if sub.origin.is_empty() {
         tracing::info!(
@@ -775,7 +869,8 @@ use std::sync::Arc;
 use super::auth::AuthenticatedTokenHash;
 use super::AppState;
 
-/// Body accepted by POST /api/push/subscribe.
+/// Body accepted by POST /api/push/subscribe. Mirrors the browser's
+/// `PushSubscription.toJSON()` output.
 #[derive(Deserialize)]
 pub struct SubscribeBody {
     pub endpoint: String,
@@ -800,13 +895,17 @@ pub struct TestResult {
     pub gone: u32,
 }
 
-/// GET /api/push/status Tells the client whether the feature is enabled server-wide.
+/// GET /api/push/status
+/// Tells the client whether the feature is enabled server-wide. Cheap,
+/// no secrets: used by the UI on mount to decide whether to show the
+/// Enable button or the "disabled by operator" state.
 pub async fn get_status(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     Json(serde_json::json!({ "enabled": state.push_enabled }))
 }
 
-/// GET /api/push/vapid-public-key Returns the base64url-encoded raw public key for the
-/// browser's `pushManager.subscribe({ applicationServerKey })` call.
+/// GET /api/push/vapid-public-key
+/// Returns the base64url-encoded raw public key for the browser's
+/// `pushManager.subscribe({ applicationServerKey })` call.
 pub async fn get_vapid_public_key(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
@@ -816,15 +915,26 @@ pub async fn get_vapid_public_key(
     ))
 }
 
-/// POST /api/push/subscribe Stores a browser subscription, binding it to the requesting
-/// token's hash.
+/// POST /api/push/subscribe
+/// Stores a browser subscription, binding it to the requesting token's
+/// hash. Idempotent: re-subscribing the same endpoint updates the stored
+/// keys/user-agent and bumps the generation counter (the GC path uses
+/// that counter to avoid wiping freshly-re-subscribed entries when a
+/// concurrent 410 arrives for the old generation).
 pub async fn subscribe(
     State(state): State<Arc<AppState>>,
-    Extension(auth): Extension<AuthenticatedTokenHash>,
+    auth: Option<Extension<AuthenticatedTokenHash>>,
     headers: HeaderMap,
     body: Result<Json<SubscribeBody>, axum::extract::rejection::JsonRejection>,
 ) -> Result<StatusCode, axum::response::Response> {
     use axum::response::IntoResponse;
+    let Some(Extension(auth)) = auth else {
+        return Err((
+            StatusCode::CONFLICT,
+            "Push subscriptions require browser ownership",
+        )
+            .into_response());
+    };
     if state.read_only {
         return Err(StatusCode::FORBIDDEN.into_response());
     }
@@ -864,7 +974,13 @@ pub async fn subscribe(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Extract the client's origin (scheme + host + optional port) from the request headers.
+/// Extract the client's origin (scheme + host + optional port) from the
+/// request headers. Prefers the `Origin` header (sent by browsers on
+/// fetch() and cross-origin requests, and on same-origin POSTs with a
+/// JSON body, which covers /api/push/subscribe). Falls back to building
+/// from `X-Forwarded-Proto` + `Host` for reverse-proxy deployments
+/// (Cloudflare, nginx, Traefik) where `Origin` may be stripped. Returns
+/// `None` when neither produces a usable value. See #1188.
 pub fn extract_request_origin(headers: &HeaderMap) -> Option<String> {
     let origin_header = headers
         .get(axum::http::header::ORIGIN)
@@ -887,13 +1003,23 @@ pub fn extract_request_origin(headers: &HeaderMap) -> Option<String> {
     Some(format!("{scheme}://{host}"))
 }
 
-/// POST /api/push/unsubscribe Removes a subscription by endpoint.
+/// POST /api/push/unsubscribe
+/// Removes a subscription by endpoint. Requires owner match: cross-token
+/// attempts return 403 (intentionally visible: helps debug "why isn't
+/// my disable working" without leaking whether the endpoint exists).
 pub async fn unsubscribe(
     State(state): State<Arc<AppState>>,
-    Extension(auth): Extension<AuthenticatedTokenHash>,
+    auth: Option<Extension<AuthenticatedTokenHash>>,
     body: Result<Json<EndpointBody>, axum::extract::rejection::JsonRejection>,
 ) -> Result<StatusCode, axum::response::Response> {
     use axum::response::IntoResponse;
+    let Some(Extension(auth)) = auth else {
+        return Err((
+            StatusCode::CONFLICT,
+            "Push subscriptions require browser ownership",
+        )
+            .into_response());
+    };
     if state.read_only {
         return Err(StatusCode::FORBIDDEN.into_response());
     }
@@ -914,18 +1040,29 @@ pub async fn unsubscribe(
         Ok(StatusCode::NO_CONTENT)
     } else {
         // Either the endpoint doesn't exist or belongs to another owner.
+        // Return 403 rather than 204 so clients know the call did nothing.
         Err(StatusCode::FORBIDDEN.into_response())
     }
 }
 
-/// POST /api/push/test Fires a single notification to the given endpoint (which MUST belong
-/// to the caller).
+/// POST /api/push/test
+/// Fires a single notification to the given endpoint (which MUST belong
+/// to the caller). Used by the "Send test notification" button. No
+/// fire-to-all fallback: that would let any authenticated caller spam
+/// every subscriber.
 pub async fn test(
     State(state): State<Arc<AppState>>,
-    Extension(auth): Extension<AuthenticatedTokenHash>,
+    auth: Option<Extension<AuthenticatedTokenHash>>,
     body: Result<Json<EndpointBody>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Json<TestResult>, axum::response::Response> {
     use axum::response::IntoResponse;
+    let Some(Extension(auth)) = auth else {
+        return Err((
+            StatusCode::CONFLICT,
+            "Push subscriptions require browser ownership",
+        )
+            .into_response());
+    };
     if state.read_only {
         return Err(StatusCode::FORBIDDEN.into_response());
     }
@@ -938,7 +1075,8 @@ pub async fn test(
         return Err(StatusCode::BAD_REQUEST.into_response());
     }
 
-    // Confirm ownership before doing anything.
+    // Confirm ownership before doing anything. Reject cross-owner test
+    // calls with 403 even if the subscription exists.
     let owned = push
         .store
         .for_owner(&auth.0)
@@ -958,7 +1096,8 @@ pub async fn test(
     };
 
     let Some(url) = build_push_url(&subscription, "/") else {
-        // Stale subscription with no recorded origin.
+        // Stale subscription with no recorded origin. Test path can't be
+        // useful without an absolute URL; ask the user to re-subscribe.
         tracing::info!(
             target: "push",
             endpoint = %subscription.endpoint,
@@ -988,8 +1127,9 @@ pub async fn test(
         super::push_send::SendOutcome::Failed => result.failed = 1,
         super::push_send::SendOutcome::Gone => {
             result.gone = 1;
-            // Best-effort GC; the result still reports gone=1 even if GC races with a
-            // re-subscribe (that's what the generation counter in gc_stale prevents).
+            // Best-effort GC; the result still reports gone=1 even if GC
+            // races with a re-subscribe (that's what the generation
+            // counter in gc_stale prevents).
             if let Err(e) = push
                 .store
                 .gc_stale(&body.endpoint, subscription.generation)
@@ -1123,65 +1263,88 @@ mod tests {
         assert_eq!(store.snapshot().await.len(), 0);
     }
 
-    /// The push URL's origin comes from the Origin header when the browser sent one,
-    /// otherwise from the proxy's forwarded scheme plus Host. A `null` Origin (an opaque
-    /// context) is no signal, and a forwarded-proto chain names its first hop.
     #[test]
-    fn extract_request_origin_prefers_origin_then_forwarded_host() {
-        let origin = |headers: &[(&str, &str)]| {
-            let mut h = HeaderMap::new();
-            for (name, value) in headers {
-                h.insert(
-                    axum::http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
-                    value.parse().unwrap(),
-                );
-            }
-            extract_request_origin(&h)
-        };
-        let host = ("host", "aoe.example.com");
+    fn extract_origin_prefers_origin_header() {
+        let mut h = HeaderMap::new();
+        h.insert(
+            axum::http::header::ORIGIN,
+            "http://localhost:42041".parse().unwrap(),
+        );
+        h.insert(axum::http::header::HOST, "ignored.example".parse().unwrap());
+        assert_eq!(
+            extract_request_origin(&h).as_deref(),
+            Some("http://localhost:42041")
+        );
+    }
 
-        type Case<'a> = (&'a str, &'a [(&'a str, &'a str)], Option<&'a str>);
-        let cases: &[Case] = &[
-            (
-                "origin wins over host",
-                &[
-                    ("origin", "http://localhost:42041"),
-                    ("host", "ignored.example"),
-                ],
-                Some("http://localhost:42041"),
-            ),
-            (
-                "trailing slash trimmed",
-                &[("origin", "https://aoe.example.com/")],
-                Some("https://aoe.example.com"),
-            ),
-            (
-                "null origin falls back to host",
-                &[("origin", "null"), host],
-                Some("https://aoe.example.com"),
-            ),
-            (
-                "forwarded proto",
-                &[("x-forwarded-proto", "https"), host],
-                Some("https://aoe.example.com"),
-            ),
-            (
-                "forwarded proto chain takes the first hop",
-                &[("x-forwarded-proto", "https, http"), host],
-                Some("https://aoe.example.com"),
-            ),
-            (
-                "host alone defaults to https",
-                &[host],
-                Some("https://aoe.example.com"),
-            ),
-            ("no signal", &[], None),
-        ];
-        for (name, headers, want) in cases {
-            assert_eq!(origin(headers).as_deref(), *want, "{name}");
-        }
+    #[test]
+    fn extract_origin_trims_trailing_slash_from_origin_header() {
+        let mut h = HeaderMap::new();
+        h.insert(
+            axum::http::header::ORIGIN,
+            "https://aoe.example.com/".parse().unwrap(),
+        );
+        assert_eq!(
+            extract_request_origin(&h).as_deref(),
+            Some("https://aoe.example.com")
+        );
+    }
 
-        let with_origin = |origin: &str| Subscription {
+    #[test]
+    fn extract_origin_ignores_null_origin() {
+        let mut h = HeaderMap::new();
+        h.insert(axum::http::header::ORIGIN, "null".parse().unwrap());
+        h.insert(axum::http::header::HOST, "aoe.example.com".parse().unwrap());
+        // Falls back to Host + default scheme.
+        assert_eq!(
+            extract_request_origin(&h).as_deref(),
+            Some("https://aoe.example.com")
+        );
+    }
+
+    #[test]
+    fn extract_origin_falls_back_to_forwarded_proto_and_host() {
+        let mut h = HeaderMap::new();
+        h.insert("x-forwarded-proto", "https".parse().unwrap());
+        h.insert(axum::http::header::HOST, "aoe.example.com".parse().unwrap());
+        assert_eq!(
+            extract_request_origin(&h).as_deref(),
+            Some("https://aoe.example.com")
+        );
+    }
+
+    #[test]
+    fn extract_origin_forwarded_proto_handles_chained_values() {
+        // X-Forwarded-Proto can carry a comma-separated chain when there
+        // are multiple proxies in front. Take the first value.
+        let mut h = HeaderMap::new();
+        h.insert("x-forwarded-proto", "https, http".parse().unwrap());
+        h.insert(axum::http::header::HOST, "aoe.example.com".parse().unwrap());
+        assert_eq!(
+            extract_request_origin(&h).as_deref(),
+            Some("https://aoe.example.com")
+        );
+    }
+
+    #[test]
+    fn extract_origin_defaults_scheme_to_https_when_only_host_set() {
+        let mut h = HeaderMap::new();
+        h.insert(axum::http::header::HOST, "aoe.example.com".parse().unwrap());
+        assert_eq!(
+            extract_request_origin(&h).as_deref(),
+            Some("https://aoe.example.com")
+        );
+    }
+
+    #[test]
+    fn extract_origin_returns_none_when_no_signal() {
+        let h = HeaderMap::new();
+        assert_eq!(extract_request_origin(&h), None);
+    }
+
+    #[test]
+    fn build_push_url_joins_origin_and_path() {
+        let sub = Subscription {
             endpoint: "https://push.example/abc".into(),
             p256dh: "pk".into(),
             auth: "auth".into(),
@@ -1189,65 +1352,110 @@ mod tests {
             user_agent: "UA".into(),
             created_at: Utc::now(),
             generation: 0,
-            origin: origin.into(),
+            origin: "http://localhost:42041".into(),
         };
         assert_eq!(
-            build_push_url(&with_origin("http://localhost:42041"), "/session/abc").as_deref(),
+            build_push_url(&sub, "/session/abc").as_deref(),
             Some("http://localhost:42041/session/abc")
         );
-        assert_eq!(
-            build_push_url(&with_origin("https://aoe.example.com/"), "/").as_deref(),
-            Some("https://aoe.example.com/")
-        );
-        assert_eq!(build_push_url(&with_origin(""), "/session/abc"), None);
     }
 
-    /// Each notifiable status owns one dwell clock: entering a status starts its clock
-    /// and stops the others, and leaving the notifiable statuses altogether drops the
-    /// entry so a stopped session cannot fire later.
     #[test]
-    fn dwell_tracks_one_clock_per_status_and_drops_on_stopped() {
+    fn build_push_url_trims_origin_trailing_slash() {
+        let sub = Subscription {
+            endpoint: "https://push.example/abc".into(),
+            p256dh: "pk".into(),
+            auth: "auth".into(),
+            owner_token_hash: [1u8; 32],
+            user_agent: "UA".into(),
+            created_at: Utc::now(),
+            generation: 0,
+            origin: "https://aoe.example.com/".into(),
+        };
+        assert_eq!(
+            build_push_url(&sub, "/").as_deref(),
+            Some("https://aoe.example.com/")
+        );
+    }
+
+    #[test]
+    fn build_push_url_none_for_empty_origin() {
+        let sub = Subscription {
+            endpoint: "https://push.example/abc".into(),
+            p256dh: "pk".into(),
+            auth: "auth".into(),
+            owner_token_hash: [1u8; 32],
+            user_agent: "UA".into(),
+            created_at: Utc::now(),
+            generation: 0,
+            origin: String::new(),
+        };
+        assert_eq!(build_push_url(&sub, "/session/abc"), None);
+    }
+
+    #[test]
+    fn dwell_starts_on_enter_waiting_and_clears_on_exit() {
         let mut dwell: HashMap<String, DwellState> = HashMap::new();
         let id = "sess-1".to_string();
-        let mut step = |old: Status, new: Status| {
-            handle_status_change(
-                &mut dwell,
-                StatusChange {
-                    instance_id: id.clone(),
-                    instance_title: "my session".to_string(),
-                    old,
-                    new,
-                    at: Utc::now(),
-                },
-            );
-            dwell.get(&id).map(|s| {
-                (
-                    s.title.clone(),
-                    s.waiting_since.is_some(),
-                    s.idle_since.is_some(),
-                    s.error_since.is_some(),
-                )
-            })
+
+        // Enter Waiting: dwell starts.
+        handle_status_change(
+            &mut dwell,
+            StatusChange {
+                instance_id: id.clone(),
+                instance_title: "my session".to_string(),
+                old: Status::Running,
+                new: Status::Waiting,
+                at: Utc::now(),
+            },
+        );
+        assert!(dwell.get(&id).unwrap().waiting_since.is_some());
+        assert_eq!(dwell.get(&id).unwrap().title, "my session");
+
+        // Leave Waiting: dwell clears (but entry still exists so
+        // last_notified survives for cooldown checking).
+        handle_status_change(
+            &mut dwell,
+            StatusChange {
+                instance_id: id.clone(),
+                instance_title: "my session".to_string(),
+                old: Status::Waiting,
+                new: Status::Running,
+                at: Utc::now(),
+            },
+        );
+        assert!(dwell.get(&id).unwrap().waiting_since.is_none());
+    }
+
+    #[test]
+    fn dwell_switches_between_event_types() {
+        let mut dwell: HashMap<String, DwellState> = HashMap::new();
+        let id = "sess-3".to_string();
+        let ev = |new: Status| StatusChange {
+            instance_id: id.clone(),
+            instance_title: "s".into(),
+            old: Status::Running,
+            new,
+            at: Utc::now(),
         };
 
-        let title = "my session".to_string();
-        assert_eq!(
-            step(Status::Running, Status::Waiting),
-            Some((title.clone(), true, false, false))
-        );
-        assert_eq!(
-            step(Status::Waiting, Status::Error),
-            Some((title.clone(), false, false, true))
-        );
-        assert_eq!(
-            step(Status::Error, Status::Idle),
-            Some((title.clone(), false, true, false))
-        );
-        assert_eq!(
-            step(Status::Idle, Status::Running),
-            Some((title, false, false, false))
-        );
-        assert_eq!(step(Status::Running, Status::Stopped), None);
+        handle_status_change(&mut dwell, ev(Status::Waiting));
+        let s = dwell.get(&id).unwrap();
+        assert!(s.waiting_since.is_some());
+        assert!(s.idle_since.is_none());
+        assert!(s.error_since.is_none());
+
+        handle_status_change(&mut dwell, ev(Status::Error));
+        let s = dwell.get(&id).unwrap();
+        assert!(s.waiting_since.is_none());
+        assert!(s.idle_since.is_none());
+        assert!(s.error_since.is_some());
+
+        handle_status_change(&mut dwell, ev(Status::Idle));
+        let s = dwell.get(&id).unwrap();
+        assert!(s.waiting_since.is_none());
+        assert!(s.idle_since.is_some());
+        assert!(s.error_since.is_none());
     }
 
     #[test]
@@ -1303,11 +1511,40 @@ mod tests {
             &inst
         ));
 
-        // Trash deliberately stops the pane.
+        // Trash deliberately stops the pane. A late poll result must not turn
+        // that teardown into a false error notification.
         inst.trash();
         assert!(!notification_matches_live_instance(
             NotificationEvent::Waiting,
             &inst
         ));
+    }
+
+    #[test]
+    fn dwell_entry_drops_on_stopped() {
+        let mut dwell: HashMap<String, DwellState> = HashMap::new();
+        let id = "sess-2".to_string();
+        handle_status_change(
+            &mut dwell,
+            StatusChange {
+                instance_id: id.clone(),
+                instance_title: "s".to_string(),
+                old: Status::Running,
+                new: Status::Waiting,
+                at: Utc::now(),
+            },
+        );
+        assert!(dwell.contains_key(&id));
+        handle_status_change(
+            &mut dwell,
+            StatusChange {
+                instance_id: id.clone(),
+                instance_title: "s".to_string(),
+                old: Status::Waiting,
+                new: Status::Stopped,
+                at: Utc::now(),
+            },
+        );
+        assert!(!dwell.contains_key(&id));
     }
 }

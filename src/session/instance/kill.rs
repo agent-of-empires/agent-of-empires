@@ -1,39 +1,26 @@
 //! Tearing a session down.
 
 use super::*;
+pub(crate) struct PiSidecarUpdate {
+    session_id: Option<String>,
+    path: Option<String>,
+}
 
-impl Instance {
-    pub(super) fn flush_published_if_present(&mut self) {
-        if !self.uses_pi_session_sidecar()
-            && !matches!(
-                self.active_execution
-                    .as_ref()
-                    .and_then(|active| active.capture.as_ref()),
-                Some(CaptureContext::Hooks(_))
-            )
-        {
-            return;
+impl PiSidecarUpdate {
+    pub(crate) fn apply(self, instance: &mut Instance) {
+        if let Some(id) = self.session_id {
+            instance.agent_session_id = Some(id);
         }
-        let profile = self.effective_profile();
-        let Ok(storage) =
-            crate::session::storage::Storage::new(&profile, self.resolve_file_watch())
-        else {
-            return;
-        };
-        if self.flush_published_conversation(&storage) == Some(SidWrite::Failed) {
-            tracing::warn!(target: "session.store", instance = %self.id, "could not persist final conversation publication");
-            return;
-        }
-        if let Ok(instances) = storage.load() {
-            if let Some(row) = instances.iter().find(|i| i.id == self.id) {
-                self.adopt_conversation_state(row.conversation_state());
-            }
+        if let Some(path) = self.path {
+            instance.pi_session_path = Some(path);
         }
     }
+}
 
+impl Instance {
     pub(crate) fn flush_published_conversation(
         &self,
-        storage: &crate::session::storage::Storage,
+        storage: &dyn crate::session::SessionStore,
     ) -> Option<SidWrite> {
         let observation = self.final_publication_observation()?;
         if self.is_capture_excluded(&observation.sid, observation.source.as_ref()) {
@@ -103,8 +90,42 @@ impl Instance {
         }
     }
 
-    /// Tear down the current tmux session cleanly so a fresh `start_with_size_opts` can recreate
-    /// it.
+    pub(crate) fn read_pi_sidecar_update(&self) -> Option<PiSidecarUpdate> {
+        if !self.uses_pi_session_sidecar() {
+            return None;
+        }
+        let observation = self.pi_published_conversation(true)?;
+        let published = observation.sid;
+        let path = observation.pi_session_path;
+        if self.agent_session_id.as_deref() == Some(published.as_str()) {
+            if path.is_none() || path == self.pi_session_path {
+                return None;
+            }
+            return Some(PiSidecarUpdate {
+                session_id: None,
+                path,
+            });
+        }
+        Some(PiSidecarUpdate {
+            session_id: Some(published),
+            path,
+        })
+    }
+
+    /// Tear down the current tmux session cleanly so a fresh
+    /// `start_with_size_opts` can recreate it.
+    ///
+    /// `remain-on-exit on` keeps the tmux session alive after the agent
+    /// process exits, leaving a frozen pane. The plain kill-session +
+    /// new-session flow can race against the session cache
+    /// (kill_process_tree on a defunct pid stalls on macOS, and the
+    /// subsequent kill can run while start's exists() check still sees the
+    /// cached entry), leaving the dead pane in place. Respawning the pane
+    /// into a shell first puts it back in a live state so the kill path
+    /// proceeds cleanly. The kill below then sees a live pane and tears it
+    /// down. Caller is responsible for the subsequent
+    /// `start_with_size_opts` to recreate the session with the agent
+    /// command.
     pub(super) fn kill_clean_locked(&self) -> Result<()> {
         let session = self.tmux_session()?;
         if !session.exists() {
@@ -130,7 +151,7 @@ impl Instance {
         Ok(())
     }
 
-    pub(crate) fn kill_clean(&self) -> Result<()> {
+    pub(crate) fn kill_clean(&self) -> Result<u64> {
         let profile = self.effective_profile();
         let storage = crate::session::storage::Storage::new(&profile, self.resolve_file_watch())
             .context("failed to open lifecycle lock storage")?;
@@ -138,17 +159,23 @@ impl Instance {
             .acquire_instance_lifecycle_lock(&self.id)
             .context("failed to acquire instance kill lock")?;
         let mut lifecycle = self.clone();
-        lifecycle.acquire_lifecycle_reservation(&storage, LifecycleOperation::Stop, None)?;
+        let generation =
+            lifecycle.acquire_lifecycle_reservation(&storage, LifecycleOperation::Stop, None)?;
         match self.kill_clean_locked() {
-            Ok(()) => lifecycle.commit_lifecycle_status(
-                &storage,
-                LifecycleOperation::Stop,
-                Status::Stopped,
-            ),
+            Ok(()) => {
+                lifecycle.commit_lifecycle_status(
+                    &storage,
+                    LifecycleOperation::Stop,
+                    generation,
+                    Status::Stopped,
+                )?;
+                Ok(generation)
+            }
             Err(error) => {
                 let _ = lifecycle.commit_lifecycle_status(
                     &storage,
                     LifecycleOperation::Stop,
+                    generation,
                     Status::Error,
                 );
                 Err(error)
@@ -158,11 +185,7 @@ impl Instance {
 
     pub(crate) fn kill_locked(&self) -> Result<()> {
         self.stop_poller();
-        let session = self.tmux_session()?;
-        if session.exists() {
-            session.kill()?;
-        }
-        Ok(())
+        self.tmux_session()?.kill()
     }
 
     pub fn kill(&self) -> Result<()> {
@@ -173,17 +196,20 @@ impl Instance {
             .acquire_instance_lifecycle_lock(&self.id)
             .context("failed to acquire instance kill lock")?;
         let mut lifecycle = self.clone();
-        lifecycle.acquire_lifecycle_reservation(&storage, LifecycleOperation::Stop, None)?;
+        let generation =
+            lifecycle.acquire_lifecycle_reservation(&storage, LifecycleOperation::Stop, None)?;
         match self.kill_locked() {
             Ok(()) => lifecycle.commit_lifecycle_status(
                 &storage,
                 LifecycleOperation::Stop,
+                generation,
                 Status::Stopped,
             ),
             Err(error) => {
                 let _ = lifecycle.commit_lifecycle_status(
                     &storage,
                     LifecycleOperation::Stop,
+                    generation,
                     Status::Error,
                 );
                 Err(error)
@@ -191,8 +217,7 @@ impl Instance {
         }
     }
 
-    /// Kill every tmux session owned by this instance (agent, web terminal, container terminal,
-    /// tool sub-sessions).
+    /// Best-effort coordinated stop of the agent and every ancillary tmux session.
     pub fn kill_all_tmux_sessions(&self) {
         let profile = self.effective_profile();
         let storage =
@@ -232,10 +257,20 @@ impl Instance {
             );
             return;
         }
-        self.kill_all_tmux_sessions_locked();
-        if let Err(error) =
-            lifecycle.commit_lifecycle_status(&storage, LifecycleOperation::Stop, Status::Stopped)
-        {
+        let stopped = self.kill_all_tmux_sessions_locked();
+        if let Err(error) = &stopped {
+            tracing::warn!(target: "session.tmux_cleanup", session_id = %self.id, %error, "tmux teardown failed");
+        }
+        if let Err(error) = lifecycle.commit_lifecycle_status(
+            &storage,
+            LifecycleOperation::Stop,
+            lifecycle.lifecycle_generation,
+            if stopped.is_ok() {
+                Status::Stopped
+            } else {
+                Status::Error
+            },
+        ) {
             tracing::warn!(
                 target: "session.tmux_cleanup",
                 session_id = %self.id,
@@ -245,33 +280,34 @@ impl Instance {
         }
     }
 
-    /// Kill every tmux session owned by this instance while the caller holds the selected profile's
-    /// per-instance lifecycle lock.
-    pub(crate) fn kill_all_tmux_sessions_locked(&self) {
-        self.kill_all_tmux_sessions_uncoordinated();
+    /// Caller holds the per-instance lifecycle lock through teardown and commit.
+    pub(crate) fn kill_all_tmux_sessions_locked(&self) -> Result<()> {
+        self.kill_all_tmux_sessions_uncoordinated()
     }
 
-    /// Tear down tmux resources when no durable lifecycle row exists.
-    pub(crate) fn kill_all_tmux_sessions_without_lifecycle_row(&self) {
-        self.kill_all_tmux_sessions_uncoordinated();
+    /// Caller has excluded launches for an id without a durable lifecycle row.
+    pub(crate) fn kill_all_tmux_sessions_without_lifecycle_row(&self) -> Result<()> {
+        self.kill_all_tmux_sessions_uncoordinated()
     }
 
-    fn kill_all_tmux_sessions_uncoordinated(&self) {
-        if let Err(e) = self.kill_locked() {
-            tracing::debug!(
-                target: "session.tmux_cleanup",
-                session_id = %self.id,
-                kind = "agent",
-                error = %e,
-                "kill_all_tmux_sessions_uncoordinated: kill failed"
-            );
+    fn kill_all_tmux_sessions_uncoordinated(&self) -> Result<()> {
+        // The ancillary sessions run their own processes, so they are reaped
+        // even when the agent kill fails: short-circuiting leaks a shell per
+        // failed kill. The agent failure is what the caller reports.
+        let agent = self.kill_locked();
+        let ancillary = self.kill_ancillary_tmux_sessions_locked();
+        match (agent, ancillary) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Ok(()), Err(ancillary)) => Err(ancillary).context("ancillary tmux teardown failed"),
+            (Err(agent), Ok(())) => Err(agent),
+            (Err(agent), Err(ancillary)) => Err(agent.context(format!(
+                "ancillary tmux teardown also failed: {ancillary:#}"
+            ))),
         }
-        self.kill_ancillary_tmux_sessions_locked();
     }
 
-    pub(crate) fn kill_ancillary_tmux_sessions_locked(&self) {
-        crate::tmux::kill_all_terminals_for_id(&self.id);
-        crate::tmux::kill_all_tool_sessions_for_id(&self.id);
+    pub(crate) fn kill_ancillary_tmux_sessions_locked(&self) -> Result<()> {
+        crate::tmux::utils::kill_ancillary_sessions_for_id(&self.id)
     }
 
     /// Kill every tmux session owned by this instance EXCEPT the agent
@@ -315,7 +351,9 @@ impl Instance {
             );
             return;
         }
-        self.kill_ancillary_tmux_sessions_locked();
+        if let Err(error) = self.kill_ancillary_tmux_sessions_locked() {
+            tracing::warn!(target: "session.tmux_cleanup", session_id = %self.id, %error, "ancillary tmux teardown failed");
+        }
         if let Err(error) =
             lifecycle.release_lifecycle_reservation(&storage, LifecycleOperation::Stop)
         {
@@ -326,6 +364,11 @@ impl Instance {
                 "kill_ancillary_tmux_sessions: lifecycle release failed"
             );
         }
+    }
+
+    pub(crate) fn stop_resources_locked(&self) -> Result<()> {
+        self.kill_locked()?;
+        crate::session::worktree_edit::stop_sandbox_container(&self.id, self.is_sandboxed())
     }
 
     /// Stop the session and its sandbox container under the same lifecycle
@@ -343,7 +386,8 @@ impl Instance {
             .find(|row| row.id == self.id)
             .context("session disappeared before stop")?;
         lifecycle.source_profile = profile.clone();
-        lifecycle.acquire_lifecycle_reservation(&storage, LifecycleOperation::Stop, None)?;
+        let generation =
+            lifecycle.acquire_lifecycle_reservation(&storage, LifecycleOperation::Stop, None)?;
         self.stop_poller();
         let teardown = lifecycle.kill_locked().and_then(|()| {
             let mut current = storage
@@ -378,8 +422,10 @@ impl Instance {
                 lifecycle.commit_lifecycle_status(
                     &storage,
                     LifecycleOperation::Stop,
+                    generation,
                     Status::Stopped,
                 )?;
+
                 crate::hooks::cleanup_hook_status_dir(&self.id);
                 Ok(())
             }
@@ -387,6 +433,7 @@ impl Instance {
                 let _ = lifecycle.commit_lifecycle_status(
                     &storage,
                     LifecycleOperation::Stop,
+                    generation,
                     Status::Error,
                 );
                 Err(error)
@@ -663,5 +710,47 @@ mod tests {
         assert_eq!(row.resume_intent, ResumeIntent::Use(pinned.into()));
         assert_eq!(row.status, Status::Stopped);
         assert!(!sidecar.exists());
+    }
+
+    /// The ancillary sessions (web terminal, container terminal, tool
+    /// sub-sessions) hold their own processes, so a failed agent kill must
+    /// still reap them: short-circuiting on that error leaks a shell per
+    /// failed kill. The agent failure is still what the caller is told.
+    #[test]
+    #[serial_test::serial]
+    #[cfg(unix)]
+    fn a_failed_agent_kill_still_reaps_ancillary_sessions() {
+        use std::os::unix::fs::PermissionsExt;
+        let _env_read = crate::session::test_support::EnvGuard::read_lock();
+        let temp = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let inst = Instance::new("Ancillary teardown", temp.path().to_str().unwrap());
+        let terminal = crate::tmux::TerminalSession::generate_name(&inst.id, "web terminal");
+        let reaped = temp.path().join("ancillary-reaped");
+        let reaped_marker = reaped.display().to_string();
+        // A tmux that reports the web terminal as live, refuses the agent
+        // session with a real (not "absent") failure, and reaps the terminal.
+        let shim = temp.path().join("tmux");
+        std::fs::write(
+            &shim,
+            format!(
+                "#!/bin/sh\ncase \" $* \" in\n  *\" list-sessions \"*) printf '%s\\n' '{terminal}'; exit 0 ;;\nesac\ncase \" $* \" in\n  *\" kill-session \"*)\n    case \"$*\" in\n      *'={terminal}'*) : > '{reaped_marker}'; exit 0 ;;\n    esac\n    echo 'permission denied' >&2\n    exit 1\n    ;;\nesac\nexit 0\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = format!(
+            "{}:{}",
+            temp.path().display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let _guard = crate::session::test_support::EnvGuard::set(&[("PATH", path)]);
+
+        inst.kill_all_tmux_sessions_locked()
+            .expect_err("the refused agent kill is reported to the caller");
+        assert!(
+            reaped.exists(),
+            "the ancillary session must be reaped even when the agent kill fails"
+        );
     }
 }

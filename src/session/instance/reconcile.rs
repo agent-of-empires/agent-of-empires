@@ -3,72 +3,52 @@
 use super::*;
 
 impl Instance {
-    /// Reload this instance from disk before a launch that would re-persist peer-writable fields.
+    /// Best-effort CLI reload; native launch uses the fallible store path.
+    #[cfg(test)]
     pub(super) fn reconcile_from_disk(&mut self) {
-        if let Err(error) = self.try_reconcile_from_disk() {
+        let Ok(storage) = crate::session::storage::Storage::new(
+            &self.effective_profile(),
+            self.resolve_file_watch(),
+        ) else {
             tracing::warn!(target: "session.store",
                 session = %self.id,
-                error = %format_args!("{error:#}"),
-                "failed to reload disk state before launch; using in-memory value");
+                "failed to open storage to reload disk state before launch; using in-memory value");
+            return;
+        };
+        if let Err(error) = self.reconcile_from_store(&storage) {
+            tracing::warn!(target: "session.store", session = %self.id, %error,
+                "failed to reconcile session from disk");
         }
     }
 
-    /// [`Self::reconcile_from_disk`] that reports a storage failure. `Ok(false)`
-    /// means the row is gone from disk and `self` is unchanged.
-    pub(super) fn try_reconcile_from_disk(&mut self) -> Result<bool> {
-        let storage = crate::session::storage::Storage::new(
-            &self.effective_profile(),
-            self.resolve_file_watch(),
-        )
-        .context("failed to open storage")?;
-        let Some(mut disk) = storage
-            .load()
-            .context("failed to load sessions")?
+    pub(crate) fn reconcile_from_store(
+        &mut self,
+        storage: &dyn crate::session::SessionStore,
+    ) -> Result<()> {
+        let mut disk = storage
+            .load()?
             .into_iter()
-            .find(|i| i.id == self.id)
-        else {
-            return Ok(false);
+            .find(|row| row.id == self.id)
+            .ok_or(LifecycleReservationError::Superseded)?;
+        let preserve_errors = disk.lifecycle_generation <= self.lifecycle_generation;
+        disk.source_profile = if self.source_profile == storage.storage().profile() {
+            std::mem::take(&mut self.source_profile)
+        } else {
+            storage.storage().profile().to_owned()
         };
-
-        // Carry runtime-only fields (`#[serde(skip)]`) and locally-mutated launch-time state from
-        // `self` onto the disk snapshot.
-        let disk_has_newer_lifecycle = disk.lifecycle_generation > self.lifecycle_generation;
-        if !disk_has_newer_lifecycle {
-            disk.last_error_check = self.last_error_check;
-            disk.last_error = self.last_error.take();
-        }
-        if self.active_execution != disk.active_execution {
-            self.stop_poller();
-            self.session_id_poller = None;
-        }
-        disk.last_start_time = self.last_start_time;
-        disk.session_id_poller = self.session_id_poller.take();
-        disk.session_id_poller_retry_after = self.session_id_poller_retry_after;
-        // Preserve the serde-skipped backoff so reloads cannot trigger an early retry.
-        disk.poller_repair = self.poller_repair.clone();
-        disk.pane_dead_observed = self.pane_dead_observed;
-        disk.force_fresh_next_launch = self.force_fresh_next_launch;
-        disk.pending_host_env = std::mem::take(&mut self.pending_host_env);
-        disk.identity_publisher_launched = self.identity_publisher_launched;
-        disk.source_profile = std::mem::take(&mut self.source_profile);
-        disk.ever_confirmed_present = self.ever_confirmed_present;
-        disk.unknown_since = self.unknown_since;
-        // `before_start_env` is `#[serde(skip)]`, so the disk snapshot always has it empty.
-        if let (Some(disk_sandbox), Some(runtime_sandbox)) =
-            (disk.sandbox_info.as_mut(), self.sandbox_info.as_ref())
-        {
-            disk_sandbox.before_start_env = runtime_sandbox.before_start_env.clone();
-        }
-
-        *self = disk;
-        Ok(true)
+        let prior = std::mem::replace(self, disk);
+        self.inherit_runtime(prior, preserve_errors);
+        Ok(())
     }
 
     /// Flush the previous pane's publication before its source is retired.
-    pub(super) fn reconcile_sidecar_into_disk(&mut self) {
+    pub(super) fn reconcile_sidecar_into_disk_in(
+        &mut self,
+        storage: &dyn crate::session::SessionStore,
+    ) -> Result<()> {
         if self.source_capture_backend() == Some(crate::agents::SessionCaptureBackend::Pi) {
-            self.absorb_published_pi_session();
-            return;
+            self.absorb_published_pi_session_in(storage);
+            return Ok(());
         }
         if !matches!(
             self.source_capture_backend(),
@@ -76,47 +56,46 @@ impl Instance {
                 crate::agents::SessionCaptureBackend::Claude
                     | crate::agents::SessionCaptureBackend::HookSidecar
             )
-        ) {
-            return;
-        }
-        if !matches!(self.resume_intent, ResumeIntent::Default) {
-            return;
+        ) || !matches!(self.resume_intent, ResumeIntent::Default)
+        {
+            return Ok(());
         }
         let Some(observation) = super::execution::hook_session_observation(
             &self.id,
             self.active_execution.as_ref(),
             None,
         ) else {
-            return;
+            return Ok(());
         };
         let fresh = &observation.sid;
         let binding = self.observed_binding(&observation);
         if Some(fresh) == self.agent_session_id.as_ref() && self.agent_session_binding == binding {
-            return;
+            return Ok(());
         }
         if self.is_capture_excluded(fresh, observation.source.as_ref()) {
-            return;
+            return Ok(());
         }
-        let profile = self.effective_profile();
         let baseline = self.conversation_state();
-        match persist_session_to_storage(
-            &profile,
+        match super::sid_persist::persist_session_with_storage(
+            storage,
             &self.id,
             &observation,
             &baseline,
-            &self.resolve_file_watch(),
         ) {
-            SidWrite::Applied => {
-                self.set_agent_conversation(Some(observation.sid), binding, None);
-            }
-            // A pinned-foreign publication is a deliberate non-write; like a
-            // divergence skip, it carries no update worth reconciling.
+            SidWrite::Applied => self.apply_conversation_observation(&observation),
             SidWrite::Skipped | SidWrite::PinnedForeign => {
-                // Peer wrote between reconcile and CAS; reload to converge.
-                self.reconcile_from_disk();
+                self.reconcile_from_store(storage)?;
             }
             SidWrite::Failed => {}
         }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(super) fn reconcile_sidecar_into_disk(&mut self) -> anyhow::Result<()> {
+        let storage =
+            crate::session::storage::Storage::new_unwatched(&self.effective_profile()).unwrap();
+        self.reconcile_sidecar_into_disk_in(&storage)
     }
 }
 
@@ -319,7 +298,7 @@ mod tests {
             }
             let dir = c.sidecar.map(|sid| write_sidecar(&inst.id, sid));
 
-            inst.reconcile_sidecar_into_disk();
+            inst.reconcile_sidecar_into_disk().unwrap();
 
             if let Some(dir) = dir {
                 std::fs::remove_dir_all(&dir).ok();

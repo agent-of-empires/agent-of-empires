@@ -16,26 +16,6 @@ impl HomeView {
         }
     }
 
-    /// Rebuild `flat_items` and move the cursor back onto the selected session or group.
-    pub(super) fn rebuild_flat_items_keeping_cursor(&mut self) {
-        self.rebuild_flat_items();
-        let restored = match (&self.selected_session, &self.selected_group) {
-            (Some(sid), _) => self.session_row(sid),
-            (None, Some(gpath)) => self
-                .flat_items
-                .iter()
-                .position(|item| matches!(item, Item::Group { path, .. } if path == gpath)),
-            (None, None) => None,
-        };
-        match restored {
-            Some(idx) => self.cursor = idx,
-            None if self.cursor >= self.flat_items.len() && !self.flat_items.is_empty() => {
-                self.cursor = self.flat_items.len() - 1;
-            }
-            None => {}
-        }
-    }
-
     pub fn sort_order(&self) -> SortOrder {
         self.sort_order
     }

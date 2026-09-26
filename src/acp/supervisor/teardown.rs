@@ -502,7 +502,7 @@ async fn tear_down_runner_from(
             pid,
             "runner survived SIGKILL; holding the session until it exits"
         );
-        return Settlement::Unproven(identity);
+        return Settlement::Unproven(Some(identity));
     }
     if !worker_registry::delete_if_owned_by(session_id, pid, identity.generation) {
         warn!(
@@ -511,7 +511,7 @@ async fn tear_down_runner_from(
             pid,
             "runner exited but its registry record could not be read; retrying settlement"
         );
-        return Settlement::Unproven(identity);
+        return Settlement::Unproven(Some(identity));
     }
     Settlement::Proven
 }
@@ -529,7 +529,7 @@ pub(super) async fn tear_down_replacement(
     };
     match tear_down_runner(control, session_id, Some(previous)).await {
         Settlement::Unproven(_) if settlement == Settlement::Proven => {
-            Settlement::Unproven(previous)
+            Settlement::Unproven(Some(previous))
         }
         _ => settlement,
     }

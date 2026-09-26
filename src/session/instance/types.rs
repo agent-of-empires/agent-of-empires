@@ -16,7 +16,44 @@ pub struct TerminalInfo {
     pub created: bool,
 }
 
-/// How a session is rendered: ACP-native `Structured` or raw tmux `Terminal`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum AuxiliaryTarget {
+    Host { index: u32 },
+    Container { index: u32 },
+    Tool { tool_name: String },
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PanePresence {
+    Absent,
+    Alive,
+    Dead,
+    #[default]
+    Unknown,
+}
+
+/// Native handoff requires Alive and the same name as the preparation receipt.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaneObservation {
+    #[serde(default)]
+    pub state: PanePresence,
+    #[serde(default)]
+    pub tmux_session: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuxiliaryObservation {
+    pub target: AuxiliaryTarget,
+    #[serde(flatten)]
+    pub pane: PaneObservation,
+}
+
+/// How a session is rendered. `Structured` uses the ACP-based native
+/// rendering (plan panels, tool-call cards, approvals); `Terminal` streams
+/// the raw tmux/PTY through xterm.js. `Terminal` is the conservative
+/// deserialization default; session creation sets the value explicitly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum View {
@@ -26,6 +63,8 @@ pub enum View {
 }
 
 impl View {
+    /// `skip_serializing_if` predicate: only the non-default `Structured`
+    /// value is persisted, mirroring the old `structured_view` bool shape.
     pub fn is_terminal(&self) -> bool {
         matches!(self, View::Terminal)
     }
@@ -37,8 +76,13 @@ pub struct WorktreeInfo {
     pub main_repo_path: String,
     pub managed_by_aoe: bool,
     pub created_at: DateTime<Utc>,
-    /// Branch an AoE-managed worktree was created from; `None` for the default
-    /// branch or an attached pre-existing branch.
+    /// Branch the worktree was created from when `managed_by_aoe` is
+    /// true. None means "the repo's default branch was used" (the
+    /// historical behavior before #948) or the worktree was attached
+    /// to a pre-existing branch (`create_branch = false`). Surfaced
+    /// in `aoe list --json`, the TUI preview, and the web sessions
+    /// API; not used by core logic, so old `sessions.json` files
+    /// deserialize without the field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_branch: Option<String>,
 }
@@ -51,15 +95,32 @@ pub struct WorkspaceRepo {
     pub worktree_path: String,
     pub main_repo_path: String,
     pub managed_by_aoe: bool,
-    /// The branch already existed and was only checked out, so deleting the
-    /// session must not delete it.
+    /// True when `branch` already existed in this repo and aoe merely checked it
+    /// out, which makes branch deletion on session delete a no-op.
+    ///
+    /// Only ever set by `attach_project` with `--attach-existing-branch` (#3103):
+    /// the workspace builder always creates the branch it names, so branch and
+    /// worktree ownership coincide for a repo present at creation. Phrased as
+    /// "pre-existing" rather than "aoe created it" so the serde default is
+    /// correct for every record written before the field existed.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub branch_preexisting: bool,
-    /// Per-repo counterpart of [`WorktreeInfo::base_branch`]; set only when AoE
-    /// created the branch from that base.
+    /// Branch this repo's worktree branch was forked from, recorded at
+    /// creation. The per-repo counterpart of [`WorktreeInfo::base_branch`],
+    /// and the reason a workspace member's diff can default to the right
+    /// ref: workspace sessions leave `worktree_info` unset, so before this
+    /// field existed there was nothing per-repo to fall back to (#3329).
+    ///
+    /// Only set when aoe actually created the branch from that base. A repo
+    /// attached to a pre-existing branch records None, so "reset to default"
+    /// never compares against a ref that was not the checkout's base.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_branch: Option<String>,
-    /// Diff-base override for this repo alone; wins over `base_branch`.
+    /// Explicit diff-base override for this repo alone, set by the web
+    /// diff picker or `aoe session set-base --repo <name>`. Wins over
+    /// `base_branch`. `Instance::base_branch_override` does NOT apply to a
+    /// workspace member; that field covers a single-repo session's own
+    /// checkout. See #3329.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_branch_override: Option<String>,
 }
@@ -91,20 +152,34 @@ pub struct SandboxInfo {
     pub container_id: Option<String>,
     pub image: String,
     pub container_name: String,
-    /// `KEY` passes through from the host; `KEY=VALUE` sets explicitly.
+    /// Additional environment entries (session-specific).
+    /// `KEY` = pass through from host, `KEY=VALUE` = set explicitly.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extra_env: Option<Vec<String>>,
+    /// Custom instruction text to inject into agent launch command
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_instruction: Option<String>,
-    /// Working directory the container was built with; recomputing it can drift (#2414).
+    /// The container's working directory, captured from
+    /// `ContainerConfig::working_dir` when the container is created (and
+    /// backfilled from a live container for sessions created before this field
+    /// existed). [`Instance::container_workdir`] returns this verbatim so every
+    /// `docker exec -w` targets the path the container was actually built with,
+    /// instead of a live recomputation that can drift once the host worktree's
+    /// git linkage breaks (#2414).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub container_workdir: Option<String>,
-    /// Values minted by `host_hooks.before_start`; secret, so never serialized.
+    /// `KEY=VALUE` pairs minted on the host by `host_hooks.before_start` when
+    /// the container last came up. Injected into the container environment as
+    /// inherited (leak-safe) entries by `crate::session::environment::collect_environment`.
+    ///
+    /// Runtime-only and secret: never serialized (so short-lived tokens never
+    /// hit disk and a stale value never survives a restart) and re-minted on the
+    /// next container come-up. See `Instance::ensure_before_start_env`.
     #[serde(skip)]
     pub before_start_env: Vec<(String, String)>,
 }
 
-/// Blank session ids deserialize as `None`.
+/// Deserialize agent_session_id, treating empty/whitespace strings as None.
 pub(super) fn deserialize_session_id<'de, D>(
     deserializer: D,
 ) -> std::result::Result<Option<String>, D::Error>
@@ -129,25 +204,37 @@ pub(crate) struct PriorToolSession {
 }
 
 impl PriorToolSession {
+    /// Nothing worth parking: an agent that never got a conversation id (never
+    /// launched, or `/clear`ed) leaves no entry behind.
     pub(super) fn is_empty(&self) -> bool {
         self.agent_session_id.is_none() && self.acp_session_id.is_none()
     }
 }
 
-/// User intent gating `acquire_session_id`, written separately from the poller's
-/// observed `agent_session_id`. Wire names are pinned by `#[serde(rename)]`.
+/// User intent gating `acquire_session_id`, persisted independently of the
+/// poller's observation in `agent_session_id`. CLI/REST/TUI write intent;
+/// the poller writes observation. Disjoint writers, no race.
+///
+/// `#[serde(rename)]` pins wire names so a Rust-side variant rename
+/// cannot silently break existing `sessions.json` deserialisation.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", content = "value")]
 pub(crate) enum ResumeIntent {
+    /// Fall back to the poller's observed `agent_session_id`.
     #[default]
     #[serde(rename = "Default")]
     Default,
+    /// Pin to this sid: pass `--resume <sid>` regardless of observation.
     #[serde(rename = "Use")]
     Use(String),
-    /// One-shot fresh start; promotes to `Default` after the launch.
+    /// Force a fresh start on the next launch. Auto-promotes to `Default`
+    /// after the launch completes (one-shot semantics).
     #[serde(rename = "Cleared")]
     Cleared,
-    /// One-shot fork of `from` into the child id pre-pinned in `agent_session_id`.
+    /// One-shot fork seed: on the next (first) launch, resume `from` and fork
+    /// into a NEW session whose id was pre-pinned in `agent_session_id`.
+    /// Auto-promotes to `Default` after that launch, exactly like `Cleared`,
+    /// so later restarts resume the child's own id with a plain `--resume`.
     #[serde(rename = "Fork")]
     Fork { from: String },
 }
@@ -156,14 +243,6 @@ impl ResumeIntent {
     pub(super) fn is_default(&self) -> bool {
         matches!(self, ResumeIntent::Default)
     }
-}
-
-/// Plugin create-idempotency record; a retried key with a different
-/// `payload_hash` is rejected.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct PluginCreateIdempotency {
-    pub key: String,
-    pub payload_hash: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -215,6 +294,17 @@ impl SessionSidecarSource {
     pub(crate) fn matches_host_hooks(&self, instance_id: &str) -> bool {
         *self == Self::host_hooks(instance_id)
     }
+}
+
+/// Create-idempotency record for a plugin-created session (#2897). `key` is
+/// the plugin-supplied idempotency key, unique within the creating plugin's
+/// sessions; `payload_hash` is the host-computed hash of the semantic create
+/// request, so a retried key with a different payload is rejected instead of
+/// silently returning a session that does not match the request.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PluginCreateIdempotency {
+    pub key: String,
+    pub payload_hash: String,
 }
 
 #[cfg(test)]

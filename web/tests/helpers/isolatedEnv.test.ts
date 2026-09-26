@@ -35,6 +35,7 @@ const NON_SUFFIX_HOST_STATE: Record<string, string> = {
   AOE_DAEMON_PASSPHRASE: "host-passphrase",
   AOE_DAEMON_TOKEN: "host-token",
   AOE_DAEMON_URL: "http://a-real-daemon.internal:8080",
+  AOE_DASHBOARD_URL: "https://host.invalid/dashboard",
   AOE_E2E_INPUT_BARRIER: `${HOST}/input-barrier`,
   AOE_E2E_PARTIAL_FRAME_FILE: `${HOST}/partial-frame`,
   AOE_E2E_PROMPT_COMPLETED_FILE: `${HOST}/prompt-completed`,
@@ -93,8 +94,12 @@ const INHERITED_BY_CONTRACT = new Set([
   "AOE_TERMINAL_TRACE",
   "AOE_TEST_TOKEN_GRACE_SECS",
   "AOE_TEST_TOKEN_LIFETIME_SECS",
-  // Rust test-binary re-entry marker, compiled out of aoe serve.
+  // Rust test-binary re-entry markers, compiled out of aoe serve.
   "AOE_AGENT_PROBE_TEST_CHILD",
+  "AOE_TEST_ANCILLARY_KILL_CHILD",
+  "AOE_TEST_AUXILIARY_LAUNCH_CHILD",
+  "AOE_TEST_TMUX_KILL_CHILD",
+  "AOE_TEST_TOOL_ADMISSION_CHILD",
   // A marker `aoe` echoes into a pane to probe a login shell, not a variable
   // the daemon resolves anything from.
   "AOE_AGENT_OK",

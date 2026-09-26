@@ -121,6 +121,8 @@ dependencies = [
  "git2",
  "glob",
  "hkdf 0.13.0",
+ "hyper",
+ "hyper-util",
  "indexmap 2.14.2",
  "jsonwebtoken",
  "libc",

@@ -43,7 +43,7 @@ afterEach(() => {
 
 function renderStep(data: Partial<WizardData> = {}, props: { initialTab?: "import"; agents?: AgentInfo[] } = {}) {
   const onChange = vi.fn();
-  render(<ProjectStep data={{ ...initialData, ...data }} onChange={onChange} {...props} />);
+  render(<ProjectStep profile="default" data={{ ...initialData, ...data }} onChange={onChange} {...props} />);
   return { onChange };
 }
 
@@ -124,7 +124,14 @@ describe("recent and saved projects", () => {
       { name: "beta", path: "/repo/beta", scope: "global", pinned: false },
     ] as ProjectInfo[]);
     const onSelectSavedProject = vi.fn();
-    render(<ProjectStep data={initialData} onChange={vi.fn()} onSelectSavedProject={onSelectSavedProject} />);
+    render(
+      <ProjectStep
+        profile="default"
+        data={initialData}
+        onChange={vi.fn()}
+        onSelectSavedProject={onSelectSavedProject}
+      />,
+    );
     fireEvent.click((await screen.findByText("/repo/alpha")).closest("button")!);
     fireEvent.click((await screen.findByText("/repo/beta")).closest("button")!);
     expect(onSelectSavedProject.mock.calls).toEqual([[true], [undefined]]);

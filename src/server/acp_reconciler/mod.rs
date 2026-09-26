@@ -316,9 +316,8 @@ pub async fn reconcile_acp_workers(
         return;
     }
 
-    let cfg = crate::session::config::profile_config::resolve_config_or_warn(&state.profile);
     let resume_limit = MAX_CONCURRENT_RESUMES
-        .min(cfg.acp.max_concurrent_workers)
+        .min(state.acp_supervisor.max_concurrent_workers())
         .max(1);
     let semaphore = Arc::new(Semaphore::new(resume_limit as usize));
     let mut set: JoinSet<(String, ResumeOutcome)> = JoinSet::new();

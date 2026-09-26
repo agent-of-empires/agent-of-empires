@@ -567,9 +567,12 @@ pub async fn session_diff_file_raw(
     .await;
 
     match result {
-        Ok(Ok((mime, bytes))) => {
-            super::artifacts::raw_file_response(&mime, !renders_inline(&mime), "no-store", bytes)
-        }
+        Ok(Ok((mime, bytes))) => super::artifacts::raw_file_response(
+            &mime,
+            !super::artifacts::renders_inline(&mime),
+            "no-store",
+            bytes,
+        ),
         Ok(Err((status, msg))) => (
             status,
             Json(serde_json::json!({"error": "file_read", "message": msg})),
@@ -602,18 +605,6 @@ fn open_file_mime(path: &std::path::Path, bytes: &[u8]) -> mime_guess::Mime {
     } else {
         guessed
     }
-}
-
-/// Types a browser renders in a tab. Anything else is sent as an attachment,
-/// which the dashboard saves under the file's own name.
-fn renders_inline(ty: &mime_guess::Mime) -> bool {
-    use mime_guess::mime;
-    let top = ty.type_();
-    top == mime::IMAGE
-        || top == mime::AUDIO
-        || top == mime::VIDEO
-        || ty.essence_str() == "text/plain"
-        || *ty == mime::APPLICATION_PDF
 }
 
 #[derive(Deserialize)]

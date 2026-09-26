@@ -29,6 +29,7 @@ impl HomeView {
             })?;
         // Unit fixtures do not own background disk healing or agent recovery.
         view.startup_recovery_gate = None;
+        view.sidebar_source = crate::tui::session_feed::SidebarSource::Daemon;
         Ok(view)
     }
 
@@ -57,10 +58,11 @@ impl HomeView {
             for inst in &mut instances {
                 inst.source_profile = profile_name.clone();
             }
-            // Clear expired lifecycle reservations in one write, under the same per-instance
-            // flocks live transitions take, acquired in sorted id order like the only other
-            // multi-lock holder (`Storage::move_instance_between_profiles`), so the two
-            // cannot close a cycle.
+            // Clear expired lifecycle reservations in one write, under the same
+            // per-instance flocks live transitions take. Acquired in sorted id
+            // order, matching the only other multi-lock holder
+            // (`Storage::move_instance_between_profiles`), which sorts too, so
+            // the two cannot close a cycle.
             let ttl = crate::session::Instance::LIFECYCLE_RESERVATION_TTL;
             let now = chrono::Utc::now();
             let mut expired: Vec<String> = instances
@@ -81,8 +83,9 @@ impl HomeView {
                     }
                     Err(_) => false,
                 });
-                // `retain` can empty this when every lock failed; writing then would
-                // rewrite sessions.json and notify subscribers for no change.
+                // `retain` can empty this when every lock failed; writing then
+                // would rewrite sessions.json and notify subscribers for no
+                // change at all.
                 if !expired.is_empty() {
                     let cleared = storage.update(|disk, _groups| {
                         for id in &expired {
@@ -107,9 +110,10 @@ impl HomeView {
             storages.insert(profile_name.clone(), storage);
         }
 
-        // Duplicate detection across every loaded profile runs before any loaded state is
-        // published (#3459): journal-guided repairs fix durable state under lock here, so
-        // the reload below publishes exactly one row per session.
+        // Duplicate detection across every loaded profile runs before any of
+        // the loaded state is published (#3459). Journal-guided repairs fix
+        // durable state under lock here, so a clean reload below publishes
+        // exactly one row per session. Legacy ambiguities stay excluded.
         let legacy_duplicate_reports = {
             let loads_view: Vec<(&str, &[Instance])> = profile_loads
                 .iter()
@@ -150,14 +154,6 @@ impl HomeView {
             DefaultTerminalMode::Container => TerminalMode::Container,
         };
         let sound_config = resolved.sound.clone();
-        let status_hook_configs = Self::load_status_hook_configs(Self::status_hook_profile_names(
-            active_profile.as_deref(),
-            &storages,
-        ));
-        let status_hook_config = status_hook_configs
-            .get(&config_profile)
-            .cloned()
-            .unwrap_or_else(|| resolved.status_hooks.clone());
         let strict_hotkeys = resolved.session.strict_hotkeys;
         let confirm_before_quit = resolved.session.confirm_before_quit;
         let host_tab_title = resolved.session.host_tab_title;
@@ -170,9 +166,10 @@ impl HomeView {
             .as_ref()
             .and_then(|c| c.app_state.sort_order)
             .unwrap_or_default();
-        // New users (who haven't dismissed the welcome screen) default to Project grouping
-        // so they see the web dashboard's layout; existing users keep Manual unless they
-        // toggle with `g`.
+        // New users (haven't dismissed the welcome screen) default to Project
+        // grouping so they see the same layout as the web dashboard. Existing
+        // users keep Manual (the existing behavior) unless they explicitly
+        // toggle to Project with `g`.
         let is_new_user = user_config
             .as_ref()
             .is_none_or(|c| !c.app_state.has_seen_welcome);
@@ -206,6 +203,9 @@ impl HomeView {
             active_profile,
             instances: Self::build_instances_map(all_instances),
             pending_deletions: HashMap::new(),
+            observed_workspace_ordering: crate::session::load_workspace_ordering()
+                .map(|ordering| ordering.order)
+                .unwrap_or_default(),
             pending_group_deletions: HashMap::new(),
             pending_added: HashMap::new(),
             group_trees,
@@ -263,6 +263,7 @@ impl HomeView {
             group_rename_context: None,
             repo_trust_dialog: None,
             pending_repo_trust_data: None,
+            pending_repo_trust_fingerprint: None,
             hooks_install_dialog: None,
             pending_hooks_install_data: None,
             volume_ignores_glob_dialog: None,
@@ -272,6 +273,8 @@ impl HomeView {
             no_agents_dialog: None,
             changelog_dialog: None,
             info_dialog: None,
+            pending_indeterminate_resolution: None,
+            pending_indeterminate_queue: Vec::new(),
             snooze_duration_dialog: None,
             pending_snooze_session: None,
             profile_picker_dialog: None,
@@ -297,6 +300,7 @@ impl HomeView {
             pending_send_session: None,
             pending_send_target: live_send::LiveSendTarget::Agent,
             pending_live_send_target: live_send::LiveSendTarget::Agent,
+            pending_native_attachment: None,
             live_send: None,
             live_send_worker: None,
             preview_capture_worker: None,
@@ -326,8 +330,7 @@ impl HomeView {
             pending_paste_for_structured_view: HashMap::new(),
             pending_attach_after_warning: None,
             pending_stop_session: None,
-            pending_stop_terminal: None,
-            pending_stop_tool: None,
+            pending_stop_auxiliary: None,
             pending_image_pull: None,
             pending_switch_view_session: None,
             pending_daemon_start_session: None,
@@ -341,8 +344,6 @@ impl HomeView {
             search_matches: Vec::new(),
             search_match_index: 0,
             available_tools,
-            status_poller: StatusPoller::new(),
-            pending_status_refresh: false,
             show_diagnostics: resolved.session.show_diagnostics_pane,
             metrics_poller: crate::tui::metrics_poller::MetricsPoller::new(),
             pending_metrics_refresh: false,
@@ -362,31 +363,23 @@ impl HomeView {
             structured_approval_poller: crate::tui::approval_poller::StructuredApprovalPoller::new(
             ),
             session_feed: crate::tui::session_feed::SessionFeed::new(),
-            pending_session_feed: false,
-            daemon_sidebar: resolved.session.daemon_sidebar,
-            sidebar_source: crate::tui::session_feed::SidebarSource::Storage,
+            sidebar_source: crate::tui::session_feed::SidebarSource::Disconnected,
             deletion_poller: DeletionPoller::new(),
-            stop_poller: StopPoller::new(),
             trash_poller: crate::tui::trash_poller::TrashPoller::new(),
             reconcile_poller: make_reconcile(),
             startup_recovery_gate: None,
             pending_reconcile_reload: false,
             reconcile_reload_retry_at: None,
-            restart_poller: RestartPoller::new(),
             restart_in_flight: std::collections::HashSet::new(),
-            attach_after_restart: std::collections::HashSet::new(),
-            restarted_attaches: Vec::new(),
             store_move_poller: crate::tui::store_move_poller::StoreMovePoller::new(),
             store_move_in_flight: None,
             store_move_bypass: None,
             attach_project_poller: crate::tui::attach_project_poller::AttachProjectPoller::new(),
             attach_project_in_flight: std::collections::HashSet::new(),
-            creation_poller: CreationPoller::new(),
-            creation_cancelled: false,
-            on_launch_hooks_ran: HashSet::new(),
+            pending_creation: None,
             creating_hook_progress: HashMap::new(),
             creating_stub_id: None,
-            creating_provisional_group_paths: HashSet::new(),
+            pending_archive_cursor: None,
             preview_cache: PreviewCache::default(),
             preview_timings: PreviewTimings::default(),
             terminal_preview_cache: PreviewCache::default(),
@@ -410,8 +403,6 @@ impl HomeView {
             terminal_modes: HashMap::new(),
             default_terminal_mode,
             sound_config,
-            status_hook_config,
-            status_hook_configs,
             strict_hotkeys,
             confirm_before_quit,
             host_tab_title,
@@ -488,18 +479,21 @@ impl HomeView {
             }
         }
 
-        // Batch-sync instance and captured session ids to tmux hidden env so other AoE
-        // instances' build_exclusion_set() sees them. One observation serves both walks
-        // below, which visit every instance, so a per-item `list-sessions` fork would scale
-        // with the whole store and dominate this pass's tmux cost.
+        // Batch-sync instance IDs and captured session IDs to tmux hidden env
+        // so that build_exclusion_set() on other AoE instances can see them.
+        // One observation for both per-instance walks below. They visit every
+        // instance in the view, so a per-item `list-sessions` fork scales with
+        // the whole store, measured as the dominant tmux cost of this pass on
+        // a store of a few hundred sessions.
         let live = crate::tmux::LiveSessionSnapshot::new();
         {
             let mut set_batch: Vec<(String, String, String)> = Vec::new();
             let mut unset_batch: Vec<(String, String)> = Vec::new();
             for inst in view.instances.values() {
-                // This publication is one-shot: no reload re-runs it and a poller does not
-                // re-emit an unchanged sid, so a row dropped here stays unpublished until
-                // an unrelated sid change. A snapshot that could not reach the server is
+                // This publication is one-shot: no reload re-runs it and a
+                // poller does not re-emit an unchanged sid, so a row dropped
+                // here stays unpublished until an unrelated sid change or a
+                // relaunch. A snapshot that could not reach the server is
                 // therefore probed per row rather than read as "no live pane".
                 let Some(tmux_name) = inst.tmux_env_session_name_in_or_probe(&live) else {
                     continue;
@@ -556,29 +550,39 @@ impl HomeView {
         view.refresh_registered_projects();
         view.flat_items = view.build_flat_items();
         view.update_selected();
-        // Disk subscriptions stay scoped to the loaded storages: in single-profile mode
-        // the user opted into that profile's instance state only. Sorted so the
-        // install-loop's last-write-wins target stays stable across HashMap rehash between
-        // rewire ticks (#2584).
+        // Disk subscriptions stay scoped to the loaded storages: in
+        // single-profile mode (`aoe --profile X`) the user opted into
+        // exactly that profile's instance state, so we don't watch
+        // sessions.json/groups.json for unrelated profiles. Sorted so
+        // the install-loop's last-write-wins target stays stable across
+        // HashMap rehash between rewire ticks (see #2584).
         let mut initial_disk_profiles: Vec<String> = view.storages.keys().cloned().collect();
         initial_disk_profiles.sort();
         view.rewire_disk_subscriptions(&initial_disk_profiles);
-        // Trashed-worktree relocation (#2522) and repairing a worktree moved outside aoe
-        // (#2002) are healing work, not render input, and cost a git spawn and a storage
-        // write per broken row, so they sweep the loaded profiles on a worker and never
-        // delay the first frame (#3611).
+        // Trashed-worktree relocation (#2522) and the repair of a worktree
+        // moved outside aoe (#2002) are healing work, not render input, and
+        // cost a git spawn and a storage write per broken row. They sweep the
+        // loaded profiles on a worker so they never delay the first frame
+        // (#3611).
         view.reconcile_poller.request(initial_disk_profiles.clone());
-        // Startup auto-recovery restarts resume-capable sessions whose pane is missing,
-        // launching each from its recorded `project_path` and recording the attempt in a
-        // boot-scoped ledger that is not retried. It must wait for the sweep above: a row
-        // whose worktree moved outside aoe still carries the stale path, and recovering
-        // from it would burn that row's only attempt for the boot.
-        // `release_startup_recovery_gate` starts it once the sweep lands, or on a deadline.
+        // Startup auto-recovery restarts resume-capable sessions whose tmux
+        // pane is missing, launching each from its recorded `project_path` and
+        // recording the attempt in a boot-scoped ledger that is not retried.
+        // It therefore has to wait for the sweep above: a row whose worktree
+        // moved outside aoe (#2002) still carries the stale path until the
+        // sweep repoints it, and recovering from the stale path would burn
+        // that row's only attempt for the whole boot.
+        // `release_startup_recovery_gate` starts it once the sweep lands, or on
+        // a deadline if it never does.
         view.startup_recovery_gate = Some(std::time::Instant::now());
-        // Config subscriptions are deliberately asymmetric: even in single-profile mode,
-        // peer edits to any profile's config.toml must be observable so the picker UI and
-        // status-hook config cache reflect them. The reload helper rewires the same way
-        // every tick, so this is the startup-side counterpart.
+        // Config subscriptions are intentionally asymmetric: even in
+        // single-profile mode, peer edits to ANY profile's config.toml
+        // (or the global config) must be observable so the picker UI
+        // and status-hook config cache reflect external changes (e.g.
+        // a peer process creating a new profile while the user runs in
+        // filtered mode). The reload helper rewires the same way on
+        // every tick once running, so this is the startup-side
+        // counterpart that closes the boot-time window.
         let initial_config_profiles: Vec<String> = match crate::session::list_profiles() {
             Ok(p) => p,
             Err(e) => {
@@ -594,19 +598,20 @@ impl HomeView {
         Ok(view)
     }
 
-    /// Full reload: status-hook config-cache refresh plus storage, for the 5s heartbeat
-    /// and event-driven sites (attach-return, save+reload pairs, profile switch).
-    /// Watcher-driven ticks call `reload_storage_only`, since the disk watcher only fires
-    /// on `sessions.json` / `groups.json` and the config watcher drives
-    /// `refresh_from_config`.
+    /// Full reload: status-hook config-cache refresh + storage. Used by
+    /// the 5s heartbeat tick and by event-driven sites (attach-return,
+    /// save+reload pairs, profile switch). Watcher-driven ticks call
+    /// `reload_storage_only` because the disk watcher only fires on
+    /// `sessions.json` / `groups.json`; the config watcher drives
+    /// `refresh_from_config` independently.
     pub fn reload(&mut self) -> anyhow::Result<()> {
-        self.refresh_status_hook_config_cache();
         self.reload_storage_only()
     }
 
-    /// Storage-only reload: profile rediscovery, per-profile load, tree rebuild and cursor
-    /// restore. Skips the status-hook config-cache refresh, which the full `reload()`
-    /// drives. Used by watcher and live-send heartbeat ticks.
+    /// Storage-only reload: profile rediscovery + per-profile load + tree
+    /// rebuild + cursor restore. Skips the status-hook config-cache refresh,
+    /// which is driven by the full `reload()` path. Used by watcher and
+    /// live-send heartbeat ticks.
     pub(in crate::tui) fn reload_storage_only(&mut self) -> anyhow::Result<()> {
         use crate::session::list_profiles;
 
@@ -626,12 +631,15 @@ impl HomeView {
             }
         };
 
-        // Asymmetric rewire mirroring `HomeView::new`: config rewire covers the full
-        // `list_profiles()` set so peer config edits surface to the picker UI and
-        // status-hook cache in any mode, while disk rewire is scoped (unified mode tracks
-        // every profile, single-profile stays bounded to `self.storages.keys()`). The
-        // helpers are set-diff idempotent, so the unconditional call is a no-op on a stable
-        // profile set.
+        // Asymmetric rewire mirrors `HomeView::new` startup wiring. Config
+        // rewire covers the full `list_profiles()` set so peer config edits
+        // surface to the picker UI and status-hook cache regardless of mode
+        // (e.g. a peer process creating a new profile while the user runs
+        // `aoe --profile X`). Disk rewire is scoped: unified mode tracks
+        // every profile, single-profile mode stays bounded to
+        // `self.storages.keys()` (the active profile, plus any profile
+        // loaded via `move_to_profile`). Helpers are set-diff idempotent,
+        // so the unconditional call is a no-op on a stable profile set.
         self.rewire_config_subscriptions(&current_profiles);
         if self.active_profile.is_some() {
             let mut active_only: Vec<String> = self.storages.keys().cloned().collect();
@@ -641,8 +649,9 @@ impl HomeView {
             self.rewire_disk_subscriptions(&current_profiles);
         }
 
-        // Storage rebuild is unified mode only: single-profile mode keeps the scope set at
-        // startup, with only the active profile in memory.
+        // Storage rebuild: unified mode only. Single-profile mode keeps the
+        // explicit scope set at startup; only the active profile is loaded
+        // into memory.
         if self.active_profile.is_none() {
             for name in &current_profiles {
                 if !self.storages.contains_key(name) {
@@ -653,8 +662,9 @@ impl HomeView {
             self.storages.retain(|k, _| current_profiles.contains(k));
         }
 
-        // Collect per-profile state without publishing it, so duplicate detection (#3459)
-        // can run journal-guided repairs before anything reaches the unified map.
+        // Collect per-profile state without publishing it, so duplicate
+        // detection (#3459) can run journal-guided repairs before anything
+        // reaches the unified map.
         type ProfileLoads = Vec<(String, Vec<Instance>, Vec<Group>)>;
         let collect_loads = |storages: &HashMap<String, Storage>,
                              prev: &indexmap::IndexMap<String, Instance>|
@@ -712,8 +722,7 @@ impl HomeView {
         let storage_keys: Vec<String> = self.storages.keys().cloned().collect();
         self.group_trees.retain(|k, _| storage_keys.contains(k));
 
-        // Snapshot the in-flight Creating stub before `self.instances` is overwritten: a
-        // save may have persisted it, but while it is memory-only it would vanish.
+        // Preserve the display-only placeholder across a canonical row reload.
         let creating_stub_snapshot: Option<Instance> = self
             .creating_stub_id
             .as_ref()
@@ -724,22 +733,62 @@ impl HomeView {
         if let Some(stub) = creating_stub_snapshot {
             self.instances.entry(stub.id.clone()).or_insert(stub);
         }
+        // The creation in flight is displayed by its placeholder alone; its own
+        // reservation row stays out of the model until the daemon commits.
+        if let Some(id) = self.in_flight_creation_id().map(str::to_owned) {
+            self.instances.shift_remove(&id);
+        }
 
         // Refresh the project registry so project view's empty pinned headers
         // and pin indicators reflect the current on-disk registry.
         self.refresh_registered_projects();
 
-        // Drop memoized remote-owner lookups so a `git remote add` since the last reload is
-        // picked up on the next org-mode rebuild instead of sticking with a stale owner (or
-        // a stale "no owner"). Cheap: local `.git/config` only, on a multi-second cadence.
+        // Drop memoized remote-owner lookups so a `git remote add`/`set-url`
+        // run since the last reload is picked up on the next org-mode
+        // rebuild, instead of sticking with a stale cached owner (or a
+        // stale cached "no owner") for the rest of the process. Cheap: this
+        // only re-reads local `.git/config` state, no network access, and
+        // this reload path already runs on a multi-second cadence, not
+        // per-render.
         self.remote_owner_cache.borrow_mut().clear();
 
-        self.rebuild_flat_items_keeping_cursor();
+        // Remember what the cursor was pointing at so we can follow it
+        let prev_selected_session = self.selected_session.clone();
+        let prev_selected_group = self.selected_group.clone();
+
+        self.rebuild_flat_items();
+
+        // Try to restore cursor to the same session/group after rebuild
+        let mut restored = false;
+        if let Some(ref sid) = prev_selected_session {
+            for (idx, item) in self.flat_items.iter().enumerate() {
+                if let Item::Session { id, .. } = item {
+                    if id == sid {
+                        self.cursor = idx;
+                        restored = true;
+                        break;
+                    }
+                }
+            }
+        } else if let Some(ref gpath) = prev_selected_group {
+            for (idx, item) in self.flat_items.iter().enumerate() {
+                if let Item::Group { path, .. } = item {
+                    if path == gpath {
+                        self.cursor = idx;
+                        restored = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if !restored && self.cursor >= self.flat_items.len() && !self.flat_items.is_empty() {
+            self.cursor = self.flat_items.len() - 1;
+        }
 
         // Storage rebuilds and search re-scoring must not move the live-send
         // selection. Teardown reconciles it with the latest projection.
         let preserve_live_selection = self.live_send.as_ref().is_some_and(|state| {
-            self.selected_session.as_deref() == Some(state.session_id.as_str())
+            prev_selected_session.as_deref() == Some(state.session_id.as_str())
         });
 
         if self.search_active && !self.search_query.value().is_empty() {
@@ -776,10 +825,11 @@ impl HomeView {
             .rewire(&self.file_watch, current, &mut self.reload_failure_state);
     }
 
-    /// Rewire disk and config subscriptions after a successful profile delete. Surfaces a
-    /// `Watcher Warning` dialog when `list_profiles()` cannot enumerate profiles, since the
-    /// dialog is the delete path's only user-facing signal; the next successful reload
-    /// repairs watcher state.
+    /// Rewire disk + config subscriptions after a successful profile
+    /// delete. Surfaces a `Watcher Warning` dialog when
+    /// `list_profiles()` cannot enumerate profiles, since the dialog
+    /// is the only user-facing signal the delete path has; the next
+    /// successful reload repairs watcher state.
     pub(in crate::tui) fn rewire_after_profile_delete(&mut self, profile_name: &str) {
         match crate::session::list_profiles() {
             Ok(profiles) => {
@@ -815,14 +865,24 @@ impl HomeView {
     }
 
     /// Open or refresh the `Reload Failed` dialog from the current
-    /// `reload_failure_state`, returning `true` when it was opened or its body refreshed so
-    /// the caller can redraw.
+    /// `reload_failure_state`. Returns `true` when the dialog was
+    /// opened or its body refreshed in place so the caller can
+    /// request a redraw.
     ///
-    /// Three paths converge here: a new burst presents the dialog and consumes the ack
-    /// latch; an acknowledged burst whose failing-source set has shifted rebuilds the body
-    /// in place without re-notifying; and everything else is a no-op (live-send active,
-    /// nothing failing, body unchanged, or another dialog in the slot), which leaves the
-    /// latch armed for a later tick.
+    /// Three update paths converge here:
+    /// * New burst presentation: `has_unacknowledged_failure()` is
+    ///   true. The dialog opens (or re-opens) and the ack latch is
+    ///   consumed.
+    /// * Body refresh: when a `Reload Failed` dialog is on screen
+    ///   and the ack latch is acknowledged, the body is rebuilt if
+    ///   the failing-source set has shifted (partial recovery that
+    ///   leaves at least one source still failing, or a new source
+    ///   recorded for the same acknowledged burst). The ack latch
+    ///   stays in place; the user is not re-notified for the same
+    ///   ongoing burst.
+    /// * No-op: live-send active, nothing failing, body unchanged, or an
+    ///   unrelated dialog occupies the slot. While live or another dialog is
+    ///   open, the ack latch stays armed so a later tick can present it.
     pub(in crate::tui) fn try_present_reload_failure_dialog(&mut self) -> bool {
         if self.live_send.is_some() || !self.reload_failure_state.has_any_failure() {
             return false;
@@ -862,10 +922,12 @@ impl HomeView {
         true
     }
 
-    /// Recovery-edge cleanup: clear a stale `Reload Failed` dialog once every reload source
-    /// is healthy, returning `true` when cleared so the caller can redraw. The
-    /// `Watcher Warning` dialog from `rewire_after_profile_delete` is deliberately outside
-    /// `reload_failure_state` and left for the user to dismiss.
+    /// Recovery-edge cleanup: clear a stale `Reload Failed` dialog
+    /// when every reload source returns to healthy. Returns `true`
+    /// when the dialog was cleared so the caller can request a redraw.
+    /// The `Watcher Warning` dialog raised by
+    /// `rewire_after_profile_delete` is intentionally outside
+    /// `reload_failure_state` and is left for the user to dismiss.
     pub(in crate::tui) fn try_clear_recovered_reload_dialog(&mut self) -> bool {
         if !self.reload_failure_state.has_any_failure()
             && self

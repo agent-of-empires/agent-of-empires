@@ -338,6 +338,11 @@ async fn no_revive_refuses_a_stopped_or_dormant_worker_without_side_effects() {
         .into_response();
 
         assert_eq!(response.status(), StatusCode::CONFLICT, "dormant={dormant}");
+        assert_eq!(
+            crate::daemon::ApiErrorCode::from_headers(response.status(), response.headers(), false),
+            Some(crate::daemon::ApiErrorCode::NoRevive),
+            "dormant={dormant}"
+        );
         let inst = state.instances.read().await[0].clone();
         assert!(
             inst.pending_initial_turn.is_some(),

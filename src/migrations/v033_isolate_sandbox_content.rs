@@ -2271,13 +2271,16 @@ fn reconcile_pending_with_home(move_stores: bool, home: Option<PathBuf>) -> Resu
             &probes.exposure,
         );
     }
+    let runtime = crate::containers::get_container_runtime();
+    let running = layout::batched_running_probe(&runtime, false);
+    let reap = |id: &str| layout::reap_migrated_container(id, &runtime);
     reconcile_in(
         &app,
         &home,
         None,
         move_stores,
-        &layout::batched_running_probe(false),
-        &layout::reap_migrated_container,
+        &running,
+        &reap,
         &live_bind_sources,
     )
 }
@@ -2285,13 +2288,16 @@ fn reconcile_pending_with_home(move_stores: bool, home: Option<PathBuf>) -> Resu
 pub(crate) fn migrate_instance(id: &str) -> Result<()> {
     let app = crate::session::get_app_dir()?;
     let home = dirs::home_dir().context("home directory unavailable for content isolation")?;
+    let runtime = crate::containers::get_container_runtime();
+    let running = layout::batched_running_probe(&runtime, false);
+    let reap = |id: &str| layout::reap_migrated_container(id, &runtime);
     reconcile_in(
         &app,
         &home,
         Some(id),
         true,
-        &layout::batched_running_probe(false),
-        &layout::reap_migrated_container,
+        &running,
+        &reap,
         &live_bind_sources,
     )
 }

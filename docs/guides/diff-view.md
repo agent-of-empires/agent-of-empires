@@ -32,6 +32,33 @@ The changed-files list has two layouts, toggled in its header: **flat** lists ev
 
 The **Files** pane (folder icon in the activity bar) browses the session's whole working directory, not just its git changes, so it lists files even in a non-git scratch session. Markdown renders as HTML with a **Rendered** / **Raw** toggle, in this pane and from the diff list. Files an agent cites that live outside the session's repo open only when that agent actually read or wrote them during this session: the dashboard cannot open an arbitrary host path.
 
+### "Open file" and the raw route
+
+**Open file** does not navigate the tab to the file. It fetches
+`GET /api/sessions/<id>/diff/file/raw?path=<repo-relative-path>` through the
+authenticated client and hands the bytes to the new tab as a blob URL, because
+a bare navigation carries no auth token. The response:
+
+- is capped at **50 MiB**; a larger file is answered `413 Payload Too Large`
+  rather than being read into memory. The cap is enforced on the read itself,
+  so a file that grows mid-request cannot slip past it;
+- is confined to the selected repo's worktree — the same checks the file reader
+  applies, with no provenance fallback — so an absolute path, a `..` segment,
+  or a file that has been deleted from the worktree is a `404`;
+- always carries `X-Content-Type-Options: nosniff`;
+- is sent as `Content-Disposition: attachment` for every type a browser would
+  not render in a tab, and additionally for every *scriptable* type (HTML, SVG,
+  XML, and the JavaScript/ECMAScript family), which is also re-typed as
+  `application/octet-stream`. Blob URLs drop `Content-Disposition`, so the
+  dashboard saves the attachment itself under the file's own name. A scriptable
+  artifact can therefore never become a document the dashboard's own origin
+  renders.
+
+Session artifacts written by an agent into the session's artifact directory
+(`GET /api/sessions/<id>/artifacts/<path>`) are served under the same rules:
+the same 50 MiB cap, the same `nosniff`, the same attachment-forcing, and
+confinement to that session's artifact directory.
+
 ### Split view
 
 Split layout shows old on the left and new on the right, with an aligned placeholder opposite a pure addition or deletion. The TUI stores the choice in `[diff].split_view`; the web dashboard stores it per browser (**Settings > Diff**). Both fall back to unified on a narrow pane.

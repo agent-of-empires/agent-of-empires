@@ -3,6 +3,22 @@
 use super::*;
 
 /// Command run inside the sandbox container for the web Container terminal tab.
+///
+/// Resolves the container user's preferred shell at spawn time, inside the
+/// container. Known-compatible shells run in login mode so profile/rc files
+/// load; other authorized shells run plain.
+/// Resolution order: the passwd entry, `$SHELL`, bash, then sh. Each candidate
+/// is resolved and validated inside the container as a regular executable
+/// authorized shell. Passwd is read directly when `getent` is unavailable.
+///
+/// The script is evaluated by the container's `/bin/sh`, not the host shell tmux
+/// uses to spawn the session, so the embedded `$()` runs in the container. The
+/// host does not propagate its own `$SHELL` into the container, so this reads the
+/// container's value, not the host's.
+///
+/// `@KNOWN_SHELLS@` and `@LOGIN_FLAG_SHELLS@` are substituted from
+/// [`crate::session::environment`] so the container tab recognizes the same
+/// shells, and makes the same login-mode call, as the host tab.
 const CONTAINER_TERMINAL_AUTODETECT_SCRIPT: &str = r#"passwd_file=$1
 shells_file=$2
 
@@ -112,13 +128,92 @@ fn container_terminal_exec_options(workdir: &str, env_args: &str) -> String {
     format!("-w {} {}", shell_escape_script_word(workdir), env_args)
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("Tool '{0}' requires a configured non-empty foreground command")]
+pub(crate) struct ToolLaunchUnavailable(pub String);
+
 impl Instance {
+    pub(crate) fn acquire_auxiliary_locks_in(
+        &mut self,
+        store: &dyn crate::session::SessionStore,
+    ) -> Result<(crate::session::StorageFlock, crate::session::StorageFlock)> {
+        let title = crate::session::storage::acquire_session_title_lock(&self.id)?;
+        let lifecycle = store.storage().acquire_instance_lifecycle_lock(&self.id)?;
+        store.check_available()?;
+        self.reconcile_from_store(store)?;
+        anyhow::ensure!(
+            !self.is_trashed() && !matches!(self.status, Status::Creating | Status::Deleting),
+            LifecycleReservationError::Superseded
+        );
+        if self.has_fresh_lifecycle_reservation(Utc::now()) {
+            return Err(LifecycleReservationError::Busy(
+                self.lifecycle_reservation
+                    .as_ref()
+                    .expect("fresh reservation")
+                    .op,
+            )
+            .into());
+        }
+        Ok((title, lifecycle))
+    }
+
+    pub(crate) fn start_tool_with_size_in(
+        &mut self,
+        tool_name: &str,
+        size: Option<(u16, u16)>,
+        store: &dyn crate::session::SessionStore,
+    ) -> Result<(tmux::ToolSession, bool)> {
+        let (_title, _lifecycle) = self.acquire_auxiliary_locks_in(store)?;
+        let config = store.configuration(Some(store.storage().profile()))?;
+        let tool = config
+            .tools
+            .get(tool_name)
+            .filter(|tool| !tool.command.is_empty() && !tool.background)
+            .ok_or_else(|| ToolLaunchUnavailable(tool_name.to_owned()))?;
+        let panes = crate::tmux::batch_pane_metadata()?;
+        let session = tmux::ToolSession::from_snapshot(&self.id, &self.title, tool_name, &panes)
+            .map_err(|error| error.context(ToolLaunchUnavailable(tool_name.to_owned())))?;
+        let metadata = panes.get(session.session_name());
+        if metadata.is_some_and(|pane| pane.pane_dead) {
+            session.kill()?;
+        }
+        let created = metadata.is_none_or(|pane| pane.pane_dead);
+        if created {
+            session.create_with_size(
+                &self.project_path,
+                &tool.command,
+                size,
+                &self.effective_profile(),
+                &self.id,
+                tool_name,
+            )?;
+        }
+        let branch = self
+            .worktree_info
+            .as_ref()
+            .map(|worktree| worktree.branch.as_str())
+            .or_else(|| {
+                self.workspace_info
+                    .as_ref()
+                    .map(|workspace| workspace.branch.as_str())
+            });
+        crate::tmux::status_bar::apply_all_tmux_options(
+            session.session_name(),
+            &format!("{} ({tool_name})", self.title),
+            branch,
+            None,
+            &self.effective_profile(),
+        );
+        Ok((session, created))
+    }
+
     pub fn terminal_tmux_session(&self) -> Result<tmux::TerminalSession> {
         self.terminal_tmux_session_indexed(0)
     }
 
-    /// Paired host terminal at `index`. Index 0 is the historical single terminal (the only one the
-    /// TUI uses).
+    /// Paired host terminal at `index`. Index 0 is the historical single
+    /// terminal (the only one the TUI uses); index >= 1 are the additional
+    /// web dashboard terminal tabs (#2437).
     pub fn terminal_tmux_session_indexed(&self, index: u32) -> Result<tmux::TerminalSession> {
         tmux::TerminalSession::new_indexed(&self.id, &self.title, index)
     }
@@ -130,6 +225,10 @@ impl Instance {
             .unwrap_or(false)
     }
 
+    pub fn start_terminal(&mut self) -> Result<()> {
+        self.start_terminal_with_size(None)
+    }
+
     pub fn start_terminal_with_size(&mut self, size: Option<(u16, u16)>) -> Result<()> {
         self.start_terminal_with_size_indexed(0, size)
     }
@@ -139,21 +238,44 @@ impl Instance {
         index: u32,
         size: Option<(u16, u16)>,
     ) -> Result<()> {
+        let storage = crate::session::Storage::open_unwatched(&self.effective_profile())?;
+        self.start_terminal_with_size_indexed_in(index, size, &storage)
+            .map(|_| ())
+    }
+
+    pub(crate) fn start_terminal_with_size_indexed_in(
+        &mut self,
+        index: u32,
+        size: Option<(u16, u16)>,
+        store: &dyn crate::session::SessionStore,
+    ) -> Result<(tmux::TerminalSession, bool)> {
+        let (_title, _lifecycle) = self.acquire_auxiliary_locks_in(store)?;
+        crate::tmux::refresh_session_cache();
         let session = self.terminal_tmux_session_indexed(index)?;
+        if session.exists() && session.is_pane_dead() {
+            session.kill()?;
+        }
 
         let is_new = !session.exists();
         if is_new {
             session.create_with_size(&self.project_path, None, size, &self.effective_profile())?;
-            // Apply all configured tmux options to terminal sessions too
             self.apply_terminal_tmux_options(index);
         }
 
-        // The persisted `terminal_info` cache is the index-0 fast path the TUI reads.
+        // Only terminal zero has a persisted cache flag.
         if index == 0 {
+            store.update(|rows, _| {
+                let row = rows
+                    .iter_mut()
+                    .find(|row| row.id == self.id)
+                    .ok_or(LifecycleReservationError::Superseded)?;
+                row.terminal_info = Some(TerminalInfo { created: true });
+                Ok(())
+            })?;
             self.terminal_info = Some(TerminalInfo { created: true });
         }
 
-        Ok(())
+        Ok((session, is_new))
     }
 
     pub fn kill_terminal(&self) -> Result<()> {
@@ -168,8 +290,14 @@ impl Instance {
         Ok(())
     }
 
-    /// Kill the paired terminal tmux session if its pane is dead (the shell exited while
-    /// `remain-on-exit on` kept the session as a tombstone).
+    /// Kill the paired terminal tmux session if its pane is dead (shell
+    /// exited while `remain-on-exit on` kept the session as a tombstone).
+    /// Returns true if a kill happened so the caller knows to re-spawn.
+    /// A missing session or a live pane both return Ok(false).
+    pub fn kill_terminal_if_dead(&self) -> Result<bool> {
+        self.kill_terminal_if_dead_indexed(0)
+    }
+
     pub fn kill_terminal_if_dead_indexed(&self, index: u32) -> Result<bool> {
         let session = self.terminal_tmux_session_indexed(index)?;
         if session.exists() && session.is_pane_dead() {
@@ -205,64 +333,149 @@ impl Instance {
         index: u32,
         size: Option<(u16, u16)>,
     ) -> Result<()> {
-        if !self.is_sandboxed() {
-            anyhow::bail!("Cannot create container terminal for non-sandboxed session");
-        }
+        let storage = crate::session::Storage::open_unwatched(&self.effective_profile())?;
+        self.start_container_terminal_with_hook_in(
+            index,
+            size,
+            &storage,
+            Self::mint_before_start_env,
+        )
+        .map(|_| ())
+    }
 
-        let container = self.get_container_for_instance()?;
-        let sandbox = self
-            .sandbox_info
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("sandbox_info missing for sandboxed session"))?;
-
-        let managed_codex_home = container_config::managed_codex_home(
-            &self.tool,
-            Some(self.get_tool_command()),
-            &self.source_profile,
-            &self.id,
-        )?;
-        let env_info = build_docker_env_args_with_managed_codex_home(
-            &self.source_profile,
-            sandbox,
-            std::path::Path::new(&self.project_path),
-            managed_codex_home.as_deref(),
+    pub(crate) fn start_container_terminal_with_hook_in(
+        &mut self,
+        index: u32,
+        size: Option<(u16, u16)>,
+        store: &dyn crate::session::SessionStore,
+        mut run_hook: impl FnMut(&mut Self, &crate::session::LaunchConfig) -> Result<()>,
+    ) -> Result<(tmux::ContainerTerminalSession, bool)> {
+        let mut ownership = Some(self.acquire_auxiliary_locks_in(store)?);
+        anyhow::ensure!(
+            self.is_sandboxed(),
+            "Cannot create container terminal for non-sandboxed session"
         );
-        let env_part = if env_info.docker_args.is_empty() {
-            String::new()
-        } else {
-            format!("{} ", env_info.docker_args)
-        };
-
-        // Get workspace path inside container (handles bare repo worktrees correctly)
-        let container_workdir = self.container_workdir();
-
-        let resolver_command = container_terminal_autodetect_command("/etc/passwd", "/etc/shells");
-        let cmd = container.exec_command(
-            Some(&container_terminal_exec_options(
-                &container_workdir,
-                &env_part,
-            )),
-            &resolver_command,
-        );
-
-        // Values ride the protected env-file, never the host shell or runtime
-        // process env. See [`crate::session::environment::DockerExecEnv`].
+        tmux::refresh_session_cache();
         let session = self.container_terminal_tmux_session_indexed(index)?;
-        let is_new = !session.exists();
-        if is_new {
-            let session = tmux::Session::from_name(session.name());
-            session.create_with_size_env_and_container_env(
-                &self.project_path,
-                Some(&cmd),
-                size,
-                &self.effective_profile(),
-                &[],
-                &env_info.env,
-            )?;
-            self.apply_container_terminal_tmux_options(index);
+        if session.exists() && !session.is_pane_dead() {
+            return Ok((session, false));
         }
+        let generation =
+            self.acquire_lifecycle_reservation(store, LifecycleOperation::Launch, None)?;
+        let result = (|| {
+            let container = self.ensure_container_with_hook_in(store, |instance, config| {
+                drop(ownership.take());
+                let result = run_hook(instance, config);
+                let title = crate::session::acquire_session_title_lock(&instance.id)?;
+                let lifecycle = store
+                    .storage()
+                    .acquire_instance_lifecycle_lock(&instance.id)?;
+                ownership = Some((title, lifecycle));
+                store.check_available()?;
+                instance.reconcile_from_store(store)?;
+                anyhow::ensure!(
+                    instance.lifecycle_reservation_is_owned(LifecycleOperation::Launch, generation),
+                    LifecycleReservationError::Superseded
+                );
+                result
+            })?;
+            let sandbox = self
+                .sandbox_info
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("sandbox_info missing for sandboxed session"))?;
 
-        Ok(())
+            let config = store.launch_configuration(std::path::Path::new(&self.project_path))?;
+            let managed_codex_home = container_config::managed_codex_home(
+                &self.tool,
+                Some(self.get_tool_command()),
+                &self.source_profile,
+                &self.id,
+            )?;
+            let env_info = build_docker_env_args_with_managed_codex_home(
+                config.sandbox(),
+                sandbox,
+                managed_codex_home.as_deref(),
+            );
+            let env_part = if env_info.docker_args.is_empty() {
+                String::new()
+            } else {
+                format!("{} ", env_info.docker_args)
+            };
+
+            // Bare-repository worktrees have a distinct container path.
+            let container_workdir = self.container_workdir();
+
+            let resolver_command =
+                container_terminal_autodetect_command("/etc/passwd", "/etc/shells");
+            let cmd = container.exec_command(
+                Some(&container_terminal_exec_options(
+                    &container_workdir,
+                    &env_part,
+                )),
+                &resolver_command,
+            );
+
+            // Values ride the protected env-file, never the host shell or runtime
+            // process env. See [`crate::session::environment::DockerExecEnv`].
+            let session = self.container_terminal_tmux_session_indexed(index)?;
+            if session.exists() && session.is_pane_dead() {
+                session.kill()?;
+            }
+            let is_new = !session.exists();
+            if is_new {
+                let session = tmux::Session::from_name(session.name());
+                session.create_with_size_env_and_container_env(
+                    &self.project_path,
+                    Some(&cmd),
+                    size,
+                    &self.effective_profile(),
+                    &[],
+                    &env_info.env,
+                )?;
+                self.apply_container_terminal_tmux_options(index);
+            }
+
+            Ok((session, is_new))
+        })();
+        match result {
+            Ok(outcome) => {
+                store.update(|rows, _| {
+                    let row = rows
+                        .iter_mut()
+                        .find(|row| row.id == self.id)
+                        .ok_or(LifecycleReservationError::Superseded)?;
+                    anyhow::ensure!(
+                        row.lifecycle_reservation_is_owned(LifecycleOperation::Launch, generation),
+                        LifecycleReservationError::Superseded
+                    );
+                    row.sandbox_info = self.sandbox_info.clone();
+                    row.release_lifecycle_reservation_if_owned(
+                        LifecycleOperation::Launch,
+                        generation,
+                    );
+                    Ok(())
+                })?;
+                self.lifecycle_reservation = None;
+                Ok(outcome)
+            }
+            Err(error) => {
+                if let Err(release_error) = store.update(|rows, _| {
+                    if let Some(row) = rows.iter_mut().find(|row| row.id == self.id) {
+                        row.release_lifecycle_reservation_if_owned(
+                            LifecycleOperation::Launch,
+                            generation,
+                        );
+                    }
+                    Ok(())
+                }) {
+                    return Err(release_error.context(error));
+                }
+                if self.lifecycle_generation == generation {
+                    self.lifecycle_reservation = None;
+                }
+                Err(error)
+            }
+        }
     }
 
     pub fn kill_container_terminal(&self) -> Result<()> {
@@ -275,16 +488,6 @@ impl Instance {
             session.kill()?;
         }
         Ok(())
-    }
-
-    /// Container counterpart of [`Self::kill_terminal_if_dead_indexed`].
-    pub fn kill_container_terminal_if_dead_indexed(&self, index: u32) -> Result<bool> {
-        let session = self.container_terminal_tmux_session_indexed(index)?;
-        if session.exists() && session.is_pane_dead() {
-            let _ = session.kill();
-            return Ok(true);
-        }
-        Ok(false)
     }
 }
 

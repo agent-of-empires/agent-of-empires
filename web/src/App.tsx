@@ -80,7 +80,8 @@ import {
   markWebTourSeen,
   updateWorkspaceOrdering,
   createProject,
-  setProjectPinned,
+  updateProject,
+  projectTarget,
   deleteProject,
   setSessionUnread,
   killTerminal,
@@ -443,7 +444,12 @@ function AppContent({
     [setSidebarSortMode],
   );
 
-  const { projects, refresh: refreshProjects } = useProjects();
+  const { projects, profile: projectProfile, ready: projectsReady, refresh: refreshProjects } = useProjects();
+  const requireProjectProfile = useCallback(() => {
+    if (projectsReady && projectProfile) return projectProfile;
+    toastBus.handler?.error("Projects are not ready. Refresh before changing the registry.");
+    return undefined;
+  }, [projectProfile, projectsReady]);
   const {
     groups: repoGroups,
     savedProjects,
@@ -1327,39 +1333,39 @@ function AppContent({
         .filter((s) => (s.main_repo_path || s.project_path) === repoPath)
         .sort((a, b) => (b.last_accessed_at ?? "").localeCompare(a.last_accessed_at ?? ""));
       const latest = projectSessions[0];
-
-      // Quick-create skips ProjectStep's selection, which is what normally reports the override.
+      const profile = latest?.profile || requireProjectProfile();
+      if (!profile) return;
       const key = normalizeProjectPathKey(repoPath);
-      const registered = projects.find((p) => normalizeProjectPathKey(p.path) === key);
+      const registered = projects.find((project) => normalizeProjectPathKey(project.path) === key);
 
       setWizardPrefill({
         path: repoPath,
         tool: latest?.tool ?? "claude",
         yoloMode: latest?.yolo_mode ?? false,
         sandboxEnabled: latest?.is_sandboxed ?? false,
-        profile: latest?.profile || undefined,
+        profile,
         group: latest?.group_path || undefined,
         worktreeEnabled: registered?.overrides?.worktree_enabled,
       });
       setShowSessionWizard(true);
     },
-    [sessions, projects],
+    [sessions, projects, requireProjectProfile],
   );
 
-  // Pin a repo so its header persists with zero sessions. If the repo is
-  // already a saved project, just set its pin flag (PATCH); otherwise register
-  // it pinned (scope global, matching the TUI's global registry). Then refresh
-  // so the diamond / empty header reflects it. See #2047, #2208.
   const handlePinProject = useCallback(
     async (repoPath: string) => {
+      const profile = requireProjectProfile();
+      if (!profile) return;
       const key = normalizeProjectPathKey(repoPath);
       const existing = projects.filter((p) => normalizeProjectPathKey(p.path) === key);
       let failed: { error?: string } | undefined;
       if (existing.length > 0) {
-        const results = await Promise.all(existing.map((p) => setProjectPinned(p.name, p.scope, true)));
+        const results = await Promise.all(
+          existing.map((p) => updateProject(p.path, projectTarget(p.scope, profile), { pinned: true })),
+        );
         failed = results.find((r) => !r.ok);
       } else {
-        const res = await createProject({ path: repoPath, scope: "global", pinned: true });
+        const res = await createProject({ path: repoPath, scope: "global", profile, pinned: true });
         if (!res.ok) failed = res;
       }
       if (failed) {
@@ -1368,65 +1374,77 @@ function AppContent({
       }
       await refreshProjects();
     },
-    [projects, refreshProjects],
+    [projects, refreshProjects, requireProjectProfile],
   );
 
-  // Unpin a repo: clear the pin flag on every pinned registry entry for its
-  // path (a path can be registered under both global and profile scope),
-  // keeping the saved project so it stays in the Projects view and the wizard.
-  // Only the Projects view's Remove deletes the entry. See #2208.
+  // Unpin every returned registration without deleting saved projects.
   const handleUnpinProject = useCallback(
     async (group: SidebarGroup) => {
+      const profile = requireProjectProfile();
+      if (!profile || !group.registeredProjects.every((project) => projects.includes(project))) return;
       const pinned = group.registeredProjects.filter((p) => p.pinned);
-      const results = await Promise.all(pinned.map((p) => setProjectPinned(p.name, p.scope, false)));
+      const results = await Promise.all(
+        pinned.map((p) => updateProject(p.path, projectTarget(p.scope, profile), { pinned: false })),
+      );
       const failed = results.find((r) => !r.ok);
       if (failed) {
         toastBus.handler?.error(failed.error ?? "Failed to unpin project");
       }
       await refreshProjects();
     },
-    [refreshProjects],
+    [projects, refreshProjects, requireProjectProfile],
   );
 
-  // Add / edit a saved project from the sidebar Projects section. The modal is
-  // open for `add` (no editProject) or `edit` (a specific registration); both
-  // refresh the registry on save. See #2212.
-  const [projectForm, setProjectForm] = useState<{ editProject: ProjectInfo | null } | null>(null);
-  const handleAddProject = useCallback(() => setProjectForm({ editProject: null }), []);
-  const handleEditProject = useCallback((project: ProjectInfo) => setProjectForm({ editProject: project }), []);
+  const [projectForm, setProjectForm] = useState<{ editProject: ProjectInfo | null; profile: string } | null>(null);
+  const handleAddProject = useCallback(() => {
+    const profile = requireProjectProfile();
+    if (profile) setProjectForm({ editProject: null, profile });
+  }, [requireProjectProfile]);
+  const handleEditProject = useCallback(
+    (project: ProjectInfo) => {
+      const profile = requireProjectProfile();
+      if (profile && projects.includes(project)) setProjectForm({ editProject: project, profile });
+    },
+    [projects, requireProjectProfile],
+  );
 
-  // A group with live sessions may be unregistered; register it globally before editing.
   const handleEditProjectSettings = useCallback(
     async (group: SidebarGroup) => {
-      if (group.registeredProjects.length > 0) {
-        setProjectForm({ editProject: group.registeredProjects[0]! });
+      const profile = requireProjectProfile();
+      if (!profile) return;
+      const registered = group.registeredProjects.find((project) => projects.includes(project));
+      if (registered) {
+        setProjectForm({ editProject: registered, profile });
         return;
       }
       if (!group.repoPath) return;
-      const res = await createProject({ path: group.repoPath, scope: "global" });
-      if (!res.ok || !res.project) {
-        toastBus.handler?.error(res.error ?? "Failed to register project");
+      const result = await createProject({ path: group.repoPath, scope: "global", profile });
+      if (!result.ok || !result.project) {
+        toastBus.handler?.error(result.error ?? "Failed to register project");
         return;
       }
       await refreshProjects();
-      setProjectForm({ editProject: res.project });
+      setProjectForm({ editProject: result.project, profile });
     },
-    [refreshProjects],
+    [projects, refreshProjects, requireProjectProfile],
   );
 
-  // Remove a saved project: delete every registration for its path, then
-  // refresh. Confirms first since it is not undoable. See #2212.
+  // Remove only the registrations captured by this sidebar row.
   const handleRemoveProject = useCallback(
     async (group: RepoGroup) => {
+      const profile = requireProjectProfile();
+      if (!profile || !group.registeredProjects.every((project) => projects.includes(project))) return;
       if (!confirm(`Remove project '${group.displayName}' from the sidebar?`)) return;
-      const results = await Promise.all(group.registeredProjects.map((p) => deleteProject(p.name, p.scope)));
+      const results = await Promise.all(
+        group.registeredProjects.map((p) => deleteProject(p.path, projectTarget(p.scope, profile))),
+      );
       const failed = results.find((r) => !r.ok);
       if (failed) {
         toastBus.handler?.error(failed.error ?? "Failed to remove project");
       }
       await refreshProjects();
     },
-    [refreshProjects],
+    [projects, refreshProjects, requireProjectProfile],
   );
 
   // The right-panel control toggles the desktop split, but on mobile there
@@ -2338,9 +2356,9 @@ function AppContent({
                 setShowSessionWizard(true);
               }}
               onCreateSession={handleCreateSession}
-              onPinProject={handlePinProject}
-              onUnpinProject={handleUnpinProject}
-              onEditProjectSettings={handleEditProjectSettings}
+              onPinProject={projectsReady ? handlePinProject : undefined}
+              onUnpinProject={projectsReady ? handleUnpinProject : undefined}
+              onEditProjectSettings={projectsReady ? handleEditProjectSettings : undefined}
               savedProjects={savedProjects}
               onAddProject={handleAddProject}
               onEditProject={handleEditProject}
@@ -2389,6 +2407,7 @@ function AppContent({
         {projectForm && (
           <ProjectFormModal
             initial={projectForm.editProject}
+            profile={projectForm.profile}
             onClose={() => setProjectForm(null)}
             onSaved={() => refreshProjects()}
           />

@@ -11,6 +11,8 @@ fn git(dir: &Path, args: &[&str]) {
     let out = std::process::Command::new("git")
         .args(args)
         .current_dir(dir)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
         .output()
         .expect("run git");
     assert!(

@@ -97,6 +97,12 @@ slot = "row-badge"
 id = "my_badge"
 ```
 
+`href` may also be a same-origin relative path, which is the only portable way
+to link back into aoe (a plugin cannot know the host, port, or tunnel origin).
+Relative hrefs must start with exactly one `/`; `//host`, backslashes, and
+embedded tab/CR/LF are rejected because a browser would resolve them onto a
+different origin. See [Link targets](#link-targets).
+
 ## Keybinds
 
 ```toml
@@ -332,6 +338,25 @@ Clicking an `action` block, or a `row` carrying a `method`, POSTs to `/api/plugi
 The host merges in the authoritative `session_id` (a plugin cannot spoof it) and delivers the call as a **fire-and-forget JSON-RPC notification**: no reply, no return value. The worker does its work and re-pushes its UI state, and the clicked control spins until the plugin's UI revision moves, with a 15s timeout. Actions are read-write-mode only and are not passphrase gated, so treat every method as reachable by anyone who can use the dashboard.
 
 The TUI renders panes read-only: it draws the text of every kind (dropping icons, hrefs, and tooltips, and stacking `columns`) but cannot fire an action, so `action` blocks appear as inert `[action] <label>` labels.
+
+#### Link targets
+
+An `href` is either an absolute `http(s)://` URL, or a same-origin path
+resolved against the host's own dashboard origin:
+
+- **In the web dashboard** a relative path navigates inside the open SPA, so
+  the browser stays on the same origin and no page reload is needed.
+- **In the TUI** there is no browser origin, so a relative path needs a
+  reachable dashboard to open: a local `aoe serve` web daemon (its published
+  URL, including its bootstrap token, is used), or an explicit
+  `AOE_DASHBOARD_URL` when the TUI is attached to a remote daemon
+  (`AOE_DAEMON_URL`). A core-only daemon has no TCP listener and no dashboard,
+  so a relative link is refused with a message rather than opened against a
+  guessed host. Absolute `http(s)` hrefs work everywhere and need no
+  dashboard.
+
+Dashboard bootstrap query parameters are preserved across the navigation, so
+a tokenized `serve.url` still authenticates a relative link.
 
 ### Composer action payload
 

@@ -12,7 +12,9 @@ use std::io::Read;
 use std::os::fd::OwnedFd;
 use std::os::unix::ffi::OsStringExt;
 use std::path::{Component, Path, PathBuf};
+use std::time::Duration;
 
+#[derive(Debug)]
 pub(crate) struct AnchoredDir {
     root: PathBuf,
     fd: OwnedFd,
@@ -28,9 +30,226 @@ thread_local! {
     pub(crate) static FAIL_SYNC_ONCE: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
 }
 
+/// A user-managed file link resolved once, without creating directories.
+#[derive(Debug)]
+pub(crate) struct ResolvedDataFile {
+    parent: AnchoredDir,
+    leaf: OsString,
+    _source: Option<AnchoredDir>,
+}
+
+impl ResolvedDataFile {
+    pub(crate) fn open(path: &Path) -> Result<Self> {
+        let parent = path.parent().context("data file needs a parent")?;
+        let parent = AnchoredDir::open(if parent.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            parent
+        })?;
+        let leaf = path
+            .file_name()
+            .context("data file needs a leaf")?
+            .to_owned();
+        Self::resolve(parent, leaf)
+    }
+
+    fn resolve(mut parent: AnchoredDir, mut leaf: OsString) -> Result<Self> {
+        let mut source = None;
+        for hop in 0..=32 {
+            let target = match nix::fcntl::readlinkat(&parent.fd, leaf.as_os_str()) {
+                Ok(target) => PathBuf::from(target),
+                Err(Errno::EINVAL) | Err(Errno::ENOENT) => {
+                    return Ok(Self {
+                        parent,
+                        leaf,
+                        _source: source,
+                    });
+                }
+                Err(error) => return Err(error).context("resolving data-file link"),
+            };
+            if hop == 32 {
+                bail!("data-file symlink chain too deep");
+            }
+            let target_parent = target.parent().context("data-file link needs a parent")?;
+            let target_parent = if target_parent.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                target_parent
+            };
+            let next = AnchoredDir {
+                fd: openat(
+                    &parent.fd,
+                    target_parent,
+                    OFlag::O_DIRECTORY | OFlag::O_CLOEXEC | OFlag::O_RDONLY,
+                    Mode::empty(),
+                )
+                .context("opening data-file target directory")?,
+                root: parent.root.join(target_parent),
+            };
+            leaf = target
+                .file_name()
+                .context("data-file link needs a leaf")?
+                .to_owned();
+            if source.is_none() {
+                source = Some(parent);
+            }
+            parent = next;
+        }
+        unreachable!()
+    }
+
+    pub(crate) fn same_target(&self, other: &Self) -> Result<bool> {
+        if self.leaf != other.leaf {
+            return Ok(false);
+        }
+        let left = fstat(&self.parent.fd)?;
+        let right = fstat(&other.parent.fd)?;
+        Ok(left.st_dev == right.st_dev && left.st_ino == right.st_ino)
+    }
+
+    pub(crate) fn open_sidecar(&self) -> Result<(File, PathBuf)> {
+        let mut name = OsString::from(".");
+        name.push(&self.leaf);
+        name.push(".lock");
+        self.parent.open_lock(&name)
+    }
+
+    pub(crate) fn read(&self) -> Result<Option<String>> {
+        let fd = match openat(
+            &self.parent.fd,
+            self.leaf.as_os_str(),
+            OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK,
+            Mode::empty(),
+        ) {
+            Ok(fd) => fd,
+            Err(Errno::ENOENT) => return Ok(None),
+            Err(error) => return Err(error).context("opening resolved data file"),
+        };
+        if fstat(&fd)?.st_mode & nix::libc::S_IFMT != nix::libc::S_IFREG {
+            bail!("resolved data file is not a regular file");
+        }
+        let mut content = String::new();
+        File::from(fd).read_to_string(&mut content)?;
+        Ok(Some(content))
+    }
+
+    pub(crate) fn replace(&self, content: &[u8]) -> Result<()> {
+        super::storage::replace_anchored_file(
+            &self.parent.fd,
+            &self.leaf,
+            content,
+            Mode::from_bits_truncate(0o600),
+        )
+    }
+
+    /// Remove this resolved regular-file slot without following its name.
+    pub(crate) fn remove(&self) -> Result<()> {
+        match unlinkat(
+            &self.parent.fd,
+            self.leaf.as_os_str(),
+            UnlinkatFlags::NoRemoveDir,
+        ) {
+            Ok(()) => Ok(()),
+            Err(Errno::ENOENT) => Ok(()),
+            Err(error) => Err(error).context("removing resolved data file"),
+        }
+    }
+
+    pub(crate) fn replace_preserving_permissions(&self, content: &[u8]) -> Result<()> {
+        let mode = match fstatat(
+            &self.parent.fd,
+            self.leaf.as_os_str(),
+            AtFlags::AT_SYMLINK_NOFOLLOW,
+        ) {
+            Ok(stat) if stat.st_mode & nix::libc::S_IFMT == nix::libc::S_IFREG => {
+                Mode::from_bits_truncate(stat.st_mode)
+            }
+            Ok(_) => bail!("resolved data file is not a regular file"),
+            Err(Errno::ENOENT) => Mode::from_bits_truncate(0o600),
+            Err(error) => return Err(error).context("reading resolved data-file permissions"),
+        };
+        super::storage::replace_anchored_file(&self.parent.fd, &self.leaf, content, mode)
+    }
+
+    pub(crate) fn sync_parent(&self) -> Result<()> {
+        nix::unistd::fsync(&self.parent.fd).context("syncing resolved data-file directory")
+    }
+}
+
 impl AnchoredDir {
-    /// Anchor at `path`, whose ancestors are resolved the way any other caller resolves them and
-    /// whose own leaf may not be a symlink.
+    pub(crate) fn bind_file(&self, leaf: &std::ffi::OsStr) -> Result<ResolvedDataFile> {
+        if Path::new(leaf).file_name() != Some(leaf) {
+            bail!("data file needs a single leaf");
+        }
+        Ok(ResolvedDataFile {
+            parent: Self {
+                root: self.root.clone(),
+                fd: self.fd.try_clone()?,
+            },
+            leaf: leaf.to_owned(),
+            _source: None,
+        })
+    }
+
+    pub(crate) fn resolve_file(&self, leaf: &std::ffi::OsStr) -> Result<ResolvedDataFile> {
+        if Path::new(leaf).file_name() != Some(leaf) {
+            bail!("data file needs a single leaf");
+        }
+        ResolvedDataFile::resolve(
+            Self {
+                root: self.root.clone(),
+                fd: self.fd.try_clone()?,
+            },
+            leaf.to_owned(),
+        )
+    }
+
+    pub(crate) fn same_directory(&self, other: &Self) -> Result<bool> {
+        let left = fstat(&self.fd)?;
+        let right = fstat(&other.fd)?;
+        Ok(left.st_dev == right.st_dev && left.st_ino == right.st_ino)
+    }
+
+    pub(crate) fn open_lock(&self, name: &std::ffi::OsStr) -> Result<(File, PathBuf)> {
+        if Path::new(name).file_name() != Some(name) {
+            bail!("lock file needs a single leaf");
+        }
+        let mut retries = 0u8;
+        let fd = loop {
+            match openat(
+                &self.fd,
+                name,
+                OFlag::O_RDWR
+                    | OFlag::O_CREAT
+                    | OFlag::O_CLOEXEC
+                    | OFlag::O_NOFOLLOW
+                    | OFlag::O_NONBLOCK,
+                Mode::from_bits_truncate(0o600),
+            ) {
+                Ok(fd) => break fd,
+                // POSIX gives O_CREAT on an open directory descriptor no way
+                // to report ENOENT for a non-empty leaf. macOS APFS does so
+                // transiently while sibling threads churn creates and renames
+                // in the same directory. A deleted anchor keeps failing and
+                // the context below still names the sidecar.
+                Err(Errno::ENOENT) if retries < 3 => {
+                    retries += 1;
+                    std::thread::sleep(Duration::from_millis(u64::from(retries)));
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("opening lock sidecar {}", self.root.join(name).display())
+                    });
+                }
+            }
+        };
+        if fstat(&fd)?.st_mode & nix::libc::S_IFMT != nix::libc::S_IFREG {
+            bail!("data-file sidecar is not a regular file");
+        }
+        Ok((File::from(fd), self.root.join(name)))
+    }
+
+    /// Follow ancestors, but never a symlink at the anchor leaf or below it.
     pub(crate) fn open(path: &Path) -> Result<Self> {
         let root = path.to_path_buf();
         for component in path.components() {
@@ -244,8 +463,15 @@ impl AnchoredDir {
         self.modified(relative, true)
     }
 
-    /// What `relative` names: `Some(true)` a regular file, `Some(false)` something that is not one,
-    /// `None` nothing at all.
+    /// What `relative` names: `Some(true)` a regular file, `Some(false)`
+    /// something that is not one, `None` nothing at all. `Err` when the
+    /// lookup itself could not be made, which callers that treat absence as
+    /// evidence must keep distinct from `None`.
+    ///
+    /// Inspects with `fstatat` rather than opening, so an entry this process
+    /// may stat but not read still answers `Some(true)`. A sandbox writes its
+    /// files as the container's user, and the host side only needs to know
+    /// they are there.
     pub(crate) fn regular_lookup(&self, relative: &Path) -> Result<Option<bool>> {
         let (parent, leaf) = self.open_parent(relative)?;
         match fstatat(&parent, leaf.as_os_str(), AtFlags::AT_SYMLINK_NOFOLLOW) {
@@ -575,6 +801,10 @@ mod tests {
         );
     }
 
+    /// A symlinked ancestor of the anchor is normal on macOS, where `/tmp`
+    /// and the per-user temp root under `/var` both resolve through one, and
+    /// it says nothing about whether the store below the anchor is safe.
+    /// Refusing it made every anchored read fail there.
     #[cfg(unix)]
     #[test]
     fn symlinked_ancestors_open_but_a_symlinked_anchor_leaf_does_not() {
@@ -583,6 +813,8 @@ mod tests {
         std::fs::create_dir_all(real.join("store")).unwrap();
         std::fs::write(real.join("store/id"), b"anchored").unwrap();
         std::os::unix::fs::symlink(&real, temp.path().join("link")).unwrap();
+        // The anchor's own leaf still may not be a symlink: that is the swap an
+        // attacker controls, unlike the system directories above it.
         for (anchor, id) in [("link/store", Some(&b"anchored"[..])), ("link", None)] {
             let opened = AnchoredDir::open(&temp.path().join(anchor))
                 .ok()

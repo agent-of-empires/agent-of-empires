@@ -21,7 +21,10 @@ fn click_selects_session_at_clicked_row() {
     env.view.cursor = 0;
     env.view.update_selected();
     let expected = Some(crate::tui::app::Action::EnterLiveSend(
-        session_id_at(&env.view, 2).unwrap(),
+        match &env.view.flat_items[2] {
+            Item::Session { id, .. } => id.clone(),
+            _ => panic!("flat_items[2] should be a session"),
+        },
     ));
 
     let t0 = std::time::Instant::now();
@@ -121,7 +124,9 @@ fn single_click_on_archived_row_selects_without_reviving() {
     env.view.cursor = 0;
     env.view.update_selected();
     let archived_id = env.view.selected_session.clone().unwrap();
-    env.view.toggle_archive_at_cursor().unwrap();
+    with_canonical_archive(&mut env, |env| {
+        env.view.toggle_archive_at_cursor().unwrap();
+    });
     assert!(
         env.view.get_instance(&archived_id).unwrap().is_archived(),
         "precondition: the session must be archived"
@@ -572,7 +577,10 @@ fn click_on_session_that_cannot_go_live_only_selects() {
         setup_inner(&mut env);
         env.view.cursor = 0;
         env.view.update_selected();
-        let target_id = session_id_at(&env.view, 2).unwrap();
+        let target_id = match &env.view.flat_items[2] {
+            Item::Session { id, .. } => id.clone(),
+            _ => panic!("flat_items[2] should be a session"),
+        };
         env.view.mutate_instance(&target_id, mutate);
 
         let t0 = Instant::now();

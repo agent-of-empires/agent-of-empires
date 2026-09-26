@@ -70,7 +70,8 @@ fn adopt_persisted_structured_instance(
     source_profile: &str,
 ) -> Instance {
     persisted.source_profile = source_profile.to_owned();
-    crate::server::reload::merge_runtime_fields(cached, persisted)
+    crate::server::reload::merge_runtime_fields(cached, &mut persisted);
+    persisted
 }
 
 pub async fn acp_enable(
@@ -171,7 +172,9 @@ async fn commit_structured_view(
         if let Err(e) = inst_for_transition.kill_locked() {
             tracing::warn!(target: "acp.switch", session = %inst_for_transition.id, "kill tmux failed: {e}");
         }
-        inst_for_transition.kill_ancillary_tmux_sessions_locked();
+        if let Err(error) = inst_for_transition.kill_ancillary_tmux_sessions_locked() {
+            tracing::warn!(target: "acp.switch", session = %inst_for_transition.id, "kill ancillary tmux sessions failed: {error}");
+        }
         storage.update(|all, _groups| {
             let Some(slot) = all
                 .iter_mut()

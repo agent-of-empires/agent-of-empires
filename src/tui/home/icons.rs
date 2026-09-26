@@ -1,5 +1,22 @@
 //! The glyphs the list view draws with.
 
+pub(in crate::tui) const INDENTS: [&str; 10] = [
+    "",
+    " ",
+    "  ",
+    "   ",
+    "    ",
+    "     ",
+    "      ",
+    "       ",
+    "        ",
+    "         ",
+];
+
+pub(in crate::tui) fn get_indent(depth: usize) -> &'static str {
+    INDENTS.get(depth).copied().unwrap_or(INDENTS[9])
+}
+
 pub(in crate::tui) const ICON_IDLE: &str = "⠒";
 /// Solid dot so unread reads at a glance; matches the web sidebar.
 pub(in crate::tui) const ICON_UNREAD: &str = "●";

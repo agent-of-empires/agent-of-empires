@@ -1,4 +1,98 @@
-//! Session storage - JSON file persistence with in-process and cross-process locking.
+//! Session storage - JSON file persistence with in-process and cross-process
+//! locking.
+//!
+//! `Storage` serialises read-modify-write cycles via two layers:
+//!
+//! 1. **In-process per-profile mutex** (one `Arc<Mutex<()>>` per profile name,
+//!    registered process-wide). Performance + observability layer, not a
+//!    correctness primitive on the supported platforms (Linux, macOS): a
+//!    userspace mutex is roughly an order of magnitude cheaper than the
+//!    flock syscall on the uncontended path, and same-thread re-entry
+//!    deadlocks here immediately rather than via a 50ms polling loop on
+//!    the flock. Removing this layer would still produce correct on-disk
+//!    state because `fs2::FileExt` maps to `flock(2)`, whose locks are
+//!    scoped to the open file description (OFD) on **both** Linux and
+//!    macOS/BSD. (A common misconception is that macOS `flock` is
+//!    process-scoped; it is not. Apple's flock(2) man page and
+//!    `xnu/bsd/kern/kern_descrip.c::sys_flock` key the lock on
+//!    `fp->fp_glob`, the open file description, identical in effect to
+//!    Linux's documented OFD scoping.) Every `Storage::update` opens its
+//!    own fd via `OpenOptions::open`, so two `Storage` handles in the
+//!    same process get distinct OFDs and `flock` between them conflicts
+//!    just as it does between processes. If AoE is ever ported to a
+//!    platform whose underlying lock primitive is process-scoped (e.g.
+//!    POSIX `fcntl(F_SETLK)` advisory locks, or certain Windows backends
+//!    that key on the `HANDLE` rather than the open file description),
+//!    this mutex becomes load-bearing and must not be removed without
+//!    re-establishing intra-process exclusion.
+//! 2. **Cross-process advisory `flock(2)`** on a sidecar lock file
+//!    (`<profile_dir>/.storage.lock` for sessions+groups,
+//!    `<app_dir>/.workspace-ordering.lock` for ordering). Sole guarantor
+//!    of write serialisation; `atomic_write` separately guarantees that
+//!    lock-free readers observe a consistent JSON document. Every mutator
+//!    holds the flock from before `load` until after `atomic_write`.
+//!    Polled `fs2::FileExt::try_lock_exclusive` with a 50ms backoff so
+//!    that a wait longer than 1s fires a single `tracing::warn`; the
+//!    kernel releases the lock on process exit, including SIGKILL, so a
+//!    crashed peer cannot wedge other aoe processes. Mirrors the pattern
+//!    already used by `recovery.rs` and `logging.rs`.
+//!
+//! Title writers additionally hold an app-global, per-session title flock
+//! across persistence and the post-commit tmux rekey. It is independent of
+//! profile so a cross-profile move and writers using either profile still
+//! serialize. Terminal title writers and launch callers then acquire the
+//! source profile's per-instance lifecycle flock before any profile Storage
+//! mutex/flock: session title -> lifecycle -> Storage.
+//!
+//! Storage mutations use a locked load/mutate/save cycle. Native callers retain
+//! their transition guard through canonical adoption.
+//!
+//! Identity-changing writers take app-global identity, optional session title,
+//! then lifecycle and profile storage locks. `aoe add` has no lifecycle lock.
+//! Hold identity through commit/publication; rekey retains title/lifecycle only.
+//! Launch and same-profile restart omit identity; cross-profile restart does not.
+//! Never acquire identity or title while holding lifecycle or profile storage.
+//!
+//! Purge, trash, restore and reconciliation serialize resource changes with identity.
+//! Reacquire identity before lifecycle after hooks or asynchronous runtime teardown.
+//! Catalogue transactions take identity before the store transition.
+//!
+//! Acquire the store transition before publication and profile-save mutexes.
+//! Release it between launch phases before invoking a migration.
+//!
+//! Server callers MUST drop `AppState.instances` (tokio RwLock) before
+//! acquiring any flock via `tokio::task::spawn_blocking`. A flock can park on
+//! a wedged peer for arbitrary time; holding the tokio RwLock across the wait
+//! would block every other reader/writer and park the worker thread. The
+//! cross-process storage flock is acquired AFTER the in-process mutex and
+//! released BEFORE it (RAII drop order). The closure passed to `update` is
+//! `FnOnce(...) -> Result<R>` and cannot await, so `std::sync::Mutex` is safe
+//! across the body even on the tokio runtime. A caller already holding the
+//! outer session-title and lifecycle locks must use the internal locked launch
+//! path rather than reacquiring them.
+//!
+//! `Storage::update` closures must remain CPU/memory only (no network, user
+//! input, or tmux work). The profile-move transaction has one explicit
+//! exception: its `before_commit` effect may perform an already-preflighted
+//! worktree move or sandbox-container release, never a tmux rekey. Across that
+//! effect BOTH per-profile mutexes and BOTH cross-process storage flocks are
+//! held (they are acquired in canonical directory order before `load` and
+//! released only after the final write), so every peer process is excluded from
+//! both profiles. Every subprocess is bounded: Git mutations use the worktree
+//! mutation timeout and container commands use the runtime timeout. The effect
+//! must not re-enter storage.
+//!
+//! Residual window: `before_commit` can move the worktree before profile rows
+//! are written. A later write or sync failure may retain source and target rows
+//! with the same global session id, or retain only the source row pointing at
+//! the old leaf. The TUI excludes ambiguous ids instead of selecting a profile
+//! by iteration order. Effect-first ordering still makes a failed worktree move
+//! a clean abort that changes no profile row.
+//!
+//! `update_workspace_ordering` and `Storage::update` must NOT be called from
+//! inside each other's closures. They use distinct lock files but acquiring
+//! both in different orders across processes would deadlock cross-process.
+//! Today no caller does this; this comment is the invariant.
 
 use anyhow::{anyhow, Context, Result};
 use fs2::FileExt;
@@ -6,8 +100,30 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
+
+/// Injected `sessions.json` write failure. Global rather than per-`Storage` so
+/// a test can arm it on a handle it still holds while the code under test
+/// writes through a backend it opened itself; every test that arms it runs
+/// serially and disarms it again.
+#[cfg(test)]
+static FAIL_WRITES_FOR_TEST: AtomicBool = AtomicBool::new(false);
+
+/// Disarms [`FAIL_WRITES_FOR_TEST`] on drop, so an armed test can never leak
+/// the injection into the rest of the suite, since a panic unwinds through
+/// `Drop` and a bare `set(false)` after the failing call would not run.
+#[cfg(test)]
+pub(crate) struct WriteFailureGuard;
+
+#[cfg(test)]
+impl Drop for WriteFailureGuard {
+    fn drop(&mut self) {
+        FAIL_WRITES_FOR_TEST.store(false, Ordering::SeqCst);
+    }
+}
 
 use crate::file_watch::FileWatchService;
 
@@ -15,24 +131,45 @@ use super::{
     get_app_dir, get_profile_dir, get_profile_dir_path, resolve_existing_profile, Group, Instance,
 };
 
-/// Sidecar lock file name for per-profile storage.
+/// Sidecar lock file name for per-profile storage. Lives next to
+/// `sessions.json` and `groups.json` and covers both: every code path that
+/// mutates them does so as a pair under the same in-process mutex, so a
+/// single sidecar is sufficient and avoids any sub-file lock-ordering rule.
 pub(crate) const STORAGE_LOCK_FILENAME: &str = ".storage.lock";
 
-/// Sidecar lock file name for the global workspace-ordering file.
+/// Sidecar lock file name for the global workspace-ordering file. Lives in
+/// `<app_dir>` next to `workspace-ordering.json`.
 const WORKSPACE_LOCK_FILENAME: &str = ".workspace-ordering.lock";
-/// Sidecar lock prefix for one session's launch lifecycle.
+/// Sidecar lock prefix for one session's launch lifecycle. The validated
+/// instance id is appended verbatim, yielding one lock per (profile, instance).
 const INSTANCE_LIFECYCLE_LOCK_PREFIX: &str = ".instance-lifecycle-";
-/// Sidecar lock for every mutation that can create or change a session's `(title,
-/// project_path)` identity.
+/// Sidecar lock for every mutation that can create or change a session's
+/// `(title, project_path)` identity. It lives at app scope because TUI renames
+/// can move a row between profiles.
+/// The historical filename is retained so mixed-version processes still
+/// coordinate during an upgrade.
 const SESSION_IDENTITY_LOCK_FILENAME: &str = ".title-mutation.lock";
 /// Sidecar lock prefix for one session's title persistence plus tmux rekey.
+/// Lives at the app-data root so it remains stable across profile moves.
 const SESSION_TITLE_LOCK_PREFIX: &str = ".session-title-";
 
-/// Emit a tracing warn if the cross-process `flock` is held by a peer for longer than this.
+/// Emit a tracing warn if the cross-process `flock` is held by a peer for
+/// longer than this. Surfaces a wedged peer in `aoe logs` instead of a
+/// silent stall. The acquire itself blocks indefinitely; the warning is
+/// observability only, not a timeout.
 const FLOCK_WAIT_WARN_AFTER: Duration = Duration::from_secs(1);
 
-/// Write `content` atomically (temp file + data/metadata fsync + rename + best-effort dir
-/// fsync).
+/// Write `content` atomically (temp file + data/metadata fsync + rename + best-effort dir fsync).
+/// Existing perms are preserved; on a fresh file the result is tempfile's 0o600 default.
+/// All fallible file mutations complete before the final rename, so an error
+/// means the destination was not replaced.
+///
+/// A symlink at `path` is resolved first and the write lands on the target, so
+/// a user who symlinks `config.toml` (or any other file we own) into a dotfiles
+/// repo keeps the link: `rename(2)` would otherwise replace it with a regular
+/// file and silently desync the dotfile tree (#2784, #3186). Nothing in AoE
+/// wants to clobber such a link, so this is the single write behavior rather
+/// than an opt-in helper the next caller can forget to reach for.
 pub(crate) fn atomic_write(path: &Path, content: &[u8]) -> Result<()> {
     let resolved = resolve_symlink_chain(path)?;
     atomic_write_resolved(&resolved, content)
@@ -60,14 +197,31 @@ fn atomic_write_resolved(path: &Path, content: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Replace `root`/`rel` with `content`, creating `rel`'s directories, without ever
-/// traversing a symlink below `root`.
+/// Replace `root`/`rel` with `content`, creating `rel`'s directories, without
+/// ever traversing a symlink below `root`.
+///
+/// For the files AoE writes inside a bind mount the container can write to. A
+/// process in the sandbox can plant a link at the destination, or swap a
+/// parent directory for one, between the create and the write; a plain
+/// `std::fs::write` follows either and lands on a host file of the container's
+/// choosing. Every component below `root` is opened `O_NOFOLLOW` from the
+/// previous directory's descriptor, so a swapped ancestor fails the walk
+/// instead of redirecting it, and the temp file is created and renamed through
+/// that descriptor rather than by path. `root` itself is the caller's trusted
+/// anchor (an AoE-owned directory, or the host side of the mount, which the
+/// container cannot replace) and is opened normally.
+///
+/// [`atomic_write`] is the opposite contract, resolving symlinks so a user's
+/// dotfile link survives, and must not be used for these paths.
+///
+/// The temp name is unique per attempt, so two concurrent installs cannot
+/// rename each other's half-written file, and the result is 0o644: the reader
+/// is a process in the container, which need not be the uid owning the bind.
 #[cfg(unix)]
 pub(crate) fn replace_file_no_follow(root: &Path, rel: &Path, content: &[u8]) -> Result<()> {
     use nix::errno::Errno;
-    use nix::fcntl::{open, openat, renameat, OFlag};
-    use nix::sys::stat::{fchmod, mkdirat, Mode};
-    use nix::unistd::{unlinkat, UnlinkatFlags};
+    use nix::fcntl::{open, openat, OFlag};
+    use nix::sys::stat::{mkdirat, Mode};
     use std::os::fd::OwnedFd;
 
     let (dirs, file_name) = split_no_follow_rel(rel, "replace_file_no_follow")?;
@@ -98,6 +252,19 @@ pub(crate) fn replace_file_no_follow(root: &Path, rel: &Path, content: &[u8]) ->
         )?;
     }
 
+    replace_anchored_file(&dir, file_name, content, Mode::from_bits_truncate(0o644))
+        .with_context(|| format!("writing {} under {}", rel.display(), root.display()))
+}
+
+pub(crate) fn replace_anchored_file(
+    dir: &std::os::fd::OwnedFd,
+    file_name: &std::ffi::OsStr,
+    content: &[u8],
+    mode: nix::sys::stat::Mode,
+) -> Result<()> {
+    use nix::fcntl::{openat, renameat, OFlag};
+    use nix::sys::stat::fchmod;
+    use nix::unistd::{unlinkat, UnlinkatFlags};
     let tmp_name = format!(
         ".{}.{}.{}.tmp",
         file_name.to_string_lossy(),
@@ -105,30 +272,30 @@ pub(crate) fn replace_file_no_follow(root: &Path, rel: &Path, content: &[u8]) ->
         NO_FOLLOW_TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     );
     let tmp = openat(
-        &dir,
+        dir,
         tmp_name.as_str(),
         OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_CLOEXEC,
-        Mode::from_bits_truncate(0o644),
-    )
-    .with_context(|| format!("creating a temp file under {}", root.display()))?;
+        mode,
+    )?;
 
     let written = (|| -> Result<()> {
         let mut file = fs::File::from(tmp);
         file.write_all(content)?;
-        fchmod(&file, Mode::from_bits_truncate(0o644))?;
+        fchmod(&file, mode)?;
         file.sync_all()?;
         drop(file);
-        renameat(&dir, tmp_name.as_str(), &dir, file_name)?;
+        renameat(dir, tmp_name.as_str(), dir, file_name)?;
         Ok(())
     })();
     if written.is_err() {
-        let _ = unlinkat(&dir, tmp_name.as_str(), UnlinkatFlags::NoRemoveDir);
+        let _ = unlinkat(dir, tmp_name.as_str(), UnlinkatFlags::NoRemoveDir);
     }
-    written.with_context(|| format!("writing {} under {}", rel.display(), root.display()))
+    written
 }
 
-/// Split `rel` into the directories to walk and the final name, rejecting anything but
-/// plain relative components so no `..` or absolute segment can leave the anchor.
+/// Split `rel` into the directories to walk and the final name, rejecting
+/// anything but plain relative components so no `..` or absolute segment can
+/// leave the anchor. `what` names the caller for the error.
 fn split_no_follow_rel<'a>(
     rel: &'a Path,
     what: &str,
@@ -154,6 +321,18 @@ fn split_no_follow_rel<'a>(
 }
 
 /// Read `root`/`rel` as UTF-8 without ever traversing a symlink below `root`.
+///
+/// The read half of [`replace_file_no_follow`]'s contract, for the same
+/// bind-mounted files. Validating the pathname and then reopening it to read
+/// leaves a window a process sharing the bind wins by swapping the file for a
+/// symlink, which pulls a host file into the config AoE merges and republishes
+/// into the container. Here every component is opened `O_NOFOLLOW` from the
+/// previous descriptor, and the decisive regular-file check and the bytes both
+/// come from that one descriptor, so there is no pathname to re-resolve.
+///
+/// `None` when the entry is missing, is not a regular file (a planted link
+/// included), or cannot be read: callers merge into what they read, so absent
+/// is the fail-closed answer.
 #[cfg(unix)]
 pub(crate) fn read_file_no_follow(root: &Path, rel: &Path) -> Result<Option<String>> {
     use nix::fcntl::{open, openat, AtFlags, OFlag};
@@ -175,7 +354,13 @@ pub(crate) fn read_file_no_follow(root: &Path, rel: &Path) -> Result<Option<Stri
 
     let regular = |mode| mode & libc::S_IFMT == libc::S_IFREG;
 
-    // Stat the name on the descriptor first.
+    // Stat the name on the descriptor first. Opening is not free of side
+    // effects on every file type a container can plant: a character device
+    // arms on open, and `O_NONBLOCK` only covers a fifo parking the open until
+    // a peer shows up. This stat is not what makes the read safe, so do not
+    // read it as the check-then-open shape this function exists to replace:
+    // the open still decides, and the identity check below pins the descriptor
+    // to the entry stat'd here, so a swap in between yields nothing.
     let Ok(before) = fstatat(&dir, file_name, AtFlags::AT_SYMLINK_NOFOLLOW) else {
         return Ok(None);
     };
@@ -203,8 +388,9 @@ pub(crate) fn read_file_no_follow(root: &Path, rel: &Path) -> Result<Option<Stri
 #[cfg(unix)]
 static NO_FOLLOW_TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Windows keeps the check-then-open the unix arm closes; the sandbox this guards against
-/// is Linux and macOS only.
+/// Windows keeps the check-then-open the unix arm closes; the sandbox this
+/// guards against is Linux and macOS only. Kept so the module compiles. `rel`
+/// is still validated, so the two arms agree on what a caller may ask for.
 #[cfg(not(unix))]
 pub(crate) fn read_file_no_follow(root: &Path, rel: &Path) -> Result<Option<String>> {
     split_no_follow_rel(rel, "read_file_no_follow")?;
@@ -231,7 +417,16 @@ pub(crate) fn replace_file_no_follow(root: &Path, rel: &Path, content: &[u8]) ->
     Ok(())
 }
 
-/// Resolve `path` through a symlink chain to the underlying target file.
+/// Resolve `path` through a symlink chain to the underlying target file. Used
+/// for user-facing config files where users symlink to a dotfiles repo:
+/// `rename(2)` would otherwise replace the symlink instead of updating the
+/// target, silently desyncing the dotfile tree.
+///
+/// Returns `path` unchanged when it is not a symlink. When the chain ends in
+/// a missing target (fresh install or dangling link), returns that target
+/// path so the caller materialises a regular file there. Caps recursion at
+/// 32 hops, well below typical kernel MAXSYMLINKS limits (40 on Linux, 32 on
+/// Darwin); deeper chains are almost certainly loops.
 pub(crate) fn resolve_symlink_chain(path: &Path) -> Result<PathBuf> {
     let mut current = path.to_path_buf();
     let mut hops: usize = 0;
@@ -297,8 +492,6 @@ where
     let result = mutate(&mut value);
     if result.is_ok() {
         atomic_write(path, serialize(&value)?.as_bytes())?;
-        // Best-effort here, unlike atomic_write's "every fallible mutation before the
-        // rename" contract.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -308,7 +501,62 @@ where
     Ok(result)
 }
 
-/// Process-wide registry of per-profile save mutexes.
+/// A resolved data file protected by its sidecar flock.
+/// The sidecar survives atomic replacement; aliases lock the same target.
+pub(crate) struct LockedDataFile {
+    target: super::anchored_fs::ResolvedDataFile,
+    _flock: StorageFlock,
+}
+
+impl LockedDataFile {
+    pub(crate) fn open(path: &Path) -> Result<Self> {
+        Self::lock(super::anchored_fs::ResolvedDataFile::open(path)?)
+    }
+
+    pub(crate) fn lock(target: super::anchored_fs::ResolvedDataFile) -> Result<Self> {
+        let (file, path) = target.open_sidecar()?;
+        let flock = acquire_open_storage_flock(file, &path)?;
+        Ok(Self {
+            target,
+            _flock: flock,
+        })
+    }
+
+    pub(crate) fn read(&self) -> Result<Option<String>> {
+        self.target.read()
+    }
+
+    pub(crate) fn into_target(self) -> super::anchored_fs::ResolvedDataFile {
+        self.target
+    }
+
+    /// Return the closure result and complete committed value, without rereading.
+    /// Missing/blank files start at T::default(). A mutator error writes nothing;
+    /// the outer Result carries read, parse, serialization and write failures.
+    pub(crate) fn update<T, R, E>(
+        &self,
+        parse: impl FnOnce(&str) -> Result<T>,
+        serialize: impl FnOnce(&T) -> Result<String>,
+        mutate: impl FnOnce(&mut T) -> std::result::Result<R, E>,
+    ) -> Result<std::result::Result<(R, T), E>>
+    where
+        T: Default,
+    {
+        let mut value = match self.read()? {
+            Some(content) if !content.trim().is_empty() => parse(&content)?,
+            _ => T::default(),
+        };
+        let result = mutate(&mut value);
+        if result.is_ok() {
+            self.target.replace(serialize(&value)?.as_bytes())?;
+        }
+        Ok(result.map(|result| (result, value)))
+    }
+}
+
+/// Process-wide registry of per-profile save mutexes. Every `Storage::new` for
+/// a given profile name resolves to the same `Arc<Mutex<()>>`, so independent
+/// `Storage` handles in different parts of the process serialise correctly.
 fn save_lock_for(profile: &str) -> Arc<Mutex<()>> {
     static REGISTRY: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
     let registry = REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
@@ -321,13 +569,17 @@ fn save_lock_for(profile: &str) -> Arc<Mutex<()>> {
         .clone()
 }
 
-/// Dedicated lock for the global `workspace-ordering.json` file.
+/// Dedicated lock for the global `workspace-ordering.json` file. Separate from
+/// the per-profile registry because the file lives at the app-data root and is
+/// shared across profiles.
 fn workspace_ordering_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
-/// RAII guard for a held cross-process `flock`.
+/// RAII guard for a held cross-process `flock`. Drops via `fs2::FileExt::unlock`,
+/// which is also performed by the kernel when the file descriptor is closed,
+/// so a panic during the critical section still releases the lock.
 pub(crate) struct StorageFlock {
     file: fs::File,
 }
@@ -338,7 +590,84 @@ impl Drop for StorageFlock {
     }
 }
 
-fn app_dir_for_profile_dir(profile_dir: &Path) -> &Path {
+pub(crate) struct StorageTransition {
+    flock: StorageFlock,
+}
+
+impl StorageTransition {
+    pub(crate) fn acquire() -> Result<Self> {
+        let (file, path) = open_existing_storage_lock_file(
+            &super::get_app_dir()?,
+            crate::migrations::v027_isolate_sandbox_stores::LOCK,
+        )?;
+        Ok(Self {
+            flock: acquire_open_storage_shared_flock(file, &path)?,
+        })
+    }
+
+    pub(crate) fn acquire_exclusive(app_dir: &Path) -> Result<Self> {
+        Ok(Self {
+            flock: acquire_storage_flock(
+                app_dir,
+                crate::migrations::v027_isolate_sandbox_stores::LOCK,
+            )?,
+        })
+    }
+
+    pub(crate) fn update_with_snapshot<F, R>(
+        &self,
+        storage: &Storage,
+        f: F,
+    ) -> Result<(R, Vec<Instance>, Vec<Group>)>
+    where
+        F: FnOnce(&mut Vec<Instance>, &mut Vec<Group>) -> Result<R>,
+    {
+        self.verify_storage(storage)?;
+        storage.update_snapshot_under_transition(f)
+    }
+
+    pub(crate) fn move_instances_with_snapshot<F>(
+        &self,
+        source: &Storage,
+        target: &Storage,
+        changes: &[(Instance, Instance)],
+        group_move: &GroupMovePlan,
+        validate_target: F,
+    ) -> Result<ProfileMoveCommit>
+    where
+        F: FnOnce(&[Instance], &mut [Instance]) -> Result<()>,
+    {
+        source.move_instances_to_inner(
+            target,
+            changes,
+            MoveTransactionPlan {
+                group_move,
+                merge_complete_post: false,
+                transition: Some(self),
+                account_swap: false,
+            },
+            validate_target,
+            |_| Ok(()),
+            sync_resolved_parent_directory,
+        )
+    }
+
+    fn verify_storage(&self, storage: &Storage) -> Result<()> {
+        let profile_dir = storage
+            .sessions_path
+            .parent()
+            .context("sessions path needs a parent")?;
+        let path = app_dir_for_profile_dir(profile_dir)
+            .join(crate::migrations::v027_isolate_sandbox_stores::LOCK);
+        anyhow::ensure!(
+            same_filesystem_identity(&self.flock.file.metadata()?, &fs::metadata(path)?),
+            "storage transition belongs to a different namespace"
+        );
+        Ok(())
+    }
+}
+
+pub(super) fn app_dir_for_profile_dir(profile_dir: &Path) -> &Path {
     profile_dir
         .parent()
         .filter(|parent| parent.file_name().is_some_and(|name| name == "profiles"))
@@ -370,7 +699,9 @@ fn same_filesystem_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
 
 #[cfg(not(unix))]
 fn same_filesystem_identity(_left: &fs::Metadata, _right: &fs::Metadata) -> bool {
-    // Portable metadata exposes no stable file identity.
+    // Portable metadata exposes no stable file identity. Canonical path equality
+    // still catches direct aliases, but junctions or reparse points may bypass
+    // these guards on non-Unix platforms.
     false
 }
 
@@ -395,6 +726,10 @@ fn existing_paths_share_filesystem_identity(left: &Path, right: &Path) -> Result
 
 fn open_storage_lock_file(dir: &Path, name: &str) -> Result<(fs::File, PathBuf)> {
     fs::create_dir_all(dir)?;
+    open_existing_storage_lock_file(dir, name)
+}
+
+fn open_existing_storage_lock_file(dir: &Path, name: &str) -> Result<(fs::File, PathBuf)> {
     let path = dir.join(name);
     #[cfg(unix)]
     let file = {
@@ -416,7 +751,6 @@ fn open_storage_lock_file(dir: &Path, name: &str) -> Result<(fs::File, PathBuf)>
         .open(&path)?;
     Ok((file, path))
 }
-
 #[cfg(test)]
 thread_local! {
     static LOCK_CONTENTION_OBSERVER: std::cell::RefCell<Option<std::sync::mpsc::Sender<PathBuf>>> =
@@ -448,7 +782,7 @@ fn report_lock_contention_for_test(path: &Path) {
     });
 }
 
-fn acquire_open_storage_flock(file: fs::File, path: &Path) -> Result<StorageFlock> {
+pub(crate) fn acquire_open_storage_flock(file: fs::File, path: &Path) -> Result<StorageFlock> {
     if let Err(e) = file.try_lock_exclusive() {
         if e.kind() != std::io::ErrorKind::WouldBlock {
             return Err(e.into());
@@ -518,7 +852,7 @@ fn acquire_open_storage_shared_flock(file: fs::File, path: &Path) -> Result<Stor
                         tracing::warn!(
                             target: "session.store",
                             path = %path.display(),
-                            "storage transition flock contended for >1s; migration is active"
+                            "shared storage flock contended for >1s; another writer holds it"
                         );
                         warned = true;
                     }
@@ -532,12 +866,32 @@ fn acquire_open_storage_shared_flock(file: fs::File, path: &Path) -> Result<Stor
 }
 
 /// Acquire the app-wide session identity-mutation lock.
+///
+/// Callers must take this before loading authoritative profile storage and
+/// retain it through duplicate validation, external rename effects, durable
+/// writes, and any in-memory cache publication. See the module lock order.
+///
+/// Held across slow external effects. The tied worktree rename path
+/// (`session::worktree_edit::edit_worktree_workdir`) may run `git branch -m`
+/// and `git worktree move` while this lock is held. Both mutations are bounded
+/// by `WORKTREE_MUTATION_TIMEOUT`, so a stalled filesystem returns an error
+/// instead of blocking every identity writer indefinitely. Title writers
+/// release this lock after the durable commit and retain their per-session
+/// title and lifecycle locks through the bounded tmux rekey.
+///
+/// Imports, restores, and other creation surfaces that do not use guarded add
+/// or rename paths remain outside this lock. The lock prevents participating
+/// writers from introducing a duplicate; it does not repair existing rows.
 pub(crate) fn acquire_session_identity_lock() -> Result<StorageFlock> {
     acquire_storage_flock(&get_app_dir()?, SESSION_IDENTITY_LOCK_FILENAME)
 }
 
-/// Serialize one session's title commit and post-commit tmux rekey across profiles and
-/// processes.
+/// Serialize one session's title commit and post-commit tmux rekey across
+/// profiles and processes.
+/// Callers must acquire this app-dir lock before a source per-instance
+/// lifecycle flock and before any profile [`Storage`] lock, then hold it until
+/// rekeying finishes. Keeping it separate from lifecycle locks limits its
+/// scope to title writers while still covering cross-profile moves.
 pub(crate) fn acquire_session_title_lock(instance_id: &str) -> Result<StorageFlock> {
     super::validate_instance_id(instance_id)
         .context("refusing session title lock for invalid instance id")?;
@@ -547,7 +901,11 @@ pub(crate) fn acquire_session_title_lock(instance_id: &str) -> Result<StorageFlo
     )
 }
 
-// Test-only crash injection for the profile-move transaction.
+// Test-only crash injection for the profile-move transaction (#3459). Tests
+// arm a named point and `move_instances_to_inner` panics when it is reached,
+// unwinding through the rollback paths exactly like a process death would.
+// Thread-local so concurrent test threads can never trip each other's
+// armed points.
 #[cfg(test)]
 thread_local! {
     static TEST_CRASH_POINTS: std::cell::RefCell<Vec<String>> =
@@ -612,7 +970,9 @@ fn sync_resolved_parent_directory(path: &Path) -> Result<()> {
 fn sync_resolved_parent_directory(path: &Path) -> Result<()> {
     path.parent()
         .ok_or_else(|| anyhow!("path has no parent: {}", path.display()))?;
-    // Rust exposes no portable directory flush outside Unix.
+    // Rust exposes no portable directory flush outside Unix. The file content
+    // was already synced before rename; do not turn every profile move into a
+    // post-publication error on platforms that cannot open directories as files.
     Ok(())
 }
 
@@ -652,7 +1012,20 @@ fn atomic_write_verified_resolved(path: &Path, content: &[u8]) -> Result<PathBuf
 }
 
 /// Acquire the cross-process advisory `flock` on `<dir>/<name>` by polling
-/// `try_lock_exclusive` every 50ms until it is granted.
+/// `try_lock_exclusive` every 50ms until it is granted. Open semantics
+/// mirror `recovery::try_acquire_recovery_lock` (read+write, create, no
+/// truncate) and `logging.rs`'s rotation lock.
+///
+/// Polling instead of `lock_exclusive` is deliberate: `fs2` exposes no hook
+/// to instrument a blocking acquire, and we need a single `tracing::warn`
+/// after `FLOCK_WAIT_WARN_AFTER` so a wedged peer is observable in
+/// `aoe logs`. The 50ms cadence is below human perception and far above any
+/// realistic mutator's hold time.
+///
+/// On Unix the lock file is chmodded to `0o600` so it never widens beyond
+/// the rest of `<app_dir>` regardless of the caller's umask. The kernel
+/// releases the lock on process exit (including SIGKILL), so a crashed peer
+/// cannot wedge us forever.
 pub(crate) fn acquire_storage_flock(dir: &Path, name: &str) -> Result<StorageFlock> {
     let (file, path) = open_storage_lock_file(dir, name)?;
     acquire_open_storage_flock(file, &path)
@@ -663,7 +1036,9 @@ pub(crate) fn acquire_storage_shared_flock(dir: &Path, name: &str) -> Result<Sto
     acquire_open_storage_shared_flock(file, &path)
 }
 
-/// [`acquire_storage_flock`] without the wait.
+/// [`acquire_storage_flock`] without the wait: `None` when another holder has
+/// the lock, for a caller that must not block while it holds a lock ordered
+/// before this one.
 pub(crate) fn try_acquire_storage_flock(dir: &Path, name: &str) -> Result<Option<StorageFlock>> {
     let (file, _path) = open_storage_lock_file(dir, name)?;
     match file.try_lock_exclusive() {
@@ -676,16 +1051,404 @@ pub(crate) fn try_acquire_storage_flock(dir: &Path, name: &str) -> Result<Option
 pub struct Storage {
     profile: String,
     sessions_path: PathBuf,
+    files: Option<Box<ProfileFiles>>,
     save_lock: Arc<Mutex<()>>,
+    /// Dispatch successful in-process writes to file-watch subscribers.
     file_watch: Arc<FileWatchService>,
-    #[cfg(test)]
-    fail_writes_for_test: bool,
 }
 
-// Cross-device-syncable sidebar ordering.
+pub(crate) type SessionMutation<'a> =
+    dyn FnMut(&mut Vec<Instance>, &mut Vec<Group>) -> Result<()> + 'a;
+
+#[derive(Debug, thiserror::Error)]
+#[error("runtime state is unavailable")]
+pub(crate) struct NativeStoreUnavailable;
+
+pub(crate) trait SessionStore: Send + Sync {
+    fn storage(&self) -> &Storage;
+    fn load(&self) -> Result<Vec<Instance>>;
+    fn check_available(&self) -> Result<()>;
+    fn configuration(&self, profile: Option<&str>) -> Result<super::config::Config>;
+    fn sandbox_configuration(
+        &self,
+        base: &super::config::SandboxConfig,
+        project: &Path,
+    ) -> Result<Option<super::config::SandboxConfig>> {
+        self.check_available()?;
+        super::config::repo_config::resolve_sandbox_config_with_repo(base, project)
+    }
+    /// Runs synchronously, at most once and exactly once on success.
+    /// Mutation errors must prevent the write.
+    fn commit(&self, mutation: &mut SessionMutation<'_>) -> Result<()>;
+    fn release_lifecycle_reservation(
+        &self,
+        id: &str,
+        operation: super::LifecycleOperation,
+        generation: u64,
+        lifecycle: Option<StorageFlock>,
+    ) -> Result<()> {
+        self.check_available()?;
+        let _lifecycle = match lifecycle {
+            Some(lifecycle) => lifecycle,
+            None => self.storage().acquire_instance_lifecycle_lock(id)?,
+        };
+        self.commit(&mut |rows, _| {
+            if let Some(row) = rows.iter_mut().find(|row| row.id == id) {
+                row.release_lifecycle_reservation_if_owned(operation, generation);
+            }
+            Ok(())
+        })
+    }
+    fn defer_lifecycle_release(
+        self,
+        id: String,
+        operation: super::LifecycleOperation,
+        generation: u64,
+        lifecycle: Option<StorageFlock>,
+    ) where
+        Self: Sized + 'static,
+    {
+        let _ = std::thread::Builder::new()
+            .name("aoe-lifecycle-reservation-release".into())
+            .spawn(move || {
+                if let Err(error) = self.release_lifecycle_reservation(&id, operation, generation, lifecycle) {
+                    tracing::warn!(target: "session.lifecycle", session = %id, %error, "deferred reservation release failed");
+                }
+            });
+    }
+    fn managed_capture_store_is_exclusive(
+        &self,
+        current: &Instance,
+        backend: crate::agents::SessionCaptureBackend,
+        current_store: &Path,
+    ) -> Result<bool>;
+    fn commit_sandbox_checkpoint(
+        &self,
+        checkpoint: crate::migrations::v027_isolate_sandbox_stores::LockedSandboxCheckpoint<'_>,
+    ) -> Result<()>;
+    fn migrate_sandbox_store(
+        &self,
+        id: &str,
+        reporter: Option<crate::migrations::progress::Reporter>,
+        runtime: &crate::containers::ContainerRuntime,
+    ) -> Result<()>;
+}
+
+/// Repository overrides stay separate from trusted host hook settings.
+pub(crate) struct LaunchConfig {
+    pub global: super::config::Config,
+    pub profile: super::config::Config,
+    sandbox: Option<super::config::SandboxConfig>,
+}
+
+impl LaunchConfig {
+    pub(crate) fn sandbox(&self) -> &super::config::SandboxConfig {
+        self.sandbox.as_ref().unwrap_or(&self.profile.sandbox)
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum CaptureStorage<'a> {
+    Profiles(&'a Arc<FileWatchService>),
+    Scoped(&'a dyn SessionStore),
+}
+
+impl CaptureStorage<'_> {
+    pub(crate) fn launch_configuration(
+        &self,
+        profile: &str,
+        project: &Path,
+    ) -> Result<LaunchConfig> {
+        match self {
+            Self::Profiles(_) => Ok(local_launch_configuration(profile, project)),
+            Self::Scoped(storage) => {
+                anyhow::ensure!(
+                    storage.storage().profile() == profile,
+                    "capture profile changed during launch"
+                );
+                storage.launch_configuration(project)
+            }
+        }
+    }
+
+    pub(crate) fn with_store<R>(
+        &self,
+        profile: &str,
+        action: impl FnOnce(&dyn SessionStore) -> Result<R>,
+    ) -> Result<R> {
+        match self {
+            Self::Profiles(file_watch) => {
+                let storage = Storage::new(profile, (*file_watch).clone())?;
+                action(&storage)
+            }
+            Self::Scoped(storage) => {
+                anyhow::ensure!(
+                    storage.storage().profile() == profile,
+                    "capture profile changed during launch"
+                );
+                action(*storage)
+            }
+        }
+    }
+}
+
+impl dyn SessionStore + '_ {
+    pub(crate) fn launch_configuration(&self, project: &Path) -> Result<LaunchConfig> {
+        let global = self.configuration(None)?;
+        let profile = self.configuration(Some(self.storage().profile()))?;
+        let sandbox = self.sandbox_configuration(&profile.sandbox, project)?;
+        Ok(LaunchConfig {
+            global,
+            profile,
+            sandbox,
+        })
+    }
+
+    pub(crate) fn update<F, R>(&self, mutation: F) -> Result<R>
+    where
+        F: FnOnce(&mut Vec<Instance>, &mut Vec<Group>) -> Result<R>,
+    {
+        let mut mutation = Some(mutation);
+        let mut result = None;
+        self.commit(&mut |rows, groups| {
+            let mutation = mutation.take().context("session mutation invoked twice")?;
+            result = Some(mutation(rows, groups)?);
+            Ok(())
+        })?;
+        result.context("session commit did not invoke its mutation")
+    }
+}
+
+fn local_configuration(profile: Option<&str>) -> super::config::Config {
+    let mut config = match profile {
+        Some(profile) => super::config::profile_config::resolve_config_or_warn(profile),
+        None => super::config::Config::load_or_warn(),
+    };
+    super::config::profile_config::apply_cityhall_overrides(&mut config);
+    config
+}
+
+fn local_sandbox_configuration(
+    base: &super::config::SandboxConfig,
+    project: &Path,
+) -> Option<super::config::SandboxConfig> {
+    match super::config::repo_config::resolve_sandbox_config_with_repo(base, project) {
+        Ok(config) => config,
+        Err(error) => {
+            tracing::warn!(target: "session.store",
+                "Failed to load repo sandbox config at {}, falling back to profile config: {error:#}",
+                project.display());
+            None
+        }
+    }
+}
+
+pub(super) fn local_launch_configuration(profile: &str, project: &Path) -> LaunchConfig {
+    let global = local_configuration(None);
+    let profile = local_configuration(Some(profile));
+    let sandbox = local_sandbox_configuration(&profile.sandbox, project);
+    LaunchConfig {
+        global,
+        profile,
+        sandbox,
+    }
+}
+
+impl SessionStore for Storage {
+    fn storage(&self) -> &Storage {
+        self
+    }
+
+    fn load(&self) -> Result<Vec<Instance>> {
+        Storage::load(self)
+    }
+
+    fn check_available(&self) -> Result<()> {
+        match self.files.as_deref() {
+            Some(files) => files.verify_current(&self.sessions_path),
+            None => ProfileFiles::open(&self.sessions_path).map(|_| ()),
+        }
+    }
+
+    fn configuration(&self, profile: Option<&str>) -> Result<super::config::Config> {
+        Ok(local_configuration(profile))
+    }
+
+    fn sandbox_configuration(
+        &self,
+        base: &super::config::SandboxConfig,
+        project: &Path,
+    ) -> Result<Option<super::config::SandboxConfig>> {
+        Ok(local_sandbox_configuration(base, project))
+    }
+
+    fn commit(&self, mutation: &mut SessionMutation<'_>) -> Result<()> {
+        self.update(mutation)
+    }
+
+    fn commit_sandbox_checkpoint(
+        &self,
+        checkpoint: crate::migrations::v027_isolate_sandbox_stores::LockedSandboxCheckpoint<'_>,
+    ) -> Result<()> {
+        checkpoint.commit_local()
+    }
+
+    fn migrate_sandbox_store(
+        &self,
+        id: &str,
+        reporter: Option<crate::migrations::progress::Reporter>,
+        runtime: &crate::containers::ContainerRuntime,
+    ) -> Result<()> {
+        crate::migrations::migrate_sandbox_store_for_with(id, reporter, self, runtime)
+    }
+
+    fn managed_capture_store_is_exclusive(
+        &self,
+        current: &Instance,
+        backend: crate::agents::SessionCaptureBackend,
+        current_store: &Path,
+    ) -> Result<bool> {
+        if !current.is_sandboxed() {
+            return Ok(false);
+        }
+        let check = || -> Result<bool> {
+            let current_store = std::fs::canonicalize(current_store)?;
+            let home = dirs::home_dir().context("home directory unavailable")?;
+            let mut profiles = super::list_profiles()?;
+            if !profiles.iter().any(|profile| profile == self.profile()) {
+                profiles.push(self.profile().to_owned());
+            }
+            for profile in profiles {
+                let peers = if profile == self.profile() {
+                    self.load()?
+                } else {
+                    Storage::new_unwatched(&profile)?.load()?
+                };
+                let mut config = None;
+                for peer in peers {
+                    if !peer.is_managed_capture_peer(&current.id, profile == self.profile()) {
+                        continue;
+                    }
+                    let config = config.get_or_insert_with(|| {
+                        super::config::profile_config::resolve_config_or_warn(&profile)
+                    });
+                    if peer.managed_capture_store_conflicts(backend, &current_store, config, &home)
+                    {
+                        return Ok(false);
+                    }
+                }
+            }
+            Ok(true)
+        };
+        Ok(check().unwrap_or(false))
+    }
+}
+
+struct ProfileFiles {
+    directory: super::anchored_fs::AnchoredDir,
+    sessions: super::anchored_fs::ResolvedDataFile,
+    groups: super::anchored_fs::ResolvedDataFile,
+}
+
+impl ProfileFiles {
+    fn open(path: &Path) -> Result<Self> {
+        let directory = super::anchored_fs::AnchoredDir::open(
+            path.parent().context("sessions path needs a parent")?,
+        )?;
+        let sessions =
+            directory.resolve_file(path.file_name().context("sessions path needs a leaf")?)?;
+        let groups = directory.resolve_file(std::ffi::OsStr::new("groups.json"))?;
+        Ok(Self {
+            directory,
+            sessions,
+            groups,
+        })
+    }
+
+    fn verify_current(&self, path: &Path) -> Result<()> {
+        let current = Self::open(path)?;
+        if !self.directory.same_directory(&current.directory)?
+            || !self.sessions.same_target(&current.sessions)?
+            || !self.groups.same_target(&current.groups)?
+        {
+            anyhow::bail!("profile storage binding changed");
+        }
+        Ok(())
+    }
+}
+
+// Cross-device-syncable sidebar ordering. Workspaces are a client
+// construct (a group of sessions keyed on `repoPath::branch` or
+// `repoPath::__session__::session_id`), so the server treats the entries
+// here as opaque strings. The list is a partial order: workspace ids not
+// in the list fall back to the default newest-first ordering. Persisted
+// globally (not per-profile) because the sidebar shows sessions across
+// all profiles and a per-profile file would fragment the user's layout.
+// See #1169.
 #[derive(serde::Deserialize, serde::Serialize, Default)]
 pub struct WorkspaceOrdering {
     pub order: Vec<String>,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub(crate) struct ProfileMoveRejected(&'static str);
+
+#[derive(Debug)]
+pub(crate) struct ProfileMoveCommit {
+    pub(crate) source: (Vec<Instance>, Vec<Group>),
+    pub(crate) target: (Vec<Instance>, Vec<Group>),
+    moved_start: usize,
+}
+
+impl ProfileMoveCommit {
+    fn into_moved(mut self) -> Vec<Instance> {
+        self.target.0.split_off(self.moved_start)
+    }
+}
+
+struct MoveDataFile<'a> {
+    path: &'a Path,
+    bound: Option<&'a super::anchored_fs::ResolvedDataFile>,
+}
+
+impl MoveDataFile<'_> {
+    fn write(&self, content: &[u8]) -> Result<Option<PathBuf>> {
+        match self.bound {
+            Some(file) => file.replace_preserving_permissions(content).map(|()| None),
+            None => atomic_write_verified_resolved(self.path, content).map(Some),
+        }
+    }
+
+    fn sync_parent(&self) -> Result<()> {
+        match self.bound {
+            Some(file) => file.sync_parent(),
+            None => sync_parent_directory(self.path),
+        }
+    }
+
+    fn sync_target(
+        &self,
+        resolved: Option<&Path>,
+        sync: &mut impl FnMut(&Path) -> Result<()>,
+    ) -> Result<()> {
+        match self.bound {
+            Some(file) => file.sync_parent(),
+            None => sync(resolved.context("profile move target has no resolved path")?),
+        }
+    }
+
+    fn restore<W, S>(&self, content: &[u8], write_context: W, sync_context: S) -> Result<()>
+    where
+        W: FnOnce() -> String,
+        S: FnOnce() -> String,
+    {
+        if self.bound.is_none() {
+            return restore_file_durably(self.path, content, write_context, sync_context);
+        }
+        let _ = self.write(content).with_context(write_context)?;
+        self.sync_parent().with_context(sync_context)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -716,9 +1479,8 @@ impl GroupMovePlan {
 struct MoveTransactionPlan<'a> {
     group_move: &'a GroupMovePlan,
     merge_complete_post: bool,
-    /// A tool change on this move swaps accounts of one agent rather than
-    /// agents, so the moved row keeps its conversation; see
-    /// [`Instance::merge_profile_move_diff`].
+    transition: Option<&'a StorageTransition>,
+    /// Whether an account-only tool swap should preserve the conversation.
     account_swap: bool,
 }
 
@@ -777,12 +1539,25 @@ fn apply_group_move(
         }
     }
 
-    // Re-tree both sides so a group implied only by a moved instance's path materialises as
-    // an explicit row.
+    // Re-tree both sides so a group implied only by a moved instance's path
+    // materialises as an explicit row. This is order-stable, not a renormalise:
+    // `new_with_groups` seeds `insertion_order` from the passed groups verbatim
+    // and only appends paths that were missing, and `get_all_groups` replays
+    // that order, so when the input already covers every referenced group the
+    // output is byte-identical to the input. That is what keeps
+    // `source_groups_changed` (a byte comparison at the call site) a true
+    // semantic-change signal, so an unchanged source is never rewritten or
+    // fsynced. See `apply_group_move_is_byte_stable_without_semantic_change`.
     *source_groups =
         super::GroupTree::new_with_groups(source_instances, source_groups).get_all_groups();
     *target_groups =
         super::GroupTree::new_with_groups(target_instances, target_groups).get_all_groups();
+}
+
+#[derive(Clone, Copy)]
+enum ReadPolicy<'a> {
+    Recover,
+    Complete(&'a ProfileFiles),
 }
 
 impl Storage {
@@ -799,15 +1574,14 @@ impl Storage {
 
         Ok(Self {
             profile: profile_name,
+            files: None,
             sessions_path,
             save_lock,
             file_watch,
-            #[cfg(test)]
-            fail_writes_for_test: false,
         })
     }
 
-    /// Construct a `Storage` wired to a noop `FileWatchService`.
+    /// [`Storage::new`] without file-watch subscriptions.
     pub fn new_unwatched(profile: &str) -> Result<Self> {
         Self::new(profile, FileWatchService::noop())
     }
@@ -816,14 +1590,14 @@ impl Storage {
     pub(crate) fn new_for_test_path(profile: &str, sessions_path: PathBuf) -> Self {
         Self {
             profile: profile.to_string(),
+            files: None,
             sessions_path,
             save_lock: save_lock_for(profile),
             file_watch: FileWatchService::noop(),
-            fail_writes_for_test: false,
         }
     }
 
-    /// Construct a `Storage` for an existing profile, never creating it.
+    /// Bind an existing profile and its data files without creating directories.
     pub fn open(profile: &str, file_watch: Arc<FileWatchService>) -> Result<Self> {
         let profile_name = resolve_existing_profile(profile)?;
         let profile_dir = get_profile_dir_path(&profile_name)?;
@@ -832,27 +1606,36 @@ impl Storage {
 
         Ok(Self {
             profile: profile_name,
+            files: Some(Box::new(ProfileFiles::open(&sessions_path)?)),
             sessions_path,
             save_lock,
             file_watch,
-            #[cfg(test)]
-            fail_writes_for_test: false,
         })
     }
 
-    /// [`Storage::open`] wired to a noop `FileWatchService`.
+    /// [`Storage::open`] without file-watch subscriptions.
     pub fn open_unwatched(profile: &str) -> Result<Self> {
         Self::open(profile, FileWatchService::noop())
     }
 
-    /// Serialize launch/restart and explicit resume-target mutation for one instance across
-    /// every process using this profile.
+    /// Serialize launch/restart and explicit resume-target mutation for one
+    /// instance across every process using this profile.
+    ///
+    /// This lock is deliberately distinct from `.storage.lock`: lifecycle
+    /// callers hold it while invoking `Storage::update`, so reusing the storage
+    /// flock would deadlock. Every lifecycle caller acquires this lock first,
+    /// then takes short-lived storage flocks as needed.
     pub(crate) fn acquire_instance_lifecycle_lock(
         &self,
         instance_id: &str,
     ) -> Result<StorageFlock> {
         super::validate_instance_id(instance_id)
             .context("refusing lifecycle lock for invalid instance id")?;
+        if let Some(files) = &self.files {
+            let name = format!("{INSTANCE_LIFECYCLE_LOCK_PREFIX}{instance_id}.lock");
+            let (file, path) = files.directory.open_lock(std::ffi::OsStr::new(&name))?;
+            return acquire_open_storage_flock(file, &path);
+        }
         let profile_dir = self
             .sessions_path
             .parent()
@@ -863,9 +1646,15 @@ impl Storage {
         )
     }
 
+    /// Arm the injected `sessions.json` write failure until the returned guard
+    /// drops. Preferred over the raw setter because the flag is process-wide:
+    /// a test that panics (or simply returns early) while it is armed would
+    /// otherwise leave every later test failing with
+    /// "injected sessions write failure".
     #[cfg(test)]
-    pub(crate) fn set_fail_writes_for_test(&mut self, fail: bool) {
-        self.fail_writes_for_test = fail;
+    pub(crate) fn fail_writes_for_test(&mut self) -> crate::session::storage::WriteFailureGuard {
+        FAIL_WRITES_FOR_TEST.store(true, Ordering::SeqCst);
+        crate::session::storage::WriteFailureGuard
     }
 
     pub fn profile(&self) -> &str {
@@ -878,58 +1667,159 @@ impl Storage {
         &self.sessions_path
     }
 
-    pub fn load(&self) -> Result<Vec<Instance>> {
-        if !self.sessions_path.exists() {
-            return Ok(Vec::new());
-        }
+    pub(crate) fn cleanup_protection(
+        &self,
+        current: &Instance,
+    ) -> Result<super::path_identity::CleanupProtection> {
+        self.cleanup_protection_inner(std::slice::from_ref(current), false)
+    }
 
-        let content = fs::read_to_string(&self.sessions_path)?;
+    pub(crate) fn cleanup_protection_excluding(
+        &self,
+        excluded: &[Instance],
+    ) -> Result<super::path_identity::CleanupProtection> {
+        self.cleanup_protection_inner(excluded, true)
+    }
+
+    fn cleanup_protection_inner(
+        &self,
+        excluded: &[Instance],
+        require_match: bool,
+    ) -> Result<super::path_identity::CleanupProtection> {
+        let exclusions = excluded
+            .iter()
+            .map(|row| {
+                let path = if row.source_profile.is_empty() {
+                    self.sessions_path.clone()
+                } else {
+                    get_profile_dir(&row.source_profile)?.join("sessions.json")
+                };
+                Ok((path, row.id.as_str(), row.lifecycle_generation))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut matched = require_match.then(|| vec![false; exclusions.len()]);
+        let profile_dir = self
+            .sessions_path
+            .parent()
+            .context("profile directory missing")?;
+        let paths =
+            super::sandbox_store_reclaim::registry_paths(app_dir_for_profile_dir(profile_dir))?;
+        anyhow::ensure!(
+            paths.iter().any(|path| path == &self.sessions_path),
+            "Selected session registry is unavailable"
+        );
+        let mut protection = super::path_identity::CleanupProtection::default();
+        for path in paths {
+            let parent = path
+                .parent()
+                .context("registry directory missing")?
+                .canonicalize()?;
+            let bound = super::anchored_fs::ResolvedDataFile::open(
+                &parent.join(path.file_name().context("registry file name missing")?),
+            )?;
+            let content = bound
+                .read()?
+                .with_context(|| format!("Registry disappeared: {}", path.display()))?;
+            let rows: Vec<Instance> = serde_json::from_str(&content).with_context(|| {
+                format!("Reading complete resource owners in {}", path.display())
+            })?;
+            protection.extend(rows.iter().filter(|row| {
+                let index = exclusions.iter().position(|(registry, id, generation)| {
+                    path == *registry && row.id == *id && row.lifecycle_generation == *generation
+                });
+                if let (Some(matched), Some(index)) = (&mut matched, index) {
+                    matched[index] = true;
+                }
+                index.is_none()
+            }))?;
+        }
+        anyhow::ensure!(
+            matched.is_none_or(|matched| matched.into_iter().all(|found| found)),
+            "Selected batch member changed before cleanup"
+        );
+        protection.validate()?;
+        Ok(protection)
+    }
+
+    pub fn load(&self) -> Result<Vec<Instance>> {
+        self.load_instances(ReadPolicy::Recover)
+    }
+
+    fn profile_files<'a>(&'a self, policy: ReadPolicy<'a>) -> Option<&'a ProfileFiles> {
+        match policy {
+            ReadPolicy::Recover => self.files.as_deref(),
+            ReadPolicy::Complete(files) => Some(files),
+        }
+    }
+
+    fn load_instances(&self, policy: ReadPolicy<'_>) -> Result<Vec<Instance>> {
+        let mut instances: Vec<Instance> = self.load_rows(
+            &self.sessions_path,
+            policy,
+            "session",
+            self.profile_files(policy).map(|files| &files.sessions),
+        )?;
+        for instance in &mut instances {
+            instance.set_file_watch(self.file_watch.clone());
+        }
+        Ok(instances)
+    }
+
+    fn load_rows<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &Path,
+        policy: ReadPolicy<'_>,
+        kind: &str,
+        source: Option<&super::anchored_fs::ResolvedDataFile>,
+    ) -> Result<Vec<T>> {
+        let content = match source {
+            Some(source) => source.read()?,
+            None => match fs::read_to_string(path) {
+                Ok(content) => Some(content),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(error.into()),
+            },
+        };
+        let Some(content) = content else {
+            return Ok(Vec::new());
+        };
+        if matches!(policy, ReadPolicy::Complete(_)) {
+            return Ok(serde_json::from_str(&content)?);
+        }
         if content.trim().is_empty() {
             return Ok(Vec::new());
         }
-
         let rows: Vec<serde_json::Value> = serde_json::from_str(&content)?;
-        let mut instances = Vec::with_capacity(rows.len());
-        let mut corrupt: Vec<serde_json::Value> = Vec::new();
-        for (idx, row) in rows.into_iter().enumerate() {
-            match <Instance as serde::Deserialize>::deserialize(&row) {
-                Ok(mut inst) => {
-                    inst.set_file_watch(self.file_watch.clone());
-                    instances.push(inst);
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        profile = %self.profile,
-                        row = idx,
-                        error = %e,
-                        path = %self.sessions_path.display(),
-                        "skipping corrupt session row"
-                    );
+        let mut valid = Vec::with_capacity(rows.len());
+        let mut corrupt = Vec::new();
+        for (index, row) in rows.into_iter().enumerate() {
+            match T::deserialize(&row) {
+                Ok(row) => valid.push(row),
+                Err(error) => {
+                    tracing::warn!(profile = %self.profile, row = index, %error, %kind, path = %path.display(), "skipping corrupt stored row");
                     corrupt.push(row);
                 }
             }
         }
-
         if !corrupt.is_empty() {
-            self.quarantine_corrupt_rows(&corrupt);
+            let quarantine = path.with_file_name(format!("{kind}s.corrupt.jsonl"));
+            Self::write_corrupt_rows_quarantine(
+                &quarantine,
+                &corrupt,
+                kind,
+                self.profile_files(policy).map(|files| &files.directory),
+            );
         }
-
-        Ok(instances)
+        Ok(valid)
     }
 
-    fn quarantine_corrupt_rows(&self, rows: &[serde_json::Value]) {
-        let path = self.sessions_path.with_file_name("sessions.corrupt.jsonl");
-        Self::write_corrupt_rows_quarantine(&path, rows, "session");
-    }
-
-    fn quarantine_corrupt_group_rows(&self, rows: &[serde_json::Value]) {
-        let path = self.sessions_path.with_file_name("groups.corrupt.jsonl");
-        Self::write_corrupt_rows_quarantine(&path, rows, "group");
-    }
-
-    /// Write corrupt rows to a sibling quarantine sidecar for later inspection and manual
-    /// recovery.
-    fn write_corrupt_rows_quarantine(path: &Path, rows: &[serde_json::Value], row_kind: &str) {
+    /// Preserve the current corrupt set without growing it on every recovery read.
+    fn write_corrupt_rows_quarantine(
+        path: &Path,
+        rows: &[serde_json::Value],
+        row_kind: &str,
+        directory: Option<&super::anchored_fs::AnchoredDir>,
+    ) {
         let mut buf = String::new();
         for row in rows {
             match serde_json::to_string(row) {
@@ -948,9 +1838,16 @@ impl Storage {
             return;
         }
 
-        // `atomic_write` (not `fs::write`) so the sidecar matches the durability and
-        // privacy guarantees of the source JSON file.
-        if let Err(e) = atomic_write(path, buf.as_bytes()) {
+        // Keep the recovery copy atomic.
+        let written = match directory {
+            Some(directory) => path
+                .file_name()
+                .context("quarantine needs a leaf")
+                .and_then(|leaf| directory.resolve_file(leaf))
+                .and_then(|target| target.replace_preserving_permissions(buf.as_bytes())),
+            None => atomic_write(path, buf.as_bytes()),
+        };
+        if let Err(e) = written {
             tracing::warn!(
                 error = %e,
                 path = %path.display(),
@@ -961,48 +1858,157 @@ impl Storage {
     }
 
     pub fn load_with_groups(&self) -> Result<(Vec<Instance>, Vec<Group>)> {
-        let instances = self.load()?;
+        self.load_bundle(ReadPolicy::Recover)
+    }
 
-        let groups_path = self.sessions_path.with_file_name("groups.json");
-        let groups = if groups_path.exists() {
-            let content = fs::read_to_string(&groups_path)?;
-            if content.trim().is_empty() {
-                Vec::new()
-            } else {
-                let rows: Vec<serde_json::Value> = serde_json::from_str(&content)?;
-                let mut groups = Vec::with_capacity(rows.len());
-                let mut corrupt: Vec<serde_json::Value> = Vec::new();
-                for (idx, row) in rows.into_iter().enumerate() {
-                    match <Group as serde::Deserialize>::deserialize(&row) {
-                        Ok(group) => groups.push(group),
-                        Err(e) => {
-                            tracing::warn!(
-                                profile = %self.profile,
-                                row = idx,
-                                error = %e,
-                                path = %groups_path.display(),
-                                "skipping corrupt group row"
-                            );
-                            corrupt.push(row);
-                        }
-                    }
-                }
-
-                if !corrupt.is_empty() {
-                    self.quarantine_corrupt_group_rows(&corrupt);
-                }
-
-                groups
+    pub(crate) fn load_complete_with_groups(&self) -> Result<(Vec<Instance>, Vec<Group>)> {
+        let opened;
+        let files = match self.files.as_deref() {
+            Some(files) => files,
+            None => {
+                opened = ProfileFiles::open(&self.sessions_path)?;
+                &opened
             }
-        } else {
-            Vec::new()
         };
+        let (file, path) = files
+            .directory
+            .open_lock(std::ffi::OsStr::new(STORAGE_LOCK_FILENAME))?;
+        let _flock = acquire_open_storage_shared_flock(file, &path)?;
+        let bundle = self.load_bundle(ReadPolicy::Complete(files))?;
+        files.verify_current(&self.sessions_path)?;
+        Ok(bundle)
+    }
 
+    pub(crate) fn verify_bound_profile(&self) -> Result<()> {
+        self.files
+            .as_deref()
+            .context("profile store is not bound")?
+            .verify_current(&self.sessions_path)
+    }
+
+    pub(crate) fn read_sandbox_checkpoint(
+        &self,
+        pending: &serde_json::Value,
+        registry_lock: &StorageFlock,
+        transition: &StorageTransition,
+    ) -> Result<(Vec<Instance>, Vec<Group>)> {
+        transition.verify_storage(self)?;
+        self.verify_bound_profile()?;
+        let files = self
+            .files
+            .as_deref()
+            .context("profile store is not bound")?;
+        let (file, _) = files
+            .directory
+            .open_lock(std::ffi::OsStr::new(STORAGE_LOCK_FILENAME))?;
+        anyhow::ensure!(
+            same_filesystem_identity(&file.metadata()?, &registry_lock.file.metadata()?),
+            "sandbox checkpoint does not hold this registry lock"
+        );
+        let mut rows: Vec<Instance> = serde::Deserialize::deserialize(pending)?;
+        for row in &mut rows {
+            row.set_file_watch(self.file_watch.clone());
+        }
+        let groups = self.load_rows(
+            &self.sessions_path.with_file_name("groups.json"),
+            ReadPolicy::Complete(files),
+            "group",
+            Some(&files.groups),
+        )?;
+        self.verify_bound_profile()?;
+        Ok((rows, groups))
+    }
+
+    pub(crate) fn write_sandbox_checkpoint(
+        &self,
+        bytes: &[u8],
+        transition: &StorageTransition,
+    ) -> Result<()> {
+        transition.verify_storage(self)?;
+        self.verify_bound_profile()?;
+        self.files
+            .as_deref()
+            .context("profile store is not bound")?
+            .sessions
+            .replace_preserving_permissions(bytes)?;
+        self.verify_bound_profile()
+    }
+    fn load_bundle(&self, policy: ReadPolicy<'_>) -> Result<(Vec<Instance>, Vec<Group>)> {
+        let instances = self.load_instances(policy)?;
+        let groups = self.load_rows(
+            &self.sessions_path.with_file_name("groups.json"),
+            policy,
+            "group",
+            self.profile_files(policy).map(|files| &files.groups),
+        )?;
         Ok((instances, groups))
     }
 
-    /// Locked load -> mutate -> save.
+    /// Serialize both files before writing groups, then sessions, under the storage locks.
+    /// A second-file failure can leave a partial commit; notifications follow each write.
     pub fn update<F, R>(&self, f: F) -> Result<R>
+    where
+        F: FnOnce(&mut Vec<Instance>, &mut Vec<Group>) -> Result<R>,
+    {
+        self.update_with_policy(ReadPolicy::Recover, f)
+            .map(|(result, _, _)| result)
+    }
+
+    /// Return the committed rows and groups without rereading after releasing the flock.
+    pub(crate) fn update_with_snapshot<F, R>(&self, f: F) -> Result<(R, Vec<Instance>, Vec<Group>)>
+    where
+        F: FnOnce(&mut Vec<Instance>, &mut Vec<Group>) -> Result<R>,
+    {
+        self.acquire_write_transition()?
+            .update_with_snapshot(self, f)
+    }
+
+    pub(crate) fn acquire_write_transition(&self) -> Result<StorageTransition> {
+        let profile_dir = self
+            .sessions_path
+            .parent()
+            .context("sessions path needs a parent")?;
+        let (file, path) = open_existing_storage_lock_file(
+            app_dir_for_profile_dir(profile_dir),
+            crate::migrations::v027_isolate_sandbox_stores::LOCK,
+        )?;
+        Ok(StorageTransition {
+            flock: acquire_open_storage_shared_flock(file, &path)?,
+        })
+    }
+
+    fn update_snapshot_under_transition<F, R>(&self, f: F) -> Result<(R, Vec<Instance>, Vec<Group>)>
+    where
+        F: FnOnce(&mut Vec<Instance>, &mut Vec<Group>) -> Result<R>,
+    {
+        let opened;
+        let files = match self.files.as_deref() {
+            Some(files) => files,
+            None => {
+                opened = ProfileFiles::open(&self.sessions_path)?;
+                &opened
+            }
+        };
+        self.update_under_transition(ReadPolicy::Complete(files), f)
+    }
+
+    fn update_with_policy<F, R>(
+        &self,
+        policy: ReadPolicy<'_>,
+        f: F,
+    ) -> Result<(R, Vec<Instance>, Vec<Group>)>
+    where
+        F: FnOnce(&mut Vec<Instance>, &mut Vec<Group>) -> Result<R>,
+    {
+        let _transition = self.acquire_write_transition()?;
+        self.update_under_transition(policy, f)
+    }
+
+    fn update_under_transition<F, R>(
+        &self,
+        policy: ReadPolicy<'_>,
+        f: F,
+    ) -> Result<(R, Vec<Instance>, Vec<Group>)>
     where
         F: FnOnce(&mut Vec<Instance>, &mut Vec<Group>) -> Result<R>,
     {
@@ -1022,26 +2028,36 @@ impl Storage {
                 self.sessions_path.display()
             )
         })?;
-        let _transition = acquire_storage_shared_flock(
-            app_dir_for_profile_dir(profile_dir),
-            crate::migrations::v027_isolate_sandbox_stores::LOCK,
-        )?;
-        let _flock = acquire_storage_flock(profile_dir, STORAGE_LOCK_FILENAME)?;
-        self.update_under_lock(f)
+        if let ReadPolicy::Complete(files) = policy {
+            files.verify_current(&self.sessions_path)?;
+        }
+        let files = self.profile_files(policy);
+        let _flock = if let Some(files) = files {
+            let (file, path) = files
+                .directory
+                .open_lock(std::ffi::OsStr::new(STORAGE_LOCK_FILENAME))?;
+            acquire_open_storage_flock(file, &path)?
+        } else {
+            acquire_storage_flock(profile_dir, STORAGE_LOCK_FILENAME)?
+        };
+        self.update_under_lock(policy, f)
     }
 
     /// Apply one storage mutation while the caller already owns this profile's
     /// in-process save lock and cross-process storage flock.
-    fn update_under_lock<F, R>(&self, f: F) -> Result<R>
+    fn update_under_lock<F, R>(
+        &self,
+        policy: ReadPolicy<'_>,
+        f: F,
+    ) -> Result<(R, Vec<Instance>, Vec<Group>)>
     where
         F: FnOnce(&mut Vec<Instance>, &mut Vec<Group>) -> Result<R>,
     {
-        let (mut instances, mut groups) = self.load_with_groups()?;
+        let (mut instances, mut groups) = self.load_bundle(policy)?;
         let groups_before = groups.clone();
         let result = f(&mut instances, &mut groups)?;
 
-        // Pre-serialise both buffers so a serde failure on either side
-        // aborts before any file is touched.
+        // Serialization failure must leave both files untouched.
         let instances_buf = serde_json::to_vec_pretty(&instances)?;
         let groups_changed = groups != groups_before;
         let groups_buf = if groups_changed {
@@ -1050,24 +2066,34 @@ impl Storage {
             None
         };
 
-        // groups first, sessions last.
+        // Groups first: partial commits leave orphan groups, not missing targets.
         if let Some(buf) = groups_buf {
             let groups_path = self.sessions_path.with_file_name("groups.json");
-            atomic_write(&groups_path, &buf)?;
+            match self.profile_files(policy) {
+                Some(files) => files.groups.replace_preserving_permissions(&buf)?,
+                None => atomic_write(&groups_path, &buf)?,
+            }
             self.file_watch.notify_local_change(&groups_path);
         }
         #[cfg(test)]
-        if self.fail_writes_for_test {
+        if FAIL_WRITES_FOR_TEST.load(Ordering::SeqCst) {
             anyhow::bail!("injected sessions write failure");
         }
 
-        atomic_write(&self.sessions_path, &instances_buf)?;
+        match self.profile_files(policy) {
+            Some(files) => files
+                .sessions
+                .replace_preserving_permissions(&instances_buf)?,
+            None => atomic_write(&self.sessions_path, &instances_buf)?,
+        }
         self.file_watch.notify_local_change(&self.sessions_path);
-        Ok(result)
+        if let ReadPolicy::Complete(files) = policy {
+            files.verify_current(&self.sessions_path)?;
+        }
+        Ok((result, instances, groups))
     }
 
-    /// Move one session, running `before_commit` only after the authoritative
-    /// target validation succeeds while both profile locks are still held.
+    /// Move one session after validating its final identity under both store locks.
     pub(crate) fn move_instance_to_with_effect<F, B>(
         &self,
         target: &Storage,
@@ -1083,22 +2109,25 @@ impl Storage {
     {
         let changes = [(before.clone(), after.clone())];
         let group_move = GroupMovePlan::single(&before.group_path, &after.group_path);
-        let mut moved = self.move_instances_to_inner(
-            target,
-            &changes,
-            MoveTransactionPlan {
-                group_move: &group_move,
-                merge_complete_post: true,
-                account_swap,
-            },
-            |instances, candidates| validate_target(instances, &candidates[0]),
-            |candidates| before_commit(&candidates[0]),
-            sync_resolved_parent_directory,
-        )?;
+        let mut moved = self
+            .move_instances_to_inner(
+                target,
+                &changes,
+                MoveTransactionPlan {
+                    group_move: &group_move,
+                    merge_complete_post: true,
+                    transition: None,
+                    account_swap,
+                },
+                |instances, candidates| validate_target(instances, &candidates[0]),
+                |candidates| before_commit(&candidates[0]),
+                sync_resolved_parent_directory,
+            )?
+            .into_moved();
         Ok(moved.remove(0))
     }
 
-    /// Move a batch between profiles as one dual-locked transaction.
+    /// Move a batch with target-first publication and a durable recovery journal.
     pub(crate) fn move_instances_to<F>(
         &self,
         target: &Storage,
@@ -1115,12 +2144,14 @@ impl Storage {
             MoveTransactionPlan {
                 group_move,
                 merge_complete_post: false,
+                transition: None,
                 account_swap: false,
             },
-            validate_target,
+            |existing, candidates| validate_target(existing, candidates),
             |_| Ok(()),
             sync_resolved_parent_directory,
         )
+        .map(ProfileMoveCommit::into_moved)
     }
 
     fn move_instances_to_inner<F, B, S>(
@@ -1131,14 +2162,41 @@ impl Storage {
         validate_target: F,
         before_commit: B,
         mut sync_target_parent: S,
-    ) -> Result<Vec<Instance>>
+    ) -> Result<ProfileMoveCommit>
     where
-        F: FnOnce(&[Instance], &[Instance]) -> Result<()>,
+        F: FnOnce(&[Instance], &mut [Instance]) -> Result<()>,
         B: FnOnce(&[Instance]) -> Result<()>,
         S: FnMut(&Path) -> Result<()>,
     {
         if self.profile == target.profile {
-            return Err(anyhow!("source and target profile are the same"));
+            return Err(ProfileMoveRejected("source and target profile are the same").into());
+        }
+        let (source_policy, target_policy) = if let Some(transition) = plan.transition {
+            transition.verify_storage(self)?;
+            transition.verify_storage(target)?;
+            (
+                ReadPolicy::Complete(
+                    self.files
+                        .as_deref()
+                        .context("native source store is not bound")?,
+                ),
+                ReadPolicy::Complete(
+                    target
+                        .files
+                        .as_deref()
+                        .context("native target store is not bound")?,
+                ),
+            )
+        } else {
+            (ReadPolicy::Recover, ReadPolicy::Recover)
+        };
+        let source_files = self.profile_files(source_policy);
+        let target_files = target.profile_files(target_policy);
+        if let Some(files) = source_files {
+            files.verify_current(&self.sessions_path)?;
+        }
+        if let Some(files) = target_files {
+            files.verify_current(&target.sessions_path)?;
         }
         let source_dir = self
             .sessions_path
@@ -1155,11 +2213,23 @@ impl Storage {
                 "source and target profiles resolve to the same physical directory"
             ));
         }
-
-        let (first, second) = if source_dir < target_dir {
-            (self, target)
+        let (first, first_files, second, second_files) = if source_dir < target_dir {
+            (self, source_files, target, target_files)
         } else {
-            (target, self)
+            (target, target_files, self, source_files)
+        };
+        let first_dir = first
+            .sessions_path
+            .parent()
+            .ok_or_else(|| anyhow!("sessions path has no parent"))?;
+        let second_dir = second
+            .sessions_path
+            .parent()
+            .ok_or_else(|| anyhow!("sessions path has no parent"))?;
+        let _transition_flocks = if plan.transition.is_some() {
+            Vec::new()
+        } else {
+            acquire_transition_flocks_for_profile_dirs(&[first_dir, second_dir])?
         };
         let _first_mu = first
             .save_lock
@@ -1169,20 +2239,18 @@ impl Storage {
             .save_lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let first_dir = first
-            .sessions_path
-            .parent()
-            .ok_or_else(|| anyhow!("sessions path has no parent"))?;
-        let second_dir = second
-            .sessions_path
-            .parent()
-            .ok_or_else(|| anyhow!("sessions path has no parent"))?;
-        let _transition_flocks =
-            acquire_transition_flocks_for_profile_dirs(&[first_dir, second_dir])?;
-        let (first_lock_file, first_lock_path) =
-            open_storage_lock_file(first_dir, STORAGE_LOCK_FILENAME)?;
-        let (second_lock_file, second_lock_path) =
-            open_storage_lock_file(second_dir, STORAGE_LOCK_FILENAME)?;
+        let (first_lock_file, first_lock_path) = match first_files {
+            Some(files) => files
+                .directory
+                .open_lock(std::ffi::OsStr::new(STORAGE_LOCK_FILENAME))?,
+            None => open_storage_lock_file(first_dir, STORAGE_LOCK_FILENAME)?,
+        };
+        let (second_lock_file, second_lock_path) = match second_files {
+            Some(files) => files
+                .directory
+                .open_lock(std::ffi::OsStr::new(STORAGE_LOCK_FILENAME))?,
+            None => open_storage_lock_file(second_dir, STORAGE_LOCK_FILENAME)?,
+        };
         if same_filesystem_identity(&first_lock_file.metadata()?, &second_lock_file.metadata()?) {
             return Err(anyhow!(
                 "source and target profiles resolve to the same physical storage lock"
@@ -1190,37 +2258,69 @@ impl Storage {
         }
         let _first_flock = acquire_open_storage_flock(first_lock_file, &first_lock_path)?;
         let _second_flock = acquire_open_storage_flock(second_lock_file, &second_lock_path)?;
-
+        if let Some(files) = source_files {
+            files.verify_current(&self.sessions_path)?;
+        }
+        if let Some(files) = target_files {
+            files.verify_current(&target.sessions_path)?;
+        }
         let source_groups_path = self.sessions_path.with_file_name("groups.json");
         let target_groups_path = target.sessions_path.with_file_name("groups.json");
-        if existing_paths_share_filesystem_identity(&self.sessions_path, &target.sessions_path)? {
-            return Err(anyhow!(
-                "source and target profiles resolve to the same physical sessions file"
-            ));
+        let source_sessions_file = MoveDataFile {
+            path: &self.sessions_path,
+            bound: source_files.map(|files| &files.sessions),
+        };
+        let source_groups_file = MoveDataFile {
+            path: &source_groups_path,
+            bound: source_files.map(|files| &files.groups),
+        };
+        let target_sessions_file = MoveDataFile {
+            path: &target.sessions_path,
+            bound: target_files.map(|files| &files.sessions),
+        };
+        let target_groups_file = MoveDataFile {
+            path: &target_groups_path,
+            bound: target_files.map(|files| &files.groups),
+        };
+        let data_files = [
+            &source_sessions_file,
+            &source_groups_file,
+            &target_sessions_file,
+            &target_groups_file,
+        ];
+        for (index, left) in data_files.iter().enumerate() {
+            for right in &data_files[index + 1..] {
+                let same_bound_target = match (left.bound, right.bound) {
+                    (Some(left), Some(right)) => left.same_target(right)?,
+                    _ => false,
+                };
+                if same_bound_target
+                    || existing_paths_share_filesystem_identity(left.path, right.path)?
+                {
+                    anyhow::bail!("profile move registries resolve to the same physical file");
+                }
+            }
         }
-        if existing_paths_share_filesystem_identity(&source_groups_path, &target_groups_path)? {
-            return Err(anyhow!(
-                "source and target profiles resolve to the same physical groups file"
-            ));
-        }
-
-        let (mut source_instances, mut source_groups) = self.load_with_groups()?;
-        let (mut target_instances, mut target_groups) = target.load_with_groups()?;
+        let (mut source_instances, mut source_groups) = self.load_bundle(source_policy)?;
+        let (mut target_instances, mut target_groups) = target.load_bundle(target_policy)?;
         let mut ids = std::collections::HashSet::with_capacity(changes.len());
-        let mut moved = Vec::with_capacity(changes.len());
+        let moved_start = target_instances.len();
+        target_instances.reserve(changes.len());
         for (before, after) in changes {
             if !ids.insert(before.id.as_str()) {
-                return Err(anyhow!("duplicate session id in profile move batch"));
+                return Err(
+                    ProfileMoveRejected("duplicate session id in profile move batch").into(),
+                );
             }
             let source = source_instances
                 .iter()
                 .find(|instance| instance.id == before.id)
-                .ok_or_else(|| anyhow!("Session not found in source profile"))?;
-            if target_instances
+                .ok_or(ProfileMoveRejected("Session not found in source profile"))?;
+            if target_instances[..moved_start]
                 .iter()
                 .any(|instance| instance.id == before.id)
             {
-                return Err(anyhow!("Session already exists in target profile"));
+                return Err(ProfileMoveRejected("Session already exists in target profile").into());
             }
             let mut candidate = source.clone();
             if plan.merge_complete_post {
@@ -1229,7 +2329,7 @@ impl Storage {
                 candidate.merge_user_action_diff(before, after);
             }
             candidate.source_profile.clone_from(&target.profile);
-            moved.push(candidate);
+            target_instances.push(candidate);
         }
         if plan.group_move.move_subtree {
             let source_prefix = format!("{}/", plan.group_move.source_path);
@@ -1241,21 +2341,53 @@ impl Storage {
                 })
                 .map(|instance| instance.id.as_str())
                 .collect();
+            if locked_members.is_empty()
+                && !source_groups.iter().any(|group| {
+                    group.path == plan.group_move.source_path
+                        || group.path.starts_with(&source_prefix)
+                })
+            {
+                return Err(ProfileMoveRejected("Source group no longer exists").into());
+            }
+            if plan.group_move.source_path != plan.group_move.target_path {
+                let target_prefix = format!("{}/", plan.group_move.target_path);
+                let matches_target = |path: &str| {
+                    path == plan.group_move.target_path || path.starts_with(&target_prefix)
+                };
+                if target_groups
+                    .iter()
+                    .any(|group| matches_target(&group.path))
+                    || target_instances[..moved_start]
+                        .iter()
+                        .any(|instance| matches_target(&instance.group_path))
+                {
+                    return Err(ProfileMoveRejected("Target group already exists").into());
+                }
+            }
             if locked_members != ids {
-                return Err(anyhow!(
-                    "group membership changed while the cross-profile move was pending"
-                ));
+                return Err(ProfileMoveRejected(
+                    "group membership changed while the cross-profile move was pending",
+                )
+                .into());
             }
         }
-        validate_target(&target_instances, &moved)?;
+        {
+            let (existing, moved) = target_instances.split_at_mut(moved_start);
+            validate_target(existing, moved)?;
+        }
+        if let Some(files) = source_files {
+            files.verify_current(&self.sessions_path)?;
+        }
+        if let Some(files) = target_files {
+            files.verify_current(&target.sessions_path)?;
+        }
 
         let source_groups_before = serde_json::to_vec_pretty(&source_groups)?;
-        let target_instances_before = serde_json::to_vec_pretty(&target_instances)?;
+        let target_instances_before = serde_json::to_vec_pretty(&target_instances[..moved_start])?;
         let target_groups_before = serde_json::to_vec_pretty(&target_groups)?;
 
         let source_instances_before = serde_json::to_vec_pretty(&source_instances)?;
         source_instances.retain(|instance| !ids.contains(instance.id.as_str()));
-        target_instances.extend(moved.iter().cloned());
         apply_group_move(
             plan.group_move,
             &source_instances,
@@ -1265,10 +2397,12 @@ impl Storage {
         );
         let source_instances_after = serde_json::to_vec_pretty(&source_instances)?;
         let source_groups_after = serde_json::to_vec_pretty(&source_groups)?;
+        let moved = &target_instances[moved_start..];
         let target_instances_after = serde_json::to_vec_pretty(&target_instances)?;
         let target_groups_after = serde_json::to_vec_pretty(&target_groups)?;
         let source_groups_changed = source_groups_after != source_groups_before;
         let target_groups_changed = target_groups_after != target_groups_before;
+        // Record the intent before external effects or target publication.
         let journal_entry = super::move_journal::MoveJournalEntry {
             version: super::move_journal::MOVE_JOURNAL_VERSION,
             ids: {
@@ -1295,26 +2429,22 @@ impl Storage {
         #[cfg(test)]
         test_crash_point("profile-move-journal");
         // The durable journal precedes every mutation, including the external
-        // worktree/container effect.
-        before_commit(&moved)?;
+        // worktree/container effect. If the effect fails or partially lands,
+        // the retained journal proves which profiles the recovery may inspect.
+        before_commit(moved)?;
 
         let resolved_target_groups_path = if target_groups_changed {
-            Some(atomic_write_verified_resolved(
-                &target_groups_path,
-                &target_groups_after,
-            )?)
+            target_groups_file.write(&target_groups_after)?
         } else {
             None
         };
-        let resolved_target_sessions_path = match atomic_write_verified_resolved(
-            &target.sessions_path,
-            &target_instances_after,
-        ) {
+        let resolved_target_sessions_path = match target_sessions_file
+            .write(&target_instances_after)
+        {
             Ok(path) => path,
             Err(target_error) => {
                 if target_groups_changed {
-                    if let Err(rollback_error) = restore_file_durably(
-                        &target_groups_path,
+                    if let Err(rollback_error) = target_groups_file.restore(
                         &target_groups_before,
                         || "target group rollback failed".to_string(),
                         || "target group rollback was not durable".to_string(),
@@ -1327,11 +2457,16 @@ impl Storage {
                 return Err(target_error);
             }
         };
-        // `atomic_write` already syncs file content and attempts a directory sync.
-        if let Some(path) = resolved_target_groups_path.as_deref() {
-            sync_target_parent(path)?;
+        if target_groups_changed {
+            target_groups_file.sync_target(
+                resolved_target_groups_path.as_deref(),
+                &mut sync_target_parent,
+            )?;
         }
-        sync_target_parent(&resolved_target_sessions_path)?;
+        target_sessions_file.sync_target(
+            resolved_target_sessions_path.as_deref(),
+            &mut sync_target_parent,
+        )?;
         #[cfg(test)]
         test_crash_point("profile-move-target");
         if target_groups_changed {
@@ -1340,53 +2475,38 @@ impl Storage {
         target.file_watch.notify_local_change(&target.sessions_path);
 
         if source_groups_changed {
-            let source_group_result =
-                atomic_write_verified(&source_groups_path, &source_groups_after)
-                    .and_then(|()| sync_parent_directory(&source_groups_path));
+            let source_group_result = source_groups_file
+                .write(&source_groups_after)
+                .and_then(|_| source_groups_file.sync_parent());
             if let Err(source_group_error) = source_group_result {
-                restore_file_durably(
-                    &source_groups_path,
-                    &source_groups_before,
-                    || {
-                        format!(
-                            "source group write failed ({source_group_error}); source group rollback failed"
-                        )
-                    },
-                    || {
-                        format!(
-                            "source group write failed ({source_group_error}); source group rollback was not durable"
-                        )
-                    },
-                )?;
-                restore_file_durably(
-                    &target.sessions_path,
-                    &target_instances_before,
-                    || {
-                        format!(
-                            "source group write failed ({source_group_error}); target session rollback failed"
-                        )
-                    },
-                    || {
-                        format!(
-                            "source group write failed ({source_group_error}); target session rollback was not durable"
-                        )
-                    },
-                )?;
+                source_groups_file.restore(&source_groups_before, || {
+                    format!(
+                        "source group write failed ({source_group_error}); source group rollback failed"
+                    )
+                }, || {
+                    format!(
+                        "source group write failed ({source_group_error}); source group rollback was not durable"
+                    )
+                })?;
+                target_sessions_file.restore(&target_instances_before, || {
+                    format!(
+                        "source group write failed ({source_group_error}); target session rollback failed"
+                    )
+                }, || {
+                    format!(
+                        "source group write failed ({source_group_error}); target session rollback was not durable"
+                    )
+                })?;
                 if target_groups_changed {
-                    restore_file_durably(
-                        &target_groups_path,
-                        &target_groups_before,
-                        || {
-                            format!(
-                                "source group write failed ({source_group_error}); target group rollback failed"
-                            )
-                        },
-                        || {
-                            format!(
-                                "source group write failed ({source_group_error}); target group rollback was not durable"
-                            )
-                        },
-                    )?;
+                    target_groups_file.restore(&target_groups_before, || {
+                        format!(
+                            "source group write failed ({source_group_error}); target group rollback failed"
+                        )
+                    }, || {
+                        format!(
+                            "source group write failed ({source_group_error}); target group rollback was not durable"
+                        )
+                    })?;
                 }
                 self.file_watch.notify_local_change(&source_groups_path);
                 target.file_watch.notify_local_change(&target.sessions_path);
@@ -1398,12 +2518,13 @@ impl Storage {
             #[cfg(test)]
             test_crash_point("profile-move-source-groups");
         }
+        // Crash window #3459: dying here leaves the target published while
+        // the source rows are not yet durably removed, i.e. the duplicate
+        // state recovery must arbitrate.
         #[cfg(test)]
         test_crash_point("profile-move-source-sessions");
-        if let Err(source_error) =
-            atomic_write_verified(&self.sessions_path, &source_instances_after)
-        {
-            match self.load() {
+        if let Err(source_error) = source_sessions_file.write(&source_instances_after) {
+            match self.load_instances(source_policy) {
                 Ok(instances)
                     if moved
                         .iter()
@@ -1413,50 +2534,35 @@ impl Storage {
                 }
                 Ok(_) => {
                     if source_groups_changed {
-                        restore_file_durably(
-                            &source_groups_path,
-                            &source_groups_before,
-                            || {
-                                format!(
-                                    "source session write failed ({source_error}); source group rollback failed"
-                                )
-                            },
-                            || {
-                                format!(
-                                    "source session write failed ({source_error}); source group rollback was not durable"
-                                )
-                            },
-                        )?;
+                        source_groups_file.restore(&source_groups_before, || {
+                            format!(
+                                "source session write failed ({source_error}); source group rollback failed"
+                            )
+                        }, || {
+                            format!(
+                                "source session write failed ({source_error}); source group rollback was not durable"
+                            )
+                        })?;
                     }
-                    restore_file_durably(
-                        &target.sessions_path,
-                        &target_instances_before,
-                        || {
-                            format!(
-                                "source session write failed ({source_error}); target session rollback failed"
-                            )
-                        },
-                        || {
-                            format!(
-                                "source session write failed ({source_error}); target session rollback was not durable"
-                            )
-                        },
-                    )?;
+                    target_sessions_file.restore(&target_instances_before, || {
+                        format!(
+                            "source session write failed ({source_error}); target session rollback failed"
+                        )
+                    }, || {
+                        format!(
+                            "source session write failed ({source_error}); target session rollback was not durable"
+                        )
+                    })?;
                     if target_groups_changed {
-                        restore_file_durably(
-                            &target_groups_path,
-                            &target_groups_before,
-                            || {
-                                format!(
-                                    "source session write failed ({source_error}); target group rollback failed"
-                                )
-                            },
-                            || {
-                                format!(
-                                    "source session write failed ({source_error}); target group rollback was not durable"
-                                )
-                            },
-                        )?;
+                        target_groups_file.restore(&target_groups_before, || {
+                            format!(
+                                "source session write failed ({source_error}); target group rollback failed"
+                            )
+                        }, || {
+                            format!(
+                                "source session write failed ({source_error}); target group rollback was not durable"
+                            )
+                        })?;
                     }
                     if source_groups_changed {
                         self.file_watch.notify_local_change(&source_groups_path);
@@ -1474,44 +2580,40 @@ impl Storage {
                 }
             }
         }
-        if let Err(sync_error) = sync_parent_directory(&self.sessions_path) {
+        if let Err(sync_error) = source_sessions_file.sync_parent() {
             if source_groups_changed {
-                restore_file_durably(
-                    &source_groups_path,
-                    &source_groups_before,
-                    || {
-                        format!(
-                            "source session directory sync failed ({sync_error}); source group restore failed"
-                        )
-                    },
-                    || {
-                        format!(
-                            "source session directory sync failed ({sync_error}); restored source groups were not durable"
-                        )
-                    },
-                )?;
+                source_groups_file.restore(&source_groups_before, || {
+                    format!(
+                        "source session directory sync failed ({sync_error}); source group restore failed"
+                    )
+                }, || {
+                    format!(
+                        "source session directory sync failed ({sync_error}); restored source groups were not durable"
+                    )
+                })?;
                 self.file_watch.notify_local_change(&source_groups_path);
             }
-            restore_file_durably(
-                &self.sessions_path,
-                &source_instances_before,
-                || {
-                    format!(
-                        "source session directory sync failed ({sync_error}); source row restore failed"
-                    )
-                },
-                || {
-                    format!(
-                        "source session directory sync failed ({sync_error}); restored source rows were not durable"
-                    )
-                },
-            )?;
+            source_sessions_file.restore(&source_instances_before, || {
+                format!(
+                    "source session directory sync failed ({sync_error}); source row restore failed"
+                )
+            }, || {
+                format!(
+                    "source session directory sync failed ({sync_error}); restored source rows were not durable"
+                )
+            })?;
             self.file_watch.notify_local_change(&self.sessions_path);
             return Err(anyhow!(
                 "source session removal was not durable ({sync_error}); source rows were restored and target copies retained"
             ));
         }
-        // Every write and directory barrier above has passed.
+        if let Some(files) = source_files {
+            files.verify_current(&self.sessions_path)?;
+        }
+        if let Some(files) = target_files {
+            files.verify_current(&target.sessions_path)?;
+        }
+        // A retained journal can be reconciled without replaying the move.
         if let Err(error) = super::move_journal::consume(&journal_path) {
             tracing::warn!(
                 target: "session.store",
@@ -1523,11 +2625,19 @@ impl Storage {
             self.file_watch.notify_local_change(&source_groups_path);
         }
         self.file_watch.notify_local_change(&self.sessions_path);
-        Ok(moved)
+        Ok(ProfileMoveCommit {
+            source: (source_instances, source_groups),
+            target: (target_instances, target_groups),
+            moved_start,
+        })
     }
 }
 
-// Workspace ordering is stored at the app-data root, not per-profile.
+// Workspace ordering is stored at the app-data root, not per-profile:
+// `list_sessions` returns sessions across all profiles, so the sidebar
+// is a single global view and a per-profile file would only fragment
+// the user's chosen layout. Workspace ids derive from `repoPath::branch`
+// (or `repoPath::__session__::session_id`) and are profile-independent.
 fn workspace_ordering_path() -> Result<PathBuf> {
     Ok(get_app_dir()?.join("workspace-ordering.json"))
 }
@@ -1544,8 +2654,9 @@ pub fn load_workspace_ordering() -> Result<WorkspaceOrdering> {
     Ok(serde_json::from_str(&content)?)
 }
 
-/// Locked load -> mutate -> save for the global workspace ordering file.
-pub fn update_workspace_ordering<F, R>(f: F) -> Result<R>
+/// Mutate under the global workspace lock and return the exact committed ordering.
+/// A closure error leaves the file untouched.
+pub fn update_workspace_ordering<F, R>(f: F) -> Result<(R, WorkspaceOrdering)>
 where
     F: FnOnce(&mut WorkspaceOrdering) -> Result<R>,
 {
@@ -1557,7 +2668,7 @@ where
     let mut ordering = load_workspace_ordering()?;
     let result = f(&mut ordering)?;
     save_workspace_ordering(&ordering)?;
-    Ok(result)
+    Ok((result, ordering))
 }
 
 fn save_workspace_ordering(ordering: &WorkspaceOrdering) -> Result<()> {
@@ -1570,9 +2681,12 @@ fn save_workspace_ordering(ordering: &WorkspaceOrdering) -> Result<()> {
     Ok(())
 }
 
-// Recent projects is a global most-recently-used store, written when a session is deleted so the
-// project it lived in survives in the new-session wizard's Recent tab after its last session is
-// gone.
+// Recent projects is a global most-recently-used store, written when a
+// session is deleted so the project it lived in survives in the new-session
+// wizard's Recent tab after its last session is gone (#2141). Live projects
+// still come from the session list directly; this file is only the tombstone
+// + recency for projects that no longer have any session. Stored at the
+// app-data root for the same cross-profile reason as workspace ordering.
 const RECENT_PROJECTS_LOCK_FILENAME: &str = ".recent-projects.lock";
 const RECENT_PROJECTS_CAP: usize = 20;
 
@@ -1599,8 +2713,13 @@ struct RecentProjects {
     projects: Vec<RecentProjectEntry>,
 }
 
-/// Build a recent-project entry from a session being deleted, or `None` for sessions that
-/// must never appear in the wizard Recent list.
+/// Build a recent-project entry from a session being deleted, or `None` for
+/// sessions that must never appear in the wizard Recent list: scratch
+/// sessions (transient dirs) and multi-repo workspaces (they collapse to a
+/// single path and re-selecting one would silently drop the other repos).
+/// Mirrors the web client filter in `ProjectStep.tsx::collectRecentProjects`.
+/// The path is the worktree's main repo when present, else the project path,
+/// with any trailing slash trimmed so it keys identically to the client.
 pub fn recent_project_entry_for(inst: &Instance) -> Option<RecentProjectEntry> {
     if inst.scratch || inst.workspace_info.is_some() {
         return None;
@@ -1612,8 +2731,9 @@ pub fn recent_project_entry_for(inst: &Instance) -> Option<RecentProjectEntry> {
         .unwrap_or(inst.project_path.as_str());
     let trimmed = raw.trim_end_matches(['/', '\\']);
     let path = if trimmed.is_empty() { "/" } else { trimmed };
-    // `file_name` resolves the basename with the host platform's separator rules, so a
-    // Windows path like `C:\repo\proj` yields `proj` rather than the whole string.
+    // `file_name` resolves the basename with the host platform's separator
+    // rules, so a Windows path like `C:\repo\proj` yields `proj` rather than
+    // the whole string. Falls back to the path itself for roots (`/`, `C:\`).
     let display_name = std::path::Path::new(path)
         .file_name()
         .and_then(|s| s.to_str())
@@ -1631,8 +2751,9 @@ pub fn recent_project_entry_for(inst: &Instance) -> Option<RecentProjectEntry> {
     })
 }
 
-/// Upsert a recently used project, keyed by normalized path (newest `last_used_at` wins),
-/// capped to the most recent `RECENT_PROJECTS_CAP`.
+/// Upsert a recently used project, keyed by normalized path (newest
+/// `last_used_at` wins), capped to the most recent `RECENT_PROJECTS_CAP`.
+/// Best-effort from the caller's view: delete flows log and ignore errors.
 pub fn record_recent_project(entry: RecentProjectEntry) -> Result<()> {
     let _mu = recent_projects_lock()
         .lock()
@@ -1650,7 +2771,8 @@ pub fn record_recent_project(entry: RecentProjectEntry) -> Result<()> {
     Ok(())
 }
 
-/// Persisted recent projects, newest first.
+/// Persisted recent projects, newest first. Lock-free read; `atomic_write`
+/// guarantees a consistent document. Callers still filter dead directories.
 pub fn load_recent_projects() -> Result<Vec<RecentProjectEntry>> {
     Ok(load_recent_projects_inner()?.projects)
 }
@@ -1703,8 +2825,9 @@ pub(crate) struct DuplicateIdReport {
 }
 
 impl DuplicateIdReport {
-    /// Single-line, user-actionable summary naming every copy's profile, store file, and
-    /// mtime.
+    /// Single-line, user-actionable summary naming every copy's profile,
+    /// store file, and mtime. Written to the log by the reconciliation
+    /// layer; the TUI surfaces a count marker derived from these reports.
     pub(crate) fn actionable_message(&self) -> String {
         let copies = self
             .copies
@@ -1743,8 +2866,9 @@ fn file_mtime_epoch_ms(path: &Path) -> Option<u64> {
 pub(crate) fn detect_duplicate_ids<'a>(
     loaded: impl IntoIterator<Item = (&'a str, &'a [Instance])>,
 ) -> Vec<String> {
-    // Counts occurrences across every profile; an id repeated even within one profile is ambiguous
-    // the same way (corrupt file or writer bug) and must surface, not silently fail closed.
+    // Counts occurrences across every profile; an id repeated even within
+    // one profile is ambiguous the same way (corrupt file or writer bug) and
+    // must surface, not silently fail closed.
     let mut order: Vec<String> = Vec::new();
     let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
     for (_, instances) in loaded {
@@ -1762,11 +2886,18 @@ pub(crate) fn detect_duplicate_ids<'a>(
         .collect()
 }
 
-/// Journal evidence older than this is insufficient for arbitration.
+/// Journal evidence older than this is insufficient for arbitration (#3459):
+/// an entry that outlived its move (leaked by a consume failure, a crash
+/// before the TUI ever reloaded, CLI-only usage) must never delete a copy the
+/// user created or edited afterwards. Expired entries degrade to the surfaced
+/// legacy path. Generous by design: live residuals are consumed within one
+/// reload of the crash.
 const MOVE_JOURNAL_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 3600);
 
-/// How long after journal creation a store mtime still counts as part of the crashed
-/// transaction itself rather than a later user edit.
+/// How long after journal creation a store mtime still counts as part of the
+/// crashed transaction itself rather than a later user edit. Legit residuals
+/// are written within seconds of record; edits beyond this slack degrade the
+/// entry to surfaced legacy instead of arbitrating.
 const MOVE_JOURNAL_MTIME_SLACK_MS: u64 = 5 * 60 * 1000;
 
 /// Paths already reported as unusable this process lifetime, so a permanently
@@ -1815,8 +2946,11 @@ fn entry_age(entry: &super::move_journal::MoveJournalEntry) -> std::time::Durati
     std::time::Duration::from_millis(now_ms.saturating_sub(entry.created_at_epoch_ms))
 }
 
-/// Detect duplicates across the loaded profiles, run journal-guided repair for the cases
-/// with durable evidence, and return reports for whatever remains ambiguous.
+/// Detect duplicates across the loaded profiles, run journal-guided repair
+/// for the cases with durable evidence, and return reports for whatever
+/// remains ambiguous. Repairs happen under the app-global identity lock, the
+/// sorted per-session title/lifecycle locks, and each profile's own storage
+/// flock (`Storage::update`). `repaired` tells the caller to reload from disk.
 pub(crate) fn reconcile_profile_duplicates(
     loaded: &[(&str, &[Instance])],
     storages: &[(&str, &Storage)],
@@ -1877,7 +3011,8 @@ pub(crate) fn reconcile_profile_duplicates(
         let mut blocked_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
         for (path, entry) in valid_entries {
             if entry.ids.iter().any(|id| blocked_ids.contains(id)) {
-                // Shadowing is transitive across a multi-id batch.
+                // Shadowing is transitive across a multi-id batch: if X blocks
+                // this X+Y entry, Y must also block still-older evidence.
                 blocked_ids.extend(entry.ids.iter().cloned());
                 tracing::debug!(
                     target: "session.store",
@@ -1945,7 +3080,8 @@ pub(crate) fn reconcile_profile_duplicates(
         }
     }
     if !outcome.repaired {
-        // Nothing changed on disk.
+        // Nothing changed on disk: build reports from the caller's fresh
+        // load instead of re-reading every profile again.
         outcome.reports = duplicate_reports(&normalized, storages);
         return outcome;
     }
@@ -1986,7 +3122,9 @@ fn reports_after_repair(
     (duplicate_reports(&reloaded_refs, storages), true)
 }
 
-/// Build one report per duplicated id with per-copy profile, store path, and mtime.
+/// Build one report per duplicated id with per-copy profile, store path, and
+/// mtime. `loaded` must be sorted deterministically or first-seen order is
+/// used as-is; reports follow `detect_duplicate_ids` order.
 fn duplicate_reports(
     loaded: &[(&str, &[Instance])],
     storages: &[(&str, &Storage)],
@@ -2081,6 +3219,8 @@ pub(crate) fn with_storages_locked<R>(storages: &[Storage], f: impl FnOnce() -> 
     sorted.sort_by(|(left, _), (right, _)| left.cmp(right));
     sorted.dedup_by(|(left, _), (right, _)| left == right);
 
+    let dirs: Vec<&Path> = sorted.iter().map(|(dir, _)| dir.as_path()).collect();
+    let _transition_flocks = acquire_transition_flocks_for_profile_dirs(&dirs)?;
     let _mutexes: Vec<_> = sorted
         .iter()
         .map(|(_, storage)| {
@@ -2090,8 +3230,6 @@ pub(crate) fn with_storages_locked<R>(storages: &[Storage], f: impl FnOnce() -> 
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
         })
         .collect();
-    let dirs: Vec<&Path> = sorted.iter().map(|(dir, _)| dir.as_path()).collect();
-    let _transition_flocks = acquire_transition_flocks_for_profile_dirs(&dirs)?;
     let mut held: Vec<(fs::Metadata, StorageFlock)> = Vec::with_capacity(dirs.len());
     for dir in dirs {
         let (file, path) = open_storage_lock_file(dir, STORAGE_LOCK_FILENAME)?;
@@ -2130,6 +3268,9 @@ where
     } else {
         (target, source)
     };
+    let first_dir = first.sessions_path.parent().unwrap();
+    let second_dir = second.sessions_path.parent().unwrap();
+    let _transition_flocks = acquire_transition_flocks_for_profile_dirs(&[first_dir, second_dir])?;
     let _first_mu = first
         .save_lock
         .lock()
@@ -2138,9 +3279,6 @@ where
         .save_lock
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let first_dir = first.sessions_path.parent().unwrap();
-    let second_dir = second.sessions_path.parent().unwrap();
-    let _transition_flocks = acquire_transition_flocks_for_profile_dirs(&[first_dir, second_dir])?;
     let (first_file, first_path) = open_storage_lock_file(first_dir, STORAGE_LOCK_FILENAME)?;
     let (second_file, second_path) = open_storage_lock_file(second_dir, STORAGE_LOCK_FILENAME)?;
     if same_filesystem_identity(&first_file.metadata()?, &second_file.metadata()?) {
@@ -2151,7 +3289,10 @@ where
     f()
 }
 
-/// Apply the winner policy to one journal entry.
+/// Apply the winner policy to one journal entry. Returns Ok(true) when the
+/// entry was consumed (state repaired or already consistent) and Ok(false)
+/// when it cannot be applied because a referenced store is missing or has
+/// moved; those entries stay on disk and their duplicates surface as legacy.
 fn repair_journal_entry(
     entry: &super::move_journal::MoveJournalEntry,
     storages: &[(&str, &Storage)],
@@ -2191,9 +3332,16 @@ where
         return Ok(false);
     }
 
+    // Freshness gate: a losing store modified well after the journal was
+    // written means the user edited it since the crash; arbitrating on the
+    // journal would discard those edits. Legit residuals are written within
+    // seconds of record, so a slack separates them from real edits.
     for storage in [source_storage, target_storage] {
         let mtime = file_mtime_epoch_ms(storage.sessions_path()).unwrap_or_default();
         if mtime.saturating_sub(entry.created_at_epoch_ms) > MOVE_JOURNAL_MTIME_SLACK_MS {
+            // Permanent: mtimes only grow relative to created_at, so this
+            // entry can never become applicable again. Blacklist it like the
+            // other permanent insufficiency causes to avoid tick spam.
             mark_unusable_journal_entry(journal_path);
             tracing::warn!(
                 target: "session.store",
@@ -2205,8 +3353,9 @@ where
         }
     }
 
-    // App-global identity lock first, then sorted title/lifecycle locks, then the
-    // per-profile storage flocks taken inside `Storage::update`.
+    // App-global identity lock first, then sorted title/lifecycle locks, then
+    // the per-profile storage flocks taken inside `Storage::update`. This is
+    // the same global-to-local order every other identity mutation uses.
     let _identity_lock = acquire_session_identity_lock()?;
     let mut ids_sorted = entry.ids.clone();
     ids_sorted.sort();
@@ -2240,7 +3389,9 @@ where
             target_path: entry.group_move_target_path.clone(),
             move_subtree: entry.group_move_subtree,
         };
-        // Automatic arbitration requires one valid row on each side.
+        // Automatic arbitration requires one valid row on each side. If
+        // either profile already contains repeated rows for this id, preserve
+        // every copy and the journal so duplicate surfacing stays in control.
         if entry.ids.iter().any(|id| {
             source_instances.iter().filter(|row| &row.id == id).count() > 1
                 || target_instances.iter().filter(|row| &row.id == id).count() > 1
@@ -2262,7 +3413,7 @@ where
             return Ok(true);
         }
 
-        source_storage.update_under_lock(|instances, groups| {
+        source_storage.update_under_lock(ReadPolicy::Recover, |instances, groups| {
             if !target_still_holds(target_storage.sessions_path(), &source_losers)? {
                 anyhow::bail!(
                     "target copies vanished while the repair was starting; leaving the journal for a retry"
@@ -2291,16 +3442,22 @@ fn sync_repaired_profile_durably<S>(storage: &Storage, mut sync: S) -> Result<()
 where
     S: FnMut(&Path) -> Result<()>,
 {
-    // The two files normally share a profile directory, but supported symlinks may resolve
-    // them into different directories.
+    // The two files normally share a profile directory, but supported
+    // symlinks may resolve them into different directories. Verify both rename
+    // parents before journal removal can become durable.
     sync(storage.sessions_path()).context("repaired sessions directory was not made durable")?;
     sync(&storage.sessions_path().with_file_name("groups.json"))
         .context("repaired groups directory was not made durable")
 }
 
 /// True when the target sessions file currently holds every loser id.
+/// Deliberately lock-free: it runs inside the source profile's update closure
+/// and only narrows the race window; the identity/title/lifecycle locks held
+/// by the caller already exclude every lifecycle-mutating surface.
 fn target_still_holds(target_sessions_path: &Path, losers: &[String]) -> Result<bool> {
-    // Two-phase parse mirroring `Storage::load`.
+    // Two-phase parse mirroring `Storage::load`: a single corrupt row is
+    // skipped, not a whole-file failure, so a quarantined-row file cannot
+    // wedge the repair into retrying forever.
     let content = match fs::read_to_string(target_sessions_path) {
         Ok(content) => content,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
@@ -2348,7 +3505,8 @@ fn resolve_journal_store<'a>(
 
 const RECOVERY_BACKUPS_TO_KEEP: usize = 3;
 
-/// Back up one repaired file and keep only the newest bounded set for that filename.
+/// Back up one repaired file and keep only the newest bounded set for that
+/// filename. Backups are durably written before old entries are pruned.
 fn backup_before_repair(path: &Path) -> Result<()> {
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
@@ -2408,12 +3566,20 @@ where
         fs::remove_file(&old)
             .with_context(|| format!("failed pruning old recovery backup {}", old.display()))?;
     }
-    // Backup files are lexical siblings of path even when path itself is a symlink.
+    // Backup files are lexical siblings of path even when path itself is a
+    // symlink. Sync that lexical parent, not the symlink target directory.
     sync(path).context("recovery backup pruning was not made durable")
 }
 
-/// Keep the repaired profile's groups sidecar consistent with what an uninterrupted
-/// `apply_group_move` would have left on disk.
+/// Keep the repaired profile's groups sidecar consistent with what an
+/// uninterrupted `apply_group_move` would have left on disk: explicit group
+/// rows attributable to the move are dropped when their members left, except
+/// that a non-subtree move keeps the moved-path row alive while an explicit
+/// child row survives (apply_group_move's own rule); winning rows' groups are
+/// materialized and the sidecar is re-treeed through GroupTree so ancestor
+/// chains and metadata match.
+/// Attributable follows `apply_group_move`'s own matching: the moved path
+/// itself always, descendants only for a subtree move.
 fn reconcile_groups_after_repair(
     instances: &[Instance],
     groups: &mut Vec<Group>,
@@ -2430,7 +3596,9 @@ fn reconcile_groups_after_repair(
             .iter()
             .any(|instance| group_path_covers(path, &instance.group_path))
     };
-    // Mirror apply_group_move's non-subtree branch.
+    // Mirror apply_group_move's non-subtree branch: an explicitly created
+    // child under the moved path keeps the parent row alive (removing it
+    // would orphan the surviving child below a nonexistent ancestor).
     let existing_paths: Vec<String> = groups.iter().map(|group| group.path.clone()).collect();
     let has_explicit_descendant = |path: &str| {
         let prefix = format!("{path}/");
@@ -2463,7 +3631,6 @@ fn reconcile_groups_after_repair(
 
 #[cfg(test)]
 mod tests {
-    use super::super::move_journal;
     use super::*;
     use crate::file_watch::{FileMatcher, FileWatchService, WatchSpec};
     use crate::session::test_support::{isolate_app_dir_at, AppDirGuard};
@@ -2475,86 +3642,168 @@ mod tests {
         isolate_app_dir_at(temp)
     }
 
+    /// True when the effective uid is 0. Root bypasses the Unix DAC permission
+    /// bits, so a test that injects a write failure by making a dir read-only
+    /// cannot make the write fail and must skip rather than assert `is_err()`.
     #[cfg(unix)]
     fn running_as_root() -> bool {
         nix::unistd::geteuid().is_root()
     }
 
-    #[cfg(unix)]
-    fn mode(path: &Path) -> u32 {
-        use std::os::unix::fs::PermissionsExt;
-        fs::metadata(path).unwrap().permissions().mode() & 0o777
+    fn parse_u64(s: &str) -> Result<u64> {
+        Ok(s.trim().parse::<u64>()?)
     }
 
-    #[cfg(unix)]
-    fn is_symlink(path: &Path) -> bool {
-        fs::symlink_metadata(path).unwrap().file_type().is_symlink()
-    }
-
-    fn increment(path: &Path, fail: bool) -> Result<u64> {
-        locked_update(
-            path,
-            |s| Ok(s.trim().parse::<u64>()?),
-            |v| Ok(v.to_string()),
-            |v| {
-                let seen = *v;
-                *v += 1;
-                if fail {
-                    return Err(anyhow!("validation failed after mutating"));
-                }
-                Ok(seen)
-            },
-        )?
-    }
-
-    fn seed(storage: &Storage, instances: &[Instance]) -> Result<()> {
-        storage.update(|i, g| {
-            *i = instances.to_vec();
-            *g = GroupTree::new_with_groups(instances, &[]).get_all_groups();
-            Ok(())
-        })
+    fn serialize_u64(v: &u64) -> Result<String> {
+        Ok(v.to_string())
     }
 
     #[test]
-    fn locked_update_contract() {
+    fn locked_update_does_not_recreate_a_missing_parent() {
+        let tmp = tempdir().unwrap();
+        let parent = tmp.path().join("removed-profile");
+        assert!(LockedDataFile::open(&parent.join("counter.txt")).is_err());
+        assert!(!parent.exists());
+    }
+
+    #[test]
+    fn snapshot_rejects_a_profile_removed_after_open() -> Result<()> {
+        let root = tempdir()?;
+        let parent = root.path().join("removed-profile");
+        fs::create_dir(&parent)?;
+        let storage = Storage::new_for_test_path("removed-profile", parent.join("sessions.json"));
+        fs::remove_dir(&parent)?;
+        assert!(storage.load_complete_with_groups().is_err());
+        assert!(storage.update_with_snapshot(|_, _| Ok(())).is_err());
+        assert!(!parent.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn snapshot_preserves_existing_file_permissions() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempdir()?;
+        let sessions = root.path().join("sessions.json");
+        let groups = root.path().join("groups.json");
+        for path in [&sessions, &groups] {
+            fs::write(path, b"[]")?;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o640))?;
+        }
+        let storage = Storage::new_for_test_path("permissions", sessions.clone());
+        storage.update_with_snapshot(|rows, groups| {
+            rows.push(Instance::new("new", "/tmp/new"));
+            groups.push(Group::new("group", "group"));
+            Ok(())
+        })?;
+        for path in [sessions, groups] {
+            assert_eq!(fs::metadata(path)?.permissions().mode() & 0o777, 0o640);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn snapshot_stays_bound_when_profile_is_replaced_during_commit() -> Result<()> {
+        let root = tempdir()?;
+        let parent = root.path().join("profile");
+        let moved = root.path().join("moved");
+        fs::create_dir(&parent)?;
+        let storage = Storage::new_for_test_path("profile", parent.join("sessions.json"));
+        storage.update(|rows, _| {
+            rows.push(Instance::new("original", "/tmp/original"));
+            Ok(())
+        })?;
+        let result = storage.update_with_snapshot(|rows, _| {
+            rows[0].title = "committed".into();
+            fs::rename(&parent, &moved)?;
+            fs::create_dir(&parent)?;
+            fs::write(parent.join("sessions.json"), b"[]")?;
+            Ok(())
+        });
+        assert_eq!(fs::read(parent.join("sessions.json"))?, b"[]");
+        assert!(result.is_err());
+        let original: Vec<Instance> =
+            serde_json::from_slice(&fs::read(moved.join("sessions.json"))?)?;
+        assert_eq!(original[0].title, "committed");
+        Ok(())
+    }
+
+    #[test]
+    fn locked_update_stays_in_the_opened_directory() {
+        let tmp = tempdir().unwrap();
+        let parent = tmp.path().join("profile");
+        let renamed = tmp.path().join("renamed");
+        fs::create_dir(&parent).unwrap();
+        fs::write(parent.join("counter.txt"), "41").unwrap();
+        let locked = LockedDataFile::open(&parent.join("counter.txt")).unwrap();
+        fs::rename(&parent, &renamed).unwrap();
+        fs::create_dir(&parent).unwrap();
+        fs::write(parent.join("counter.txt"), "900").unwrap();
+        locked
+            .update(parse_u64, serialize_u64, |value| {
+                *value += 1;
+                Ok::<_, anyhow::Error>(())
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(parent.join("counter.txt")).unwrap(),
+            "900"
+        );
+        assert_eq!(
+            fs::read_to_string(renamed.join("counter.txt")).unwrap(),
+            "42"
+        );
+        fs::remove_dir_all(&renamed).unwrap();
+        assert!(locked
+            .update(parse_u64, serialize_u64, |value| {
+                *value += 1;
+                Ok::<_, anyhow::Error>(())
+            })
+            .is_err());
+        assert!(!renamed.exists());
+        assert_eq!(
+            fs::read_to_string(parent.join("counter.txt")).unwrap(),
+            "900"
+        );
+    }
+
+    #[test]
+    fn locked_update_missing_file_starts_from_default() {
         let tmp = tempdir().unwrap();
         let path = tmp.path().join("counter.txt");
-        assert_eq!(
-            increment(&path, false).unwrap(),
-            0,
-            "missing file parses as default"
-        );
-        assert_eq!(fs::read_to_string(&path).unwrap(), "1");
+        let seen = LockedDataFile::open(&path)
+            .unwrap()
+            .update(parse_u64, serialize_u64, |v| {
+                let seen = *v;
+                *v += 1;
+                Ok::<_, anyhow::Error>(seen)
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(seen, (0, 1), "missing file must commit from T::default()");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "1");
+    }
 
-        fs::write(&path, "41").unwrap();
+    #[test]
+    fn locked_update_round_trips_existing_content() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("counter.txt");
+        std::fs::write(&path, "41").unwrap();
+        LockedDataFile::open(&path)
+            .unwrap()
+            .update(parse_u64, serialize_u64, |v| {
+                *v += 1;
+                Ok::<_, anyhow::Error>(())
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "42");
+
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
-        }
-        assert_eq!(increment(&path, false).unwrap(), 41);
-        assert_eq!(fs::read_to_string(&path).unwrap(), "42");
-        #[cfg(unix)]
-        assert_eq!(
-            mode(&path),
-            0o600,
-            "data file must be re-tightened owner-only"
-        );
-
-        assert!(increment(&path, true).is_err());
-        assert_eq!(
-            fs::read_to_string(&path).unwrap(),
-            "42",
-            "a failed mutation must not persist half-applied state"
-        );
-
-        #[cfg(unix)]
-        {
-            let link = tmp.path().join("link.txt");
-            std::os::unix::fs::symlink(&path, &link).unwrap();
-            increment(&link, false).unwrap();
-            assert!(is_symlink(&link));
-            assert_eq!(fs::read_to_string(&path).unwrap(), "43");
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "data file must land owner-only");
         }
     }
 
@@ -2562,45 +3811,107 @@ mod tests {
     fn locked_update_concurrent_writers_lose_no_updates() {
         let tmp = tempdir().unwrap();
         let path = tmp.path().join("counter.txt");
-        std::thread::scope(|scope| {
-            for _ in 0..4 {
-                scope.spawn(|| {
-                    for _ in 0..25 {
-                        increment(&path, false).unwrap();
-                    }
-                });
-            }
-        });
-        assert_eq!(fs::read_to_string(&path).unwrap(), "100");
+        const THREADS: usize = 4;
+        const INCREMENTS: usize = 25;
+
+        let mut handles = Vec::new();
+        for _ in 0..THREADS {
+            let path = path.clone();
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..INCREMENTS {
+                    LockedDataFile::open(&path)
+                        .unwrap()
+                        .update(parse_u64, serialize_u64, |v| {
+                            *v += 1;
+                            Ok::<_, anyhow::Error>(())
+                        })
+                        .unwrap()
+                        .unwrap();
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            (THREADS * INCREMENTS).to_string(),
+            "every increment must land; the sidecar flock serializes read-modify-write"
+        );
     }
 
+    /// Every write goes through the symlink to the target. Users symlink
+    /// `config.toml` and friends into a dotfiles repo, and a `rename(2)` over
+    /// the link would swap it for a regular file, silently desyncing the
+    /// dotfile tree (#2784, #3186).
     #[cfg(unix)]
     #[test]
-    fn atomic_write_follows_symlinks_and_preserves_mode() {
-        use std::os::unix::fs::PermissionsExt;
+    fn atomic_write_follows_symlinks() {
         let tmp = tempdir().unwrap();
         let target = tmp.path().join("real-config.toml");
-        fs::write(&target, "old").unwrap();
-        fs::set_permissions(&target, fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::write(&target, "old").unwrap();
         let link = tmp.path().join("config.toml");
         std::os::unix::fs::symlink(&target, &link).unwrap();
 
         atomic_write(&link, b"new").unwrap();
-        assert!(
-            is_symlink(&link),
-            "a rename over the link would desync dotfiles"
-        );
-        assert_eq!(fs::read_to_string(&target).unwrap(), "new");
-        assert_eq!(mode(&target), 0o644);
 
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the symlink must survive; a rename over it would desync dotfile setups"
+        );
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "new");
+
+        // A dangling link materialises the target, not a regular file at the
+        // link path: a fresh install can symlink config.toml before it exists.
         let missing = tmp.path().join("not-yet.toml");
         let dangling = tmp.path().join("dangling.toml");
         std::os::unix::fs::symlink(&missing, &dangling).unwrap();
         atomic_write(&dangling, b"seeded").unwrap();
-        assert_eq!(fs::read_to_string(&missing).unwrap(), "seeded");
-        assert!(is_symlink(&dangling));
+        assert_eq!(std::fs::read_to_string(&missing).unwrap(), "seeded");
+        assert!(std::fs::symlink_metadata(&dangling)
+            .unwrap()
+            .file_type()
+            .is_symlink());
     }
 
+    /// A pre-existing file's non-default mode survives the write: `atomic_write`
+    /// copies the destination's permissions onto the temp file before the
+    /// rename, so a 0o644 file stays 0o644 rather than reverting to
+    /// `NamedTempFile`'s 0o600 default.
+    ///
+    /// The dual half of the contract, that a failure inside `set_permissions`
+    /// leaves the destination unreplaced, is deliberately not exercised here:
+    /// `set_permissions` on a freshly created temp file we own has no reachable
+    /// failure mode without a fault-injection seam, so that guarantee rests on
+    /// the ordering in the code (every fallible step precedes `persist`) rather
+    /// than on a test.
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_preserves_existing_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("perms.txt");
+        std::fs::write(&path, "old").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        atomic_write(&path, b"new").unwrap();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o644,
+            "a pre-existing non-default mode must survive the rename"
+        );
+    }
+
+    /// The mirror of `atomic_write_follows_symlinks`, for the paths AoE writes
+    /// inside a sandbox bind: a link planted there by a container process must
+    /// be replaced, never written through, and a swapped parent directory must
+    /// fail the write rather than redirect it out of the bind.
     #[cfg(unix)]
     #[test]
     fn replace_file_no_follow_refuses_planted_links() {
@@ -2614,6 +3925,7 @@ mod tests {
         fs::write(&secret, "untouched").unwrap();
         let rel = Path::new("agent/extensions/extension.js");
 
+        // A link at the destination is replaced, not followed.
         std::os::unix::fs::symlink(&secret, root.join(rel)).unwrap();
         replace_file_no_follow(&root, rel, b"payload").unwrap();
         assert_eq!(fs::read_to_string(&secret).unwrap(), "untouched");
@@ -2628,6 +3940,8 @@ mod tests {
             "the container reader may not be the uid that owns the bind"
         );
 
+        // A parent swapped for a link fails the walk, leaving the target dir
+        // untouched: nothing is written outside the bind root.
         fs::remove_dir_all(root.join("agent")).unwrap();
         std::os::unix::fs::symlink(&outside, root.join("agent")).unwrap();
         let err = replace_file_no_follow(&root, rel, b"payload").unwrap_err();
@@ -2636,6 +3950,7 @@ mod tests {
             "a swapped ancestor must not be traversed: {err:#}"
         );
 
+        // And nothing is left behind for a concurrent writer to collide with.
         fs::remove_file(root.join("agent")).unwrap();
         let leftovers: Vec<_> = fs::read_dir(root.join("agent/extensions"))
             .into_iter()
@@ -2646,6 +3961,12 @@ mod tests {
         assert!(leftovers.is_empty(), "stray temp files: {leftovers:?}");
     }
 
+    /// The read half of the same contract: whatever a container plants at the
+    /// name, the bytes AoE merges come from a regular file it opened
+    /// `O_NOFOLLOW` below the bind root, or from nothing at all. The
+    /// substitution the fix closes is a swap between the type check and the
+    /// open, so the check runs on the descriptor the read uses and there is no
+    /// second resolution of the pathname to redirect.
     #[cfg(unix)]
     #[test]
     fn read_file_no_follow_reads_only_regular_files_below_root() {
@@ -2671,6 +3992,7 @@ mod tests {
             Some("inside")
         );
 
+        // A link planted at the name reads as absent, not as its target.
         fs::remove_file(root.join(rel)).unwrap();
         std::os::unix::fs::symlink(&secret, root.join(rel)).unwrap();
         assert_eq!(
@@ -2679,6 +4001,8 @@ mod tests {
             "planted link"
         );
 
+        // So does anything else that is not a regular file. The fifo also
+        // pins that the open does not park waiting for a writer.
         fs::remove_file(root.join(rel)).unwrap();
         nix::unistd::mkfifo(
             &root.join(rel),
@@ -2690,6 +4014,8 @@ mod tests {
         fs::create_dir(root.join(rel)).unwrap();
         assert_eq!(read_file_no_follow(&root, rel).unwrap(), None, "directory");
 
+        // A parent swapped for a link fails the walk rather than resolving
+        // out of the bind, even though the entry it points at is a plain file.
         fs::write(outside.join("config.json"), "host-only").unwrap();
         fs::remove_dir_all(root.join("agent")).unwrap();
         std::os::unix::fs::symlink(&outside, root.join("agent")).unwrap();
@@ -2707,274 +4033,814 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn resolve_symlink_chain_cases() {
+    fn locked_update_preserves_symlinks() {
+        let tmp = tempdir().unwrap();
+        let target = tmp.path().join("real-counter.txt");
+        std::fs::write(&target, "41").unwrap();
+        let link = tmp.path().join("counter.txt");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        LockedDataFile::open(&link)
+            .unwrap()
+            .update(parse_u64, serialize_u64, |v| {
+                *v += 1;
+                Ok::<_, anyhow::Error>(())
+            })
+            .unwrap()
+            .unwrap();
+
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the symlink must survive; a rename over it would desync dotfile setups"
+        );
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "42");
+    }
+
+    #[test]
+    fn locked_update_failed_mutation_leaves_file_untouched() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("counter.txt");
+        std::fs::write(&path, "41").unwrap();
+
+        let inner = LockedDataFile::open(&path)
+            .unwrap()
+            .update(parse_u64, serialize_u64, |v| {
+                *v += 1;
+                Err::<(), _>(anyhow!("validation failed after mutating"))
+            })
+            .unwrap();
+
+        assert!(inner.is_err());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "41",
+            "a failed mutation must not persist half-applied state"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_resolve_symlink_chain_returns_path_when_missing() {
+        let tmp = tempdir().unwrap();
+        let missing = tmp.path().join("does-not-exist.json");
+        assert_eq!(resolve_symlink_chain(&missing).unwrap(), missing);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_resolve_symlink_chain_returns_path_when_regular_file() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("regular.json");
+        std::fs::write(&path, b"x").unwrap();
+        assert_eq!(resolve_symlink_chain(&path).unwrap(), path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_resolve_symlink_chain_follows_multi_hop_chain() {
         use std::os::unix::fs::symlink;
         let tmp = tempdir().unwrap();
-        let p = |name: &str| tmp.path().join(name);
-        let chain = |len: usize| {
-            let target = p(&format!("target-{len}"));
-            fs::write(&target, b"x").unwrap();
-            let mut prev = target.clone();
-            for i in 0..len {
-                let link = p(&format!("chain-{len}-{i}"));
-                symlink(&prev, &link).unwrap();
-                prev = link;
-            }
-            (target, prev)
-        };
+        let target = tmp.path().join("target.json");
+        std::fs::write(&target, b"x").unwrap();
+        let mid = tmp.path().join("mid.json");
+        symlink(&target, &mid).unwrap();
+        let top = tmp.path().join("top.json");
+        symlink("mid.json", &top).unwrap();
+        assert_eq!(resolve_symlink_chain(&top).unwrap(), target);
+    }
 
-        assert_eq!(resolve_symlink_chain(&p("missing")).unwrap(), p("missing"));
-        fs::write(p("regular"), b"x").unwrap();
-        assert_eq!(resolve_symlink_chain(&p("regular")).unwrap(), p("regular"));
-        symlink("regular", p("relative")).unwrap();
-        symlink(p("relative"), p("top")).unwrap();
-        assert_eq!(resolve_symlink_chain(&p("top")).unwrap(), p("regular"));
-        symlink(p("nowhere"), p("dangling")).unwrap();
-        assert_eq!(resolve_symlink_chain(&p("dangling")).unwrap(), p("nowhere"));
-        let (target, head) = chain(32);
-        assert_eq!(resolve_symlink_chain(&head).unwrap(), target);
+    #[cfg(unix)]
+    #[test]
+    fn test_resolve_symlink_chain_detects_loop() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempdir().unwrap();
+        let a = tmp.path().join("a");
+        let b = tmp.path().join("b");
+        symlink(&b, &a).unwrap();
+        symlink(&a, &b).unwrap();
+        let err = resolve_symlink_chain(&a).unwrap_err().to_string();
+        assert!(err.contains("too deep"), "got: {err}");
+    }
 
-        symlink(p("b"), p("a")).unwrap();
-        symlink(p("a"), p("b")).unwrap();
-        for head in [p("a"), chain(33).1] {
-            let err = resolve_symlink_chain(&head).unwrap_err().to_string();
-            assert!(err.contains("too deep"), "got: {err}");
+    #[cfg(unix)]
+    #[test]
+    fn test_resolve_symlink_chain_dangling_returns_target_path() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempdir().unwrap();
+        let missing = tmp.path().join("missing.json");
+        let link = tmp.path().join("link.json");
+        symlink(&missing, &link).unwrap();
+        assert_eq!(resolve_symlink_chain(&link).unwrap(), missing);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_resolve_symlink_chain_resolves_at_max_depth() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempdir().unwrap();
+        let target = tmp.path().join("target.json");
+        std::fs::write(&target, b"x").unwrap();
+        let mut prev = target.clone();
+        for i in (0..32).rev() {
+            let link = tmp.path().join(format!("link_{}.json", i));
+            symlink(&prev, &link).unwrap();
+            prev = link;
         }
+        assert_eq!(resolve_symlink_chain(&prev).unwrap(), target);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_resolve_symlink_chain_rejects_over_max_depth() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempdir().unwrap();
+        let target = tmp.path().join("target.json");
+        std::fs::write(&target, b"x").unwrap();
+        let mut prev = target.clone();
+        for i in (0..33).rev() {
+            let link = tmp.path().join(format!("link_{}.json", i));
+            symlink(&prev, &link).unwrap();
+            prev = link;
+        }
+        let err = resolve_symlink_chain(&prev).unwrap_err().to_string();
+        assert!(err.contains("too deep"), "got: {err}");
     }
 
     #[test]
     #[serial]
-    fn storage_round_trips_sessions_and_groups() -> Result<()> {
+    fn test_storage_roundtrip() -> Result<()> {
+        let temp = tempdir()?;
+        let _guard = setup_test_home(temp.path());
+
+        let storage = Storage::new_unwatched("test-profile")?;
+
+        let instances = vec![
+            Instance::new("test1", "/tmp/test1"),
+            Instance::new("test2", "/tmp/test2"),
+        ];
+
+        storage.update(|i, g| {
+            *i = instances.to_vec();
+            *g = GroupTree::new_with_groups(&instances, &[]).get_all_groups();
+            Ok(())
+        })?;
+        let loaded = storage.load()?;
+
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].title, "test1");
+        assert_eq!(loaded[1].title, "test2");
+
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn test_open_unwatched_errors_on_unknown_profile_without_creating_dir() {
+        let temp = tempdir().unwrap();
+        let guard = setup_test_home(temp.path());
+        let profile_dir = guard.path().join("profiles").join("ghost");
+        assert!(!profile_dir.exists());
+
+        let result = Storage::open_unwatched("ghost");
+        let err = match result {
+            Ok(_) => panic!("unknown profile must error"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("does not exist"), "got: {err}");
+        assert!(
+            !profile_dir.exists(),
+            "open_unwatched must not create profiles/<name>/ as a side effect",
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_open_unwatched_succeeds_for_created_profile() {
+        let temp = tempdir().unwrap();
+        let _guard = setup_test_home(temp.path());
+        crate::session::create_profile("known").unwrap();
+
+        let storage = Storage::open_unwatched("known").expect("known profile must open");
+        assert_eq!(storage.profile(), "known");
+    }
+
+    #[test]
+    #[serial]
+    fn test_load_skips_corrupt_row_and_quarantines() -> Result<()> {
         let temp = tempdir()?;
         let _guard = setup_test_home(temp.path());
         let storage = Storage::new_unwatched("test-profile")?;
-        let groups_path = storage.sessions_path.with_file_name("groups.json");
 
-        assert!(storage.load()?.is_empty(), "missing file loads empty");
+        // [ valid, malformed, valid ]: the malformed row is an object that
+        // is missing `Instance`'s required `id`/`project_path` fields.
+        let valid = [
+            Instance::new("alpha", "/tmp/alpha"),
+            Instance::new("beta", "/tmp/beta"),
+        ];
+        let mut rows: Vec<serde_json::Value> = valid
+            .iter()
+            .map(|i| serde_json::to_value(i).unwrap())
+            .collect();
+        rows.insert(1, serde_json::json!({ "title": "corrupt-no-id" }));
+
         fs::create_dir_all(storage.sessions_path.parent().unwrap())?;
-        for blank in ["", "   \n  \t  "] {
-            fs::write(&storage.sessions_path, blank)?;
-            assert!(storage.load()?.is_empty());
-        }
-        fs::write(&storage.sessions_path, "{ invalid json }")?;
-        assert!(storage.load().is_err());
+        fs::write(&storage.sessions_path, serde_json::to_vec_pretty(&rows)?)?;
 
-        // `update` reads before it writes, so clear the corrupt file first.
+        let loaded = storage.load()?;
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].title, "alpha");
+        assert_eq!(loaded[1].title, "beta");
+
+        let quarantine = storage
+            .sessions_path
+            .with_file_name("sessions.corrupt.jsonl");
+        assert!(quarantine.exists(), "quarantine sidecar should be created");
+        let q = fs::read_to_string(&quarantine)?;
+        assert_eq!(q.lines().count(), 1, "exactly one row quarantined");
+        assert!(q.contains("corrupt-no-id"), "malformed row is preserved");
+
+        // The sidecar can echo tokens carried in `Instance.command`, so it
+        // must be written 0o600 like `sessions.json`, not umask-default 0o644.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&quarantine)?.permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "quarantine sidecar must be owner-only");
+        }
+
+        // A second read-only load must not duplicate the row: load() runs on
+        // refresh paths that never rewrite sessions.json, so the sidecar is
+        // overwritten with the current corrupt set rather than appended to.
+        assert_eq!(storage.load()?.len(), 2);
+        let q = fs::read_to_string(&quarantine)?;
+        assert_eq!(q.lines().count(), 1, "repeated load must not duplicate");
+
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn test_load_top_level_corruption_still_errors() -> Result<()> {
+        let temp = tempdir()?;
+        let _guard = setup_test_home(temp.path());
+        let storage = Storage::new_unwatched("test-profile")?;
+
+        fs::create_dir_all(storage.sessions_path.parent().unwrap())?;
+        let quarantine = storage
+            .sessions_path
+            .with_file_name("sessions.corrupt.jsonl");
+
+        // Both forms of top-level corruption must surface as Err and never be
+        // masked by the per-row fallthrough: valid JSON of the wrong shape (an
+        // object, not an array) and syntactically invalid JSON (a torn write).
+        for bad in [&b"{}"[..], &b"{ this is not valid json ]"[..]] {
+            fs::write(&storage.sessions_path, bad)?;
+            assert!(
+                storage.load().is_err(),
+                "top-level corruption should still surface as Err"
+            );
+            assert!(
+                !quarantine.exists(),
+                "no quarantine file for top-level corruption"
+            );
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn test_storage_new_with_empty_profile_bootstraps() -> Result<()> {
+        // On a fresh install with no profiles, an empty profile argument
+        // resolves through `resolve_default_profile`, which bootstraps the
+        // first profile. The name is "main", never the magic "default".
+        let temp = tempdir()?;
+        let _guard = setup_test_home(temp.path());
+
+        let storage = Storage::new_unwatched("")?;
+        assert_eq!(storage.profile(), "main");
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn test_storage_new_with_empty_profile_uses_existing() -> Result<()> {
+        // When profiles already exist, an empty profile argument resolves to
+        // the first one (sorted), not a hard-coded name.
+        let temp = tempdir()?;
+        let _guard = setup_test_home(temp.path());
+
+        get_profile_dir("work")?;
+        get_profile_dir("personal")?;
+
+        let storage = Storage::new_unwatched("")?;
+        assert_eq!(storage.profile(), "personal");
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn test_storage_new_with_empty_profile_honors_config() -> Result<()> {
+        // An explicitly configured default_profile wins over the first-found
+        // directory.
+        let temp = tempdir()?;
+        let _guard = setup_test_home(temp.path());
+
+        get_profile_dir("work")?;
+        get_profile_dir("personal")?;
+        super::super::config::update_config(|config| {
+            config.default_profile = "work".to_string();
+        })?;
+
+        let storage = Storage::new_unwatched("")?;
+        assert_eq!(storage.profile(), "work");
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn test_storage_new_with_custom_profile() -> Result<()> {
+        let temp = tempdir()?;
+        let _guard = setup_test_home(temp.path());
+
+        let storage = Storage::new_unwatched("custom-profile")?;
+        assert_eq!(storage.profile(), "custom-profile");
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn test_storage_load_nonexistent_file() -> Result<()> {
+        let temp = tempdir()?;
+        let _guard = setup_test_home(temp.path());
+
+        let storage = Storage::new_unwatched("test-empty")?;
+        let loaded = storage.load()?;
+
+        assert!(loaded.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn test_storage_load_empty_file() -> Result<()> {
+        let temp = tempdir()?;
+        let _guard = setup_test_home(temp.path());
+
+        let storage = Storage::new_unwatched("test-empty-file")?;
+
+        // Create empty file
+        fs::create_dir_all(storage.sessions_path.parent().unwrap())?;
+        fs::write(&storage.sessions_path, "")?;
+
+        let loaded = storage.load()?;
+        assert!(loaded.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn test_storage_load_whitespace_only_file() -> Result<()> {
+        let temp = tempdir()?;
+        let _guard = setup_test_home(temp.path());
+
+        let storage = Storage::new_unwatched("test-whitespace")?;
+
+        fs::create_dir_all(storage.sessions_path.parent().unwrap())?;
+        fs::write(&storage.sessions_path, "   \n  \t  ")?;
+
+        let loaded = storage.load()?;
+        assert!(loaded.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn test_storage_save_leaves_no_temp_files() -> Result<()> {
+        let temp = tempdir()?;
+        let _guard = setup_test_home(temp.path());
+
+        let storage = Storage::new_unwatched("test-no-debris")?;
+
+        for i in 0..5 {
+            let instances = vec![Instance::new(&format!("iter{i}"), "/tmp/test")];
+            storage.update(|i, g| {
+                *i = instances.to_vec();
+                *g = GroupTree::new_with_groups(&instances, &[]).get_all_groups();
+                Ok(())
+            })?;
+        }
+
+        let dir = storage.sessions_path.parent().unwrap();
+        let entries: Vec<_> = fs::read_dir(dir)?
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+
+        for entry in &entries {
+            assert!(
+                !entry.contains(".tmp"),
+                "atomic_write must not leak temp files; found {}",
+                entry
+            );
+        }
+        assert!(entries.contains(&"sessions.json".to_string()));
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn test_storage_save_empty_array() -> Result<()> {
+        let temp = tempdir()?;
+        let _guard = setup_test_home(temp.path());
+
+        let storage = Storage::new_unwatched("test-empty-save")?;
+        {
+            let xs: Vec<Instance> = vec![];
+            storage.update(|i, g| {
+                *i = xs.to_vec();
+                *g = GroupTree::new_with_groups(&xs, &[]).get_all_groups();
+                Ok(())
+            })?
+        };
+
+        let content = fs::read_to_string(&storage.sessions_path)?;
+        assert_eq!(content.trim(), "[]");
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn test_storage_load_with_groups_no_groups_file() -> Result<()> {
+        let temp = tempdir()?;
+        let _guard = setup_test_home(temp.path());
+
+        let storage = Storage::new_unwatched("test-no-groups")?;
+
+        let instances = vec![Instance::new("test", "/tmp/test")];
+        storage.update(|i, g| {
+            *i = instances.to_vec();
+            *g = GroupTree::new_with_groups(&instances, &[]).get_all_groups();
+            Ok(())
+        })?;
+
+        let (loaded_instances, loaded_groups) = storage.load_with_groups()?;
+        assert_eq!(loaded_instances.len(), 1);
+        assert!(loaded_groups.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn test_storage_save_and_load_with_groups() -> Result<()> {
+        let temp = tempdir()?;
+        let _guard = setup_test_home(temp.path());
+
+        let storage = Storage::new_unwatched("test-with-groups")?;
+
+        let mut instances = vec![Instance::new("test", "/tmp/test")];
+        instances[0].group_path = "work/projects".to_string();
+
+        let groups = vec![Group::new("projects", "work/projects")];
+        let group_tree = GroupTree::new_with_groups(&instances, &groups);
+
+        storage.update(|i, g| {
+            *i = instances.to_vec();
+            *g = group_tree.get_all_groups();
+            Ok(())
+        })?;
+
+        let (loaded_instances, loaded_groups) = storage.load_with_groups()?;
+        assert_eq!(loaded_instances.len(), 1);
+        assert_eq!(loaded_instances[0].group_path, "work/projects");
+        assert!(!loaded_groups.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn test_load_with_groups_skips_corrupt_row_and_quarantines() -> Result<()> {
+        let temp = tempdir()?;
+        let _guard = setup_test_home(temp.path());
+
+        let storage = Storage::new_unwatched("test-groups-corrupt-row")?;
+        fs::create_dir_all(storage.sessions_path.parent().unwrap())?;
+        let expected_instances = [Instance::new("session", "/tmp/session")];
+        fs::write(
+            &storage.sessions_path,
+            serde_json::to_vec_pretty(&expected_instances)?,
+        )?;
+
+        let groups_path = storage.sessions_path.with_file_name("groups.json");
+        let valid = [
+            Group::new("alpha", "work/alpha"),
+            Group::new("beta", "work/beta"),
+        ];
+        let mut rows: Vec<serde_json::Value> = valid
+            .iter()
+            .map(|group| serde_json::to_value(group).unwrap())
+            .collect();
+        rows.insert(1, serde_json::json!({ "name": "corrupt-no-path" }));
+        fs::write(&groups_path, serde_json::to_vec_pretty(&rows)?)?;
+
+        let (instances, groups) = storage.load_with_groups()?;
+        assert_eq!(instances.len(), 1);
+        assert_eq!(instances[0].title, "session");
+        assert_eq!(instances[0].project_path, "/tmp/session");
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].name, "alpha");
+        assert_eq!(groups[0].path, "work/alpha");
+        assert_eq!(groups[1].name, "beta");
+        assert_eq!(groups[1].path, "work/beta");
+
+        let quarantine = storage.sessions_path.with_file_name("groups.corrupt.jsonl");
+        assert!(quarantine.exists(), "quarantine sidecar should be created");
+        let q = fs::read_to_string(&quarantine)?;
+        assert_eq!(q.lines().count(), 1, "exactly one row quarantined");
+        assert!(q.contains("corrupt-no-path"), "malformed row is preserved");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&quarantine)?.permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "quarantine sidecar must be owner-only");
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn test_load_with_groups_repeated_read_overwrites_quarantine() -> Result<()> {
+        let temp = tempdir()?;
+        let _guard = setup_test_home(temp.path());
+
+        let storage = Storage::new_unwatched("test-groups-corrupt-row-repeat")?;
+        fs::create_dir_all(storage.sessions_path.parent().unwrap())?;
         fs::write(&storage.sessions_path, "[]")?;
-        seed(&storage, &[])?;
-        assert_eq!(fs::read_to_string(&storage.sessions_path)?.trim(), "[]");
+
+        let groups_path = storage.sessions_path.with_file_name("groups.json");
+        let rows = serde_json::json!([
+            Group::new("alpha", "work/alpha"),
+            { "name": "corrupt-no-path" },
+            Group::new("beta", "work/beta")
+        ]);
+        fs::write(&groups_path, serde_json::to_vec_pretty(&rows)?)?;
+
+        assert_eq!(storage.load_with_groups()?.1.len(), 2);
+        let quarantine = storage.sessions_path.with_file_name("groups.corrupt.jsonl");
+        let first = fs::read_to_string(&quarantine)?;
+
+        assert_eq!(storage.load_with_groups()?.1.len(), 2);
+        let second = fs::read_to_string(&quarantine)?;
+        assert_eq!(second, first);
+        assert_eq!(
+            second.lines().count(),
+            1,
+            "repeated load must not duplicate"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn test_load_with_groups_top_level_corruption_still_errors() -> Result<()> {
+        let temp = tempdir()?;
+        let _guard = setup_test_home(temp.path());
+
+        let storage = Storage::new_unwatched("test-groups-top-level-corrupt")?;
+        fs::create_dir_all(storage.sessions_path.parent().unwrap())?;
+        fs::write(&storage.sessions_path, "[]")?;
+
+        let groups_path = storage.sessions_path.with_file_name("groups.json");
+        let quarantine = storage.sessions_path.with_file_name("groups.corrupt.jsonl");
+        for bad in [&b"{}"[..], &b"{ this is not valid json ]"[..]] {
+            fs::write(&groups_path, bad)?;
+            assert!(
+                storage.load_with_groups().is_err(),
+                "top-level corruption should still surface as Err"
+            );
+            assert!(
+                !quarantine.exists(),
+                "no quarantine file for top-level corruption"
+            );
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn test_storage_load_invalid_json() -> Result<()> {
+        let temp = tempdir()?;
+        let _guard = setup_test_home(temp.path());
+
+        let storage = Storage::new_unwatched("test-invalid")?;
+
+        fs::create_dir_all(storage.sessions_path.parent().unwrap())?;
+        fs::write(&storage.sessions_path, "{ invalid json }")?;
+
+        let result = storage.load();
+        assert!(result.is_err());
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn test_storage_preserves_instance_fields() -> Result<()> {
+        let temp = tempdir()?;
+        let _guard = setup_test_home(temp.path());
+
+        let storage = Storage::new_unwatched("test-fields")?;
 
         let mut instance = Instance::new("Test Project", "/home/user/project");
         instance.tool = "opencode".to_string();
         instance.command = "opencode --config test".to_string();
         instance.group_path = "work/clients".to_string();
-        for i in 0..3 {
-            let second = Instance::new(&format!("iter{i}"), "/tmp/test");
-            seed(&storage, &[instance.clone(), second])?;
+
+        {
+            let xs: Vec<Instance> = vec![instance.clone()];
+            storage.update(|i, g| {
+                *i = xs.to_vec();
+                *g = GroupTree::new_with_groups(&xs, &[]).get_all_groups();
+                Ok(())
+            })?
+        };
+        let loaded = storage.load()?;
+
+        assert_eq!(loaded.len(), 1);
+        let loaded_instance = &loaded[0];
+        assert_eq!(loaded_instance.title, "Test Project");
+        assert_eq!(loaded_instance.project_path, "/home/user/project");
+        assert_eq!(loaded_instance.tool, "opencode");
+        assert_eq!(loaded_instance.command, "opencode --config test");
+        assert_eq!(loaded_instance.group_path, "work/clients");
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn test_storage_profile_accessor() -> Result<()> {
+        let temp = tempdir()?;
+        let _guard = setup_test_home(temp.path());
+
+        // Verify profiles are correctly named
+        let storage1 = Storage::new_unwatched("profile-alpha")?;
+        let storage2 = Storage::new_unwatched("profile-beta")?;
+
+        assert_eq!(storage1.profile(), "profile-alpha");
+        assert_eq!(storage2.profile(), "profile-beta");
+
+        // Verify they use different paths (implying isolation)
+        assert_ne!(storage1.sessions_path, storage2.sessions_path);
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn test_storage_groups_file_empty() -> Result<()> {
+        let temp = tempdir()?;
+        let _guard = setup_test_home(temp.path());
+
+        let storage = Storage::new_unwatched("test-empty-groups")?;
+
+        // Save sessions
+        {
+            let xs: Vec<Instance> = vec![Instance::new("test", "/tmp/test")];
+            storage.update(|i, g| {
+                *i = xs.to_vec();
+                *g = GroupTree::new_with_groups(&xs, &[]).get_all_groups();
+                Ok(())
+            })?
+        };
+
+        // Create empty groups file
+        let groups_path = storage.sessions_path.with_file_name("groups.json");
+        fs::write(&groups_path, "   ")?;
+
+        let (instances, groups) = storage.load_with_groups()?;
+        assert_eq!(instances.len(), 1);
+        assert!(groups.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn test_workspace_ordering_roundtrip() -> Result<()> {
+        let temp = tempdir()?;
+        let _guard = setup_test_home(temp.path());
+
+        // Empty by default.
+        let empty = load_workspace_ordering()?;
+        assert!(empty.order.is_empty());
+
+        let saved = WorkspaceOrdering {
+            order: vec![
+                "/repo/a::main".to_string(),
+                "/repo/b::feature/x".to_string(),
+                "/repo/c::__session__::abc123".to_string(),
+            ],
+        };
+        save_workspace_ordering(&saved)?;
+
+        let loaded = load_workspace_ordering()?;
+        assert_eq!(loaded.order, saved.order);
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn test_workspace_ordering_overwrites_on_save() -> Result<()> {
+        let temp = tempdir()?;
+        let _guard = setup_test_home(temp.path());
+
+        save_workspace_ordering(&WorkspaceOrdering {
+            order: vec!["a".to_string(), "b".to_string()],
+        })?;
+        save_workspace_ordering(&WorkspaceOrdering {
+            order: vec!["b".to_string()],
+        })?;
+
+        let loaded = load_workspace_ordering()?;
+        assert_eq!(loaded.order, vec!["b".to_string()]);
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn test_workspace_ordering_handles_empty_file() -> Result<()> {
+        let temp = tempdir()?;
+        let _guard = setup_test_home(temp.path());
+
+        let path = workspace_ordering_path()?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
         }
+        fs::write(&path, "   ")?;
+
+        let loaded = load_workspace_ordering()?;
+        assert!(loaded.order.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn test_update_atomic_load_modify_save() -> Result<()> {
+        let temp = tempdir()?;
+        let _guard = setup_test_home(temp.path());
+
+        let storage = Storage::new_unwatched("test-update-roundtrip")?;
+        storage.update(|i, g| {
+            *i = [Instance::new("seed", "/tmp/seed")].to_vec();
+            *g = GroupTree::new_with_groups(&[], &[]).get_all_groups();
+            Ok(())
+        })?;
+
+        storage.update(|instances, _groups| {
+            instances.push(Instance::new("added", "/tmp/added"));
+            Ok(())
+        })?;
+
         let loaded = storage.load()?;
         assert_eq!(loaded.len(), 2);
-        let first = &loaded[0];
-        assert_eq!(
-            (
-                &*first.title,
-                &*first.project_path,
-                &*first.tool,
-                &*first.command
-            ),
-            (
-                "Test Project",
-                "/home/user/project",
-                "opencode",
-                "opencode --config test"
-            )
-        );
-        assert_eq!(first.group_path, "work/clients");
-        assert_eq!(loaded[1].title, "iter2");
-        let entries: Vec<_> = fs::read_dir(storage.sessions_path.parent().unwrap())?
-            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
-            .collect();
-        assert!(
-            entries.iter().all(|e| !e.contains(".tmp")),
-            "atomic_write leaked temp files: {entries:?}"
-        );
-
-        fs::write(&groups_path, "   ")?;
-        let (instances, groups) = storage.load_with_groups()?;
-        assert_eq!(instances.len(), 2);
-        assert!(groups.is_empty());
-
-        storage.update(|_, groups| {
-            groups.push(Group::new("projects", "work/projects"));
-            Ok(())
-        })?;
-        let (_, groups) = storage.load_with_groups()?;
-        assert_eq!(groups.len(), 1);
-        assert_eq!(groups[0].path, "work/projects");
+        assert_eq!(loaded[0].title, "seed");
+        assert_eq!(loaded[1].title, "added");
         Ok(())
     }
 
     #[test]
     #[serial]
-    fn open_unwatched_requires_existing_profile() {
-        let temp = tempdir().unwrap();
-        let guard = setup_test_home(temp.path());
-        let profile_dir = guard.path().join("profiles").join("ghost");
-
-        let err = Storage::open_unwatched("ghost")
-            .err()
-            .expect("unknown profile");
-        assert!(err.to_string().contains("does not exist"), "got: {err}");
-        assert!(!profile_dir.exists(), "must not create the profile dir");
-
-        crate::session::create_profile("known").unwrap();
-        assert_eq!(Storage::open_unwatched("known").unwrap().profile(), "known");
-    }
-
-    #[test]
-    #[serial]
-    fn corrupt_rows_are_quarantined_and_top_level_corruption_errors() -> Result<()> {
-        let temp = tempdir()?;
-        let _guard = setup_test_home(temp.path());
-        let storage = Storage::new_unwatched("test-profile")?;
-        fs::create_dir_all(storage.sessions_path.parent().unwrap())?;
-        let sessions_q = storage
-            .sessions_path
-            .with_file_name("sessions.corrupt.jsonl");
-        let groups_path = storage.sessions_path.with_file_name("groups.json");
-        let groups_q = storage.sessions_path.with_file_name("groups.corrupt.jsonl");
-
-        for bad in [&b"{}"[..], &b"{ this is not valid json ]"[..]] {
-            fs::write(&storage.sessions_path, bad)?;
-            assert!(storage.load().is_err());
-            fs::write(&storage.sessions_path, "[]")?;
-            fs::write(&groups_path, bad)?;
-            assert!(storage.load_with_groups().is_err());
-        }
-        assert!(!sessions_q.exists() && !groups_q.exists());
-
-        let sessions = serde_json::json!([
-            Instance::new("alpha", "/tmp/alpha"),
-            { "title": "corrupt-no-id" },
-            Instance::new("beta", "/tmp/beta"),
-        ]);
-        let groups = serde_json::json!([
-            Group::new("alpha", "work/alpha"),
-            { "name": "corrupt-no-path" },
-            Group::new("beta", "work/beta"),
-        ]);
-        fs::write(&storage.sessions_path, serde_json::to_vec(&sessions)?)?;
-        fs::write(&groups_path, serde_json::to_vec(&groups)?)?;
-
-        for _ in 0..2 {
-            let (instances, groups) = storage.load_with_groups()?;
-            let titles: Vec<_> = instances.iter().map(|i| i.title.as_str()).collect();
-            let paths: Vec<_> = groups.iter().map(|g| g.path.as_str()).collect();
-            assert_eq!(titles, ["alpha", "beta"]);
-            assert_eq!(paths, ["work/alpha", "work/beta"]);
-            assert_eq!(storage.load()?.len(), 2);
-            for (quarantine, needle) in [
-                (&sessions_q, "corrupt-no-id"),
-                (&groups_q, "corrupt-no-path"),
-            ] {
-                let q = fs::read_to_string(quarantine)?;
-                assert_eq!(q.lines().count(), 1, "repeated load must not duplicate");
-                assert!(q.contains(needle));
-                #[cfg(unix)]
-                assert_eq!(mode(quarantine), 0o600);
-            }
-        }
-        Ok(())
-    }
-
-    #[test]
-    #[serial]
-    fn empty_profile_argument_resolves_default_profile() -> Result<()> {
-        for (existing, configured, expected) in [
-            (&[][..], None, "main"),
-            (&["work", "personal"][..], None, "personal"),
-            (&["work", "personal"][..], Some("work"), "work"),
-        ] {
-            let temp = tempdir()?;
-            let _guard = setup_test_home(temp.path());
-            for profile in existing {
-                get_profile_dir(profile)?;
-            }
-            if let Some(name) = configured {
-                super::super::config::update_config(|config| {
-                    config.default_profile = name.to_string();
-                })?;
-            }
-            assert_eq!(Storage::new_unwatched("")?.profile(), expected);
-        }
-        Ok(())
-    }
-
-    #[test]
-    #[serial]
-    fn workspace_ordering_round_trips_and_serializes_updates() -> Result<()> {
+    fn test_update_propagates_closure_error() -> Result<()> {
         let temp = tempdir()?;
         let _guard = setup_test_home(temp.path());
 
-        assert!(load_workspace_ordering()?.order.is_empty());
-        let path = workspace_ordering_path()?;
-        fs::create_dir_all(path.parent().unwrap())?;
-        fs::write(&path, "   ")?;
-        assert!(load_workspace_ordering()?.order.is_empty());
-
-        let order = |items: &[&str]| WorkspaceOrdering {
-            order: items.iter().map(|s| s.to_string()).collect(),
-        };
-        save_workspace_ordering(&order(&["/repo/a::main", "/repo/c::__session__::abc123"]))?;
-        save_workspace_ordering(&order(&["b"]))?;
-        assert_eq!(load_workspace_ordering()?.order, ["b"]);
-
-        std::thread::scope(|scope| {
-            for tid in 0..16 {
-                scope.spawn(move || {
-                    update_workspace_ordering(|ord| {
-                        ord.order.push(format!("ws-{tid}"));
-                        Ok(())
-                    })
-                    .unwrap();
-                });
-            }
-        });
-        let loaded = load_workspace_ordering()?;
-        assert_eq!(loaded.order.len(), 17);
-        assert!((0..16).all(|tid| loaded.order.contains(&format!("ws-{tid}"))));
-        Ok(())
-    }
-
-    #[test]
-    #[serial]
-    fn update_error_leaves_both_files_untouched() -> Result<()> {
-        let temp = tempdir()?;
-        let _guard = setup_test_home(temp.path());
         let storage = Storage::new_unwatched("test-update-err")?;
+        let initial = vec![Instance::new("keep", "/tmp/keep")];
         storage.update(|i, g| {
-            *i = vec![Instance::new("seed", "/tmp/seed")];
-            g.push(Group::new("seed-group", "work/seed"));
+            *i = initial.to_vec();
+            *g = GroupTree::new_with_groups(&initial, &[]).get_all_groups();
             Ok(())
         })?;
-        let groups_path = storage.sessions_path.with_file_name("groups.json");
-        let before = (fs::read(&storage.sessions_path)?, fs::read(&groups_path)?);
 
-        let outcome: Result<()> = storage.update(|instances, groups| {
+        let result: Result<()> = storage.update(|instances, _| {
             instances.push(Instance::new("doomed", "/tmp/doomed"));
-            groups.push(Group::new("doomed-group", "doomed/path"));
             Err(anyhow!("forced abort"))
         });
-        assert!(outcome.is_err());
-        assert_eq!(
-            (fs::read(&storage.sessions_path)?, fs::read(&groups_path)?),
-            before
-        );
+        assert!(result.is_err());
+
+        let loaded = storage.load()?;
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].title, "keep");
         Ok(())
     }
 
     #[test]
     #[serial]
+
     fn instance_lifecycle_lock_serializes_same_profile_and_instance() -> Result<()> {
         let temp = tempdir()?;
         let _guard = setup_test_home(temp.path());
@@ -2995,15 +4861,21 @@ mod tests {
             let contended = contended_rx.recv_timeout(Duration::from_secs(2));
             let entered_early = acquired_rx.try_recv().is_ok();
             drop(first);
-            assert!(contended.is_ok(), "peer never demonstrated contention");
+            assert!(
+                contended.is_ok(),
+                "peer never demonstrated lifecycle lock contention"
+            );
             assert!(!entered_early, "peer acquired before release");
             acquired_rx
                 .recv_timeout(Duration::from_secs(2))
                 .expect("peer did not acquire lifecycle lock after release");
         });
-        assert!(storage
-            .acquire_instance_lifecycle_lock("../escape")
-            .is_err());
+        assert!(
+            storage
+                .acquire_instance_lifecycle_lock("../escape")
+                .is_err(),
+            "lock filename must reject an unsafe instance id"
+        );
         Ok(())
     }
 
@@ -3052,14 +4924,14 @@ mod tests {
         let storage = Storage::new_unwatched("test-commit-lock")?;
         for layer in ["mutex", "flock"] {
             let mutex = (layer == "mutex").then(|| storage.save_lock.lock().unwrap());
-            let flock = (layer == "flock")
-                .then(|| {
-                    acquire_storage_flock(
-                        storage.sessions_path.parent().unwrap(),
-                        STORAGE_LOCK_FILENAME,
-                    )
-                })
-                .transpose()?;
+            let flock = if layer == "flock" {
+                Some(acquire_storage_flock(
+                    storage.sessions_path.parent().unwrap(),
+                    STORAGE_LOCK_FILENAME,
+                )?)
+            } else {
+                None
+            };
             let (contended_tx, contended_rx) = std::sync::mpsc::channel();
             let (entered_tx, entered_rx) = std::sync::mpsc::channel();
             let writer = std::thread::spawn(move || {
@@ -3088,6 +4960,118 @@ mod tests {
             );
             assert_eq!(storage.load()?[0].title, layer);
         }
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn test_workspace_ordering_update_serializes() -> Result<()> {
+        let temp = tempdir()?;
+        let _guard = setup_test_home(temp.path());
+
+        update_workspace_ordering(|ord| {
+            ord.order.clear();
+            Ok(())
+        })?;
+
+        let n_threads = 16usize;
+        std::thread::scope(|scope| {
+            for tid in 0..n_threads {
+                scope.spawn(move || {
+                    update_workspace_ordering(|ord| {
+                        ord.order.push(format!("ws-{tid}"));
+                        Ok(())
+                    })
+                    .unwrap();
+                });
+            }
+        });
+
+        let loaded = load_workspace_ordering()?;
+        assert_eq!(loaded.order.len(), n_threads);
+        for tid in 0..n_threads {
+            assert!(
+                loaded.order.contains(&format!("ws-{tid}")),
+                "missing ws-{tid}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn test_profile_lock_registry_returns_same_arc_for_same_profile() -> Result<()> {
+        let temp = tempdir()?;
+        let _guard = setup_test_home(temp.path());
+
+        let s1 = Storage::new_unwatched("test-registry-shared")?;
+        let s2 = Storage::new_unwatched("test-registry-shared")?;
+        assert!(Arc::ptr_eq(&s1.save_lock, &s2.save_lock));
+
+        let s3 = Storage::new_unwatched("test-registry-distinct")?;
+        assert!(!Arc::ptr_eq(&s1.save_lock, &s3.save_lock));
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn test_update_writes_both_sessions_and_groups_files() -> Result<()> {
+        let temp = tempdir()?;
+        let _guard = setup_test_home(temp.path());
+
+        let storage = Storage::new_unwatched("test-update-both-files")?;
+        storage.update(|i, g| {
+            *i = [].to_vec();
+            *g = GroupTree::new_with_groups(&[], &[]).get_all_groups();
+            Ok(())
+        })?;
+
+        storage.update(|instances, groups| {
+            instances.push(Instance::new("inst", "/tmp/inst"));
+            groups.push(Group::new("projects", "work/projects"));
+            Ok(())
+        })?;
+
+        let groups_path = storage.sessions_path.with_file_name("groups.json");
+        assert!(groups_path.exists(), "groups.json should exist");
+
+        let (loaded_instances, loaded_groups) = storage.load_with_groups()?;
+        assert_eq!(loaded_instances.len(), 1);
+        assert_eq!(loaded_groups.len(), 1);
+        assert_eq!(loaded_groups[0].name, "projects");
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn test_update_closure_err_leaves_both_files_untouched() -> Result<()> {
+        let temp = tempdir()?;
+        let _guard = setup_test_home(temp.path());
+
+        let storage = Storage::new_unwatched("test-update-err-untouched")?;
+        let seed = vec![Instance::new("seed", "/tmp/seed")];
+        let seed_groups = vec![Group::new("seed-group", "work/seed")];
+        let mut tree = GroupTree::new_with_groups(&seed, &seed_groups);
+        tree.create_group("work/seed");
+        storage.update(|i, g| {
+            *i = seed.to_vec();
+            *g = tree.get_all_groups();
+            Ok(())
+        })?;
+
+        let groups_path = storage.sessions_path.with_file_name("groups.json");
+        let sessions_before = fs::read(&storage.sessions_path)?;
+        let groups_before = fs::read(&groups_path)?;
+
+        let outcome: Result<()> = storage.update(|instances, groups| {
+            instances.push(Instance::new("doomed-inst", "/tmp/doomed"));
+            groups.push(Group::new("doomed-group", "doomed/path"));
+            Err(anyhow!("forced abort"))
+        });
+        assert!(outcome.is_err());
+
+        assert_eq!(fs::read(&storage.sessions_path)?, sessions_before);
+        assert_eq!(fs::read(&groups_path)?, groups_before);
         Ok(())
     }
 
@@ -3214,12 +5198,14 @@ mod tests {
 
     #[test]
     #[serial]
-    fn update_rewrites_groups_only_when_changed() -> Result<()> {
+    fn test_update_skips_groups_write_when_groups_unchanged() -> Result<()> {
         let temp = tempdir()?;
         let _guard = setup_test_home(temp.path());
+
         let storage = Storage::new_unwatched("test-skip-groups-write")?;
+        let seed_instances = [Instance::new("seed", "/tmp/seed")];
         storage.update(|i, g| {
-            *i = vec![Instance::new("seed", "/tmp/seed")];
+            *i = seed_instances.to_vec();
             g.push(Group::new("seed-group", "seed-group"));
             Ok(())
         })?;
@@ -3230,19 +5216,48 @@ mod tests {
             .write(true)
             .open(&groups_path)?
             .set_times(fs::FileTimes::new().set_modified(sentinel))?;
+        let groups_mtime_before = fs::metadata(&groups_path)?.modified()?;
+
         storage.update(|instances, _groups| {
             instances.push(Instance::new("added", "/tmp/added"));
             Ok(())
         })?;
-        assert_eq!(fs::metadata(&groups_path)?.modified()?, sentinel);
+
+        let groups_mtime_after = fs::metadata(&groups_path)?.modified()?;
+        assert_eq!(
+            groups_mtime_before, groups_mtime_after,
+            "groups.json should not be rewritten when closure does not mutate groups"
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn test_update_rewrites_groups_when_changed() -> Result<()> {
+        let temp = tempdir()?;
+        let _guard = setup_test_home(temp.path());
+
+        let storage = Storage::new_unwatched("test-rewrite-groups")?;
+        let seed_instances = [Instance::new("seed", "/tmp/seed")];
+        storage.update(|i, g| {
+            *i = seed_instances.to_vec();
+            g.push(Group::new("seed-group", "seed-group"));
+            Ok(())
+        })?;
 
         storage.update(|_instances, groups| {
             groups.push(Group::new("new-group", "work/new-group"));
             Ok(())
         })?;
+
         let (_, groups) = storage.load_with_groups()?;
-        let paths: Vec<_> = groups.iter().map(|group| group.path.as_str()).collect();
-        assert_eq!(paths, ["seed-group", "work/new-group"]);
+        assert_eq!(
+            groups
+                .iter()
+                .map(|group| group.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["seed-group", "work/new-group"]
+        );
         Ok(())
     }
 
@@ -3445,6 +5460,60 @@ mod tests {
     }
 
     #[test]
+    fn profile_move_rejects_changed_group_metadata() -> Result<()> {
+        for fault in ["removed source", "explicit target", "implicit target"] {
+            let temp = tempdir()?;
+            let source_dir = temp.path().join("source");
+            let target_dir = temp.path().join("target");
+            fs::create_dir_all(&source_dir)?;
+            fs::create_dir_all(&target_dir)?;
+            let source = Storage::new_for_test_path("source", source_dir.join("sessions.json"));
+            let target = Storage::new_for_test_path("target", target_dir.join("sessions.json"));
+            source.update(|_, groups| {
+                groups.push(Group::new("empty", "empty"));
+                Ok(())
+            })?;
+            target.update(|_, groups| {
+                groups.push(Group::new("peer", "peer"));
+                Ok(())
+            })?;
+            let plan = GroupMovePlan::subtree("empty", "renamed");
+            match fault {
+                "removed source" => source.update(|_, groups| {
+                    groups.clear();
+                    Ok(())
+                })?,
+                "explicit target" => target.update(|_, groups| {
+                    groups.push(Group::new("renamed", "renamed"));
+                    Ok(())
+                })?,
+                _ => target.update(|rows, _| {
+                    let mut row = Instance::new("peer", "/repo/peer");
+                    row.group_path = "renamed/child".into();
+                    rows.push(row);
+                    Ok(())
+                })?,
+            }
+            let paths = [
+                source.sessions_path().to_path_buf(),
+                source_dir.join("groups.json"),
+                target.sessions_path().to_path_buf(),
+                target_dir.join("groups.json"),
+            ];
+            let before = paths
+                .iter()
+                .map(fs::read)
+                .collect::<std::io::Result<Vec<_>>>()?;
+            let result = source.move_instances_to(&target, &[], &plan, |_, _| Ok(()));
+            assert!(result.is_err(), "accepted {fault}");
+            for (path, bytes) in paths.iter().zip(before) {
+                assert_eq!(fs::read(path)?, bytes, "changed {}", path.display());
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn profile_group_move_rejects_fresh_unplanned_member() -> Result<()> {
         let temp = tempdir()?;
         let source_dir = temp.path().join("source-members");
@@ -3526,6 +5595,7 @@ mod tests {
             MoveTransactionPlan {
                 group_move: &GroupMovePlan::single("work", "work"),
                 merge_complete_post: true,
+                transition: None,
                 account_swap: false,
             },
             |_existing, _candidates| Ok(()),
@@ -3555,49 +5625,134 @@ mod tests {
     }
 
     #[test]
-    #[serial]
-    fn profile_move_keeps_both_rows_when_target_directory_sync_fails() -> Result<()> {
-        for effect_runs in [false, true] {
-            let (_temp, _guard, source, target, before, _after) = setup_recovery_env("sync")?;
-            let effect_ran = std::cell::Cell::new(false);
-            let result = source.move_instances_to_inner(
-                &target,
-                &[(before.clone(), before.clone())],
-                MoveTransactionPlan {
-                    group_move: &GroupMovePlan::single("work", "work"),
-                    merge_complete_post: true,
-                    account_swap: false,
-                },
-                |_existing, _candidates| Ok(()),
-                |_moved| {
-                    effect_ran.set(effect_runs);
-                    Ok(())
-                },
-                |_path| Err(anyhow!("forced target directory sync failure")),
-            );
-            assert!(result.is_err());
-            assert_eq!(effect_ran.get(), effect_runs);
-            for storage in [&source, &target] {
-                let (rows, groups) = storage.load_with_groups()?;
-                assert_eq!(
-                    rows.len(),
-                    1,
-                    "{}: row retained for recovery",
-                    storage.profile()
-                );
-                assert!(groups.iter().any(|group| group.path == "work"));
-            }
-        }
+    fn profile_move_keeps_source_when_target_directory_sync_fails() -> Result<()> {
+        let temp = tempdir()?;
+        let source_dir = temp.path().join("source");
+        let target_dir = temp.path().join("target");
+        fs::create_dir_all(&source_dir)?;
+        fs::create_dir_all(&target_dir)?;
+        let source = Storage::new_for_test_path("sync-source", source_dir.join("sessions.json"));
+        let target = Storage::new_for_test_path("sync-target", target_dir.join("sessions.json"));
+        let mut before = Instance::new("session", "/repo/session");
+        before.source_profile = "sync-source".to_string();
+        before.group_path = "work".to_string();
+        source.update(|instances, groups| {
+            instances.push(before.clone());
+            groups.push(Group::new("work", "work"));
+            Ok(())
+        })?;
+        target.update(|_instances, _groups| Ok(()))?;
+        let after = before.clone();
+        let plan = GroupMovePlan::single("work", "work");
+
+        let result = source.move_instances_to_inner(
+            &target,
+            &[(before.clone(), after)],
+            MoveTransactionPlan {
+                group_move: &plan,
+                merge_complete_post: true,
+                transition: None,
+                account_swap: false,
+            },
+            |_existing, _candidates| Ok(()),
+            |_| Ok(()),
+            |_path| Err(anyhow!("forced target directory sync failure")),
+        );
+        assert!(result.is_err());
+        let (source_rows, source_groups) = source.load_with_groups()?;
+        assert_eq!(source_rows.len(), 1, "source row must remain durable");
+        assert!(source_groups.iter().any(|group| group.path == "work"));
+        let (target_rows, target_groups) = target.load_with_groups()?;
+        assert_eq!(
+            target_rows.len(),
+            1,
+            "the durable target copy is retained for recovery"
+        );
+        assert!(target_groups.iter().any(|group| group.path == "work"));
+        Ok(())
+    }
+
+    #[test]
+    fn profile_move_retains_recoverable_source_after_effect_ran_and_write_fails() -> Result<()> {
+        // D2 residual window: `before_commit` moves the worktree directory before
+        // any row is written, so a write failure after it aborts with the effect
+        // applied. The transaction does not auto-reverse the effect; instead it
+        // keeps both the source row and the durable target copy, leaving a
+        // reconcilable state (never a lost row) that recovery can repair.
+        let temp = tempdir()?;
+        let source_dir = temp.path().join("source-effect-window");
+        let target_dir = temp.path().join("target-effect-window");
+        fs::create_dir_all(&source_dir)?;
+        fs::create_dir_all(&target_dir)?;
+        let source = Storage::new_for_test_path("window-source", source_dir.join("sessions.json"));
+        let target = Storage::new_for_test_path("window-target", target_dir.join("sessions.json"));
+        let mut before = Instance::new("session", "/repo/session");
+        before.source_profile = "window-source".to_string();
+        before.group_path = "work".to_string();
+        source.update(|instances, groups| {
+            instances.push(before.clone());
+            groups.push(Group::new("work", "work"));
+            Ok(())
+        })?;
+        target.update(|_instances, _groups| Ok(()))?;
+        let after = before.clone();
+        let plan = GroupMovePlan::single("work", "work");
+        let effect_ran = std::cell::Cell::new(false);
+
+        let result = source.move_instances_to_inner(
+            &target,
+            &[(before.clone(), after)],
+            MoveTransactionPlan {
+                group_move: &plan,
+                merge_complete_post: true,
+                transition: None,
+                account_swap: false,
+            },
+            |_existing, _candidates| Ok(()),
+            |_moved| {
+                // Stand in for the worktree move / tmux rename effect.
+                effect_ran.set(true);
+                Ok(())
+            },
+            |_path| {
+                Err(anyhow!(
+                    "forced target directory sync failure after the effect"
+                ))
+            },
+        );
+
+        assert!(result.is_err());
+        assert!(
+            effect_ran.get(),
+            "the external effect runs before the failing write"
+        );
+        let source_rows = source.load()?;
+        assert_eq!(
+            source_rows.len(),
+            1,
+            "the source row is retained so the moved directory is reconcilable, not lost"
+        );
+        assert_eq!(
+            target.load()?.len(),
+            1,
+            "the durable target copy is retained"
+        );
         Ok(())
     }
 
     #[test]
     fn apply_group_move_is_byte_stable_without_semantic_change() -> Result<()> {
+        // When a group the move touches is still used by a remaining source
+        // instance, `apply_group_move` must leave the source groups byte-for-byte
+        // unchanged: the re-tree replays insertion order and preserves metadata,
+        // so `source_groups_changed` stays a true semantic signal and an unchanged
+        // source is never rewritten or fsynced (point 4 of the review).
         let mut mover = Instance::new("mover", "/repo/mover");
         mover.group_path = "work".to_string();
         let mut stayer = Instance::new("stayer", "/repo/stayer");
         stayer.group_path = "work".to_string();
 
+        // Post-retain source still holds `stayer` in "work"; the mover has left.
         let source_instances = vec![stayer];
         let mut work_group = Group::new("work", "work");
         work_group.collapsed = true;
@@ -3624,66 +5779,94 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    #[serial]
     fn profile_move_rejects_shared_storage_lock_inode() -> Result<()> {
-        let (temp, _guard, source, target, before, _after) = setup_recovery_env("inode")?;
-        let source_dir = temp.path().join("inode-source");
-        let target_dir = temp.path().join("inode-target");
+        let temp = tempdir()?;
+        let source_dir = temp.path().join("source");
+        let target_dir = temp.path().join("target");
+        fs::create_dir_all(&source_dir)?;
+        fs::create_dir_all(&target_dir)?;
+        let source = Storage::new_for_test_path("inode-source", source_dir.join("sessions.json"));
+        let target = Storage::new_for_test_path("inode-target", target_dir.join("sessions.json"));
+        let mut before = Instance::new("session", "/repo/session");
+        before.source_profile = "inode-source".to_string();
+        before.group_path = "work".to_string();
+        source.update(|instances, groups| {
+            instances.push(before.clone());
+            groups.push(Group::new("work", "work"));
+            Ok(())
+        })?;
         target.update(|_instances, groups| {
             groups.push(Group::new("target", "target"));
             Ok(())
         })?;
+        let source_lock = source_dir.join(STORAGE_LOCK_FILENAME);
         let target_lock = target_dir.join(STORAGE_LOCK_FILENAME);
         fs::remove_file(&target_lock)?;
-        fs::hard_link(source_dir.join(STORAGE_LOCK_FILENAME), &target_lock)?;
-        let effect_ran = std::cell::Cell::new(false);
-        let try_move = || {
-            let effect = |_: &Instance| {
-                effect_ran.set(true);
-                Ok(())
-            };
-            source
-                .move_instance_to_with_effect(
-                    &target,
-                    &before,
-                    &before,
-                    false,
-                    |_, _| Ok(()),
-                    effect,
-                )
-                .expect_err("shared inode must be rejected before locking or effects")
-                .to_string()
-        };
+        fs::hard_link(&source_lock, &target_lock)?;
 
-        assert!(try_move().contains("physical storage lock"));
+        source
+            .move_instance_to_with_effect(
+                &target,
+                &before,
+                &before,
+                false,
+                |_instances, _candidate| Ok(()),
+                |_| Ok(()),
+            )
+            .expect_err("shared lock inode must be rejected before either flock can self-deadlock");
+
         assert_eq!(source.load()?.len(), 1);
         assert!(target.load()?.is_empty());
 
         fs::remove_file(&target_lock)?;
         fs::File::create(&target_lock)?;
+        let source_groups = source_dir.join("groups.json");
         let target_groups = target_dir.join("groups.json");
         fs::remove_file(&target_groups)?;
-        fs::hard_link(source_dir.join("groups.json"), &target_groups)?;
-        assert!(try_move().contains("physical groups file"));
+        fs::hard_link(&source_groups, &target_groups)?;
+        let effect_ran = std::cell::Cell::new(false);
+        source
+            .move_instance_to_with_effect(
+                &target,
+                &before,
+                &before,
+                false,
+                |_instances, _candidate| Ok(()),
+                |_| {
+                    effect_ran.set(true);
+                    Ok(())
+                },
+            )
+            .expect_err("shared groups inode must be rejected before external effects");
         assert!(!effect_ran.get());
         Ok(())
     }
 
     #[test]
-    fn recent_project_entry_for_cases() {
+    fn recent_entry_normalizes_and_uses_basename() {
         let mut inst = Instance::new("s", "/home/me/projects/frontend/");
         inst.tool = "claude".to_string();
-        let accessed = inst.created_at + chrono::Duration::hours(5);
-        inst.last_accessed_at = Some(accessed);
         let e = recent_project_entry_for(&inst).expect("single-repo session recorded");
-        assert_eq!(
-            (&*e.path, &*e.display_name, &*e.tool),
-            ("/home/me/projects/frontend", "frontend", "claude")
-        );
-        assert_eq!(e.last_used_at, accessed.to_rfc3339());
+        assert_eq!(e.path, "/home/me/projects/frontend");
+        assert_eq!(e.display_name, "frontend");
+        assert_eq!(e.tool, "claude");
+    }
 
+    #[test]
+    fn recent_entry_skips_scratch() {
+        // Workspaces hit the same `is_workspace()` early-return branch.
+        let mut inst = Instance::new("s", "/tmp/scratch/x");
         inst.scratch = true;
         assert!(recent_project_entry_for(&inst).is_none());
+    }
+
+    #[test]
+    fn recent_entry_prefers_last_accessed_over_created() {
+        let mut inst = Instance::new("s", "/repo");
+        let accessed = inst.created_at + chrono::Duration::hours(5);
+        inst.last_accessed_at = Some(accessed);
+        let e = recent_project_entry_for(&inst).unwrap();
+        assert_eq!(e.last_used_at, accessed.to_rfc3339());
     }
 
     #[test]
@@ -3692,6 +5875,7 @@ mod tests {
         let temp = tempdir()?;
         let _guard = setup_test_home(temp.path());
 
+        // Capacity + 5 distinct projects, oldest first.
         for i in 0..(RECENT_PROJECTS_CAP + 5) {
             record_recent_project(RecentProjectEntry {
                 path: format!("/p/{i}"),
@@ -3702,9 +5886,11 @@ mod tests {
         }
         let loaded = load_recent_projects()?;
         assert_eq!(loaded.len(), RECENT_PROJECTS_CAP, "capped");
+        // Newest first; the 5 oldest were evicted.
         assert_eq!(loaded[0].path, format!("/p/{}", RECENT_PROJECTS_CAP + 4));
         assert!(loaded.iter().all(|p| p.path != "/p/0"));
 
+        // Re-recording an existing path dedupes and refreshes recency.
         record_recent_project(RecentProjectEntry {
             path: format!("/p/{}", RECENT_PROJECTS_CAP + 1),
             display_name: "x".to_string(),
@@ -3729,6 +5915,8 @@ mod tests {
         Ok(())
     }
 
+    /// Shared harness for the #3459 recovery tests: stores, journals, and
+    /// app-global identity/title locks all live below one isolated temp root.
     fn setup_recovery_env(
         tag: &str,
     ) -> Result<(
@@ -3765,6 +5953,7 @@ mod tests {
 
     fn run_crashing_move(source: &Storage, target: &Storage, point: &'static str) {
         let _crash = ArmedCrashPoint::arm(point);
+        // Panic output for the simulated crash is expected noise.
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut after = source.load().unwrap().remove(0);
             after.group_path = "moved".to_string();
@@ -3775,6 +5964,7 @@ mod tests {
                 MoveTransactionPlan {
                     group_move: &GroupMovePlan::single("work", "moved"),
                     merge_complete_post: true,
+                    transition: None,
                     account_swap: false,
                 },
                 |_existing, _candidates| Ok(()),
@@ -3787,6 +5977,11 @@ mod tests {
     #[test]
     #[serial]
     fn profile_move_crash_recovery_target_wins_from_each_crash_point() -> Result<()> {
+        // One case per crash point #3459 requires: target write/fsync,
+        // source group write/fsync, source session write/fsync. In all
+        // three the target copy is already durable when the process dies,
+        // so the journal arbitrates: target wins, source copy removed,
+        // sidecars consistent, journal consumed, backups left behind.
         for point in [
             "profile-move-target",
             "profile-move-source-groups",
@@ -3809,7 +6004,9 @@ mod tests {
                 "{point}: exactly one journal entry guards the residual"
             );
 
-            let outcome = reconcile_loaded(&[&source, &target]);
+            let view: Vec<(&str, &Storage)> =
+                vec![(source.profile(), &source), (target.profile(), &target)];
+            let outcome = reconcile_loaded(&[&source, &target], &view);
 
             assert!(outcome.repaired, "{point}: repair must run");
             assert!(
@@ -3836,21 +6033,14 @@ mod tests {
                 "{point}: losing attributable group entry pruned"
             );
             assert_eq!(journal_entry_count(&source), 0, "{point}: journal consumed");
-            let backups = fs::read_dir(source.sessions_path().parent().unwrap())?
-                .filter(|e| {
-                    e.as_ref()
-                        .unwrap()
-                        .file_name()
-                        .to_string_lossy()
-                        .contains(".pre-recovery-")
-                })
-                .count();
+            let backup_count = count_recovery_backups(source.sessions_path());
             assert!(
-                backups >= 1,
+                backup_count >= 1,
                 "{point}: sessions.json backed up before repair"
             );
 
-            let outcome = reconcile_loaded(&[&source, &target]);
+            // Idempotence: reconciling an already-repaired state is a no-op.
+            let outcome = reconcile_loaded(&[&source, &target], &view);
             assert!(!outcome.repaired && outcome.reports.is_empty(), "{point}");
         }
         Ok(())
@@ -3859,6 +6049,10 @@ mod tests {
     #[test]
     #[serial]
     fn profile_move_crash_before_publication_source_wins() -> Result<()> {
+        // Crash right after the journal is written but before any row was
+        // touched: the evidence says the target never published, so the
+        // source row wins and nothing is removed. The leaked journal entry
+        // is still consumed as consistent.
         let (temp, _guard, source, target, _before, _after) = setup_recovery_env("prepub")?;
         assert!(
             crate::session::get_app_dir()?.starts_with(temp.path()),
@@ -3884,7 +6078,9 @@ mod tests {
         assert!(target.load()?.is_empty(), "target never published");
         assert_eq!(journal_entry_count(&source), 1);
 
-        let outcome = reconcile_loaded(&[&source, &target]);
+        let view: Vec<(&str, &Storage)> =
+            vec![(source.profile(), &source), (target.profile(), &target)];
+        let outcome = reconcile_loaded(&[&source, &target], &view);
 
         assert!(outcome.repaired, "the leaked journal must be consumed");
         assert!(outcome.reports.is_empty());
@@ -3901,11 +6097,39 @@ mod tests {
     #[test]
     fn unprovable_journal_evidence_keeps_duplicates_surfaced() -> Result<()> {
         type Arrange = fn(&Storage, &Storage, &Instance) -> Result<()>;
-        fn record(entry: &move_journal::MoveJournalEntry, at: &Storage) -> Result<()> {
-            move_journal::record(entry, at.sessions_path()).map(drop)
+        fn record(
+            entry: &super::super::move_journal::MoveJournalEntry,
+            at: &Storage,
+        ) -> Result<()> {
+            super::super::move_journal::record(entry, at.sessions_path()).map(drop)
+        }
+        /// Append a duplicate row of `instance` to `storage`, rewinding its
+        /// `source_profile` to the store it now lives in, exactly as a
+        /// half-finished cross-profile move leaves it.
+        fn push_copy(storage: &Storage, instance: &Instance) -> Result<()> {
+            storage.update(|instances, _| {
+                let mut copy = instance.clone();
+                copy.source_profile = storage.profile().to_string();
+                instances.push(copy);
+                Ok(())
+            })
+        }
+        fn now_ms() -> u64 {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64
+        }
+        fn first_journal_path(storage: &Storage) -> PathBuf {
+            super::super::move_journal::scan([storage.sessions_path().to_path_buf()])
+                .entries
+                .into_iter()
+                .next()
+                .map(|(path, _)| path)
+                .expect("journal entry on disk")
         }
         fn copy_and_record(
-            edit: fn(&mut move_journal::MoveJournalEntry),
+            edit: fn(&mut super::super::move_journal::MoveJournalEntry),
         ) -> impl Fn(&Storage, &Storage, &Instance) -> Result<()> {
             move |a, b, before| {
                 push_copy(b, before)?;
@@ -3916,7 +6140,9 @@ mod tests {
         }
         let legacy: Arrange = |_, b, before| push_copy(b, before);
         let wrong_version: Arrange = |a, b, before| {
-            copy_and_record(|e| e.version = move_journal::MOVE_JOURNAL_VERSION + 1)(a, b, before)
+            copy_and_record(|e| e.version = super::super::move_journal::MOVE_JOURNAL_VERSION + 1)(
+                a, b, before,
+            )
         };
         // Stores untouched since before the entry, so only its age disqualifies it.
         let expired: Arrange = |a, b, before| {
@@ -4041,10 +6267,15 @@ mod tests {
             let check = || -> Result<()> {
                 let (_temp, _guard, a, b, before, _after) = setup_recovery_env(tag)?;
                 arrange(&a, &b, &before)?;
-                let outcome = if source_only {
-                    reconcile_loaded(&[&a])
+                let view: Vec<(&str, &Storage)> = if source_only {
+                    vec![(a.profile(), &a)]
                 } else {
-                    reconcile_loaded(&[&a, &b])
+                    vec![(a.profile(), &a), (b.profile(), &b)]
+                };
+                let outcome = if source_only {
+                    reconcile_loaded(&[&a], &view)
+                } else {
+                    reconcile_loaded(&[&a, &b], &view)
                 };
                 anyhow::ensure!(!outcome.repaired, "arbitrated");
                 anyhow::ensure!(outcome.reports.len() == reports, "{:?}", outcome.reports);
@@ -4079,14 +6310,25 @@ mod tests {
 
     #[test]
     fn resolve_miss_is_transient_not_permanent() -> Result<()> {
+        // A journal whose target store is missing from the loaded view is a
+        // transient skip, not corruption: the same entry must repair once the
+        // missing profile appears, which is exactly the single-profile ->
+        // unified switch flow.
         let (_temp, _guard, source, target, before, _after) = setup_recovery_env("resolvemiss")?;
-        push_copy(&target, &before)?;
-        move_journal::record(
+        target.update(|instances, _| {
+            let mut copy = before.clone();
+            copy.source_profile = target.profile().to_string();
+            instances.push(copy);
+            Ok(())
+        })?;
+        super::super::move_journal::record(
             &fresh_journal_entry(&source, &target, &before.id),
             source.sessions_path(),
         )?;
 
-        let outcome = reconcile_loaded(&[&source]);
+        // First pass: only the source profile is loaded (single-profile mode).
+        let source_only_view: Vec<(&str, &Storage)> = vec![(source.profile(), &source)];
+        let outcome = reconcile_loaded(&[&source], &source_only_view);
         assert!(!outcome.repaired, "nothing to arbitrate without the target");
         assert_eq!(
             journal_entry_count(&source),
@@ -4094,7 +6336,10 @@ mod tests {
             "entry must survive the miss"
         );
 
-        let outcome = reconcile_loaded(&[&source, &target]);
+        // Second pass: unified view. The previously skipped entry repairs.
+        let full_view: Vec<(&str, &Storage)> =
+            vec![(source.profile(), &source), (target.profile(), &target)];
+        let outcome = reconcile_loaded(&[&source, &target], &full_view);
         assert!(
             outcome.repaired,
             "resolve-miss must not poison later passes"
@@ -4106,15 +6351,27 @@ mod tests {
 
     #[test]
     fn multi_id_batch_arbitrates_surviving_ids_and_skips_vanished_ones() -> Result<()> {
+        // Mixed batch: id `a` is duplicated (target published -> target wins,
+        // source copy removed); id `b` vanished from both stores (hand
+        // resolved). The batch arbitrates `a`, consumes the journal, and
+        // touches nothing for `b`.
         let (_temp, _guard, source, target, before, _after) = setup_recovery_env("multi")?;
+        // Never persisted anywhere: hand-resolved before recovery ran.
         let vanished_id = Instance::new("vanished", "/repo/vanished").id;
-        push_copy(&target, &before)?;
+        target.update(|instances, _| {
+            let mut copy = before.clone();
+            copy.source_profile = target.profile().to_string();
+            instances.push(copy);
+            Ok(())
+        })?;
         let mut entry = fresh_journal_entry(&source, &target, &before.id);
         entry.ids.push(vanished_id.clone());
         entry.ids.sort();
-        move_journal::record(&entry, source.sessions_path())?;
+        super::super::move_journal::record(&entry, source.sessions_path())?;
 
-        let outcome = reconcile_loaded(&[&source, &target]);
+        let view: Vec<(&str, &Storage)> =
+            vec![(source.profile(), &source), (target.profile(), &target)];
+        let outcome = reconcile_loaded(&[&source, &target], &view);
 
         assert!(outcome.repaired, "the duplicated sibling must arbitrate");
         assert!(outcome.reports.is_empty());
@@ -4154,6 +6411,7 @@ mod tests {
             }));
             let contended = contended_rx.recv_timeout(Duration::from_secs(2));
             let entered_early = done_rx.try_recv().is_ok();
+            // Return the observations so assertion failure cannot retain the locks.
             Ok((contended, entered_early))
         })?;
 
@@ -4173,16 +6431,28 @@ mod tests {
     }
 
     #[test]
+
     fn post_repair_load_error_prevents_home_reload_and_keeps_report() -> Result<()> {
         let (temp, _guard, source, target, before, _after) = setup_recovery_env("reload-fallback")?;
-        push_copy(&target, &before)?;
+        target.update(|instances, _| {
+            let mut copy = before.clone();
+            copy.source_profile = target.profile().to_string();
+            instances.push(copy);
+            Ok(())
+        })?;
         let entry = fresh_journal_entry(&source, &target, &before.id);
-        move_journal::record(&entry, source.sessions_path())?;
+        super::super::move_journal::record(&entry, source.sessions_path())?;
         let bad_dir = temp.path().join("bad");
         fs::create_dir_all(&bad_dir)?;
         let bad = Storage::new_for_test_path("bad", bad_dir.join("sessions.json"));
         fs::write(bad.sessions_path(), b"not-json")?;
-        let outcome = reconcile_loaded(&[&source, &target, &bad]);
+        let stores: Vec<(&str, &Storage)> = vec![
+            (source.profile(), &source),
+            (target.profile(), &target),
+            (bad.profile(), &bad),
+        ];
+
+        let outcome = reconcile_loaded(&[&source, &target, &bad], &stores);
 
         assert!(source.load()?.is_empty(), "repair reached disk");
         assert_eq!(target.load()?.len(), 1);
@@ -4203,12 +6473,16 @@ mod tests {
         let rows = vec![winner.clone(), bystander.clone()];
         fs::write(&path, serde_json::to_vec_pretty(&rows)?)?;
 
+        // Both present -> holds. One missing -> does not hold. No file -> no.
         assert!(target_still_holds(&path, std::slice::from_ref(&winner.id))?);
         assert!(!target_still_holds(
             &path,
             &[winner.id.clone(), "gone".to_string()]
         )?);
 
+        // A corrupt row is skipped the way Storage::load quarantines it: the
+        // surviving winner still holds instead of wedging the repair into
+        // retrying forever.
         let mut corrupt_row = serde_json::Map::new();
         corrupt_row.insert("id".to_string(), serde_json::Value::from(42));
         let mixed = vec![
@@ -4224,13 +6498,13 @@ mod tests {
     }
 
     fn journal_entry_count(source: &Storage) -> usize {
-        move_journal::scan([source.sessions_path().to_path_buf()])
+        super::super::move_journal::scan([source.sessions_path().to_path_buf()])
             .entries
             .len()
     }
 
     fn journal_entry_scan_ids(source: &Storage) -> Vec<String> {
-        move_journal::scan([source.sessions_path().to_path_buf()])
+        super::super::move_journal::scan([source.sessions_path().to_path_buf()])
             .entries
             .into_iter()
             .filter_map(|(_, parsed)| parsed.ok())
@@ -4240,6 +6514,13 @@ mod tests {
 
     #[test]
     fn group_repair_scope_matches_apply_group_move() -> Result<()> {
+        // Table over subtree mode: an explicit memberless child under the
+        // moved path survives a single-group repair (apply_group_move's
+        // non-subtree branch preserves explicit descendants) and is pruned
+        // for a subtree move. Either way the losing path itself is pruned.
+        // Single move: apply_group_move's non-subtree branch keeps the
+        // moved-path row alive while an explicit child survives. Subtree
+        // move: the whole moved namespace goes.
         let cases = [
             ("gscope-single", false, true, true),
             ("gscope-subtree", true, false, false),
@@ -4252,14 +6533,21 @@ mod tests {
                 groups.push(child);
                 Ok(())
             })?;
-            push_copy(&target, &before)?;
-            let entry = move_journal::MoveJournalEntry {
+            target.update(|instances, _| {
+                let mut copy = before.clone();
+                copy.source_profile = target.profile().to_string();
+                instances.push(copy);
+                Ok(())
+            })?;
+            let entry = super::super::move_journal::MoveJournalEntry {
                 group_move_subtree: move_subtree,
                 ..fresh_journal_entry(&source, &target, &before.id)
             };
-            move_journal::record(&entry, source.sessions_path())?;
+            super::super::move_journal::record(&entry, source.sessions_path())?;
 
-            let outcome = reconcile_loaded(&[&source, &target]);
+            let view: Vec<(&str, &Storage)> =
+                vec![(source.profile(), &source), (target.profile(), &target)];
+            let outcome = reconcile_loaded(&[&source, &target], &view);
 
             assert!(outcome.repaired, "{tag}");
             assert!(outcome.reports.is_empty(), "{tag}");
@@ -4284,19 +6572,30 @@ mod tests {
 
     #[test]
     fn chained_move_journals_apply_newest_intent_first() -> Result<()> {
+        // J1 records A -> B and leaks after completion. J2 is the newer
+        // reverse B -> A move and crashes after publishing A, leaving both
+        // stores populated. The newest intent must win.
         let (_temp, _guard, a, b, before, _after) = setup_recovery_env("chain")?;
-        push_copy(&b, &before)?;
-        let now = now_ms();
+        b.update(|instances, _| {
+            let mut copy = before.clone();
+            copy.source_profile = b.profile().to_string();
+            instances.push(copy);
+            Ok(())
+        })?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_millis() as u64;
         let mut j1 = fresh_journal_entry(&a, &b, &before.id);
         j1.created_at_epoch_ms = now;
         let mut j2 = fresh_journal_entry(&b, &a, &before.id);
         j2.group_move_source_path = "moved".to_string();
         j2.group_move_target_path = "work".to_string();
         j2.created_at_epoch_ms = now;
-        move_journal::record(&j1, a.sessions_path())?;
-        move_journal::record(&j2, b.sessions_path())?;
+        super::super::move_journal::record(&j1, a.sessions_path())?;
+        super::super::move_journal::record(&j2, b.sessions_path())?;
 
-        let outcome = reconcile_loaded(&[&a, &b]);
+        let view: Vec<(&str, &Storage)> = vec![(a.profile(), &a), (b.profile(), &b)];
+        let outcome = reconcile_loaded(&[&a, &b], &view);
 
         assert!(outcome.repaired);
         assert!(outcome.reports.is_empty());
@@ -4326,11 +6625,18 @@ mod tests {
             groups.push(bystander);
             Ok(())
         })?;
-        push_copy(&target, &before)?;
+        target.update(|instances, _| {
+            let mut copy = before.clone();
+            copy.source_profile = target.profile().to_string();
+            instances.push(copy);
+            Ok(())
+        })?;
         let entry = fresh_journal_entry(&source, &target, &before.id);
-        move_journal::record(&entry, source.sessions_path())?;
+        super::super::move_journal::record(&entry, source.sessions_path())?;
 
-        let outcome = reconcile_loaded(&[&source, &target]);
+        let view: Vec<(&str, &Storage)> =
+            vec![(source.profile(), &source), (target.profile(), &target)];
+        let outcome = reconcile_loaded(&[&source, &target], &view);
 
         assert!(outcome.repaired);
         let groups = source.load_with_groups()?.1;
@@ -4361,6 +6667,7 @@ mod tests {
                 MoveTransactionPlan {
                     group_move: &GroupMovePlan::single("work", "moved"),
                     merge_complete_post: true,
+                    transition: None,
                     account_swap: false,
                 },
                 |_existing, _candidates| Ok(()),
@@ -4384,10 +6691,16 @@ mod tests {
     #[test]
     fn failed_repair_directory_sync_retains_journal() -> Result<()> {
         let (_temp, _guard, source, target, before, _after) = setup_recovery_env("sync-fail")?;
-        push_copy(&target, &before)?;
+        target.update(|instances, _| {
+            let mut copy = before.clone();
+            copy.source_profile = target.profile().to_string();
+            instances.push(copy);
+            Ok(())
+        })?;
         let entry = fresh_journal_entry(&source, &target, &before.id);
-        let journal_path = move_journal::record(&entry, source.sessions_path())?;
-        let stores = stores(&[&source, &target]);
+        let journal_path = super::super::move_journal::record(&entry, source.sessions_path())?;
+        let stores: Vec<(&str, &Storage)> =
+            vec![(source.profile(), &source), (target.profile(), &target)];
         let error = repair_journal_entry_with_sync(&entry, &stores, &journal_path, |_path| {
             Err(anyhow!("forced repaired-profile sync failure"))
         })
@@ -4403,7 +6716,7 @@ mod tests {
         assert!(retry_error.to_string().contains("not made durable"));
         assert_eq!(journal_entry_count(&source), 1, "retry keeps evidence too");
 
-        let outcome = reconcile_loaded(&[&source, &target]);
+        let outcome = reconcile_loaded(&[&source, &target], &stores);
         assert!(outcome.repaired, "rerun consumes retained evidence safely");
         assert_eq!(journal_entry_count(&source), 0);
         Ok(())
@@ -4476,9 +6789,9 @@ mod tests {
         source: &Storage,
         target: &Storage,
         id: &str,
-    ) -> move_journal::MoveJournalEntry {
-        move_journal::MoveJournalEntry {
-            version: move_journal::MOVE_JOURNAL_VERSION,
+    ) -> super::super::move_journal::MoveJournalEntry {
+        super::super::move_journal::MoveJournalEntry {
+            version: super::super::move_journal::MOVE_JOURNAL_VERSION,
             ids: vec![id.to_string()],
             source_profile: source.profile().to_string(),
             target_profile: target.profile().to_string(),
@@ -4487,30 +6800,42 @@ mod tests {
             group_move_source_path: "work".to_string(),
             group_move_target_path: "moved".to_string(),
             group_move_subtree: false,
-            created_at_epoch_ms: now_ms(),
+            created_at_epoch_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or_default(),
         }
     }
 
     #[test]
     fn recovery_survives_a_panic_mid_repair_and_stays_idempotent() -> Result<()> {
+        // A panic between the repair write and the journal consumption must
+        // leave a state a plain rerun converges on, and further reruns are
+        // exact no-ops.
         let (_temp, _guard, source, target, _before, _after) = setup_recovery_env("midpanic")?;
         run_crashing_move(&source, &target, "profile-move-source-sessions");
         assert_eq!(journal_entry_count(&source), 1);
 
+        let view: Vec<(&str, &Storage)> =
+            vec![(source.profile(), &source), (target.profile(), &target)];
         {
+            // Guard scoped to the interrupted pass only, so its Drop runs
+            // before the converging rerun below.
             let _crash = ArmedCrashPoint::arm("profile-repair-source-written");
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                reconcile_loaded(&[&source, &target]);
+                reconcile_loaded(&[&source, &target], &view);
             }));
         }
-        let outcome = reconcile_loaded(&[&source, &target]);
+        // The interrupted pass wrote the repaired source but died before
+        // consuming the journal; the rerun finishes the job.
+        let outcome = reconcile_loaded(&[&source, &target], &view);
         assert!(outcome.repaired || journal_entry_count(&source) == 0);
         assert!(outcome.reports.is_empty());
         assert!(source.load()?.is_empty());
         assert_eq!(target.load()?.len(), 1);
         assert_eq!(journal_entry_count(&source), 0);
 
-        let outcome = reconcile_loaded(&[&source, &target]);
+        let outcome = reconcile_loaded(&[&source, &target], &view);
         assert!(
             !outcome.repaired && outcome.reports.is_empty(),
             "rerun is a no-op"
@@ -4518,45 +6843,49 @@ mod tests {
         Ok(())
     }
 
-    fn reconcile_loaded(storages: &[&Storage]) -> ReconciliationOutcome {
-        let loaded: Vec<_> = storages
+    /// Run one reconciliation pass over freshly loaded copies of the given
+    /// storages, matching the production call shape (borrowed views only).
+    fn reconcile_loaded(
+        storages: &[&Storage],
+        view: &[(&str, &Storage)],
+    ) -> super::ReconciliationOutcome {
+        let loaded = collect_loaded(storages);
+        let refs: Vec<(&str, &[Instance])> = loaded
             .iter()
-            .map(|s| s.load().unwrap_or_default())
+            .map(|(name, instances)| (name.as_str(), instances.as_slice()))
             .collect();
-        let refs: Vec<(&str, &[Instance])> = storages
+        super::reconcile_profile_duplicates(&refs, view)
+    }
+
+    fn collect_loaded(storages: &[&Storage]) -> Vec<(String, Vec<Instance>)> {
+        storages
             .iter()
-            .zip(&loaded)
-            .map(|(s, rows)| (s.profile(), rows.as_slice()))
-            .collect();
-        reconcile_profile_duplicates(&refs, &stores(storages))
+            .map(|storage| {
+                (
+                    storage.profile().to_string(),
+                    storage.load().unwrap_or_default(),
+                )
+            })
+            .collect()
     }
 
-    fn stores<'a>(storages: &[&'a Storage]) -> Vec<(&'a str, &'a Storage)> {
-        storages.iter().map(|s| (s.profile(), *s)).collect()
-    }
-
-    fn push_copy(storage: &Storage, instance: &Instance) -> Result<()> {
-        storage.update(|instances, _| {
-            let mut copy = instance.clone();
-            copy.source_profile = storage.profile().to_string();
-            instances.push(copy);
-            Ok(())
-        })
-    }
-
-    fn now_ms() -> u64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64
-    }
-
-    fn first_journal_path(storage: &Storage) -> PathBuf {
-        move_journal::scan([storage.sessions_path().to_path_buf()])
-            .entries
-            .into_iter()
-            .next()
-            .map(|(path, _)| path)
-            .expect("journal entry on disk")
+    fn count_recovery_backups(sessions_path: &Path) -> usize {
+        let dir = match sessions_path.parent() {
+            Some(dir) => dir,
+            None => return 0,
+        };
+        std::fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .filter_map(|entry| entry.ok())
+                    .filter(|entry| {
+                        entry
+                            .file_name()
+                            .to_string_lossy()
+                            .contains(".pre-recovery-")
+                    })
+                    .count()
+            })
+            .unwrap_or(0)
     }
 }

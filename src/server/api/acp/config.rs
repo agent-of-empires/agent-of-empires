@@ -92,6 +92,9 @@ async fn persist_selector(
             return;
         };
         selector.apply(inst, value.to_string());
+        state
+            .mutation_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         inst.source_profile.clone()
     };
     match crate::session::Storage::new(&profile, state.file_watch.clone()) {
@@ -225,8 +228,23 @@ mod tests {
                 })
                 .unwrap();
 
+            let stale = inst.clone();
             let state = crate::server::test_support::build_test_app_state(vec![inst]);
+            let read_epoch = state
+                .mutation_epoch
+                .load(std::sync::atomic::Ordering::SeqCst);
+            let metadata = state.canonical_metadata.read().await.clone();
             persist_selector(&state, &id, selector, value).await;
+            crate::server::reload::reload_state_instances_from_disk(
+                &state,
+                vec![stale],
+                vec![],
+                crate::server::state::StatusSource::DiskOnly,
+                read_epoch,
+                metadata,
+                std::collections::HashMap::new(),
+            )
+            .await;
 
             let field = |inst: &crate::session::Instance| match selector {
                 PersistedSelector::Model => inst.agent_model.clone(),
@@ -235,7 +253,8 @@ mod tests {
             };
             assert_eq!(
                 field(&state.instances.read().await[0]).as_deref(),
-                Some(value)
+                Some(value),
+                "a stale reload must not replace the selector"
             );
             let reloaded = crate::session::Storage::new_unwatched("default")
                 .unwrap()

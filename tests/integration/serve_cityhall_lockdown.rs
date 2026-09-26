@@ -176,9 +176,94 @@ async fn sensitive_routes_are_blocked() {
             "/api/profiles/default/settings",
             r#"{"session":{"yolo_mode":true}}"#,
         ),
+        // Session-owned ACP surfaces a locked-down client must not reach for a
+        // target it does not own: the transcript replay, the context primer,
+        // and a persisted prompt attachment all read conversation content, and
+        // the queue and the whole turn-control set write into it.
+        (Method::GET, "/api/sessions/x/acp/replay", ""),
+        (
+            Method::GET,
+            "/api/sessions/x/acp/context-primer?before_seq=0",
+            "",
+        ),
+        (Method::GET, "/api/sessions/x/acp/attachments/att-1", ""),
+        (Method::GET, "/api/sessions/x/artifacts/shot.png", ""),
+        (Method::GET, "/api/sessions/x/queue", ""),
+        (Method::POST, "/api/sessions/x/queue", r#"{"text":"hi"}"#),
+        (Method::DELETE, "/api/sessions/x/queue", ""),
+        (
+            Method::PATCH,
+            "/api/sessions/x/queue/p1",
+            r#"{"text":"hi"}"#,
+        ),
+        (Method::DELETE, "/api/sessions/x/queue/p1", ""),
+        (
+            Method::POST,
+            "/api/sessions/x/acp/prompt",
+            r#"{"text":"hi"}"#,
+        ),
+        (
+            Method::POST,
+            "/api/sessions/x/acp/prompt/diff-comments",
+            r#"{"assembled_markdown":"hi","comments":[]}"#,
+        ),
+        (Method::POST, "/api/sessions/x/acp/cancel", ""),
+        (Method::POST, "/api/sessions/x/acp/force_end_turn", ""),
+        (
+            Method::POST,
+            "/api/sessions/x/acp/approvals/n1",
+            r#"{"decision":"allow_once"}"#,
+        ),
+        (
+            Method::POST,
+            "/api/sessions/x/acp/elicitations/n1",
+            r#"{"answers":{}}"#,
+        ),
+        // Host-side admin reads: skills and MCP definitions are read out of the
+        // agents' own config files under $HOME, and the plugin surface is the
+        // installed third-party code (its manifests, icons, workers' UI state,
+        // and job logs) — the same host state the denied plugin mutations act on.
+        (Method::GET, "/api/skills", ""),
+        (Method::GET, "/api/skills/claude-user/review", ""),
+        (Method::GET, "/api/mcp/servers?agent=claude", ""),
+        (Method::GET, "/api/plugins", ""),
+        (Method::GET, "/api/plugins/x/icon", ""),
+        (Method::GET, "/api/plugins/commands", ""),
+        (Method::GET, "/api/plugins/ui-state", ""),
+        (Method::GET, "/api/plugins/updates", ""),
+        (Method::GET, "/api/plugins/discover", ""),
+        (Method::GET, "/api/plugins/details?source=gh%3Ao%2Fr", ""),
+        (Method::GET, "/api/plugins/jobs/job-1", ""),
+        (Method::GET, "/api/plugins/x/update/preview", ""),
+        // The import picker enumerates the user's own `claude` runs on disk.
+        (Method::GET, "/api/claude-sessions", ""),
     ];
     for (method, uri, body) in cases {
         assert_cityhall_blocked(method.clone(), uri, Body::from(*body)).await;
+    }
+}
+
+#[tokio::test]
+async fn creation_cancellation_is_limited_to_structured_targets() {
+    let state =
+        build_test_app_state_cityhall(vec![structured_session("own"), plain_session("foreign")]);
+    let app = build_router_for_test(state);
+    for (id, status, code) in [
+        ("own", StatusCode::CONFLICT, "creation_not_pending"),
+        ("foreign", StatusCode::FORBIDDEN, "cityhall_mode"),
+        ("missing", StatusCode::FORBIDDEN, "cityhall_mode"),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(request(
+                Method::POST,
+                &format!("/api/sessions/{id}/creation/cancel"),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), status, "{id}");
+        assert_eq!(response.headers()["aoe-error-code"], code, "{id}");
     }
 }
 
@@ -285,4 +370,72 @@ async fn paste_image_against_plain_session_is_blocked() {
         .await
         .unwrap();
     assert!(String::from_utf8_lossy(&bytes).contains("cityhall_mode"));
+}
+
+/// A real WebSocket handshake, so the `WebSocketUpgrade` extractor accepts the
+/// request and the route's own CityHall guard is what refuses it. A plain GET
+/// would be rejected by the extractor before any handler code ran, proving
+/// nothing about the boundary.
+///
+/// The upgrade state is what hyper attaches when it serves a real connection;
+/// `oneshot` bypasses that, so it is attached here. Without it the extractor
+/// answers `426 Upgrade Required` ("no upgrade state was present") and no
+/// handler code runs at all, which would make the two tests below decide
+/// something other than the boundary they claim to test. The installed task is
+/// never driven: these tests assert the handshake response, not the stream.
+fn ws_upgrade_request(uri: &str) -> Request<Body> {
+    let mut req = Request::builder()
+        .method(Method::GET)
+        .uri(uri)
+        .header("host", "127.0.0.1")
+        .header("connection", "Upgrade")
+        .header("upgrade", "websocket")
+        .header("sec-websocket-version", "13")
+        .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+        .body(Body::empty())
+        .unwrap();
+    let on_upgrade = hyper::upgrade::on(&mut req);
+    req.extensions_mut().insert(on_upgrade);
+    req.extensions_mut().insert(ConnectInfo(loopback()));
+    req
+}
+
+// The structured view's WebSocket streams the whole transcript and every live
+// ACP frame, so it carries the same content the gated REST reads refuse. The
+// upgrade must be refused for a target this mode does not own.
+#[tokio::test]
+#[serial_test::parallel]
+async fn acp_ws_is_blocked_for_a_foreign_session() {
+    let state = build_test_app_state_cityhall(vec![plain_session("foreign")]);
+    let app = build_router_for_test(state);
+    let resp = app
+        .oneshot(ws_upgrade_request("/sessions/foreign/acp/ws"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&bytes).contains("cityhall_mode"),
+        "the WS upgrade must be refused with the canonical CityHall body"
+    );
+}
+
+// The other side of the same guard: a structured session this mode owns still
+// upgrades, so the lockdown does not brick the client's own live view.
+#[tokio::test]
+#[serial_test::parallel]
+async fn acp_ws_still_upgrades_for_an_owned_structured_session() {
+    let state = build_test_app_state_cityhall(vec![structured_session("own")]);
+    let app = build_router_for_test(state);
+    let resp = app
+        .oneshot(ws_upgrade_request("/sessions/own/acp/ws"))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::SWITCHING_PROTOCOLS,
+        "an owned structured session must still reach the WS handler"
+    );
 }

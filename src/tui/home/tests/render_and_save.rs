@@ -117,9 +117,24 @@ fn test_row_tag_modes_in_all_profiles_view() {
 #[serial]
 fn test_row_tag_profile_modes_in_filtered_view() {
     use crate::session::config::RowTagMode;
-    let (_temp, _guard) = test_home();
-    seed_profile("alpha", &[Instance::new("A1", "/tmp/a")]);
-    let mut view = test_view(Some("alpha"));
+    let temp = TempDir::new().unwrap();
+    let _guard = setup_test_home(&temp);
+    let storage = Storage::new_unwatched("alpha").unwrap();
+    let instances = vec![Instance::new("A1", "/tmp/a")];
+    storage
+        .update(|i, g| {
+            *i = instances.to_vec();
+            *g = GroupTree::new_with_groups(&instances, &[]).get_all_groups();
+            Ok(())
+        })
+        .unwrap();
+    let tools = AvailableTools::with_tools(&["claude"]);
+    let mut view = HomeView::new_for_test(
+        Some("alpha".to_string()),
+        tools,
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
     view.group_by = crate::session::config::GroupByMode::Manual;
     let rendered = crate::tui::home::render::RowTag {
         content: crate::tui::home::render::profile_short_code("alpha"),
@@ -142,8 +157,6 @@ fn test_row_tag_profile_modes_in_filtered_view() {
 #[test]
 #[serial]
 fn test_create_session_in_all_mode_is_findable() {
-    use crate::tui::dialogs::NewSessionData;
-
     let temp = TempDir::new().unwrap();
     let _guard = setup_test_home(&temp);
 
@@ -160,9 +173,6 @@ fn test_create_session_in_all_mode_is_findable() {
             .unwrap();
     }
 
-    let project_dir = temp.path().join("project");
-    std::fs::create_dir_all(&project_dir).unwrap();
-
     let tools = AvailableTools::with_tools(&["claude"]);
     let mut view =
         HomeView::new_for_test(None, tools, crate::file_watch::FileWatchService::noop()).unwrap();
@@ -170,29 +180,18 @@ fn test_create_session_in_all_mode_is_findable() {
     view.flat_items = view.build_flat_items();
     view.update_selected();
 
-    let data = NewSessionData {
-        profile: "alpha".to_string(),
-        title: "New Session".to_string(),
-        path: project_dir.to_str().unwrap().to_string(),
-        group: String::new(),
-        tool: "claude".to_string(),
-        worktree_enabled: false,
-        worktree_branch: None,
-        create_new_branch: false,
-        base_branch: None,
-        extra_repo_paths: Vec::new(),
-        sandbox: false,
-        sandbox_image: String::new(),
-        yolo_mode: false,
-        extra_env: Vec::new(),
-        extra_args: String::new(),
-        command_override: String::new(),
-        scratch: false,
-        fork_seed: None,
-        structured: false,
-    };
-
-    let session_id = view.create_session(data).unwrap();
+    // A row created elsewhere (the daemon, the CLI) lands through the reload
+    // path, which is the only creator left once creation is daemon-owned.
+    let mut created = Instance::new("New Session", "/tmp/new-session");
+    created.source_profile = "alpha".to_string();
+    let session_id = created.id.clone();
+    storage
+        .update(|rows, _| {
+            rows.push(created.clone());
+            Ok(())
+        })
+        .unwrap();
+    view.reload().unwrap();
 
     // In unified view, the session IS findable (fixes #419)
     assert!(
@@ -303,9 +302,24 @@ fn test_save_preserves_per_profile_collapsed_state() {
 #[test]
 #[serial]
 fn test_group_delete_scoped_to_owning_profile() {
-    let (_temp, _guard) = test_home();
-    seed_profile("alpha", &[instance_in("A1", "/tmp/a", "work")]);
-    seed_profile("beta", &[instance_in("B1", "/tmp/b", "work")]);
+    let temp = TempDir::new().unwrap();
+    let _guard = setup_test_home(&temp);
+    for (profile, instance) in [
+        ("alpha", Instance::new("A1", "/tmp/a")),
+        ("beta", Instance::new("B1", "/tmp/b")),
+    ] {
+        let mut instance = instance;
+        instance.group_path = "work".to_string();
+        let instances = vec![instance];
+        Storage::new_unwatched(profile)
+            .unwrap()
+            .update(|i, g| {
+                *i = instances.to_vec();
+                *g = GroupTree::new_with_groups(&instances, &[]).get_all_groups();
+                Ok(())
+            })
+            .unwrap();
+    }
     Storage::new_unwatched("gamma")
         .unwrap()
         .update(|_instances, groups| {
@@ -313,7 +327,9 @@ fn test_group_delete_scoped_to_owning_profile() {
             Ok(())
         })
         .unwrap();
-    let mut view = test_view(None);
+    let tools = AvailableTools::with_tools(&["claude"]);
+    let mut view =
+        HomeView::new_for_test(None, tools, crate::file_watch::FileWatchService::noop()).unwrap();
     view.group_by = crate::session::config::GroupByMode::Manual;
     view.flat_items = view.build_flat_items();
     view.update_selected();

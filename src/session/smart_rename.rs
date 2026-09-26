@@ -1,4 +1,19 @@
-//! Automatic "smart" rename of a structured-view (ACP) session from its first turn.
+//! Automatic "smart" rename of a structured-view (ACP) session from its first
+//! turn.
+//!
+//! When a session still carries its auto-generated civilization name (see
+//! [`crate::session::civilizations`]) the session's own agent is run once in
+//! non-interactive one-shot mode (e.g. `claude -p`) to produce a short title,
+//! and the session is renamed. The one-shot fires at turn-end and summarizes
+//! the whole first turn (prompt plus agent output), so it never races the
+//! live worker for the provider API (#2348). This is best-effort and
+//! fire-and-forget: it never blocks or fails the user's prompt, and any
+//! failure leaves the generated name in place.
+//!
+//! Title only: the worktree directory is intentionally not moved. The live ACP
+//! worker holds the worktree as its working directory, so a directory move
+//! would fail exactly like a manual rename of a running tied session does. The
+//! visible session title is what gains meaning here.
 
 use crate::agents;
 use crate::session::civilizations::is_default_civ_name;
@@ -7,11 +22,14 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-/// Cap on concurrent smart-rename one-shots across the process.
+/// Cap on concurrent smart-rename one-shots across the process. Two slots keep
+/// steady-state throughput on multi-core hosts without letting N stuck
+/// sessions each hold a slot for up to `ONESHOT_TIMEOUT`. See #2348.
 pub const MAX_CONCURRENT: usize = 2;
 
-/// Per-session smart-rename state surfaced to the dashboard so the sidebar can show that a session
-/// will be (or is being) auto-named.
+/// Per-session smart-rename state surfaced to the dashboard so the sidebar can
+/// show that a session will be (or is being) auto-named. `Inactive` for
+/// sessions that are not eligible or already renamed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SmartRenameState {
@@ -23,7 +41,9 @@ pub enum SmartRenameState {
     Running,
 }
 
-/// Why a session is not eligible for smart rename, for logging and to gate the `Pending` indicator.
+/// Why a session is not eligible for smart rename, for logging and to gate the
+/// `Pending` indicator. The same predicate drives both the runtime gate and the
+/// sidebar state so they cannot drift.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SkipReason {
     NotStructured,
@@ -51,7 +71,9 @@ impl SkipReason {
         }
     }
 
-    /// The reason phrased for a user.
+    /// The reason phrased for a user. Shared by the web endpoint's response and
+    /// the TUI's "Auto-name now" dialog so the two surfaces cannot word the same
+    /// skip differently.
     pub fn user_message(self) -> &'static str {
         match self {
             SkipReason::NotStructured => "Session is not a structured-view session",
@@ -67,8 +89,14 @@ impl SkipReason {
     }
 }
 
-/// Single source of truth for "is this session eligible to be auto-named right now". `force` is the
-/// manual "Auto-name now" action, which may regenerate over an already-chosen title.
+/// Single source of truth for whether a session is eligible to be auto-named.
+/// The force flag is the manual action, which may regenerate over a chosen title.
+/// command_override_in_cfg indicates that profile configuration replaces this
+/// agent's binary. A non-empty command differing from the agent binary is also
+/// an override.
+///
+/// Sandbox state is not an input here. The sandbox rule requiring the session's
+/// own agent needs both tool names, so it lives in check_eligible_resolved.
 pub fn check_eligible(
     structured: bool,
     setting_on: bool,
@@ -99,8 +127,9 @@ pub fn check_eligible(
     Ok(())
 }
 
-/// Resolve the tool name used for the one-shot rename: the configured `smart_rename_agent` when
-/// non-empty, otherwise the session's own tool.
+/// Resolve the tool name used for the one-shot rename: the configured
+/// `smart_rename_agent` when non-empty, otherwise the session's own tool. A
+/// blank or whitespace-only setting means "same as session".
 pub fn resolve_rename_tool<'a>(session_tool: &'a str, rename_setting: &'a str) -> &'a str {
     let setting = rename_setting.trim();
     if setting.is_empty() {
@@ -110,8 +139,23 @@ pub fn resolve_rename_tool<'a>(session_tool: &'a str, rename_setting: &'a str) -
     }
 }
 
-/// Resolve the rename agent from the `smart_rename_agent` setting and gate it, returning the
-/// resolved built-in agent on success.
+/// Resolve the rename agent from the `smart_rename_agent` setting and gate it,
+/// returning the resolved built-in agent on success. This is the single place
+/// the command-override semantics differ by rename target: when the rename
+/// agent is the session's own agent, the session's launch command and an
+/// override of that agent count (exactly as before). When the rename agent is
+/// a DIFFERENT agent, the session's launch command is irrelevant (the one-shot
+/// spawns the built-in binary fresh), so only a config override of the rename
+/// agent's own binary disqualifies it. Both the runtime gate
+/// (`try_smart_rename`) and the sidebar `Pending` indicator call this so they
+/// cannot drift.
+///
+/// `sandboxed` gates one rule: a sandboxed session's one-shot runs inside that
+/// session's container, and `build_container_config` mounts only the SESSION
+/// agent's credential dir there, so a different rename agent would find its
+/// binary (the sandbox image ships them all) and then fail to authenticate. Left
+/// ungated it would fail on every turn forever, since a non-zero exit
+/// deliberately leaves the session un-attempted so a later turn retries.
 // One more input than `check_eligible` (the rename-agent setting); a params
 // struct would only add boilerplate to the two call sites and the unit tests.
 #[allow(clippy::too_many_arguments)]
@@ -151,6 +195,10 @@ pub fn check_eligible_resolved(
 }
 
 /// Config fields the smart-rename indicator and runtime gate both consume.
+/// Named fields (rather than a tuple) prevent the sidebar overlay and
+/// `try_smart_rename` from drifting on positional order. Fields borrow from
+/// the caller-owned [`SessionConfig`] so the sidebar's per-row projection is
+/// allocation-free on the 3s poll hot path.
 #[derive(Debug, Clone, Copy)]
 pub struct SmartRenameConfig<'a> {
     pub setting_on: bool,
@@ -159,19 +207,28 @@ pub struct SmartRenameConfig<'a> {
     pub rename_model: &'a HashMap<String, String>,
 }
 
-/// Input for a one-shot title call.
+/// Input for a one-shot title call. `context` is what the agent summarizes
+/// (the rendered first-turn transcript for the turn-end fire; the manual
+/// "Auto-name now" action passes whatever context it has).
+/// `first_user_prompt` is kept separately as the echo baseline so
+/// [`sanitize_title`] rejects a title that merely parrots the raw prompt,
+/// even when `context` wraps that prompt in a `User:`/`Agent:` frame.
 #[derive(Debug, Clone)]
 pub struct SmartRenameInput {
     pub first_user_prompt: String,
     pub context: String,
 }
 
-/// Byte budget for the agent's prose in the rendered first-turn context.
+/// Byte budget for the agent's prose in the rendered first-turn context. Kept
+/// well under `MAX_PROMPT_BYTES` so a large first prompt cannot starve the agent
+/// half: [`render_first_turn`] caps the prompt and the agent independently.
 pub const FIRST_TURN_AGENT_BYTES: usize = 1024;
 /// Byte budget for the user prompt inside the rendered first-turn context.
 const FIRST_TURN_USER_BYTES: usize = 3072;
 
-/// Render the first turn into a single summarizable block.
+/// Render the first turn into a single summarizable block. Prompt and agent
+/// prose are capped independently so neither can crowd the other out. With no
+/// agent prose the render is prompt-only, identical to the pre-#2801 behavior.
 pub fn render_first_turn(user_prompt: &str, agent_prose: &str) -> String {
     let user = truncate_bytes(user_prompt.trim(), FIRST_TURN_USER_BYTES);
     let agent = truncate_bytes(agent_prose.trim(), FIRST_TURN_AGENT_BYTES);
@@ -182,10 +239,9 @@ pub fn render_first_turn(user_prompt: &str, agent_prose: &str) -> String {
     }
 }
 
-/// Project a resolved [`SessionConfig`] into the fields the smart-rename indicator
-/// (`list_sessions` in `src/server/api/sessions/list.rs`) and the runtime gate
-/// ([`try_smart_rename`]) both consume. `smart_rename_override` is the registered project's
-/// override, resolved by the caller so a hot loop can look it up once per project.
+/// Project a resolved [`SessionConfig`] into the fields the smart-rename
+/// indicator (`list_sessions` in `src/server/api/sessions/list.rs`) and runtime
+/// gates consume. The caller resolves the registered project override once.
 pub fn resolve_smart_rename_config(
     session: &SessionConfig,
     smart_rename_override: Option<bool>,
@@ -198,14 +254,18 @@ pub fn resolve_smart_rename_config(
     }
 }
 
-/// Hard cap on how much of the user's first message is handed to the one-shot call.
+/// Hard cap on how much of the user's first message is handed to the one-shot
+/// call. A title needs only the opening intent, and very large argv values can
+/// trip some shells/agents.
 const MAX_PROMPT_BYTES: usize = 4096;
 /// Reject a candidate title longer than this many characters.
 const MAX_TITLE_CHARS: usize = 60;
 /// Reject a candidate title with more than this many words.
 const MAX_TITLE_WORDS: usize = 8;
 
-/// Instruction prefix sent to the agent.
+/// Instruction prefix sent to the agent. Constrains the output so the sanitizer
+/// has the least possible work to do; anything off-format is rejected, never
+/// salvaged.
 const INSTRUCTION: &str = "Generate a concise 3 to 5 word title summarizing the following task. \
 The transcript may begin with the CLI tool's startup banner, welcome message, tips, or help \
 text; ignore that boilerplate and title the user's actual request and the work done, never the \
@@ -225,15 +285,30 @@ pub fn build_prompt(user_message: &str) -> String {
     format!("{INSTRUCTION}\n\nTask:\n{capped}")
 }
 
-/// What a one-shot argv targets.
+/// What a one-shot argv targets. `Title(model_args)` is a throwaway
+/// smart-rename title: it injects the already-resolved model selector tokens
+/// (empty = the CLI's own model). `CliDefault` is a whole-transcript
+/// conversation summary that always runs the agent's normal (bigger) model. It
+/// deliberately has no zero-value, so every call site states its intent: a
+/// title cannot silently bill the frontier model and a summary cannot silently
+/// be downgraded to the cheap tier.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OneshotModel {
     Title(Vec<String>),
     CliDefault,
 }
 
-/// Resolve the model-selector tokens (`[flag, model_id]` or empty) for a title one-shot from the
-/// per-agent `smart_rename_model` map.
+/// Resolve the model-selector tokens (`[flag, model_id]` or empty) for a title
+/// one-shot from the per-agent `smart_rename_model` map. Three-state: an absent
+/// key uses the agent's built-in cheap default (claude pins `haiku`); an empty
+/// value forces the CLI default (opt out of the cheap alias); a non-empty value
+/// pins that model. An agent with no model flag (or no default and no override)
+/// yields no tokens, i.e. the CLI default. This is the sole entry point for the
+/// title-vs-CLI-default decision, so a caller must pass the raw map through: the
+/// empty-string state must not be collapsed in the call chain (e.g. by stripping
+/// empty values before this call). The web widget cannot emit an empty value (it
+/// removes the key on clear), so that state is reachable only via the TUI or
+/// config.toml.
 pub fn resolve_title_model_args(
     agent: &agents::AgentDef,
     models: &HashMap<String, String>,
@@ -252,8 +327,17 @@ pub fn resolve_title_model_args(
     vec![flag.to_string(), model]
 }
 
-/// Build the argv for a one-shot title or summary call, or `None` when the agent has no known
-/// one-shot mode.
+/// Build the argv for a one-shot title or summary call, or `None` when the
+/// agent has no known one-shot mode. Shape is `[binary, oneshot_token, model..,
+/// extra.., prompt, trailing..]`, where `model..` (for a `Title`) sits before
+/// the prompt for a positional-prompt flag but AFTER the prompt for a
+/// value-binding flag (copilot, gemini, kimi `-p`, whose value is the prompt),
+/// so the flag can never bind the model selector as the prompt. The prompt is a
+/// single argv element passed straight to the process, never interpolated into
+/// a shell string, so untrusted user text cannot inject arguments.
+/// `oneshot_trailing_args` is only populated for value-binding one-shots, where
+/// the CLI has already bound the prompt to the flag, so trailing flags stay
+/// unambiguous.
 pub fn build_oneshot_argv(
     agent: &agents::AgentDef,
     prompt: &str,
@@ -278,7 +362,11 @@ pub fn build_oneshot_argv(
     Some(argv)
 }
 
-/// Turn raw agent stdout into a clean title, or `None` to keep the generated name.
+/// Turn raw agent stdout into a clean title, or `None` to keep the generated
+/// name. Strips ANSI escapes, scans every line, and returns the last line that
+/// looks like a plausible title (short, has letters, not a refusal, not an echo
+/// of the prompt). Verbose agents (`codex exec`, `opencode run`) print logs
+/// around the answer; the final qualifying line is the answer.
 pub fn sanitize_title(raw: &str, user_message: &str) -> Option<String> {
     let cleaned = strip_ansi(raw);
     let user_lc = user_message.trim().to_lowercase();
@@ -377,13 +465,29 @@ pub(crate) fn truncate_bytes(s: &str, max: usize) -> &str {
     &s[..end]
 }
 
-// The ACP one-shot is deferred to the first `prompt_complete` `Event::Stopped`, so it never races
-// the live worker for the same provider API.
+// Since #2348 the ACP one-shot is deferred to the first `prompt_complete`
+// `Event::Stopped`, so it no longer races the live worker for the same
+// provider API. The terminal path (below) fires only after the poller sees the
+// pane go idle, so it likewise runs post-turn. Standalone the call finishes
+// well under 12s; 60s is a conservative ceiling that leaves headroom for cold
+// agent starts.
 pub(crate) const ONESHOT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// Run the agent one-shot in the session's working directory, capturing stdout.
-// ponytail: a hung in-container one-shot outlives its 60s timeout and is only reaped when the
-// container goes down.
+/// Run the agent one-shot in the session's working directory, capturing
+/// stdout. Returns `None` on spawn error, non-zero exit, or timeout. Shared
+/// with the serve ACP path, the terminal `__smart-rename` runner, and
+/// `session::conversation_summary` (which passes a longer `timeout` for its
+/// larger transcript input).
+///
+/// The child is killed on drop, so a timed-out HOST call leaves no orphan. For
+/// a sandboxed session (see [`resolve_oneshot_target`]) the child is the
+/// container runtime client, and killing it does not kill the agent process the
+/// `exec` started inside the container.
+// ponytail: a hung in-container one-shot outlives its 60s timeout and is only
+// reaped when the container goes down. Bounding it needs an in-container
+// `timeout`, which is not in the sandbox-image contract (a custom image without
+// coreutils would exit 127 and lose the feature instead). Follow-up, not fixed
+// here.
 pub(crate) async fn run_oneshot(
     session_id: &str,
     argv: &[String],
@@ -395,8 +499,9 @@ pub(crate) async fn run_oneshot(
     cmd.args(&argv[1..])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        // Capture stderr so a non-zero exit logs WHY (e.g. codex's "Not inside a trusted
-        // directory"); without it the failure is an opaque exit code.
+        // Capture stderr so a non-zero exit logs WHY (e.g. codex's
+        // "Not inside a trusted directory"); without it the failure is an
+        // opaque exit code.
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
     if !cwd.is_empty() {
@@ -438,15 +543,24 @@ pub(crate) async fn run_oneshot(
     }
 }
 
-/// Where a one-shot runs for this session: the argv to spawn and the host working directory to
-/// spawn it in (empty for a container, whose workdir comes from the `exec` itself).
+/// Where a one-shot runs for this session: the argv to spawn and the host
+/// working directory to spawn it in (empty for a container, whose workdir comes
+/// from the `exec` itself).
 pub(crate) struct OneshotTarget {
     pub argv: Vec<String>,
     pub cwd: String,
 }
 
-/// Resolve the spawn target for a session's one-shot: unchanged on the host, wrapped in a container
-/// `exec` when the session is sandboxed.
+/// Resolve the spawn target for a session's one-shot: unchanged on the host,
+/// wrapped in a container `exec` when the session is sandboxed.
+///
+/// The agent runs in the container, so its binary and the credential dir the
+/// sandbox mounts for it are the ones the pane already uses; a host spawn would
+/// reach neither. `None` means the container cannot take an `exec` right now
+/// (stopped, absent, or the runtime could not be inspected). That is transient,
+/// so the caller must leave the session un-attempted and let a later turn retry
+/// rather than burning its one attempt. A stopped container is never started
+/// just to name a session.
 pub(crate) async fn resolve_oneshot_target(
     session_id: &str,
     sandboxed: bool,
@@ -491,9 +605,9 @@ pub(crate) async fn resolve_oneshot_target(
     }
 }
 
-/// Whether a renamer may overwrite this session's title: `force` (the manual "Auto-name now"
-/// action) always may; otherwise only a still-default civ name or the last title an auto renamer
-/// wrote.
+/// Whether a renamer may overwrite this session's title. The manual action may
+/// always do so; otherwise the title must still be a default civilization name
+/// or the last title written by an automatic renamer.
 pub(crate) fn title_is_auto_overwritable(
     inst: &crate::session::instance::Instance,
     force: bool,
@@ -503,21 +617,39 @@ pub(crate) fn title_is_auto_overwritable(
         || inst.last_auto_title.as_deref() == Some(inst.title.as_str())
 }
 
+// ---------------------------------------------------------------------------
 // Terminal (non-ACP) smart rename.
+//
+// ACP sessions rename from a typed turn-boundary event inside the daemon.
+// Terminal sessions have no such event and no clean first-message chokepoint
+// (native `tmux attach` types straight into the pane, invisible to AoE at
+// input time). Instead the status poller (both the TUI's and the daemon's)
+// fires `maybe_spawn_terminal_smart_rename` on the `Running -> Idle` edge of a
+// still-default-named session: that single edge covers every input path
+// (native attach, web live-view, `aoe send`) and fires only once the pane
+// agent is idle, so the one-shot never races it for the provider API. The work
+// runs in a detached `aoe __smart-rename` child so it never blocks the poller.
+// Cross-process guards (a per-session advisory lock, MAX_CONCURRENT global slot
+// locks, and the persisted `Instance.smart_rename_attempted` marker) coordinate
+// the TUI, the daemon, and sibling children, which are all separate processes.
+// ---------------------------------------------------------------------------
 
-/// Head/tail byte budgets for the captured first-turn transcript handed to the one-shot.
+/// Head/tail byte budgets for the captured first-turn transcript handed to the
+/// one-shot. The user's opening intent sits near the top and the agent's
+/// result near the bottom, so a middle-elided head+tail keeps both while
+/// staying well under `MAX_PROMPT_BYTES`.
 const CONTEXT_HEAD_BYTES: usize = 3072;
 const CONTEXT_TAIL_BYTES: usize = 1024;
 
-/// Cheap poll-hot-path gate: fire a detached terminal rename for this session iff it is a
-/// still-default-named, non-structured, not-yet-attempted session whose resolved config has smart
-/// rename on.
+pub(crate) fn terminal_smart_rename_candidate(inst: &crate::session::Instance) -> bool {
+    !inst.is_structured() && !inst.smart_rename_attempted && is_default_civ_name(&inst.title)
+}
+
 pub fn maybe_spawn_terminal_smart_rename(inst: &crate::session::instance::Instance) {
-    if inst.is_structured() || inst.smart_rename_attempted || !is_default_civ_name(&inst.title) {
+    if !terminal_smart_rename_candidate(inst) {
         return;
     }
-    // Resolve config and run the FULL eligibility check on the (rare) turn-completion edge, never
-    // per tick.
+    // Reject disabled or unsupported naming before creating a child process.
     let resolved = crate::session::config::repo_config::resolve_config_with_repo_or_warn(
         &inst.source_profile,
         Path::new(&inst.project_path),
@@ -526,7 +658,7 @@ pub fn maybe_spawn_terminal_smart_rename(inst: &crate::session::instance::Instan
         &inst.source_profile,
         Path::new(inst.repo_path()),
     )
-    .and_then(|p| p.overrides.smart_rename);
+    .and_then(|project| project.overrides.smart_rename);
     let cfg = resolve_smart_rename_config(&resolved.session, smart_rename_override);
     if check_eligible_resolved(
         true,
@@ -546,14 +678,18 @@ pub fn maybe_spawn_terminal_smart_rename(inst: &crate::session::instance::Instan
     spawn_detached(&inst.source_profile, &inst.id, false);
 }
 
-/// Spawn an on-demand terminal rename for a session, forcing past the `smart_rename`-disabled and
-/// name-not-default gates.
+/// Spawn an on-demand terminal rename for a session, forcing past the
+/// `smart_rename`-disabled gate. The manual TUI "Auto-name now" action calls
+/// this for a still-default-named terminal session; the detached child re-reads
+/// storage and re-checks every other gate, so this never acts on a stale
+/// snapshot (#3039).
 pub fn spawn_smart_rename_now(profile: &str, session_id: &str) {
     spawn_detached(profile, session_id, true);
 }
 
-/// Re-exec `aoe __smart-rename [--force] <profile> <id>` as a detached child (setsid, null stdio,
-/// dropped handle), mirroring the `__acp-runner` launcher.
+/// Re-exec `aoe __smart-rename [--force] <profile> <id>` as a detached child (setsid,
+/// null stdio, dropped handle), mirroring the `__acp-runner` launcher. Never
+/// blocks and never fails the caller.
 fn spawn_detached(profile: &str, session_id: &str, force: bool) {
     let Ok(exe) = std::env::current_exe() else {
         return;
@@ -580,9 +716,10 @@ fn spawn_detached(profile: &str, session_id: &str, force: bool) {
         }
     }
     match cmd.spawn() {
-        // The child is setsid-detached and does its own work; we only need to reap it so it does
-        // not linger as a zombie in the long-lived poller process (unlike __acp-runner, this child
-        // exits quickly).
+        // The child is setsid-detached and does its own work; we only need to
+        // reap it so it does not linger as a zombie in the long-lived poller
+        // process (unlike __acp-runner, this child exits quickly). A short
+        // dedicated thread waits for it, then ends.
         Ok(child) => {
             std::thread::spawn(move || {
                 let mut child = child;
@@ -595,15 +732,18 @@ fn spawn_detached(profile: &str, session_id: &str, force: bool) {
     }
 }
 
-/// Directory holding the advisory lock files, under the app data dir so the path is identical
-/// across the TUI, the daemon, and detached children in the same build namespace.
+/// Directory holding the advisory lock files, under the app data dir so the
+/// path is identical across the TUI, the daemon, and detached children in the
+/// same build namespace.
 fn lock_dir() -> Option<PathBuf> {
     let dir = crate::session::get_app_dir().ok()?.join("smart-rename");
     std::fs::create_dir_all(&dir).ok()?;
     Some(dir)
 }
 
-/// Try to take an exclusive advisory (`flock`) lock on `path`, returning the held file on success.
+/// Try to take an exclusive advisory (`flock`) lock on `path`, returning the
+/// held file on success. Dropping the returned file releases the lock, so a
+/// crash also releases it (unlike a `create_new` sentinel).
 fn try_lock(path: &Path) -> Option<std::fs::File> {
     use fs2::FileExt;
     let f = std::fs::OpenOptions::new()
@@ -621,17 +761,18 @@ fn try_session_lock(id: &str) -> Option<std::fs::File> {
     try_lock(&lock_dir()?.join(format!("{id}.lock")))
 }
 
-/// Non-blocking global slot lock preserving `MAX_CONCURRENT` across processes, so a burst of
-/// sessions going idle at once (e.g. a batch launch) cannot fan out into one host agent process per
-/// session.
+/// Non-blocking global slot lock preserving `MAX_CONCURRENT` across processes,
+/// so a burst of sessions going idle at once (e.g. a batch launch) cannot fan
+/// out into one host agent process per session.
 fn try_global_slot() -> Option<std::fs::File> {
     let dir = lock_dir()?;
     (0..MAX_CONCURRENT).find_map(|n| try_lock(&dir.join(format!("slot-{n}.lock"))))
 }
 
-/// Capture the pane's full first-turn transcript and reduce it to a bounded, middle-elided
-/// head+tail block, or `None` when the capture is empty or looks like garbage (so the caller keeps
-/// the civ name without paying for a one-shot).
+/// Capture the pane's full first-turn transcript and reduce it to a bounded,
+/// middle-elided head+tail block, or `None` when the capture is empty or looks
+/// like garbage (so the caller keeps the civ name without paying for a
+/// one-shot).
 fn capture_terminal_context(tmux: &crate::tmux::Session, tool: &str) -> Option<String> {
     let raw = tmux.capture_pane_full().ok()?;
     let cleaned = strip_ansi(&raw);
@@ -643,14 +784,24 @@ fn capture_terminal_context(tmux: &crate::tmux::Session, tool: &str) -> Option<S
     Some(head_tail(trimmed, CONTEXT_HEAD_BYTES, CONTEXT_TAIL_BYTES))
 }
 
-/// CLI agents print a startup banner (a welcome box plus "getting started" tips) on launch.
+/// CLI agents print a startup banner (a welcome box plus "getting started"
+/// tips) on launch. It dominates the pane head, so a first-turn capture ends up
+/// summarizing the banner instead of the task (Claude Code -> "claude code
+/// getting started"). Best-effort: for agents we recognize, drop the leading
+/// run of banner lines. It only acts when the banner's signature marker is
+/// present, and falls back to the original text if stripping would leave nothing
+/// substantive, so it can never make the capture worse. The `INSTRUCTION` prose
+/// is the backstop for banners this misses or for other agents.
 fn strip_agent_banner(text: &str, tool: &str) -> String {
     // Only Claude Code has a verified banner shape to key on. Other agents rely
     // on the instruction prose; add a case here per agent as needed.
     if !tool.eq_ignore_ascii_case("claude") {
         return text.to_string();
     }
-    // Gate loosely: the startup box names the tool ("Claude Code v2.1.216" in its top border).
+    // Gate loosely: the startup box names the tool ("Claude Code v2.1.216" in
+    // its top border). A false positive is harmless because the line filter
+    // below only strips an actual leading run of box chrome, so a task that
+    // merely mentions Claude Code (with no leading box) loses nothing.
     if !text.to_lowercase().contains("claude code") {
         return text.to_string();
     }
@@ -664,16 +815,26 @@ fn strip_agent_banner(text: &str, tool: &str) -> String {
         kept.push(line);
     }
     let stripped = kept.join("\n");
-    // Guard against eating the whole transcript (a pane that was nothing but banner, or a future
-    // banner shape that trips the heuristic): keep the original when stripping leaves too little to
-    // title.
+    // Guard against eating the whole transcript (a pane that was nothing but
+    // banner, or a future banner shape that trips the heuristic): keep the
+    // original when stripping leaves too little to title.
     if stripped.chars().filter(|c| c.is_alphabetic()).count() < 12 {
         return text.to_string();
     }
     stripped
 }
 
-/// Whether a line belongs to the Claude Code startup banner.
+/// Whether a line belongs to the Claude Code startup banner. The banner is a
+/// box: its borders are box-drawing glyphs, every body row opens with a vertical
+/// box edge, and its logo uses block-element glyphs, so a structural test
+/// captures the whole box regardless of the (version-dependent) wording inside.
+/// The `MARKERS` cover the notices printed just under the box (MCP-auth warning,
+/// tips, "what's new") before the REPL settles. Blank lines inside the leading
+/// block count so the run isn't cut short by the gaps between sections.
+///
+/// Verified against Claude Code v2.1.216, whose banner is a two-column box
+/// titled `Claude Code v<ver>` with "Welcome back <name>!", an ASCII logo, and a
+/// tips / what's-new column, followed by a `⚠ N MCP servers ...` notice.
 fn is_claude_banner_line(line: &str) -> bool {
     let t = line.trim();
     if t.is_empty() {
@@ -707,13 +868,14 @@ fn is_claude_banner_line(line: &str) -> bool {
     if t.starts_with('\u{26A0}') || t.starts_with('\u{203B}') || lc.starts_with("tip:") {
         return true;
     }
-    // Numbered tip: "1...." or "2)...".
+    // Numbered tip: "1. ..." or "2) ...".
     let mut chars = t.chars();
     matches!((chars.next(), chars.next()), (Some(d), Some(p)) if d.is_ascii_digit() && (p == '.' || p == ')'))
 }
 
-/// Reject a pane capture that is empty, has no letters, or is dominated by control characters (a
-/// garbled/binary pane).
+/// Reject a pane capture that is empty, has no letters, or is dominated by
+/// control characters (a garbled/binary pane). Syntactic only: a semantically
+/// useless capture can still pass here and is caught later by `sanitize_title`.
 fn context_looks_usable(s: &str) -> bool {
     if s.is_empty() || !s.chars().any(|c| c.is_alphabetic()) {
         return false;
@@ -740,8 +902,9 @@ fn head_tail(s: &str, head: usize, tail: usize) -> String {
     format!("{h}\n...\n{}", &s[start..])
 }
 
-/// First non-empty line of the transcript, the best proxy for the user's opening message, used only
-/// as the echo baseline so `sanitize_title` rejects a title that merely parrots the prompt.
+/// First non-empty line of the transcript, the best proxy for the user's
+/// opening message, used only as the echo baseline so `sanitize_title` rejects
+/// a title that merely parrots the prompt.
 fn extract_echo_baseline(context: &str) -> String {
     context
         .lines()
@@ -751,60 +914,65 @@ fn extract_echo_baseline(context: &str) -> String {
         .to_string()
 }
 
-/// Persist the outcome of a terminal one-shot. Without `force`, a manual rename that landed during
-/// the one-shot wins.
+fn apply_title_outcome(
+    instances: &mut [crate::session::Instance],
+    id: &str,
+    new_title: Option<String>,
+    force: bool,
+) -> Option<(String, String)> {
+    let index = instances.iter().position(|instance| instance.id == id)?;
+    let terminal = !instances[index].is_structured();
+    if terminal {
+        instances[index].smart_rename_attempted = true;
+    }
+    let title = new_title?;
+    let instance = &instances[index];
+    if !title_is_auto_overwritable(instance, force) || instance.title == title {
+        return None;
+    }
+    if crate::session::is_duplicate_session(
+        instances.iter(),
+        &title,
+        &instance.project_path,
+        Some(id),
+    ) {
+        tracing::warn!(target: "smart_rename", session = %id, title = %title, "skipped duplicate auto-title");
+        return None;
+    }
+    let instance = &mut instances[index];
+    let old = std::mem::replace(&mut instance.title, title.clone());
+    let rekey = terminal.then(|| (old, title.clone()));
+    instance.last_auto_title = Some(title);
+    rekey
+}
+
 fn apply_terminal_title(
     storage: &crate::session::storage::Storage,
     id: &str,
-    new_title: Option<&str>,
+    new_title: Option<String>,
     force: bool,
 ) -> anyhow::Result<()> {
-    let id = id.to_string();
-    let new_title = new_title.map(str::to_string);
     let identity_lock = crate::session::acquire_session_identity_lock()?;
-    let _session_title_lock = crate::session::storage::acquire_session_title_lock(&id)?;
-    let _lifecycle_lock = storage.acquire_instance_lifecycle_lock(&id)?;
-    let rekey = storage.update(|instances, _groups| {
-        let mut rekey = None;
-        if let Some(index) = instances.iter().position(|instance| instance.id == id) {
-            instances[index].smart_rename_attempted = true;
-            if let Some(title) = &new_title {
-                let should_write = title_is_auto_overwritable(&instances[index], force)
-                    && instances[index].title != *title;
-                // Manual and automatic rename paths share one domain predicate; exclude this row
-                // explicitly so the uniqueness contract does not depend on `should_write` remaining
-                // title-sensitive.
-                let path = instances[index].project_path.clone();
-                let duplicate = should_write
-                    && crate::session::is_duplicate_session(
-                        instances.iter(),
-                        title,
-                        &path,
-                        Some(&id),
-                    );
-                if duplicate {
-                    tracing::warn!(target: "smart_rename", session = %id, title = %title, "skipped duplicate auto-title");
-                } else if should_write {
-                    let instance = &mut instances[index];
-                    rekey = Some((instance.title.clone(), title.clone()));
-                    tracing::info!(target: "smart_rename", session = %id, old = %instance.title, new = %title, "auto-renamed terminal session");
-                    instance.title = title.clone();
-                    instance.last_auto_title = Some(title.clone());
-                }
-            }
-        }
-        Ok(rekey)
-    })?;
+    let _session_title_lock = crate::session::storage::acquire_session_title_lock(id)?;
+    let _lifecycle_lock = storage.acquire_instance_lifecycle_lock(id)?;
+    let rekey = storage
+        .update(|instances, _groups| Ok(apply_title_outcome(instances, id, new_title, force)))?;
     drop(identity_lock);
     if let Some((old_title, new_title)) = rekey {
-        if let Err(error) = crate::tmux::rekey_session(&id, &old_title, &new_title) {
+        if let Err(error) = crate::tmux::rekey_session(id, &old_title, &new_title) {
             tracing::warn!(target: "smart_rename", session = %id, "tmux rename failed: {error}");
         }
     }
     Ok(())
 }
 
-/// Entry point for the detached `aoe __smart-rename [--force] <profile> <id>` child.
+/// Entry point for the detached `aoe __smart-rename [--force] <profile> <id>`
+/// child. Routes by session kind: a structured (ACP) session renames through
+/// the daemon's `/smart-rename` endpoint (its title lives behind the ACP
+/// worker, not a tmux pane), a terminal session runs the local one-shot below.
+/// `force` bypasses the `smart_rename`-disabled gate for the manual on-demand
+/// action (#3039); the poller passes `false`. Best-effort: every failure leaves
+/// the generated name in place.
 pub async fn run_smart_rename_now(
     profile: &str,
     session_id: &str,
@@ -824,8 +992,10 @@ pub async fn run_smart_rename_now(
     }
 }
 
-/// Ask the running daemon to (re-)run the smart-rename one-shot for a structured session via `POST
-/// /api/sessions/{id}/smart-rename`.
+/// Ask the running daemon to (re-)run the smart-rename one-shot for a
+/// structured session via `POST /api/sessions/{id}/smart-rename`. The endpoint
+/// already forces past the disabled-setting gate. Best-effort: no daemon, or a
+/// non-2xx response, just leaves the generated name in place.
 async fn rename_structured_via_daemon(session_id: &str) -> anyhow::Result<()> {
     use crate::acp::client::{discovery, HttpClient};
     let endpoint = match discovery::discover() {
@@ -842,118 +1012,122 @@ async fn rename_structured_via_daemon(session_id: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Body of the terminal (non-ACP) smart rename.
-pub async fn run_terminal_rename(
+struct TerminalRenameReservation {
+    storage: crate::session::storage::Storage,
+    _session_lock: std::fs::File,
+    _slot: std::fs::File,
+}
+
+struct TerminalRenameWork {
+    reservation: TerminalRenameReservation,
+    baseline: String,
+    argv: Vec<String>,
+    sandboxed: bool,
+    container_workdir: String,
+    project_path: String,
+}
+
+fn prepare_terminal_rename(
     profile: &str,
     session_id: &str,
     force: bool,
-) -> anyhow::Result<()> {
-    // Per-session lock first: if another process is already handling this
-    // session, exit immediately (do not queue).
-    let Some(_session_lock) = try_session_lock(session_id) else {
-        return Ok(());
+) -> anyhow::Result<Option<TerminalRenameWork>> {
+    let Some(session_lock) = try_session_lock(session_id) else {
+        return Ok(None);
     };
-
     let storage = crate::session::storage::Storage::open_unwatched(profile)?;
-    let (instances, _groups) = storage.load_with_groups()?;
-    let Some((
-        title,
-        tool,
-        command,
-        project_path,
-        repo_path,
-        sandboxed,
-        container_workdir,
-        detect_as,
-        already,
-        structured,
-    )) = instances.iter().find(|i| i.id == session_id).map(|i| {
-        (
-            i.title.clone(),
-            i.tool.clone(),
-            i.command.clone(),
-            i.project_path.clone(),
-            i.repo_path().to_string(),
-            i.is_sandboxed(),
-            i.container_workdir(),
-            i.detect_as.clone(),
-            i.smart_rename_attempted,
-            i.is_structured(),
-        )
-    })
-    else {
-        return Ok(());
+    let Some(instance) = storage.load()?.into_iter().find(|row| row.id == session_id) else {
+        return Ok(None);
     };
-    drop(instances);
-    // Durable double-check: storage may have propagated a completed attempt (or a manual rename)
-    // since the poller observed the edge.
-    if (already && !force) || structured {
-        return Ok(());
+    if (instance.smart_rename_attempted && !force) || instance.is_structured() {
+        return Ok(None);
     }
-
     let resolved = crate::session::config::repo_config::resolve_config_with_repo_or_warn(
         profile,
-        Path::new(&project_path),
+        Path::new(&instance.project_path),
     );
     let smart_rename_override =
-        crate::session::projects::find_by_canonical_path(profile, Path::new(&repo_path))
-            .and_then(|p| p.overrides.smart_rename);
+        crate::session::projects::find_by_canonical_path(profile, Path::new(instance.repo_path()))
+            .and_then(|project| project.overrides.smart_rename);
     let cfg = resolve_smart_rename_config(&resolved.session, smart_rename_override);
+    let sandboxed = instance.is_sandboxed();
     let agent = match check_eligible_resolved(
-        // Terminal owned turns are an eligible session kind; the `structured` gate exists only so
-        // the daemon's generic ACP listener skips non-structured sessions, which does not apply to
-        // this deliberate terminal trigger.
         true,
         cfg.setting_on || force,
         force,
-        &title,
-        &tool,
+        &instance.title,
+        &instance.tool,
         cfg.rename_agent,
         sandboxed,
-        &command,
+        &instance.command,
         cfg.overrides,
     ) {
         Ok(agent) => agent,
         Err(reason) => {
             tracing::debug!(target: "smart_rename", session = %session_id, reason = reason.as_str(), "terminal skip");
-            return Ok(());
+            return Ok(None);
         }
     };
-
-    let tmux = crate::tmux::Session::new(session_id, &title)?;
-    // Same resolution the status poller uses: own status rules first, then the `agent_detect_as`
-    // alias, resolved through the live registry so a session whose alias entry landed after it was
-    // created is not stranded on the raw tool name here (which would skip `strip_agent_banner` and
-    // read the pane with no detector).
-    let detect_tool = crate::tmux::status_rules::detection_tool(profile, &tool, &detect_as);
-
-    // Best-effort no-race: the poller fired on Running -> Idle, but the user may have started
-    // another turn since.
+    let tmux = crate::tmux::Session::new(session_id, &instance.title)?;
+    let detect_tool =
+        crate::tmux::status_rules::detection_tool(profile, &instance.tool, &instance.detect_as);
     if let Ok(content) = tmux.capture_pane(50) {
         if crate::tmux::detect_status_from_content_in(profile, &content, &detect_tool)
             == crate::session::Status::Running
         {
-            return Ok(());
+            return Ok(None);
         }
     }
-
     let Some(context) = capture_terminal_context(&tmux, &detect_tool) else {
         tracing::debug!(target: "smart_rename", session = %session_id, "terminal skip: unusable pane capture");
-        return Ok(());
+        return Ok(None);
     };
-
-    // Global concurrency slot, taken only once real work is imminent so
-    // early-return paths never hold one.
-    let Some(_slot) = try_global_slot() else {
-        return Ok(());
+    let Some(slot) = try_global_slot() else {
+        return Ok(None);
     };
-
     let baseline = extract_echo_baseline(&context);
     let prompt = build_prompt(&context);
     let model = OneshotModel::Title(resolve_title_model_args(agent, cfg.rename_model));
     let Some(argv) = build_oneshot_argv(agent, &prompt, model) else {
-        return Ok(());
+        return Ok(None);
     };
+    let container_workdir = instance.container_workdir();
+    Ok(Some(TerminalRenameWork {
+        reservation: TerminalRenameReservation {
+            storage,
+            _session_lock: session_lock,
+            _slot: slot,
+        },
+        baseline,
+        argv,
+        sandboxed,
+        container_workdir,
+        project_path: instance.project_path,
+    }))
+}
+
+async fn compute_terminal_rename(
+    profile: &str,
+    session_id: &str,
+    force: bool,
+) -> anyhow::Result<Option<(TerminalRenameReservation, Option<String>)>> {
+    let profile_owned = profile.to_owned();
+    let id_owned = session_id.to_owned();
+    let Some(work) = tokio::task::spawn_blocking(move || {
+        prepare_terminal_rename(&profile_owned, &id_owned, force)
+    })
+    .await??
+    else {
+        return Ok(None);
+    };
+    let TerminalRenameWork {
+        reservation,
+        baseline,
+        argv,
+        sandboxed,
+        container_workdir,
+        project_path,
+    } = work;
     let Some(target) = resolve_oneshot_target(
         session_id,
         sandboxed,
@@ -963,19 +1137,46 @@ pub async fn run_terminal_rename(
     )
     .await
     else {
-        // Container not usable right now: transient, so leave the session
-        // un-attempted for a later idle edge.
-        return Ok(());
+        return Ok(None);
     };
     let Some(raw) = run_oneshot(session_id, &target.argv, &target.cwd, ONESHOT_TIMEOUT).await
     else {
-        // Transient failure (spawn / timeout / non-zero exit): leave the session
-        // un-attempted so a later turn can retry.
-        return Ok(());
+        return Ok(None);
     };
-    let new_title = sanitize_title(&raw, &baseline);
-    apply_terminal_title(&storage, session_id, new_title.as_deref(), force)?;
+    Ok(Some((reservation, sanitize_title(&raw, &baseline))))
+}
+
+pub async fn run_terminal_rename(
+    profile: &str,
+    session_id: &str,
+    force: bool,
+) -> anyhow::Result<()> {
+    if let Some((reservation, title)) = compute_terminal_rename(profile, session_id, force).await? {
+        apply_terminal_title(&reservation.storage, session_id, title, force)?;
+    }
     Ok(())
+}
+
+pub(crate) async fn try_terminal_smart_rename(
+    state: std::sync::Arc<crate::server::AppState>,
+    profile: String,
+    session_id: String,
+    force: bool,
+) {
+    let result: anyhow::Result<()> = async {
+        let Some((reservation, title)) =
+            compute_terminal_rename(&profile, &session_id, force).await?
+        else {
+            return Ok(());
+        };
+        let result = serve::apply_auto_title(&state, &session_id, &profile, title, force).await;
+        drop(reservation);
+        result
+    }
+    .await;
+    if let Err(error) = result {
+        tracing::warn!(target: "smart_rename", session = %session_id, %error, "terminal title job failed");
+    }
 }
 
 pub use serve::{should_trigger_smart_rename, try_smart_rename};
@@ -986,7 +1187,13 @@ mod serve {
     use std::collections::HashSet;
     use std::sync::{Arc, Mutex};
 
-    /// Should this ACP broadcast event trigger a smart-rename one-shot for its session?
+    /// Should this ACP broadcast event trigger a smart-rename one-shot for its
+    /// session? Cheap sync predicate: reason-allowlists `prompt_complete` (all
+    /// other `Stopped` reasons like `user_stopped`, `rate_limited`,
+    /// `agent_unresponsive`, `reattach_idle` are either not turn boundaries or
+    /// states where auto-renaming would be intrusive), and short-circuits on
+    /// the two per-session gates so the listener drops non-matching events
+    /// before touching the event store or spawning a task. See #2348.
     pub fn should_trigger_smart_rename(
         event: &crate::acp::state::Event,
         session_id: &str,
@@ -1000,7 +1207,9 @@ mod serve {
         is_clean_stop && !attempted.contains(session_id) && !inflight.contains(session_id)
     }
 
-    /// Whether a one-shot has already been attempted for this session this process lifetime.
+    /// Whether a one-shot has already been attempted for this session this
+    /// process lifetime. Shared by the turn-end firing site and the manual
+    /// action so a fire after an attempt that already produced output no-ops.
     fn attempted_contains(state: &AppState, session_id: &str) -> bool {
         state
             .smart_rename_attempted
@@ -1009,8 +1218,9 @@ mod serve {
             .contains(session_id)
     }
 
-    /// Marks a session as having an in-flight one-shot rename so a burst of rapid first prompts
-    /// cannot spawn concurrent title generators.
+    /// Marks a session as having an in-flight one-shot rename so a burst of
+    /// rapid first prompts cannot spawn concurrent title generators. Removed on
+    /// drop, so every exit path (including early returns) releases it.
     struct InflightGuard<'a> {
         set: &'a Mutex<HashSet<String>>,
         id: String,
@@ -1035,7 +1245,20 @@ mod serve {
         }
     }
 
-    /// Best-effort auto-rename of a structured-view session from its first turn.
+    /// Best-effort auto-rename of a structured-view session from its first
+    /// turn. Spawn this detached from a firing site (the daemon event
+    /// listener at turn-end, or the manual "Auto-name now" action); it never
+    /// returns an error and never touches the prompt flow. All gates are
+    /// re-checked under the per-session lock before the title is written, so
+    /// a manual rename (or a deletion) that lands during the one-shot call
+    /// always wins.
+    ///
+    /// `force` bypasses only the `smart_rename`-disabled gate: the manual
+    /// "Auto-name now" action runs on demand even when auto-rename-on-start is
+    /// off (#3039), mirroring how the manual summary bypasses the
+    /// `conversation_summary` setting (#2808). The automatic listener passes
+    /// `false`; every other gate (structured, name-not-default, sandbox,
+    /// one-shot support, command override) still applies on both paths.
     pub async fn try_smart_rename(
         state: Arc<AppState>,
         session_id: String,
@@ -1046,6 +1269,10 @@ mod serve {
             return;
         }
 
+        // Internal attempted gate. With two firing sites (the listener at
+        // turn-end and the manual action), call-site gating alone is not
+        // enough. A session that already produced a one-shot answer (even one
+        // the sanitizer rejected) must not be retried.
         if attempted_contains(&state, &session_id) {
             return;
         }
@@ -1086,7 +1313,7 @@ mod serve {
         );
         let smart_rename_override =
             crate::session::projects::find_by_canonical_path(&profile, Path::new(&repo_path))
-                .and_then(|p| p.overrides.smart_rename);
+                .and_then(|project| project.overrides.smart_rename);
         let cfg = resolve_smart_rename_config(&resolved.session, smart_rename_override);
         let agent = match check_eligible_resolved(
             structured,
@@ -1110,8 +1337,9 @@ mod serve {
             return;
         };
 
-        // Re-check attempted after taking the inflight slot: another task may have completed and
-        // marked this session between the entry check and acquiring the guard.
+        // Re-check attempted after taking the inflight slot: another task may
+        // have completed and marked this session between the entry check and
+        // acquiring the guard.
         if attempted_contains(&state, &session_id) {
             return;
         }
@@ -1122,7 +1350,15 @@ mod serve {
             return;
         };
 
-        // A spawn error, timeout, or non-zero exit returns None.
+        // A spawn error, timeout, or non-zero exit returns None. Do NOT mark the
+        // session attempted in that case: a transient slow first prompt (cold
+        // agent start) must not permanently disable naming. A later prompt
+        // retries. The inflight guard above already prevents concurrent spawns.
+        //
+        // The permit is scoped tightly around `run_oneshot` so ineligible /
+        // early-return paths above never consume a slot. Same-session duplicates
+        // are already rejected by the InflightGuard, so this permit only gates
+        // cross-session concurrency (#2348).
         let Some(target) = resolve_oneshot_target(
             &session_id,
             sandboxed,
@@ -1146,7 +1382,9 @@ mod serve {
             return;
         };
 
-        // The agent produced output (usable or not).
+        // The agent produced output (usable or not). Mark attempted now, once per
+        // session lifetime: an answer the sanitizer rejects is not worth respawning
+        // a one-shot agent (tokens) for on every later prompt.
         {
             let mut attempted = state
                 .smart_rename_attempted
@@ -1161,104 +1399,201 @@ mod serve {
             return;
         };
 
-        // Serialization against manual rename / worktree edits is handled
-        // inside apply_auto_title via the per-session instance lock.
-        apply_auto_title(&state, &session_id, &profile, &new_title, force).await;
+        if let Err(error) =
+            apply_auto_title(&state, &session_id, &profile, Some(new_title), force).await
+        {
+            tracing::warn!(target: "smart_rename", session = %session_id, %error, "title commit failed");
+        }
     }
 
-    /// Persist a generated title and mirror it into AppState. Without `force`, a manual rename that
-    /// landed during the one-shot wins.
     pub(crate) async fn apply_auto_title(
         state: &Arc<AppState>,
         id: &str,
         profile: &str,
-        new_title: &str,
+        new_title: Option<String>,
         force: bool,
-    ) {
-        let lock = state.instance_lock(id).await;
-        let _serialized = lock.lock().await;
-
-        let storage = match crate::session::storage::Storage::new(profile, state.file_watch.clone())
+    ) -> anyhow::Result<()> {
+        let namespace = state.profile_namespace.read().await;
+        if !state
+            .instances
+            .read()
+            .await
+            .iter()
+            .any(|row| row.id == id && row.source_profile == profile)
         {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!(target: "smart_rename", session = %id, "storage open failed: {e}");
-                return;
-            }
+            return Ok(());
+        }
+        let lock = state.instance_lock(id).await;
+        let serialized = lock.lock().await;
+        let profile_owned = profile.to_owned();
+        let id_owned = id.to_owned();
+        let file_watch = state.file_watch.clone();
+        let failure_health = || crate::daemon::RuntimeHealth::Degraded {
+            code: crate::daemon::ReloadFailureCode::ProfileData,
+            profiles: vec![profile.to_owned()],
         };
-        // Own copies for the closure below: `storage.update` runs inside `spawn_blocking`, whose
-        // body must be `'static + Send`, so the borrowed `id`/`new_title` cannot cross the thread
-        // boundary.
-        let id_owned = id.to_string();
-        let title_owned = new_title.to_string();
-        let persisted = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-            let identity_lock = crate::session::acquire_session_identity_lock()?;
-            let session_title_lock =
-                crate::session::storage::acquire_session_title_lock(&id_owned)?;
-            let wrote = storage.update(|instances, _groups| {
-                let Some(index) = instances
-                    .iter()
-                    .position(|instance| instance.id == id_owned)
-                else {
-                    return Ok(false);
-                };
-                // Manual and automatic rename paths share one domain predicate; exclude this row
-                // explicitly so a future no-op policy change cannot make the row collide with
-                // itself.
-                let should_write = title_is_auto_overwritable(&instances[index], force)
-                    && instances[index].title != title_owned;
-                let path = instances[index].project_path.clone();
-                let duplicate = should_write
-                    && crate::session::is_duplicate_session(
-                        instances.iter(),
-                        &title_owned,
-                        &path,
-                        Some(&id_owned),
-                    );
-                if duplicate {
-                    tracing::warn!(target: "smart_rename", session = %id_owned, title = %title_owned, "skipped duplicate auto-title");
-                    Ok(false)
-                } else if should_write {
-                    instances[index].title = title_owned.clone();
-                    // Last owned use of `title_owned`: move it into the field
-                    // rather than cloning a second time.
-                    instances[index].last_auto_title = Some(title_owned);
-                    Ok(true)
-                } else {
-                    Ok(false)
-                }
-            })?;
-            drop(identity_lock);
-            Ok((wrote, session_title_lock))
+        let locked = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+            let storage = crate::session::storage::Storage::open(&profile_owned, file_watch)?;
+            let identity = crate::session::acquire_session_identity_lock()?;
+            let title = crate::session::storage::acquire_session_title_lock(&id_owned)?;
+            let lifecycle = storage.acquire_instance_lifecycle_lock(&id_owned)?;
+            let transition = storage.acquire_write_transition()?;
+            Ok((storage, identity, title, lifecycle, transition, id_owned))
         })
-        .await;
-        let (wrote, _session_title_lock) = match persisted {
-            Ok(Ok(result)) => result,
-            Ok(Err(e)) => {
-                tracing::warn!(target: "smart_rename", session = %id, "persist failed: {e}");
-                return;
-            }
-            Err(e) => {
-                tracing::warn!(target: "smart_rename", session = %id, "persist join failed: {e}");
-                return;
+        .await
+        .map_err(anyhow::Error::from)
+        .and_then(|result| result);
+        let (storage, identity, title, lifecycle, transition, id_owned) = match locked {
+            Ok(locked) => locked,
+            Err(error) => {
+                state.mark_reload_failure(failure_health()).await;
+                return Err(error);
             }
         };
-        if !wrote {
-            return;
+        let publication = state.publication.write().await;
+        anyhow::ensure!(
+            *state.canonical_health.read().await == crate::daemon::RuntimeHealth::Healthy,
+            "runtime state is unavailable"
+        );
+        let committed = tokio::task::spawn_blocking(move || {
+            transition
+                .update_with_snapshot(&storage, |instances, _groups| {
+                    Ok(apply_title_outcome(instances, &id_owned, new_title, force))
+                })
+                .map(|(rekey, rows, groups)| (rekey, rows, groups, id_owned, (storage, transition)))
+        })
+        .await
+        .map_err(anyhow::Error::from)
+        .and_then(|result| result);
+        let (rekey, rows, groups, id_owned, prepared) = match committed {
+            Ok(committed) => committed,
+            Err(error) => {
+                *state.canonical_health.write().await = failure_health();
+                state.runtime.request_publish();
+                return Err(error);
+            }
+        };
+        if let Err(error) = crate::server::reload::adopt_committed_profiles(
+            state,
+            [(profile, rows, groups)],
+            |_| false,
+            &publication,
+        )
+        .await
+        {
+            *state.canonical_health.write().await = error.health.clone();
+            state.runtime.request_publish();
+            return Err(error.into());
         }
-
-        let mut instances = state.instances.write().await;
-        if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
-            tracing::info!(target: "smart_rename", session = %id, old = %inst.title, new = %new_title, "auto-renamed session");
-            inst.title = new_title.to_string();
-            inst.last_auto_title = Some(new_title.to_string());
+        drop(publication);
+        drop(prepared);
+        drop(identity);
+        if let Some((old, new)) = rekey {
+            let rekeyed = tokio::task::spawn_blocking(move || {
+                crate::tmux::rekey_session(&id_owned, &old, &new)
+            })
+            .await;
+            match rekeyed {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => {
+                    tracing::warn!(target: "smart_rename", session = %id, %error, "tmux rename failed")
+                }
+                Err(error) => {
+                    tracing::warn!(target: "smart_rename", session = %id, %error, "tmux rename task failed")
+                }
+            }
         }
+        drop(lifecycle);
+        drop(title);
+        drop(serialized);
+        drop(namespace);
+        state.runtime.publish(state).await?;
+        Ok(())
     }
 
     #[cfg(test)]
     mod tests {
         use super::*;
         use std::time::Duration;
+
+        async fn state_for_default_profile(rows: Vec<crate::session::Instance>) -> Arc<AppState> {
+            let state = crate::server::test_support::build_test_app_state(rows);
+            *state.canonical_metadata.write().await = crate::server::reload::CanonicalMetadata {
+                default_profile: "default".into(),
+                profiles: vec![crate::daemon::ProfileSnapshot {
+                    name: "default".into(),
+                    description: None,
+                    groups: Vec::new(),
+                    projects: Vec::new(),
+                }],
+                ..Default::default()
+            };
+            state
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn auto_title_publishes_its_complete_committed_profile() {
+            let _guard = crate::session::test_support::isolate_app_dir();
+            let storage = crate::session::storage::Storage::new_unwatched("default").unwrap();
+            let mut target = crate::session::Instance::new("Franks", "/tmp/title-target");
+            target.source_profile = "default".into();
+            let target_id = target.id.clone();
+            storage
+                .update(|rows, _| {
+                    rows.push(target.clone());
+                    Ok(())
+                })
+                .unwrap();
+            let state = state_for_default_profile(vec![target]).await;
+            state.runtime.publish(&state).await.unwrap();
+
+            let peer = crate::session::Instance::new("Peer", "/tmp/title-peer");
+            let peer_id = peer.id.clone();
+            let mut group = crate::session::Group::new("Peer group", "peer");
+            group.collapsed = true;
+            storage
+                .update(|rows, groups| {
+                    rows.push(peer);
+                    groups.push(group.clone());
+                    Ok(())
+                })
+                .unwrap();
+
+            apply_auto_title(
+                &state,
+                &target_id,
+                "default",
+                Some("Commit canonical titles".into()),
+                false,
+            )
+            .await
+            .unwrap();
+
+            let snapshot = state.runtime.snapshot(&state).await.unwrap();
+            let titles: std::collections::BTreeMap<_, _> = snapshot
+                .value
+                .contents
+                .sessions
+                .iter()
+                .map(|row| (row.id.as_str(), row.title.as_str()))
+                .collect();
+            assert_eq!(
+                titles,
+                std::collections::BTreeMap::from([
+                    (target_id.as_str(), "Commit canonical titles"),
+                    (peer_id.as_str(), "Peer"),
+                ])
+            );
+            let profile = snapshot
+                .value
+                .contents
+                .profiles
+                .iter()
+                .find(|profile| profile.name == "default")
+                .unwrap();
+            assert_eq!(profile.groups, vec![group]);
+        }
 
         #[tokio::test]
         #[serial_test::serial]
@@ -1282,10 +1617,26 @@ mod serve {
                     Ok(())
                 })
                 .unwrap();
-            let state = crate::server::test_support::build_test_app_state(rows);
+            let state = state_for_default_profile(rows).await;
 
-            apply_auto_title(&state, &target_id, "default", "Already owned", false).await;
-            apply_auto_title(&state, &manual_id, "default", "Regenerated title", true).await;
+            apply_auto_title(
+                &state,
+                &target_id,
+                "default",
+                Some("Already owned".into()),
+                false,
+            )
+            .await
+            .unwrap();
+            apply_auto_title(
+                &state,
+                &manual_id,
+                "default",
+                Some("Regenerated title".into()),
+                true,
+            )
+            .await
+            .unwrap();
 
             let title_of = |instances: &[crate::session::Instance], id: &str| {
                 instances
@@ -1305,8 +1656,11 @@ mod serve {
 
         #[test]
         fn is_duplicate_session_normalizes_trailing_slash() {
-            // The skip in `apply_auto_title` / `apply_terminal_title` reuses the creation
-            // predicate, which trims trailing '/' on both sides before comparing paths.
+            // The skip in `apply_auto_title` / `apply_terminal_title` reuses the
+            // creation predicate, which trims trailing '/' on both sides before
+            // comparing paths. Pin that normalization explicitly: an existing
+            // session at "/tmp/shared" collides with a candidate whose path
+            // differs only by a trailing slash.
             let mut existing = crate::session::Instance::new("Already owned", "/tmp/shared");
             existing.source_profile = "default".to_string();
             let instances = [existing];
@@ -1331,8 +1685,9 @@ mod serve {
 
         #[tokio::test]
         async fn run_oneshot_returns_none_on_spawn_failure() {
-            // A failed spawn must surface as None so try_smart_rename leaves the session
-            // un-attempted and a later prompt can retry.
+            // A failed spawn must surface as None so try_smart_rename leaves the
+            // session un-attempted and a later prompt can retry. A binary that
+            // does not exist is the deterministic, machine-independent failure.
             let argv = vec![
                 "aoe-smart-rename-nonexistent-binary-xyz".to_string(),
                 "-p".to_string(),
@@ -1365,16 +1720,7 @@ mod serve {
             legacy.title = "Hand-picked name".to_string();
             legacy.last_auto_title = None;
             assert!(!title_is_auto_overwritable(&legacy, false));
-            // The manual "Auto-name now" action may overwrite even a hand-picked title.
             assert!(title_is_auto_overwritable(&legacy, true));
-        }
-
-        #[test]
-        fn oneshot_timeout_is_60s() {
-            // Drift-guard against future bump-back: raised this to 120s to absorb the
-            // prompt-handler race; removed the race at source, so this should stay at the
-            // deferred-trigger ceiling.
-            assert_eq!(ONESHOT_TIMEOUT, Duration::from_secs(60));
         }
 
         #[test]
@@ -1445,84 +1791,31 @@ mod tests {
         agents::get_agent("claude").expect("claude agent exists")
     }
 
-    /// The one-shot argv for `name`, joined with spaces, with `model` standing in
-    /// for that agent's `smart_rename_model` entry (`None` leaves it unset).
-    fn argv_for(name: &str, model: Option<&str>) -> String {
-        let agent = agents::get_agent(name).unwrap_or_else(|| panic!("{name} agent exists"));
-        let models: HashMap<String, String> = model
-            .map(|m| (name.to_string(), m.to_string()))
-            .into_iter()
-            .collect();
-        let args = OneshotModel::Title(resolve_title_model_args(agent, &models));
-        build_oneshot_argv(agent, "name this", args)
-            .unwrap_or_else(|| panic!("{name} one-shot"))
-            .join(" ")
+    /// A title one-shot with no user override: the agent's built-in default
+    /// (claude pins `haiku`, others none), reproducing the pre-tunable behavior.
+    fn title_default(agent: &agents::AgentDef) -> OneshotModel {
+        OneshotModel::Title(resolve_title_model_args(agent, &HashMap::new()))
     }
 
     #[test]
-    fn oneshot_argv_places_model_args_by_agent_convention() {
-        // (agent, smart_rename_model entry, argv)
-        let cases = [
-            ("claude", None, "claude -p --model haiku name this"),
-            ("codex", None, "codex exec --skip-git-repo-check name this"),
-            ("copilot", None, COPILOT_DEFAULT),
-            (
-                "codex",
-                Some("gpt-5"),
-                "codex exec -m gpt-5 --skip-git-repo-check name this",
-            ),
-            ("copilot", Some("claude-haiku-4.5"), COPILOT_MODEL),
-            (
-                "gemini",
-                Some("gemini-2.5-flash"),
-                "gemini -p name this -m gemini-2.5-flash",
-            ),
-            (
-                "kimi",
-                Some("moonshot-v1-8k"),
-                "kimi -p name this -m moonshot-v1-8k",
-            ),
-            (
-                "opencode",
-                Some("anthropic/claude-haiku-4-5"),
-                OPENCODE_MODEL,
-            ),
-        ];
-        for (name, model, want) in cases {
-            assert_eq!(argv_for(name, model), want, "{name} model={model:?}");
-        }
+    fn argv_is_binary_token_prompt() {
+        let argv = build_oneshot_argv(claude(), "hello", title_default(claude()))
+            .expect("claude one-shot");
+        assert_eq!(argv, vec!["claude", "-p", "--model", "haiku", "hello"]);
     }
 
-    const COPILOT_DEFAULT: &str = "copilot -p name this -s --allow-all-tools --no-ask-user";
-    const COPILOT_MODEL: &str =
-        "copilot -p name this --model claude-haiku-4.5 -s --allow-all-tools --no-ask-user";
-    const OPENCODE_MODEL: &str = "opencode run -m anthropic/claude-haiku-4-5 name this";
-
     #[test]
-    fn cli_default_drops_only_the_resolved_model_args() {
-        assert_eq!(
-            build_oneshot_argv(claude(), "name this", OneshotModel::CliDefault).unwrap(),
-            vec!["claude", "-p", "name this"]
-        );
-        for agent in agents::AGENTS.iter().filter(|a| a.oneshot_flag.is_some()) {
-            let default_args = resolve_title_model_args(agent, &HashMap::new());
-            let title = build_oneshot_argv(
-                agent,
-                "name this",
-                OneshotModel::Title(default_args.clone()),
-            )
-            .expect("one-shot");
-            let cli =
-                build_oneshot_argv(agent, "name this", OneshotModel::CliDefault).expect("one-shot");
-            assert!(!cli.iter().any(|a| a == "--model" || a == "-m"));
-            assert_eq!(cli.len(), title.len() - default_args.len());
-        }
+    fn argv_none_for_agent_without_oneshot() {
+        let cursor = agents::get_agent("cursor").expect("cursor agent exists");
+        assert!(build_oneshot_argv(cursor, "hello", OneshotModel::CliDefault).is_none());
     }
 
     #[test]
     fn check_eligible_reasons() {
         let c = Some(claude());
+        // Happy path.
         assert!(check_eligible(true, true, false, "Vikings", c, "", false).is_ok());
+        // Each disqualifier maps to its reason.
         assert_eq!(
             check_eligible(false, true, false, "Vikings", c, "", false),
             Err(SkipReason::NotStructured)
@@ -1559,76 +1852,84 @@ mod tests {
             check_eligible(true, true, false, "Vikings", c, "my-wrapper", false),
             Err(SkipReason::CommandOverridden)
         );
+        // Command equal to the agent binary is not an override.
         assert!(check_eligible(true, true, false, "Vikings", c, "claude", false).is_ok());
+    }
 
-        // Manual "Auto-name now" bypasses only the disabled and already-named gates.
-        let auto = false;
-        let force = true;
-        assert_eq!(
-            check_eligible(true, auto, false, "Vikings", c, "", false),
-            Err(SkipReason::Disabled),
-            "automatic path must still honor the disabled setting"
-        );
-        assert!(
-            check_eligible(true, auto || force, force, "Vikings", c, "", false).is_ok(),
-            "manual force must bypass the disabled gate"
-        );
-        assert!(
-            matches!(
-                check_eligible_resolved(
-                    true,
-                    auto || force,
-                    force,
-                    "Vikings",
-                    "claude",
-                    "codex",
-                    true,
-                    "",
-                    &HashMap::new()
-                ),
-                Err(SkipReason::SandboxRenameAgentMismatch)
+    #[test]
+    fn sandboxed_session_is_eligible_for_its_own_agent() {
+        // #3159: a sandboxed session used to be rejected outright. Its one-shot
+        // now runs inside its container, where that agent's credentials are
+        // mounted, so it is eligible like any other session.
+        let overrides = HashMap::new();
+        assert!(check_eligible_resolved(
+            true, true, false, "Vikings", "claude", "", true, "", &overrides
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn sandboxed_session_rejects_a_different_rename_agent() {
+        // Only the session agent's credential dir is mounted in the container
+        // (see build_container_config), so `codex` would resolve its binary from
+        // the sandbox image and then fail to authenticate, on every turn.
+        let overrides = HashMap::new();
+        assert!(matches!(
+            check_eligible_resolved(
+                true, true, false, "Vikings", "claude", "codex", true, "", &overrides
             ),
-            "sandbox rename-agent gate still applies when forced"
-        );
-        assert!(
-            check_eligible(true, auto || force, force, "Fix login bug", c, "", false).is_ok(),
-            "manual force must bypass the already-named gate too"
-        );
-        assert_eq!(
-            check_eligible(false, auto || force, force, "Vikings", c, "", false),
-            Err(SkipReason::NotStructured),
-            "structured gate still applies when forced"
-        );
-        assert_eq!(
-            check_eligible(true, auto || force, force, "Vikings", None, "", false),
-            Err(SkipReason::NoOneshot),
-            "no-one-shot gate still applies when forced"
-        );
-        assert_eq!(
-            check_eligible(true, auto || force, force, "Vikings", c, "", true),
-            Err(SkipReason::CommandOverridden),
-            "command-override gate still applies when forced"
-        );
+            Err(SkipReason::SandboxRenameAgentMismatch)
+        ));
+        // An unsupported rename agent still reports the more specific reason, so
+        // the message does not blame credential mounting for a bad setting.
+        assert!(matches!(
+            check_eligible_resolved(
+                true, true, false, "Vikings", "claude", "cursor", true, "", &overrides
+            ),
+            Err(SkipReason::NoOneshot)
+        ));
+        // A host session may still borrow a different rename agent.
+        assert!(check_eligible_resolved(
+            true, true, false, "Vikings", "claude", "codex", false, "", &overrides
+        )
+        .is_ok());
     }
 
     #[tokio::test]
-    async fn oneshot_target_runs_on_the_host_only_for_host_sessions() {
+    async fn host_session_spawns_the_agent_binary_in_the_project_dir() {
         let argv = vec!["claude".to_string(), "-p".to_string(), "hi".to_string()];
         let target = resolve_oneshot_target("abc123", false, "/workspace", "/repo", argv.clone())
             .await
             .expect("host target");
         assert_eq!(target.argv, argv, "a host one-shot must not be wrapped");
         assert_eq!(target.cwd, "/repo");
+    }
+
+    #[tokio::test]
+    async fn sandboxed_session_spawns_through_the_container_runtime() {
+        // Without a live container the probe returns NotRunning or Unknown, which
+        // must yield no target at all: that keeps the session un-attempted so a
+        // later turn retries, instead of silently spawning the agent on the host
+        // where the sandbox's credentials are not mounted.
         assert!(
-            resolve_oneshot_target("nosuchsession", true, "/workspace", "/repo", argv)
-                .await
-                .is_none(),
+            resolve_oneshot_target(
+                "nosuchsession",
+                true,
+                "/workspace",
+                "/repo",
+                vec!["claude".to_string()],
+            )
+            .await
+            .is_none(),
             "a sandboxed session with no usable container must not fall back to the host"
         );
     }
 
     #[test]
     fn sandboxed_target_wraps_the_agent_argv_for_the_container() {
+        // The wrapping itself, without needing a running container: the runtime
+        // binary leads, the container workdir is explicit, and the agent argv
+        // (prompt included) is carried through unchanged.
         let container = crate::containers::DockerContainer::from_session_id("abc12345");
         let argv = vec![
             "claude".to_string(),
@@ -1648,15 +1949,225 @@ mod tests {
     }
 
     #[test]
+    fn argv_codex_skips_git_repo_check_with_prompt_last() {
+        // codex `exec` refuses to run outside a git repo without this flag, so a
+        // scratch-session one-shot would exit non-zero. The flag goes between
+        // the token and the prompt; the prompt stays the final element.
+        // codex has no built-in cheap alias, so with no override it takes no
+        // model args: still [binary, flag, skip-git-repo-check, prompt].
+        let codex = agents::get_agent("codex").unwrap();
+        let argv =
+            build_oneshot_argv(codex, "name this", title_default(codex)).expect("codex one-shot");
+        assert_eq!(
+            argv,
+            vec!["codex", "exec", "--skip-git-repo-check", "name this"]
+        );
+        // claude pins the cheap `haiku` alias between the flag and the prompt;
+        // the prompt stays the final element.
+        assert_eq!(
+            build_oneshot_argv(claude(), "name this", title_default(claude())).unwrap(),
+            vec!["claude", "-p", "--model", "haiku", "name this"]
+        );
+    }
+
+    #[test]
+    fn argv_copilot_appends_silent_autoapprove_flags_after_prompt() {
+        // Copilot's `-p` binds the prompt as its value, so the auto-approve and
+        // silent flags follow the prompt. Without them a non-interactive title
+        // call can block on a permission prompt or print stats that pollute the
+        // title; with them stdout is just the final answer.
+        let copilot = agents::get_agent("copilot").unwrap();
+        let argv = build_oneshot_argv(copilot, "name this", title_default(copilot))
+            .expect("copilot one-shot");
+        assert_eq!(
+            argv,
+            vec![
+                "copilot",
+                "-p",
+                "name this",
+                "-s",
+                "--allow-all-tools",
+                "--no-ask-user"
+            ]
+        );
+    }
+
+    #[test]
+    fn argv_claude_injects_cheap_model_before_prompt() {
+        let argv = build_oneshot_argv(claude(), "name this", title_default(claude()))
+            .expect("claude one-shot");
+        let model_idx = argv.iter().position(|a| a == "--model").expect("--model");
+        assert_eq!(argv[model_idx + 1], "haiku");
+        let prompt_idx = argv.iter().position(|a| a == "name this").expect("prompt");
+        assert!(
+            model_idx < prompt_idx,
+            "model args must precede the prompt, got {argv:?}"
+        );
+        assert_eq!(
+            prompt_idx,
+            argv.len() - 1,
+            "prompt must be the last element"
+        );
+    }
+
+    #[test]
+    fn argv_summary_model_uses_cli_default() {
+        // conversation_summary reads the whole transcript and may need a bigger
+        // model turn, so OneshotModel::CliDefault must NOT inject any model
+        // selector: the argv is exactly the pre-tunable CLI-default shape.
+        let argv = build_oneshot_argv(claude(), "name this", OneshotModel::CliDefault)
+            .expect("claude one-shot");
+        assert!(!argv.iter().any(|a| a == "--model" || a == "haiku"));
+        assert_eq!(argv, vec!["claude", "-p", "name this"]);
+    }
+
+    #[test]
+    fn argv_cli_default_omits_only_the_resolved_model_args() {
+        // Across every one-shot agent, CliDefault yields exactly the built-in
+        // Title argv minus the resolved model slot: the model selector is the
+        // only difference between the two intents.
+        for agent in agents::AGENTS.iter().filter(|a| a.oneshot_flag.is_some()) {
+            let default_args = resolve_title_model_args(agent, &HashMap::new());
+            let title = build_oneshot_argv(
+                agent,
+                "name this",
+                OneshotModel::Title(default_args.clone()),
+            )
+            .expect("one-shot");
+            let cli =
+                build_oneshot_argv(agent, "name this", OneshotModel::CliDefault).expect("one-shot");
+            assert!(!cli.iter().any(|a| a == "--model" || a == "-m"));
+            assert_eq!(cli.len(), title.len() - default_args.len());
+        }
+    }
+
+    #[test]
+    fn argv_agents_without_cheap_default_take_no_model_args() {
+        // With no user override, only claude has a built-in cheap alias; every
+        // other one-shot agent runs the CLI default (no model flag).
+        for name in ["opencode", "kimi", "codex", "gemini", "copilot"] {
+            let agent = agents::get_agent(name).unwrap();
+            let argv = build_oneshot_argv(agent, "name this", title_default(agent))
+                .unwrap_or_else(|| panic!("{name} one-shot"));
+            assert!(
+                !argv.iter().any(|a| a == "--model" || a == "-m"),
+                "{name} has no built-in cheap alias, so its default argv carries no model flag: {argv:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn argv_user_model_override_positioned_by_flag_binding() {
+        // A positional-prompt agent (codex `exec`) gets the model selector
+        // before the prompt; a value-binding agent (copilot `-p`) gets it after
+        // the prompt so the flag never swallows `--model` as its value.
+        let mut models = HashMap::new();
+        models.insert("codex".to_string(), "gpt-5".to_string());
+        models.insert("copilot".to_string(), "claude-haiku-4.5".to_string());
+
+        let codex = agents::get_agent("codex").unwrap();
+        let codex_argv = build_oneshot_argv(
+            codex,
+            "name this",
+            OneshotModel::Title(resolve_title_model_args(codex, &models)),
+        )
+        .expect("codex one-shot");
+        assert_eq!(
+            codex_argv,
+            vec![
+                "codex",
+                "exec",
+                "-m",
+                "gpt-5",
+                "--skip-git-repo-check",
+                "name this"
+            ]
+        );
+
+        let copilot = agents::get_agent("copilot").unwrap();
+        let copilot_argv = build_oneshot_argv(
+            copilot,
+            "name this",
+            OneshotModel::Title(resolve_title_model_args(copilot, &models)),
+        )
+        .expect("copilot one-shot");
+        assert_eq!(
+            copilot_argv,
+            vec![
+                "copilot",
+                "-p",
+                "name this",
+                "--model",
+                "claude-haiku-4.5",
+                "-s",
+                "--allow-all-tools",
+                "--no-ask-user"
+            ]
+        );
+
+        // gemini and kimi `-p` are value-binding (verified), so the model
+        // selector must trail the prompt, exactly like copilot.
+        let mut vb_models = HashMap::new();
+        vb_models.insert("gemini".to_string(), "gemini-2.5-flash".to_string());
+        vb_models.insert("kimi".to_string(), "moonshot-v1-8k".to_string());
+        let gemini = agents::get_agent("gemini").unwrap();
+        assert_eq!(
+            build_oneshot_argv(
+                gemini,
+                "name this",
+                OneshotModel::Title(resolve_title_model_args(gemini, &vb_models)),
+            )
+            .expect("gemini one-shot"),
+            vec!["gemini", "-p", "name this", "-m", "gemini-2.5-flash"]
+        );
+        let kimi = agents::get_agent("kimi").unwrap();
+        assert_eq!(
+            build_oneshot_argv(
+                kimi,
+                "name this",
+                OneshotModel::Title(resolve_title_model_args(kimi, &vb_models)),
+            )
+            .expect("kimi one-shot"),
+            vec!["kimi", "-p", "name this", "-m", "moonshot-v1-8k"]
+        );
+
+        // opencode `run` takes a positional prompt, so its model selector goes
+        // before the prompt.
+        let mut oc_models = HashMap::new();
+        oc_models.insert(
+            "opencode".to_string(),
+            "anthropic/claude-haiku-4-5".to_string(),
+        );
+        let opencode = agents::get_agent("opencode").unwrap();
+        assert_eq!(
+            build_oneshot_argv(
+                opencode,
+                "name this",
+                OneshotModel::Title(resolve_title_model_args(opencode, &oc_models)),
+            )
+            .expect("opencode one-shot"),
+            vec![
+                "opencode",
+                "run",
+                "-m",
+                "anthropic/claude-haiku-4-5",
+                "name this"
+            ]
+        );
+    }
+
+    #[test]
     fn resolve_title_model_args_precedence() {
         let claude = claude();
         let codex = agents::get_agent("codex").unwrap();
         let mut models = HashMap::new();
+        // Absent key -> built-in default (claude pins haiku; codex has none).
         assert_eq!(
             resolve_title_model_args(claude, &models),
             vec!["--model", "haiku"]
         );
         assert!(resolve_title_model_args(codex, &models).is_empty());
+        // Non-empty override -> that model via the agent's flag.
         models.insert("claude".to_string(), "opus".to_string());
         models.insert("codex".to_string(), "gpt-5".to_string());
         assert_eq!(
@@ -1667,8 +2178,10 @@ mod tests {
             resolve_title_model_args(codex, &models),
             vec!["-m", "gpt-5"]
         );
+        // Empty (or whitespace) value -> force CLI default (opt out of haiku).
         models.insert("claude".to_string(), "  ".to_string());
         assert!(resolve_title_model_args(claude, &models).is_empty());
+        // A padded non-empty value is trimmed before it is pinned.
         models.insert("claude".to_string(), "  opus  ".to_string());
         assert_eq!(
             resolve_title_model_args(claude, &models),
@@ -1677,75 +2190,98 @@ mod tests {
     }
 
     #[test]
-    fn the_rename_agent_and_its_override_gate_resolve_independently_of_the_session() {
-        let none = HashMap::new();
-        let resolve = |rename_agent: &str, command: &str, overrides: &HashMap<String, String>| {
-            check_eligible_resolved(
-                true,
-                true,
-                false,
-                "Vikings",
-                "claude",
-                rename_agent,
-                false,
-                command,
-                overrides,
-            )
-            .map(|agent| agent.binary)
-        };
-        assert_eq!(resolve("", "", &none), Ok("claude"));
-        assert_eq!(resolve("codex", "", &none), Ok("codex"));
-        assert_eq!(
-            resolve("not-a-real-agent", "", &none),
-            Err(SkipReason::NoOneshot)
-        );
-
-        // The override that matters is the one on the agent actually being run.
-        let claude_override = HashMap::from([("claude".to_string(), "my-wrapper".to_string())]);
-        assert_eq!(
-            resolve("", "", &claude_override),
-            Err(SkipReason::CommandOverridden)
-        );
-        assert_eq!(resolve("codex", "", &claude_override), Ok("codex"));
-        let codex_override = HashMap::from([("codex".to_string(), "my-codex".to_string())]);
-        assert_eq!(
-            resolve("codex", "", &codex_override),
-            Err(SkipReason::CommandOverridden)
-        );
-
-        assert!(
-            check_eligible_resolved(
-                true, true, false, "Vikings", "opencode", "claude", false, "opencode", &none
-            )
-            .is_ok(),
-            "the session's own command is irrelevant to a distinct rename agent"
-        );
-
-        // A sandboxed session may only be named by its own agent.
-        let sandboxed = |rename_agent: &str| {
-            check_eligible_resolved(
-                true,
-                true,
-                false,
-                "Vikings",
-                "claude",
-                rename_agent,
-                true,
-                "",
-                &none,
-            )
-        };
-        assert!(sandboxed("").is_ok(), "its own agent is fine");
-        assert!(matches!(
-            sandboxed("codex"),
-            Err(SkipReason::SandboxRenameAgentMismatch)
-        ));
-        assert!(
-            matches!(sandboxed("cursor"), Err(SkipReason::NoOneshot)),
-            "an agent with no one-shot mode reports that, not the sandbox gate"
-        );
+    fn resolved_unset_uses_session_agent() {
+        let overrides = HashMap::new();
+        // Unset rename agent => resolves to the session's claude agent.
+        let agent = check_eligible_resolved(
+            true, true, false, "Vikings", "claude", "", false, "", &overrides,
+        )
+        .expect("eligible");
+        assert_eq!(agent.binary, "claude");
     }
 
+    #[test]
+    fn resolved_picks_distinct_rename_agent() {
+        let overrides = HashMap::new();
+        let agent = check_eligible_resolved(
+            true, true, false, "Vikings", "claude", "codex", false, "", &overrides,
+        )
+        .expect("eligible");
+        assert_eq!(agent.binary, "codex");
+    }
+
+    #[test]
+    fn resolved_override_gate_targets_the_right_agent() {
+        // A session-agent command override only blocks when the rename agent IS
+        // the session agent.
+        let mut overrides = HashMap::new();
+        overrides.insert("claude".to_string(), "my-wrapper".to_string());
+        assert!(matches!(
+            check_eligible_resolved(
+                true, true, false, "Vikings", "claude", "", false, "", &overrides
+            ),
+            Err(SkipReason::CommandOverridden)
+        ));
+        // ...but when the rename agent is a DIFFERENT agent (codex), the
+        // session's claude override is irrelevant: the one-shot launches codex
+        // fresh, so it stays eligible.
+        assert!(check_eligible_resolved(
+            true, true, false, "Vikings", "claude", "codex", false, "", &overrides
+        )
+        .is_ok());
+        // An override of the RENAME agent's own binary does block it.
+        let mut codex_override = HashMap::new();
+        codex_override.insert("codex".to_string(), "my-codex".to_string());
+        assert!(matches!(
+            check_eligible_resolved(
+                true,
+                true,
+                false,
+                "Vikings",
+                "claude",
+                "codex",
+                false,
+                "",
+                &codex_override
+            ),
+            Err(SkipReason::CommandOverridden)
+        ));
+    }
+
+    #[test]
+    fn resolved_session_command_ignored_for_distinct_rename_agent() {
+        // The instance's launch command (for the session agent) must not be
+        // matched against a different rename agent's binary.
+        let overrides = HashMap::new();
+        assert!(check_eligible_resolved(
+            true, true, false, "Vikings", "opencode", "claude", false, "opencode", &overrides
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn resolved_unknown_rename_agent_is_no_oneshot() {
+        let overrides = HashMap::new();
+        assert!(matches!(
+            check_eligible_resolved(
+                true,
+                true,
+                false,
+                "Vikings",
+                "claude",
+                "not-a-real-agent",
+                false,
+                "",
+                &overrides
+            ),
+            Err(SkipReason::NoOneshot)
+        ));
+    }
+
+    // Reproduces the real Claude Code v2.1.216 startup banner shape: a
+    // two-column box titled `Claude Code v<ver>` (identity + logo on the left,
+    // tips / what's-new on the right), then a `⚠ ... MCP servers ...` notice,
+    // then the actual conversation. Captured from a live `claude` launch.
     const CLAUDE_BANNER_TRANSCRIPT: &str = "\
 ╭─── Claude Code v2.1.216 ──────────────────────────────────────────────────╮
 │                                    │ Tips for getting started             │
@@ -1771,15 +2307,49 @@ Patched the race in auth.rs and added a regression test.";
         assert!(lc.contains("startup banner") && lc.contains("ignore"));
 
         let stripped = strip_agent_banner(CLAUDE_BANNER_TRANSCRIPT, "claude");
+        // The box, its wording, the logo, and the MCP notice are gone.
         assert!(!stripped.contains("Claude Code v"));
         assert!(!stripped.contains("Welcome back"));
         assert!(!stripped.contains("Tips for getting started"));
         assert!(!stripped.contains("What's new"));
         assert!(!stripped.contains("MCP servers"));
         assert!(!stripped.contains('╭') && !stripped.contains('│') && !stripped.contains('█'));
+        // The real conversation survives.
         assert!(stripped.contains("fix the flaky login redirect test"));
         assert!(stripped.contains("Patched the race in auth.rs"));
+    }
 
+    #[test]
+    fn strip_agent_banner_is_noop_for_other_agents() {
+        // A non-claude agent keeps the text verbatim (no verified signature).
+        assert_eq!(
+            strip_agent_banner(CLAUDE_BANNER_TRANSCRIPT, "codex"),
+            CLAUDE_BANNER_TRANSCRIPT
+        );
+    }
+
+    #[test]
+    fn strip_agent_banner_is_noop_without_claude_code_mention() {
+        // Real transcript that never names the tool is untouched, even for claude.
+        let plain = "> refactor the payment retry loop\n\nDone: added a backoff and a test.";
+        assert_eq!(strip_agent_banner(plain, "claude"), plain);
+    }
+
+    #[test]
+    fn strip_agent_banner_keeps_content_merely_mentioning_claude_code() {
+        // The gate matches "claude code", but a task ABOUT Claude Code with no
+        // leading banner box must be preserved: the line filter only strips an
+        // actual leading run of chrome, so `in_banner` flips off on line 1.
+        let about = "> make the Claude Code onboarding docs clearer\n\n\
+Rewrote the getting-started section and fixed two broken links.";
+        assert_eq!(strip_agent_banner(about, "claude"), about);
+    }
+
+    #[test]
+    fn strip_agent_banner_falls_back_when_only_banner() {
+        // A pane that is nothing but banner must not strip down to empty; keep
+        // the original so the caller still has something (and the instruction
+        // prose can do its job) rather than skipping on an empty capture.
         let banner_only = "\
 ╭─── Claude Code v2.1.216 ──────────╮
 │         Welcome back Nathan!      │
@@ -1787,25 +2357,12 @@ Patched the race in auth.rs and added a regression test.";
 ╰────────────────────────────────────╯
 
  ⚠ 3 MCP servers need authentication · run /mcp";
-        for (case, text, tool) in [
-            ("another agent", CLAUDE_BANNER_TRANSCRIPT, "codex"),
-            (
-                "no claude code mention",
-                "> refactor the payment retry loop\n\nDone: added a backoff and a test.",
-                "claude",
-            ),
-            (
-                "content about claude code",
-                "> make the Claude Code onboarding docs clearer\n\n\
-Rewrote the getting-started section and fixed two broken links.",
-                "claude",
-            ),
-            ("nothing but banner", banner_only, "claude"),
-        ] {
-            assert_eq!(strip_agent_banner(text, tool), text, "{case}");
-        }
+        assert_eq!(strip_agent_banner(banner_only, "claude"), banner_only);
     }
 
+    /// Framing, per-half capping and the prompt bound in one place: these are
+    /// the three properties of the first turn that must hold together, since a
+    /// regression in any one of them silently degrades the rename.
     #[test]
     fn first_turn_and_prompt_are_framed_and_bounded() {
         let r = render_first_turn("fix the login bug", "Patched the redirect in auth.rs");
@@ -1833,54 +2390,120 @@ Rewrote the getting-started section and fixed two broken links.",
         let p = build_prompt(&msg);
         assert!(p.contains("start"));
         assert!(!p.contains('\u{0}'));
+        // Instruction + capped body, well under message length.
         assert!(p.len() < 5000 + INSTRUCTION.len() + 64);
     }
 
     #[test]
-    fn sanitize_title_accepts_one_clean_line_and_rejects_the_rest() {
-        // Raw agent stdout, and the title kept from it.
-        let kept: &[(&str, &str)] = &[
-            ("Fix login bug", "Fix login bug"),
-            ("**\"Refactor auth module.\"**", "Refactor auth module"),
-            ("- Update README", "Update README"),
-            ("1. Add dark mode", "Add dark mode"),
-            ("\u{1b}[32mGreen title here\u{1b}[0m", "Green title here"),
-            // The last qualifying line wins over preamble and log noise.
-            (
-                "Sure, here is a concise title:\n\nFix login redirect bug\n",
-                "Fix login redirect bug",
-            ),
-            (
-                "[2024] booting agent\nthinking...\nWire up websockets\n",
-                "Wire up websockets",
-            ),
-        ];
-        for (raw, want) in kept {
-            assert_eq!(sanitize_title(raw, "x").as_deref(), Some(*want), "{raw:?}");
-        }
-
-        let too_wordy = "a ".repeat(20);
-        let too_long = "z".repeat(80);
-        let rejected = [
-            "I cannot help with that",
-            "Sorry, no.",
-            "NONE",
-            "   \n  ",
-            too_wordy.as_str(),
-            too_long.as_str(),
-            "12345",
-        ];
-        for raw in rejected {
-            assert!(sanitize_title(raw, "x").is_none(), "{raw:?}");
-        }
-        assert!(
-            sanitize_title("fix the thing", "fix the thing").is_none(),
-            "a title echoing the prompt is not a title"
+    fn sanitize_picks_title_from_chatty_output() {
+        // The tightened instruction asks for the bare title, but a chatty agent
+        // may still wrap it; the last qualifying line is the title.
+        let raw = "Sure, here is a concise title:\n\nFix login redirect bug\n";
+        assert_eq!(
+            sanitize_title(raw, "fix the login redirect").as_deref(),
+            Some("Fix login redirect bug")
         );
     }
 
-    // Regression for: pins the shared helper that both `try_smart_rename` and the sidebar indicator
-    // overlay in `src/server/api/sessions/list.rs` route through.
+    #[test]
+    fn argv_per_agent_tokens() {
+        assert_eq!(
+            build_oneshot_argv(
+                agents::get_agent("codex").unwrap(),
+                "x",
+                OneshotModel::CliDefault
+            )
+            .unwrap()[1],
+            "exec"
+        );
+        assert_eq!(
+            build_oneshot_argv(
+                agents::get_agent("opencode").unwrap(),
+                "x",
+                OneshotModel::CliDefault
+            )
+            .unwrap()[1],
+            "run"
+        );
+        assert_eq!(
+            build_oneshot_argv(
+                agents::get_agent("gemini").unwrap(),
+                "x",
+                OneshotModel::CliDefault
+            )
+            .unwrap()[1],
+            "-p"
+        );
+    }
+
+    #[test]
+    fn sanitize_plain_title() {
+        assert_eq!(
+            sanitize_title("Fix login bug", "whatever").as_deref(),
+            Some("Fix login bug")
+        );
+    }
+
+    #[test]
+    fn sanitize_strips_quotes_markdown_punctuation() {
+        assert_eq!(
+            sanitize_title("**\"Refactor auth module.\"**", "x").as_deref(),
+            Some("Refactor auth module")
+        );
+        assert_eq!(
+            sanitize_title("- Update README", "x").as_deref(),
+            Some("Update README")
+        );
+        assert_eq!(
+            sanitize_title("1. Add dark mode", "x").as_deref(),
+            Some("Add dark mode")
+        );
+    }
+
+    #[test]
+    fn sanitize_picks_last_qualifying_line_from_verbose_output() {
+        let raw = "[2024] booting agent\nthinking...\nWire up websockets\n";
+        assert_eq!(
+            sanitize_title(raw, "x").as_deref(),
+            Some("Wire up websockets")
+        );
+    }
+
+    #[test]
+    fn sanitize_strips_ansi() {
+        let raw = "\u{1b}[32mGreen title here\u{1b}[0m";
+        assert_eq!(
+            sanitize_title(raw, "x").as_deref(),
+            Some("Green title here")
+        );
+    }
+
+    #[test]
+    fn sanitize_rejects_refusals_none_empty_and_echo() {
+        assert!(sanitize_title("I cannot help with that", "x").is_none());
+        assert!(sanitize_title("Sorry, no.", "x").is_none());
+        assert!(sanitize_title("NONE", "x").is_none());
+        assert!(sanitize_title("   \n  ", "x").is_none());
+        assert!(sanitize_title("fix the thing", "fix the thing").is_none());
+    }
+
+    #[test]
+    fn sanitize_rejects_too_long_or_wordy() {
+        assert!(sanitize_title("a ".repeat(20).trim(), "x").is_none());
+        assert!(sanitize_title(&"z".repeat(80), "x").is_none());
+        // Numeric-only is not a title.
+        assert!(sanitize_title("12345", "x").is_none());
+    }
+
+    // Regression for #2351: pins the shared helper that both `try_smart_rename`
+    // and the sidebar indicator overlay in `src/server/api/sessions/list.rs` route
+    // through. The helper is verified in isolation here; call-site coverage is
+    // design-level (reverting either site to bypass the helper is visible in
+    // review because both explicitly name `resolve_smart_rename_config`).
+    //
+    // Also pins the repo boundary from #3154: the utility agent and the command
+    // override are global/profile only, so a checked-out repo cannot redirect
+    // the one-shot at another agent or swap the binary it launches.
     #[test]
     #[serial_test::serial]
     fn resolve_smart_rename_config_reads_repo_aware_config_but_not_repo_commands() {
@@ -1927,6 +2550,9 @@ claude = "repo-wrapper"
             "default",
             repo.path(),
         );
+        // Pins that the repo file was actually discovered: an allowed field
+        // from it lands, so the assertions below are about the boundary and
+        // not about a fixture that silently never loaded.
         assert_eq!(
             resolved
                 .session
@@ -1938,7 +2564,7 @@ claude = "repo-wrapper"
         let cfg = resolve_smart_rename_config(
             &resolved.session,
             crate::session::projects::find_by_canonical_path("default", repo.path())
-                .and_then(|p| p.overrides.smart_rename),
+                .and_then(|project| project.overrides.smart_rename),
         );
         assert_eq!(
             cfg.rename_agent, "opencode",
@@ -1970,7 +2596,6 @@ claude = "repo-wrapper"
     fn resolve_smart_rename_config_honors_project_override() {
         let home = tempfile::tempdir().expect("tempdir HOME");
         let _home_guard = crate::session::test_support::isolate_home(home.path());
-
         let repo = tempfile::tempdir().expect("tempdir repo");
         crate::session::projects::add(
             "default",
@@ -1987,7 +2612,7 @@ claude = "repo-wrapper"
             "default",
             crate::session::ProjectScope::Global,
             "demo",
-            |ov| ov.smart_rename = Some(false),
+            |overrides| overrides.smart_rename = Some(false),
         )
         .expect("set override");
 
@@ -1998,19 +2623,20 @@ claude = "repo-wrapper"
         let cfg = resolve_smart_rename_config(
             &resolved.session,
             crate::session::projects::find_by_canonical_path("default", repo.path())
-                .and_then(|p| p.overrides.smart_rename),
+                .and_then(|project| project.overrides.smart_rename),
         );
-        assert!(
-            !cfg.setting_on,
-            "project override (false) should win over the global default (true, per mod.rs's smart_rename default)"
-        );
+        assert!(!cfg.setting_on);
     }
+
+    // ---- Terminal (non-ACP) smart rename ----
 
     #[test]
     fn terminal_context_helpers() {
         assert!(context_looks_usable("Fix the login bug in auth.rs"));
         assert!(!context_looks_usable(""));
+        // No letters.
         assert!(!context_looks_usable("12345 6789 %%%"));
+        // Control-char dominated (garbled/binary pane): keep the civ name.
         let garbled: String = std::iter::repeat_n('\u{7}', 50)
             .chain("ab".chars())
             .collect();
@@ -2030,6 +2656,10 @@ claude = "repo-wrapper"
         assert_eq!(extract_echo_baseline(""), "");
     }
 
+    /// Explicit named skip for tests that need a live tmux server. Returns
+    /// `true` when tmux is usable; otherwise prints a per-test skip line and
+    /// the caller early-returns, so a tmux-less environment reports the skip
+    /// instead of silently asserting nothing.
     fn require_tmux(test: &str) -> bool {
         let available = crate::tmux::tmux_command()
             .arg("-V")
@@ -2092,7 +2722,8 @@ claude = "repo-wrapper"
             let _observer =
                 crate::session::storage::observe_lock_contention_for_test(identity_contended_tx);
             let storage = Storage::new_unwatched("identity-lock").unwrap();
-            apply_terminal_title(&storage, &writer_id, Some("Shared title"), false).unwrap();
+            apply_terminal_title(&storage, &writer_id, Some("Shared title".to_owned()), false)
+                .unwrap();
             finished_tx.send(()).unwrap();
         });
         let contended = identity_contended_rx.recv_timeout(std::time::Duration::from_secs(2));
@@ -2124,6 +2755,7 @@ claude = "repo-wrapper"
         let storage = Storage::new_unwatched("default").expect("storage");
         let civ = Instance::new("Vikings", "/tmp/x");
         let civ_id = civ.id.clone();
+
         let mut manual = Instance::new("Britons", "/tmp/y");
         manual.title = "Hand-picked".to_string();
         let manual_id = manual.id.clone();
@@ -2141,10 +2773,28 @@ claude = "repo-wrapper"
             })
             .unwrap();
 
-        apply_terminal_title(&storage, &civ_id, Some("Fix login bug"), false).unwrap();
-        apply_terminal_title(&storage, &manual_id, Some("Should Not Apply"), false).unwrap();
-        apply_terminal_title(&storage, &forced_id, Some("Regenerated title"), true).unwrap();
-        apply_terminal_title(&storage, &duplicate_id, Some("Already owned"), false).unwrap();
+        apply_terminal_title(&storage, &civ_id, Some("Fix login bug".to_owned()), false).unwrap();
+        apply_terminal_title(
+            &storage,
+            &manual_id,
+            Some("Should Not Apply".to_owned()),
+            false,
+        )
+        .unwrap();
+        apply_terminal_title(
+            &storage,
+            &forced_id,
+            Some("Regenerated title".to_owned()),
+            true,
+        )
+        .unwrap();
+        apply_terminal_title(
+            &storage,
+            &duplicate_id,
+            Some("Already owned".to_owned()),
+            false,
+        )
+        .unwrap();
 
         let instances = storage.load().unwrap();
         let row = |id: &str| instances.iter().find(|i| i.id == id).unwrap();
@@ -2200,12 +2850,21 @@ claude = "repo-wrapper"
             None
         };
 
-        storage.set_fail_writes_for_test(true);
-        let error = apply_terminal_title(&storage, &failed_id, Some("Must Not Land"), false)
+        // Scoped: the injection is process-wide, so the guard must drop before
+        // the assertions that read storage back.
+        {
+            let _failing_writes = storage.fail_writes_for_test();
+            let error = apply_terminal_title(
+                &storage,
+                &failed_id,
+                Some("Must Not Land".to_owned()),
+                false,
+            )
             .expect_err("injected persistence failure must abort the title mutation");
-        assert!(error
-            .to_string()
-            .contains("injected sessions write failure"));
+            assert!(error
+                .to_string()
+                .contains("injected sessions write failure"));
+        }
 
         let failed = storage
             .load()
@@ -2261,7 +2920,7 @@ claude = "repo-wrapper"
         );
         crate::tmux::refresh_session_cache();
 
-        apply_terminal_title(&storage, &civ_id, Some("Fix login bug"), false).unwrap();
+        apply_terminal_title(&storage, &civ_id, Some("Fix login bug".to_owned()), false).unwrap();
 
         assert!(!crate::tmux::Session::from_name(&old_tmux_name).exists());
         assert!(

@@ -34,6 +34,7 @@ function setup(over: { selectedPaths?: string[]; repoBases?: Record<string, stri
   const onRepoBasesChange = vi.fn();
   const { container } = render(
     <ExtraReposPicker
+      profile="default"
       primaryPath="/repos/primary"
       selectedPaths={over.selectedPaths ?? []}
       onChange={onChange}

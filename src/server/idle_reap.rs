@@ -66,7 +66,7 @@ pub(super) async fn reap_idle_sessions(
     for cand in candidates {
         let sem = sem.clone();
         let file_watch = state.file_watch.clone();
-        tokio::spawn(async move {
+        state.runtime.work.spawn("server.idle_reap", async move {
             let _permit = sem.acquire().await;
             let claim = {
                 let cand = cand.clone();

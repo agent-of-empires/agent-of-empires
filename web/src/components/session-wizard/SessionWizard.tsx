@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useReducer, useState } from "react";
-import type { CreateSessionRequest, SessionResponse } from "../../lib/types";
+import type { CreateSessionRequest, SessionResponse, CreationTrustFingerprint } from "../../lib/types";
 import {
   fetchAgents,
   fetchGroups,
@@ -8,6 +8,7 @@ import {
   fetchProjects,
   fetchSettings,
   createSession,
+  reviewCreationTrust,
   fetchVolumeIgnoresPreview,
   fetchIsGitRepo,
   markVolumeIgnoresGlobsAcknowledged,
@@ -122,6 +123,8 @@ export function SessionWizard({ onClose, onCreated, prefill, nameOnly = false }:
     info: HooksNeedTrust;
     body: CreateSessionRequest;
     tool: string;
+    fingerprint: CreationTrustFingerprint;
+    mcpSummaries: string[];
   } | null>(null);
   // A remembered path satisfies the submit gate at mount, so Launch waits for
   // the defaults below rather than sending initialData's sandbox/worktree/yolo.
@@ -132,28 +135,29 @@ export function SessionWizard({ onClose, onCreated, prefill, nameOnly = false }:
     fetchAgents().then((a) => dispatch({ type: "SET_AGENTS", agents: a }));
     fetchGroups().then((g) => dispatch({ type: "SET_GROUPS", groups: g }));
     fetchDockerStatus().then((d) => dispatch({ type: "SET_DOCKER", available: d.available }));
-    // A remembered or prefilled path is never selected in ProjectStep, so seed its override here.
+    // Seed resolved profile defaults and the remembered project override together.
     const initialPath = state.data.path;
-    const projectSeed = initialPath
-      ? fetchProjects()
-          .then((projects) => {
-            const key = normalizeProjectPathKey(initialPath);
-            const override = projects.find((p) => normalizeProjectPathKey(p.path) === key)?.overrides?.worktree_enabled;
-            if (override !== undefined) {
-              dispatch({ type: "SEED_PROJECT_WORKTREE_OVERRIDE", override, path: initialPath });
-            }
-          })
-          .catch(() => {})
-      : Promise.resolve();
-    // Seed resolved profile defaults: the profile picker is hidden for single-profile users.
-    const settingsSeed = fetchProfiles()
+    const defaultsSeed = fetchProfiles()
       // A failed profiles fetch must not skip settings: an explicit prefill
       // profile, or the unresolved global config, still applies.
       .catch(() => [] as Awaited<ReturnType<typeof fetchProfiles>>)
-      .then((p) => {
-        dispatch({ type: "SET_PROFILES", profiles: p });
-        const effectiveProfile = prefill?.profile || p.find((x) => x.is_default)?.name || "";
-        return fetchSettings(effectiveProfile || undefined);
+      .then((profiles) => {
+        dispatch({ type: "SET_PROFILES", profiles });
+        const effectiveProfile = prefill?.profile || profiles.find((profile) => profile.is_default)?.name || "";
+        const projectSeed =
+          initialPath && effectiveProfile
+            ? fetchProjects({ profile: effectiveProfile })
+                .then((projects) => {
+                  const key = normalizeProjectPathKey(initialPath);
+                  const override = projects?.find((project) => normalizeProjectPathKey(project.path) === key)?.overrides
+                    ?.worktree_enabled;
+                  if (override !== undefined) {
+                    dispatch({ type: "SEED_PROJECT_WORKTREE_OVERRIDE", override, path: initialPath });
+                  }
+                })
+                .catch(() => {})
+            : Promise.resolve();
+        return Promise.all([fetchSettings(effectiveProfile || undefined), projectSeed]).then(([settings]) => settings);
       })
       .then((s) => {
         if (!s) return;
@@ -171,7 +175,7 @@ export function SessionWizard({ onClose, onCreated, prefill, nameOnly = false }:
         });
       })
       .catch(() => {});
-    void Promise.all([settingsSeed, projectSeed]).then(() => setDefaultsReady(true));
+    void defaultsSeed.then(() => setDefaultsReady(true));
     // Seed once; a re-render with a new prefill object must not stomp user edits.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -201,6 +205,41 @@ export function SessionWizard({ onClose, onCreated, prefill, nameOnly = false }:
     dispatch({ type: "APPLY_PROFILE_DEFAULTS", ...rest });
   }, []);
 
+  const openHooksTrust = async (body: CreateSessionRequest, tool: string) => {
+    const review = await reviewCreationTrust({
+      path: body.path,
+      profile: body.profile,
+      scratch: body.scratch,
+    });
+    if (!review.ok) {
+      dispatch({ type: "SUBMIT_ERROR", error: review.error });
+      return;
+    }
+    if (!review.review.hooks_need_trust && !review.review.mcp_need_trust) {
+      await runCreate(
+        {
+          ...body,
+          trust_hooks: undefined,
+          trust_review: undefined,
+        },
+        tool,
+      );
+      return;
+    }
+    setHooksTrust({
+      info: {
+        onCreate: review.review.merged_hooks.on_create ?? [],
+        onLaunch: review.review.merged_hooks.on_launch ?? [],
+        onDestroy: review.review.merged_hooks.on_destroy ?? [],
+        needsMcpTrust: review.review.mcp_need_trust,
+      },
+      body,
+      tool,
+      fingerprint: review.review.fingerprint,
+      mcpSummaries: review.review.mcp_summaries,
+    });
+  };
+
   const runCreate = async (body: CreateSessionRequest, tool: string) => {
     const result = await createSession(body);
     if (result.ok) {
@@ -210,9 +249,17 @@ export function SessionWizard({ onClose, onCreated, prefill, nameOnly = false }:
       if (body.path.startsWith("/")) safeSetItem(LAST_USED_PROJECT_KEY, body.path);
       for (const w of result.session?.warnings ?? []) toastBus.handler?.error(w);
       onCreated(result.session);
+    } else if (result.trustChanged) {
+      await openHooksTrust(
+        {
+          ...body,
+          trust_hooks: undefined,
+          trust_review: undefined,
+        },
+        tool,
+      );
     } else if (result.hooksNeedTrust && !body.trust_hooks) {
-      // The trust_hooks guard stops a loop if the server refuses again after opting in.
-      setHooksTrust({ info: result.hooksNeedTrust, body, tool });
+      await openHooksTrust(body, tool);
     } else {
       dispatch({ type: "SUBMIT_ERROR", error: result.error || "Unknown error" });
     }
@@ -257,7 +304,7 @@ export function SessionWizard({ onClose, onCreated, prefill, nameOnly = false }:
     const pending = hooksTrust;
     if (!pending) return;
     setHooksTrust(null);
-    await runCreate({ ...pending.body, trust_hooks: true }, pending.tool);
+    await runCreate({ ...pending.body, trust_hooks: true, trust_review: pending.fingerprint }, pending.tool);
   };
 
   return (
@@ -281,6 +328,7 @@ export function SessionWizard({ onClose, onCreated, prefill, nameOnly = false }:
           {!nameOnly && (
             <ProjectStep
               data={state.data}
+              profile={state.data.profile || state.profiles.find((profile) => profile.is_default)?.name}
               onChange={handleChange}
               initialTab={prefill?.initialTab}
               agents={state.agents}
@@ -370,6 +418,7 @@ export function SessionWizard({ onClose, onCreated, prefill, nameOnly = false }:
           onLaunch={hooksTrust.info.onLaunch}
           onDestroy={hooksTrust.info.onDestroy}
           needsMcpTrust={hooksTrust.info.needsMcpTrust}
+          mcpSummaries={hooksTrust.mcpSummaries}
           onConfirm={handleHooksTrustConfirm}
           onCancel={cancelPending}
         />

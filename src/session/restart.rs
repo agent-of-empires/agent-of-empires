@@ -1,4 +1,10 @@
 //! Shared session restart logic.
+//!
+//! Restarting a session re-runs the start cascade. For sandboxed sessions that
+//! shells out to Docker (image pull with no built-in timeout, container
+//! create/start) and runs the `before_start` host hook, any of which can block
+//! for seconds. The daemon runs it off the caller's thread; the TUI submits
+//! it as a runtime mutation.
 
 use crate::session::{Instance, StartOutcome};
 
@@ -13,9 +19,13 @@ pub struct RestartRequest {
     pub wake_message: String,
     /// Skip on_launch hooks that already ran in the background creation poller.
     pub skip_on_launch: bool,
-    /// Kill a hook that outlives the recovery hook timeout, so a hung hook cannot wedge the worker.
+    /// Kill a hook that outlives the recovery hook timeout, so a hung hook
+    /// cannot wedge the worker. Unset for the launch behind Enter or a new
+    /// session, whose hooks have always run unbounded.
     pub bound_hooks: bool,
-    /// Remove the sandbox container before relaunching, so the next start creates a fresh one.
+    /// Remove the sandbox container before relaunching, so the next start
+    /// creates a fresh one. Set on a tool swap: launch recreates a container
+    /// labelled for another tool, but not one created before that label (#3959).
     pub discard_sandbox_container: bool,
     /// Copy the conversation into the incoming account's agent config root.
     /// Set on a swap that changes only the account (#4030); planned against the
@@ -29,7 +39,10 @@ pub struct RestartResult {
     /// Pre-cascade snapshot used as a compare-and-swap baseline when merging
     /// peer-writable identity fields back into a live row.
     pub before: Box<Instance>,
-    /// Post-cascade instance snapshot.
+    /// Post-cascade instance snapshot. Written back into the TUI's in-memory
+    /// copy so `#[serde(skip)]` fields (e.g. `last_start_time`) and the
+    /// cascade's mutations (cleared stale `agent_session_id`, container id)
+    /// survive without a disk reload.
     pub instance: Box<Instance>,
     pub outcome: Result<StartOutcome, String>,
 }
@@ -50,9 +63,11 @@ pub fn perform_restart(request: RestartRequest) -> RestartResult {
     let tool = instance.tool.clone();
     let before = instance.clone();
 
-    // With `bound_hooks`, honor the on_launch / before_start hook timeout the startup-recovery
-    // worker installs (`run_recovery_for_instance`), so a hanging hook (e.g. a `mint` script
-    // waiting on the network) cannot wedge this serial worker.
+    // With `bound_hooks`, honor the on_launch / before_start hook timeout the
+    // startup-recovery worker installs (`run_recovery_for_instance`), so a
+    // hanging hook (e.g. a `mint` script waiting on the network) cannot wedge
+    // this serial worker. Enter and new-session launches opt out to keep their
+    // hooks unbounded; a hang there stalls later restarts until the hook exits.
     let outcome = {
         let _scope = bound_hooks.then(|| {
             crate::session::recovery::HookTimeoutScope::new(
@@ -69,12 +84,12 @@ pub fn perform_restart(request: RestartRequest) -> RestartResult {
             .map_err(|e| e.to_string())
     };
 
-    // On a successful restart, send the wake-up keys on a detached thread so the result (and the
-    // row's status update) propagate back immediately rather than waiting out the up-to-3s
-    // pane-readiness probe.
+    // On a successful restart, send the wake-up keys on a detached thread so
+    // the result (and the row's status update) propagate back immediately
+    // rather than waiting out the up-to-3s pane-readiness probe.
     let should_wake = launched_agent(&outcome);
     if should_wake && !wake_message.is_empty() {
-        spawn_wake_worker(session_id.clone(), title, tool, wake_message);
+        spawn_wake_worker(session_id.clone(), title, tool, wake_message, None);
     }
 
     RestartResult {
@@ -95,9 +110,16 @@ pub(crate) fn launched_agent(outcome: &Result<StartOutcome, String>) -> bool {
     )
 }
 
-/// Wait for the restarted pane to become live and past its boot shell, then send the wake-up
-/// message.
-fn spawn_wake_worker(session_id: String, title: String, tool: String, wake_message: String) {
+/// Wait for the restarted pane to become live and past its boot shell, then
+/// send the wake-up message. Best-effort: a failure to spawn or send is logged,
+/// never fatal.
+pub(crate) fn spawn_wake_worker(
+    session_id: String,
+    title: String,
+    tool: String,
+    wake_message: String,
+    identity: Option<(String, u64)>,
+) {
     let spawn_result = std::thread::Builder::new()
         .name(format!("aoe-restart-wake/{}", session_id))
         .stack_size(128 * 1024)
@@ -125,6 +147,20 @@ fn spawn_wake_worker(session_id: String, title: String, tool: String, wake_messa
                 return;
             }
             let delay = crate::agents::send_keys_enter_delay(&tool);
+            if let Some((profile, generation)) = identity {
+                let current = crate::session::Storage::new_unwatched(&profile)
+                    .and_then(|storage| storage.load())
+                    .ok()
+                    .is_some_and(|rows| rows.iter().any(|row| {
+                        row.id == session_id
+                            && row.lifecycle_generation == generation
+                            && row.title == title
+                            && row.tool == tool
+                    }));
+                if !current {
+                    return;
+                }
+            }
             if let Err(e) = tmux_session.send_keys_with_delay(&wake_message, delay) {
                 tracing::warn!(target: "session.restart", "failed to send wake-up message after restart: {}", e);
             }
@@ -142,6 +178,8 @@ mod tests {
         Instance::new("Test Session", "/tmp/test-project")
     }
 
+    /// A tool-swap restart must not remove a container whose session a peer
+    /// lifecycle operation still owns (#3972).
     #[cfg(unix)]
     #[test]
     #[serial_test::serial]
@@ -154,6 +192,8 @@ mod tests {
         let bin = temp.path().join("bin");
         std::fs::create_dir(&bin).unwrap();
         let calls = temp.path().join("runtime-calls");
+        // Record every runtime call; only removal succeeds, so an owned
+        // relaunch stops at container creation instead of reaching tmux.
         for binary in ["docker", "podman", "container"] {
             let script = bin.join(binary);
             std::fs::write(

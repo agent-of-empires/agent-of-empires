@@ -272,6 +272,10 @@ impl<S: BroadcastSink> Supervisor<S> {
         }
     }
 
+    pub(crate) fn max_concurrent_workers(&self) -> u32 {
+        self.max_concurrent_workers
+    }
+
     /// Flag a build-stale worker kept alive to finish its turn.
     pub fn mark_build_respawn_pending(&self, session_id: &str) {
         lock_recover(&self.respawn_pending).insert(session_id.to_string());

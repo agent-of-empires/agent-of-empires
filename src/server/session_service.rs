@@ -1,14 +1,26 @@
 //! Shared session-domain service handle.
+//!
+//! Holds the narrow set of daemon state the session create/turn paths need
+//! (live instances, ACP supervisor, storage file-watch, per-instance locks,
+//! telemetry counter), so those paths can be driven by callers that do not
+//! hold the HTTP `AppState`: today the HTTP handlers, next the plugin host
+//! RPCs (#2897). `AppState` constructs one and keeps cloned handles to the
+//! same underlying state, so both views stay consistent; neither owns the
+//! other, which avoids an `AppState`/`PluginHost` reference cycle.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use tokio::sync::RwLock;
 
+use crate::daemon::{CreationPhase, CreationProgress};
 use crate::server::session_spawn::{spawn_structured_session, SpawnOutcome, StructuredSessionSpec};
 use crate::session::{Instance, PluginCreateIdempotency};
 
 /// A create currently being built for a `(plugin_id, idempotency_key)` scope.
+/// Present only between the idempotency claim and the end of the build, so a
+/// concurrent retry of the same key waits for the winner instead of
+/// provisioning a second worktree.
 struct CreateInFlight {
     payload_hash: String,
     notify: Arc<tokio::sync::Notify>,
@@ -25,8 +37,9 @@ enum ClaimOutcome {
     Conflict,
 }
 
-/// Marker error for a plugin create that reused an idempotency key with a different request
-/// payload.
+/// Marker error for a plugin create that reused an idempotency key with a
+/// different request payload. Callers downcast it the same way the HTTP
+/// handler downcasts `SessionBuildPanicked` / `HooksNeedTrust`.
 #[derive(Debug)]
 pub(crate) struct IdempotencyConflict {
     pub key: String,
@@ -63,14 +76,29 @@ enum IdempotentMatch {
     None,
 }
 
-/// The `Instance` fields `mutate_instance_persisted` copies from memory to disk.
+/// The `Instance` fields `mutate_instance_persisted` copies from memory to
+/// disk. Deliberately explicit: the disk write no longer re-runs the caller's
+/// closure, so a field that is not listed here is simply not persisted.
 struct MirroredFields {
     queued_prompts: Vec<crate::daemon::QueuedPromptEntry>,
     queued_prompt_next_seq: u64,
     idle_dormant_since: Option<chrono::DateTime<chrono::Utc>>,
-    /// Mirrored as `disk = max(disk, memory)`, not copied, because the field is documented
-    /// monotone non-decreasing and disk can legitimately lead memory when a peer process
-    /// touched the row.
+    /// Mirrored as `disk = max(disk, memory)`, not copied, because the field is
+    /// documented monotone non-decreasing and disk can legitimately lead memory
+    /// when a peer process touched the row.
+    ///
+    /// Note what that means for the callers that do not advance it themselves
+    /// (edit / remove / clear / the dormancy clear): the max is NOT a no-op for
+    /// them. It runs against the disk row, so whenever memory leads disk those
+    /// mutations flush memory's value too. That is intended. Since #3465 and
+    /// #3481 removed the passive stamps, a leading memory value can only have
+    /// come from a real user gesture that has not reached disk yet, so
+    /// persisting it opportunistically is correct rather than fabricated.
+    ///
+    /// It is also safe in the direction #3465 cares about: a max advances
+    /// recency but never clears `archived_at` / `snoozed_until` /
+    /// `idle_dormant_since`, so no queue mutation can lift a sink. Writing this
+    /// as `touch_last_accessed()` would.
     last_accessed_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
@@ -80,13 +108,19 @@ pub(crate) enum EditQueuedOutcome {
     Updated,
     /// No row with that `prompt_id` in the session's queue.
     NotFound,
-    /// The edit would leave a row with neither text nor attachments, which the drain cannot
-    /// deliver.
+    /// The edit would leave a row with neither text nor attachments, which the
+    /// drain cannot deliver. Refused at the door: the drain now retires such a
+    /// row rather than wedging on it, but silently discarding what the user
+    /// typed is a worse outcome than a 400.
     WouldEmpty,
 }
 
-/// Pick the leading drain batch from a session's queue and its combined text, matching the
-/// client's `useAcpSession` split exactly.
+/// Pick the leading drain batch from a session's queue and its combined text,
+/// matching the client's `useAcpSession` split exactly: a clear-command row at
+/// the head fires as its own turn; otherwise the leading run of non-clear rows
+/// combines with blank-line separators (empty-text rows skipped). An agent with
+/// no clear aliases combines the whole queue. Pure, so the boundary logic is
+/// unit-tested without a live worker.
 fn queue_drain_batch<'a>(
     queue: &'a [crate::daemon::QueuedPromptEntry],
     profile: &crate::acp::agent_profiles::AgentProfile,
@@ -115,53 +149,61 @@ fn queue_drain_batch<'a>(
 }
 
 pub struct SessionService {
+    pub(crate) work: Arc<super::runtime::RuntimeWork>,
+    native_state: std::sync::OnceLock<std::sync::Weak<super::AppState>>,
+    creations_by_profile: std::sync::Mutex<HashMap<String, usize>>,
+    active_creations: std::sync::Mutex<HashMap<String, Arc<std::sync::Mutex<CreationEntry>>>>,
     /// Live in-memory session list, shared with `AppState.instances`.
     pub instances: Arc<RwLock<Vec<Instance>>>,
     /// Per-instance mutation locks, shared with `AppState.instance_locks`.
     pub instance_locks: Arc<RwLock<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     /// Storage change-notification service, shared with `AppState.file_watch`.
     pub file_watch: Arc<crate::file_watch::FileWatchService>,
-    /// Opt-in telemetry create counter, shared with `AppState.telemetry_session_creates`.
+    /// Opt-in telemetry create counter, shared with
+    /// `AppState.telemetry_session_creates`.
     pub telemetry_session_creates: Arc<std::sync::atomic::AtomicU32>,
-    /// Shared with `AppState.mutation_epoch`. Bumped under the `instances` write lock by
-    /// any change a disk snapshot read earlier would not carry, so that reload drops
-    /// itself instead of overwriting the change.
+    /// Shared with `AppState.mutation_epoch`. Bumped under the `instances`
+    /// write lock by any in-memory change an earlier disk snapshot would not
+    /// carry. Reloaders drop snapshots whose captured epoch no longer matches.
+    /// See invariant 8 on `reload_state_instances_from_disk`.
     pub mutation_epoch: Arc<std::sync::atomic::AtomicU64>,
-    /// Owns the per-session ACP agent subprocesses, shared with `AppState.acp_supervisor`.
+    /// Owns the per-session ACP agent subprocesses, shared with
+    /// `AppState.acp_supervisor`.
     pub acp_supervisor:
         Arc<crate::acp::supervisor::Supervisor<crate::acp::supervisor::ChannelSink>>,
-    /// Durable ACP event store, shared with `AppState.acp_event_store`. Used by the
-    /// pending-turn drain to reload attachment blobs for a rate-limit resume continuation.
+    /// Durable ACP event store, shared with `AppState.acp_event_store`. Used
+    /// by the pending-turn drain to reload attachment blobs for a rate-limit
+    /// resume continuation (#3028).
     pub acp_event_store: Arc<crate::acp::event_store::EventStore>,
     /// Live control-state projection, shared with `AppState.acp_control_cache`.
     /// The queue drain reads turn liveness from it so it agrees with prompt
     /// dispatch; see [`SessionService::fold_control_state`].
     pub acp_control_cache: Arc<crate::acp::control_cache::ControlStateCache>,
     /// In-flight plugin creates keyed by `(plugin_id, idempotency_key)`.
-    // ponytail.
+    /// Sync mutex: critical sections are tiny and never span an `await`.
     create_in_flight: std::sync::Mutex<HashMap<(String, String), CreateInFlight>>,
-    /// Session ids with a pending-initial-turn drain in flight, so the create fast path and
-    /// the reconciler tick cannot queue duplicate drains.
+    /// Session ids with a pending-initial-turn drain in flight, so the create
+    /// fast path and the reconciler tick cannot queue duplicate drains.
+    /// Sync mutex: critical sections are tiny and never span an `await`.
     pending_drains: std::sync::Mutex<std::collections::HashSet<String>>,
-    /// Per-session persist locks for `mutate_instance_persisted`, held across snapshot AND
-    /// disk write so the two cannot be reordered.
+    /// Per-session persist locks for `mutate_instance_persisted`, held across
+    /// snapshot AND disk write so the two cannot be reordered. Distinct from
+    /// the other two: the drains hold `prompt_locks` across `send_turn` and
+    /// then call this path, so reusing either would self-deadlock.
     persist_locks: RwLock<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
-    /// Per-session prompt-submission locks.
+    /// Per-session prompt-submission locks. See
+    /// [`SessionService::prompt_submission`].
     prompt_locks: RwLock<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// Test-only tap on [`SessionService::prompt_submission`], fired before it
     /// reaches `prompt_locks`. See [`SessionService::watch_submission_claims`].
     #[cfg(test)]
     submission_claims: std::sync::OnceLock<tokio::sync::mpsc::UnboundedSender<String>>,
-    #[cfg(test)]
-    pub(super) created_instance_gate: std::sync::Mutex<
-        Option<(
-            tokio::sync::oneshot::Sender<()>,
-            tokio::sync::oneshot::Receiver<()>,
-        )>,
-    >,
 }
 
-/// Who is asking the session service to act.
+/// Who is asking the session service to act. Constructed only by the
+/// transport layer (HTTP handler, plugin RPC connection context, or the
+/// drain reconstructing the creator), never decoded from a request payload,
+/// so a caller cannot forge an identity (#2897).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SessionCaller {
     /// A human-facing surface (HTTP dashboard, TUI).
@@ -170,7 +212,9 @@ pub(crate) enum SessionCaller {
     Plugin { plugin_id: String },
 }
 
-/// Why a caller may not open a turn on a session.
+/// Why a caller may not open a turn on a session. Settled before any live
+/// state is read, so an unauthorized caller learns nothing about what the
+/// session is currently doing (#3685).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TurnAdmissionError {
     /// No session with this id.
@@ -188,20 +232,31 @@ impl From<TurnAdmissionError> for SendTurnError {
     }
 }
 
-/// Typed outcome of [`SessionService::send_turn`], split by whether the failure happened
-/// before or after the prompt was published into the event stream, so callers can map each
-/// stage faithfully (the HTTP handler keeps its exact pre-extraction status codes, and only
-/// fires the post-publish smart-rename hook when a publish actually happened).
+/// Typed outcome of [`SessionService::send_turn`], split by whether the
+/// failure happened before or after the prompt was published into the event
+/// stream, so callers can map each stage faithfully (the HTTP handler keeps
+/// its exact pre-extraction status codes, and only fires the post-publish
+/// smart-rename hook when a publish actually happened).
 pub(crate) enum SendTurnError {
-    /// Pre-publish.
+    /// Pre-publish: the session vanished (or was triaged) before the resume
+    /// snapshot. Nothing was published; the honest answer is "not found",
+    /// not a retryable worker_not_ready. See #1748.
     SessionNotFound,
-    /// Pre-publish.
+    /// Pre-publish: a plugin caller targeted a session it did not create
+    /// (user-created, another plugin's, or a legacy row). Nothing was
+    /// published; no side effects ran.
     NotOwner,
-    /// Pre-publish.
+    /// Pre-publish: the session's persisted explicit mode could not be
+    /// re-asserted before a plugin-delivered turn. The prompt is withheld
+    /// rather than run under an unconfirmed approval posture.
     ModeApplication(crate::acp::supervisor::SupervisorError),
-    /// Pre-publish.
+    /// Pre-publish: reserving the resume slot failed (includes
+    /// `SupervisorError::CapacityFull`). Nothing was published.
     ResumeFailed(crate::acp::supervisor::SupervisorError),
-    /// Pre-publish.
+    /// Pre-publish: the worker did not become ready within
+    /// `WORKER_READY_TIMEOUT` (slow sandbox / spawn). The worker is still
+    /// coming; retryable, and nothing was published, so the transcript is
+    /// not left with a prompt no agent ever received. See #1748 and #3172.
     WorkerNotReady,
     /// Pre-publish: `no_revive` was set and delivering this turn would have
     /// required resuming a worker that is not currently running.
@@ -268,7 +323,9 @@ impl std::fmt::Display for SendTurnError {
     }
 }
 
-/// The ACP collaborators `SessionService` shares with `AppState`.
+/// The ACP collaborators `SessionService` shares with `AppState`. Grouped so
+/// the constructor keeps one parameter for "the ACP side" rather than one per
+/// handle.
 pub struct AcpDeps {
     pub supervisor: Arc<crate::acp::supervisor::Supervisor<crate::acp::supervisor::ChannelSink>>,
     pub event_store: Arc<crate::acp::event_store::EventStore>,
@@ -285,6 +342,10 @@ impl SessionService {
         acp: AcpDeps,
     ) -> Self {
         Self {
+            work: Arc::new(super::runtime::RuntimeWork::default()),
+            native_state: std::sync::OnceLock::new(),
+            creations_by_profile: std::sync::Mutex::new(HashMap::new()),
+            active_creations: std::sync::Mutex::new(HashMap::new()),
             instances,
             instance_locks,
             file_watch,
@@ -299,13 +360,166 @@ impl SessionService {
             prompt_locks: RwLock::new(HashMap::new()),
             #[cfg(test)]
             submission_claims: std::sync::OnceLock::new(),
-            #[cfg(test)]
-            created_instance_gate: std::sync::Mutex::new(None),
         }
     }
 
-    /// Create a structured session through the shared spawn pipeline, optionally as a
-    /// plugin with a create-idempotency key.
+    pub(super) fn bind_native_state(&self, state: &Arc<super::AppState>) {
+        assert!(
+            self.native_state.set(Arc::downgrade(state)).is_ok(),
+            "native session context is bound once"
+        );
+    }
+
+    pub(super) fn native_state(&self) -> anyhow::Result<Arc<super::AppState>> {
+        self.native_state
+            .get()
+            .and_then(std::sync::Weak::upgrade)
+            .ok_or_else(|| crate::session::NativeStoreUnavailable.into())
+    }
+
+    /// The caller holds the profile namespace read lock.
+    pub(super) fn claim_creation_profile(self: &Arc<Self>, profile: &str) -> CreationProfileGuard {
+        *self
+            .creations_by_profile
+            .lock()
+            .expect("creation profiles mutex poisoned")
+            .entry(profile.to_owned())
+            .or_default() += 1;
+        CreationProfileGuard {
+            service: Arc::clone(self),
+            profile: profile.to_owned(),
+        }
+    }
+
+    pub(super) fn has_profile_creation(&self, profile: &str) -> bool {
+        self.creations_by_profile
+            .lock()
+            .expect("creation profiles mutex poisoned")
+            .contains_key(profile)
+    }
+
+    /// Register a creation before it touches shared resources. The returned
+    /// guard owns its published progress and removes both on drop.
+    pub(super) fn register_creation(
+        self: &Arc<Self>,
+        id: &str,
+        title: &str,
+        profile: &str,
+        request_key: Option<&str>,
+    ) -> anyhow::Result<CreationGuard> {
+        let entry = Arc::new(std::sync::Mutex::new(CreationEntry {
+            lifecycle: CreationLifecycle::Running,
+            progress: CreationProgress {
+                session_id: id.to_owned(),
+                title: title.to_owned(),
+                profile: profile.to_owned(),
+                phase: CreationPhase::Reserving,
+                request_key: request_key.map(str::to_owned),
+                command: None,
+                output: Vec::new(),
+                cancelled: false,
+            },
+            published_at: std::time::Instant::now(),
+        }));
+        {
+            let mut active = self
+                .active_creations
+                .lock()
+                .expect("creation registry poisoned");
+            let std::collections::hash_map::Entry::Vacant(slot) = active.entry(id.to_owned())
+            else {
+                anyhow::bail!("creation already registered");
+            };
+            slot.insert(Arc::clone(&entry));
+        }
+        self.publish_creation_progress();
+        Ok(CreationGuard {
+            service: Arc::clone(self),
+            entry,
+            id: id.to_owned(),
+        })
+    }
+
+    /// Refuse a cancellation the creation can no longer honor. Accepted
+    /// requests only mark the in-flight phase; the rollback still owns cleanup.
+    pub(crate) fn cancel_creation(&self, id: &str) -> bool {
+        let entry = {
+            let active = self
+                .active_creations
+                .lock()
+                .expect("creation registry poisoned");
+            active.get(id).map(Arc::clone)
+        };
+        let Some(entry) = entry else {
+            return false;
+        };
+        {
+            let mut entry = entry.lock().expect("creation entry poisoned");
+            match entry.lifecycle {
+                CreationLifecycle::Committed => return false,
+                CreationLifecycle::Running | CreationLifecycle::Cancelled => {
+                    entry.lifecycle = CreationLifecycle::Cancelled;
+                    entry.progress.cancelled = true;
+                }
+            }
+        }
+        self.publish_creation_progress();
+        true
+    }
+
+    fn creation_progress(&self) -> Vec<CreationProgress> {
+        let entries: Vec<Arc<std::sync::Mutex<CreationEntry>>> = {
+            let active = self
+                .active_creations
+                .lock()
+                .expect("creation registry poisoned");
+            active.values().map(Arc::clone).collect()
+        };
+        let mut progress: Vec<CreationProgress> = entries
+            .into_iter()
+            .map(|entry| {
+                entry
+                    .lock()
+                    .expect("creation entry poisoned")
+                    .progress
+                    .clone()
+            })
+            .collect();
+        progress.sort_by(|left, right| left.session_id.cmp(&right.session_id));
+        progress
+    }
+
+    /// Advisory display state, so an unbound or shutting-down runtime is not
+    /// an error: the work itself continues and publishes its canonical result.
+    fn publish_creation_progress(&self) {
+        let Ok(state) = self.native_state() else {
+            return;
+        };
+        state
+            .runtime
+            .publish_creation_progress(self.creation_progress());
+    }
+
+    /// Create a structured session through the shared spawn pipeline,
+    /// optionally as a plugin with a create-idempotency key (#2897).
+    ///
+    /// For a user caller (`plugin_id: None`) this is exactly the pre-service
+    /// create path. For a plugin caller it additionally:
+    /// - stamps `created_by_plugin` and the idempotency record on the
+    ///   instance before it is persisted, atomically with the row itself;
+    /// - refuses untrusted repo hooks regardless of plugin install grants;
+    /// - deduplicates on `(plugin_id, idempotency_key)`: a retry with the
+    ///   same payload returns the existing session (`created: false` in the
+    ///   returned pair), a retry with a different payload fails with
+    ///   [`IdempotencyConflict`], and a concurrent identical retry waits for
+    ///   the in-flight build instead of provisioning a second worktree.
+    ///
+    /// Idempotency retention equals the session record's lifetime: archived,
+    /// snoozed, and trashed sessions still deduplicate; a hard-deleted
+    /// session releases its key, and a later retry creates a fresh session.
+    ///
+    /// Returns the spawn outcome plus `created`: `false` when an existing
+    /// session was returned by idempotency instead of a new one.
     pub(crate) async fn create_structured_session(
         self: &Arc<Self>,
         mut spec: StructuredSessionSpec,
@@ -324,7 +538,8 @@ impl SessionService {
 
         spec.created_by_plugin = Some(plugin_id.to_string());
         // Fail-closed: install-time plugin consent is not repository trust.
-        spec.trust_hooks = Some(false);
+        spec.trust_hooks = None;
+        spec.trust_review = None;
 
         let Some(key) = idempotency_key else {
             let outcome = spawn_structured_session(self, spec).await?;
@@ -339,7 +554,8 @@ impl SessionService {
         let scope = (plugin_id.to_string(), key.to_string());
 
         loop {
-            // Persisted-first lookup.
+            // Persisted-first lookup: a completed create (this daemon life or
+            // an earlier one) wins before any in-flight coordination.
             {
                 let instances = self.instances.read().await;
                 match find_idempotent_match(&instances, plugin_id, key, &payload_hash) {
@@ -363,8 +579,14 @@ impl SessionService {
             match self.try_claim_in_flight(&scope, &payload_hash) {
                 ClaimOutcome::Claimed => break,
                 ClaimOutcome::Wait(notify) => {
-                    // The winner removes its entry and notifies on every exit path (guard
-                    // drop), after which the loop re-checks the persisted list.
+                    // The winner removes its entry and notifies on every exit
+                    // path (guard drop), after which the loop re-checks the
+                    // persisted list: a successful winner is found there, a
+                    // failed winner leaves this retry to build fresh. The
+                    // wait is bounded because `notify_waiters` only wakes
+                    // already-registered waiters; a winner finishing between
+                    // our claim attempt and this await would otherwise strand
+                    // us. A missed notify costs one extra loop iteration.
                     let _ = tokio::time::timeout(
                         std::time::Duration::from_millis(250),
                         notify.notified(),
@@ -387,8 +609,13 @@ impl SessionService {
         Ok((outcome, true))
     }
 
-    /// Resolve a persisted plugin create-idempotency decision without any side effect, so a
-    /// caller can charge admission (rate/concurrency) only for genuinely new creates.
+    /// Resolve a persisted plugin create-idempotency decision without any side
+    /// effect, so a caller can charge admission (rate/concurrency) only for
+    /// genuinely new creates (#2897). `spec` must be the exact spec that will
+    /// be passed to [`Self::create_structured_session`] (in particular
+    /// `pending_initial_turn` already set), so the payload hash matches. Only
+    /// the persisted list is consulted: an in-flight same-process retry still
+    /// dedupes inside `create_structured_session`, at the cost of one admission.
     pub(crate) async fn probe_plugin_create_idempotency(
         &self,
         spec: &StructuredSessionSpec,
@@ -492,7 +719,12 @@ impl SessionService {
         }
     }
 
-    /// Deliver a turn to a structured session.
+    /// Deliver a turn to a structured session: resume a dead/dormant worker
+    /// if needed, publish the prompt into the event stream, then forward it
+    /// to the agent. Extracted from the `acp_prompt` HTTP handler so a
+    /// non-HTTP caller (the plugin host, #2897) delivers turns through the
+    /// same path; the handler keeps HTTP concerns (read-only gate, wake,
+    /// attachment validation, smart-rename, status mapping).
     pub(crate) async fn send_turn(
         self: &Arc<Self>,
         caller: &SessionCaller,
@@ -508,8 +740,13 @@ impl SessionService {
             no_revive,
         } = turn;
         use crate::server::acp_reconciler::ResumeTrigger;
-        // Ownership gate, before ANY side effect (no wake, resume, publish, or forward for
-        // a denied caller).
+        // Ownership gate, before ANY side effect (no wake, resume, publish,
+        // or forward for a denied caller): a plugin may deliver turns only
+        // to sessions it created. Ownership is immutable after creation, so
+        // a read snapshot suffices. Deliberately no instance_lock anywhere in
+        // this function: it waits on worker readiness below, and the resume it
+        // waits for needs that lock to finish (#3172, #3621). Callers own the
+        // per-session ordering through [`Self::prompt_submission`] instead.
         let (acp_mode_id, yolo_mode) = {
             let instances = self.instances.read().await;
             let Some(inst) = instances.iter().find(|i| i.id == id) else {
@@ -522,7 +759,21 @@ impl SessionService {
             }
             (inst.acp_mode_id.clone(), inst.yolo_mode)
         };
-        // Resume a worker that is not currently live.
+        // Resume a worker that is not currently live. Two cases:
+        //   - Idle-dormant wake: the worker was auto-stopped for inactivity
+        //     (#1689) and the reconciler will not respawn it until its next
+        //     ~2s tick.
+        //   - Dead worker: the worker exited for another reason (e.g. the
+        //     silent-orphan watchdog escalated a monitor / `/loop` turn) and
+        //     is neither dormant nor mid-respawn, so a send would otherwise
+        //     404 and force a manual `aoe acp restart`.
+        // Either way, reserve the resume slot synchronously and drive a fresh
+        // spawn in a detached task NOW so the `send_prompt` below blocks on
+        // `wait_for_worker` until the worker is live instead of racing ahead
+        // to a 404. The detached task survives the originating request being
+        // cancelled on client disconnect. `is_running` is true for a live or
+        // mid-respawn worker, so a healthy session never double-spawns. See
+        // #1748.
         let needs_resume = woke_idle_dormant || !self.acp_supervisor.is_running(id).await;
         if no_revive && needs_resume {
             return Err(SendTurnError::RevivalRefused);
@@ -534,7 +785,19 @@ impl SessionService {
                 Err(e) => return Err(SendTurnError::ResumeFailed(e)),
             }
         }
-        // Gate the publish below on the worker actually being there.
+        // Gate the publish below on the worker actually being there. Without
+        // this the prompt lands in the durable event stream and only THEN
+        // does `send_prompt` discover the respawn never finished, leaving a
+        // `UserPromptSent` with no turn behind it and a UI stuck on
+        // "running" until someone stops the session and re-sends (#3172).
+        // Failing here instead returns a 503 the frontend already treats as
+        // transient: it rolls the optimistic row back and re-queues for the
+        // drain to re-fire on the next `AcpSessionAssigned` (#3094).
+        //
+        // Unconditional, not gated on `needs_resume`: `is_running` is also
+        // true for a resume another caller already reserved, so a false
+        // `needs_resume` does not imply a live worker. For one that is live
+        // this is a single worker-map lookup.
         if let Err(e) = self.acp_supervisor.wait_until_ready(id).await {
             return match e {
                 crate::acp::supervisor::SupervisorError::UnknownSession(_) => {
@@ -543,7 +806,12 @@ impl SessionService {
                 other => Err(SendTurnError::ResumeFailed(other)),
             };
         }
-        // A plugin-delivered turn must run under the session's persisted explicit mode.
+        // A plugin-delivered turn must run under the session's persisted
+        // explicit mode: re-assert it before publishing, and withhold the
+        // prompt when the assertion fails (#2897). set_mode waits on the
+        // same ready-client path send_prompt uses, so a just-resumed worker
+        // is awaited, not raced. User surfaces skip this; the supervisor
+        // already re-asserts the mode on every (re)spawn.
         if matches!(caller, SessionCaller::Plugin { .. }) {
             if let Some(mode_id) = &acp_mode_id {
                 if let Err(e) = self.acp_supervisor.set_mode(id, mode_id).await {
@@ -551,8 +819,19 @@ impl SessionService {
                 }
             }
         }
-        // Publish the user's prompt into the event stream BEFORE forwarding to the agent so
-        // the replay buffer / on-disk store captures it even if the agent forward fails.
+        // Publish the user's prompt into the event stream BEFORE forwarding
+        // to the agent so the replay buffer / on-disk store captures it
+        // even if the agent forward fails. The frontend treats UserPromptSent
+        // as authoritative and dedupes against its own optimistic row.
+        //
+        // The publish step owns clear-command detection and tells us what to
+        // do with the text: either forward it as an ordinary prompt or drive
+        // a real reset on the live worker for a clear alias whose adapter
+        // cannot hand back a durable post-reset session id. Forwarding a codex
+        // `/new` would be swallowed as an unknown command and the conversation
+        // would silently keep its context (#2979); forwarding a claude
+        // `/clear` resets the context but leaves the new conversation
+        // unresumable across a worker restart (upstream #906).
         let disposition = self
             .acp_supervisor
             .publish_user_prompt_with_attachments(
@@ -575,7 +854,11 @@ impl SessionService {
         };
         match outcome {
             Ok(()) => Ok(()),
-            // Intentional override of the canonical UnknownSession 404.
+            // Intentional override of the canonical UnknownSession 404: the
+            // readiness barrier above passed, so the worker was alive a
+            // moment ago and died in the gap. Retryable rather than a 404,
+            // same as before. This one IS post-publish; closing that window
+            // needs delivery acknowledgements, not a longer timeout.
             Err(crate::acp::supervisor::SupervisorError::UnknownSession(_)) if needs_resume => {
                 Err(SendTurnError::WorkerNotReady)
             }
@@ -584,6 +867,17 @@ impl SessionService {
     }
 
     /// Deliver a session's persisted `pending_initial_turn`, then clear it.
+    ///
+    /// Single drain owner: callers (the create fast path and the reconciler
+    /// tick) race through the `pending_drains` claim, and the delivery runs
+    /// under the session's [`Self::prompt_submission_for_session`] guard, so
+    /// the turn cannot be published twice concurrently and a direct prompt
+    /// cannot decide its own disposition mid-delivery. A delivery failure
+    /// leaves the field set; the reconciler tick retries once the worker is
+    /// live. Clearing writes memory first,
+    /// then disk: a crash (or failed persist) between the forward and the
+    /// disk clear re-delivers after restart, which is the documented
+    /// at-least-once contract.
     pub(crate) async fn drain_pending_initial_turn(self: &Arc<Self>, id: &str) {
         {
             let mut drains = self
@@ -598,7 +892,9 @@ impl SessionService {
             service: Arc::clone(self),
             id: id.to_string(),
         };
-        // Non-vivifying.
+        // Non-vivifying: the reconciler spawns this from an earlier snapshot,
+        // so a delete can have completed in the gap and the raw guard would
+        // leave a fresh registry entry nothing prunes (#3687).
         let Some(_submission) = self.prompt_submission_for_session(id).await else {
             return;
         };
@@ -627,8 +923,10 @@ impl SessionService {
         }) else {
             return;
         };
-        // Reload the attachment blobs so a rate-limit resume continuation replays the
-        // interrupted prompt's images/files, not just its text.
+        // Reload the attachment blobs so a rate-limit resume continuation
+        // replays the interrupted prompt's images/files, not just its text
+        // (#3028). Refs are empty for create-time initial turns. Bytes live in
+        // the event store (a locking sqlite read), so load off the runtime.
         let attachments = if attachment_refs.is_empty() {
             Vec::new()
         } else {
@@ -714,9 +1012,12 @@ impl SessionService {
         }
     }
 
-    /// Queue `text` (with its `attachments` refs) as the session's next turn, reusing the
-    /// pending-initial-turn drain so the turn is delivered once the (resumed) worker is
-    /// live.
+    /// Queue `text` (with its `attachments` refs) as the session's next turn,
+    /// reusing the pending-initial-turn drain so the turn is delivered once the
+    /// (resumed) worker is live. No-op when a turn is already queued (never
+    /// clobber a create/plugin turn) or the session is gone. Persists so a
+    /// daemon restart mid-resume still re-delivers. Used to continue a
+    /// rate-limit-interrupted turn on resume (#3028).
     pub(crate) async fn set_pending_initial_turn(
         self: &Arc<Self>,
         id: &str,
@@ -769,8 +1070,10 @@ impl SessionService {
         }
     }
 
-    /// Drop any queued pending initial turn (text + attachment refs) for a session, in
-    /// memory and on disk.
+    /// Drop any queued pending initial turn (text + attachment refs) for a
+    /// session, in memory and on disk. A newer user prompt supersedes a queued
+    /// rate-limit resume continuation, so the stale continuation must not
+    /// replay after the newer message (#3028). No-op when nothing is queued.
     pub(crate) async fn clear_pending_initial_turn(self: &Arc<Self>, id: &str) {
         let profile = {
             let mut instances = self.instances.write().await;
@@ -820,8 +1123,34 @@ impl SessionService {
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 
-    /// Apply `mutate` to a session's in-memory `Instance`, then mirror the resulting state
-    /// to disk.
+    /// Apply `mutate` to a session's in-memory `Instance`, then mirror the
+    /// resulting state to disk. Returns what `mutate` produced, or `None` if
+    /// the session is gone.
+    ///
+    /// `mutate` runs exactly once, against the in-memory instance, which is the
+    /// authoritative copy: every queue mutation takes `instances.write()`, so
+    /// that list is always correctly ordered. The disk write then *copies* the
+    /// post-mutation fields rather than re-running the closure.
+    ///
+    /// Re-running it was wrong under concurrency. The instances lock is
+    /// released before the disk write, so two concurrent enqueues could reach
+    /// `storage.update` in either order and each re-derive `seq` from whatever
+    /// the on-disk copy happened to hold, persisting an order the in-memory
+    /// list never had (or losing a row entirely). Copying instead means the
+    /// last writer persists the complete, correct state.
+    ///
+    /// Only the fields listed in `MirroredFields` survive to disk, which covers
+    /// every caller today (the five queue mutations plus the dormancy clear).
+    /// A new caller that mutates something else must extend that struct, so the
+    /// set is explicit rather than implied by whatever the closure touched.
+    ///
+    /// Snapshot and disk write happen under one per-session persist lock.
+    /// `Storage::update` serializes the writes themselves but not their order,
+    /// so without this two concurrent mutations could snapshot as `[a]` then
+    /// `[a, b]` and land in the opposite order, leaving `b` off disk and losing
+    /// it on the next daemon restart. Copying a whole snapshot makes ordering
+    /// load-bearing in a way that re-running the closure did not, so the lock
+    /// comes with it.
     async fn mutate_instance_persisted<T, F>(self: &Arc<Self>, id: &str, mutate: F) -> Option<T>
     where
         T: Send + 'static,
@@ -854,7 +1183,11 @@ impl SessionService {
                             inst.queued_prompts = mirrored.queued_prompts;
                             inst.queued_prompt_next_seq = mirrored.queued_prompt_next_seq;
                             inst.idle_dormant_since = mirrored.idle_dormant_since;
-                            // Monotone max, never `touch_last_accessed()`.
+                            // Monotone max, never `touch_last_accessed()`: a
+                            // queued prompt is a recency gesture, not a wake,
+                            // so it must not clear `archived_at` /
+                            // `snoozed_until` / `idle_dormant_since` a peer
+                            // wrote after this daemon's snapshot (#3465).
                             inst.last_accessed_at =
                                 inst.last_accessed_at.max(mirrored.last_accessed_at);
                         }
@@ -873,8 +1206,31 @@ impl SessionService {
         Some(result)
     }
 
-    /// Append a prompt to the session's server-owned queue and return the stored entry
-    /// (with its assigned `seq`).
+    /// Append a prompt to the session's server-owned queue and return the
+    /// stored entry (with its assigned `seq`). Idempotent on `prompt_id`:
+    /// re-enqueuing an existing id updates its text/attachments in place instead
+    /// of adding a duplicate, so an optimistic client retry cannot double-queue.
+    ///
+    /// Queueing is a user gesture, so it advances `last_accessed_at`. Both
+    /// enqueue routes land here (`POST /queue` from the web composer, and
+    /// `/acp/prompt`'s Tier 3 `Queued` disposition, which the TUI takes because
+    /// it always posts the prompt endpoint), so the two clients stay symmetric
+    /// without either endpoint plumbing recency itself. It is only a recency
+    /// advance, never a wake: the respawn kick a real wake needs lives on the
+    /// prompt endpoint, and a client queues behind a live turn, so there is no
+    /// sunk row to lift here.
+    ///
+    /// Until #3465 this was invisible. `apply_status_intent` restamped the
+    /// field on every worker-event transition, so a queued turn's Running/Idle
+    /// edges kept recency fresh by accident; dropping that stamp is what made
+    /// the missing gesture-side write observable in the attention sort and the
+    /// TUI activity column.
+    ///
+    /// Deliberately does NOT take [`Self::prompt_submission`]: `acp_prompt`
+    /// calls this through `buffer_and_enqueue` while already holding it, and
+    /// the guard is not reentrant. The `queue_enqueue` handler claims it
+    /// instead, so the row rewrite this does for an existing id still cannot
+    /// land inside a drain's snapshot-to-send window.
     pub(crate) async fn enqueue_prompt(
         self: &Arc<Self>,
         id: &str,
@@ -908,6 +1264,19 @@ impl SessionService {
     }
 
     /// Replace a queued prompt's text in place.
+    ///
+    /// Enforces the same non-empty invariant `queue_enqueue` does, because the
+    /// drain relies on it: a row whose text is blank and which carries no
+    /// attachments makes `drain_queued_prompts_once` return without retiring
+    /// the batch, so it retries on every reconciler tick, nothing behind it
+    /// ever drains, and the idle reaper (which skips a session with a queue)
+    /// keeps its worker alive forever.
+    ///
+    /// Takes [`Self::prompt_submission`] for the same reason
+    /// `remove_queued_prompt` does: the drain snapshots its batch and only
+    /// then sends, so an unserialized edit landing inside that window is
+    /// written to a row the drain has already copied. It delivers the old
+    /// text and retires the row, and the edit is lost with nothing to retry.
     pub(crate) async fn edit_queued_prompt(
         self: &Arc<Self>,
         id: &str,
@@ -933,7 +1302,17 @@ impl SessionService {
         .unwrap_or(EditQueuedOutcome::NotFound)
     }
 
-    /// Remove a queued prompt by id.
+    /// Remove a queued prompt by id. Returns `true` if a row was removed. Also
+    /// drops any attachment bytes buffered for that prompt so they don't leak.
+    ///
+    /// Takes the [`Self::prompt_submission`] guard the drain holds across its
+    /// whole snapshot -> send -> retire, so a removal cannot land in the middle
+    /// of a delivery. Without it the web's "Send now" (which removes the row, then
+    /// POSTs the same text itself) could tap inside the drain window: the drain
+    /// already holds its own copy of the batch, so both would deliver and the
+    /// agent would see the prompt twice. Serialized, the removal either beats
+    /// the drain's snapshot (the drain never sees the row) or follows its
+    /// retire (the removal reports `false`, and the caller sends nothing).
     pub(crate) async fn remove_queued_prompt(
         self: &Arc<Self>,
         id: &str,
@@ -958,8 +1337,13 @@ impl SessionService {
         removed
     }
 
-    /// Drop every queued prompt for a session, plus every attachment blob buffered for
-    /// those prompts.
+    /// Drop every queued prompt for a session, plus every attachment blob
+    /// buffered for those prompts.
+    ///
+    /// Serialized against delivery like the other queue mutations: clearing
+    /// inside the drain's snapshot-to-send window empties the durable rows
+    /// while the batch the drain already copied still goes to the agent, so
+    /// the user watches the queue empty and then sees it sent anyway.
     pub(crate) async fn clear_queued_prompts(self: &Arc<Self>, id: &str) {
         let Some(_submission) = self.prompt_submission_for_session(id).await else {
             return;
@@ -995,8 +1379,17 @@ impl SessionService {
             .unwrap_or_default()
     }
 
-    /// The daemon's live control state for a session, folded once at the publish choke
-    /// point and hydrated from the event log on a cache miss.
+    /// The daemon's live control state for a session, folded once at the
+    /// publish choke point and hydrated from the event log on a cache miss.
+    ///
+    /// This is the daemon's only non-lagging answer to "is a turn in flight":
+    /// `ChannelSink::publish_persisted` folds each event in as it records it,
+    /// whereas `Instance.status` is a mirror the broadcast listener applies
+    /// afterwards, one serial task behind every session's event stream.
+    ///
+    /// The fold is cached because rebuilding it per call measured 68ms at 20k
+    /// events and 342ms at 100k, holding the event store's connection mutex
+    /// for the whole scan, which stalls event recording daemon-wide.
     pub(crate) async fn fold_control_state(&self, id: &str) -> crate::acp::state::AcpState {
         use crate::acp::state::{AcpSessionId, AcpState, AgentName};
         let (agent, model) = {
@@ -1015,8 +1408,9 @@ impl SessionService {
         let store = Arc::clone(&self.acp_event_store);
         let cache = Arc::clone(&self.acp_control_cache);
         let sid = id.to_string();
-        // The hydrate closure runs under the cache's per-session lock and does a locking
-        // SQLite scan, so the whole thing goes off the runtime rather than just the scan.
+        // The hydrate closure runs under the cache's per-session lock and does
+        // a locking SQLite scan, so the whole thing goes off the runtime rather
+        // than just the scan.
         tokio::task::spawn_blocking(move || {
             cache.get_or_hydrate(&sid.clone(), || {
                 let mut reduced = AcpState::new(AcpSessionId(sid.clone()), agent, model);
@@ -1030,7 +1424,9 @@ impl SessionService {
         })
         .await
         .unwrap_or_else(|_| {
-            // The blocking pool panicked or shut down.
+            // The blocking pool panicked or shut down. An empty state reads as
+            // "idle", which would let both prompt dispatch and the queue drain
+            // push into whatever turn is running, so hand back one that parks.
             let mut fallback =
                 AcpState::new(AcpSessionId(id.to_string()), AgentName(String::new()), None);
             fallback.turn_active = true;
@@ -1038,8 +1434,30 @@ impl SessionService {
         })
     }
 
-    /// Drain the leading batch of a session's server-owned queue into the live worker once
-    /// the current turn has ended.
+    /// Drain the leading batch of a session's server-owned queue into the live
+    /// worker once the current turn has ended. Mirrors
+    /// `drain_pending_initial_turn`'s single-owner `pending_drains` claim +
+    /// [`Self::prompt_submission_for_session`] delivery, so a batch is never
+    /// sent twice concurrently and the idle check below cannot be invalidated
+    /// by a direct prompt deciding its own disposition before this one reaches
+    /// the agent.
+    ///
+    /// Only drains an idle turn, and asks the live control fold rather than
+    /// `Instance.status`: dispatch parks a prompt on that fold, so gating the
+    /// delivery on the lagging status mirror lets the drain hand a queued
+    /// prompt to the turn it was parked behind.
+    ///
+    /// The reconciler tick gates on `is_running`, which is also true for a
+    /// resume that has reserved its slot but has no worker yet, so `send_turn`
+    /// here can park on `WORKER_READY_TIMEOUT`. That is why delivery must not
+    /// hold `instance_lock`: the resume being waited for takes it inside
+    /// `build_spawn_request`, and holding it stalled the drain for the whole
+    /// timeout and left the queue for a later retry (#3621).
+    ///
+    /// The `/clear`-boundary split matches the client
+    /// (`useAcpSession`): a clear-command row fires as its own turn; a leading
+    /// run of non-clear rows combines into one with blank-line separators.
+    /// A batch's buffered attachment bytes are reloaded and forwarded with it.
     pub(crate) async fn drain_queued_prompts_once(self: &Arc<Self>, id: &str) {
         {
             let mut drains = self
@@ -1054,7 +1472,8 @@ impl SessionService {
             service: Arc::clone(self),
             id: id.to_string(),
         };
-        // Non-vivifying, for the same reason as the pending-initial drain.
+        // Non-vivifying, for the same reason as the pending-initial drain
+        // (#3687).
         let Some(_submission) = self.prompt_submission_for_session(id).await else {
             return;
         };
@@ -1087,9 +1506,12 @@ impl SessionService {
             (caller, agent_key, queue)
         };
 
-        // `Status::Idle` above is a mirror the broadcast listener applies one serial task
-        // behind every session's events, so it still reads Idle for as long as that task is
-        // behind.
+        // `Status::Idle` above is a mirror the broadcast listener applies one
+        // serial task behind every session's events, so it still reads Idle for
+        // as long as that task is behind. Prompt dispatch reads the live fold
+        // instead, which is why a prompt can be parked as `turn_active` and
+        // then drained into that very turn a moment later. Ask the same
+        // authority dispatch asked before delivering; the next tick retries.
         if self.fold_control_state(id).await.turn_active {
             return;
         }
@@ -1098,10 +1520,11 @@ impl SessionService {
         let profile = crate::acp::agent_profiles::resolve(&agent_key);
         let (sub, combined) = queue_drain_batch(&queue, profile);
         let sent_ids: Vec<String> = sub.iter().map(|e| e.id.clone()).collect();
-        // Reload every buffered attachment blob for the batch, in queue order, so a queued
-        // screenshot/file is forwarded with the text (matches the client's old
-        // `snapshot.flatMap(q => q.attachments)`). Bytes live in the pending-attachment
-        // store keyed by prompt id; a locking SQLite read, so do it off the runtime.
+        // Reload every buffered attachment blob for the batch, in queue order,
+        // so a queued screenshot/file is forwarded with the text (matches the
+        // client's old `snapshot.flatMap(q => q.attachments)`). Bytes live in
+        // the pending-attachment store keyed by prompt id; a locking SQLite
+        // read, so do it off the runtime.
         let attachments: Vec<crate::acp::event_store::AttachmentBlob> = {
             let store = Arc::clone(&self.acp_event_store);
             let session_id = id.to_string();
@@ -1115,7 +1538,20 @@ impl SessionService {
             .await
             .unwrap_or_default()
         };
-        // An attachment-only batch has empty combined text but real blobs.
+        // An attachment-only batch has empty combined text but real blobs. A
+        // batch with neither cannot be delivered at all, and must be retired
+        // rather than left queued.
+        //
+        // This guard used to `return`, which wedged the session: the batch
+        // stayed at the head of the queue, the drain retried it on every
+        // reconciler tick, nothing behind it ever drained, and
+        // `reap_idle_workers` (which skips a session holding a queue) kept the
+        // agent subprocess alive forever. Two routes reach the state, so
+        // guarding the entry points is not enough on its own: an attachment-only
+        // prompt whose buffered bytes the 24h `PENDING_ATTACHMENT_TTL` sweep
+        // reclaimed, and (before it was rejected) an edit that blanked a
+        // text-only row. There is nothing left to send by this point, so the
+        // rows are husks; log loudly and clear them.
         if combined.trim().is_empty() && attachments.is_empty() {
             tracing::warn!(
                 target: "acp.queue",
@@ -1128,7 +1564,9 @@ impl SessionService {
             return;
         }
 
-        // Deliver as a fresh turn on the live worker.
+        // Deliver as a fresh turn on the live worker. `send_turn` re-records the
+        // blobs under the real `UserPromptSent` seq. On failure leave the rows
+        // (and their buffered blobs) queued; the next tick retries.
         if let Err(e) = self
             .send_turn(
                 &caller,
@@ -1153,6 +1591,8 @@ impl SessionService {
     }
 
     /// Drop a set of queue rows and the attachment bytes buffered for them.
+    /// Shared by the delivered path and the undeliverable-husk path so both
+    /// leave the queue and the pending-attachment store consistent.
     async fn retire_drained_rows(self: &Arc<Self>, id: &str, ids: Vec<String>) {
         for pid in &ids {
             self.acp_event_store
@@ -1165,9 +1605,18 @@ impl SessionService {
         .await;
     }
 
-    /// Clear the idle-dormant marker for a session that has queued work so the reconciler's
-    /// resume pass respawns its worker, after which the next tick drains the queue (see
-    /// `acp_reconciler::drain_queued_prompts`).
+    /// Clear the idle-dormant marker for a session that has queued work so the
+    /// reconciler's resume pass respawns its worker, after which the next tick
+    /// drains the queue (see `acp_reconciler::drain_queued_prompts`).
+    ///
+    /// Deliberately does NOT kick a resume directly: routing the wake through
+    /// the resume pass keeps that pass's respawn budget/park guard and never
+    /// spawns while holding a lock, so it cannot hit the #3172 re-entrant-spawn
+    /// deadlock the way a `send_turn`-under-lock wake would. Persists the clear
+    /// via the instances-write path (not `instance_lock`), so a daemon restart
+    /// keeps the session awake and the write never blocks a spawn. Guards on
+    /// `is_idle_dormant` so a session woken by another path between the
+    /// reconciler snapshot and this call is left untouched.
     pub(crate) async fn wake_dormant_for_queue_drain(self: &Arc<Self>, id: &str) {
         self.mutate_instance_persisted(id, |inst| {
             if inst.is_idle_dormant() {
@@ -1177,8 +1626,13 @@ impl SessionService {
         .await;
     }
 
-    /// Same lazy per-instance mutex registry as `AppState::instance_lock`; both operate on
-    /// the shared map, so a lock taken through either handle excludes the other.
+    /// Same lazy per-instance mutex registry as `AppState::instance_lock`;
+    /// both operate on the shared map, so a lock taken through either handle
+    /// excludes the other.
+    /// Per-session lock ordering the snapshot-and-persist in
+    /// `mutate_instance_persisted`. Always acquired BEFORE `instances.write()`
+    /// and never while holding it, and nothing acquires `instance_lock` while
+    /// holding this, so it cannot form a cycle with either.
     async fn persist_lock(&self, id: &str) -> Arc<tokio::sync::Mutex<()>> {
         {
             let guard = self.persist_locks.read().await;
@@ -1207,7 +1661,41 @@ impl SessionService {
             .clone()
     }
 
-    /// The session's single prompt-submission authority.
+    /// The session's single prompt-submission authority: hold this guard
+    /// across the whole decide-then-dispatch step, so the `Sent` / `Steered` /
+    /// `Queued` disposition ([`crate::acp::dispatch::PromptDispatch`]) is
+    /// settled atomically for every surface that can start a turn (both prompt
+    /// endpoints, the plugin host's `sessions.turn.send`, the queue drain, and
+    /// the pending-initial-turn drain). Every barrier that quiesces a worker
+    /// holds it too: stop, trash, archive, snooze, ACP shutdown, agent switch,
+    /// ACP disable, `attach_project`, the tied-worktree renames, and every
+    /// permanent delete. The drain reads status and the
+    /// trashed/archived/snoozed flags once and then reaches `send_turn`, which
+    /// respawns a worker it finds gone, so a quiesce landing inside that window
+    /// is undone and a delete races teardown against a live delivery. The
+    /// supervisor's reapers stay outside this: they drop a handle rather than
+    /// start a turn, so the worst they do to a delivery in flight is fail it,
+    /// and a failed delivery leaves its rows queued for the next tick. See
+    /// #3621 and #3650. Callers that have not yet proved the session exists take
+    /// [`Self::prompt_submission_for_session`] instead.
+    ///
+    /// Two rules make this work, and neither is optional:
+    ///
+    /// 1. **Decide and dispatch under one hold.** Dispatch reads
+    ///    [`Self::fold_control_state`], and the fold flips to `turn_active` at
+    ///    the publish choke point inside `send_turn`. Deciding under this lock
+    ///    means the loser of a race reads the winner's publish and parks,
+    ///    rather than pushing a second `ClientCmd::Prompt` at a busy agent that
+    ///    answers `PromptRejected(agent_busy)` after the queue row is retired.
+    /// 2. **Never `instance_lock`.** `send_turn` waits on worker readiness, and
+    ///    the resume it waits for builds its spawn request under `instance_lock`
+    ///    (`acp_reconciler::build_spawn_request`). A submitter that held that
+    ///    lock would stall the very resume it is waiting for and give up after
+    ///    `WORKER_READY_TIMEOUT`. Where both are genuinely needed, take this
+    ///    one first and release `instance_lock` before the wait: the prompt
+    ///    handlers claim this guard on entry and wake under it, and
+    ///    `touch_and_wake_on_prompt` drops `instance_lock` before returning.
+    ///    Never the reverse order.
     pub(crate) async fn prompt_submission(&self, id: &str) -> tokio::sync::OwnedMutexGuard<()> {
         #[cfg(test)]
         if let Some(tap) = self.submission_claims.get() {
@@ -1230,8 +1718,18 @@ impl SessionService {
         lock.lock_owned().await
     }
 
-    /// [`Self::prompt_submission`] for a caller that has not yet proved it may act on the
-    /// session.
+    /// [`Self::prompt_submission`] for a caller that has not yet proved it may
+    /// act on the session. `Err` means "do not act", and no registry entry is
+    /// left behind for an id that was never admitted: the registry
+    /// auto-vivifies per id it is asked for and nothing else prunes it, so an
+    /// authenticated client probing random ids would otherwise grow it for the
+    /// daemon's lifetime (#3651).
+    ///
+    /// The re-check under the guard is what makes a permanent delete a
+    /// barrier (#3650). A delete holds this guard across its irreversible
+    /// teardown and removes the session row before dropping its lock, so both
+    /// a waiter parked on that lock and one that vivified a fresh entry after
+    /// `forget_prompt_lock` observe the removal and decline.
     pub(crate) async fn admit_prompt_submission(
         &self,
         caller: &SessionCaller,
@@ -1241,7 +1739,8 @@ impl SessionService {
         let guard = self.prompt_submission(id).await;
         if let Err(e) = self.admits_turn(caller, id).await {
             drop(guard);
-            // Only for a vanished session.
+            // Only for a vanished session: forgetting a live one's entry
+            // would hand the next waiter a different mutex.
             if matches!(e, TurnAdmissionError::SessionNotFound) {
                 self.forget_prompt_lock(id).await;
             }
@@ -1250,7 +1749,10 @@ impl SessionService {
         Ok(guard)
     }
 
-    /// May `caller` open a turn on `id`?
+    /// May `caller` open a turn on `id`? Existence plus, for a plugin, the
+    /// immutable ownership gate: a plugin may act only on a session it
+    /// created. Decided before any live state is folded, so a foreign session
+    /// answers `not_owner` whatever it is currently doing (#3685).
     pub(crate) async fn admits_turn(
         &self,
         caller: &SessionCaller,
@@ -1283,9 +1785,15 @@ impl SessionService {
             .ok()
     }
 
-    /// Settle the prompt's disposition under a submission guard the caller already holds,
-    /// so every turn-starting surface decides and dispatches as one step instead of
-    /// dispatching unconditionally after the wait.
+    /// Settle the prompt's disposition under a submission guard the caller
+    /// already holds, so every turn-starting surface decides and dispatches as
+    /// one step instead of dispatching unconditionally after the wait (#3649).
+    ///
+    /// Separate from the claim because the two are not adjacent: every caller
+    /// takes [`Self::admit_prompt_submission`] on entry (a `/acp/cancel` must
+    /// not be able to overtake the prompt it is meant to stop, see
+    /// `api::acp::acp_cancel`) and only has an `idle_dormant` to decide with
+    /// after the wake it runs under the hold.
     pub(crate) async fn prompt_dispatch_under_submission(
         &self,
         id: &str,
@@ -1312,20 +1820,30 @@ impl SessionService {
             .unwrap_or(false)
     }
 
-    /// Drop a deleted session's submission lock, mirroring the `instance_locks` removal the
-    /// same delete paths already do.
+    /// Drop a deleted session's submission lock, mirroring the `instance_locks`
+    /// removal the same delete paths already do. The registry is keyed by
+    /// session id and nothing prunes it otherwise, so without this a long-lived
+    /// daemon retains one entry per session it has ever seen.
     pub(crate) async fn forget_prompt_lock(&self, id: &str) {
         self.prompt_locks.write().await.remove(id);
     }
 
     /// Registry size for a test asserting `prompt_locks` stays bounded (e.g.
+    /// does not grow for ids that were never admitted past an existence
+    /// check).
     #[cfg(test)]
     pub(crate) async fn prompt_locks_len(&self) -> usize {
         self.prompt_locks.read().await.len()
     }
 
-    /// Report every [`Self::prompt_submission`] claim at the one moment a deletion-race
-    /// test can use.
+    /// Report every [`Self::prompt_submission`] claim at the one moment a
+    /// deletion-race test can use: the claimer has cleared
+    /// [`Self::prompt_submission_for_session`]'s pre-acquisition existence
+    /// check and has not yet touched `prompt_locks`, so a delete landing now
+    /// is precisely the race the post-acquisition check exists for. Sampling
+    /// the raw claim rather than the admission above it keeps the same
+    /// checkpoint on a build where the drains take the vivifying guard, so the
+    /// test still fails there instead of hanging. One watcher per service.
     #[cfg(test)]
     pub(crate) fn watch_submission_claims(&self) -> tokio::sync::mpsc::UnboundedReceiver<String> {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1353,8 +1871,167 @@ impl Drop for PendingDrainGuard {
     }
 }
 
-/// Releases the in-flight slot and wakes waiters on every exit path of the winning create,
-/// including an error return or a panic unwinding through the caller.
+pub(super) struct CreationProfileGuard {
+    service: Arc<SessionService>,
+    profile: String,
+}
+
+impl Drop for CreationProfileGuard {
+    fn drop(&mut self) {
+        let mut profiles = self
+            .service
+            .creations_by_profile
+            .lock()
+            .expect("creation profiles mutex poisoned");
+        let count = profiles
+            .get_mut(&self.profile)
+            .expect("active creation profile");
+        *count -= 1;
+        if *count == 0 {
+            profiles.remove(&self.profile);
+        }
+    }
+}
+
+/// Bounded live view: creation progress is display-only, so it never grows
+/// with hook output. Output lines are also capped individually, because a
+/// single hook line can be arbitrarily large.
+const CREATION_PROGRESS_LINES: usize = 20;
+const CREATION_PROGRESS_LINE_CHARS: usize = 400;
+/// Minimum spacing between two published output lines, so a chatty hook cannot
+/// drive a snapshot-sized write per line. Phase and command changes publish
+/// immediately.
+const CREATION_PROGRESS_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+fn bounded_progress_line(line: &str) -> String {
+    match line
+        .char_indices()
+        .nth(CREATION_PROGRESS_LINE_CHARS)
+        .map(|(end, _)| end)
+    {
+        Some(end) => format!("{}...", &line[..end]),
+        None => line.to_owned(),
+    }
+}
+
+/// Let the next output line publish immediately. A hook that prints one line
+/// and then blocks must not stay invisible behind the rate limit.
+fn allow_immediate_output(entry: &mut CreationEntry) {
+    entry.published_at = std::time::Instant::now()
+        .checked_sub(CREATION_PROGRESS_INTERVAL)
+        .unwrap_or_else(std::time::Instant::now);
+}
+
+/// Whether the creation may still be cancelled or launched.
+enum CreationLifecycle {
+    Running,
+    Cancelled,
+    Committed,
+}
+
+struct CreationEntry {
+    lifecycle: CreationLifecycle,
+    progress: CreationProgress,
+    published_at: std::time::Instant,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("Session creation cancelled")]
+pub(crate) struct CreationCancelled;
+
+pub(super) struct CreationGuard {
+    service: Arc<SessionService>,
+    id: String,
+    entry: Arc<std::sync::Mutex<CreationEntry>>,
+}
+
+impl CreationGuard {
+    pub(super) fn check(&self) -> Result<(), CreationCancelled> {
+        if matches!(
+            self.entry
+                .lock()
+                .expect("creation entry poisoned")
+                .lifecycle,
+            CreationLifecycle::Cancelled
+        ) {
+            Err(CreationCancelled)
+        } else {
+            Ok(())
+        }
+    }
+
+    pub(super) fn commit(&self) -> Result<(), CreationCancelled> {
+        let mut entry = self.entry.lock().expect("creation entry poisoned");
+        match entry.lifecycle {
+            CreationLifecycle::Cancelled => Err(CreationCancelled),
+            CreationLifecycle::Running | CreationLifecycle::Committed => {
+                entry.lifecycle = CreationLifecycle::Committed;
+                Ok(())
+            }
+        }
+    }
+
+    /// Enter a phase, discarding the previous phase's command and output.
+    pub(super) fn phase(&self, phase: CreationPhase) {
+        {
+            let mut entry = self.entry.lock().expect("creation entry poisoned");
+            entry.progress.phase = phase;
+            entry.progress.command = None;
+            entry.progress.output.clear();
+            allow_immediate_output(&mut entry);
+        }
+        self.service.publish_creation_progress();
+    }
+
+    pub(super) fn command(&self, command: &str) {
+        {
+            let mut entry = self.entry.lock().expect("creation entry poisoned");
+            entry.progress.command = Some(bounded_progress_line(command));
+            allow_immediate_output(&mut entry);
+        }
+        self.service.publish_creation_progress();
+    }
+
+    fn output(&self, line: &str) {
+        {
+            let mut entry = self.entry.lock().expect("creation entry poisoned");
+            let output = &mut entry.progress.output;
+            if output.len() == CREATION_PROGRESS_LINES {
+                output.remove(0);
+            }
+            output.push(bounded_progress_line(line));
+            if entry.published_at.elapsed() < CREATION_PROGRESS_INTERVAL {
+                return;
+            }
+            entry.published_at = std::time::Instant::now();
+        }
+        self.service.publish_creation_progress();
+    }
+
+    /// Route one hook event into the published progress.
+    pub(super) fn hook_event(&self, event: crate::session::config::repo_config::HookProgress) {
+        use crate::session::config::repo_config::HookProgress;
+        match event {
+            HookProgress::Started(command) => self.command(&command),
+            HookProgress::Output(line) => self.output(&line),
+        }
+    }
+}
+
+impl Drop for CreationGuard {
+    fn drop(&mut self) {
+        self.service
+            .active_creations
+            .lock()
+            .expect("creation registry poisoned")
+            .remove(&self.id);
+        self.service.publish_creation_progress();
+    }
+}
+
+/// Releases the in-flight slot and wakes waiters on every exit path of the
+/// winning create, including an error return or a panic unwinding through
+/// the caller.
 struct InFlightGuard {
     service: Arc<SessionService>,
     scope: (String, String),
@@ -1373,8 +2050,11 @@ impl Drop for InFlightGuard {
     }
 }
 
-/// Match a plugin create request against the persisted sessions by `(created_by_plugin,
-/// idempotency key)`.
+/// Match a plugin create request against the persisted sessions by
+/// `(created_by_plugin, idempotency key)`. Archived, snoozed, and trashed
+/// sessions still match: the record exists, so the create already happened;
+/// returning it does not restore or unarchive anything. Only a hard-deleted
+/// record (absent from the list) frees the key.
 fn find_idempotent_match(
     instances: &[Instance],
     plugin_id: &str,
@@ -1399,7 +2079,8 @@ fn find_idempotent_match(
     IdempotentMatch::None
 }
 
-/// Versioned, restart-stable hash of the semantic create request.
+/// Versioned request hash with fixed field order and length-prefixed values.
+/// Plugin trust inputs are forced and are not part of request identity.
 fn spec_payload_hash(spec: &StructuredSessionSpec) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
@@ -1473,7 +2154,18 @@ fn spec_payload_hash(spec: &StructuredSessionSpec) -> String {
 }
 
 /// Disk-side half of [`SessionService::touch_and_wake_on_prompt`], mirroring onto disk
-/// whatever the memory side actually did.
+/// whatever the memory side actually did. A waking prompt keeps touch semantics
+/// and lifts the sink; any other prompt advances recency monotonically and
+/// leaves sink state alone.
+///
+/// What the second tier buys, precisely: `wake` is computed from
+/// `state.instances`, so a daemon whose memory predates a peer's archive would
+/// otherwise clear a sink it has never observed. Tier 2 stops that, and only
+/// that.
+///
+/// Advancing `last_accessed_at` on disk is the signal `merge_user_action_diff`
+/// (`session/instance/merge.rs`) keys on to clear a park, which is right for a
+/// real user gesture (#3465 was about a passive stamp reaching that arm).
 pub(crate) fn apply_prompt_persist_to_disk(disk: &mut crate::session::Instance, wake: bool) {
     if wake {
         disk.touch_last_accessed();
@@ -1486,12 +2178,6 @@ pub(crate) fn apply_prompt_persist_to_disk(disk: &mut crate::session::Instance, 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn service_for(rows: Vec<Instance>) -> Arc<SessionService> {
-        crate::server::test_support::build_test_app_state(rows)
-            .session_service
-            .clone()
-    }
 
     fn plugin_instance(plugin_id: &str, key: &str, payload_hash: &str) -> Instance {
         let mut inst = Instance::new("scheduled", "/tmp/aoe-2897-project");
@@ -1506,6 +2192,7 @@ mod tests {
     fn test_spec() -> StructuredSessionSpec {
         StructuredSessionSpec {
             title: Some("nightly".to_string()),
+            size: None,
             path: "/tmp/aoe-2897-project".to_string(),
             group: String::new(),
             tool: "claude".to_string(),
@@ -1523,6 +2210,7 @@ mod tests {
             repo_base_branches: Vec::new(),
             scratch: false,
             trust_hooks: None,
+            trust_review: None,
             custom_instruction: None,
             callback_url: None,
             idempotency_key: None,
@@ -1538,6 +2226,42 @@ mod tests {
             import_acp_session_id: None,
             fork_seed: None,
         }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn plugin_creation_cannot_approve_or_skip_untrusted_hooks() -> anyhow::Result<()> {
+        let home = crate::session::test_support::isolate_app_dir();
+        let project = home.path().join("project");
+        let config_dir = project.join(".agent-of-empires");
+        std::fs::create_dir_all(&config_dir)?;
+        std::fs::write(
+            config_dir.join("config.toml"),
+            "[hooks]\non_create = [\"false\"]\n",
+        )?;
+        let storage = crate::session::Storage::new_unwatched("default")?;
+        let state = crate::server::test_support::build_test_app_state(Vec::new());
+        for decision in [Some(false), Some(true)] {
+            let mut spec = test_spec();
+            spec.path = project.to_string_lossy().into_owned();
+            spec.trust_hooks = decision;
+            // Invalid Git input prevents launching a real agent if the trust gate regresses.
+            spec.worktree_enabled = true;
+            spec.worktree_branch = Some("planned".into());
+            spec.create_new_branch = true;
+            let error = state
+                .session_service
+                .create_structured_session(spec, Some("cron"), None, None)
+                .await
+                .err()
+                .expect("plugin trust decisions must be refused");
+            assert!(
+                error.is::<crate::server::api::sessions::HooksNeedTrust>(),
+                "{error:#}"
+            );
+        }
+        assert!(storage.load()?.is_empty());
+        Ok(())
     }
 
     #[test]
@@ -1565,7 +2289,9 @@ mod tests {
 
     #[tokio::test]
     async fn in_flight_claim_waits_same_hash_and_conflicts_on_mismatch() {
-        let service = service_for(Vec::new());
+        let service = crate::server::test_support::build_test_app_state(Vec::new())
+            .session_service
+            .clone();
         let scope = ("cron".to_string(), "job-1".to_string());
 
         let ClaimOutcome::Claimed = service.try_claim_in_flight(&scope, "hash-a") else {
@@ -1603,7 +2329,9 @@ mod tests {
         let hash = spec_payload_hash(&spec);
         let mut prior = plugin_instance("cron", "job-1", &hash);
         prior.id = "sess-prior".to_string();
-        let service = service_for(vec![prior]);
+        let service = crate::server::test_support::build_test_app_state(vec![prior])
+            .session_service
+            .clone();
 
         // Same plugin, key, and payload: replay the existing session.
         match service
@@ -1676,7 +2404,10 @@ mod tests {
         let mut cron_session = Instance::new("cron-owned", "/tmp/aoe-2897-project");
         cron_session.id = "sess-cron".to_string();
         cron_session.created_by_plugin = Some("cron".to_string());
-        let service = service_for(vec![user_session, cron_session]);
+        let service =
+            crate::server::test_support::build_test_app_state(vec![user_session, cron_session])
+                .session_service
+                .clone();
 
         let cron = SessionCaller::Plugin {
             plugin_id: "cron".to_string(),
@@ -1739,9 +2470,10 @@ mod tests {
             Err(SendTurnError::SessionNotFound)
         ));
 
-        // The owner passes the gate; these terminal-view test sessions fail at a LATER
-        // stage (resume snapshot or worker capacity, both environment dependent), proving
-        // the denials above came from the ownership check specifically.
+        // The owner passes the gate; these terminal-view test sessions fail
+        // at a LATER stage (resume snapshot or worker capacity, both
+        // environment dependent), proving the denials above came from the
+        // ownership check specifically.
         assert!(!matches!(
             service
                 .send_turn(
@@ -1783,9 +2515,15 @@ mod tests {
         let mut inst = Instance::new("no-pending", "/tmp/aoe-2897-project");
         inst.id = "sess-drain".to_string();
         inst.view = crate::session::View::Structured;
-        let service = service_for(vec![inst]);
+        let service = crate::server::test_support::build_test_app_state(vec![inst])
+            .session_service
+            .clone();
 
-        // No pending turn.
+        // No pending turn: returns without touching the supervisor. Missing
+        // session: same. Both must release the per-session claim so a later
+        // drain can run (the second call would return early if the first
+        // leaked its claim, which this test cannot distinguish from a no-op,
+        // so assert on the claim set directly).
         service.drain_pending_initial_turn("sess-drain").await;
         service.drain_pending_initial_turn("sess-missing").await;
         assert!(
@@ -1798,7 +2536,20 @@ mod tests {
         );
     }
 
-    /// The drain must not deliver into a turn prompt dispatch parked the prompt behind.
+    /// The drain must not deliver into a turn prompt dispatch parked the
+    /// prompt behind.
+    ///
+    /// `Instance.status` is applied by `acp_event_listener`, one serial task
+    /// behind every session's event stream, while dispatch reads the fold
+    /// `ChannelSink::publish_persisted` updates as it records. Whenever the
+    /// listener is behind, a session with a live turn still reads `Idle`, and
+    /// the pre-fix drain took that as "the turn ended" and sent the queued
+    /// prompt as a second concurrent turn.
+    ///
+    /// Both rows below are undeliverable husks (empty text, no buffered
+    /// bytes), because retiring a husk is the drain's only externally visible
+    /// effect in a test with no live worker: the idle session's row is retired,
+    /// the mid-turn session's row survives untouched.
     #[tokio::test]
     async fn a_queued_prompt_is_not_drained_into_a_turn_status_has_not_caught_up_with() {
         let _app_dir = crate::session::test_support::isolate_app_dir();
@@ -1812,12 +2563,14 @@ mod tests {
         let mut mid_turn = Instance::new("mid", "/tmp/aoe-queue-mid-turn");
         mid_turn.id = "sess-mid-turn".to_string();
         mid_turn.view = crate::session::View::Structured;
-        // The lagging mirror.
+        // The lagging mirror: a turn is running, but the listener has not
+        // applied its `UserPromptSent` yet, so the row still says Idle.
         mid_turn.status = crate::session::Status::Idle;
         let state = crate::server::test_support::build_test_app_state(vec![idle, mid_turn]);
         let service = state.session_service.clone();
 
-        // Publish through the real choke point.
+        // Publish through the real choke point: that is what folds the live
+        // projection the drain now reads.
         let sink = crate::acp::supervisor::ChannelSink {
             tx: state.acp_events_tx.clone(),
             event_store: Arc::clone(&state.acp_event_store),
@@ -1872,7 +2625,21 @@ mod tests {
         );
     }
 
-    /// #3621.
+    /// #3621: the queue drain must leave `instance_lock` free while it waits
+    /// for a worker.
+    ///
+    /// The reconciler starts the drain on `is_running`, which is also true for
+    /// a resume that has reserved its slot but has not produced a worker yet.
+    /// The drain then parks in `send_turn`'s readiness wait, and the resume it
+    /// is parked on cannot finish, because `build_spawn_request` needs that
+    /// same lock. Pre-fix the two sat on each other for the whole
+    /// `WORKER_READY_TIMEOUT`, after which the drain gave up and left the batch
+    /// for a later tick.
+    ///
+    /// A held `ResumeReservation` stands in for the spawn in flight, the same
+    /// fixture `acp::wake_prompt_frees_instance_lock_and_publishes_nothing_without_a_worker`
+    /// uses: it makes `wait_for_worker` park exactly as it does mid-respawn,
+    /// with no process, sandbox, or agent involved.
     #[tokio::test]
     #[serial_test::serial]
     async fn the_queue_drain_frees_instance_lock_while_it_waits_for_a_resuming_worker() {
@@ -1884,7 +2651,9 @@ mod tests {
         inst.id = "sess-3621".to_string();
         inst.view = crate::session::View::Structured;
         inst.status = crate::session::Status::Idle;
-        let service = service_for(vec![inst]);
+        let service = crate::server::test_support::build_test_app_state(vec![inst])
+            .session_service
+            .clone();
 
         // Deliverable text, so the drain reaches `send_turn` rather than
         // retiring an undeliverable husk on the way.
@@ -1950,6 +2719,13 @@ mod tests {
     }
 
     /// Every queue mutation that can race a delivery waits for it.
+    ///
+    /// The drain snapshots its batch and only then sends, so a mutation
+    /// landing inside that window changes rows the agent is already about to
+    /// receive: an edit is delivered as its old text and then retired, losing
+    /// the new text with nothing to retry, and a clear empties the durable
+    /// queue for a batch that goes out anyway. `remove_queued_prompt` was
+    /// already serialized for this reason; `edit` and `clear` were not.
     #[tokio::test]
     async fn queue_mutations_wait_for_an_in_flight_delivery() {
         let _app_dir = crate::session::test_support::isolate_app_dir();
@@ -1959,7 +2735,9 @@ mod tests {
         inst.id = "sess-mut".to_string();
         inst.view = crate::session::View::Structured;
         inst.status = crate::session::Status::Idle;
-        let service = service_for(vec![inst]);
+        let service = crate::server::test_support::build_test_app_state(vec![inst])
+            .session_service
+            .clone();
         service
             .enqueue_prompt(
                 "sess-mut",
@@ -2026,7 +2804,15 @@ mod tests {
         assert!(service.queued_prompts_snapshot("sess-mut").await.is_empty());
     }
 
-    /// #3687.
+    /// #3687: a background drain spawned from a pre-deletion snapshot must not
+    /// re-create the deleted session's `prompt_locks` entry.
+    ///
+    /// The registry vivifies an entry per id it is asked for and only a
+    /// permanent delete prunes it, so a drain claiming the raw guard after the
+    /// row is gone leaves one behind for the daemon's lifetime. Both windows
+    /// count: the drain that starts after the delete finished, and the one
+    /// that proves existence first and then vivifies its entry after the
+    /// delete's own `forget_prompt_lock` has already run.
     #[tokio::test]
     async fn drains_leave_no_prompt_lock_for_a_deleted_session() {
         use std::time::Duration;
@@ -2073,7 +2859,18 @@ mod tests {
             "a drain for an id that no longer exists must not vivify an entry"
         );
 
-        // Window two.
+        // Window two: the drain cleared the existence check and then parked
+        // reaching the registry, so it vivifies its entry after the delete's
+        // own `forget_prompt_lock` (a no-op here: no entry existed yet) and
+        // only the post-acquisition check can retire it.
+        //
+        // The claim tap is what pins the drain to that state. A timer plus
+        // `!is_finished()` would only say the task had not returned, which is
+        // equally true of a drain that had not been polled at all and would
+        // then decline at the first check, quietly collapsing this case into
+        // window one. Holding the registry write guard is the other half: the
+        // tap fires immediately before `prompt_locks` is read, so the drain
+        // cannot advance past it while the guard is held.
         let mut claims = service.watch_submission_claims();
         let registry = service.prompt_locks.write().await;
         let drain = tokio::spawn({
@@ -2106,9 +2903,22 @@ mod tests {
         );
     }
 
-    /// Queueing a follow-up is a user gesture, so it must advance `last_accessed_at` in
-    /// memory and on disk, and it must do so WITHOUT clearing a sink a peer wrote after
-    /// this daemon's snapshot.
+    /// Queueing a follow-up is a user gesture, so it must advance
+    /// `last_accessed_at` in memory and on disk, and it must do so WITHOUT
+    /// clearing a sink a peer wrote after this daemon's snapshot.
+    ///
+    /// Before #3465 the recency half was supplied by accident:
+    /// `apply_status_intent` restamped the field on every worker-event
+    /// transition, so the queued turn's Running/Idle edges kept it fresh.
+    /// Dropping that stamp left the web composer's `POST /queue` path (the one
+    /// it takes for a follow-up typed behind a live turn) advancing nothing, so
+    /// an actively-queued session aged into the top of the attention sort as
+    /// the most neglected one (`groups.rs::attention_session_key` sorts
+    /// `last_accessed_at` ASC) and the TUI activity column showed a stale age.
+    ///
+    /// The sink assertion is the other half: mirroring this field with
+    /// `touch_last_accessed()` instead of a monotone max would pass the recency
+    /// checks and reintroduce #3465's wipe.
     #[tokio::test]
     #[serial_test::serial]
     async fn enqueueing_a_prompt_advances_recency_without_clearing_a_peer_sink() {
@@ -2138,7 +2948,9 @@ mod tests {
             })
             .unwrap();
 
-        let service = service_for(vec![inst]);
+        let service = crate::server::test_support::build_test_app_state(vec![inst])
+            .session_service
+            .clone();
         service
             .enqueue_prompt(
                 "sess-recency",
@@ -2176,7 +2988,16 @@ mod tests {
         );
     }
 
-    /// Concurrent enqueues all survive with distinct seqs, in memory and on disk.
+    /// Concurrent enqueues all survive with distinct seqs, in memory and on
+    /// disk. Guards review finding 8: the disk copy used to re-run the caller's
+    /// closure and re-derive `seq` from whatever the file happened to hold, so
+    /// racing enqueues could persist duplicate or reordered seqs.
+    ///
+    /// It does NOT prove the per-session persist lock. Copying a whole snapshot
+    /// makes write ordering load-bearing (a stale `[a]` landing after `[a, b]`
+    /// would drop `b`), and the lock exists to make that ordering guaranteed
+    /// rather than incidental, but 32-way concurrency here never reordered the
+    /// two `Storage::update` calls, so the lock is defensive and unproven.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[serial_test::serial]
     async fn concurrent_enqueues_all_survive_to_disk() {
@@ -2196,7 +3017,9 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        let service = service_for(vec![inst]);
+        let service = crate::server::test_support::build_test_app_state(vec![inst])
+            .session_service
+            .clone();
 
         // Fire them together, the way two quick taps on Queue do.
         let mut tasks = Vec::new();
@@ -2236,7 +3059,8 @@ mod tests {
             .expect("session on disk")
             .queued_prompts;
         assert_eq!(persisted.len(), 32, "every enqueue reaches disk");
-        // The disk-side check is the one that fails on finding 8.
+        // The disk-side check is the one that fails on finding 8: re-deriving
+        // `seq` per copy let two rows persist the same one.
         let mut disk_seqs: Vec<u64> = persisted.iter().map(|q| q.seq).collect();
         disk_seqs.sort_unstable();
         disk_seqs.dedup();
@@ -2309,6 +3133,7 @@ mod tests {
             let read_epoch = state
                 .mutation_epoch
                 .load(std::sync::atomic::Ordering::SeqCst);
+            let metadata = state.canonical_metadata.read().await.clone();
 
             mutate(Arc::clone(&state.session_service)).await;
             crate::server::reload::reload_state_instances_from_disk(
@@ -2317,6 +3142,8 @@ mod tests {
                 vec![],
                 crate::server::state::StatusSource::DiskOnly,
                 read_epoch,
+                metadata,
+                std::collections::HashMap::new(),
             )
             .await;
 
@@ -2330,9 +3157,12 @@ mod tests {
         let mut inst = Instance::new("queue", "/tmp/aoe-queue-project");
         inst.id = "sess-q".to_string();
         inst.view = crate::session::View::Structured;
-        let service = service_for(vec![inst]);
+        let service = crate::server::test_support::build_test_app_state(vec![inst])
+            .session_service
+            .clone();
 
-        // Enqueue two.
+        // Enqueue two: seqs are assigned monotonically and the snapshot is
+        // ordered by seq.
         let a = service
             .enqueue_prompt(
                 "sess-q",
@@ -2362,7 +3192,8 @@ mod tests {
             ["first", "second"]
         );
 
-        // Re-enqueue by the same id is an idempotent update, not a duplicate.
+        // Re-enqueue by the same id is an idempotent update, not a duplicate:
+        // an optimistic client retry cannot double-queue.
         let a2 = service
             .enqueue_prompt(
                 "sess-q",
@@ -2390,7 +3221,10 @@ mod tests {
                 .await,
             EditQueuedOutcome::NotFound
         );
-        // Blanking a text-only row is refused and leaves the text intact.
+        // Blanking a text-only row is refused and leaves the text intact. The
+        // drain can neither deliver nor retire such a row, so accepting the
+        // edit would wedge the queue behind it (and pin the worker alive,
+        // since the idle reaper skips a session that has one).
         for blank in ["", "   ", "\n\t "] {
             assert_eq!(
                 service
@@ -2471,7 +3305,8 @@ mod tests {
         assert_eq!(sub.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(), ["c"]);
         assert_eq!(combined, "/clear");
 
-        // No clear anywhere.
+        // No clear anywhere: the whole queue combines and empty-text rows are
+        // skipped (so no stray blank-line separators).
         let q = vec![
             entry("a", 0, "one"),
             entry("b", 1, ""),

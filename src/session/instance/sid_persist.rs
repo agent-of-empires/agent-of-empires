@@ -50,161 +50,64 @@ pub(crate) fn persist_session_to_storage(
     persist_session_with_storage(&storage, instance_id, observation, expected)
 }
 
-pub(super) fn persist_session_with_storage(
-    storage: &crate::session::storage::Storage,
-    instance_id: &str,
-    observation: &crate::session::poller::SessionIdObservation,
-    expected: &ConversationState,
-) -> SidWrite {
-    use crate::session::poller::SessionIdGuard;
-    let session_id = observation.sid.as_str();
-    if !is_valid_session_id(session_id) {
-        return SidWrite::Failed;
-    }
-    if observation.execution != expected.active {
-        return SidWrite::Skipped;
-    }
-    let binding = observation.conversation_binding();
-    let result = storage.update(|instances, _groups| {
-        let Some(index) = instances
-            .iter()
-            .position(|instance| instance.id == instance_id)
-        else {
+impl Instance {
+    /// Consume an explicit OMP resume pin only after the matching launch
+    /// reports the already-durable sid. All three facts are checked under the
+    /// storage flock so a concurrent re-pin or relaunch cannot be consumed.
+    pub(crate) fn persist_omp_pin_confirmation(
+        storage: &dyn crate::session::SessionStore,
+        instance_id: &str,
+        session_id: &str,
+        generation: &str,
+    ) -> Result<SidWrite> {
+        if !is_valid_session_id(session_id) {
             return Ok(SidWrite::Failed);
-        };
-        let instance = &instances[index];
-        if !expected.matches(instance)
-            || matches!(instance.resume_intent, ResumeIntent::Fork { .. })
-        {
-            return Ok(SidWrite::Skipped);
         }
-        match &observation.guard {
-            SessionIdGuard::OmpGeneration(generation)
-                if instance.omp_capture_generation.as_ref() != Some(generation) =>
+        storage.update(|instances, _groups| {
+            let Some(instance) = instances
+                .iter_mut()
+                .find(|instance| instance.id == instance_id)
+            else {
+                return Err(LifecycleReservationError::Superseded.into());
+            };
+            let intent_matches = matches!(
+                &instance.resume_intent,
+                ResumeIntent::Use(pinned) if pinned == session_id
+            );
+            if instance.agent_session_id.as_deref() != Some(session_id)
+                || !intent_matches
+                || instance.omp_capture_generation.as_deref() != Some(generation)
             {
-                return Ok(SidWrite::Skipped)
-            }
-            SessionIdGuard::OmpLegacy if instance.omp_capture_generation.is_some() => {
-                return Ok(SidWrite::Skipped)
-            }
-            _ => {}
-        }
-        // A pin to another conversation is a deliberate refusal, not a race:
-        // report it distinctly so teardown can proceed without touching the
-        // pin. Only the sid mismatch qualifies; a divergent execution binding
-        // for the pinned sid stays a namespace doubt (`Skipped`).
-        if let ResumeIntent::Use(pinned) = &instance.resume_intent {
-            if pinned != session_id {
-                return Ok(SidWrite::PinnedForeign);
-            }
-            if instance.resume_binding.as_ref().is_some_and(|target| {
-                target.execution.as_ref()
-                    != binding
-                        .as_ref()
-                        .and_then(|binding| binding.execution.as_ref())
-            }) {
+                tracing::warn!(target: "session.store",
+                    instance = %instance_id,
+                    sid = %session_id,
+                    generation = %generation,
+                    disk_sid = ?instance.agent_session_id,
+                    disk_intent = ?instance.resume_intent,
+                    disk_generation = ?instance.omp_capture_generation,
+                    "OMP pin confirmation CAS mismatch"
+                );
                 return Ok(SidWrite::Skipped);
             }
-        }
-        if instance.is_capture_excluded(session_id, observation.source.as_ref()) {
-            return Ok(SidWrite::Skipped);
-        }
-        let owns = |sid: Option<&str>, owner: Option<&ConversationBinding>| {
-            sid == Some(session_id)
-                && crate::session::capture::owner_excludes(
-                    observation.source.as_ref(),
-                    owner,
-                    session_id,
-                )
-        };
-        let conflict = instances.iter().any(|peer| {
-            peer.id != instance_id
-                && (owns(
-                    peer.agent_session_id.as_deref(),
-                    peer.agent_session_binding.as_ref(),
-                ) || peer.prior_tool_session_ids.values().any(|parked| {
-                    owns(
-                        parked.agent_session_id.as_deref(),
-                        parked.agent_session_binding.as_ref(),
-                    )
-                }))
-        });
-        if conflict {
-            return Ok(SidWrite::Skipped);
-        }
-        let instance = &mut instances[index];
-        let confirms_pin = observation.confirms_omp_pin(&instance.resume_intent);
-        // A source-less observation of the id the row already holds is not
-        // evidence that a conversation qualified, nor that a failed resume now
-        // works; keep the binding and the loop breaker.
-        let establishes = binding.is_some();
-        let new_conversation = instance.agent_session_id.as_deref() != Some(session_id);
-        let binding = binding.or_else(|| instance.observed_binding(observation));
-        instance.set_agent_conversation(
-            Some(session_id.into()),
-            binding,
-            observation.pi_session_path.clone(),
-        );
-        if establishes || new_conversation {
-            instance.resume_probe_failed_sid = None;
-        }
-        if confirms_pin {
             instance.resume_intent = ResumeIntent::Default;
-            instance.resume_binding = None;
-        }
-        Ok(SidWrite::Applied)
-    });
-    match result {
-        Ok(outcome) => outcome,
-        Err(error) => {
-            tracing::warn!(target: "session.store", "Cannot persist captured conversation: {error}");
-            SidWrite::Failed
-        }
-    }
-}
-
-impl Instance {
-    pub(super) fn persist_session_id(
-        &mut self,
-        profile: &str,
-        expected: &ConversationState,
-    ) -> SidPersistOutcome {
-        let new_sid = self.agent_session_id.clone();
-
-        if let Some(ref sid) = new_sid {
-            if !is_valid_session_id(sid) {
-                tracing::warn!(target: "session.store",
-                    "Refusing to persist invalid session ID {:?} for {}",
-                    sid,
-                    self.id
-                );
-                return SidPersistOutcome::Skip;
-            }
-        }
-
-        let storage =
-            match crate::session::storage::Storage::new(profile, self.resolve_file_watch()) {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!(target: "session.store",
-                        "Failed to create storage for finalize-launch persist for {}: {}",
-                        self.id,
-                        e
-                    );
-                    return SidPersistOutcome::Skip;
-                }
-            };
-
-        self.persist_session_id_with_storage(&storage, expected)
+            Ok(SidWrite::Applied)
+        })
     }
 
-    fn persist_session_id_with_storage(
+    pub(super) fn persist_session_id_with_storage(
         &mut self,
-        storage: &crate::session::storage::Storage,
+        storage: &dyn crate::session::SessionStore,
         expected: &ConversationState,
     ) -> SidPersistOutcome {
         let expected_prior_intent = expected.intent.clone();
         let new_sid = self.agent_session_id.clone();
+        if self
+            .agent_session_id
+            .as_deref()
+            .is_some_and(|sid| !is_valid_session_id(sid))
+        {
+            return SidPersistOutcome::Skip;
+        }
         // Cleared and Fork are one-shot launch directives. Use stays durable
         // only when no pane-scoped capture backend can observe a later `/new`;
         // capture-backed agents hand ownership back to their poller.
@@ -230,7 +133,7 @@ impl Instance {
         let instance_id = self.id.clone();
         let new_sid_for_closure = new_sid.clone();
         let expected_prior_intent_for_closure = expected_prior_intent.clone();
-        let mut cleared_holder_ids: Vec<String> = Vec::new();
+        let mut cleared_holder_ids = Vec::new();
         let outcome = storage.update(|instances, _groups| {
             let Some(index) = instances
                 .iter()
@@ -426,7 +329,133 @@ impl Instance {
             }
         }
     }
+    #[cfg(test)]
+    pub(crate) fn persist_session_id(
+        &mut self,
+        profile: &str,
+        expected: &ConversationState,
+    ) -> SidPersistOutcome {
+        let Ok(storage) = crate::session::storage::Storage::new(profile, self.resolve_file_watch())
+        else {
+            return SidPersistOutcome::Skip;
+        };
+        self.persist_session_id_with_storage(&storage, expected)
+    }
 }
+
+pub(super) fn persist_session_with_storage(
+    storage: &dyn crate::session::SessionStore,
+    instance_id: &str,
+    observation: &crate::session::poller::SessionIdObservation,
+    expected: &ConversationState,
+) -> SidWrite {
+    use crate::session::poller::SessionIdGuard;
+    let session_id = observation.sid.as_str();
+    if !is_valid_session_id(session_id) {
+        return SidWrite::Failed;
+    }
+    if observation.execution != expected.active {
+        return SidWrite::Skipped;
+    }
+    let binding = observation.conversation_binding();
+    let result = storage.update(|instances, _groups| {
+        let Some(index) = instances
+            .iter()
+            .position(|instance| instance.id == instance_id)
+        else {
+            return Ok(SidWrite::Failed);
+        };
+        let instance = &instances[index];
+        if !expected.matches(instance)
+            || matches!(instance.resume_intent, ResumeIntent::Fork { .. })
+        {
+            return Ok(SidWrite::Skipped);
+        }
+        match &observation.guard {
+            SessionIdGuard::OmpGeneration(generation)
+                if instance.omp_capture_generation.as_ref() != Some(generation) =>
+            {
+                return Ok(SidWrite::Skipped)
+            }
+            SessionIdGuard::OmpLegacy if instance.omp_capture_generation.is_some() => {
+                return Ok(SidWrite::Skipped)
+            }
+            _ => {}
+        }
+        // A pin to another conversation is a deliberate refusal, not a race:
+        // report it distinctly so teardown can proceed without touching the
+        // pin. Only the sid mismatch qualifies; a divergent execution binding
+        // for the pinned sid stays a namespace doubt (`Skipped`).
+        if let ResumeIntent::Use(pinned) = &instance.resume_intent {
+            if pinned != session_id {
+                return Ok(SidWrite::PinnedForeign);
+            }
+            if instance.resume_binding.as_ref().is_some_and(|target| {
+                target.execution.as_ref()
+                    != binding
+                        .as_ref()
+                        .and_then(|binding| binding.execution.as_ref())
+            }) {
+                return Ok(SidWrite::Skipped);
+            }
+        }
+        if instance.is_capture_excluded(session_id, observation.source.as_ref()) {
+            return Ok(SidWrite::Skipped);
+        }
+        let owns = |sid: Option<&str>, owner: Option<&ConversationBinding>| {
+            sid == Some(session_id)
+                && crate::session::capture::owner_excludes(
+                    observation.source.as_ref(),
+                    owner,
+                    session_id,
+                )
+        };
+        let conflict = instances.iter().any(|peer| {
+            peer.id != instance_id
+                && (owns(
+                    peer.agent_session_id.as_deref(),
+                    peer.agent_session_binding.as_ref(),
+                ) || peer.prior_tool_session_ids.values().any(|parked| {
+                    owns(
+                        parked.agent_session_id.as_deref(),
+                        parked.agent_session_binding.as_ref(),
+                    )
+                }))
+        });
+        if conflict {
+            return Ok(SidWrite::Skipped);
+        }
+        let instance = &mut instances[index];
+        let confirms_pin = observation.confirms_omp_pin(&instance.resume_intent);
+        // A source-less observation of the id the row already holds is not
+        // evidence that a conversation qualified, nor that a failed resume now
+        // works; keep the binding and the loop breaker.
+        let establishes = binding.is_some();
+        let new_conversation = instance.agent_session_id.as_deref() != Some(session_id);
+        let binding = binding.or_else(|| instance.observed_binding(observation));
+        instance.set_agent_conversation(
+            Some(session_id.into()),
+            binding,
+            observation.pi_session_path.clone(),
+        );
+        if establishes || new_conversation {
+            instance.resume_probe_failed_sid = None;
+        }
+        if confirms_pin {
+            instance.resume_intent = ResumeIntent::Default;
+            instance.resume_binding = None;
+        }
+        Ok(SidWrite::Applied)
+    });
+    match result {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            tracing::warn!(target: "session.store", "Cannot persist captured conversation: {error}");
+            SidWrite::Failed
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1042,7 +1071,9 @@ mod tests {
             inst.omp_capture_generation = Some(old_generation.to_string());
             seed(profile, &[&inst]);
 
-            assert!(inst.publish_omp_launch_generation(profile, None, Some(old_generation)));
+            assert!(inst
+                .publish_omp_launch_generation(profile, None, Some(old_generation))
+                .unwrap());
             let disk = Storage::new_unwatched(profile).unwrap().load().unwrap();
             assert!(disk[0].omp_capture_generation.is_some());
             assert_eq!(disk[0].omp_capture_generation, inst.omp_capture_generation);

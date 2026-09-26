@@ -84,9 +84,10 @@ fn fork_denied_for_unforkable_parents_shows_info() {
     }
 }
 
-/// The fork seed forks the parent's agent, so the dialog opens preselected on it rather
-/// than the configured default: a Codex parent must land on codex, or the dialog's tool and
-/// the seed disagree.
+/// The fork seed forks the parent's agent, so the dialog must open preselected
+/// on that agent rather than the configured default. A Codex parent forking
+/// while the default tool is claude must land on codex, not claude (otherwise
+/// the dialog's tool and the seed disagree).
 #[test]
 #[serial]
 fn fork_from_selection_preselects_parent_tool() {
@@ -112,9 +113,9 @@ fn fork_from_selection_preselects_parent_tool() {
     );
 }
 
-/// A structured parent forks via the ACP `session/fork` handshake, so the seed must be
-/// `Structured` carrying the parent's captured ACP session id, not a terminal
-/// resume-with-fork-flag seed.
+/// A structured (ACP) parent forks via the ACP `session/fork` handshake, so the
+/// seed must be `Structured` carrying the parent's captured ACP session id, not
+/// a terminal resume-with-fork-flag seed.
 #[test]
 #[serial]
 fn fork_from_selection_structured_parent_seeds_structured_fork() {
@@ -146,7 +147,7 @@ fn fork_from_selection_structured_parent_seeds_structured_fork() {
 }
 
 /// Context-menu Snooze mirrors the Attention-gated `h` key: on an active session it opens
-/// the duration picker, on a snoozed one it wakes immediately.
+/// the duration picker, on a snoozed one it submits the wake to the daemon.
 #[test]
 #[serial]
 fn test_session_context_menu_snooze_toggle() {
@@ -154,6 +155,7 @@ fn test_session_context_menu_snooze_toggle() {
     use crate::tui::dialogs::ContextMenuAction;
 
     let mut env = create_test_env_with_groups();
+
     let session_idx = env
         .view
         .flat_items
@@ -168,18 +170,7 @@ fn test_session_context_menu_snooze_toggle() {
         .clone()
         .expect("a session should be selected");
 
-    env.view.snooze_session_for(&id, 60).unwrap();
-    env.view
-        .dispatch_context_menu_action(ContextMenuAction::ToggleSnooze);
-    assert!(
-        env.view.snooze_duration_dialog.is_none(),
-        "waking a snoozed session must not open the duration picker"
-    );
-    assert!(
-        !env.view.instances.get(&id).is_some_and(|i| i.is_snoozed()),
-        "context-menu Snooze on a snoozed session must wake it immediately"
-    );
-
+    // Active row: the menu opens the duration picker, exactly like the `h` key.
     env.view.sort_order = SortOrder::Attention;
     env.view.flat_items = env.view.build_flat_items();
     env.view.select_session_by_id(&id);
@@ -189,6 +180,26 @@ fn test_session_context_menu_snooze_toggle() {
         env.view.snooze_duration_dialog.is_some(),
         "context-menu Snooze on an active session must open the duration picker"
     );
+
+    // Snoozed row: the toggle is a daemon mutation, so the row only moves once
+    // the canonical snapshot lands.
+    env.view.snooze_duration_dialog = None;
+    env.view
+        .mutate_instance(&id, |instance| instance.snooze(60));
+    assert!(
+        env.view.instances.get(&id).is_some_and(|i| i.is_snoozed()),
+        "session should be snoozed before the toggle"
+    );
+    env.view
+        .dispatch_context_menu_action(ContextMenuAction::ToggleSnooze);
+    assert!(
+        env.view.snooze_duration_dialog.is_none(),
+        "waking a snoozed session must not open the duration picker"
+    );
+    assert!(
+        env.view.instances.get(&id).is_some_and(|i| i.is_snoozed()),
+        "an offline action must not alter the snooze"
+    );
 }
 
 /// `N` prefills the new-session dialog from the selected session: a worktree row borrows its
@@ -196,7 +207,12 @@ fn test_session_context_menu_snooze_toggle() {
 #[test]
 #[serial]
 fn test_shift_n_prefills_from_selected_session() {
+    // Rows are only ever built for the active profile
+    // (`cloned_instances_in_active_view`), so a fixture row has to carry that
+    // profile like the ones `observed_fork_parent` seeds: an instance with an
+    // empty `source_profile` is held by the view but never reaches the list.
     let mut worktree = Instance::new("worktree-session", "/tmp/repo-worktrees/feature-branch");
+    worktree.source_profile = "test".to_string();
     worktree.worktree_info = Some(crate::session::WorktreeInfo {
         branch: "feature-branch".to_string(),
         main_repo_path: "/tmp/repo".to_string(),
@@ -204,11 +220,15 @@ fn test_shift_n_prefills_from_selected_session() {
         created_at: chrono::Utc::now(),
         base_branch: None,
     });
-    let mut env = seeded_env(
-        test_home(),
-        &[worktree, Instance::new("ungrouped", "/tmp/u")],
-        true,
-    );
+    let mut ungrouped = Instance::new("ungrouped", "/tmp/u");
+    ungrouped.source_profile = "test".to_string();
+    let mut env = create_test_env_empty();
+    for instance in [worktree, ungrouped] {
+        env.view.add_instance(instance);
+    }
+    env.view.group_by = crate::session::config::GroupByMode::Manual;
+    env.view.flat_items = env.view.build_flat_items();
+    env.view.update_selected();
 
     for (title, path) in [("worktree-session", "/tmp/repo"), ("ungrouped", "/tmp/u")] {
         let idx = env
@@ -666,282 +686,6 @@ fn test_q_in_search_mode_types_q_not_quit() {
     assert_eq!(action, None);
     assert!(view.search_active);
     assert_eq!(view.search_query.value(), "q");
-}
-
-/// The async CreationPoller result must replace a `Creating` stub even when an intervening
-/// save already persisted it, keep the finalized row's group, and treat the committed row as
-/// authoritative rather than a provisional pending add, so a later peer deletion is not
-/// resurrected by `save`.
-#[test]
-#[serial]
-fn apply_creation_results_finalizes_persisted_stub() {
-    let CreationTestEnv {
-        mut view,
-        storage,
-        project_dir,
-        _guard,
-        _temp,
-    } = setup_creation_test_env();
-
-    view.request_creation(
-        creation_data(&project_dir, "Async Test", "async-success"),
-        None,
-    );
-    assert!(view.is_creation_pending());
-    let stub_id = view
-        .creating_stub_id
-        .clone()
-        .expect("request should install a Creating stub");
-    view.save().unwrap();
-    let (persisted_while_creating, groups_while_creating) = storage.load_with_groups().unwrap();
-    assert_eq!(persisted_while_creating.len(), 1);
-    assert_eq!(persisted_while_creating[0].id, stub_id);
-    assert_eq!(
-        persisted_while_creating[0].status,
-        crate::session::Status::Creating
-    );
-    assert!(
-        groups_while_creating
-            .iter()
-            .any(|group| group.path == "async-success"),
-        "the intervening save should persist the stub's provisional group"
-    );
-
-    let session_id = drain_creation_result(&mut view)
-        .expect("apply_creation_results should return Some(session_id)");
-    assert!(
-        view.creating_provisional_group_paths.is_empty(),
-        "finalization must leave no provisional group paths behind"
-    );
-    assert!(
-        view.get_instance(&session_id).is_some(),
-        "created session should be findable after apply_creation_results"
-    );
-    assert!(
-        !view
-            .pending_added
-            .get("default")
-            .is_some_and(|pending| pending.contains(&session_id)),
-        "a row committed by finalization is not a provisional pending add"
-    );
-    let (persisted_after_finalization, groups_after_finalization) =
-        storage.load_with_groups().unwrap();
-    assert_eq!(
-        persisted_after_finalization.len(),
-        1,
-        "finalization should replace the persisted stub with one real row"
-    );
-    assert_eq!(persisted_after_finalization[0].id, session_id);
-    assert!(
-        persisted_after_finalization
-            .iter()
-            .all(|instance| instance.id != stub_id
-                && instance.status != crate::session::Status::Creating),
-        "the persisted Creating stub must not survive finalization"
-    );
-    assert!(
-        groups_after_finalization
-            .iter()
-            .any(|group| group.path == "async-success"),
-        "the finalized row's group should remain persisted"
-    );
-    assert!(
-        view.get_instance(&stub_id).is_none(),
-        "the in-memory Creating stub must be replaced too"
-    );
-
-    storage
-        .update(|instances, _groups| {
-            instances.retain(|instance| instance.id != session_id);
-            Ok(())
-        })
-        .unwrap();
-    view.save().unwrap();
-    assert!(
-        view.get_instance(&session_id).is_none(),
-        "save must evict the peer-deleted finalized row from memory"
-    );
-    assert!(
-        !storage
-            .load()
-            .unwrap()
-            .iter()
-            .any(|instance| instance.id == session_id),
-        "a peer-deleted finalized row must not be resurrected by save"
-    );
-}
-
-/// A peer can commit the same title/path while the background builder waits for
-/// finalization. The duplicate rollback must preserve every resource the persisted winner
-/// references and its own pre-existing empty group, while discarding the losing stub's
-/// provisional group, in memory and across a later save.
-#[test]
-#[serial]
-fn apply_creation_results_rolls_back_on_peer_collision() {
-    let CreationTestEnv {
-        mut view,
-        storage,
-        project_dir,
-        _guard,
-        _temp,
-    } = setup_creation_test_env();
-
-    // Use a real created branch/worktree so rollback proves it preserves
-    // resources referenced by the persisted winner.
-    let preexisting_group = "existing-empty";
-    let transient_group = "existing-empty/collision";
-    view.group_trees
-        .get_mut("default")
-        .expect("default profile should have a group tree")
-        .create_group(preexisting_group);
-    view.save().unwrap();
-    assert!(
-        storage
-            .load_with_groups()
-            .unwrap()
-            .1
-            .iter()
-            .any(|group| group.path == preexisting_group),
-        "the parent group must be intentionally persisted before the request"
-    );
-    let branch = "raced-worktree";
-    let mut raced = creation_data(&project_dir, "Raced title", transient_group);
-    raced.worktree_enabled = true;
-    raced.worktree_branch = Some(branch.to_string());
-    raced.create_new_branch = true;
-    view.request_creation(raced, None);
-    let raced_stub_id = view
-        .creating_stub_id
-        .clone()
-        .expect("raced request should install a Creating stub");
-    view.save().unwrap();
-    let (raced_rows, raced_groups) = storage.load_with_groups().unwrap();
-    assert!(raced_rows.iter().any(|instance| {
-        instance.id == raced_stub_id && instance.status == crate::session::Status::Creating
-    }));
-    assert!(
-        raced_groups
-            .iter()
-            .any(|group| group.path == transient_group),
-        "the intervening save should persist the raced stub's child group"
-    );
-
-    let main_repo_path = project_dir.canonicalize().unwrap();
-    let git = crate::git::GitWorktree::new(main_repo_path.clone()).unwrap();
-    let start = std::time::Instant::now();
-    let winner_path = loop {
-        if let Some(path) = git
-            .list_worktrees()
-            .unwrap()
-            .into_iter()
-            .find(|worktree| worktree.branch.as_deref() == Some(branch))
-            .map(|worktree| worktree.path)
-        {
-            break path;
-        }
-        assert!(
-            start.elapsed() < std::time::Duration::from_secs(5),
-            "background worktree creation timed out"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    };
-
-    let mut owner = Instance::new("Raced title", winner_path.to_str().unwrap());
-    owner.source_profile = "default".to_string();
-    owner.worktree_info = Some(crate::session::WorktreeInfo {
-        branch: branch.to_string(),
-        main_repo_path: main_repo_path.to_string_lossy().into_owned(),
-        managed_by_aoe: false,
-        created_at: chrono::Utc::now(),
-        base_branch: None,
-    });
-    let owner_id = owner.id.clone();
-    storage
-        .update(|instances, _groups| {
-            instances.push(owner);
-            Ok(())
-        })
-        .unwrap();
-
-    let unexpected_id = drain_creation_result(&mut view);
-    assert_eq!(unexpected_id, None);
-    assert!(
-        view.creating_provisional_group_paths.is_empty(),
-        "rollback must leave no provisional group paths behind"
-    );
-    assert!(view.info_dialog.is_some());
-    assert!(
-        winner_path.is_dir(),
-        "rollback must preserve the winner's worktree"
-    );
-    assert!(
-        git.list_worktrees()
-            .unwrap()
-            .iter()
-            .any(|worktree| worktree.path == winner_path),
-        "winner worktree must remain registered"
-    );
-    assert!(
-        git2::Repository::open(&main_repo_path)
-            .unwrap()
-            .find_branch(branch, git2::BranchType::Local)
-            .is_ok(),
-        "rollback must preserve the winner's branch"
-    );
-    assert!(
-        view.group_trees.get("default").is_none_or(|tree| tree
-            .get_all_groups()
-            .iter()
-            .all(|group| group.path != transient_group)),
-        "duplicate rejection must discard the stub's provisional group"
-    );
-    assert!(
-        view.group_trees
-            .get("default")
-            .is_some_and(|tree| tree.group_exists(preexisting_group)),
-        "duplicate rejection must preserve an intentionally pre-existing empty group"
-    );
-
-    view.save().unwrap();
-    let (persisted, groups) = storage.load_with_groups().unwrap();
-    assert_eq!(
-        persisted
-            .iter()
-            .filter(|instance| {
-                instance.title == "Raced title"
-                    && std::path::Path::new(&instance.project_path) == winner_path
-            })
-            .count(),
-        1
-    );
-    assert_eq!(
-        persisted.len(),
-        1,
-        "duplicate rejection should leave only the authoritative peer row"
-    );
-    assert!(
-        persisted.iter().all(|instance| {
-            instance.id != raced_stub_id && instance.status != crate::session::Status::Creating
-        }),
-        "duplicate rejection must remove the persisted Creating stub"
-    );
-    assert!(
-        groups.iter().all(|group| group.path != transient_group),
-        "a later save must not persist the rejected stub's group"
-    );
-    assert!(
-        groups.iter().any(|group| group.path == preexisting_group),
-        "a later save must preserve the pre-existing empty parent group"
-    );
-
-    storage
-        .update(|instances, _groups| {
-            instances.retain(|instance| instance.id != owner_id);
-            Ok(())
-        })
-        .unwrap();
-    git.remove_worktree(&winner_path, true).unwrap();
-    git.delete_branch(branch).unwrap();
 }
 
 #[test]

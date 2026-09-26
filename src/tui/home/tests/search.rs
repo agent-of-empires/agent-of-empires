@@ -242,7 +242,10 @@ fn test_search_matching_and_cursor() {
 
     env.view.search_query = Input::new("session2".to_string());
     env.view.update_search();
-    let best = session_id_at(&env.view, env.view.search_matches[0]).expect("session row");
+    let best = match &env.view.flat_items[env.view.search_matches[0]] {
+        Item::Session { id, .. } => id.clone(),
+        _ => panic!("best match should be a session row"),
+    };
     assert!(env
         .view
         .get_instance(&best)
@@ -616,8 +619,14 @@ fn test_select_session_by_id() {
 #[serial]
 fn test_select_top_attention() {
     let mut env = create_test_env_with_sessions(3);
-    let first_id = session_id_at(&env.view, 0).expect("first row is a session");
-    let second_id = session_id_at(&env.view, 1).expect("second row is a session");
+    let first_id = match &env.view.flat_items[0] {
+        Item::Session { id, .. } => id.clone(),
+        _ => panic!("first row is a session"),
+    };
+    let second_id = match &env.view.flat_items[1] {
+        Item::Session { id, .. } => id.clone(),
+        _ => panic!("second row is a session"),
+    };
     env.view.cursor = 2;
     env.view.update_selected();
 
@@ -636,7 +645,10 @@ fn test_select_top_attention() {
     );
 
     let mut env = create_test_env_with_sessions(1);
-    let only_id = session_id_at(&env.view, 0).expect("only row is a session");
+    let only_id = match &env.view.flat_items[0] {
+        Item::Session { id, .. } => id.clone(),
+        _ => panic!("only row is a session"),
+    };
     env.view.select_top_attention(Some(&only_id));
     assert_eq!(env.view.cursor, 0);
     assert_eq!(env.view.selected_session.as_deref(), Some(only_id.as_str()));

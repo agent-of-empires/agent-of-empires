@@ -39,6 +39,9 @@ fn peer_cli_add_reflects_during_live_send_without_changing_target() {
     );
 
     h.spawn_tui();
+    // The native pane preparation refuses an unhealthy runtime, so wait for the
+    // subscription to report readiness before driving panes.
+    h.wait_for("Runtime ready");
     h.wait_for("active-live");
     h.send_keys("Tab");
     h.wait_for_timeout("LIVE →  active-live", Duration::from_secs(10));

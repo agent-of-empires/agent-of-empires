@@ -1,5 +1,4 @@
-//! HTTP REST handlers for the web dashboard, plus shared response and
-//! validation helpers.
+//! REST handlers and shared validation for daemon and dashboard clients.
 
 pub(super) use super::AppState;
 
@@ -7,6 +6,7 @@ mod acp;
 mod client_log;
 mod file_provenance;
 mod git;
+mod groups;
 mod log_level;
 mod mcp;
 pub(crate) mod plugin_settings;
@@ -31,6 +31,7 @@ pub use queue::{queue_clear, queue_edit, queue_enqueue, queue_list, queue_remove
 
 pub use client_log::post_client_log;
 pub use git::{clone_repo, is_git_repo, list_branches};
+pub use groups::{collapse_group, create_group, delete_group, move_group};
 pub use log_level::{get_log_level, patch_log_level};
 pub use mcp::{drop_mcp_server, get_mcp_servers, keep_mcp_server, resolve_mcp_conflict};
 pub use plugin_settings::resolve_options;
@@ -43,23 +44,24 @@ pub use plugins::{
 };
 pub use projects::{create_project, delete_project, list_projects, update_project};
 pub use sessions::{
-    attach_session_project, create_session, delete_session, delete_workspace,
-    ensure_container_terminal, ensure_session, ensure_terminal, force_smart_rename,
-    get_recent_projects, kill_terminal, list_sessions, paste_image, preview_volume_ignores_globs,
-    read_output, rename_session, restore_session, search_sessions, send_message,
-    serve_session_artifact, session_diff_file, session_diff_file_raw, session_diff_files,
-    session_file, set_worktree_name, start_session, stop_session, summarize_session, trash_session,
-    update_session_archive, update_session_color, update_session_diff_base, update_session_group,
-    update_session_notifications, update_session_pin, update_session_snooze, update_session_unread,
-    update_workspace_ordering, OutputQuery, SendMessageRequest,
+    abandon_purge, attach_session_project, cancel_creation, create_session, delete_session,
+    delete_workspace, ensure_container_terminal, ensure_session, ensure_terminal, ensure_tool,
+    force_smart_rename, get_recent_projects, kill_terminal, list_sessions, paste_image,
+    preview_volume_ignores_globs, read_output, rename_session, restart_session, restore_session,
+    review_creation_trust, search_sessions, send_message, serve_session_artifact,
+    session_diff_file, session_diff_file_raw, session_diff_files, session_file, set_worktree_name,
+    start_session, stop_auxiliary, stop_session, summarize_session, touch_session_access,
+    trash_session, update_session_archive, update_session_color, update_session_diff_base,
+    update_session_favorite, update_session_group, update_session_notifications,
+    update_session_pin, update_session_snooze, update_session_unread, update_workspace_ordering,
+    OutputQuery, SendMessageRequest,
+};
+pub(crate) use sessions::{
+    lifecycle_rejection, persist_session_update, purge_expired_trash, reconcile_trashed_worktrees,
+    reconcile_worktree_paths,
 };
 pub use skills::{
     adopt_skill, create_skill, delete_skill, edit_skill, list_skills, read_skill, sync_skills,
-};
-// Not route handlers: used by the daemon's background loops.
-pub(crate) use sessions::{
-    persist_session_update, purge_expired_trash, reconcile_trashed_worktrees,
-    reconcile_worktree_paths,
 };
 pub use system::{
     browse_filesystem, create_profile, default_profile, delete_profile, dismiss_update,
@@ -76,76 +78,110 @@ pub use telemetry::{
     set_telemetry_consent,
 };
 
-use axum::http::StatusCode;
-use axum::response::{IntoResponse as _, Response};
-
-/// JSON error body shared by the API: `{"error": code, "message": message}`.
-pub(crate) fn api_error(status: StatusCode, code: &str, message: impl Into<String>) -> Response {
-    let message: String = message.into();
-    (
-        status,
-        axum::Json(serde_json::json!({ "error": code, "message": message })),
-    )
-        .into_response()
-}
-
-pub(super) fn session_not_found() -> Response {
-    api_error(StatusCode::NOT_FOUND, "not_found", "Session not found")
-}
-
-/// 404 with no `message`, used by the terminal/send endpoints.
-pub(super) fn bare_not_found() -> Response {
-    (
-        StatusCode::NOT_FOUND,
-        axum::Json(serde_json::json!({ "error": "not_found" })),
-    )
-        .into_response()
-}
-
-pub(super) fn read_only_response() -> Response {
-    api_error(
-        StatusCode::FORBIDDEN,
-        "read_only",
-        "Server is in read-only mode",
-    )
-}
-
-/// 403 guard for `aoe serve --read-only`.
-pub(crate) fn read_only_block(state: &AppState) -> Option<Response> {
-    state.read_only.then(read_only_response)
-}
-
-/// 403 for CityHall client mode. Enforced default-deny by the `cityhall_gate`
-/// middleware; per-handler `cityhall_block*` calls are defense in depth.
-pub(crate) fn cityhall_response() -> Response {
-    api_error(
-        StatusCode::FORBIDDEN,
-        "cityhall_mode",
-        "This action is disabled in CityHall client mode",
-    )
-}
-
-pub(crate) fn cityhall_block(state: &AppState) -> Option<Response> {
-    state.cityhall_mode.then(cityhall_response)
-}
-
-/// A clone of the live instance with this id.
-pub(super) async fn find_instance(state: &AppState, id: &str) -> Option<crate::session::Instance> {
+pub(crate) async fn find_instance(
+    state: &std::sync::Arc<AppState>,
+    id: &str,
+) -> Option<crate::session::Instance> {
     state
         .instances
         .read()
         .await
         .iter()
-        .find(|i| i.id == id)
+        .find(|instance| instance.id == id)
         .cloned()
 }
 
-pub(super) async fn instance_exists(state: &AppState, id: &str) -> bool {
-    state.instances.read().await.iter().any(|i| i.id == id)
+pub(crate) async fn instance_exists(state: &std::sync::Arc<AppState>, id: &str) -> bool {
+    state
+        .instances
+        .read()
+        .await
+        .iter()
+        .any(|instance| instance.id == id)
 }
 
-/// The operator agent allowlist, loaded off the async runtime. The supervisor
-/// re-checks at spawn, so this is only an early answer.
+pub(crate) fn api_error(
+    status: axum::http::StatusCode,
+    code: &str,
+    message: impl Into<String>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+    (
+        status,
+        axum::Json(serde_json::json!({ "error": code, "message": message.into() })),
+    )
+        .into_response()
+}
+
+pub(crate) fn read_only_block(state: &AppState) -> Option<axum::response::Response> {
+    state.read_only.then(read_only_response)
+}
+
+/// Canonical 404 for a session id that does not resolve to a live instance.
+/// Body shape (`error` discriminator + human `message`) matches the rest of
+/// the JSON error surface so the dashboard's generic `.message` handling and
+/// `.error` discrimination both keep working.
+pub(super) fn session_not_found() -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+    (
+        axum::http::StatusCode::NOT_FOUND,
+        axum::Json(serde_json::json!({ "error": "not_found", "message": "Session not found" })),
+    )
+        .into_response()
+}
+
+/// Canonical 403 body for `aoe serve --read-only`.
+pub(super) fn read_only_response() -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+    (
+        axum::http::StatusCode::FORBIDDEN,
+        crate::daemon::ApiErrorCode::ReadOnly.header(),
+        axum::Json(serde_json::json!({
+            "error": "read_only",
+            "message": "Server is in read-only mode"
+        })),
+    )
+        .into_response()
+}
+
+/// Canonical 403 body for CityHall client mode (`AOE_CITYHALL_MODE`). Terminal
+/// (keystrokes + raw pane/output reads), diff, project management, agent/worker
+/// lifecycle + config, git clone/probe, and uncurated settings/profile writes
+/// are all closed here, not only by hiding the UI: the create path also strips
+/// every client-controlled spawn field, and the curated settings/theme writes
+/// are field-filtered. Reachability is enforced default-deny by the
+/// `cityhall_gate` middleware against the `CITYHALL_MUTATION_ALLOW` table (with
+/// the per-handler `cityhall_block*` calls kept as defense in depth); the
+/// `every_mutating_route_is_cityhall_classified` audit and the
+/// `serve_cityhall_lockdown` route tests keep the contract honest. See #7.
+pub(crate) fn cityhall_response() -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+    (
+        axum::http::StatusCode::FORBIDDEN,
+        crate::daemon::ApiErrorCode::CityhallMode.header(),
+        axum::Json(serde_json::json!({
+            "error": "cityhall_mode",
+            "message": "This action is disabled in CityHall client mode"
+        })),
+    )
+        .into_response()
+}
+
+/// 403 guard for CityHall client mode, mirroring `read_only_block`. Callers do
+/// `if let Some(resp) = cityhall_block(&state) { return resp; }`.
+pub(crate) fn cityhall_block(state: &AppState) -> Option<axum::response::Response> {
+    state.cityhall_mode.then(cityhall_response)
+}
+
+/// The operator agent allowlist, read off the async runtime because it touches
+/// disk. Handlers use it to answer up front instead of letting a disallowed
+/// agent fail at spawn time, which is the complaint #3241 opens with.
+///
+/// One load per request. Two requests can observe different policies if the
+/// operator edits it in between, which is fine: each response is internally
+/// consistent, and the supervisor re-checks at spawn regardless, so a handler
+/// preflight is never the thing standing between a disallowed agent and a
+/// process.
 pub(crate) async fn agent_policy() -> crate::acp::agent_policy::AgentPolicy {
     tokio::task::spawn_blocking(crate::acp::agent_policy::AgentPolicy::load)
         .await
@@ -156,13 +192,20 @@ pub(crate) async fn agent_policy() -> crate::acp::agent_policy::AgentPolicy {
         })
 }
 
-/// 404 when the instance vanished between persisting a write and applying it.
-pub(super) fn session_gone_after_persist() -> Response {
-    api_error(
-        StatusCode::NOT_FOUND,
-        "not_found",
-        "Session was removed while the update was being applied",
+/// 404 for the persist-then-apply race: the write was persisted to disk, but
+/// the in-memory instance was concurrently removed before the apply step.
+/// This is a caller-visible "session no longer exists", not a persist
+/// failure, so it must not surface as a 500.
+pub(super) fn session_gone_after_persist() -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+    (
+        axum::http::StatusCode::NOT_FOUND,
+        axum::Json(serde_json::json!({
+            "error": "not_found",
+            "message": "Session was removed while the update was being applied"
+        })),
     )
+        .into_response()
 }
 
 const SHELL_METACHARACTERS: &[char] = &[
@@ -180,15 +223,24 @@ pub(super) fn validate_no_shell_injection(value: &str, field_name: &str) -> Resu
     Ok(())
 }
 
-/// Bidi override/isolate characters (category Cf, missed by `is_control`);
-/// in a label they can spoof the rendered order (CVE-2021-42574).
+/// Unicode bidirectional-format characters (category Cf): `char::is_control()`
+/// only covers Cc, so these pass through unblocked otherwise. Left in a
+/// display label, they let the rendered text reorder relative to what's
+/// stored (Trojan-Source-style spoofing, e.g. CVE-2021-42574) in shared UI
+/// surfaces. This is the same set rustc's own bidi lint blocks in source
+/// literals.
 const BIDI_CONTROL_CHARS: &[char] = &[
     '\u{202A}', '\u{202B}', '\u{202C}', '\u{202D}', '\u{202E}', // LRE RLE PDF LRO RLO
     '\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}', // LRI RLI FSI PDI
 ];
 
-/// Validate a display label (title, group path). Labels never reach a shell
-/// (#2624), so only control and bidi characters are rejected.
+/// Validate a pure display label (session title, group path): these are
+/// never passed to a shell or interpreted as a path (#2624), so unlike
+/// `validate_no_shell_injection` this allows apostrophes, punctuation, and
+/// most metacharacters. It still rejects control characters and bidi
+/// override/isolate characters, since a literal newline, NUL, or bidi
+/// override corrupts single-line UI rendering, storage, or the displayed
+/// text's actual order regardless of shell context.
 pub(super) fn validate_display_label(value: &str, field_name: &str) -> Result<(), String> {
     if let Some(c) = value
         .chars()
@@ -202,7 +254,15 @@ pub(super) fn validate_display_label(value: &str, field_name: &str) -> Result<()
     Ok(())
 }
 
-/// Profile names are path components: ASCII alphanumerics, `-`, `_`.
+// The settings PATCH write surface (which sections/fields the web may write,
+// which need elevation, which are host-only) is no longer a hand-kept list
+// here: it is derived from the settings schema in
+// `crate::session::config::settings_schema::policy`, the single source of truth shared
+// with the TUI and web (#1692). See `update_settings` / `update_profile_settings`
+// in `system.rs`, which validate each PATCH leaf via `validate_patch`.
+
+/// Validate that a profile name contains only safe characters.
+/// Rejects path traversal attempts (../, /) and shell metacharacters.
 pub(super) fn validate_profile_name(name: &str) -> Result<(), String> {
     if name.is_empty() {
         return Err("Profile name cannot be empty".to_string());
@@ -223,264 +283,185 @@ pub(super) fn validate_profile_name(name: &str) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    //! Regression tests that pin security-critical helpers.
+    //!
+    //! `SHELL_METACHARACTERS` was silently rewritten in an earlier hand-
+    //! assembled version of this split: a refactor PR that claimed "no
+    //! behavior changes" dropped 4 shell metacharacters (`#`, `[`, `]`,
+    //! `~`) from the injection blocklist. Pin its contents here so the
+    //! next refactor that touches this file fails CI instead of silently
+    //! regressing security.
+    //!
+    //! The settings PATCH write surface (allowed sections, blocked agent-
+    //! command fields, elevation surfaces) is no longer a constant here:
+    //! it is derived from the settings schema and pinned by the tests in
+    //! `crate::session::config::settings_schema::policy` (#1692).
     use super::*;
 
-    /// Mutating handlers by source file. Each must short-circuit in read-only
-    /// mode and must extract any JSON body lazily, or axum's `Json<T>` 422s on a
-    /// malformed body before the read-only guard runs (#1229).
-    const MUTATING_HANDLERS: &[(&str, &str, &[&str])] = &[
-        (
-            "sessions/create.rs",
-            include_str!("sessions/create.rs"),
-            &["create_session"],
-        ),
-        (
-            "sessions/delete.rs",
-            include_str!("sessions/delete.rs"),
-            &["delete_session", "delete_workspace"],
-        ),
-        (
-            "sessions/rename.rs",
-            include_str!("sessions/rename.rs"),
-            &[
-                "rename_session",
-                "set_worktree_name",
-                "attach_session_project",
-            ],
-        ),
-        (
-            "sessions/send.rs",
-            include_str!("sessions/send.rs"),
-            &["send_message"],
-        ),
-        (
-            "sessions/ensure.rs",
-            include_str!("sessions/ensure.rs"),
-            &[
-                "ensure_session",
-                "ensure_terminal",
-                "ensure_container_terminal",
-            ],
-        ),
-        (
-            "sessions/update.rs",
-            include_str!("sessions/update.rs"),
-            &[
-                "update_session_group",
-                "update_session_notifications",
-                "update_session_diff_base",
-            ],
-        ),
-        (
-            "sessions/lifecycle.rs",
-            include_str!("sessions/lifecycle.rs"),
-            &[
-                "update_session_pin",
-                "update_session_color",
-                "update_session_archive",
-                "update_session_snooze",
-                "trash_session",
-                "restore_session",
-                "update_session_unread",
-                "stop_session",
-                "force_smart_rename",
-                "start_session",
-            ],
-        ),
-        (
-            "sessions/list.rs",
-            include_str!("sessions/list.rs"),
-            &["update_workspace_ordering"],
-        ),
-        ("git.rs", include_str!("git.rs"), &["clone_repo"]),
-        (
-            "mcp.rs",
-            include_str!("mcp.rs"),
-            &["resolve_mcp_conflict", "keep_mcp_server", "drop_mcp_server"],
-        ),
-        (
-            "log_level.rs",
-            include_str!("log_level.rs"),
-            &["patch_log_level"],
-        ),
-        (
-            "projects.rs",
-            include_str!("projects.rs"),
-            &["create_project", "delete_project", "update_project"],
-        ),
-        (
-            "system.rs",
-            include_str!("system.rs"),
-            &[
-                "update_settings",
-                "dismiss_update",
-                "patch_web_ui_state",
-                "mark_web_tour_seen",
-                "mark_tip_seen",
-                "set_show_tips",
-                "mark_volume_ignores_globs_acknowledged",
-                "create_profile",
-                "delete_profile",
-                "rename_profile",
-                "default_profile",
-                "update_profile_settings",
-            ],
-        ),
-        (
-            "acp/worker.rs",
-            include_str!("acp/worker.rs"),
-            &["spawn_acp", "shutdown_acp"],
-        ),
-        (
-            "acp/prompt.rs",
-            include_str!("acp/prompt.rs"),
-            &[
-                "acp_prompt",
-                "acp_prompt_diff_comments",
-                "acp_cancel",
-                "acp_force_end_turn",
-                "resolve_approval",
-                "resolve_elicitation",
-            ],
-        ),
-        (
-            "acp/view.rs",
-            include_str!("acp/view.rs"),
-            &["acp_enable", "acp_disable"],
-        ),
-        (
-            "acp/config.rs",
-            include_str!("acp/config.rs"),
-            &["acp_set_mode", "acp_set_config_option"],
-        ),
-        (
-            "push.rs",
-            include_str!("../push.rs"),
-            &["subscribe", "unsubscribe", "test"],
-        ),
-        (
-            "telemetry.rs",
-            include_str!("telemetry.rs"),
-            &[
-                "set_telemetry_consent",
-                "post_telemetry_seen",
-                "post_telemetry_structured_interaction",
-            ],
-        ),
-        (
-            "plugins.rs",
-            include_str!("plugins.rs"),
-            &["invoke_plugin_action"],
-        ),
-    ];
+    /// CityHall lockdown (#7): the shared guard returns 403 so terminal, diff,
+    /// project-management, and advanced-settings endpoints are unreachable in
+    /// CityHall client mode, not merely hidden in the UI.
+    #[test]
+    fn cityhall_response_is_forbidden() {
+        assert_eq!(
+            cityhall_response().status(),
+            axum::http::StatusCode::FORBIDDEN
+        );
+    }
 
-    /// `(signature, body)` of `fn name(` in `source`. The body runs to the
-    /// next top-level fn definition.
-    fn handler_source<'a>(source: &'a str, name: &str) -> Option<(&'a str, &'a str)> {
-        let needle = format!("fn {name}(");
-        let rest = &source[source.find(&needle)? + needle.len()..];
-        let mut depth = 1usize;
-        let sig_end = rest.char_indices().find_map(|(i, c)| {
-            match c {
-                '(' => depth += 1,
-                ')' => depth -= 1,
-                _ => {}
-            }
-            (depth == 0).then_some(i)
-        })?;
-        let body_end = ["\npub async fn ", "\npub fn ", "\nasync fn ", "\nfn "]
+    /// A plugin pane action is forwarded to the worker (the trust boundary)
+    /// and mutates no host-managed state, so it is gated on read-write mode
+    /// only, never on passphrase elevation (#2454). This static check guards
+    /// against a refactor re-introducing the elevation gate on the action
+    /// path and re-breaking the refresh button under login. Same body-boundary
+    /// walk as `every_mutating_handler_has_read_only_guard`.
+    #[test]
+    fn plugin_action_does_not_require_elevation() {
+        let source = include_str!("plugins.rs");
+        let needle = "fn invoke_plugin_action(";
+        let start = source
+            .find(needle)
+            .expect("handler `invoke_plugin_action` not found (rename/refactor?)");
+        let rest = &source[start + needle.len()..];
+        let body_terminators: &[&str] = &["\npub async fn ", "\npub fn ", "\nasync fn ", "\nfn "];
+        let end = body_terminators
             .iter()
             .filter_map(|t| rest.find(t))
             .min()
             .unwrap_or(rest.len());
-        Some((&rest[..sig_end], &rest[..body_end]))
-    }
-
-    #[test]
-    fn mutating_handlers_guard_read_only_before_body_extraction() {
-        let mut failures = Vec::new();
-        for (file, source, handlers) in MUTATING_HANDLERS {
-            for name in *handlers {
-                let Some((signature, body)) = handler_source(source, name) else {
-                    failures.push(format!("{file}: handler `{name}` not found"));
-                    continue;
-                };
-                if !["state.read_only", "self.read_only", "read_only_block("]
-                    .iter()
-                    .any(|p| body.contains(p))
-                {
-                    failures.push(format!("{file}: `{name}` lacks a read-only guard"));
-                }
-                let eager = signature.split(',').any(|arg| {
-                    let arg = arg.trim_start();
-                    arg.starts_with("Json(") || arg.contains(": Json<")
-                });
-                if eager {
-                    failures.push(format!(
-                        "{file}: `{name}` extracts its JSON body eagerly; use \
-                         `Result<Json<T>, JsonRejection>` or `Option<Json<T>>`"
-                    ));
-                }
-            }
-        }
-        assert!(failures.is_empty(), "{}", failures.join("\n"));
-
-        // A plugin pane action mutates no host state, so it is gated on
-        // read-only mode only, never on elevation (#2454).
-        let (_, body) = handler_source(include_str!("plugins.rs"), "invoke_plugin_action")
-            .expect("invoke_plugin_action");
+        let body = &rest[..end];
+        // `mutation_gate` bundles the elevation check; `is_elevated` /
+        // `elevation_required` would mean elevation was reintroduced inline.
         for marker in ["mutation_gate", "is_elevated", "elevation_required"] {
             assert!(
                 !body.contains(marker),
-                "invoke_plugin_action: found `{marker}`"
+                "invoke_plugin_action must not elevation-gate (found `{marker}`). \
+                 A pane action mutates no host state; keep the read-only gate only. \
+                 If an action ever needs elevation, make it opt-in per action (#2454)."
             );
         }
     }
 
     #[test]
-    fn input_validators_reject_shell_control_and_path_characters() {
-        // Removing a character here is a security change, not a tidy-up.
+    fn shell_metacharacters_blocklist_is_exhaustive() {
+        // Every character here has a documented shell-injection vector when
+        // interpolated into a command line. Removing a character from this
+        // list without removing the corresponding regression below is a
+        // security change that must be reviewed on its own, not smuggled
+        // through a refactor.
         let expected: &[char] = &[
             ';', '&', '|', '$', '`', '(', ')', '{', '}', '<', '>', '\n', '\r', '\\', '"', '\'',
             '!', '#', '*', '?', '[', ']', '~', '\t', '\0',
         ];
-        assert_eq!(SHELL_METACHARACTERS, expected);
-        for &c in SHELL_METACHARACTERS {
-            assert!(validate_no_shell_injection(&format!("prefix{c}suffix"), "field").is_err());
+        assert_eq!(
+            SHELL_METACHARACTERS.len(),
+            expected.len(),
+            "SHELL_METACHARACTERS size changed; every addition/removal must be \
+             reviewed as a security change, not a refactor tidy-up"
+        );
+        for c in expected {
+            assert!(
+                SHELL_METACHARACTERS.contains(c),
+                "SHELL_METACHARACTERS lost character {:?}. Each character blocks \
+                 a specific shell-injection vector: # starts a comment, [ ] are \
+                 glob metacharacters, ~ triggers tilde expansion, etc. If the \
+                 intent is to actually stop blocking this character, update both \
+                 this test and the list in the same commit with justification.",
+                c
+            );
         }
+    }
 
-        // #2624: imported titles carry punctuation that is harmless in a label.
+    #[test]
+    fn validate_no_shell_injection_rejects_every_metacharacter() {
+        for &c in SHELL_METACHARACTERS {
+            let input = format!("prefix{}suffix", c);
+            let result = validate_no_shell_injection(&input, "field");
+            assert!(
+                result.is_err(),
+                "validate_no_shell_injection should reject {:?} but accepted {:?}",
+                c,
+                input
+            );
+        }
+    }
+
+    /// #2624: real-world session titles/groups (imported from Claude Code
+    /// summaries) routinely contain apostrophes, question marks, and other
+    /// shell metacharacters that are harmless for a display label.
+    #[test]
+    fn display_label_accepts_common_punctuation() {
         for value in [
             "I've read @filename?",
+            "I'm testing this out",
+            "Goal: fix the parser",
             "What's next?",
             "Fix [draft] (wip) ~ #123",
             "work/claude/imports",
         ] {
-            assert!(validate_display_label(value, "title").is_ok(), "{value:?}");
+            assert!(
+                validate_display_label(value, "title").is_ok(),
+                "should accept {:?}",
+                value
+            );
         }
-        let bidi = BIDI_CONTROL_CHARS.iter().map(|c| format!("bad{c}name"));
-        let control = [
+    }
+
+    #[test]
+    fn display_label_rejects_control_characters() {
+        for value in [
             "bad\nname",
             "bad\rname",
             "bad\tname",
             "bad\u{1b}name",
             "bad\0name",
-        ]
-        .into_iter()
-        .map(String::from);
-        for value in control.chain(bidi) {
+        ] {
             assert!(
-                validate_display_label(&value, "title").is_err(),
-                "{value:?}"
+                validate_display_label(value, "title").is_err(),
+                "should reject {:?}",
+                value
             );
         }
+    }
 
-        for bad in ["../etc", "foo/bar", "..", ".hidden", ""] {
-            assert!(validate_profile_name(bad).is_err(), "{bad:?}");
+    /// `is_control()` alone misses Cf-category bidi override/isolate chars;
+    /// unblocked, they let a title's rendered order differ from what's
+    /// stored (Trojan-Source-style spoofing).
+    #[test]
+    fn display_label_rejects_bidi_control_characters() {
+        for &c in BIDI_CONTROL_CHARS {
+            let value = format!("bad{}name", c);
+            assert!(
+                validate_display_label(&value, "title").is_err(),
+                "should reject {:?}",
+                value
+            );
         }
+    }
+
+    // The settings PATCH write-surface pins (allowed sections, blocked session
+    // fields, elevation surfaces) moved to
+    // `crate::session::config::settings_schema::policy` when the curated constants were
+    // replaced by schema-derived `validate_patch` (#1692). The security
+    // invariants (hooks never writable, agent-command fields denied,
+    // sandbox/worktree require elevation) are pinned by that module's tests.
+
+    #[test]
+    fn profile_name_rejects_path_traversal() {
+        assert!(validate_profile_name("../etc").is_err());
+        assert!(validate_profile_name("foo/bar").is_err());
+        assert!(validate_profile_name("..").is_err());
+        assert!(validate_profile_name(".hidden").is_err());
+        assert!(validate_profile_name("").is_err());
         assert!(validate_profile_name(&"a".repeat(65)).is_err());
-        for good in ["default", "my-profile", "profile_2", "A"] {
-            assert!(validate_profile_name(good).is_ok(), "{good:?}");
-        }
+    }
+
+    #[test]
+    fn profile_name_accepts_valid_names() {
+        assert!(validate_profile_name("default").is_ok());
+        assert!(validate_profile_name("work").is_ok());
+        assert!(validate_profile_name("my-profile").is_ok());
+        assert!(validate_profile_name("profile_2").is_ok());
+        assert!(validate_profile_name("A").is_ok());
     }
 }

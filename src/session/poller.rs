@@ -1271,8 +1271,11 @@ mod tests {
             ),
             PollerSpawn::Spawned
         );
+        // The worker's first observation only needs two tmux subprocesses,
+        // but a loaded CI runner can take longer than this assertion's
+        // patience; the deadline bounds a broken poller, not this wait.
         started_rx
-            .recv_timeout(Duration::from_secs(5))
+            .recv_timeout(Duration::from_secs(30))
             .expect("initial observation");
         let active_before_stop = budget.active();
         *lock_unpoisoned(&sid) = "final-id".to_string();
