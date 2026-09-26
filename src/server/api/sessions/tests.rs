@@ -769,7 +769,7 @@ fn qualified_parent_binding() -> crate::session::ConversationBinding {
             agent: "claude".into(),
             stores: vec!["/tmp/claude-store".into()],
             configuration: Vec::new(),
-            exported_default_store: false,
+            exported_default_store: None,
             cwd: "/tmp".into(),
             cwd_filesystem: "host".into(),
             filesystem: "host".into(),

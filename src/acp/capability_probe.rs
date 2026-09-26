@@ -62,6 +62,7 @@ pub async fn probe_agent(agent: &str) -> anyhow::Result<bool> {
         generation: 0,
         artifact_dir: None,
         claude_store_pin: None,
+        base_host_environment: Vec::new(),
     };
 
     // Probe-scoped id so it never collides with a real structured-view worker.

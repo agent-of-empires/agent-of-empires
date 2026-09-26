@@ -30,43 +30,10 @@ pub struct ExecutionBinding {
     pub cwd: PathBuf,
     pub cwd_filesystem: String,
     pub filesystem: String,
-    /// The launch exported the store's routing variable although the store is the
-    /// agent's implicit default, so later launches keep exporting it (Claude, #4119).
-    /// Routing only: equality and hashing ignore it, so it never makes a binding
-    /// name a different conversation.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub exported_default_store: bool,
-}
-
-impl ExecutionBinding {
-    fn identity(
-        &self,
-    ) -> (
-        &str,
-        &[PathBuf],
-        &[ExecutionLocation],
-        &std::path::Path,
-        &str,
-        &str,
-    ) {
-        let Self {
-            agent,
-            stores,
-            configuration,
-            cwd,
-            cwd_filesystem,
-            filesystem,
-            exported_default_store: _,
-        } = self;
-        (
-            agent,
-            stores,
-            configuration,
-            cwd,
-            cwd_filesystem,
-            filesystem,
-        )
-    }
+    /// Whether the launch explicitly exported Claude's implicit default store.
+    /// `None` identifies bindings written before routing provenance existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exported_default_store: Option<bool>,
 }
 
 impl PartialEq for ExecutionBinding {
@@ -84,6 +51,26 @@ impl std::hash::Hash for ExecutionBinding {
 }
 
 impl ExecutionBinding {
+    fn identity(
+        &self,
+    ) -> (
+        &str,
+        &[PathBuf],
+        &[ExecutionLocation],
+        &std::path::Path,
+        &str,
+        &str,
+    ) {
+        (
+            &self.agent,
+            &self.stores,
+            &self.configuration,
+            &self.cwd,
+            &self.cwd_filesystem,
+            &self.filesystem,
+        )
+    }
+
     pub(crate) fn key<'a>(&'a self, sid: &'a str) -> ConversationKey<'a> {
         ConversationKey {
             session_id: sid,
@@ -147,6 +134,74 @@ impl ConversationBinding {
             stores: &execution.stores,
             filesystem: &execution.filesystem,
         })
+    }
+}
+
+/// Attest the default-store route a launch observed onto a binding written
+/// before routing provenance existed (#4127).
+///
+/// The marker records what a worker was actually launched with, so only an
+/// observed launch may write it: a request never persists a guess about the
+/// configuration as it stands, and a marker already written is never
+/// overwritten. The observation must be a single-store host Claude launch
+/// carrying its own marker, and it must name the same store as the target, so
+/// a different agent, filesystem, or store attests nothing. Stores are compared
+/// canonically because two spellings of one directory are one store.
+///
+/// Nothing else about the binding moves — not the session id, the provenance,
+/// the transcript path, the store, the cwd — which is what keeps the
+/// conversation identity stable: `identity()` excludes the marker, so stamping
+/// it cannot reclassify the conversation it describes.
+pub(crate) fn attest_observed_default_store(
+    binding: &mut ConversationBinding,
+    observed: Option<&ExecutionBinding>,
+) -> bool {
+    let Some(observed) = observed.filter(|o| o.agent == "claude" && o.filesystem == "host") else {
+        return false;
+    };
+    let Some(observed_store) = single_store(&observed.stores) else {
+        return false;
+    };
+    let Some(observed_marker) = observed.exported_default_store else {
+        return false;
+    };
+    if !binding.is_known() {
+        return false;
+    }
+    let Some(execution) = binding.execution.as_mut() else {
+        return false;
+    };
+    if execution.exported_default_store.is_some() {
+        return false;
+    }
+    if execution.agent != observed.agent || execution.filesystem != observed.filesystem {
+        return false;
+    }
+    let same_store = match single_store(&execution.stores) {
+        Some(target) => same_canonical_store(target, observed_store),
+        None => false,
+    };
+    if !same_store {
+        return false;
+    }
+    execution.exported_default_store = Some(observed_marker);
+    true
+}
+
+fn single_store(stores: &[PathBuf]) -> Option<&std::path::Path> {
+    match stores {
+        [store] => Some(store.as_path()),
+        _ => None,
+    }
+}
+
+fn same_canonical_store(left: &std::path::Path, right: &std::path::Path) -> bool {
+    match (
+        crate::session::capture::canonicalize_allowing_missing_leaf(left),
+        crate::session::capture::canonicalize_allowing_missing_leaf(right),
+    ) {
+        (Some(left), Some(right)) => left == right,
+        _ => false,
     }
 }
 
@@ -1236,11 +1291,17 @@ impl Instance {
                 inputs.cwd.join(path)
             })
         };
-        let declared = config
+        // A container routes to an isolated store, so the declaration does not
+        // select its root and is filtered out below. It still names a store
+        // otherwise, though, and the default-store route rule reads the
+        // declaration whether or not a container is in play.
+        let declared_store = config
             .session
             .agent_config_dir_for(&self.tool, &home)
-            .filter(|_| inputs.container.is_none())
             .map(absolute);
+        let declared = declared_store
+            .clone()
+            .filter(|_| inputs.container.is_none());
         let config_home = absolute(
             value("XDG_CONFIG_HOME")
                 .filter(|value| !value.is_empty())
@@ -1256,17 +1317,13 @@ impl Instance {
         let mut routing = Vec::new();
         let mut case_insensitive_routing: &'static [&'static str] = &[];
         let mut configuration = Vec::new();
+        let mut exported_default_store = None;
         let mut pi_root = None;
         let mut pi_transcript_path = None;
         let mut namespace_arguments = Vec::new();
-        let mut exported_default_store = false;
         let mut roots = match agent.name {
             "claude" => {
-                // The recorded binding names the store this conversation
-                // actually lives in, whether it was asserted with `--store`
-                // or captured by a validated launch; assertions must survive
-                // the qualified publication that relabels them Observed.
-                let recorded = (inputs.container.is_none())
+                let recorded_execution = (inputs.container.is_none())
                     .then(|| {
                         target
                             .and_then(|(_, binding, _)| binding)
@@ -1275,33 +1332,34 @@ impl Instance {
                             .filter(|execution| !execution.stores.is_empty())
                     })
                     .flatten();
-                let exported = value("CLAUDE_CONFIG_DIR")
-                    .filter(|value| !value.is_empty())
-                    .map(|value| absolute(PathBuf::from(value)));
-                // `~/.claude` spelled out selects nothing beyond Claude's own default.
-                let selected = declared
-                    .clone()
-                    .filter(|declared| *declared != crate::git::template::lexical_normalize(&home.join(".claude")));
-                // Only an implicit default store leaves `CLAUDE_CONFIG_DIR` unset (#4119). A
-                // recorded store stays explicit when its launch exported it or a selector names it.
-                let explicit = match recorded {
-                    Some(execution) => {
-                        execution.exported_default_store
-                            || [&exported, &selected].into_iter().flatten().any(|dir| {
-                                inputs.canonical_path(dir).ok().as_ref() == Some(&execution.stores[0])
-                            })
-                    }
-                    None => selected.is_some() || exported.is_some(),
-                };
-                let root = absolute(recorded
-                    .map(|execution| execution.stores[0].clone())
+                let recorded = recorded_execution.and_then(|execution| execution.stores.first().cloned());
+                // The same root is exported here and recorded on the binding
+                // below, and the binding canonicalizes it either way: resolve
+                // it now so the routed value and the stored one name one path,
+                // as the sibling namespaces already do.
+                let root = inputs.canonical_path(&absolute(recorded
                     .or_else(|| declared.clone())
-                    .or(exported)
-                    .unwrap_or_else(|| home.join(".claude")));
-                let pinned = root.to_str().context("native store is not UTF-8")?.to_owned();
+                    .or_else(|| value("CLAUDE_CONFIG_DIR").filter(|value| !value.is_empty()).map(PathBuf::from))
+                    .unwrap_or_else(|| home.join(".claude"))))?;
                 let default = crate::session::capture::is_default_claude_store(&root, &home);
+                let explicit = recorded_execution
+                    .and_then(|execution| execution.exported_default_store)
+                    .unwrap_or_else(|| {
+                        let ambient = value("CLAUDE_CONFIG_DIR")
+                            .filter(|value| !value.is_empty())
+                            .and_then(|value| {
+                                inputs.canonical_path(&absolute(PathBuf::from(value))).ok()
+                            });
+                        crate::session::capture::is_explicit_claude_store_route(
+                            &root,
+                            &home,
+                            declared_store.as_deref(),
+                            ambient.as_deref(),
+                        )
+                    });
                 let export = inputs.container.is_some() || explicit || !default;
-                exported_default_store = export && default && inputs.container.is_none();
+                exported_default_store = Some(export && default);
+                let pinned = root.to_str().context("native store is not UTF-8")?.to_owned();
                 routing.push(("CLAUDE_CONFIG_DIR".into(), export.then_some(pinned)));
                 vec![root]
             }
@@ -2302,12 +2360,13 @@ impl Instance {
             *primary = crate::session::capture::canonicalize_or_raw(
                 store.to_str().context("store path must be UTF-8")?,
             );
-            // A store named other than `~/.claude` is exported even when it aliases the default.
-            let home = super::hooks::host_home(&self.resolved_host_environment())
+            let selected_home = super::hooks::host_home(&self.resolved_host_environment())
                 .context("native HOME is unavailable")?;
-            execution.exported_default_store = crate::git::template::lexical_normalize(store)
-                != crate::git::template::lexical_normalize(&home.join(".claude"))
-                && crate::session::capture::is_default_claude_store(primary, &home);
+            execution.exported_default_store = Some(
+                crate::git::template::lexical_normalize(store)
+                    != crate::git::template::lexical_normalize(&selected_home.join(".claude"))
+                    && crate::session::capture::is_default_claude_store(primary, &selected_home),
+            );
         }
         Ok(ConversationBinding {
             session_id: sid.into(),
@@ -2371,17 +2430,11 @@ mod tests {
             cwd: root.join("cwd"),
             cwd_filesystem: "host".into(),
             filesystem: "host".into(),
-            exported_default_store: false,
+            exported_default_store: None,
         };
         let host = binding(&real);
         let host_alias = binding(&alias);
         assert!(Instance::execution_identity_matches(&host, &host_alias));
-        // Store routing does not change which conversation a binding names.
-        let exported = ExecutionBinding {
-            exported_default_store: true,
-            ..host_alias.clone()
-        };
-        assert!(Instance::execution_identity_matches(&host, &exported));
 
         let mut runtime_cwd = host.clone();
         runtime_cwd.cwd_filesystem = "runtime:docker:test".into();
@@ -2409,6 +2462,160 @@ mod tests {
             &container_store,
             &container_store_alias
         ));
+    }
+
+    #[test]
+    fn legacy_binding_routing_marker_is_optional_and_not_identity() {
+        use std::hash::{Hash, Hasher};
+
+        let legacy: ExecutionBinding = serde_json::from_value(serde_json::json!({
+            "agent": "claude",
+            "stores": ["/tmp/claude"],
+            "cwd": "/tmp",
+            "cwd_filesystem": "host",
+            "filesystem": "host"
+        }))
+        .unwrap();
+        assert_eq!(legacy.exported_default_store, None);
+        let mut exported = legacy.clone();
+        exported.exported_default_store = Some(true);
+        assert_eq!(legacy, exported);
+        // The predicate handoff, validation and carry compare on is its own
+        // thing: it ignores the routing marker, so a legacy row and its
+        // attested counterpart stay the same execution.
+        assert!(Instance::execution_identity_matches(&legacy, &exported));
+
+        let digest = |binding: &ExecutionBinding| {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            binding.hash(&mut hasher);
+            hasher.finish()
+        };
+        assert_eq!(digest(&legacy), digest(&exported));
+    }
+
+    /// #4127: a binding written before routing provenance existed adopts the
+    /// route a launch attested, and nothing else about it moves.
+    #[cfg(unix)]
+    #[test]
+    fn attest_observed_default_store_stamps_only_the_attested_route() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = temp.path().join("claude");
+        std::fs::create_dir_all(&store).unwrap();
+        let observed = ExecutionBinding {
+            agent: "claude".into(),
+            stores: vec![store.clone()],
+            configuration: Vec::new(),
+            cwd: temp.path().to_path_buf(),
+            cwd_filesystem: "host".into(),
+            filesystem: "host".into(),
+            exported_default_store: Some(true),
+        };
+        let legacy = |agent: &str, filesystem: &str, store: PathBuf| ConversationBinding {
+            session_id: "sid-1".into(),
+            execution: Some(ExecutionBinding {
+                agent: agent.into(),
+                stores: vec![store],
+                configuration: Vec::new(),
+                cwd: temp.path().to_path_buf(),
+                cwd_filesystem: "host".into(),
+                filesystem: filesystem.into(),
+                exported_default_store: None,
+            }),
+            provenance: ConversationProvenance::Observed,
+            transcript_path: Some(temp.path().join("transcript.jsonl")),
+        };
+        let marker = |binding: &ConversationBinding| {
+            binding
+                .execution
+                .as_ref()
+                .and_then(|execution| execution.exported_default_store)
+        };
+        let without_marker = |binding: &ConversationBinding| {
+            let mut execution = binding.execution.clone().unwrap();
+            execution.exported_default_store = None;
+            (
+                binding.session_id.clone(),
+                binding.provenance.clone(),
+                binding.transcript_path.clone(),
+                execution,
+            )
+        };
+
+        // Two spellings of one store are one store, so the marker is written.
+        let mut binding = legacy("claude", "host", temp.path().join("claude/"));
+        let before = binding.clone();
+        assert!(attest_observed_default_store(&mut binding, Some(&observed)));
+        assert_eq!(marker(&binding), Some(true));
+        assert_eq!(without_marker(&binding), without_marker(&before));
+        assert_eq!(binding, before, "the marker is not part of the identity");
+
+        // Idempotent, and a marker already attested is never overwritten.
+        assert!(!attest_observed_default_store(
+            &mut binding,
+            Some(&observed)
+        ));
+        let mut attested = binding.clone();
+        attested.execution.as_mut().unwrap().exported_default_store = Some(false);
+        let downgrade = ExecutionBinding {
+            exported_default_store: Some(false),
+            ..observed.clone()
+        };
+        assert!(!attest_observed_default_store(
+            &mut attested,
+            Some(&downgrade)
+        ));
+        assert_eq!(marker(&attested), Some(false));
+
+        let other_store = temp.path().join("other");
+        let refusals = [
+            ("codex", "host", store.clone(), observed.clone()),
+            (
+                "claude",
+                "container:session",
+                store.clone(),
+                observed.clone(),
+            ),
+            ("claude", "host", other_store, observed.clone()),
+            (
+                "claude",
+                "host",
+                store.clone(),
+                ExecutionBinding {
+                    stores: vec![store.clone(), temp.path().join("second")],
+                    ..observed.clone()
+                },
+            ),
+            (
+                "claude",
+                "host",
+                store.clone(),
+                ExecutionBinding {
+                    exported_default_store: None,
+                    ..observed.clone()
+                },
+            ),
+        ];
+        for (agent, filesystem, store, observed) in refusals {
+            let mut binding = legacy(agent, filesystem, store);
+            assert!(
+                !attest_observed_default_store(&mut binding, Some(&observed)),
+                "agent={agent} filesystem={filesystem} stores={:?}",
+                observed.stores
+            );
+            assert_eq!(marker(&binding), None);
+        }
+
+        // A binding no observation qualified, and an observation nobody
+        // reported, attest nothing.
+        let mut unknown = legacy("claude", "host", store.clone());
+        unknown.provenance = ConversationProvenance::Unknown;
+        assert!(!attest_observed_default_store(
+            &mut unknown,
+            Some(&observed)
+        ));
+        let mut binding = legacy("claude", "host", store);
+        assert!(!attest_observed_default_store(&mut binding, None));
+        assert_eq!(marker(&binding), None);
     }
 
     fn hermes_fixture() -> (tempfile::TempDir, NativeLaunchInputs, rusqlite::Connection) {
@@ -2626,5 +2833,54 @@ mod tests {
         );
         instance.agent_session_id = None;
         assert!(instance.fork_parent_ref().is_none());
+    }
+
+    /// The exported `CLAUDE_CONFIG_DIR` and the store recorded on the binding
+    /// must name one identity: a symlinked declaration would otherwise route
+    /// the agent through the alias while persisting the resolved path.
+    #[test]
+    #[cfg(unix)]
+    #[serial_test::serial]
+    fn claude_store_route_and_binding_share_one_canonical_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let _config_dir = crate::session::test_support::EnvGuard::unset(&["CLAUDE_CONFIG_DIR"]);
+        let _claude = crate::session::test_support::install_login_shell_path_command(
+            temp.path(),
+            "claude",
+            "#!/bin/sh\nexit 0\n",
+        );
+        let real = temp.path().join("real-store");
+        let alias = temp.path().join("alias-store");
+        std::fs::create_dir_all(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let profile = "claude-store-route-identity";
+        let path =
+            crate::session::config::profile_config::get_profile_config_path(profile).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            format!(
+                "[session.agent_config_dir]\nclaude = {:?}\n",
+                alias.to_str().unwrap()
+            ),
+        )
+        .unwrap();
+        let _registry = crate::tmux::status_rules::ProfileRegistryGuard::take(profile);
+        let mut inst = Instance::new("claude-route-identity", temp.path().to_str().unwrap());
+        inst.source_profile = profile.into();
+        inst.tool = "claude".into();
+        inst.view = crate::session::View::Structured;
+
+        let native = inst.resolve_native_execution(None).unwrap();
+
+        let resolved = real.canonicalize().unwrap();
+        assert_eq!(native.binding.stores, vec![resolved.clone()]);
+        let routed = native
+            .routing
+            .iter()
+            .find(|(key, _)| key == "CLAUDE_CONFIG_DIR")
+            .map(|(_, value)| value.as_deref());
+        assert_eq!(routed, Some(resolved.to_str()));
     }
 }
