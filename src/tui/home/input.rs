@@ -3067,14 +3067,15 @@ impl HomeView {
             match crate::session::fork::terminal_fork_seed(parent_ref, child_id) {
                 Ok(s) => s,
                 Err(denied) => {
-                    let title = match denied {
+                    let dialog_title = match denied {
                         crate::session::ForkDenied::AgentCannotFork => "Fork not supported",
                         crate::session::ForkDenied::NoParentSession => "Nothing to fork yet",
                         crate::session::ForkDenied::UnqualifiedParent { .. } => {
                             "Conversation not qualified"
                         }
                     };
-                    self.info_dialog = Some(InfoDialog::new(title, denied.user_message()));
+                    self.info_dialog =
+                        Some(InfoDialog::new(dialog_title, &denied.user_message(&title)));
                     return;
                 }
             }

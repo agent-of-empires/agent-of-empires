@@ -865,7 +865,8 @@ fn fork_from_an_unqualified_parent_is_refused_as_unqualified() {
     assert_eq!(
         resolve_create_fork_seed("parent-uuid", false, &[parent]),
         Err(crate::session::ForkDenied::UnqualifiedParent {
-            provenance: Some(crate::session::ConversationProvenance::Unknown)
+            provenance: Some(crate::session::ConversationProvenance::Unknown),
+            recorded: "parent-uuid".into(),
         })
     );
 }
@@ -879,7 +880,10 @@ fn fork_from_a_parent_with_no_binding_is_refused_without_provenance() {
 
     assert_eq!(
         resolve_create_fork_seed("parent-uuid", false, &[parent]),
-        Err(crate::session::ForkDenied::UnqualifiedParent { provenance: None })
+        Err(crate::session::ForkDenied::UnqualifiedParent {
+            provenance: None,
+            recorded: "parent-uuid".into(),
+        })
     );
 }
 
@@ -921,7 +925,8 @@ fn fork_from_unqualified_rows_is_refused_the_same_way_in_either_order() {
         assert_eq!(
             resolve_create_fork_seed("parent-uuid", false, &parents),
             Err(crate::session::ForkDenied::UnqualifiedParent {
-                provenance: Some(crate::session::ConversationProvenance::Unknown)
+                provenance: Some(crate::session::ConversationProvenance::Unknown),
+                recorded: "parent-uuid".into(),
             })
         );
     }

@@ -2810,7 +2810,8 @@ mod tests {
                 "child-uuid".into()
             ),
             Err(crate::session::ForkDenied::UnqualifiedParent {
-                provenance: Some(ConversationProvenance::Unknown)
+                provenance: Some(ConversationProvenance::Unknown),
+                recorded: "legacy-uuid".into(),
             })
         );
     }
@@ -2829,7 +2830,10 @@ mod tests {
                 instance.fork_parent_ref(),
                 "child-uuid".into()
             ),
-            Err(crate::session::ForkDenied::UnqualifiedParent { provenance: None })
+            Err(crate::session::ForkDenied::UnqualifiedParent {
+                provenance: None,
+                recorded: "legacy-uuid".into(),
+            })
         );
         instance.agent_session_id = None;
         assert!(instance.fork_parent_ref().is_none());

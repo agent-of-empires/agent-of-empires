@@ -26,25 +26,51 @@ pub enum ForkDenied {
     /// No conversation id is recorded for the parent at all.
     NoParentSession,
     /// A conversation id is recorded, but nothing qualifies it, so the id
-    /// cannot be shown to name a real conversation to fork. `None` when no
-    /// binding stands behind it, so nothing says which conversation it names.
+    /// cannot be shown to name a real conversation to fork. `provenance` is
+    /// `None` when no binding stands behind it, so nothing says which
+    /// conversation it names. `recorded` is the id the parent carries, always
+    /// present: it is the value the remedy re-asserts, and the state the refusal
+    /// is about.
     UnqualifiedParent {
         provenance: Option<ConversationProvenance>,
+        recorded: String,
     },
 }
 
 impl ForkDenied {
     /// The refusal phrased for a user. Every surface reads this, so a refusal
     /// cannot read three ways.
-    pub fn user_message(&self) -> &'static str {
+    pub fn user_message(&self, parent: &str) -> String {
         match self {
-            Self::AgentCannotFork => "This agent has no native fork capability. Forkable agents: claude, codex, opencode.",
-            Self::NoParentSession => "This session has no single captured conversation to fork from: it has captured none, or more than one session records this conversation id.",
-            Self::UnqualifiedParent { provenance: None } => "This session records a conversation id that nothing qualifies: no record says which agent, store or directory it belongs to, so which conversation it names is unknown. Re-assert the id with 'aoe session set-session-id <session> <id>'.",
-            Self::UnqualifiedParent { provenance: Some(ConversationProvenance::Preallocated) } => "This session has no captured conversation to fork from. Send it at least one message first.",
-            Self::UnqualifiedParent { provenance: Some(_) } => "This session records a conversation id, but it was never qualified against a native agent. Run 'aoe session set-session-id <session> <id>' on it to qualify it.",
+            Self::AgentCannotFork => format!(
+                "Nothing to fork: session '{parent}' runs an agent with no native fork capability. Forkable agents: claude, codex, opencode."
+            ),
+            Self::NoParentSession => format!(
+                "Nothing to fork: session '{parent}' has no single captured conversation to fork from: it has captured none, or more than one session records this conversation id."
+            ),
+            Self::UnqualifiedParent { provenance: None, recorded } => format!(
+                "Nothing to fork: session '{parent}' records conversation '{recorded}', which nothing qualifies: no record says which agent, store or directory it belongs to, so which conversation it names is unknown. Re-assert it with '{}', and for a pi or omp session add '--store /absolute/transcript/file' naming its transcript.",
+                qualify_command(parent, recorded)
+            ),
+            Self::UnqualifiedParent { provenance: Some(ConversationProvenance::Preallocated), .. } => format!(
+                "Nothing to fork: session '{parent}' has no captured conversation to fork from. Send it at least one message first."
+            ),
+            Self::UnqualifiedParent { provenance: Some(_), recorded } => format!(
+                "Nothing to fork: session '{parent}' records conversation '{recorded}', which was never qualified against a native agent. Qualify it with '{}', and for a pi or omp session add '--store /absolute/transcript/file' naming its transcript.",
+                qualify_command(parent, recorded)
+            ),
         }
     }
+}
+
+/// The one command that can qualify a recorded id, filled in and quoted so it
+/// runs as printed from any surface.
+fn qualify_command(parent: &str, recorded: &str) -> String {
+    format!(
+        "aoe session set-session-id {} {}",
+        shell_words::quote(parent),
+        shell_words::quote(recorded)
+    )
 }
 
 /// The conversation an explicit fork would carry, with the evidence for it
@@ -115,10 +141,14 @@ pub fn terminal_fork_seed(
         Some(ForkParentRef::Bound(parent)) => {
             return Err(ForkDenied::UnqualifiedParent {
                 provenance: Some(parent.provenance.clone()),
+                recorded: parent.session_id.clone(),
             })
         }
-        Some(ForkParentRef::Recorded(_)) => {
-            return Err(ForkDenied::UnqualifiedParent { provenance: None })
+        Some(ForkParentRef::Recorded(recorded)) => {
+            return Err(ForkDenied::UnqualifiedParent {
+                provenance: None,
+                recorded: recorded.to_string(),
+            })
         }
         None => return Err(ForkDenied::NoParentSession),
     };
@@ -171,7 +201,8 @@ mod tests {
             assert_eq!(
                 terminal_fork_seed(Some(ForkParentRef::Bound(&parent)), "child-uuid".into()),
                 Err(ForkDenied::UnqualifiedParent {
-                    provenance: Some(provenance)
+                    provenance: Some(provenance),
+                    recorded: "parent-uuid".into(),
                 })
             );
         }
@@ -180,7 +211,10 @@ mod tests {
                 Some(ForkParentRef::Recorded("legacy-uuid")),
                 "child-uuid".into()
             ),
-            Err(ForkDenied::UnqualifiedParent { provenance: None })
+            Err(ForkDenied::UnqualifiedParent {
+                provenance: None,
+                recorded: "legacy-uuid".into(),
+            })
         );
         assert_eq!(
             terminal_fork_seed(None, "child-uuid".into()),
@@ -210,31 +244,68 @@ mod tests {
         let cases = [
             (
                 ForkDenied::AgentCannotFork,
-                "This agent has no native fork capability. Forkable agents: claude, codex, opencode.",
+                "Nothing to fork: session 'Legacy Parent' runs an agent with no native fork capability. Forkable agents: claude, codex, opencode.",
             ),
             (
                 ForkDenied::NoParentSession,
-                "This session has no single captured conversation to fork from: it has captured none, or more than one session records this conversation id.",
+                "Nothing to fork: session 'Legacy Parent' has no single captured conversation to fork from: it has captured none, or more than one session records this conversation id.",
             ),
             (
                 ForkDenied::UnqualifiedParent {
                     provenance: Some(ConversationProvenance::Preallocated),
+                    recorded: "parent-uuid".into(),
                 },
-                "This session has no captured conversation to fork from. Send it at least one message first.",
+                "Nothing to fork: session 'Legacy Parent' has no captured conversation to fork from. Send it at least one message first.",
             ),
             (
                 ForkDenied::UnqualifiedParent {
                     provenance: Some(ConversationProvenance::Unknown),
+                    recorded: "parent-uuid".into(),
                 },
-                "This session records a conversation id, but it was never qualified against a native agent. Run 'aoe session set-session-id <session> <id>' on it to qualify it.",
+                "Nothing to fork: session 'Legacy Parent' records conversation 'parent-uuid', which was never qualified against a native agent. Qualify it with 'aoe session set-session-id 'Legacy Parent' parent-uuid', and for a pi or omp session add '--store /absolute/transcript/file' naming its transcript.",
             ),
             (
-                ForkDenied::UnqualifiedParent { provenance: None },
-                "This session records a conversation id that nothing qualifies: no record says which agent, store or directory it belongs to, so which conversation it names is unknown. Re-assert the id with 'aoe session set-session-id <session> <id>'.",
+                ForkDenied::UnqualifiedParent {
+                    provenance: None,
+                    recorded: "parent-uuid".into(),
+                },
+                "Nothing to fork: session 'Legacy Parent' records conversation 'parent-uuid', which nothing qualifies: no record says which agent, store or directory it belongs to, so which conversation it names is unknown. Re-assert it with 'aoe session set-session-id 'Legacy Parent' parent-uuid', and for a pi or omp session add '--store /absolute/transcript/file' naming its transcript.",
             ),
         ];
         for (denied, expected) in cases {
-            assert_eq!(denied.user_message(), expected);
+            assert_eq!(denied.user_message("Legacy Parent"), expected);
         }
+    }
+
+    /// A printed remedy has to run as printed, so a title or an id holding a
+    /// space is quoted and no placeholder survives into the message.
+    #[test]
+    fn the_printed_remedy_is_a_runnable_command() {
+        for provenance in [None, Some(ConversationProvenance::Unknown)] {
+            let denied = ForkDenied::UnqualifiedParent {
+                provenance,
+                recorded: "parent uuid".into(),
+            };
+            let message = denied.user_message("Legacy Parent");
+            assert!(
+                message.contains("'aoe session set-session-id 'Legacy Parent' 'parent uuid''"),
+                "{message}"
+            );
+            assert!(!message.contains('<'), "{message}");
+            assert!(!message.contains('>'), "{message}");
+        }
+    }
+
+    /// A preallocated id names no conversation yet, so the remedy cannot be a
+    /// qualification command that would be refused anyway.
+    #[test]
+    fn a_preallocated_id_gets_no_qualification_command() {
+        let message = ForkDenied::UnqualifiedParent {
+            provenance: Some(ConversationProvenance::Preallocated),
+            recorded: "parent-uuid".into(),
+        }
+        .user_message("Legacy Parent");
+        assert!(!message.contains("set-session-id"), "{message}");
+        assert!(!message.contains("--store"), "{message}");
     }
 }

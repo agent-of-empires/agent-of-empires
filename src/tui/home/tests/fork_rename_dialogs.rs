@@ -69,10 +69,11 @@ fn fork_row_offers_a_preallocated_parent() {
     );
 }
 
-/// A recorded conversation AoE cannot fork is refused three ways, and each
-/// names the remedy its own state admits: a pre-pinned id has no conversation
-/// to qualify, a never-qualified one can be re-asserted, and a binding-less
-/// one names no conversation to assert.
+/// A recorded conversation AoE cannot fork is refused three ways, and the
+/// dialog carries the shared wording, so each state shows the remedy its own
+/// evidence admits: a pre-pinned id has no conversation to qualify, a
+/// never-qualified one can be re-asserted, and a binding-less one names no
+/// conversation to assert.
 #[test]
 #[serial]
 fn fork_from_selection_reports_why_the_conversation_cannot_be_forked() {
@@ -85,24 +86,31 @@ fn fork_from_selection_reports_why_the_conversation_cannot_be_forked() {
         /// No binding at all.
         Absent,
     }
+    let recorded = "parent-1111-2222-3333-444444444444".to_string();
     let cases = [
         (
             Binding::Preallocated,
-            "Conversation not qualified",
-            "This session has no captured conversation to fork from. Send it at least one message first.",
+            crate::session::ForkDenied::UnqualifiedParent {
+                provenance: Some(crate::session::ConversationProvenance::Preallocated),
+                recorded: recorded.clone(),
+            },
         ),
         (
             Binding::Unknown,
-            "Conversation not qualified",
-            "This session records a conversation id, but it was never qualified against a native agent. Run 'aoe session set-session-id <session> <id>' on it to qualify it.",
+            crate::session::ForkDenied::UnqualifiedParent {
+                provenance: Some(crate::session::ConversationProvenance::Unknown),
+                recorded: recorded.clone(),
+            },
         ),
         (
             Binding::Absent,
-            "Conversation not qualified",
-            "This session records a conversation id that nothing qualifies: no record says which agent, store or directory it belongs to, so which conversation it names is unknown. Re-assert the id with 'aoe session set-session-id <session> <id>'.",
+            crate::session::ForkDenied::UnqualifiedParent {
+                provenance: None,
+                recorded: recorded.clone(),
+            },
         ),
     ];
-    for (binding, title, message) in cases {
+    for (binding, denied) in cases {
         let mut env = create_test_env_empty();
         let mut inst = observed_fork_parent("claude");
         match binding {
@@ -112,11 +120,12 @@ fn fork_from_selection_reports_why_the_conversation_cannot_be_forked() {
             }
             Binding::Unknown => {
                 inst.agent_session_binding = Some(crate::session::ConversationBinding::unknown(
-                    "parent-1111-2222-3333-444444444444",
+                    recorded.as_str(),
                 ));
             }
             Binding::Absent => inst.agent_session_binding = None,
         }
+        let title = inst.title.clone();
         let id = inst.id.clone();
         env.view.add_instance(inst);
         env.view.selected_session = Some(id);
@@ -128,8 +137,8 @@ fn fork_from_selection_reports_why_the_conversation_cannot_be_forked() {
             "an unqualified parent must not open a fork dialog"
         );
         let dialog = env.view.info_dialog.as_ref().expect("info dialog");
-        assert_eq!(dialog.title(), title);
-        assert_eq!(dialog.message(), message);
+        assert_eq!(dialog.title(), "Conversation not qualified");
+        assert_eq!(dialog.message(), denied.user_message(&title));
     }
 }
 

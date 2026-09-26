@@ -290,36 +290,11 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
             resolved_tool = source.tool.clone();
         }
         let parent_ref = source.fork_parent_ref();
-        let recorded = parent_ref.map(|parent| parent.session_id());
         let seed = crate::session::fork::terminal_fork_seed(
             parent_ref,
             crate::session::capture::generate_session_uuid(),
         )
-        .map_err(|denied| {
-            // The refusal sentence is the shared one, except where the CLI holds
-            // something it cannot: the parent's title, and the exact arguments of
-            // the pin the remedy names.
-            let message = match denied {
-                crate::session::ForkDenied::UnqualifiedParent {
-                    provenance: Some(_),
-                } => {
-                    let recorded = recorded.expect("a bound parent records an id");
-                    format!(
-                        "Nothing to fork: session '{}' records conversation '{}' but it was never qualified against a native agent; run `aoe session set-session-id {} {}` to qualify it.",
-                        source.title,
-                        recorded,
-                        shell_words::quote(&source.title),
-                        shell_words::quote(recorded)
-                    )
-                }
-                other => format!(
-                    "Nothing to fork: session '{}'. {}",
-                    source.title,
-                    other.user_message()
-                ),
-            };
-            anyhow::Error::msg(message)
-        })?;
+        .map_err(|denied| anyhow::Error::msg(denied.user_message(&source.title)))?;
         Some(seed)
     } else {
         None

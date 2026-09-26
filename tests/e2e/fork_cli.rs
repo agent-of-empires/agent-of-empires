@@ -392,3 +392,48 @@ fn fork_from_refusals_persist_nothing() {
         assert_no_scratch_dirs(&h);
     }
 }
+
+/// A pre-pinned id names no conversation yet, so the refusal must send the user
+/// to the parent rather than print a qualification the command would refuse
+/// anyway, and it must leave nothing behind.
+#[test]
+#[parallel]
+fn a_preallocated_parent_is_told_to_talk_not_to_reassert() {
+    let h = TuiTestHarness::new("fork_cli_preallocated");
+    let project = h.project_path();
+    h.run_cli_ok(&[
+        "add",
+        project.to_str().unwrap(),
+        "--cmd",
+        "claude",
+        "-t",
+        "Parent",
+    ]);
+    patch_session(&h, "Parent", |session| {
+        session["agent_session_id"] = json!(PARENT_AGENT_ID);
+        session["agent_session_binding"] = json!({
+            "session_id": PARENT_AGENT_ID,
+            "execution": {
+                "agent": "claude",
+                "stores": ["/native-store"],
+                "cwd": "/tmp",
+                "cwd_filesystem": "host",
+                "filesystem": "host",
+            },
+            "provenance": "preallocated",
+        });
+    });
+
+    let stderr = h.run_cli_err(&[
+        "add",
+        project.to_str().unwrap(),
+        "-t",
+        "Child",
+        "--fork-from",
+        "Parent",
+    ]);
+
+    assert!(stderr.contains("no captured conversation"), "{stderr}");
+    assert!(!stderr.contains("set-session-id"), "{stderr}");
+    assert_not_persisted(&h, "Child");
+}

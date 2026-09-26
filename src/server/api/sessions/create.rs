@@ -881,10 +881,20 @@ pub async fn create_session(
             match resolve_create_fork_seed(parent_id, structured, &parents) {
                 Ok(seed) => Some(seed),
                 Err(denied) => {
+                    // The remedy names the row the request asked to fork, so it
+                    // runs as printed. The fallback can only reach a refusal
+                    // that admits no remedy, which needs no row.
+                    let parent = parents
+                        .iter()
+                        .find(|row| {
+                            row.fork_parent_ref()
+                                .is_some_and(|candidate| candidate.session_id() == parent_id)
+                        })
+                        .map_or(parent_id, |row| row.title.as_str());
                     return api_error(
                         StatusCode::BAD_REQUEST,
                         "fork_unsupported",
-                        denied.user_message(),
+                        denied.user_message(parent),
                     );
                 }
             }
