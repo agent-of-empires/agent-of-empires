@@ -17,6 +17,7 @@
 pub mod daemon_manager;
 pub mod discovery;
 pub mod http;
+mod passphrase_session;
 pub mod ws;
 
 pub use daemon_manager::{require_daemon, ManagerError};

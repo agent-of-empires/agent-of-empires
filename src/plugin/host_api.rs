@@ -875,7 +875,7 @@ mod tests {
     }
 
     #[test]
-    fn plugin_storage_roundtrip_namespace_and_persistence() {
+    fn plugin_storage_roundtrip_namespace_persistence_and_cas() {
         let tmp = tempfile::tempdir().unwrap();
         let cron = ctx_for("cron", &[CAP_WORKER]);
         let other = ctx_for("other", &[CAP_WORKER]);
@@ -912,15 +912,8 @@ mod tests {
         let state = state(tmp.path());
         let got = dispatch(&state, &cron, "plugin.storage.get", &key()).unwrap();
         assert_eq!(got, json!({ "value": "kept" }), "storage survives a reopen");
-    }
 
-    #[test]
-    fn plugin_storage_cas_swaps_only_on_match() {
-        let tmp = tempfile::tempdir().unwrap();
-        let state = state(tmp.path());
-        let c = ctx(&[CAP_WORKER]);
-        let cas = |params: Value| dispatch(&state, &c, "plugin.storage.cas", &params);
-
+        let cas = |params: Value| dispatch(&state, &cron, "plugin.storage.cas", &params);
         let cases = [
             (json!({"key": "k", "expected": null, "value": 1}), true, 1),
             (json!({"key": "k", "expected": 99, "value": 2}), false, 1),
@@ -933,7 +926,6 @@ mod tests {
                 "{params}"
             );
         }
-
         let err = cas(json!({"key": "k", "value": 3})).unwrap_err();
         assert_eq!(err.code, codes::INVALID_PARAMS, "expected is required");
     }
@@ -1027,67 +1019,7 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn session_meta_cas_namespace_and_list() {
-        use crate::session::{Instance, Storage};
-
-        let tmp = tempfile::tempdir().unwrap();
-        let _home = crate::session::test_support::isolate_app_dir_at(tmp.path());
-
-        let storage = Storage::new_unwatched("default").unwrap();
-        let session_id = storage
-            .update(|instances, _groups| {
-                let inst = Instance::new("sess", "/tmp/plugin-host-test");
-                let id = inst.id.clone();
-                instances.push(inst);
-                Ok(id)
-            })
-            .unwrap();
-
-        let state =
-            HostApiState::open(&tmp.path().join("plugin_events.db"), "default", 100).unwrap();
-        let a = ctx(&[CAP_SESSION_READ, CAP_SESSION_WRITE]);
-        let meta = |c: &PluginRpcContext, method: &str, extra: Value| {
-            let mut params = json!({"session_id": session_id, "key": "k"});
-            for (k, v) in extra.as_object().expect("object").clone() {
-                params[k] = v;
-            }
-            dispatch(&state, c, method, &params).unwrap()
-        };
-
-        meta(&a, "session.meta.set", json!({ "value": 42 }));
-        assert_eq!(meta(&a, "session.meta.get", json!({}))["value"], json!(42));
-
-        let lose = meta(&a, "session.meta.cas", json!({"expected": 0, "value": 99}));
-        assert_eq!(lose["swapped"], json!(false));
-        assert_eq!(lose["current"], json!(42));
-        let win = meta(&a, "session.meta.cas", json!({"expected": 42, "value": 99}));
-        assert_eq!(win["swapped"], json!(true));
-
-        let b = PluginRpcContext {
-            plugin_id: "other.plugin".to_string(),
-            granted_capabilities: vec![CAP_SESSION_READ.to_string()],
-            ui_contributions: HashSet::new(),
-            ui_generation: 0,
-        };
-        assert_eq!(
-            meta(&b, "session.meta.get", json!({}))["value"],
-            json!(null),
-            "session meta is namespaced per plugin"
-        );
-
-        let list = dispatch(&state, &a, "sessions.list", &json!({})).unwrap();
-        let sessions = list["sessions"].as_array().unwrap();
-        let seeded = sessions
-            .iter()
-            .find(|s| s["id"] == json!(session_id))
-            .unwrap();
-        assert_eq!(seeded["archived"], json!(false));
-        assert_eq!(seeded["snoozed"], json!(false));
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn sessions_list_reports_dormancy_flags_and_honors_exclude() {
+    fn session_meta_is_namespaced_and_sessions_list_honors_dormancy() {
         use crate::session::{Instance, Storage};
 
         let tmp = tempfile::tempdir().unwrap();
@@ -1119,6 +1051,44 @@ mod tests {
 
         let state =
             HostApiState::open(&tmp.path().join("plugin_events.db"), "default", 100).unwrap();
+        let writer = ctx(&[CAP_SESSION_READ, CAP_SESSION_WRITE]);
+        let meta = |c: &PluginRpcContext, method: &str, extra: Value| {
+            let mut params = json!({"session_id": active_id, "key": "k"});
+            for (k, v) in extra.as_object().expect("object").clone() {
+                params[k] = v;
+            }
+            dispatch(&state, c, method, &params).unwrap()
+        };
+        meta(&writer, "session.meta.set", json!({ "value": 42 }));
+        assert_eq!(
+            meta(&writer, "session.meta.get", json!({}))["value"],
+            json!(42)
+        );
+        let lose = meta(
+            &writer,
+            "session.meta.cas",
+            json!({"expected": 0, "value": 99}),
+        );
+        assert_eq!(
+            (&lose["swapped"], &lose["current"]),
+            (&json!(false), &json!(42))
+        );
+        let win = meta(
+            &writer,
+            "session.meta.cas",
+            json!({"expected": 42, "value": 99}),
+        );
+        assert_eq!(win["swapped"], json!(true));
+        assert_eq!(
+            meta(
+                &ctx_for("other.plugin", &[CAP_SESSION_READ]),
+                "session.meta.get",
+                json!({})
+            )["value"],
+            json!(null),
+            "session meta is namespaced per plugin"
+        );
+
         let reader = ctx(&[CAP_SESSION_READ]);
         let list = |params: Value| dispatch(&state, &reader, "sessions.list", &params).unwrap();
         let ids = |v: &Value| -> Vec<String> {
@@ -1299,34 +1269,24 @@ mod tests {
     }
 
     #[test]
-    fn ui_notify_requires_notifications_capability() {
-        let tmp = tempfile::tempdir().unwrap();
-        let state = state(tmp.path());
-        let params = json!({"title": "Build failed", "tone": "danger"});
-
-        let c = ui_ctx(&state, &[CAP_WORKER], UiSlot::Notification, "n");
-        let err = dispatch(&state, &c, "ui.notify", &params).unwrap_err();
-        assert_eq!(err.code, codes::FORBIDDEN);
-
-        let c = ui_ctx(&state, &[CAP_NOTIFICATIONS], UiSlot::Notification, "n");
-        let ok = dispatch(&state, &c, "ui.notify", &params).unwrap();
-        assert_eq!(ok["seq"], json!(1));
-        assert_eq!(state.ui_snapshot().notifications.len(), 1);
-    }
-
-    #[test]
-    fn ui_open_url_requires_browser_open_and_validates_scheme() {
+    fn ui_notify_and_open_url_require_their_capabilities() {
         let tmp = tempfile::tempdir().unwrap();
         let state = state(tmp.path());
         let open = |c: &PluginRpcContext, url: &str| {
             dispatch(&state, c, "ui.open_url", &json!({ "url": url }))
         };
 
+        let params = json!({"title": "Build failed", "tone": "danger"});
         let c = ui_ctx(&state, &[CAP_WORKER], UiSlot::Notification, "n");
+        let err = dispatch(&state, &c, "ui.notify", &params).unwrap_err();
+        assert_eq!(err.code, codes::FORBIDDEN);
         assert_eq!(
             open(&c, "https://example.com").unwrap_err().code,
             codes::FORBIDDEN
         );
+        let notifier = ui_ctx(&state, &[CAP_NOTIFICATIONS], UiSlot::Notification, "n");
+        let ok = dispatch(&state, &notifier, "ui.notify", &params).unwrap();
+        assert_eq!(ok["seq"], json!(1));
 
         let c = ui_ctx(&state, &[CAP_BROWSER_OPEN], UiSlot::Notification, "n");
         assert_eq!(
@@ -1335,10 +1295,10 @@ mod tests {
         );
 
         let ok = open(&c, "https://example.com/pr/1").unwrap();
-        assert_eq!(ok["seq"], json!(1));
+        assert_eq!(ok["seq"], json!(2));
         let notifs = state.ui_snapshot().notifications;
-        assert_eq!(notifs.len(), 1);
-        assert_eq!(notifs[0].href.as_deref(), Some("https://example.com/pr/1"));
+        assert_eq!(notifs.len(), 2);
+        assert_eq!(notifs[1].href.as_deref(), Some("https://example.com/pr/1"));
     }
 
     #[test]

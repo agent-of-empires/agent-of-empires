@@ -65,107 +65,41 @@ pub(crate) fn run_in(app_dir: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn write_profile_default(app_dir: &Path) {
-        fs::create_dir_all(app_dir.join("profiles").join("default")).unwrap();
-    }
+    use crate::migrations::test_cases::assert_rewrites;
 
     #[test]
-    fn no_op_when_default_profile_dir_absent() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("config.toml");
-        fs::write(&path, "[other]\nkey = \"value\"\n").unwrap();
-
-        run_in(temp.path()).unwrap();
-
-        let after = fs::read_to_string(&path).unwrap();
-        assert!(!after.contains("default_profile"));
-    }
-
-    #[test]
-    fn no_op_when_default_profile_explicitly_set() {
-        let temp = tempfile::tempdir().unwrap();
-        write_profile_default(temp.path());
-        let path = temp.path().join("config.toml");
-        fs::write(&path, "default_profile = \"mzai\"\n").unwrap();
-
-        run_in(temp.path()).unwrap();
-
-        let after: toml::Table = fs::read_to_string(&path).unwrap().parse().unwrap();
-        assert_eq!(after["default_profile"].as_str(), Some("mzai"));
-    }
-
-    #[test]
-    fn writes_default_when_dir_exists_and_field_missing() {
-        let temp = tempfile::tempdir().unwrap();
-        write_profile_default(temp.path());
-        let path = temp.path().join("config.toml");
-        fs::write(&path, "[other]\nkey = \"value\"\n").unwrap();
-
-        run_in(temp.path()).unwrap();
-
-        let after: toml::Table = fs::read_to_string(&path).unwrap().parse().unwrap();
-        assert_eq!(after["default_profile"].as_str(), Some("default"));
-        assert!(after.contains_key("other"), "other sections preserved");
-    }
-
-    #[test]
-    fn writes_default_when_field_is_explicit_empty_string() {
-        // Empty string fell through to "default" pre-PR, so locking it in
-        // matches the old runtime behavior rather than the user's literal
-        // (and surprising) explicit empty value.
-        let temp = tempfile::tempdir().unwrap();
-        write_profile_default(temp.path());
-        let path = temp.path().join("config.toml");
-        fs::write(&path, "default_profile = \"\"\n").unwrap();
-
-        run_in(temp.path()).unwrap();
-
-        let after: toml::Table = fs::read_to_string(&path).unwrap().parse().unwrap();
-        assert_eq!(after["default_profile"].as_str(), Some("default"));
-    }
-
-    #[test]
-    fn writes_default_when_config_file_is_absent() {
-        let temp = tempfile::tempdir().unwrap();
-        write_profile_default(temp.path());
-        let path = temp.path().join("config.toml");
-        assert!(!path.exists());
-
-        run_in(temp.path()).unwrap();
-
-        let after: toml::Table = fs::read_to_string(&path).unwrap().parse().unwrap();
-        assert_eq!(after["default_profile"].as_str(), Some("default"));
-    }
-
-    #[test]
-    fn is_idempotent() {
-        let temp = tempfile::tempdir().unwrap();
-        write_profile_default(temp.path());
-        let path = temp.path().join("config.toml");
-        fs::write(&path, "[other]\nkey = \"value\"\n").unwrap();
-
-        run_in(temp.path()).unwrap();
-        let after_first = fs::read_to_string(&path).unwrap();
-
-        run_in(temp.path()).unwrap();
-        let after_second = fs::read_to_string(&path).unwrap();
-
-        assert_eq!(after_first, after_second);
-    }
-
-    #[test]
-    fn skips_malformed_config_without_failing() {
-        let temp = tempfile::tempdir().unwrap();
-        write_profile_default(temp.path());
-        let path = temp.path().join("config.toml");
-        fs::write(&path, "not = valid = toml = at = all\n").unwrap();
-
-        // Migration must not propagate a parse error; downstream code already
-        // logs a warning and falls back to defaults on its own.
-        run_in(temp.path()).unwrap();
-
-        let after = fs::read_to_string(&path).unwrap();
-        assert_eq!(after, "not = valid = toml = at = all\n");
+    fn locks_in_default_only_when_the_default_profile_dir_exists() {
+        let other = "[other]\nkey = \"value\"\n";
+        let with_dir = |path: &Path| {
+            let app_dir = path.parent().unwrap();
+            fs::create_dir_all(app_dir.join("profiles").join("default"))?;
+            run_in(app_dir)
+        };
+        let explicit = "default_profile = \"mzai\"\n";
+        // A parse error is left for the config loader to warn about.
+        let malformed = "not = valid = toml = at = all\n";
+        assert_rewrites(
+            "config.toml",
+            with_dir,
+            &[
+                (
+                    Some(other),
+                    Some("default_profile = \"default\"\n[other]\nkey = \"value\"\n"),
+                ),
+                // Empty fell through to "default" at runtime before this migration.
+                (
+                    Some("default_profile = \"\"\n"),
+                    Some("default_profile = \"default\"\n"),
+                ),
+                (None, Some("default_profile = \"default\"\n")),
+                (Some(explicit), Some(explicit)),
+                (Some(malformed), Some(malformed)),
+            ],
+        );
+        assert_rewrites(
+            "config.toml",
+            |path| run_in(path.parent().unwrap()),
+            &[(Some(other), Some(other))],
+        );
     }
 }

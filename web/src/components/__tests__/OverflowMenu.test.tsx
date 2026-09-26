@@ -8,35 +8,24 @@ import { OverflowMenu } from "../OverflowMenu";
 afterEach(cleanup);
 
 describe("OverflowMenu", () => {
-  it("opens on trigger click and lists items", () => {
-    render(<OverflowMenu items={[{ label: "Rename", onClick: () => {} }]} />);
-    const trigger = screen.getByRole("button", { name: "More options" });
-    expect(trigger.getAttribute("aria-expanded")).toBe("false");
-
-    fireEvent.click(trigger);
-    expect(trigger.getAttribute("aria-expanded")).toBe("true");
-    expect(screen.getByRole("menuitem", { name: "Rename" })).toBeTruthy();
-  });
-
-  it("fires the item handler and closes on selection", () => {
+  it("opens on trigger click, fires the item handler, and closes on selection", () => {
     const onClick = vi.fn();
     render(<OverflowMenu items={[{ label: "Delete", onClick }]} />);
-    fireEvent.click(screen.getByRole("button", { name: "More options" }));
+    const trigger = screen.getByRole("button", { name: "More options" });
+    expect(trigger.getAttribute("aria-expanded")).toBe("false");
+    fireEvent.click(trigger);
+    expect(trigger.getAttribute("aria-expanded")).toBe("true");
     fireEvent.click(screen.getByRole("menuitem", { name: "Delete" }));
     expect(onClick).toHaveBeenCalledOnce();
     expect(screen.queryByRole("menu")).toBeNull();
   });
 
-  it("closes on outside mousedown", () => {
+  it("closes on outside mousedown and on Escape", () => {
     render(<OverflowMenu items={[{ label: "X", onClick: () => {} }]} />);
     fireEvent.click(screen.getByRole("button", { name: "More options" }));
     expect(screen.getByRole("menu")).toBeTruthy();
     fireEvent.mouseDown(document.body);
     expect(screen.queryByRole("menu")).toBeNull();
-  });
-
-  it("closes on Escape", () => {
-    render(<OverflowMenu items={[{ label: "X", onClick: () => {} }]} />);
     fireEvent.click(screen.getByRole("button", { name: "More options" }));
     fireEvent.keyDown(document, { key: "Escape" });
     expect(screen.queryByRole("menu")).toBeNull();

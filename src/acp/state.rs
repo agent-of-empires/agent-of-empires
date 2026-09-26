@@ -347,6 +347,7 @@ pub struct AcpState {
     pub pending_approvals: Vec<Approval>,
     #[serde(default)]
     pub pending_elicitations: Vec<Elicitation>,
+    #[serde(default)]
     pub recent_diffs: Vec<DiffPreview>,
     pub thinking: Option<ThinkingSignal>,
     pub rate_limit: Option<RateLimitInfo>,
@@ -1152,7 +1153,7 @@ mod tests {
     }
 
     #[test]
-    fn turn_flags_follow_prompt_stop_cancel_and_compaction_edges() {
+    fn turn_flags_and_rate_limit_park_follow_their_edges() {
         let mut s = fresh_state();
         assert!(!s.turn_active);
         s.apply_event(prompt("hi")).unwrap();
@@ -1201,10 +1202,29 @@ mod tests {
             !applied([Event::ConversationCompactionStarted, stopped("end_turn")]).compacting,
             "Stopped self-heals a stuck compaction"
         );
-    }
 
-    #[test]
-    fn rate_limit_park_ends_on_a_live_prompt_session_or_organic_stop() {
+        let mut s = fresh_state();
+        let before = s.updated_at;
+        let seq = s
+            .apply_event(Event::ModeSwitchFailed {
+                mode_id: "bypassPermissions".into(),
+                reason: "Mode bypassPermissions is not available.".into(),
+            })
+            .unwrap();
+        assert_eq!(seq, 1);
+        assert_eq!(
+            s.mode,
+            SessionMode::Default,
+            "a failed switch changes nothing"
+        );
+        assert!(s.updated_at >= before);
+        let result = s.apply_event(Event::ApprovalResolved {
+            nonce: Nonce::new(),
+            decision: ApprovalDecision::Allow,
+        });
+        assert!(matches!(result, Err(StateError::UnknownApprovalNonce(_))));
+
+        // A rate-limit park ends on a live prompt, session, or organic stop.
         assert!(applied([rate_limit()]).rate_limit.is_some());
         let resumed = Event::RateLimitAutoResumed {
             resets_at: Utc::now(),
@@ -1231,30 +1251,6 @@ mod tests {
                 "{end:?}"
             );
         }
-    }
-
-    #[test]
-    fn apply_event_bumps_seq_and_rejects_unknown_approvals() {
-        let mut s = fresh_state();
-        let before = s.updated_at;
-        let seq = s
-            .apply_event(Event::ModeSwitchFailed {
-                mode_id: "bypassPermissions".into(),
-                reason: "Mode bypassPermissions is not available.".into(),
-            })
-            .unwrap();
-        assert_eq!(seq, 1);
-        assert_eq!(
-            s.mode,
-            SessionMode::Default,
-            "a failed switch changes nothing"
-        );
-        assert!(s.updated_at >= before);
-        let result = s.apply_event(Event::ApprovalResolved {
-            nonce: Nonce::new(),
-            decision: ApprovalDecision::Allow,
-        });
-        assert!(matches!(result, Err(StateError::UnknownApprovalNonce(_))));
     }
 
     #[test]
@@ -1313,10 +1309,8 @@ mod tests {
             tool.diffs[0].path, "src/foo.rs",
             "the repeated start keeps the diff"
         );
-    }
 
-    #[test]
-    fn phases_clear_when_a_tool_or_question_takes_over() {
+        // Phases clear when a tool or question takes over.
         let elicitation = |nonce: &str, tool_call_id: &str| Event::ElicitationRequested {
             elicitation: Elicitation {
                 nonce: Nonce(nonce.into()),
@@ -1402,6 +1396,25 @@ mod tests {
         );
         assert_eq!((agent.tool_count, agent.tools.len()), (3, 1));
         assert_eq!(agent.result.as_deref(), Some("done"));
+
+        // A stalled Progress sets no `ended_at`, so the next one resumes it.
+        let s = applied([launched(), bg_progress(BackgroundAgentStatus::Stalled, 4)]);
+        assert_eq!(
+            s.background_agents[0].status,
+            BackgroundAgentStatus::Stalled
+        );
+        assert!(s.background_agents[0].ended_at.is_none());
+        assert!(s.has_active_background_agent());
+
+        let s = applied([
+            launched(),
+            bg_progress(BackgroundAgentStatus::Stalled, 4),
+            bg_progress(BackgroundAgentStatus::Running, 5),
+        ]);
+        assert_eq!(
+            s.background_agents[0].status,
+            BackgroundAgentStatus::Running
+        );
     }
 
     fn launched() -> Event {
@@ -1462,29 +1475,6 @@ mod tests {
             assert!(agent.ended_at.is_some(), "{status:?}");
             assert!(!s.has_active_background_agent(), "{status:?}");
         }
-    }
-
-    /// Only `BackgroundAgentCompleted` sets `ended_at`, so a `Progress`
-    /// reporting a stall is not terminal and the next one resumes it.
-    #[test]
-    fn background_agent_progress_stalled_without_ended_at_still_resumes() {
-        let s = applied([launched(), bg_progress(BackgroundAgentStatus::Stalled, 4)]);
-        assert_eq!(
-            s.background_agents[0].status,
-            BackgroundAgentStatus::Stalled
-        );
-        assert!(s.background_agents[0].ended_at.is_none());
-        assert!(s.has_active_background_agent());
-
-        let s = applied([
-            launched(),
-            bg_progress(BackgroundAgentStatus::Stalled, 4),
-            bg_progress(BackgroundAgentStatus::Running, 5),
-        ]);
-        assert_eq!(
-            s.background_agents[0].status,
-            BackgroundAgentStatus::Running
-        );
     }
 
     /// #4001: `turn_active` gates prompt dispatch and the queue drain, not

@@ -306,52 +306,145 @@ mod tests {
     }
 
     #[test]
-    fn single_pane_fills_the_window_unchanged() {
-        let panes = [pane(0, 0, 5, 2, &["hello", "world"])];
-        assert_eq!(composite_window(5, 2, &panes), "hello\nworld\n");
-    }
-
-    #[test]
-    fn side_by_side_panes_are_joined_by_a_vertical_border() {
-        // `C-b %`: two panes split at column 5, tmux's border occupying it.
-        let panes = [
-            pane(0, 0, 5, 2, &["aaaaa", "bbbbb"]),
-            pane(6, 0, 5, 2, &["ccccc", "ddddd"]),
+    fn composite_window_joins_panes_with_borders() {
+        let styled = format!("ab{}  ", "\x1b[44m");
+        let reset_padded = format!("ab{}  ", SGR_RESET);
+        let red = "\x1b[0m\x1b[31mred\x1b[0m";
+        let grn = "\x1b[0m\x1b[32mgrn\x1b[0m";
+        let cases: Vec<(&str, u16, u16, Vec<CapturedPane>, String)> = vec![
+            (
+                "single pane",
+                5,
+                2,
+                vec![pane(0, 0, 5, 2, &["hello", "world"])],
+                "hello\nworld\n".into(),
+            ),
+            (
+                "side by side",
+                11,
+                2,
+                vec![
+                    pane(0, 0, 5, 2, &["aaaaa", "bbbbb"]),
+                    pane(6, 0, 5, 2, &["ccccc", "ddddd"]),
+                ],
+                "aaaaa│ccccc\nbbbbb│ddddd\n".into(),
+            ),
+            (
+                "stacked",
+                4,
+                3,
+                vec![pane(0, 0, 4, 1, &["topp"]), pane(0, 2, 4, 1, &["botm"])],
+                "topp\n────\nbotm\n".into(),
+            ),
+            (
+                "shorter neighbour pads",
+                7,
+                2,
+                vec![
+                    pane(0, 0, 3, 1, &["abc"]),
+                    pane(4, 0, 3, 2, &["xyz", "uvw"]),
+                ],
+                "abc│xyz\n───│uvw\n".into(),
+            ),
+            (
+                "missing capture row pads",
+                7,
+                2,
+                vec![
+                    pane(0, 0, 3, 2, &["abc"]),
+                    pane(4, 0, 3, 2, &["xyz", "uvw"]),
+                ],
+                "abc│xyz\n   │uvw\n".into(),
+            ),
+            (
+                "rule crossing is a junction",
+                9,
+                3,
+                vec![
+                    pane(0, 0, 4, 1, &["tl.."]),
+                    pane(5, 0, 4, 1, &["tr.."]),
+                    pane(0, 2, 4, 1, &["bl.."]),
+                    pane(5, 2, 4, 1, &["br.."]),
+                ],
+                "tl..│tr..\n────┼────\nbl..│br..\n".into(),
+            ),
+            (
+                "split left column",
+                9,
+                3,
+                vec![
+                    pane(0, 0, 4, 1, &["top1"]),
+                    pane(0, 2, 4, 1, &["bot1"]),
+                    pane(5, 0, 4, 3, &["rgt1", "rgt2", "rgt3"]),
+                ],
+                "top1│rgt1\n────│rgt2\nbot1│rgt3\n".into(),
+            ),
+            (
+                "ansi rows spliced whole",
+                7,
+                1,
+                vec![pane(0, 0, 3, 1, &[red]), pane(4, 0, 3, 1, &[grn])],
+                format!("{red}│{grn}\n"),
+            ),
+            (
+                "unclaimed column",
+                5,
+                1,
+                vec![pane(2, 0, 3, 1, &["xyz"])],
+                " │xyz\n".into(),
+            ),
+            (
+                "zero-width pane",
+                3,
+                1,
+                vec![pane(0, 0, 0, 1, &[""]), pane(1, 0, 2, 1, &["ok"])],
+                "│ok\n".into(),
+            ),
+            (
+                "styled fill to the edge survives",
+                7,
+                1,
+                vec![pane(0, 0, 2, 1, &["xy"]), pane(3, 0, 4, 1, &[&styled])],
+                format!("xy│{styled}\n"),
+            ),
+            (
+                "reset-prefixed padding trimmed",
+                7,
+                1,
+                vec![
+                    pane(0, 0, 2, 1, &["xy"]),
+                    pane(3, 0, 4, 1, &[&reset_padded]),
+                ],
+                "xy│ab\n".into(),
+            ),
+            (
+                "blank bottom row",
+                4,
+                3,
+                vec![pane(0, 0, 4, 1, &["top."])],
+                "top.\n────\n\n".into(),
+            ),
+            ("no panes", 3, 2, vec![], "\n\n".into()),
         ];
-        assert_eq!(
-            composite_window(11, 2, &panes),
-            "aaaaa│ccccc\nbbbbb│ddddd\n"
+        for (label, w, h, panes, expected) in cases {
+            let out = composite_window(w, h, &panes);
+            assert_eq!(out, expected, "{label}");
+            assert_eq!(out.lines().count(), usize::from(h), "{label}: line count");
+        }
+
+        let dead_corner = composite_window(
+            7,
+            3,
+            &[
+                pane(0, 0, 3, 1, &["abc"]),
+                pane(4, 0, 3, 3, &["x", "y", "z"]),
+            ],
         );
-    }
-
-    #[test]
-    fn stacked_panes_are_joined_by_a_horizontal_border() {
-        // `C-b "`: the row between the panes belongs to no pane.
-        let panes = [pane(0, 0, 4, 1, &["topp"]), pane(0, 2, 4, 1, &["botm"])];
-        assert_eq!(composite_window(4, 3, &panes), "topp\n────\nbotm\n");
-    }
-
-    #[test]
-    fn a_pane_shorter_than_its_neighbour_pads_rather_than_shifting() {
-        // The right pane spans both rows; the left only the first. Row 1 must
-        // still start the right pane at the same column, and the space the
-        // short pane vacated reads as the rule tmux would draw beneath it.
-        let panes = [
-            pane(0, 0, 3, 1, &["abc"]),
-            pane(4, 0, 3, 2, &["xyz", "uvw"]),
-        ];
-        assert_eq!(composite_window(7, 2, &panes), "abc│xyz\n───│uvw\n");
-    }
-
-    #[test]
-    fn a_row_missing_from_a_capture_pads_its_width() {
-        // Pane claims two rows but the capture came back with one (a resize
-        // raced the frame). The neighbour must not slide left.
-        let panes = [
-            pane(0, 0, 3, 2, &["abc"]),
-            pane(4, 0, 3, 2, &["xyz", "uvw"]),
-        ];
-        assert_eq!(composite_window(7, 2, &panes), "abc│xyz\n   │uvw\n");
+        let last = dead_corner.lines().nth(2).expect("row 2");
+        assert!(
+            !last.contains('┼'),
+            "void corner became a junction: {last:?}"
+        );
     }
 
     fn layout(w: u16, h: u16, panes: Vec<CapturedPane>) -> WindowLayout {
@@ -363,22 +456,7 @@ mod tests {
     }
 
     #[test]
-    fn first_pane_is_the_one_at_the_window_origin() {
-        // tmux layout order puts pane 0 at the top-left pane position; its
-        // actual origin remains part of the returned geometry.
-        let l = layout(
-            9,
-            1,
-            vec![pane(0, 0, 4, 1, &["left"]), pane(5, 0, 4, 1, &["rght"])],
-        );
-        let first = l.first_pane().expect("a first pane");
-        assert_eq!((first.left, first.top), (0, 0));
-    }
-
-    #[test]
-    fn swapping_the_first_pane_rows_leaves_the_others_alone() {
-        // The live path's whole trick: a cached layout re-rendered with only
-        // pane 0 refreshed from its VT grid.
+    fn first_pane_rows_swap_leaves_the_others_alone() {
         let l = layout(
             9,
             2,
@@ -387,6 +465,8 @@ mod tests {
                 pane(5, 0, 4, 2, &["keep", "same"]),
             ],
         );
+        let first = l.first_pane().expect("a first pane");
+        assert_eq!((first.left, first.top), (0, 0));
         let fresh = vec!["new1".to_string(), "new2".to_string()];
         assert_eq!(
             l.composite_with_first_pane_rows("%0_0", &fresh),
@@ -399,26 +479,10 @@ mod tests {
             l.composite(),
             "a secondary pane's grid must not replace the agent rectangle"
         );
-    }
-
-    /// A composite must always count `window_height` lines, whatever the bottom
-    /// row holds. The cursor is rebased onto `window_height`, so a row lost off
-    /// the bottom paints it one row too high, and a blank bottom row is the
-    /// common case (a stacked split with an idle shell underneath).
-    #[test]
-    fn every_row_is_terminated_so_the_line_count_matches_the_window() {
-        for (label, panes) in [
-            ("blank bottom row", vec![pane(0, 0, 4, 1, &["top."])]),
-            (
-                "content on every row",
-                vec![pane(0, 0, 4, 3, &["r0..", "r1..", "r2.."])],
-            ),
-            ("no panes at all", vec![]),
-        ] {
-            let out = composite_window(4, 3, &panes);
-            assert_eq!(out.lines().count(), 3, "{label}: lines() short");
-            assert!(out.ends_with('\n'), "{label}: last row not terminated");
-        }
+        assert_eq!(
+            layout(3, 1, vec![]).composite_with_first_pane_rows("%0_0", &["x".to_string()]),
+            "\n"
+        );
     }
 
     /// A zoomed pane (`C-b z`) is reported at the window's full rectangle while
@@ -478,113 +542,6 @@ mod tests {
         assert!(!empty.overlaps(&unzoomed_0));
     }
 
-    /// Where a horizontal and a vertical rule cross, no pane touches the cell
-    /// orthogonally, so it used to render as a blank hole in the middle of an
-    /// otherwise unbroken rule. A pane on the diagonal marks it as a junction.
-    #[test]
-    fn a_rule_crossing_draws_a_junction_not_a_hole() {
-        // Four panes in a 2x2 grid, rules at row 1 and column 4.
-        let panes = [
-            pane(0, 0, 4, 1, &["tl.."]),
-            pane(5, 0, 4, 1, &["tr.."]),
-            pane(0, 2, 4, 1, &["bl.."]),
-            pane(5, 2, 4, 1, &["br.."]),
-        ];
-        let out = composite_window(9, 3, &panes);
-        let rule = out.lines().nth(1).expect("rule row");
-        assert_eq!(rule, "────┼────", "cross cell should be a junction");
-    }
-
-    /// The dead corner beside a SHORT pane has no pane on any side and no pane
-    /// on the diagonal either, so it must stay blank rather than being promoted
-    /// to a junction by the crossing rule above.
-    #[test]
-    fn a_dead_corner_stays_blank() {
-        // A one-row pane on the left, a three-row pane on the right. Rows 1-2 of
-        // the left column are void.
-        let panes = [
-            pane(0, 0, 3, 1, &["abc"]),
-            pane(4, 0, 3, 3, &["x", "y", "z"]),
-        ];
-        let out = composite_window(7, 3, &panes);
-        let last = out.lines().nth(2).expect("row 2");
-        assert!(
-            !last.contains('┼'),
-            "void corner became a junction: {last:?}"
-        );
-    }
-
-    #[test]
-    fn swapping_rows_on_an_empty_layout_is_a_no_op() {
-        let l = layout(3, 1, vec![]);
-        assert_eq!(
-            l.composite_with_first_pane_rows("%0_0", &["x".to_string()]),
-            "\n"
-        );
-    }
-
-    #[test]
-    fn a_left_column_split_in_two_draws_a_rule_between_its_panes() {
-        // The layout `C-b %` then `C-b "` produces: a tall pane down the right
-        // side, and the left column split into two stacked panes. The rule
-        // between the stacked pair must stop at the vertical border rather
-        // than running through it or vanishing.
-        let panes = [
-            pane(0, 0, 4, 1, &["top1"]),
-            pane(0, 2, 4, 1, &["bot1"]),
-            pane(5, 0, 4, 3, &["rgt1", "rgt2", "rgt3"]),
-        ];
-        assert_eq!(
-            composite_window(9, 3, &panes),
-            "top1│rgt1\n────│rgt2\nbot1│rgt3\n"
-        );
-    }
-
-    #[test]
-    fn ansi_rows_are_spliced_without_being_cut() {
-        // A styled row must arrive at the seam intact, escapes and all.
-        let left = "\x1b[0m\x1b[31mred\x1b[0m";
-        let right = "\x1b[0m\x1b[32mgrn\x1b[0m";
-        let panes = [pane(0, 0, 3, 1, &[left]), pane(4, 0, 3, 1, &[right])];
-        let out = composite_window(7, 1, &panes);
-        assert_eq!(out, format!("{left}│{right}\n"));
-    }
-
-    #[test]
-    fn an_unclaimed_column_degrades_to_border_fill() {
-        // A layout the walk cannot attribute (pane starts at 2, nothing at 0)
-        // must still produce a full-width row instead of looping or panicking.
-        // Only the column abutting the pane reads as a border; the rest is void.
-        let panes = [pane(2, 0, 3, 1, &["xyz"])];
-        assert_eq!(composite_window(5, 1, &panes), " │xyz\n");
-    }
-
-    #[test]
-    fn a_zero_width_pane_cannot_stall_the_walk() {
-        let panes = [pane(0, 0, 0, 1, &[""]), pane(1, 0, 2, 1, &["ok"])];
-        assert_eq!(composite_window(3, 1, &panes), "│ok\n");
-    }
-
-    #[test]
-    fn a_styled_fill_running_to_the_window_edge_survives_the_trim() {
-        // The rightmost pane ends in a background fill (a status bar). Blanket
-        // trimming trailing spaces would strip the coloured cells and leave the
-        // escape behind, shortening the fill.
-        let filled = format!("ab{}  ", "\x1b[44m");
-        let panes = [pane(0, 0, 2, 1, &["xy"]), pane(3, 0, 4, 1, &[&filled])];
-        let out = composite_window(7, 1, &panes);
-        assert_eq!(out, format!("xy│{filled}\n"), "styled fill was trimmed");
-    }
-
-    #[test]
-    fn reset_prefixed_padding_is_still_trimmed() {
-        // What `capture_rows_padded` appends: an explicit reset, then spaces.
-        // Both go, since nothing is colouring them.
-        let padded = format!("ab{}  ", SGR_RESET);
-        let panes = [pane(0, 0, 2, 1, &["xy"]), pane(3, 0, 4, 1, &[&padded])];
-        assert_eq!(composite_window(7, 1, &panes), "xy│ab\n");
-    }
-
     #[test]
     fn trim_padding_handles_each_tail_shape() {
         assert_eq!(trim_padding("abc"), "abc", "no trailing spaces: untouched");
@@ -600,12 +557,5 @@ mod tests {
             "\x1b[44m   ",
             "spaces under a live SGR: preserved"
         );
-    }
-
-    #[test]
-    fn no_panes_renders_a_blank_grid() {
-        // Nothing to separate, so nothing to draw: borders only appear where
-        // they divide real panes.
-        assert_eq!(composite_window(3, 2, &[]), "\n\n");
     }
 }

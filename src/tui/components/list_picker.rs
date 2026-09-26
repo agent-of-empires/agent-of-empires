@@ -289,199 +289,69 @@ mod tests {
         ]
     }
 
-    #[test]
-    fn test_new_is_inactive() {
-        let picker = ListPicker::new("Test");
-        assert!(!picker.is_active());
-    }
-
-    #[test]
-    fn test_activate() {
+    /// Feed `keys` to a freshly activated picker and describe the final
+    /// outcome: `Some(value)` for a selection, `None` for a cancel.
+    fn run(items: Vec<String>, keys: &[KeyCode]) -> (ListPicker, Option<Option<String>>) {
         let mut picker = ListPicker::new("Test");
-        picker.activate(sample_items());
+        assert!(!picker.is_active());
+        picker.activate(items);
         assert!(picker.is_active());
-        assert_eq!(picker.selected, 0);
-        assert_eq!(picker.filter.value(), "");
-        assert_eq!(picker.items.len(), 4);
-    }
-
-    #[test]
-    fn test_esc_cancels() {
-        let mut picker = ListPicker::new("Test");
-        picker.activate(sample_items());
-
-        let result = picker.handle_key(key(KeyCode::Esc));
-        assert!(matches!(result, ListPickerResult::Cancelled));
-        assert!(!picker.is_active());
-    }
-
-    #[test]
-    fn test_enter_selects() {
-        let mut picker = ListPicker::new("Test");
-        picker.activate(sample_items());
-
-        let result = picker.handle_key(key(KeyCode::Enter));
-        match result {
-            ListPickerResult::Selected(value) => assert_eq!(value, "Alpha"),
-            _ => panic!("Expected Selected"),
+        let mut outcome = None;
+        for code in keys {
+            outcome = match picker.handle_key(key(*code)) {
+                ListPickerResult::Continue => None,
+                ListPickerResult::Cancelled => Some(None),
+                ListPickerResult::Selected(v) => Some(Some(v)),
+            };
         }
-        assert!(!picker.is_active());
+        (picker, outcome)
     }
 
     #[test]
-    fn test_navigation_down_up() {
-        let mut picker = ListPicker::new("Test");
-        picker.activate(sample_items());
-
-        picker.handle_key(key(KeyCode::Down));
-        assert_eq!(picker.selected, 1);
-
-        picker.handle_key(key(KeyCode::Down));
-        assert_eq!(picker.selected, 2);
-
-        picker.handle_key(key(KeyCode::Up));
-        assert_eq!(picker.selected, 1);
+    fn keys_navigate_filter_and_resolve() {
+        use KeyCode::{Backspace, Char, Down, Enter, Esc, Up};
+        // (keys, selected index after, filtered count after, outcome)
+        type Case<'a> = (&'a [KeyCode], usize, usize, Option<Option<&'a str>>);
+        let cases: &[Case] = &[
+            (&[], 0, 4, None),
+            (&[Esc], 0, 4, Some(None)),
+            (&[Enter], 0, 4, Some(Some("Alpha"))),
+            (&[Down, Down, Up], 1, 4, None),
+            // Clamps at both ends.
+            (&[Up], 0, 4, None),
+            (&[Down, Down, Down, Down], 3, 4, None),
+            // Case-insensitive substring filter; typing resets the selection.
+            (&[Down, Down, Char('a')], 0, 4, None),
+            (&[Char('a'), Char('l')], 0, 1, None),
+            (&[Char('b'), Char('e'), Enter], 0, 1, Some(Some("Beta"))),
+            (&[Char('a'), Down, Enter], 1, 4, Some(Some("Beta"))),
+            (&[Char('z'), Char('z'), Enter], 0, 0, Some(None)),
+            (&[Char('z'), Char('z'), Backspace, Backspace], 0, 4, None),
+        ];
+        for (keys, selected, filtered, want) in cases {
+            let (picker, outcome) = run(sample_items(), keys);
+            assert_eq!(picker.selected, *selected, "{keys:?}");
+            assert_eq!(picker.filtered_items().len(), *filtered, "{keys:?}");
+            let want = want.map(|o| o.map(str::to_string));
+            assert_eq!(outcome, want, "{keys:?}");
+            assert_eq!(picker.is_active(), want.is_none(), "{keys:?}");
+        }
     }
 
     #[test]
-    fn test_j_and_k_type_into_filter_not_navigate() {
-        let mut picker = ListPicker::new("Test");
-        picker.activate(vec![
+    fn j_and_k_type_into_filter_not_navigate() {
+        use KeyCode::{Backspace, Char};
+        let items = vec![
             "jukebox".to_string(),
             "kanban".to_string(),
             "webapp".to_string(),
-        ]);
-
-        picker.handle_key(key(KeyCode::Char('j')));
+        ];
+        let (picker, _) = run(items.clone(), &[Char('j')]);
         assert_eq!(picker.selected, 0, "'j' must not move the selection");
-        assert_eq!(picker.filter.value(), "j");
         assert_eq!(picker.filtered_items().len(), 1);
-
-        picker.handle_key(key(KeyCode::Backspace));
-        picker.handle_key(key(KeyCode::Char('k')));
-        picker.handle_key(key(KeyCode::Char('a')));
+        let (picker, _) = run(items, &[Char('j'), Backspace, Char('k'), Char('a')]);
         assert_eq!(picker.selected, 0, "'k' must not move the selection");
         assert_eq!(picker.filter.value(), "ka");
         assert_eq!(*picker.filtered_items()[0], "kanban");
-    }
-
-    #[test]
-    fn test_navigation_clamps() {
-        let mut picker = ListPicker::new("Test");
-        picker.activate(sample_items());
-
-        // Can't go above 0
-        picker.handle_key(key(KeyCode::Up));
-        assert_eq!(picker.selected, 0);
-
-        // Go to last
-        picker.handle_key(key(KeyCode::Down));
-        picker.handle_key(key(KeyCode::Down));
-        picker.handle_key(key(KeyCode::Down));
-        assert_eq!(picker.selected, 3);
-
-        // Can't go past last
-        picker.handle_key(key(KeyCode::Down));
-        assert_eq!(picker.selected, 3);
-    }
-
-    #[test]
-    fn test_filter_narrows_items() {
-        let mut picker = ListPicker::new("Test");
-        picker.activate(sample_items());
-
-        picker.handle_key(key(KeyCode::Char('a')));
-        let filtered = picker.filtered_items();
-        // "Alpha", "Beta", "Gamma", "Delta" all contain 'a'
-        assert_eq!(filtered.len(), 4);
-
-        picker.handle_key(key(KeyCode::Char('l')));
-        let filtered = picker.filtered_items();
-        // Only "Alpha" contains "al"
-        assert_eq!(filtered.len(), 1);
-    }
-
-    #[test]
-    fn test_filter_case_insensitive() {
-        let mut picker = ListPicker::new("Test");
-        picker.activate(sample_items());
-
-        picker.handle_key(key(KeyCode::Char('b')));
-        let filtered = picker.filtered_items();
-        assert_eq!(filtered.len(), 1);
-        assert_eq!(*filtered[0], "Beta");
-    }
-
-    #[test]
-    fn test_filter_resets_selection() {
-        let mut picker = ListPicker::new("Test");
-        picker.activate(sample_items());
-
-        picker.handle_key(key(KeyCode::Down));
-        picker.handle_key(key(KeyCode::Down));
-        assert_eq!(picker.selected, 2);
-
-        picker.handle_key(key(KeyCode::Char('a')));
-        assert_eq!(picker.selected, 0);
-    }
-
-    #[test]
-    fn test_enter_on_filtered_list() {
-        let mut picker = ListPicker::new("Test");
-        picker.activate(sample_items());
-
-        // Filter to "Beta"
-        picker.handle_key(key(KeyCode::Char('b')));
-        picker.handle_key(key(KeyCode::Char('e')));
-
-        let result = picker.handle_key(key(KeyCode::Enter));
-        match result {
-            ListPickerResult::Selected(value) => assert_eq!(value, "Beta"),
-            _ => panic!("Expected Selected"),
-        }
-    }
-
-    #[test]
-    fn test_enter_on_empty_filtered_list_cancels() {
-        let mut picker = ListPicker::new("Test");
-        picker.activate(sample_items());
-
-        // Filter to nothing
-        picker.handle_key(key(KeyCode::Char('z')));
-        picker.handle_key(key(KeyCode::Char('z')));
-        picker.handle_key(key(KeyCode::Char('z')));
-
-        let result = picker.handle_key(key(KeyCode::Enter));
-        assert!(matches!(result, ListPickerResult::Cancelled));
-    }
-
-    #[test]
-    fn test_backspace_removes_filter_char() {
-        let mut picker = ListPicker::new("Test");
-        picker.activate(sample_items());
-
-        picker.handle_key(key(KeyCode::Char('z')));
-        picker.handle_key(key(KeyCode::Char('z')));
-        assert_eq!(picker.filtered_items().len(), 0);
-
-        picker.handle_key(key(KeyCode::Backspace));
-        picker.handle_key(key(KeyCode::Backspace));
-        assert_eq!(picker.filtered_items().len(), 4);
-    }
-
-    #[test]
-    fn test_select_then_navigate_on_filtered() {
-        let mut picker = ListPicker::new("Test");
-        picker.activate(sample_items());
-
-        // Filter to items containing "a" -> Alpha, Beta, Gamma, Delta
-        picker.handle_key(key(KeyCode::Char('a')));
-        picker.handle_key(key(KeyCode::Down));
-
-        let result = picker.handle_key(key(KeyCode::Enter));
-        match result {
-            ListPickerResult::Selected(value) => assert_eq!(value, "Beta"),
-            _ => panic!("Expected Selected"),
-        }
     }
 }

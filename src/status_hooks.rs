@@ -554,32 +554,46 @@ mod tests {
     }
 
     #[test]
-    fn resolves_specific_command_before_catch_all() {
-        let config = StatusHookConfig {
+    fn commands_for_transition_runs_specific_then_catch_all() {
+        let config = |on_waiting: &str| StatusHookConfig {
             enabled: true,
-            on_waiting: Some("waiting-command".to_string()),
+            on_waiting: Some(on_waiting.to_string()),
             on_change: Some("change-command".to_string()),
             ..Default::default()
         };
-        assert_eq!(
-            commands_for_transition(Status::Running, Status::Waiting, &config),
-            vec!["waiting-command".to_string(), "change-command".to_string()]
-        );
+        let cases = [
+            (StatusHookConfig::default(), Status::Running, &[][..]),
+            (
+                config("waiting-command"),
+                Status::Running,
+                &["waiting-command", "change-command"][..],
+            ),
+            // A blank command is skipped, and an unchanged status runs nothing.
+            (config("  "), Status::Running, &["change-command"][..]),
+            (config("waiting-command"), Status::Waiting, &[][..]),
+        ];
+        for (config, old, expected) in cases {
+            assert_eq!(
+                commands_for_transition(old, Status::Waiting, &config),
+                expected,
+                "{old:?} {:?}",
+                config.on_waiting
+            );
+        }
     }
 
+    /// `debounce_ms` was removed; configs that still carry it must deserialize.
     #[test]
-    fn skips_empty_commands_and_same_status() {
-        let config = StatusHookConfig {
-            enabled: true,
-            on_waiting: Some("  ".to_string()),
-            on_change: Some("change-command".to_string()),
-            ..Default::default()
-        };
-        assert!(commands_for_transition(Status::Waiting, Status::Waiting, &config).is_empty());
-        assert_eq!(
-            commands_for_transition(Status::Running, Status::Waiting, &config),
-            vec!["change-command".to_string()]
-        );
+    fn legacy_debounce_ms_is_ignored() {
+        let config: StatusHookConfig = toml::from_str(
+            r#"
+            enabled = true
+            debounce_ms = 500
+            on_waiting = "notify-send waiting"
+            "#,
+        )
+        .expect("legacy debounce_ms should not error");
+        assert!(config.enabled);
     }
 
     #[tokio::test]

@@ -379,9 +379,14 @@ fn a_snapshot_row_outside_the_local_view_is_not_adopted() {
     );
 }
 
+/// A snapshot drives rows and marks the runtime as the sidebar source; a
+/// disconnect is not an error the row surfaces: the source flips to
+/// `Disconnected` (so the view drops the stale session content and offers
+/// recovery) while the row keeps the runtime's last status. Either result
+/// leaves the feed drained and ready for the next publication.
 #[test]
 #[serial]
-fn session_feed_snapshot_drives_structured_rows_and_marks_the_daemon_source() {
+fn session_feed_result_selects_the_sidebar_source() {
     let mut env = create_test_env_empty();
     env.view.sidebar_source = SidebarSource::Disconnected;
     let id = structured_row(&mut env, Status::Idle);
@@ -392,30 +397,35 @@ fn session_feed_snapshot_drives_structured_rows_and_marks_the_daemon_source() {
         env.view.apply_session_feed(),
         "an applied row asks for a redraw"
     );
-
     assert_eq!(
         env.view.get_instance(&id).map(|i| i.status),
         Some(Status::Running)
     );
     assert_eq!(env.view.sidebar_source, SidebarSource::Daemon);
-}
 
-#[test]
-#[serial]
-fn unavailable_session_feed_retains_the_last_canonical_status() {
-    let mut env = create_test_env_empty();
-    let id = structured_row(&mut env, Status::Running);
-    env.view.sidebar_source = SidebarSource::Daemon;
+    // Losing the runtime source is a visible transition, so the drain asks for
+    // a redraw; the row itself keeps the last status the runtime gave it.
     env.view.session_feed =
         SessionFeed::seeded_for_test(SessionFeedResult::Unavailable("no daemon".to_string()));
-
-    env.view.apply_session_feed();
-
+    assert!(
+        env.view.apply_session_feed(),
+        "dropping the runtime source must ask for a redraw"
+    );
     assert_eq!(
         env.view.get_instance(&id).map(|i| i.status),
         Some(Status::Running)
     );
     assert_eq!(env.view.sidebar_source, SidebarSource::Disconnected);
+
+    // A repeat of the same disconnected source changes nothing to redraw, so
+    // the redraw flag comes from the source transition and not from the drain
+    // itself.
+    env.view.session_feed =
+        SessionFeed::seeded_for_test(SessionFeedResult::Unavailable("no daemon".to_string()));
+    assert!(
+        !env.view.apply_session_feed(),
+        "a source that is already disconnected has nothing new to draw"
+    );
 }
 
 #[test]

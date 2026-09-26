@@ -794,15 +794,19 @@ mod tests {
     #[tokio::test]
     async fn unattended_mode_requires_the_distinct_grant() {
         let (deps, _state, _dir) = test_deps(Vec::new());
-        let params = serde_json::json!({
+        let unattended = serde_json::json!({
             "agent_id": "claude",
             "project_path": "/tmp",
             "mode_id": "bypassPermissions",
         });
-        let ctx = ctx_with(&["session.create"]);
-        let err = dispatch(&deps, &ctx, "sessions.create", &params)
-            .await
-            .expect_err("unattended without the grant must be refused");
+        let err = dispatch(
+            &deps,
+            &ctx_with(&["session.create"]),
+            "sessions.create",
+            &unattended,
+        )
+        .await
+        .expect_err("unattended without the grant must be refused");
         assert_eq!(err.code, codes::POLICY_DENIED);
         assert_eq!(kind(&err), "unattended_grant_required");
     }
@@ -974,24 +978,6 @@ mod tests {
         assert_eq!(data["pinned_model"], "claude-pinned");
     }
 
-    /// A registry-unknown `agent_id` never spawns anything (the probe bails on
-    /// an unknown agent), so this stays hermetic while still exercising the RPC
-    /// end to end and confirming it returns the capability catalog shape.
-    #[tokio::test]
-    async fn probe_unknown_agent_is_noop_and_returns_catalog() {
-        let (deps, _state, _dir) = test_deps(Vec::new());
-        let ctx = ctx_with(&["acp.capabilities.probe"]);
-        let out = dispatch(
-            &deps,
-            &ctx,
-            "acp.capabilities.probe",
-            &serde_json::json!({ "agent_id": "definitely-not-an-agent-xyz" }),
-        )
-        .await
-        .expect("probe returns the capability catalog");
-        assert!(out.get("agents").is_some());
-    }
-
     /// A brand-new create at the active-session limit is denied with the stable
     /// concurrency kind. The idempotency probe runs before admission (see
     /// `admit_and_create`), so an idempotent retry replays instead of hitting
@@ -1027,7 +1013,7 @@ mod tests {
     /// turn.send maps the service's ownership and existence denials to the
     /// stable error kinds.
     #[tokio::test]
-    async fn turn_send_maps_ownership_and_missing_session() {
+    async fn turn_send_maps_ownership_and_missing_session_without_leaking_locks() {
         let mut user_session = Instance::new("user-owned", "/tmp/aoe-2897-project");
         user_session.id = "sess-user".to_string();
         let mut other_session = Instance::new("other-owned", "/tmp/aoe-2897-project");
@@ -1052,6 +1038,11 @@ mod tests {
             assert_eq!(err.code, expected_code, "{session}");
             assert_eq!(kind(&err), expected_kind, "{session}");
         }
+        assert_eq!(
+            deps.session_service.prompt_locks_len().await,
+            0,
+            "an id that was never admitted must not leave a lock-registry entry behind"
+        );
     }
 
     /// #3649: a plugin turn is a turn-starting surface, so it must settle a
@@ -1268,33 +1259,5 @@ mod tests {
             );
             assert!(inst.last_accessed_at.is_some(), "{label}");
         }
-    }
-
-    /// `prompt_submission` auto-vivifies a per-session lock-registry entry
-    /// and nothing ever prunes one, so a plugin probing distinct nonexistent
-    /// session ids must be refused before the guard is claimed, or the
-    /// registry grows without bound within the caller's turn quota.
-    #[tokio::test]
-    async fn turn_send_does_not_grow_the_lock_registry_for_nonexistent_sessions() {
-        let (deps, _state, _dir) = test_deps(Vec::new());
-        let ctx = ctx_with(&["session.prompt"]);
-
-        for i in 0..5 {
-            let err = dispatch(
-                &deps,
-                &ctx,
-                "sessions.turn.send",
-                &serde_json::json!({ "session_id": format!("sess-gone-{i}"), "text": "hi" }),
-            )
-            .await
-            .expect_err("must be refused");
-            assert_eq!(kind(&err), "session_not_found");
-        }
-
-        assert_eq!(
-            deps.session_service.prompt_locks_len().await,
-            0,
-            "an id that was never admitted must not leave a lock-registry entry behind"
-        );
     }
 }

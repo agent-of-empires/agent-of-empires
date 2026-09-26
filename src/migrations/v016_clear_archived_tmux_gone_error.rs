@@ -51,52 +51,40 @@ fn clear_archived_error(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::migrations::test_cases::assert_rewrites;
 
     #[test]
     fn clears_only_archived_error_rows() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("sessions.json");
-        fs::write(
-            &path,
-            r#"[
+        let corrupt = "{ not valid json";
+        assert_rewrites(
+            "sessions.json",
+            clear_archived_error,
+            &[
+                (
+                    Some(
+                        r#"[
                 {"id":"a","status":"error","archived_at":"2026-06-05T16:04:12Z"},
                 {"id":"b","status":"error"},
                 {"id":"c","status":"idle","archived_at":"2026-06-05T16:04:12Z"},
                 {"id":"d","status":"stopped","archived_at":"2026-06-05T16:04:12Z"},
                 {"id":"e","status":"error","archived_at":null}
             ]"#,
-        )
-        .unwrap();
-
-        clear_archived_error(&path).unwrap();
-
-        let v: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
-        let arr = v.as_array().unwrap();
-        // archived + error -> idle (the bug footprint)
-        assert_eq!(arr[0]["status"], "idle");
-        // non-archived error -> untouched
-        assert_eq!(arr[1]["status"], "error");
-        // archived non-error -> untouched
-        assert_eq!(arr[2]["status"], "idle");
-        assert_eq!(arr[3]["status"], "stopped");
-        // explicit null archived_at counts as non-archived -> untouched
-        assert_eq!(arr[4]["status"], "error");
-    }
-
-    #[test]
-    fn missing_file_is_ok() {
-        let dir = tempfile::tempdir().unwrap();
-        clear_archived_error(&dir.path().join("does-not-exist.json")).unwrap();
-    }
-
-    #[test]
-    fn corrupt_file_is_skipped_not_an_error() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("sessions.json");
-        fs::write(&path, "{ not valid json").unwrap();
-        // Must not error; a corrupt file is left untouched.
-        clear_archived_error(&path).unwrap();
-        assert_eq!(fs::read_to_string(&path).unwrap(), "{ not valid json");
+                    ),
+                    // Only archived + error (the bug footprint) settles; a null
+                    // archived_at counts as not archived.
+                    Some(
+                        r#"[
+                {"id":"a","status":"idle","archived_at":"2026-06-05T16:04:12Z"},
+                {"id":"b","status":"error"},
+                {"id":"c","status":"idle","archived_at":"2026-06-05T16:04:12Z"},
+                {"id":"d","status":"stopped","archived_at":"2026-06-05T16:04:12Z"},
+                {"id":"e","status":"error","archived_at":null}
+            ]"#,
+                    ),
+                ),
+                (Some(corrupt), Some(corrupt)),
+                (None, None),
+            ],
+        );
     }
 }

@@ -102,48 +102,23 @@ mod tests {
     }
 
     #[test]
-    fn system_time_to_ms_at_epoch_is_zero() {
+    fn system_time_to_ms_converts_and_saturates() {
         assert_eq!(system_time_to_ms(UNIX_EPOCH), 0);
-    }
-
-    #[test]
-    fn system_time_to_ms_converts_offset() {
-        let t = UNIX_EPOCH + Duration::from_millis(1_500);
-        assert_eq!(system_time_to_ms(t), 1_500);
-    }
-
-    #[test]
-    fn pre_epoch_saturates_to_zero() {
-        let before = UNIX_EPOCH - Duration::from_secs(1);
-        assert_eq!(system_time_to_ms(before), 0);
-    }
-
-    #[test]
-    fn now_ms_matches_seconds_at_same_instant() {
+        assert_eq!(
+            system_time_to_ms(UNIX_EPOCH + Duration::from_millis(1_500)),
+            1_500
+        );
+        assert_eq!(system_time_to_ms(UNIX_EPOCH - Duration::from_secs(1)), 0);
         let t = SystemTime::now();
-        let ms = system_time_to_ms(t);
-        let secs = t
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        assert_eq!(ms / 1_000, secs);
+        let secs = t.duration_since(UNIX_EPOCH).unwrap().as_secs();
+        assert_eq!(system_time_to_ms(t) / 1_000, secs);
     }
 
     #[test]
-    fn now_helpers_are_post_epoch() {
-        assert!(now_secs() > 0);
-        assert!(now_ms() > 0);
-    }
-
-    #[test]
-    fn is_allowed_href_accepts_http_and_relative_paths() {
+    fn is_allowed_href_accepts_only_http_and_same_origin_paths() {
         for url in ["https://example.com", "http://example.com", "/session/xyz"] {
             assert!(is_allowed_href(url), "{url}");
         }
-    }
-
-    #[test]
-    fn is_allowed_href_rejects_dangerous_and_scheme_relative_urls() {
         for url in [
             "javascript:alert(1)",
             "file:///etc/passwd",

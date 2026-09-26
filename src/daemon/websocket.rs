@@ -10,7 +10,9 @@ use tokio_tungstenite::{
 };
 
 use super::{ApiErrorCode, DaemonClientError};
+use crate::acp::client::http::HttpError;
 use crate::acp::client::DaemonEndpoint;
+use reqwest::header::{HeaderName, HeaderValue};
 
 #[derive(Debug, Error)]
 pub enum WsError {
@@ -21,6 +23,10 @@ pub enum WsError {
         status: reqwest::StatusCode,
         code: Option<ApiErrorCode>,
     },
+    /// The passphrase-login handshake (see `acp::client::passphrase_session`)
+    /// failed before the WS upgrade was even attempted.
+    #[error("passphrase login failed: {0}")]
+    Auth(#[from] HttpError),
     #[error("invalid websocket URL")]
     InvalidUrl,
     #[error(transparent)]
@@ -48,10 +54,24 @@ pub(crate) enum NativeSocket {
     Tcp(Box<WebSocketStream<MaybeTlsStream<TcpStream>>>),
 }
 
+/// Open the native WebSocket, authenticating with the endpoint's bearer
+/// token when it has one.
 pub(crate) async fn connect(
     endpoint: &DaemonEndpoint,
     path: &str,
     query: Option<&str>,
+) -> Result<NativeSocket, WsError> {
+    connect_with_headers(endpoint, path, query, &[]).await
+}
+
+/// [`connect`], plus headers to add to the upgrade request: a passphrase
+/// daemon never mints a bearer token, so its login session travels as a
+/// `Cookie` plus a `Sec-WebSocket-Protocol` offering instead.
+pub(crate) async fn connect_with_headers(
+    endpoint: &DaemonEndpoint,
+    path: &str,
+    query: Option<&str>,
+    extra_headers: &[(HeaderName, HeaderValue)],
 ) -> Result<NativeSocket, WsError> {
     let token = endpoint.bearer_token();
     let base = super::native_url(&endpoint.base_url)?;
@@ -75,6 +95,9 @@ pub(crate) async fn connect(
         request
             .headers_mut()
             .insert(reqwest::header::AUTHORIZATION, authorization);
+    }
+    for (name, value) in extra_headers {
+        request.headers_mut().insert(name.clone(), value.clone());
     }
     let config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
         .max_message_size(Some(16 * 1024 * 1024))

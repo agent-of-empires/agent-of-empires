@@ -1184,10 +1184,11 @@ mod dirty_tracking_tests {
         (home, temp, view)
     }
 
-    /// The unsaved-changes flag is diff-based, not a one-way latch.
+    /// The unsaved-changes flag is diff-based, not a one-way latch, and a
+    /// save resets the baseline it diffs against.
     #[test]
     #[serial]
-    fn reverting_an_edit_clears_unsaved_changes() {
+    fn unsaved_changes_track_the_diff_from_the_last_save() {
         let (_home, _temp, mut view) = fresh_view();
         assert!(!view.has_changes, "a freshly loaded view is clean");
 
@@ -1203,13 +1204,8 @@ mod dirty_tracking_tests {
             !view.has_changes,
             "reverting the edit should clear unsaved changes"
         );
-    }
 
-    /// Saving adopts the live config as the new baseline.
-    #[test]
-    #[serial]
-    fn save_resets_the_baseline() {
-        let (_home, _temp, mut view) = fresh_view();
+        // Saving adopts the live config as the new baseline.
         view.scope = SettingsScope::Profile;
 
         view.profile_config.description = Some("from-save".to_string());
@@ -1497,10 +1493,11 @@ mod scroll_tests {
         );
     }
 
-    /// The hit test covers the bar plus the padding column to its left.
+    /// The hit test covers the bar plus the padding column to its left, and
+    /// a drag maps the track row onto the scroll range.
     #[test]
     #[serial]
-    fn hit_scrollbar_covers_the_bar_and_its_padding_column() {
+    fn scrollbar_hit_test_and_drag() {
         let (_t, _guard, mut view) = fresh_view();
         view.scrollbar_area = Rect::new(70, 3, 1, 10);
 
@@ -1513,13 +1510,8 @@ mod scroll_tests {
 
         view.scrollbar_area = Rect::default();
         assert!(!view.hit_scrollbar(70, 5), "no bar => no hit");
-    }
 
-    /// Dragging the thumb pins the offset to either end of the track.
-    #[test]
-    #[serial]
-    fn scrollbar_drag_maps_row_to_offset() {
-        let (_t, _guard, mut view) = fresh_view();
+        // Dragging the thumb pins the offset to either end of the track.
         make_overflowing(&mut view);
         let max = view.max_fields_scroll();
         view.scrollbar_area = Rect::new(70, 3, 1, 10); // rows 3..=12

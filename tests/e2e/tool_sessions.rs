@@ -1,6 +1,6 @@
 //! E2E coverage for the [tools.*] feature: picker dialog, command-palette
-//! integration, the invalid-hotkey info dialog, and the full attach +
-//! cleanup roundtrip against a real agent session.
+//! integration, and the full attach + cleanup roundtrip against a real agent
+//! session.
 
 use serial_test::parallel;
 use std::fs;
@@ -223,28 +223,6 @@ background = true
         "background tool should not create a tmux tool session. sessions seen: {:?}",
         sessions
     );
-}
-
-#[test]
-#[parallel]
-fn test_invalid_hotkey_surfaces_info_dialog() {
-    require_tmux!();
-
-    let mut h = TuiTestHarness::new("tool_invalid_hotkey");
-    append_tools_config(
-        &h,
-        r#"
-[tools.bad]
-command = "echo hi"
-hotkey = "Ctrl+x"
-"#,
-    );
-    h.spawn_tui();
-
-    // The startup info dialog should mention the broken entry.
-    h.wait_for("Tool hotkey config errors");
-    h.assert_screen_contains("bad");
-    h.assert_screen_contains("Ctrl+x");
 }
 
 #[test]

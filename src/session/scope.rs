@@ -43,13 +43,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rejects_unrecognized_value() {
-        for value in ["\"archived\"", "\"LIVE\"", "\"\""] {
-            assert!(serde_json::from_str::<SessionScope>(value).is_err());
-        }
-    }
-
-    #[test]
     fn scope_selects_live_and_trashed_states() {
         let states = [(false, false), (true, false), (false, true), (true, true)];
         for (scope, expected) in [

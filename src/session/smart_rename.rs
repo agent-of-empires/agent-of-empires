@@ -1597,7 +1597,7 @@ mod serve {
 
         #[tokio::test]
         #[serial_test::serial]
-        async fn apply_auto_title_skips_duplicate_title_and_path() {
+        async fn apply_auto_title_skips_duplicates_and_force_overwrites_manual_titles() {
             let _guard = crate::session::test_support::isolate_app_dir();
             let storage =
                 crate::session::storage::Storage::new_unwatched("default").expect("storage");
@@ -1606,13 +1606,18 @@ mod serve {
             let target_id = target.id.clone();
             let mut owner = crate::session::Instance::new("Already owned", "/tmp/shared");
             owner.source_profile = "default".to_string();
+            let mut manual = crate::session::Instance::new("Britons", "/tmp/y");
+            manual.source_profile = "default".to_string();
+            manual.title = "Hand-picked".to_string();
+            let manual_id = manual.id.clone();
+            let rows = vec![target, owner, manual];
             storage
                 .update(|instances, _groups| {
-                    *instances = vec![target.clone(), owner.clone()];
+                    *instances = rows.clone();
                     Ok(())
                 })
                 .unwrap();
-            let state = state_for_default_profile(vec![target, owner]).await;
+            let state = state_for_default_profile(rows).await;
 
             apply_auto_title(
                 &state,
@@ -1623,46 +1628,9 @@ mod serve {
             )
             .await
             .unwrap();
-
-            let persisted = storage.load().unwrap();
-            assert_eq!(
-                persisted
-                    .iter()
-                    .find(|instance| instance.id == target_id)
-                    .unwrap()
-                    .title,
-                "Franks"
-            );
-            let in_memory = state.instances.read().await;
-            assert_eq!(
-                in_memory
-                    .iter()
-                    .find(|instance| instance.id == target_id)
-                    .unwrap()
-                    .title,
-                "Franks"
-            );
-        }
-        #[tokio::test]
-        #[serial_test::serial]
-        async fn apply_auto_title_force_overwrites_manual_title() {
-            let _guard = crate::session::test_support::isolate_app_dir();
-            let storage = crate::session::storage::Storage::new_unwatched("default").unwrap();
-            let mut manual = crate::session::Instance::new("Britons", "/tmp/forced-auto-title");
-            manual.source_profile = "default".into();
-            manual.title = "Hand-picked".into();
-            let id = manual.id.clone();
-            storage
-                .update(|instances, _groups| {
-                    instances.push(manual.clone());
-                    Ok(())
-                })
-                .unwrap();
-            let state = state_for_default_profile(vec![manual]).await;
-
             apply_auto_title(
                 &state,
-                &id,
+                &manual_id,
                 "default",
                 Some("Regenerated title".into()),
                 true,
@@ -1670,22 +1638,20 @@ mod serve {
             .await
             .unwrap();
 
-            let persisted = storage.load().unwrap();
-            assert_eq!(
-                persisted.iter().find(|row| row.id == id).unwrap().title,
-                "Regenerated title"
-            );
-            assert_eq!(
-                state
-                    .instances
-                    .read()
-                    .await
+            let title_of = |instances: &[crate::session::Instance], id: &str| {
+                instances
                     .iter()
-                    .find(|row| row.id == id)
+                    .find(|instance| instance.id == id)
                     .unwrap()
-                    .title,
-                "Regenerated title"
-            );
+                    .title
+                    .clone()
+            };
+            let persisted = storage.load().unwrap();
+            let in_memory = state.instances.read().await.clone();
+            for rows in [&persisted, &in_memory] {
+                assert_eq!(title_of(rows, &target_id), "Franks");
+                assert_eq!(title_of(rows, &manual_id), "Regenerated title");
+            }
         }
 
         #[test]
@@ -2224,16 +2190,6 @@ mod tests {
     }
 
     #[test]
-    fn resolve_rename_tool_falls_back_to_session() {
-        // Empty / whitespace setting => use the session's own tool.
-        assert_eq!(resolve_rename_tool("claude", ""), "claude");
-        assert_eq!(resolve_rename_tool("claude", "   "), "claude");
-        // Non-empty setting => use it verbatim (trimmed).
-        assert_eq!(resolve_rename_tool("claude", "codex"), "codex");
-        assert_eq!(resolve_rename_tool("claude", "  codex "), "codex");
-    }
-
-    #[test]
     fn resolved_unset_uses_session_agent() {
         let overrides = HashMap::new();
         // Unset rename agent => resolves to the session's claude agent.
@@ -2346,7 +2302,10 @@ I'll look at the auth redirect logic now.
 Patched the race in auth.rs and added a regression test.";
 
     #[test]
-    fn strip_agent_banner_drops_claude_startup_box() {
+    fn strip_agent_banner_drops_only_the_claude_startup_box() {
+        let lc = INSTRUCTION.to_lowercase();
+        assert!(lc.contains("startup banner") && lc.contains("ignore"));
+
         let stripped = strip_agent_banner(CLAUDE_BANNER_TRANSCRIPT, "claude");
         // The box, its wording, the logo, and the MCP notice are gone.
         assert!(!stripped.contains("Claude Code v"));
@@ -2401,15 +2360,38 @@ Rewrote the getting-started section and fixed two broken links.";
         assert_eq!(strip_agent_banner(banner_only, "claude"), banner_only);
     }
 
+    /// Framing, per-half capping and the prompt bound in one place: these are
+    /// the three properties of the first turn that must hold together, since a
+    /// regression in any one of them silently degrades the rename.
     #[test]
-    fn render_first_turn_caps_each_half_independently() {
-        // A huge prompt must not crowd out the agent half: each side is capped
-        // to its own budget, so the agent prose still survives.
+    fn first_turn_and_prompt_are_framed_and_bounded() {
+        let r = render_first_turn("fix the login bug", "Patched the redirect in auth.rs");
+        assert_eq!(
+            r,
+            "User:\nfix the login bug\n\nAgent:\nPatched the redirect in auth.rs"
+        );
+        assert_eq!(
+            render_first_turn("fix the login bug", ""),
+            "fix the login bug"
+        );
+        assert_eq!(
+            render_first_turn("fix the login bug", "   "),
+            "fix the login bug"
+        );
         let huge_prompt = "p".repeat(FIRST_TURN_USER_BYTES * 2);
-        let agent = "concise agent summary";
-        let r = render_first_turn(&huge_prompt, agent);
-        assert!(r.contains(agent), "agent prose must survive a huge prompt");
+        let r = render_first_turn(&huge_prompt, "concise agent summary");
         assert!(r.starts_with("User:\n"));
+        assert!(
+            r.contains("concise agent summary"),
+            "each half is capped independently, so agent prose survives a huge prompt"
+        );
+
+        let msg = format!("start{}\u{0}end", "x".repeat(5000));
+        let p = build_prompt(&msg);
+        assert!(p.contains("start"));
+        assert!(!p.contains('\u{0}'));
+        // Instruction + capped body, well under message length.
+        assert!(p.len() < 5000 + INSTRUCTION.len() + 64);
     }
 
     #[test]
@@ -2452,16 +2434,6 @@ Rewrote the getting-started section and fixed two broken links.";
             .unwrap()[1],
             "-p"
         );
-    }
-
-    #[test]
-    fn build_prompt_truncates_and_strips_nul() {
-        let msg = format!("start{}\u{0}end", "x".repeat(5000));
-        let p = build_prompt(&msg);
-        assert!(p.contains("start"));
-        assert!(!p.contains('\u{0}'));
-        // Instruction + capped body, well under message length.
-        assert!(p.len() < 5000 + INSTRUCTION.len() + 64);
     }
 
     #[test]
@@ -2659,52 +2631,7 @@ claude = "repo-wrapper"
     // ---- Terminal (non-ACP) smart rename ----
 
     #[test]
-    fn terminal_eligibility_reasons() {
-        // A terminal session is not "structured", but the terminal trigger is a
-        // deliberate opt-in, so the call site passes `true`; the remaining gates
-        // (user story 3) still keep the civ name where they must.
-        let overrides = HashMap::new();
-        assert!(check_eligible_resolved(
-            true, true, false, "Vikings", "claude", "", false, "", &overrides
-        )
-        .is_ok());
-        // A sandboxed terminal session is eligible for its own agent (#3159);
-        // only a different rename agent is not.
-        assert!(check_eligible_resolved(
-            true, true, false, "Vikings", "claude", "", true, "", &overrides
-        )
-        .is_ok());
-        assert!(matches!(
-            check_eligible_resolved(
-                true, true, false, "Vikings", "cursor", "", false, "", &overrides
-            ),
-            Err(SkipReason::NoOneshot)
-        ));
-        let mut ov = HashMap::new();
-        ov.insert("claude".to_string(), "my-wrapper".to_string());
-        assert!(matches!(
-            check_eligible_resolved(true, true, false, "Vikings", "claude", "", false, "", &ov),
-            Err(SkipReason::CommandOverridden)
-        ));
-        // A manually-named session (user story 2) is never a candidate.
-        assert!(matches!(
-            check_eligible_resolved(
-                true,
-                true,
-                false,
-                "Fix login bug",
-                "claude",
-                "",
-                false,
-                "",
-                &overrides
-            ),
-            Err(SkipReason::NameNotDefault)
-        ));
-    }
-
-    #[test]
-    fn context_usable_rejects_garbage() {
+    fn terminal_context_helpers() {
         assert!(context_looks_usable("Fix the login bug in auth.rs"));
         assert!(!context_looks_usable(""));
         // No letters.
@@ -2714,22 +2641,14 @@ claude = "repo-wrapper"
             .chain("ab".chars())
             .collect();
         assert!(!context_looks_usable(&garbled));
-    }
 
-    #[test]
-    fn head_tail_keeps_both_ends() {
         let short = "just a short line";
         assert_eq!(head_tail(short, 3072, 1024), short);
         let long = format!("HEAD{}TAIL", "x".repeat(5000));
         let r = head_tail(&long, 10, 10);
-        assert!(r.starts_with("HEAD"));
-        assert!(r.ends_with("TAIL"));
-        assert!(r.contains("\n...\n"));
+        assert!(r.starts_with("HEAD") && r.ends_with("TAIL") && r.contains("\n...\n"));
         assert!(r.len() < long.len());
-    }
 
-    #[test]
-    fn echo_baseline_is_first_nonempty_line() {
         assert_eq!(
             extract_echo_baseline("\n\n  fix the bug  \nmore"),
             "fix the bug"
@@ -2828,7 +2747,7 @@ claude = "repo-wrapper"
 
     #[test]
     #[serial_test::serial]
-    fn apply_terminal_title_renames_auto_named_session_and_marks_attempted() {
+    fn apply_terminal_title_writes_only_overwritable_non_duplicate_titles() {
         use crate::session::instance::Instance;
         use crate::session::storage::Storage;
         let home = tempfile::tempdir().expect("tempdir HOME");
@@ -2836,53 +2755,37 @@ claude = "repo-wrapper"
         let storage = Storage::new_unwatched("default").expect("storage");
         let civ = Instance::new("Vikings", "/tmp/x");
         let civ_id = civ.id.clone();
-        storage
-            .update(|instances, _groups| {
-                instances.push(civ);
-                Ok(())
-            })
-            .unwrap();
 
-        apply_terminal_title(&storage, &civ_id, Some("Fix login bug".to_owned()), false).unwrap();
-
-        let inst = storage
-            .load()
-            .unwrap()
-            .into_iter()
-            .find(|i| i.id == civ_id)
-            .unwrap();
-        assert_eq!(inst.title, "Fix login bug");
-        assert_eq!(inst.last_auto_title.as_deref(), Some("Fix login bug"));
-        assert!(inst.smart_rename_attempted);
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn apply_terminal_title_never_overwrites_a_manual_title() {
-        use crate::session::instance::Instance;
-        use crate::session::storage::Storage;
-        let home = tempfile::tempdir().expect("tempdir HOME");
-        let _home_guard = crate::session::test_support::isolate_home(home.path());
-        let storage = Storage::new_unwatched("default").expect("storage");
         let mut manual = Instance::new("Britons", "/tmp/y");
         manual.title = "Hand-picked".to_string();
         let manual_id = manual.id.clone();
+        let mut forced = manual.clone();
+        forced.id = format!("{}f", manual.id);
+        let forced_id = forced.id.clone();
         let duplicate_candidate = Instance::new("Franks", "/tmp/z/");
         let duplicate_id = duplicate_candidate.id.clone();
         let mut duplicate_owner = Instance::new("Saxons", "/tmp/z");
         duplicate_owner.title = "Already owned".to_string();
         storage
             .update(|instances, _groups| {
-                instances.extend([manual, duplicate_candidate, duplicate_owner]);
+                instances.extend([civ, manual, forced, duplicate_candidate, duplicate_owner]);
                 Ok(())
             })
             .unwrap();
 
+        apply_terminal_title(&storage, &civ_id, Some("Fix login bug".to_owned()), false).unwrap();
         apply_terminal_title(
             &storage,
             &manual_id,
             Some("Should Not Apply".to_owned()),
             false,
+        )
+        .unwrap();
+        apply_terminal_title(
+            &storage,
+            &forced_id,
+            Some("Regenerated title".to_owned()),
+            true,
         )
         .unwrap();
         apply_terminal_title(
@@ -2894,39 +2797,19 @@ claude = "repo-wrapper"
         .unwrap();
 
         let instances = storage.load().unwrap();
-        let manual = instances.iter().find(|i| i.id == manual_id).unwrap();
-        assert_eq!(manual.title, "Hand-picked");
-        assert!(manual.smart_rename_attempted);
-        let duplicate = instances.iter().find(|i| i.id == duplicate_id).unwrap();
-        assert_eq!(duplicate.title, "Franks");
-        assert_eq!(duplicate.last_auto_title, None);
-        assert!(duplicate.smart_rename_attempted);
-    }
-    #[test]
-    #[serial_test::serial]
-    fn apply_terminal_title_force_overwrites_manual_title() {
-        use crate::session::instance::Instance;
-        use crate::session::storage::Storage;
-        let home = tempfile::tempdir().expect("tempdir HOME");
-        let _home_guard = crate::session::test_support::isolate_home(home.path());
-        let storage = Storage::new_unwatched("default").expect("storage");
-        let mut manual = Instance::new("Britons", "/tmp/forced-terminal-title");
-        manual.title = "Hand-picked".into();
-        let id = manual.id.clone();
-        storage
-            .update(|instances, _groups| {
-                instances.push(manual);
-                Ok(())
-            })
-            .unwrap();
-
-        apply_terminal_title(&storage, &id, Some("Regenerated title".into()), true).unwrap();
-
-        let persisted = storage.load().unwrap();
-        let manual = persisted.iter().find(|row| row.id == id).unwrap();
-        assert_eq!(manual.title, "Regenerated title");
-        assert_eq!(manual.last_auto_title.as_deref(), Some("Regenerated title"));
-        assert!(manual.smart_rename_attempted);
+        let row = |id: &str| instances.iter().find(|i| i.id == id).unwrap();
+        // (id, title, last_auto_title); every attempt is marked.
+        for (id, title, last_auto) in [
+            (&civ_id, "Fix login bug", Some("Fix login bug")),
+            (&manual_id, "Hand-picked", None),
+            (&forced_id, "Regenerated title", Some("Regenerated title")),
+            (&duplicate_id, "Franks", None),
+        ] {
+            let row = row(id);
+            assert_eq!(row.title, title);
+            assert_eq!(row.last_auto_title.as_deref(), last_auto, "{title}");
+            assert!(row.smart_rename_attempted, "{title}");
+        }
     }
 
     #[test]

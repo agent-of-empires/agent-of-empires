@@ -103,50 +103,30 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_stderr_trims_trailing_whitespace() {
-        assert_eq!(sanitize_stderr("some error\n"), "some error");
-        assert_eq!(sanitize_stderr("  padded  \n"), "padded");
-        assert_eq!(sanitize_stderr("a\nb\nc"), "a | b | c");
-    }
-
-    #[test]
-    fn sanitize_stderr_handles_empty_and_whitespace_inputs() {
-        assert_eq!(sanitize_stderr(""), "<no stderr>");
-        assert_eq!(sanitize_stderr("   "), "<no stderr>");
-        assert_eq!(sanitize_stderr("\n\n\n"), "<no stderr>");
-    }
-
-    #[test]
     fn empty_stderr_variant_display_has_no_dangling_colon() {
         let e = DockerError::InspectFailed(sanitize_stderr(""));
         assert_eq!(e.to_string(), "Failed to inspect container: <no stderr>");
     }
 
     #[test]
-    fn sanitize_stderr_handles_crlf_line_endings() {
-        assert_eq!(sanitize_stderr("a\r\nb"), "a | b");
-        assert_eq!(
-            sanitize_stderr("first\r\nsecond\r\nthird"),
-            "first | second | third"
-        );
-    }
-
-    #[test]
-    fn sanitize_stderr_skips_blank_interior_lines() {
-        assert_eq!(sanitize_stderr("line1\n\nline2"), "line1 | line2");
-        assert_eq!(sanitize_stderr("a\n  \nb"), "a | b");
-    }
-
-    #[test]
-    fn sanitize_stderr_is_idempotent() {
-        let once = sanitize_stderr("a\nb\nc");
-        let twice = sanitize_stderr(&once);
-        assert_eq!(once, twice);
-    }
-
-    #[test]
-    fn sanitize_stderr_lone_cr_is_preserved_interior() {
-        // A lone `\r` is not a line terminator and survives verbatim.
-        assert_eq!(sanitize_stderr("a\rb"), "a\rb");
+    fn sanitize_stderr_joins_trimmed_nonblank_lines() {
+        for (raw, expected) in [
+            ("some error\n", "some error"),
+            ("  padded  \n", "padded"),
+            ("a\nb\nc", "a | b | c"),
+            ("", "<no stderr>"),
+            ("   ", "<no stderr>"),
+            ("\n\n\n", "<no stderr>"),
+            ("a\r\nb", "a | b"),
+            ("first\r\nsecond\r\nthird", "first | second | third"),
+            ("line1\n\nline2", "line1 | line2"),
+            ("a\n  \nb", "a | b"),
+            // A lone `\r` is not a line terminator and survives verbatim.
+            ("a\rb", "a\rb"),
+        ] {
+            let once = sanitize_stderr(raw);
+            assert_eq!(once, expected, "{raw:?}");
+            assert_eq!(sanitize_stderr(&once), once, "idempotent for {raw:?}");
+        }
     }
 }

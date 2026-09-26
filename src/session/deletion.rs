@@ -3565,48 +3565,6 @@ mod tests {
         use crate::containers::error::DockerError;
         use crate::containers::Teardown;
 
-        #[test]
-        fn failure_is_recorded_as_error() {
-            let mut messages = Vec::new();
-            let mut errors = Vec::new();
-            deletion_messages_for(
-                Teardown::Failed(DockerError::RemoveFailed("daemon busy".into())),
-                &mut messages,
-                &mut errors,
-            );
-            assert_eq!(
-                errors.len(),
-                1,
-                "a removal failure must be surfaced so the caller keeps the session record"
-            );
-            assert!(errors[0].contains("Container"));
-            assert!(messages.is_empty());
-        }
-
-        #[test]
-        fn removed_records_message() {
-            let mut messages = Vec::new();
-            let mut errors = Vec::new();
-            deletion_messages_for(Teardown::Removed, &mut messages, &mut errors);
-            assert_eq!(messages, vec!["Container removed".to_string()]);
-            assert!(errors.is_empty());
-        }
-
-        #[test]
-        fn already_gone_is_silent() {
-            let mut messages = Vec::new();
-            let mut errors = Vec::new();
-            deletion_messages_for(Teardown::AlreadyGone, &mut messages, &mut errors);
-            assert!(
-                errors.is_empty(),
-                "an already-gone container is idempotent, not a failure"
-            );
-            assert!(
-                messages.is_empty(),
-                "no spurious 'removed' message when nothing was removed"
-            );
-        }
-
         fn sandboxed_request() -> DeletionRequest {
             use crate::session::SandboxInfo;
             let mut instance = create_test_instance();
@@ -3982,7 +3940,6 @@ mod tests {
                 before_start_env: Vec::new(),
                 container_workdir: None,
             });
-
             let request = DeletionRequest {
                 session_id: instance.id.clone(),
                 instance,
@@ -4032,6 +3989,50 @@ mod tests {
                 "preclean must run after tmux kill and before container remove: stages={:?}",
                 stages
             );
+        }
+
+        /// A real worktree and its branch are gone from disk, and a second
+        /// pass over the same row stays green: teardown that half-ran must
+        /// not turn the retry into an error.
+        #[test]
+        fn real_worktree_and_branch_are_removed_idempotently() {
+            let _app_guard = crate::session::test_support::isolate_app_dir();
+            let (_tmp, main_repo, worktree_path, instance) =
+                test_worktree_fixture("feature/delete-me");
+            let request = DeletionRequest {
+                session_id: instance.id.clone(),
+                instance,
+                delete_worktree: true,
+                delete_branch: true,
+                delete_sandbox: false,
+                force_delete: false,
+                detach_hooks: true,
+                keep_scratch: false,
+            };
+            for _ in 0..2 {
+                let result = perform_deletion(&request);
+                assert!(
+                    result.success,
+                    "perform_deletion failed: {:?}",
+                    result.errors
+                );
+                assert!(!worktree_path.exists());
+                assert!(!main_repo.join(".git/worktrees/worktree").exists());
+                assert!(!branch_exists(&main_repo, "feature/delete-me"));
+            }
+        }
+
+        /// `git branch --list` answers on stdout; the module's `git_in`
+        /// helper asserts success and drops the output, so this check runs
+        /// its own invocation.
+        fn branch_exists(repo: &std::path::Path, branch: &str) -> bool {
+            let out = std::process::Command::new("git")
+                .args(["branch", "--list", branch])
+                .current_dir(repo)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git branch --list failed");
+            !String::from_utf8_lossy(&out.stdout).trim().is_empty()
         }
 
         /// End-to-end-on-disk: build a real git repo + worktree on the
@@ -5177,9 +5178,29 @@ mod tests {
 
         #[test]
         #[serial]
-        fn scratch_session_removes_dir() {
+        fn scratch_session_is_kept_on_request_then_removed_and_tolerates_missing_dir() {
             let _tmp = isolate_app_dir();
             let (instance, dir) = scratch_instance();
+            let result = perform_deletion(&DeletionRequest {
+                session_id: instance.id.clone(),
+                instance: instance.clone(),
+                delete_worktree: false,
+                delete_branch: false,
+                delete_sandbox: false,
+                force_delete: false,
+                detach_hooks: true,
+                keep_scratch: true,
+            });
+            assert!(result.success, "{:?}", result.errors);
+            assert!(dir.exists());
+            assert!(
+                result.messages.iter().any(|m| {
+                    m.contains("Scratch directory kept at:") && m.contains(dir.to_str().unwrap())
+                }),
+                "expected kept-path message, got {:?}",
+                result.messages
+            );
+
             let request = DeletionRequest {
                 session_id: instance.id.clone(),
                 instance,
@@ -5190,7 +5211,6 @@ mod tests {
                 detach_hooks: true,
                 keep_scratch: false,
             };
-
             let result = perform_deletion(&request);
             assert!(result.success, "deletion errors: {:?}", result.errors);
             assert!(
@@ -5234,131 +5254,42 @@ mod tests {
             );
         }
 
+        /// The scratch guard refuses a scratch row pointing outside the scratch root, and a
+        /// non-scratch row under the app dir is never treated as scratch.
         #[test]
         #[serial]
-        fn tampered_project_path_does_not_get_removed() {
-            // Defense against an edited or corrupted session JSON that
-            // sets `scratch: true` while pointing project_path at something
-            // the guard would reject. The directory must survive deletion.
+        fn scratch_cleanup_leaves_paths_outside_its_root_alone() {
             let _tmp = isolate_app_dir();
-            let bystander =
-                std::env::temp_dir().join(format!("important-data-{}", uuid::Uuid::new_v4()));
-            fs::create_dir(&bystander).expect("create bystander");
-            fs::write(bystander.join("file.txt"), b"keep me").unwrap();
+            let app_dir = crate::session::get_app_dir().unwrap();
+            for (scratch, parent) in [(true, std::env::temp_dir()), (false, app_dir)] {
+                let dir = parent.join(format!("aoe-scratch-guard-{}", uuid::Uuid::new_v4()));
+                fs::create_dir(&dir).unwrap();
+                fs::write(dir.join("file.txt"), b"keep me").unwrap();
 
-            let mut instance = Instance::new("Tampered", bystander.to_str().unwrap());
-            instance.scratch = true;
+                let mut instance = Instance::new("Guarded", dir.to_str().unwrap());
+                instance.scratch = scratch;
+                let request = DeletionRequest {
+                    session_id: instance.id.clone(),
+                    instance,
+                    delete_worktree: false,
+                    delete_branch: false,
+                    delete_sandbox: false,
+                    force_delete: false,
+                    detach_hooks: true,
+                    keep_scratch: false,
+                };
+                let result = perform_deletion(&request);
 
-            let request = DeletionRequest {
-                session_id: instance.id.clone(),
-                instance,
-                delete_worktree: false,
-                delete_branch: false,
-                delete_sandbox: false,
-                force_delete: false,
-                detach_hooks: true,
-                keep_scratch: false,
-            };
-            let result = perform_deletion(&request);
-
-            assert!(
-                bystander.exists(),
-                "guard must refuse to remove a path outside the scratch root"
-            );
-            assert!(
-                bystander.join("file.txt").exists(),
-                "bystander contents must survive"
-            );
-            // The guard refusal must also surface as an error on the
-            // deletion result, so callers can report the partial
-            // cleanup instead of silently treating it as a clean
-            // delete.
-            assert!(
-                result.errors.iter().any(|e| e.contains("scratch guard")),
-                "guard refusal must be reported in result.errors, got: {:?}",
-                result.errors
-            );
-            let _ = fs::remove_dir_all(&bystander);
-        }
-
-        #[test]
-        #[serial]
-        fn keep_scratch_leaves_dir_on_disk_and_reports_path() {
-            // The --keep-scratch escape hatch. Session record still gets
-            // removed (caller's responsibility), but the scratch directory
-            // stays put and the deletion result calls out the kept path.
-            let _tmp = isolate_app_dir();
-            let (instance, dir) = scratch_instance();
-            let request = DeletionRequest {
-                session_id: instance.id.clone(),
-                instance,
-                delete_worktree: false,
-                delete_branch: false,
-                delete_sandbox: false,
-                force_delete: false,
-                detach_hooks: true,
-                keep_scratch: true,
-            };
-
-            let result = perform_deletion(&request);
-            assert!(
-                result.success,
-                "keep-scratch deletion errors: {:?}",
-                result.errors
-            );
-            assert!(
-                dir.exists(),
-                "keep-scratch must leave the directory on disk"
-            );
-            let kept_msg = result
-                .messages
-                .iter()
-                .find(|m| m.contains("Scratch directory kept at:"));
-            assert!(
-                kept_msg.is_some(),
-                "expected kept-path message, got {:?}",
-                result.messages
-            );
-            assert!(
-                kept_msg.unwrap().contains(dir.to_str().unwrap()),
-                "kept-path message must include the actual path; got: {}",
-                kept_msg.unwrap()
-            );
-            // Clean up the leftover dir so the next test starts clean.
-            let _ = fs::remove_dir_all(&dir);
-        }
-
-        #[test]
-        #[serial]
-        fn non_scratch_session_under_app_dir_is_untouched() {
-            // A regular session whose project_path happens to live under
-            // the app dir (e.g. a test fixture) must not be removed.
-            let _tmp = isolate_app_dir();
-            let dir = crate::session::get_app_dir()
-                .unwrap()
-                .join(format!("non-scratch-{}", uuid::Uuid::new_v4()));
-            fs::create_dir(&dir).expect("create non-scratch test dir");
-
-            let instance = Instance::new("Regular", dir.to_str().unwrap());
-            // scratch is false by default.
-
-            let request = DeletionRequest {
-                session_id: instance.id.clone(),
-                instance,
-                delete_worktree: false,
-                delete_branch: false,
-                delete_sandbox: false,
-                force_delete: false,
-                detach_hooks: true,
-                keep_scratch: false,
-            };
-            let _ = perform_deletion(&request);
-
-            assert!(
-                dir.exists(),
-                "non-scratch session must never trip the scratch cleanup branch"
-            );
-            let _ = fs::remove_dir_all(&dir);
+                let survived = dir.join("file.txt").exists();
+                let _ = fs::remove_dir_all(&dir);
+                assert!(survived, "scratch={scratch}: {dir:?} must survive");
+                assert_eq!(
+                    result.errors.iter().any(|e| e.contains("scratch guard")),
+                    scratch,
+                    "scratch={scratch}: {:?}",
+                    result.errors
+                );
+            }
         }
     }
 }

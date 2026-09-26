@@ -2,47 +2,132 @@
 
 use super::*;
 
-/// Archiving in the default (non-Attention) sort advances the cursor to the
-/// next active session below instead of following the archived row into the
-/// Archived section. The section is NOT auto-revealed; its header count is
-/// the feedback. The preview follows the new selection through the normal
-/// per-frame retarget (cache gates on session id, worker drops stale frames).
+/// Archiving moves the cursor to the nearest active session, never into the Archived section:
+/// down to the next row (the section is not auto-revealed; its header count is the feedback),
+/// up when archiving the bottom row, and nowhere (selection cleared, cursor clamped) when no
+/// active row remains, even with an expanded archived row below.
 #[test]
 #[serial]
 fn archive_advances_cursor_to_next_session() {
-    let mut env = create_test_env_with_sessions(3);
-    // Start with the Archived section collapsed (the default).
-    env.view.archived_section_collapsed = true;
-    env.view.cursor = 0;
-    env.view.update_selected();
-    let id = env.view.selected_session.clone().unwrap();
-    let next_id = match env.view.flat_items.get(1) {
-        Some(Item::Session { id, .. }) => id.clone(),
-        other => panic!("expected a session row below the cursor, got {other:?}"),
-    };
+    // Next row below.
+    {
+        let mut env = create_test_env_with_sessions(3);
+        // Start with the Archived section collapsed (the default).
+        env.view.archived_section_collapsed = true;
+        env.view.cursor = 0;
+        env.view.update_selected();
+        let id = env.view.selected_session.clone().unwrap();
+        let next_id = match env.view.flat_items.get(1) {
+            Some(Item::Session { id, .. }) => id.clone(),
+            other => panic!("expected a session row below the cursor, got {other:?}"),
+        };
 
-    with_canonical_archive(&mut env, |env| {
-        env.view.toggle_archive_at_cursor().unwrap();
-    });
+        with_canonical_archive(&mut env, |env| {
+            env.view.toggle_archive_at_cursor().unwrap();
+        });
 
-    assert!(
-        env.view.get_instance(&id).unwrap().is_archived(),
-        "the session must be archived"
-    );
-    assert_eq!(
-        env.view.selected_session.as_deref(),
-        Some(next_id.as_str()),
-        "selection must advance to the next active session"
-    );
-    assert!(
-        env.view.archived_section_collapsed,
-        "single-row archive must not auto-reveal the Archived section"
-    );
-    match env.view.flat_items.get(env.view.cursor) {
-        Some(Item::Session { id: cur, .. }) => {
-            assert_eq!(cur, &next_id, "cursor must sit on the next session's row")
+        assert!(
+            env.view.get_instance(&id).unwrap().is_archived(),
+            "the session must be archived"
+        );
+        assert_eq!(
+            env.view.selected_session.as_deref(),
+            Some(next_id.as_str()),
+            "selection must advance to the next active session"
+        );
+        assert!(
+            env.view.archived_section_collapsed,
+            "single-row archive must not auto-reveal the Archived section"
+        );
+        match env.view.flat_items.get(env.view.cursor) {
+            Some(Item::Session { id: cur, .. }) => {
+                assert_eq!(cur, &next_id, "cursor must sit on the next session's row")
+            }
+            _ => panic!("cursor should be on the next session row"),
         }
-        _ => panic!("cursor should be on the next session row"),
+    }
+    // Bottom row: fall back to the session above.
+    {
+        let mut env = create_test_env_with_sessions(2);
+        env.view.archived_section_collapsed = true;
+        let last = env.view.flat_items.len() - 1;
+        env.view.cursor = last;
+        env.view.update_selected();
+        let id = env.view.selected_session.clone().unwrap();
+        let above_id = match env.view.flat_items.get(last - 1) {
+            Some(Item::Session { id, .. }) => id.clone(),
+            other => panic!("expected a session row above the cursor, got {other:?}"),
+        };
+
+        with_canonical_archive(&mut env, |env| {
+            env.view.toggle_archive_at_cursor().unwrap();
+        });
+
+        assert!(env.view.get_instance(&id).unwrap().is_archived());
+        assert_eq!(
+            env.view.selected_session.as_deref(),
+            Some(above_id.as_str()),
+            "with nothing below, selection must land on the session above"
+        );
+    }
+    // An expanded archived row below is not a successor.
+    {
+        let mut env = create_test_env_with_sessions(2);
+        env.view.archived_section_collapsed = false;
+
+        // Park the second session first, so an archived row sits below.
+        let parked_id = match env.view.flat_items.get(1) {
+            Some(Item::Session { id, .. }) => id.clone(),
+            other => panic!("expected a second session row, got {other:?}"),
+        };
+        env.view.select_session_by_id(&parked_id);
+        with_canonical_archive(&mut env, |env| {
+            env.view.toggle_archive_at_cursor().unwrap();
+        });
+        assert!(env.view.get_instance(&parked_id).unwrap().is_archived());
+
+        // Archive the remaining active session. The only session row left below
+        // the cursor is the parked one, which must NOT become the selection.
+        let id = env.view.selected_session.clone().unwrap();
+        assert_ne!(
+            id, parked_id,
+            "selection must have fallen back to the active row"
+        );
+        with_canonical_archive(&mut env, |env| {
+            env.view.toggle_archive_at_cursor().unwrap();
+        });
+
+        assert!(env.view.get_instance(&id).unwrap().is_archived());
+        assert_eq!(
+            env.view.selected_session, None,
+            "the cursor must not advance onto a row inside the Archived section"
+        );
+    }
+    // Last active row, in any sort.
+    for sort in [None, Some(crate::session::config::SortOrder::Attention)] {
+        let mut env = create_test_env_with_sessions(1);
+        if let Some(sort) = sort {
+            env.view.sort_order = sort;
+            env.view.flat_items = env.view.build_flat_items();
+        }
+        env.view.archived_section_collapsed = true;
+        env.view.cursor = 0;
+        env.view.update_selected();
+        let id = env.view.selected_session.clone().unwrap();
+
+        with_canonical_archive(&mut env, |env| {
+            env.view.toggle_archive_at_cursor().unwrap();
+        });
+
+        assert!(env.view.get_instance(&id).unwrap().is_archived());
+        assert_eq!(
+            env.view.selected_session, None,
+            "{sort:?}: nothing active remains, so the archived row must not stay selected"
+        );
+        assert!(
+            env.view.cursor < env.view.flat_items.len(),
+            "{sort:?}: cursor must stay clamped inside the rebuilt list"
+        );
     }
 }
 
@@ -74,99 +159,6 @@ fn rejected_archive_drops_only_its_pending_cursor_and_ignores_late_transition() 
         .publish_for_test(super::session_feed_tests::archived_daemon_snapshot(&id));
     assert!(env.view.apply_session_feed());
     assert!(env.view.pending_archive_cursor.is_none());
-}
-
-/// Archiving the bottom session has no row below to advance to, so the
-/// cursor falls back to the nearest active session above.
-#[test]
-#[serial]
-fn archive_bottom_row_falls_back_to_session_above() {
-    let mut env = create_test_env_with_sessions(2);
-    env.view.archived_section_collapsed = true;
-    let last = env.view.flat_items.len() - 1;
-    env.view.cursor = last;
-    env.view.update_selected();
-    let id = env.view.selected_session.clone().unwrap();
-    let above_id = match env.view.flat_items.get(last - 1) {
-        Some(Item::Session { id, .. }) => id.clone(),
-        other => panic!("expected a session row above the cursor, got {other:?}"),
-    };
-
-    with_canonical_archive(&mut env, |env| {
-        env.view.toggle_archive_at_cursor().unwrap();
-    });
-
-    assert!(env.view.get_instance(&id).unwrap().is_archived());
-    assert_eq!(
-        env.view.selected_session.as_deref(),
-        Some(above_id.as_str()),
-        "with nothing below, selection must land on the session above"
-    );
-}
-
-/// Archiving the only active session leaves nothing to advance to: the
-/// cursor clamps into the remaining list (the Archived section header) and
-/// the selection clears instead of pointing at a vanished row.
-#[test]
-#[serial]
-fn archive_last_active_session_clears_selection() {
-    let mut env = create_test_env_with_sessions(1);
-    env.view.archived_section_collapsed = true;
-    env.view.cursor = 0;
-    env.view.update_selected();
-    let id = env.view.selected_session.clone().unwrap();
-
-    with_canonical_archive(&mut env, |env| {
-        env.view.toggle_archive_at_cursor().unwrap();
-    });
-
-    assert!(env.view.get_instance(&id).unwrap().is_archived());
-    assert_eq!(
-        env.view.selected_session, None,
-        "no active session remains, so nothing should be selected"
-    );
-    assert!(
-        env.view.cursor < env.view.flat_items.len(),
-        "cursor must stay clamped inside the rebuilt list"
-    );
-}
-
-/// The successor scan must skip rows already parked under an EXPANDED
-/// Archived section: archiving the last active row with an archived row
-/// visible below clears the selection instead of advancing into the section.
-#[test]
-#[serial]
-fn archive_successor_skips_archived_rows() {
-    let mut env = create_test_env_with_sessions(2);
-    env.view.archived_section_collapsed = false;
-
-    // Park the second session first, so an archived row sits below.
-    let parked_id = match env.view.flat_items.get(1) {
-        Some(Item::Session { id, .. }) => id.clone(),
-        other => panic!("expected a second session row, got {other:?}"),
-    };
-    env.view.select_session_by_id(&parked_id);
-    with_canonical_archive(&mut env, |env| {
-        env.view.toggle_archive_at_cursor().unwrap();
-    });
-    assert!(env.view.get_instance(&parked_id).unwrap().is_archived());
-
-    // Archive the remaining active session. The only session row left below
-    // the cursor is the parked one, which must NOT become the selection.
-    let id = env.view.selected_session.clone().unwrap();
-    assert_ne!(
-        id, parked_id,
-        "selection must have fallen back to the active row"
-    );
-    with_canonical_archive(&mut env, |env| {
-        env.view.toggle_archive_at_cursor().unwrap();
-    });
-
-    assert!(env.view.get_instance(&id).unwrap().is_archived());
-    assert_eq!(
-        env.view.selected_session, None,
-        "the cursor must not advance onto a row inside the Archived section"
-    );
 }
 
 /// Attention sort: archiving the only active session with the Archived
@@ -237,17 +229,6 @@ fn unarchive_keeps_selection() {
         }
         _ => panic!("cursor should be on the unarchived session row"),
     }
-}
-
-/// A restart with no selection neither submits nor reserves a row.
-#[test]
-#[serial]
-fn restart_selected_session_noop_with_no_selection() {
-    let mut env = create_test_env_empty();
-    env.view.selected_session = None;
-    let result = env.view.restart_selected_session(None, None, None, None);
-    assert!(result.is_ok());
-    assert!(env.view.restart_cooldown_at.is_empty());
 }
 
 /// Sunk rows (`archived` / `snoozed` / `pane_dead_observed`) and transient
@@ -701,106 +682,115 @@ fn build_flat_items_by_org_scopes_same_named_owners_by_host() {
 #[test]
 #[serial]
 fn project_grouping_survives_attention_sort() {
-    use crate::session::config::{GroupByMode, SortOrder};
+    // Both project headers survive.
+    {
+        use crate::session::config::{GroupByMode, SortOrder};
 
-    let mut env = create_test_env_two_projects_mixed_attention();
-    env.view.group_by = GroupByMode::Project;
-    env.view.sort_order = SortOrder::Attention;
-    env.view.flat_items = env.view.build_flat_items();
+        let mut env = create_test_env_two_projects_mixed_attention();
+        env.view.group_by = GroupByMode::Project;
+        env.view.sort_order = SortOrder::Attention;
+        env.view.flat_items = env.view.build_flat_items();
 
-    let group_count = env
-        .view
-        .flat_items
-        .iter()
-        .filter(|i| matches!(i, Item::Group { .. }))
-        .count();
-    assert_eq!(
-        group_count, 2,
-        "Project + Attention must keep both project headers (alpha, beta), \
-         got flat_items: {:?}",
-        env.view.flat_items
-    );
+        let group_count = env
+            .view
+            .flat_items
+            .iter()
+            .filter(|i| matches!(i, Item::Group { .. }))
+            .count();
+        assert_eq!(
+            group_count, 2,
+            "Project + Attention must keep both project headers (alpha, beta), \
+             got flat_items: {:?}",
+            env.view.flat_items
+        );
 
-    let group_names: Vec<String> = env
-        .view
-        .flat_items
-        .iter()
-        .filter_map(|i| match i {
-            Item::Group { name, .. } => Some(name.clone()),
-            _ => None,
-        })
-        .collect();
-    assert!(
-        group_names.iter().any(|n| n == "alpha") && group_names.iter().any(|n| n == "beta"),
-        "expected alpha and beta project headers, got {group_names:?}"
-    );
-}
+        let group_names: Vec<String> = env
+            .view
+            .flat_items
+            .iter()
+            .filter_map(|i| match i {
+                Item::Group { name, .. } => Some(name.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            group_names.iter().any(|n| n == "alpha") && group_names.iter().any(|n| n == "beta"),
+            "expected alpha and beta project headers, got {group_names:?}"
+        );
+    }
+    // Waiting above Running within alpha.
+    {
+        use crate::session::config::{GroupByMode, SortOrder};
 
-/// Within a project group under Attention sort, sessions must order by
-/// attention tier: Waiting (tier 0) above Running (tier 4). Confirms that
-/// the existing `sort_sessions` helper, already reached by the project
-/// flatten path via `flatten_tree`, is doing its job once we stopped
-/// short-circuiting it.
-#[test]
-#[serial]
-fn project_grouping_sorts_sessions_by_attention_within_group() {
-    use crate::session::config::{GroupByMode, SortOrder};
+        let mut env = create_test_env_two_projects_mixed_attention();
+        env.view.group_by = GroupByMode::Project;
+        env.view.sort_order = SortOrder::Attention;
+        env.view.flat_items = env.view.build_flat_items();
 
-    let mut env = create_test_env_two_projects_mixed_attention();
-    env.view.group_by = GroupByMode::Project;
-    env.view.sort_order = SortOrder::Attention;
-    env.view.flat_items = env.view.build_flat_items();
-
-    let mut current_group: Option<String> = None;
-    let mut alpha_session_order: Vec<String> = Vec::new();
-    for item in &env.view.flat_items {
-        match item {
-            Item::Group { name, .. } => current_group = Some(name.clone()),
-            Item::Session { id, .. } => {
-                if current_group.as_deref() == Some("alpha") {
-                    if let Some(inst) = env.view.instances.get(id) {
-                        alpha_session_order.push(inst.title.clone());
+        let mut current_group: Option<String> = None;
+        let mut alpha_session_order: Vec<String> = Vec::new();
+        for item in &env.view.flat_items {
+            match item {
+                Item::Group { name, .. } => current_group = Some(name.clone()),
+                Item::Session { id, .. } => {
+                    if current_group.as_deref() == Some("alpha") {
+                        if let Some(inst) = env.view.instances.get(id) {
+                            alpha_session_order.push(inst.title.clone());
+                        }
                     }
                 }
             }
         }
+        assert_eq!(
+            alpha_session_order,
+            vec!["alpha-waiting".to_string(), "alpha-running".to_string()],
+            "Waiting session must rank above Running within the alpha group"
+        );
     }
-    assert_eq!(
-        alpha_session_order,
-        vec!["alpha-waiting".to_string(), "alpha-running".to_string()],
-        "Waiting session must rank above Running within the alpha group"
-    );
-}
+    // alpha's Waiting outranks beta's Error.
+    {
+        use crate::session::config::{GroupByMode, SortOrder};
 
-/// The most-attention-urgent project floats to the top. `attention_group_key`
-/// scores groups by their best member's tier; beta has an Error (tier 1)
-/// while alpha's best is Waiting (tier 0), so alpha sorts first. This
-/// confirms that the existing group-sort path is reached for project mode
-/// under Attention sort.
-#[test]
-#[serial]
-fn project_groups_sort_by_top_attention_member() {
-    use crate::session::config::{GroupByMode, SortOrder};
+        let mut env = create_test_env_two_projects_mixed_attention();
+        env.view.group_by = GroupByMode::Project;
+        env.view.sort_order = SortOrder::Attention;
+        env.view.flat_items = env.view.build_flat_items();
 
-    let mut env = create_test_env_two_projects_mixed_attention();
-    env.view.group_by = GroupByMode::Project;
-    env.view.sort_order = SortOrder::Attention;
-    env.view.flat_items = env.view.build_flat_items();
+        let group_order: Vec<String> = env
+            .view
+            .flat_items
+            .iter()
+            .filter_map(|i| match i {
+                Item::Group { name, .. } => Some(name.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            group_order,
+            vec!["alpha".to_string(), "beta".to_string()],
+            "alpha (Waiting=tier 0) must sort above beta (Error=tier 1)"
+        );
+    }
+    // Manual + Attention stays flat.
+    {
+        use crate::session::config::{GroupByMode, SortOrder};
 
-    let group_order: Vec<String> = env
-        .view
-        .flat_items
-        .iter()
-        .filter_map(|i| match i {
-            Item::Group { name, .. } => Some(name.clone()),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(
-        group_order,
-        vec!["alpha".to_string(), "beta".to_string()],
-        "alpha (Waiting=tier 0) must sort above beta (Error=tier 1)"
-    );
+        let mut env = create_test_env_two_projects_mixed_attention();
+        env.view.group_by = GroupByMode::Manual;
+        env.view.sort_order = SortOrder::Attention;
+        env.view.flat_items = env.view.build_flat_items();
+
+        let group_count = env
+            .view
+            .flat_items
+            .iter()
+            .filter(|i| matches!(i, Item::Group { .. }))
+            .count();
+        assert_eq!(
+            group_count, 0,
+            "Manual + Attention should produce a flat list, no group headers"
+        );
+    }
 }
 
 /// Archiving a project header while in Attention sort must remove the project
@@ -1341,79 +1331,6 @@ fn scratch_bucket_absent_from_main_flow_when_only_scratch_is_archived() {
     );
 }
 
-/// Pin a project, archive its only session, then unpin: the empty header must
-/// leave the main flow (the archived session stays under the Archived section).
-#[test]
-#[serial]
-fn unpin_archived_only_project_leaves_main_flow() {
-    use crate::session::{config::GroupByMode, is_within_archived_section};
-
-    let mut env = create_test_env_two_projects_mixed_attention();
-    env.view.group_by = GroupByMode::Project;
-    env.view.flat_items = env.view.build_flat_items();
-
-    // Pin beta.
-    let beta_idx = env
-        .view
-        .flat_items
-        .iter()
-        .position(|i| matches!(i, Item::Group { name, .. } if name == "beta"))
-        .expect("beta header present");
-    env.view.cursor = beta_idx;
-    env.view.update_selected();
-    env.view.toggle_project_pin_at_cursor();
-    assert!(env.view.is_project_label_pinned("beta"));
-
-    // Archive both beta sessions.
-    let beta_ids: Vec<String> = env
-        .view
-        .instances
-        .values()
-        .filter(|i| crate::tui::home::project_group_key(i) == "beta")
-        .map(|i| i.id.clone())
-        .collect();
-    for id in &beta_ids {
-        env.view
-            .apply_user_action(id, |inst| inst.archive())
-            .unwrap();
-    }
-    env.view.flat_items = env.view.build_flat_items();
-
-    // Now unpin via the cursor on the empty main-flow beta header.
-    let beta_idx = env
-        .view
-        .flat_items
-        .iter()
-        .position(|i| matches!(i, Item::Group { name, path, .. } if name == "beta" && !is_within_archived_section(path)))
-        .expect("empty beta header present in main flow after archiving");
-    env.view.cursor = beta_idx;
-    env.view.update_selected();
-    env.view.toggle_project_pin_at_cursor();
-
-    assert!(
-        !env.view.is_project_label_pinned("beta"),
-        "beta must read as unpinned after the toggle; registry still has it"
-    );
-
-    // Count beta headers OUTSIDE the Archived section.
-    let mut in_archived = false;
-    let mut main_beta = 0;
-    for item in &env.view.flat_items {
-        if let Item::Group { path, name, .. } = item {
-            if is_within_archived_section(path) {
-                in_archived = true;
-            } else if name == "beta" && !in_archived {
-                main_beta += 1;
-            }
-        }
-    }
-    assert_eq!(
-        main_beta, 0,
-        "unpinned archived-only beta must not render in the main flow; got: {:?}",
-        env.view.flat_items
-    );
-}
-
 /// A registry entry whose path differs from an archived session's repo path
 /// sharing the same basename must still read as pinned and be unpinnable.
 /// The empty header is surfaced by LABEL match (`unpopulated_projects`), so
@@ -1870,141 +1787,88 @@ fn unpin_clears_both_global_and_profile_entries_for_a_path() {
 #[test]
 #[serial]
 fn group_by_toggle_preserves_selected_session() {
-    use crate::session::config::GroupByMode;
+    // Manual to Project.
+    {
+        use crate::session::config::GroupByMode;
 
-    let mut env = create_test_env_two_projects_mixed_attention();
-    env.view.group_by = GroupByMode::Manual;
-    env.view.sort_order = crate::session::config::SortOrder::Newest;
-    env.view.flat_items = env.view.build_flat_items();
+        let mut env = create_test_env_two_projects_mixed_attention();
+        env.view.group_by = GroupByMode::Manual;
+        env.view.sort_order = crate::session::config::SortOrder::Newest;
+        env.view.flat_items = env.view.build_flat_items();
 
-    // Pick the last session in the Manual flat list; that's the row whose
-    // index is most likely to be invalidated when project headers get
-    // inserted in front of it.
-    let target_id = env
-        .view
-        .flat_items
-        .iter()
-        .rev()
-        .find_map(|i| match i {
-            Item::Session { id, .. } => Some(id.clone()),
-            _ => None,
-        })
-        .expect("manual flat list should contain at least one session");
-    env.view.select_session_by_id(&target_id);
-    assert_eq!(
-        env.view.selected_session.as_deref(),
-        Some(target_id.as_str())
-    );
+        // The last session in the Manual flat list is the row whose index is most likely to be
+        // invalidated once project headers are inserted in front of it.
+        let target_id = env
+            .view
+            .flat_items
+            .iter()
+            .rev()
+            .find_map(|i| match i {
+                Item::Session { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .expect("manual flat list should contain at least one session");
+        env.view.select_session_by_id(&target_id);
+        assert_eq!(
+            env.view.selected_session.as_deref(),
+            Some(target_id.as_str())
+        );
 
-    env.view.handle_key(key(KeyCode::Char('g')), None);
-    // 'g' opens the picker; pick Project to apply the flip.
-    env.view.handle_key(key(KeyCode::Down), None);
-    env.view.handle_key(key(KeyCode::Enter), None);
-    assert_eq!(env.view.group_by, GroupByMode::Project);
-    assert_eq!(
-        env.view.selected_session.as_deref(),
-        Some(target_id.as_str()),
-        "cursor must stay on the same session after group_by flip"
-    );
-    let cursor_item = env
-        .view
-        .flat_items
-        .get(env.view.cursor)
-        .expect("cursor must point into flat_items");
-    match cursor_item {
-        Item::Session { id, .. } => assert_eq!(id, &target_id),
-        Item::Group { .. } => panic!("cursor landed on a group header, not the session"),
+        env.view.handle_key(key(KeyCode::Char('g')), None);
+        // 'g' opens the picker; pick Project to apply the flip.
+        env.view.handle_key(key(KeyCode::Down), None);
+        env.view.handle_key(key(KeyCode::Enter), None);
+        assert_eq!(env.view.group_by, GroupByMode::Project);
+        assert_eq!(
+            env.view.selected_session.as_deref(),
+            Some(target_id.as_str()),
+            "cursor must stay on the same session after group_by flip"
+        );
+        let cursor_item = env
+            .view
+            .flat_items
+            .get(env.view.cursor)
+            .expect("cursor must point into flat_items");
+        match cursor_item {
+            Item::Session { id, .. } => assert_eq!(id, &target_id),
+            Item::Group { .. } => panic!("cursor landed on a group header, not the session"),
+        }
     }
-}
+    // Newest to Attention under Project grouping.
+    {
+        use crate::session::config::{GroupByMode, SortOrder};
 
-/// Pressing `o` to flip `sort_order` keeps the cursor on the previously
-/// selected session. Most visible when going Newest → Attention with
-/// Project grouping on, since Attention reorders both groups (by top
-/// member) and sessions within each group, so the target session is very
-/// unlikely to keep its index across the rebuild.
-#[test]
-#[serial]
-fn sort_order_toggle_preserves_selected_session() {
-    use crate::session::config::{GroupByMode, SortOrder};
+        let mut env = create_test_env_two_projects_mixed_attention();
+        env.view.group_by = GroupByMode::Project;
+        env.view.sort_order = SortOrder::Newest;
+        env.view.flat_items = env.view.build_flat_items();
 
-    let mut env = create_test_env_two_projects_mixed_attention();
-    env.view.group_by = GroupByMode::Project;
-    env.view.sort_order = SortOrder::Newest;
-    env.view.flat_items = env.view.build_flat_items();
+        // Pin the Running session inside alpha. Under Attention sort it sinks
+        // below alpha-waiting, so its index will shift on the rebuild.
+        let target_id = env
+            .view
+            .instances
+            .values()
+            .find(|i| i.title == "alpha-running")
+            .map(|i| i.id.clone())
+            .expect("fixture provides alpha-running");
+        env.view.select_session_by_id(&target_id);
+        assert_eq!(
+            env.view.selected_session.as_deref(),
+            Some(target_id.as_str())
+        );
 
-    // Pin the Running session inside alpha. Under Attention sort it sinks
-    // below alpha-waiting, so its index will shift on the rebuild.
-    let target_id = env
-        .view
-        .instances
-        .values()
-        .find(|i| i.title == "alpha-running")
-        .map(|i| i.id.clone())
-        .expect("fixture provides alpha-running");
-    env.view.select_session_by_id(&target_id);
-    assert_eq!(
-        env.view.selected_session.as_deref(),
-        Some(target_id.as_str())
-    );
-
-    // Open the sort picker and pick Attention (one down from Newest).
-    env.view.handle_key(key(KeyCode::Char('o')), None);
-    env.view.handle_key(key(KeyCode::Down), None);
-    env.view.handle_key(key(KeyCode::Enter), None);
-    assert_eq!(env.view.sort_order, SortOrder::Attention);
-    assert_eq!(
-        env.view.selected_session.as_deref(),
-        Some(target_id.as_str()),
-        "cursor must stay on the same session after sort_order flip"
-    );
-}
-
-/// `reseat_cursor_after_rebuild` falls back to index clamping when there
-/// is no prior session selection. Guards against the helper accidentally
-/// regressing the empty-or-group-only path, where the original clamp
-/// logic was correct.
-#[test]
-#[serial]
-fn reseat_cursor_clamps_when_no_session_selected() {
-    use crate::session::config::GroupByMode;
-
-    let mut env = create_test_env_two_projects_mixed_attention();
-    env.view.group_by = GroupByMode::Project;
-    env.view.flat_items = env.view.build_flat_items();
-    env.view.selected_session = None;
-    env.view.cursor = env.view.flat_items.len() + 50; // intentionally out of range
-
-    env.view.reseat_cursor_after_rebuild();
-    assert!(
-        env.view.cursor < env.view.flat_items.len(),
-        "cursor must be clamped into the flat_items range"
-    );
-}
-
-/// Manual grouping + Attention sort must still flatten. The cross-cutting
-/// flat priority view is the original Attention design and is the right
-/// behavior when the user has not opted into project grouping. Guards
-/// against an over-eager refactor flipping both modes to grouped.
-#[test]
-#[serial]
-fn manual_grouping_attention_sort_stays_flat() {
-    use crate::session::config::{GroupByMode, SortOrder};
-
-    let mut env = create_test_env_two_projects_mixed_attention();
-    env.view.group_by = GroupByMode::Manual;
-    env.view.sort_order = SortOrder::Attention;
-    env.view.flat_items = env.view.build_flat_items();
-
-    let group_count = env
-        .view
-        .flat_items
-        .iter()
-        .filter(|i| matches!(i, Item::Group { .. }))
-        .count();
-    assert_eq!(
-        group_count, 0,
-        "Manual + Attention should produce a flat list, no group headers"
-    );
+        // Open the sort picker and pick Attention (one down from Newest).
+        env.view.handle_key(key(KeyCode::Char('o')), None);
+        env.view.handle_key(key(KeyCode::Down), None);
+        env.view.handle_key(key(KeyCode::Enter), None);
+        assert_eq!(env.view.sort_order, SortOrder::Attention);
+        assert_eq!(
+            env.view.selected_session.as_deref(),
+            Some(target_id.as_str()),
+            "cursor must stay on the same session after sort_order flip"
+        );
+    }
 }
 
 /// A profile move commits the source-group removal with the row transfer, so
@@ -2087,162 +1951,155 @@ fn profile_move_group_metadata_survives_reload() {
 #[test]
 #[serial]
 fn favorite_decoration_gated_to_attention_sort() {
-    use crate::session::config::SortOrder;
+    // Favorites-first off: star is Attention-only.
+    {
+        use crate::session::config::SortOrder;
 
-    let original = crate::session::favorites_first();
+        let original = crate::session::favorites_first();
 
-    let mut env = create_test_env_with_sessions(1);
-    let id = env.view.instance_at(0).id.clone();
-    let title = env.view.instance_at(0).title.clone();
-    env.view.mutate_instance(&id, |inst| inst.favorite());
+        let mut env = create_test_env_with_sessions(1);
+        let id = env.view.instance_at(0).id.clone();
+        let title = env.view.instance_at(0).title.clone();
+        env.view.mutate_instance(&id, |inst| inst.favorite());
 
-    // After the env is built: constructing it applies config, which resets the
-    // process-wide flag to the shipped default (on).
-    crate::session::set_favorites_first(false);
+        // After the env is built: constructing it applies config, which resets the
+        // process-wide flag to the shipped default (on).
+        crate::session::set_favorites_first(false);
 
-    // In Newest: row should NOT have the `* ` prefix or the bold/
-    // underlined favorite styling.
-    env.view.sort_order = SortOrder::Newest;
-    env.view.flat_items = env.view.build_flat_items();
-    let item = env
-        .view
-        .flat_items
-        .iter()
-        .find(|i| matches!(i, Item::Session { id: sid, .. } if *sid == id))
-        .cloned()
-        .expect("session item present in Newest sort");
-    let text_newest = rendered_row_text(&env.view, &item);
-    assert!(
-        !text_newest.contains("* "),
-        "favorite prefix must be hidden outside Attention sort; got: {:?}",
-        text_newest
-    );
-    assert!(
-        text_newest.contains(&title),
-        "row title must still render; got: {:?}",
-        text_newest
-    );
-
-    // Flip to Attention: the prefix returns.
-    env.view.sort_order = SortOrder::Attention;
-    env.view.flat_items = env.view.build_flat_items();
-    let item_attention = env
-        .view
-        .flat_items
-        .iter()
-        .find(|i| matches!(i, Item::Session { id: sid, .. } if *sid == id))
-        .cloned()
-        .expect("session item present in Attention sort");
-    let text_attention = rendered_row_text(&env.view, &item_attention);
-    assert!(
-        text_attention.contains("* "),
-        "favorite prefix must surface in Attention sort; got: {:?}",
-        text_attention
-    );
-
-    crate::session::set_favorites_first(original);
-}
-
-/// With favorites-first on (the default), the star follows the pin: a
-/// favorited row shows it in Newest too, because it is pinned there.
-/// A snoozed favorite is not pinned, so it must not be decorated either.
-#[test]
-#[serial]
-fn favorite_decoration_shows_outside_attention_when_favorites_first() {
-    use crate::session::config::SortOrder;
-
-    let original = crate::session::favorites_first();
-
-    let mut env = create_test_env_with_sessions(1);
-    let id = env.view.instance_at(0).id.clone();
-    let title = env.view.instance_at(0).title.clone();
-    env.view.mutate_instance(&id, |inst| inst.favorite());
-
-    // Set after the env is built: constructing it applies config, which would
-    // overwrite the flag.
-    crate::session::set_favorites_first(true);
-
-    env.view.sort_order = SortOrder::Newest;
-    env.view.flat_items = env.view.build_flat_items();
-    let row = |view: &HomeView, id: &str| {
-        let item = view
+        // In Newest: row should NOT have the `* ` prefix or the bold/
+        // underlined favorite styling.
+        env.view.sort_order = SortOrder::Newest;
+        env.view.flat_items = env.view.build_flat_items();
+        let item = env
+            .view
             .flat_items
             .iter()
-            .find(|i| matches!(i, Item::Session { id: sid, .. } if sid == id))
+            .find(|i| matches!(i, Item::Session { id: sid, .. } if *sid == id))
             .cloned()
-            .expect("session item present");
-        rendered_row_text(view, &item)
-    };
+            .expect("session item present in Newest sort");
+        let text_newest = rendered_row_text(&env.view, &item);
+        assert!(
+            !text_newest.contains("* "),
+            "favorite prefix must be hidden outside Attention sort; got: {:?}",
+            text_newest
+        );
+        assert!(
+            text_newest.contains(&title),
+            "row title must still render; got: {:?}",
+            text_newest
+        );
 
-    let text = row(&env.view, &id);
-    assert!(
-        text.contains("* "),
-        "favorite prefix must show in Newest when favorites-first is on; got: {:?}",
-        text
-    );
-    assert!(
-        text.contains(&title),
-        "row title must still render; got: {:?}",
-        text
-    );
+        // Flip to Attention: the prefix returns.
+        env.view.sort_order = SortOrder::Attention;
+        env.view.flat_items = env.view.build_flat_items();
+        let item_attention = env
+            .view
+            .flat_items
+            .iter()
+            .find(|i| matches!(i, Item::Session { id: sid, .. } if *sid == id))
+            .cloned()
+            .expect("session item present in Attention sort");
+        let text_attention = rendered_row_text(&env.view, &item_attention);
+        assert!(
+            text_attention.contains("* "),
+            "favorite prefix must surface in Attention sort; got: {:?}",
+            text_attention
+        );
 
-    // Snooze outranks the star: the row is no longer pinned, so it must not
-    // be decorated as a favorite either.
-    env.view.mutate_instance(&id, |inst| inst.snooze(30));
-    env.view.flat_items = env.view.build_flat_items();
-    let text_snoozed = row(&env.view, &id);
-    assert!(
-        !text_snoozed.contains("* "),
-        "a snoozed favorite is not pinned, so it must not show the star; got: {:?}",
-        text_snoozed
-    );
+        crate::session::set_favorites_first(original);
+    }
+    // Favorites-first on: star shows in Newest.
+    {
+        use crate::session::config::SortOrder;
 
-    crate::session::set_favorites_first(original);
-}
+        let original = crate::session::favorites_first();
 
-/// Snoozed rows: prefix and remaining-time column only appear in Attention
-/// sort. Outside Attention, the snooze flag persists silently and the row
-/// paints with its underlying status.
-#[test]
-#[serial]
-fn snooze_decoration_gated_to_attention_sort() {
-    use crate::session::config::SortOrder;
+        let mut env = create_test_env_with_sessions(1);
+        let id = env.view.instance_at(0).id.clone();
+        let title = env.view.instance_at(0).title.clone();
+        env.view.mutate_instance(&id, |inst| inst.favorite());
 
-    let mut env = create_test_env_with_sessions(1);
-    let id = env.view.instance_at(0).id.clone();
-    env.view.mutate_instance(&id, |inst| inst.snooze(30));
+        // Set after the env is built: constructing it applies config, which would
+        // overwrite the flag.
+        crate::session::set_favorites_first(true);
 
-    env.view.sort_order = SortOrder::Newest;
-    env.view.flat_items = env.view.build_flat_items();
-    let item_newest = env
-        .view
-        .flat_items
-        .iter()
-        .find(|i| matches!(i, Item::Session { id: sid, .. } if *sid == id))
-        .cloned()
-        .expect("session item present in Newest sort");
-    let text_newest = rendered_row_text(&env.view, &item_newest);
-    assert!(
-        !text_newest.contains("z "),
-        "snooze prefix must be hidden outside Attention sort; got: {:?}",
-        text_newest
-    );
+        env.view.sort_order = SortOrder::Newest;
+        env.view.flat_items = env.view.build_flat_items();
+        let row = |view: &HomeView, id: &str| {
+            let item = view
+                .flat_items
+                .iter()
+                .find(|i| matches!(i, Item::Session { id: sid, .. } if sid == id))
+                .cloned()
+                .expect("session item present");
+            rendered_row_text(view, &item)
+        };
 
-    env.view.sort_order = SortOrder::Attention;
-    env.view.flat_items = env.view.build_flat_items();
-    let item_attention = env
-        .view
-        .flat_items
-        .iter()
-        .find(|i| matches!(i, Item::Session { id: sid, .. } if *sid == id))
-        .cloned()
-        .expect("session item present in Attention sort");
-    let text_attention = rendered_row_text(&env.view, &item_attention);
-    assert!(
-        text_attention.contains("z "),
-        "snooze prefix must surface in Attention sort; got: {:?}",
-        text_attention
-    );
+        let text = row(&env.view, &id);
+        assert!(
+            text.contains("* "),
+            "favorite prefix must show in Newest when favorites-first is on; got: {:?}",
+            text
+        );
+        assert!(
+            text.contains(&title),
+            "row title must still render; got: {:?}",
+            text
+        );
+
+        // Snooze outranks the star: the row is no longer pinned, so it must not
+        // be decorated as a favorite either.
+        env.view.mutate_instance(&id, |inst| inst.snooze(30));
+        env.view.flat_items = env.view.build_flat_items();
+        let text_snoozed = row(&env.view, &id);
+        assert!(
+            !text_snoozed.contains("* "),
+            "a snoozed favorite is not pinned, so it must not show the star; got: {:?}",
+            text_snoozed
+        );
+
+        crate::session::set_favorites_first(original);
+    }
+    // Snooze prefix is Attention-only.
+    {
+        use crate::session::config::SortOrder;
+
+        let mut env = create_test_env_with_sessions(1);
+        let id = env.view.instance_at(0).id.clone();
+        env.view.mutate_instance(&id, |inst| inst.snooze(30));
+
+        env.view.sort_order = SortOrder::Newest;
+        env.view.flat_items = env.view.build_flat_items();
+        let item_newest = env
+            .view
+            .flat_items
+            .iter()
+            .find(|i| matches!(i, Item::Session { id: sid, .. } if *sid == id))
+            .cloned()
+            .expect("session item present in Newest sort");
+        let text_newest = rendered_row_text(&env.view, &item_newest);
+        assert!(
+            !text_newest.contains("z "),
+            "snooze prefix must be hidden outside Attention sort; got: {:?}",
+            text_newest
+        );
+
+        env.view.sort_order = SortOrder::Attention;
+        env.view.flat_items = env.view.build_flat_items();
+        let item_attention = env
+            .view
+            .flat_items
+            .iter()
+            .find(|i| matches!(i, Item::Session { id: sid, .. } if *sid == id))
+            .cloned()
+            .expect("session item present in Attention sort");
+        let text_attention = rendered_row_text(&env.view, &item_attention);
+        assert!(
+            text_attention.contains("z "),
+            "snooze prefix must surface in Attention sort; got: {:?}",
+            text_attention
+        );
+    }
 }
 
 /// Archived sessions live under the synthetic "Archived" section pinned to
@@ -2320,365 +2177,294 @@ fn archived_section_pinned_to_bottom_in_every_sort() {
 #[test]
 #[serial]
 fn archived_section_nests_by_project_in_project_mode() {
-    use crate::session::{
-        archived_project_sub_path,
-        config::{GroupByMode, SortOrder},
-        is_archived_section_path, ARCHIVED_SECTION_NAME,
-    };
+    // Depth layout under AZ.
+    {
+        use crate::session::{
+            archived_project_sub_path,
+            config::{GroupByMode, SortOrder},
+            is_archived_section_path, ARCHIVED_SECTION_NAME,
+        };
 
-    let mut env = create_test_env_two_projects_mixed_attention();
-    env.view.group_by = GroupByMode::Project;
-    // Pin to AZ so this test asserts only the depth-0/1/2 layout shape,
-    // not the sort-order behavior. Sort_order coverage lives in
-    // `archived_sub_folders_honor_sort_order` below.
-    env.view.sort_order = SortOrder::AZ;
-    // Archive one session from each project so we expect two sub-folders.
-    let alpha_id = env
-        .view
-        .instances
-        .values()
-        .find(|i| i.title == "alpha-running")
-        .map(|i| i.id.clone())
-        .unwrap();
-    let beta_id = env
-        .view
-        .instances
-        .values()
-        .find(|i| i.title == "beta-error")
-        .map(|i| i.id.clone())
-        .unwrap();
-    env.view
-        .apply_user_action(&alpha_id, |inst| inst.archive())
-        .unwrap();
-    env.view
-        .apply_user_action(&beta_id, |inst| inst.archive())
-        .unwrap();
-    env.view.archived_section_collapsed = false;
-    env.view.flat_items = env.view.build_flat_items();
-
-    // Find the Archived section header and walk forward.
-    let arch_idx = env
-        .view
-        .flat_items
-        .iter()
-        .position(|it| matches!(it, Item::Group { path, .. } if is_archived_section_path(path)))
-        .expect("Archived section header must be present");
-
-    // Header sanity: depth 0, count = 2, name = Archived.
-    match &env.view.flat_items[arch_idx] {
-        Item::Group {
-            depth,
-            session_count,
-            name,
-            ..
-        } => {
-            assert_eq!(*depth, 0, "Archived header depth");
-            assert_eq!(*session_count, 2, "two archived sessions across projects");
-            assert_eq!(name, ARCHIVED_SECTION_NAME);
-        }
-        _ => unreachable!(),
-    }
-
-    // The next two non-session items should be sub-folder headers at depth 1,
-    // one for "alpha" and one for "beta", in alphabetical order. Between them
-    // and after the second, the sessions at depth 2 belong to that sub-folder.
-    let tail = &env.view.flat_items[arch_idx + 1..];
-
-    let sub_alpha_path = archived_project_sub_path("alpha");
-    let sub_beta_path = archived_project_sub_path("beta");
-
-    // First sub-header must be alpha (AZ sort orders by name).
-    match &tail[0] {
-        Item::Group {
-            path,
-            name,
-            depth,
-            session_count,
-            ..
-        } => {
-            assert_eq!(path, &sub_alpha_path);
-            assert_eq!(name, "alpha");
-            assert_eq!(*depth, 1);
-            assert_eq!(*session_count, 1);
-        }
-        other => panic!("expected alpha sub-header at depth 1, got {:?}", other),
-    }
-    // Then alpha's archived session at depth 2.
-    match &tail[1] {
-        Item::Session { id, depth } => {
-            assert_eq!(
-                id, &alpha_id,
-                "alpha sub-folder should contain alpha-running"
-            );
-            assert_eq!(*depth, 2);
-        }
-        other => panic!("expected alpha-running session row, got {:?}", other),
-    }
-    // Then the beta sub-header at depth 1.
-    match &tail[2] {
-        Item::Group {
-            path,
-            name,
-            depth,
-            session_count,
-            ..
-        } => {
-            assert_eq!(path, &sub_beta_path);
-            assert_eq!(name, "beta");
-            assert_eq!(*depth, 1);
-            assert_eq!(*session_count, 1);
-        }
-        other => panic!("expected beta sub-header at depth 1, got {:?}", other),
-    }
-    // Then beta's archived session at depth 2.
-    match &tail[3] {
-        Item::Session { id, depth } => {
-            assert_eq!(id, &beta_id, "beta sub-folder should contain beta-error");
-            assert_eq!(*depth, 2);
-        }
-        other => panic!("expected beta-error session row, got {:?}", other),
-    }
-}
-
-/// A project whose only remaining member is archived must NOT leave an empty
-/// phantom header in the main (non-archived) flow. The archived session shows
-/// under the Archived section instead; an empty project header would be
-/// undeletable in project mode ("Project groups are automatic").
-#[test]
-#[serial]
-fn archived_only_project_leaves_no_phantom_header() {
-    use crate::session::{config::GroupByMode, is_within_archived_section};
-
-    let mut env = create_test_env_two_projects_mixed_attention();
-    env.view.group_by = GroupByMode::Project;
-
-    // Drain beta down to a single ARCHIVED member: archive beta-error, then
-    // delete beta-running (the "last visible session in the group").
-    let beta_error = env
-        .view
-        .instances
-        .values()
-        .find(|i| i.title == "beta-error")
-        .map(|i| i.id.clone())
-        .unwrap();
-    let beta_running = env
-        .view
-        .instances
-        .values()
-        .find(|i| i.title == "beta-running")
-        .map(|i| i.id.clone())
-        .unwrap();
-    env.view
-        .apply_user_action(&beta_error, |inst| inst.archive())
-        .unwrap();
-    env.view.instances.shift_remove(&beta_running);
-    env.view.flat_items = env.view.build_flat_items();
-
-    // Count "beta" headers that live OUTSIDE the Archived section.
-    let mut in_archived = false;
-    let mut main_beta_headers = 0;
-    for item in &env.view.flat_items {
-        if let Item::Group { path, name, .. } = item {
-            if is_within_archived_section(path) {
-                in_archived = true;
-            } else if name == "beta" && !in_archived {
-                main_beta_headers += 1;
-            }
-        }
-    }
-    assert_eq!(
-        main_beta_headers, 0,
-        "archived-only project must not render a header in the main flow; got flat_items: {:?}",
-        env.view.flat_items
-    );
-}
-
-/// Collapsing the Archived umbrella in Project mode hides both sub-folder
-/// headers and their session rows.
-#[test]
-#[serial]
-fn archived_section_collapsed_hides_project_sub_folders() {
-    use crate::session::{config::GroupByMode, is_within_archived_section};
-
-    let mut env = create_test_env_two_projects_mixed_attention();
-    env.view.group_by = GroupByMode::Project;
-    let alpha_id = env
-        .view
-        .instances
-        .values()
-        .find(|i| i.title == "alpha-running")
-        .map(|i| i.id.clone())
-        .unwrap();
-    env.view
-        .apply_user_action(&alpha_id, |inst| inst.archive())
-        .unwrap();
-    env.view.archived_section_collapsed = true;
-    env.view.flat_items = env.view.build_flat_items();
-
-    let within_archive_items: Vec<&Item> = env
-        .view
-        .flat_items
-        .iter()
-        .filter(|it| match it {
-            Item::Group { path, .. } => is_within_archived_section(path),
-            Item::Session { .. } => false,
-        })
-        .collect();
-    assert_eq!(
-        within_archive_items.len(),
-        1,
-        "collapsed Archived must render only its top-level header, got {:?}",
-        within_archive_items
-    );
-}
-
-/// Collapsing a single project sub-folder under Archived hides its session
-/// rows but leaves the sub-header (and any other sub-folders) intact. Uses
-/// the same `project_group_collapsed` map that drives regular project mode
-/// collapse, keyed by the synthetic `archived_project_sub_path`.
-#[test]
-#[serial]
-fn archived_project_sub_folder_collapse_hides_only_its_sessions() {
-    use crate::session::{archived_project_sub_path, config::GroupByMode};
-
-    let mut env = create_test_env_two_projects_mixed_attention();
-    env.view.group_by = GroupByMode::Project;
-    let alpha_id = env
-        .view
-        .instances
-        .values()
-        .find(|i| i.title == "alpha-running")
-        .map(|i| i.id.clone())
-        .unwrap();
-    let beta_id = env
-        .view
-        .instances
-        .values()
-        .find(|i| i.title == "beta-error")
-        .map(|i| i.id.clone())
-        .unwrap();
-    env.view
-        .apply_user_action(&alpha_id, |inst| inst.archive())
-        .unwrap();
-    env.view
-        .apply_user_action(&beta_id, |inst| inst.archive())
-        .unwrap();
-    env.view.archived_section_collapsed = false;
-    // Collapse only alpha's archived sub-folder.
-    env.view
-        .project_group_collapsed
-        .insert(archived_project_sub_path("alpha"), true);
-    env.view.flat_items = env.view.build_flat_items();
-
-    // alpha sub-folder must still appear as a header but with no session row
-    // following it; beta sub-folder must still emit its session row.
-    let has_alpha_session = env
-        .view
-        .flat_items
-        .iter()
-        .any(|it| matches!(it, Item::Session { id, .. } if id == &alpha_id));
-    let has_beta_session = env
-        .view
-        .flat_items
-        .iter()
-        .any(|it| matches!(it, Item::Session { id, .. } if id == &beta_id));
-    assert!(
-        !has_alpha_session,
-        "collapsed alpha sub-folder must hide its archived session"
-    );
-    assert!(
-        has_beta_session,
-        "expanded beta sub-folder must still surface its archived session"
-    );
-    let alpha_sub_path = archived_project_sub_path("alpha");
-    assert!(
-        env.view.flat_items.iter().any(
-            |it| matches!(it, Item::Group { path, collapsed, .. } if path == &alpha_sub_path && *collapsed)
-        ),
-        "alpha sub-folder header must remain visible with collapsed=true"
-    );
-}
-
-/// Archived project sub-folders honor `sort_order`, mirroring how active
-/// project headers order in `flatten_tree`. AZ/ZA sort by project name;
-/// recency sorts (Newest, LastActivity, Attention) bring the most-
-/// recently-archived project to the top; Oldest does the inverse. Probes
-/// AZ, ZA, and Newest as representatives; the Oldest/LastActivity/Attention
-/// branches share the same `sort_archived_project_buckets` machinery.
-#[test]
-#[serial]
-fn archived_sub_folders_honor_sort_order() {
-    use crate::session::{
-        archived_project_sub_path,
-        config::{GroupByMode, SortOrder},
-        is_archived_section_path,
-    };
-
-    let mut env = create_test_env_two_projects_mixed_attention();
-    env.view.group_by = GroupByMode::Project;
-    let alpha_id = env
-        .view
-        .instances
-        .values()
-        .find(|i| i.title == "alpha-running")
-        .map(|i| i.id.clone())
-        .unwrap();
-    let beta_id = env
-        .view
-        .instances
-        .values()
-        .find(|i| i.title == "beta-error")
-        .map(|i| i.id.clone())
-        .unwrap();
-    // Archive alpha first, then beta. archived_at is `Utc::now()` at the
-    // moment of `archive()`, so beta is strictly more recent than alpha.
-    env.view
-        .apply_user_action(&alpha_id, |inst| inst.archive())
-        .unwrap();
-    env.view
-        .apply_user_action(&beta_id, |inst| inst.archive())
-        .unwrap();
-    env.view.archived_section_collapsed = false;
-
-    let first_sub_folder = |env: &TestEnv| -> Option<String> {
-        let arch_idx = env.view.flat_items.iter().position(
-            |it| matches!(it, Item::Group { path, .. } if is_archived_section_path(path)),
-        )?;
+        let mut env = create_test_env_two_projects_mixed_attention();
+        env.view.group_by = GroupByMode::Project;
+        // Pin to AZ so this block asserts only the depth-0/1/2 layout.
+        env.view.sort_order = SortOrder::AZ;
+        // Archive one session from each project so we expect two sub-folders.
+        let alpha_id = env
+            .view
+            .instances
+            .values()
+            .find(|i| i.title == "alpha-running")
+            .map(|i| i.id.clone())
+            .unwrap();
+        let beta_id = env
+            .view
+            .instances
+            .values()
+            .find(|i| i.title == "beta-error")
+            .map(|i| i.id.clone())
+            .unwrap();
         env.view
+            .apply_user_action(&alpha_id, |inst| inst.archive())
+            .unwrap();
+        env.view
+            .apply_user_action(&beta_id, |inst| inst.archive())
+            .unwrap();
+        env.view.archived_section_collapsed = false;
+        env.view.flat_items = env.view.build_flat_items();
+
+        // Find the Archived section header and walk forward.
+        let arch_idx = env
+            .view
             .flat_items
-            .get(arch_idx + 1)
-            .and_then(|it| match it {
-                Item::Group { path, .. } => Some(path.clone()),
-                _ => None,
+            .iter()
+            .position(|it| matches!(it, Item::Group { path, .. } if is_archived_section_path(path)))
+            .expect("Archived section header must be present");
+
+        // Header sanity: depth 0, count = 2, name = Archived.
+        match &env.view.flat_items[arch_idx] {
+            Item::Group {
+                depth,
+                session_count,
+                name,
+                ..
+            } => {
+                assert_eq!(*depth, 0, "Archived header depth");
+                assert_eq!(*session_count, 2, "two archived sessions across projects");
+                assert_eq!(name, ARCHIVED_SECTION_NAME);
+            }
+            _ => unreachable!(),
+        }
+
+        // The next two non-session items are sub-folder headers at depth 1, "alpha" then
+        // "beta", with each folder's sessions at depth 2 following it.
+        let tail = &env.view.flat_items[arch_idx + 1..];
+
+        let sub_alpha_path = archived_project_sub_path("alpha");
+        let sub_beta_path = archived_project_sub_path("beta");
+
+        // First sub-header must be alpha (AZ sort orders by name).
+        match &tail[0] {
+            Item::Group {
+                path,
+                name,
+                depth,
+                session_count,
+                ..
+            } => {
+                assert_eq!(path, &sub_alpha_path);
+                assert_eq!(name, "alpha");
+                assert_eq!(*depth, 1);
+                assert_eq!(*session_count, 1);
+            }
+            other => panic!("expected alpha sub-header at depth 1, got {:?}", other),
+        }
+        // Then alpha's archived session at depth 2.
+        match &tail[1] {
+            Item::Session { id, depth } => {
+                assert_eq!(
+                    id, &alpha_id,
+                    "alpha sub-folder should contain alpha-running"
+                );
+                assert_eq!(*depth, 2);
+            }
+            other => panic!("expected alpha-running session row, got {:?}", other),
+        }
+        // Then the beta sub-header at depth 1.
+        match &tail[2] {
+            Item::Group {
+                path,
+                name,
+                depth,
+                session_count,
+                ..
+            } => {
+                assert_eq!(path, &sub_beta_path);
+                assert_eq!(name, "beta");
+                assert_eq!(*depth, 1);
+                assert_eq!(*session_count, 1);
+            }
+            other => panic!("expected beta sub-header at depth 1, got {:?}", other),
+        }
+        // Then beta's archived session at depth 2.
+        match &tail[3] {
+            Item::Session { id, depth } => {
+                assert_eq!(id, &beta_id, "beta sub-folder should contain beta-error");
+                assert_eq!(*depth, 2);
+            }
+            other => panic!("expected beta-error session row, got {:?}", other),
+        }
+    }
+    // Sub-folder order follows sort_order.
+    {
+        use crate::session::{
+            archived_project_sub_path,
+            config::{GroupByMode, SortOrder},
+            is_archived_section_path,
+        };
+
+        let mut env = create_test_env_two_projects_mixed_attention();
+        env.view.group_by = GroupByMode::Project;
+        let alpha_id = env
+            .view
+            .instances
+            .values()
+            .find(|i| i.title == "alpha-running")
+            .map(|i| i.id.clone())
+            .unwrap();
+        let beta_id = env
+            .view
+            .instances
+            .values()
+            .find(|i| i.title == "beta-error")
+            .map(|i| i.id.clone())
+            .unwrap();
+        // Archive alpha first, then beta. archived_at is `Utc::now()` at the
+        // moment of `archive()`, so beta is strictly more recent than alpha.
+        env.view
+            .apply_user_action(&alpha_id, |inst| inst.archive())
+            .unwrap();
+        env.view
+            .apply_user_action(&beta_id, |inst| inst.archive())
+            .unwrap();
+        env.view.archived_section_collapsed = false;
+
+        let first_sub_folder = |env: &TestEnv| -> Option<String> {
+            let arch_idx = env.view.flat_items.iter().position(
+                |it| matches!(it, Item::Group { path, .. } if is_archived_section_path(path)),
+            )?;
+            env.view
+                .flat_items
+                .get(arch_idx + 1)
+                .and_then(|it| match it {
+                    Item::Group { path, .. } => Some(path.clone()),
+                    _ => None,
+                })
+        };
+
+        let alpha_sub = archived_project_sub_path("alpha");
+        let beta_sub = archived_project_sub_path("beta");
+
+        env.view.sort_order = SortOrder::AZ;
+        env.view.flat_items = env.view.build_flat_items();
+        assert_eq!(
+            first_sub_folder(&env).as_deref(),
+            Some(alpha_sub.as_str()),
+            "AZ: alphabetical, alpha first"
+        );
+
+        env.view.sort_order = SortOrder::ZA;
+        env.view.flat_items = env.view.build_flat_items();
+        assert_eq!(
+            first_sub_folder(&env).as_deref(),
+            Some(beta_sub.as_str()),
+            "ZA: reverse alphabetical, beta first"
+        );
+
+        env.view.sort_order = SortOrder::Newest;
+        env.view.flat_items = env.view.build_flat_items();
+        assert_eq!(
+            first_sub_folder(&env).as_deref(),
+            Some(beta_sub.as_str()),
+            "Newest: most-recently-archived project first (beta archived after alpha)"
+        );
+    }
+    // Collapsing one sub-folder hides only its sessions.
+    {
+        use crate::session::{archived_project_sub_path, config::GroupByMode};
+
+        let mut env = create_test_env_two_projects_mixed_attention();
+        env.view.group_by = GroupByMode::Project;
+        let alpha_id = env
+            .view
+            .instances
+            .values()
+            .find(|i| i.title == "alpha-running")
+            .map(|i| i.id.clone())
+            .unwrap();
+        let beta_id = env
+            .view
+            .instances
+            .values()
+            .find(|i| i.title == "beta-error")
+            .map(|i| i.id.clone())
+            .unwrap();
+        env.view
+            .apply_user_action(&alpha_id, |inst| inst.archive())
+            .unwrap();
+        env.view
+            .apply_user_action(&beta_id, |inst| inst.archive())
+            .unwrap();
+        env.view.archived_section_collapsed = false;
+        // Collapse only alpha's archived sub-folder.
+        env.view
+            .project_group_collapsed
+            .insert(archived_project_sub_path("alpha"), true);
+        env.view.flat_items = env.view.build_flat_items();
+
+        // alpha sub-folder must still appear as a header but with no session row
+        // following it; beta sub-folder must still emit its session row.
+        let has_alpha_session = env
+            .view
+            .flat_items
+            .iter()
+            .any(|it| matches!(it, Item::Session { id, .. } if id == &alpha_id));
+        let has_beta_session = env
+            .view
+            .flat_items
+            .iter()
+            .any(|it| matches!(it, Item::Session { id, .. } if id == &beta_id));
+        assert!(
+            !has_alpha_session,
+            "collapsed alpha sub-folder must hide its archived session"
+        );
+        assert!(
+            has_beta_session,
+            "expanded beta sub-folder must still surface its archived session"
+        );
+        let alpha_sub_path = archived_project_sub_path("alpha");
+        assert!(
+            env.view.flat_items.iter().any(
+                |it| matches!(it, Item::Group { path, collapsed, .. } if path == &alpha_sub_path && *collapsed)
+            ),
+            "alpha sub-folder header must remain visible with collapsed=true"
+        );
+    }
+    // Collapsing the umbrella hides every sub-folder.
+    {
+        use crate::session::{config::GroupByMode, is_within_archived_section};
+
+        let mut env = create_test_env_two_projects_mixed_attention();
+        env.view.group_by = GroupByMode::Project;
+        let alpha_id = env
+            .view
+            .instances
+            .values()
+            .find(|i| i.title == "alpha-running")
+            .map(|i| i.id.clone())
+            .unwrap();
+        env.view
+            .apply_user_action(&alpha_id, |inst| inst.archive())
+            .unwrap();
+        env.view.archived_section_collapsed = true;
+        env.view.flat_items = env.view.build_flat_items();
+
+        let within_archive_items: Vec<&Item> = env
+            .view
+            .flat_items
+            .iter()
+            .filter(|it| match it {
+                Item::Group { path, .. } => is_within_archived_section(path),
+                Item::Session { .. } => false,
             })
-    };
-
-    let alpha_sub = archived_project_sub_path("alpha");
-    let beta_sub = archived_project_sub_path("beta");
-
-    env.view.sort_order = SortOrder::AZ;
-    env.view.flat_items = env.view.build_flat_items();
-    assert_eq!(
-        first_sub_folder(&env).as_deref(),
-        Some(alpha_sub.as_str()),
-        "AZ: alphabetical, alpha first"
-    );
-
-    env.view.sort_order = SortOrder::ZA;
-    env.view.flat_items = env.view.build_flat_items();
-    assert_eq!(
-        first_sub_folder(&env).as_deref(),
-        Some(beta_sub.as_str()),
-        "ZA: reverse alphabetical, beta first"
-    );
-
-    env.view.sort_order = SortOrder::Newest;
-    env.view.flat_items = env.view.build_flat_items();
-    assert_eq!(
-        first_sub_folder(&env).as_deref(),
-        Some(beta_sub.as_str()),
-        "Newest: most-recently-archived project first (beta archived after alpha)"
-    );
+            .collect();
+        assert_eq!(
+            within_archive_items.len(),
+            1,
+            "collapsed Archived must render only its top-level header, got {:?}",
+            within_archive_items
+        );
+    }
 }
 
 #[test]
@@ -3269,179 +3055,64 @@ fn startup_recovery_waits_for_the_first_reconcile_sweep() {
 #[test]
 #[serial]
 fn startup_recovery_gate_expires_when_the_sweep_never_lands() {
-    let temp = TempDir::new().unwrap();
-    let _guard = setup_test_home(&temp);
-    let _storage = Storage::new_unwatched("test").unwrap();
-    let mut view = HomeView::new_for_test(
-        Some("test".to_string()),
-        AvailableTools::with_tools(&["claude"]),
-        crate::file_watch::FileWatchService::noop(),
-    )
-    .unwrap();
-    // No request is queued: only the gate deadline can release recovery.
-    view.reconcile_poller = crate::tui::reconcile_poller::ReconcilePoller::new();
-    view.startup_recovery_gate = Some(std::time::Instant::now());
-
-    assert!(!view.apply_reconcile_results());
-    assert!(
-        view.startup_recovery_gate.is_some(),
-        "an un-landed sweep inside the deadline must still hold the gate"
-    );
-
-    view.startup_recovery_gate =
-        Some(std::time::Instant::now() - HomeView::STARTUP_RECOVERY_GATE_TIMEOUT);
-    assert!(!view.apply_reconcile_results());
-    assert!(
-        view.startup_recovery_gate.is_none(),
-        "past the deadline recovery must start without the sweep"
-    );
-}
-
-/// A failed reload must not be retried on every tick. `apply_reconcile_results`
-/// runs ~30 times a second, so an unreadable store would spin on storage and
-/// flood the log where every other reload in that loop is throttled.
-#[test]
-#[serial]
-fn a_failed_reload_backs_off_instead_of_retrying_every_tick() {
-    let temp = TempDir::new().unwrap();
-    let _guard = setup_test_home(&temp);
-    let storage = Storage::new_unwatched("test").unwrap();
-    let mut seed = Instance::new("row", "/tmp/stale-path");
-    seed.source_profile = "test".to_string();
-    storage
-        .update(|instances, _groups| {
-            instances.push(seed);
-            Ok(())
-        })
+    {
+        let temp = TempDir::new().unwrap();
+        let _guard = setup_test_home(&temp);
+        let _storage = Storage::new_unwatched("test").unwrap();
+        let mut view = HomeView::new_for_test(
+            Some("test".to_string()),
+            AvailableTools::with_tools(&["claude"]),
+            crate::file_watch::FileWatchService::noop(),
+        )
         .unwrap();
-    let mut view = HomeView::new_for_test(
-        Some("test".to_string()),
-        AvailableTools::with_tools(&["claude"]),
-        crate::file_watch::FileWatchService::noop(),
-    )
-    .unwrap();
-    view.reconcile_poller =
-        crate::tui::reconcile_poller::ReconcilePoller::with_result_for_test(true);
+        // No request is queued: only the gate deadline can release recovery.
+        view.reconcile_poller = crate::tui::reconcile_poller::ReconcilePoller::new();
+        view.startup_recovery_gate = Some(std::time::Instant::now());
 
-    let groups = crate::session::get_app_dir()
-        .unwrap()
-        .join("profiles")
-        .join("test")
-        .join("groups.json");
-    std::fs::remove_file(&groups).ok();
-    std::fs::create_dir(&groups).unwrap();
+        assert!(!view.apply_reconcile_results());
+        assert!(
+            view.startup_recovery_gate.is_some(),
+            "an un-landed sweep inside the deadline must still hold the gate"
+        );
 
-    assert!(!view.apply_reconcile_results(), "the first attempt fails");
-    let armed = view
-        .reconcile_reload_retry_at
-        .expect("a failed reload must arm the backoff");
+        view.startup_recovery_gate =
+            Some(std::time::Instant::now() - HomeView::STARTUP_RECOVERY_GATE_TIMEOUT);
+        assert!(!view.apply_reconcile_results());
+        assert!(
+            view.startup_recovery_gate.is_none(),
+            "past the deadline recovery must start without the sweep"
+        );
+    }
+    // A long paste must not strand recovery either.
+    {
+        use crate::tui::home::live_send::{LiveSendState, LiveSendTarget};
 
-    // Storage is readable again, but the backoff has not elapsed, so the next
-    // tick must not touch it.
-    std::fs::remove_dir(&groups).unwrap();
-    std::fs::write(&groups, "[]").unwrap();
-    assert!(!view.apply_reconcile_results(), "still inside the backoff");
-    assert_eq!(
-        view.reconcile_reload_retry_at,
-        Some(armed),
-        "a skipped attempt must not re-arm the backoff"
-    );
-    assert!(view.pending_reconcile_reload, "the repair is still pending");
-
-    // Once it elapses the retry lands.
-    view.reconcile_reload_retry_at = Some(std::time::Instant::now());
-    assert!(view.apply_reconcile_results(), "the retry must land");
-    assert!(view.reconcile_reload_retry_at.is_none());
-    assert!(!view.pending_reconcile_reload);
-}
-
-/// The deadline is also checked while live-send holds the reload, since starting
-/// recovery spawns workers rather than touching the terminal.
-#[test]
-#[serial]
-fn startup_recovery_gate_expires_during_live_send() {
-    use crate::tui::home::live_send::{LiveSendState, LiveSendTarget};
-
-    let temp = TempDir::new().unwrap();
-    let _guard = setup_test_home(&temp);
-    let _storage = Storage::new_unwatched("test").unwrap();
-    let mut view = HomeView::new_for_test(
-        Some("test".to_string()),
-        AvailableTools::with_tools(&["claude"]),
-        crate::file_watch::FileWatchService::noop(),
-    )
-    .unwrap();
-    view.live_send = Some(LiveSendState {
-        session_id: "s".to_string(),
-        title: "s".to_string(),
-        tmux_name: "aoe_test_live".to_string(),
-        target: LiveSendTarget::Agent,
-        exit_chords: Vec::new(),
-        leader: None,
-    });
-    view.startup_recovery_gate =
-        Some(std::time::Instant::now() - HomeView::STARTUP_RECOVERY_GATE_TIMEOUT);
-
-    assert!(!view.apply_reconcile_results());
-    assert!(
-        view.startup_recovery_gate.is_none(),
-        "a long paste must not strand recovery either"
-    );
-}
-
-/// a repair queued in the channel must be applied to `instances`
-/// before the gate opens, deadline or not. Releasing first let startup recovery
-/// clone a `project_path` the sweep had already fixed on disk and spend that
-/// row's one boot-scoped attempt on it, which is what the gate exists to stop.
-#[test]
-#[serial]
-fn a_queued_repair_is_applied_before_the_gate_opens_at_the_deadline() {
-    let temp = TempDir::new().unwrap();
-    let _guard = setup_test_home(&temp);
-    let storage = Storage::new_unwatched("test").unwrap();
-    let mut seed = Instance::new("row", "/tmp/stale-path");
-    seed.source_profile = "test".to_string();
-    let id = seed.id.clone();
-    storage
-        .update(|instances, _groups| {
-            instances.push(seed);
-            Ok(())
-        })
+        let temp = TempDir::new().unwrap();
+        let _guard = setup_test_home(&temp);
+        let _storage = Storage::new_unwatched("test").unwrap();
+        let mut view = HomeView::new_for_test(
+            Some("test".to_string()),
+            AvailableTools::with_tools(&["claude"]),
+            crate::file_watch::FileWatchService::noop(),
+        )
         .unwrap();
+        view.live_send = Some(LiveSendState {
+            session_id: "s".to_string(),
+            title: "s".to_string(),
+            tmux_name: "aoe_test_live".to_string(),
+            target: LiveSendTarget::Agent,
+            exit_chords: Vec::new(),
+            leader: None,
+        });
+        view.startup_recovery_gate =
+            Some(std::time::Instant::now() - HomeView::STARTUP_RECOVERY_GATE_TIMEOUT);
 
-    let mut view = HomeView::new_for_test(
-        Some("test".to_string()),
-        AvailableTools::with_tools(&["claude"]),
-        crate::file_watch::FileWatchService::noop(),
-    )
-    .unwrap();
-    assert_eq!(
-        view.get_instance(&id).unwrap().project_path,
-        "/tmp/stale-path"
-    );
-
-    // The sweep repaired durable storage and reported the change.
-    storage
-        .update(|instances, _groups| {
-            instances[0].project_path = "/tmp/repaired-path".to_string();
-            Ok(())
-        })
-        .unwrap();
-    view.reconcile_poller =
-        crate::tui::reconcile_poller::ReconcilePoller::with_result_for_test(true);
-    view.startup_recovery_gate =
-        Some(std::time::Instant::now() - HomeView::STARTUP_RECOVERY_GATE_TIMEOUT);
-
-    assert!(
-        view.apply_reconcile_results(),
-        "the queued repair must reload"
-    );
-    assert_eq!(
-        view.get_instance(&id).unwrap().project_path,
-        "/tmp/repaired-path",
-        "recovery must not be released against the stale in-memory path"
-    );
-    assert!(view.startup_recovery_gate.is_none());
+        assert!(!view.apply_reconcile_results());
+        assert!(
+            view.startup_recovery_gate.is_none(),
+            "a long paste must not strand recovery either"
+        );
+    }
 }
 
 /// The live-send case of the same rule: the reload is postponed, so the result
@@ -3514,73 +3185,126 @@ fn a_queued_repair_keeps_the_gate_armed_while_live_send_holds_the_reload() {
 #[test]
 #[serial]
 fn a_failed_reload_keeps_the_repair_pending_and_the_gate_shut() {
-    let temp = TempDir::new().unwrap();
-    let _guard = setup_test_home(&temp);
-    let storage = Storage::new_unwatched("test").unwrap();
-    let mut seed = Instance::new("row", "/tmp/stale-path");
-    seed.source_profile = "test".to_string();
-    let id = seed.id.clone();
-    storage
-        .update(|instances, _groups| {
-            instances.push(seed);
-            Ok(())
-        })
+    {
+        let temp = TempDir::new().unwrap();
+        let _guard = setup_test_home(&temp);
+        let storage = Storage::new_unwatched("test").unwrap();
+        let mut seed = Instance::new("row", "/tmp/stale-path");
+        seed.source_profile = "test".to_string();
+        let id = seed.id.clone();
+        storage
+            .update(|instances, _groups| {
+                instances.push(seed);
+                Ok(())
+            })
+            .unwrap();
+
+        let mut view = HomeView::new_for_test(
+            Some("test".to_string()),
+            AvailableTools::with_tools(&["claude"]),
+            crate::file_watch::FileWatchService::noop(),
+        )
         .unwrap();
+        storage
+            .update(|instances, _groups| {
+                instances[0].project_path = "/tmp/repaired-path".to_string();
+                Ok(())
+            })
+            .unwrap();
+        view.reconcile_poller =
+            crate::tui::reconcile_poller::ReconcilePoller::with_result_for_test(true);
 
-    let mut view = HomeView::new_for_test(
-        Some("test".to_string()),
-        AvailableTools::with_tools(&["claude"]),
-        crate::file_watch::FileWatchService::noop(),
-    )
-    .unwrap();
-    storage
-        .update(|instances, _groups| {
-            instances[0].project_path = "/tmp/repaired-path".to_string();
-            Ok(())
-        })
+        view.startup_recovery_gate = Some(std::time::Instant::now());
+
+        // A groups.json that is a directory makes `load_with_groups` fail.
+        let groups = crate::session::get_app_dir()
+            .unwrap()
+            .join("profiles")
+            .join("test")
+            .join("groups.json");
+        std::fs::remove_file(&groups).ok();
+        std::fs::create_dir(&groups).unwrap();
+
+        assert!(
+            !view.apply_reconcile_results(),
+            "the reload failed, so no refresh"
+        );
+        assert!(
+            view.startup_recovery_gate.is_some(),
+            "a dropped repair must not open the gate onto stale rows"
+        );
+        assert_eq!(
+            view.get_instance(&id).unwrap().project_path,
+            "/tmp/stale-path",
+            "the in-memory row is still the stale one"
+        );
+
+        // The repair is retried, not lost, once storage is readable. Let the backoff elapse
+        // as a later tick would; the next block covers the throttle.
+        std::fs::remove_dir(&groups).unwrap();
+        std::fs::write(&groups, "[]").unwrap();
+        view.reconcile_reload_retry_at = Some(std::time::Instant::now());
+        assert!(
+            view.apply_reconcile_results(),
+            "the retry must land the repair"
+        );
+        assert_eq!(
+            view.get_instance(&id).unwrap().project_path,
+            "/tmp/repaired-path"
+        );
+        assert!(view.startup_recovery_gate.is_none());
+    }
+    // The retry is throttled.
+    {
+        let temp = TempDir::new().unwrap();
+        let _guard = setup_test_home(&temp);
+        let storage = Storage::new_unwatched("test").unwrap();
+        let mut seed = Instance::new("row", "/tmp/stale-path");
+        seed.source_profile = "test".to_string();
+        storage
+            .update(|instances, _groups| {
+                instances.push(seed);
+                Ok(())
+            })
+            .unwrap();
+        let mut view = HomeView::new_for_test(
+            Some("test".to_string()),
+            AvailableTools::with_tools(&["claude"]),
+            crate::file_watch::FileWatchService::noop(),
+        )
         .unwrap();
-    view.reconcile_poller =
-        crate::tui::reconcile_poller::ReconcilePoller::with_result_for_test(true);
+        view.reconcile_poller =
+            crate::tui::reconcile_poller::ReconcilePoller::with_result_for_test(true);
 
-    view.startup_recovery_gate = Some(std::time::Instant::now());
+        let groups = crate::session::get_app_dir()
+            .unwrap()
+            .join("profiles")
+            .join("test")
+            .join("groups.json");
+        std::fs::remove_file(&groups).ok();
+        std::fs::create_dir(&groups).unwrap();
 
-    // A groups.json that is a directory makes `load_with_groups` fail.
-    let groups = crate::session::get_app_dir()
-        .unwrap()
-        .join("profiles")
-        .join("test")
-        .join("groups.json");
-    std::fs::remove_file(&groups).ok();
-    std::fs::create_dir(&groups).unwrap();
+        assert!(!view.apply_reconcile_results(), "the first attempt fails");
+        let armed = view
+            .reconcile_reload_retry_at
+            .expect("a failed reload must arm the backoff");
 
-    assert!(
-        !view.apply_reconcile_results(),
-        "the reload failed, so no refresh"
-    );
-    assert!(
-        view.startup_recovery_gate.is_some(),
-        "a dropped repair must not open the gate onto stale rows"
-    );
-    assert_eq!(
-        view.get_instance(&id).unwrap().project_path,
-        "/tmp/stale-path",
-        "the in-memory row is still the stale one"
-    );
+        // Storage is readable again, but the backoff has not elapsed, so the next
+        // tick must not touch it.
+        std::fs::remove_dir(&groups).unwrap();
+        std::fs::write(&groups, "[]").unwrap();
+        assert!(!view.apply_reconcile_results(), "still inside the backoff");
+        assert_eq!(
+            view.reconcile_reload_retry_at,
+            Some(armed),
+            "a skipped attempt must not re-arm the backoff"
+        );
+        assert!(view.pending_reconcile_reload, "the repair is still pending");
 
-    // The repair is retried, not lost, once storage is readable again. The
-    // retry is throttled, so let the backoff elapse as a later tick would;
-    // `a_failed_reload_backs_off_instead_of_retrying_every_tick` covers the
-    // throttle itself.
-    std::fs::remove_dir(&groups).unwrap();
-    std::fs::write(&groups, "[]").unwrap();
-    view.reconcile_reload_retry_at = Some(std::time::Instant::now());
-    assert!(
-        view.apply_reconcile_results(),
-        "the retry must land the repair"
-    );
-    assert_eq!(
-        view.get_instance(&id).unwrap().project_path,
-        "/tmp/repaired-path"
-    );
-    assert!(view.startup_recovery_gate.is_none());
+        // Once it elapses the retry lands.
+        view.reconcile_reload_retry_at = Some(std::time::Instant::now());
+        assert!(view.apply_reconcile_results(), "the retry must land");
+        assert!(view.reconcile_reload_retry_at.is_none());
+        assert!(!view.pending_reconcile_reload);
+    }
 }

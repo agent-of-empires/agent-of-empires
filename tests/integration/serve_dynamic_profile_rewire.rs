@@ -1,7 +1,7 @@
 //! Dynamic per-profile disk-watch rewire. Two layers of coverage:
 //!
-//! * Lower layer (`dynamic_profile_rewire_inserts_and_removes_entries`):
-//!   drives `add_profile_disk_watch` / `remove_profile_disk_watch` / `rename_profile_disk_watch` directly against an in-process
+//! * Lower layer (the overwrite and rename tests below):
+//!   drives `add_profile_disk_watch` / `rename_profile_disk_watch` directly against an in-process
 //!   `AppState`, asserting `disk_watch_handles` insert/remove under the
 //!   canonical drop-then-abort order. Observable only at this layer
 //!   because the handles map is daemon-internal state that the HTTP
@@ -19,60 +19,13 @@ use std::time::Duration;
 
 use agent_of_empires::server::test_support::{
     add_profile_disk_watch, build_test_app_state_configured, disk_watch_handle_count,
-    has_disk_watch_handle, remove_profile_disk_watch, rename_profile_disk_watch,
+    has_disk_watch_handle, rename_profile_disk_watch,
 };
 use serial_test::serial;
 use tempfile::TempDir;
 
 use crate::common::set_temp_home;
 use crate::common::{pick_free_port, wait_for_port};
-
-#[tokio::test]
-#[serial]
-async fn dynamic_profile_rewire_inserts_and_removes_entries() {
-    let temp = tempfile::tempdir().unwrap();
-    let _home = set_temp_home(temp.path());
-    let _ = agent_of_empires::session::get_profile_dir("rewire-profile").expect("profile dir");
-
-    let live = agent_of_empires::file_watch::test_support::new_filewatch().expect("live svc");
-    let state = build_test_app_state_configured(Vec::new(), |state| {
-        agent_of_empires::server::test_support::replace_file_watch(state, live);
-    });
-
-    add_profile_disk_watch(&state, "rewire-profile").await;
-    {
-        assert!(
-            has_disk_watch_handle(&state, "rewire-profile").await,
-            "add must insert the per-profile entry"
-        );
-    }
-
-    remove_profile_disk_watch(&state, "rewire-profile").await;
-    {
-        assert!(
-            !has_disk_watch_handle(&state, "rewire-profile").await,
-            "remove must drop the per-profile entry"
-        );
-    }
-
-    add_profile_disk_watch(&state, "rewire-profile").await;
-    {
-        assert!(
-            has_disk_watch_handle(&state, "rewire-profile").await,
-            "re-add after remove must converge back to one live entry"
-        );
-        assert_eq!(
-            disk_watch_handle_count(&state).await,
-            1,
-            "re-add must not duplicate entries"
-        );
-    }
-    assert_eq!(
-        agent_of_empires::server::test_support::file_watch(&state).subscriber_count(),
-        1,
-        "re-add after remove must leave exactly one live subscription"
-    );
-}
 
 #[tokio::test]
 #[serial]

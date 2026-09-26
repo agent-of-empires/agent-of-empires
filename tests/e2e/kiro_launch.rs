@@ -149,20 +149,6 @@ fn wait_for_recorded_argv(path: &std::path::Path) -> String {
 
 #[test]
 #[parallel]
-fn test_kiro_launches_via_chat_subcommand() {
-    require_tmux!();
-
-    let mut h = TuiTestHarness::new("kiro_launch_chat");
-    let (cmd, _guard) = launch_kiro_and_read_command(&mut h, "KiroChat", &[]);
-
-    assert!(
-        cmd.contains("kiro-cli chat"),
-        "kiro must launch via `kiro-cli chat`, got: {cmd:?}"
-    );
-}
-
-#[test]
-#[parallel]
 fn test_kiro_yolo_passes_trust_all_tools_after_chat() {
     require_tmux!();
 

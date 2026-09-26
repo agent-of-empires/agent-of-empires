@@ -38,6 +38,9 @@ export const HOST_STATE_VARS = new Set([
   // Browser origin used to resolve plugin-relative links. A host value would
   // point the private daemon's own navigation at a host dashboard.
   "AOE_DASHBOARD_URL",
+  // A host passphrase would let discovery log in against a host daemon's
+  // session store instead of the private one the harness spawned.
+  "AOE_DAEMON_PASSPHRASE",
   // Private fixture files and subprocess controls cannot come from the host.
   "AOE_E2E_INPUT_BARRIER",
   "AOE_E2E_PARTIAL_FRAME_FILE",

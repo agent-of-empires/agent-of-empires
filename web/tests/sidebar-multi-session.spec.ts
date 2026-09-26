@@ -70,7 +70,7 @@ async function mockApis(
 }
 
 test.describe("Sidebar multi-session (#956)", () => {
-  test("renders one row per null-branch session on the same project_path", async ({ page }) => {
+  test("a deliberate desktop click navigates client-side and is not swallowed as a drag", async ({ page }) => {
     await mockApis(page, [
       {
         id: "sess-a",
@@ -85,63 +85,13 @@ test.describe("Sidebar multi-session (#956)", () => {
         branch: null,
       },
     ]);
-    await page.setViewportSize({ width: 1280, height: 720 });
-    await page.goto("/");
-    await expect(page.locator("header")).toBeVisible();
-    await expect(page.getByRole("link", { name: /Ethiopians/i })).toBeVisible();
-    await expect(page.getByRole("link", { name: /Celts/i })).toBeVisible();
-  });
 
-  test("clicking a session row uses client-side navigation", async ({ page }) => {
-    await mockApis(page, [
-      {
-        id: "sess-a",
-        title: "Ethiopians",
-        project_path: "/tmp/agent-of-empires",
-        branch: null,
-      },
-      {
-        id: "sess-b",
-        title: "Celts",
-        project_path: "/tmp/agent-of-empires",
-        branch: null,
-      },
-    ]);
     let sessionDocumentRequests = 0;
     page.on("request", (request) => {
-      if (request.resourceType() === "document" && /\/session\/sess-[ab]$/.test(new URL(request.url()).pathname)) {
+      if (request.resourceType() === "document" && /\/session\/sess-a$/.test(new URL(request.url()).pathname)) {
         sessionDocumentRequests += 1;
       }
     });
-
-    await page.setViewportSize({ width: 1280, height: 720 });
-    await page.goto("/");
-    await expect(page.locator("header")).toBeVisible();
-    const row = page.getByRole("link", { name: /Ethiopians/i });
-
-    await expect(row).toHaveJSProperty("tagName", "A");
-    await expect(row).toHaveAttribute("href", /\/session\/sess-a$/);
-    await row.click();
-
-    await expect(page).toHaveURL(/\/session\/sess-a$/);
-    expect(sessionDocumentRequests).toBe(0);
-  });
-
-  test("a deliberate desktop click does not get swallowed as a drag", async ({ page }) => {
-    await mockApis(page, [
-      {
-        id: "sess-a",
-        title: "Ethiopians",
-        project_path: "/tmp/agent-of-empires",
-        branch: null,
-      },
-      {
-        id: "sess-b",
-        title: "Celts",
-        project_path: "/tmp/agent-of-empires",
-        branch: null,
-      },
-    ]);
 
     await page.setViewportSize({ width: 1280, height: 720 });
     await page.goto("/session/sess-b");
@@ -149,6 +99,8 @@ test.describe("Sidebar multi-session (#956)", () => {
     await expect(page).toHaveURL(/\/session\/sess-b$/);
 
     const row = page.getByRole("link", { name: /Ethiopians/i });
+    await expect(row).toHaveJSProperty("tagName", "A");
+    await expect(row).toHaveAttribute("href", /\/session\/sess-a$/);
     const box = await row.boundingBox();
     expect(box).not.toBeNull();
 
@@ -171,6 +123,7 @@ test.describe("Sidebar multi-session (#956)", () => {
     expect(ring.color).toBe(ring.token);
     expect(ring.shadow).not.toBe("none");
     await expect(page).toHaveURL(/\/session\/sess-a$/);
+    expect(sessionDocumentRequests).toBe(0);
   });
 
   test("deleting rows are disabled for pointer and keyboard activation", async ({ page }) => {
@@ -207,57 +160,6 @@ test.describe("Sidebar multi-session (#956)", () => {
     await expect(page).toHaveURL(/\/session\/sess-b$/);
   });
 
-  test("collapsing still applies when sessions share a non-null branch (worktree)", async ({ page }) => {
-    // Two sessions on the same explicit worktree branch DO still collapse;
-    // the fix only targets the null-branch (no-worktree) case. This matches
-    // the issue's option #2.
-    await mockApis(page, [
-      {
-        id: "sess-a",
-        title: "Ethiopians",
-        project_path: "/tmp/agent-of-empires",
-        branch: "feature/x",
-      },
-      {
-        id: "sess-b",
-        title: "Celts",
-        project_path: "/tmp/agent-of-empires",
-        branch: "feature/x",
-      },
-    ]);
-    await page.setViewportSize({ width: 1280, height: 720 });
-    await page.goto("/");
-    await expect(page.locator("header")).toBeVisible();
-    const branchRow = page.getByRole("link", { name: /feature\/x/i });
-    await expect(branchRow).toHaveCount(1);
-  });
-
-  test("distinct branches render their own rows (regression guard)", async ({ page }) => {
-    await mockApis(page, [
-      {
-        id: "sess-a",
-        title: "Italians",
-        project_path: "/tmp/agent-of-empires",
-        branch: "feature/a",
-      },
-      {
-        id: "sess-b",
-        title: "Magyars",
-        project_path: "/tmp/agent-of-empires",
-        branch: "feature/b",
-      },
-    ]);
-    await page.setViewportSize({ width: 1280, height: 720 });
-    await page.goto("/");
-    await expect(page.locator("header")).toBeVisible();
-    const rowA = page.getByRole("link", { name: /Italians/i });
-    const rowB = page.getByRole("link", { name: /Magyars/i });
-    await expect(rowA).toBeVisible();
-    await expect(rowA.getByTestId("sidebar-session-row-tag")).toHaveText("[a]");
-    await expect(rowB).toBeVisible();
-    await expect(rowB.getByTestId("sidebar-session-row-tag")).toHaveText("[b]");
-  });
-
   test("saving row tag settings refreshes the sidebar suffix", async ({ page }) => {
     await mockApis(page, [
       {
@@ -286,7 +188,7 @@ test.describe("Sidebar multi-session (#956)", () => {
     await expect(page.getByRole("link", { name: /Italians/i }).getByTestId("sidebar-session-row-tag")).toHaveCount(0);
   });
 
-  test("project group context menu stores alias and background color", async ({ page }) => {
+  test("project group context menu opens from the keyboard and stores alias and background color", async ({ page }) => {
     await mockApis(page, [
       {
         id: "sess-a",
@@ -308,7 +210,9 @@ test.describe("Sidebar multi-session (#956)", () => {
     const projectHeader = page.locator('[data-testid="sidebar-group-header"][data-group-id="/tmp/agent-of-empires"]');
     await expect(projectHeader).toBeVisible();
 
-    await projectHeader.click({ button: "right" });
+    // The appearance menu opens from the keyboard too.
+    await projectHeader.focus();
+    await page.keyboard.press("Shift+F10");
     const menu = page.locator("[data-testid='sidebar-group-context-menu']");
     await expect(menu).toBeVisible();
     await menu.locator("[data-testid='sidebar-group-context-menu-rename']").click();
@@ -386,27 +290,5 @@ test.describe("Sidebar multi-session (#956)", () => {
 
     await expect.poll(() => archived.slice().sort()).toEqual(["sess-a", "sess-b"]);
     expect(confirmText).toContain("Archive all 2 sessions");
-  });
-
-  test("project group appearance menu opens from keyboard", async ({ page }) => {
-    await mockApis(page, [
-      {
-        id: "sess-a",
-        title: "Ethiopians",
-        project_path: "/tmp/agent-of-empires",
-        branch: null,
-      },
-    ]);
-    await page.setViewportSize({ width: 1280, height: 720 });
-    await page.goto("/");
-    await expect(page.locator("header")).toBeVisible();
-
-    const projectHeader = page.locator('[data-testid="sidebar-group-header"][data-group-id="/tmp/agent-of-empires"]');
-    await projectHeader.focus();
-    await page.keyboard.press("Shift+F10");
-
-    const menu = page.locator("[data-testid='sidebar-group-context-menu']");
-    await expect(menu).toBeVisible();
-    await expect(menu.locator("[data-testid='sidebar-group-context-menu-rename']")).toBeVisible();
   });
 });

@@ -1313,82 +1313,49 @@ mod tests {
         inst
     }
 
-    /// A scratch session's cwd is a throwaway directory under the app dir, so
-    /// there is no repo for an attached one to sit beside and deletion drops the
-    /// whole tree. Refused at the shared choke point rather than per surface, so
-    /// the CLI and the REST endpoint cannot reach it behind the pickers' backs.
-    /// The path here is not a repo either: the assertion is that the scratch
-    /// refusal wins, so the user is told the real reason.
-    #[test]
-    fn plan_refuses_a_scratch_session() {
-        let mut inst = Instance::new("Scratchpad", "/tmp/scratch/abc");
-        inst.scratch = true;
-        let Err(err) = plan(
-            &inst,
-            "default",
-            Path::new("/tmp/definitely-not-a-repo"),
-            ExistingBranch::Refuse,
-        ) else {
-            panic!("a scratch session has no repo to attach to");
-        };
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("scratch session"),
-            "the scratch refusal must win over the not-a-git-repo error: {msg}"
-        );
-    }
-
     /// The lifecycle refusals live at the shared choke point, so the CLI and the
     /// REST endpoint cannot attach into a window the pickers already refuse.
     /// `Deleting` is the one with teeth: the deletion pass has already read the
     /// repo list, so a worktree created here is orphaned with its record about
-    /// to be dropped. The path is not a repo either, which is the point:
-    /// each lifecycle refusal has to win over the not-a-git-repo error so the user
-    /// is told the real reason.
+    /// to be dropped. The path is not a repo either, which is the point: each
+    /// refusal has to win over the not-a-git-repo error so the user is told the
+    /// real reason. A scratch session is refused for the same reason it has no
+    /// repo to sit beside: its cwd is a throwaway directory under the app dir
+    /// that deletion drops whole.
     #[test]
+
     fn plan_refuses_states_that_are_never_attachable() {
-        let attempt = |inst: &Instance| {
+        use super::super::Status;
+        type Setup = fn(&mut Instance);
+        // Each refusal must win over the not-a-git-repo error; a Running session reaches it.
+        let cases: [(Setup, &str); 6] = [
+            (|i| i.scratch = true, "scratch session"),
+            (
+                |i| i.status = Status::Creating,
+                "being created or is being deleted",
+            ),
+            (
+                |i| i.status = Status::Deleting,
+                "being created or is being deleted",
+            ),
+            (|i| i.trashed_at = Some(Utc::now()), "in the trash"),
+            (|i| i.archived_at = Some(Utc::now()), "archived"),
+            (|i| i.status = Status::Running, "not a git repository"),
+        ];
+        for (setup, want) in cases {
+            let mut inst = Instance::new("Attach", "/tmp/attach");
+            setup(&mut inst);
             let Err(err) = plan(
-                inst,
+                &inst,
                 "default",
                 Path::new("/tmp/definitely-not-a-repo"),
                 ExistingBranch::Refuse,
             ) else {
-                panic!("this lifecycle state must be refused");
+                panic!("{want}: must be refused");
             };
-            format!("{err:#}")
-        };
-
-        for status in [
-            super::super::Status::Creating,
-            super::super::Status::Deleting,
-        ] {
-            let mut inst = Instance::new("Busy", "/tmp/busy");
-            inst.status = status;
-            let msg = attempt(&inst);
-            assert!(
-                msg.contains("being created or is being deleted"),
-                "{status:?} must be refused with its own reason: {msg}"
-            );
+            let msg = format!("{err:#}");
+            assert!(msg.contains(want), "{want}: {msg}");
         }
-
-        let mut trashed = Instance::new("Trashed", "/tmp/trashed");
-        trashed.trashed_at = Some(Utc::now());
-        assert!(attempt(&trashed).contains("in the trash"));
-
-        let mut archived = Instance::new("Archived", "/tmp/archived");
-        archived.archived_at = Some(Utc::now());
-        assert!(attempt(&archived).contains("archived"));
-
-        // `Running` is deliberately allowed through: the daemon decides it on the
-        // in-flight-turn probe, so gating it here would make that check coarser.
-        // It falls through to the not-a-git-repo error instead.
-        let mut running = Instance::new("Running", "/tmp/running");
-        running.status = super::super::Status::Running;
-        assert!(
-            attempt(&running).contains("not a git repository"),
-            "a Running session must reach the repo checks, not a lifecycle refusal"
-        );
     }
 
     /// The `is_sandboxed` short-circuit is load-bearing, not a micro-optimisation:
@@ -1797,51 +1764,50 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_by_main_repo_path_is_rejected() {
-        let inst = workspace_instance();
-        let err = reject_duplicate(&inst, Path::new("/tmp/src/backend"), "backend-alias")
-            .expect_err("the same repo must not attach twice");
-        assert!(
-            err.to_string().contains("already attached"),
-            "unexpected error: {err}"
-        );
-    }
-
-    /// A different repo that happens to share a directory leaf would land on
-    /// the same worktree path and render identically in repo-relative output.
-    #[test]
-    fn duplicate_by_leaf_name_is_rejected_case_insensitively() {
-        let inst = workspace_instance();
-        let err = reject_duplicate(&inst, Path::new("/other/src/BackEnd"), "BackEnd")
-            .expect_err("a colliding directory leaf must not attach");
-        assert!(
-            err.to_string().contains("collide on disk"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn attaching_the_sessions_own_repo_is_rejected() {
-        let mut inst = Instance::new("WT", "/tmp/worktrees/feature");
-        inst.worktree_info = Some(WorktreeInfo {
+    fn reject_duplicate_cases() {
+        let workspace = workspace_instance();
+        let mut own = Instance::new("WT", "/tmp/worktrees/feature");
+        own.worktree_info = Some(WorktreeInfo {
             branch: "feature/abc".to_string(),
             main_repo_path: "/tmp/src/backend".to_string(),
             managed_by_aoe: true,
             created_at: Utc::now(),
             base_branch: None,
         });
-        let err = reject_duplicate(&inst, Path::new("/tmp/src/backend"), "backend")
-            .expect_err("the session's own repo must not attach to itself");
-        assert!(
-            err.to_string().contains("already this session's own repo"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn a_genuinely_new_repo_is_accepted() {
-        let inst = workspace_instance();
-        reject_duplicate(&inst, Path::new("/tmp/src/frontend"), "frontend").unwrap();
+        // (session, repo, leaf, expected error fragment; None = accepted)
+        let cases = [
+            (
+                &workspace,
+                "/tmp/src/backend",
+                "backend-alias",
+                Some("already attached"),
+            ),
+            (
+                &workspace,
+                "/other/src/BackEnd",
+                "BackEnd",
+                Some("collide on disk"),
+            ),
+            (
+                &own,
+                "/tmp/src/backend",
+                "backend",
+                Some("already this session's own repo"),
+            ),
+            (&workspace, "/tmp/src/frontend", "frontend", None),
+        ];
+        for (inst, repo, leaf, want) in cases {
+            let got = reject_duplicate(inst, Path::new(repo), leaf)
+                .err()
+                .map(|e| e.to_string());
+            match want {
+                Some(want) => assert!(
+                    got.as_deref().is_some_and(|e| e.contains(want)),
+                    "{repo} {leaf}: {got:?}"
+                ),
+                None => assert_eq!(got, None, "{repo} {leaf}"),
+            }
+        }
     }
 
     /// A plain in-place session gets a branch derived from its title, never the

@@ -376,6 +376,13 @@ async fn paste_image_against_plain_session_is_blocked() {
 /// request and the route's own CityHall guard is what refuses it. A plain GET
 /// would be rejected by the extractor before any handler code ran, proving
 /// nothing about the boundary.
+///
+/// The upgrade state is what hyper attaches when it serves a real connection;
+/// `oneshot` bypasses that, so it is attached here. Without it the extractor
+/// answers `426 Upgrade Required` ("no upgrade state was present") and no
+/// handler code runs at all, which would make the two tests below decide
+/// something other than the boundary they claim to test. The installed task is
+/// never driven: these tests assert the handshake response, not the stream.
 fn ws_upgrade_request(uri: &str) -> Request<Body> {
     let mut req = Request::builder()
         .method(Method::GET)
@@ -387,6 +394,8 @@ fn ws_upgrade_request(uri: &str) -> Request<Body> {
         .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
         .body(Body::empty())
         .unwrap();
+    let on_upgrade = hyper::upgrade::on(&mut req);
+    req.extensions_mut().insert(on_upgrade);
     req.extensions_mut().insert(ConnectInfo(loopback()));
     req
 }

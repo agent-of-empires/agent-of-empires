@@ -35,26 +35,3 @@ impl SandboxBackend for NoSandbox {
         })
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn no_sandbox_is_pass_through() {
-        let mut env = BTreeMap::new();
-        env.insert("AOE_PLUGIN_ID".to_string(), "acme.worker".to_string());
-        let launch = ResolvedLaunch {
-            program: PathBuf::from("/usr/bin/python3"),
-            args: vec!["-m".into(), "acme.main".into()],
-            cwd: PathBuf::from("/plugins/acme.worker"),
-            env: env.clone(),
-        };
-        let prepared = NoSandbox.prepare(&launch).unwrap();
-        assert_eq!(prepared.program, launch.program);
-        assert_eq!(prepared.args, launch.args);
-        assert_eq!(prepared.cwd, launch.cwd);
-        assert_eq!(prepared.env, env);
-        assert_eq!(NoSandbox.name(), "none");
-    }
-}

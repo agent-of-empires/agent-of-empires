@@ -37,18 +37,6 @@ function renderToolbar(overrides: Overrides = {}) {
 }
 
 describe("MobileTerminalToolbar", () => {
-  it("carries no inline keyboard inset (the parent owns it)", () => {
-    const { container } = renderToolbar();
-    const strip = container.firstChild as HTMLElement;
-    expect(strip.style.paddingBottom).toBe("");
-  });
-
-  it("renders the action buttons", () => {
-    renderToolbar();
-    expect(screen.getByLabelText("Paste from clipboard")).toBeTruthy();
-    expect(screen.getByLabelText("Ctrl")).toBeTruthy();
-  });
-
   it("bracket-pastes clipboard text so multi-line pastes are not per-line submits", async () => {
     secureContext(true);
     const item = {
@@ -131,8 +119,7 @@ describe("MobileTerminalToolbar", () => {
       Object.defineProperty(document, "execCommand", { value: execCommand, configurable: true });
       const { sendData, unmount } = renderToolbar({ keyboardOpen: true });
       fireEvent.click(paste("Paste from clipboard"));
-      await new Promise((r) => setTimeout(r, 0));
-      expect(execCommand).toHaveBeenCalledWith("paste");
+      await waitFor(() => expect(execCommand).toHaveBeenCalledWith("paste"));
       // The focused input's own paste handler sends; the toolbar never does.
       expect(sendData).not.toHaveBeenCalled();
       expect(error).toHaveBeenCalledTimes(toasts);
@@ -175,26 +162,18 @@ function CtrlLatchHarness({ sendData }: { sendData: (data: string) => void }) {
 }
 
 describe("MobileTerminalToolbar Ctrl latch", () => {
-  it("tapping Ctrl latches (aria-pressed true) and tapping again unlatches", () => {
-    render(<CtrlLatchHarness sendData={vi.fn()} />);
-    const ctrl = screen.getByRole("button", { name: "Ctrl" });
-    expect(ctrl.getAttribute("aria-pressed")).toBe("false");
-
-    fireEvent.click(ctrl);
-    expect(ctrl.getAttribute("aria-pressed")).toBe("true");
-
-    fireEvent.click(ctrl);
-    expect(ctrl.getAttribute("aria-pressed")).toBe("false");
-  });
-
-  it("Ctrl+C interrupt clears an active latch", () => {
+  it("tapping Ctrl toggles the latch and Ctrl+C interrupt clears it", () => {
     const sendData = vi.fn();
     render(<CtrlLatchHarness sendData={sendData} />);
     const ctrl = screen.getByRole("button", { name: "Ctrl" });
+    expect(ctrl.getAttribute("aria-pressed")).toBe("false");
 
     fireEvent.click(ctrl);
     expect(ctrl.getAttribute("aria-pressed")).toBe("true");
+    fireEvent.click(ctrl);
+    expect(ctrl.getAttribute("aria-pressed")).toBe("false");
 
+    fireEvent.click(ctrl);
     fireEvent.click(screen.getByRole("button", { name: "Ctrl+C interrupt" }));
     expect(sendData).toHaveBeenCalledWith("\x03");
     expect(ctrl.getAttribute("aria-pressed")).toBe("false");

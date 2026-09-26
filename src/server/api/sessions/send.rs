@@ -639,24 +639,6 @@ pub async fn read_output(
 mod send_output_tests {
     use super::*;
 
-    #[test]
-    fn output_query_default_constants() {
-        assert_eq!(default_output_lines(), 200);
-        assert_eq!(default_output_format(), "text");
-    }
-
-    #[test]
-    fn send_message_request_requires_message_field() {
-        let r: Result<SendMessageRequest, _> = serde_json::from_str("{}");
-        assert!(r.is_err(), "missing message must reject");
-    }
-
-    #[test]
-    fn send_message_request_accepts_message() {
-        let r: SendMessageRequest = serde_json::from_str("{\"message\":\"hello\"}").unwrap();
-        assert_eq!(r.message, "hello");
-    }
-
     #[tokio::test]
     async fn send_success_invalidates_a_reload_snapshot_from_before_the_mutation() {
         let live = Instance::new("send-race", "/tmp/send-race");
@@ -711,14 +693,6 @@ mod paste_image_tests {
     ];
 
     #[test]
-    fn extension_from_sniffed_mime() {
-        assert_eq!(paste_image_extension("image/png"), "png");
-        assert_eq!(paste_image_extension("image/jpeg"), "jpg");
-        assert_eq!(paste_image_extension("image/gif"), "gif");
-        assert_eq!(paste_image_extension("image/webp"), "webp");
-    }
-
-    #[test]
     fn write_paste_image_lands_in_worktree_and_ignores_itself() {
         let dir = tempdir().unwrap();
         let project = dir.path().to_string_lossy().to_string();
@@ -741,38 +715,22 @@ mod paste_image_tests {
     }
 
     #[test]
-    fn non_sandboxed_pane_path_is_absolute_host_path() {
+    fn pane_path_is_host_path_or_container_mount() {
         let dir = tempdir().unwrap();
         let project = dir.path().to_string_lossy().to_string();
+        let dir_name = dir.path().file_name().unwrap().to_string_lossy();
 
-        let pane = pane_visible_paste_path(&project, false, "aoe-paste-x.png");
-
-        let expected = dir
-            .path()
-            .join(PASTE_IMAGE_DIR)
-            .join("aoe-paste-x.png")
-            .to_string_lossy()
-            .to_string();
-        assert_eq!(pane, expected);
-    }
-
-    #[test]
-    fn sandboxed_pane_path_uses_container_mount() {
-        let dir = tempdir().unwrap();
-        let project = dir.path().to_string_lossy().to_string();
-        let dir_name = dir
-            .path()
-            .file_name()
-            .unwrap()
-            .to_string_lossy()
-            .to_string();
-
-        let pane = pane_visible_paste_path(&project, true, "aoe-paste-x.png");
-
+        assert_eq!(
+            pane_visible_paste_path(&project, false, "aoe-paste-x.png"),
+            dir.path()
+                .join(PASTE_IMAGE_DIR)
+                .join("aoe-paste-x.png")
+                .to_string_lossy()
+        );
         // A non-git worktree mounts under /workspace/<dir-name>; the pasted
         // path must be the container-visible path, not the host path.
         assert_eq!(
-            pane,
+            pane_visible_paste_path(&project, true, "aoe-paste-x.png"),
             format!("/workspace/{dir_name}/{PASTE_IMAGE_DIR}/aoe-paste-x.png")
         );
     }

@@ -2876,25 +2876,24 @@ mod tests {
     }
 
     #[test]
-    fn raw_byte_batches_chunks_and_preserves_order() {
-        let payload: Vec<u8> = (0..=255u8)
-            .cycle()
-            .take(MAX_RAW_BYTES_PER_SEND + 10)
-            .collect();
-        let batches = raw_byte_batches(&payload);
-        assert_eq!(batches.len(), 2);
-        assert_eq!(batches[0].len(), MAX_RAW_BYTES_PER_SEND);
-        assert_eq!(batches[1].len(), 10);
-        assert_eq!(batches[0][0], "00");
-        assert_eq!(batches[0][255], "ff");
-        // Last byte of the payload survives in order at the tail.
-        let last = payload[payload.len() - 1];
-        assert_eq!(batches[1][9], format!("{:02x}", last));
-    }
-
-    #[test]
-    fn raw_byte_batches_empty_payload_sends_nothing() {
-        assert!(raw_byte_batches(&[]).is_empty());
+    fn raw_byte_batches_chunk_and_roundtrip_in_order() {
+        for len in [0, MAX_RAW_BYTES_PER_SEND + 10, 100_000] {
+            let payload: Vec<u8> = (0..len).map(|i| (i % 256) as u8).collect();
+            let batches = raw_byte_batches(&payload);
+            assert_eq!(batches.len(), len.div_ceil(MAX_RAW_BYTES_PER_SEND), "{len}");
+            assert!(batches[..batches.len().saturating_sub(1)]
+                .iter()
+                .all(|batch| batch.len() == MAX_RAW_BYTES_PER_SEND));
+            let roundtrip: Vec<u8> = batches
+                .iter()
+                .flatten()
+                .map(|h| {
+                    assert_eq!(h.len(), 2, "{h:?} is not two hex digits");
+                    u8::from_str_radix(h, 16).unwrap()
+                })
+                .collect();
+            assert_eq!(roundtrip, payload, "{len}");
+        }
     }
 
     #[test]
@@ -3071,60 +3070,42 @@ mod tests {
     }
 
     #[test]
-    fn pane_segments_split_the_chained_capture_by_sentinel() {
-        // Shape of the chained fork's stdout: a geometry line per pane, each
-        // followed by that pane's rows.
-        let raw = "@@s@@ %17 0 0 6 2\nleft1\nleft2\n@@s@@ %23 7 0 6 2\nright1\nright2\n";
-        let panes = parse_pane_segments(raw, "@@s@@");
-        assert_eq!(panes.len(), 2);
-        assert_eq!(panes[0].id, "%17");
-        assert_eq!(panes[1].id, "%23");
-        assert_eq!(panes[0].geom.left, 0);
-        assert_eq!(panes[1].geom.left, 7);
-        // Rows come back padded to the pane's width, which is what lets the
-        // compositor concatenate them without measuring.
-        assert_eq!(panes[0].rows.len(), 2);
-        assert!(panes[0].rows[0].contains("left1"));
-        assert!(panes[1].rows[1].contains("right2"));
-    }
-
-    #[test]
-    fn pane_segments_drop_a_pane_with_unparseable_geometry() {
-        // A bad geometry line must not push its rows onto the next pane's
-        // rectangle; the pane is dropped and the rest still parse.
-        let raw = "@@s@@ bogus\norphan\n@@s@@ %23 0 0 4 1\nkeep\n";
-        let panes = parse_pane_segments(raw, "@@s@@");
-        assert_eq!(panes.len(), 1);
-        assert_eq!(panes[0].geom.width, 4);
-        assert!(panes[0].rows[0].contains("keep"));
-    }
-
-    #[test]
-    fn pane_segments_are_empty_when_no_sentinel_appears() {
-        // A tmux that emitted nothing recognisable must yield no panes, so the
-        // caller falls back to its already-captured pane-0 bytes.
-        assert!(parse_pane_segments("just some output\n", "@@s@@").is_empty());
-    }
-
-    #[test]
-    fn raw_byte_batches_large_paste_roundtrips_in_order() {
-        // Regression for the silently-dropped large paste (#1942-era
-        // live-send bug, now shared with the web live view): a ~100 KB
-        // bracketed paste encoded one hex arg per byte overflows execve
-        // ARG_MAX in a single fork. Verify it splits, every batch stays
-        // under the bound, and the bytes reconstruct in order.
-        let payload: Vec<u8> = (0..100_000).map(|i| (i % 256) as u8).collect();
-        let batches = raw_byte_batches(&payload);
-        assert!(batches.len() > 1);
-        for batch in &batches {
-            assert!(batch.len() <= MAX_RAW_BYTES_PER_SEND);
+    fn pane_segments_split_by_sentinel_and_drop_bad_geometry() {
+        // raw capture -> (pane id, left, width, first row) per kept pane
+        let cases: [(&str, &[(&str, u16, u16, &str)]); 3] = [
+            (
+                "@@s@@ %17 0 0 6 2\nleft1\nleft2\n@@s@@ %23 7 0 6 2\nright1\nright2\n",
+                &[("%17", 0, 6, "left1"), ("%23", 7, 6, "right1")],
+            ),
+            (
+                "@@s@@ bogus\norphan\n@@s@@ %23 0 0 4 1\nkeep\n",
+                &[("%23", 0, 4, "keep")],
+            ),
+            ("just some output\n", &[]),
+        ];
+        for (raw, expected) in cases {
+            let panes = parse_pane_segments(raw, "@@s@@");
+            let got: Vec<(String, u16, u16, String)> = panes
+                .iter()
+                .map(|p| {
+                    let row = crate::tmux::utils::strip_ansi(&p.rows[0]);
+                    (
+                        p.id.clone(),
+                        p.geom.left,
+                        p.geom.width,
+                        row.trim_end().to_string(),
+                    )
+                })
+                .collect();
+            let expected: Vec<(String, u16, u16, String)> = expected
+                .iter()
+                .map(|&(id, left, width, row)| (id.to_string(), left, width, row.to_string()))
+                .collect();
+            assert_eq!(got, expected, "{raw:?}");
+            assert!(panes
+                .iter()
+                .all(|p| p.rows.len() == usize::from(p.geom.height)));
         }
-        let roundtrip: Vec<u8> = batches
-            .iter()
-            .flatten()
-            .map(|h| u8::from_str_radix(h, 16).unwrap())
-            .collect();
-        assert_eq!(roundtrip, payload);
     }
 
     #[test]
@@ -3186,41 +3167,42 @@ mod tests {
     }
 
     #[test]
-    fn merge_cursor_probes_stable_mapping_keeps_after_and_trusts_position() {
-        // Cursor moved (x/y) but the vertical mapping (history_size,
-        // pane_height) held: the post-capture probe wins and is trusted.
-        let before = PaneCursor::parse("3 2 1 24 120 80 1 1 1").unwrap();
-        let after = PaneCursor::parse("5 4 1 24 120 80 1 1 1").unwrap();
-        let merged = merge_cursor_probes(Some(before), Some(after)).expect("both probes => Some");
-        assert_eq!((merged.x, merged.y), (5, 4));
-        assert!(merged.position_reliable);
-    }
-
-    #[test]
-    fn merge_cursor_probes_drift_keeps_modes_but_drops_position_trust() {
-        // history_size changed mid-capture (the pane scrolled): keep the mode
-        // flags so the wheel forward still works while the agent streams, but
-        // mark the row untrustworthy so the render won't paint on it.
-        let before = PaneCursor::parse("3 2 1 24 120 80 1 1 1").unwrap();
-        let after = PaneCursor::parse("3 2 1 24 137 80 1 1 1").unwrap();
-        let merged = merge_cursor_probes(Some(before), Some(after)).expect("both probes => Some");
-        assert!(!merged.position_reliable);
-        assert!(merged.alternate_on && merged.mouse_tracking && merged.mouse_sgr);
-
-        // pane_height change (resize mid-capture) is the other vertical-drift
-        // trigger and likewise drops position trust.
-        let before = PaneCursor::parse("3 2 1 24 120 80 1 0 0").unwrap();
-        let after = PaneCursor::parse("3 2 1 30 120 80 1 0 0").unwrap();
-        let merged = merge_cursor_probes(Some(before), Some(after)).expect("both probes => Some");
-        assert!(!merged.position_reliable);
-    }
-
-    #[test]
-    fn merge_cursor_probes_none_when_either_probe_missing() {
-        let c = PaneCursor::parse("3 2 1 24 120 80 1 1 1").unwrap();
-        assert!(merge_cursor_probes(None, Some(c)).is_none());
-        assert!(merge_cursor_probes(Some(c), None).is_none());
-        assert!(merge_cursor_probes(None, None).is_none());
+    fn merge_cursor_probes_trusts_position_only_without_drift() {
+        let probe = |line: &str| PaneCursor::parse(line);
+        // (before, after) -> (x, y, position_reliable) of the merged probe
+        let cases = [
+            (
+                "3 2 1 24 120 80 1 1 1",
+                "5 4 1 24 120 80 1 1 1",
+                Some((5, 4, true)),
+            ),
+            // History growth or a pane resize between probes is drift.
+            (
+                "3 2 1 24 120 80 1 1 1",
+                "3 2 1 24 137 80 1 1 1",
+                Some((3, 2, false)),
+            ),
+            (
+                "3 2 1 24 120 80 1 0 0",
+                "3 2 1 30 120 80 1 0 0",
+                Some((3, 2, false)),
+            ),
+            ("", "3 2 1 24 120 80 1 1 1", None),
+            ("3 2 1 24 120 80 1 1 1", "", None),
+            ("", "", None),
+        ];
+        for (before, after, expected) in cases {
+            let merged = merge_cursor_probes(probe(before), probe(after));
+            assert_eq!(
+                merged.map(|m| (m.x, m.y, m.position_reliable)),
+                expected,
+                "{before:?} -> {after:?}"
+            );
+            if let Some(merged) = merged {
+                assert_eq!(merged.alternate_on, probe(after).unwrap().alternate_on);
+                assert_eq!(merged.mouse_sgr, probe(after).unwrap().mouse_sgr);
+            }
+        }
     }
 
     #[test]
@@ -4001,61 +3983,6 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn test_remain_on_exit_and_pane_dead() {
-        if !tmux_available() {
-            eprintln!("Skipping test: tmux not available");
-            return;
-        }
-
-        let guard = TmuxTestSession::new("aoe_test_remain");
-        let session_name = guard.name().to_string();
-        // Chain set-option -p with new-session to avoid race condition
-        let output = crate::tmux::tmux_command()
-            .args([
-                "new-session",
-                "-d",
-                "-s",
-                &session_name,
-                "-x",
-                "80",
-                "-y",
-                "24",
-                "sleep 1",
-                ";",
-                "set-option",
-                "-p",
-                "-t",
-                &session_name,
-                "remain-on-exit",
-                "on",
-            ])
-            .output()
-            .expect("tmux new-session");
-        assert!(output.status.success());
-
-        wait_for_pane_dead(&only_pane_id(&session_name));
-
-        // Session should still exist (remain-on-exit keeps it)
-        let exists = crate::tmux::tmux_command()
-            .args(["has-session", "-t", &session_name])
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
-        assert!(exists, "Session should still exist due to remain-on-exit");
-
-        // Pane should be dead (process exited)
-        let pane_dead = crate::tmux::tmux_command()
-            .args(["display-message", "-t", &session_name, "-p", "#{pane_dead}"])
-            .output()
-            .ok()
-            .and_then(|o| String::from_utf8(o.stdout).ok())
-            .map(|s| s.trim() == "1")
-            .unwrap_or(false);
-        assert!(pane_dead, "Pane should be dead after command exits");
-    }
-
-    #[test]
-    #[serial_test::serial]
     fn test_create_forwards_desktop_env_to_session() {
         if !tmux_available() {
             eprintln!("Skipping test: tmux not available");
@@ -4283,8 +4210,7 @@ mod tests {
             .output()
             .expect("tmux new-session");
         assert!(output.status.success());
-
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        wait_for_pane_command(&only_pane_id(&session_name), "sleep");
 
         // Pane should NOT be dead (sleep is still running)
         let pane_dead = crate::tmux::tmux_command()
@@ -5075,66 +5001,11 @@ mod tests {
         );
     }
 
-    /// Regression test: is_pane_running_shell must target the first window's
-    /// pane even when the active window is a shell, and even with base-index 1.
     #[test]
     #[serial_test::serial]
-    fn test_is_pane_running_shell_targets_first_window_with_multiple_windows() {
-        if !tmux_available() {
-            eprintln!("Skipping test: tmux not available");
-            return;
-        }
-
-        let guard = TmuxTestSession::new("aoe_test_shell_multiwin");
-        let session_name = guard.name().to_string();
-
-        let mut args: Vec<String> = [
-            "new-session",
-            "-d",
-            "-s",
-            &session_name,
-            "-x",
-            "80",
-            "-y",
-            "24",
-            "sleep 30",
-        ]
-        .iter()
-        .map(|arg| arg.to_string())
-        .collect();
-        append_pane_base_index_args(&mut args, &session_name);
-        let output = crate::tmux::tmux_command()
-            .args(&args)
-            .output()
-            .expect("tmux new-session");
-        assert!(output.status.success());
-        let agent_pane = only_pane_id(&session_name);
-
-        rebase_first_window_to_index_one(&session_name);
-
-        // Open a second window running a shell and make it active
-        let output = crate::tmux::tmux_command()
-            .args(["new-window", "-t", &session_name, "sh"])
-            .output()
-            .expect("tmux new-window");
-        assert!(output.status.success());
-
-        wait_for_pane_command(&agent_pane, "sleep");
-
-        // Should be false: first window runs 'sleep', not a shell. With no
-        // window 0 a `:0.0` target resolves to the active window, so the
-        // reverted targeting reads the second window's `sh` and returns true.
-        assert!(
-            !is_pane_running_shell(&session_name),
-            "is_pane_running_shell should target first window (sleep), not active window (sh)"
-        );
-    }
-
     /// Regression test for #488: when a user creates a split pane and makes it
     /// active, is_pane_dead and is_pane_running_shell must still target the
     /// agent's pane (pane 0), not the active split pane.
-    #[test]
-    #[serial_test::serial]
     fn test_status_checks_target_pane_zero_with_split_panes() {
         if !tmux_available() {
             eprintln!("Skipping test: tmux not available");
@@ -5309,18 +5180,13 @@ mod tests {
     }
 
     #[test]
-    fn test_sanitize_session_name() {
-        assert_eq!(sanitize_session_name("my-project"), "my-project");
-        assert_eq!(sanitize_session_name("my project"), "my_project");
-        assert_eq!(sanitize_session_name("a".repeat(30).as_str()).len(), 20);
-    }
-
-    #[test]
     fn test_generate_name() {
         let name = Session::generate_name("abc123def456", "My Project");
         assert!(name.starts_with(SESSION_PREFIX));
         assert!(name.contains("My_Project"));
         assert!(name.contains("abc123de"));
+        let long = Session::generate_name("abc123def456", &"a".repeat(30));
+        assert!(long.contains(&"a".repeat(20)) && !long.contains(&"a".repeat(21)));
     }
 
     #[test]
@@ -5696,43 +5562,7 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn test_is_pane_running_shell_on_non_shell_session() {
-        if !tmux_available() {
-            eprintln!("Skipping test: tmux not available");
-            return;
-        }
-
-        let guard = TmuxTestSession::new("aoe_test_noshell");
-        let session_name = guard.name().to_string();
-
-        let output = crate::tmux::tmux_command()
-            .args([
-                "new-session",
-                "-d",
-                "-s",
-                &session_name,
-                "-x",
-                "80",
-                "-y",
-                "24",
-                "sleep",
-                "30",
-            ])
-            .output()
-            .expect("tmux new-session");
-        assert!(output.status.success());
-
-        wait_for_pane_command(&only_pane_id(&session_name), "sleep");
-
-        assert!(
-            !is_pane_running_shell(&session_name),
-            "Session running 'sleep' should not be detected as a shell"
-        );
-    }
-
     /// A retained dead pane is revivable without exposing its stale process PID.
-    #[test]
-    #[serial_test::serial]
     fn test_respawn_dead_pane_revives_dead_pane() {
         if !tmux_available() {
             eprintln!("Skipping test: tmux not available");

@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { render, screen, waitFor, act } from "@testing-library/react";
+import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 
 import type { SessionResponse } from "../../lib/types";
 import { makeSession as baseSession } from "./fixtures";
@@ -73,33 +73,16 @@ afterEach(() => {
 });
 
 describe("TerminalView early-return states", () => {
-  it("renders the 'Starting session...' placeholder while ensure is pending", () => {
-    // Never-resolving promise keeps ensureState at "pending" so the
-    // placeholder branch stays mounted.
+  it("shows a placeholder while pending and the error, or generic copy, when ensure fails", async () => {
+    // Never-resolving promise keeps ensureState at "pending".
     ensureSession.mockReturnValue(new Promise(() => {}));
     render(<TerminalView session={makeSession()} />);
     expect(screen.getByText(/Starting session/i)).toBeDefined();
-  });
+    cleanup();
 
-  it("renders the error message + Retry button when ensure rejects", async () => {
-    ensureSession.mockResolvedValueOnce({
-      ok: false,
-      message: "boom",
-    });
-    render(<TerminalView session={makeSession()} />);
-    await waitFor(() => {
-      expect(screen.getByText("boom")).toBeDefined();
-    });
-    const retry = screen.getByRole("button", { name: /retry/i });
-    expect(retry).toBeDefined();
-  });
-
-  it("falls back to the generic error copy when ensure omits a message", async () => {
     ensureSession.mockResolvedValueOnce({ ok: false });
     render(<TerminalView session={makeSession()} />);
-    await waitFor(() => {
-      expect(screen.getByText(/Could not start session/i)).toBeDefined();
-    });
+    await waitFor(() => expect(screen.getByText(/Could not start session/i)).toBeDefined());
   });
 
   it("re-runs ensureSession when Retry is clicked", async () => {
@@ -108,6 +91,7 @@ describe("TerminalView early-return states", () => {
     await waitFor(() => {
       expect(screen.getByText("first fail")).toBeDefined();
     });
+    expect(screen.getByRole("button", { name: /retry/i })).toBeDefined();
     ensureSession.mockResolvedValueOnce({ ok: false, message: "second fail" });
     // The error branch only ever renders one button.
     const retry = container.querySelector("button");

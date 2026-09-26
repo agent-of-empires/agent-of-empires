@@ -1447,6 +1447,18 @@ mod tests {
             headers.get("x-aoe-token").and_then(|v| v.to_str().ok()),
             Some("tok123")
         );
+
+        let insecure = build_cookie("mytoken", false, 14400);
+        for needle in [
+            "aoe_token=mytoken",
+            "HttpOnly",
+            "SameSite=Strict",
+            "Max-Age=14400",
+        ] {
+            assert!(insecure.contains(needle), "{insecure:?} lacks {needle}");
+        }
+        assert!(!insecure.contains("Secure"));
+        assert!(build_cookie("mytoken", true, 14400).contains("Secure"));
     }
 
     // Regression test for the logout-clobber bug: when a request

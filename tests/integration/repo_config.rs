@@ -1,270 +1,117 @@
-//! Integration tests for repo config loading, trust system, and hook execution.
+//! Integration tests for repo config loading, the trust system, and resolving
+//! the repo layer against saved profile config.
 
+use agent_of_empires::session::config::repo_config::{
+    check_repo_trust, load_repo_config, resolve_config_with_repo, trust_repo, TrustSurface,
+    INIT_TEMPLATE,
+};
 use serial_test::serial;
 use std::fs;
+use std::path::Path;
 use tempfile::TempDir;
 
 use crate::common::set_temp_home;
 
-/// Helper to set up a temp dir with `.agent-of-empires/config.toml`.
-fn setup_repo_config(content: &str) -> TempDir {
+/// Write `content` to `<tmp>/<dir>/config.toml` for each `(dir, content)`.
+fn repo_with(files: &[(&str, &str)]) -> TempDir {
     let tmp = TempDir::new().unwrap();
-    let config_dir = tmp.path().join(".agent-of-empires");
-    fs::create_dir_all(&config_dir).unwrap();
-    fs::write(config_dir.join("config.toml"), content).unwrap();
-    tmp
-}
-
-/// Helper to set up a temp dir with legacy `.aoe/config.toml`.
-fn setup_legacy_repo_config(content: &str) -> TempDir {
-    let tmp = TempDir::new().unwrap();
-    let aoe_dir = tmp.path().join(".aoe");
-    fs::create_dir_all(&aoe_dir).unwrap();
-    fs::write(aoe_dir.join("config.toml"), content).unwrap();
-    tmp
-}
-
-#[test]
-#[serial_test::parallel]
-fn test_load_repo_config_from_temp_dir() {
-    let tmp = setup_repo_config(
-        r#"
-[hooks]
-on_create = ["echo setup"]
-on_launch = ["echo start"]
-
-[session]
-default_tool = "claude"
-"#,
-    );
-
-    let config = agent_of_empires::session::config::repo_config::load_repo_config(tmp.path())
-        .unwrap()
-        .unwrap();
-
-    let hooks = config.hooks().unwrap();
-    assert_eq!(hooks.on_create, vec!["echo setup"]);
-    assert_eq!(hooks.on_launch, vec!["echo start"]);
-    let ov = serde_json::to_value(&config).unwrap();
-    assert_eq!(ov["session"]["default_tool"], serde_json::json!("claude"));
-}
-
-#[test]
-#[serial_test::parallel]
-fn test_load_repo_config_empty_file() {
-    let tmp = setup_repo_config("");
-    let config =
-        agent_of_empires::session::config::repo_config::load_repo_config(tmp.path()).unwrap();
-    assert!(config.is_none());
-}
-
-#[test]
-#[serial_test::parallel]
-fn test_load_repo_config_comments_only() {
-    let tmp = setup_repo_config(agent_of_empires::session::config::repo_config::INIT_TEMPLATE);
-    let config = agent_of_empires::session::config::repo_config::load_repo_config(tmp.path())
-        .unwrap()
-        .unwrap();
-    // All-commented template should parse as empty config
-    assert!(config.hooks().is_none());
-    let ov = serde_json::to_value(&config).unwrap();
-    assert!(ov.get("session").is_none());
-}
-
-#[test]
-#[serial]
-fn test_trust_untrust_cycle() {
-    let temp_home = TempDir::new().unwrap();
-    let _home = set_temp_home(temp_home.path());
-
-    let project_dir = TempDir::new().unwrap();
-    let project_path = project_dir.path();
-    let hooks_hash = "test_hash_123";
-
-    use agent_of_empires::session::config::repo_config::{is_repo_trusted, trust_repo};
-
-    // Initially not trusted
-    assert!(!is_repo_trusted(project_path, Some(hooks_hash), None).unwrap());
-
-    // Trust it
-    trust_repo(project_path, Some(hooks_hash), None).unwrap();
-    assert!(is_repo_trusted(project_path, Some(hooks_hash), None).unwrap());
-
-    // Different hash should not be trusted
-    assert!(!is_repo_trusted(project_path, Some("different_hash"), None).unwrap());
-
-    // Re-trust with new hash (simulating hooks changed)
-    trust_repo(project_path, Some("new_hash"), None).unwrap();
-    // Old hash no longer trusted
-    assert!(!is_repo_trusted(project_path, Some(hooks_hash), None).unwrap());
-    // New hash is trusted
-    assert!(is_repo_trusted(project_path, Some("new_hash"), None).unwrap());
-}
-
-#[test]
-#[serial_test::parallel]
-fn test_hook_execution_simple_echo() {
-    let tmp = TempDir::new().unwrap();
-    let marker = tmp.path().join("hook_ran");
-
-    let cmd = format!("touch {}", marker.display());
-    agent_of_empires::session::config::repo_config::execute_hooks(&[cmd], tmp.path(), &[]).unwrap();
-
-    assert!(marker.exists());
-}
-
-#[test]
-#[serial_test::parallel]
-fn test_hook_execution_failure() {
-    let tmp = TempDir::new().unwrap();
-    let result = agent_of_empires::session::config::repo_config::execute_hooks(
-        &["exit 1".to_string()],
-        tmp.path(),
-        &[],
-    );
-    assert!(result.is_err());
-}
-
-#[test]
-#[serial_test::parallel]
-fn test_changed_hooks_invalidate_trust() {
-    use agent_of_empires::session::config::repo_config::{compute_hooks_hash, HooksConfig};
-
-    let hooks_v1 = HooksConfig {
-        on_create: vec!["npm install".to_string()],
-        ..Default::default()
-    };
-    let hooks_v2 = HooksConfig {
-        on_create: vec!["npm install".to_string(), "npm run build".to_string()],
-        ..Default::default()
-    };
-
-    let hash_v1 = compute_hooks_hash(&hooks_v1);
-    let hash_v2 = compute_hooks_hash(&hooks_v2);
-    assert_ne!(
-        hash_v1, hash_v2,
-        "different hooks should produce different hashes"
-    );
-}
-
-#[test]
-#[serial]
-fn test_hook_trust_invalidated_on_config_change() {
-    use agent_of_empires::session::config::repo_config::{
-        check_repo_trust, trust_repo, TrustSurface,
-    };
-
-    let temp_home = TempDir::new().unwrap();
-    let _home = set_temp_home(temp_home.path());
-
-    // Create a repo with hooks
-    let repo = setup_repo_config(
-        r#"
-[hooks]
-on_create = ["echo setup"]
-"#,
-    );
-
-    // Initially untrusted
-    let trust = check_repo_trust(repo.path()).unwrap();
-    let hash = match &trust.hooks {
-        TrustSurface::NeedsTrust { hash, .. } => hash.clone(),
-        _ => panic!("Hooks should initially need trust"),
-    };
-
-    // Trust the hooks
-    trust_repo(repo.path(), Some(&hash), None).unwrap();
-
-    // Now should be trusted
-    let trust = check_repo_trust(repo.path()).unwrap();
-    assert!(
-        matches!(trust.hooks, TrustSurface::Trusted(_)),
-        "Hooks should be trusted after trust_repo"
-    );
-
-    // Modify the hooks config
-    let config_dir = repo.path().join(".agent-of-empires");
-    fs::write(
-        config_dir.join("config.toml"),
-        r#"
-[hooks]
-on_create = ["echo setup", "echo extra"]
-"#,
-    )
-    .unwrap();
-
-    // Should no longer be trusted (hash changed)
-    let trust = check_repo_trust(repo.path()).unwrap();
-    assert!(
-        trust.hooks.needs_trust(),
-        "Modified hooks should need re-trust"
-    );
-}
-
-#[test]
-#[serial]
-fn test_hook_re_trust_after_change() {
-    use agent_of_empires::session::config::repo_config::{
-        check_repo_trust, trust_repo, TrustSurface,
-    };
-
-    let temp_home = TempDir::new().unwrap();
-    let _home = set_temp_home(temp_home.path());
-
-    let repo = setup_repo_config(
-        r#"
-[hooks]
-on_create = ["echo v1"]
-"#,
-    );
-
-    // Trust v1
-    let trust = check_repo_trust(repo.path()).unwrap();
-    let hash = match &trust.hooks {
-        TrustSurface::NeedsTrust { hash, .. } => hash.clone(),
-        _ => panic!("v1 hooks should initially need trust"),
-    };
-    trust_repo(repo.path(), Some(&hash), None).unwrap();
-
-    // Modify to v2
-    let config_dir = repo.path().join(".agent-of-empires");
-    fs::write(
-        config_dir.join("config.toml"),
-        r#"
-[hooks]
-on_create = ["echo v2"]
-"#,
-    )
-    .unwrap();
-
-    // Re-trust v2
-    let trust = check_repo_trust(repo.path()).unwrap();
-    assert!(trust.hooks.needs_trust());
-    if let TrustSurface::NeedsTrust { hash, .. } = &trust.hooks {
-        trust_repo(repo.path(), Some(hash), None).unwrap();
+    for (dir, content) in files {
+        let config_dir = tmp.path().join(dir);
+        fs::create_dir_all(&config_dir).unwrap();
+        fs::write(config_dir.join("config.toml"), content).unwrap();
     }
+    tmp
+}
 
-    // Should now be trusted again
-    let trust = check_repo_trust(repo.path()).unwrap();
-    assert!(
-        matches!(trust.hooks, TrustSurface::Trusted(_)),
-        "Re-trusted hooks should be trusted"
+fn setup_repo_config(content: &str) -> TempDir {
+    repo_with(&[(".agent-of-empires", content)])
+}
+
+/// Which file is read, and what an empty or all-commented file yields:
+/// `(files, expected on_create hooks)`, `None` meaning no repo layer at all.
+#[test]
+#[serial_test::parallel]
+fn load_repo_config_picks_the_file_and_skips_empty_ones() {
+    let hooks_toml = |cmd: &str| format!("[hooks]\non_create = [\"{cmd}\"]\n");
+    let new = hooks_toml("echo new");
+    let legacy = hooks_toml("echo legacy");
+    let cases: [(Vec<(&str, &str)>, Option<Option<&str>>); 5] = [
+        (vec![(".agent-of-empires", "")], None),
+        (vec![(".agent-of-empires", INIT_TEMPLATE)], Some(None)),
+        (vec![(".agent-of-empires", &new)], Some(Some("echo new"))),
+        (vec![(".aoe", &legacy)], Some(Some("echo legacy"))),
+        (
+            vec![(".agent-of-empires", &new), (".aoe", &legacy)],
+            Some(Some("echo new")),
+        ),
+    ];
+    for (files, expected) in cases {
+        let repo = repo_with(&files);
+        let config = load_repo_config(repo.path()).unwrap();
+        let hooks = config.map(|c| c.hooks().map(|h| h.on_create));
+        assert_eq!(
+            hooks,
+            expected.map(|e| e.map(|cmd| vec![cmd.to_string()])),
+            "{files:?}"
+        );
+    }
+}
+
+/// Trust is pinned to the hooks hash: editing the hooks revokes it until the
+/// new content is trusted, and trusting the new hash drops the old one.
+#[test]
+#[serial]
+fn hook_trust_follows_the_config_content() {
+    let temp_home = TempDir::new().unwrap();
+    let _home = set_temp_home(temp_home.path());
+
+    let repo = setup_repo_config("[hooks]\non_create = [\"echo v1\"]\n");
+    let needs_trust = |path: &Path| match check_repo_trust(path).unwrap().hooks {
+        TrustSurface::NeedsTrust { hash, .. } => Some(hash),
+        TrustSurface::Trusted(_) => None,
+        TrustSurface::Absent => panic!("hooks surface must be present"),
+    };
+
+    let v1 = needs_trust(repo.path()).expect("new hooks need trust");
+    trust_repo(repo.path(), Some(&v1), None).unwrap();
+    assert_eq!(needs_trust(repo.path()), None);
+
+    fs::write(
+        repo.path().join(".agent-of-empires/config.toml"),
+        "[hooks]\non_create = [\"echo v1\", \"echo v2\"]\n",
+    )
+    .unwrap();
+    let v2 = needs_trust(repo.path()).expect("edited hooks need re-trust");
+    assert_ne!(v1, v2);
+    trust_repo(repo.path(), Some(&v2), None).unwrap();
+    assert_eq!(needs_trust(repo.path()), None);
+
+    fs::write(
+        repo.path().join(".agent-of-empires/config.toml"),
+        "[hooks]\non_create = [\"echo v1\"]\n",
+    )
+    .unwrap();
+    assert_eq!(
+        needs_trust(repo.path()),
+        Some(v1),
+        "re-trusting replaces the old hash"
     );
 }
 
-/// Regression test for #557: repo-level sandbox config (volume_ignores) must be
-/// included in the resolved config, not silently dropped. `extra_volumes` and
-/// `mount_ssh` (#3154) and `environment` (#3710) are global/profile only: they
-/// hand repo-chosen code the host filesystem, SSH keys, or host env vars.
+/// The repo layer reaches the resolved config for the fields a repo may set
+/// (#557: `volume_ignores` was silently dropped, `auto_cleanup`), while host
+/// access (`extra_volumes`, `mount_ssh` #3154, `environment` #3710) and
+/// worktree placement (#3711) keep the profile's values.
 #[test]
 #[serial]
-fn test_repo_sandbox_config_merged_into_resolved_config() {
+fn repo_layer_resolves_only_repo_settable_fields() {
     let temp_home = TempDir::new().unwrap();
     let _home = set_temp_home(temp_home.path());
 
     let profile: agent_of_empires::session::ProfileConfig =
         serde_json::from_value(serde_json::json!({
-            "sandbox": {"environment": ["GH_TOKEN=$AOE_GH_TOKEN"]}
+            "sandbox": {"environment": ["GH_TOKEN=$AOE_GH_TOKEN"]},
+            "worktree": {"bare_repo_path_template": "../{branch}"}
         }))
         .unwrap();
     agent_of_empires::session::save_profile_config("default", &profile).unwrap();
@@ -276,52 +123,7 @@ volume_ignores = [".venv", "node_modules"]
 environment = ["AWS_SECRET_ACCESS_KEY", "CI=$HOME"]
 extra_volumes = ["/data:/data:ro"]
 mount_ssh = true
-"#,
-    );
 
-    let config = agent_of_empires::session::config::repo_config::resolve_config_with_repo(
-        "default",
-        repo.path(),
-    )
-    .unwrap();
-
-    assert_eq!(
-        config.sandbox.volume_ignores,
-        vec![".venv", "node_modules"],
-        "volume_ignores from repo config should be present"
-    );
-    assert_eq!(
-        config.sandbox.environment,
-        vec!["GH_TOKEN=$AOE_GH_TOKEN"],
-        "environment must come from the profile, not the repo (#3710)"
-    );
-    assert!(
-        config.sandbox.extra_volumes.is_empty(),
-        "extra_volumes from repo config must be dropped (#3154)"
-    );
-    assert!(
-        !config.sandbox.mount_ssh,
-        "mount_ssh from repo config must be dropped (#3154)"
-    );
-}
-
-/// #3711: a repo cannot enable worktrees or choose where they are created; the
-/// profile's templates (the #568 layout) still reach the resolved config.
-#[test]
-#[serial]
-fn test_repo_worktree_placement_comes_from_profile() {
-    let temp_home = TempDir::new().unwrap();
-    let _home = set_temp_home(temp_home.path());
-
-    let profile: agent_of_empires::session::ProfileConfig =
-        serde_json::from_value(serde_json::json!({
-            "worktree": {"bare_repo_path_template": "../{branch}"}
-        }))
-        .unwrap();
-    agent_of_empires::session::save_profile_config("default", &profile).unwrap();
-
-    let repo = setup_repo_config(
-        r#"
 [worktree]
 enabled = true
 path_template = "/tmp/{branch}"
@@ -331,13 +133,13 @@ auto_cleanup = false
 "#,
     );
 
-    let config = agent_of_empires::session::config::repo_config::resolve_config_with_repo(
-        "default",
-        repo.path(),
-    )
-    .unwrap();
+    let config = resolve_config_with_repo("default", repo.path()).unwrap();
     let defaults = agent_of_empires::session::config::WorktreeConfig::default();
 
+    assert_eq!(config.sandbox.volume_ignores, vec![".venv", "node_modules"]);
+    assert_eq!(config.sandbox.environment, vec!["GH_TOKEN=$AOE_GH_TOKEN"]);
+    assert!(config.sandbox.extra_volumes.is_empty());
+    assert!(!config.sandbox.mount_ssh);
     assert_eq!(config.worktree.bare_repo_path_template, "../{branch}");
     assert!(!config.worktree.enabled);
     assert_eq!(config.worktree.path_template, defaults.path_template);
@@ -347,7 +149,7 @@ auto_cleanup = false
     );
     assert!(
         !config.worktree.auto_cleanup,
-        "auto_cleanup stays repo-settable"
+        "auto_cleanup is repo-settable"
     );
 }
 
@@ -398,66 +200,6 @@ fn test_project_path_that_resolves_to_global_config_is_not_a_repo_config() {
         fs::read_to_string(&global_config).unwrap(),
         global_content,
         "the global config must be left byte-identical"
-    );
-}
-
-/// Legacy `.aoe/config.toml` should still be loaded via backwards compat fallback.
-#[test]
-#[serial_test::parallel]
-fn test_legacy_aoe_path_still_loads() {
-    let repo = setup_legacy_repo_config(
-        r#"
-[hooks]
-on_create = ["echo legacy"]
-"#,
-    );
-
-    let config = agent_of_empires::session::config::repo_config::load_repo_config(repo.path())
-        .unwrap()
-        .unwrap();
-
-    let hooks = config.hooks().unwrap();
-    assert_eq!(hooks.on_create, vec!["echo legacy"]);
-}
-
-/// New `.agent-of-empires/config.toml` takes priority over legacy `.aoe/config.toml`.
-#[test]
-#[serial_test::parallel]
-fn test_new_path_takes_priority_over_legacy() {
-    let tmp = TempDir::new().unwrap();
-
-    // Create both paths with different content
-    let new_dir = tmp.path().join(".agent-of-empires");
-    fs::create_dir_all(&new_dir).unwrap();
-    fs::write(
-        new_dir.join("config.toml"),
-        r#"
-[hooks]
-on_create = ["echo new"]
-"#,
-    )
-    .unwrap();
-
-    let legacy_dir = tmp.path().join(".aoe");
-    fs::create_dir_all(&legacy_dir).unwrap();
-    fs::write(
-        legacy_dir.join("config.toml"),
-        r#"
-[hooks]
-on_create = ["echo legacy"]
-"#,
-    )
-    .unwrap();
-
-    let config = agent_of_empires::session::config::repo_config::load_repo_config(tmp.path())
-        .unwrap()
-        .unwrap();
-
-    let hooks = config.hooks().unwrap();
-    assert_eq!(
-        hooks.on_create,
-        vec!["echo new"],
-        "new path should take priority over legacy"
     );
 }
 

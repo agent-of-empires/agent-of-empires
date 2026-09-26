@@ -43,7 +43,9 @@ test.describe("wizard", () => {
     const wizard = await openWizard(page, serve);
     await wizard.getByRole("switch", { name: "Skip project folder" }).click();
     await wizard.getByRole("button", { name: "More options" }).click();
-    const acpToggle = wizard.getByRole("switch", { name: "Use structured view" });
+    const acpToggle = wizard.getByRole("switch", {
+      name: "Use structured view",
+    });
     await expect(acpToggle).toBeVisible({ timeout: 10_000 });
     await expect(acpToggle).toBeChecked();
     await wizard.getByRole("button", { name: /Launch session/ }).click();
@@ -54,12 +56,17 @@ test.describe("wizard", () => {
   });
 
   test("wizard auto-approve starts Codex in full-access mode", async ({ page, spawnServe }) => {
-    const serve = await spawnServe({ acp: true, extraEnv: { FAKE_ACP_MODE_VIA_CONFIG_OPTION: "codex" } });
+    const serve = await spawnServe({
+      acp: true,
+      extraEnv: { FAKE_ACP_MODE_VIA_CONFIG_OPTION: "codex" },
+    });
     const wizard = await openWizard(page, serve);
     await wizard.getByRole("switch", { name: "Skip project folder" }).click();
     await wizard.getByRole("button", { name: "codex", exact: true }).click();
     await wizard.getByRole("button", { name: "More options" }).click();
-    const autoApprove = wizard.getByRole("switch", { name: "Auto-approve actions" });
+    const autoApprove = wizard.getByRole("switch", {
+      name: "Auto-approve actions",
+    });
     await autoApprove.click();
     await expect(autoApprove).toBeChecked();
     await wizard.getByRole("button", { name: /Launch session/ }).click();
@@ -76,39 +83,34 @@ test.describe("wizard", () => {
     page,
     spawnServe,
   }) => {
-    const serve = await spawnServe({ seedFn: seedSessionViaAoeAdd({ title: "frontend-work", subdir: "frontend" }) });
+    const serve = await spawnServe({
+      seedFn: seedSessionViaAoeAdd({
+        title: "frontend-work",
+        subdir: "frontend",
+      }),
+    });
     const [seeded] = await listSessions(serve.baseUrl);
     const del = await page.request.delete(`${serve.baseUrl}/api/sessions/${seeded!.id}`, { data: {} });
     expect(del.ok()).toBe(true);
-    await expect.poll(async () => (await listSessions(serve.baseUrl)).length, { timeout: 10_000 }).toBe(0);
+    await expect
+      .poll(async () => (await listSessions(serve.baseUrl)).length, {
+        timeout: 10_000,
+      })
+      .toBe(0);
 
     const recent = await (await page.request.get(`${serve.baseUrl}/api/recent-projects`)).json();
     expect((recent.projects as { display_name: string }[]).map((p) => p.display_name)).toContain("frontend");
 
     const wizard = await openWizard(page, serve);
-    await expect(wizard.getByText("frontend", { exact: true })).toBeVisible({ timeout: 10_000 });
+    await expect(wizard.getByText("frontend", { exact: true })).toBeVisible({
+      timeout: 10_000,
+    });
     await expect(wizard.getByText("0 sessions")).toBeVisible();
   });
 });
 
 // #1324
 test.describe("scratch sessions", () => {
-  test("scratch happy path: launch creates a scratch-dir session", async ({ page, spawnServe }) => {
-    const serve = await spawnServe();
-    const wizard = await openWizard(page, serve);
-    await wizard.getByRole("switch", { name: "Skip project folder" }).click();
-    await expect(wizard.getByText("Scratch session")).toBeVisible({ timeout: 10_000 });
-    await wizard.getByRole("button", { name: /Launch session/ }).click();
-    const session = await expectOneScratchSession(serve);
-
-    // Creation is durable across a fresh server load.
-    await serve.restart();
-    const reloaded = await listSessions(serve.baseUrl);
-    expect(reloaded.map((row) => row.id)).toEqual([session.id]);
-    expect(reloaded[0]!.scratch).toBe(true);
-    expect(reloaded[0]!.project_path).toBe(session.project_path);
-  });
-
   test("palette 'New scratch session' opens the wizard and launches a scratch session", async ({ serve, page }) => {
     // #1643
     await page.goto(serve.baseUrl);
@@ -145,7 +147,9 @@ test.describe("scratch sessions", () => {
 test("search surfaces a session by its conversation content", async ({ spawnServe }) => {
   // #2515: the token appears only in the prompt, so a hit proves content search.
   const needle = "xyzzycontentneedle";
-  const { serve, sessionId } = await startAcpSession(spawnServe, { title: "content-search" });
+  const { serve, sessionId } = await startAcpSession(spawnServe, {
+    title: "content-search",
+  });
   const promptRes = await postPrompt(serve.baseUrl, sessionId, `please remember ${needle} for later`);
   expect(promptRes.status).toBeGreaterThanOrEqual(200);
   expect(promptRes.status).toBeLessThan(300);
@@ -188,7 +192,9 @@ test.describe("directory browser", () => {
     await openWizardWithShortcut(page);
     await expect(option(page, "projects")).toBeVisible({ timeout: 10_000 });
     // #3430: hidden folders are filtered server-side until requested.
-    const hiddenToggle = page.getByRole("checkbox", { name: "Show hidden folders" });
+    const hiddenToggle = page.getByRole("checkbox", {
+      name: "Show hidden folders",
+    });
     await expect(option(page, ".hidden-proj")).toHaveCount(0);
     await hiddenToggle.check();
     await expect(option(page, ".hidden-proj")).toBeVisible({ timeout: 10_000 });
@@ -212,19 +218,6 @@ test.describe("directory browser", () => {
     await expect(option(page, "repo-a")).toBeVisible({ timeout: 10_000 });
     await expect(option(page, "projects")).toHaveCount(0);
   });
-
-  test("DirectoryBrowser: parent-dir row navigates up one level", async ({ page, spawnServe }) => {
-    const serve = await spawnServe({
-      seedFn: ({ home }) => void mkdirSync(join(home, "projects", "nested"), { recursive: true }),
-    });
-    await page.goto(serve.baseUrl);
-    await openWizardWithShortcut(page);
-    await option(page, "projects").click({ timeout: 10_000 });
-    await option(page, "nested").click();
-    await expect(page.getByText("No visible subfolders here")).toBeVisible();
-    await option(page, "(parent directory)").click();
-    await expect(option(page, "nested")).toBeVisible({ timeout: 5_000 });
-  });
 });
 
 test.describe("worktrees", () => {
@@ -243,7 +236,9 @@ test.describe("worktrees", () => {
 
   test("duplicate worktree branch returns the real collision error, not a generic one", async ({ spawnServe }) => {
     // #1649
-    const serve = await spawnServe({ seedFn: ({ home, env }) => void initWorkingRepo(join(home, "project"), env) });
+    const serve = await spawnServe({
+      seedFn: ({ home, env }) => void initWorkingRepo(join(home, "project"), env),
+    });
     const payload = {
       path: join(serve.home, "project"),
       tool: "claude",

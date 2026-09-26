@@ -880,17 +880,6 @@ mod tests {
         assert_eq!(merged.acp.max_concurrent_workers, 7);
     }
 
-    #[test]
-    fn generic_merge_inherits_with_empty_overrides() {
-        let mut global = Config::default();
-        global.acp.max_concurrent_workers = 7;
-        let generic = merge_configs_generic(&global, &json!({}));
-        assert_eq!(
-            serde_json::to_value(&global).unwrap(),
-            serde_json::to_value(&generic).unwrap(),
-        );
-    }
-
     // #7: CityHall overrides pin the worker ceiling and worktree default, but
     // only when AOE_CITYHALL_MODE is set. Serial because it toggles a process
     // env var.

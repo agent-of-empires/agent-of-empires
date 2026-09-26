@@ -45,23 +45,11 @@ describe("resolveModeChannel", () => {
     expect(channel!.modes.some((m) => m.id === "default")).toBe(false);
   });
 
-  it("reflects an in-flight config switch as the pending id", () => {
-    const channel = resolveModeChannel({
-      ...BASE,
-      configOptions: [OPENCODE_MODE_OPTION],
-      pendingConfigOption: { configId: "mode", value: "plan" },
-    });
-    expect(channel!.pendingId).toBe("plan");
-    expect(channel!.activeId).toBe("build");
-  });
-
-  it("ignores a pending config option for a different control", () => {
-    const channel = resolveModeChannel({
-      ...BASE,
-      configOptions: [OPENCODE_MODE_OPTION],
-      pendingConfigOption: { configId: "model", value: "claude-opus-4-8" },
-    });
-    expect(channel!.pendingId).toBeNull();
+  it("reflects an in-flight switch only for the mode control", () => {
+    const pending = (configId: string, value: string) =>
+      resolveModeChannel({ ...BASE, configOptions: [OPENCODE_MODE_OPTION], pendingConfigOption: { configId, value } });
+    expect(pending("mode", "plan")).toMatchObject({ pendingId: "plan", activeId: "build" });
+    expect(pending("model", "claude-opus-4-8")!.pendingId).toBeNull();
   });
 
   it("falls back to the SessionModeState channel and switches via set_mode", () => {
@@ -84,26 +72,11 @@ describe("resolveModeChannel", () => {
     expect(channel!.kind).toBe("legacy");
     expect(channel!.modes.map((m) => m.id)).toEqual(["default", "plan", "accept_edits", "bypass_permissions"]);
     expect(channel!.activeId).toBe("default");
+    expect(resolveModeChannel({ ...BASE, legacyMode: "Plan", allowLegacyFallback: true })!.activeId).toBe("plan");
   });
 
-  it("maps the legacy SessionMode enum to the fallback active id", () => {
-    const channel = resolveModeChannel({
-      ...BASE,
-      legacyMode: "Plan",
-      allowLegacyFallback: true,
-    });
-    expect(channel!.activeId).toBe("plan");
-  });
-
-  it("renders nothing for a non-claude agent that advertised no modes", () => {
+  it("renders nothing without advertised modes or with an empty mode option", () => {
     expect(resolveModeChannel(BASE)).toBeNull();
-  });
-
-  it("ignores an empty mode config option", () => {
-    const empty: ConfigOptionDescriptor = {
-      ...OPENCODE_MODE_OPTION,
-      options: [],
-    };
-    expect(resolveModeChannel({ ...BASE, configOptions: [empty] })).toBeNull();
+    expect(resolveModeChannel({ ...BASE, configOptions: [{ ...OPENCODE_MODE_OPTION, options: [] }] })).toBeNull();
   });
 });

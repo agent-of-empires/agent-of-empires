@@ -82,11 +82,8 @@ mod tests {
                 "{a}.{b}.{c}.{d}"
             );
         }
-    }
 
-    #[test]
-    fn ip_kind_ordering_prefers_tailscale() {
-        // This is the "Tailscale first in QR" contract.
+        // Tailscale sorts first in the QR.
         let mut v = [IpKind::Loopback, IpKind::Lan, IpKind::Tailscale];
         v.sort();
         assert_eq!(v, [IpKind::Tailscale, IpKind::Lan, IpKind::Loopback]);

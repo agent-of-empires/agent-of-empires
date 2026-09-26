@@ -277,7 +277,7 @@ capabilities = ["runtime.worker"]
     }
 
     #[test]
-    fn command_bare_name_resolves_on_path() {
+    fn command_resolves_bare_names_on_path_and_relative_paths_in_the_plugin_dir() {
         let p = plugin(
             Some("[runtime]\nkind = \"command\"\ncommand = [\"python3\", \"-m\", \"acme.main\"]\nsystem = true"),
             Some("/plugins/acme.worker"),
@@ -291,19 +291,15 @@ capabilities = ["runtime.worker"]
             launch.env.get("AOE_PLUGIN_ID").map(String::as_str),
             Some("acme.worker")
         );
-    }
 
-    #[test]
-    fn command_relative_path_must_exist_in_the_plugin_dir_and_be_executable() {
+        // A relative path must exist in the plugin dir and be executable.
         let p = plugin(
             Some("[runtime]\nkind = \"command\"\ncommand = [\"bin/worker\"]"),
             Some("/plugins/acme.worker"),
         );
         let bin = PathBuf::from("/plugins/acme.worker/bin/worker");
-
         let resolver = FakeResolver::new().file(bin.clone(), true);
         assert_eq!(resolve_launch(&p, &resolver).unwrap().program, bin);
-
         let resolver = FakeResolver::new().file(bin, false);
         let err = resolve_launch(&p, &resolver).unwrap_err();
         assert!(matches!(err, LaunchError::NotExecutable { .. }), "{err:?}");

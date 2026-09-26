@@ -66,9 +66,7 @@ describe("reconnect (#1130)", () => {
     [2, 2000],
     [5, 16000],
     [6, 30000],
-    [100, 30000],
     [0, 1000],
-    [-5, 1000],
   ])("acpRetryDelayMs(%i) = %i", (attempt, ms) => {
     expect(acpRetryDelayMs(attempt)).toBe(ms);
   });

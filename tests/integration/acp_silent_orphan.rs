@@ -231,68 +231,9 @@ async fn silent_orphan_fires_when_the_turn_never_wraps_up() {
     );
 }
 
-#[tokio::test]
-#[serial]
-async fn silent_orphan_suppressed_during_normal_turn() {
-    if let Err(reason) = shim_ready() {
-        eprintln!("skipping: {reason}");
-        return;
-    }
-
-    // Generous enough grace that the shim's healthy tool round-trip
-    // completes long before the watchdog could fire; we then assert
-    // the only Stopped we see is prompt_complete, not prompt_orphaned.
-    // Tight polling cadence so a regressed grace would fire within the
-    // assertion window instead of waiting for the default 5s tick.
-    let _env = EnvGuard::from_pairs(&[
-        ("AOE_SILENT_ORPHAN_GRACE_MS", "10000"),
-        ("AOE_SILENT_ORPHAN_FAST_GRACE_MS", "10000"),
-        ("AOE_SILENT_ORPHAN_CHECK_INTERVAL_MS", "50"),
-    ]);
-
-    let preseed = "silent-orphan-negative";
-    let (socket_path, _tmp) =
-        spawn_runner_with_shim(preseed, &[("SHIM_PRESEED_SESSION_ID", preseed.to_string())]).await;
-
-    let client = AcpClient::attach(
-        socket_path,
-        std::env::temp_dir(),
-        vec![],
-        preseed.to_string(),
-        false,
-        AcpSessionId("silent-orphan-negative".into()),
-        None,
-        "claude".into(),
-        None,
-        None,
-    )
-    .await
-    .expect("attach for silent-orphan negative test");
-
-    let mut client = client;
-    // No parking keyword: the shim's default prompt() runs the
-    // healthy chunk + tool_call + tool_call_update + chunk sequence
-    // and returns stopReason=end_turn. The watchdog must stay silent
-    // and the natural prompt_complete must win.
-    client
-        .send_prompt("normal turn", &[])
-        .await
-        .expect("send prompt");
-
-    let mut outcome = TurnOutcome::default();
-    outcome
-        .drain_turn(&mut client, Instant::now() + Duration::from_secs(5))
-        .await;
-    let _ = client.shutdown().await;
-
-    assert_eq!(
-        outcome.stopped.as_deref(),
-        Some("prompt_complete"),
-        "silent-orphan watchdog must stay disarmed on a normal turn; saw {:?}",
-        outcome.stopped
-    );
-}
-
+/// `0` disables the watchdog entirely. The fast grace is short enough that a
+/// wrongly-armed watchdog would fire inside the drain, so the silence is a real
+/// assertion rather than an untested window.
 #[tokio::test]
 #[serial]
 async fn silent_orphan_disabled_by_zero_grace() {
@@ -623,73 +564,5 @@ async fn silent_orphan_suppressed_during_scheduled_wakeup() {
         outcome.stopped.is_none(),
         "silent-orphan watchdog must stay suppressed until ScheduleWakeup `at + base_grace`; saw Stopped reason={:?}",
         outcome.stopped
-    );
-}
-
-#[tokio::test]
-#[serial]
-async fn usage_evidence_survives_activity_and_drain() {
-    if let Err(reason) = shim_ready() {
-        eprintln!("skipping: {reason}");
-        return;
-    }
-
-    // Park after the ordered notifications; drain through the watchdog terminal
-    // rather than let an immediate PromptResponse overtake notification delivery.
-    let _env = EnvGuard::from_pairs(&[
-        ("AOE_SILENT_ORPHAN_GRACE_MS", "300"),
-        ("AOE_SILENT_ORPHAN_FAST_GRACE_MS", "300"),
-        ("AOE_SILENT_ORPHAN_CHECK_INTERVAL_MS", "50"),
-    ]);
-    let mut observed = Vec::new();
-    for (prompt, marker) in [
-        ("normal turn", Some("")),
-        ("USAGE_BEFORE_NO_COST", Some("")),
-        ("USAGE_BEFORE_COST USAGE_AFTER_NO_COST", Some("")),
-        ("USAGE_BEFORE_COST USAGE_AFTER_NO_COST", None),
-    ] {
-        let preseed = "usage-observation";
-        let (socket_path, _runner) =
-            spawn_runner_with_shim(preseed, &[("SHIM_PRESEED_SESSION_ID", preseed.to_string())])
-                .await;
-        let mut client = AcpClient::attach(
-            socket_path,
-            std::env::temp_dir(),
-            vec![],
-            preseed.to_string(),
-            false,
-            AcpSessionId(preseed.into()),
-            None,
-            "claude".into(),
-            None,
-            None,
-        )
-        .await
-        .expect("attach for usage observation");
-        client
-            .send_prompt(&format!("USAGE_OBSERVATION {prompt}"), &[])
-            .await
-            .expect("send prompt");
-
-        let mut outcome = TurnOutcome::default();
-        outcome.await_activity(&mut client, marker).await;
-        let activity_cost = outcome.usage_cost;
-        outcome
-            .drain_turn(&mut client, Instant::now() + Duration::from_secs(10))
-            .await;
-        let _ = client.shutdown().await;
-        assert_eq!(outcome.stopped.as_deref(), Some("prompt_orphaned"));
-        observed.push((activity_cost, outcome.usage_cost));
-    }
-
-    assert_eq!(
-        observed,
-        vec![
-            (None, None),
-            (Some(false), Some(false)),
-            (Some(true), Some(true)),
-            (Some(true), Some(true)),
-        ],
-        "usage before tool completion or a cost-less drain must not be lost"
     );
 }

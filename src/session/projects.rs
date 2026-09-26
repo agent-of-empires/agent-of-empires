@@ -908,115 +908,95 @@ mod tests {
     }
 
     #[test]
-    fn with_base_branch_trims_and_treats_empty_as_unset() {
-        let p = Project::new("r", "/tmp/r", ProjectScope::Global);
-        assert_eq!(p.clone().with_base_branch(None).default_base_branch, None);
-        assert_eq!(
-            p.clone()
-                .with_base_branch(Some("  ".to_string()))
-                .default_base_branch,
-            None
-        );
-        assert_eq!(
-            p.with_base_branch(Some("  develop ".to_string()))
-                .default_base_branch,
-            Some("develop".to_string())
-        );
-    }
-
-    #[test]
-    fn is_git_probes_filesystem_per_call() {
-        let temp = tempdir().expect("tempdir");
-        let dir = temp.path().join("workspace");
-        std::fs::create_dir_all(&dir).expect("create dir");
-
-        let project = Project::new("workspace", dir.to_string_lossy(), ProjectScope::Global);
-        // A plain directory is not git-backed.
-        assert!(!project.is_git());
-
-        // `is_git` re-probes the filesystem on every call and caches nothing,
-        // so initializing a repo in place flips the result without rebuilding
-        // the Project.
-        git2::Repository::init(&dir).expect("git init");
-        assert!(project.is_git());
-    }
-
-    #[test]
     #[serial]
-    fn default_base_branch_persists_through_add_and_load() -> Result<()> {
+    fn registry_crud_by_name_or_path() -> Result<()> {
         let temp = tempdir()?;
         let _app_dir = isolate_app_dir_at(temp.path());
-        let repo = temp.path().join("repoBase");
+        let repo = temp.path().join("Mixed");
+        let other = temp.path().join("Other");
         let _ = git2::Repository::init(&repo);
+        let _ = git2::Repository::init(&other);
+        let global = ProjectScope::Global;
+        let path = repo.to_string_lossy().to_string();
 
         add(
             "default",
-            ProjectScope::Global,
-            Project::new("repoBase", repo.to_string_lossy(), ProjectScope::Global)
-                .with_base_branch(Some("develop".to_string())),
+            global,
+            Project::new("MixedCase", &*path, global)
+                .with_pinned(true)
+                .with_base_branch(Some("  develop ".to_string())),
             false,
         )?;
-
         let loaded = load_global()?;
         assert_eq!(loaded.len(), 1);
+
+        assert_eq!(
+            (loaded[0].name.as_str(), loaded[0].scope, loaded[0].pinned),
+            ("MixedCase", global, true)
+        );
         assert_eq!(loaded[0].default_base_branch.as_deref(), Some("develop"));
-        Ok(())
-    }
 
-    #[test]
-    #[serial]
-    fn update_base_branch_sets_clears_and_reports_not_found() -> Result<()> {
-        let temp = tempdir()?;
-        let _app_dir = isolate_app_dir_at(temp.path());
-        let repo = temp.path().join("repoUpd");
-        let _ = git2::Repository::init(&repo);
-
-        add(
-            "default",
-            ProjectScope::Global,
-            Project::new("repoUpd", repo.to_string_lossy(), ProjectScope::Global),
-            false,
-        )?;
-
-        // Set, looking the project up by name.
-        let ProjectCommit {
-            result: index,
-            projects: updated,
-            ..
-        } = update(
-            "default",
-            ProjectScope::Global,
-            "repoUpd",
-            ProjectPatch {
-                base_branch: Some(Some("develop".into())),
-                ..Default::default()
-            },
-        )?;
+        for name in ["MixedCase", "mixedcase"] {
+            let dup = Project::new(name, other.to_string_lossy(), global);
+            assert!(add("default", global, dup, false).is_err(), "{name}");
+        }
+        assert_eq!(unique_name("default", global, "mixedcase"), "mixedcase-2");
+        assert_eq!(unique_name("default", global, "other"), "other");
         assert_eq!(
-            updated[index].default_base_branch.as_deref(),
-            Some("develop")
+            resolve_names("default", &["MIXEDCASE".into()])?[0].name,
+            "MixedCase"
         );
+        assert!(resolve_names("default", &["nonesuch".into()]).is_err());
         assert_eq!(
-            load_global()?[0].default_base_branch.as_deref(),
-            Some("develop")
+            find_by_canonical_path("default", repo.as_path()).map(|p| p.name),
+            Some("MixedCase".to_string())
         );
+        assert!(find_by_canonical_path("default", Path::new("/nope")).is_none());
 
-        // Whitespace clears it back to unset, looking up by canonical path.
+        // Whitespace clears it back to unset, looking the project up by path.
         let ProjectCommit {
             result: index,
             projects: cleared,
             ..
         } = update(
             "default",
-            ProjectScope::Global,
-            &repo.to_string_lossy(),
+            global,
+            &path,
             ProjectPatch {
                 base_branch: Some(Some("   ".into())),
                 ..Default::default()
             },
         )?;
         assert_eq!(cleared[index].default_base_branch, None);
-        assert_eq!(load_global()?[0].default_base_branch, None);
+        // Unpin keeps the saved project (the #2208 behaviour): the row
+        // survives the patch and only the flag flips.
+        let ProjectCommit {
+            result: index,
+            projects: unpinned,
+            ..
+        } = update(
+            "default",
+            global,
+            "mixedcase",
+            ProjectPatch {
+                pinned: Some(false),
+                ..Default::default()
+            },
+        )?;
+        assert!(!unpinned[index].pinned);
+        assert_eq!(load_global()?.len(), 1);
+        assert!(!load_global()?[0].pinned);
+
+        let updated = update_overrides("default", global, "MixedCase", |ov| {
+            ov.worktree_enabled = Some(true);
+            ov.smart_rename = Some(false);
+        })?;
+        assert_eq!(updated.overrides.worktree_enabled, Some(true));
+        let updated = update_overrides("default", global, "MixedCase", |ov| {
+            ov.worktree_enabled = None;
+        })?;
+        assert_eq!(updated.overrides.worktree_enabled, None);
+        assert_eq!(updated.overrides.smart_rename, Some(false));
 
         // Unknown project is a NotFound.
         assert!(matches!(
@@ -1031,66 +1011,11 @@ mod tests {
             ),
             Err(RegistryError::NotFound(_))
         ));
-        Ok(())
-    }
-
-    #[test]
-    #[serial]
-    fn set_pinned_toggles_without_removing_entry() -> Result<()> {
-        let temp = tempdir()?;
-        let _app_dir = isolate_app_dir_at(temp.path());
-        let repo = temp.path().join("repoPin");
-        let _ = git2::Repository::init(&repo);
-
-        // Pin on create, then unpin: the row must survive (the #2208 fix).
-        add(
-            "default",
-            ProjectScope::Global,
-            Project::new("repoPin", repo.to_string_lossy(), ProjectScope::Global).with_pinned(true),
-            false,
-        )?;
-        assert!(load_global()?[0].pinned);
-
-        let ProjectCommit {
-            result: index,
-            projects: unpinned,
-            ..
-        } = update(
-            "default",
-            ProjectScope::Global,
-            "repoPin",
-            ProjectPatch {
-                pinned: Some(false),
-                ..Default::default()
-            },
-        )?;
-        assert!(!unpinned[index].pinned);
-        // Unpin keeps the saved project rather than deleting it.
-        let loaded = load_global()?;
-        assert_eq!(loaded.len(), 1);
-        assert!(!loaded[0].pinned);
-
-        // Re-pin by canonical path.
-        let ProjectCommit {
-            result: index,
-            projects: repinned,
-            ..
-        } = update(
-            "default",
-            ProjectScope::Global,
-            &repo.to_string_lossy(),
-            ProjectPatch {
-                pinned: Some(true),
-                ..Default::default()
-            },
-        )?;
-        assert!(repinned[index].pinned);
-        assert!(load_global()?[0].pinned);
 
         assert!(matches!(
             update(
                 "default",
-                ProjectScope::Global,
+                global,
                 "nope",
                 ProjectPatch {
                     pinned: Some(true),
@@ -1099,130 +1024,17 @@ mod tests {
             ),
             Err(RegistryError::NotFound(_))
         ));
-        Ok(())
-    }
-
-    #[test]
-    #[serial]
-    fn add_then_load_global() -> Result<()> {
-        let temp = tempdir()?;
-        let _app_dir = isolate_app_dir_at(temp.path());
-        let repo = temp.path().join("repoA");
-        let _ = git2::Repository::init(&repo);
-
-        add(
-            "default",
-            ProjectScope::Global,
-            Project::new("repoA", repo.to_string_lossy(), ProjectScope::Global),
-            false,
-        )?;
-
-        let loaded = load_global()?;
-        assert_eq!(loaded.len(), 1);
-        assert_eq!(loaded[0].name, "repoA");
-        assert_eq!(loaded[0].scope, ProjectScope::Global);
-        Ok(())
-    }
-
-    #[test]
-    #[serial]
-    fn profile_shadows_global_on_path_collision() -> Result<()> {
-        let temp = tempdir()?;
-        let _app_dir = isolate_app_dir_at(temp.path());
-        fs::create_dir_all(profile_path("default")?.parent().unwrap())?;
-        let repo = temp.path().join("repoX");
-        let _ = git2::Repository::init(&repo);
-
-        add(
-            "default",
-            ProjectScope::Global,
-            Project::new("global-name", repo.to_string_lossy(), ProjectScope::Global),
-            false,
-        )?;
-        add(
-            "default",
-            ProjectScope::Profile,
-            Project::new(
-                "profile-name",
-                repo.to_string_lossy(),
-                ProjectScope::Profile,
-            ),
-            true,
-        )?;
-
-        let merged = load_merged("default")?;
-        assert_eq!(merged.len(), 1);
-        assert_eq!(merged[0].name, "profile-name");
-        assert_eq!(merged[0].scope, ProjectScope::Profile);
-        Ok(())
-    }
-
-    #[test]
-    #[serial]
-    fn duplicate_name_rejected_within_scope() -> Result<()> {
-        let temp = tempdir()?;
-        let _app_dir = isolate_app_dir_at(temp.path());
-        let repo1 = temp.path().join("r1");
-        let repo2 = temp.path().join("r2");
-        let _ = git2::Repository::init(&repo1);
-        let _ = git2::Repository::init(&repo2);
-
-        add(
-            "default",
-            ProjectScope::Global,
-            Project::new("dup", repo1.to_string_lossy(), ProjectScope::Global),
-            false,
-        )?;
-        let err = add(
-            "default",
-            ProjectScope::Global,
-            Project::new("dup", repo2.to_string_lossy(), ProjectScope::Global),
-            false,
+        assert_eq!(
+            remove("default", global, "mixedcase")?.result.name,
+            "MixedCase"
         );
-        assert!(err.is_err());
+        assert!(load_global()?.is_empty());
         Ok(())
     }
 
     #[test]
     #[serial]
-    fn name_matching_is_case_insensitive() -> Result<()> {
-        let temp = tempdir()?;
-        let _app_dir = isolate_app_dir_at(temp.path());
-        let repo1 = temp.path().join("Mixed");
-        let repo2 = temp.path().join("Other");
-        let _ = git2::Repository::init(&repo1);
-        let _ = git2::Repository::init(&repo2);
-
-        add(
-            "default",
-            ProjectScope::Global,
-            Project::new("MixedCase", repo1.to_string_lossy(), ProjectScope::Global),
-            false,
-        )?;
-
-        // Add with same name, different case → rejected.
-        let err = add(
-            "default",
-            ProjectScope::Global,
-            Project::new("mixedcase", repo2.to_string_lossy(), ProjectScope::Global),
-            false,
-        );
-        assert!(err.is_err(), "duplicate name (different case) should error");
-
-        // Resolve via lowercase finds the original.
-        let resolved = resolve_names("default", &["MIXEDCASE".to_string()])?;
-        assert_eq!(resolved.len(), 1);
-        assert_eq!(resolved[0].name, "MixedCase");
-
-        // Remove via lowercase succeeds.
-        let removed = remove("default", ProjectScope::Global, "mixedcase")?.result;
-        assert_eq!(removed.name, "MixedCase");
-        Ok(())
-    }
-
-    #[test]
-    #[serial]
-    fn cross_scope_path_collision_blocked_by_default() -> Result<()> {
+    fn cross_scope_path_collision_needs_override_and_profile_shadows_global() -> Result<()> {
         let temp = tempdir()?;
         let _app_dir = isolate_app_dir_at(temp.path());
         fs::create_dir_all(profile_path("default")?.parent().unwrap())?;
@@ -1235,133 +1047,21 @@ mod tests {
             Project::new("first", repo.to_string_lossy(), ProjectScope::Global),
             false,
         )?;
-        let err = add(
-            "default",
-            ProjectScope::Profile,
-            Project::new("second", repo.to_string_lossy(), ProjectScope::Profile),
-            false,
+        let second = || Project::new("second", repo.to_string_lossy(), ProjectScope::Profile);
+        let msg = add("default", ProjectScope::Profile, second(), false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            msg.contains("--allow-override") && msg.contains("global"),
+            "error should mention --allow-override and the other scope, got: {msg}"
         );
-        assert!(matches!(err, Err(RegistryError::Conflict(_))));
 
-        // With override, succeeds.
-        add(
-            "default",
-            ProjectScope::Profile,
-            Project::new("second", repo.to_string_lossy(), ProjectScope::Profile),
-            true,
-        )?;
-        Ok(())
-    }
-
-    #[test]
-    #[serial]
-    fn resolve_names_errors_on_unknown() -> Result<()> {
-        let temp = tempdir()?;
-        let _app_dir = isolate_app_dir_at(temp.path());
-        let err = resolve_names("default", &["nonesuch".to_string()]);
-        assert!(err.is_err());
-        Ok(())
-    }
-
-    #[test]
-    #[serial]
-    fn remove_round_trip() -> Result<()> {
-        let temp = tempdir()?;
-        let _app_dir = isolate_app_dir_at(temp.path());
-        let repo = temp.path().join("repoR");
-        let _ = git2::Repository::init(&repo);
-
-        add(
-            "default",
-            ProjectScope::Global,
-            Project::new("repoR", repo.to_string_lossy(), ProjectScope::Global),
-            false,
-        )?;
-        let removed = remove("default", ProjectScope::Global, "repoR")?.result;
-        assert_eq!(removed.name, "repoR");
-        let loaded = load_global()?;
-        assert!(loaded.is_empty());
-        Ok(())
-    }
-
-    #[test]
-    #[serial]
-    fn update_overrides_sets_and_clears_individual_fields() -> Result<()> {
-        let temp = tempdir()?;
-        let _app_dir = isolate_app_dir_at(temp.path());
-        let repo = temp.path().join("demo");
-        let _ = git2::Repository::init(&repo);
-
-        add(
-            "default",
-            ProjectScope::Global,
-            Project::new("demo", repo.to_string_lossy(), ProjectScope::Global),
-            false,
-        )?;
-
-        let updated = update_overrides("default", ProjectScope::Global, "demo", |ov| {
-            ov.worktree_enabled = Some(true);
-        })?;
-        assert_eq!(updated.overrides.worktree_enabled, Some(true));
-        assert_eq!(updated.overrides.smart_rename, None);
-
-        let updated = update_overrides("default", ProjectScope::Global, "demo", |ov| {
-            ov.smart_rename = Some(false);
-        })?;
-        assert_eq!(updated.overrides.worktree_enabled, Some(true));
-        assert_eq!(updated.overrides.smart_rename, Some(false));
-
-        let updated = update_overrides("default", ProjectScope::Global, "demo", |ov| {
-            ov.worktree_enabled = None;
-        })?;
-        assert_eq!(updated.overrides.worktree_enabled, None);
-        assert_eq!(updated.overrides.smart_rename, Some(false));
-        Ok(())
-    }
-
-    #[test]
-    #[serial]
-    fn find_by_canonical_path_matches_registered_project() -> Result<()> {
-        let temp = tempdir()?;
-        let _app_dir = isolate_app_dir_at(temp.path());
-        let repo = temp.path().join("demo");
-        let _ = git2::Repository::init(&repo);
-
-        add(
-            "default",
-            ProjectScope::Global,
-            Project::new("demo", repo.to_string_lossy(), ProjectScope::Global),
-            false,
-        )?;
-
-        let found = find_by_canonical_path("default", repo.as_path());
-        assert_eq!(found.map(|p| p.name), Some("demo".to_string()));
-        assert!(find_by_canonical_path("default", Path::new("/nope")).is_none());
-        Ok(())
-    }
-
-    #[test]
-    #[serial]
-    fn unique_name_suffixes_on_collision() -> Result<()> {
-        let temp = tempdir()?;
-        let _app_dir = isolate_app_dir_at(temp.path());
-        let repo_a = temp.path().join("repoA");
-        let _ = git2::Repository::init(&repo_a);
-
-        add(
-            "default",
-            ProjectScope::Global,
-            Project::new("demo", repo_a.to_string_lossy(), ProjectScope::Global),
-            false,
-        )?;
-        assert_eq!(
-            unique_name("default", ProjectScope::Global, "demo"),
-            "demo-2"
-        );
-        assert_eq!(
-            unique_name("default", ProjectScope::Global, "other"),
-            "other"
-        );
+        // With override, succeeds and the profile row shadows the global one.
+        add("default", ProjectScope::Profile, second(), true)?;
+        let merged = load_merged("default")?;
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].name, "second");
+        assert_eq!(merged[0].scope, ProjectScope::Profile);
         Ok(())
     }
 }

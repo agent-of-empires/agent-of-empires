@@ -138,10 +138,8 @@ mod tests {
         assert!(classify_rate_limit_error(&err("closed", Some(internal)), None).is_none());
         let invalid = agent_client_protocol::Error::invalid_params();
         assert!(classify_rate_limit_error(&invalid, None).is_none());
-    }
 
-    #[test]
-    fn classify_rate_limit_from_message_matches_acp_fingerprint() {
+        // The same fingerprint inside a flattened error message.
         let captured = chrono::Utc::now() + chrono::Duration::minutes(20);
         for msg in [
             "ACP connection failed: Internal error: limit: {\n  \"errorKind\":\"rate_limit\"\n}",
@@ -155,7 +153,7 @@ mod tests {
     }
 
     #[test]
-    fn rate_limit_rejection_from_meta_cases() {
+    fn rate_limit_reset_windows() {
         let secs = 4_102_444_800_i64;
         let meta = |value| {
             Some(serde_json::Map::from_iter([(
@@ -200,29 +198,28 @@ mod tests {
         for (meta, want) in cases {
             assert_eq!(rate_limit_rejection_from_meta(&meta), want, "{meta:?}");
         }
-    }
 
-    #[test]
-    fn captured_rate_limit_resets_at_takes_the_last_future_window() {
-        let now = chrono::DateTime::from_timestamp(1_800_000_000, 0).unwrap();
-        let five_hour = now + chrono::Duration::hours(2);
-        let seven_day = now + chrono::Duration::days(3);
-        let past = now - chrono::Duration::minutes(1);
-        let cases = [
-            (vec![five_hour, seven_day], Some(seven_day)),
-            (vec![five_hour, past], Some(five_hour)),
-            (vec![], None),
-            (vec![past], None),
-        ];
-        for (resets, want) in cases {
-            let captures = std::sync::Mutex::new(
-                resets
-                    .iter()
-                    .enumerate()
-                    .map(|(i, dt)| (i.to_string(), dt.timestamp()))
-                    .collect(),
-            );
-            assert_eq!(captured_rate_limit_resets_at(&captures, now), want);
+        {
+            let now = chrono::DateTime::from_timestamp(1_800_000_000, 0).unwrap();
+            let five_hour = now + chrono::Duration::hours(2);
+            let seven_day = now + chrono::Duration::days(3);
+            let past = now - chrono::Duration::minutes(1);
+            let cases = [
+                (vec![five_hour, seven_day], Some(seven_day)),
+                (vec![five_hour, past], Some(five_hour)),
+                (vec![], None),
+                (vec![past], None),
+            ];
+            for (resets, want) in cases {
+                let captures = std::sync::Mutex::new(
+                    resets
+                        .iter()
+                        .enumerate()
+                        .map(|(i, dt)| (i.to_string(), dt.timestamp()))
+                        .collect(),
+                );
+                assert_eq!(captured_rate_limit_resets_at(&captures, now), want);
+            }
         }
     }
 

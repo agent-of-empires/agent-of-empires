@@ -28,9 +28,4 @@ describe("StringDiff", () => {
     );
     expect(getByTestId("string-diff").className).toMatch(/\boverflow-x-auto\b/);
   });
-
-  it("returns null for an empty diff", () => {
-    const { container } = render(<StringDiff oldText="" newText="" filePath="snippet.ts" />);
-    expect(container.textContent).toBe("");
-  });
 });

@@ -94,12 +94,9 @@ fn archived_running_session_renders_stopped_icon_not_spinner() {
     );
 }
 
-/// Regression: paste over a group header must stash to `pending_paste`,
-/// never open a compose dialog targeted at "the first running session".
-/// Earlier behavior fell through to the first-running fallback whenever
-/// `selected_session` was None — silently misrouting voice/dictation
-/// across groups. With cursor on a group, `selected_session` is None and
-/// `resolve_send_target` must return None unconditionally.
+/// Paste over a group header must stash to `pending_paste`, never open a compose dialog
+/// targeted at "the first running session": the old fallback fired whenever
+/// `selected_session` was None and silently misrouted dictation across groups.
 #[test]
 #[serial]
 fn paste_on_group_header_stashes_instead_of_misrouting() {
@@ -182,114 +179,110 @@ fn update_bar_renders_status_toast_without_update_info() {
     );
 }
 
-/// The sandbox-image update banner renders (with its `[u] pull` /
-/// `[Ctrl+x] dismiss` hints) when an `ImageUpdate` is present and no
-/// higher-priority banner is up. Guards the lowest-priority slot in
-/// `render_update_bar`.
+/// The sandbox-image banner renders with its `[u] pull` / `[Ctrl+x] dismiss` hints in the lowest
+/// slot of `render_update_bar`, and an app update wins the shared row over it so the `u` and
+/// Ctrl+x keys stay unambiguous.
 #[test]
 #[serial]
 fn update_bar_renders_sandbox_image_banner() {
-    use crate::containers::image_update::ImageUpdate;
-    use crate::tui::styles::load_theme;
-    use ratatui::backend::TestBackend;
-    use ratatui::Terminal;
+    // Image banner alone.
+    {
+        use crate::containers::image_update::ImageUpdate;
+        use crate::tui::styles::load_theme;
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
 
-    let mut env = create_test_env_empty();
-    let backend = TestBackend::new(100, 30);
-    let mut terminal = Terminal::new(backend).unwrap();
-    let theme = load_theme("empire");
+        let mut env = create_test_env_empty();
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let theme = load_theme("empire");
 
-    let image_update = ImageUpdate {
-        image: "ghcr.io/agent-of-empires/aoe-sandbox:latest".to_string(),
-        remote_digest: "sha256:abc".to_string(),
-    };
+        let image_update = ImageUpdate {
+            image: "ghcr.io/agent-of-empires/aoe-sandbox:latest".to_string(),
+            remote_digest: "sha256:abc".to_string(),
+        };
 
-    terminal
-        .draw(|f| {
-            let area = f.area();
-            env.view
-                .render(f, area, &theme, None, None, Some(&image_update));
-        })
-        .unwrap();
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                env.view
+                    .render(f, area, &theme, None, None, Some(&image_update));
+            })
+            .unwrap();
 
-    let buf = terminal.backend().buffer();
-    let mut out = String::new();
-    for y in 0..buf.area.height {
-        for x in 0..buf.area.width {
-            out.push_str(buf[(x, y)].symbol());
+        let buf = terminal.backend().buffer();
+        let mut out = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                out.push_str(buf[(x, y)].symbol());
+            }
+            out.push('\n');
         }
-        out.push('\n');
+
+        assert!(
+            out.contains("sandbox image update available"),
+            "expected the sandbox image banner to render.\nFull buffer:\n{out}"
+        );
+        assert!(
+            out.contains("[u] pull") && out.contains("[Ctrl+x] dismiss"),
+            "expected the pull/dismiss hints alongside the image banner.\nFull buffer:\n{out}"
+        );
     }
+    // App update hides the image banner.
+    {
+        use crate::containers::image_update::ImageUpdate;
+        use crate::tui::styles::load_theme;
+        use crate::update::UpdateInfo;
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
 
-    assert!(
-        out.contains("sandbox image update available"),
-        "expected the sandbox image banner to render.\nFull buffer:\n{out}"
-    );
-    assert!(
-        out.contains("[u] pull") && out.contains("[Ctrl+x] dismiss"),
-        "expected the pull/dismiss hints alongside the image banner.\nFull buffer:\n{out}"
-    );
-}
+        let mut env = create_test_env_empty();
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let theme = load_theme("empire");
 
-/// The app-update banner wins the shared bottom row over a pending
-/// sandbox-image update: only one shows at a time, so the lower-priority
-/// image banner must stay hidden (and its `[u] pull` hint absent) while an
-/// app update is up. This is what keeps the `u` / Ctrl+x keys unambiguous.
-#[test]
-#[serial]
-fn app_update_banner_takes_precedence_over_image_banner() {
-    use crate::containers::image_update::ImageUpdate;
-    use crate::tui::styles::load_theme;
-    use crate::update::UpdateInfo;
-    use ratatui::backend::TestBackend;
-    use ratatui::Terminal;
+        let update_info = UpdateInfo {
+            available: true,
+            current_version: "1.0.0".to_string(),
+            latest_version: "1.1.0".to_string(),
+        };
+        let image_update = ImageUpdate {
+            image: "ghcr.io/agent-of-empires/aoe-sandbox:latest".to_string(),
+            remote_digest: "sha256:abc".to_string(),
+        };
 
-    let mut env = create_test_env_empty();
-    let backend = TestBackend::new(100, 30);
-    let mut terminal = Terminal::new(backend).unwrap();
-    let theme = load_theme("empire");
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                env.view.render(
+                    f,
+                    area,
+                    &theme,
+                    Some(&update_info),
+                    None,
+                    Some(&image_update),
+                );
+            })
+            .unwrap();
 
-    let update_info = UpdateInfo {
-        available: true,
-        current_version: "1.0.0".to_string(),
-        latest_version: "1.1.0".to_string(),
-    };
-    let image_update = ImageUpdate {
-        image: "ghcr.io/agent-of-empires/aoe-sandbox:latest".to_string(),
-        remote_digest: "sha256:abc".to_string(),
-    };
-
-    terminal
-        .draw(|f| {
-            let area = f.area();
-            env.view.render(
-                f,
-                area,
-                &theme,
-                Some(&update_info),
-                None,
-                Some(&image_update),
-            );
-        })
-        .unwrap();
-
-    let buf = terminal.backend().buffer();
-    let mut out = String::new();
-    for y in 0..buf.area.height {
-        for x in 0..buf.area.width {
-            out.push_str(buf[(x, y)].symbol());
+        let buf = terminal.backend().buffer();
+        let mut out = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                out.push_str(buf[(x, y)].symbol());
+            }
+            out.push('\n');
         }
-        out.push('\n');
-    }
 
-    assert!(
-        out.contains("update available 1.0.0"),
-        "expected the app update banner to win the row.\nFull buffer:\n{out}"
-    );
-    assert!(
-        !out.contains("sandbox image update available"),
-        "image banner must stay hidden while an app update is shown.\nFull buffer:\n{out}"
-    );
+        assert!(
+            out.contains("update available 1.0.0"),
+            "expected the app update banner to win the row.\nFull buffer:\n{out}"
+        );
+        assert!(
+            !out.contains("sandbox image update available"),
+            "image banner must stay hidden while an app update is shown.\nFull buffer:\n{out}"
+        );
+    }
 }
 
 /// Issue #2220: the app-update banner reassures users that updating is safe
@@ -412,77 +405,80 @@ fn wants_paste_burst_only_for_paste_aware_dialogs() {
     );
 }
 
+/// Rows with recovery in flight are excluded from polling until the flag clears.
 #[test]
 #[serial]
 fn pollable_instances_excludes_recovery_in_flight() {
-    let mut env = create_test_env_with_sessions(3);
-    let id_skipped = env.view.instance_at(1).id.clone();
-    env.view.recovery_in_flight.insert(id_skipped.clone());
+    {
+        let mut env = create_test_env_with_sessions(3);
+        let id_skipped = env.view.instance_at(1).id.clone();
+        env.view.recovery_in_flight.insert(id_skipped.clone());
 
-    let pollable = env.view.pollable_instances();
+        let pollable = env.view.pollable_instances();
 
-    assert_eq!(pollable.len(), 2);
-    assert!(pollable.iter().all(|i| i.id != id_skipped));
+        assert_eq!(pollable.len(), 2);
+        assert!(pollable.iter().all(|i| i.id != id_skipped));
+    }
+    // Clearing the flag makes the row pollable again.
+    {
+        let mut env = create_test_env_with_sessions(1);
+        let id = env.view.instance_at(0).id.clone();
+        env.view.recovery_in_flight.insert(id.clone());
+        assert!(env.view.pollable_instances().is_empty());
+
+        env.view.recovery_in_flight.remove(&id);
+
+        assert_eq!(env.view.pollable_instances().len(), 1);
+    }
 }
 
-#[test]
-#[serial]
-fn pollable_instances_recovers_after_inflight_clear() {
-    let mut env = create_test_env_with_sessions(1);
-    let id = env.view.instance_at(0).id.clone();
-    env.view.recovery_in_flight.insert(id.clone());
-    assert!(env.view.pollable_instances().is_empty());
-
-    env.view.recovery_in_flight.remove(&id);
-
-    assert_eq!(env.view.pollable_instances().len(), 1);
-}
-
+/// The System Health panel survives a refresh but closes on selection change, and its tip is
+/// earned only after three consecutive samples with six or more agents.
 #[test]
 #[serial]
 fn system_health_survives_refresh_but_closes_on_selection_change() {
-    let mut env = create_test_env_with_sessions(2);
-    env.view.update_selected();
-    env.view.open_system_health();
+    {
+        let mut env = create_test_env_with_sessions(2);
+        env.view.update_selected();
+        env.view.open_system_health();
 
-    env.view.update_selected();
-    assert!(env.view.system_health_open);
+        env.view.update_selected();
+        assert!(env.view.system_health_open);
 
-    env.view.cursor = 1;
-    env.view.update_selected();
-    assert!(!env.view.system_health_open);
-}
-
-#[test]
-#[serial]
-fn system_health_tip_requires_three_six_agent_samples() {
-    let mut env = create_test_env_empty();
-    env.view.metrics.counts.agents = 6;
-
-    env.view.observe_system_health_tip_load();
-    env.view.observe_system_health_tip_load();
-    assert!(!env.view.system_health_tip_earned);
-    assert!(env.view.pending_tip_pop.is_none());
-
-    env.view.metrics.counts.agents = 5;
-    env.view.observe_system_health_tip_load();
-    assert_eq!(env.view.system_health_tip_high_samples, 0);
-
-    env.view.metrics.counts.agents = 6;
-    for _ in 0..3 {
-        env.view.observe_system_health_tip_load();
+        env.view.cursor = 1;
+        env.view.update_selected();
+        assert!(!env.view.system_health_open);
     }
-    assert!(env.view.system_health_tip_earned);
-    assert_eq!(
-        env.view.pending_tip_pop.map(|tip| tip.id),
-        Some("system-health")
-    );
+    // Tip earning.
+    {
+        let mut env = create_test_env_empty();
+        env.view.metrics.counts.agents = 6;
 
-    env.view.open_system_health();
-    assert!(env.view.pending_tip_pop.is_none());
-    let config = crate::session::Config::load().unwrap();
-    assert!(config.app_state.system_health_tip_earned);
-    assert!(config.app_state.used_system_health);
+        env.view.observe_system_health_tip_load();
+        env.view.observe_system_health_tip_load();
+        assert!(!env.view.system_health_tip_earned);
+        assert!(env.view.pending_tip_pop.is_none());
+
+        env.view.metrics.counts.agents = 5;
+        env.view.observe_system_health_tip_load();
+        assert_eq!(env.view.system_health_tip_high_samples, 0);
+
+        env.view.metrics.counts.agents = 6;
+        for _ in 0..3 {
+            env.view.observe_system_health_tip_load();
+        }
+        assert!(env.view.system_health_tip_earned);
+        assert_eq!(
+            env.view.pending_tip_pop.map(|tip| tip.id),
+            Some("system-health")
+        );
+
+        env.view.open_system_health();
+        assert!(env.view.pending_tip_pop.is_none());
+        let config = crate::session::Config::load().unwrap();
+        assert!(config.app_state.system_health_tip_earned);
+        assert!(config.app_state.used_system_health);
+    }
 }
 
 /// Footer discoverability hints track where each key actually does something.
@@ -570,36 +566,6 @@ fn favorite_without_runtime_cannot_change_local_state() {
     env.view.selected_session = Some(env.view.instance_at(0).id.clone());
     assert!(env.view.toggle_favorite_at_cursor().is_err());
     assert!(!env.view.instance_at(0).is_favorited());
-}
-
-/// `toggle_archive_at_cursor` flips the cursor's instance archived state
-/// and persists the change. No toast: the row sinks to tier 99 and that
-/// visible reordering is the feedback.
-#[test]
-#[serial]
-fn toggle_archive_at_cursor_round_trip() {
-    let mut env = create_test_env_with_sessions(1);
-    // Keep the Archived section expanded so the archived row stays reachable.
-    env.view.archived_section_collapsed = false;
-    let id = env.view.instance_at(0).id.clone();
-    env.view.selected_session = Some(id.clone());
-
-    // Initial state: not archived.
-    assert!(!env.view.instance_at(0).is_archived());
-
-    with_canonical_archive(&mut env, |env| {
-        env.view.toggle_archive_at_cursor().unwrap();
-    });
-    assert!(env.view.instance_at(0).is_archived());
-
-    // Archiving moved the selection off the row (it advances to the next
-    // active session; here there is none). Navigate back onto the archived
-    // row, as a user would, before toggling it back.
-    env.view.select_session_by_id(&id);
-    with_canonical_archive(&mut env, |env| {
-        env.view.toggle_archive_at_cursor().unwrap();
-    });
-    assert!(!env.view.instance_at(0).is_archived());
 }
 
 /// Trashing a session hides it from the active list and surfaces it under
@@ -825,244 +791,238 @@ fn trash_then_immediate_restore_hands_off_cleanly() {
     assert_eq!(final_row.lifecycle_reservation, None);
 }
 
-/// Right-clicking the synthetic Trash section header opens the bulk menu
-/// (Empty Trash / Restore All / Collapse), not the meaningless "Rename Group /
-/// Delete Group" a real group would show.
+/// The Trash and Archived sections render in the pinned shelf. Right-clicking their synthetic
+/// headers opens bulk menus, not a real group's Rename/Delete: Trash offers Empty Trash, Archived
+/// has no destructive action. The Trash header shows its type glyph and count, and the sort
+/// indicator is not duplicated on the shelf divider.
 #[test]
 #[serial]
 fn right_click_trash_header_shows_bulk_menu() {
-    let mut env = create_test_env_with_sessions(2);
-    env.view.trashed_section_collapsed = false;
-    let id = env.view.instance_at(0).id.clone();
-    env.view.trash_session_by_id(&id);
+    // Trash header menu.
+    {
+        let mut env = create_test_env_with_sessions(2);
+        env.view.trashed_section_collapsed = false;
+        let id = env.view.instance_at(0).id.clone();
+        env.view.trash_session_by_id(&id);
 
-    let header_idx = env
-        .view
-        .flat_items
-        .iter()
-        .position(|it| {
-            matches!(it, Item::Group { path, .. }
-                if crate::session::is_trash_section_path(path))
-        })
-        .expect("Trash header must render");
-    render_geometry(&mut env.view);
-    let row = shelf_row_for_idx(&env.view, header_idx);
-    assert!(env.view.handle_right_click(5, row));
-
-    let labels: Vec<&str> = env
-        .view
-        .context_menu
-        .as_ref()
-        .unwrap()
-        .items_for_test()
-        .iter()
-        .map(|(_, l)| *l)
-        .collect();
-    assert_eq!(labels, vec!["Empty Trash", "Restore All", "Collapse"]);
-}
-
-/// Right-clicking the synthetic Archived section header offers Restore All and
-/// the collapse toggle, but no destructive "empty" action (archived rows are
-/// never purged from there).
-#[test]
-#[serial]
-fn right_click_archived_header_shows_restore_menu() {
-    let mut env = create_test_env_with_sessions(2);
-    env.view.archived_section_collapsed = false;
-    env.view.cursor = 0;
-    env.view.update_selected();
-    with_canonical_archive(&mut env, |env| {
-        env.view.toggle_archive_at_cursor().unwrap();
-    });
-
-    let header_idx = env
-        .view
-        .flat_items
-        .iter()
-        .position(|it| {
-            matches!(it, Item::Group { path, .. }
-                if crate::session::is_archived_section_path(path))
-        })
-        .expect("Archived header must render");
-    render_geometry(&mut env.view);
-    let row = shelf_row_for_idx(&env.view, header_idx);
-    assert!(env.view.handle_right_click(5, row));
-
-    let labels: Vec<&str> = env
-        .view
-        .context_menu
-        .as_ref()
-        .unwrap()
-        .items_for_test()
-        .iter()
-        .map(|(_, l)| *l)
-        .collect();
-    assert_eq!(labels, vec!["Restore All", "Collapse"]);
-}
-
-/// "Empty Trash" routes through a destructive confirm carrying the count; the
-/// confirmed action queues every trashed row without taking a flock.
-#[test]
-#[serial]
-fn empty_trash_confirm_purges_every_trashed_row() {
-    use crate::session::Status;
-    let mut env = create_test_env_with_sessions(3);
-    let a = env.view.instance_at(0).id.clone();
-    let b = env.view.instance_at(1).id.clone();
-    env.view.trash_session_by_id(&a);
-    env.view.trash_session_by_id(&b);
-
-    env.view.prompt_empty_trash();
-    let dialog = env
-        .view
-        .confirm_dialog
-        .as_ref()
-        .expect("Empty Trash must open a confirm dialog");
-    assert_eq!(dialog.action(), "empty_trash");
-
-    env.view.dispatch_confirm_submit("empty_trash");
-    for id in [&a, &b] {
-        let inst = env
+        let header_idx = env
             .view
-            .get_instance(id)
-            .expect("row kept until purge lands");
-        assert_eq!(
-            inst.status,
-            Status::Deleting,
-            "each trashed row must be marked Deleting"
+            .flat_items
+            .iter()
+            .position(|it| {
+                matches!(it, Item::Group { path, .. }
+                    if crate::session::is_trash_section_path(path))
+            })
+            .expect("Trash header must render");
+        render_geometry(&mut env.view);
+        let row = shelf_row_for_idx(&env.view, header_idx);
+        assert!(env.view.handle_right_click(5, row));
+
+        let labels: Vec<&str> = env
+            .view
+            .context_menu
+            .as_ref()
+            .unwrap()
+            .items_for_test()
+            .iter()
+            .map(|(_, l)| *l)
+            .collect();
+        assert_eq!(labels, vec!["Empty Trash", "Restore All", "Collapse"]);
+    }
+    // Archived header menu.
+    {
+        let mut env = create_test_env_with_sessions(2);
+        env.view.archived_section_collapsed = false;
+        env.view.cursor = 0;
+        env.view.update_selected();
+        with_canonical_archive(&mut env, |env| {
+            env.view.toggle_archive_at_cursor().unwrap();
+        });
+
+        let header_idx = env
+            .view
+            .flat_items
+            .iter()
+            .position(|it| {
+                matches!(it, Item::Group { path, .. }
+                    if crate::session::is_archived_section_path(path))
+            })
+            .expect("Archived header must render");
+        render_geometry(&mut env.view);
+        let row = shelf_row_for_idx(&env.view, header_idx);
+        assert!(env.view.handle_right_click(5, row));
+
+        let labels: Vec<&str> = env
+            .view
+            .context_menu
+            .as_ref()
+            .unwrap()
+            .items_for_test()
+            .iter()
+            .map(|(_, l)| *l)
+            .collect();
+        assert_eq!(labels, vec!["Restore All", "Collapse"]);
+    }
+    // Trash shelf rendering.
+    {
+        use crate::tui::styles::load_theme;
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut env = create_test_env_with_sessions(2);
+        env.view.trashed_section_collapsed = false;
+        let id = env.view.instance_at(0).id.clone();
+        env.view.trash_session_by_id(&id);
+
+        let theme = load_theme("empire");
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                env.view.render(f, area, &theme, None, None, None);
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let mut screen = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                screen.push_str(buf[(x, y)].symbol());
+            }
+            screen.push('\n');
+        }
+
+        assert!(
+            screen.contains(crate::tui::home::ICON_TRASH_SECTION),
+            "shelf must show the Trash type glyph"
+        );
+        assert!(
+            screen.contains("Trash (1)"),
+            "shelf must show the Trash count"
+        );
+        assert!(
+            !screen.contains("sort:"),
+            "the shelf divider must not duplicate the header's sort indicator"
+        );
+        assert!(
+            env.view.shelf_inner_area.height > 0,
+            "a shelf rect must be populated when trash is present"
         );
     }
 }
 
-/// "Empty Trash" on an already-empty trash shows an info dialog instead of a
-/// confirm that would delete nothing.
+/// Shelf bulk actions: "Empty Trash" routes through a destructive confirm and marks every trashed
+/// row Deleting (an empty trash shows an info dialog instead), and "Restore All" un-trashes or
+/// unarchives every row of its section.
 #[test]
 #[serial]
-fn empty_trash_on_empty_trash_is_a_noop_info() {
-    let mut env = create_test_env_with_sessions(2);
-    env.view.prompt_empty_trash();
-    assert!(env.view.confirm_dialog.is_none());
-    assert_eq!(
-        env.view.info_dialog.as_ref().map(|d| d.title()),
-        Some("Trash is empty")
-    );
-}
+fn empty_trash_confirm_purges_every_trashed_row() {
+    // Empty Trash confirm.
+    {
+        use crate::session::Status;
+        let mut env = create_test_env_with_sessions(3);
+        let a = env.view.instance_at(0).id.clone();
+        let b = env.view.instance_at(1).id.clone();
+        env.view.trash_session_by_id(&a);
+        env.view.trash_session_by_id(&b);
 
-/// "Restore All" pulls every trashed session back out of the trash in one go.
-#[test]
-#[serial]
-fn restore_all_from_trash_restores_every_row() {
-    let mut env = create_test_env_with_sessions(3);
-    let a = env.view.instance_at(0).id.clone();
-    let b = env.view.instance_at(1).id.clone();
-    env.view.trash_session_by_id(&a);
-    env.view.trash_session_by_id(&b);
-    assert_eq!(
-        env.view
-            .instances
-            .values()
-            .filter(|i| i.is_trashed())
-            .count(),
-        2
-    );
+        env.view.prompt_empty_trash();
+        let dialog = env
+            .view
+            .confirm_dialog
+            .as_ref()
+            .expect("Empty Trash must open a confirm dialog");
+        assert_eq!(dialog.action(), "empty_trash");
 
-    env.view.restore_all_from_trash();
-    assert_eq!(
-        env.view
-            .instances
-            .values()
-            .filter(|i| i.is_trashed())
-            .count(),
-        0,
-        "Restore All must un-trash every row"
-    );
-}
-
-/// Restore All queues every archived row without writing a local substitute.
-#[test]
-#[serial]
-fn unarchive_all_submits_all_archived_rows() {
-    use crate::daemon::{RuntimeCursor, SessionMutation};
-    let mut env = create_test_env_with_sessions(3);
-    for i in 0..2 {
-        env.view.cursor = i;
-        env.view.update_selected();
-        with_canonical_archive(&mut env, |env| env.view.toggle_archive_at_cursor().unwrap());
-    }
-    let expected: std::collections::HashSet<_> = env
-        .view
-        .instances()
-        .filter(|row| row.is_archived())
-        .map(|row| row.id.clone())
-        .collect();
-    assert_eq!(expected.len(), 2);
-    let mut respond = env.view.session_feed.command_driver_for_test();
-    env.view.unarchive_all();
-    assert_eq!(
-        env.view.instances().filter(|row| row.is_archived()).count(),
-        2
-    );
-    let submitted: std::collections::HashSet<_> = (0..2)
-        .map(|_| {
-            let (id, mutation) = respond(Ok(RuntimeCursor {
-                epoch: "test".into(),
-                revision: 3,
-            }))
-            .unwrap();
-            assert!(matches!(mutation, SessionMutation::Archive(body) if !body.archived));
-            id
-        })
-        .collect();
-    assert_eq!(submitted, expected);
-}
-
-/// The Trash section renders in the pinned shelf with its distinct type glyph,
-/// and the sort indicator moves onto the divider above it.
-#[test]
-#[serial]
-fn shelf_renders_trash_with_glyph_and_divider_sort() {
-    use crate::tui::styles::load_theme;
-    use ratatui::backend::TestBackend;
-    use ratatui::Terminal;
-
-    let mut env = create_test_env_with_sessions(2);
-    env.view.trashed_section_collapsed = false;
-    let id = env.view.instance_at(0).id.clone();
-    env.view.trash_session_by_id(&id);
-
-    let theme = load_theme("empire");
-    let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
-    terminal
-        .draw(|f| {
-            let area = f.area();
-            env.view.render(f, area, &theme, None, None, None);
-        })
-        .unwrap();
-    let buf = terminal.backend().buffer().clone();
-    let mut screen = String::new();
-    for y in 0..buf.area.height {
-        for x in 0..buf.area.width {
-            screen.push_str(buf[(x, y)].symbol());
+        env.view.dispatch_confirm_submit("empty_trash");
+        for id in [&a, &b] {
+            let inst = env
+                .view
+                .get_instance(id)
+                .expect("row kept until purge lands");
+            assert_eq!(
+                inst.status,
+                Status::Deleting,
+                "each trashed row must be marked Deleting"
+            );
         }
-        screen.push('\n');
     }
+    // Empty Trash with nothing trashed.
+    {
+        let mut env = create_test_env_with_sessions(2);
+        env.view.prompt_empty_trash();
+        assert!(env.view.confirm_dialog.is_none());
+        assert_eq!(
+            env.view.info_dialog.as_ref().map(|d| d.title()),
+            Some("Trash is empty")
+        );
+    }
+    // Restore All from Trash.
+    {
+        let mut env = create_test_env_with_sessions(3);
+        let a = env.view.instance_at(0).id.clone();
+        let b = env.view.instance_at(1).id.clone();
+        env.view.trash_session_by_id(&a);
+        env.view.trash_session_by_id(&b);
+        assert_eq!(
+            env.view
+                .instances
+                .values()
+                .filter(|i| i.is_trashed())
+                .count(),
+            2
+        );
 
-    assert!(
-        screen.contains(crate::tui::home::ICON_TRASH_SECTION),
-        "shelf must show the Trash type glyph"
-    );
-    assert!(
-        screen.contains("Trash (1)"),
-        "shelf must show the Trash count"
-    );
-    assert!(
-        !screen.contains("sort:"),
-        "the shelf divider must not duplicate the header's sort indicator"
-    );
-    assert!(
-        env.view.shelf_inner_area.height > 0,
-        "a shelf rect must be populated when trash is present"
-    );
+        env.view.restore_all_from_trash();
+        assert_eq!(
+            env.view
+                .instances
+                .values()
+                .filter(|i| i.is_trashed())
+                .count(),
+            0,
+            "Restore All must un-trash every row"
+        );
+    }
+    // Restore All from Archived: every archived row is queued for the daemon,
+    // and nothing is unarchived locally until the canonical revision says so.
+    {
+        use crate::daemon::{RuntimeCursor, SessionMutation};
+        let mut env = create_test_env_with_sessions(3);
+        for i in 0..2 {
+            env.view.cursor = i;
+            env.view.update_selected();
+            with_canonical_archive(&mut env, |env| {
+                env.view.toggle_archive_at_cursor().unwrap();
+            });
+        }
+        let expected: std::collections::HashSet<_> = env
+            .view
+            .instances()
+            .filter(|row| row.is_archived())
+            .map(|row| row.id.clone())
+            .collect();
+        assert_eq!(expected.len(), 2);
+
+        let mut respond = env.view.session_feed.command_driver_for_test();
+        env.view.unarchive_all();
+        assert_eq!(
+            env.view.instances().filter(|row| row.is_archived()).count(),
+            2,
+            "Restore All (archived) must queue the daemon, not unarchive locally"
+        );
+        let submitted: std::collections::HashSet<_> = (0..2)
+            .map(|_| {
+                let (id, mutation) = respond(Ok(RuntimeCursor {
+                    epoch: "test".into(),
+                    revision: 3,
+                }))
+                .unwrap();
+                assert!(matches!(mutation, SessionMutation::Archive(body) if !body.archived));
+                id
+            })
+            .collect();
+        assert_eq!(submitted, expected);
+    }
 }
 
 /// A trashed row whose permanent delete failed carries `Status::Error` +
@@ -1611,15 +1571,4 @@ fn confirm_delete_dialog_cancel_leaves_session() {
         env.view.pending_trash_session.is_none(),
         "cancelling must clear the pending trash target"
     );
-}
-
-/// When no session is selected, the toggle is a silent no-op.
-#[test]
-#[serial]
-fn toggle_archive_at_cursor_noop_with_no_selection() {
-    let mut env = create_test_env_empty();
-    env.view.selected_session = None;
-    with_canonical_archive(&mut env, |env| {
-        env.view.toggle_archive_at_cursor().unwrap();
-    });
 }

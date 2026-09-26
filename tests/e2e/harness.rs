@@ -1205,6 +1205,24 @@ last_seen_version = "{}"
             .expect("failed to run aoe CLI")
     }
 
+    /// Like [`Self::run_cli`], but spawns `aoe <args>` in the background
+    /// instead of blocking for exit. For a long-running command like `acp
+    /// tail`, which streams until killed rather than returning.
+    pub fn spawn_cli(&self, args: &[&str]) -> std::process::Child {
+        Command::new(&self.binary_path)
+            .args(args)
+            .env("HOME", self.home_dir.path())
+            .env("XDG_CONFIG_HOME", self.home_dir.path().join(".config"))
+            .env("PATH", self.env_path())
+            .env_remove("AGENT_OF_EMPIRES_DEBUG")
+            .env_remove("AOE_LOG_LEVEL")
+            .envs(self.extra_env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("failed to spawn aoe CLI")
+    }
+
     /// Like [`Self::run_cli`], but writes `stdin` to the child before
     /// collecting output. Used by the plugin-worker tests, which speak
     /// ndjson JSON-RPC on stdio and exit on EOF.

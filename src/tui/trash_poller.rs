@@ -111,6 +111,8 @@ mod tests {
         (guard, instance, generation)
     }
 
+    /// A request is in flight until its result lands. A plain (non-worktree,
+    /// non-sandbox) session has nothing to relocate.
     #[test]
     #[serial_test::serial]
     fn test_trash_poller_channel_communication() {

@@ -201,17 +201,14 @@ mod tests {
     }
 
     #[test]
-    fn resolve_href_leaves_an_absolute_url_unchanged() {
+    fn resolve_href_joins_only_relative_paths() {
+        let base = "http://127.0.0.1:8080";
         assert_eq!(
-            resolve_href(None, "https://example.com/pr/1").unwrap(),
+            resolve_href(Some(base), "https://example.com/pr/1").unwrap(),
             "https://example.com/pr/1"
         );
-    }
-
-    #[test]
-    fn resolve_href_uses_dashboard_not_api_transport() {
         assert_eq!(
-            resolve_href(Some("http://127.0.0.1:8080"), "/session/xyz").unwrap(),
+            resolve_href(Some(base), "/session/xyz").unwrap(),
             "http://127.0.0.1:8080/session/xyz"
         );
     }

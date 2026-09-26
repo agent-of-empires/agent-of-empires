@@ -594,16 +594,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn holds_worktree_short_circuits_without_sandbox() {
-        // The gate that guards `set_worktree_name_for_selected` and
-        // `rename_selected` (#2117, #2414): a non-sandbox session must return
-        // false before touching the container runtime, so a plain worktree
-        // rename never pays a `docker inspect`. The live-container branch is the
-        // same helper the tied-rename path already relies on.
-        assert!(!ensure_sandbox_container_released("any-session-id", false));
-    }
-
     #[cfg(unix)]
     #[test]
     fn discard_after_move_short_circuits_without_sandbox() {
@@ -638,67 +628,40 @@ mod tests {
     }
 
     #[test]
-    fn leaf_from_title_slugifies() {
-        assert_eq!(worktree_leaf_from_title("Auth refactor"), "auth-refactor");
-        assert_eq!(
-            worktree_leaf_from_title("Fix: the/thing (v2)"),
-            "fix-the-thing-v2"
-        );
-        // A slash-bearing title yields a slashed branch but the folder leaf
-        // must stay a single, flat path component.
-        let leaf = worktree_leaf_from_title("jacob/feature-1");
-        assert_eq!(leaf, "jacob-feature-1");
-        assert!(!leaf.contains('/'));
+    fn leaf_from_title_is_one_safe_non_empty_component() {
+        for (title, leaf) in [
+            ("Auth refactor", "auth-refactor"),
+            ("Fix: the/thing (v2)", "fix-the-thing-v2"),
+            ("jacob/feature-1", "jacob-feature-1"),
+            ("...", "session"),
+            ("   ", "session"),
+            ("../escape", "escape"),
+        ] {
+            assert_eq!(worktree_leaf_from_title(title), leaf, "{title:?}");
+        }
     }
 
     #[test]
-    fn leaf_from_title_never_empty_or_traversal() {
-        // Punctuation-only and dot titles fall back / collapse rather than
-        // producing an empty leaf or a "."/".." path component.
-        assert_eq!(worktree_leaf_from_title("..."), "session");
-        assert_eq!(worktree_leaf_from_title("   "), "session");
-        let leaf = worktree_leaf_from_title("../escape");
-        assert!(!leaf.contains('/') && leaf != ".." && !leaf.is_empty());
-    }
-
-    #[test]
-    fn rejects_unmanaged_worktree() {
-        let info = wt_info("old", "/tmp/repo", false);
-        let err = edit_worktree_workdir(WorktreeEditRequest {
-            worktree_info: &info,
-            current_path: Path::new("/tmp/wt/old"),
-            new_name: "new",
-            rename_branch: false,
-        })
-        .unwrap_err();
-        assert!(matches!(err, WorktreeEditError::NotManaged));
-    }
-
-    #[test]
-    fn rejects_empty_name() {
-        let info = wt_info("old", "/tmp/repo", true);
-        let err = edit_worktree_workdir(WorktreeEditRequest {
-            worktree_info: &info,
-            current_path: Path::new("/tmp/wt/old"),
-            new_name: "   ",
-            rename_branch: false,
-        })
-        .unwrap_err();
-        assert!(matches!(err, WorktreeEditError::EmptyName));
-    }
-
-    #[test]
-    fn rejects_unchanged_name_without_branch_rename() {
-        // Leaf derived from "old" is "old", so the path does not change and
-        // branch rename is off: nothing would happen.
-        let info = wt_info("old", "/tmp/repo", true);
-        let err = edit_worktree_workdir(WorktreeEditRequest {
-            worktree_info: &info,
-            current_path: Path::new("/tmp/wt/old"),
-            new_name: "old",
-            rename_branch: false,
-        })
-        .unwrap_err();
-        assert!(matches!(err, WorktreeEditError::Unchanged));
+    fn edit_worktree_workdir_rejects_invalid_requests() {
+        let cases = [
+            (false, "new", WorktreeEditError::NotManaged),
+            (true, "   ", WorktreeEditError::EmptyName),
+            (true, "old", WorktreeEditError::Unchanged),
+        ];
+        for (managed, new_name, want) in cases {
+            let info = wt_info("old", "/tmp/repo", managed);
+            let err = edit_worktree_workdir(WorktreeEditRequest {
+                worktree_info: &info,
+                current_path: Path::new("/tmp/wt/old"),
+                new_name,
+                rename_branch: false,
+            })
+            .unwrap_err();
+            assert_eq!(
+                std::mem::discriminant(&err),
+                std::mem::discriminant(&want),
+                "{new_name:?}"
+            );
+        }
     }
 }

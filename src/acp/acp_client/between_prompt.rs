@@ -418,14 +418,6 @@ mod tests {
     }
 
     #[test]
-    fn between_prompt_stop_reason_maps_adopted_and_agent_initiated() {
-        assert_eq!(between_prompt_stop_reason(false, false), "agent_idle");
-        assert_eq!(between_prompt_stop_reason(false, true), "agent_idle");
-        assert_eq!(between_prompt_stop_reason(true, true), "prompt_complete");
-        assert_eq!(between_prompt_stop_reason(true, false), "reattach_idle");
-    }
-
-    #[test]
     fn between_prompt_signal_update_cases() {
         let tracked = |cost_seen, wake_at| {
             Some(BetweenPromptUpdate {
@@ -490,5 +482,12 @@ mod tests {
         assert_eq!(tracker.take_idle_fire(2_000 + ms(FAST) - 1), None);
         assert_eq!(tracker.take_idle_fire(2_000 + ms(FAST)), Some(true));
         assert_eq!(tracker.take_idle_fire(10_000_000), None);
+
+        {
+            assert_eq!(between_prompt_stop_reason(false, false), "agent_idle");
+            assert_eq!(between_prompt_stop_reason(false, true), "agent_idle");
+            assert_eq!(between_prompt_stop_reason(true, true), "prompt_complete");
+            assert_eq!(between_prompt_stop_reason(true, false), "reattach_idle");
+        }
     }
 }

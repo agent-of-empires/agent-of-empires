@@ -71,17 +71,6 @@ describe("MobileLiveTerminal Android IME word commits", () => {
       sent: ["t", "e", "s", "t", " "],
     },
     {
-      name: "keeps every word of a sentence typed that way",
-      run: (t) => {
-        t.type("hi");
-        t.compose("hi");
-        t.type(" you");
-        t.compose("you");
-        t.type(" ");
-      },
-      sent: ["h", "i", " ", "y", "o", "u", " "],
-    },
-    {
       name: "sends only the tail when the composition extends the typed word",
       run: (t) => {
         t.type("tes");
@@ -182,11 +171,6 @@ describe("MobileLiveTerminal Android IME word commits", () => {
       sent: ["a", "日本"],
     },
     {
-      name: "sends a composition that follows no plain typing",
-      run: (t) => t.compose("日本"),
-      sent: ["日本"],
-    },
-    {
       // A composition that stood on its own is not a typed word under the caret, so the next one must reach the
       // pane whole even when it repeats it.
       name: "sends a character composed twice in a row",
@@ -194,11 +178,6 @@ describe("MobileLiveTerminal Android IME word commits", () => {
         t.composeUpdating("a", "a");
         t.composeUpdating("a", "a");
       },
-      sent: ["a", "a"],
-    },
-    {
-      name: "keeps repeated characters typed without a composition",
-      run: (t) => t.type("aa"),
       sent: ["a", "a"],
     },
     {

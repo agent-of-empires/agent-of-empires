@@ -16,11 +16,23 @@
 //!   parsed as an event frame (#3560). See `parse_text`.
 //!
 //! Native authentication uses a sensitive Authorization header, never the URL.
+//!
+//! A `--auth=passphrase` daemon never mints a bearer token, so when only a
+//! passphrase resolves the upgrade request instead carries `Cookie:
+//! aoe_session=...` and `Sec-WebSocket-Protocol: aoe-auth,
+//! aoe-device.<secret>` headers, the same passphrase-login session
+//! `HttpClient` uses (see `passphrase_session`). `aoe-auth` must be offered
+//! alongside the device-binding value: the daemon (`acp_ws.rs`) only echoes
+//! a `Sec-WebSocket-Protocol` response header, at all, when the client
+//! offered that literal string, and tungstenite fails the handshake outright
+//! if the response omits it while the request carried one (RFC 6455). The
+//! web client already offers it the same way (`useAcpSession.ts`).
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
+use reqwest::header::{self, HeaderName, HeaderValue};
 use serde::Deserialize;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -30,6 +42,7 @@ use tokio_tungstenite::WebSocketStream;
 use tracing::debug;
 
 use super::discovery::DaemonEndpoint;
+use super::passphrase_session::{self, PassphraseSessionCache};
 use crate::acp::protocol::AcpBroadcastFrame;
 use crate::acp::state::AcpState;
 use crate::acp::transcript::{TranscriptDelta, TranscriptRow};
@@ -143,7 +156,7 @@ pub async fn connect_with(
     let session_id = crate::daemon::transport::path_segment(session_id)?;
     let path = format!("/sessions/{session_id}/acp/ws");
     let query = format!("since={since}&frames={}", u8::from(forward_frames));
-    match websocket::connect(endpoint, &path, Some(&query)).await? {
+    match connect_session(endpoint, &path, &query).await? {
         NativeSocket::Unix(stream) => Ok(start_reader(*stream)),
         NativeSocket::Tcp(stream) => Ok(start_reader(*stream)),
     }
@@ -163,6 +176,70 @@ where
         shutdown,
         _drop_guard,
     }
+}
+
+/// Open the session stream, retrying once after a fresh passphrase login if a
+/// *cached* session was rejected (rotated passphrase, expired or evicted
+/// session). A first-ever login failure is not retried: the passphrase itself
+/// is wrong, not merely stale.
+async fn connect_session(
+    endpoint: &DaemonEndpoint,
+    path: &str,
+    query: &str,
+) -> Result<NativeSocket, WsError> {
+    let cache = PassphraseSessionCache::default();
+    let had_cached_session = cache.get(endpoint).is_some();
+    let headers = session_headers(endpoint, &cache).await?;
+    match websocket::connect_with_headers(endpoint, path, Some(query), &headers).await {
+        Err(error) if had_cached_session && is_unauthorized(&error) => {
+            cache.invalidate(endpoint);
+            let headers = session_headers(endpoint, &cache).await?;
+            websocket::connect_with_headers(endpoint, path, Some(query), &headers).await
+        }
+        connected => connected,
+    }
+}
+
+/// The passphrase-login headers this upgrade must carry, or none when the
+/// endpoint needs none: a resolved bearer token already rides the
+/// `Authorization` header, a local Unix-socket daemon is authorized by its
+/// peer owner, and `--auth=none` resolves no passphrase at all.
+async fn session_headers(
+    endpoint: &DaemonEndpoint,
+    cache: &PassphraseSessionCache,
+) -> Result<Vec<(HeaderName, HeaderValue)>, WsError> {
+    if endpoint.bearer_token().is_some()
+        || endpoint.unix_path().is_some()
+        || endpoint.resolved_passphrase().is_none()
+    {
+        return Ok(Vec::new());
+    }
+    let session = match cache.get(endpoint) {
+        Some(session) => session,
+        None => passphrase_session::login(endpoint, cache).await?,
+    };
+    let cookie = HeaderValue::from_str(&session.cookie).map_err(|_| WsError::InvalidUrl)?;
+    // `aoe-auth` must be offered too: the daemon only echoes a
+    // `Sec-WebSocket-Protocol` response header when the client offered that
+    // exact literal, and tungstenite hard-fails the handshake
+    // (`NoSubProtocol`) if the response omits it while the request carried
+    // one. See the module doc comment.
+    let protocol =
+        HeaderValue::from_str(&format!("aoe-auth, aoe-device.{}", session.binding_secret))
+            .map_err(|_| WsError::InvalidUrl)?;
+    Ok(vec![
+        (header::COOKIE, cookie),
+        (header::SEC_WEBSOCKET_PROTOCOL, protocol),
+    ])
+}
+
+/// Only a 401 means the credential was rejected; every other failure is a
+/// real transport or handshake error and must not trigger a re-login.
+fn is_unauthorized(error: &WsError) -> bool {
+    matches!(
+        error,
+        WsError::Rejected { status, .. } if *status == reqwest::StatusCode::UNAUTHORIZED
+    )
 }
 
 async fn reader_loop<S>(
@@ -320,7 +397,10 @@ fn parse_text(raw: &str) -> Result<Option<WsMessage>, WsError> {
 mod tests {
     use super::*;
     use crate::acp::client::discovery::Source;
-    use crate::acp::state::Event;
+
+    fn endpoint(base: &str, token: Option<&str>) -> DaemonEndpoint {
+        DaemonEndpoint::new(base.to_string(), token.map(str::to_string), Source::Env)
+    }
 
     #[tokio::test]
     async fn websocket_auth_never_uses_url_credentials() {
@@ -421,68 +501,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_text_frame() {
-        let raw = serde_json::to_string(&serde_json::json!({
-            "session_id": "s-1",
-            "seq": 7,
-            "event": "ThinkingStarted",
-        }))
-        .unwrap();
-        let m = parse_text(&raw).unwrap();
-        match m {
-            Some(WsMessage::Frame(f)) => {
-                assert_eq!(f.session_id, "s-1");
-                assert_eq!(f.seq, 7);
-                assert!(matches!(*f.event, Event::ThinkingStarted));
-            }
-            other => panic!("expected frame, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn parse_text_transcript_snapshot_and_delta() {
-        // The connect snapshot yields the row buffer; a live delta yields
-        // one row change. Both are keyed by id so the consumer reconciles
-        // idempotently against a `?view=rows` replay overlap.
-        let snapshot = serde_json::json!({
-            "kind": "transcript_snapshot",
-            "session_id": "s-1",
-            "seq": 3,
-            "rows": [{
-                "id": "msg-1",
-                "group_id": "g1",
-                "kind": "message",
-                "at": "2024-01-01T00:00:00Z",
-                "text": "hi",
-            }],
-        })
-        .to_string();
-        match parse_text(&snapshot).unwrap() {
-            Some(WsMessage::TranscriptSnapshot(rows)) => {
-                assert_eq!(rows.len(), 1);
-                assert_eq!(rows[0].id, "msg-1");
-                assert_eq!(rows[0].text, "hi");
-            }
-            other => panic!("expected snapshot, got {other:?}"),
-        }
-
-        let delta = serde_json::json!({
-            "kind": "transcript_delta",
-            "session_id": "s-1",
-            "seq": 4,
-            "delta": { "Remove": "msg-1" },
-        })
-        .to_string();
-        match parse_text(&delta).unwrap() {
-            Some(WsMessage::TranscriptDelta(boxed)) => match *boxed {
-                TranscriptDelta::Remove(id) => assert_eq!(id, "msg-1"),
-                other => panic!("expected Remove, got {other:?}"),
-            },
-            other => panic!("expected delta, got {other:?}"),
-        }
-    }
-
-    #[test]
     fn parse_text_reads_the_reduced_state_frame() {
         // The whole control state rides on this frame, and the fields the
         // sender omits must default rather than fail the parse: a parse error
@@ -500,7 +518,6 @@ mod tests {
                 "todos": [],
                 "in_flight_tool": null,
                 "pending_approvals": [],
-                "recent_diffs": [],
                 "thinking": null,
                 "rate_limit": null,
                 "turn_active": true,
@@ -514,8 +531,80 @@ mod tests {
                 assert_eq!(seq, 7);
                 assert!(state.turn_active);
                 assert!(state.available_modes.is_empty(), "absent field defaults");
+                // `recent_diffs` is one of the server's cold fields (omitted
+                // from the wire when unchanged, see `COLD_STATE_FIELDS` in
+                // `src/server/acp_ws.rs`), so it must default the same way.
+                assert!(state.recent_diffs.is_empty(), "absent field defaults");
             }
             other => panic!("expected reduced state, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn session_headers_add_nothing_when_a_bearer_token_resolves() {
+        let _env = crate::session::test_support::EnvGuard::unset(&["AOE_DAEMON_PASSPHRASE"]);
+        let e = endpoint("http://127.0.0.1:8080", Some("tok"));
+        let cache = PassphraseSessionCache::default();
+        assert!(session_headers(&e, &cache).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn session_headers_add_nothing_without_token_or_passphrase() {
+        let _env = crate::session::test_support::EnvGuard::unset(&["AOE_DAEMON_PASSPHRASE"]);
+        let e = endpoint("http://127.0.0.1:8080", None);
+        let cache = PassphraseSessionCache::default();
+        assert!(session_headers(&e, &cache).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn session_headers_carry_a_cached_passphrase_session() {
+        let _env = crate::session::test_support::EnvGuard::unset(&["AOE_DAEMON_PASSPHRASE"]);
+        let dir = tempfile::tempdir().unwrap();
+        let passphrase_path = dir.path().join("serve.passphrase");
+        std::fs::write(&passphrase_path, "hunter2").unwrap();
+        let e = DaemonEndpoint::new("http://127.0.0.1:8080".into(), None, Source::LocalDaemon)
+            .with_local_passphrase_path(passphrase_path);
+        let cache = PassphraseSessionCache::default();
+        cache.set_for_test(passphrase_session::PassphraseSession {
+            cookie: "aoe_session=abc123".to_string(),
+            binding_secret: "the-binding-secret".to_string(),
+        });
+
+        let headers = session_headers(&e, &cache).await.unwrap();
+        let value_of = |name: header::HeaderName| {
+            headers
+                .iter()
+                .find(|(header, _)| *header == name)
+                .map(|(_, value)| value.to_str().unwrap().to_string())
+        };
+
+        assert_eq!(
+            value_of(header::COOKIE).as_deref(),
+            Some("aoe_session=abc123")
+        );
+        // Must include the `aoe-auth` literal alongside the device-binding
+        // value, or the daemon never echoes a Sec-WebSocket-Protocol
+        // response header and tungstenite fails the handshake outright.
+        assert_eq!(
+            value_of(header::SEC_WEBSOCKET_PROTOCOL).as_deref(),
+            Some("aoe-auth, aoe-device.the-binding-secret")
+        );
+    }
+
+    #[test]
+    fn only_a_401_counts_as_a_rejected_credential() {
+        let rejected = WsError::Rejected {
+            status: reqwest::StatusCode::UNAUTHORIZED,
+            code: None,
+        };
+        assert!(is_unauthorized(&rejected));
+        assert!(!is_unauthorized(&WsError::Rejected {
+            status: reqwest::StatusCode::FORBIDDEN,
+            code: None,
+        }));
+        assert!(!is_unauthorized(&WsError::Transport));
     }
 }

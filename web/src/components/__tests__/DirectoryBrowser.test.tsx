@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 
 import type { BrowseResponse } from "../../lib/types";
 
@@ -24,25 +24,28 @@ function dir(name: string, path = `/home/user/${name}`) {
 }
 
 afterEach(() => {
-  cleanup();
   window.localStorage.clear();
   browseFilesystem.mockReset();
   getHomePath.mockReset();
 });
 
 describe("DirectoryBrowser", () => {
-  it("falls back to home when the initial path cannot be loaded", async () => {
+  it("falls back to home when the initial path cannot be loaded, and selects it via 'Use this folder'", async () => {
     getHomePath.mockResolvedValue("/home/user");
     browseFilesystem.mockImplementation(async (path: string) => {
       if (path === "/missing") return { entries: [], has_more: false, ok: false };
       return response([dir("project")]);
     });
+    const onSelect = vi.fn();
 
-    render(<DirectoryBrowser initialPath="/missing" onSelect={vi.fn()} />);
+    render(<DirectoryBrowser initialPath="/missing" onSelect={onSelect} />);
 
     await expect(screen.findByRole("option", { name: /project/i })).resolves.toBeTruthy();
     expect(browseFilesystem).toHaveBeenNthCalledWith(1, "/missing", 100, undefined, false);
     expect(browseFilesystem).toHaveBeenNthCalledWith(2, "/home/user", 100, undefined, false);
+    // The current folder is selectable even when it is not a git repo.
+    fireEvent.click(screen.getByRole("button", { name: /use this folder/i }));
+    expect(onSelect).toHaveBeenCalledWith("/home/user");
   });
 
   it("ignores stale browse responses after a newer navigation finishes", async () => {
@@ -72,19 +75,6 @@ describe("DirectoryBrowser", () => {
     });
     expect(screen.queryByRole("option", { name: /stale-child/i })).toBeNull();
     expect(screen.getByRole("option", { name: /newer-child/i })).toBeTruthy();
-  });
-
-  it("selects the current folder via 'Use this folder', even when it is not a git repo", async () => {
-    getHomePath.mockResolvedValue("/home/user");
-    browseFilesystem.mockResolvedValue(response([dir("project")]));
-    const onSelect = vi.fn();
-
-    render(<DirectoryBrowser onSelect={onSelect} />);
-
-    await screen.findByRole("option", { name: /project/i });
-    fireEvent.click(screen.getByRole("button", { name: /use this folder/i }));
-
-    expect(onSelect).toHaveBeenCalledWith("/home/user");
   });
 
   it("requests filtered results from the server so entries past the first page can be found", async () => {

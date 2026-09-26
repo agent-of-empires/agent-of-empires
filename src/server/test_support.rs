@@ -1,9 +1,6 @@
 //! Test-only constructors that integration tests in `tests/` need to drive
 //! `reload_state_instances_from_disk` and the dynamic-profile-rewire helpers
-//! without going through the full daemon. Mirrors the pattern at
-//! `src/tmux/mod.rs`'s `test_support` module: gated on
-//! `#[cfg(any(test, feature = "test-support"))]` so the surface stays out of
-//! production builds, and `#[doc(hidden)]` so it's invisible in rustdoc.
+//! without going through the full daemon.
 
 use super::*;
 use crate::file_watch::FileWatchService;
@@ -280,10 +277,6 @@ pub use super::api::system::{create_profile, delete_profile, rename_profile};
 
 pub async fn add_profile_disk_watch(state: &Arc<AppState>, profile: &str) {
     super::add_profile_disk_watch(state, profile).await
-}
-
-pub async fn remove_profile_disk_watch(state: &Arc<AppState>, profile: &str) {
-    super::remove_profile_disk_watch(state, profile).await
 }
 
 pub async fn rename_profile_disk_watch(state: &Arc<AppState>, old: &str, new: &str) {

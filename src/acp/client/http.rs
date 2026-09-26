@@ -11,6 +11,7 @@ use reqwest::{header, StatusCode};
 use thiserror::Error;
 
 use super::discovery::DaemonEndpoint;
+use super::passphrase_session::{self, PassphraseSessionCache};
 use crate::acp::elicitations::ElicitationResolution;
 use crate::acp::protocol::{
     ApprovalDecisionWire, FilesResponse, PromptRequest, ReplayResponse, ResolveApprovalRequest,
@@ -67,6 +68,7 @@ pub const REPLAY_PAGE_SIZE: u64 = 1000;
 pub struct HttpClient {
     http: reqwest::Client,
     endpoint: DaemonEndpoint,
+    passphrase_session: PassphraseSessionCache,
 }
 
 #[derive(Debug, Error)]
@@ -102,7 +104,11 @@ impl HttpClient {
         let token = endpoint.bearer_token();
         crate::daemon::authorization_header(token)?;
         let http = crate::daemon::native_http_client(&url, token.is_some())?;
-        Ok(Self { http, endpoint })
+        Ok(Self {
+            http,
+            endpoint,
+            passphrase_session: PassphraseSessionCache::default(),
+        })
     }
 
     /// `GET /api/sessions/{id}/acp/replay?since=N`. Unbounded fetch
@@ -639,21 +645,83 @@ impl HttpClient {
         check_global_status(res).map(|_| ())
     }
 
+    /// Build, authenticate and send one request, retrying once after a fresh
+    /// passphrase login when a *cached* login session comes back 401 (rotated
+    /// passphrase, expired or evicted session). A first-ever login failure,
+    /// or a 401 carrying a bearer token, is not retried: the credential
+    /// itself is wrong, not merely stale.
     async fn execute(
         &self,
         builder: reqwest::RequestBuilder,
     ) -> Result<reqwest::Response, HttpError> {
-        let token = self.endpoint.bearer_token();
-        let mut request = builder.build()?;
-        if let Some(authorization) = crate::daemon::authorization_header(token)? {
-            request
-                .headers_mut()
-                .insert(header::AUTHORIZATION, authorization);
+        let request = builder.build()?;
+        // Every body here is an in-memory JSON payload, so the retry below
+        // can reuse the built request. A body that cannot be cloned (none
+        // today) simply keeps the first response.
+        let retry = request.try_clone();
+        let had_cached_session = self.passphrase_session.get(&self.endpoint).is_some();
+        let response = self.send_authenticated(request).await?;
+        if !had_cached_session || response.status() != StatusCode::UNAUTHORIZED {
+            return Ok(response);
         }
+        self.passphrase_session.invalidate(&self.endpoint);
+        let Some(retry) = retry else {
+            return Ok(response);
+        };
+        self.send_authenticated(retry).await
+    }
+
+    async fn send_authenticated(
+        &self,
+        mut request: reqwest::Request,
+    ) -> Result<reqwest::Response, HttpError> {
+        self.attach_credential(&mut request).await?;
         Ok(
             crate::daemon::transport::execute(&self.http, self.endpoint.unix_path(), request)
                 .await?,
         )
+    }
+
+    /// Attach whichever credential is available: a bearer token when one
+    /// resolves (`--auth=token`), otherwise the passphrase-login session
+    /// (`--auth=passphrase`), logging in on first use. Neither resolving
+    /// (`--auth=none`) leaves the request untouched.
+    ///
+    /// The passphrase only ever travels to an endpoint that can keep it
+    /// confidential: `resolved_passphrase` refuses a plaintext `http://`
+    /// non-loopback URL, and a local Unix-socket daemon is skipped outright
+    /// because its peer owner already authorizes the request.
+    async fn attach_credential(&self, request: &mut reqwest::Request) -> Result<(), HttpError> {
+        let token = self.endpoint.bearer_token();
+        if let Some(authorization) = crate::daemon::authorization_header(token)? {
+            request
+                .headers_mut()
+                .insert(header::AUTHORIZATION, authorization);
+            return Ok(());
+        }
+        if self.endpoint.unix_path().is_some() || self.endpoint.resolved_passphrase().is_none() {
+            return Ok(());
+        }
+        let session = self.ensure_passphrase_session().await?;
+        request.headers_mut().insert(
+            header::COOKIE,
+            header::HeaderValue::from_str(&session.cookie).map_err(|_| HttpError::Transport)?,
+        );
+        request.headers_mut().insert(
+            "x-aoe-device-binding",
+            header::HeaderValue::from_str(&session.binding_secret)
+                .map_err(|_| HttpError::Transport)?,
+        );
+        Ok(())
+    }
+
+    async fn ensure_passphrase_session(
+        &self,
+    ) -> Result<passphrase_session::PassphraseSession, HttpError> {
+        if let Some(session) = self.passphrase_session.get(&self.endpoint) {
+            return Ok(session);
+        }
+        passphrase_session::login(&self.endpoint, &self.passphrase_session).await
     }
 }
 
@@ -728,6 +796,80 @@ mod tests {
         let result = tokio::time::timeout(Duration::from_secs(1), client.health_check()).await;
         server.abort();
         assert!(matches!(result.unwrap(), Err(HttpError::ReadOnly)));
+    }
+
+    /// The request `attach_credential` would put on the wire, headers and all.
+    async fn credentialed(client: &HttpClient, url: &str) -> reqwest::Request {
+        let mut request = client.http.get(url).build().unwrap();
+        client.attach_credential(&mut request).await.unwrap();
+        request
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn no_credential_without_token_or_passphrase() {
+        // --auth=none: neither a token nor a passphrase resolves, so the
+        // request must go out exactly as built, matching pre-passphrase
+        // behavior.
+        let _env = crate::session::test_support::EnvGuard::unset(&["AOE_DAEMON_PASSPHRASE"]);
+        let client = HttpClient::new(endpoint("http://127.0.0.1:8080", None)).unwrap();
+        let request = credentialed(&client, "http://127.0.0.1:8080/api/sessions").await;
+        assert!(request.headers().get(header::AUTHORIZATION).is_none());
+        assert!(request.headers().get(header::COOKIE).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_bearer_token_wins_over_a_passphrase() {
+        let dir = tempfile::tempdir().unwrap();
+        let passphrase_path = dir.path().join("serve.passphrase");
+        std::fs::write(&passphrase_path, "hunter2").unwrap();
+        let client = HttpClient::new(
+            DaemonEndpoint::new(
+                "http://127.0.0.1:8080".into(),
+                Some("tok".into()),
+                Source::LocalDaemon,
+            )
+            .with_local_passphrase_path(passphrase_path),
+        )
+        .unwrap();
+
+        let request = credentialed(&client, "http://127.0.0.1:8080/api/sessions").await;
+        assert_eq!(
+            request.headers().get(header::AUTHORIZATION).unwrap(),
+            "Bearer tok"
+        );
+        assert!(request.headers().get(header::COOKIE).is_none());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_cached_passphrase_session_rides_as_a_cookie() {
+        let _env = crate::session::test_support::EnvGuard::unset(&["AOE_DAEMON_PASSPHRASE"]);
+        let dir = tempfile::tempdir().unwrap();
+        let passphrase_path = dir.path().join("serve.passphrase");
+        std::fs::write(&passphrase_path, "hunter2").unwrap();
+        let client = HttpClient::new(
+            DaemonEndpoint::new("http://127.0.0.1:8080".into(), None, Source::LocalDaemon)
+                .with_local_passphrase_path(passphrase_path),
+        )
+        .unwrap();
+        client
+            .passphrase_session
+            .set_for_test(passphrase_session::PassphraseSession {
+                cookie: "aoe_session=abc123".to_string(),
+                binding_secret: "the-binding-secret".to_string(),
+            });
+
+        let request = credentialed(&client, "http://127.0.0.1:8080/api/sessions").await;
+        assert!(request.headers().get(header::AUTHORIZATION).is_none());
+        assert_eq!(
+            request.headers().get(header::COOKIE).unwrap(),
+            "aoe_session=abc123"
+        );
+        assert_eq!(
+            request.headers().get("X-Aoe-Device-Binding").unwrap(),
+            "the-binding-secret"
+        );
     }
 
     #[tokio::test]

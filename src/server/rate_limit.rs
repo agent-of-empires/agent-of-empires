@@ -218,11 +218,17 @@ impl RateLimiter {
 mod tests {
     use super::*;
 
-    // Record failures with spacing > COALESCE_WINDOW so each counts separately.
-    async fn record_spaced(limiter: &RateLimiter, ip: IpAddr, budget: AuthBudget) -> bool {
-        let result = limiter.record_failure(ip, budget).await;
-        tokio::time::sleep(COALESCE_WINDOW + std::time::Duration::from_millis(50)).await;
-        result
+    /// Record the `n`th failure `n` coalesce windows after `base`, so each counts
+    /// separately.
+    async fn record_spaced(
+        limiter: &RateLimiter,
+        ip: IpAddr,
+        budget: AuthBudget,
+        base: Instant,
+        n: u32,
+    ) -> bool {
+        let mut failures = limiter.failures.write().await;
+        RateLimiter::record_failure_at(&mut failures, (ip, budget), base + COALESCE_WINDOW * 2 * n)
     }
 
     const TOKEN: AuthBudget = AuthBudget::Token;
@@ -235,14 +241,15 @@ mod tests {
         let limiter = RateLimiter::new();
         let ip: IpAddr = "1.2.3.4".parse().unwrap();
         let other: IpAddr = "5.6.7.8".parse().unwrap();
+        let base = Instant::now();
         assert!(limiter.check_locked(ip, TOKEN).await.is_none());
 
-        for _ in 0..MAX_FAILURES - 1 {
-            assert!(!record_spaced(&limiter, ip, TOKEN).await);
+        for n in 0..MAX_FAILURES - 1 {
+            assert!(!record_spaced(&limiter, ip, TOKEN, base, n).await);
         }
         assert!(limiter.check_locked(ip, TOKEN).await.is_none());
         assert!(
-            record_spaced(&limiter, ip, TOKEN).await,
+            record_spaced(&limiter, ip, TOKEN, base, MAX_FAILURES).await,
             "the threshold arms it"
         );
         assert!(limiter.check_locked(ip, TOKEN).await.is_some());
@@ -259,22 +266,23 @@ mod tests {
         let limiter = RateLimiter::new();
         let ip: IpAddr = "1.2.3.4".parse().unwrap();
         let spent = 3;
+        let base = Instant::now();
 
-        for _ in 0..spent {
-            record_spaced(&limiter, ip, TOKEN).await;
-            record_spaced(&limiter, ip, PASSPHRASE).await;
+        for n in 0..spent {
+            record_spaced(&limiter, ip, TOKEN, base, n).await;
+            record_spaced(&limiter, ip, PASSPHRASE, base, n).await;
         }
         // A valid token or an authenticated session proves nothing about a
         // passphrase guess, so it must not reset that budget.
         limiter.record_success(ip, TOKEN).await;
-        for _ in 0..MAX_FAILURES - spent - 1 {
+        for n in spent..MAX_FAILURES - 1 {
             assert!(
-                !record_spaced(&limiter, ip, PASSPHRASE).await,
+                !record_spaced(&limiter, ip, PASSPHRASE, base, n).await,
                 "the passphrase budget survived a token success"
             );
         }
         assert!(
-            record_spaced(&limiter, ip, PASSPHRASE).await,
+            record_spaced(&limiter, ip, PASSPHRASE, base, MAX_FAILURES - 1).await,
             "the passphrase budget still reaches its own threshold"
         );
         assert!(limiter.check_locked(ip, PASSPHRASE).await.is_some());
@@ -287,6 +295,12 @@ mod tests {
         limiter.record_success(ip, PASSPHRASE).await;
         assert!(limiter.check_locked(ip, PASSPHRASE).await.is_none());
         assert!(limiter.check_locked_any(ip).await.is_none());
+        for n in MAX_FAILURES..MAX_FAILURES * 2 - 1 {
+            assert!(
+                !record_spaced(&limiter, ip, PASSPHRASE, base, n).await,
+                "a cleared budget counts again from zero"
+            );
+        }
     }
 
     #[tokio::test]

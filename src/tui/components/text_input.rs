@@ -348,263 +348,128 @@ mod tests {
         names.iter().map(|s| s.to_string()).collect()
     }
 
-    // --- longest_common_prefix tests ---
-
     #[test]
-    fn lcp_empty_input() {
-        assert_eq!(longest_common_prefix(&[]), "");
+    fn longest_common_prefix_cases() {
+        let cases: &[(&[&str], &str)] = &[
+            (&[], ""),
+            (&["hello"], "hello"),
+            (&["abc", "abc"], "abc"),
+            (&["work/api", "work/backend", "work/frontend"], "work/"),
+            (&["alpha", "beta"], ""),
+            (&["cafe\u{0301}1", "cafe\u{0301}2"], "cafe\u{0301}"),
+            (&["work", "work/frontend"], "work"),
+        ];
+        for (values, want) in cases {
+            assert_eq!(longest_common_prefix(&groups(values)), *want, "{values:?}");
+        }
     }
 
     #[test]
-    fn lcp_single_value() {
-        assert_eq!(longest_common_prefix(&groups(&["hello"])), "hello");
-    }
+    fn ghost_completion_cases() {
+        let cases: &[(&str, &[&str], Option<&str>)] = &[
+            ("w", &[], None),
+            ("", &["work"], None),
+            ("z", &["work", "personal"], None),
+            ("per", &["work", "personal"], Some("sonal")),
+            ("w", &["work/api", "work/backend"], Some("ork/")),
+            // Common prefix equals the input: fall back to the first sorted match.
+            ("work/", &["work/api", "work/backend"], Some("api")),
+            ("work", &["work"], None),
+            ("W", &["work"], None),
+        ];
+        for (typed, names, want) in cases {
+            let input = Input::new(typed.to_string());
+            let ghost = GroupGhostCompletion::compute(&input, &groups(names));
+            assert_eq!(
+                ghost.as_ref().map(|g| g.ghost_text()),
+                *want,
+                "{typed:?} in {names:?}"
+            );
+        }
 
-    #[test]
-    fn lcp_identical_values() {
-        assert_eq!(longest_common_prefix(&groups(&["abc", "abc"])), "abc");
-    }
-
-    #[test]
-    fn lcp_common_prefix() {
-        assert_eq!(
-            longest_common_prefix(&groups(&["work/api", "work/backend", "work/frontend"])),
-            "work/"
-        );
-    }
-
-    #[test]
-    fn lcp_no_common_prefix() {
-        assert_eq!(longest_common_prefix(&groups(&["alpha", "beta"])), "");
-    }
-
-    #[test]
-    fn lcp_unicode() {
-        assert_eq!(
-            longest_common_prefix(&groups(&["cafe\u{0301}1", "cafe\u{0301}2"])),
-            "cafe\u{0301}"
-        );
-    }
-
-    #[test]
-    fn lcp_one_is_prefix_of_another() {
-        assert_eq!(
-            longest_common_prefix(&groups(&["work", "work/frontend"])),
-            "work"
-        );
-    }
-
-    // --- GroupGhostCompletion tests ---
-
-    #[test]
-    fn ghost_no_groups() {
-        let input = Input::new("w".to_string());
-        assert!(GroupGhostCompletion::compute(&input, &[]).is_none());
-    }
-
-    #[test]
-    fn ghost_empty_input() {
-        let input = Input::default();
-        let groups = groups(&["work"]);
-        assert!(GroupGhostCompletion::compute(&input, &groups).is_none());
-    }
-
-    #[test]
-    fn ghost_no_match() {
-        let input = Input::new("z".to_string());
-        let groups = groups(&["work", "personal"]);
-        assert!(GroupGhostCompletion::compute(&input, &groups).is_none());
-    }
-
-    #[test]
-    fn ghost_single_match() {
         let input = Input::new("per".to_string());
-        let groups = groups(&["work", "personal"]);
-        let ghost = GroupGhostCompletion::compute(&input, &groups).unwrap();
-        assert_eq!(ghost.ghost_text(), "sonal");
+        let ghost = || GroupGhostCompletion::compute(&input, &groups(&["personal"])).unwrap();
+        assert_eq!(ghost().accept(&input).unwrap(), "personal");
+        // Input changed after computing the ghost: stale.
+        assert!(ghost().accept(&Input::new("pers".to_string())).is_none());
     }
 
     #[test]
-    fn ghost_multiple_matches_with_common_prefix() {
-        let input = Input::new("w".to_string());
-        let groups = groups(&["work/api", "work/backend"]);
-        let ghost = GroupGhostCompletion::compute(&input, &groups).unwrap();
-        assert_eq!(ghost.ghost_text(), "ork/");
-    }
-
-    #[test]
-    fn ghost_multiple_matches_no_extra_common_prefix() {
-        let input = Input::new("work/".to_string());
-        let groups = groups(&["work/api", "work/backend"]);
-        let ghost = GroupGhostCompletion::compute(&input, &groups).unwrap();
-        // Common prefix is "work/" which equals input, so falls back to first sorted match
-        assert_eq!(ghost.ghost_text(), "api");
-    }
-
-    #[test]
-    fn ghost_exact_match_returns_none() {
-        let input = Input::new("work".to_string());
-        let groups = groups(&["work"]);
-        // Ghost text would be empty since input == match
-        assert!(GroupGhostCompletion::compute(&input, &groups).is_none());
-    }
-
-    #[test]
-    fn ghost_case_sensitive() {
-        let input = Input::new("W".to_string());
-        let groups = groups(&["work"]);
-        assert!(GroupGhostCompletion::compute(&input, &groups).is_none());
-    }
-
-    #[test]
-    fn ghost_accept_valid() {
-        let input = Input::new("per".to_string());
-        let groups = groups(&["personal"]);
-        let ghost = GroupGhostCompletion::compute(&input, &groups).unwrap();
-        let result = ghost.accept(&input).unwrap();
-        assert_eq!(result, "personal");
-    }
-
-    #[test]
-    fn ghost_accept_stale_value() {
-        let input = Input::new("per".to_string());
-        let groups = groups(&["personal"]);
-        let ghost = GroupGhostCompletion::compute(&input, &groups).unwrap();
-        // Input changed after computing ghost
-        let changed_input = Input::new("pers".to_string());
-        assert!(ghost.accept(&changed_input).is_none());
-    }
-
-    #[test]
-    fn focused_text_field_sets_terminal_cursor() {
+    fn focused_text_field_cursor_uses_display_columns() {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
 
-        let backend = TestBackend::new(40, 3);
-        let mut terminal = Terminal::new(backend).unwrap();
-        let input = Input::new("hi".to_string());
         let theme = load_theme("empire");
-
-        terminal
-            .draw(|f| {
-                render_text_field(
-                    f,
-                    Rect::new(2, 1, 30, 1),
-                    "Name:",
-                    &input,
-                    true,
-                    None,
-                    &theme,
-                );
-            })
-            .unwrap();
-
-        terminal
-            .backend_mut()
-            .assert_cursor_position(Position::new(10, 1));
+        // "hi" and the double-width "你" both end at column 10.
+        for value in ["hi", "你"] {
+            let mut terminal = Terminal::new(TestBackend::new(40, 3)).unwrap();
+            let input = Input::new(value.to_string());
+            terminal
+                .draw(|f| {
+                    render_text_field(
+                        f,
+                        Rect::new(2, 1, 30, 1),
+                        "Name:",
+                        &input,
+                        true,
+                        None,
+                        &theme,
+                    );
+                })
+                .unwrap();
+            terminal
+                .backend_mut()
+                .assert_cursor_position(Position::new(10, 1));
+        }
     }
 
     #[test]
-    fn focused_text_field_uses_display_columns_for_wide_chars() {
-        use ratatui::backend::TestBackend;
-        use ratatui::Terminal;
-
-        let backend = TestBackend::new(40, 3);
-        let mut terminal = Terminal::new(backend).unwrap();
-        let input = Input::new("你".to_string());
-        let theme = load_theme("empire");
-
-        terminal
-            .draw(|f| {
-                render_text_field(
-                    f,
-                    Rect::new(2, 1, 30, 1),
-                    "Name:",
-                    &input,
-                    true,
-                    None,
-                    &theme,
-                );
-            })
-            .unwrap();
-
-        terminal
-            .backend_mut()
-            .assert_cursor_position(Position::new(10, 1));
-    }
-
-    // --- horizontal scrolling ---
-
-    #[test]
-    fn visible_char_start_skips_scrolled_columns() {
+    fn horizontal_scroll_windows() {
         assert_eq!(visible_char_start("abcdef", 0), 0);
         assert_eq!(visible_char_start("abcdef", 2), 2);
         // Wide chars are two columns each, so a 2-column scroll skips one char.
         assert_eq!(visible_char_start("你好世界", 2), 1);
         assert_eq!(visible_char_start("你好世界", 4), 2);
-    }
 
-    #[test]
-    fn visible_slice_clips_and_reports_end_visibility() {
-        let (s, end) = visible_slice("abcdefghij", 0, 5);
-        assert_eq!(s, "abcde");
-        assert!(!end, "end of a too-long value is not visible");
-
-        let (s, end) = visible_slice("abc", 0, 5);
-        assert_eq!(s, "abc");
-        assert!(end, "short value fits entirely");
-
-        // Scrolled to the tail: the end becomes visible again.
-        let (s, end) = visible_slice("abcdefghij", 5, 5);
-        assert_eq!(s, "fghij");
-        assert!(end);
-    }
-
-    #[test]
-    fn focused_spans_keep_cursor_visible_at_end_of_long_value() {
-        let value = "0123456789"; // 10 single-width chars
-        let available_width = 5;
-        let input = Input::new(value.to_string()); // cursor at end
-        let scroll = input_scroll(&input, available_width);
-
-        let (spans, end_visible) = focused_input_spans(
-            value,
-            input.cursor(),
-            scroll,
-            available_width,
-            Style::default(),
-            Style::default(),
+        assert_eq!(
+            visible_slice("abcdefghij", 0, 5),
+            ("abcde".to_string(), false)
         );
-
-        let rendered: String = spans.iter().map(|s| s.content.as_ref()).collect();
-        // A column is reserved for the cursor, so the last char plus a blank
-        // cursor cell are both visible and the whole window stays within width.
-        assert!(end_visible);
-        assert!(rendered.ends_with("9 "), "got {rendered:?}");
-        assert!(rendered.width() <= available_width);
+        assert_eq!(visible_slice("abc", 0, 5), ("abc".to_string(), true));
+        assert_eq!(
+            visible_slice("abcdefghij", 5, 5),
+            ("fghij".to_string(), true)
+        );
     }
 
     #[test]
-    fn focused_spans_hide_end_when_cursor_in_middle() {
+    fn focused_spans_show_end_only_when_cursor_reaches_it() {
         let value = "0123456789";
         let available_width = 5;
-        // Cursor near the start: the end of the value is scrolled off-screen.
-        let input = Input::new(value.to_string()).with_cursor(1);
-        let scroll = input_scroll(&input, available_width);
-
-        let (_, end_visible) = focused_input_spans(
-            value,
-            input.cursor(),
-            scroll,
-            available_width,
-            Style::default(),
-            Style::default(),
-        );
-
-        assert!(
-            !end_visible,
-            "ghost text must stay hidden when end is clipped"
-        );
+        for (cursor, want_end) in [(None, true), (Some(1), false)] {
+            let mut input = Input::new(value.to_string());
+            if let Some(c) = cursor {
+                input = input.with_cursor(c);
+            }
+            let scroll = input_scroll(&input, available_width);
+            let (spans, end_visible) = focused_input_spans(
+                value,
+                input.cursor(),
+                scroll,
+                available_width,
+                Style::default(),
+                Style::default(),
+            );
+            // Ghost text must stay hidden when the end is clipped.
+            assert_eq!(end_visible, want_end, "cursor {cursor:?}");
+            if want_end {
+                // A column is reserved for the cursor, so the last char plus a
+                // blank cursor cell are visible within width.
+                let rendered: String = spans.iter().map(|s| s.content.as_ref()).collect();
+                assert!(rendered.ends_with("9 "), "got {rendered:?}");
+                assert!(rendered.width() <= available_width);
+            }
+        }
     }
 
     fn row_text(terminal: &ratatui::Terminal<ratatui::backend::TestBackend>, y: u16) -> String {

@@ -25,18 +25,16 @@ fn button_key(env: &TestEnv, code: KeyCode) -> Option<KeyEvent> {
         .map(|(_, k)| *k)
 }
 
-/// Each rendered shortcut produces a hit rect carrying the equivalent
-/// key, and `footer_button_at` resolves a click inside one to that key.
+/// Each rendered shortcut produces a hit rect carrying the equivalent key: a click inside
+/// one resolves to that key and dispatching it runs the keypress's action, hover tracks the
+/// button under the pointer, and an open non-live overlay (help) blocks footer and sidebar
+/// clicks behind it.
 #[test]
 #[serial]
-fn buttons_map_clicks_to_shortcuts() {
+fn buttons_map_clicks_hover_and_yield_to_overlays() {
     let mut env = create_test_env_with_sessions(3);
     render_at(&mut env, 120, 12);
 
-    assert!(
-        !env.view.footer_buttons.is_empty(),
-        "footer should expose clickable buttons"
-    );
     // New / View / Group / Cmds are always present in the home view.
     assert_eq!(
         button_key(&env, KeyCode::Char('n')).map(|k| k.modifiers),
@@ -46,9 +44,7 @@ fn buttons_map_clicks_to_shortcuts() {
     let cmds = button_key(&env, KeyCode::Char('k')).expect("Cmds button present");
     assert_eq!(cmds.modifiers, KeyModifiers::CONTROL, "Cmds maps to Ctrl+K");
 
-    // A click inside the New button's rect resolves to its key; a click
-    // outside every button resolves to nothing.
-    let (new_rect, _) = env
+    let (new_rect, new_key) = env
         .view
         .footer_buttons
         .iter()
@@ -67,36 +63,31 @@ fn buttons_map_clicks_to_shortcuts() {
             .is_none(),
         "a click off the footer row hits no button"
     );
-}
 
-/// Dispatching a footer button's key runs the same action as the
-/// keypress: the New button opens the new-session dialog.
-#[test]
-#[serial]
-fn clicking_new_opens_dialog() {
-    let mut env = create_test_env_with_sessions(3);
-    render_at(&mut env, 120, 12);
-    let key = button_key(&env, KeyCode::Char('n')).expect("New button");
+    let (rect, hover_key) = env.view.footer_buttons[1];
+    assert!(env.view.footer_hover.is_none());
+    assert!(
+        env.view.handle_hover(rect.x + 1, rect.y),
+        "moving onto a button is a hover change"
+    );
+    assert_eq!(env.view.footer_hover, Some(hover_key));
+    assert!(
+        !env.view.handle_hover(rect.x, rect.y),
+        "same button, no change"
+    );
+    assert!(env.view.handle_hover(rect.x, rect.y.saturating_sub(5)));
+    assert!(
+        env.view.footer_hover.is_none(),
+        "leaving the footer clears hover"
+    );
+
     assert!(env.view.new_dialog.is_none());
-    env.view.handle_key(key, None);
+    env.view.handle_key(new_key, None);
     assert!(
         env.view.new_dialog.is_some(),
         "clicking New opens the new-session dialog"
     );
-}
-
-/// While a non-live overlay (here the help screen) is open, the footer
-/// is drawn underneath but the overlay owns clicks: `footer_button_at`
-/// and `handle_sidebar_collapse_click` must report no hit so a click
-/// can't fire a shortcut or toggle the sidebar behind the modal.
-#[test]
-#[serial]
-fn overlay_blocks_footer_and_sidebar_clicks() {
-    let mut env = create_test_env_with_sessions(3);
-    render_at(&mut env, 120, 12);
-    let (rect, _) = env.view.footer_buttons[0];
-    // No overlay: the button resolves.
-    assert!(env.view.footer_button_at(rect.x, rect.y).is_some());
+    env.view.new_dialog = None;
 
     env.view.show_help = true;
     assert!(
@@ -104,7 +95,7 @@ fn overlay_blocks_footer_and_sidebar_clicks() {
         "help screen is a non-live overlay"
     );
     assert!(
-        env.view.footer_button_at(rect.x, rect.y).is_none(),
+        env.view.footer_button_at(new_rect.x, new_rect.y).is_none(),
         "footer click is blocked while an overlay owns the screen"
     );
     assert!(
@@ -132,29 +123,6 @@ fn strict_mode_buttons_carry_shifted_chords() {
         button_key(&env, KeyCode::Char('D')).is_some(),
         "strict Delete is an uppercase D"
     );
-}
-
-/// Hover sets `footer_hover` to the button under the pointer, reports the
-/// change, and clears when the pointer leaves the footer.
-#[test]
-#[serial]
-fn hover_tracks_button_under_pointer() {
-    let mut env = create_test_env_with_sessions(3);
-    render_at(&mut env, 120, 12);
-    let (rect, key) = env.view.footer_buttons[1];
-
-    assert!(env.view.footer_hover.is_none());
-    let changed = env.view.handle_hover(rect.x + 1, rect.y);
-    assert!(changed, "moving onto a button is a hover change");
-    assert_eq!(env.view.footer_hover, Some(key));
-
-    // Same button, no change reported.
-    assert!(!env.view.handle_hover(rect.x, rect.y));
-
-    // Off the footer row clears the hover.
-    let changed = env.view.handle_hover(rect.x, rect.y.saturating_sub(5));
-    assert!(changed);
-    assert!(env.view.footer_hover.is_none());
 }
 
 /// The footer is replaced by the live-send banner, so it exposes no

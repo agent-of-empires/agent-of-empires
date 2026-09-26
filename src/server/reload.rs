@@ -1643,6 +1643,14 @@ mod tests {
             assert_eq!(fresh.last_error.as_deref(), expected_error);
             assert_eq!(fresh.status, committed_status);
         }
+
+        // A capability the prior row discovered is runtime state too: a reload
+        // must not drop it and make the next load re-probe the session.
+        let mut prior = Instance::new("seed", "/tmp/seed");
+        prior.acp_load_session_capable = Some(true);
+        let mut fresh = Instance::new("seed", "/tmp/seed");
+        merge_runtime_fields(prior, &mut fresh);
+        assert_eq!(fresh.acp_load_session_capable, Some(true));
     }
 
     #[tokio::test]

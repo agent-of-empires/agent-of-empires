@@ -924,54 +924,6 @@ mod tests {
         );
     }
 
-    // The success path: once the write is durable, the mark lands on both the
-    // live vec (which feeds `state.instances`) and disk.
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn flush_passive_transition_applies_unread_after_persist_ok() {
-        let _app_dir = crate::session::test_support::isolate_app_dir();
-
-        let profile = "flush-persist-success";
-        let mut inst = Instance::new("idle-session", "/tmp/idle");
-        inst.source_profile = profile.to_string();
-        let id = inst.id.clone();
-
-        // Seed the row on disk so the persist closure has a matching id to mark.
-        let seed = inst.clone();
-        crate::session::Storage::new_unwatched(profile)
-            .expect("storage")
-            .update(move |instances, _groups| {
-                *instances = vec![seed];
-                Ok(())
-            })
-            .expect("seed write");
-
-        let mut instances = vec![inst];
-        let mut bundles: std::collections::HashMap<String, PassiveTransitionWrites> =
-            std::collections::HashMap::new();
-        bundles
-            .entry(profile.to_string())
-            .or_default()
-            .unread_ids
-            .push(id.clone());
-
-        flush_test_rows(&mut instances, bundles).await;
-
-        assert!(
-            instances[0].unread,
-            "a durable persist must mirror the unread mark into the live vec"
-        );
-        let disk = crate::session::Storage::new_unwatched(profile)
-            .expect("storage")
-            .load()
-            .expect("load");
-        assert!(
-            disk.iter().find(|i| i.id == id).expect("seeded row").unread,
-            "the unread mark must be durable on disk"
-        );
-    }
-
-    /// Each profile receives only its own durable status and timestamp patch.
     #[tokio::test]
     #[serial_test::serial]
     async fn flush_passive_transition_routes_patches_per_profile() {
@@ -1025,6 +977,11 @@ mod tests {
                 },
             );
         bundles
+            .entry("flush-a".to_string())
+            .or_default()
+            .unread_ids
+            .push(a1_id.clone());
+        bundles
             .entry("flush-b".to_string())
             .or_default()
             .patches
@@ -1059,6 +1016,12 @@ mod tests {
             Some(new_ts),
             "profile A's patch must merge its last_accessed_at onto profile A's storage"
         );
+        assert!(row_a.unread, "the unread mark must be durable on disk");
+        assert!(
+            instances[0].unread,
+            "a durable persist must mirror the unread mark into the live vec"
+        );
+        assert!(!instances[1].unread);
 
         let disk_b = crate::session::Storage::new_unwatched("flush-b")
             .expect("storage")

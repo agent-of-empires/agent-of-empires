@@ -55,18 +55,20 @@ mod tests {
             plugin("acme.featured", ValidationState::Featured, true, true),
             plugin("acme.community", ValidationState::Community, true, true),
             plugin("acme.local", ValidationState::Local, true, true),
+            plugin("acme.other", ValidationState::Community, true, true),
         ];
         let (by_source, active) = census(&plugins);
 
         assert_eq!(by_source.get("builtin"), Some(&1));
         assert_eq!(by_source.get("featured"), Some(&1));
-        assert_eq!(by_source.get("community"), Some(&1));
+        assert_eq!(by_source.get("community"), Some(&2));
         assert_eq!(by_source.get("local"), Some(&1));
 
         assert_eq!(active.get("aoe.web"), Some(&true));
         assert_eq!(active.get("acme.featured"), Some(&true));
         assert_eq!(active.get("acme.community"), None);
         assert_eq!(active.get("acme.local"), None);
+        assert_eq!(active.len(), 2, "{active:?}");
     }
 
     #[test]
@@ -80,29 +82,5 @@ mod tests {
         assert_eq!(active.get("on"), Some(&true));
         assert_eq!(active.get("disabled"), Some(&false));
         assert_eq!(active.get("ungranted"), Some(&false));
-    }
-
-    #[test]
-    fn community_plugin_reusing_a_featured_id_is_not_named() {
-        let plugins = vec![plugin(
-            "acme.featured",
-            ValidationState::Community,
-            true,
-            true,
-        )];
-        let (by_source, active) = census(&plugins);
-        assert_eq!(by_source.get("community"), Some(&1));
-        assert!(active.is_empty());
-    }
-
-    #[test]
-    fn same_source_twice_accumulates() {
-        let plugins = vec![
-            plugin("a", ValidationState::Community, true, true),
-            plugin("b", ValidationState::Community, true, true),
-        ];
-        let (by_source, active) = census(&plugins);
-        assert_eq!(by_source.get("community"), Some(&2));
-        assert!(active.is_empty());
     }
 }

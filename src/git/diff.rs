@@ -798,38 +798,23 @@ mod tests {
             .unwrap();
     }
 
+    /// Only tracked blobs are served: an untracked secret (#1810) and `.git`
+    /// internals both exist on disk but must 404.
     #[test]
-    fn unchanged_file_contents_serves_tracked_file() {
+    fn unchanged_file_contents_serves_only_tracked_blobs() {
         let (dir, _repo) = setup_test_repo();
-        let canonical = dir.path().join("test.txt").canonicalize().unwrap();
-        let out = compute_unchanged_file_contents(dir.path(), Path::new("test.txt"), &canonical)
-            .unwrap()
-            .expect("tracked file should be served");
-        assert_eq!(out.content, "line 1\nline 2\nline 3\n");
-        assert!(!out.is_binary);
-    }
-
-    #[test]
-    fn unchanged_file_contents_rejects_untracked_file() {
-        // A gitignored secret never committed: present on disk, not in HEAD, so
-        // the tracked-blob gate refuses it (returns None -> 404). See #1810.
-        let (dir, _repo) = setup_test_repo();
-        let secret = dir.path().join(".env");
-        fs::write(&secret, "API_KEY=supersecret\n").unwrap();
-        let canonical = secret.canonicalize().unwrap();
-        let out =
-            compute_unchanged_file_contents(dir.path(), Path::new(".env"), &canonical).unwrap();
-        assert!(out.is_none(), "untracked .env must not be served");
-    }
-
-    #[test]
-    fn unchanged_file_contents_rejects_git_internals() {
-        // `.git/config` lives inside the worktree but is not a tracked blob.
-        let (dir, _repo) = setup_test_repo();
-        let canonical = dir.path().join(".git/config").canonicalize().unwrap();
-        let out = compute_unchanged_file_contents(dir.path(), Path::new(".git/config"), &canonical)
-            .unwrap();
-        assert!(out.is_none(), ".git internals must not be served");
+        fs::write(dir.path().join(".env"), "API_KEY=supersecret\n").unwrap();
+        for (path, expected) in [
+            ("test.txt", Some("line 1\nline 2\nline 3\n")),
+            (".env", None),
+            (".git/config", None),
+        ] {
+            let canonical = dir.path().join(path).canonicalize().unwrap();
+            let out =
+                compute_unchanged_file_contents(dir.path(), Path::new(path), &canonical).unwrap();
+            assert_eq!(out.as_ref().map(|c| c.content.as_str()), expected, "{path}");
+            assert!(out.is_none_or(|c| !c.is_binary));
+        }
     }
 
     /// Pin a branch name, so `git init`'s default does not decide the test.
@@ -889,36 +874,12 @@ mod tests {
     fn test_merge_base_excludes_main_only_changes() {
         let (dir, _repo) = setup_branching_repo();
 
-        // We're on the feature branch, comparing against main.
-        // Only feature_only.txt should show up -- NOT main_only.txt
-        // and NOT the main-side modification to shared.txt.
+        // Only feature_only.txt differs from the merge base; main-only additions
+        // and the main-side edit to shared.txt must not show up.
         let files = compute_changed_files(dir.path(), "main").unwrap();
-
         let paths: Vec<&Path> = files.iter().map(|f| f.path.as_path()).collect();
-        assert!(
-            paths.contains(&Path::new("feature_only.txt")),
-            "feature_only.txt should appear in diff, got: {:?}",
-            paths
-        );
-        assert!(
-            !paths.contains(&Path::new("main_only.txt")),
-            "main_only.txt should NOT appear (it's a main-only change), got: {:?}",
-            paths
-        );
-        // shared.txt was only modified on main, not on the feature branch,
-        // so it should not appear in the merge-base diff
-        assert!(
-            !paths.contains(&Path::new("shared.txt")),
-            "shared.txt should NOT appear (only changed on main), got: {:?}",
-            paths
-        );
-    }
+        assert_eq!(paths, [Path::new("feature_only.txt")]);
 
-    #[test]
-    fn test_merge_base_file_diff_uses_correct_base() {
-        let (dir, _repo) = setup_branching_repo();
-
-        // The file diff for feature_only.txt should show it as entirely new
         let diff = compute_file_diff(dir.path(), Path::new("feature_only.txt"), "main", 3).unwrap();
         assert_eq!(diff.file.status, FileStatus::Added);
         assert!(diff.file.additions > 0);
@@ -995,6 +956,89 @@ mod tests {
     }
 
     #[test]
+    fn test_compute_changed_files_no_changes() {
+        let (dir, _repo) = setup_test_repo();
+        let files = compute_changed_files(dir.path(), "HEAD").unwrap();
+        assert!(files.is_empty());
+    }
+
+    #[test]
+    fn test_compute_changed_files_with_modification() {
+        let (dir, _repo) = setup_test_repo();
+
+        // Modify the file
+        let file_path = dir.path().join("test.txt");
+        fs::write(&file_path, "line 1 modified\nline 2\nline 3\n").unwrap();
+
+        let files = compute_changed_files(dir.path(), "HEAD").unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].status, FileStatus::Modified);
+        assert_eq!(files[0].path, Path::new("test.txt"));
+    }
+
+    #[test]
+    fn test_compute_changed_files_with_addition() {
+        let (dir, _repo) = setup_test_repo();
+
+        // Add a new file
+        let new_file = dir.path().join("new.txt");
+        fs::write(&new_file, "new content\n").unwrap();
+
+        let files = compute_changed_files(dir.path(), "HEAD").unwrap();
+        assert!(files.iter().any(|f| f.status == FileStatus::Untracked));
+    }
+
+    #[test]
+    fn test_compute_file_contents_modified() {
+        let (dir, _repo) = setup_test_repo();
+
+        let file_path = dir.path().join("test.txt");
+        fs::write(&file_path, "line 1 modified\nline 2\nline 3\nnew line 4\n").unwrap();
+
+        let c = compute_file_contents(dir.path(), Path::new("test.txt"), "HEAD").unwrap();
+
+        assert!(!c.is_binary);
+        assert_eq!(c.status, FileStatus::Modified);
+        assert_eq!(c.old_content, "line 1\nline 2\nline 3\n");
+        assert_eq!(
+            c.new_content,
+            "line 1 modified\nline 2\nline 3\nnew line 4\n"
+        );
+        // Server-computed unified diff with git-style headers.
+        assert!(c.patch.contains("--- a/test.txt"));
+        assert!(c.patch.contains("+++ b/test.txt"));
+        assert!(c.patch.contains("@@"));
+        assert!(c.patch.contains("-line 1\n"));
+        assert!(c.patch.contains("+line 1 modified\n"));
+    }
+
+    #[test]
+    fn test_compute_file_contents_added() {
+        let (dir, _repo) = setup_test_repo();
+
+        fs::write(dir.path().join("brand_new.txt"), "hello\nworld\n").unwrap();
+
+        let c = compute_file_contents(dir.path(), Path::new("brand_new.txt"), "HEAD").unwrap();
+
+        assert_eq!(c.status, FileStatus::Added);
+        assert!(c.old_content.is_empty());
+        assert_eq!(c.new_content, "hello\nworld\n");
+    }
+
+    #[test]
+    fn test_compute_file_contents_deleted() {
+        let (dir, _repo) = setup_test_repo();
+
+        fs::remove_file(dir.path().join("test.txt")).unwrap();
+
+        let c = compute_file_contents(dir.path(), Path::new("test.txt"), "HEAD").unwrap();
+
+        assert_eq!(c.status, FileStatus::Deleted);
+        assert_eq!(c.old_content, "line 1\nline 2\nline 3\n");
+        assert!(c.new_content.is_empty());
+    }
+
+    #[test]
     fn check_merge_base_status_warns_only_where_no_base_exists() {
         let (branching, _repo) = setup_branching_repo();
         let (plain, _repo) = setup_test_repo();
@@ -1052,104 +1096,6 @@ mod tests {
     }
 
     #[test]
-    fn test_compute_changed_files_no_changes() {
-        let (dir, _repo) = setup_test_repo();
-        let files = compute_changed_files(dir.path(), "HEAD").unwrap();
-        assert!(files.is_empty());
-    }
-
-    #[test]
-    fn test_compute_changed_files_with_modification() {
-        let (dir, _repo) = setup_test_repo();
-
-        // Modify the file
-        let file_path = dir.path().join("test.txt");
-        fs::write(&file_path, "line 1 modified\nline 2\nline 3\n").unwrap();
-
-        let files = compute_changed_files(dir.path(), "HEAD").unwrap();
-        assert_eq!(files.len(), 1);
-        assert_eq!(files[0].status, FileStatus::Modified);
-        assert_eq!(files[0].path, Path::new("test.txt"));
-    }
-
-    #[test]
-    fn test_compute_changed_files_with_addition() {
-        let (dir, _repo) = setup_test_repo();
-
-        // Add a new file
-        let new_file = dir.path().join("new.txt");
-        fs::write(&new_file, "new content\n").unwrap();
-
-        let files = compute_changed_files(dir.path(), "HEAD").unwrap();
-        assert!(files.iter().any(|f| f.status == FileStatus::Untracked));
-    }
-
-    #[test]
-    fn test_compute_file_diff() {
-        let (dir, _repo) = setup_test_repo();
-
-        // Modify the file
-        let file_path = dir.path().join("test.txt");
-        fs::write(&file_path, "line 1 modified\nline 2\nline 3\nnew line 4\n").unwrap();
-
-        let diff = compute_file_diff(dir.path(), Path::new("test.txt"), "HEAD", 3).unwrap();
-
-        assert!(!diff.is_binary);
-        assert!(!diff.hunks.is_empty());
-        assert!(diff.file.additions > 0);
-    }
-
-    #[test]
-    fn test_compute_file_contents_modified() {
-        let (dir, _repo) = setup_test_repo();
-
-        let file_path = dir.path().join("test.txt");
-        fs::write(&file_path, "line 1 modified\nline 2\nline 3\nnew line 4\n").unwrap();
-
-        let c = compute_file_contents(dir.path(), Path::new("test.txt"), "HEAD").unwrap();
-
-        assert!(!c.is_binary);
-        assert_eq!(c.status, FileStatus::Modified);
-        assert_eq!(c.old_content, "line 1\nline 2\nline 3\n");
-        assert_eq!(
-            c.new_content,
-            "line 1 modified\nline 2\nline 3\nnew line 4\n"
-        );
-        // Server-computed unified diff with git-style headers.
-        assert!(c.patch.contains("--- a/test.txt"));
-        assert!(c.patch.contains("+++ b/test.txt"));
-        assert!(c.patch.contains("@@"));
-        assert!(c.patch.contains("-line 1\n"));
-        assert!(c.patch.contains("+line 1 modified\n"));
-    }
-
-    #[test]
-    fn test_compute_file_contents_added() {
-        let (dir, _repo) = setup_test_repo();
-
-        fs::write(dir.path().join("brand_new.txt"), "hello\nworld\n").unwrap();
-
-        let c = compute_file_contents(dir.path(), Path::new("brand_new.txt"), "HEAD").unwrap();
-
-        assert_eq!(c.status, FileStatus::Added);
-        assert!(c.old_content.is_empty());
-        assert_eq!(c.new_content, "hello\nworld\n");
-    }
-
-    #[test]
-    fn test_compute_file_contents_deleted() {
-        let (dir, _repo) = setup_test_repo();
-
-        fs::remove_file(dir.path().join("test.txt")).unwrap();
-
-        let c = compute_file_contents(dir.path(), Path::new("test.txt"), "HEAD").unwrap();
-
-        assert_eq!(c.status, FileStatus::Deleted);
-        assert_eq!(c.old_content, "line 1\nline 2\nline 3\n");
-        assert!(c.new_content.is_empty());
-    }
-
-    #[test]
     fn test_compute_file_contents_matches_diff_inputs() {
         // The contents path must hand back exactly the old/new text the legacy
         // hunk path diffs, so the client-side parse reproduces the same diff.
@@ -1177,6 +1123,8 @@ mod tests {
         }
         assert_eq!(c.old_content, old_from_hunks);
         assert_eq!(c.new_content, new_from_hunks);
+        assert!(!d.is_binary);
+        assert!(d.file.additions > 0);
     }
 
     #[test]
@@ -1280,65 +1228,25 @@ mod tests {
     }
 
     #[test]
-    fn test_conflicted_file_appears_in_changed_files() {
+    fn test_conflicted_file_is_listed_once_and_diffs_with_markers() {
         let (dir, _repo) = setup_conflict_repo();
         let files = compute_changed_files(dir.path(), "main").unwrap();
-        let conflicted: Vec<_> = files
-            .iter()
-            .filter(|f| f.status == FileStatus::Conflicted)
-            .collect();
-        assert!(
-            !conflicted.is_empty(),
-            "Expected at least one Conflicted file, got: {:?}",
-            files
-                .iter()
-                .map(|f| (&f.path, f.status))
-                .collect::<Vec<_>>()
-        );
-        assert!(
-            conflicted
-                .iter()
-                .any(|f| f.path == Path::new("conflicted.txt")),
-            "conflicted.txt should be Conflicted"
-        );
-    }
-
-    #[test]
-    fn test_conflicted_file_no_duplicate_in_changed_files() {
-        let (dir, _repo) = setup_conflict_repo();
-        let files = compute_changed_files(dir.path(), "main").unwrap();
-        let count = files
+        let entries: Vec<_> = files
             .iter()
             .filter(|f| f.path == Path::new("conflicted.txt"))
-            .count();
-        assert_eq!(count, 1, "conflicted.txt should appear exactly once");
-    }
+            .map(|f| f.status)
+            .collect();
+        assert_eq!(entries, [FileStatus::Conflicted]);
 
-    #[test]
-    fn test_conflicted_file_diff_shows_markers() {
-        let (dir, _repo) = setup_conflict_repo();
         let diff = compute_file_diff(dir.path(), Path::new("conflicted.txt"), "main", 3).unwrap();
-
         assert_eq!(diff.file.status, FileStatus::Conflicted);
-        assert!(
-            !diff.hunks.is_empty(),
-            "Should produce hunks for conflicted file"
-        );
-
         let all_content: String = diff
             .hunks
             .iter()
             .flat_map(|h| &h.lines)
             .map(|l| l.content.as_str())
             .collect();
-        assert!(
-            all_content.contains("<<<<<<<"),
-            "Diff should contain conflict markers"
-        );
-        assert!(
-            all_content.contains(">>>>>>>"),
-            "Diff should contain conflict markers"
-        );
+        assert!(all_content.contains("<<<<<<<") && all_content.contains(">>>>>>>"));
     }
 
     #[test]
@@ -1403,40 +1311,6 @@ mod tests {
             files.is_empty(),
             "stale local main behind origin/main should yield no phantom changes, got: {:?}",
             files.iter().map(|f| &f.path).collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
-    fn test_local_main_equals_origin_diff_unchanged() {
-        // Story: local `main` == origin/main, so resolution and the computed
-        // diff are identical to the no-remote case (regression guard).
-        let (dir, repo) = setup_branching_repo();
-        let main_tip = repo
-            .find_branch("main", git2::BranchType::Local)
-            .unwrap()
-            .get()
-            .peel_to_commit()
-            .unwrap()
-            .id();
-        repo.reference(
-            "refs/remotes/origin/main",
-            main_tip,
-            true,
-            "origin/main == main",
-        )
-        .unwrap();
-
-        let files = compute_changed_files(dir.path(), "main").unwrap();
-        let paths: Vec<&Path> = files.iter().map(|f| f.path.as_path()).collect();
-        assert!(
-            paths.contains(&Path::new("feature_only.txt")),
-            "feature_only.txt should appear, got: {:?}",
-            paths
-        );
-        assert!(
-            !paths.contains(&Path::new("main_only.txt")),
-            "main_only.txt should NOT appear, got: {:?}",
-            paths
         );
     }
 

@@ -99,7 +99,6 @@ version = "1.17.2"
 dependencies = [
  "aes-gcm",
  "agent-client-protocol",
- "agent-of-empires",
  "ansi-to-tui",
  "anyhow",
  "aoe-plugin-api",

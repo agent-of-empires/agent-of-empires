@@ -6,81 +6,27 @@ use std::fs;
 
 use crate::common::setup_temp_home;
 
-fn get_schema_version_path() -> Result<std::path::PathBuf> {
-    let app_dir = agent_of_empires::session::get_app_dir()?;
-    Ok(app_dir.join(".schema_version"))
-}
-
+/// A fresh app dir, and one whose version file reads 0, both advance to the
+/// current schema version; a second run leaves the file untouched.
 #[test]
 #[serial]
-fn test_fresh_dir_runs_all_migrations() -> Result<()> {
-    let _temp = setup_temp_home();
+fn migrations_advance_to_current_version_once() -> Result<()> {
+    let current = agent_of_empires::migrations::current_schema_version();
+    for seed in [None, Some("0")] {
+        let _temp = setup_temp_home();
+        let version_path = agent_of_empires::session::get_app_dir()?.join(".schema_version");
+        assert!(!version_path.exists());
+        if let Some(seed) = seed {
+            fs::write(&version_path, seed)?;
+        }
 
-    // Ensure no schema version file exists
-    let version_path = get_schema_version_path()?;
-    assert!(!version_path.exists());
+        agent_of_empires::migrations::run_migrations()?;
+        let after_first = fs::read_to_string(&version_path)?;
+        assert_eq!(after_first.trim().parse::<u32>()?, current, "{seed:?}");
 
-    agent_of_empires::migrations::run_migrations()?;
-
-    // After migrations, .schema_version should exist and be at the current version
-    assert!(version_path.exists());
-    let version: u32 = fs::read_to_string(&version_path)?.trim().parse()?;
-    assert!(version >= 1, "Schema version should be at least 1");
-
-    Ok(())
-}
-
-#[test]
-#[serial]
-fn test_up_to_date_is_noop() -> Result<()> {
-    let _temp = setup_temp_home();
-
-    // Run migrations to get to current version
-    agent_of_empires::migrations::run_migrations()?;
-
-    let version_path = get_schema_version_path()?;
-    let version_before = fs::read_to_string(&version_path)?;
-
-    // Run again - should be a no-op
-    agent_of_empires::migrations::run_migrations()?;
-
-    let version_after = fs::read_to_string(&version_path)?;
-    assert_eq!(version_before, version_after, "Version should not change");
-
-    Ok(())
-}
-
-#[test]
-#[serial]
-fn test_idempotent_double_run() -> Result<()> {
-    let _temp = setup_temp_home();
-
-    // Run migrations twice from fresh state
-    agent_of_empires::migrations::run_migrations()?;
-    agent_of_empires::migrations::run_migrations()?;
-
-    let version_path = get_schema_version_path()?;
-    let version: u32 = fs::read_to_string(&version_path)?.trim().parse()?;
-    assert!(version >= 1);
-
-    Ok(())
-}
-
-#[test]
-#[serial]
-fn test_partial_version_runs_remaining() -> Result<()> {
-    let _temp = setup_temp_home();
-
-    // Manually set schema version to 0 (as if no migrations have run but file exists)
-    let app_dir = agent_of_empires::session::get_app_dir()?;
-    let version_path = app_dir.join(".schema_version");
-    fs::write(&version_path, "0")?;
-
-    agent_of_empires::migrations::run_migrations()?;
-
-    let version: u32 = fs::read_to_string(&version_path)?.trim().parse()?;
-    assert!(version >= 1, "Should have run migrations beyond version 0");
-
+        agent_of_empires::migrations::run_migrations()?;
+        assert_eq!(fs::read_to_string(&version_path)?, after_first, "{seed:?}");
+    }
     Ok(())
 }
 

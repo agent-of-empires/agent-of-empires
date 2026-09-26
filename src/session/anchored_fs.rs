@@ -807,39 +807,24 @@ mod tests {
     /// Refusing it made every anchored read fail there.
     #[cfg(unix)]
     #[test]
-    fn opens_through_a_symlinked_ancestor() {
-        use std::os::unix::fs::symlink;
-
+    fn symlinked_ancestors_open_but_a_symlinked_anchor_leaf_does_not() {
         let temp = tempfile::tempdir().unwrap();
         let real = temp.path().join("real");
         std::fs::create_dir_all(real.join("store")).unwrap();
         std::fs::write(real.join("store/id"), b"anchored").unwrap();
-        symlink(&real, temp.path().join("via-link")).unwrap();
-
-        let anchored = AnchoredDir::open(&temp.path().join("via-link/store"))
-            .expect("an anchor reached through a symlinked ancestor must open");
-        assert_eq!(
-            anchored
-                .read_regular(Path::new("id"), 64)
-                .unwrap()
-                .as_deref(),
-            Some(&b"anchored"[..])
-        );
-    }
-
-    /// The anchor's own leaf still may not be a symlink: that is the swap an
-    /// attacker controls, unlike the system directories above it.
-    #[cfg(unix)]
-    #[test]
-    fn refuses_a_symlinked_anchor_leaf() {
-        use std::os::unix::fs::symlink;
-
-        let temp = tempfile::tempdir().unwrap();
-        let real = temp.path().join("real");
-        std::fs::create_dir_all(&real).unwrap();
-        symlink(&real, temp.path().join("leaf-link")).unwrap();
-
-        assert!(AnchoredDir::open(&temp.path().join("leaf-link")).is_err());
+        std::os::unix::fs::symlink(&real, temp.path().join("link")).unwrap();
+        // The anchor's own leaf still may not be a symlink: that is the swap an
+        // attacker controls, unlike the system directories above it.
+        for (anchor, id) in [("link/store", Some(&b"anchored"[..])), ("link", None)] {
+            let opened = AnchoredDir::open(&temp.path().join(anchor))
+                .ok()
+                .map(|dir| dir.read_regular(Path::new("id"), 64).unwrap());
+            assert_eq!(
+                opened.as_ref().map(|read| read.as_deref()),
+                id.map(Some),
+                "{anchor}"
+            );
+        }
     }
 
     #[cfg(unix)]

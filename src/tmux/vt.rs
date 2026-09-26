@@ -3985,91 +3985,45 @@ mod tests {
 
     #[test]
     fn capture_rows_padded_fills_every_row_to_the_pane_width() {
-        // The compositor concatenates rows to splice panes side by side, so a
-        // short row must be padded or the next pane slides left into the gap.
-        let rows = capture_rows_padded(b"ab\nlonger\n", 8, 3);
-        assert_eq!(rows.len(), 3, "one entry per pane row, blanks included");
-        for (i, row) in rows.iter().enumerate() {
-            assert_eq!(visible_width(row), 8, "row {i} not padded: {row:?}");
+        // (capture, width, height, visible text per row when it is pinned)
+        let cases: [(&str, u16, u16, Option<&[&str]>); 8] = [
+            ("ab\nlonger\n", 8, 3, Some(&["ab", "longer", ""])),
+            ("line-1\nline-2\n", 10, 2, Some(&["line-1", "line-2"])),
+            ("\x1b[41mred", 8, 1, Some(&["red"])),
+            ("ab漢", 4, 1, Some(&["ab漢"])),
+            ("ab漢", 7, 1, Some(&["ab漢"])),
+            ("abc漢", 4, 2, None),
+            ("keep", 3, 1, None),
+            ("abcdefgh", 4, 2, None),
+        ];
+        for (capture, width, height, text) in cases {
+            let rows = capture_rows_padded(capture.as_bytes(), width, height);
+            assert_eq!(rows.len(), usize::from(height), "{capture:?}");
+            for row in &rows {
+                assert_eq!(
+                    visible_width(row),
+                    usize::from(width),
+                    "{capture:?}: {row:?}"
+                );
+            }
+            if let Some(text) = text {
+                let plain: Vec<String> = rows
+                    .iter()
+                    .map(|r| crate::tmux::utils::strip_ansi(r).trim_end().to_string())
+                    .collect();
+                assert_eq!(plain, text, "{capture:?}");
+            }
         }
-        assert!(rows[0].contains("ab"));
-        assert!(rows[1].contains("longer"));
-    }
-
-    #[test]
-    fn capture_rows_padded_unstaircases_bare_lf_input() {
-        // Same hazard `lf_to_crlf` fixes for the live seed: `capture-pane`
-        // joins rows with a bare LF, which would staircase each pane row off
-        // the previous one's end column.
-        let rows = capture_rows_padded(b"line-1\nline-2\n", 10, 2);
-        let plain: Vec<String> = rows
-            .iter()
-            .map(|r| crate::tmux::utils::strip_ansi(r))
-            .collect();
-        assert_eq!(plain[0].trim_end(), "line-1");
-        assert_eq!(plain[1].trim_end(), "line-2", "row 1 staircased");
-    }
-
-    #[test]
-    fn capture_rows_padded_resets_style_before_padding() {
-        // A row ending in a background fill must not bleed that color across
-        // the border into the pane beside it.
-        let rows = capture_rows_padded(b"\x1b[41mred", 8, 1);
-        assert_eq!(visible_width(&rows[0]), 8);
+        let styled = &capture_rows_padded(b"\x1b[41mred", 8, 1)[0];
         assert!(
-            rows[0].ends_with("\x1b[0m     "),
-            "padding not reset: {:?}",
-            rows[0]
+            styled.ends_with("\x1b[0m     "),
+            "padding not reset: {styled:?}"
         );
-    }
-
-    #[test]
-    fn capture_rows_padded_counts_a_trailing_wide_glyph_as_two_columns() {
-        // A wide glyph's continuation cell holds no contents and, unstyled, no
-        // style, so counting one column per occupied cell under-counts the row
-        // by one. The padding step then appended a space to a row that already
-        // filled its pane, making it `cols + 1` wide and shifting every pane to
-        // its right by a column.
-        let rows = capture_rows_padded("ab漢".as_bytes(), 4, 1);
-        assert_eq!(
-            visible_width(&rows[0]),
-            4,
-            "row should exactly fill the pane: {:?}",
-            rows[0]
-        );
+        let full = &capture_rows_padded("ab漢".as_bytes(), 4, 1)[0];
         assert!(
-            !rows[0].ends_with(' '),
-            "no padding belongs on a row that already fills its width: {:?}",
-            rows[0]
+            !full.ends_with(' '),
+            "a full row takes no padding: {full:?}"
         );
-
-        // The same glyph with room to spare still pads, to the right total.
-        let rows = capture_rows_padded("ab漢".as_bytes(), 7, 1);
-        assert_eq!(visible_width(&rows[0]), 7, "{:?}", rows[0]);
-
-        // A wide glyph split by the pane edge cannot push the count past `cols`.
-        let rows = capture_rows_padded("abc漢".as_bytes(), 4, 2);
-        for (i, r) in rows.iter().enumerate() {
-            assert_eq!(visible_width(r), 4, "row {i}: {r:?}");
-        }
-    }
-
-    #[test]
-    fn capture_rows_padded_survives_a_one_row_pane_that_wraps() {
-        // `resize-pane -y 1` is a real layout, and vt100 panics on a wrapping
-        // one-row grid, so this must come back with a single padded row.
-        let rows = capture_rows_padded(b"keep", 3, 1);
-        assert_eq!(rows.len(), 1);
-        assert_eq!(visible_width(&rows[0]), 3);
-    }
-
-    #[test]
-    fn capture_rows_padded_truncates_content_wider_than_the_pane() {
-        // Content wider than the pane wraps inside the parser rather than
-        // overflowing the row and shifting the neighbour.
-        let rows = capture_rows_padded(b"abcdefgh", 4, 2);
-        assert_eq!(visible_width(&rows[0]), 4);
-        assert_eq!(visible_width(&rows[1]), 4);
     }
 
     #[test]
@@ -4202,146 +4156,41 @@ mod tests {
         assert_eq!(strip_trailing_row_terminator(b""), b"");
     }
 
+    /// The seed lands the cursor at the queried, visible-screen-relative
+    /// position (bottom-anchored when the pane outgrew the grid), honours its
+    /// visibility, and never over-scrolls the content it replays.
     #[test]
-    fn seed_places_cursor_at_queried_position_not_end_of_content() {
-        // Regression for #2902: a full-grid body (nothing to trim) plus a real
-        // cursor position that differs from the end of the seeded content. The
-        // seeded parser must land the cursor where tmux reported it, not
-        // bottom-right where the last replayed glyph ended.
-        let rows: u16 = 6;
-        let cols: u16 = 20;
-        // Six full rows, so the parser cursor would otherwise strand at the
-        // bottom-right after the last glyph.
-        let body = b"row0-full-content\nrow1-full-content\nrow2-full-content\nrow3-full-content\nrow4-full-content\nrow5-full-content\n";
-        let state = PaneSeedState {
-            cursor_x: 3,
-            cursor_y: 1,
-            cursor_visible: true,
-            pane_height: rows,
-            ..Default::default()
+    fn seed_places_the_cursor_where_the_pane_reports_it() {
+        let lines = |rows: std::ops::Range<usize>, label: &str| -> String {
+            rows.map(|i| format!("{label}{i:02}\n")).collect()
         };
-        let mut p = vt100::Parser::new(rows, cols, SCROLLBACK_LINES);
-        p.process(&assemble_seed_stream(body, &state, rows));
-
-        assert_eq!(
-            p.screen().cursor_position(),
-            (1, 3),
-            "cursor must sit at the queried (row 1, col 3), not end-of-content"
-        );
-        assert!(
-            !p.screen().hide_cursor(),
-            "cursor_flag=1 must show the cursor"
-        );
-        // The faithful body is still there: row 0 was not scrolled off by a
-        // stray trailing newline.
-        assert!(
-            p.screen().contents().contains("row0-full-content"),
-            "top row must survive (no over-scroll):\n{}",
-            p.screen().contents()
-        );
-    }
-
-    #[test]
-    fn seed_hides_cursor_when_pane_hid_it() {
-        // An app that parked its hardware cursor (DECTCEM off) reports
-        // cursor_flag=0; the seed must hide the parser cursor to match, instead
-        // of a fresh parser's visible-by-default caret (issue #2902).
-        let state = PaneSeedState {
-            cursor_x: 0,
-            cursor_y: 0,
-            cursor_visible: false,
-            ..Default::default()
-        };
-        let mut p = vt100::Parser::new(4, 10, 0);
-        p.process(&assemble_seed_stream(b"hi\n", &state, 4));
-        assert!(
-            p.screen().hide_cursor(),
-            "cursor_flag=0 must hide the seeded cursor"
-        );
-    }
-
-    #[test]
-    fn seed_cursor_row_is_visible_screen_relative_with_scrollback() {
-        // With scrollback seeded, the parser's visible screen is the LAST rows
-        // of the grid, and history scrolls off the top. tmux reports the cursor
-        // relative to the visible pane, so the CUP must land there regardless of
-        // how deep the scrollback is.
-        let rows: u16 = 4;
-        let cols: u16 = 12;
-        // Ten rows into a 4-row screen: six scroll into history, the last four
-        // are the visible screen.
-        let mut body = Vec::new();
-        for i in 0..10 {
-            body.extend_from_slice(format!("HL{i:02}\n").as_bytes());
+        let full = lines(0..6, "row-full-content-");
+        let history = lines(0..10, "HL");
+        let outgrown = format!("{}READY> \n{}", lines(0..3, "line-"), "\n".repeat(4));
+        // (body, grid rows, pane height, cursor x/y/visible) -> (position, text kept on screen)
+        type Case<'a> = (&'a str, u16, u16, (u16, u16, bool), (u16, u16), &'a str);
+        let cases: [Case; 4] = [
+            (&full, 6, 6, (3, 1, true), (1, 3), "row-full-content-00"),
+            (&history, 4, 4, (2, 1, true), (1, 2), "HL09"),
+            (&outgrown, 6, 8, (7, 3, true), (1, 7), "READY>"),
+            ("hi\n", 4, 0, (0, 0, false), (0, 0), "hi"),
+        ];
+        for (body, rows, pane_height, (cursor_x, cursor_y, cursor_visible), position, kept) in cases
+        {
+            let state = PaneSeedState {
+                cursor_x,
+                cursor_y,
+                cursor_visible,
+                pane_height,
+                ..Default::default()
+            };
+            let mut p = vt100::Parser::new(rows, 20, SCROLLBACK_LINES);
+            p.process(&assemble_seed_stream(body.as_bytes(), &state, rows));
+            let screen = p.screen();
+            assert_eq!(screen.cursor_position(), position, "{}", screen.contents());
+            assert_eq!(screen.hide_cursor(), !cursor_visible, "{body:?}");
+            assert!(screen.contents().contains(kept), "{}", screen.contents());
         }
-        let state = PaneSeedState {
-            cursor_x: 2,
-            cursor_y: 1,
-            cursor_visible: true,
-            pane_height: rows,
-            ..Default::default()
-        };
-        let mut p = vt100::Parser::new(rows, cols, SCROLLBACK_LINES);
-        p.process(&assemble_seed_stream(&body, &state, rows));
-        assert_eq!(
-            p.screen().cursor_position(),
-            (1, 2),
-            "cursor row is visible-screen-relative, not counted from the top of history"
-        );
-        // The visible screen shows the newest rows (HL06..HL09), oldest in
-        // history.
-        assert!(
-            p.screen().contents().contains("HL09"),
-            "newest row must be on the visible screen:\n{}",
-            p.screen().contents()
-        );
-    }
-
-    #[test]
-    fn seed_keeps_cursor_on_the_prompt_when_the_pane_outgrows_the_grid() {
-        // #3824. A reseed that runs before `resize-window` lands captures the
-        // pane at its OLD height, so the body is taller than the grid being
-        // built and its top rows scroll into history, carrying the content up.
-        // The cursor has to travel with them; left at a bare `#{cursor_y}` it
-        // parks below the prompt, and the app's next SIGWINCH redraw prints a
-        // second prompt row there that no reconcile can see (grid and pane
-        // agree on geometry and cursor, only the cells differ).
-        let rows: u16 = 6;
-        let cols: u16 = 20;
-        // Pane is two rows taller than the grid: three content rows, a prompt,
-        // and the blank rows capture-pane pads to the pane height.
-        let pane_height: u16 = 8;
-        let mut body = Vec::new();
-        for i in 0..3 {
-            body.extend_from_slice(format!("line-{i}\n").as_bytes());
-        }
-        body.extend_from_slice(b"READY> \n");
-        for _ in 4..pane_height {
-            body.extend_from_slice(b"\n");
-        }
-        let state = PaneSeedState {
-            cursor_x: 7,
-            cursor_y: 3,
-            cursor_visible: true,
-            pane_height,
-            ..Default::default()
-        };
-        let mut p = vt100::Parser::new(rows, cols, SCROLLBACK_LINES);
-        p.process(&assemble_seed_stream(&body, &state, rows));
-
-        // Two body rows scrolled off, so the prompt sits on row 1 and the
-        // cursor must be on it, not two rows below on row 3.
-        assert_eq!(
-            p.screen().cursor_position(),
-            (1, 7),
-            "cursor must follow the prompt row the taller body pushed up:\n{}",
-            p.screen().contents()
-        );
-        assert!(
-            p.screen().contents().contains("READY>"),
-            "prompt must be on the visible screen:\n{}",
-            p.screen().contents()
-        );
     }
 
     #[test]
@@ -5808,24 +5657,35 @@ mod tests {
     }
 
     #[test]
-    fn osc52_scanner_extracts_bel_and_st_terminated_writes() {
-        // "hello" = aGVsbG8=
-        let mut s = Osc52Scanner::new();
-        assert_eq!(
-            s.feed(b"before\x1b]52;c;aGVsbG8=\x07after"),
-            Some("hello".to_string())
-        );
-        let mut s = Osc52Scanner::new();
-        assert_eq!(
-            s.feed(b"\x1b]52;c;aGVsbG8=\x1b\\"),
-            Some("hello".to_string())
-        );
-        // Unpadded base64 ("hi" = aGk) must decode too.
-        let mut s = Osc52Scanner::new();
-        assert_eq!(s.feed(b"\x1b]52;c;aGk\x07"), Some("hi".to_string()));
-        // Empty targets field (`52;;`) is the spec's shorthand for `c`.
-        let mut s = Osc52Scanner::new();
-        assert_eq!(s.feed(b"\x1b]52;;aGVsbG8=\x07"), Some("hello".to_string()));
+    fn osc52_scanner_extracts_clipboard_writes() {
+        let hello = Some("hello");
+        let cases: [(&[u8], Option<&str>); 11] = [
+            (b"before\x1b]52;c;aGVsbG8=\x07after", hello),
+            (b"\x1b]52;c;aGVsbG8=\x1b\\", hello),
+            (b"\x1b]52;c;aGk\x07", Some("hi")),
+            (b"\x1b]52;;aGVsbG8=\x07", hello),
+            // Queries and empty writes are not copies.
+            (b"\x1b]52;c;?\x07", None),
+            (b"\x1b]52;c;\x07", None),
+            (b"\x1b]52;c;=====\x07", None),
+            // Other sequences are skipped and the latest write wins.
+            (
+                b"\x1b]0;title\x07\x1b[31m\x1b]521;x\x07\x1b]52;c;aGVsbG8=\x07",
+                hello,
+            ),
+            (b"\x1b]52;c;aGVsbG8=\x07\x1b]52;c;aGk=\x07", Some("hi")),
+            // tmux passthrough wrapping, with BEL and doubled-ESC ST.
+            (b"\x1bPtmux;\x1b\x1b]52;c;aGVsbG8=\x07\x1b\\", hello),
+            (b"\x1bPtmux;\x1b\x1b]52;c;aGVsbG8=\x1b\x1b\\\x1b\\", hello),
+        ];
+        for (chunk, expected) in cases {
+            assert_eq!(
+                Osc52Scanner::new().feed(chunk).as_deref(),
+                expected,
+                "{:?}",
+                String::from_utf8_lossy(chunk)
+            );
+        }
     }
 
     #[test]
@@ -5843,57 +5703,6 @@ mod tests {
                 "split at byte {split} lost the copy"
             );
         }
-    }
-
-    #[test]
-    fn osc52_scanner_skips_queries_and_empty_writes() {
-        // A query asks the terminal to REPLY with the clipboard; forwarding
-        // it as a write (empty pbcopy/xclip input) would CLEAR the host
-        // clipboard. Same for an explicit empty payload.
-        let mut s = Osc52Scanner::new();
-        assert_eq!(s.feed(b"\x1b]52;c;?\x07"), None);
-        let mut s = Osc52Scanner::new();
-        assert_eq!(s.feed(b"\x1b]52;c;\x07"), None);
-        // Undecodable payloads are dropped, not forwarded as garbage.
-        let mut s = Osc52Scanner::new();
-        assert_eq!(s.feed(b"\x1b]52;c;=====\x07"), None);
-    }
-
-    #[test]
-    fn osc52_scanner_ignores_other_sequences_and_recovers() {
-        let mut s = Osc52Scanner::new();
-        // Title OSC, a CSI, an OSC 5-something that is not 52, then a real
-        // copy: only the copy comes out, and prior garbage doesn't wedge
-        // the state machine.
-        assert_eq!(
-            s.feed(b"\x1b]0;title\x07\x1b[31m\x1b]521;x\x07\x1b]52;c;aGVsbG8=\x07"),
-            Some("hello".to_string())
-        );
-        // The last complete write in a chunk wins (clipboard semantics).
-        let mut s = Osc52Scanner::new();
-        assert_eq!(
-            s.feed(b"\x1b]52;c;aGVsbG8=\x07\x1b]52;c;aGk=\x07"),
-            Some("hi".to_string())
-        );
-    }
-
-    #[test]
-    fn osc52_scanner_unwraps_tmux_passthrough_wrapped_writes() {
-        // An agent that wraps its OSC 52 in tmux DCS passthrough doubles the
-        // inner ESCs: `ESC P tmux; ESC ESC ] 52 ... ESC \`. The scanner must
-        // still find the copy (BEL-terminated inner form, as emitted by our
-        // own clipboard.rs and by OpenCode).
-        let mut s = Osc52Scanner::new();
-        assert_eq!(
-            s.feed(b"\x1bPtmux;\x1b\x1b]52;c;aGVsbG8=\x07\x1b\\"),
-            Some("hello".to_string())
-        );
-        // ST-terminated inner form: the terminator arrives ESC-doubled.
-        let mut s = Osc52Scanner::new();
-        assert_eq!(
-            s.feed(b"\x1bPtmux;\x1b\x1b]52;c;aGVsbG8=\x1b\x1b\\\x1b\\"),
-            Some("hello".to_string())
-        );
     }
 
     #[test]

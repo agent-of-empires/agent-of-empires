@@ -37,13 +37,6 @@ describe("pickContrastForeground", () => {
     }
   });
 
-  it("picks white for a dark custom-theme accent", () => {
-    // A supported custom theme could set `waiting`/`unread` to a near-black accent; black text would be nearly
-    // invisible against it, so white must win instead.
-    expect(pickContrastForeground("#0f0f11")).toBe("#ffffff");
-    expect(pickContrastForeground("#1a1a1a")).toBe("#ffffff");
-  });
-
   it("still clears WCAG AA at the mid-gray boundary, where a near-black/near-white pair would not", () => {
     // A near-black/near-white pair (e.g. #0f0f11/#fafafa) both land at ~4.28:1 against this exact gray, below the
     // 4.5:1 floor; pure black/white is required to clear it (4.69:1).

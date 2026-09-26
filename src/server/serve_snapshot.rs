@@ -343,25 +343,26 @@ pub(super) fn decrement_reported_count(counter: &std::sync::atomic::AtomicU32, r
 mod tests {
     use super::*;
 
-    // #1874 / #1875: a confirmed snapshot clears a reported telemetry counter
-    // (the create counter and the web/acp open counts all share this path)
-    // by exactly the value it reported, so an increment that arrives during the
-    // in-flight send survives into the next snapshot instead of being reset away.
+    /// #1874 / #1875 / #1888: a confirmed send clears only the increments it
+    /// reported, so one that lands mid-flight survives, a zero report touches
+    /// nothing, and a double clear saturates at zero instead of wrapping.
     #[test]
     fn reported_count_decrement_preserves_concurrent_increments() {
         use std::sync::atomic::{AtomicU32, Ordering};
-        let counter = AtomicU32::new(5);
-        // The snapshot reported the 5 increments seen at build time.
-        let reported = counter.load(Ordering::Relaxed);
-        // One more lands while the snapshot is in flight.
-        counter.fetch_add(1, Ordering::Relaxed);
-        // The confirmed send clears only what it reported.
-        decrement_reported_count(&counter, reported);
-        assert_eq!(
-            counter.load(Ordering::Relaxed),
-            1,
-            "the increment that arrived during the send must be retained"
-        );
+
+        // (start, reported, landed mid-flight, want)
+        for (start, reported, landed, want) in
+            [(5, 5, 1, 1), (2, 2, 1, 1), (1, 0, 0, 1), (2, 5, 0, 0)]
+        {
+            let counter = AtomicU32::new(start);
+            counter.fetch_add(landed, Ordering::Relaxed);
+            decrement_reported_count(&counter, reported);
+            assert_eq!(
+                counter.load(Ordering::Relaxed),
+                want,
+                "start={start} reported={reported} landed={landed}"
+            );
+        }
     }
 
     #[test]
@@ -405,29 +406,5 @@ mod tests {
             1,
             "the open that arrived during the send must be retained"
         );
-    }
-
-    // #1888: the same decrement path carries the structured-interaction counters,
-    // so an interaction that lands mid-send must survive the clear (the plan
-    // mode counter shown here, which the snapshot reports as the bool count>0).
-    #[test]
-    fn reported_count_decrement_preserves_concurrent_structured_interaction() {
-        use std::sync::atomic::{AtomicU32, Ordering};
-        let plan_mode = AtomicU32::new(2);
-        let reported = plan_mode.load(Ordering::Relaxed);
-        plan_mode.fetch_add(1, Ordering::Relaxed);
-        decrement_reported_count(&plan_mode, reported);
-        assert_eq!(plan_mode.load(Ordering::Relaxed), 1);
-    }
-
-    // The decrement saturates rather than underflow-wrapping the AtomicU32, so a
-    // hypothetical future refactor that detaches sends (double-clearing a
-    // counter) degrades to zero instead of jumping to u32::MAX.
-    #[test]
-    fn reported_count_decrement_saturates_below_zero() {
-        use std::sync::atomic::{AtomicU32, Ordering};
-        let counter = AtomicU32::new(2);
-        decrement_reported_count(&counter, 5);
-        assert_eq!(counter.load(Ordering::Relaxed), 0);
     }
 }

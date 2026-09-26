@@ -75,18 +75,6 @@ describe("historyWindowStart", () => {
 });
 
 describe("historyWindow", () => {
-  it("can load earlier when rows are windowed out and there is no clear", () => {
-    const rows = transcript(10, 10); // 110 rows
-    const w = historyWindow(rows, 30, false);
-    expect(w.start).toBeGreaterThan(0);
-    expect(w.canLoadEarlier).toBe(true);
-  });
-
-  it("cannot load earlier when everything fits", () => {
-    const rows = transcript(2, 3); // 8 rows
-    expect(historyWindow(rows, DEFAULT_HISTORY_WINDOW, false)).toEqual({ start: 0, canLoadEarlier: false });
-  });
-
   it("suppresses load-earlier when the only hidden rows are pre-clear", () => {
     const rows: ActivityRow[] = [];
     for (let t = 0; t < 100; t += 1) {

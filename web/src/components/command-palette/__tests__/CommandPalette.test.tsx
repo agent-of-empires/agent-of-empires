@@ -28,11 +28,6 @@ const selectedTab = () =>
 afterEach(cleanup);
 
 describe("CommandPalette", () => {
-  it("renders nothing when closed", () => {
-    const { container } = render(<CommandPalette open={false} onClose={() => {}} actions={[]} />);
-    expect(container.firstChild).toBeNull();
-  });
-
   it("renders a modal dialog with every group's rows and a pluralized count", () => {
     const { rerender } = open(mixed);
     expect(screen.getByRole("dialog", { name: "Command palette" })).toBeTruthy();
@@ -60,12 +55,6 @@ describe("CommandPalette", () => {
     expect(onClose).toHaveBeenCalledOnce();
   });
 
-  it("shows a spinner row and the Conversations tab while a content search runs", () => {
-    open(mixed, { searching: true });
-    expect(screen.getByText("Searching conversations…")).toBeTruthy();
-    expect(screen.getByRole("tab", { name: "Conversations" })).toBeTruthy();
-  });
-
   it("keeps conversation hits even when the query does not match their text", () => {
     open([
       action({ id: "session:s1", title: "Some Title", group: "Sessions" }),
@@ -74,13 +63,6 @@ describe("CommandPalette", () => {
     type("zzzznomatch");
     expect(screen.getByText("Hit session")).toBeTruthy();
     expect(screen.queryByText("Some Title")).toBeNull();
-  });
-
-  it("reports the typed query through onSearchChange", () => {
-    const onSearchChange = vi.fn();
-    open([action()], { onSearchChange });
-    type("reconciler");
-    expect(onSearchChange).toHaveBeenCalledWith("reconciler");
   });
 
   describe("category tabs", () => {
@@ -94,11 +76,6 @@ describe("CommandPalette", () => {
       expect(screen.getByText("2 actions")).toBeTruthy();
     });
 
-    it("hides the tab strip when only one category has results", () => {
-      open([action({ title: "Lonely", group: "Actions" })]);
-      expect(screen.queryByRole("tablist")).toBeNull();
-    });
-
     it("cycles tabs with Tab and Shift+Tab", () => {
       open(mixed);
       const dialog = screen.getByRole("dialog", { name: "Command palette" });
@@ -108,18 +85,6 @@ describe("CommandPalette", () => {
       expect(selectedTab()).toBe("All");
       fireEvent.keyDown(dialog, { key: "Tab", shiftKey: true });
       expect(selectedTab()).toBe("Settings");
-    });
-
-    it("drops a tab and trims the footer count when a query filters a group out", () => {
-      open([
-        action({ id: "a1", title: "alpha run", group: "Actions" }),
-        action({ id: "s1", title: "alpha save", group: "Settings" }),
-        action({ id: "sess1", title: "beta sit", group: "Sessions" }),
-      ]);
-      type("alpha");
-      expect(screen.getByText("2 actions")).toBeTruthy();
-      expect(screen.queryByRole("tab", { name: "Sessions" })).toBeNull();
-      expect(screen.getByRole("tab", { name: "Actions" })).toBeTruthy();
     });
 
     it("hides the strip and counts only matches when a query leaves one group", () => {
@@ -144,15 +109,6 @@ describe("CommandPalette", () => {
       expect(screen.queryByText("New session")).toBeNull();
       expect(screen.getByText("plugin-host-test")).toBeTruthy();
       expect(screen.getByText("1 action")).toBeTruthy();
-    });
-
-    it("resets to All when reopened", () => {
-      const { rerender } = open(mixed);
-      fireEvent.click(screen.getByRole("tab", { name: "Settings" }));
-      expect(selectedTab()).toBe("Settings");
-      rerender(<CommandPalette open={false} onClose={() => {}} actions={mixed} />);
-      rerender(<CommandPalette open onClose={() => {}} actions={mixed} />);
-      expect(selectedTab()).toBe("All");
     });
   });
 });

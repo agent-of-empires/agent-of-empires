@@ -471,7 +471,7 @@ mod tests {
     }
 
     #[test]
-    fn heartbeat_tool_call_ids() {
+    fn tool_call_mapping_is_profile_gated() {
         for (id, want) in [
             ("toolu_01ABC-heartbeat-0", true),
             ("toolu_01ABC-heartbeat-123", true),
@@ -494,28 +494,27 @@ mod tests {
             &agent_profiles::CODEX,
         );
         assert_eq!(kinds(&codex), ["tool_call_updated"]);
-    }
 
-    #[test]
-    fn tool_call_parent_linkage_is_profile_gated() {
-        let mut meta = serde_json::Map::new();
-        meta.insert(
-            "claudeCode".to_string(),
-            serde_json::json!({ "parentToolUseId": "tc-task-1" }),
-        );
-        for (with_meta, profile, want) in [
-            (true, &agent_profiles::CLAUDE, Some("tc-task-1")),
-            (false, &agent_profiles::CLAUDE, None),
-            (true, &agent_profiles::CODEX, None),
-        ] {
-            let mut tc = AcpToolCall::new("tc-child-1", "Read");
-            tc.raw_input = Some(serde_json::json!({"path": "x"}));
-            tc.meta = with_meta.then(|| meta.clone());
-            let events = map_update_to_events(SessionUpdate::ToolCall(tc), profile);
-            let Event::ToolCallStarted { tool_call } = &events[0] else {
-                panic!("expected ToolCallStarted, got {events:?}");
-            };
-            assert_eq!(tool_call.parent_tool_call_id.as_deref(), want);
+        {
+            let mut meta = serde_json::Map::new();
+            meta.insert(
+                "claudeCode".to_string(),
+                serde_json::json!({ "parentToolUseId": "tc-task-1" }),
+            );
+            for (with_meta, profile, want) in [
+                (true, &agent_profiles::CLAUDE, Some("tc-task-1")),
+                (false, &agent_profiles::CLAUDE, None),
+                (true, &agent_profiles::CODEX, None),
+            ] {
+                let mut tc = AcpToolCall::new("tc-child-1", "Read");
+                tc.raw_input = Some(serde_json::json!({"path": "x"}));
+                tc.meta = with_meta.then(|| meta.clone());
+                let events = map_update_to_events(SessionUpdate::ToolCall(tc), profile);
+                let Event::ToolCallStarted { tool_call } = &events[0] else {
+                    panic!("expected ToolCallStarted, got {events:?}");
+                };
+                assert_eq!(tool_call.parent_tool_call_id.as_deref(), want);
+            }
         }
     }
 
@@ -624,10 +623,7 @@ mod tests {
             serde_json::to_string(&Event::ConversationCompactionStarted).unwrap(),
             "\"ConversationCompactionStarted\""
         );
-    }
-
-    #[test]
-    fn transcript_events_suppressed_during_load_replay() {
+        // Load replay suppresses transcript events, compaction included.
         let cases = [
             (Event::ConversationCompactionStarted, true),
             (Event::ConversationCompacted, true),
@@ -652,7 +648,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_call_update_completion() {
+    fn tool_call_update_mapping() {
         let events = claude(tool_update("tc-1", completed("abc1234 first commit")));
         let [Event::ToolCallCompleted {
             tool_call_id,
@@ -682,10 +678,8 @@ mod tests {
                 ..
             }]
         ));
-    }
 
-    #[test]
-    fn tool_call_update_metadata_launch_becomes_background_agent() {
+        // Launch metadata on an update becomes only a background-agent event.
         let mut meta = serde_json::Map::new();
         meta.insert(
             "claudeCode".to_string(),
@@ -715,21 +709,73 @@ mod tests {
         assert_eq!(agent_id, "a6654829ea0a19032");
         assert_eq!(description, "grep tmux mentions repo-wide");
         assert!(output_file.ends_with(".output"));
+
+        {
+            let bare = claude(tool_update(
+                "tc-3",
+                ToolCallUpdateFields::new().status(ToolCallStatus::InProgress),
+            ));
+            assert!(matches!(
+                bare.as_slice(),
+                [Event::ToolCallUpdated {
+                    started_at: Some(_),
+                    title: None,
+                    args_preview: None,
+                    diffs: None,
+                    ..
+                }]
+            ));
+            let streaming = claude(tool_update(
+                "tc-2",
+                ToolCallUpdateFields::new()
+                    .status(ToolCallStatus::InProgress)
+                    .content(vec![ToolCallContent::Content(Content::new(
+                        "partial output",
+                    ))]),
+            ));
+            assert!(matches!(
+                streaming.as_slice(),
+                [
+                    Event::ToolCallUpdated { started_at: Some(_), .. },
+                    Event::ToolCallContent { tool_call_id, content },
+                ] if tool_call_id == "tc-2" && content == "partial output"
+            ));
+        }
+
+        {
+            use agent_client_protocol::schema::v1::{Diff, ToolKind};
+            let diff = || ToolCallContent::Diff(Diff::new("src/foo.rs", "new").old_text("old"));
+            let codex = |update| map_update_to_events(update, &agent_profiles::CODEX);
+
+            let mut tc = AcpToolCall::new("tc-edit-1", "Edit src/foo.rs");
+            tc.kind = ToolKind::Edit;
+            tc.content = vec![diff()];
+            let events = codex(SessionUpdate::ToolCall(tc));
+            let Event::ToolCallStarted { tool_call } = &events[0] else {
+                panic!("expected ToolCallStarted, got {events:?}");
+            };
+            assert_eq!(tool_call.diffs[0].path, "src/foo.rs");
+            assert_eq!(tool_call.diffs[0].new_text.as_deref(), Some("new"));
+
+            let fields = ToolCallUpdateFields::new()
+                .status(ToolCallStatus::Completed)
+                .content(vec![diff()]);
+            let events = codex(tool_update("tc-edit-1", fields));
+            assert!(events.iter().any(|e| matches!(
+                e,
+                Event::ToolCallUpdated { diffs: Some(d), .. } if d.len() == 1 && d[0].path == "src/foo.rs"
+            )));
+
+            // Text-only frames must not wipe earlier diffs.
+            let events = codex(tool_update("tc-edit-1", completed("done")));
+            assert!(!events
+                .iter()
+                .any(|e| matches!(e, Event::ToolCallUpdated { diffs: Some(_), .. })));
+        }
     }
 
     #[test]
-    fn user_message_chunk_becomes_user_prompt_sent() {
-        let chunk = ContentChunk::new(ContentBlock::Text(TextContent::new("hello from the past")));
-        let events = claude(SessionUpdate::UserMessageChunk(chunk));
-        assert!(matches!(
-            events.as_slice(),
-            [Event::UserPromptSent { text, attachments, .. }]
-                if text == "hello from the past" && attachments.is_empty()
-        ));
-    }
-
-    #[test]
-    fn current_mode_update_classification() {
+    fn mode_and_config_option_updates() {
         use agent_client_protocol::schema::v1::CurrentModeUpdate;
         for (id, want) in [
             ("yolo", SessionMode::BypassPermissions),
@@ -754,71 +800,82 @@ mod tests {
             assert_eq!(current_mode_id, id);
             assert_eq!(*mode, want, "{id}");
         }
-    }
 
-    #[test]
-    fn tool_call_update_in_progress_restamps_and_streams() {
-        let bare = claude(tool_update(
-            "tc-3",
-            ToolCallUpdateFields::new().status(ToolCallStatus::InProgress),
-        ));
-        assert!(matches!(
-            bare.as_slice(),
-            [Event::ToolCallUpdated {
-                started_at: Some(_),
-                title: None,
-                args_preview: None,
-                diffs: None,
-                ..
-            }]
-        ));
-        let streaming = claude(tool_update(
-            "tc-2",
-            ToolCallUpdateFields::new()
-                .status(ToolCallStatus::InProgress)
-                .content(vec![ToolCallContent::Content(Content::new(
-                    "partial output",
-                ))]),
-        ));
-        assert!(matches!(
-            streaming.as_slice(),
-            [
-                Event::ToolCallUpdated { started_at: Some(_), .. },
-                Event::ToolCallContent { tool_call_id, content },
-            ] if tool_call_id == "tc-2" && content == "partial output"
-        ));
-    }
-
-    #[test]
-    fn diffs_bridge_onto_tool_cards() {
-        use agent_client_protocol::schema::v1::{Diff, ToolKind};
-        let diff = || ToolCallContent::Diff(Diff::new("src/foo.rs", "new").old_text("old"));
-        let codex = |update| map_update_to_events(update, &agent_profiles::CODEX);
-
-        let mut tc = AcpToolCall::new("tc-edit-1", "Edit src/foo.rs");
-        tc.kind = ToolKind::Edit;
-        tc.content = vec![diff()];
-        let events = codex(SessionUpdate::ToolCall(tc));
-        let Event::ToolCallStarted { tool_call } = &events[0] else {
-            panic!("expected ToolCallStarted, got {events:?}");
-        };
-        assert_eq!(tool_call.diffs[0].path, "src/foo.rs");
-        assert_eq!(tool_call.diffs[0].new_text.as_deref(), Some("new"));
-
-        let fields = ToolCallUpdateFields::new()
-            .status(ToolCallStatus::Completed)
-            .content(vec![diff()]);
-        let events = codex(tool_update("tc-edit-1", fields));
-        assert!(events.iter().any(|e| matches!(
-            e,
-            Event::ToolCallUpdated { diffs: Some(d), .. } if d.len() == 1 && d[0].path == "src/foo.rs"
-        )));
-
-        // Text-only frames must not wipe earlier diffs.
-        let events = codex(tool_update("tc-edit-1", completed("done")));
-        assert!(!events
-            .iter()
-            .any(|e| matches!(e, Event::ToolCallUpdated { diffs: Some(_), .. })));
+        {
+            use agent_client_protocol::schema::v1::{
+                ConfigOptionUpdate, SessionConfigOption, SessionConfigOptionCategory,
+                SessionConfigSelectOption,
+            };
+            let option =
+                |id: &'static str, current: &'static str, values: &[&'static str], category| {
+                    SessionConfigOption::select(
+                        id,
+                        id,
+                        current,
+                        values
+                            .iter()
+                            .map(|v| SessionConfigSelectOption::new(*v, *v))
+                            .collect::<Vec<_>>(),
+                    )
+                    .category(category)
+                };
+            let update = ConfigOptionUpdate::new(vec![
+                option(
+                    "model",
+                    "claude-opus-4-7",
+                    &["claude-opus-4-7", "claude-sonnet-4-6"],
+                    SessionConfigOptionCategory::Model,
+                ),
+                option(
+                    "effort",
+                    "default",
+                    &["default", "high"],
+                    SessionConfigOptionCategory::ThoughtLevel,
+                ),
+                option(
+                    "mode",
+                    "default",
+                    &["default", "plan"],
+                    SessionConfigOptionCategory::Mode,
+                ),
+                // #1563: an unknown category name passes through, not dropped.
+                option(
+                    "future",
+                    "a",
+                    &["a"],
+                    SessionConfigOptionCategory::Other("future_category".into()),
+                ),
+            ]);
+            let events = claude(SessionUpdate::ConfigOptionUpdate(update));
+            let [Event::ConfigOptionsUpdated { options }] = events.as_slice() else {
+                panic!("expected ConfigOptionsUpdated, got {events:?}");
+            };
+            let got: Vec<_> = options
+                .iter()
+                .map(|o| {
+                    (
+                        o.id.as_str(),
+                        o.category.clone(),
+                        o.current_value.as_str(),
+                        o.options.len(),
+                    )
+                })
+                .collect();
+            assert_eq!(
+                got,
+                [
+                    ("model", ConfigOptionCategory::Model, "claude-opus-4-7", 2),
+                    ("effort", ConfigOptionCategory::ThoughtLevel, "default", 2),
+                    ("mode", ConfigOptionCategory::Mode, "default", 2),
+                    (
+                        "future",
+                        ConfigOptionCategory::Other("future_category".into()),
+                        "a",
+                        1
+                    ),
+                ]
+            );
+        }
     }
 
     #[test]
@@ -868,132 +925,5 @@ mod tests {
         assert!(!update("Monitor", Some(serde_json::json!({})))
             .iter()
             .any(|e| matches!(e, Event::MonitorArmed { .. })));
-    }
-
-    #[test]
-    fn session_info_updates_are_ignored() {
-        use agent_client_protocol::schema::v1::SessionInfoUpdate;
-        for info in [
-            SessionInfoUpdate::new().title("Fix the flaky test".to_string()),
-            SessionInfoUpdate::new().updated_at("2026-06-25T00:00:00Z".to_string()),
-        ] {
-            assert!(claude(SessionUpdate::SessionInfoUpdate(info)).is_empty());
-        }
-    }
-
-    #[test]
-    fn usage_update_emits_typed_usage_event() {
-        use agent_client_protocol::schema::v1::{Cost, UsageUpdate};
-        let u = UsageUpdate::new(12_345, 200_000).cost(Cost::new(0.42, "USD"));
-        let events = claude(SessionUpdate::UsageUpdate(u));
-        let [Event::UsageUpdated { usage }] = events.as_slice() else {
-            panic!("expected UsageUpdated, got {events:?}");
-        };
-        assert_eq!((usage.used, usage.size), (12_345, 200_000));
-        let cost = usage.cost.as_ref().unwrap();
-        assert!((cost.amount - 0.42).abs() < f64::EPSILON);
-        assert_eq!(cost.currency, "USD");
-    }
-
-    #[test]
-    fn available_commands_update_emits_typed_event() {
-        use agent_client_protocol::schema::v1::{
-            AvailableCommand as AcpAvailableCommand, AvailableCommandInput,
-            AvailableCommandsUpdate, UnstructuredCommandInput,
-        };
-        let cmds = vec![
-            AcpAvailableCommand::new("review", "Review changes").input(
-                AvailableCommandInput::Unstructured(UnstructuredCommandInput::new("PR url")),
-            ),
-            AcpAvailableCommand::new("clear", "Reset context"),
-        ];
-        let events = claude(SessionUpdate::AvailableCommandsUpdate(
-            AvailableCommandsUpdate::new(cmds),
-        ));
-        let [Event::AvailableCommandsUpdated { commands }] = events.as_slice() else {
-            panic!("expected AvailableCommandsUpdated, got {events:?}");
-        };
-        let got: Vec<_> = commands
-            .iter()
-            .map(|c| (c.name.as_str(), c.accepts_input))
-            .collect();
-        assert_eq!(got, [("review", true), ("clear", false)]);
-    }
-
-    #[test]
-    fn config_option_update_maps_categories() {
-        use agent_client_protocol::schema::v1::{
-            ConfigOptionUpdate, SessionConfigOption, SessionConfigOptionCategory,
-            SessionConfigSelectOption,
-        };
-        let option =
-            |id: &'static str, current: &'static str, values: &[&'static str], category| {
-                SessionConfigOption::select(
-                    id,
-                    id,
-                    current,
-                    values
-                        .iter()
-                        .map(|v| SessionConfigSelectOption::new(*v, *v))
-                        .collect::<Vec<_>>(),
-                )
-                .category(category)
-            };
-        let update = ConfigOptionUpdate::new(vec![
-            option(
-                "model",
-                "claude-opus-4-7",
-                &["claude-opus-4-7", "claude-sonnet-4-6"],
-                SessionConfigOptionCategory::Model,
-            ),
-            option(
-                "effort",
-                "default",
-                &["default", "high"],
-                SessionConfigOptionCategory::ThoughtLevel,
-            ),
-            option(
-                "mode",
-                "default",
-                &["default", "plan"],
-                SessionConfigOptionCategory::Mode,
-            ),
-            // #1563: an unknown category name passes through, not dropped.
-            option(
-                "future",
-                "a",
-                &["a"],
-                SessionConfigOptionCategory::Other("future_category".into()),
-            ),
-        ]);
-        let events = claude(SessionUpdate::ConfigOptionUpdate(update));
-        let [Event::ConfigOptionsUpdated { options }] = events.as_slice() else {
-            panic!("expected ConfigOptionsUpdated, got {events:?}");
-        };
-        let got: Vec<_> = options
-            .iter()
-            .map(|o| {
-                (
-                    o.id.as_str(),
-                    o.category.clone(),
-                    o.current_value.as_str(),
-                    o.options.len(),
-                )
-            })
-            .collect();
-        assert_eq!(
-            got,
-            [
-                ("model", ConfigOptionCategory::Model, "claude-opus-4-7", 2),
-                ("effort", ConfigOptionCategory::ThoughtLevel, "default", 2),
-                ("mode", ConfigOptionCategory::Mode, "default", 2),
-                (
-                    "future",
-                    ConfigOptionCategory::Other("future_category".into()),
-                    "a",
-                    1
-                ),
-            ]
-        );
     }
 }

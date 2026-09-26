@@ -840,23 +840,7 @@ mod tests {
     }
 
     #[test]
-    fn retention_prunes_oldest_but_keeps_pinned() {
-        let schema = Schema::new("demo").unwrap();
-        let conn = mem(&schema);
-        insert_event(&conn, &schema, "t", 1, "{\"Pinned\":{}}", 1).unwrap();
-        for seq in 2..=5u64 {
-            insert_event(&conn, &schema, "t", seq, "{\"Chunk\":{}}", seq as i64).unwrap();
-        }
-        prune_retention(&conn, &schema, "t", 2, &["Pinned"]);
-        let kept: Vec<u64> = scan(&conn, &schema, "t", SeqBound::After(0), Order::Asc, None)
-            .into_iter()
-            .map(|(s, _)| s)
-            .collect();
-        assert_eq!(kept, vec![1, 4, 5]);
-    }
-
-    #[test]
-    fn retention_keeps_pinned_event_attachments() {
+    fn retention_prunes_oldest_but_keeps_pinned_events_and_their_attachments() {
         let schema = Schema::new("demo").unwrap();
         let conn = mem(&schema);
         insert_event(&conn, &schema, "t", 1, "{\"Pinned\":{}}", 1).unwrap();
@@ -888,6 +872,11 @@ mod tests {
             0,
         );
         prune_retention(&conn, &schema, "t", 2, &["Pinned"]);
+        let kept: Vec<u64> = scan(&conn, &schema, "t", SeqBound::After(0), Order::Asc, None)
+            .into_iter()
+            .map(|(s, _)| s)
+            .collect();
+        assert_eq!(kept, vec![1, 4, 5]);
         assert!(
             load_attachment(&conn, &schema, "t", "pinned-att").is_some(),
             "blob owned by a pinned (surviving) event must be kept"
@@ -922,16 +911,6 @@ mod tests {
     }
 
     #[test]
-    fn last_event_at_excludes_prefixes() {
-        let schema = Schema::new("demo").unwrap();
-        let conn = mem(&schema);
-        insert_event(&conn, &schema, "t", 1, "{\"Chunk\":{}}", 100).unwrap();
-        insert_event(&conn, &schema, "t", 2, "{\"Snapshot\":{}}", 200).unwrap();
-        let map = last_event_at_for_topics(&conn, &schema, &["t".into()], &["Snapshot"]);
-        assert_eq!(map.get("t"), Some(&100));
-    }
-
-    #[test]
     fn latest_by_discriminant_returns_newest_match() {
         let schema = Schema::new("demo").unwrap();
         let conn = mem(&schema);
@@ -947,6 +926,8 @@ mod tests {
             latest_by_discriminant(&conn, &schema, "t", "WakeupScheduled"),
             None
         );
+        let last_at = last_event_at_for_topics(&conn, &schema, &["t".into()], &["Chunk"]);
+        assert_eq!(last_at.get("t"), Some(&3), "excluded prefixes are skipped");
         insert_event(&conn, &schema, "t", 5, "\"ThinkingStarted\"", 5).unwrap();
         assert_eq!(
             latest_by_discriminant(&conn, &schema, "t", "ThinkingStarted"),
@@ -957,13 +938,7 @@ mod tests {
             latest_by_discriminant(&conn, &schema, "t", "PlanUpdated"),
             Some((3, "{\"PlanUpdated\":{\"n\":2}}".to_string()))
         );
-    }
 
-    #[test]
-    fn latest_by_discriminant_uses_the_index() {
-        let schema = Schema::new("demo").unwrap();
-        let conn = mem(&schema);
-        insert_event(&conn, &schema, "t", 1, "{\"PlanUpdated\":{}}", 1).unwrap();
         let plan: String = conn
             .query_row(
                 &format!(

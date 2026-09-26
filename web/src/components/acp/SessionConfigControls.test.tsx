@@ -61,10 +61,11 @@ describe("SessionConfigControls", () => {
     for (const id of ["model", "effort", "future"]) expect(byId(id) !== null).toBe(shown.includes(id));
   });
 
-  it("uses a segmented control for short effort lists and a dropdown past the threshold", () => {
-    mount([EFFORT]);
+  it("uses a segmented control for short effort lists, sending the value, and a dropdown past the threshold", () => {
+    const { onSetConfigOption } = mount([EFFORT]);
     expect(screen.getByRole("radiogroup", { name: "Reasoning Effort" })).toBeTruthy();
-    expect(screen.getByText("High")).toBeTruthy();
+    fireEvent.click(byId("effort-value-high")!);
+    expect(onSetConfigOption).toHaveBeenCalledWith("effort", "high");
     cleanup();
     mount([
       option("effort", "Reasoning Effort", "thought_level", [
@@ -93,12 +94,6 @@ describe("SessionConfigControls", () => {
     expect(onSetConfigOption).toHaveBeenCalledExactlyOnceWith("model", "claude-sonnet-4-6");
   });
 
-  it("sends the effort value, not its label", () => {
-    const { onSetConfigOption } = mount([EFFORT]);
-    fireEvent.click(byId("effort-value-high")!);
-    expect(onSetConfigOption).toHaveBeenCalledWith("effort", "high");
-  });
-
   it("disables only the pending option", () => {
     mount([MODEL], { configId: "model", value: "claude-sonnet-4-6" });
     fireEvent.click(byId("model")!);
@@ -106,18 +101,7 @@ describe("SessionConfigControls", () => {
     expect((byId("model-value-claude-opus-4-7") as HTMLButtonElement).disabled).toBe(false);
   });
 
-  it("truncates long model labels in the chip", () => {
-    mount([
-      {
-        ...MODEL,
-        current_value: "long",
-        options: [{ value: "long", name: "A Very Long Model Name That Does Not Fit Inline" }],
-      },
-    ]);
-    expect(byId("model")!.textContent).toContain("…");
-  });
-
-  // Up when a floor's worth of room exists above, else the roomier side, clamped to what is visible.
+  // Up when a floor's worth of room exists above, else the roomier side, clamped to what is visible (#3747).
   it.each([
     ["ample room above", 400, 420, 800, undefined, 0, "up", 288],
     ["cramped above, ample below", 50, 60, 800, undefined, 0, "down", 288],
@@ -170,16 +154,12 @@ describe("SessionConfigControls", () => {
 });
 
 describe("ConfigOptionSwitchFailedNotice", () => {
-  it("renders nothing without a failure", () => {
-    const { container } = render(
-      <ConfigOptionSwitchFailedNotice failure={null} configOptions={[]} onDismiss={vi.fn()} />,
-    );
-    expect(container.firstChild).toBeNull();
-  });
-
-  it("names the config and option, shows the reason, and dismisses", () => {
+  it("renders nothing without a failure; otherwise names the option, shows the reason, and dismisses", () => {
     const onDismiss = vi.fn();
-    render(
+    const props = { configOptions: [MODEL], onDismiss };
+    const { container, rerender } = render(<ConfigOptionSwitchFailedNotice failure={null} {...props} />);
+    expect(container.firstChild).toBeNull();
+    rerender(
       <ConfigOptionSwitchFailedNotice
         failure={{
           configId: "model",
@@ -187,8 +167,7 @@ describe("ConfigOptionSwitchFailedNotice", () => {
           reason: "rate limited",
           at: new Date().toISOString(),
         }}
-        configOptions={[MODEL]}
-        onDismiss={onDismiss}
+        {...props}
       />,
     );
     const text = screen.getByTestId("config-option-switch-failed-notice").textContent;

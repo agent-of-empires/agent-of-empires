@@ -1982,55 +1982,43 @@ mod tests {
     }
 
     #[test]
-    fn carried_directory_cannot_redirect_its_declared_root_to_internal_history() {
-        let temporary = tempfile::tempdir().unwrap();
-        let source = temporary.path().join("source");
-        let active = temporary.path().join("active");
-        fs::create_dir_all(source.join("history-tree/proj")).unwrap();
-        fs::create_dir(&active).unwrap();
-        let history = source.join("history-tree/proj/session.jsonl");
-        fs::write(&history, b"OTHER_NATIVE_HISTORY").unwrap();
-        std::os::unix::fs::symlink("history-tree", source.join("projects")).unwrap();
-        let mut boundary = NativeStateBoundary::for_source(&source, &active).unwrap();
-        boundary.stopped_original = Some(boundary.source_root.path().to_path_buf());
-        boundary.add_path(source.join("history-tree"));
-        let result = carry_sandbox_state(&source, &active, &["projects"], &boundary);
-        assert!(
-            result.is_err(),
-            "a redirected carried directory must fail: {result:?}"
-        );
-        assert!(!active.join("projects").exists());
-        assert_eq!(fs::read(&history).unwrap(), b"OTHER_NATIVE_HISTORY");
-        assert_eq!(
-            fs::read_link(source.join("projects")).unwrap(),
-            Path::new("history-tree")
-        );
-    }
-
-    #[test]
-    fn carried_file_cannot_redirect_its_declared_root_to_internal_history() {
-        let temporary = tempfile::tempdir().unwrap();
-        let source = temporary.path().join("source");
-        let active = temporary.path().join("active");
-        fs::create_dir(&source).unwrap();
-        fs::create_dir(&active).unwrap();
-        let history = source.join("history.db");
-        fs::write(&history, b"OTHER_NATIVE_DATABASE").unwrap();
-        std::os::unix::fs::symlink("history.db", source.join("opencode.db")).unwrap();
-        let mut boundary = NativeStateBoundary::for_source(&source, &active).unwrap();
-        boundary.stopped_original = Some(boundary.source_root.path().to_path_buf());
-        boundary.add_path(history.clone());
-        let result = carry_sandbox_state(&source, &active, &["opencode.db*"], &boundary);
-        assert!(
-            result.is_err(),
-            "a redirected carried file must fail: {result:?}"
-        );
-        assert!(!active.join("opencode.db").exists());
-        assert_eq!(fs::read(&history).unwrap(), b"OTHER_NATIVE_DATABASE");
-        assert_eq!(
-            fs::read_link(source.join("opencode.db")).unwrap(),
-            Path::new("history.db")
-        );
+    fn carried_entries_cannot_redirect_their_declared_root_to_internal_history() {
+        // (history dir, history file, declared link, link target, boundary path, pattern)
+        for (dir, history, link, target, internal, pattern) in [
+            (
+                "history-tree/proj",
+                "history-tree/proj/session.jsonl",
+                "projects",
+                "history-tree",
+                "history-tree",
+                "projects",
+            ),
+            (
+                "",
+                "history.db",
+                "opencode.db",
+                "history.db",
+                "history.db",
+                "opencode.db*",
+            ),
+        ] {
+            let temporary = tempfile::tempdir().unwrap();
+            let source = temporary.path().join("source");
+            let active = temporary.path().join("active");
+            fs::create_dir_all(source.join(dir)).unwrap();
+            fs::create_dir(&active).unwrap();
+            let history = source.join(history);
+            fs::write(&history, b"OTHER_NATIVE_HISTORY").unwrap();
+            std::os::unix::fs::symlink(target, source.join(link)).unwrap();
+            let mut boundary = NativeStateBoundary::for_source(&source, &active).unwrap();
+            boundary.stopped_original = Some(boundary.source_root.path().to_path_buf());
+            boundary.add_path(source.join(internal));
+            let result = carry_sandbox_state(&source, &active, &[pattern], &boundary);
+            assert!(result.is_err(), "a redirected {link} must fail: {result:?}");
+            assert!(!active.join(link).exists(), "{link}");
+            assert_eq!(fs::read(&history).unwrap(), b"OTHER_NATIVE_HISTORY");
+            assert_eq!(fs::read_link(source.join(link)).unwrap(), Path::new(target));
+        }
     }
 
     #[test]

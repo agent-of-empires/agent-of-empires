@@ -181,13 +181,41 @@ mod tests {
         });
         assert!(state.turn_active, "the live fold reached the reader");
 
-        cache.apply_if_cached("s-1", 2, &stopped("end_turn"));
+        // A repeated seq is a publish retry and must not double-apply.
+        let approval = Event::ApprovalRequested {
+            approval: crate::acp::approvals::Approval {
+                nonce: crate::acp::approvals::Nonce("n-1".into()),
+                tool_call: crate::acp::state::ToolCall {
+                    id: "tc-1".into(),
+                    name: "Edit".into(),
+                    kind: "edit".into(),
+                    args_preview: String::new(),
+                    started_at: chrono::Utc::now(),
+                    diffs: Vec::new(),
+                    memory_recall: None,
+                    parent_tool_call_id: None,
+                },
+                destructive: false,
+                options: Vec::new(),
+                choice: false,
+                requested_at: chrono::Utc::now(),
+                resolved: None,
+            },
+        };
+        cache.apply_if_cached("s-1", 2, &approval);
+        cache.apply_if_cached("s-1", 2, &approval);
+        cache.apply_if_cached("s-1", 3, &stopped("end_turn"));
         let state = cache.get_or_hydrate("s-1", || {
             hydrate_count();
             (seed(), 0)
         });
         assert!(!state.turn_active);
+        assert_eq!(state.pending_approvals.len(), 1);
         assert_eq!(hydrates, 1, "one hydrate for the session's whole life");
+
+        // Forget drops the fold so a reused id starts clean.
+        cache.forget("s-1");
+        assert!(!cache.is_hydrated("s-1"));
     }
 
     /// Anything that does not continue the sequence evicts rather than folds.
@@ -212,49 +240,5 @@ mod tests {
             cache.apply_if_cached("s-1", second, &stopped("end_turn"));
             assert_eq!(cache.is_hydrated("s-1"), still_cached, "{name}");
         }
-    }
-
-    /// A repeat must not double-apply.
-    #[test]
-    fn a_repeated_seq_is_not_folded_twice() {
-        let approval = |nonce: &str| crate::acp::approvals::Approval {
-            nonce: crate::acp::approvals::Nonce(nonce.to_string()),
-            tool_call: crate::acp::state::ToolCall {
-                id: "tc-1".into(),
-                name: "Edit".into(),
-                kind: "edit".into(),
-                args_preview: String::new(),
-                started_at: chrono::Utc::now(),
-                diffs: Vec::new(),
-                memory_recall: None,
-                parent_tool_call_id: None,
-            },
-            destructive: false,
-            options: Vec::new(),
-            choice: false,
-            requested_at: chrono::Utc::now(),
-            resolved: None,
-        };
-        let cache = ControlStateCache::new();
-        cache.get_or_hydrate("s-1", || (seed(), 0));
-        let event = Event::ApprovalRequested {
-            approval: approval("n-1"),
-        };
-        cache.apply_if_cached("s-1", 1, &event);
-        cache.apply_if_cached("s-1", 1, &event);
-        let state = cache.get_or_hydrate("s-1", || (seed(), 0));
-        assert_eq!(state.pending_approvals.len(), 1);
-    }
-
-    #[test]
-    fn forget_drops_the_fold_so_a_reused_id_starts_clean() {
-        let cache = ControlStateCache::new();
-        cache.get_or_hydrate("s-1", || (seed(), 0));
-        cache.apply_if_cached("s-1", 1, &prompt("go"));
-        assert!(cache.get_or_hydrate("s-1", || (seed(), 0)).turn_active);
-
-        cache.forget("s-1");
-        assert!(!cache.is_hydrated("s-1"));
-        assert!(!cache.get_or_hydrate("s-1", || (seed(), 0)).turn_active);
     }
 }

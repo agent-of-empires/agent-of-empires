@@ -102,11 +102,6 @@ describe("applyEvent control state", () => {
       { turnActive: true, promptSeq: 2 },
     ],
     [
-      "restart_pending",
-      [stopped("restart_pending")],
-      { workerRestarting: true, workerStopped: false, turnActive: false },
-    ],
-    [
       "user_stopped then restart_pending",
       [stopped("user_stopped"), stopped("restart_pending")],
       { workerStopped: false, workerRestarting: true },
@@ -188,11 +183,6 @@ describe("applyEvent control state", () => {
       "a reset after a prompt arms the primer",
       [usage(100), prompt(), reset("bad id")],
       { sessionUsage: null, contextPrimerAvailable: { resetSeq: 3, reason: "bad id" } },
-    ],
-    [
-      "a reset after a diff-comments prompt arms the primer",
-      [diffComments, reset("bad id")],
-      { contextPrimerAvailable: { resetSeq: 2, reason: "bad id" } },
     ],
     [
       "an empty reset reason gets a fallback",

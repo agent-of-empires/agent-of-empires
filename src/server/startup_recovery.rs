@@ -330,6 +330,9 @@ mod tests {
             return;
         }
 
+        // The recovery lock lives in the app dir; the shared one can be held by
+        // another process running this test or a daemon.
+        let _home = crate::session::test_support::isolate_app_dir();
         let ledger_dir = tempfile::tempdir().expect("tempdir");
         let _env = crate::session::test_support::EnvGuard::set(&[(
             crate::session::recovery::RECOVERY_ATTEMPT_DIR_ENV,
