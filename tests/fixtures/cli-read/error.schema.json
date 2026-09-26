@@ -28,7 +28,6 @@
       "type": "string",
       "enum": [
         "parser_error",
-        "identifier_required",
         "schema_invalid",
         "invalid_endpoint",
         "invalid_token",

@@ -38,6 +38,10 @@ const DIRECTION_CLIENT_TO_SERVER: u8 = 1;
 const DIRECTION_SERVER_TO_CLIENT: u8 = 2;
 const ROLE_CLIENT: u8 = 1;
 const ROLE_SERVER: u8 = 2;
+/// The published per-case error metadata schema.
+pub const ERROR_SCHEMA: &str = "error.schema.json";
+/// The published per-case expected result schema.
+pub const EXPECTED_SCHEMA: &str = "expected.schema.json";
 
 #[derive(Debug)]
 pub struct PackError(String);
@@ -191,62 +195,155 @@ fn alias_allowed(command: &str, alias: Option<&str>) -> bool {
     }
 }
 
-/// The exhaustive phase/code/exit table. `code` is `None` only for a
-/// successful render, which exits 0.
-fn expected_exit(phase: &str, code: Option<&str>) -> Option<u8> {
-    let table: &[(&str, &[&str], u8)] = &[
-        ("parser", &["parser_error", "identifier_required"], 2),
-        ("handshake", &["schema_invalid"], 4),
-        (
-            "pre_transport",
-            &[
-                "invalid_endpoint",
-                "invalid_token",
-                "establishment_timeout",
-                "marker_missing",
-                "marker_invalid",
-                "marker_identity",
-                "anchored_alias_unavailable",
-            ],
-            2,
-        ),
-        (
-            "transport",
-            &[
-                "unauthorized",
-                "unavailable",
-                "socket_identity",
-                "peer_identity",
-                "protocol_mismatch",
-                "frame_limit",
-                "connection_closed",
-            ],
-            4,
-        ),
-        ("snapshot", &["schema_invalid"], 4),
-        (
-            "semantic",
-            &[
-                "health_degraded",
-                "freshness_unavailable",
-                "default_missing",
-                "profile_missing",
-                "session_missing",
-                "session_ambiguous",
-            ],
-            4,
-        ),
-        ("close", &["close_timeout"], 4),
-        ("renderer", &["renderer_internal"], 1),
-    ];
+/// The closed phase vocabulary. A phase is where in the exchange the read was
+/// when it stopped, so the table below and both JSON Schemas must name exactly
+/// these and nothing else.
+const PHASES: &[&str] = &[
+    "parser",
+    "handshake",
+    "pre_transport",
+    "transport",
+    "snapshot",
+    "semantic",
+    "close",
+    "renderer",
+];
+
+/// The exhaustive phase/code/exit table: every code a scoped read can emit, in
+/// the phase it is emitted in, with the exits that phase may carry. `code` is
+/// `None` only for a successful render, which exits 0.
+const TABLE: &[(&str, &[&str], &[u8])] = &[
+    ("parser", &["parser_error"], &[2]),
+    ("handshake", &["schema_invalid"], &[4]),
+    (
+        "pre_transport",
+        &[
+            "invalid_endpoint",
+            "invalid_token",
+            "establishment_timeout",
+            "marker_missing",
+            "marker_invalid",
+            "marker_identity",
+            "anchored_alias_unavailable",
+        ],
+        &[2],
+    ),
+    (
+        "transport",
+        &[
+            "unauthorized",
+            "unavailable",
+            "socket_identity",
+            "peer_identity",
+            "protocol_mismatch",
+            "frame_limit",
+            "connection_closed",
+        ],
+        &[4],
+    ),
+    ("snapshot", &["schema_invalid"], &[4]),
+    (
+        "semantic",
+        &[
+            "health_degraded",
+            "freshness_unavailable",
+            "default_missing",
+            "profile_missing",
+            "session_missing",
+            "session_ambiguous",
+        ],
+        &[4],
+    ),
+    ("close", &["close_timeout"], &[4]),
+    // The renderer chooses the exit itself: an internal fault leaves 1, and a
+    // refusal on the user's own state — no tmux session to read, or a pane
+    // that is not an Agent of Empires session — leaves 2.
+    ("renderer", &["renderer_internal"], &[1, 2]),
+];
+
+/// The exits a phase/code pair may carry, or `None` when the pair is not in the
+/// table at all.
+///
+/// A code that no emitter can produce is not in the table, so a pack that
+/// freezes one fails verification. That is the check `identifier_required`
+/// needed and did not have: a renderer that auto-detects tmux had removed the
+/// only emitter, and the frozen case kept passing because the table agreed with
+/// itself.
+fn expected_exits(phase: &str, code: Option<&str>) -> Option<&'static [u8]> {
     match (phase, code) {
-        ("renderer", None) => Some(0),
-        (_, Some(code)) => table
+        ("renderer", None) => Some(&[0]),
+        (_, Some(code)) => TABLE
             .iter()
             .find(|(row_phase, codes, _)| *row_phase == phase && codes.contains(&code))
-            .map(|(_, _, exit)| *exit),
+            .map(|(_, _, exits)| *exits),
         _ => None,
     }
+}
+
+/// Whether every code the table names is one a scoped read can actually emit,
+/// and every phase one the table itself recognises. Both directions of that
+/// link are load-bearing: a new emitter asserts its code is in
+/// [`EMITTABLE_CODES`](super::EMITTABLE_CODES), and the table may not name a
+/// code outside it.
+fn table_is_reachable() -> bool {
+    TABLE.iter().all(|(phase, codes, _)| {
+        PHASES.contains(phase)
+            && codes
+                .iter()
+                .all(|code| super::EMITTABLE_CODES.contains(code))
+    })
+}
+
+/// Whether a published schema enumerates exactly the pack's phase and code
+/// vocabulary, so a schema cannot drift away from the table either. The
+/// Schemas are human-readable documents rather than frozen artefacts, so only
+/// their vocabulary is gated, not their formatting.
+fn schema_vocabulary_is_reachable(root: &Path) -> Result<()> {
+    for name in [ERROR_SCHEMA, EXPECTED_SCHEMA] {
+        let value: serde_json::Value = serde_json::from_slice(&read(root, name)?)
+            .map_err(|error| PackError(format!("{name} is not JSON: {error}")))?;
+        let declared = value
+            .get("properties")
+            .and_then(|value| value.get("phase"))
+            .and_then(|value| value.get("enum"))
+            .and_then(|value| value.as_array())
+            .ok_or_else(|| PackError(format!("{name} does not enumerate its phases")))?;
+        let declared: Vec<&str> = declared
+            .iter()
+            .map(|value| value.as_str().unwrap_or_default())
+            .collect();
+        // As sets: the schema lays its codes out in phase order, which is
+        // information the table carries and this check has no opinion about.
+        let mut declared_sorted = declared.clone();
+        declared_sorted.sort_unstable();
+        let mut phases: Vec<&str> = PHASES.to_vec();
+        phases.sort_unstable();
+        if declared_sorted != phases {
+            return fail(format!(
+                "{name} enumerates {declared:?}, which is not the pack's phase vocabulary"
+            ));
+        }
+        let codes = value
+            .get("$defs")
+            .and_then(|value| value.get("code"))
+            .and_then(|value| value.get("enum"))
+            .and_then(|value| value.as_array())
+            .ok_or_else(|| PackError(format!("{name} does not enumerate its codes")))?;
+        let codes: Vec<&str> = codes
+            .iter()
+            .map(|value| value.as_str().unwrap_or_default())
+            .collect();
+        let mut declared_codes = codes.clone();
+        declared_codes.sort_unstable();
+        let mut emittable: Vec<&str> = super::EMITTABLE_CODES.to_vec();
+        emittable.sort_unstable();
+        if declared_codes != emittable {
+            return fail(format!(
+                "{name} enumerates {codes:?}, which is not the emittable code set"
+            ));
+        }
+    }
+    Ok(())
 }
 
 const COMMANDS: &[&str] = &[
@@ -696,6 +793,14 @@ pub fn verify(root: &Path) -> Result<VerifiedPack> {
         }
     }
 
+    // Reachability comes before anything is replayed: a table naming a code no
+    // emitter can produce, or a published schema naming one the table does not
+    // carry, is drift in the contract itself, not in a case.
+    if !table_is_reachable() {
+        return fail("the phase/code/exit table names a code or phase no scoped read can produce");
+    }
+    schema_vocabulary_is_reachable(root)?;
+
     let cases_bytes = read(root, CASES_NAME)?;
     let value = check_canonical(&cases_bytes, CASES_NAME)?;
     let cases: CasesFile = serde_json::from_value(value).map_err(|error| {
@@ -900,15 +1005,15 @@ fn verify_case(root: &Path, physical: &[String], row: &CaseRow) -> Result<Verifi
     if !valid_digest(&expected.stdout_sha256) || !valid_digest(&expected.stderr_sha256) {
         return fail(format!("case {case_id} expected.json has a malformed hash"));
     }
-    let Some(exit) = expected_exit(&expected.phase, expected.code.as_deref()) else {
+    let Some(exits) = expected_exits(&expected.phase, expected.code.as_deref()) else {
         return fail(format!(
             "case {case_id} pairs phase {} with code {:?}, which the matrix forbids",
             expected.phase, expected.code
         ));
     };
-    if expected.exit != exit {
+    if !exits.contains(&expected.exit) {
         return fail(format!(
-            "case {case_id} exits {} but its phase/code pair requires {exit}",
+            "case {case_id} exits {} but its phase/code pair allows {exits:?}",
             expected.exit
         ));
     }

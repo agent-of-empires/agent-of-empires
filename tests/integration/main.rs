@@ -56,7 +56,12 @@ mod agent_lifecycle_cli;
 mod build_cache_config;
 mod build_version_rerun;
 mod cli_read_pack;
+mod cli_read_parity;
 mod cli_read_server;
+// The local read is Linux-only: the admission re-derives process identity from
+// /proc, so the publisher refuses every other platform and there is nothing
+// for these tests to admit there.
+#[cfg(target_os = "linux")]
 mod cli_read_uds;
 #[cfg(debug_assertions)]
 mod daemon_core_web_optional;

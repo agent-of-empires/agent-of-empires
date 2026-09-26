@@ -297,7 +297,7 @@ fn an_exit_outside_the_phase_code_matrix_is_rejected() {
     assert!(
         error
             .to_string()
-            .contains("exits 2 but its phase/code pair requires 4"),
+            .contains("exits 2 but its phase/code pair allows [4]"),
         "unexpected error: {error}"
     );
 }
