@@ -194,6 +194,12 @@ impl PollerRepairBackoff {
         self.delay
     }
 
+    /// The instant the next attempt is armed for (tests assert where a deadline comes from).
+    #[cfg(test)]
+    pub(crate) fn armed_at(&self) -> Option<Instant> {
+        self.next_attempt
+    }
+
     /// Make the next attempt due immediately without clearing the schedule
     /// (tests simulate elapsed time with this).
     #[cfg(test)]
@@ -1025,6 +1031,9 @@ mod tests {
     fn re_probes_back_off_to_their_own_ceiling_and_end_each_other_streaks() {
         let mut b = PollerRepairBackoff::default();
         let now = Instant::now();
+        // A failure first, so the reset below is a real transition and not the default value.
+        b.defer(now);
+        assert_eq!(b.deferrals(), 1, "fixture: one deferral on record");
 
         let mut reprobe_delays = Vec::new();
         for _ in 0..4 {

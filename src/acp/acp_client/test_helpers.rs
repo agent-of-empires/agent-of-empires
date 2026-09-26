@@ -45,6 +45,7 @@ pub(super) fn env_test_spawn_config(cwd: std::path::PathBuf) -> SpawnConfig {
         source_profile: None,
         mcp_servers: Vec::new(),
         claude_store_pin: None,
+        base_host_environment: vec![],
     }
 }
 
@@ -90,5 +91,6 @@ pub(super) fn reset_fake_spawn_config(
         source_profile: None,
         mcp_servers: Vec::new(),
         claude_store_pin: None,
+        base_host_environment: vec![],
     }
 }
