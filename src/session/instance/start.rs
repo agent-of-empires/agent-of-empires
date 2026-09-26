@@ -444,7 +444,7 @@ impl Instance {
                 launch_store = %launch.display(),
                 new_session_store = %new_session.display(),
                 new_session_store_source = %source,
-                "the recorded Claude store overrides the store a new session would use here, so this conversation stays on the account it recorded"
+                "the recorded Claude store overrides the store a new session would use here, so this launch runs on the account it recorded"
             );
         }
     }

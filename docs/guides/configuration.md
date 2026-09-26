@@ -160,7 +160,7 @@ Custom agents remain selectable even for remote or unmanaged commands. Profile m
 
 ### One CLI, two accounts
 
-A wrapper that runs the same CLI against a second login usually exports the agent's config-dir variable, which AoE cannot see: the wrapper sets it after AoE has chosen which file to write. Name the directory in `agent_config_dir` so folder-trust records and [native MCP discovery](mcp-servers.md) land on the config the agent actually reads.
+A wrapper that runs the same CLI against a second login usually exports the agent's config-dir variable, which AoE cannot see: the wrapper sets it after AoE has chosen which file to write. Name the directory in `agent_config_dir` so folder-trust records and [native MCP discovery](mcp-servers.md) land on the config the agent actually reads, for as long as the conversation has not recorded a store of its own.
 
 ```toml
 [session.custom_agents]
@@ -176,7 +176,7 @@ claude-personal = "claude"
 claude-personal = "~/.claude-personal"
 ```
 
-The value is a host path. Host sessions use the directory itself; each sandboxed session gets a private `sandbox-v2/<instance-id>` child mounted at the agent's canonical container config path, so do not mount that tree through `sandbox.extra_volumes` and keep the config-dir variables AoE sets inside the container. A host Claude conversation that already recorded its store keeps resuming there, so repointing an entry moves new sessions only and the launch logs a warning naming both stores; see [Native Session Resume](session-resume.md#swapping-the-engine-on-a-restart) for the account swap that carries a conversation across.
+The value is a host path. Host sessions use the directory itself; each sandboxed session gets a private `sandbox-v2/<instance-id>` child mounted at the agent's canonical container config path, so do not mount that tree through `sandbox.extra_volumes` and keep the config-dir variables AoE sets inside the container. A host Claude conversation that already recorded its store keeps resuming there, so repointing an entry moves new sessions only, the folder-trust record still lands in the directory named here, and a host terminal launch logs a warning naming both stores; see [Native Session Resume](session-resume.md#swapping-the-engine-on-a-restart) for the account swap that carries a conversation across.
 
 ### Status rules for custom agents
 
