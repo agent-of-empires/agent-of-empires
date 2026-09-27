@@ -3032,6 +3032,7 @@ impl HomeView {
         let parent_is_structured = parent.is_structured();
         let parent_agent_name = parent.agent_name.clone();
         let parent_acp_session_id = parent.acp_session_id.clone();
+        let parent_profile = parent.effective_profile();
 
         let seed = if parent_is_structured {
             // A structured parent forks via the ACP `session/fork` handshake rather than
@@ -3086,7 +3087,7 @@ impl HomeView {
                     };
                     self.info_dialog = Some(InfoDialog::new(
                         dialog_title,
-                        &denied.user_message(&title, &parent.id),
+                        &denied.user_message(&title, &parent.id, &parent_profile),
                     ));
                     return;
                 }

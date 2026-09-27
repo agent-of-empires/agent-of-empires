@@ -34,11 +34,13 @@ pub enum ForkDenied {
     NoParentSession,
     /// A conversation id is recorded, but no qualified record names the
     /// conversation it is, so it cannot be shown to name a conversation to fork.
-    /// `preallocated` is true only when a binding proves the id was reserved by a
-    /// launch that never ran: such an id names no conversation yet, so the
-    /// remedy is a message rather than an assertion about a conversation that
-    /// does not exist. `recorded` is the id the parent carries, and it is the
-    /// value a qualification re-asserts.
+    /// `preallocated` is true when the binding's provenance is `preallocated`:
+    /// the launch reserved the id and no qualified binding was ever published
+    /// for it, which is not the same as no conversation having run (the native
+    /// command is launched before the binding is written), so the remedy is a
+    /// message rather than an assertion about a conversation that does not
+    /// exist. `recorded` is the id the parent carries, and it is the value a
+    /// qualification re-asserts.
     UnqualifiedParent {
         preallocated: bool,
         recorded: String,
@@ -53,8 +55,10 @@ impl ForkDenied {
     /// one place. `title` names the session as the user knows it; `id` is what
     /// the remedy carries, because `resolve_session` resolves a title to
     /// whichever row it meets first, so an id is the only session name a
-    /// printed command can act on.
-    pub fn user_message(&self, title: &str, id: &str) -> String {
+    /// printed command can act on. `profile` is the store the parent lives in,
+    /// which the remedy has to name: `set-session-id` opens only the store
+    /// the profile names.
+    pub fn user_message(&self, title: &str, id: &str, profile: &str) -> String {
         match self {
             Self::AgentCannotFork { agent } => format!(
                 "Nothing to fork: session '{title}' runs agent '{agent}', which has no native fork capability. Forkable agents: claude, codex, opencode."
@@ -63,11 +67,11 @@ impl ForkDenied {
                 "Nothing to fork: session '{title}' has no single captured conversation to fork from: it has captured none, or more than one session records this conversation id."
             ),
             Self::UnqualifiedParent { preallocated: false, recorded } => format!(
-                "Nothing to fork: session '{title}' records conversation '{recorded}', which nothing qualifies, so which conversation it names is unknown. Qualify it with `{command}`, and for a pi or omp session add a --store flag naming the absolute path of its transcript.",
-                command = qualify_command(id, recorded)
+                "Nothing to fork: session '{title}' records conversation '{recorded}', which nothing qualifies, so which conversation it names is unknown. Qualify it with `{command}`.",
+                command = qualify_command(id, recorded, profile)
             ),
             Self::UnqualifiedParent { preallocated: true, .. } => format!(
-                "Nothing to fork: session '{title}' has no captured conversation to fork from. Send it at least one message first."
+                "Nothing to fork: session '{title}' has no qualified conversation to fork from. Send it at least one message first."
             ),
             Self::UnlaunchedFork => format!(
                 "Nothing to fork: session '{title}' is a fork that has not launched yet. Start it once, then fork from the child conversation."
@@ -76,14 +80,18 @@ impl ForkDenied {
     }
 }
 
-/// The one command that re-asserts a recorded id. It carries the session id,
-/// not the title, because `resolve_session` resolves a title to whichever row
-/// it meets first, and each value is quoted so one holding a space stays one
-/// argument. Backticks delimit it in prose: the apostrophe would be one more
-/// shell metacharacter to demangle, the backtick only marks a span.
-fn qualify_command(id: &str, recorded: &str) -> String {
+/// The one command that re-asserts a recorded id. It names the profile,
+/// because `set-session-id` opens only the store that profile names, and a
+/// remedy run against the default profile would qualify nothing. It carries
+/// the session id, not the title, because `resolve_session` resolves a title
+/// to whichever row it meets first, and each value is quoted so one holding a
+/// space stays one argument. Backticks delimit it in prose: the apostrophe
+/// would be one more shell metacharacter to demangle, the backtick only marks
+/// a span.
+fn qualify_command(id: &str, recorded: &str, profile: &str) -> String {
     format!(
-        "aoe session set-session-id {} {}",
+        "aoe -p {} session set-session-id {} {}",
+        shell_words::quote(profile),
         shell_words::quote(id),
         shell_words::quote(recorded)
     )
@@ -201,8 +209,8 @@ pub fn terminal_fork_seed(
     child_session_id: String,
 ) -> Result<ForkSeed, ForkDenied> {
     // One refusal for every id nothing qualifies: only a binding can prove the
-    // id was reserved by a launch that never ran, and a row with no binding
-    // proves nothing at all.
+    // id was reserved and never published, and a row with no binding proves
+    // nothing at all.
     let unqualified = |binding: Option<&crate::session::ConversationBinding>, recorded: &str| {
         ForkDenied::UnqualifiedParent {
             preallocated: binding.is_some_and(|binding| {
@@ -291,7 +299,7 @@ mod tests {
             );
         }
         // A binding nothing qualified and no binding at all are one refusal:
-        // neither proves the id was reserved by a launch that never ran.
+        // neither proves a qualified conversation was ever published for the id.
         assert_eq!(
             terminal_fork_seed(
                 Some(ForkParentRef::Recorded("legacy-uuid")),
@@ -398,7 +406,7 @@ mod tests {
             unlaunched,
         ];
         for (denied, own) in &cases {
-            let message = denied.user_message("Legacy Parent", "4f2a8c10");
+            let message = denied.user_message("Legacy Parent", "4f2a8c10", "default");
             for remedy in own {
                 assert!(
                     message.contains(remedy),
@@ -425,7 +433,7 @@ mod tests {
             preallocated: false,
             recorded: "parent uuid".into(),
         }
-        .user_message("Legacy Parent", "4f2a 8c10");
+        .user_message("Legacy Parent", "4f2a 8c10", "my profile");
         let command = message
             .split_once('`')
             .and_then(|(_, rest)| rest.split_once('`'))
@@ -437,6 +445,8 @@ mod tests {
             shell_words::split(command).expect("the remedy tokenizes"),
             [
                 "aoe",
+                "-p",
+                "my profile",
                 "session",
                 "set-session-id",
                 "4f2a 8c10",

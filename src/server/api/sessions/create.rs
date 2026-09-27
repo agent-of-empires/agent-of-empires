@@ -891,13 +891,19 @@ pub async fn create_session(
                 // it runs as printed. A refusal naming no row admits no remedy,
                 // so the requested id stands in for both.
                 Err((denied, index)) => {
+                    // The remedy names the profile the parent row lives in,
+                    // because `set-session-id` opens only that store.
+                    let parent_profile = match index {
+                        Some(index) => parents[index].effective_profile(),
+                        None => validation_profile.to_string(),
+                    };
                     let (title, id) = index.map_or((parent_id, parent_id), |index| {
-                        (&parents[index].title, &parents[index].id)
+                        (parents[index].title.as_str(), parents[index].id.as_str())
                     });
                     return api_error(
                         StatusCode::BAD_REQUEST,
                         "fork_unsupported",
-                        denied.user_message(title, id),
+                        denied.user_message(title, id, &parent_profile),
                     );
                 }
             }

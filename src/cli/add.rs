@@ -285,7 +285,10 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
             parent_ref,
             crate::session::capture::generate_session_uuid(),
         )
-        .map_err(|denied| anyhow::Error::msg(denied.user_message(&source.title, &source.id)))?;
+        .map_err(|denied| {
+            let profile = source.effective_profile();
+            anyhow::Error::msg(denied.user_message(&source.title, &source.id, &profile))
+        })?;
         Some(seed)
     } else {
         None
