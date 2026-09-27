@@ -55,13 +55,18 @@ mod acp_runner_orphan;
 mod agent_lifecycle_cli;
 mod build_cache_config;
 mod build_version_rerun;
+#[cfg(debug_assertions)]
 mod cli_read_pack;
+#[cfg(debug_assertions)]
 mod cli_read_parity;
+#[cfg(debug_assertions)]
 mod cli_read_server;
 // The local read is Linux-only: the admission re-derives process identity from
 // /proc, so the publisher refuses every other platform and there is nothing
 // for these tests to admit there.
-#[cfg(target_os = "linux")]
+// The read transports themselves are debug-assertion-gated, so these modules
+// cannot compile without them either.
+#[cfg(all(target_os = "linux", debug_assertions))]
 mod cli_read_uds;
 #[cfg(debug_assertions)]
 mod daemon_core_web_optional;

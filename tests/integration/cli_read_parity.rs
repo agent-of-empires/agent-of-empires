@@ -61,15 +61,11 @@ impl Drop for Fixture {
 }
 
 impl Fixture {
-    /// The store lives in a temporary home unless `AOE_PARITY_HOME` names one,
-    /// which is how an out-of-band smoke run reuses exactly the fixture these
-    /// assertions compare.
+    /// Always a fresh temporary home. The ambient environment cannot name one:
+    /// an assertion whose store depends on a variable nobody sets is an
+    /// assertion that silently stops testing anything, so the named-home
+    /// capability lives in its own `#[ignore]`d smoke run below instead.
     fn new() -> Self {
-        if let Some(base) = std::env::var_os("AOE_PARITY_HOME") {
-            let home = PathBuf::from(base);
-            std::fs::create_dir_all(&home).expect("the named home");
-            return Self::seed(home, None);
-        }
         let home = tempfile::tempdir().expect("temp home");
         Self::seed(home.path().to_path_buf(), Some(home))
     }
@@ -106,6 +102,14 @@ impl Fixture {
             .expect("projects"),
         )
         .expect("seed projects");
+        // The update check is the one preflight step that reaches the network,
+        // and its notice would land on stdout and make the two passes differ for
+        // a reason that has nothing to do with the transport.
+        std::fs::write(
+            app_dir.join("config.toml"),
+            "[updates]\nupdate_check_mode = \"off\"\n",
+        )
+        .expect("config");
         let base = home.clone();
         let mut fixture = Self {
             home: base.clone(),
@@ -338,6 +342,10 @@ fn run_blocking(home: &Path, args: &[String]) -> String {
 #[serial_test::serial]
 async fn the_served_bytes_are_the_bytes_the_local_command_prints() {
     let fixture = Fixture::new();
+    compare_both_transports(&fixture).await;
+}
+
+async fn compare_both_transports(fixture: &Fixture) {
     let xdg_base = fixture.path().join(".config");
     let state = build_test_app_state_with_policy(
         daemon_instances(),
@@ -389,4 +397,64 @@ async fn the_served_bytes_are_the_bytes_the_local_command_prints() {
             args.join(" ")
         );
     }
+}
+
+/// Hermeticity, asserted rather than intended: with the update check off in the
+/// seeded config, a probe read must come back with no update notice on either
+/// stream. A notice here would mean the fixture depends on the network, and the
+/// comparison below would be measuring that instead of the transport.
+#[tokio::test]
+#[serial_test::serial]
+async fn the_fixture_read_reaches_no_network() {
+    let fixture = Fixture::new();
+    let home = fixture.path().to_path_buf();
+    let output = tokio::task::spawn_blocking({
+        let home = home.clone();
+        move || {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_aoe"));
+            command
+                .current_dir(&home)
+                .env("HOME", &home)
+                .env("XDG_CONFIG_HOME", home.join(".config"))
+                .env("XDG_DATA_HOME", home.join(".local/share"))
+                .env_remove("AOE_DAEMON_URL")
+                .env_remove("AOE_DAEMON_TOKEN")
+                .args(["list"]);
+            command.output().expect("the aoe binary runs")
+        }
+    })
+    .await
+    .expect("the probe task joins");
+    let streams = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !streams.contains("Update available"),
+        "the fixture read reached the network:\n{streams}"
+    );
+}
+
+/// The same comparison, against a home the operator names, so a real store can
+/// be replayed through both transports out of band:
+///
+/// ```text
+/// AOE_PARITY_HOME=~/src/my-project cargo test --test integration \
+///   cli_read_parity -- --ignored --nocapture
+/// ```
+///
+/// Ignored by default: the assertion suite above must not read the ambient
+/// environment, and this is the one case that deliberately does.
+#[tokio::test]
+#[serial_test::serial]
+#[ignore = "needs a named home in AOE_PARITY_HOME"]
+async fn the_named_home_produces_the_same_bytes_on_both_transports() {
+    let home = match std::env::var_os("AOE_PARITY_HOME") {
+        Some(home) => PathBuf::from(home),
+        None => panic!("AOE_PARITY_HOME must name a home for this run"),
+    };
+    std::fs::create_dir_all(&home).expect("the named home");
+    let fixture = Fixture::seed(home, None);
+    compare_both_transports(&fixture).await;
 }
