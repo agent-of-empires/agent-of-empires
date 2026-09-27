@@ -280,7 +280,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         if !user_chose_tool {
             resolved_tool = source.tool.clone();
         }
-        let parent_ref = source.fork_parent_ref();
+        let parent_ref = source.fork_parent_ref()?;
         let seed = crate::session::fork::terminal_fork_seed(
             parent_ref,
             crate::session::capture::generate_session_uuid(),

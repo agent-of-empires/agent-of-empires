@@ -1165,26 +1165,39 @@ impl Instance {
 
 impl Instance {
     /// The conversation an explicit fork would carry, with the evidence for it:
-    /// `Bound` when a binding qualifies the recorded id, `Recorded` when the id
-    /// stands alone, so an unqualified parent reaches `terminal_fork_seed` and is
-    /// refused as such rather than as a session with no conversation, and
-    /// `Unlaunched` for a fork whose launch has not happened.
-    pub(crate) fn fork_parent_ref(&self) -> Option<ForkParentRef<'_>> {
+    /// `Bound` when a binding qualifies the recorded id, `Unattributed` when a
+    /// migration left the binding without an execution, `Recorded` when the id
+    /// stands alone, so an unqualified parent reaches `terminal_fork_seed` and
+    /// is refused as such rather than as a session with no conversation, and
+    /// `Unlaunched` for a fork whose launch has not happened. The row's own
+    /// native agent is resolved to decide a fork's capability, so a wrapper
+    /// whose identity cannot be resolved fails instead of forking.
+    pub(crate) fn fork_parent_ref(&self) -> Result<Option<ForkParentRef<'_>>> {
         let (sid, binding) = match &self.resume_intent {
-            ResumeIntent::Fork { .. } => return Some(ForkParentRef::Unlaunched),
+            ResumeIntent::Fork { .. } => return Ok(Some(ForkParentRef::Unlaunched)),
             ResumeIntent::Use(sid) => (Some(sid), self.resume_binding.as_ref()),
             _ => (
                 self.agent_session_id.as_ref(),
                 self.agent_session_binding.as_ref(),
             ),
         };
-        let sid = sid?;
+        let Some(sid) = sid else {
+            return Ok(None);
+        };
         match binding {
-            Some(binding) if binding.session_id == *sid => Some(ForkParentRef::Bound(binding)),
+            Some(binding) if binding.session_id == *sid && binding.is_unattributed() => {
+                // The row's own agent decides the fork capability; the store comes
+                // from the context the child's launch resolves.
+                Ok(Some(ForkParentRef::Unattributed {
+                    binding,
+                    agent: self.execution_agent()?.name,
+                }))
+            }
+            Some(binding) if binding.session_id == *sid => Ok(Some(ForkParentRef::Bound(binding))),
             // A binding naming a different conversation is an inconsistency,
             // not a recorded id awaiting proof.
-            Some(_) => None,
-            None => Some(ForkParentRef::Recorded(sid)),
+            Some(_) => Ok(None),
+            None => Ok(Some(ForkParentRef::Recorded(sid))),
         }
     }
 
@@ -2818,27 +2831,44 @@ mod tests {
         }
     }
 
-    /// A recorded id must reach `terminal_fork_seed` even unqualified, so the
-    /// fork can name the conversation instead of claiming nothing to fork,
-    /// whether a degraded launch kept its binding or dropped it.
+    /// A recorded id must reach `terminal_fork_seed` whatever evidence stands
+    /// behind it: a binding a migration left unattributed forks on the row's
+    /// own agent, while a binding a degraded launch dropped is still refused as
+    /// unqualified, because nothing proves what it names.
     #[test]
+    #[serial_test::serial]
     fn fork_parent_ref_keeps_a_recorded_but_unqualified_conversation() {
-        let mut instance = Instance::new("parent", "/tmp");
+        let root = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(root.path());
+        let _claude = crate::session::test_support::install_login_shell_path_command(
+            root.path(),
+            "claude",
+            "#!/bin/sh\nexit 0\n",
+        );
+        let mut instance = Instance::new("parent", root.path().to_str().unwrap());
+        instance.tool = "claude".into();
         instance.agent_session_id = Some("legacy-uuid".into());
 
-        for binding in [Some(ConversationBinding::unknown("legacy-uuid")), None] {
-            instance.agent_session_binding = binding;
-            assert_eq!(
-                crate::session::fork::terminal_fork_seed(
-                    instance.fork_parent_ref(),
-                    "child-uuid".into()
-                ),
-                Err(crate::session::ForkDenied::UnqualifiedParent {
-                    preallocated: false,
-                    recorded: "legacy-uuid".into(),
-                })
-            );
-        }
+        instance.agent_session_binding = Some(ConversationBinding::unknown("legacy-uuid"));
+        assert!(matches!(
+            crate::session::fork::terminal_fork_seed(
+                instance.fork_parent_ref().unwrap(),
+                "child-uuid".into()
+            ),
+            Ok(crate::session::ForkSeed::Terminal { .. })
+        ));
+
+        instance.agent_session_binding = None;
+        assert_eq!(
+            crate::session::fork::terminal_fork_seed(
+                instance.fork_parent_ref().unwrap(),
+                "child-uuid".into()
+            ),
+            Err(crate::session::ForkDenied::UnqualifiedParent {
+                preallocated: false,
+                recorded: "legacy-uuid".into(),
+            })
+        );
     }
 
     /// A row whose own fork intent has not launched holds the parent's
@@ -2867,7 +2897,7 @@ mod tests {
 
         assert_eq!(
             crate::session::fork::terminal_fork_seed(
-                instance.fork_parent_ref(),
+                instance.fork_parent_ref().unwrap(),
                 "child-uuid".into()
             ),
             Err(crate::session::ForkDenied::UnlaunchedFork)

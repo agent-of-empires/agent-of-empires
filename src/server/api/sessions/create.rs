@@ -150,8 +150,12 @@ pub(super) fn resolve_create_fork_seed(
     let mut chosen: Option<(usize, crate::session::ForkParentRef<'_>)> = None;
     let mut disagreeing = false;
     for (index, parent) in parents.iter().enumerate() {
+        // A row whose native identity cannot be resolved names no conversation
+        // a fork could name, so it is dropped like one carrying another id.
         let Some(candidate) = parent
             .fork_parent_ref()
+            .ok()
+            .flatten()
             .filter(|candidate| candidate.session_id() == Some(parent_id))
         else {
             continue;

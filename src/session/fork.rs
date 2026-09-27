@@ -88,12 +88,19 @@ fn qualify_command(id: &str, recorded: &str) -> String {
 /// bare recorded id proves nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ForkParentRef<'a> {
-    /// The id has a binding, whose provenance says how far that binding is
-    /// trusted, so an unqualified one is still evidence of something.
+    /// The id has a binding whose provenance says how far it is trusted, so an
+    /// unqualified one is still evidence of something.
     Bound(&'a crate::session::ConversationBinding),
+    /// The row records an id a migration left unattributed: no binding
+    /// qualifies it, so the store comes from the context this launch resolves.
+    /// `agent` is the row's own native agent, which decides whether a fork
+    /// can be dispatched at all.
+    Unattributed {
+        binding: &'a crate::session::ConversationBinding,
+        agent: &'a str,
+    },
     /// The id is recorded with no binding behind it, so no record names the
-    /// agent, store or directory it belongs to: a degraded launch dropped the
-    /// binding it could not attest, or the row predates bindings.
+    /// agent, store or directory it belongs to.
     Recorded(&'a str),
     /// The row is a fork whose launch has not happened, so it holds no
     /// conversation of its own.
@@ -105,7 +112,7 @@ impl<'a> ForkParentRef<'a> {
     /// of its own, so it names no conversation a fork could name.
     pub fn session_id(self) -> Option<&'a str> {
         match self {
-            Self::Bound(binding) => Some(&binding.session_id),
+            Self::Bound(binding) | Self::Unattributed { binding, .. } => Some(&binding.session_id),
             Self::Recorded(session_id) => Some(session_id),
             Self::Unlaunched => None,
         }
@@ -114,7 +121,7 @@ impl<'a> ForkParentRef<'a> {
     /// The binding, when the parent still has one.
     pub fn binding(self) -> Option<&'a crate::session::ConversationBinding> {
         match self {
-            Self::Bound(binding) => Some(binding),
+            Self::Bound(binding) | Self::Unattributed { binding, .. } => Some(binding),
             Self::Recorded(_) | Self::Unlaunched => None,
         }
     }
@@ -162,26 +169,32 @@ pub fn terminal_fork_seed(
             recorded: recorded.to_string(),
         }
     };
-    // A qualified binding is the whole gate, and it is stricter than the
-    // resume path, which also accepts a binding migration left unattributed.
-    let parent = match parent {
-        Some(ForkParentRef::Bound(parent)) if parent.is_known() => parent,
+    // A qualified binding is the whole gate, and so is a binding a migration
+    // left unattributed, which the resume path also accepts.
+    let (parent, agent) = match parent {
+        Some(ForkParentRef::Bound(parent)) if parent.is_known() => (
+            parent,
+            parent
+                .execution
+                .as_ref()
+                .map(|execution| execution.agent.as_str()),
+        ),
+        Some(ForkParentRef::Unattributed { binding, agent }) => (binding, Some(agent)),
         Some(ForkParentRef::Bound(parent)) => {
-            return Err(unqualified(Some(parent), &parent.session_id))
+            return Err(unqualified(Some(parent), &parent.session_id));
         }
         Some(ForkParentRef::Recorded(recorded)) => return Err(unqualified(None, recorded)),
         Some(ForkParentRef::Unlaunched) => return Err(ForkDenied::UnlaunchedFork),
         None => return Err(ForkDenied::NoParentSession),
     };
-    let execution = parent
-        .execution
-        .as_ref()
-        .expect("is_known requires an execution");
-    let forkable = get_agent(&execution.agent)
-        .is_some_and(|agent| !matches!(agent.fork_strategy, ForkStrategy::Unsupported));
-    if !forkable {
+    // A known binding always records an execution, so both admitted arms name
+    // an agent; one that does not proves nothing and stays refused.
+    let Some(agent) = agent else {
+        return Err(unqualified(Some(parent), &parent.session_id));
+    };
+    if !terminal_agent_can_fork(agent) {
         return Err(ForkDenied::AgentCannotFork {
-            agent: execution.agent.clone(),
+            agent: agent.to_owned(),
         });
     }
     Ok(ForkSeed::Terminal {
@@ -267,6 +280,32 @@ mod tests {
                 agent: "gemini".into()
             })
         );
+    }
+
+    /// A binding a migration left unattributed forks when the row's own agent
+    /// can, and is refused naming that agent when it cannot; the binding is
+    /// carried through untouched, so the child still launches unattributed.
+    #[test]
+    fn an_unattributed_parent_forks_on_the_rows_own_agent() {
+        let binding = ConversationBinding::unknown("parent-uuid");
+        for (agent, forked) in [("claude", true), ("gemini", false)] {
+            let seed = terminal_fork_seed(
+                Some(ForkParentRef::Unattributed {
+                    binding: &binding,
+                    agent,
+                }),
+                "child-uuid".into(),
+            );
+            match (seed, forked) {
+                (Ok(ForkSeed::Terminal { parent, .. }), true) => {
+                    assert_eq!(parent.as_ref(), &binding, "the binding is carried as is");
+                }
+                (Err(ForkDenied::AgentCannotFork { agent: named }), false) => {
+                    assert_eq!(named, agent, "the refusal names the row's own agent");
+                }
+                (seed, forked) => panic!("{agent} forked={forked}: {seed:?}"),
+            }
+        }
     }
 
     /// Every refusal state names the remedy that comes back to it, and no

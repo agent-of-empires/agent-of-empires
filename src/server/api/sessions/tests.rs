@@ -891,28 +891,32 @@ fn fork_seed_and_structured_fork_guard_agree_per_agent() {
     }
 }
 
-/// Nothing qualifies the recorded id, whether a binding survived the launch or
-/// not, so both are refused as the same unqualified parent.
+/// A binding migration left unattributed is enough to fork, because the row's
+/// own agent decides the capability, while a row with no binding at all names
+/// no agent and stays refused.
 #[test]
-fn fork_from_an_unqualified_parent_is_refused_as_unqualified() {
-    for binding in [
-        Some(crate::session::ConversationBinding::unknown("parent-uuid")),
-        None,
-    ] {
-        let mut parent = crate::session::Instance::new("parent", "/tmp");
-        parent.agent_session_id = Some("parent-uuid".into());
-        parent.agent_session_binding = binding;
-        assert_eq!(
-            resolve_create_fork_seed("parent-uuid", false, &[parent]),
-            Err((
-                crate::session::ForkDenied::UnqualifiedParent {
-                    preallocated: false,
-                    recorded: "parent-uuid".into(),
-                },
-                Some(0),
-            ))
-        );
-    }
+fn fork_from_a_bindingless_parent_is_refused_as_unqualified() {
+    let mut unattributed = crate::session::Instance::new("parent", "/tmp");
+    unattributed.agent_session_id = Some("parent-uuid".into());
+    unattributed.agent_session_binding =
+        Some(crate::session::ConversationBinding::unknown("parent-uuid"));
+    assert!(matches!(
+        resolve_create_fork_seed("parent-uuid", false, &[unattributed]),
+        Ok(crate::session::ForkSeed::Terminal { .. })
+    ));
+
+    let mut bare = crate::session::Instance::new("parent", "/tmp");
+    bare.agent_session_id = Some("parent-uuid".into());
+    assert_eq!(
+        resolve_create_fork_seed("parent-uuid", false, &[bare]),
+        Err((
+            crate::session::ForkDenied::UnqualifiedParent {
+                preallocated: false,
+                recorded: "parent-uuid".into(),
+            },
+            Some(0),
+        ))
+    );
 }
 
 /// A pinned row carries the id it was pinned to, so the fork resolves on the
