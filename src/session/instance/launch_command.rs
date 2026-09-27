@@ -2009,13 +2009,18 @@ mod tests {
                 .is_some_and(|command| command.contains(&format!("--resume {sid}"))),
             "a dangling selector must not block a recorded-store resume"
         );
+        // It is still a divergence, and the one a user can act on: the
+        // launch is not on the store they wrote, so report that spelling.
+        let reported = unresolved
+            .execution
+            .as_ref()
+            .and_then(|execution| execution.store_override.as_ref())
+            .expect("an unresolvable selector is still a divergence")
+            .clone();
+        assert_eq!(reported.2, "agent_config_dir");
         assert!(
-            unresolved
-                .execution
-                .as_ref()
-                .and_then(|execution| execution.store_override.as_ref())
-                .is_none(),
-            "an unresolvable selector is not a divergence to report"
+            reported.1.to_string_lossy().ends_with("broken"),
+            "the report must name the spelling the user wrote: {reported:?}"
         );
 
         // The other side of that bargain: with nothing recorded the selector
@@ -2026,9 +2031,13 @@ mod tests {
             Ok(_) => panic!("an unresolvable selector must refuse a launch it decides"),
         };
         let refusal = format!("{refusal:#}");
+        // The path, not the wording: it is this test's own input, and it is
+        // what a discarded error chain would take with it. Asserting the
+        // refusal's phrasing would couple this to a message in execution.rs
+        // that #4154 deliberately stopped freezing.
         assert!(
-            refusal.contains("native path cannot be resolved") && refusal.contains("broken"),
-            "the refusal must name the path and keep the underlying cause: {refusal}"
+            refusal.contains(&*broken.to_string_lossy()),
+            "the refusal must keep the cause, which names the path: {refusal}"
         );
 
         // Same declaration as the recorded store: the common launch stays quiet.
