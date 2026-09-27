@@ -655,3 +655,184 @@ fn a_timestamp_outside_the_producer_grammar_is_refused() {
         "the refusal names the timestamp that broke the grammar: {reason}"
     );
 }
+
+/// A staged pack whose published document has been edited and then restaged,
+/// and the refusal `verify` reports. The pack is restaged so the manifest
+/// digests and the `FileRef`s agree with the edited bytes: the only thing that
+/// can refuse the pack afterwards is the document itself, which is the point.
+/// Without the restage the manifest digest fires first and the test would prove
+/// nothing about the schema.
+fn refusal_after_a_document_edit(suffix: &str, from: &str, to: &str) -> String {
+    let (_dir, root) = staged_pack();
+    let path = root.join(format!("{suffix}.schema.json"));
+    let text = fs::read_to_string(&path).expect("read the published document");
+    assert!(
+        text.contains(from),
+        "{suffix}.schema.json carries the text the edit replaces"
+    );
+    fs::write(&path, text.replacen(from, to, 1)).expect("rewrite the document");
+    restage(&root);
+    pack::verify(&root)
+        .err()
+        .unwrap_or_else(|| panic!("{suffix}.schema.json was accepted after being edited"))
+        .to_string()
+}
+
+/// A producer that grows a `health.profiles` entry and a schema that does not
+/// follow it. `snapshot.schema.json` declares the map with
+/// `additionalProperties: {"$ref": "#/$defs/profile_health"}`, and that
+/// subschema used to be compiled and then discarded, so every key and value
+/// under `health.profiles` went unchecked while the keyword stayed in the
+/// supported set.
+#[test]
+#[parallel]
+fn a_profile_health_member_that_is_not_one_is_refused() {
+    let (_dir, root) = staged_pack();
+    let path = case_dir(&root, "uds-list-nominal").join("wire.raw");
+    let recorded = fs::read(&path).expect("read the re-recorded transcript");
+    let broken = splice_text(
+        &recorded,
+        r#""main":{"profile_enumeration":{"kind":"healthy"},"metadata":{"kind":"healthy"},"profile_data":{"kind":"healthy"}}"#,
+        r#""main":123"#,
+    );
+    fs::write(&path, broken).expect("rewrite wire.raw");
+    restage(&root);
+
+    let reason = pack::verify(&root)
+        .expect_err("a profile health that is not one is refused")
+        .to_string();
+    assert!(
+        reason.contains("does not satisfy snapshot.schema.json")
+            && reason.contains("health/profiles/main")
+            && reason.contains("it is a number where the schema wants [\"object\"]"),
+        "the refusal names the member and the profile health it is not: {reason}"
+    );
+}
+
+/// A `pattern` written inside a `oneOf` branch, proved in both directions.
+///
+/// Every published document leans on `oneOf`, and the load-time walk used to
+/// stop at the array, so a pattern inside a branch was never compiled and the
+/// check that reads it never fired. The document is edited here rather than
+/// added, so the test states the whole claim: the pattern inside the branch is
+/// compiled, it accepts the frame the producer emits, and it refuses the frame
+/// that breaks it.
+#[test]
+#[parallel]
+fn a_pattern_inside_a_one_of_branch_is_enforced() {
+    let (_dir, root) = staged_pack();
+    let schema = root.join("snapshot.schema.json");
+    let text = fs::read_to_string(&schema).expect("read the published document");
+    let branch = r##""oneOf": [{ "$ref": "#/$defs/safe_text" }, { "type": "null" }]"##;
+    // `default_profile` is the only property in this document whose `oneOf` over
+    // a string and a null is spelled on one line, and the property name is what
+    // makes the edit unique.
+    let from = format!("\"default_profile\": {{\n      {branch}\n    }}");
+    let to = from.replace(
+        r##"{ "$ref": "#/$defs/safe_text" }"##,
+        r##"{ "$ref": "#/$defs/safe_text", "pattern": "^(main|absent)$" }"##,
+    );
+    assert!(
+        text.contains(&from),
+        "the document carries the edited branch"
+    );
+    fs::write(&schema, text.replacen(&from, &to, 1)).expect("rewrite the document");
+    restage(&root);
+
+    // Every recorded `default_profile` — "main" on the nominal frames, and
+    // the dangling "absent" on the schema-invalid one — is inside the pattern, so
+    // a compiled pattern inside a branch does not refuse a conforming frame.
+    pack::verify(&root).expect("a frame the branch's pattern admits is accepted");
+
+    // And it refuses the frame that breaks it, which is the half the old walk
+    // silently passed.
+    let wire = case_dir(&root, "uds-list-nominal").join("wire.raw");
+    let recorded = fs::read(&wire).expect("read the re-recorded transcript");
+    let broken = splice_text(
+        &recorded,
+        r#""default_profile":"main""#,
+        r#""default_profile":"other""#,
+    );
+    fs::write(&wire, broken).expect("rewrite wire.raw");
+    restage(&root);
+
+    let reason = pack::verify(&root)
+        .expect_err("a frame the branch's pattern refuses is refused")
+        .to_string();
+    assert!(
+        reason.contains("does not satisfy snapshot.schema.json")
+            && reason.contains(r#"does not match ^(main|absent)$"#),
+        "the refusal quotes the pattern that fired: {reason}"
+    );
+}
+
+/// A 2019-09 `#/definitions/uuid` is the likeliest author error, and it used to
+/// be skipped rather than refused, which turned every reference in the
+/// document into a no-op behind a green gate. The refusal names the reference,
+/// because a load failure that does not say which spelling was written leaves
+/// nothing to fix.
+#[test]
+#[parallel]
+fn a_definitions_reference_is_refused_by_name() {
+    let reason = refusal_after_a_document_edit(
+        "hello",
+        r##""$ref": "#/$defs/uuid""##,
+        r##""$ref": "#/definitions/uuid""##,
+    );
+    assert!(
+        reason.contains("#/definitions/uuid"),
+        "the refusal quotes the reference: {reason}"
+    );
+}
+
+/// A boolean subschema. Read as an object with no members, `false` deletes a
+/// published constraint and `true` writes one that constrains nothing, so both
+/// are refused at load rather than at the frame.
+#[test]
+#[parallel]
+fn a_boolean_subschema_in_a_published_document_is_refused() {
+    let reason = refusal_after_a_document_edit(
+        "hello",
+        r#""local_owner": { "type": "boolean" }"#,
+        r#""local_owner": false"#,
+    );
+    assert!(
+        reason.contains("a subschema must be an object"),
+        "the refusal explains why: {reason}"
+    );
+}
+
+/// A node that is not a schema at all. `properties: "x"` used to load clean and
+/// constrain nothing at all.
+#[test]
+#[parallel]
+fn a_node_that_is_not_a_schema_in_a_published_document_is_refused() {
+    let reason = refusal_after_a_document_edit(
+        "hello",
+        r#""local_owner": { "type": "boolean" }"#,
+        r#""local_owner": "boolean""#,
+    );
+    assert!(
+        reason.contains("a subschema must be an object")
+            && reason.contains("/properties/local_owner"),
+        "the refusal names the position: {reason}"
+    );
+}
+
+/// A keyword inside a `oneOf` branch that reaches past the subset. Every
+/// published document leans on `oneOf`, and the load-time walk used to stop at
+/// the array, so a branch was never reached: a keyword written inside one was
+/// neither refused nor evaluated. The refusal names the branch it sits in.
+#[test]
+#[parallel]
+fn a_keyword_inside_a_one_of_branch_reaching_past_the_subset_is_refused() {
+    let reason = refusal_after_a_document_edit(
+        "hello",
+        r##"{ "$ref": "#/$defs/safe_text" }, { "type": "null" }]"##,
+        r##"{ "allOf": [] }, { "type": "null" }]"##,
+    );
+    assert!(
+        reason.contains("/oneOf/0") && reason.contains("\"allOf\""),
+        "the refusal names the branch and the keyword: {reason}"
+    );
+}
