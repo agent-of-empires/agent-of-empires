@@ -1507,7 +1507,7 @@ mod tests {
             inst.resume_binding = Some(asserted.clone());
             inst.resume_intent = ResumeIntent::Use(sid.into());
             assert_eq!(routed(&inst).0, expected, "exported={exported:?}");
-            asserted.execution.as_mut().unwrap().exported_default_store = false;
+            asserted.execution.as_mut().unwrap().exported_default_store = None;
             inst.resume_binding = Some(asserted);
             let (legacy, execution) = routed(&inst);
             assert_eq!(legacy, expected, "legacy exported={exported:?}");
@@ -1605,7 +1605,7 @@ mod tests {
             capture(
                 &mut inst,
                 crate::session::ExecutionBinding {
-                    exported_default_store: false,
+                    exported_default_store: None,
                     ..binding
                 },
             );
@@ -1702,5 +1702,150 @@ mod tests {
             inst.agent_session_binding,
             Some(crate::session::ConversationBinding::unknown(sid))
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn migration_unattributed_pins_resume_against_configured_store() {
+        let root = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(&root.path().join("app"));
+        // $HOME is the last store fallback, so pin it to the fixture root.
+        let _env = EnvGuard::set(&[("HOME", root.path().to_str().unwrap())]);
+        let _unset = EnvGuard::unset(&["CLAUDE_CONFIG_DIR"]);
+        let _claude = crate::session::test_support::install_login_shell_path_command(
+            root.path(),
+            "claude",
+            "#!/bin/sh\nexit 1\n",
+        );
+        let project = root.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let store = root.path().join("account");
+        std::fs::create_dir_all(&store).unwrap();
+        let profile = "unattributed-store";
+        let parent = "11111111-2222-4333-8444-555555555555";
+        let child = "22222222-3333-4444-8555-666666666666";
+        let config =
+            crate::session::config::profile_config::get_profile_config_path(profile).unwrap();
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        std::fs::write(
+            config,
+            format!(
+                "[session.agent_config_dir]\nclaude = {:?}\n",
+                store.to_str().unwrap()
+            ),
+        )
+        .unwrap();
+
+        // Pre-upgrade rows: a pinned conversation and a forked child, neither
+        // of which recorded a binding.
+        let mut pinned = tool_instance("claude", project.to_str().unwrap());
+        pinned.agent_session_id = Some(parent.into());
+        pinned.resume_intent = ResumeIntent::Use(parent.into());
+        let mut forked = tool_instance("claude", project.to_str().unwrap());
+        forked.agent_session_id = Some(child.into());
+        forked.resume_intent = ResumeIntent::Fork {
+            from: parent.into(),
+        };
+        crate::session::storage::Storage::new_unwatched(profile)
+            .unwrap()
+            .update(|rows, _| {
+                *rows = vec![pinned, forked];
+                Ok(())
+            })
+            .unwrap();
+
+        // Pin below v031 so only the provenance migration and its successors touch this fixture.
+        std::fs::write(
+            crate::session::get_app_dir()
+                .unwrap()
+                .join(".schema_version"),
+            "30",
+        )
+        .unwrap();
+        crate::migrations::run_migrations().unwrap();
+
+        let rows = crate::session::storage::Storage::new_unwatched(profile)
+            .unwrap()
+            .load()
+            .unwrap();
+        let pin = bound_row(&rows, profile, parent);
+        let fork = bound_row(&rows, profile, child);
+        assert_eq!(
+            pin.resume_binding,
+            Some(ConversationBinding::unknown(parent))
+        );
+        assert_eq!(
+            pin.agent_session_binding,
+            Some(ConversationBinding::unknown(parent))
+        );
+        assert_eq!(
+            fork.resume_binding,
+            Some(ConversationBinding::unknown(parent))
+        );
+        assert_eq!(
+            fork.agent_session_binding,
+            Some(ConversationBinding::unknown(child))
+        );
+
+        for (row, forks) in [(&pin, false), (&fork, true)] {
+            let prepared = prepared_launch(row);
+            let command = prepared.command.clone().unwrap();
+            assert!(command.contains(&format!("--resume {parent}")), "{command}");
+            // Nothing recorded a store, so the launch has to take the store
+            // that current configuration names, resolved to its real path.
+            assert_eq!(
+                prepared.execution.unwrap().binding.stores[0],
+                path_identity(&store),
+                "{command}"
+            );
+            // A pin resumes its own conversation; a fork writes a new one.
+            assert_eq!(command.contains("--fork-session"), forks, "{command}");
+            assert_eq!(
+                command.contains(&format!("--session-id {child}")),
+                forks,
+                "{command}"
+            );
+        }
+
+        // An explicit pin still needs a binding that names its own
+        // conversation, whatever its provenance.
+        let mut foreign = pin.clone();
+        foreign.resume_binding = Some(ConversationBinding::unknown(child));
+        assert!(
+            foreign
+                .prepare_launch_command(foreign.conversation_state())
+                .is_err(),
+            "a pin naming another conversation stays refused"
+        );
+
+        // Provenance that contradicts an attached execution identity is not
+        // the migration's shape, so it buys nothing.
+        let mut contradictory = pin.clone();
+        let mut asserted = contradictory.asserted_resume_binding(parent, None).unwrap();
+        asserted.provenance = crate::session::ConversationProvenance::Unknown;
+        contradictory.resume_binding = Some(asserted);
+        assert!(
+            contradictory
+                .prepare_launch_command(contradictory.conversation_state())
+                .is_err(),
+            "a contradictory provenance stays refused"
+        );
+    }
+
+    /// The migrated row that names `sid`; load does not stamp the launch's config profile.
+    fn bound_row(rows: &[Instance], profile: &str, sid: &str) -> Instance {
+        let mut row = rows
+            .iter()
+            .find(|row| row.agent_session_id.as_deref() == Some(sid))
+            .unwrap_or_else(|| panic!("migration left no row bound to {sid}"))
+            .clone();
+        row.source_profile = profile.into();
+        row
+    }
+
+    fn prepared_launch(row: &Instance) -> PreparedLaunch {
+        let mut row = row.clone();
+        row.prepare_launch_command(row.conversation_state())
+            .expect("a conversation migration left unattributed must resume")
     }
 }

@@ -470,9 +470,12 @@ impl Instance {
                 self.apply_conversation_observation(&observation);
                 self.resume_probe_failed_sid = None;
             }
-            // A pinned-foreign publication is a deliberate non-write; like a
-            // divergence skip, it carries no update worth reconciling.
-            SidWrite::Skipped | SidWrite::PinnedForeign => self.reconcile_from_disk(),
+            // Nothing was written in any of these arms: a peer wrote between
+            // capture and CAS, a peer durably owns the sid, or the row pins
+            // another conversation. Reloading converges on all three.
+            SidWrite::Skipped | SidWrite::OwnershipConflict | SidWrite::PinnedForeign => {
+                self.reconcile_from_disk();
+            }
             SidWrite::Failed => {}
         }
     }

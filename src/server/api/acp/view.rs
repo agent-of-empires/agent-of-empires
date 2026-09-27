@@ -242,9 +242,7 @@ fn spawn_enabled_worker(
     agent_name: String,
     selected_conversation: Option<(String, crate::session::ExecutionBinding)>,
 ) {
-    let claude_store_pin = selected_conversation
-        .as_ref()
-        .and_then(|(_, execution)| crate::session::capture::ClaudeStorePin::of(execution));
+    let claude_store_pin = instance.selected_claude_store_pin();
     let resume_sid = selected_conversation
         .as_ref()
         .map(|(sid, _)| sid.as_str())

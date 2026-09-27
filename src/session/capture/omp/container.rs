@@ -296,11 +296,8 @@ pub(crate) fn omp_poll_fn_sandboxed(
         if refreshed != metadata {
             return None;
         }
-        let exclusion = super::super::compose_exclusion(
-            &instance_id,
-            &extra_excludes,
-            captured.source.as_ref(),
-        );
+        let exclusion =
+            super::super::compose_exclusion(&instance_id, &extra_excludes, captured.source());
         (!exclusion.contains(&captured.sid)).then_some(captured)
     }
 }
