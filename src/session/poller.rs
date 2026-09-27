@@ -306,12 +306,26 @@ pub(crate) enum SessionIdGuard {
     },
 }
 
+/// What an observation claims about the conversation its sid names. Ownership
+/// turns on this: an `Identified` claim stakes the whole sid namespace, while a
+/// `Scoped` one names a single conversation and competes only with that
+/// conversation's own claims.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ConversationClaim {
+    /// The sid alone, with no binding to scope it.
+    Identified,
+    /// Read inside `source`, which scopes the sid to one conversation. Pi only
+    /// scopes once its transcript has been validated; the store-scoped backends
+    /// scope from the launch binding alone.
+    Scoped(crate::session::ExecutionBinding),
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SessionIdObservation {
     pub(crate) sid: String,
     pub(crate) guard: SessionIdGuard,
     pub(crate) execution: Option<crate::session::instance::ActiveExecution>,
-    pub(crate) source: Option<crate::session::ExecutionBinding>,
+    pub(crate) claim: ConversationClaim,
     pub(crate) transcript_path: Option<std::path::PathBuf>,
     pub(crate) pi_session_path: Option<String>,
 }
@@ -320,12 +334,24 @@ pub(crate) type SessionIdPollFn =
     Box<dyn Fn(&str) -> Option<SessionIdObservation> + Send + 'static>;
 
 impl SessionIdObservation {
+    /// The binding that scopes this sid to one conversation, when it names one.
+    pub(crate) fn source(&self) -> Option<&crate::session::ExecutionBinding> {
+        match &self.claim {
+            ConversationClaim::Scoped(source) => Some(source),
+            ConversationClaim::Identified => None,
+        }
+    }
+
+    pub(crate) fn scope_to(&mut self, source: crate::session::ExecutionBinding) {
+        self.claim = ConversationClaim::Scoped(source);
+    }
+
     pub(crate) fn unguarded(sid: String) -> Self {
         Self {
             sid,
             guard: SessionIdGuard::Unguarded,
             execution: None,
-            source: None,
+            claim: ConversationClaim::Identified,
             transcript_path: None,
             pi_session_path: None,
         }
@@ -336,7 +362,7 @@ impl SessionIdObservation {
             sid,
             guard: SessionIdGuard::InstanceSidecar { transcript },
             execution: None,
-            source: None,
+            claim: ConversationClaim::Identified,
             transcript_path: None,
             pi_session_path: None,
         }
@@ -347,7 +373,7 @@ impl SessionIdObservation {
             sid,
             guard: SessionIdGuard::OmpLegacy,
             execution: None,
-            source: None,
+            claim: ConversationClaim::Identified,
             transcript_path: None,
             pi_session_path: None,
         }
@@ -357,15 +383,14 @@ impl SessionIdObservation {
             sid,
             guard: SessionIdGuard::OmpGeneration(generation),
             execution: None,
-            source: None,
+            claim: ConversationClaim::Identified,
             transcript_path: None,
             pi_session_path: None,
         }
     }
     pub(crate) fn conversation_binding(&self) -> Option<crate::session::ConversationBinding> {
         self.execution.as_ref()?;
-        self.source
-            .as_ref()
+        self.source()
             .map(|source| crate::session::ConversationBinding {
                 session_id: self.sid.clone(),
                 execution: Some(source.clone()),
@@ -375,13 +400,13 @@ impl SessionIdObservation {
     }
     pub(crate) fn confirms_omp_pin(&self, intent: &crate::session::ResumeIntent) -> bool {
         self.execution.is_some()
-            && self.source.is_some()
+            && self.source().is_some()
             && matches!(&self.guard, SessionIdGuard::OmpGeneration(_))
             && matches!(intent, crate::session::ResumeIntent::Use(pinned) if pinned == &self.sid)
     }
 
     pub(crate) fn conversation_key(&self) -> Option<crate::session::instance::ConversationKey<'_>> {
-        self.source.as_ref().map(|source| source.key(&self.sid))
+        self.source().map(|source| source.key(&self.sid))
     }
 }
 

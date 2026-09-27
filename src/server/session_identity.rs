@@ -64,6 +64,18 @@ fn apply_poller_runtime_if_unchanged(
     }
 }
 
+fn apply_drained_lifecycle_if_unchanged(
+    live: &mut Instance,
+    drained: &Instance,
+    baseline: &SessionIdentityBaseline,
+) {
+    let baseline_generation = baseline.5;
+    if live.lifecycle_generation == baseline_generation {
+        live.lifecycle_generation = drained.lifecycle_generation;
+        live.lifecycle_reservation = drained.lifecycle_reservation.clone();
+    }
+}
+
 pub(super) async fn drain_session_id_updates_in_state(state: &Arc<AppState>) {
     // Drain poller observations into sessions.json so daemon-only sessions persist
     // post-`/clear` sids.
@@ -118,6 +130,11 @@ pub(super) async fn drain_session_id_updates_in_state(state: &Arc<AppState>) {
                 .chain(outcome.rolled_back.iter())
                 .map(String::as_str)
                 .collect();
+            let lifecycle_advanced: std::collections::HashSet<&str> = outcome
+                .lifecycle_advanced
+                .iter()
+                .map(String::as_str)
+                .collect();
             let mut guard = state.instances.write().await;
             for src in &mutated {
                 let Some(dst) = guard.iter_mut().find(|i| i.id == src.id) else {
@@ -134,6 +151,9 @@ pub(super) async fn drain_session_id_updates_in_state(state: &Arc<AppState>) {
                 }
                 if runtime_changed.contains(&src.id) {
                     apply_poller_runtime_if_unchanged(dst, src, identity_baseline);
+                }
+                if lifecycle_advanced.contains(src.id.as_str()) {
+                    apply_drained_lifecycle_if_unchanged(dst, src, identity_baseline);
                 }
             }
         }
@@ -309,5 +329,45 @@ mod tests {
         live.lifecycle_generation = 1;
         apply_poller_runtime_if_unchanged(&mut live, &repaired, &baseline);
         assert_eq!(live.session_id_poller_retry_after, None);
+    }
+
+    #[test]
+    fn drained_lifecycle_reapply_keeps_a_concurrent_reservation() {
+        let baseline: SessionIdentityBaseline = (
+            Instance::new("session", "/tmp/project").conversation_state(),
+            None,
+            None,
+            None,
+            None,
+            0,
+            crate::session::Status::Idle,
+        );
+        let mut drained = Instance::new("session", "/tmp/project");
+        drained.lifecycle_generation = 7;
+        drained.lifecycle_reservation = Some(crate::session::LifecycleReservation {
+            op: crate::session::LifecycleOperation::Capture,
+            generation: 7,
+            at: chrono::Utc::now(),
+        });
+
+        // Nothing moved under the guard, so the drained values land.
+        let mut quiet = Instance::new("session", "/tmp/project");
+        apply_drained_lifecycle_if_unchanged(&mut quiet, &drained, &baseline);
+        assert_eq!(quiet.lifecycle_generation, 7);
+        assert_eq!(quiet.lifecycle_reservation, drained.lifecycle_reservation);
+
+        // A relaunch advanced the generation while the drain ran: copying the
+        // drained values would roll that reservation back, so it must not happen.
+        let mut relaunched = Instance::new("session", "/tmp/project");
+        let reservation = crate::session::LifecycleReservation {
+            op: crate::session::LifecycleOperation::Launch,
+            generation: 9,
+            at: chrono::Utc::now(),
+        };
+        relaunched.lifecycle_generation = 9;
+        relaunched.lifecycle_reservation = Some(reservation.clone());
+        apply_drained_lifecycle_if_unchanged(&mut relaunched, &drained, &baseline);
+        assert_eq!(relaunched.lifecycle_generation, 9);
+        assert_eq!(relaunched.lifecycle_reservation, Some(reservation));
     }
 }
