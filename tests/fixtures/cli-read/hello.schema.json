@@ -52,7 +52,7 @@
     },
     "health_code": {
       "type": "string",
-      "enum": ["enumeration", "profile_enumeration", "metadata", "profile_data"]
+      "enum": ["enumeration", "profile_enumeration", "metadata"]
     },
     "aggregate_health": {
       "type": "object",

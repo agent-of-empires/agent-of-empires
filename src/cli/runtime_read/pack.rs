@@ -12,6 +12,11 @@
 //! contract; the closed structs below enforce the same closure at run time, so
 //! no JSON Schema engine is needed to gate a run.
 //!
+//! This module is deliberately debug-resident: the `dev-release` profile turns
+//! `debug-assertions` off, so the gate is absent there, and the runtime
+//! `cfg!(debug_assertions)` guard is what makes `verify` refuse under
+//! `cargo test --release --lib` rather than let an unverified fixture replay.
+//!
 //! `root-home` is a replay scratch path, never manifest-listed: a harness that
 //! materializes it must remove the subtree before calling [`verify`].
 
@@ -292,6 +297,15 @@ fn table_is_reachable() -> bool {
                 .iter()
                 .all(|code| super::EMITTABLE_CODES.contains(code))
     })
+}
+
+/// The other direction, which nothing asserted: every code a scoped read may
+/// emit needs a table row, or a pack that froze it has no phase or exits to
+/// verify against and the code escapes the contract entirely.
+fn every_emittable_code_has_a_row() -> bool {
+    super::EMITTABLE_CODES
+        .iter()
+        .all(|code| TABLE.iter().any(|(_, codes, _)| codes.contains(code)))
 }
 
 /// Whether a published schema enumerates exactly the pack's phase and code
@@ -798,6 +812,9 @@ pub fn verify(root: &Path) -> Result<VerifiedPack> {
     // carry, is drift in the contract itself, not in a case.
     if !table_is_reachable() {
         return fail("the phase/code/exit table names a code or phase no scoped read can produce");
+    }
+    if !every_emittable_code_has_a_row() {
+        return fail("a code a scoped read can emit has no phase/code/exit table row");
     }
     schema_vocabulary_is_reachable(root)?;
 

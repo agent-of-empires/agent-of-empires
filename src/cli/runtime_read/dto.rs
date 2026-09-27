@@ -84,7 +84,6 @@ pub(crate) enum HealthCode {
     Enumeration,
     ProfileEnumeration,
     Metadata,
-    ProfileData,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Serialize)]
@@ -187,13 +186,10 @@ pub(crate) struct SessionRead {
     pub pinned_at: Option<String>,
     pub agent_session_id: Option<String>,
     pub parent_session_id: Option<String>,
-    pub has_terminal: bool,
     pub has_worktree_info: bool,
     pub has_managed_worktree: bool,
-    pub has_cleanable_worktree: bool,
     pub worktree: Option<WorktreeRead>,
     pub workspace_repos: Vec<WorkspaceRepo>,
-    pub cleanup_defaults: CleanupDefaults,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
@@ -294,15 +290,6 @@ pub(crate) struct WorkspaceRepo {
     pub name: String,
     pub source_path: String,
     pub branch: String,
-}
-
-#[derive(Debug, Clone, Copy, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct CleanupDefaults {
-    pub delete_worktree: bool,
-    pub delete_branch: bool,
-    pub delete_sandbox: bool,
-    pub delete_to_trash: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -469,7 +456,7 @@ pub(crate) fn validate_hello(hello: &HelloData) -> Result<(), &'static str> {
     validate_profiles(&hello.profiles)?;
     validate_freshness(&hello.status_freshness)?;
     if let AggregateHealth::Degraded { code } = hello.health {
-        validate_health_code(code)?;
+        validate_health_code(code, HELLO_HEALTH_CODES)?;
     }
     Ok(())
 }
@@ -690,28 +677,35 @@ fn validate_profile_health(health: &ProfileHealth) -> Result<(), &'static str> {
     validate_profile_component(health.profile_data)
 }
 
-fn validate_health_code(code: HealthCode) -> Result<(), &'static str> {
-    let _ = code;
-    Ok(())
+/// The aggregate health a Hello may carry: the global enumeration and metadata
+/// components the snapshot also carries, and nothing profile-scoped.
+const HELLO_HEALTH_CODES: &[HealthCode] = &[HealthCode::Enumeration, HealthCode::Metadata];
+
+/// One health code against the components that may actually carry it. The
+/// client's vocabulary is the producer's, and each component is degraded by
+/// its own failure, so a code outside the component's own set is a schema
+/// violation rather than a fact about the daemon.
+fn validate_health_code(code: HealthCode, allowed: &[HealthCode]) -> Result<(), &'static str> {
+    if allowed.contains(&code) {
+        Ok(())
+    } else {
+        Err("schema_invalid")
+    }
 }
 
 fn validate_global_health(health: ComponentHealth) -> Result<(), &'static str> {
     if let ComponentHealth::Degraded { code } = health {
-        if !matches!(code, HealthCode::Enumeration | HealthCode::Metadata) {
-            return Err("schema_invalid");
-        }
+        validate_health_code(code, &[HealthCode::Enumeration, HealthCode::Metadata])?;
     }
     Ok(())
 }
 
 fn validate_profile_component(health: ComponentHealth) -> Result<(), &'static str> {
     if let ComponentHealth::Degraded { code } = health {
-        if !matches!(
+        validate_health_code(
             code,
-            HealthCode::ProfileEnumeration | HealthCode::Metadata | HealthCode::ProfileData
-        ) {
-            return Err("schema_invalid");
-        }
+            &[HealthCode::ProfileEnumeration, HealthCode::Metadata],
+        )?;
     }
     Ok(())
 }
@@ -806,14 +800,6 @@ fn validate_session(session: &SessionRead) -> Result<(), &'static str> {
     {
         return Err("schema_invalid");
     }
-    let _ = (
-        session.has_terminal,
-        session.has_cleanable_worktree,
-        session.cleanup_defaults.delete_worktree,
-        session.cleanup_defaults.delete_branch,
-        session.cleanup_defaults.delete_sandbox,
-        session.cleanup_defaults.delete_to_trash,
-    );
     if session
         .last_error
         .as_deref()
@@ -1108,18 +1094,10 @@ mod tests {
             pinned_at: None,
             agent_session_id: None,
             parent_session_id: Some("b".into()),
-            has_terminal: false,
             has_worktree_info: false,
             has_managed_worktree: false,
-            has_cleanable_worktree: false,
             worktree: None,
             workspace_repos: vec![],
-            cleanup_defaults: CleanupDefaults {
-                delete_worktree: false,
-                delete_branch: false,
-                delete_sandbox: false,
-                delete_to_trash: false,
-            },
         };
         value.sessions.push(base.clone());
         assert_eq!(validate_snapshot(&value), Err("schema_invalid"));
@@ -1204,18 +1182,10 @@ mod tests {
             pinned_at: None,
             agent_session_id: None,
             parent_session_id: None,
-            has_terminal: false,
             has_worktree_info: false,
             has_managed_worktree: false,
-            has_cleanable_worktree: false,
             worktree: None,
             workspace_repos: vec![],
-            cleanup_defaults: CleanupDefaults {
-                delete_worktree: false,
-                delete_branch: false,
-                delete_sandbox: false,
-                delete_to_trash: false,
-            },
         };
         value.sessions.push(row.clone());
         assert_eq!(validate_snapshot(&value), Ok(()));
@@ -1319,18 +1289,10 @@ mod tests {
             pinned_at: None,
             agent_session_id: None,
             parent_session_id: None,
-            has_terminal: false,
             has_worktree_info: false,
             has_managed_worktree: false,
-            has_cleanable_worktree: false,
             worktree: None,
             workspace_repos: repos,
-            cleanup_defaults: CleanupDefaults {
-                delete_worktree: false,
-                delete_branch: false,
-                delete_sandbox: false,
-                delete_to_trash: false,
-            },
         }
     }
 }

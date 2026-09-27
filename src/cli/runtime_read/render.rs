@@ -140,7 +140,7 @@ fn render_list(
     let sessions: Vec<&SessionRead> = sessions_for_profile(snapshot, profile_name)
         .filter(|session| matches_state(session.state, state))
         .collect();
-    require_selected_profile_health(snapshot, profile, true)?;
+    require_selected_profile_health(snapshot, profile)?;
 
     if args.json {
         let rows: Vec<SessionJson> = sessions
@@ -257,7 +257,7 @@ fn render_status(
     let profile_name = selected_profile(snapshot, source)?;
     let profile = profile(snapshot, profile_name)?;
     let sessions: Vec<&SessionRead> = sessions_for_profile(snapshot, profile_name).collect();
-    require_selected_profile_health(snapshot, profile, true)?;
+    require_selected_profile_health(snapshot, profile)?;
     if !freshness_observed(&snapshot.status_freshness) {
         return Err(ReadFailure::post("freshness_unavailable"));
     }
@@ -326,7 +326,7 @@ fn render_show(
 ) -> Result<Projection, ReadFailure> {
     let profile_name = selected_profile(snapshot, source)?;
     let profile = profile(snapshot, profile_name)?;
-    require_selected_profile_health(snapshot, profile, true)?;
+    require_selected_profile_health(snapshot, profile)?;
     if !freshness_observed(&snapshot.status_freshness) {
         return Err(ReadFailure::post("freshness_unavailable"));
     }
@@ -508,7 +508,7 @@ fn render_trash(
     let sessions: Vec<&SessionRead> = sessions_for_profile(snapshot, profile_name)
         .filter(|session| session.state == WireState::Trashed)
         .collect();
-    require_selected_profile_health(snapshot, profile, true)?;
+    require_selected_profile_health(snapshot, profile)?;
     if sessions.is_empty() {
         return Ok("Trash is empty.\n".into());
     }
@@ -535,7 +535,7 @@ fn render_groups(
     let profile_name = selected_profile(snapshot, source)?;
     let profile = profile(snapshot, profile_name)?;
     let sessions: Vec<&SessionRead> = sessions_for_profile(snapshot, profile_name).collect();
-    require_selected_profile_health(snapshot, profile, true)?;
+    require_selected_profile_health(snapshot, profile)?;
     if args.json() {
         #[derive(Serialize)]
         struct GroupJson {
@@ -733,14 +733,14 @@ fn require_list_all_health(snapshot: &SnapshotData) -> Result<(), ReadFailure> {
     Ok(())
 }
 
+/// Every command that names one profile still needs the global components: the
+/// profile list it prints is built from the global registry.
 fn require_selected_profile_health(
     snapshot: &SnapshotData,
     profile: &ProfileRead,
-    include_global: bool,
 ) -> Result<(), ReadFailure> {
-    if include_global
-        && (!component_healthy(&snapshot.health.global_enumeration)
-            || !component_healthy(&snapshot.health.global_metadata))
+    if !component_healthy(&snapshot.health.global_enumeration)
+        || !component_healthy(&snapshot.health.global_metadata)
     {
         return Err(ReadFailure::post("health_degraded"));
     }
@@ -793,8 +793,7 @@ impl ProjectScope {
 mod tests {
     use super::*;
     use crate::cli::runtime_read::dto::{
-        CleanupDefaults, ComponentHealth, Cursor, ProfileHealth, SnapshotHealth, StatusFreshness,
-        WireStatus,
+        ComponentHealth, Cursor, ProfileHealth, SnapshotHealth, StatusFreshness, WireStatus,
     };
     use crate::cli::runtime_read::endpoint::ReadRequestSource;
     use std::collections::BTreeMap;
@@ -829,18 +828,10 @@ mod tests {
             pinned_at: None,
             agent_session_id: None,
             parent_session_id: None,
-            has_terminal: false,
             has_worktree_info: false,
             has_managed_worktree: false,
-            has_cleanable_worktree: false,
             worktree: None,
             workspace_repos: vec![],
-            cleanup_defaults: CleanupDefaults {
-                delete_worktree: false,
-                delete_branch: false,
-                delete_sandbox: false,
-                delete_to_trash: false,
-            },
         }
     }
 

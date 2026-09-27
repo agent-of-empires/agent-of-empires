@@ -18,7 +18,10 @@ mod render;
 /// reports the publication absent, which runs the command from the local store
 /// exactly as it did before the read existed.
 #[cfg(target_os = "linux")]
-mod uds;
+/// `pub(crate)` because the publisher runs the identical walk
+/// (`server::runtime_uds`): the client stays the enforcing boundary, and a
+/// producer that re-derived the rules could only ever be weaker.
+pub(crate) mod uds;
 
 use std::time::Duration;
 use tokio::time::Instant;
@@ -47,12 +50,13 @@ use super::session::ShowArgs;
 use super::status::StatusArgs;
 use super::{Cli, Commands};
 
-/// How long a read may take to establish, admission included. The daemon
-/// bounds its own side of the same window with the same constant
+/// How long a read may take end to end, admission included. The daemon bounds
+/// its own side of the same window with the same constant
 /// (`server::runtime_ws::CONNECTION_BUDGET`), so one stalled peer can never
-/// hold a client task and a server task open at once.
+/// hold a client task and a server task open at once, and a read has exactly
+/// one budget: the exchange deadline is the establishment deadline, never a
+/// second window opened after it.
 pub(crate) const ESTABLISHMENT_BUDGET: Duration = Duration::from_secs(15);
-const EXCHANGE_BUDGET: Duration = Duration::from_secs(15);
 const CLOSE_BUDGET: Duration = Duration::from_millis(200);
 pub(crate) const APPLICATION_LIMIT: usize = 16 * 1024 * 1024;
 
@@ -170,7 +174,6 @@ impl ReadFailure {
     /// not a wire failure. The code stays the renderer's own, so the pack can
     /// still tell an internal fault (exit 1) from a refusal (exit 2).
     pub(crate) fn exit(exit: i32, message: &'static str) -> Self {
-        debug_assert!(EMITTABLE_CODES.contains(&RENDERER_INTERNAL));
         Self {
             code: RENDERER_INTERNAL,
             exit,
@@ -239,8 +242,8 @@ pub async fn attempt(command: ScopedCommand<'_>, source: &ReadRequestSource) -> 
     }
 }
 
-/// Whether this failure means no daemon has ever published here, which is the
-/// one pre-admission refusal the local command path may take over. A named
+/// Whether this failure means no daemon is publishing here, which is the one
+/// pre-admission refusal the local command path may take over. A named
 /// endpoint, and every refusal that says the artifacts are present but not
 /// trustworthy, are the daemon's answer to keep: falling back on those would
 /// quietly serve data the admission was built to withhold.
@@ -301,7 +304,9 @@ async fn execute_inner(
             .await
             .map_err(|_| ReadFailure::pre("establishment_timeout"))?;
             let (stream, _) = connected.map_err(map_upgrade_error)?;
-            let exchange_deadline = connection_deadline(Instant::now());
+            // One budget per read: the exchange rides the establishment
+            // window rather than opening a second one behind it.
+            let exchange_deadline = establishment_deadline;
             exchange_stream(
                 stream,
                 exchange_deadline,
@@ -313,10 +318,6 @@ async fn execute_inner(
             .await
         }
     }
-}
-
-fn connection_deadline(now: Instant) -> Instant {
-    now + EXCHANGE_BUDGET
 }
 
 fn websocket_config() -> WebSocketConfig {
@@ -456,22 +457,22 @@ where
                 | WsError::AlreadyClosed
                 | WsError::Io(_)
                 | WsError::Protocol(ProtocolError::ResetWithoutClosingHandshake),
-            )) => {
-                let mut failure = ReadFailure::post("connection_closed");
-                failure.attempt_close = false;
-                return Err(failure);
-            }
+            )) => return Err(peer_gone()),
             Some(Err(WsError::Protocol(_)))
             | Some(Err(WsError::Utf8(_)))
             | Some(Err(WsError::AttackAttempt)) => return Err(ReadFailure::post("schema_invalid")),
             Some(Err(_)) => return Err(ReadFailure::post("unavailable")),
-            None => {
-                let mut failure = ReadFailure::post("connection_closed");
-                failure.attempt_close = false;
-                return Err(failure);
-            }
+            None => return Err(peer_gone()),
         }
     }
+}
+
+/// A peer that is already gone: the connection is closed, so there is nobody
+/// left to send a close frame to and the refusal stands on its own.
+fn peer_gone() -> ReadFailure {
+    let mut failure = ReadFailure::post("connection_closed");
+    failure.attempt_close = false;
+    failure
 }
 
 /// Close the exchange and settle on the answer.
@@ -593,14 +594,14 @@ mod tests {
         assert!(Cli::try_parse_from(["aoe", "session", "list-trash"]).is_ok());
     }
 
+    /// The wire limits the verifier enforces, taken from the config a read
+    /// actually builds; the budgets themselves are documented on the
+    /// constants.
     #[test]
-    fn websocket_limits_and_close_budget_are_normative() {
+    fn websocket_limits_are_normative() {
         let config = websocket_config();
         assert_eq!(config.max_frame_size, Some(APPLICATION_LIMIT));
         assert_eq!(config.max_message_size, Some(APPLICATION_LIMIT));
-        assert_eq!(ESTABLISHMENT_BUDGET, Duration::from_secs(15));
-        assert_eq!(EXCHANGE_BUDGET, Duration::from_secs(15));
-        assert_eq!(CLOSE_BUDGET, Duration::from_millis(200));
     }
 
     #[test]
@@ -621,7 +622,7 @@ mod tests {
     #[tokio::test]
     async fn a_failed_close_never_replaces_the_failure_that_caused_it() {
         let mut stream = broken_stream().await;
-        let deadline = Instant::now() + EXCHANGE_BUDGET;
+        let deadline = Instant::now() + ESTABLISHMENT_BUDGET;
         for code in ["schema_invalid", "profile_missing", "freshness_unavailable"] {
             let error = finish_with_close(&mut stream, deadline, Err(ReadFailure::post(code)))
                 .await
@@ -636,7 +637,7 @@ mod tests {
     #[tokio::test]
     async fn a_failed_close_is_the_answer_when_the_read_otherwise_succeeded() {
         let mut stream = broken_stream().await;
-        let deadline = Instant::now() + EXCHANGE_BUDGET;
+        let deadline = Instant::now() + ESTABLISHMENT_BUDGET;
         let projection = render::Projection {
             stdout: "rows\n".into(),
             session_table: false,

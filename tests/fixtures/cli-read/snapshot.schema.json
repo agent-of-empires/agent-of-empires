@@ -50,7 +50,7 @@
     },
     "health_code": {
       "type": "string",
-      "enum": ["enumeration", "profile_enumeration", "metadata", "profile_data"]
+      "enum": ["enumeration", "profile_enumeration", "metadata"]
     },
     "component_health": {
       "type": "object",
@@ -201,17 +201,6 @@
         "branch": { "$ref": "#/$defs/safe_text" }
       }
     },
-    "cleanup_defaults": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["delete_worktree", "delete_branch", "delete_sandbox", "delete_to_trash"],
-      "properties": {
-        "delete_worktree": { "type": "boolean" },
-        "delete_branch": { "type": "boolean" },
-        "delete_sandbox": { "type": "boolean" },
-        "delete_to_trash": { "type": "boolean" }
-      }
-    },
     "session_read": {
       "type": "object",
       "additionalProperties": false,
@@ -235,13 +224,10 @@
         "pinned_at",
         "agent_session_id",
         "parent_session_id",
-        "has_terminal",
         "has_worktree_info",
         "has_managed_worktree",
-        "has_cleanable_worktree",
         "worktree",
-        "workspace_repos",
-        "cleanup_defaults"
+        "workspace_repos"
       ],
       "properties": {
         "id": { "$ref": "#/$defs/safe_text" },
@@ -296,15 +282,12 @@
         "parent_session_id": {
           "oneOf": [{ "$ref": "#/$defs/safe_text" }, { "type": "null" }]
         },
-        "has_terminal": { "type": "boolean" },
         "has_worktree_info": { "type": "boolean" },
         "has_managed_worktree": { "type": "boolean" },
-        "has_cleanable_worktree": { "type": "boolean" },
         "worktree": {
           "oneOf": [{ "$ref": "#/$defs/worktree_read" }, { "type": "null" }]
         },
-        "workspace_repos": { "type": "array", "items": { "$ref": "#/$defs/workspace_repo" } },
-        "cleanup_defaults": { "$ref": "#/$defs/cleanup_defaults" }
+        "workspace_repos": { "type": "array", "items": { "$ref": "#/$defs/workspace_repo" } }
       }
     }
   }

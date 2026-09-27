@@ -21,6 +21,8 @@ use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use chrono::{DateTime, SecondsFormat, Utc};
 use futures_util::{SinkExt, StreamExt};
+use std::path::Path;
+
 use serde::Serialize;
 use tokio_tungstenite::tungstenite;
 
@@ -30,8 +32,9 @@ use crate::session::{GroupTree, Instance, Storage};
 /// Wire protocol version. The client refuses anything else.
 const PROTOCOL_VERSION: u16 = 2;
 /// A stalled reader must not hold a connection slot — or a full disk rescan's
-/// worth of work — open indefinitely. Both transports spend this one budget:
-/// the local socket path in `runtime_uds`, the HTTP route here, so a peer that
+/// worth of work — open indefinitely. Both transports spend this one budget,
+/// each for the whole connection from accept to close rather than per stage,
+/// and it matches the client's single read budget, so a peer that
 /// authenticates and then says nothing is bounded identically either way.
 pub(crate) const CONNECTION_BUDGET: Duration = Duration::from_secs(15);
 /// The trusted namespace this build publishes for itself, and the name the
@@ -324,7 +327,6 @@ struct Sampled {
 struct ProfileDisk {
     projects: Result<Vec<ProjectRead>, ()>,
     groups: Result<Vec<crate::session::Group>, ()>,
-    cleanup: CleanupDefaults,
 }
 
 fn build_snapshot(runtime: &RuntimeState, instances: &[Instance], owner: Owner) -> Sampled {
@@ -368,7 +370,6 @@ fn build_snapshot(runtime: &RuntimeState, instances: &[Instance], owner: Owner) 
                         .and_then(|storage| storage.load_with_groups())
                         .map(|(_, groups)| groups)
                         .map_err(|_| ()),
-                    cleanup: cleanup_defaults(),
                 },
             )
         })
@@ -393,13 +394,11 @@ fn build_snapshot(runtime: &RuntimeState, instances: &[Instance], owner: Owner) 
         }
     };
     let global_metadata_healthy = global_projects.is_some();
-    let global_projects = global_projects.unwrap_or_default();
+    let mut global_projects = global_projects.unwrap_or_default();
+    drop_unusable_projects(&mut global_projects);
 
     sessions.retain(|row| names.contains(&row.profile));
     reconcile_legacy_rows(&mut sessions);
-    for row in &mut sessions {
-        row.cleanup_defaults = disk[&row.profile].cleanup;
-    }
 
     let mut profile_reads = Vec::with_capacity(names.len());
     let mut profile_health = BTreeMap::new();
@@ -412,6 +411,7 @@ fn build_snapshot(runtime: &RuntimeState, instances: &[Instance], owner: Owner) 
             .filter(|inst| &inst.source_profile == name)
             .collect();
         let mut projects = entry.projects.clone().unwrap_or_default();
+        drop_unusable_projects(&mut projects);
         // Referential integrity: every session's project path is a member of its
         // own profile's project list.
         add_session_projects(&mut projects, &scoped, &global_projects);
@@ -491,6 +491,18 @@ fn build_snapshot(runtime: &RuntimeState, instances: &[Instance], owner: Owner) 
             status_freshness: freshness,
         },
     }
+}
+
+/// Drop a project row the client could not admit.
+///
+/// The client's contract requires an absolute path, because a relative one is
+/// not a path any session row can reference. A hand-edited `projects.json` is
+/// the one way a row gets one, and refusing a whole snapshot over a single row
+/// would fail every read command on every profile — so the row goes, in the
+/// same spirit as [`reconcile_legacy_rows`], and the client's own
+/// `valid_absolute_path` stays fail-closed.
+fn drop_unusable_projects(projects: &mut Vec<ProjectRead>) {
+    projects.retain(|project| Path::new(&project.path).is_absolute());
 }
 
 /// Reconcile the stored rows against the rules a read projects under, field by
@@ -607,20 +619,6 @@ fn aggregate_health(health: &SnapshotHealth) -> AggregateHealth {
     match worst {
         None => AggregateHealth::Healthy,
         Some(code) => AggregateHealth::Degraded { code },
-    }
-}
-
-/// Cleanup defaults. The effective per-profile config is deliberately not
-/// resolved here: `resolve_config` installs a process-global status-rule
-/// registry, which a read-only snapshot must not do. No read command projects
-/// these four flags, so the compiled defaults are what the wire carries.
-fn cleanup_defaults() -> CleanupDefaults {
-    let config = crate::session::config::Config::default();
-    CleanupDefaults {
-        delete_worktree: config.worktree.auto_cleanup,
-        delete_branch: config.worktree.should_delete_branch_on_cleanup(),
-        delete_sandbox: config.sandbox.auto_cleanup,
-        delete_to_trash: config.session.delete_to_trash,
     }
 }
 
@@ -843,14 +841,6 @@ enum ProjectScope {
     Profile,
 }
 
-#[derive(Serialize, Clone, Copy)]
-struct CleanupDefaults {
-    delete_worktree: bool,
-    delete_branch: bool,
-    delete_sandbox: bool,
-    delete_to_trash: bool,
-}
-
 #[derive(Serialize, Clone)]
 struct WorktreeRead {
     branch: String,
@@ -887,14 +877,10 @@ struct SessionRead {
     pinned_at: Option<String>,
     agent_session_id: Option<String>,
     parent_session_id: Option<String>,
-    has_terminal: bool,
     has_worktree_info: bool,
     has_managed_worktree: bool,
-    has_cleanable_worktree: bool,
     worktree: Option<WorktreeRead>,
     workspace_repos: Vec<WorkspaceRepo>,
-    /// Replaced by the per-profile config during assembly.
-    cleanup_defaults: CleanupDefaults,
 }
 
 impl SessionRead {
@@ -942,13 +928,11 @@ impl SessionRead {
             pinned_at: timestamp(inst.pinned_at),
             agent_session_id: inst.agent_session_id.clone(),
             parent_session_id: inst.parent_session_id.clone(),
-            has_terminal: inst.terminal_info.is_some(),
             has_worktree_info: inst.worktree_info.is_some(),
             has_managed_worktree: inst
                 .worktree_info
                 .as_ref()
                 .is_some_and(|worktree| worktree.managed_by_aoe),
-            has_cleanable_worktree: inst.has_managed_worktree_or_workspace(),
             worktree: inst.worktree_info.as_ref().map(|worktree| WorktreeRead {
                 branch: worktree.branch.clone(),
                 main_repo_path: worktree.main_repo_path.clone(),
@@ -956,12 +940,6 @@ impl SessionRead {
                 base_branch: worktree.base_branch.clone(),
             }),
             workspace_repos,
-            cleanup_defaults: CleanupDefaults {
-                delete_worktree: true,
-                delete_branch: false,
-                delete_sandbox: true,
-                delete_to_trash: true,
-            },
         }
     }
 }
