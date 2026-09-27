@@ -120,7 +120,9 @@ impl HttpClient {
     pub async fn replay(&self, session_id: &str, since: u64) -> Result<ReplayResponse, HttpError> {
         let url = format!(
             "{}/api/sessions/{}/acp/replay?since={}",
-            self.endpoint.base_url, session_id, since
+            self.endpoint.base_url,
+            path_segment(session_id)?,
+            since
         );
         let res = self.execute(self.http.get(&url)).await?;
         let res = check_status(res, session_id)?;

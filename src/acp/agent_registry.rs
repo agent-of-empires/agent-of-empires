@@ -40,10 +40,6 @@ pub struct AgentRegistry {
 }
 
 impl AgentRegistry {
-    pub fn upsert(&mut self, name: String, spec: AgentSpec) {
-        self.agents.insert(name, spec);
-    }
-
     /// One entry per tool with a published ACP server, plus the built-in agent.
     pub fn with_defaults() -> Self {
         let claude_install = install_hint_for("claude-agent-acp").unwrap_or("(see project docs)");
