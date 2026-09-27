@@ -400,7 +400,7 @@ impl Instance {
             )
         }) {
             observation.execution = Some(active.clone());
-            observation.source = Some(active.binding.clone());
+            observation.scope_to(active.binding.clone());
         }
         observation
     }

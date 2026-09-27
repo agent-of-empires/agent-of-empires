@@ -234,6 +234,8 @@ pub(crate) enum CaptureContext {
     },
     Pi {
         source: super::SessionSidecarSource,
+        /// Canonical, as the launch builds it: readers compare the published transcript path
+        /// against it, and a differently spelled root silently drops every observation.
         root: PathBuf,
     },
     Omp(super::OmpCaptureMetadata),
@@ -1007,7 +1009,7 @@ pub(super) fn hook_session_observation(
     }
     let mut observation = crate::session::poller::SessionIdObservation::instance_sidecar(sid, None);
     observation.execution = Some(active.clone());
-    observation.source = Some(active.binding.clone());
+    observation.scope_to(active.binding.clone());
     Some(observation)
 }
 
@@ -2274,9 +2276,7 @@ impl Instance {
         self.pi_session_path = pi_session_path.filter(|_| sid.is_some());
         self.agent_session_id = sid;
     }
-    /// The binding an observation is allowed to establish for this instance.
-    ///
-    /// An observation without launch evidence cannot qualify a conversation, so
+    /// An observation without a qualified source cannot qualify a conversation, so
     /// it may refresh the published id and transcript path but must keep the
     /// binding an earlier qualified publication established.
     pub(super) fn observed_binding(
@@ -2290,16 +2290,32 @@ impl Instance {
         })
     }
 
+    /// A sidecar observation that named no transcript may refresh the SID without
+    /// erasing the path already published for that same conversation.
+    pub(super) fn observed_pi_session_path(
+        &self,
+        observation: &crate::session::poller::SessionIdObservation,
+    ) -> Option<String> {
+        observation.pi_session_path.clone().or_else(|| {
+            let id_only_sidecar = observation.source().is_none()
+                && matches!(
+                    &observation.guard,
+                    crate::session::poller::SessionIdGuard::InstanceSidecar { transcript: None }
+                )
+                && self.agent_session_id.as_deref() == Some(observation.sid.as_str());
+            id_only_sidecar
+                .then(|| self.pi_session_path.clone())
+                .flatten()
+        })
+    }
+
     pub(crate) fn apply_conversation_observation(
         &mut self,
         observation: &crate::session::poller::SessionIdObservation,
     ) {
         let binding = self.observed_binding(observation);
-        self.set_agent_conversation(
-            Some(observation.sid.clone()),
-            binding,
-            observation.pi_session_path.clone(),
-        );
+        let pi_session_path = self.observed_pi_session_path(observation);
+        self.set_agent_conversation(Some(observation.sid.clone()), binding, pi_session_path);
     }
 
     pub(crate) fn asserted_resume_binding(

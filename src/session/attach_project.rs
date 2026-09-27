@@ -709,6 +709,18 @@ pub fn attach_planned(
     if plan.moves_session {
         match instance.flush_published_conversation(storage) {
             Some(crate::session::SidWrite::Applied) | None => {}
+            // The flush read this row's own publication and the owner keeps the
+            // sid, so the refusal is final: no publication of ours is waiting.
+            // (What the poller still has queued is invisible here: the callers
+            // hand `attach_planned` an instance loaded from disk, which carries
+            // no poller.)
+            Some(crate::session::SidWrite::OwnershipConflict) => {
+                tracing::debug!(
+                    target: "session.attach",
+                    instance = %instance.id,
+                    "converting with a sid another row owns",
+                );
+            }
             Some(outcome) => anyhow::bail!(
                 "'{}' has an undrained conversation publication ({outcome:?}); drain it or \
                  clear the resume target before converting",

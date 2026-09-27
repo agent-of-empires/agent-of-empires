@@ -573,7 +573,7 @@ fn omp_source_observation(
         .to_path_buf()];
     source.filesystem = filesystem;
     observation.execution = Some(active.clone());
-    observation.source = Some(source);
+    observation.scope_to(source);
     observation.transcript_path = Some(path);
     Ok(observation)
 }
@@ -663,8 +663,7 @@ pub(crate) fn omp_poll_fn(
         if refreshed != identity {
             return None;
         }
-        let exclusion =
-            super::compose_exclusion(&instance_id, &extra_excludes, captured.source.as_ref());
+        let exclusion = super::compose_exclusion(&instance_id, &extra_excludes, captured.source());
         (!exclusion.contains(&captured.sid)).then_some(captured)
     }
 }
