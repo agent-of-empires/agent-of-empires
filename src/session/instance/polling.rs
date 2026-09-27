@@ -1173,19 +1173,22 @@ mod tests {
         inst
     }
 
-    /// A refusal from the profile walk is evidence about a peer only when that
-    /// profile is enumerated and its storage loads.
-    fn assert_enumerable(profiles: &[&str]) {
-        let enumerated = crate::session::list_profiles().expect("profile enumeration");
-        for profile in profiles {
-            assert!(
-                enumerated.iter().any(|name| name.as_str() == *profile)
-                    && crate::session::Storage::new_unwatched(profile)
-                        .and_then(|storage| storage.load())
-                        .is_ok(),
-                "profile {profile} is not enumerable and readable, so a refusal cannot name its peer"
-            );
-        }
+    /// Publish a peer row and hand back what the profile walk will load, so no step
+    /// can be green on a roster the walk never saw.
+    fn write_peer(storage: &crate::session::Storage, peer: &Instance) -> Instance {
+        let id = peer.id.clone();
+        storage
+            .update(|instances, _| {
+                *instances = vec![peer.clone()];
+                Ok(())
+            })
+            .unwrap();
+        storage
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.id == id)
+            .expect("the published peer is the row the profile walk loads")
     }
 
     #[test]
@@ -1225,31 +1228,15 @@ mod tests {
         };
         bind(&mut current, &shared_store);
         bind(&mut peer, &shared_store);
-        current_storage
-            .update(|instances, _| {
-                *instances = vec![current.clone()];
-                Ok(())
-            })
-            .unwrap();
-        peer_storage
-            .update(|instances, _| {
-                *instances = vec![peer.clone()];
-                Ok(())
-            })
-            .unwrap();
-        assert_enumerable(&["capture-owner-a", "capture-owner-b"]);
+        write_peer(&current_storage, &current);
+        write_peer(&peer_storage, &peer);
         assert!(
             !current.managed_capture_store_is_exclusive(backend),
             "inspected mounts override predicted private stores"
         );
 
         peer.tool = "claude".into();
-        peer_storage
-            .update(|instances, _| {
-                *instances = vec![peer.clone()];
-                Ok(())
-            })
-            .unwrap();
+        write_peer(&peer_storage, &peer);
         assert!(
             !current.managed_capture_store_is_exclusive(backend),
             "configuration changes do not change the running writer"
@@ -1258,12 +1245,7 @@ mod tests {
         let peer_store = app.path().join("distinct");
         std::fs::create_dir_all(&peer_store).unwrap();
         bind(&mut peer, &peer_store);
-        peer_storage
-            .update(|instances, _| {
-                *instances = vec![peer.clone()];
-                Ok(())
-            })
-            .unwrap();
+        write_peer(&peer_storage, &peer);
         assert!(
             current.managed_capture_store_is_exclusive(backend),
             "distinct physical stores do not conflict"
@@ -1276,24 +1258,33 @@ mod tests {
             );
         }
 
+        // A peer whose recorded agent is not in the registry cannot say which
+        // backend it captures on, so it must refuse before the backend compare.
+        let mut unresolved = peer.clone();
+        unresolved
+            .active_execution
+            .as_mut()
+            .expect("the peer carries a recorded binding here")
+            .binding
+            .agent = "not-a-registered-agent".into();
+        assert!(
+            unresolved.capture_store_dir().is_some(),
+            "the peer still resolves its store, so only the agent lookup can refuse"
+        );
+        write_peer(&peer_storage, &unresolved);
+        assert!(
+            !current.managed_capture_store_is_exclusive(backend),
+            "a peer whose agent does not resolve cannot prove exclusivity"
+        );
+
         peer.active_execution = None;
-        peer_storage
-            .update(|instances, _| {
-                *instances = vec![peer.clone()];
-                Ok(())
-            })
-            .unwrap();
+        write_peer(&peer_storage, &peer);
         assert!(
             current.managed_capture_store_is_exclusive(backend),
             "an unlocated Claude peer must not block Gemini capture"
         );
         peer.tool = "gemini".into();
-        peer_storage
-            .update(|instances, _| {
-                *instances = vec![peer.clone()];
-                Ok(())
-            })
-            .unwrap();
+        write_peer(&peer_storage, &peer);
         assert!(
             current.managed_capture_store_is_exclusive(backend),
             "a peer without an execution context falls back to its own predicted private store"
@@ -1305,12 +1296,7 @@ mod tests {
             .sandbox_capture_store_path()
             .expect("a generation-1 gemini peer resolves the legacy shared store");
         std::fs::create_dir_all(&legacy).unwrap();
-        peer_storage
-            .update(|instances, _| {
-                *instances = vec![peer.clone()];
-                Ok(())
-            })
-            .unwrap();
+        write_peer(&peer_storage, &peer);
         assert!(
             !current.managed_capture_store_is_exclusive(backend),
             "a peer below the current store generation cannot prove exclusivity"
@@ -1322,12 +1308,7 @@ mod tests {
             unadmitted.sandbox_capture_store_dir().is_none(),
             "an unadmitted peer has no private store to compare"
         );
-        peer_storage
-            .update(|instances, _| {
-                *instances = vec![unadmitted.clone()];
-                Ok(())
-            })
-            .unwrap();
+        write_peer(&peer_storage, &unadmitted);
         assert!(
             !current.managed_capture_store_is_exclusive(backend),
             "a peer without certified sandbox content cannot prove exclusivity"
@@ -1335,12 +1316,7 @@ mod tests {
 
         let missing_store = app.path().join("missing-store");
         bind(&mut peer, &missing_store);
-        peer_storage
-            .update(|instances, _| {
-                *instances = vec![peer.clone()];
-                Ok(())
-            })
-            .unwrap();
+        write_peer(&peer_storage, &peer);
         assert!(
             !current.managed_capture_store_is_exclusive(backend),
             "a peer whose store cannot be canonicalized cannot prove exclusivity"
@@ -1373,13 +1349,7 @@ mod tests {
             )),
             "sandboxed Codex resolves the only context that must prove store exclusivity"
         );
-        current_storage
-            .update(|instances, _| {
-                *instances = vec![current.clone()];
-                Ok(())
-            })
-            .unwrap();
-        assert_enumerable(&["codex-owner-a", "codex-owner-b"]);
+        write_peer(&current_storage, &current);
 
         // The self row is skipped only in its own profile, so the same id under
         // another profile is still compared.
@@ -1395,15 +1365,26 @@ mod tests {
             current_store.is_some() && shadow_store == current_store,
             "the same session id under another profile predicts this session's own physical store"
         );
-        peer_storage
-            .update(|instances, _| {
-                *instances = vec![shadow];
-                Ok(())
-            })
-            .unwrap();
+        write_peer(&peer_storage, &shadow);
         assert!(
             !current.managed_capture_store_is_exclusive(backend),
             "a peer that resolves this session's own store cannot prove exclusivity"
+        );
+
+        // The reported case: a second sandboxed Codex session, no execution context,
+        // and its own instance id giving it a store of its own.
+        let mut distinct = tool_instance("codex", "/repos/distinct");
+        distinct.status = Status::Running;
+        distinct.source_profile = "codex-owner-b".into();
+        distinct.sandbox_info = Some(test_sandbox(
+            &format!("test-{}", distinct.id),
+            Some("/workspace/distinct"),
+        ));
+        admit_sandbox_fixture(&distinct);
+        write_peer(&peer_storage, &distinct);
+        assert!(
+            current.managed_capture_store_is_exclusive(backend),
+            "a second sandboxed Codex session owns a distinct physical store"
         );
     }
 
