@@ -1173,22 +1173,26 @@ mod tests {
         inst
     }
 
-    /// Publish a peer row and hand back what the profile walk will load, so no step
-    /// can be green on a roster the walk never saw.
-    fn write_peer(storage: &crate::session::Storage, peer: &Instance) -> Instance {
-        let id = peer.id.clone();
+    /// The profile walk needs the peer's profile to be enumerated and its row to be
+    /// persisted, so publish both and check them before the caller asserts anything.
+    fn write_peer(storage: &crate::session::Storage, peer: &Instance) {
         storage
             .update(|instances, _| {
                 *instances = vec![peer.clone()];
                 Ok(())
             })
             .unwrap();
-        storage
-            .load()
-            .unwrap()
-            .into_iter()
-            .find(|row| row.id == id)
-            .expect("the published peer is the row the profile walk loads")
+        assert!(
+            crate::session::list_profiles()
+                .expect("profile enumeration")
+                .iter()
+                .any(|profile| profile == storage.profile()),
+            "the peer's profile must be enumerated by the walk"
+        );
+        assert!(
+            storage.load().unwrap().iter().any(|row| row.id == peer.id),
+            "the published peer must persist to its profile"
+        );
     }
 
     #[test]
@@ -1304,6 +1308,17 @@ mod tests {
 
         let mut unadmitted = sandboxed_gemini("unadmitted", "/repos/unadmitted", "/workspace/u");
         unadmitted.source_profile = "capture-owner-b".into();
+        // Materialize the predicted store without certifying it, so a missing directory
+        // cannot stand in for the admission check this step names.
+        let predicted_store = unadmitted
+            .sandbox_capture_store_path()
+            .expect("an unadmitted Gemini peer still predicts a private store");
+        std::fs::create_dir_all(&predicted_store).unwrap();
+        assert_ne!(
+            std::fs::canonicalize(&predicted_store).unwrap(),
+            std::fs::canonicalize(&shared_store).unwrap(),
+            "the unadmitted peer's store must exist and differ from ours, or the refusal is not about certification"
+        );
         assert!(
             unadmitted.sandbox_capture_store_dir().is_none(),
             "an unadmitted peer has no private store to compare"
