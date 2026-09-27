@@ -24,7 +24,6 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::mem::MaybeUninit;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
-use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -158,17 +157,18 @@ impl PublishedRuntime {
         if self.retracted {
             return Ok(());
         }
-        self.retracted = true;
-        if !lock(&self.lock, libc::LOCK_EX | libc::LOCK_NB) {
-            // Another process holds the namespace exclusively, so it owns the
-            // artifacts now; retracting would delete a live publication.
-            return Err(PublishError::new(
-                "namespace_locked",
-                "the namespace lock is held exclusively elsewhere",
-            ));
-        }
+        // The artifacts are unlinked under the shared lock this daemon already
+        // holds, not under a fresh exclusive one: every client holds `LOCK_SH`
+        // for its whole exchange, so asking for `LOCK_EX` would fail for the
+        // entire life of any read and strand the three artifacts forever. The
+        // shared lock already excludes a competing publisher, and `retract_locked`
+        // proves ownership per file by comparing the recorded prebind instance
+        // id and re-checking the socket's device and inode.
         let result = self.retract_locked();
         unlock(&self.lock);
+        if result.is_ok() {
+            self.retracted = true;
+        }
         result
     }
 
@@ -377,11 +377,15 @@ async fn connection(state: Arc<AppState>, stream: UnixStream) {
         tracing::warn!(target: "runtime.uds", "refused a local runtime read from another uid");
         return;
     }
+    // One budget for the whole connection, handshake and read alike: two
+    // separate windows would let a peer spend twice the client's own budget by
+    // stalling in the handshake.
+    let deadline = tokio::time::Instant::now() + CONNECTION_BUDGET;
     let config = WebSocketConfig::default()
         .max_message_size(Some(FRAME_LIMIT))
         .max_frame_size(Some(FRAME_LIMIT));
-    let upgraded = tokio::time::timeout(
-        CONNECTION_BUDGET,
+    let upgraded = tokio::time::timeout_at(
+        deadline,
         tokio_tungstenite::accept_async_with_config(stream, Some(config)),
     )
     .await;
@@ -396,12 +400,9 @@ async fn connection(state: Arc<AppState>, stream: UnixStream) {
             return;
         }
     };
-    if tokio::time::timeout(
-        CONNECTION_BUDGET,
-        runtime_ws::serve_runtime_read_uds(socket, state),
-    )
-    .await
-    .is_err()
+    if tokio::time::timeout_at(deadline, runtime_ws::serve_runtime_read_uds(socket, state))
+        .await
+        .is_err()
     {
         tracing::warn!(target: "runtime.uds", "local runtime read exceeded its budget");
     }
@@ -541,8 +542,10 @@ fn directory_entries(dir: RawFd) -> Result<Vec<String>, PublishError> {
         ));
     }
     let scan = unsafe { OwnedFd::from_raw_fd(duplicate) };
-    let entries = unsafe { libc::fdopendir(scan.into_raw_fd()) };
+    let raw = scan.into_raw_fd();
+    let entries = unsafe { libc::fdopendir(raw) };
     if entries.is_null() {
+        unsafe { libc::close(raw) };
         return Err(PublishError::new(
             "namespace_scan",
             std::io::Error::last_os_error().to_string(),
@@ -565,118 +568,44 @@ fn directory_entries(dir: RawFd) -> Result<Vec<String>, PublishError> {
 // Namespace, lock and marker files
 // ---------------------------------------------------------------------------
 
+/// The namespace directory the client admits, as the descriptor that walk ends
+/// on.
+///
+/// The client is the enforcing boundary for which directories a local read may
+/// live in, so the producer runs the client's own walk
+/// (`cli::runtime_read::uds::open_trusted_directory`) rather than a copy of
+/// it: a prefix symlink — a home reached through one — is followed and the
+/// directory it resolves to is verified by descriptor, a symlinked app
+/// directory is a refusal, and every resolved component must satisfy the
+/// ownership, group/other-write, sticky-root and POSIX-ACL rules.
+///
+/// The returned descriptor is the walk's final one, so nothing downstream
+/// re-resolves the app directory by name: the lock, the markers, the socket
+/// and the retraction all address this inode.
 fn open_trusted_app_dir(path: &Path) -> Result<OwnedFd, PublishError> {
-    if !path.is_absolute() || !trusted_chain(path) {
-        return Err(PublishError::new(
-            "app_dir_untrusted",
-            format!("{} is not an owned private directory chain", path.display()),
-        ));
-    }
-    let dir = open_dir(path)?;
-    // Tighten only what the client's admission rejects; never widen.
-    if let Some(stat) = file_stat(dir.as_raw_fd())? {
-        if stat.st_mode & 0o022 != 0
-            && unsafe { libc::fchmod(dir.as_raw_fd(), stat.st_mode & !0o022) } != 0
-        {
-            return Err(PublishError::new(
-                "app_dir_untrusted",
-                std::io::Error::last_os_error().to_string(),
-            ));
-        }
-    }
-    Ok(dir)
-}
-
-/// The same ancestor rule the client's trusted walk applies: every component
-/// must be searchable and owned by root or this uid. A non-final component is
-/// additionally tolerated when it is writable by group or others only if it is
-/// root-owned and sticky, which is what `/tmp` and a test namespace under it
-/// offer.
-fn trusted_chain(path: &Path) -> bool {
-    let euid = unsafe { libc::geteuid() };
-    let components: Vec<CString> = path
-        .components()
-        .skip(1)
-        .map(|component| CString::new(component.as_os_str().as_bytes()))
-        .collect::<Result<_, _>>()
-        .unwrap_or_default();
-    if components.is_empty() {
-        return false;
-    }
-    let Ok(root) = open_dir(Path::new("/")) else {
-        return false;
-    };
-    let mut current = root;
-    for (index, component) in components.iter().enumerate() {
-        let Ok(next) = open_dir_at(current.as_raw_fd(), component) else {
-            return false;
-        };
-        let Ok(Some(stat)) = file_stat(next.as_raw_fd()) else {
-            return false;
-        };
-        let final_component = index + 1 == components.len();
-        let owner_ok = if final_component {
-            stat.st_uid == euid
-        } else {
-            stat.st_uid == 0 || stat.st_uid == euid
-        };
-        if stat.st_mode & libc::S_IFMT != libc::S_IFDIR
-            || stat.st_mode & 0o111 == 0
-            || !owner_ok
-            || !(stat.st_mode & 0o022 == 0 || (!final_component && sticky_root_directory(&stat)))
-        {
-            return false;
-        }
-        current = next;
-    }
-    true
-}
-
-/// A root-owned sticky directory: a stranger may create entries there but
-/// cannot rename or replace an entry somebody else owns, so the walk through
-/// it is no less safe than through a private one.
-fn sticky_root_directory(stat: &libc::stat) -> bool {
-    stat.st_uid == 0 && stat.st_mode & libc::S_ISVTX != 0
-}
-
-fn open_dir(path: &Path) -> Result<OwnedFd, PublishError> {
-    let name = CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+    client_trusted_directory(path).map_err(|_| {
         PublishError::new(
             "app_dir_untrusted",
-            "the app directory path is not representable",
+            format!(
+                "{} is not a directory chain the client admits",
+                path.display()
+            ),
         )
-    })?;
-    let fd = unsafe {
-        libc::open(
-            name.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
-    };
-    owned_fd(fd)
+    })
 }
 
-fn open_dir_at(parent: RawFd, name: &CString) -> std::io::Result<OwnedFd> {
-    let fd = unsafe {
-        libc::openat(
-            parent,
-            name.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
-    };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+/// The client's walk, error collapsed: both of its refusals — an unreadable
+/// chain and one that does not exist — mean the same thing to a producer,
+/// which cannot offer a read the client would refuse.
+#[cfg(target_os = "linux")]
+fn client_trusted_directory(path: &Path) -> Result<OwnedFd, ()> {
+    crate::cli::runtime_read::uds::open_trusted_directory(path, unsafe { libc::geteuid() })
+        .map_err(|_| ())
 }
 
-fn owned_fd(fd: RawFd) -> Result<OwnedFd, PublishError> {
-    if fd < 0 {
-        return Err(PublishError::new(
-            "io",
-            std::io::Error::last_os_error().to_string(),
-        ));
-    }
-    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+#[cfg(not(target_os = "linux"))]
+fn client_trusted_directory(_: &Path) -> Result<OwnedFd, ()> {
+    Err(())
 }
 
 /// Open the namespace lock, creating it 0600 if absent, and reject a lock file

@@ -6,6 +6,8 @@
 
 use std::ffi::CString;
 use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use super::*;
@@ -23,6 +25,13 @@ impl Namespace {
     }
 }
 
+/// Whether the client itself would admit this chain. The tests below ask the
+/// client's walk rather than a second opinion of it: the publisher adopting a
+/// chain the client refuses is exactly the bug they exist to catch.
+fn client_admits(path: &Path) -> bool {
+    crate::cli::runtime_read::uds::open_trusted_directory(path, unsafe { libc::geteuid() }).is_ok()
+}
+
 /// The first base whose whole ancestor chain is private enough for the client's
 /// walk. `None` means this host has no such directory, which is reported rather
 /// than silently passed.
@@ -36,7 +45,7 @@ fn namespace() -> Option<Namespace> {
         candidates.push(home);
     }
     for base in candidates {
-        if !base.is_absolute() || !trusted_chain(&base) {
+        if !client_admits(&base) {
             continue;
         }
         let Ok(base) = tempfile::tempdir_in(&base) else {
@@ -137,7 +146,7 @@ async fn publication_writes_the_pair_the_client_parses() {
     assert!(mode_of(&dir) & 0o022 == 0, "the app dir must stay private");
 
     // A create-then-rename write leaves no temporary name behind.
-    let leftovers: Vec<String> = directory_entries(open_dir(&dir).expect("app dir fd").as_raw_fd())
+    let leftovers: Vec<String> = directory_entries(test_dir_fd(&dir))
         .expect("scan")
         .into_iter()
         .filter(|name| name.contains(".tmp."))
@@ -368,13 +377,13 @@ fn the_publisher_only_publishes_into_a_trusted_chain() {
     let Some(namespace) = namespace_or_skip() else {
         return;
     };
-    assert!(trusted_chain(&app_dir(&namespace)));
+    assert!(client_admits(&app_dir(&namespace)));
 
     let widened = namespace.base.path().join("widened");
     std::fs::create_dir(&widened).expect("widened");
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&widened, std::fs::Permissions::from_mode(0o770)).expect("widen");
-    assert!(!trusted_chain(&widened));
+    assert!(!client_admits(&widened));
     assert_eq!(
         open_trusted_app_dir(&widened)
             .err()
@@ -384,10 +393,184 @@ fn the_publisher_only_publishes_into_a_trusted_chain() {
     );
 }
 
+/// A home reached through a symlink is the ordinary case on macOS and a real
+/// one on Linux, and it is the case the walk is written for: the prefix symlink
+/// is followed, the directory it resolves to is verified by descriptor, and the
+/// descriptor the publisher keeps is that directory — not a second resolution
+/// of the path by name, which is the only way a swapped directory could be
+/// published into after the chain was validated.
+#[test]
+#[serial_test::serial]
+fn a_symlinked_prefix_resolves_to_the_directory_it_verified() {
+    let Some(namespace) = namespace_or_skip() else {
+        return;
+    };
+    let real = namespace.base.path().join("real");
+    let app = real.join(crate::session::APP_DIR_NAME_XDG);
+    std::fs::create_dir_all(&app).expect("app dir under the real prefix");
+    let link = namespace.base.path().join("link");
+    std::os::unix::fs::symlink(&real, &link).expect("prefix symlink");
+
+    let through_the_link = link.join(crate::session::APP_DIR_NAME_XDG);
+    let dir = open_trusted_app_dir(&through_the_link).expect("a symlinked prefix is followed");
+    let expected = std::fs::symlink_metadata(&through_the_link).expect("the resolved directory");
+    let stat = std::fs::metadata(format!("/proc/self/fd/{}", dir.as_raw_fd())).expect("fd stat");
+    assert_eq!(
+        (stat.dev(), stat.ino()),
+        (expected.dev(), expected.ino()),
+        "the returned descriptor must be the directory the walk verified"
+    );
+}
+
+/// The producer applies the client's POSIX-ACL rule, so it cannot publish into a
+/// namespace the client would refuse. An ACL naming a user who may write is
+/// refused wherever in the chain it is found.
+#[test]
+#[serial_test::serial]
+fn a_named_user_write_acl_is_refused_on_an_intermediate_component() {
+    let Some(namespace) = namespace_or_skip() else {
+        return;
+    };
+    let intermediate = namespace.base.path().join("intermediate");
+    let app = intermediate.join(crate::session::APP_DIR_NAME_XDG);
+    std::fs::create_dir_all(&app).expect("app dir under the intermediate prefix");
+    assert!(
+        client_admits(&app),
+        "the chain is admitted before the ACL lands"
+    );
+
+    let other = unsafe { libc::geteuid() }.wrapping_add(1);
+    if !set_named_user_write_acl(&intermediate, other) {
+        // A filesystem without POSIX ACL support cannot be given one, so there
+        // is nothing to assert here. Skipping is the same call `namespace_or_skip`
+        // makes for a chain this host will not admit.
+        return;
+    }
+
+    assert_eq!(
+        open_trusted_app_dir(&app).err().map(|error| error.code()),
+        Some("app_dir_untrusted"),
+        "a named-user write ACL is refused wherever it appears in the chain"
+    );
+}
+
+/// A symlinked *final* component would let the app directory itself be swapped
+/// for an attacker-chosen inode, so it stays a refusal even though a symlinked
+/// prefix is followed.
+#[test]
+#[serial_test::serial]
+fn a_symlinked_final_component_is_still_refused() {
+    let Some(namespace) = namespace_or_skip() else {
+        return;
+    };
+    let real = namespace.base.path().join("real");
+    std::fs::create_dir_all(&real).expect("real dir");
+    let link = namespace.base.path().join(crate::session::APP_DIR_NAME_XDG);
+    std::os::unix::fs::symlink(&real, &link).expect("final symlink");
+    assert_eq!(
+        open_trusted_app_dir(&link).err().map(|error| error.code()),
+        Some("app_dir_untrusted"),
+        "a symlinked app directory is never adopted"
+    );
+}
+
+/// Following a prefix symlink does not relax the checks on what it resolves to:
+/// a link into a world-writable directory is refused on the resolved directory's
+/// own attributes.
+#[test]
+#[serial_test::serial]
+fn a_symlinked_prefix_to_a_world_writable_directory_is_refused() {
+    let Some(namespace) = namespace_or_skip() else {
+        return;
+    };
+    let open_dir = namespace.base.path().join("open");
+    std::fs::create_dir_all(&open_dir).expect("open dir");
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&open_dir, std::fs::Permissions::from_mode(0o777)).expect("widen");
+    let link = namespace.base.path().join("elsewhere");
+    std::os::unix::fs::symlink(&open_dir, &link).expect("prefix symlink");
+
+    assert_eq!(
+        open_trusted_app_dir(&link).err().map(|error| error.code()),
+        Some("app_dir_untrusted"),
+        "the resolved directory is judged on its own attributes"
+    );
+}
+
+/// `system.posix_acl_access` in the text spelling the kernel writes, with one
+/// named user holding the write bit. Returns whether the filesystem took it:
+/// a kernel or filesystem without POSIX ACL support refuses, and the caller
+/// skips rather than asserting a chain this host cannot build.
+fn set_named_user_write_acl(dir: &Path, uid: u32) -> bool {
+    let value = format!("u::rw-,g::r--,o::r--,u:{uid}:rwx");
+    let path = std::ffi::CString::new(dir.as_os_str().as_bytes()).expect("path");
+    let name = std::ffi::CString::new("system.posix_acl_access").expect("name");
+    unsafe {
+        libc::setxattr(
+            path.as_ptr(),
+            name.as_ptr(),
+            value.as_ptr().cast(),
+            value.len(),
+            0,
+        ) == 0
+    }
+}
+
+/// A shutdown that happens while a client holds the namespace shared for its
+/// whole exchange still retracts. Asking for an exclusive lock to do it — which
+/// is what the old code did — could only ever fail while that client was
+/// reading, so the three artifacts were stranded for as long as the daemon took
+/// to notice.
+#[tokio::test]
+#[serial_test::serial]
+async fn retraction_succeeds_while_a_client_holds_the_namespace() {
+    let Some(namespace) = namespace_or_skip() else {
+        return;
+    };
+    let dir = app_dir(&namespace);
+    let mut published = publish().expect("the namespace is free");
+    let client = open_client_lock(&dir);
+    assert!(lock_shared(&client), "a client must be able to lock");
+
+    published
+        .retract()
+        .expect("retraction under a held shared lock");
+    for name in [PREBIND_FILE, POSTBIND_FILE, SOCKET_FILE] {
+        assert!(
+            !dir.join(name).exists(),
+            "{} must be gone after retraction",
+            name
+        );
+    }
+    unlock(&client);
+}
+
+/// A directory descriptor for a test that wants to scan a namespace, opened the
+/// way any other code would now: by descriptor, not by a name the walk rejects.
+fn test_dir_fd(dir: &Path) -> RawFd {
+    let path = std::ffi::CString::new(dir.as_os_str().as_bytes()).expect("path");
+    let fd = unsafe {
+        libc::open(
+            path.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    assert!(fd >= 0, "the directory opens");
+    fd
+}
+
 /// How a client opens the lock file: a second descriptor on the same inode.
 fn open_client_lock(dir: &Path) -> File {
     let name = CString::new(LOCK_FILE).expect("constant");
-    let parent = open_dir(dir).expect("app dir fd");
+    let path = std::ffi::CString::new(dir.as_os_str().as_bytes()).expect("app dir path");
+    // A client resolves the namespace by name and opens the lock inside it.
+    let parent = unsafe {
+        OwnedFd::from_raw_fd(libc::open(
+            path.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        ))
+    };
+    assert!(parent.as_raw_fd() >= 0, "the app dir opens");
     let fd = unsafe {
         libc::openat(
             parent.as_raw_fd(),
