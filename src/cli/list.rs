@@ -539,31 +539,44 @@ mod tests {
     }
 
     #[test]
-    fn session_json_reports_state_and_only_the_timestamps_that_apply() {
-        let plain = Instance::new("z", "/repo");
-        assert_eq!(state_tag(&plain), "live");
-        let json = session_json(&plain, "p");
-        assert_eq!(json.state, "live");
-        let serialized = serde_json::to_string(&json).unwrap();
-        assert!(!serialized.contains("trashed_at"));
-        assert!(!serialized.contains("archived_at"));
-        assert!(serialized.contains("\"state\":\"live\""));
+    fn state_tag_covers_the_three_states() {
+        let live = Instance::new("live", "/repo");
+        assert_eq!(state_tag(&live), "live");
 
-        let mut archived = Instance::new("z", "/repo");
+        let mut archived = Instance::new("archived", "/repo");
         archived.archive();
         assert_eq!(state_tag(&archived), "archived");
-        let json = session_json(&archived, "p");
-        assert_eq!(json.state, "archived");
-        assert!(json.archived_at.is_some());
-        assert!(json.trashed_at.is_none());
 
-        let mut trashed = Instance::new("z", "/repo");
+        let mut trashed = Instance::new("trashed", "/repo");
         trashed.trash();
         assert_eq!(state_tag(&trashed), "trashed");
-        let json = session_json(&trashed, "p");
+    }
+
+    /// #3350: the whole point of the JSON change. A consumer keying on
+    /// state needs the `state` string AND the timestamp to distinguish
+    /// a trashed session from a genuinely failed one without a second
+    /// `aoe session list-trash` shellout.
+    #[test]
+    fn session_json_exposes_state_and_trashed_at_for_a_trashed_row() {
+        let mut inst = Instance::new("z", "/repo");
+        inst.trash();
+        let json = session_json(&inst, "p");
         assert_eq!(json.state, "trashed");
         assert!(json.trashed_at.is_some());
         assert!(json.archived_at.is_none());
+    }
+
+    /// Companion for the follow-up comment on #3350: archived sessions
+    /// need the same treatment. The two states are semantically distinct
+    /// and both must be observable from a single `aoe list --json` call.
+    #[test]
+    fn session_json_exposes_state_and_archived_at_for_an_archived_row() {
+        let mut inst = Instance::new("z", "/repo");
+        inst.archive();
+        let json = session_json(&inst, "p");
+        assert_eq!(json.state, "archived");
+        assert!(json.archived_at.is_some());
+        assert!(json.trashed_at.is_none());
     }
 
     /// An unreadable profile must surface, not vanish: a silent skip makes a
@@ -593,6 +606,23 @@ mod tests {
                 .contains("incomplete"),
             "an incomplete listing must not exit zero"
         );
+    }
+
+    /// The default `state = "live"` and both timestamp fields being
+    /// `None` must not serialize any of the state-tracking keys as
+    /// `null`: consumers depending on `serde_if_none` semantics see no
+    /// difference from the pre-#3350 output. The `state` field is a
+    /// small addition and always serialized, so a v1.14.1 consumer that
+    /// parses JSON strictly will see one new key.
+    #[test]
+    fn session_json_omits_absent_timestamps_and_keeps_state_alive() {
+        let inst = Instance::new("z", "/repo");
+        let json = session_json(&inst, "p");
+        assert_eq!(json.state, "live");
+        let serialized = serde_json::to_string(&json).unwrap();
+        assert!(!serialized.contains("trashed_at"));
+        assert!(!serialized.contains("archived_at"));
+        assert!(serialized.contains("\"state\":\"live\""));
     }
 
     /// #3415: snooze and pin complete the four-timestamp state set the API
