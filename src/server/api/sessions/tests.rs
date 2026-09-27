@@ -1002,6 +1002,30 @@ fn fork_from_an_unattributed_row_wins_over_a_bare_row_in_either_order() {
 
 /// Resolution reads a qualified row first whatever the load order, so the one
 /// unqualified row sharing its id cannot steal the seed.
+/// A row whose native identity cannot be resolved names no conversation a fork
+/// could name, so the election drops it: the id is present and its binding
+/// names the conversation, yet nothing can be forked from that row.
+#[test]
+fn fork_from_a_parent_whose_agent_cannot_be_resolved_is_dropped() {
+    use crate::session::ConversationProvenance;
+    let row = parent_row_with_id(
+        "wrapper",
+        "wrapper",
+        Some(unqualified_parent_binding(ConversationProvenance::Unknown)),
+    );
+    let mut row = row;
+    row.tool = "claude".into();
+    row.command = "ssh -t host claude".into();
+    assert!(
+        row.fork_parent_ref().is_err(),
+        "a wrapper with no execution contract resolves to no agent"
+    );
+    assert_eq!(
+        resolve_create_fork_seed("parent-uuid", false, &[row]),
+        Err((crate::session::ForkDenied::NoParentSession, None))
+    );
+}
+
 #[test]
 fn fork_from_rows_carrying_one_id_resolves_the_qualified_row_in_either_order() {
     let qualified = qualified_parent_binding();

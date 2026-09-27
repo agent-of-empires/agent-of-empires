@@ -280,7 +280,10 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         if !user_chose_tool {
             resolved_tool = source.tool.clone();
         }
-        let parent_ref = source.fork_parent_ref()?;
+        // One rule on both surfaces: a row whose native identity cannot be
+        // resolved names no conversation a fork could carry, so it is not a
+        // candidate here either, exactly as the REST election drops it.
+        let parent_ref = source.fork_parent_ref().unwrap_or(None);
         let seed = crate::session::fork::terminal_fork_seed(
             parent_ref,
             crate::session::capture::generate_session_uuid(),
@@ -1440,6 +1443,54 @@ mod tests {
         /// `add` builds the fork child itself rather than through the session
         /// builder, so it needs its own identity comparison: a child asked for
         /// under another agent must not fork a conversation it cannot resume.
+        /// A wrapper with no execution contract resolves to no agent, so the
+        /// row names no conversation a fork could carry and is not a candidate.
+        /// The REST election drops it; the CLI has to refuse it the same way
+        /// rather than propagating the resolution error the other surface hides.
+        #[tokio::test]
+        #[serial]
+        async fn add_refuses_an_unresolvable_parent_the_way_rest_drops_it() {
+            let _guard = crate::session::test_support::isolate_app_dir();
+            let project = tempfile::tempdir().unwrap();
+            let parent_id = "unresolvable-parent-uuid";
+            crate::session::Storage::new_unwatched("real")
+                .unwrap()
+                .update(|rows, _| {
+                    let mut parent =
+                        crate::session::Instance::new("parent", project.path().to_str().unwrap());
+                    parent.id = parent_id.to_string();
+                    parent.tool = "claude".into();
+                    parent.command = "ssh -t host claude".into();
+                    parent.agent_session_id = Some("legacy-conversation-uuid".into());
+                    parent.agent_session_binding = Some(
+                        crate::session::ConversationBinding::unknown("legacy-conversation-uuid"),
+                    );
+                    *rows = vec![parent];
+                    Ok(())
+                })
+                .unwrap();
+
+            let (profile, args) = dispatch_argv(&[
+                "aoe",
+                "add",
+                project.path().to_str().unwrap(),
+                "--fork-from",
+                parent_id,
+                "-p",
+                "real",
+            ]);
+            let msg = super::super::run(&profile, args)
+                .await
+                .expect_err("a parent whose agent cannot be resolved is not a candidate")
+                .to_string();
+            assert_eq!(
+                msg,
+                crate::session::ForkDenied::NoParentSession
+                    .user_message("parent", parent_id, "real"),
+                "the CLI and the REST election must refuse the row the same way"
+            );
+        }
+
         #[tokio::test]
         #[serial]
         async fn add_refuses_a_fork_child_under_another_agent() {
