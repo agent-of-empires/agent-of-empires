@@ -819,12 +819,6 @@ impl SessionPoller {
     }
 }
 
-impl Default for SessionPoller {
-    fn default() -> Self {
-        Self::new("default".to_string(), None)
-    }
-}
-
 /// Test-only budget isolation.
 #[cfg(test)]
 pub(crate) mod test_support {

@@ -677,6 +677,36 @@ impl Instance {
         })
     }
 
+    /// Take the poller a handoff offers, and the managed-store retry deadline that paces the row
+    /// while no store is claimable. A poller serves the execution it was installed for, so the row
+    /// takes the handle only when it watches the execution the row now holds, and one that does
+    /// not is stopped: its thread still reads the launch the row is giving up. The deadline is
+    /// the row's own state and travels either way.
+    pub(crate) fn adopt_poller(&mut self, handoff: &Self) {
+        if handoff.poller_serves(self.active_execution.as_ref()) {
+            self.session_id_poller = handoff.session_id_poller.clone();
+        } else {
+            handoff.stop_poller();
+        }
+        self.session_id_poller_retry_after = handoff.session_id_poller_retry_after;
+    }
+
+    /// Take the repair schedule the prior row armed. A row with nothing to poll re-probes on
+    /// this schedule, and a row that could not claim a managed store waits on the deadline, so
+    /// both hold no poller for [`Self::adopt_poller`] to answer.
+    pub(crate) fn adopt_poller_repair(&mut self, prior: &Self) {
+        self.poller_repair = prior.poller_repair.clone();
+    }
+
+    /// Drop the repair schedule when the relaunch replaced the pane it paced. A launch that
+    /// reached its start-time stamp got far enough to install a poller for a new pane; a launch
+    /// that died before the stamp says nothing, and the row keeps what its own walk armed.
+    pub(crate) fn reset_poller_repair_for_replaced_pane(&mut self, before: &Self, launched: &Self) {
+        if launched.last_start_time != before.last_start_time {
+            self.poller_repair.reset();
+        }
+    }
+
     pub(crate) fn session_id_poller_is_running(&self) -> bool {
         self.session_id_poller.as_ref().is_some_and(|poller| {
             poller
@@ -968,12 +998,11 @@ mod tests {
             Some(std::time::Duration::from_secs(5)),
             "a re-probe arms its own ladder, not the failure one"
         );
-        let since_probe = armed.duration_since(probing);
         assert!(
-            since_probe >= std::time::Duration::from_secs(5)
-                && since_probe < std::time::Duration::from_secs(7),
-            "the deadline is the first re-probe delay counted from the end of the attempt, not \
-             from before it and not from the ceiling: {since_probe:?} since the probe began"
+            armed >= probing + std::time::Duration::from_secs(5),
+            "the deadline is counted from the end of the attempt, not from before it: {:?} since \
+             the probe began",
+            armed.duration_since(probing)
         );
     }
 

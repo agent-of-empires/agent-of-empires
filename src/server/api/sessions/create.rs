@@ -1078,19 +1078,8 @@ pub(super) fn apply_post_restart_identity_sync(
             live.adopt_active_execution(started);
         }
     }
-    // A poller serves the execution it was installed for, so the row takes the launch's only when
-    // that poller watches the execution the row has just taken on.
-    if started.poller_serves(live.active_execution.as_ref()) {
-        live.session_id_poller = started.session_id_poller.clone();
-        live.session_id_poller_retry_after = started.session_id_poller_retry_after;
-    } else {
-        started.stop_poller();
-    }
-    // Same signal as `merge_post_restart_with_baseline`: a new start time means the relaunch
-    // replaced the pane this schedule paced.
-    if started.last_start_time != before.last_start_time {
-        live.poller_repair.reset();
-    }
+    live.adopt_poller(started);
+    live.reset_poller_repair_for_replaced_pane(before, started);
     if generation_can_merge && marker_unchanged && live.agent_session_id == started.agent_session_id
     {
         live.resume_probe_failed_sid = started.resume_probe_failed_sid.clone();

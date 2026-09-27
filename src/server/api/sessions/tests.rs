@@ -1799,19 +1799,6 @@ fn apply_post_restart_identity_sync_clears_the_live_poller_schedule() {
         "the re-probe schedule is not carried across the relaunch that replaced the poller"
     );
 
-    // A relaunch that died before the launch stamp says nothing about the schedule.
-    let mut died_early = started.clone();
-    died_early.last_start_time = before.last_start_time;
-    let mut live = before.clone();
-    live.poller_repair.reprobe(now);
-    live.poller_repair.reprobe(now);
-    apply_post_restart_identity_sync(&mut live, &before, &died_early);
-    assert_eq!(
-        live.poller_repair.current_reprobe_delay(),
-        Some(std::time::Duration::from_secs(10)),
-        "an unstamped relaunch leaves the live row's own schedule alone"
-    );
-
     restarted_poller
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())

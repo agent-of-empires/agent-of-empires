@@ -54,13 +54,8 @@ pub(super) fn load_all_instances(
 /// Carry over the in-memory-only fields from the prior `state.instances` entry into the
 /// freshly-loaded one.
 pub(super) fn merge_runtime_fields(prior: Instance, mut fresh: Instance) -> Instance {
-    if prior.poller_serves(fresh.active_execution.as_ref()) {
-        fresh.session_id_poller = prior.session_id_poller;
-        fresh.poller_repair = prior.poller_repair;
-        fresh.session_id_poller_retry_after = prior.session_id_poller_retry_after;
-    } else {
-        prior.stop_poller();
-    }
+    fresh.adopt_poller(&prior);
+    fresh.adopt_poller_repair(&prior);
     fresh.last_error_check = prior.last_error_check;
     fresh.last_start_time = prior.last_start_time;
     if fresh.status == Status::Error {
@@ -836,6 +831,38 @@ mod tests {
             assert_eq!(
                 stored.agent_session_binding.unwrap().provenance,
                 ConversationProvenance::Observed
+            );
+        }
+    }
+
+    #[test]
+    fn a_reload_keeps_the_repair_schedule_of_a_row_that_holds_no_poller() {
+        let now = std::time::Instant::now();
+        let mut mergers: Vec<fn(Instance, Instance) -> Instance> = vec![merge_runtime_fields];
+        mergers.push(|prior, mut fresh| {
+            fresh.merge_runtime_from_reload(&prior);
+            fresh
+        });
+        for merge in mergers {
+            // What the repair walk leaves behind: a re-probe ladder on a row with no poller, and a
+            // store-retry deadline on a row that could not claim its capture store.
+            let mut prior = Instance::new("poller-less", "/tmp/poller-less");
+            prior.poller_repair.reprobe(now);
+            let deadline = now + std::time::Duration::from_secs(30);
+            prior.session_id_poller_retry_after = Some(deadline);
+            assert!(prior.session_id_poller.is_none());
+
+            let merged = merge(prior, Instance::new("poller-less", "/tmp/poller-less"));
+
+            assert_eq!(
+                merged.poller_repair.current_reprobe_delay(),
+                Some(std::time::Duration::from_secs(5)),
+                "the re-probe ladder survives a reload, or the row re-resolves every tick"
+            );
+            assert_eq!(
+                merged.session_id_poller_retry_after,
+                Some(deadline),
+                "and so does the managed-store retry deadline"
             );
         }
     }
