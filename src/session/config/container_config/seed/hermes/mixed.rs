@@ -327,6 +327,90 @@ pub(super) fn usage_controls(value: &Value, retained: &HashSet<String>, created_
     Value::Object(projected)
 }
 
+pub(in super::super) fn seed_skill_controls(
+    boundary: &NativeStateBoundary,
+    scope: usize,
+    source: &guard::SourceRoot,
+    destination: &AnchoredDir,
+    retained: &HashSet<String>,
+) -> Result<()> {
+    let created_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, false);
+    for (relative, marker) in [
+        ("skills/.usage.json", state::SKILLS_USAGE_MARKER),
+        ("skills/.curator_state", state::SKILLS_CURATOR_MARKER),
+    ] {
+        let relative = Path::new(relative);
+        let local = optional_child(destination, Path::new("skills"))?;
+        let leaf = Path::new(relative.file_name().context("skill metadata has no name")?);
+        if let Some(local) = &local {
+            if local.regular_lookup(leaf)?.is_some() {
+                continue;
+            }
+        }
+        let lookup = source.path().join(relative);
+        let canonical = match fs::canonicalize(&lookup) {
+            Ok(path) => path,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                tracing::warn!(target: "session.profile", path = %lookup.display(), %error,
+                    "Skipping unreadable configuration source");
+                continue;
+            }
+        };
+        let leaves = [canonical];
+        let access = ReadAccess {
+            root: Some(source),
+            exception: Exception::Mixed {
+                origin: StateOrigin::Hermes { scope, marker },
+                leaves: &leaves,
+            },
+        };
+        let Some(canonical) = canonical_source(&lookup, boundary, false, access)? else {
+            continue;
+        };
+        let Some(mut file) = open_canonical_file(&canonical, access)? else {
+            continue;
+        };
+        let mut guard = guard::ReadGuard::new(boundary, access)?;
+        guard.record_route(&lookup, &canonical)?;
+        if !guard.record_file(&canonical, &file)? {
+            continue;
+        }
+
+        let value: Value = match serde_json::from_reader(&mut file) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        let value = if marker == state::SKILLS_USAGE_MARKER {
+            usage_controls(&value, retained, &created_at)
+        } else {
+            let Some(paused) = value.get("paused").and_then(Value::as_bool) else {
+                continue;
+            };
+            serde_json::json!({ "paused": paused })
+        };
+        if value.as_object().is_none_or(Map::is_empty) {
+            continue;
+        }
+        let local = match local {
+            Some(local) => local,
+            None => destination.create_child(Path::new("skills"))?,
+        };
+        let bytes = serde_json::to_vec_pretty(&value)?;
+        let validate = || guard.validate();
+        local.publish_file(
+            leaf,
+            &mut bytes.as_slice(),
+            Permissions::from_mode(0o600),
+            false,
+            Some(FilePublication {
+                staging: &boundary.private_stage.anchor,
+                validate: &validate,
+            }),
+        )?;
+    }
+    Ok(())
+}
 #[cfg(test)]
 mod tests {
     use super::super::super::super::AGENT_CONFIG_MOUNTS;
@@ -851,6 +935,34 @@ mod tests {
     }
 
     #[test]
+    fn unreadable_skill_control_does_not_skip_the_next_marker() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("source");
+        fs::create_dir_all(source.join("skills")).unwrap();
+        symlink(".usage.json", source.join("skills/.usage.json")).unwrap();
+        fs::write(source.join("skills/.curator_state"), br#"{"paused":true}"#).unwrap();
+        let destination = temporary.path().join("active");
+        let boundary = boundary(&source, &destination);
+
+        seed_skill_controls(
+            &boundary,
+            boundary.hermes.source.unwrap(),
+            &boundary.source_root,
+            &AnchoredDir::open(&destination).unwrap(),
+            &HashSet::new(),
+        )
+        .unwrap();
+
+        assert!(!destination.join("skills/.usage.json").exists());
+        assert_eq!(
+            serde_json::from_slice::<Value>(
+                &fs::read(destination.join("skills/.curator_state")).unwrap()
+            )
+            .unwrap(),
+            serde_json::json!({ "paused": true })
+        );
+    }
+    #[test]
     fn skill_controls_drop_activity_and_orphan_names_and_do_not_waive_atomic_remnants() {
         let temporary = tempfile::tempdir().unwrap();
         let source = temporary.path().join("source");
@@ -927,85 +1039,4 @@ mod tests {
             serde_json::json!({ "paused": true })
         );
     }
-}
-
-pub(in super::super) fn seed_skill_controls(
-    boundary: &NativeStateBoundary,
-    scope: usize,
-    source: &guard::SourceRoot,
-    destination: &AnchoredDir,
-    retained: &HashSet<String>,
-) -> Result<()> {
-    let created_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, false);
-    for (relative, marker) in [
-        ("skills/.usage.json", state::SKILLS_USAGE_MARKER),
-        ("skills/.curator_state", state::SKILLS_CURATOR_MARKER),
-    ] {
-        let relative = Path::new(relative);
-        let local = optional_child(destination, Path::new("skills"))?;
-        let leaf = Path::new(relative.file_name().context("skill metadata has no name")?);
-        if let Some(local) = &local {
-            if local.regular_lookup(leaf)?.is_some() {
-                continue;
-            }
-        }
-        let lookup = source.path().join(relative);
-        let canonical = match fs::canonicalize(&lookup) {
-            Ok(path) => path,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(error).context("resolving native skill controls"),
-        };
-        let leaves = [canonical];
-        let access = ReadAccess {
-            root: Some(source),
-            exception: Exception::Mixed {
-                origin: StateOrigin::Hermes { scope, marker },
-                leaves: &leaves,
-            },
-        };
-        let Some(canonical) = canonical_source(&lookup, boundary, false, access)? else {
-            continue;
-        };
-        let Some(mut file) = open_canonical_file(&canonical, access)? else {
-            continue;
-        };
-        let mut guard = guard::ReadGuard::new(boundary, access)?;
-        guard.record_route(&lookup, &canonical)?;
-        if !guard.record_file(&canonical, &file)? {
-            continue;
-        }
-
-        let value: Value = match serde_json::from_reader(&mut file) {
-            Ok(value) => value,
-            Err(_) => continue,
-        };
-        let value = if marker == state::SKILLS_USAGE_MARKER {
-            usage_controls(&value, retained, &created_at)
-        } else {
-            let Some(paused) = value.get("paused").and_then(Value::as_bool) else {
-                continue;
-            };
-            serde_json::json!({ "paused": paused })
-        };
-        if value.as_object().is_none_or(Map::is_empty) {
-            continue;
-        }
-        let local = match local {
-            Some(local) => local,
-            None => destination.create_child(Path::new("skills"))?,
-        };
-        let bytes = serde_json::to_vec_pretty(&value)?;
-        let validate = || guard.validate();
-        local.publish_file(
-            leaf,
-            &mut bytes.as_slice(),
-            Permissions::from_mode(0o600),
-            false,
-            Some(FilePublication {
-                staging: &boundary.private_stage.anchor,
-                validate: &validate,
-            }),
-        )?;
-    }
-    Ok(())
 }

@@ -17,7 +17,6 @@ use agent_of_empires::acp::approvals::{ApprovalDecision, ApprovalOption};
 use agent_of_empires::acp::state::{AcpSessionId, Event};
 
 use crate::common::{shim_path, shim_ready};
-
 /// Permission round-trip: shim asks for permission, structured view resolves
 /// allow, agent observes the selected option_id and reports back.
 #[tokio::test]
@@ -61,6 +60,7 @@ async fn shim_agent_round_trips_approval_allow() {
         source_profile: None,
         mcp_servers: Vec::new(),
         claude_store_pin: None,
+        base_host_environment: vec![],
     };
 
     let mut client = AcpClient::spawn(config, AcpSessionId("approve".into()))
@@ -174,6 +174,7 @@ async fn shim_agent_round_trips_a_question_option_list() {
         source_profile: None,
         mcp_servers: Vec::new(),
         claude_store_pin: None,
+        base_host_environment: vec![],
     };
 
     let mut client = AcpClient::spawn(config, AcpSessionId("choice".into()))
@@ -283,6 +284,7 @@ async fn shim_agent_sees_a_dismissed_question_as_cancelled() {
         source_profile: None,
         mcp_servers: Vec::new(),
         claude_store_pin: None,
+        base_host_environment: vec![],
     };
 
     let mut client = AcpClient::spawn(config, AcpSessionId("dismiss".into()))
@@ -370,6 +372,7 @@ async fn shim_agent_round_trips_fs() {
         source_profile: None,
         mcp_servers: Vec::new(),
         claude_store_pin: None,
+        base_host_environment: vec![],
     };
 
     let mut client = AcpClient::spawn(config, AcpSessionId("fs".into()))
@@ -457,6 +460,7 @@ async fn shim_agent_round_trips_terminal() {
         source_profile: None,
         mcp_servers: Vec::new(),
         claude_store_pin: None,
+        base_host_environment: vec![],
     };
 
     let mut client = AcpClient::spawn(config, AcpSessionId("term".into()))
@@ -556,6 +560,7 @@ async fn shim_agent_set_mode_emits_current_mode_changed() {
         source_profile: None,
         mcp_servers: Vec::new(),
         claude_store_pin: None,
+        base_host_environment: vec![],
     };
 
     let mut client = AcpClient::spawn(config, AcpSessionId("set-mode".into()))
@@ -639,6 +644,7 @@ async fn shim_agent_emits_rate_limit_event() {
         source_profile: None,
         mcp_servers: Vec::new(),
         claude_store_pin: None,
+        base_host_environment: vec![],
     };
 
     let mut client = AcpClient::spawn(config, AcpSessionId("rl".into()))

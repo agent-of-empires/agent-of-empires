@@ -611,7 +611,7 @@ impl Instance {
             let mut observation =
                 crate::session::poller::SessionIdObservation::instance_sidecar(poll_fn()?, None);
             if let Some(active) = &active {
-                observation.source = Some(active.binding.clone());
+                observation.scope_to(active.binding.clone());
                 observation.execution = Some(active.clone());
             }
             Some(observation)
@@ -1388,7 +1388,7 @@ mod tests {
                     agent: "gemini".into(),
                     stores: vec![store.to_path_buf()],
                     configuration: Vec::new(),
-                    exported_default_store: false,
+                    exported_default_store: None,
                     cwd: "/workspace".into(),
                     cwd_filesystem: "host".into(),
                     filesystem: "host".into(),

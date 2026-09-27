@@ -275,7 +275,9 @@ impl Instance {
             &self.resolve_file_watch(),
         ) {
             SidWrite::Applied => self.apply_conversation_observation(&observation),
-            SidWrite::Skipped | SidWrite::PinnedForeign => self.reconcile_from_disk(),
+            SidWrite::Skipped | SidWrite::OwnershipConflict | SidWrite::PinnedForeign => {
+                self.reconcile_from_disk();
+            }
             SidWrite::Failed => {}
         }
     }
@@ -303,21 +305,22 @@ impl Instance {
         pi_transcript_names(path, &observation.sid)
             && self.agent_session_id.as_deref() == Some(observation.sid.as_str())
             && self.active_execution.as_ref() == observation.execution.as_ref()
-            && self
-                .agent_session_binding
-                .as_ref()
-                .map_or(observation.source.is_none(), |binding| {
+            && self.agent_session_binding.as_ref().map_or(
+                observation.source().is_none(),
+                |binding| {
                     binding.session_id == observation.sid
-                        && binding.execution.as_ref() == observation.source.as_ref()
-                })
-            && !self.is_capture_excluded(&observation.sid, observation.source.as_ref())
+                        && binding.execution.as_ref() == observation.source()
+                },
+            )
+            && !self.is_capture_excluded(&observation.sid, observation.source())
             && match &self.resume_intent {
                 ResumeIntent::Fork { .. } | ResumeIntent::Cleared => false,
                 ResumeIntent::Use(pinned) => {
                     pinned == &observation.sid
-                        && self.resume_binding.as_ref().is_none_or(|target| {
-                            target.execution.as_ref() == observation.source.as_ref()
-                        })
+                        && self
+                            .resume_binding
+                            .as_ref()
+                            .is_none_or(|target| target.execution.as_ref() == observation.source())
                 }
                 ResumeIntent::Default => true,
             }

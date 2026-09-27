@@ -337,6 +337,21 @@ function QuestionField({
           disabled={disabled}
           onChange={(e) => onSetSingle(e.target.value)}
         />
+      ) : question.kind === "free_text" && !question.format ? (
+        <textarea
+          className={`${inputClass} resize-y`}
+          rows={3}
+          placeholder="Type your answer"
+          value={single}
+          maxLength={question.max_length ?? undefined}
+          disabled={disabled}
+          onChange={(e) => onSetSingle(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key !== "Enter" || e.shiftKey || e.nativeEvent.isComposing) return;
+            e.preventDefault();
+            e.currentTarget.form?.requestSubmit();
+          }}
+        />
       ) : question.kind === "free_text" ? (
         <input
           type={inputTypeFor(question.format)}
