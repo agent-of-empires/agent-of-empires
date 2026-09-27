@@ -312,6 +312,7 @@ impl HomeView {
                     .applied
                     .iter()
                     .chain(outcome.rolled_back.iter())
+                    .chain(outcome.lifecycle_advanced.iter())
                     .map(String::as_str)
                     .collect();
                 for inst in snapshot
@@ -320,10 +321,11 @@ impl HomeView {
                 {
                     self.instances.insert(inst.id.clone(), inst);
                 }
-                changed = !outcome.applied.is_empty() || !outcome.rolled_back.is_empty();
+                changed = !outcome.applied.is_empty()
+                    || !outcome.rolled_back.is_empty()
+                    || !outcome.lifecycle_advanced.is_empty();
             }
         }
-
         changed
     }
 

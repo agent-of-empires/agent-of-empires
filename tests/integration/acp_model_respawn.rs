@@ -59,6 +59,7 @@ fn spawn_config(
         source_profile: None,
         mcp_servers: Vec::new(),
         claude_store_pin: None,
+        base_host_environment: vec![],
     }
 }
 

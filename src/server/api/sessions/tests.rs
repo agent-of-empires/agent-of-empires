@@ -2596,7 +2596,7 @@ fn fork_seed_and_structured_fork_guard_agree_per_agent() {
                 agent: "claude".into(),
                 stores: vec!["/tmp/claude-store".into()],
                 configuration: Vec::new(),
-                exported_default_store: false,
+                exported_default_store: None,
                 cwd: "/tmp".into(),
                 cwd_filesystem: "host".into(),
                 filesystem: "host".into(),
@@ -2765,7 +2765,9 @@ fn fork_from_rejects_ambiguous_parent_session_id() {
             agent: "claude".into(),
             stores: vec!["/tmp/claude-store".into()],
             configuration: Vec::new(),
-            exported_default_store: false,
+            // Nothing was attested by a launch; the field is optional so a
+            // legacy row can say so instead of claiming `false`.
+            exported_default_store: None,
             cwd: cwd.into(),
             cwd_filesystem: "host".into(),
             filesystem: "host".into(),

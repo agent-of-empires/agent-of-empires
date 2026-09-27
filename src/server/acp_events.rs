@@ -371,10 +371,28 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
             None => None,
         };
 
+        // #4127: the worker's own store is the only observation of the route
+        // this launch applied. Read it for the id the worker just assigned, and
+        // read it before the save so the durable row and the in-memory mirror
+        // attest the same thing. Awaited before `instances` is taken: the
+        // supervisor's worker map must never be reached under that lock.
+        // A reattach answers nothing, so such a session stays unattested until
+        // its next spawn.
+        let observed = match acp_change.as_ref() {
+            Some(AcpSessionChange::Assigned(new_id)) => {
+                state
+                    .acp_supervisor
+                    .native_handoff_store(&frame.session_id, new_id)
+                    .await
+            }
+            _ => None,
+        };
+        let observed_for_save = observed.clone();
+
         let mut canonical_changed = false;
         // Acquire `instances` once for both branches. Releases before
         // the (potentially blocking) sessions.json save.
-        let (profile_to_save, unread_profile) = {
+        let (profile_to_save, unread_profile, attested_profile) = {
             let mut instances = state.instances.write().await;
             let Some(inst) = instances.iter_mut().find(|i| i.id == frame.session_id) else {
                 continue;
@@ -416,10 +434,17 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
             let unread_profile =
                 should_mark_acp_unread(inst, old_status, crate::session::unread_enabled())
                     .then(|| inst.source_profile.clone());
+            // Stamped before `apply_acp_session_change`, whose same-id arm
+            // returns without touching the row: a first `session/load`
+            // reattaching a legacy session must still attest the route its
+            // launch observed.
+            let attested = inst.attest_launch_default_store(observed.as_ref());
+            canonical_changed |= attested;
             let profile_to_save =
                 apply_acp_session_change(inst, &frame.session_id, acp_change.as_ref());
             canonical_changed |= profile_to_save.is_some();
-            (profile_to_save, unread_profile)
+            let attested_profile = attested.then(|| inst.source_profile.clone());
+            (profile_to_save, unread_profile, attested_profile)
         };
         if canonical_changed {
             state
@@ -469,7 +494,7 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
         // Persist `acp_session_id` to disk if the field changed.
         // Sync FS (file copy + JSON write) goes through spawn_blocking
         // so the runtime stays responsive under large session lists.
-        if let Some(profile) = profile_to_save {
+        if let Some(profile) = profile_to_save.or(attested_profile) {
             let session_id_for_log = frame.session_id.clone();
             let session_id_for_save = frame.session_id.clone();
             let profile_for_save = profile.clone();
@@ -479,6 +504,7 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
                 let storage = crate::session::Storage::new(&profile_for_save, file_watch)?;
                 storage.update(|all, _groups| {
                     if let Some(inst) = all.iter_mut().find(|i| i.id == session_id_for_save) {
+                        inst.attest_launch_default_store(observed_for_save.as_ref());
                         apply_acp_session_change(
                             inst,
                             &session_id_for_save,
@@ -2876,5 +2902,128 @@ mod tests {
             seed_acp_statuses(state.clone()).await;
             assert_eq!(state.instances.read().await[0].status, want, "{event:?}");
         }
+    }
+    /// Whether the row's own agent binding carries the attested route.
+    fn attested_marker(row: &Instance) -> bool {
+        row.agent_session_binding
+            .as_ref()
+            .and_then(|binding| binding.execution.as_ref())
+            .is_some_and(|execution| execution.exported_default_store == Some(true))
+    }
+
+    /// #4127: a first `session/load` reattaching a legacy session re-assigns the
+    /// very id the row already carries, so `apply_acp_session_change` takes its
+    /// same-id arm and returns without persisting anything. The route the
+    /// launch applied must still be attested there — on disk and in memory — or
+    /// the legacy binding keeps deriving it from the configuration as it
+    /// stands, which is the guess #4127 forbids.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn acp_event_listener_attests_the_observed_store_on_a_reused_acp_session() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _app_dir = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let store = temp.path().join(".claude");
+        std::fs::create_dir_all(&store).expect("store");
+
+        let profile = "acp-listener-attested-store";
+        let sid = "11111111-1111-4111-8111-111111111111";
+        let binding = |marker: Option<bool>| crate::session::ConversationBinding {
+            session_id: sid.into(),
+            execution: Some(crate::session::ExecutionBinding {
+                agent: "claude".into(),
+                stores: vec![store.clone()],
+                configuration: Vec::new(),
+                cwd: temp.path().to_path_buf(),
+                cwd_filesystem: "host".into(),
+                filesystem: "host".into(),
+                exported_default_store: marker,
+            }),
+            provenance: crate::session::ConversationProvenance::Observed,
+            transcript_path: None,
+        };
+        let mut inst = Instance::new("acp-session", "/tmp/acp");
+        inst.view = crate::session::View::Structured;
+        inst.source_profile = profile.to_string();
+        inst.agent_session_id = Some(sid.into());
+        inst.acp_session_id = Some("attested-acp-id".to_string());
+        // Legacy: no routing marker at all.
+        inst.agent_session_binding = Some(binding(None));
+        let id = inst.id.clone();
+        seed_profile_store(profile, vec![inst.clone()]);
+        let state = test_support::build_test_app_state(vec![inst]);
+
+        // What the drain published before the frame: the assigned id, and the
+        // store route this launch actually applied.
+        let observed = binding(Some(true)).execution.unwrap();
+        state
+            .acp_supervisor
+            .test_insert_worker_with_native_handoff(&id, "attested-acp-id", Some(observed))
+            .await;
+
+        let listener = tokio::spawn(acp_event_listener(state.clone()));
+        await_subscribed(&state).await;
+
+        state
+            .acp_events_tx
+            .send(AcpBroadcastFrame {
+                session_id: id.clone(),
+                seq: 1,
+                event: Arc::new(crate::acp::Event::AcpSessionAssigned {
+                    acp_session_id: "attested-acp-id".to_string(),
+                }),
+                worker_generation: None,
+            })
+            .expect("listener is subscribed");
+
+        let row = await_row(
+            &state,
+            &id,
+            attested_marker,
+            "the reused acp session id returned before the attestation",
+        )
+        .await;
+        listener.abort();
+        let _ = listener.await;
+
+        assert_eq!(row.acp_session_id.as_deref(), Some("attested-acp-id"));
+        assert!(
+            attested_marker(&load_profile_row(profile, &id).expect("row")),
+            "the attestation must be durable, or the next reload derives the \
+             route from the configuration again"
+        );
+    }
+    /// A broadcast only reaches receivers that subscribed before the send, and a spawned
+    /// listener subscribes as its first act.
+    async fn await_subscribed(state: &AppState) {
+        for _ in 0..500 {
+            if state.acp_events_tx.receiver_count() > 0 {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        panic!("listener never subscribed");
+    }
+
+    /// Poll the session row until `want` holds, bounded so a failure reports the reason.
+    async fn await_row(
+        state: &AppState,
+        id: &str,
+        want: fn(&Instance) -> bool,
+        why: &str,
+    ) -> Instance {
+        for _ in 0..500 {
+            let row = state
+                .instances
+                .read()
+                .await
+                .iter()
+                .find(|i| i.id == id)
+                .cloned();
+            if let Some(row) = row.filter(want) {
+                return row;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        panic!("{why}");
     }
 }

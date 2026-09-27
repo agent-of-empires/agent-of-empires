@@ -131,7 +131,7 @@ impl Instance {
         Ok(observation.filter(|observation| {
             !exclusion.contains(&observation.sid)
                 && !self
-                    .retroactive_capture_exclusion_set(stores, observation.source.as_ref())
+                    .retroactive_capture_exclusion_set(stores, observation.source())
                     .is_ok_and(|excluded| excluded.contains(&observation.sid))
         }))
     }

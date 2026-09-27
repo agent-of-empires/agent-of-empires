@@ -480,7 +480,10 @@ impl Instance {
                 self.apply_conversation_observation(&observation);
                 self.resume_probe_failed_sid = None;
             }
-            SidWrite::Skipped | SidWrite::PinnedForeign => {
+            // Nothing was written in any of these arms: a peer wrote between
+            // capture and CAS, a peer durably owns the sid, or the row pins
+            // another conversation. Reloading converges on all three.
+            SidWrite::Skipped | SidWrite::OwnershipConflict | SidWrite::PinnedForeign => {
                 self.reconcile_from_store(storage)?;
             }
             SidWrite::Failed => {}

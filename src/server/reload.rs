@@ -1684,7 +1684,7 @@ mod tests {
                     agent: "claude".into(),
                     stores: vec![app.path().to_path_buf()],
                     configuration: Vec::new(),
-                    exported_default_store: false,
+                    exported_default_store: None,
                     cwd: app.path().to_path_buf(),
                     cwd_filesystem: "host".into(),
                     filesystem: "host".into(),

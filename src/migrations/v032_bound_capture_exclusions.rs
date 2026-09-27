@@ -87,10 +87,10 @@ mod tests {
             agent: "claude".into(),
             stores: vec![temp.path().join("new-store")],
             configuration: Vec::new(),
-            exported_default_store: false,
             cwd: temp.path().into(),
             cwd_filesystem: "host".into(),
             filesystem: "host".into(),
+            exported_default_store: None,
         };
         assert!(exclusions
             .iter()

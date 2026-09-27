@@ -448,7 +448,7 @@ impl Instance {
             }
             _ => self.try_retroactive_capture_in(stores).ok()??,
         };
-        if self.is_capture_excluded(&observation.sid, observation.source.as_ref()) {
+        if self.is_capture_excluded(&observation.sid, observation.source()) {
             return None;
         }
         if self.agent_session_id.as_ref() == Some(&observation.sid)

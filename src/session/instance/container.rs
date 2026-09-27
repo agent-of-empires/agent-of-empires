@@ -434,15 +434,18 @@ impl Instance {
     /// can't resolve, `compute_volume_paths` silently collapses to
     /// `/workspace/<basename>` (a path the container never mounted), and the
     /// exec dies with `chdir to cwd ("/workspace/<name>") ... no such file or
-    /// directory`. The live computation survives only as a fallback for a
-    /// session whose container has not been created yet, where there is nothing
-    /// to pin to.
+    /// directory`. A recorded `WorkspaceInfo` is a third source: it replays the
+    /// repos the workspace was created with instead of rediscovering the git
+    /// linkage, so it cannot collapse that way either. The live computation
+    /// survives only as a fallback for a session with neither a pin nor a
+    /// recorded workspace, where there is nothing to replay.
     pub fn container_workdir(&self) -> String {
         container_config::container_workdir_for(
             &self.project_path,
             self.sandbox_info
                 .as_ref()
                 .and_then(|info| info.container_workdir.as_deref()),
+            self.workspace_info.as_ref(),
         )
     }
 
