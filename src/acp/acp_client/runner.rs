@@ -5,7 +5,10 @@ use tracing::{info, warn};
 use super::errors::AcpError;
 use super::resolve_command::resolve_agent_command;
 use super::session_sandbox::{build_sandbox_docker_argv, SessionSandbox};
-use super::spawn::{apply_env_filter, host_environment_denyreason, prepend_path_dirs, SpawnConfig};
+use super::spawn::{
+    apply_claude_store_route, apply_env_filter, host_environment_denyreason, prepend_path_dirs,
+    SpawnConfig,
+};
 
 /// Deadline for the runner socket to appear. 10s suffices in production, but
 /// a debug-build cold start under CI load blows past it deterministically, so
@@ -177,6 +180,7 @@ pub(super) fn spawn_runner_detached(
     // pass covers both. AOE_TOKEN is stripped here and reaches neither.
     cmd.env_clear();
     apply_env_filter(cmd.as_std_mut(), config, &[]);
+    apply_claude_store_route(cmd.as_std_mut(), config);
     #[cfg(debug_assertions)]
     if let Ok(interval) = std::env::var("AOE_ACP_WATCHDOG_POLL_MS") {
         cmd.env("AOE_ACP_WATCHDOG_POLL_MS", interval);
