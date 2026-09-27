@@ -11,16 +11,14 @@ const MANAGED_CAPTURE_RETRY_BACKOFF: std::time::Duration = std::time::Duration::
 #[cfg(test)]
 pub(super) mod probe_delay {
     thread_local! {
-        static DELAY: std::cell::RefCell<Option<Box<dyn Fn(&super::Instance)>>> =
+        static DELAY: std::cell::RefCell<Option<Box<dyn Fn()>>> =
             const { std::cell::RefCell::new(None) };
     }
 
     pub(in crate::session::instance) struct ProbeDelay;
 
     impl ProbeDelay {
-        pub(in crate::session::instance) fn install(
-            delay: impl Fn(&super::Instance) + 'static,
-        ) -> Self {
+        pub(in crate::session::instance) fn install(delay: impl Fn() + 'static) -> Self {
             DELAY.with(|slot| {
                 assert!(slot.borrow().is_none(), "one probe delay per test thread");
                 *slot.borrow_mut() = Some(Box::new(delay));
@@ -37,10 +35,10 @@ pub(super) mod probe_delay {
         }
     }
 
-    pub(super) fn hold(instance: &super::Instance) {
+    pub(super) fn hold() {
         DELAY.with(|slot| {
             if let Some(delay) = slot.borrow().as_ref() {
-                delay(instance);
+                delay();
             }
         });
     }
@@ -313,7 +311,7 @@ impl Instance {
         omp_metadata: Option<OmpCaptureMetadata>,
     ) -> PollerStart {
         #[cfg(test)]
-        probe_delay::hold(self);
+        probe_delay::hold();
         if !crate::migrations::v033_isolate_sandbox_content::instance_ready(self).unwrap_or(false) {
             self.session_id_poller = None;
             return PollerStart::NotApplicable;
@@ -983,7 +981,7 @@ mod tests {
 
         let probing = std::sync::Arc::new(std::sync::Mutex::new(None));
         let mark = probing.clone();
-        let _delay = super::probe_delay::ProbeDelay::install(move |_| {
+        let _delay = super::probe_delay::ProbeDelay::install(move || {
             *mark.lock().unwrap() = Some(std::time::Instant::now());
             std::thread::sleep(std::time::Duration::from_millis(60));
         });
