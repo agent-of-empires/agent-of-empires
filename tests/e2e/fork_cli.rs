@@ -8,7 +8,7 @@ use std::path::Path;
 use serde_json::{json, Value};
 use serial_test::parallel;
 
-use crate::harness::{app_dir_in, parse_session_id, session_by_title, TuiTestHarness};
+use crate::harness::{app_dir_in, session_by_title, TuiTestHarness};
 
 const PARENT_AGENT_ID: &str = "11111111-2222-3333-4444-555555555555";
 
@@ -239,9 +239,8 @@ fn fork_with_native_selector_is_refused_at_launch() {
 /// Every way a fork can be refused: a different agent (a captured id is
 /// agent-specific), an agent with no fork capability, flags that change the
 /// working directory or carry their own resume/fork flags, a parent with no
-/// captured conversation, a parent whose recorded conversation was never
-/// qualified, and a parent whose own fork has not launched. Each refusal fires
-/// before provisioning, so nothing is persisted or left on disk.
+/// captured conversation, and a parent whose own fork has not launched. Each
+/// refusal fires before provisioning, so nothing is persisted or left on disk.
 #[test]
 #[parallel]
 fn fork_from_refusals_persist_nothing() {
@@ -252,18 +251,14 @@ fn fork_from_refusals_persist_nothing() {
         Bare,
         /// Forked but never launched: a synthetic id plus a live Fork intent.
         UnlaunchedFork,
-        /// A pre-v1.17 row: an id is stored, but no binding qualifies it, so
-        /// the fork is refused as unqualified.
-        LegacyUnqualified,
     }
     struct Case {
         parent: Parent,
         /// The parent title: the refusal quotes it and `--fork-from` names it.
         title: &'static str,
         args: &'static [&'static str],
-        /// A span the refusal must print, absent only where the span depends
-        /// on the session id the harness generated.
-        expect: Option<&'static str>,
+        /// A span the refusal must print.
+        expect: &'static str,
     }
     let cases = [
         Case {
@@ -272,25 +267,25 @@ fn fork_from_refusals_persist_nothing() {
             parent: Parent::Seeded("gemini"),
             title: "Parent",
             args: &["--tool", "gemini"],
-            expect: Some("Forkable agents: claude, codex, opencode"),
+            expect: "Forkable agents: claude, codex, opencode",
         },
         Case {
             parent: Parent::Seeded("claude"),
             title: "Parent",
             args: &["--worktree", "wt-branch"],
-            expect: Some("--worktree"),
+            expect: "--worktree",
         },
         Case {
             parent: Parent::Seeded("claude"),
             title: "Parent",
             args: &["--scratch"],
-            expect: Some("--scratch"),
+            expect: "--scratch",
         },
         Case {
             parent: Parent::Seeded("claude"),
             title: "Parent",
             args: &["--sandbox"],
-            expect: Some("--sandbox"),
+            expect: "--sandbox",
         },
         Case {
             // A terminal fork cannot carry its state onto a structured session.
@@ -298,25 +293,19 @@ fn fork_from_refusals_persist_nothing() {
             parent: Parent::Seeded("claude"),
             title: "Parent",
             args: &["--scratch", "--structured-view"],
-            expect: Some("cannot be combined with"),
+            expect: "cannot be combined with",
         },
         Case {
             parent: Parent::Bare,
             title: "Parent",
             args: &[],
-            expect: Some("Nothing to fork"),
+            expect: "Nothing to fork",
         },
         Case {
             parent: Parent::UnlaunchedFork,
             title: "Parent",
             args: &[],
-            expect: Some("is a fork that has not launched yet"),
-        },
-        Case {
-            parent: Parent::LegacyUnqualified,
-            title: "Legacy Parent",
-            args: &[],
-            expect: None,
+            expect: "is a fork that has not launched yet",
         },
     ];
 
@@ -324,7 +313,7 @@ fn fork_from_refusals_persist_nothing() {
         let mut h = TuiTestHarness::new("fork_cli_refusal");
         h.install_path_command("gemini");
         let project = h.project_path();
-        let mut expect = case.expect.map(str::to_string);
+        let expect = case.expect;
         match case.parent {
             Parent::Seeded(tool) => seed_parent(&h, &project, case.title, tool),
             Parent::Bare => {
@@ -336,31 +325,6 @@ fn fork_from_refusals_persist_nothing() {
                     "-t",
                     case.title,
                 ]);
-            }
-            Parent::LegacyUnqualified => {
-                let added = h.run_cli_ok(&[
-                    "add",
-                    project.to_str().unwrap(),
-                    "--cmd",
-                    "claude",
-                    "-t",
-                    case.title,
-                ]);
-                patch_session(&h, case.title, |session| {
-                    session["agent_session_id"] = json!(PARENT_AGENT_ID);
-                    session["agent_session_binding"] = json!({
-                        "session_id": PARENT_AGENT_ID,
-                        "execution": null,
-                        "provenance": "unknown",
-                    });
-                });
-                // The remedy names the session id, not its title, so the
-                // expectation needs the id `aoe add` printed.
-                expect = Some(format!(
-                    "aoe session set-session-id {} {}",
-                    parse_session_id(&added),
-                    PARENT_AGENT_ID,
-                ));
             }
             Parent::UnlaunchedFork => {
                 h.run_cli_ok(&[
@@ -388,7 +352,6 @@ fn fork_from_refusals_persist_nothing() {
         args.extend_from_slice(&["-t", "Child", "--fork-from", case.title]);
 
         let stderr = h.run_cli_err(&args);
-        let expect = expect.expect("every refusal case states the span it must print");
         assert!(
             stderr.contains(&expect),
             "{args:?}: expected {expect:?} in:\n{stderr}"
@@ -441,4 +404,77 @@ fn a_preallocated_parent_is_told_to_talk_not_to_reassert() {
     assert!(stderr.contains("no captured conversation"), "{stderr}");
     assert!(!stderr.contains("set-session-id"), "{stderr}");
     assert_not_persisted(&h, "Child");
+}
+
+/// A parent a migration left unattributed records the conversation but no
+/// execution, so a fork of it is admitted today and its child runs the native
+/// fork command against the store current configuration resolves.
+#[test]
+#[parallel]
+fn fork_from_an_unattributed_parent_dispatches_against_the_configured_store() {
+    crate::harness::require_tmux!();
+    let mut h = TuiTestHarness::new("fork_cli_unattributed");
+    let bin = h.install_path_command("claude");
+    let argv_file = h.home_path().join("claude.argv");
+    std::fs::write(
+        bin.join("claude"),
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$CLAUDE_CONFIG_DIR\" > {store}\nprintf '%s ' \"$0\" \"$@\" > {argv}\nexit 0\n",
+            store = shell_words::quote(&h.home_path().join("claude.store").to_string_lossy()),
+            argv = shell_words::quote(&argv_file.to_string_lossy()),
+        ),
+    )
+    .unwrap();
+    let project = h.project_path();
+    let store = h.home_path().join("claude-store");
+    std::fs::create_dir_all(&store).unwrap();
+    h.set_env("CLAUDE_CONFIG_DIR", &store.display().to_string());
+    h.run_cli_ok(&[
+        "add",
+        project.to_str().unwrap(),
+        "--cmd",
+        "claude",
+        "-t",
+        "Legacy Parent",
+    ]);
+    patch_session(&h, "Legacy Parent", |session| {
+        session["agent_session_id"] = json!(PARENT_AGENT_ID);
+        session["agent_session_binding"] = json!({
+            "session_id": PARENT_AGENT_ID,
+            "execution": null,
+            "provenance": "unknown",
+        });
+    });
+
+    h.run_cli_ok(&[
+        "add",
+        project.to_str().unwrap(),
+        "-t",
+        "Child",
+        "--fork-from",
+        "Legacy Parent",
+    ]);
+    h.run_cli_ok(&["session", "start", "Child"]);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !argv_file.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let _ = h.run_cli(&["session", "stop", "Child"]);
+    let argv = std::fs::read_to_string(&argv_file)
+        .unwrap_or_else(|err| panic!("the child dispatched no native command: {err}"));
+    let store_file = h.home_path().join("claude.store");
+    let resolved = std::fs::read_to_string(&store_file)
+        .unwrap_or_else(|err| panic!("the child dispatched no native command: {err}"));
+    let canonical = std::fs::canonicalize(&store).unwrap();
+    assert!(
+        argv.contains(&format!(
+            "--resume {PARENT_AGENT_ID} --fork-session --session-id "
+        )),
+        "the child forks the parent's conversation: {argv}"
+    );
+    assert_eq!(
+        resolved.trim(),
+        canonical.display().to_string(),
+        "the child runs against the configured store: {argv}"
+    );
 }
