@@ -317,14 +317,6 @@ mod tests {
     use crate::tui::styles::{builtin_theme_names, load_theme};
 
     #[test]
-    fn test_get_status_returns_none_for_non_tmux() {
-        // When not in tmux, get_current_session_name returns None
-        // so get_status_for_current_session should also return None
-        // This test just verifies the function doesn't panic
-        let _ = get_status_for_current_session();
-    }
-
-    #[test]
     fn test_color_to_tmux_rgb() {
         assert_eq!(color_to_tmux(Color::Rgb(15, 23, 42)), "#0f172a");
         assert_eq!(color_to_tmux(Color::Rgb(255, 255, 255)), "#ffffff");

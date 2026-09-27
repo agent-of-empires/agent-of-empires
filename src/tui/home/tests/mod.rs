@@ -85,26 +85,63 @@ struct TestEnv {
     _temp: TempDir,
 }
 
-fn create_test_env_empty() -> TestEnv {
-    use crate::session::config::GroupByMode;
+/// An isolated app dir for a fixture; the guard must outlive every storage write.
+fn test_home() -> (TempDir, AppDirGuard) {
     let temp = TempDir::new().unwrap();
-    let _guard = setup_test_home(&temp);
-    let _storage = Storage::new_unwatched("test").unwrap(); // ensure profile dir exists
-    let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new_for_test(
-        Some("test".to_string()),
-        tools,
+    let guard = setup_test_home(&temp);
+    (temp, guard)
+}
+
+fn test_view(profile: Option<&str>) -> HomeView {
+    HomeView::new_for_test(
+        profile.map(str::to_string),
+        AvailableTools::with_tools(&["claude"]),
         crate::file_watch::FileWatchService::noop(),
     )
-    .unwrap();
-    view.group_by = GroupByMode::Manual;
-    view.flat_items = view.build_flat_items();
-    view.update_selected();
+    .unwrap()
+}
+
+/// Persist `instances` (with derived groups) to `profile`.
+fn seed_profile(profile: &str, instances: &[Instance]) {
+    Storage::new_unwatched(profile)
+        .unwrap()
+        .update(|i, g| {
+            *i = instances.to_vec();
+            *g = GroupTree::new_with_groups(instances, &[]).get_all_groups();
+            Ok(())
+        })
+        .unwrap();
+}
+
+/// A view over profile "test" seeded with `instances`. `manual` switches to manual
+/// grouping and rebuilds the rows, which most fixtures want.
+fn seeded_env(
+    (temp, guard): (TempDir, AppDirGuard),
+    instances: &[Instance],
+    manual: bool,
+) -> TestEnv {
+    seed_profile("test", instances);
+    let mut view = test_view(Some("test"));
+    if manual {
+        view.group_by = crate::session::config::GroupByMode::Manual;
+        view.flat_items = view.build_flat_items();
+        view.update_selected();
+    }
     TestEnv {
         view,
-        _guard,
+        _guard: guard,
         _temp: temp,
     }
+}
+
+fn instance_in(title: &str, path: &str, group: &str) -> Instance {
+    let mut inst = Instance::new(title, path);
+    inst.group_path = group.to_string();
+    inst
+}
+
+fn create_test_env_empty() -> TestEnv {
+    seeded_env(test_home(), &[], true)
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -147,18 +184,7 @@ async fn config_watch_keys_distinguish_global_from_profile_named_global() {
 /// Archived shelf, whose position can't be faked the way `setup_inner` fakes
 /// the flat list rect.
 fn render_geometry(view: &mut HomeView) {
-    use crate::tui::styles::load_theme;
-    use ratatui::backend::TestBackend;
-    use ratatui::Terminal;
-
-    let theme = load_theme("empire");
-    let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
-    terminal
-        .draw(|f| {
-            let area = f.area();
-            view.render(f, area, &theme, None, None, None);
-        })
-        .unwrap();
+    render_home_to_string(view, 120, 40);
 }
 
 /// Screen row (0-indexed) of the shelf item at absolute `flat_items` index
@@ -171,40 +197,10 @@ fn shelf_row_for_idx(view: &HomeView, idx: usize) -> u16 {
 }
 
 fn create_test_env_with_sessions(count: usize) -> TestEnv {
-    use crate::session::config::GroupByMode;
-    let temp = TempDir::new().unwrap();
-    let _guard = setup_test_home(&temp);
-    let storage = Storage::new_unwatched("test").unwrap();
-    let mut instances = Vec::new();
-    for i in 0..count {
-        instances.push(Instance::new(
-            &format!("session{}", i),
-            &format!("/tmp/{}", i),
-        ));
-    }
-    storage
-        .update(|i, g| {
-            *i = instances.to_vec();
-            *g = GroupTree::new_with_groups(&instances, &[]).get_all_groups();
-            Ok(())
-        })
-        .unwrap();
-
-    let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new_for_test(
-        Some("test".to_string()),
-        tools,
-        crate::file_watch::FileWatchService::noop(),
-    )
-    .unwrap();
-    view.group_by = GroupByMode::Manual;
-    view.flat_items = view.build_flat_items();
-    view.update_selected();
-    TestEnv {
-        view,
-        _guard,
-        _temp: temp,
-    }
+    let instances: Vec<Instance> = (0..count)
+        .map(|i| Instance::new(&format!("session{}", i), &format!("/tmp/{}", i)))
+        .collect();
+    seeded_env(test_home(), &instances, true)
 }
 
 /// Disable trash-first delete for tests that assert the permanent-delete
@@ -231,95 +227,22 @@ fn disable_confirm_delete() {
 }
 
 fn create_test_env_with_groups() -> TestEnv {
-    use crate::session::config::GroupByMode;
-    let temp = TempDir::new().unwrap();
-    let _guard = setup_test_home(&temp);
-    let storage = Storage::new_unwatched("test").unwrap();
-    let mut instances = Vec::new();
-
-    let inst1 = Instance::new("ungrouped", "/tmp/u");
-    instances.push(inst1);
-
-    let mut inst2 = Instance::new("work-project", "/tmp/work");
-    inst2.group_path = "work".to_string();
-    instances.push(inst2);
-
-    let mut inst3 = Instance::new("personal-project", "/tmp/personal");
-    inst3.group_path = "personal".to_string();
-    instances.push(inst3);
-
-    storage
-        .update(|i, g| {
-            *i = instances.to_vec();
-            *g = GroupTree::new_with_groups(&instances, &[]).get_all_groups();
-            Ok(())
-        })
-        .unwrap();
-
-    let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new_for_test(
-        Some("test".to_string()),
-        tools,
-        crate::file_watch::FileWatchService::noop(),
-    )
-    .unwrap();
-    view.group_by = GroupByMode::Manual;
-    view.flat_items = view.build_flat_items();
-    view.update_selected();
-    TestEnv {
-        view,
-        _guard,
-        _temp: temp,
-    }
+    let instances = [
+        Instance::new("ungrouped", "/tmp/u"),
+        instance_in("work-project", "/tmp/work", "work"),
+        instance_in("personal-project", "/tmp/personal", "personal"),
+    ];
+    seeded_env(test_home(), &instances, true)
 }
 
 fn create_test_env_with_mixed_sessions() -> TestEnv {
-    use crate::session::GroupTree;
-
-    let temp = TempDir::new().unwrap();
-    let _guard = setup_test_home(&temp);
-    let storage = Storage::new_unwatched("test").unwrap();
-    let mut instances = Vec::new();
-
-    let inst_ungrouped = Instance::new("Uncategorized", "/tmp/u");
-    instances.push(inst_ungrouped);
-
-    let mut inst1 = Instance::new("Zebra", "/tmp/z");
-    inst1.group_path = "work".to_string();
-    instances.push(inst1);
-
-    let mut inst2 = Instance::new("Mango", "/tmp/m");
-    inst2.group_path = "work".to_string();
-    instances.push(inst2);
-
-    let mut inst3 = Instance::new("Apple", "/tmp/a");
-    inst3.group_path = "work".to_string();
-    instances.push(inst3);
-
-    let group_tree = GroupTree::new_with_groups(&instances, &[]);
-    storage
-        .update(|i, g| {
-            *i = instances.to_vec();
-            *g = group_tree.get_all_groups();
-            Ok(())
-        })
-        .unwrap();
-
-    let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new_for_test(
-        Some("test".to_string()),
-        tools,
-        crate::file_watch::FileWatchService::noop(),
-    )
-    .unwrap();
-    view.group_by = crate::session::config::GroupByMode::Manual;
-    view.flat_items = view.build_flat_items();
-    view.update_selected();
-    TestEnv {
-        view,
-        _guard,
-        _temp: temp,
-    }
+    let instances = [
+        Instance::new("Uncategorized", "/tmp/u"),
+        instance_in("Zebra", "/tmp/z", "work"),
+        instance_in("Mango", "/tmp/m", "work"),
+        instance_in("Apple", "/tmp/a", "work"),
+    ];
+    seeded_env(test_home(), &instances, true)
 }
 
 // The only catalog tip is earned, so it (and the badge) appears only after the
@@ -339,25 +262,8 @@ fn earn_tip(env: &mut TestEnv) {
 // Group deletion tests
 
 fn create_test_env_with_group_sessions() -> TestEnv {
-    use crate::session::{GroupTree, SandboxInfo};
-
-    let temp = TempDir::new().unwrap();
-    let _guard = setup_test_home(&temp);
-    let storage = Storage::new_unwatched("test").unwrap();
-    let mut instances = Vec::new();
-
-    // Ungrouped session
-    let inst1 = Instance::new("ungrouped", "/tmp/u");
-    instances.push(inst1);
-
-    // Sessions in "work" group
-    let mut inst2 = Instance::new("work-session-1", "/tmp/work1");
-    inst2.group_path = "work".to_string();
-    instances.push(inst2);
-
-    let mut inst3 = Instance::new("work-session-2", "/tmp/work2");
-    inst3.group_path = "work".to_string();
-    inst3.sandbox_info = Some(SandboxInfo {
+    let mut sandboxed = instance_in("work-session-2", "/tmp/work2", "work");
+    sandboxed.sandbox_info = Some(crate::session::SandboxInfo {
         enabled: true,
         container_id: None,
         image: "ubuntu:latest".to_string(),
@@ -367,146 +273,55 @@ fn create_test_env_with_group_sessions() -> TestEnv {
         before_start_env: Vec::new(),
         container_workdir: None,
     });
-    instances.push(inst3);
-
-    // Session in nested group
-    let mut inst4 = Instance::new("work-nested", "/tmp/work/nested");
-    inst4.group_path = "work/projects".to_string();
-    instances.push(inst4);
-
-    // Build group tree from instances and save with groups
-    let group_tree = GroupTree::new_with_groups(&instances, &[]);
-    storage
-        .update(|i, g| {
-            *i = instances.to_vec();
-            *g = group_tree.get_all_groups();
-            Ok(())
-        })
-        .unwrap();
-
-    let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new_for_test(
-        Some("test".to_string()),
-        tools,
-        crate::file_watch::FileWatchService::noop(),
-    )
-    .unwrap();
-    view.group_by = crate::session::config::GroupByMode::Manual;
-    view.flat_items = view.build_flat_items();
-    view.update_selected();
-    TestEnv {
-        view,
-        _guard,
-        _temp: temp,
-    }
+    let instances = [
+        Instance::new("ungrouped", "/tmp/u"),
+        instance_in("work-session-1", "/tmp/work1", "work"),
+        sandboxed,
+        instance_in("work-nested", "/tmp/work/nested", "work/projects"),
+    ];
+    seeded_env(test_home(), &instances, true)
 }
 
 /// Build a flat list of one Running and one Waiting session in the given mode.
 /// Returns the env plus the flat index of each so callers can park the cursor.
 /// Statuses are seeded in storage before construction so `instances` and
 /// what `get_instance`/`jump_to_next_waiting` read agree.
-fn attention_env_running_then_waiting() -> (TestEnv, usize, usize) {
-    use crate::session::config::{GroupByMode, SortOrder};
-    use crate::session::Status;
+/// Attention-sorted view of a Running session and one with `other` status, plus both row indices.
+fn attention_env_running_then(other: Status) -> (TestEnv, usize, usize) {
+    use crate::session::config::SortOrder;
 
-    let temp = TempDir::new().unwrap();
-    let _guard = setup_test_home(&temp);
-    let storage = Storage::new_unwatched("test").unwrap();
-
+    let mut second = Instance::new("other", "/tmp/other");
+    second.status = other;
     let mut running = Instance::new("running", "/tmp/running");
     running.status = Status::Running;
-    let mut waiting = Instance::new("waiting", "/tmp/waiting");
-    waiting.status = Status::Waiting;
-    let instances = vec![running, waiting];
-    storage
-        .update(|i, g| {
-            *i = instances.to_vec();
-            *g = GroupTree::new_with_groups(&instances, &[]).get_all_groups();
-            Ok(())
-        })
-        .unwrap();
+    let mut env = seeded_env(test_home(), &[running, second], false);
+    env.view.strict_hotkeys = false;
+    env.view.group_by = crate::session::config::GroupByMode::Manual;
+    env.view.sort_order = SortOrder::Attention;
+    env.view.flat_items = env.view.build_flat_items();
+    env.view.update_selected();
 
-    let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new_for_test(
-        Some("test".to_string()),
-        tools,
-        crate::file_watch::FileWatchService::noop(),
-    )
-    .unwrap();
-    view.strict_hotkeys = false;
-    view.group_by = GroupByMode::Manual;
-    view.sort_order = SortOrder::Attention;
-    view.flat_items = view.build_flat_items();
-    view.update_selected();
-    let env = TestEnv {
-        view,
-        _guard,
-        _temp: temp,
+    let row_with = |status: Status| {
+        (0..env.view.flat_items.len())
+            .find(|&i| match env.view.flat_items.get(i) {
+                Some(Item::Session { id, .. }) => {
+                    env.view.get_instance(id).map(|i| i.status) == Some(status)
+                }
+                _ => false,
+            })
+            .unwrap_or_else(|| panic!("a {status:?} session row"))
     };
+    let running = row_with(Status::Running);
+    let other = row_with(other);
+    (env, running, other)
+}
 
-    let status_at = |env: &TestEnv, idx: usize| match env.view.flat_items.get(idx) {
-        Some(Item::Session { id, .. }) => env.view.get_instance(id).map(|i| i.status),
-        _ => None,
-    };
-    let running = (0..env.view.flat_items.len())
-        .find(|&i| status_at(&env, i) == Some(Status::Running))
-        .expect("a Running session row");
-    let waiting = (0..env.view.flat_items.len())
-        .find(|&i| status_at(&env, i) == Some(Status::Waiting))
-        .expect("a Waiting session row");
-    (env, running, waiting)
+fn attention_env_running_then_waiting() -> (TestEnv, usize, usize) {
+    attention_env_running_then(Status::Waiting)
 }
 
 fn attention_env_running_then_idle() -> (TestEnv, usize, usize) {
-    use crate::session::config::{GroupByMode, SortOrder};
-    use crate::session::Status;
-
-    let temp = TempDir::new().unwrap();
-    let _guard = setup_test_home(&temp);
-    let storage = Storage::new_unwatched("test").unwrap();
-
-    let mut running = Instance::new("running", "/tmp/running");
-    running.status = Status::Running;
-    let mut idle = Instance::new("idle", "/tmp/idle");
-    idle.status = Status::Idle;
-    let instances = vec![running, idle];
-    storage
-        .update(|i, g| {
-            *i = instances.to_vec();
-            *g = GroupTree::new_with_groups(&instances, &[]).get_all_groups();
-            Ok(())
-        })
-        .unwrap();
-
-    let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new_for_test(
-        Some("test".to_string()),
-        tools,
-        crate::file_watch::FileWatchService::noop(),
-    )
-    .unwrap();
-    view.strict_hotkeys = false;
-    view.group_by = GroupByMode::Manual;
-    view.sort_order = SortOrder::Attention;
-    view.flat_items = view.build_flat_items();
-    view.update_selected();
-    let env = TestEnv {
-        view,
-        _guard,
-        _temp: temp,
-    };
-
-    let status_at = |env: &TestEnv, idx: usize| match env.view.flat_items.get(idx) {
-        Some(Item::Session { id, .. }) => env.view.get_instance(id).map(|i| i.status),
-        _ => None,
-    };
-    let running = (0..env.view.flat_items.len())
-        .find(|&i| status_at(&env, i) == Some(Status::Running))
-        .expect("a Running session row");
-    let idle = (0..env.view.flat_items.len())
-        .find(|&i| status_at(&env, i) == Some(Status::Idle))
-        .expect("an Idle session row");
-    (env, running, idle)
+    attention_env_running_then(Status::Idle)
 }
 
 /// Flatten a rendered row into its plain text, dropping styling.
