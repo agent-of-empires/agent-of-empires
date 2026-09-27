@@ -23,9 +23,8 @@ pub enum ForkSeed {
 pub enum ForkDenied {
     /// The agent's CLI has no fork capability (terminal path).
     AgentCannotFork { agent: String },
-    /// The parent records no single conversation to fork: it records none, its
-    /// recorded id and its binding name different conversations, or several rows
-    /// record one id and name different conversations.
+    /// The parent names no single conversation to fork: no row carries the id,
+    /// or the rows that do name different conversations.
     NoParentSession,
     /// A conversation id is recorded, but no qualified record names the
     /// conversation it is, so it cannot be shown to name a conversation to fork.
@@ -160,6 +159,8 @@ pub fn terminal_fork_seed(
             recorded: recorded.to_string(),
         }
     };
+    // A qualified binding is the whole gate, and it is stricter than the
+    // resume path, which also accepts a binding migration left unattributed.
     let parent = match parent {
         Some(ForkParentRef::Bound(parent)) if parent.is_known() => parent,
         Some(ForkParentRef::Bound(parent)) => {
