@@ -25,7 +25,7 @@ const MARKER_LIMIT: u64 = 64 * 1024;
 /// namespace that is genuinely being rewritten.
 const RETRY_INTERVAL: Duration = Duration::from_millis(50);
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) enum TrustedPathError {
     Missing,
     Invalid,
@@ -134,7 +134,9 @@ pub(crate) struct Admission {
 /// only an exhausted budget turns the last refusal into the answer. Every
 /// other code is final, including the `marker_invalid` that says the artifacts
 /// are present but not trustworthy, and including `marker_missing`, which is
-/// the one refusal the local command path is allowed to take over.
+/// the one refusal the local command path is allowed to take over — it now
+/// covers a provably dead publisher as well as an empty namespace, so "no
+/// daemon is publishing here".
 pub(crate) async fn connect(establishment_deadline: Instant) -> Result<UdsConnection, ReadFailure> {
     loop {
         let namespace = tokio::time::timeout_at(
@@ -145,8 +147,11 @@ pub(crate) async fn connect(establishment_deadline: Instant) -> Result<UdsConnec
         .map_err(|_| ReadFailure::pre("establishment_timeout"))?
         .map_err(|_| ReadFailure::post("unavailable"))?
         .map_err(trusted_path_failure)?;
-        let attempt =
-            tokio::time::timeout_at(establishment_deadline, connect_admission(namespace)).await;
+        let attempt = tokio::time::timeout_at(
+            establishment_deadline,
+            connect_admission(namespace, establishment_deadline),
+        )
+        .await;
         match attempt {
             Ok(Ok(connection)) => return Ok(connection),
             Ok(Err(error)) if error.code() == "marker_identity" => {
@@ -205,11 +210,11 @@ pub(crate) fn existing_app_namespace() -> Result<OwnedNamespace, TrustedPathErro
     })
 }
 
-fn open_trusted_directory(path: &Path, euid: u32) -> Result<OwnedFd, TrustedPathError> {
+pub(crate) fn open_trusted_directory(path: &Path, euid: u32) -> Result<OwnedFd, TrustedPathError> {
     if !path.is_absolute() {
         return Err(TrustedPathError::Invalid);
     }
-    let root = open_dir(Path::new("/"), euid)?;
+    let root = open_dir(Path::new("/"))?;
     validate_directory_stat(&root, euid, false, true)?;
     let components: Vec<CString> = path
         .components()
@@ -251,7 +256,7 @@ fn open_trusted_directory(path: &Path, euid: u32) -> Result<OwnedFd, TrustedPath
     Ok(current)
 }
 
-fn open_dir(path: &Path, _euid: u32) -> Result<OwnedFd, TrustedPathError> {
+fn open_dir(path: &Path) -> Result<OwnedFd, TrustedPathError> {
     let path = CString::new(path.as_os_str().as_bytes()).map_err(|_| TrustedPathError::Invalid)?;
     let fd = unsafe {
         libc::open(
@@ -312,7 +317,7 @@ fn validate_directory_stat(
             return Err(TrustedPathError::Invalid);
         }
     }
-    validate_posix_acl(file.as_raw_fd(), stat.st_uid, euid, stat.st_mode)?;
+    validate_posix_acl(file.as_raw_fd())?;
     Ok(())
 }
 
@@ -327,7 +332,7 @@ fn group_other_writes_allowed(stat: &libc::stat, final_component: bool) -> bool 
         || (!final_component && stat.st_uid == 0 && stat.st_mode & libc::S_ISVTX != 0)
 }
 
-fn validate_posix_acl(fd: RawFd, owner: u32, euid: u32, mode: u32) -> Result<(), TrustedPathError> {
+fn validate_posix_acl(fd: RawFd) -> Result<(), TrustedPathError> {
     let names = xattr_names(fd)?;
     let Some(name) = names
         .into_iter()
@@ -335,8 +340,7 @@ fn validate_posix_acl(fd: RawFd, owner: u32, euid: u32, mode: u32) -> Result<(),
     else {
         return Ok(());
     };
-    let value = xattr_value(fd, &name)?;
-    validate_acl_value(&value, owner, euid, mode)
+    validate_acl_value(&xattr_value(fd, &name)?)
 }
 
 fn xattr_names(fd: RawFd) -> Result<Vec<Vec<u8>>, TrustedPathError> {
@@ -381,37 +385,57 @@ fn xattr_value(fd: RawFd, name: &[u8]) -> Result<Vec<u8>, TrustedPathError> {
     Ok(value)
 }
 
-fn validate_acl_value(
-    value: &[u8],
-    _owner: u32,
-    _euid: u32,
-    _mode: u32,
-) -> Result<(), TrustedPathError> {
-    if value.len() < 8 || u32::from_le_bytes(value[0..4].try_into().unwrap()) != 2 {
-        return Err(TrustedPathError::Invalid);
-    }
-    if (value.len() - 8) % 8 != 0 {
-        return Err(TrustedPathError::Invalid);
-    }
-    let entry_count = (value.len() - 8) / 8;
-    for index in 0..entry_count {
-        let offset = 8 + index * 8;
-        let tag = u16::from_le_bytes(value[offset..offset + 2].try_into().unwrap());
-        let permission = u16::from_le_bytes(value[offset + 2..offset + 4].try_into().unwrap());
-        if matches!(tag, 0x02 | 0x04 | 0x08) && permission & 0x2 != 0 {
+/// The kernel serves `system.posix_acl_access` in its text form, one entry per
+/// comma, each `tag[:id]:perms` with `perms` spelled in `rwx` letters — for
+/// example `u::rw-,g::r--,o::r--,u:1002:rwx`. Only a *named* user or group
+/// holding `w` is refused here: the base owner, group and other entries are
+/// already reflected in the directory mode, and the mask entry applies to
+/// them. Anything that does not parse is a refusal, so a value this code
+/// cannot read is never treated as a chain it may trust.
+fn validate_acl_value(value: &[u8]) -> Result<(), TrustedPathError> {
+    let text = std::str::from_utf8(value).map_err(|_| TrustedPathError::Invalid)?;
+    for entry in text.split(',') {
+        let mut fields = entry.split(':');
+        let tag = fields.next().ok_or(TrustedPathError::Invalid)?;
+        let id = fields.next().unwrap_or_default();
+        let permissions = fields.next().ok_or(TrustedPathError::Invalid)?;
+        if fields.next().is_some() || !matches!(tag, "u" | "g" | "o" | "m") {
+            return Err(TrustedPathError::Invalid);
+        }
+        // Permission letters are `rwx` with a dash standing in for an absent
+        // bit, so `r-x` and `rw-` are spellings, not separators.
+        if permissions.is_empty()
+            || permissions.len() > 3
+            || !permissions
+                .chars()
+                .all(|permission| matches!(permission, 'r' | 'w' | 'x' | '-'))
+        {
+            return Err(TrustedPathError::Invalid);
+        }
+        if id.is_empty() {
+            // A base entry: the directory mode already carries it.
+            continue;
+        }
+        if !id.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(TrustedPathError::Invalid);
+        }
+        if permissions.contains('w') {
             return Err(TrustedPathError::Invalid);
         }
     }
     Ok(())
 }
 
-async fn connect_admission(namespace: OwnedNamespace) -> Result<UdsConnection, ReadFailure> {
+async fn connect_admission(
+    namespace: OwnedNamespace,
+    exchange_deadline: Instant,
+) -> Result<UdsConnection, ReadFailure> {
     let dir = namespace.dir.as_raw_fd();
     let euid = unsafe { libc::geteuid() };
     // Structural and process-start validation precedes the lock and the
     // marker_missing shortcut, so retained crash state is never hidden.
     inspect_temporary_markers(dir)?;
-    let (lock, lock_identity) = match open_entry(dir, LOCK_FILE, EntryKind::Regular) {
+    let (lock, lock_identity) = match open_entry(dir, LOCK_FILE) {
         Ok(value) => value,
         Err(EntryError::Missing) if runtime_entry_present(dir) => {
             return Err(ReadFailure::pre("marker_identity"));
@@ -465,8 +489,16 @@ async fn connect_admission(namespace: OwnedNamespace) -> Result<UdsConnection, R
             return Err(ReadFailure::pre("marker_identity"));
         }
     }
-    if process_state(postbind.pid, &postbind.process_start_identity)? != ProcessState::Live {
-        return Err(ReadFailure::pre("marker_identity"));
+    // A publisher that is provably gone is an absence, not a race, and retrying
+    // it would spend the whole establishment budget to report the same thing
+    // twice. A *live* publisher mid-republication cannot reach this branch: it
+    // holds `LOCK_EX` while it writes, so the client's own `flock` above failed
+    // first with `marker_identity`. An unprovable state — an unreadable
+    // `/proc`, a malformed identity — stays `marker_identity` and keeps its
+    // retry, because that is a statement about liveness this client cannot make.
+    match process_state(postbind.pid, &postbind.process_start_identity)? {
+        ProcessState::Live => {}
+        ProcessState::Dead => return Err(ReadFailure::pre("marker_missing")),
     }
     validate_socket_entry(dir, &postbind, euid)?;
 
@@ -486,7 +518,9 @@ async fn connect_admission(namespace: OwnedNamespace) -> Result<UdsConnection, R
         },
         home: admission._namespace.home.clone(),
         admission,
-        exchange_deadline: Instant::now() + super::EXCHANGE_BUDGET,
+        // One budget per read: the exchange rides the window the caller opened
+        // for establishment rather than a second one behind it.
+        exchange_deadline,
     })
 }
 
@@ -505,8 +539,10 @@ fn directory_contains_temp_marker(dir: RawFd) -> bool {
     let Ok(scan) = fd_to_owned(duplicate) else {
         return true;
     };
-    let entries = unsafe { libc::fdopendir(scan.into_raw_fd()) };
+    let raw = scan.into_raw_fd();
+    let entries = unsafe { libc::fdopendir(raw) };
     if entries.is_null() {
+        unsafe { libc::close(raw) };
         return true;
     }
     let mut found = false;
@@ -563,11 +599,10 @@ fn validate_postbind(marker: &PostbindMarker, namespace: &str) -> Result<(), Rea
 }
 
 fn read_marker<T: for<'de> Deserialize<'de>>(dir: RawFd, name: &str) -> Result<T, ReadFailure> {
-    let (file, entry_identity) =
-        open_entry(dir, name, EntryKind::Regular).map_err(|error| match error {
-            EntryError::Missing => ReadFailure::pre("marker_missing"),
-            EntryError::Invalid => ReadFailure::pre("marker_invalid"),
-        })?;
+    let (file, entry_identity) = open_entry(dir, name).map_err(|error| match error {
+        EntryError::Missing => ReadFailure::pre("marker_missing"),
+        EntryError::Invalid => ReadFailure::pre("marker_invalid"),
+    })?;
     validate_regular_file(&file, unsafe { libc::geteuid() }, &entry_identity)
         .map_err(|_| ReadFailure::pre("marker_invalid"))?;
     let mut bytes = Vec::new();
@@ -587,8 +622,10 @@ fn read_marker<T: for<'de> Deserialize<'de>>(dir: RawFd, name: &str) -> Result<T
 fn inspect_temporary_markers(dir: RawFd) -> Result<(), ReadFailure> {
     let duplicate = unsafe { libc::dup(dir) };
     let scan = fd_to_owned(duplicate).map_err(|_| ReadFailure::pre("marker_identity"))?;
-    let entries = unsafe { libc::fdopendir(scan.into_raw_fd()) };
+    let raw = scan.into_raw_fd();
+    let entries = unsafe { libc::fdopendir(raw) };
     if entries.is_null() {
+        unsafe { libc::close(raw) };
         return Err(ReadFailure::pre("marker_identity"));
     }
     let result = scan_temporary_markers(entries);
@@ -688,8 +725,7 @@ fn temporary_kind(name: &str) -> Option<TempKind> {
 }
 
 fn read_named_file(dir: RawFd, name: &str) -> Result<Vec<u8>, ReadFailure> {
-    let (file, entry) = open_entry(dir, name, EntryKind::Regular)
-        .map_err(|_| ReadFailure::pre("marker_invalid"))?;
+    let (file, entry) = open_entry(dir, name).map_err(|_| ReadFailure::pre("marker_invalid"))?;
     validate_regular_file(&file, unsafe { libc::geteuid() }, &entry)
         .map_err(|_| ReadFailure::pre("marker_invalid"))?;
     let mut bytes = Vec::new();
@@ -776,11 +812,6 @@ fn anchored_child_path(dir: RawFd, child: &str) -> Result<PathBuf, ReadFailure> 
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum EntryKind {
-    Regular,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
 struct FileIdentity {
     device: u64,
     inode: u64,
@@ -792,7 +823,7 @@ enum EntryError {
     Invalid,
 }
 
-fn open_entry(dir: RawFd, name: &str, kind: EntryKind) -> Result<(File, FileIdentity), EntryError> {
+fn open_entry(dir: RawFd, name: &str) -> Result<(File, FileIdentity), EntryError> {
     let before = fstatat(dir, name).map_err(|error| {
         if error.raw_os_error() == Some(libc::ENOENT) {
             EntryError::Missing
@@ -800,7 +831,7 @@ fn open_entry(dir: RawFd, name: &str, kind: EntryKind) -> Result<(File, FileIden
             EntryError::Invalid
         }
     })?;
-    if before.st_nlink != 1 || (matches!(kind, EntryKind::Regular) && !regular_stat(&before)) {
+    if before.st_nlink != 1 || !regular_stat(&before) {
         return Err(EntryError::Invalid);
     }
     let c_name = CString::new(name).map_err(|_| EntryError::Invalid)?;
@@ -969,6 +1000,40 @@ fn errno() -> i32 {
 mod tests {
     use super::*;
 
+    /// The kernel serves `system.posix_acl_access` in text form, so the parser
+    /// is exercised on the spelling the kernel produces. Testing the parser
+    /// rather than the syscall keeps this deterministic on a filesystem with
+    /// no POSIX ACL support, where the syscall itself cannot be exercised.
+    #[test]
+    fn a_posix_acl_is_read_in_the_spelling_the_kernel_writes() {
+        for admitted in [
+            "u::rw-,g::r--,o::r--",
+            "u::rwx,g::r-x,o::r--,m::rwx",
+            "u::rw-,g::r--,o::r--,u:1002:r-x",
+        ] {
+            assert_eq!(
+                validate_acl_value(admitted.as_bytes()),
+                Ok(()),
+                "{admitted} grants nobody a write the mode does not already show"
+            );
+        }
+        for refused in [
+            "u::rw-,g::r--,o::r--,u:1002:rwx",
+            "u::rw-,g::r--,o::r--,g:1002:-w-",
+            "u::rw-x,zz:1002:rwx",
+            "u::rw-,g::r--,o::q--",
+            "u::",
+            "u::rw-,g::r--,o::r--,u:1002:rwx:extra",
+            "u::rw-,g::r--,o::r--,u:notanid:r--",
+        ] {
+            assert_eq!(
+                validate_acl_value(refused.as_bytes()),
+                Err(TrustedPathError::Invalid),
+                "{refused} is a named write or a value this code cannot read"
+            );
+        }
+    }
+
     #[test]
     fn process_identity_grammar_is_ascii_and_structured() {
         let boot = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
@@ -1123,6 +1188,83 @@ mod tests {
 
         std::fs::remove_file(&torn).expect("the publisher reaps it");
         inspect_temporary_markers(namespace.as_raw_fd()).expect("the reaped directory is admitted");
+    }
+
+    /// A namespace whose markers are all present, all consistent and all
+    /// perfectly valid, naming a pid that is provably not running: that is an
+    /// absence, and it must answer as one. Reporting it as an identity fault
+    /// would send the read back through the retry loop and spend the whole
+    /// establishment budget before saying the same thing twice.
+    #[tokio::test]
+    async fn a_dead_publisher_is_an_absence_rather_than_a_retryable_identity() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("namespace");
+        let lock = dir.path().join(LOCK_FILE);
+        std::fs::write(&lock, b"").expect("lock");
+        std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+
+        // A pid no process can hold, recorded against this boot, so the walk
+        // proves it dead rather than failing to prove anything.
+        let dead_pid = 4_194_302u32;
+        let identity = format!(
+            "linux:v1:{}:1",
+            std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+                .expect("boot id")
+                .trim()
+        );
+        let instance = "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d";
+        let namespace_name = "debug:agent-of-empires-dev";
+        let prebind = serde_json::json!({
+            "schema": 1,
+            "pid": dead_pid,
+            "process_start_identity": identity,
+            "prebind_instance_id": instance,
+            "namespace": namespace_name,
+        });
+        let postbind = serde_json::json!({
+            "schema": 1,
+            "pid": dead_pid,
+            "process_start_identity": identity,
+            "prebind_instance_id": instance,
+            "runtime_instance_id": "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d",
+            "runtime_epoch": "3f2b1c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5e",
+            "namespace": namespace_name,
+            "socket_path": SOCKET_FILE,
+            "owner_uid": unsafe { libc::geteuid() },
+            "socket_device": 1,
+            "socket_inode": 1,
+            "socket_creator_pid": dead_pid,
+        });
+        // The admission requires exactly 0600 on both markers, so the mode the
+        // umask would give a plain write is corrected here rather than tested
+        // as a separate refusal.
+        for (name, marker) in [(PREBIND_FILE, &prebind), (POSTBIND_FILE, &postbind)] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, marker.to_string()).expect("marker");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                .expect("marker mode");
+        }
+
+        let opened = std::fs::File::open(dir.path()).expect("open namespace");
+        let namespace = OwnedNamespace {
+            name: namespace_name.to_string(),
+            home: dir.path().to_path_buf(),
+            dir: OwnedFd::from(opened),
+        };
+        let Err(error) = connect_admission(
+            namespace,
+            Instant::now() + crate::cli::runtime_read::ESTABLISHMENT_BUDGET,
+        )
+        .await
+        else {
+            panic!("a dead publisher admits nothing");
+        };
+        assert_eq!(
+            error.code(),
+            "marker_missing",
+            "a provably dead publisher is an absence, not a retryable identity fault"
+        );
     }
 
     #[test]

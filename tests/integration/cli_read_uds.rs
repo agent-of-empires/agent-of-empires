@@ -258,7 +258,6 @@ async fn a_republication_raced_mid_admission_still_serves_the_read() {
         let marker = marker.clone();
         let published = published.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(120)).await;
             std::fs::write(&marker, published).expect("the republication lands");
         })
     };
@@ -273,4 +272,116 @@ async fn a_republication_raced_mid_admission_still_serves_the_read() {
     assert!(outcome.stdout.is_some());
     state.shutdown.cancel();
     server.join().await;
+}
+
+/// A home reached through a symlink is an ordinary setup — `/tmp` → `/private/tmp`
+/// on macOS, a linked `$HOME` on Linux — and the publisher used to refuse it
+/// outright, so a daemon under a symlinked `XDG_CONFIG_HOME` published nothing
+/// and every read fell back to the local store. The walk follows a prefix
+/// symlink and verifies what it resolves to by descriptor, so this is served.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_publication_under_a_symlinked_config_home_is_served() {
+    let base = tempfile::tempdir().expect("temp base");
+    let real = base.path().join("real");
+    std::fs::create_dir_all(&real).expect("real config home");
+    let link = base.path().join("link");
+    std::os::unix::fs::symlink(&real, &link).expect("config home symlink");
+
+    let previous = std::env::var_os("XDG_CONFIG_HOME");
+    std::env::set_var("XDG_CONFIG_HOME", &link);
+    let _restore = EnvRestore(previous);
+
+    let state = build_test_app_state_with_policy(Vec::new(), Vec::new(), Vec::new(), None);
+    let server = RuntimeUdsTestServer::start_in(&link, state.clone())
+        .unwrap_or_else(|reason| panic!("a symlinked config home is publishable: {reason}"));
+    // A profile that holds nothing: what is under test is which transport
+    // answers, not the missing-profile refusal the renderer would otherwise
+    // return for an empty state.
+    agent_of_empires::session::create_profile("main").expect("create fixture profile");
+
+    // All four artifacts exist: a publisher that walked the chain and then
+    // published by name would have produced the same two marker files, so the
+    // count is the difference between "published" and "published once".
+    for name in [
+        "lifetime.lock",
+        "runtime.prebind.json",
+        "runtime.postbind.json",
+        "runtime.sock",
+    ] {
+        assert!(
+            server.app_dir().join(name).exists(),
+            "{name} must be published under a symlinked config home"
+        );
+    }
+
+    let cli = Cli::try_parse_from(["aoe", "status"]).expect("status parses");
+    let command = classify(cli.command.as_ref()).expect("status is a scoped read");
+    let outcome = read(command).await;
+    assert_eq!(
+        outcome.exit, 0,
+        "the read must be served: {:?}",
+        outcome.stderr
+    );
+    assert!(
+        outcome.stdout.as_deref().is_some_and(|out| !out.is_empty()),
+        "a served read prints something"
+    );
+    state.shutdown.cancel();
+    server.join().await;
+}
+
+/// A daemon that was killed outright leaves its three artifacts behind, and the
+/// client has to say so at once. Reporting that as a retryable identity fault
+/// would spend the whole 15-second establishment budget before producing the
+/// same answer, so the read is handed straight back to the local command path.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_dead_publisher_hands_the_read_back_at_once() {
+    let state = build_test_app_state_with_policy(Vec::new(), Vec::new(), Vec::new(), None);
+    let server = RuntimeUdsTestServer::start(state.clone())
+        .unwrap_or_else(|reason| panic!("the local read must be publishable: {reason}"));
+
+    // Exactly what a `kill -9` leaves: the artifacts on disk, the recorded pid
+    // of a process that is provably not running, and no listener answering.
+    for name in ["runtime.prebind.json", "runtime.postbind.json"] {
+        let path = server.app_dir().join(name);
+        let published = std::fs::read(&path).expect("the live marker");
+        let mut dead: serde_json::Value =
+            serde_json::from_slice(&published).expect("the marker is json");
+        dead["pid"] = serde_json::json!(4_194_302);
+        dead["process_start_identity"] = serde_json::json!(format!(
+            "linux:v1:{}:1",
+            std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+                .expect("boot id")
+                .trim()
+        ));
+        std::fs::write(&path, serde_json::to_vec(&dead).expect("dead marker")).expect("rewrite");
+    }
+
+    let started = std::time::Instant::now();
+    let read = attempt_read(ScopedCommand::Profile, &local_source()).await;
+    let elapsed = started.elapsed();
+    assert!(
+        matches!(read, ScopedRead::NoLocalPublication),
+        "a dead publisher is an absence, not a refusal"
+    );
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "the read was handed back in {elapsed:?}, which is the whole establishment budget again"
+    );
+    state.shutdown.cancel();
+    server.join().await;
+}
+
+/// Restores `XDG_CONFIG_HOME` when the test ends, however it ends.
+struct EnvRestore(Option<OsString>);
+
+impl Drop for EnvRestore {
+    fn drop(&mut self) {
+        match &self.0 {
+            Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+    }
 }
