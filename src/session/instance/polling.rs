@@ -633,6 +633,18 @@ impl Instance {
         })
     }
 
+    /// Whether the poller still holds an observation the drain has not consumed.
+    /// A caller that moves the row must settle that observation first: the flush
+    /// reads the sidecar on its own and cannot see what is queued here.
+    pub(crate) fn session_id_poller_has_undrained_observation(&self) -> bool {
+        self.session_id_poller.as_ref().is_some_and(|poller| {
+            poller
+                .lock()
+                .map(|mut guard| guard.latest_observation().is_some())
+                .unwrap_or_else(|poisoned| poisoned.into_inner().latest_observation().is_some())
+        })
+    }
+
     /// Replace a missing or finished poller once its tmux pane is live.
     pub(crate) fn repair_session_id_poller_if_needed(
         &mut self,
@@ -1358,6 +1370,28 @@ mod tests {
             "decline must happen before the handle is cleared"
         );
     }
+    #[test]
+    fn undrained_observation_is_reported_until_acknowledged() {
+        let mut inst = Instance::new("undrained", "/tmp/undrained");
+        let poller = crate::session::poller::SessionPoller::new("test-tmux-undrained".to_string());
+        poller.inject_test_observation(
+            &inst.id,
+            crate::session::poller::SessionIdObservation::instance_sidecar(
+                "019342ab-1234-7def-8901-000000000001".to_string(),
+                None,
+            ),
+        );
+        inst.session_id_poller = Some(std::sync::Arc::new(std::sync::Mutex::new(poller)));
+
+        assert!(inst.session_id_poller_has_undrained_observation());
+        let poller = inst.session_id_poller.as_ref().unwrap().clone();
+        let mut guard = poller.lock().unwrap();
+        let pending = guard.latest_observation().expect("the queue holds it");
+        assert!(guard.acknowledge_observation(&pending));
+        drop(guard);
+        assert!(!inst.session_id_poller_has_undrained_observation());
+    }
+
     #[test]
     #[serial_test::serial]
     fn repair_preserves_live_parked_rows_for_no_kill_transitions() {
