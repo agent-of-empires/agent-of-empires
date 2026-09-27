@@ -15,13 +15,44 @@ pub struct ReadRequestSource {
     pub env_profile: Option<OsString>,
 }
 
+/// The one definition of an *unset selection* in this module: a value that is
+/// absent, empty, or whitespace only. It covers both variables a read is
+/// aimed by — [`URL_ENV`] and [`PROFILE_ENV`] — because they are the same
+/// decision, and a shell profile that exports either one empty has expressed
+/// the same thing. The local path is the oracle: `resolve_existing_profile`
+/// maps an empty profile name to the configured default, and an empty
+/// `AOE_DAEMON_URL` has always selected the local transport, so the served
+/// half may not invent a stricter rule than the local half has.
+pub(crate) fn selection_is_unset(text: &str) -> bool {
+    text.trim().is_empty()
+}
+
+/// [`selection_is_unset`] for a raw environment value. A value that is not
+/// UTF-8 is not unset: it is a malformed selection, and it fails as one.
+pub(crate) fn env_selection_is_unset(value: &OsStr) -> bool {
+    value.to_str().is_some_and(selection_is_unset)
+}
+
+impl ReadRequestSource {
+    /// Whether the environment names an endpoint. Read through
+    /// [`env_url_is_unset`] so a source built by hand (a test harness) and one
+    /// Whether the environment names an endpoint. Read through
+    /// [`env_selection_is_unset`] so a source built by hand (a test harness)
+    /// and one read from the process agree on what "unset" means.
+    pub fn env_url_is_set(&self) -> bool {
+        self.env_url
+            .as_deref()
+            .is_some_and(|value| !env_selection_is_unset(value))
+    }
+}
+
 pub(crate) fn read_request_source(cli: &super::Cli) -> ReadRequestSource {
     ReadRequestSource {
         explicit_url: cli.daemon_url.clone(),
-        env_url: std::env::var_os(URL_ENV),
+        env_url: std::env::var_os(URL_ENV).filter(|value| !env_selection_is_unset(value)),
         token: std::env::var_os(TOKEN_ENV),
         explicit_profile: cli.profile.clone(),
-        env_profile: std::env::var_os(PROFILE_ENV),
+        env_profile: std::env::var_os(PROFILE_ENV).filter(|value| !env_selection_is_unset(value)),
     }
 }
 
@@ -42,17 +73,10 @@ pub(crate) fn select_endpoint(source: &ReadRequestSource) -> Result<SelectedEndp
             let value = value
                 .to_str()
                 .ok_or_else(|| ReadFailure::pre("invalid_endpoint"))?;
-            // An empty variable is an unset one, which is how the rest of the
-            // tool reads it (`acp::client::discovery`): `AOE_DAEMON_URL=` in a
-            // shell profile or a CI environment is not a request to refuse
-            // every read, and refusing would strand the seven read commands
-            // where no daemon is published. A value that is present but not
-            // empty still has to parse, and an explicitly empty
-            // `--daemon-url` is a flag the user gave a value to by mistake.
-            match value.trim() {
-                "" => return Ok(SelectedEndpoint::Local),
-                trimmed => Some(trimmed),
+            if selection_is_unset(value) {
+                return Ok(SelectedEndpoint::Local);
             }
+            Some(value.trim())
         }
         (None, None) => return Ok(SelectedEndpoint::Local),
     };
@@ -87,12 +111,26 @@ pub(crate) fn select_endpoint(source: &ReadRequestSource) -> Result<SelectedEndp
     })
 }
 
+/// Which profile a read is aimed at, with the local path's rule for an empty
+/// value: a `-p ''` the user typed is honoured as "no selection at all" and
+/// resolves to the default profile, exactly as the local command does
+/// (`resolve_existing_profile("")`). An explicit flag stops the search even
+/// when it is empty, because the local path reads it the same way — an
+/// explicit `-p` wins over the variable whatever its value.
 pub(crate) fn selected_profile_source(source: &ReadRequestSource) -> ProfileSource<'_> {
     if let Some(value) = source.explicit_profile.as_deref() {
-        return ProfileSource::Explicit(value);
+        return if selection_is_unset(value) {
+            ProfileSource::Default
+        } else {
+            ProfileSource::Explicit(value)
+        };
     }
     if let Some(value) = source.env_profile.as_deref() {
-        return ProfileSource::Environment(value);
+        return if env_selection_is_unset(value) {
+            ProfileSource::Default
+        } else {
+            ProfileSource::Environment(value)
+        };
     }
     ProfileSource::Default
 }
@@ -350,6 +388,71 @@ mod tests {
         assert!(matches!(
             selected_profile_source(&source),
             ProfileSource::Explicit("explicit")
+        ));
+    }
+
+    fn source_with(
+        explicit_url: Option<&str>,
+        env_url: Option<&str>,
+        explicit_profile: Option<&str>,
+        env_profile: Option<&str>,
+    ) -> ReadRequestSource {
+        ReadRequestSource {
+            explicit_url: explicit_url.map(str::to_string),
+            env_url: env_url.map(OsString::from),
+            token: Some(OsString::from("token")),
+            explicit_profile: explicit_profile.map(str::to_string),
+            env_profile: env_profile.map(OsString::from),
+        }
+    }
+
+    /// An exported-but-empty variable is unset, so it selects the local
+    /// transport exactly as an absent one does. An explicitly empty
+    /// `--daemon-url` is a flag the user gave a value to by mistake and is
+    /// still refused.
+    #[test]
+    fn an_empty_environment_url_is_unset_but_an_empty_flag_is_refused() {
+        for env_url in [None, Some(""), Some("   "), Some("\t\n")] {
+            let source = source_with(None, env_url, None, None);
+            assert!(
+                matches!(select_endpoint(&source).unwrap(), SelectedEndpoint::Local),
+                "{env_url:?} must select the local transport"
+            );
+            assert!(!source.env_url_is_set(), "{env_url:?} must read as unset");
+        }
+        let source = source_with(Some(""), None, None, None);
+        let error = select_endpoint(&source).unwrap_err();
+        assert_eq!(error.code(), "invalid_endpoint");
+        // A value that is present still has to parse, and must not be trimmed
+        // into a different one.
+        assert!(select_endpoint(&source_with(None, Some("not a url"), None, None)).is_err());
+    }
+
+    /// The same rule for the profile selection, in both halves: the local path
+    /// maps an empty profile to the configured default
+    /// (`resolve_existing_profile("")`), so the served half may not refuse it
+    /// with `profile_missing` — least of all when no daemon is published at
+    /// all, where the very same command succeeds.
+    #[test]
+    fn an_empty_profile_selection_is_the_default_in_both_halves() {
+        for env_profile in [None, Some(""), Some("   ")] {
+            let source = source_with(None, None, None, env_profile);
+            assert!(
+                matches!(selected_profile_source(&source), ProfileSource::Default),
+                "{env_profile:?} must select the default profile"
+            );
+        }
+        // An explicit `-p ''` also means "no selection", and it still wins
+        // over the variable, because that is how the local path reads it.
+        let source = source_with(None, None, Some(""), Some("environment"));
+        assert!(matches!(
+            selected_profile_source(&source),
+            ProfileSource::Default
+        ));
+        let source = source_with(None, None, Some("named"), Some(""));
+        assert!(matches!(
+            selected_profile_source(&source),
+            ProfileSource::Explicit("named")
         ));
     }
 }

@@ -194,6 +194,62 @@ async fn no_daemon_publication_leaves_the_command_to_the_local_path() {
     );
 }
 
+/// An empty or whitespace-only selection in the environment is one decision,
+/// in both variables, and a live daemon must answer it the way the local
+/// command path does: `aoe list` reads the default profile and prints the
+/// table. Before, the empty profile came back as `profile_missing` (exit 4)
+/// from the daemon while the very same command succeeded with no daemon, and
+/// an empty `AOE_DAEMON_URL` stranded every read instead of selecting the
+/// local transport.
+#[tokio::test]
+#[serial_test::serial]
+async fn an_empty_environment_selection_is_answered_not_refused() {
+    let mut instance = Instance::new("s1", "/repo");
+    instance.source_profile = "main".into();
+    instance.title = "Session".into();
+    instance.tool = "claude".into();
+    instance.id = "s1".into();
+    let state = build_test_app_state_with_policy(vec![instance], Vec::new(), Vec::new(), None);
+    let server = RuntimeUdsTestServer::start(state.clone())
+        .unwrap_or_else(|reason| panic!("the local read must be publishable: {reason}"));
+    agent_of_empires::session::create_profile("main").expect("create fixture profile");
+
+    for (label, env_url, env_profile) in [
+        ("absent", None, None),
+        ("empty", Some(OsString::from("")), Some(OsString::from(""))),
+        (
+            "whitespace",
+            Some(OsString::from("   ")),
+            Some(OsString::from("  ")),
+        ),
+    ] {
+        let source = ReadRequestSource {
+            explicit_url: None,
+            env_url,
+            token: None,
+            explicit_profile: None,
+            env_profile,
+        };
+        let cli = Cli::try_parse_from(["aoe", "list"]).expect("list parses");
+        let command = classify(cli.command.as_ref()).expect("list is a scoped read");
+        let outcome = match attempt_read(command, &source).await {
+            ScopedRead::Answered(outcome) => outcome,
+            ScopedRead::NoLocalPublication => panic!("{label}: a live daemon must answer"),
+        };
+        assert_eq!(outcome.exit, 0, "{label}: {:?}", outcome.stderr);
+        assert!(
+            outcome
+                .stdout
+                .as_deref()
+                .is_some_and(|out| out.contains("s1")),
+            "{label}: the default profile's session must be listed: {:?}",
+            outcome.stdout
+        );
+    }
+    state.shutdown.cancel();
+    server.join().await;
+}
+
 /// Shutdown retracts the artifacts, so a later read fails closed at admission
 /// instead of reaching a socket that no daemon is serving.
 #[tokio::test]

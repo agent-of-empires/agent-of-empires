@@ -248,7 +248,7 @@ pub async fn attempt(command: ScopedCommand<'_>, source: &ReadRequestSource) -> 
 /// trustworthy, are the daemon's answer to keep: falling back on those would
 /// quietly serve data the admission was built to withhold.
 fn absent_local_publication(error: &ReadFailure, source: &ReadRequestSource) -> bool {
-    error.code() == "marker_missing" && source.explicit_url.is_none() && source.env_url.is_none()
+    error.code() == "marker_missing" && source.explicit_url.is_none() && !source.env_url_is_set()
 }
 
 async fn execute_inner(
@@ -550,7 +550,59 @@ fn map_upgrade_error(error: WsError) -> ReadFailure {
 mod tests {
     use super::*;
     use clap::Parser;
+    use std::ffi::OsString;
 
+    /// The local take-over is gated on the environment naming no endpoint, so
+    /// it has to read "names no endpoint" through the same definition the
+    /// selector does. An empty or whitespace-only `AOE_DAEMON_URL` is exactly
+    /// the case this exists for: with no daemon published, the command must
+    /// answer from the local store, on every platform.
+    #[test]
+    fn an_empty_environment_url_still_takes_over_from_the_local_store() {
+        let missing = ReadFailure::pre("marker_missing");
+        let cases: [(&str, Option<OsString>); 3] = [
+            ("absent", None),
+            ("empty", Some(OsString::from(""))),
+            ("whitespace", Some(OsString::from("   "))),
+        ];
+        for (label, env_url) in cases {
+            let source = ReadRequestSource {
+                explicit_url: None,
+                env_url,
+                token: None,
+                explicit_profile: None,
+                env_profile: None,
+            };
+            assert!(
+                absent_local_publication(&missing, &source),
+                "{label} must answer from the local store"
+            );
+        }
+        let named = ReadRequestSource {
+            explicit_url: None,
+            env_url: Some(OsString::from("https://example.test")),
+            token: None,
+            explicit_profile: None,
+            env_profile: None,
+        };
+        assert!(
+            !absent_local_publication(&missing, &named),
+            "a named endpoint is the daemon's answer to keep"
+        );
+        assert!(
+            !absent_local_publication(
+                &ReadFailure::pre("marker_invalid"),
+                &ReadRequestSource {
+                    explicit_url: None,
+                    env_url: None,
+                    token: None,
+                    explicit_profile: None,
+                    env_profile: None,
+                }
+            ),
+            "only an absent publication is a take-over"
+        );
+    }
     #[test]
     fn classifier_matches_only_exact_scoped_paths() {
         let cases = [
