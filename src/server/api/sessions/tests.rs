@@ -803,6 +803,18 @@ fn parent_row(
     row
 }
 
+/// A parent row whose `id` the tie-break compares, so a test decides which
+/// row a refusal names instead of inheriting a generated one.
+fn parent_row_with_id(
+    id: &str,
+    label: &str,
+    binding: Option<crate::session::ConversationBinding>,
+) -> crate::session::Instance {
+    let mut row = parent_row(label, binding);
+    row.id = id.to_string();
+    row
+}
+
 #[test]
 fn fork_seed_and_structured_fork_guard_agree_per_agent() {
     {
@@ -928,17 +940,21 @@ fn fork_from_resolves_the_conversation_the_parent_carries() {
 }
 
 /// When every row carrying the id is unqualified, the refusal names the same
-/// state whichever order the load returned them in: none of them proves the
-/// id was reserved by a launch that never ran.
+/// state whichever order the load returned them in, and the row it points at
+/// is the one holding the lowest `id`, not the one that arrived first.
 #[test]
 fn fork_from_unqualified_rows_is_refused_the_same_way_in_either_order() {
-    let mut bare = crate::session::Instance::new("bare", "/tmp");
-    bare.agent_session_id = Some("parent-uuid".into());
-    let mut stale = crate::session::Instance::new("stale", "/tmp");
-    stale.agent_session_id = Some("parent-uuid".into());
-    stale.agent_session_binding = Some(crate::session::ConversationBinding::unknown("parent-uuid"));
-
-    for parents in [vec![bare.clone(), stale.clone()], vec![stale, bare]] {
+    use crate::session::ConversationProvenance;
+    let bare = parent_row_with_id("a-bare", "bare", None);
+    let stale = parent_row_with_id(
+        "b-stale",
+        "stale",
+        Some(unqualified_parent_binding(ConversationProvenance::Unknown)),
+    );
+    for (parents, elected) in [
+        (vec![bare.clone(), stale.clone()], 0),
+        (vec![stale, bare], 1),
+    ] {
         assert_eq!(
             resolve_create_fork_seed("parent-uuid", false, &parents),
             Err((
@@ -946,7 +962,7 @@ fn fork_from_unqualified_rows_is_refused_the_same_way_in_either_order() {
                     pre_pinned: false,
                     recorded: "parent-uuid".into(),
                 },
-                Some(0),
+                Some(elected),
             ))
         );
     }
@@ -982,59 +998,93 @@ fn fork_from_rows_carrying_one_id_resolves_the_qualified_row_in_either_order() {
     }
 }
 
-/// Two rows disagreeing on provenance have no ranked winner, so the refusal
-/// reports whichever row loaded first, and only that row's evidence decides
-/// whether the id was reserved by a launch that never ran.
+/// Two rows disagreeing on provenance are refused the same way whichever order
+/// the load returned them in: only the row holding the lowest `id` has its
+/// evidence read, so what the refusal says cannot come from arrival.
 #[test]
-fn fork_from_rows_disagreeing_on_provenance_refuses_with_the_first_row() {
+fn fork_from_rows_disagreeing_on_provenance_refuses_the_lowest_id_row() {
     use crate::session::ConversationProvenance;
-    let preallocated = unqualified_parent_binding(ConversationProvenance::Preallocated);
-    let unknown = unqualified_parent_binding(ConversationProvenance::Unknown);
-    for (first, second, pre_pinned) in [
-        (&preallocated, &unknown, true),
-        (&unknown, &preallocated, false),
+    let preallocated = parent_row_with_id(
+        "a-pre",
+        "pre",
+        Some(unqualified_parent_binding(
+            ConversationProvenance::Preallocated,
+        )),
+    );
+    let unknown = parent_row_with_id(
+        "b-unknown",
+        "unknown",
+        Some(unqualified_parent_binding(ConversationProvenance::Unknown)),
+    );
+    let mut denials = Vec::new();
+    for parents in [
+        vec![preallocated.clone(), unknown.clone()],
+        vec![unknown, preallocated],
     ] {
+        let (denied, elected) = resolve_create_fork_seed("parent-uuid", false, &parents)
+            .expect_err("two unqualified rows naming one id are refused");
+        denials.push((
+            denied,
+            parents[elected.expect("a refusal names its row")]
+                .id
+                .clone(),
+        ));
+    }
+    assert_eq!(denials[0], denials[1], "the refusal cannot depend on order");
+    for (denied, elected) in &denials {
         assert_eq!(
-            resolve_create_fork_seed(
-                "parent-uuid",
-                false,
-                &[
-                    parent_row("first", Some(first.clone())),
-                    parent_row("second", Some(second.clone())),
-                ]
-            ),
-            Err((
-                crate::session::ForkDenied::UnqualifiedParent {
-                    pre_pinned,
-                    recorded: "parent-uuid".into(),
-                },
-                Some(0),
-            ))
+            *denied,
+            crate::session::ForkDenied::UnqualifiedParent {
+                pre_pinned: true,
+                recorded: "parent-uuid".into(),
+            },
+            "the pre-pinned row holds the lowest id, so its evidence is the one read"
+        );
+        assert_eq!(elected, "a-pre", "the lowest id is the row refused");
+    }
+}
+
+/// The disagreement scan is a qualified-row question, and it reads the rows
+/// before the tie-break elects between them: two qualified rows naming
+/// different conversations refuse whichever row the tie-break elects, even
+/// when the elected one only takes the seat after arriving.
+#[test]
+fn fork_from_contradictory_qualified_rows_refuses_whichever_row_wins_the_tie_break() {
+    let mut other_agent = qualified_parent_binding();
+    other_agent.execution.as_mut().unwrap().agent = "codex".into();
+    let low = parent_row_with_id("a-low", "claude", Some(qualified_parent_binding()));
+    let high = parent_row_with_id("z-high", "codex", Some(other_agent));
+    for (parents, elected) in [(vec![high.clone(), low.clone()], 1), (vec![low, high], 0)] {
+        assert_eq!(
+            resolve_create_fork_seed("parent-uuid", false, &parents),
+            Err((crate::session::ForkDenied::NoParentSession, Some(elected))),
+            "a row that only takes the seat by its id is still compared"
         );
     }
 }
 
-/// The ambiguity scan is a qualified-row question: two qualified rows naming
-/// different conversations refuse whichever loaded first, and a row recording
-/// the same id with no binding to compare never makes agreeing rows ambiguous.
+/// Two qualified rows naming the same conversation agree however they differ
+/// in provenance, and a row recording the same id with no binding to compare
+/// never makes them ambiguous.
 #[test]
-fn fork_from_contradictory_qualified_rows_is_refused_in_either_order() {
-    let mut other_agent = qualified_parent_binding();
-    other_agent.execution.as_mut().unwrap().agent = "codex".into();
-    let qualified = qualified_parent_binding();
+fn fork_from_qualified_rows_naming_one_conversation_is_allowed() {
+    use crate::session::ConversationProvenance;
+    let mut asserted = qualified_parent_binding();
+    asserted.provenance = ConversationProvenance::Asserted;
+    let observed = qualified_parent_binding();
     for parents in [
         vec![
-            parent_row("claude", Some(qualified.clone())),
-            parent_row("codex", Some(other_agent.clone())),
+            parent_row("observed", Some(observed.clone())),
+            parent_row("asserted", Some(asserted.clone())),
         ],
         vec![
-            parent_row("codex", Some(other_agent)),
-            parent_row("claude", Some(qualified)),
+            parent_row("asserted", Some(asserted)),
+            parent_row("observed", Some(observed.clone())),
         ],
     ] {
-        assert_eq!(
-            resolve_create_fork_seed("parent-uuid", false, &parents),
-            Err((crate::session::ForkDenied::NoParentSession, Some(0)))
+        assert!(
+            resolve_create_fork_seed("parent-uuid", false, &parents).is_ok(),
+            "the same key under two provenances is one conversation"
         );
     }
     assert!(

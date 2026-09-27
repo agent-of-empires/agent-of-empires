@@ -123,11 +123,10 @@ pub(super) fn create_body_combines_scratch_and_worktree(body: &CreateSessionBody
 }
 
 /// A fork refusal plus the index in `parents` of the row it is about, so the
-/// remedy names the row the request asked to fork. `None` when no row carries
-/// the id.
+/// remedy names the row the refusal was decided on. `None` when no row
+/// carries the id.
 pub(super) type ForkDenial = (crate::session::ForkDenied, Option<usize>);
 
-/// Resolve a one-shot fork seed from a uniquely identified parent binding.
 pub(super) fn resolve_create_fork_seed(
     parent_id: &str,
     structured: bool,
@@ -140,11 +139,16 @@ pub(super) fn resolve_create_fork_seed(
     }
     // The candidate is the conversation the row carries, which for a pinned row
     // is the pinned id, not the one `agent_session_id` still names, so the id is
-    // read off the candidate. Lazy: a row carrying another id, or none of its
-    // own, is dropped without materialising anything.
-    let mut first = None;
-    let mut qualified = None;
-    let mut ambiguous = false;
+    // read off the candidate. A row carrying another id, or none of its own, is
+    // dropped without materialising anything.
+    //
+    // Several rows can record that one id, and `Storage::load()` returns them in
+    // file order, so what a refusal names cannot come from arrival: a qualified
+    // row outranks an unqualified one, ties break on the lowest `id` the store
+    // holds, and qualified rows naming different conversations refuse whichever
+    // of them the tie-break elects.
+    let mut chosen: Option<(usize, crate::session::ForkParentRef<'_>)> = None;
+    let mut disagreeing = false;
     for (index, parent) in parents.iter().enumerate() {
         let Some(candidate) = parent
             .fork_parent_ref()
@@ -152,30 +156,24 @@ pub(super) fn resolve_create_fork_seed(
         else {
             continue;
         };
-        if first.is_none() {
-            first = Some((index, candidate));
-        }
-        if !candidate.is_known() {
+        let known = candidate.is_known();
+        let Some((chosen_index, elected)) = chosen else {
+            chosen = Some((index, candidate));
             continue;
+        };
+        let elected_known = elected.is_known();
+        if known && elected_known {
+            disagreeing |= candidate.binding().and_then(|binding| binding.key())
+                != elected.binding().and_then(|binding| binding.key());
         }
-        // A qualified row wins over an unqualified one carrying the same id,
-        // and the scan compares qualified rows only, so neither the seed nor
-        // the scan depends on the order `Storage::load()` returned.
-        match qualified {
-            None => qualified = Some((index, candidate)),
-            Some((_, previous))
-                if candidate.binding().and_then(|binding| binding.key())
-                    != previous.binding().and_then(|binding| binding.key()) =>
-            {
-                ambiguous = true;
-            }
-            Some(_) => {}
+        if (known && !elected_known)
+            || (known == elected_known && parent.id < parents[chosen_index].id)
+        {
+            chosen = Some((index, candidate));
         }
     }
-    let (index, parent) = qualified
-        .or(first)
-        .ok_or((crate::session::ForkDenied::NoParentSession, None))?;
-    if ambiguous {
+    let (index, parent) = chosen.ok_or((crate::session::ForkDenied::NoParentSession, None))?;
+    if disagreeing {
         return Err((crate::session::ForkDenied::NoParentSession, Some(index)));
     }
     crate::session::fork::terminal_fork_seed(
