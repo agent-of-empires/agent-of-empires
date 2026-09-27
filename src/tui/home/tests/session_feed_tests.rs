@@ -1282,3 +1282,69 @@ fn canonical_revision_reconciles_metadata_across_workspace_reordering() {
         .get_instance(&instance.id)
         .is_some_and(|row| row.title == "ordering-arrival"));
 }
+
+/// A revision that reconciles rows is only applied once the locked storage
+/// reload that reads those rows succeeded. When that reload fails the mirror
+/// is still showing pre-revision rows, so marking the revision applied would
+/// let the runtime's own "the view is synchronized" gate release rows against
+/// state this view never loaded.
+#[test]
+#[serial]
+fn a_revision_whose_reload_failed_stays_unapplied() {
+    let mut env = create_test_env_empty();
+    let instance = local_row(&mut env, "alpha", "/tmp/repo");
+    env.view.save().expect("seed the durable row");
+    let mut renamed = instance.clone();
+    renamed.title = "renamed".into();
+    Storage::new_unwatched("test")
+        .unwrap()
+        .update(|rows, _| {
+            *rows = vec![renamed.clone()];
+            Ok(())
+        })
+        .expect("publish the canonical row on disk");
+
+    // This revision renames the row, so applying it goes through the reload.
+    let unapplied = env.view.session_feed.next_revision_for_test();
+    publish_canonical_snapshot(
+        &mut env,
+        vec![canonical_row(&renamed, serde_json::json!({}))],
+        vec![],
+        5,
+    );
+    let applied = env.view.session_feed.next_revision_for_test();
+    assert!(
+        applied > unapplied,
+        "a revision whose reload succeeded is marked applied"
+    );
+    assert!(env
+        .view
+        .get_instance(&instance.id)
+        .is_some_and(|row| row.title == "renamed"));
+
+    // The file that reload has to read is unreadable from here on.
+    let sessions_path = Storage::new_unwatched("test")
+        .unwrap()
+        .sessions_path()
+        .to_path_buf();
+    std::fs::write(&sessions_path, b"{ this is not valid json ]").unwrap();
+
+    // This revision drops the row, which the view can only learn from a
+    // reload, so the failing reload is the one that must hold it back.
+    publish_canonical_snapshot(&mut env, vec![], vec![], 6);
+
+    assert_eq!(
+        env.view.info_dialog.as_ref().map(InfoDialog::title),
+        Some("Runtime state not applied"),
+        "the operator is told the revision did not land"
+    );
+    assert!(
+        env.view.get_instance(&instance.id).is_some(),
+        "the reload failed, so the pre-revision row is still on screen"
+    );
+    assert_eq!(
+        env.view.session_feed.next_revision_for_test(),
+        applied,
+        "a revision whose reload failed must not be marked applied"
+    );
+}

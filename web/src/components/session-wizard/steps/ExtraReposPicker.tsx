@@ -56,7 +56,14 @@ function RepoBaseInput({
         value={value}
         onChange={(e) => onChange(e.target.value)}
         onFocus={() => setFocused(true)}
-        onBlur={() => setTimeout(() => setFocused(false), 120)}
+        onBlur={() =>
+          setTimeout(() => {
+            setFocused(false);
+            // Drop the list so re-opening the field refetches: a list that
+            // failed or predates a fetch on the remote must not be reused.
+            setBranches(null);
+          }, 120)
+        }
         placeholder="base branch (optional)"
         aria-label={`Base branch for ${label}`}
         autoComplete="off"

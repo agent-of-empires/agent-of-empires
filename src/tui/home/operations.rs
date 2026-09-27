@@ -381,6 +381,10 @@ impl HomeView {
     }
 
     pub(super) fn delete_selected(&mut self, options: &DeleteOptions) -> anyhow::Result<()> {
+        if let Some(reason) = self.local_write_block() {
+            self.refuse_local_write(reason);
+            return Ok(());
+        }
         if let Some(id) = &self.selected_session {
             let id = id.clone();
 
@@ -617,6 +621,13 @@ impl HomeView {
 
     /// Forget a stuck deletion record; finish runtime cleanup off the input thread.
     pub(super) fn force_remove_session(&mut self, session_id: &str) -> anyhow::Result<()> {
+        if let Some(reason) = self.local_write_block() {
+            // The row must leave disk before its tmux session and container
+            // are torn down; a save the guard silently skips would leave the
+            // row on the runtime's next snapshot with its resources gone.
+            self.refuse_local_write(reason);
+            return Ok(());
+        }
         let instance = self.instances.get(session_id).cloned();
         self.remove_instance(session_id);
         self.rebuild_group_trees();
@@ -1640,6 +1651,10 @@ impl HomeView {
     /// by [`apply_trash_results`](crate::tui::home::HomeView::apply_trash_results).
     /// Stop the container before relocating its live bind-mounted worktree.
     pub(super) fn trash_session_by_id(&mut self, id: &str) {
+        if let Some(reason) = self.local_write_block() {
+            self.refuse_local_write(reason);
+            return;
+        }
         let Some((profile, mut request_instance)) = self
             .instances
             .get(id)
@@ -1705,6 +1720,10 @@ impl HomeView {
     /// The session stays stopped (trash killed its panes); the user restarts
     /// it with `e` like any stopped session. See #2489.
     pub(super) fn restore_selected_from_trash(&mut self) {
+        if let Some(reason) = self.local_write_block() {
+            self.refuse_local_write(reason);
+            return;
+        }
         let Some(id) = self.selected_session.clone() else {
             return;
         };

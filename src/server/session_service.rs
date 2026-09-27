@@ -391,6 +391,16 @@ impl SessionService {
         }
     }
 
+    /// Whether a creation is currently registered under this id. The registry
+    /// is published before the row is written, so a caller can name a session
+    /// that does not exist in storage yet.
+    pub(crate) fn has_active_creation(&self, id: &str) -> bool {
+        self.active_creations
+            .lock()
+            .expect("creation registry poisoned")
+            .contains_key(id)
+    }
+
     pub(super) fn has_profile_creation(&self, profile: &str) -> bool {
         self.creations_by_profile
             .lock()

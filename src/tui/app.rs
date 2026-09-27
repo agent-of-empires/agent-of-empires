@@ -3935,6 +3935,7 @@ impl App {
         }
         if let Err(error) = attach_result {
             tracing::warn!(target: "tui.input", %error, "Native tmux attach failed");
+            self.update_status = Some(UpdateStatus::transient(format!("Attach failed: {error}")));
         }
         Ok(())
     }

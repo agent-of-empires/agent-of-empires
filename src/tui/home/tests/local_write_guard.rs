@@ -15,12 +15,20 @@ fn key(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, crossterm::event::KeyModifiers::NONE)
 }
 
+/// The plain fixture: one profile, one row, the runtime already attached.
+fn view_with_attached_runtime() -> HomeView {
+    attached_runtime_view(|_| {}).0
+}
+
 /// A view over one profile holding the group under test, with the runtime
 /// already attached: `set_sidebar_source(Daemon)` is what a feed's first
-/// snapshot does.
-fn view_with_attached_runtime() -> HomeView {
+/// snapshot does. Returns the fixture row's id. The row is adjusted before
+/// it reaches disk, for the paths that only act on a row in one particular
+/// durable state.
+fn attached_runtime_view(adjust: impl FnOnce(&mut Instance)) -> (HomeView, String) {
     let storage = Storage::new_unwatched("test").unwrap();
-    let instances = [Instance::new("alpha", "/tmp/work")];
+    let mut instances = [Instance::new("alpha", "/tmp/work")];
+    adjust(&mut instances[0]);
     let mut tree = GroupTree::new_with_groups(&instances, &[]);
     tree.create_group("work");
     let groups = tree.get_all_groups();
@@ -49,7 +57,7 @@ fn view_with_attached_runtime() -> HomeView {
         Some("fixture"),
     );
     view.set_sidebar_source(crate::tui::session_feed::SidebarSource::Daemon, None);
-    view
+    (view, instances[0].id.clone())
 }
 
 fn disk_group_paths() -> Vec<String> {
@@ -60,6 +68,29 @@ fn disk_group_paths() -> Vec<String> {
         .1
         .into_iter()
         .map(|group| group.path)
+        .collect()
+}
+
+/// Ids of the rows on disk, in file order.
+fn disk_session_ids() -> Vec<String> {
+    Storage::new_unwatched("test")
+        .unwrap()
+        .load()
+        .unwrap()
+        .into_iter()
+        .map(|instance| instance.id)
+        .collect()
+}
+
+/// Ids of the rows `sessions.json` currently carries a trash marker for.
+fn disk_trashed_ids() -> Vec<String> {
+    Storage::new_unwatched("test")
+        .unwrap()
+        .load()
+        .unwrap()
+        .into_iter()
+        .filter(|instance| instance.is_trashed())
+        .map(|instance| instance.id)
         .collect()
 }
 
@@ -226,4 +257,90 @@ fn cityhall_refuses_profile_creation_on_disk() {
         .join("profiles")
         .join("cityhall-target")
         .exists());
+}
+
+/// Forgetting a stuck deletion record tears the row's tmux session and
+/// container down off-thread, so the row has to be gone from disk *first*.
+/// Under the gate the write cannot happen, which would leave the row on the
+/// runtime's next snapshot with its resources already destroyed. The whole
+/// operation must therefore refuse before it touches the row.
+#[test]
+#[serial]
+fn force_remove_refuses_while_the_runtime_owns_the_rows() {
+    let temp = TempDir::new().unwrap();
+    let _guard = setup_test_home(&temp);
+    let (mut view, id) = attached_runtime_view(|_| {});
+
+    view.force_remove_session(&id).unwrap();
+
+    assert_eq!(
+        view.pending_deletions
+            .get("test")
+            .map_or(0, |tombstones| tombstones.len()),
+        0,
+        "a refused force-remove must not even stage the row for deletion"
+    );
+    assert!(
+        view.get_instance(&id).is_some(),
+        "the row the refusal protects must still be listed"
+    );
+    assert_eq!(
+        disk_session_ids(),
+        vec![id.clone()],
+        "sessions.json was rewritten behind the runtime's back"
+    );
+    assert_eq!(info_title(&view), Some("Read-only"));
+}
+
+/// Trashing stamps `trashed_at` with a plain storage write, so a guarded
+/// process that stamped it anyway would publish a trash marker the runtime
+/// never sent, and the row would come back untrashed on the next snapshot.
+#[test]
+#[serial]
+fn trash_refuses_while_the_runtime_owns_the_rows() {
+    let temp = TempDir::new().unwrap();
+    let _guard = setup_test_home(&temp);
+    let (mut view, id) = attached_runtime_view(|_| {});
+
+    view.trash_session_by_id(&id);
+
+    assert!(
+        disk_trashed_ids().is_empty(),
+        "sessions.json carries a trash marker the runtime never published"
+    );
+    assert!(
+        view.get_instance(&id).is_some_and(|row| !row.is_trashed()),
+        "the row must not flip to trashed in the view either"
+    );
+    assert_eq!(info_title(&view), Some("Read-only"));
+}
+
+/// Restoring clears `trashed_at` under the same per-instance flock, so a
+/// guarded process that ran it anyway would un-trash a row the runtime still
+/// considers trashed, leaving the two views disagreeing about the row's
+/// bucket.
+#[test]
+#[serial]
+fn restore_refuses_while_the_runtime_owns_the_rows() {
+    let temp = TempDir::new().unwrap();
+    let _guard = setup_test_home(&temp);
+    let (mut view, id) = attached_runtime_view(|row| row.trash());
+    view.selected_session = Some(id.clone());
+    assert!(
+        view.get_instance(&id).is_some_and(|row| row.is_trashed()),
+        "the fixture must start with a trashed row a restore could act on"
+    );
+
+    view.restore_selected_from_trash();
+
+    assert_eq!(
+        disk_trashed_ids(),
+        vec![id.clone()],
+        "the durable trash marker was cleared behind the runtime's back"
+    );
+    assert!(
+        view.get_instance(&id).is_some_and(|row| row.is_trashed()),
+        "the row must stay trashed in the view"
+    );
+    assert_eq!(info_title(&view), Some("Read-only"));
 }

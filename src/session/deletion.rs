@@ -501,7 +501,7 @@ impl<S: SessionStore + 'static> PurgeTransaction<S> {
         let mut capture = self.capture.take();
         let durable_request = self.request().clone();
         let durable_additional_protection = self.additional_protection.clone();
-        if let Err(error) = self.store().update(|instances, _groups| {
+        let commit_result = self.store().update(|instances, _groups| {
             let Some(index) = instances.iter().position(|instance| instance.id == id) else {
                 commit = Some((CompletionGate::AlreadyGone, None));
                 return Ok(());
@@ -530,19 +530,39 @@ impl<S: SessionStore + 'static> PurgeTransaction<S> {
                 commit = Some((gate, Some(instances[index].clone())));
             }
             Ok(())
-        }) {
-            // The plan is recorded in the sidecar journal before the row leaves
-            // sessions.json, so a failed commit would leave a ghost owner
-            // behind: recovery would later tear down a session row that is
-            // still there. Release it before reporting the failure.
-            if let Some(owner) = owner {
-                if let Err(release) = owner.release() {
+        });
+        if let Err(error) = commit_result {
+            // A failure here may land before or after sessions.json was
+            // replaced, so the row's presence decides whether the recorded
+            // owner is a ghost or the only remaining plan. Releasing an owner
+            // whose row already left disk would strand that plan.
+            let row_still_present = match self.store().load() {
+                Ok(rows) => rows.iter().any(|row| row.id == id),
+                Err(read_error) => {
                     tracing::error!(
                         target: "session.deletion",
                         session = %id,
-                        "failed to release the purge owner for an uncommitted purge: {release}"
+                        "could not read sessions.json after a failed purge commit: {read_error}"
                     );
+                    false
                 }
+            };
+            if row_still_present {
+                if let Some(owner) = owner {
+                    if let Err(release) = owner.release() {
+                        tracing::error!(
+                            target: "session.deletion",
+                            session = %id,
+                            "failed to release the purge owner for an uncommitted purge: {release}"
+                        );
+                    }
+                }
+            } else {
+                tracing::warn!(
+                    target: "session.deletion",
+                    session = %id,
+                    "the purge commit failed after sessions.json dropped the row; keeping the purge owner so recovery can finish the teardown"
+                );
             }
             return Err(Box::new(DeletionResult::rejected(
                 id,
@@ -2691,6 +2711,163 @@ mod tests {
                 .is_empty(),
             "the uncommitted purge must not leave a ghost owner behind"
         );
+    }
+
+    /// The switch a test arms to make one commit report failure after it
+    /// landed, shared with the store the transaction takes ownership of.
+    type FailNextCommit = std::sync::Arc<std::sync::atomic::AtomicBool>;
+
+    /// A store that reports its commit as failed *after* the mutation has been
+    /// written, the way `update_under_lock` does when the post-write binding
+    /// check fails: the row has already left `sessions.json` by the time the
+    /// caller sees the error. `Storage::fail_writes_for_test` cannot reach this
+    /// state because it bails before the write, so this double supplies it.
+    struct CommitFailsAfterWriteStore {
+        storage: Storage,
+        fail_next_commit: FailNextCommit,
+    }
+
+    impl CommitFailsAfterWriteStore {
+        /// Returns the store and the switch the test arms once the reservation
+        /// it must not break has committed.
+        fn new(storage: Storage) -> (Self, FailNextCommit) {
+            let fail_next_commit = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            (
+                Self {
+                    storage,
+                    fail_next_commit: std::sync::Arc::clone(&fail_next_commit),
+                },
+                fail_next_commit,
+            )
+        }
+    }
+
+    impl SessionStore for CommitFailsAfterWriteStore {
+        fn storage(&self) -> &Storage {
+            &self.storage
+        }
+
+        fn load(&self) -> Result<Vec<Instance>> {
+            self.storage.load()
+        }
+
+        fn check_available(&self) -> Result<()> {
+            self.storage.check_available()
+        }
+
+        fn configuration(&self, profile: Option<&str>) -> Result<crate::session::config::Config> {
+            self.storage.configuration(profile)
+        }
+
+        fn commit(&self, mutation: &mut crate::session::SessionMutation<'_>) -> Result<()> {
+            self.storage.commit(mutation)?;
+            if self
+                .fail_next_commit
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                anyhow::bail!("injected failure after sessions.json was replaced");
+            }
+            Ok(())
+        }
+
+        fn managed_capture_store_is_exclusive(
+            &self,
+            current: &Instance,
+            backend: crate::agents::SessionCaptureBackend,
+            current_store: &Path,
+        ) -> Result<bool> {
+            self.storage
+                .managed_capture_store_is_exclusive(current, backend, current_store)
+        }
+
+        fn commit_sandbox_checkpoint(
+            &self,
+            checkpoint: crate::migrations::v027_isolate_sandbox_stores::LockedSandboxCheckpoint<'_>,
+        ) -> Result<()> {
+            self.storage.commit_sandbox_checkpoint(checkpoint)
+        }
+
+        fn migrate_sandbox_store(
+            &self,
+            id: &str,
+            reporter: Option<crate::migrations::progress::Reporter>,
+            runtime: &crate::containers::ContainerRuntime,
+        ) -> Result<()> {
+            self.storage.migrate_sandbox_store(id, reporter, runtime)
+        }
+    }
+
+    /// The other half of a failed purge commit: the error can land *after*
+    /// `sessions.json` dropped the row, and the plan journaled just before the
+    /// removal is then the only record that the teardown still has to happen.
+    /// Releasing it would strand a row whose runtime resources are never torn
+    /// down, so a later recovery has to still find it.
+    #[test]
+    #[serial_test::serial]
+    fn a_commit_that_fails_after_the_row_left_keeps_the_purge_owner() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let root = crate::session::get_app_dir().unwrap();
+        super::super::purge_owners::initialize(&root).unwrap();
+        let profile = "purge-lost-commit-owner";
+        let mut storage = Storage::new_unwatched(profile).unwrap();
+        let mut instance = create_test_instance();
+        instance.source_profile = profile.into();
+        let id = instance.id.clone();
+        storage
+            .update(|rows, _| {
+                rows.push(instance.clone());
+                Ok(())
+            })
+            .unwrap();
+        let request = DeletionRequest {
+            session_id: id.clone(),
+            instance,
+            delete_worktree: false,
+            delete_branch: false,
+            delete_sandbox: false,
+            force_delete: false,
+            detach_hooks: true,
+            keep_scratch: false,
+        };
+        let (store, fail_next_commit) =
+            CommitFailsAfterWriteStore::new(Storage::open_unwatched(profile).unwrap());
+        let transaction = match PurgeTransaction::reserve(store, request, None).unwrap() {
+            PurgeReservation::Reserved(transaction) => transaction,
+            PurgeReservation::Rejected(_) => panic!("initial purge rejected"),
+        };
+        // Arm the failure only now: the reservation itself must commit.
+        fail_next_commit.store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let result = match transaction.begin_irreversible() {
+            Err(result) => result,
+            Ok(_) => panic!("a failed commit must not report a committed purge"),
+        };
+
+        assert_eq!(result.disposition, DeletionDisposition::Failed);
+        assert!(
+            storage.load().unwrap().iter().all(|row| row.id != id),
+            "the fixture must reach the case the fix is about: the row is gone \
+             from sessions.json even though the commit reported an error"
+        );
+        assert!(
+            super::super::purge_owners::recovery_plans()
+                .unwrap()
+                .iter()
+                .any(|plan| plan.session_id == id),
+            "the recorded plan is the only remaining proof the teardown is owed, \
+             so it must survive a failure that landed after the row left"
+        );
+
+        // And it is still actionable: a later recovery pass finishes the work.
+        let committed = recover_committed_purge(&mut HashSet::new())
+            .unwrap()
+            .expect("the owner kept by a lost commit must be recoverable");
+        assert_eq!(committed.session_id(), id.as_str());
+        let recovered = committed.finish_recovered();
+        assert!(recovered.success, "recovery must finish: {recovered:?}");
+        assert!(recover_committed_purge(&mut HashSet::new())
+            .unwrap()
+            .is_none());
     }
 
     #[test]

@@ -239,8 +239,14 @@ pub async fn cancel_creation(
     if state.read_only {
         return crate::server::api::read_only_response();
     }
-    if let Some(response) = cityhall_block_non_structured(&state, &id).await {
-        return response;
+    // A creation publishes its id and its Reserving event before it writes the
+    // row, so the stored-row check cannot see it and would refuse the cancel
+    // with 403. In CityHall mode that creation is this client's own, and
+    // therefore structured by policy, so cancelling it stays in policy.
+    if !state.session_service.has_active_creation(&id) {
+        if let Some(response) = cityhall_block_non_structured(&state, &id).await {
+            return response;
+        }
     }
     if state.session_service.cancel_creation(&id) {
         // The acknowledgement is a mutation response like any other, so the

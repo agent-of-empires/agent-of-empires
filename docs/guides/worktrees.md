@@ -220,5 +220,7 @@ AOE auto-detects bare repos and uses `bare_repo_path_template` (default `./{bran
 
 | Item | Path |
 |------|------|
-| Config | `~/.agent-of-empires/config.toml` |
-| Sessions | `~/.agent-of-empires/profiles/<profile>/sessions.json` |
+| Config | `<app_dir>/config.toml` |
+| Sessions | `<app_dir>/profiles/<profile>/sessions.json` |
+
+`<app_dir>` is per-platform; see [File Locations](configuration.md#file-locations).

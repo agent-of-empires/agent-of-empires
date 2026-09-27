@@ -189,15 +189,21 @@ impl PendingCommand {
         let unknown = matches!(&failure, CommandFailure::Unknown(_));
         let message = failure.message();
         if let Some(terminal) = self.terminal.take() {
-            let _ = terminal.result.send(Err(message));
-        } else {
-            errors.push(SessionCommandError {
-                id: id.into(),
-                message,
-                marks_unread: self.marks_unread,
-                outcome_unknown: unknown,
-            });
+            let _ = terminal.result.send(Err(message.clone()));
+            if !unknown {
+                return;
+            }
+            // An unknown outcome blocks the row until it is resolved, and the
+            // queued error is the only path to that prompt. A native command
+            // carrying a terminal must queue it too, or the row stays blocked
+            // with nothing to unblock it.
         }
+        errors.push(SessionCommandError {
+            id: id.into(),
+            message,
+            marks_unread: self.marks_unread,
+            outcome_unknown: unknown,
+        });
     }
 }
 
@@ -1379,6 +1385,109 @@ mod tests {
         .expect("mutation submitted after explicit resolution");
         assert_eq!(id, "unknown");
         assert!(matches!(mutation, SessionMutation::Stop));
+    }
+
+    /// A feed with a live command lane, both grants open, and one revision
+    /// already applied: what a native command needs to be admitted.
+    fn feed_with_native_lane() -> (SessionFeed, tokio::sync::mpsc::Receiver<SessionCommand>) {
+        let mut feed =
+            SessionFeed::seeded_for_test(SessionFeedResult::Snapshot(snapshot("test", 1)));
+        feed.mark_snapshot_applied(snapshot("test", 1));
+        let (commands, requests) = tokio::sync::mpsc::channel(COMMAND_CAPACITY);
+        feed.commands = Some(commands);
+        set_grant(&feed.grant, true);
+        set_grant(&feed.native_grant, true);
+        (feed, requests)
+    }
+
+    /// A native command carries a terminal, so its failure is reported to the
+    /// attachment. An unknown outcome is a second fact: the row is quarantined
+    /// until an operator resolves it, and the queued error is the only path to
+    /// that prompt. Answering the terminal must not swallow it, or the row
+    /// stays blocked with nothing to unblock it.
+    #[tokio::test]
+    async fn unknown_native_outcome_still_queues_the_resolution_error() {
+        use crate::daemon::DaemonClientError;
+        let (mut feed, mut requests) = feed_with_native_lane();
+        let mut preparation = feed
+            .restart_agent(
+                "native".into(),
+                crate::daemon::RestartSessionBody::default(),
+            )
+            .expect("the native command is admitted");
+        requests
+            .try_recv()
+            .unwrap()
+            .result
+            .send(Err(CommandFailure::submitted(DaemonClientError::Timeout)))
+            .unwrap();
+
+        let errors = feed.drain_command_errors();
+
+        assert_eq!(errors.len(), 1, "the unknown outcome must reach the queue");
+        assert_eq!(
+            errors[0].id, "native",
+            "the resolution prompt names the row that is blocked"
+        );
+        assert!(
+            errors[0].outcome_unknown,
+            "the queued error is the one that opens the resolution prompt"
+        );
+        assert!(
+            !feed.can_submit("native"),
+            "the row stays blocked until the operator resolves it"
+        );
+        assert!(
+            preparation
+                .result
+                .try_recv()
+                .expect("the terminal waiter is answered too")
+                .is_err(),
+            "the attachment must not wait on a terminal that already failed"
+        );
+    }
+
+    /// The other side of the same branch: a definitive refusal has no unknown
+    /// outcome, so the terminal answer is the whole report. Queueing it too
+    /// would put a resolution prompt in front of an operator for a change the
+    /// runtime already rejected, and block a row nothing is waiting on.
+    #[tokio::test]
+    async fn a_refused_native_command_is_not_queued() {
+        use crate::daemon::DaemonClientError;
+        let (mut feed, mut requests) = feed_with_native_lane();
+        let mut preparation = feed
+            .restart_agent(
+                "native".into(),
+                crate::daemon::RestartSessionBody::default(),
+            )
+            .expect("the native command is admitted");
+        requests
+            .try_recv()
+            .unwrap()
+            .result
+            .send(Err(CommandFailure::submitted(DaemonClientError::Status {
+                status: reqwest::StatusCode::CONFLICT,
+                code: None,
+                body: String::new(),
+                truncated: false,
+            })))
+            .unwrap();
+
+        let errors = feed.drain_command_errors();
+
+        assert!(errors.is_empty(), "a refusal is not an unknown outcome");
+        assert!(
+            feed.can_submit("native"),
+            "a refused change leaves the row usable"
+        );
+        assert!(
+            preparation
+                .result
+                .try_recv()
+                .expect("the terminal waiter is answered")
+                .is_err(),
+            "the attachment is told the command was refused"
+        );
     }
 
     fn snapshot(epoch: &str, revision: u64) -> Arc<RuntimeSnapshot> {

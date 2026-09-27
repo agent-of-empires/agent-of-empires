@@ -368,14 +368,28 @@ impl HomeView {
                             && !self.instances.contains_key(&row.id)
                             && self.storages.contains_key(&row.profile)
                     });
+                    // A revision that reconciles rows is only applied once the
+                    // locked reload that reads those rows succeeded; otherwise
+                    // the mirror keeps showing pre-revision state while the
+                    // quarantine treats it as canonical.
+                    let mut reload_failed = false;
                     if unknown_row || self.snapshot_requires_storage_reload(&snapshot) {
                         match self.reload() {
                             Ok(()) => metadata_changed = true,
-                            Err(error) => tracing::warn!(
-                                target: "tui.session_feed",
-                                %error,
-                                "reload before applying a canonical runtime revision failed"
-                            ),
+                            Err(error) => {
+                                reload_failed = true;
+                                tracing::warn!(
+                                    target: "tui.session_feed",
+                                    %error,
+                                    "reload before applying a canonical runtime revision failed"
+                                );
+                                self.info_dialog = Some(crate::tui::dialogs::InfoDialog::new(
+                                    "Runtime state not applied",
+                                    &format!(
+                                        "The runtime's canonical state could not be loaded, so this revision stays unapplied and a session blocked on an unknown outcome stays blocked.\n\n{error}"
+                                    ),
+                                ));
+                            }
                         }
                     }
                     for row in &snapshot.contents.sessions {
@@ -452,7 +466,9 @@ impl HomeView {
                         metadata_changed |= count != self.structured_pending_approvals.len();
                     }
                     metadata_changed |= self.apply_pending_archive_cursor();
-                    metadata_changed |= self.session_feed.mark_snapshot_applied(snapshot);
+                    if !reload_failed {
+                        metadata_changed |= self.session_feed.mark_snapshot_applied(snapshot);
+                    }
                     if !self.session_feed.native_interaction_available() {
                         self.cancel_native_attachment();
                         self.teardown_live_send();

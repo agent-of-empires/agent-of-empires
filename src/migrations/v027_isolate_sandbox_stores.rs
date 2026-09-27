@@ -310,12 +310,12 @@ impl MigrationScope<'_> {
         if let Some(store) = self.store {
             return store.configuration(profile);
         }
-        let mut config = match profile {
-            Some(profile) => crate::session::resolve_config_or_warn(profile),
-            None => crate::session::config::Config::load_or_warn(),
-        };
-        crate::session::config::profile_config::apply_cityhall_overrides(&mut config);
-        Ok(config)
+        // An empty profile is the default profile, not "no profile": its
+        // overrides of `agent_config_dir` and friends must apply, so resolve
+        // through the same path a named profile takes.
+        Ok(crate::session::resolve_config_or_warn(
+            profile.unwrap_or(""),
+        ))
     }
 }
 
