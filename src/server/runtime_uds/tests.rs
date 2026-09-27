@@ -258,6 +258,50 @@ async fn a_live_temporary_marker_stops_publication() {
     assert!(!dir.join(PREBIND_FILE).exists(), "nothing was published");
 }
 
+/// A `/proc` this process cannot read proves nothing about the process that
+/// wrote a retained marker. The publisher must refuse rather than reap: a
+/// daemon that is still serving would keep its listener while its markers
+/// were unlinked and its socket published over, and every client would fall
+/// back silently.
+#[tokio::test]
+#[serial_test::serial]
+async fn an_unreadable_proc_entry_refuses_publication_and_keeps_the_artifacts() {
+    let Some(namespace) = namespace_or_skip() else {
+        return;
+    };
+    let dir = app_dir(&namespace);
+    let identity = runtime_ws::identity();
+    let marker = serde_json::json!({
+        "schema": SCHEMA,
+        "pid": std::process::id(),
+        "process_start_identity": process_start_identity(std::process::id()).expect("start"),
+        "prebind_instance_id": identity.prebind_instance_id,
+        "runtime_instance_id": identity.runtime_instance_id,
+        "runtime_epoch": identity.runtime_epoch,
+        "namespace": runtime_ws::NAMESPACE,
+        "socket_path": SOCKET_FILE,
+        "owner_uid": unsafe { libc::geteuid() },
+        "socket_device": 0,
+        "socket_inode": 0,
+        "socket_creator_pid": std::process::id(),
+    });
+    let before = marker.to_string();
+    std::fs::write(dir.join(POSTBIND_FILE), &before).expect("retained postbind");
+
+    fail_next_proc_read();
+    let error = match publish() {
+        Err(error) => error,
+        Ok(_) => panic!("an unprovable process must not be reaped"),
+    };
+    assert_eq!(error.code(), "namespace_busy");
+    assert_eq!(
+        std::fs::read(dir.join(POSTBIND_FILE)).expect("postbind"),
+        before.as_bytes(),
+        "the retained marker must survive a refused publication"
+    );
+    assert!(!dir.join(PREBIND_FILE).exists(), "nothing was published");
+}
+
 /// Shutdown removes this daemon's artifacts, and only those.
 #[tokio::test]
 #[serial_test::serial]
@@ -341,7 +385,10 @@ fn process_identity_distinguishes_live_from_retained() {
         format!(
             "linux:v1:{}:{}",
             boot_id().expect("boot id"),
-            process_start_ticks(pid).expect("ticks")
+            match process_start_ticks(pid) {
+                ProcessStart::Ticks(ticks) => ticks,
+                _ => panic!("this process's /proc entry must be readable"),
+            }
         )
     );
 

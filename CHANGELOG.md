@@ -26,6 +26,9 @@ The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 
 - **cli:** `aoe status --json` on an empty profile is compact like every other case, instead of the space-separated literal it printed before
 - **cli:** A read command stops waiting out the establishment budget on a daemon that is no longer running, and falls back to the local store as it does when nothing ever published
+- **cli:** An empty or whitespace-only `AOE_DAEMON_URL` or `AGENT_OF_EMPIRES_PROFILE` means "unset" in one place, in the transport selection and the local take-over alike, so the seven read commands answer from the local store instead of refusing; an explicitly empty `--daemon-url` is still refused
+- **server:** Refuse to publish over a retained marker whose process cannot be proven gone, instead of reaping a running daemon's state when `/proc` cannot be read for any reason other than its absence
+- **session:** A `profiles` path that exists but is not a directory is an error for the read-only enumeration, instead of an empty profile inventory reported with healthy health
 
 
 ## [1.17.2](https://github.com/agent-of-empires/agent-of-empires/releases/tag/v1.17.2) - 2026-09-25

@@ -489,8 +489,10 @@ fn is_temporary_name(name: &str) -> bool {
 /// Whether a retained temporary marker still has a live writer. A body that
 /// does not parse is not in flight: a writer that is still running has not
 /// finished its write, and only a finished write can be refused. A body that
-/// cannot even be read proves nothing about a writer either, so it reads as
-/// not in flight and the caller reaps it.
+/// cannot even be *read* proves nothing about a writer, so it is not reaped
+/// on a guess: publication is refused and the name is left in place, exactly
+/// as the client half refuses to leave `marker_identity` on an unreadable
+/// `/proc`.
 fn temporary_is_live(dir: RawFd, name: &str) -> Result<bool, PublishError> {
     let Some(stat) = entry_stat(dir, name)? else {
         return Ok(false);
@@ -507,12 +509,25 @@ fn temporary_is_live(dir: RawFd, name: &str) -> Result<bool, PublishError> {
         )
     };
     if fd < 0 {
-        return Ok(false);
+        // A name that vanished between the scan and the open is definitively
+        // gone; any other errno is a question this process cannot answer.
+        let unprovable = std::io::Error::last_os_error().raw_os_error() != Some(libc::ENOENT);
+        return if unprovable {
+            Err(PublishError::new(
+                "namespace_busy",
+                format!("{name} could not be read, so its writer cannot be ruled out"),
+            ))
+        } else {
+            Ok(false)
+        };
     }
     let mut file = unsafe { File::from_raw_fd(fd) };
     let mut bytes = Vec::new();
-    if file.read_to_end(&mut bytes).is_err() {
-        return Ok(false);
+    if let Err(error) = file.read_to_end(&mut bytes) {
+        return Err(PublishError::new(
+            "namespace_busy",
+            format!("{name} could not be read: {error}"),
+        ));
     }
     Ok(serde_json::from_slice::<MarkerProbe>(&bytes).is_ok_and(|probe| process_is_live(&probe)))
 }
@@ -828,7 +843,10 @@ fn anchored_child_path(dir: RawFd, child: &str) -> Result<PathBuf, PublishError>
 /// so a recycled pid cannot pass as this daemon.
 fn process_start_identity(pid: u32) -> Option<String> {
     let boot = boot_id()?;
-    Some(format!("linux:v1:{boot}:{}", process_start_ticks(pid)?))
+    let ProcessStart::Ticks(ticks) = process_start_ticks(pid) else {
+        return None;
+    };
+    Some(format!("linux:v1:{boot}:{ticks}"))
 }
 
 fn boot_id() -> Option<String> {
@@ -840,14 +858,53 @@ fn boot_id() -> Option<String> {
     )
 }
 
-fn process_start_ticks(pid: u32) -> Option<String> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let close = stat.rfind(')')?;
-    stat[close + 1..]
+/// A three-way answer, mirroring the client half (`cli::runtime_read::uds`):
+/// a start time on a successful read, absent only on a definite
+/// `NotFound`, and a read that failed for any other reason stays *unprovable*
+/// — a transient `EMFILE`/`ENFILE`/`EACCES`, or a `/proc` this namespace
+/// cannot see, is not evidence that the process is gone.
+enum ProcessStart {
+    Ticks(String),
+    Absent,
+    Unprovable,
+}
+
+fn process_start_ticks(pid: u32) -> ProcessStart {
+    #[cfg(test)]
+    if PROC_READ_UNPROVABLE.swap(false, std::sync::atomic::Ordering::SeqCst) {
+        return ProcessStart::Unprovable;
+    }
+    let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => stat,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return ProcessStart::Absent,
+        Err(_) => return ProcessStart::Unprovable,
+    };
+    // A body that parses as neither a stat line nor nothing is unreadable as
+    // evidence, the same as a read that failed.
+    let Some(close) = stat.rfind(')') else {
+        return ProcessStart::Unprovable;
+    };
+    match stat[close + 1..]
         .split_whitespace()
         .nth(19)
         .filter(|value| !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
-        .map(str::to_string)
+    {
+        Some(ticks) => ProcessStart::Ticks(ticks.to_string()),
+        None => ProcessStart::Unprovable,
+    }
+}
+
+/// Test-only: makes the next `/proc/<pid>/stat` reads report `Unprovable`, the
+/// way an `EACCES` or a pid-namespace mismatch does. Manufacturing an
+/// unreadable `/proc` entry for a real pid needs privileges the suite does not
+/// have; the behaviour under test is the branch, not the errno.
+#[cfg(test)]
+static PROC_READ_UNPROVABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+pub(super) fn fail_next_proc_read() {
+    PROC_READ_UNPROVABLE.store(true, std::sync::atomic::Ordering::SeqCst);
 }
 
 /// Whether the process that wrote a retained marker is still running. A marker
@@ -863,7 +920,17 @@ fn process_is_live(probe: &MarkerProbe) -> bool {
         // Without a boot id nothing can be proven dead, so fail closed.
         None => true,
         Some(boot) if boot != recorded_boot => false,
-        Some(_) => process_start_ticks(probe.pid).as_deref() == Some(recorded_start),
+        Some(_) => match process_start_ticks(probe.pid) {
+            ProcessStart::Ticks(start) => start == recorded_start,
+            // Only a proven-absent process is reaped.
+            ProcessStart::Absent => false,
+            // An unreadable `/proc` proves nothing, so the retained state of a
+            // possibly-running daemon is left alone and publication is
+            // refused. Reaping here would unlink a live daemon's markers and
+            // publish over its socket, and clients would fall back silently
+            // while that daemon kept serving the listener.
+            ProcessStart::Unprovable => true,
+        },
     }
 }
 
