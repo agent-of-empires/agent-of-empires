@@ -147,7 +147,7 @@ pub(crate) enum ResumeIntent {
     /// One-shot fresh start; promotes to `Default` after the launch.
     #[serde(rename = "Cleared")]
     Cleared,
-    /// One-shot fork of `from` into the child id pre-pinned in `agent_session_id`.
+    /// One-shot fork of `from` into the child id preallocated in `agent_session_id`.
     #[serde(rename = "Fork")]
     Fork { from: String },
 }

@@ -561,7 +561,9 @@ impl Instance {
         self.view == View::Structured
     }
 
-    /// Keep only a store asserted by the user or captured from the live worker.
+    /// Move a structured row to the terminal view, keeping the store an
+    /// asserted binding or the live worker proved, and refusing to move at all
+    /// when neither did: the row then keeps its view and its ACP id.
     pub(crate) fn switch_to_terminal_keep_context(
         &mut self,
         worker: Option<&ExecutionBinding>,
@@ -763,6 +765,24 @@ mod tests {
             ),
             (None, None, None)
         );
+    }
+
+    /// A structured row with no asserted binding and no worker has proved no
+    /// store, so the switch is refused and names the command that would, and
+    /// the row keeps the view and the ACP id it had.
+    #[test]
+    #[serial_test::serial]
+    fn switch_to_terminal_keep_context_refuses_a_row_nothing_proved() {
+        let temp = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let mut inst = Instance::new("claude-unproved", "/tmp");
+        inst.view = View::Structured;
+        inst.acp_session_id = Some("sid-abc".into());
+
+        let error = inst.switch_to_terminal_keep_context(None).unwrap_err();
+        assert!(error.to_string().contains("set-session-id"));
+        assert_eq!(inst.view, View::Structured);
+        assert_eq!(inst.acp_session_id.as_deref(), Some("sid-abc"));
     }
 
     /// A legacy binding carries no route marker, and the marker it would be

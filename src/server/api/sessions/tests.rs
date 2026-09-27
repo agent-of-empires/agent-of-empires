@@ -906,7 +906,7 @@ fn fork_from_an_unqualified_parent_is_refused_as_unqualified() {
             resolve_create_fork_seed("parent-uuid", false, &[parent]),
             Err((
                 crate::session::ForkDenied::UnqualifiedParent {
-                    pre_pinned: false,
+                    preallocated: false,
                     recorded: "parent-uuid".into(),
                 },
                 Some(0),
@@ -959,7 +959,7 @@ fn fork_from_unqualified_rows_is_refused_the_same_way_in_either_order() {
             resolve_create_fork_seed("parent-uuid", false, &parents),
             Err((
                 crate::session::ForkDenied::UnqualifiedParent {
-                    pre_pinned: false,
+                    preallocated: false,
                     recorded: "parent-uuid".into(),
                 },
                 Some(elected),
@@ -1035,10 +1035,10 @@ fn fork_from_rows_disagreeing_on_provenance_refuses_the_lowest_id_row() {
         assert_eq!(
             *denied,
             crate::session::ForkDenied::UnqualifiedParent {
-                pre_pinned: true,
+                preallocated: true,
                 recorded: "parent-uuid".into(),
             },
-            "the pre-pinned row holds the lowest id, so its evidence is the one read"
+            "the preallocated row holds the lowest id, so its evidence is the one read"
         );
         assert_eq!(elected, "a-pre", "the lowest id is the row refused");
     }

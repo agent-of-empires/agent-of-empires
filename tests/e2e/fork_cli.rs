@@ -261,7 +261,9 @@ fn fork_from_refusals_persist_nothing() {
         /// The parent title: the refusal quotes it and `--fork-from` names it.
         title: &'static str,
         args: &'static [&'static str],
-        expect: String,
+        /// A span the refusal must print, absent only where the span depends
+        /// on the session id the harness generated.
+        expect: Option<&'static str>,
     }
     let cases = [
         Case {
@@ -270,25 +272,25 @@ fn fork_from_refusals_persist_nothing() {
             parent: Parent::Seeded("gemini"),
             title: "Parent",
             args: &["--tool", "gemini"],
-            expect: "Forkable agents: claude, codex, opencode".into(),
+            expect: Some("Forkable agents: claude, codex, opencode"),
         },
         Case {
             parent: Parent::Seeded("claude"),
             title: "Parent",
             args: &["--worktree", "wt-branch"],
-            expect: "--worktree".into(),
+            expect: Some("--worktree"),
         },
         Case {
             parent: Parent::Seeded("claude"),
             title: "Parent",
             args: &["--scratch"],
-            expect: "--scratch".into(),
+            expect: Some("--scratch"),
         },
         Case {
             parent: Parent::Seeded("claude"),
             title: "Parent",
             args: &["--sandbox"],
-            expect: "--sandbox".into(),
+            expect: Some("--sandbox"),
         },
         Case {
             // A terminal fork cannot carry its state onto a structured session.
@@ -296,26 +298,25 @@ fn fork_from_refusals_persist_nothing() {
             parent: Parent::Seeded("claude"),
             title: "Parent",
             args: &["--scratch", "--structured-view"],
-            expect: "cannot be combined with".into(),
+            expect: Some("cannot be combined with"),
         },
         Case {
             parent: Parent::Bare,
             title: "Parent",
             args: &[],
-            expect: "Nothing to fork".into(),
+            expect: Some("Nothing to fork"),
         },
         Case {
             parent: Parent::UnlaunchedFork,
             title: "Parent",
             args: &[],
-            expect: "is a fork that has not launched yet".into(),
+            expect: Some("is a fork that has not launched yet"),
         },
         Case {
             parent: Parent::LegacyUnqualified,
             title: "Legacy Parent",
             args: &[],
-            // Filled in below: the remedy names the id the harness generated.
-            expect: String::new(),
+            expect: None,
         },
     ];
 
@@ -323,7 +324,7 @@ fn fork_from_refusals_persist_nothing() {
         let mut h = TuiTestHarness::new("fork_cli_refusal");
         h.install_path_command("gemini");
         let project = h.project_path();
-        let mut expect = case.expect;
+        let mut expect = case.expect.map(str::to_string);
         match case.parent {
             Parent::Seeded(tool) => seed_parent(&h, &project, case.title, tool),
             Parent::Bare => {
@@ -355,11 +356,11 @@ fn fork_from_refusals_persist_nothing() {
                 });
                 // The remedy names the session id, not its title, so the
                 // expectation needs the id `aoe add` printed.
-                expect = format!(
+                expect = Some(format!(
                     "aoe session set-session-id {} {}",
                     parse_session_id(&added),
                     PARENT_AGENT_ID,
-                );
+                ));
             }
             Parent::UnlaunchedFork => {
                 h.run_cli_ok(&[
@@ -387,6 +388,7 @@ fn fork_from_refusals_persist_nothing() {
         args.extend_from_slice(&["-t", "Child", "--fork-from", case.title]);
 
         let stderr = h.run_cli_err(&args);
+        let expect = expect.expect("every refusal case states the span it must print");
         assert!(
             stderr.contains(&expect),
             "{args:?}: expected {expect:?} in:\n{stderr}"
@@ -396,7 +398,7 @@ fn fork_from_refusals_persist_nothing() {
     }
 }
 
-/// A pre-pinned id names no conversation yet, so the refusal must send the user
+/// A preallocated id names no conversation yet, so the refusal must send the user
 /// to the parent rather than print a qualification the command would refuse
 /// anyway, and it must leave nothing behind.
 #[test]

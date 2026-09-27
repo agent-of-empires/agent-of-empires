@@ -2834,7 +2834,7 @@ mod tests {
                     "child-uuid".into()
                 ),
                 Err(crate::session::ForkDenied::UnqualifiedParent {
-                    pre_pinned: false,
+                    preallocated: false,
                     recorded: "legacy-uuid".into(),
                 })
             );

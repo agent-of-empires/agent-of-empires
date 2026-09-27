@@ -70,7 +70,7 @@ fn fork_row_offers_a_preallocated_parent() {
 }
 
 /// A recorded conversation AoE cannot fork is refused in two ways, and the
-/// dialog carries the shared wording: a pre-pinned id names no conversation to
+/// dialog carries the shared wording: a preallocated id names no conversation to
 /// qualify, while a binding that never qualified, or one a degraded launch
 /// dropped, names a conversation to re-assert.
 #[test]
@@ -81,14 +81,14 @@ fn fork_from_selection_reports_why_the_conversation_cannot_be_forked() {
         (
             crate::session::ConversationProvenance::Preallocated,
             crate::session::ForkDenied::UnqualifiedParent {
-                pre_pinned: true,
+                preallocated: true,
                 recorded: recorded.clone(),
             },
         ),
         (
             crate::session::ConversationProvenance::Unknown,
             crate::session::ForkDenied::UnqualifiedParent {
-                pre_pinned: false,
+                preallocated: false,
                 recorded: recorded.clone(),
             },
         ),

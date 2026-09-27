@@ -28,12 +28,15 @@ pub enum ForkDenied {
     NoParentSession,
     /// A conversation id is recorded, but no qualified record names the
     /// conversation it is, so it cannot be shown to name a conversation to fork.
-    /// `pre_pinned` is true only when a binding proves the id was reserved by a
+    /// `preallocated` is true only when a binding proves the id was reserved by a
     /// launch that never ran: such an id names no conversation yet, so the
     /// remedy is a message rather than an assertion about a conversation that
     /// does not exist. `recorded` is the id the parent carries, and it is the
     /// value a qualification re-asserts.
-    UnqualifiedParent { pre_pinned: bool, recorded: String },
+    UnqualifiedParent {
+        preallocated: bool,
+        recorded: String,
+    },
     /// The parent is a fork whose launch has not happened, so it holds no
     /// conversation of its own: the first launch is the fork.
     UnlaunchedFork,
@@ -53,11 +56,11 @@ impl ForkDenied {
             Self::NoParentSession => format!(
                 "Nothing to fork: session '{title}' has no single captured conversation to fork from: it has captured none, or more than one session records this conversation id."
             ),
-            Self::UnqualifiedParent { pre_pinned: false, recorded } => format!(
+            Self::UnqualifiedParent { preallocated: false, recorded } => format!(
                 "Nothing to fork: session '{title}' records conversation '{recorded}', which nothing qualifies, so which conversation it names is unknown. Qualify it with `{command}`, and for a pi or omp session add a --store flag naming the absolute path of its transcript.",
                 command = qualify_command(id, recorded)
             ),
-            Self::UnqualifiedParent { pre_pinned: true, .. } => format!(
+            Self::UnqualifiedParent { preallocated: true, .. } => format!(
                 "Nothing to fork: session '{title}' has no captured conversation to fork from. Send it at least one message first."
             ),
             Self::UnlaunchedFork => format!(
@@ -153,7 +156,7 @@ pub fn terminal_fork_seed(
     // proves nothing at all.
     let unqualified = |binding: Option<&crate::session::ConversationBinding>, recorded: &str| {
         ForkDenied::UnqualifiedParent {
-            pre_pinned: binding.is_some_and(|binding| {
+            preallocated: binding.is_some_and(|binding| {
                 matches!(binding.provenance, ConversationProvenance::Preallocated)
             }),
             recorded: recorded.to_string(),
@@ -170,11 +173,10 @@ pub fn terminal_fork_seed(
         Some(ForkParentRef::Unlaunched) => return Err(ForkDenied::UnlaunchedFork),
         None => return Err(ForkDenied::NoParentSession),
     };
-    // `is_known` accepted the binding only on the strength of its execution, so
-    // a missing one is an inconsistency nothing can qualify.
-    let Some(execution) = parent.execution.as_ref() else {
-        return Err(unqualified(None, &parent.session_id));
-    };
+    let execution = parent
+        .execution
+        .as_ref()
+        .expect("is_known requires an execution");
     let forkable = get_agent(&execution.agent)
         .is_some_and(|agent| !matches!(agent.fork_strategy, ForkStrategy::Unsupported));
     if !forkable {
@@ -211,11 +213,11 @@ mod tests {
     }
 
     /// A recorded id is refused as unqualified whatever the evidence behind it,
-    /// and only a pre-pinned one is told to send a message, while a fork whose
+    /// and only a preallocated one is told to send a message, while a fork whose
     /// launch has not happened is refused as itself.
     #[test]
     fn fork_reports_a_recorded_but_unqualified_parent_separately() {
-        for (provenance, pre_pinned) in [
+        for (provenance, preallocated) in [
             (ConversationProvenance::Preallocated, true),
             (ConversationProvenance::Unknown, false),
         ] {
@@ -223,7 +225,7 @@ mod tests {
             assert_eq!(
                 terminal_fork_seed(Some(ForkParentRef::Bound(&parent)), "child-uuid".into()),
                 Err(ForkDenied::UnqualifiedParent {
-                    pre_pinned,
+                    preallocated,
                     recorded: "parent-uuid".into(),
                 }),
                 "{provenance:?}"
@@ -237,7 +239,7 @@ mod tests {
                 "child-uuid".into()
             ),
             Err(ForkDenied::UnqualifiedParent {
-                pre_pinned: false,
+                preallocated: false,
                 recorded: "legacy-uuid".into(),
             })
         );
@@ -267,54 +269,75 @@ mod tests {
         );
     }
 
-    /// Every refusal state carries its own wording, and each names the remedy
-    /// that state admits: a pre-pinned id has no conversation to qualify, so
-    /// it is told to send a message, and the rest are told to re-assert one.
+    /// Every refusal state names the remedy that comes back to it, and no
+    /// other state's remedy: a preallocated id has no conversation to qualify,
+    /// so it is told to send a message, and the rest are told to re-assert one.
     #[test]
-    fn user_message_distinguishes_every_refusal_state() {
+    fn user_message_names_the_remedy_of_its_own_state_only() {
+        let (agent_cannot_fork, no_parent, send_a_message, re_assert, unlaunched) = (
+            "no native fork capability",
+            "captured none",
+            "Send it at least one message first",
+            "set-session-id",
+            "has not launched yet",
+        );
         let cases = [
             (
                 ForkDenied::AgentCannotFork {
                     agent: "gemini".into(),
                 },
-                "Nothing to fork: session 'Legacy Parent' runs agent 'gemini', which has no native fork capability. Forkable agents: claude, codex, opencode.",
+                vec![agent_cannot_fork, "Forkable agents: claude"],
             ),
+            (ForkDenied::NoParentSession, vec![no_parent]),
             (
-                ForkDenied::NoParentSession,
-                "Nothing to fork: session 'Legacy Parent' has no single captured conversation to fork from: it has captured none, or more than one session records this conversation id.",
+                ForkDenied::UnqualifiedParent {
+                    preallocated: true,
+                    recorded: "parent-uuid".into(),
+                },
+                vec![send_a_message],
             ),
             (
                 ForkDenied::UnqualifiedParent {
-                    pre_pinned: true,
+                    preallocated: false,
                     recorded: "parent-uuid".into(),
                 },
-                "Nothing to fork: session 'Legacy Parent' has no captured conversation to fork from. Send it at least one message first.",
+                vec![re_assert, "parent-uuid"],
             ),
-            (
-                ForkDenied::UnqualifiedParent {
-                    pre_pinned: false,
-                    recorded: "parent-uuid".into(),
-                },
-                "Nothing to fork: session 'Legacy Parent' records conversation 'parent-uuid', which nothing qualifies, so which conversation it names is unknown. Qualify it with `aoe session set-session-id 4f2a8c10 parent-uuid`, and for a pi or omp session add a --store flag naming the absolute path of its transcript.",
-            ),
-            (
-                ForkDenied::UnlaunchedFork,
-                "Nothing to fork: session 'Legacy Parent' is a fork that has not launched yet. Start it once, then fork from the child conversation.",
-            ),
+            (ForkDenied::UnlaunchedFork, vec![unlaunched]),
         ];
-        for (denied, expected) in cases {
-            assert_eq!(denied.user_message("Legacy Parent", "4f2a8c10"), expected);
+        let remedies = [
+            agent_cannot_fork,
+            no_parent,
+            send_a_message,
+            re_assert,
+            unlaunched,
+        ];
+        for (denied, own) in &cases {
+            let message = denied.user_message("Legacy Parent", "4f2a8c10");
+            for remedy in own {
+                assert!(
+                    message.contains(remedy),
+                    "{denied:?} names {remedy:?}: {message}"
+                );
+            }
+            for remedy in remedies {
+                if !own.contains(&remedy) {
+                    assert!(
+                        !message.contains(remedy),
+                        "{denied:?} names another state's remedy {remedy:?}: {message}"
+                    );
+                }
+            }
         }
     }
 
-    /// A printed remedy has to run as printed, so both values are quoted and
-    /// the printed span is one command line. Tokenising it is what a shell
-    /// hands to `execve`, and the binary cannot be run from here: this test
-    /// binary is not the `aoe` binary.
+    /// A printed remedy has to reach the shell as one command line, so both
+    /// values are quoted. Tokenising it is what a shell hands to `execve`;
+    /// that the CLI still accepts this command line is the e2e's property.
     #[test]
-    fn the_printed_remedy_tokenizes_to_one_runnable_command() {
+    fn the_printed_remedy_tokenizes_to_one_command_line() {
         let message = ForkDenied::UnqualifiedParent {
-            pre_pinned: false,
+            preallocated: false,
             recorded: "parent uuid".into(),
         }
         .user_message("Legacy Parent", "4f2a 8c10");

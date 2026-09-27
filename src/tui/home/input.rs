@@ -3047,7 +3047,7 @@ impl HomeView {
             }
             // Kept local to the structured path: an ACP parent never reaches
             // `terminal_fork_seed`, so no `ForkDenied` describes it. Named as
-            // ACP so it cannot read as the terminal pre-pinned refusal.
+            // ACP so it cannot read as the terminal preallocated refusal.
             let Some(acp_id) = parent_acp_session_id.filter(|s| !s.is_empty()) else {
                 self.info_dialog = Some(InfoDialog::new(
                     "Nothing to fork yet",
