@@ -866,4 +866,76 @@ mod tests {
             );
         }
     }
+
+    /// The window a row armed is about the execution it armed it for. Both halves of that matter:
+    /// a row with nothing to poll holds no poller and no execution, and keeps its window, while a
+    /// row another process gave a new execution does not inherit one armed for the old.
+    #[test]
+    fn a_reload_keeps_the_repair_pacing_of_a_row_about_the_same_execution() {
+        let now = std::time::Instant::now();
+        let execution = |id: &str| {
+            Some(crate::session::ActiveExecution {
+                launch_id: id.to_string(),
+                binding: crate::session::ExecutionBinding {
+                    agent: "claude".into(),
+                    stores: Vec::new(),
+                    configuration: Vec::new(),
+                    cwd: std::path::PathBuf::from("/tmp"),
+                    cwd_filesystem: "host".into(),
+                    filesystem: "host".into(),
+                    exported_default_store: None,
+                },
+                capture: None,
+                container: None,
+            })
+        };
+        let mut mergers: Vec<fn(Instance, Instance) -> Instance> = vec![merge_runtime_fields];
+        mergers.push(|prior, mut fresh| {
+            fresh.merge_runtime_from_reload(&prior);
+            fresh
+        });
+        for merge in mergers {
+            // What the repair walk leaves behind on a row with no poller: a re-probe ladder and a
+            // store-retry deadline.
+            let mut prior = Instance::new("poller-less", "/tmp/poller-less");
+            prior.poller_repair.reprobe(now);
+            let deadline = now + std::time::Duration::from_secs(30);
+            prior.session_id_poller_retry_after = Some(deadline);
+            assert!(prior.session_id_poller.is_none());
+
+            let merged = merge(prior, Instance::new("poller-less", "/tmp/poller-less"));
+
+            assert_eq!(
+                merged.poller_repair.current_reprobe_delay(),
+                Some(std::time::Duration::from_secs(5)),
+                "the row keeps its window, or it re-resolves every tick"
+            );
+            assert_eq!(
+                merged.session_id_poller_retry_after,
+                Some(deadline),
+                "and so does its store-retry deadline"
+            );
+
+            // Another process gave the row a new execution while it was waiting: the window was
+            // armed for the old one and paces nothing this row can still use.
+            let mut prior = Instance::new("replaced", "/tmp/replaced");
+            prior.active_execution = execution("launch-1");
+            prior.poller_repair.reprobe(now);
+            let deadline = now + std::time::Duration::from_secs(30);
+            prior.session_id_poller_retry_after = Some(deadline);
+            let mut fresh = Instance::new("replaced", "/tmp/replaced");
+            fresh.active_execution = execution("launch-2");
+
+            let merged = merge(prior, fresh);
+
+            assert!(
+                merged.poller_repair.due(std::time::Instant::now()),
+                "a window armed for the superseded execution does not hold the new one back"
+            );
+            assert_eq!(
+                merged.session_id_poller_retry_after, None,
+                "and neither does the deadline that went with it"
+            );
+        }
+    }
 }

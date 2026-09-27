@@ -43,9 +43,7 @@ impl Instance {
         }
         disk.last_start_time = self.last_start_time;
         disk.session_id_poller = self.session_id_poller.take();
-        disk.session_id_poller_retry_after = self.session_id_poller_retry_after;
-        // Preserve the serde-skipped backoff so reloads cannot trigger an early retry.
-        disk.poller_repair = self.poller_repair.clone();
+        disk.adopt_poller_repair(self);
         disk.pane_dead_observed = self.pane_dead_observed;
         disk.force_fresh_next_launch = self.force_fresh_next_launch;
         disk.pending_host_env = std::mem::take(&mut self.pending_host_env);

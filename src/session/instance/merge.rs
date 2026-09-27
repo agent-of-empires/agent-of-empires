@@ -132,6 +132,13 @@ impl Instance {
     /// Switch tools, parking completed conversations per tool.
     /// Pending forks retain their target for launch-time namespace validation.
     pub(crate) fn swap_tool(&mut self, new_tool: &str) {
+        if self.tool != new_tool {
+            // A poller belongs to the agent that produced it. The row is about to drop the
+            // execution, and nothing the old poller watches is the new agent's, so an execution
+            // comparison cannot decide this one.
+            self.stop_poller();
+            self.session_id_poller = None;
+        }
         if new_tool == self.tool {
             return;
         }
@@ -163,7 +170,6 @@ impl Instance {
         self.acp_load_session_capable = None;
         self.resume_probe_failed_sid = None;
         self.active_execution = None;
-        self.settle_poller_for(None);
         self.acp_effort = None;
         self.agent_model = None;
         self.import_pending = None;
@@ -1335,6 +1341,32 @@ mod tests {
         assert!(
             !inst.session_id_poller_is_running(),
             "and the poller that watched it went with the execution"
+        );
+        assert!(inst.session_id_poller.is_none());
+    }
+
+    /// A poller built while the row had no execution watches nothing that identifies the agent, so
+    /// an execution comparison keeps it: only the tool says the watcher belongs to the old one.
+    #[test]
+    fn swap_tool_stops_a_poller_that_was_built_without_an_execution() {
+        let mut inst = tool_instance("claude", "/home/user/project");
+        let mut poller = SessionPoller::new(format!("test-tmux-{}", inst.id), None);
+        assert_eq!(
+            poller.start(inst.id.clone(), Box::new(|| None), Box::new(|_| {}), None,),
+            crate::session::poller::PollerSpawn::Spawned
+        );
+        inst.session_id_poller = Some(std::sync::Arc::new(std::sync::Mutex::new(poller)));
+        assert!(inst.session_id_poller_is_running());
+        assert!(
+            inst.active_execution.is_none(),
+            "fixture: it watches no execution"
+        );
+
+        inst.swap_tool("codex");
+
+        assert!(
+            !inst.session_id_poller_is_running(),
+            "the old agent's watcher does not survive the swap, execution or not"
         );
         assert!(inst.session_id_poller.is_none());
     }

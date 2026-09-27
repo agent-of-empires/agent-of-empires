@@ -39,7 +39,10 @@ fn apply_poller_repair_if_lifecycle_unchanged(
     backoff: &crate::session::poller::PollerRepairBackoff,
     baseline: &SessionIdentityBaseline,
 ) {
-    if live.lifecycle_generation == baseline.5 {
+    if live.lifecycle_generation == baseline.5
+        && live.active_execution == baseline.0.active
+        && live.omp_capture_generation == baseline.2
+    {
         live.poller_repair = backoff.clone();
     }
 }
@@ -369,5 +372,59 @@ mod tests {
         apply_drained_lifecycle_if_unchanged(&mut relaunched, &drained, &baseline);
         assert_eq!(relaunched.lifecycle_generation, 9);
         assert_eq!(relaunched.lifecycle_reservation, Some(reservation));
+    }
+
+    /// A tool swap or a disk write can move a row's execution without moving its lifecycle counter,
+    /// because neither claims one. A walk that armed its window for the old execution must not
+    /// write it onto the new one.
+    #[test]
+    fn a_walk_verdict_is_dropped_when_the_execution_moved_under_it() {
+        let execution = |id: &str| {
+            Some(crate::session::ActiveExecution {
+                launch_id: id.to_string(),
+                binding: crate::session::ExecutionBinding {
+                    agent: "claude".into(),
+                    stores: Vec::new(),
+                    configuration: Vec::new(),
+                    cwd: "/tmp".into(),
+                    cwd_filesystem: "host".into(),
+                    filesystem: "host".into(),
+                    exported_default_store: None,
+                },
+                capture: None,
+                container: None,
+            })
+        };
+        let mut live = Instance::new("swapped", "/tmp/swapped");
+        live.lifecycle_generation = 7;
+        let baseline: SessionIdentityBaseline = (
+            live.conversation_state(),
+            None,
+            None,
+            None,
+            None,
+            7,
+            crate::session::Status::Idle,
+        );
+        let mut walked = live.clone();
+        walked.poller_repair.reprobe(std::time::Instant::now());
+
+        live.poller_repair = Default::default();
+        apply_poller_repair_if_lifecycle_unchanged(&mut live, &walked.poller_repair, &baseline);
+        assert_eq!(
+            live.poller_repair.current_reprobe_delay(),
+            Some(std::time::Duration::from_secs(5)),
+            "fixture: nothing moved, so the verdict lands"
+        );
+
+        // The row swapped tool under the walk: same lifecycle counter, different execution.
+        live.active_execution = execution("launch-2");
+        live.poller_repair = Default::default();
+        apply_poller_repair_if_lifecycle_unchanged(&mut live, &walked.poller_repair, &baseline);
+        assert_eq!(
+            live.poller_repair.current_reprobe_delay(),
+            None,
+            "a window armed for the execution the row gave up is not written onto the new one"
+        );
     }
 }

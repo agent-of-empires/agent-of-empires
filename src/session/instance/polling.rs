@@ -680,11 +680,9 @@ impl Instance {
         })
     }
 
-    /// Take the poller a handoff offers, and the managed-store retry deadline that paces the row
-    /// while no store is claimable. A poller serves the execution it was installed for, so the row
-    /// takes the handle only when it watches the execution the row now holds, and one that does
-    /// not is stopped: its thread still reads the launch the row is giving up. The deadline is
-    /// the row's own state and travels either way.
+    /// Take the poller a handoff offers. A poller serves the execution it was installed for, so the
+    /// row takes the handle only when it watches the execution the row now holds, and one that does
+    /// not is stopped: its thread still reads the launch the row is giving up.
     ///
     /// Call once the row's own execution is settled, which is what the handoff may replace: asked
     /// against the execution the row still held, it would refuse the handoff's poller and stop it.
@@ -694,14 +692,17 @@ impl Instance {
         } else {
             handoff.stop_poller();
         }
-        self.session_id_poller_retry_after = handoff.session_id_poller_retry_after;
     }
 
-    /// Take the repair schedule the prior row armed. A row with nothing to poll re-probes on
-    /// this schedule, and a row that could not claim a managed store waits on the deadline, so
-    /// both hold no poller for [`Self::adopt_poller`] to answer.
+    /// Take the row's repair pacing from a prior row about the same execution: the re-probe ladder
+    /// and the managed-store deadline, both of which hold the next attempt back. Neither depends
+    /// on a poller, so a row with nothing to poll keeps its window, and a row whose execution
+    /// another process replaced does not inherit a window armed for the old one.
     pub(crate) fn adopt_poller_repair(&mut self, prior: &Self) {
-        self.poller_repair = prior.poller_repair.clone();
+        if self.active_execution == prior.active_execution {
+            self.poller_repair = prior.poller_repair.clone();
+            self.session_id_poller_retry_after = prior.session_id_poller_retry_after;
+        }
     }
 
     /// Keep the poller only while it watches `execution`, and clear the slot otherwise. A poller
