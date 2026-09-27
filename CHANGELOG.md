@@ -15,11 +15,17 @@ The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 - **cli:** Select the transport the seven read commands use: the local daemon's own socket by default, and a named `--daemon-url` (or `AOE_DAEMON_URL`) endpoint when one is given, with a bearer token required from then on; an empty `AOE_DAEMON_URL` is an unset one, as everywhere else in the tool
 - **cli:** Run the shared preflight for a daemon-served read, so `aoe list` reports the same namespace warning, telemetry and unknown-config warnings as every other command
 - **cli:** Print `Z`-suffixed timestamps in `aoe session show` and `aoe session list-trash`, matching the JSON form they already used
-- **cli:** Exclude a project's status flag from `aoe project list`, so the inventory lists the projects a registry holds rather than the health of each one
 - **server:** Bound the HTTP runtime read with the same 15 s budget the local socket already spent, so an authenticated peer that upgrades and then stops talking cannot hold a task and a full disk rescan open
 - **server:** Retry the read's local admission while the establishment budget lasts, so a read that races a daemon publication or a daemon restart is served instead of refused; a present-but-untrustworthy namespace is still refused
 - **server:** Follow a symlinked component in the app-directory chain and verify the directory it resolves to by descriptor, so a home reached through one no longer refuses every read; the final component is still pinned against symlink substitution
 - **server:** Keep the local runtime read Linux-only, as the publisher already was, and make that explicit: on every other platform the seven reads come from the local store and the HTTP route is unaffected
+- **cli:** A read that a daemon refuses now exits with the daemon's code and its `daemon read: <code>` line, where the local command path exited 1 with its own message
+
+
+### Bug Fixes
+
+- **cli:** `aoe status --json` on an empty profile is compact like every other case, instead of the space-separated literal it printed before
+- **cli:** A read command stops waiting out the establishment budget on a daemon that is no longer running, and falls back to the local store as it does when nothing ever published
 
 
 ## [1.17.2](https://github.com/agent-of-empires/agent-of-empires/releases/tag/v1.17.2) - 2026-09-25

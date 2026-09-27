@@ -51,7 +51,13 @@ pub struct Cli {
     /// consume or create profile state require an existing profile: an unknown
     /// name is refused, not created (make one with `aoe profile create`).
     /// Profile-independent commands such as `list --all` and `serve --stop`
-    /// ignore it
+    /// ignore it. `AGENT_OF_EMPIRES_PROFILE` names one too, and an explicit
+    /// `-p` wins over it.
+    // No `env` attribute here on purpose. clap would fold the variable into
+    // `cli.profile` itself, and the two are not the same field: `explicit_profile`
+    // and `env_profile` are read separately, and which of them wins is the
+    // documented precedence. An `env` attribute would erase that distinction
+    // behind what looks like a help-text fix.
     #[arg(short = 'p', long, global = true)]
     pub profile: Option<String>,
 
@@ -69,6 +75,10 @@ pub struct Cli {
     /// the local store while this route is unaffected. At the no-subcommand
     /// `aoe` invocation (the TUI dashboard) the same URL attaches the whole
     /// session list instead.
+    // As with `-p`, no `env` attribute: `read_request_source` reads
+    // `AOE_DAEMON_URL` itself and keeps it distinct from an explicit
+    // `--daemon-url`, so the flag can win and an empty variable can still mean
+    // "unset".
     #[arg(long, global = true)]
     pub daemon_url: Option<String>,
 

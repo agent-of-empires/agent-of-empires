@@ -171,7 +171,7 @@ Run without arguments to launch the TUI dashboard.
 
 ###### **Options:**
 
-* `-p`, `--profile <PROFILE>` — Profile to use (separate workspace with its own sessions). Commands that consume or create profile state require an existing profile: an unknown name is refused, not created (make one with `aoe profile create`). Profile-independent commands such as `list --all` and `serve --stop` ignore it
+* `-p`, `--profile <PROFILE>` — Profile to use (separate workspace with its own sessions). Commands that consume or create profile state require an existing profile: an unknown name is refused, not created (make one with `aoe profile create`). Profile-independent commands such as `list --all` and `serve --stop` ignore it. `AGENT_OF_EMPIRES_PROFILE` names one too, and an explicit `-p` wins over it
 * `--daemon-url <DAEMON_URL>` — Select the transport the read-only commands (`list`, `status`, `session show`, `session list-trash`, `group list`, `profile`, `project list`) use, and attach the dashboard to a remote agent daemon instead of the local session list. Equivalent to setting `AOE_DAEMON_URL`, which `read_request_source` applies to the same seven commands: a URL here or there is what replaces the local daemon's own socket, and a bearer token is required from then on (`AOE_DAEMON_TOKEN`). The session list goes through a bearer-only client, so `AOE_DAEMON_PASSPHRASE` does not work here yet; it works for `aoe acp <verb>` against the same `AOE_DAEMON_URL`. The local socket is Linux-only, so on any other platform those seven reads always come from the local store while this route is unaffected. At the no-subcommand `aoe` invocation (the TUI dashboard) the same URL attaches the whole session list instead
 
 
@@ -248,7 +248,7 @@ List all sessions
 
 * `--json` — Output as JSON
 * `--all` — List sessions from all profiles
-* `--state <STATE>` — Filter by session state
+* `--state <STATE>` — Filter by session state. Replaces the older --all, --archived and --trash flags: --state live is the default selection without --all, and --state trashed is --trash. The values are the same vocabulary the REST API's state filter takes.
 
   Default value: `all`
 
