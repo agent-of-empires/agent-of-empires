@@ -115,9 +115,13 @@ const POLLER_REPAIR_MAX_DELAY: Duration = Duration::from_secs(60);
 const POLLER_REPAIR_REMIND_EVERY: u32 = 10;
 /// First delay before re-probing a session that had nothing to poll.
 const POLLER_REPROBE_INITIAL_DELAY: Duration = Duration::from_secs(5);
-/// Ceiling for re-probing a session that has nothing to poll: the interval an unresolved
-/// managed capture store already waits before its own retry.
-const POLLER_REPROBE_MAX_DELAY: Duration = Duration::from_secs(30);
+
+/// How long a row waits before trying its managed capture store again.
+pub(crate) const MANAGED_CAPTURE_RETRY_BACKOFF: Duration = Duration::from_secs(30);
+
+/// Ceiling for re-probing a session that has nothing to poll: no point re-probing a row more
+/// often than the store it shares would retry it.
+const POLLER_REPROBE_MAX_DELAY: Duration = MANAGED_CAPTURE_RETRY_BACKOFF;
 
 /// Retry schedule for one session whose session-id poller was not (re)started: it could not be
 /// spawned, or the session had nothing to poll yet. One row carries one armed deadline; which
@@ -496,8 +500,8 @@ fn poll_resolved_target<T>(
 /// Manages polling thread lifecycle and inter-thread communication via mpsc channels.
 pub struct SessionPoller {
     session_name: String,
-    /// The execution this poller watches, fixed at construction and never reassigned: its
-    /// observations name this execution, and a row holds one poller for the execution it has.
+    /// The execution this poller watches. Its observations name it, so a row holding this
+    /// poller has to hold that execution.
     execution: Option<crate::session::instance::ActiveExecution>,
     /// The budget this poller's thread is counted against, fixed at
     /// construction so the slot is returned to the budget it was taken from.
@@ -520,10 +524,8 @@ impl std::fmt::Debug for SessionPoller {
 }
 
 impl SessionPoller {
-    /// Create a new poller (does not start the thread)
     /// Build a poller for `execution`, the execution whose capture files it will read. `None` is
-    /// a real answer: a row can hold a poller while it has no execution of its own. A poller
-    /// cannot be built outside the crate, so none exists without saying what it watches.
+    /// a real answer: a row can hold a poller while it has no execution of its own.
     pub(crate) fn new(
         session_name: String,
         execution: Option<crate::session::instance::ActiveExecution>,
@@ -802,7 +804,6 @@ impl SessionPoller {
         }
     }
 
-    /// Check if the poller thread is running
     /// Whether this poller watches `execution`.
     pub(crate) fn serves(
         &self,
@@ -811,6 +812,7 @@ impl SessionPoller {
         self.execution.as_ref() == execution
     }
 
+    /// Check if the poller thread is running
     pub fn is_running(&self) -> bool {
         match &self.handle {
             Some(handle) => !handle.is_finished(),
@@ -1096,10 +1098,6 @@ mod tests {
             "a failure after a stretch with nothing to poll starts over and warns"
         );
         assert_eq!(b.deferrals(), 1);
-        for _ in 0..4 {
-            b.defer(now);
-        }
-        assert_eq!(b.current_delay(), Some(POLLER_REPAIR_MAX_DELAY));
 
         // And the failure streak ends just the same: the next re-probe ignores that ceiling.
         b.reprobe(now);

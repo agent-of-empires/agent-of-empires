@@ -1793,10 +1793,9 @@ fn apply_post_restart_identity_sync_clears_the_live_poller_schedule() {
     live.poller_repair.reprobe(now);
     live.poller_repair.reprobe(now);
     apply_post_restart_identity_sync(&mut live, &before, &relaunched);
-    assert_eq!(
-        live.poller_repair.current_reprobe_delay(),
-        None,
-        "the re-probe schedule is not carried across the relaunch that replaced the poller"
+    assert!(
+        live.poller_repair.due(std::time::Instant::now()),
+        "the row is due at once rather than waiting out the re-probe the relaunch replaced"
     );
 
     restarted_poller

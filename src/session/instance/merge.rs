@@ -714,10 +714,9 @@ mod tests {
         live.poller_repair.reprobe(now);
         live.poller_repair.reprobe(now);
         live.merge_post_restart_with_baseline(&before, &relaunched);
-        assert_eq!(
-            live.poller_repair.current_reprobe_delay(),
-            None,
-            "the re-probe schedule is not carried across the relaunch that replaced the poller"
+        assert!(
+            live.poller_repair.due(std::time::Instant::now()),
+            "the row is due at once rather than waiting out the re-probe the relaunch replaced"
         );
 
         // A relaunch whose conversation moved under it still replaced the pane, so the row must
@@ -775,7 +774,9 @@ mod tests {
 
         // A relaunch that replaced the pane without installing a poller carries the superseded
         // launch's own, which watches an execution the row is about to give up: it cannot keep
-        // it, and the walk is the only thing that installs one for the pane it launched.
+        // it, and the walk is the only thing that installs one for the pane it launched. The
+        // adopt above already stopped that poller, so the schedule reset below is pinned against
+        // a relaunch the rule must not consult for one.
         let outgoing = running_poller(&before.id, Some(launch_2.clone()));
         let mut relaunched = restarted.clone();
         relaunched.session_id_poller = Some(outgoing.clone());

@@ -4,7 +4,7 @@ use super::*;
 use fs2::FileExt as _;
 use sha2::{Digest as _, Sha256};
 
-const MANAGED_CAPTURE_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(30);
+use crate::session::poller::MANAGED_CAPTURE_RETRY_BACKOFF;
 
 /// Lets a test hold the start path open long enough to observe that the repair
 /// schedule is stamped after it, the way a wedged `tmux` does.
@@ -680,6 +680,9 @@ impl Instance {
     /// takes the handle only when it watches the execution the row now holds, and one that does
     /// not is stopped: its thread still reads the launch the row is giving up. The deadline is
     /// the row's own state and travels either way.
+    ///
+    /// Call once the row's own execution is settled, which is what the handoff may replace: asked
+    /// against the execution the row still held, it would refuse the handoff's poller and stop it.
     pub(crate) fn adopt_poller(&mut self, handoff: &Self) {
         if handoff.poller_serves(self.active_execution.as_ref()) {
             self.session_id_poller = handoff.session_id_poller.clone();
@@ -696,9 +699,10 @@ impl Instance {
         self.poller_repair = prior.poller_repair.clone();
     }
 
-    /// Drop the repair schedule when the relaunch replaced the pane it paced. A launch that
-    /// reached its start-time stamp got far enough to install a poller for a new pane; a launch
-    /// that died before the stamp says nothing, and the row keeps what its own walk armed.
+    /// Drop the repair schedule when the relaunch replaced the pane it paced. The start-time
+    /// stamp is the only signal that separates a launch that got far enough to re-evaluate the
+    /// row from one that died earlier and says nothing about it; a relaunch that stamps may still
+    /// have installed no poller, and the schedule goes either way.
     pub(crate) fn reset_poller_repair_for_replaced_pane(&mut self, before: &Self, launched: &Self) {
         if launched.last_start_time != before.last_start_time {
             self.poller_repair.reset();
