@@ -456,7 +456,7 @@ pub(crate) fn validate_hello(hello: &HelloData) -> Result<(), &'static str> {
     validate_profiles(&hello.profiles)?;
     validate_freshness(&hello.status_freshness)?;
     if let AggregateHealth::Degraded { code } = hello.health {
-        validate_health_code(code, HELLO_HEALTH_CODES)?;
+        validate_health_code(code, &hello_health_codes())?;
     }
     Ok(())
 }
@@ -591,11 +591,16 @@ pub(crate) fn validate_snapshot(snapshot: &SnapshotData) -> Result<(), &'static 
     }
     for (id, (profile, parent)) in &parents {
         if let Some(parent) = parent {
-            let Some((parent_profile, _)) = parents.get(parent) else {
-                return Err("schema_invalid");
-            };
-            if parent_profile != profile {
-                return Err("schema_invalid");
+            // A parent that names no row is persisted state, not corruption: the
+            // local path keeps and prints the stored id, and `rm --purge` of a
+            // parent leaves the child pointing at nothing. So the graph rules
+            // that can still be stated apply to the part that is there — the
+            // parent, when it is a row at all, sits in the same profile, and the
+            // edges that do land on a row form no cycle.
+            if let Some((parent_profile, _)) = parents.get(parent) {
+                if parent_profile != profile {
+                    return Err("schema_invalid");
+                }
             }
             let mut seen = HashSet::new();
             let mut cursor = Some(*id);
@@ -677,10 +682,6 @@ fn validate_profile_health(health: &ProfileHealth) -> Result<(), &'static str> {
     validate_profile_component(health.profile_data)
 }
 
-/// The aggregate health a Hello may carry: the global enumeration and metadata
-/// components the snapshot also carries, and nothing profile-scoped.
-const HELLO_HEALTH_CODES: &[HealthCode] = &[HealthCode::Enumeration, HealthCode::Metadata];
-
 /// One health code against the components that may actually carry it. The
 /// client's vocabulary is the producer's, and each component is degraded by
 /// its own failure, so a code outside the component's own set is a schema
@@ -693,19 +694,40 @@ fn validate_health_code(code: HealthCode, allowed: &[HealthCode]) -> Result<(), 
     }
 }
 
+/// The codes a global component is degraded by.
+const GLOBAL_HEALTH_CODES: &[HealthCode] = &[HealthCode::Enumeration, HealthCode::Metadata];
+
+/// The codes a profile-scoped component is degraded by.
+const PROFILE_COMPONENT_CODES: &[HealthCode] =
+    &[HealthCode::ProfileEnumeration, HealthCode::Metadata];
+
+/// The aggregate a Hello may carry: exactly the union of the codes the
+/// components folded into it can each carry, so the roll-up cannot name a code
+/// the components it rolls up are incapable of. Derived rather than written
+/// out, because a hand-written subset of the union is a way to refuse a Hello
+/// the producer is entitled to send.
+fn hello_health_codes() -> Vec<HealthCode> {
+    let mut codes: Vec<HealthCode> = Vec::new();
+    for component in [GLOBAL_HEALTH_CODES, PROFILE_COMPONENT_CODES] {
+        for code in component {
+            if !codes.contains(code) {
+                codes.push(*code);
+            }
+        }
+    }
+    codes
+}
+
 fn validate_global_health(health: ComponentHealth) -> Result<(), &'static str> {
     if let ComponentHealth::Degraded { code } = health {
-        validate_health_code(code, &[HealthCode::Enumeration, HealthCode::Metadata])?;
+        validate_health_code(code, GLOBAL_HEALTH_CODES)?;
     }
     Ok(())
 }
 
 fn validate_profile_component(health: ComponentHealth) -> Result<(), &'static str> {
     if let ComponentHealth::Degraded { code } = health {
-        validate_health_code(
-            code,
-            &[HealthCode::ProfileEnumeration, HealthCode::Metadata],
-        )?;
+        validate_health_code(code, PROFILE_COMPONENT_CODES)?;
     }
     Ok(())
 }
@@ -871,24 +893,17 @@ fn validate_session(session: &SessionRead) -> Result<(), &'static str> {
             return Err("schema_invalid");
         }
     }
-    // The one collection that keeps its order rule, and it is the producer's
-    // order rather than a canonical one: `SessionRead::from_instance` sorts
-    // the list it emits, so the rule holds however the stored
-    // `workspace_info.repos` happen to be arranged and an unsorted stored row
-    // cannot reach this check. Keeping it costs a client nothing and still
-    // refuses a repeated (name, source_path) pair, which a set-like
-    // collection on the wire cannot express on its own.
-    if session
-        .workspace_repos
-        .windows(2)
-        .any(|pair| (&pair[0].name, &pair[0].source_path) >= (&pair[1].name, &pair[1].source_path))
-    {
-        return Err("schema_invalid");
-    }
+    // Repos in the store's own order, like every other collection on the wire:
+    // `aoe list --json` prints them the way the workspace stored them, so a
+    // producer-side sort would make the array's order depend on the transport.
+    // Identity is the rule a set-like collection can still refuse, and a
+    // repeated (name, source_path) pair is not a thing a workspace holds.
+    let mut repo_identities: HashSet<(&str, &str)> = HashSet::new();
     for repository in &session.workspace_repos {
         if !valid_text(&repository.name)
             || !valid_text(&repository.branch)
             || !valid_absolute_path(&repository.source_path)
+            || !repo_identities.insert((&repository.name, &repository.source_path))
         {
             return Err("schema_invalid");
         }
@@ -1070,10 +1085,22 @@ mod tests {
         assert!(serde_json::from_str::<SnapshotHealth>(duplicate).is_err());
     }
 
+    /// A parent that names no row is persisted state — `rm --purge` of a parent
+    /// leaves the child pointing at nothing — and the local path keeps and
+    /// prints it, so the snapshot is accepted. The rules that can still be
+    /// stated are the ones about parents that are rows: same profile, and no
+    /// cycle.
     #[test]
-    fn parent_must_exist_in_same_profile_and_graph_is_acyclic() {
+    fn an_orphan_parent_is_accepted_and_the_graph_rules_still_hold() {
         let mut value = snapshot();
         value.health.profiles.insert("main".into(), health());
+        value.profiles[0].projects = vec![ProjectRead {
+            name: "repo".into(),
+            path: "/repo".into(),
+            scope: ProjectScope::Profile,
+            default_base_branch: None,
+            registered: true,
+        }];
         let base = SessionRead {
             id: "a".into(),
             title: "A".into(),
@@ -1099,13 +1126,65 @@ mod tests {
             worktree: None,
             workspace_repos: vec![],
         };
-        value.sessions.push(base.clone());
-        assert_eq!(validate_snapshot(&value), Err("schema_invalid"));
+        value.sessions = vec![base.clone()];
+        assert_eq!(
+            validate_snapshot(&value),
+            Ok(()),
+            "a parent that names no row is not a schema violation"
+        );
+
         let mut child = base.clone();
         child.id = "b".into();
         child.parent_session_id = Some("a".into());
-        value.sessions = vec![base.clone(), child];
-        assert_eq!(validate_snapshot(&value), Err("schema_invalid"));
+        value.sessions = vec![base.clone(), child.clone()];
+        assert_eq!(
+            validate_snapshot(&value),
+            Err("schema_invalid"),
+            "two rows pointing at each other are a cycle"
+        );
+
+        let mut foreign = child.clone();
+        foreign.profile = "other".into();
+        value.profiles.push(ProfileRead {
+            name: "other".into(),
+            groups: vec![],
+            projects: vec![],
+            health: health(),
+        });
+        value.health.profiles.insert("other".into(), health());
+        value.sessions = vec![base, foreign];
+        assert_eq!(
+            validate_snapshot(&value),
+            Err("schema_invalid"),
+            "a parent in another profile is still refused"
+        );
+    }
+
+    /// The Hello aggregate is a roll-up of the snapshot's components, so every
+    /// code a component can be degraded by is a code the roll-up may name. A
+    /// profile whose registry fails to load is a real, ordinary state, and it
+    /// must not turn into a protocol rejection for every other command.
+    #[test]
+    fn the_hello_aggregate_accepts_every_code_its_components_carry() {
+        let codes = hello_health_codes();
+        for expected in [
+            HealthCode::Enumeration,
+            HealthCode::ProfileEnumeration,
+            HealthCode::Metadata,
+        ] {
+            assert!(
+                codes.contains(&expected),
+                "{expected:?} is carried by a component the aggregate folds in"
+            );
+        }
+        for component in [GLOBAL_HEALTH_CODES, PROFILE_COMPONENT_CODES] {
+            for code in component {
+                assert!(
+                    codes.contains(code),
+                    "the union omits a code one of its own components carries"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1231,12 +1310,13 @@ mod tests {
         assert_eq!(validate_snapshot(&value), Ok(()));
     }
 
-    /// The one collection that keeps its order rule, and the reason it is
-    /// safe: the producer sorts what it emits, so a stored row in any order
-    /// arrives ascending. What the rule still buys is the refusal of a
-    /// repeated (name, source_path) pair.
+    /// Repos are accepted in any order, like every other collection here: the
+    /// producer emits the store's own order, and an ordering rule on top of it
+    /// would refuse a snapshot the local command renders from the same rows.
+    /// What identity still buys is the refusal of a repeated
+    /// (name, source_path) pair, which a workspace cannot hold.
     #[test]
-    fn workspace_repos_keep_their_ascending_rule() {
+    fn workspace_repos_are_accepted_in_any_order_and_refused_when_repeated() {
         let repo = |name: &str, source: &str| WorkspaceRepo {
             name: name.into(),
             source_path: source.into(),
@@ -1255,8 +1335,8 @@ mod tests {
                 repo("b", "/srv/a"),
                 repo("a", "/srv/b"),
             ])),
-            Err("schema_invalid"),
-            "descending rows are refused"
+            Ok(()),
+            "a descending stored order reaches the wire and must be kept"
         );
         assert_eq!(
             validate_session(&session_with_repos(vec![

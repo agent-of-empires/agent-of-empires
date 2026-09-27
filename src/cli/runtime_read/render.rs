@@ -411,11 +411,14 @@ fn render_show(
     }
     output.push_str(&format!("  Profile: {profile_name}\n"));
     if let Some(parent_id) = &session.parent_session_id {
-        let parent = sessions
-            .iter()
-            .find(|candidate| &candidate.id == parent_id)
-            .ok_or_else(|| ReadFailure::post("schema_invalid"))?;
-        output.push_str(&format!("  Parent:  {} ({parent_id})\n", parent.title));
+        // A parent that names no row is what a purged parent leaves behind, and
+        // the local path prints the bare id rather than refusing. The two JSON
+        // paths and this one have to agree, so the id is printed either way.
+        let line = match sessions.iter().find(|candidate| &candidate.id == parent_id) {
+            Some(parent) => format!("  Parent:  {} ({parent_id})", parent.title),
+            None => format!("  Parent:  {parent_id}"),
+        };
+        output.push_str(&format!("{line}\n"));
     }
     let children: Vec<&&SessionRead> = sessions
         .iter()
@@ -478,25 +481,31 @@ fn find_session<'a>(
     };
     let prefix = matches(&|session| session.id.starts_with(identifier));
     if !prefix.is_empty() {
-        return unique_or_ambiguous(prefix);
+        return match prefix.as_slice() {
+            [only] => Ok(*only),
+            _ => Err(ReadFailure::post("session_ambiguous")),
+        };
     }
-    let title = matches(&|session| session.title == identifier);
-    if !title.is_empty() {
-        return unique_or_ambiguous(title);
+    // The local resolver takes the **first** title match and the first
+    // project-path match, so this does too. Taking the first makes the rule
+    // order-dependent, which is a real wart in a long-standing command; it is
+    // reproduced rather than fixed here on purpose, because a transport that
+    // resolved a duplicated title differently would refuse a command the user
+    // can already run. An ambiguous id *prefix* is refused on both sides, which
+    // is the one case the local command calls ambiguous.
+    if let Some(session) = matches(&|session| session.title == identifier)
+        .into_iter()
+        .next()
+    {
+        return Ok(session);
     }
-    let project = matches(&|session| session.project_path == identifier);
-    if !project.is_empty() {
-        return unique_or_ambiguous(project);
+    if let Some(session) = matches(&|session| session.project_path == identifier)
+        .into_iter()
+        .next()
+    {
+        return Ok(session);
     }
     Err(ReadFailure::post("session_missing"))
-}
-
-fn unique_or_ambiguous(values: Vec<&SessionRead>) -> Result<&SessionRead, ReadFailure> {
-    if values.len() == 1 {
-        Ok(values[0])
-    } else {
-        Err(ReadFailure::post("session_ambiguous"))
-    }
 }
 
 fn render_trash(
@@ -595,12 +604,22 @@ fn render_profiles(snapshot: &SnapshotData) -> Result<String, ReadFailure> {
             "No profiles found.\nRun 'aoe' to create the first profile automatically.\n".into(),
         );
     }
+    // Picker order, the way a local `aoe profile` prints: alphabetical with a
+    // profile named `default` last. The wire carries the plain alphabetical
+    // enumeration, which `aoe list --all` prints and must not change, so the
+    // human order is applied here rather than to the shared list.
+    let mut names: Vec<&str> = snapshot
+        .profiles
+        .iter()
+        .map(|profile| profile.name.as_str())
+        .collect();
+    names.sort_by(|a, b| crate::session::profile_display_order(a, b));
     let mut output = String::from("Profiles:\n");
-    for profile in &snapshot.profiles {
-        if snapshot.default_profile.as_deref() == Some(profile.name.as_str()) {
-            output.push_str(&format!("  * {} (default)\n", profile.name));
+    for name in names {
+        if snapshot.default_profile.as_deref() == Some(name) {
+            output.push_str(&format!("  * {name} (default)\n"));
         } else {
-            output.push_str(&format!("    {}\n", profile.name));
+            output.push_str(&format!("    {name}\n"));
         }
     }
     output.push_str(&format!("\nTotal: {} profiles\n", snapshot.profiles.len()));
@@ -978,5 +997,166 @@ mod tests {
             "/home/alice2/repo"
         );
         assert_eq!(collapse_home("/remote/home", None), "/remote/home");
+    }
+
+    /// A degraded profile is the profile's own answer, not the snapshot's: a
+    /// command that never reads that profile — the global project list — is
+    /// still answerable, and the command that does read it says degraded.
+    #[test]
+    fn a_degraded_profile_does_not_refuse_a_profile_independent_read() {
+        let mut value = snapshot(vec![session("a", WireStatus::Idle)]);
+        let mut broken_health = health();
+        broken_health.profile_enumeration = ComponentHealth::Degraded {
+            code: crate::cli::runtime_read::dto::HealthCode::ProfileEnumeration,
+        };
+        let broken = ProfileRead {
+            name: "broken".into(),
+            groups: vec![],
+            projects: vec![],
+            health: broken_health.clone(),
+        };
+        value.profiles.push(broken);
+        value.health.profiles.insert("broken".into(), broken_health);
+        value.global_projects = vec![ProjectRead {
+            name: "shared".into(),
+            path: "/srv/shared".into(),
+            scope: ProjectScope::Global,
+            default_base_branch: None,
+            registered: true,
+        }];
+
+        let global = ProjectListArgs {
+            json: false,
+            scope: crate::cli::project::ScopeFilter::Global,
+        };
+        let output = render_projects(&global, &value, &source()).expect("a global list answers");
+        assert!(output.contains("shared"), "{output}");
+
+        let mut broken_source = source();
+        broken_source.explicit_profile = Some("broken".into());
+        let args = crate::cli::list::ListArgs {
+            json: false,
+            all: false,
+            state: crate::cli::list::StateFilter::All,
+        };
+        let failure = render_list(&args, &value, &broken_source)
+            .expect_err("the bad profile reports its own degradation");
+        assert_eq!(failure.code(), "health_degraded");
+    }
+
+    /// The local resolver takes the first title match and the first
+    /// project-path match, so two sessions sharing either answer the same way
+    /// here. Only an ambiguous id prefix is refused, on both sides.
+    #[test]
+    fn a_shared_title_resolves_to_the_first_match_as_the_local_path_does() {
+        let mut first = session("a", WireStatus::Idle);
+        first.title = "same".into();
+        let mut second = session("b", WireStatus::Idle);
+        second.title = "same".into();
+        let value = snapshot(vec![first, second]);
+
+        let args = ShowArgs {
+            identifier: Some("same".into()),
+            json: false,
+        };
+        let projection = render_show(&args, &value, &source()).expect("the first match answers");
+        assert!(projection.stdout.contains("a"), "{}", projection.stdout);
+    }
+
+    /// Two sessions in one project is the ordinary "several sessions per
+    /// project" state, so naming the project picks the first of them, exactly
+    /// as the local resolver does.
+    #[test]
+    fn a_shared_project_path_resolves_to_the_first_match() {
+        let value = snapshot(vec![
+            session("a", WireStatus::Idle),
+            session("b", WireStatus::Idle),
+        ]);
+        let args = ShowArgs {
+            identifier: Some("/repo".into()),
+            json: false,
+        };
+        let projection = render_show(&args, &value, &source()).expect("the first match answers");
+        assert!(projection.stdout.contains("a"), "{}", projection.stdout);
+    }
+
+    /// An ambiguous id prefix is the one ambiguity the local path refuses, and
+    /// it stays refused here.
+    #[test]
+    fn an_ambiguous_id_prefix_is_refused_on_both_sides() {
+        let value = snapshot(vec![
+            session("a1", WireStatus::Idle),
+            session("a2", WireStatus::Idle),
+        ]);
+        let args = ShowArgs {
+            identifier: Some("a".into()),
+            json: false,
+        };
+        let failure =
+            render_show(&args, &value, &source()).expect_err("an ambiguous prefix is refused");
+        assert_eq!(failure.code(), "session_ambiguous");
+    }
+
+    /// A parent that names no row is printed as the bare id, the way the local
+    /// path prints it, so the two agree on a child whose parent was purged.
+    #[test]
+    fn a_parent_that_names_no_row_is_printed_as_the_bare_id() {
+        let mut orphan = session("child", WireStatus::Idle);
+        orphan.parent_session_id = Some("gone".into());
+        let value = snapshot(vec![orphan]);
+        let args = ShowArgs {
+            identifier: Some("child".into()),
+            json: false,
+        };
+        let projection = render_show(&args, &value, &source()).expect("an orphan is shown");
+        assert!(
+            projection.stdout.contains("Parent:  gone"),
+            "{}",
+            projection.stdout
+        );
+    }
+
+    /// `aoe profile` is a picker, so a profile named `default` is listed last —
+    /// the local `list_profiles_for_display` order — while the wire keeps the
+    /// plain alphabetical enumeration `aoe list --all` prints.
+    #[test]
+    fn the_profile_listing_uses_picker_order() {
+        let mut value = snapshot(vec![]);
+        value.profiles = vec![
+            ProfileRead {
+                name: "default".into(),
+                groups: vec![],
+                projects: vec![],
+                health: health(),
+            },
+            ProfileRead {
+                name: "main".into(),
+                groups: vec![],
+                projects: vec![],
+                health: health(),
+            },
+            ProfileRead {
+                name: "zeta".into(),
+                groups: vec![],
+                projects: vec![],
+                health: health(),
+            },
+        ];
+        value.default_profile = Some("main".into());
+        let output = render_profiles(&value).expect("the listing renders");
+        let listed: Vec<String> = output
+            .lines()
+            .filter(|line| line.starts_with("  *") || line.starts_with("    "))
+            .map(|line| {
+                line.trim_start()
+                    .trim_start_matches('*')
+                    .trim()
+                    .split_whitespace()
+                    .next()
+                    .expect("a name")
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(listed, vec!["main", "zeta", "default"]);
     }
 }

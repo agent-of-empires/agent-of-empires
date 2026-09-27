@@ -20,8 +20,11 @@ use agent_of_empires::session::{Instance, Status, View};
 const PROFILE: &str = "main";
 
 /// The whole read surface, in the spelling a user types it. One assertion per
-/// command, all of them in the single test below.
-const COMMANDS: [&[&str]; 15] = [
+/// command, all of them in the single test below. The command set carries the
+/// states that used to be invisible here: a human `session show` of a child
+/// whose parent was purged, and a `profile` listing over a profile named
+/// `default`.
+const COMMANDS: [&[&str]; 16] = [
     &["list"],
     &["list", "--state", "all"],
     &["list", "--all"],
@@ -36,6 +39,7 @@ const COMMANDS: [&[&str]; 15] = [
     &["project", "list", "--json"],
     &["profile"],
     &["session", "show", "--json", "long-session-id-01"],
+    &["session", "show", "j-orphan"],
     &["session", "list-trash"],
 ];
 
@@ -102,12 +106,20 @@ impl Fixture {
             .expect("projects"),
         )
         .expect("seed projects");
+        // Two more empty profiles, one of them named `default`: the profile
+        // listing is a picker, so a profile with that name is printed last, and
+        // only a fixture that holds one can tell the two orders apart. They
+        // hold no sessions, so the profile-scoped commands are unaffected.
+        for name in ["default", "zeta"] {
+            std::fs::create_dir_all(app_dir.join("profiles").join(name)).expect("extra profile");
+        }
         // The update check is the one preflight step that reaches the network,
         // and its notice would land on stdout and make the two passes differ for
-        // a reason that has nothing to do with the transport.
+        // a reason that has nothing to do with the transport. The default is
+        // named explicitly so it does not follow the new profiles' spelling.
         std::fs::write(
             app_dir.join("config.toml"),
-            "[updates]\nupdate_check_mode = \"off\"\n",
+            format!("default_profile = \"{PROFILE}\"\n\n[updates]\nupdate_check_mode = \"off\"\n"),
         )
         .expect("config");
         let base = home.clone();
@@ -246,6 +258,18 @@ fn fixture_sessions(home: &Path) -> Vec<serde_json::Value> {
             false,
             false,
         ),
+        // A child whose parent is gone: the stored id is kept and printed by
+        // both paths, so a producer that cleared it — or a client that refused
+        // it — shows up here rather than in a reviewer's reading.
+        row(
+            "j-orphan",
+            idle,
+            "/srv/registered",
+            "",
+            "Orphan",
+            false,
+            false,
+        ),
     ];
     let mut rows: Vec<serde_json::Value> = rows;
     // A parent/child relation, spelled the way the store spells it.
@@ -253,9 +277,40 @@ fn fixture_sessions(home: &Path) -> Vec<serde_json::Value> {
         if row["id"] == "i-child" {
             row["parent_session_id"] = serde_json::json!("h-parent");
         }
+        if row["id"] == "j-orphan" {
+            row["parent_session_id"] = serde_json::json!("gone");
+        }
+        // A workspace whose repos are stored in an order no canonical sort
+        // would produce, so `aoe list --json` reads the array differently the
+        // moment either side sorts it.
+        if row["id"] == "b-running" {
+            row["workspace_info"] = serde_json::json!({
+                "branch": "main",
+                "workspace_dir": "/srv/registered/.aoe/workspace",
+                "created_at": "2026-01-02T03:04:05.123456789Z",
+                "cleanup_on_delete": true,
+                "repos": [stored_repo("zeta", "/srv/zeta"), stored_repo("alpha", "/srv/alpha")],
+            });
+        }
     }
     rows.sort_by(|left, right| left["id"].as_str().cmp(&right["id"].as_str()));
     rows
+}
+
+/// The stored spelling of one workspace repo, so the fixture's `workspace_info`
+/// is a row the local projection can emit verbatim.
+fn stored_repo(name: &str, source_path: &str) -> serde_json::Value {
+    serde_json::json!({
+        "name": name,
+        "source_path": source_path,
+        "branch": "main",
+        "worktree_path": format!("{source_path}/.worktrees/main"),
+        "main_repo_path": source_path,
+        "managed_by_aoe": true,
+        "branch_preexisting": false,
+        "base_branch": null,
+        "base_branch_override": null,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -433,6 +433,9 @@ fn build_snapshot(runtime: &RuntimeState, instances: &[Instance], owner: Owner) 
                 }
             },
             metadata: ComponentHealth::Healthy,
+            // The component the client's vocabulary gives no health code to:
+            // nothing on this path can fail, so there is no code to name here,
+            // and the client's aggregate union therefore has no entry for it.
             profile_data: ComponentHealth::Healthy,
         };
         profile_health.insert(name.clone(), health);
@@ -453,13 +456,16 @@ fn build_snapshot(runtime: &RuntimeState, instances: &[Instance], owner: Owner) 
     // The resolved default, not the daemon's active profile: `aoe profile` marks
     // the resolved one, and a client that resolved a different name would mark
     // a different row. Resolution is skipped when there is no profile at all,
-    // so a read never bootstraps one.
+    // so a read never bootstraps one. A resolved name that names no profile is
+    // published as no default rather than replaced by another: the local path
+    // refuses it (`resolve_existing_profile`), and silently serving some other
+    // profile's sessions under this profile's name is the worst thing a
+    // transport can do.
     let default_profile = if names.is_empty() {
         None
     } else {
-        Some(crate::session::config::resolve_default_profile())
-            .filter(|name| names.contains(name))
-            .or_else(|| names.iter().min().cloned())
+        let resolved = crate::session::config::resolve_default_profile();
+        names.contains(&resolved).then_some(resolved)
     };
 
     Sampled {
@@ -533,6 +539,10 @@ fn reconcile_legacy_rows(sessions: &mut [SessionRead]) {
         })
         .collect();
     let severed = cycle_entries(&index, &mut parents);
+    // A parent that names no row is left as stored: the local path keeps and
+    // prints the id, and `rm --purge` of a parent is what makes one. What is
+    // cleared is what this projection cannot stand behind — a parent in another
+    // profile, and the members of a cycle.
     let resolved: Vec<bool> = sessions
         .iter()
         .enumerate()
@@ -541,7 +551,7 @@ fn reconcile_legacy_rows(sessions: &mut [SessionRead]) {
                 && parents.get(&position).is_some_and(|parent| {
                     index
                         .get(parent)
-                        .is_some_and(|parent| sessions[*parent].profile == row.profile)
+                        .is_none_or(|parent| sessions[*parent].profile == row.profile)
                 })
         })
         .collect();
@@ -885,7 +895,10 @@ struct SessionRead {
 
 impl SessionRead {
     fn from_instance(inst: &Instance) -> Self {
-        let mut workspace_repos: Vec<WorkspaceRepo> = inst
+        // Stored order, the way the local projection emits it: sorting here
+        // would make `aoe list --json` order the array by the transport. The
+        // client's rule is identity, which the store already holds.
+        let workspace_repos: Vec<WorkspaceRepo> = inst
             .workspace_info
             .as_ref()
             .map(|info| {
@@ -899,10 +912,6 @@ impl SessionRead {
                     .collect()
             })
             .unwrap_or_default();
-        workspace_repos.sort_by(|left, right| {
-            (&left.name, &left.source_path).cmp(&(&right.name, &right.source_path))
-        });
-
         Self {
             id: inst.id.clone(),
             title: inst.title.clone(),
@@ -973,18 +982,16 @@ mod tests {
 
     use super::*;
     use crate::cli::runtime_read::dto::{
-        parse_hello, parse_snapshot, validate_cross_message, validate_snapshot,
+        parse_hello, parse_snapshot, validate_cross_message, validate_hello, validate_snapshot,
     };
     use crate::session::{WorkspaceInfo, WorkspaceRepo as StoredRepo};
 
-    /// The client keeps the one collection ordering rule the wire has, so the
-    /// producer has to make it hold: however a stored workspace's repos happen
-    /// to be arranged on disk, the row it emits is ascending, which is what
-    /// keeps an unsorted stored list from refusing a whole snapshot. The list
-    /// is also unique on the way out, so the rule the client relies on to catch
-    /// a repeated repo is still the producer's to keep.
+    /// The wire carries a session's repos in the order the workspace stored
+    /// them, because that is the order the local projection emits them in and
+    /// `aoe list --json` prints the array. Sorting here would make the array's
+    /// order depend on whether a daemon is publishing.
     #[test]
-    fn the_producer_sorts_workspace_repos_however_they_were_stored() {
+    fn the_producer_keeps_workspace_repos_in_stored_order() {
         let mut instance = Instance::new("s1", "/srv/repo");
         instance.source_profile = "main".into();
         instance.workspace_info = Some(WorkspaceInfo {
@@ -1001,14 +1008,29 @@ mod tests {
                 .iter()
                 .map(|repo| (repo.name.as_str(), repo.source_path.as_str()))
                 .collect::<Vec<_>>(),
-            vec![("alpha", "/srv/alpha"), ("beta", "/srv/beta")],
-            "an unsorted stored list must not reach the wire unsorted"
+            vec![("beta", "/srv/beta"), ("alpha", "/srv/alpha")],
+            "the stored order must reach the wire unchanged"
+        );
+        assert_eq!(
+            emitted
+                .workspace_repos
+                .iter()
+                .map(|repo| (repo.name.as_str(), repo.source_path.as_str()))
+                .collect::<Vec<_>>(),
+            instance
+                .workspace_info
+                .as_ref()
+                .expect("workspace_info")
+                .repos
+                .iter()
+                .map(|repo| (repo.name.as_str(), repo.source_path.as_str()))
+                .collect::<Vec<_>>(),
+            "the emitted order is the store's own, row for row"
         );
 
-        // The client half of this contract — an ascending list accepted, a
-        // descending or repeated one refused — is pinned in the client's own
-        // `workspace_repos_keep_their_ascending_rule`; what only the producer
-        // can prove is that the list arrives ascending at all.
+        // The client half — a repeated (name, source_path) pair refused, any
+        // order accepted — is pinned in the client's own
+        // `workspace_repos_are_accepted_in_any_order_and_refused_when_repeated`.
     }
 
     fn repo(name: &str, source_path: &str) -> StoredRepo {
@@ -1023,6 +1045,88 @@ mod tests {
             base_branch: None,
             base_branch_override: None,
         }
+    }
+
+    /// A profile whose registry cannot be read is a degraded profile, not a
+    /// broken protocol: the Hello aggregate rolls the degradation up, the
+    /// client must still admit the exchange, and the Snapshot stays usable for
+    /// the commands that do not touch that profile.
+    #[test]
+    #[serial_test::serial]
+    fn one_unreadable_profile_registry_degrades_only_that_profile() {
+        let home = TempHome::new();
+        let profiles = home.app_dir().join("profiles");
+        std::fs::create_dir_all(profiles.join("main")).expect("main profile");
+        std::fs::create_dir_all(profiles.join("broken").join("projects.json"))
+            .expect("a directory where the registry belongs: a read that cannot succeed");
+        let instances = vec![instance("a", "main"), instance("b", "broken")];
+        let sampled = build_snapshot(&RuntimeState::new(), &instances, Owner::remote());
+
+        let hello = parse_hello(&hello_frame(&sampled)).expect("the client decodes the Hello");
+        validate_hello(&hello).expect("a degraded profile is not a protocol violation");
+        let snapshot =
+            parse_snapshot(&snapshot_frame(&sampled)).expect("the client decodes the Snapshot");
+        validate_snapshot(&snapshot).expect("the Snapshot is still usable");
+        validate_cross_message(&hello, &snapshot, None).expect("Hello and Snapshot agree");
+
+        assert!(
+            matches!(
+                hello.health,
+                crate::cli::runtime_read::dto::AggregateHealth::Degraded { .. }
+            ),
+            "the roll-up reports the degradation: {:?}",
+            hello.health
+        );
+        let broken = snapshot
+            .profiles
+            .iter()
+            .find(|profile| profile.name == "broken")
+            .expect("the profile is still published");
+        assert_eq!(
+            serde_json::to_value(&broken.health.profile_enumeration).expect("encodes"),
+            serde_json::json!({"kind": "degraded", "code": "profile_enumeration"}),
+            "the bad profile says so, and the good one is untouched"
+        );
+        let main = snapshot
+            .profiles
+            .iter()
+            .find(|profile| profile.name == "main")
+            .expect("the healthy profile is published");
+        assert_eq!(
+            serde_json::to_value(&main.health.profile_enumeration).expect("encodes"),
+            serde_json::json!({"kind": "healthy"})
+        );
+    }
+
+    /// Deleting the configured default leaves the config naming a profile that
+    /// is gone. The local path refuses (`resolve_existing_profile`), so the
+    /// served path publishes no default at all rather than marking some other
+    /// profile `(default)` and serving its sessions.
+    #[test]
+    #[serial_test::serial]
+    fn a_deleted_configured_default_publishes_no_default() {
+        let home = TempHome::new();
+        let app_dir = home.app_dir();
+        std::fs::create_dir_all(app_dir.join("profiles").join("zeta")).expect("zeta profile");
+        std::fs::write(app_dir.join("config.toml"), "default_profile = \"gone\"\n")
+            .expect("config");
+
+        let sampled = build_snapshot(
+            &RuntimeState::new(),
+            &[instance("a", "zeta")],
+            Owner::remote(),
+        );
+        assert_eq!(sampled.data.default_profile, None);
+        assert_eq!(sampled.data.profiles.len(), 1);
+
+        // The local half refuses the same state, which is what makes publishing
+        // no default the matching answer rather than a second policy.
+        let refused =
+            crate::session::resolve_existing_profile("").expect_err("the local path refuses");
+        assert!(
+            refused.to_string().contains("does not exist"),
+            "unexpected refusal: {refused}"
+        );
     }
 
     /// Points the app dir at an empty temporary XDG base for the duration of one
@@ -1042,6 +1146,11 @@ mod tests {
                 _dir: dir,
                 previous,
             }
+        }
+
+        /// The app dir the seeded profiles and config live in.
+        fn app_dir(&self) -> std::path::PathBuf {
+            self._dir.path().join(crate::session::APP_DIR_NAME_XDG)
         }
     }
 
@@ -1203,10 +1312,11 @@ mod tests {
         row
     }
 
-    /// One stored row the read cannot project must not cost every other row its
-    /// read: an orphan parent nests at the top level and a legacy trailing
-    /// separator is spelled the way the store compares paths, and the client
-    /// then accepts the snapshot unchanged.
+    /// A stored row the read cannot fix is kept as it stands: a legacy
+    /// trailing separator is spelled the way the store compares paths, and an
+    /// orphan parent is left pointing at a row that is not there — the state
+    /// `rm --purge` leaves behind, and the one the local path prints. The
+    /// client then accepts the snapshot unchanged.
     #[test]
     #[serial_test::serial]
     fn a_legacy_row_is_reconciled_and_the_client_still_accepts_the_snapshot() {
@@ -1237,7 +1347,7 @@ mod tests {
             reconciled,
             vec![
                 ("a", None, "/repo"),
-                ("orphan", None, "/repo"),
+                ("orphan", Some("deleted"), "/repo"),
                 ("trailing", None, "/repo"),
             ]
         );
@@ -1245,14 +1355,17 @@ mod tests {
 
     /// A parent that names a row of another profile, and a cycle, are the two
     /// relations the client refuses. Both are severed at the row that closes
-    /// them, and both choices are the same on every run.
+    /// them, and both choices are the same on every run. A parent that names no
+    /// row at all is neither: it is persisted state, and it is kept.
     #[test]
     fn cross_profile_parents_and_cycles_are_severed_at_the_closing_row() {
         let mut cross = row("a", Some("b"), "/repo");
         cross.profile = "other".into();
+        let b = row("b", None, "/repo");
+        let orphan = row("c", Some("nowhere"), "/repo");
         let mut cycle = vec![row("x", Some("y"), "/repo"), row("y", Some("x"), "/repo")];
         cycle.push(row("z", Some("x"), "/repo"));
-        let mut rows = vec![cross];
+        let mut rows = vec![cross, b, orphan];
         rows.append(&mut cycle);
 
         reconcile_legacy_rows(&mut rows);
@@ -1263,7 +1376,14 @@ mod tests {
             .collect();
         assert_eq!(
             parents,
-            vec![("a", None), ("x", None), ("y", Some("x")), ("z", Some("x"))]
+            vec![
+                ("a", None),
+                ("b", None),
+                ("c", Some("nowhere")),
+                ("x", None),
+                ("y", Some("x")),
+                ("z", Some("x")),
+            ]
         );
     }
 

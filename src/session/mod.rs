@@ -402,13 +402,17 @@ pub fn list_profiles_readonly() -> Result<Vec<String>> {
     }
 }
 
-/// Picker order: alphabetical, with a profile named `default` last.
+/// Picker order: alphabetical, with a profile named `default` last. One
+/// comparator for every surface a human chooses from, so the served renderer
+/// and the local command cannot drift apart on which row is listed where.
+pub fn profile_display_order(left: &str, right: &str) -> std::cmp::Ordering {
+    (left == "default")
+        .cmp(&(right == "default"))
+        .then_with(|| left.cmp(right))
+}
+
 pub fn sort_profiles_for_display(profiles: &mut [String]) {
-    profiles.sort_by(|a, b| {
-        (a == "default")
-            .cmp(&(b == "default"))
-            .then_with(|| a.cmp(b))
-    });
+    profiles.sort_by(|a, b| profile_display_order(a, b));
 }
 
 /// [`list_profiles`] in picker order, for surfaces a human chooses from.
