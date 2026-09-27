@@ -1973,10 +1973,15 @@ mod tests {
         // Keyed on level, target and structured fields, not prose, so a
         // reword cannot disarm them and a downgrade cannot hide the line.
         let capture = crate::session::test_support::LogCapture::start();
-        instance().report_store_override(prepared.execution.as_ref());
+        let reporter = instance();
+        let reporting_id = reporter.id.clone();
+        reporter.report_store_override(prepared.execution.as_ref());
         let line = capture.contents();
         for expected in [
             "WARN session.store:".to_string(),
+            // The line names the session that is reporting, so assert it on
+            // the instance that reports rather than on the one resolved.
+            format!("session={reporting_id}"),
             format!("launch_store={}", source.display()),
             format!(
                 "new_session_store={}",
@@ -2018,9 +2023,14 @@ mod tests {
         // The other side of that bargain: with nothing recorded the selector
         // does choose the root, so an unresolvable one must still refuse.
         let bare = instance();
+        let refusal = match bare.resolve_native_execution(None) {
+            Err(refusal) => refusal,
+            Ok(_) => panic!("an unresolvable selector must refuse a launch it decides"),
+        };
+        let refusal = format!("{refusal:#}");
         assert!(
-            bare.resolve_native_execution(None).is_err(),
-            "an unresolvable selector must refuse a launch it decides"
+            refusal.contains("native path cannot be resolved") && refusal.contains("broken"),
+            "the refusal must name the path and keep the underlying cause: {refusal}"
         );
 
         // Same declaration as the recorded store: the common launch stays quiet.

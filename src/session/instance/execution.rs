@@ -291,21 +291,6 @@ pub(super) struct NativeLaunchInputs {
     pub(super) pane_env: Vec<crate::tmux::PaneEnvMutation>,
     pub(super) identity_extension: Option<(String, String)>,
 }
-
-/// A host path's identity, whatever its spelling. Total by construction: a
-/// path that cannot be resolved still compares by its nearest existing
-/// ancestor, so a failure never reads as agreement. Only the identity
-/// comparison uses it: the launch routes and records the store the arm that
-/// selects it already resolved.
-fn host_identity(path: &std::path::Path) -> PathBuf {
-    crate::session::capture::canonicalize_allowing_missing_leaf(path)
-        .unwrap_or_else(|| crate::git::template::lexical_normalize(path))
-}
-
-/// Whether two host paths name one location.
-fn host_paths_match(left: &std::path::Path, right: &std::path::Path) -> bool {
-    left == right || host_identity(left) == host_identity(right)
-}
 impl NativeLaunchInputs {
     fn read_native_file(&self, path: &std::path::Path) -> Result<Option<Vec<u8>>> {
         let native = self.canonical_path(path)?;
@@ -1347,38 +1332,33 @@ impl Instance {
                 // The same root is exported here and recorded on the binding
                 // below, and the binding canonicalizes it either way: resolve
                 // it now so the routed value and the stored one name one path,
-                // as the sibling namespaces already do.
-                // A new session takes that chain without the recorded store,
-                // so the difference between the two is exactly the override
-                // this launch reports. The comparison is a diagnostic: a
-                // selector that cannot be resolved must not fail a launch the
-                // recorded store already decides, so it reports nothing
-                // rather than erroring.
+                // as the sibling namespaces already do. A new session takes
+                // that chain without the recorded store, and the difference
+                // between the two is a diagnostic, never what decides.
                 let ambient = value("CLAUDE_CONFIG_DIR").filter(|value| !value.is_empty());
                 let new_session = inputs.canonical_path(&absolute(declared
                     .clone()
                     .or_else(|| ambient.clone().map(PathBuf::from))
                     .unwrap_or_else(|| home.join(".claude"))));
                 let root = match recorded.as_ref() {
-                    Some(recorded) => inputs.canonical_path(&absolute(recorded.clone()))?,
+                    Some(recorded) => {
+                        let root = inputs.canonical_path(&absolute(recorded.clone()))?;
+                        store_override = new_session.ok().and_then(|new_session| {
+                            let source = if declared.is_some() {
+                                "agent_config_dir"
+                            } else if ambient.is_some() {
+                                "environment"
+                            } else {
+                                "default"
+                            };
+                            (root != new_session)
+                                .then_some((root.clone(), new_session, source))
+                        });
+                        root
+                    }
                     None => new_session
-                        .as_ref()
-                        .ok()
-                        .cloned()
                         .context("the configured Claude store cannot be resolved")?,
                 };
-                store_override = recorded.and_then(|_| {
-                    let new_session = new_session.ok()?;
-                    let source = if declared.is_some() {
-                        "agent_config_dir"
-                    } else if ambient.is_some() {
-                        "environment"
-                    } else {
-                        "default"
-                    };
-                    (root != new_session)
-                        .then_some((root.clone(), new_session, source))
-                });
                 let default = crate::session::capture::is_default_claude_store(&root, &home);
                 let explicit = recorded_execution
                     .and_then(|execution| execution.exported_default_store)
@@ -1929,11 +1909,18 @@ impl Instance {
         right: &ExecutionBinding,
     ) -> bool {
         fn paths_match(left: &std::path::Path, right: &std::path::Path, filesystem: &str) -> bool {
-            if filesystem == "host" {
-                return host_paths_match(left, right);
+            if left == right {
+                return true;
             }
-            crate::git::template::lexical_normalize(left)
-                == crate::git::template::lexical_normalize(right)
+            let identity = |path: &std::path::Path| {
+                if filesystem == "host" {
+                    crate::session::capture::canonicalize_allowing_missing_leaf(path)
+                        .unwrap_or_else(|| crate::git::template::lexical_normalize(path))
+                } else {
+                    crate::git::template::lexical_normalize(path)
+                }
+            };
+            identity(left) == identity(right)
         }
         fn locations_match(left: &[ExecutionLocation], right: &[ExecutionLocation]) -> bool {
             left.len() == right.len()
