@@ -894,6 +894,10 @@ impl Storage {
         for (idx, row) in rows.into_iter().enumerate() {
             match <Instance as serde::Deserialize>::deserialize(&row) {
                 Ok(mut inst) => {
+                    // `source_profile` is never persisted, so a loaded row
+                    // would otherwise resolve its agent against the default
+                    // profile rather than the store it came from.
+                    inst.source_profile = self.profile.clone();
                     inst.set_file_watch(self.file_watch.clone());
                     instances.push(inst);
                 }
@@ -2473,6 +2477,37 @@ mod tests {
 
     fn setup_test_home(temp: &std::path::Path) -> AppDirGuard {
         isolate_app_dir_at(temp)
+    }
+
+    /// A row resolves its agent against the profile it was loaded from, and
+    /// that profile is never persisted, so both load paths must stamp it.
+    #[tokio::test]
+    #[serial]
+    async fn load_stamps_the_profile_each_row_came_from() -> Result<()> {
+        let temp = tempdir()?;
+        let _guard = setup_test_home(temp.path());
+        let svc = FileWatchService::new().expect("live svc");
+        for profile in ["stamp-alpha", "stamp-beta"] {
+            Storage::new(profile, svc.clone())?.update(|instances, _groups| {
+                let mut row = Instance::new(&format!("row in {profile}"), "/tmp/seed");
+                row.agent_session_id = Some("conversation-uuid".to_string());
+                *instances = vec![row];
+                Ok(())
+            })?;
+        }
+
+        let (loaded, groups) = Storage::new("stamp-beta", svc.clone())?.load_with_groups()?;
+        assert!(
+            groups.is_empty(),
+            "the fixture writes no groups, so a group here would mean the test read the wrong rows"
+        );
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].source_profile, "stamp-beta");
+        assert_eq!(loaded[0].effective_profile(), "stamp-beta");
+
+        let plain = Storage::new("stamp-alpha", svc)?.load()?;
+        assert_eq!(plain[0].source_profile, "stamp-alpha");
+        Ok(())
     }
 
     #[cfg(unix)]

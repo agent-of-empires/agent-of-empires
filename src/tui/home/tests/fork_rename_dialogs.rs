@@ -38,6 +38,7 @@ fn fork_from_selection_seeds_terminal_fork_and_inherits_parent_context() {
         crate::session::ForkSeed::Terminal {
             parent,
             child_session_id,
+            ..
         } => {
             assert_eq!(parent.session_id, "parent-1111-2222-3333-444444444444");
             assert_ne!(child_session_id, "parent-1111-2222-3333-444444444444");

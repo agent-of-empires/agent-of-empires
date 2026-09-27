@@ -683,7 +683,24 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
             crate::session::ForkSeed::Terminal {
                 parent,
                 child_session_id,
+                unattributed_parent_agent,
             } => {
+                // Only an unattributed parent needs this: the launch
+                // identity-checks a qualified one itself, and this path builds
+                // the child itself, so nothing else would hold it.
+                if let Some(parent_agent) = unattributed_parent_agent.as_deref() {
+                    let launched = crate::session::Instance::execution_agent_for(
+                        &instance.tool,
+                        &instance.command,
+                        &config.session,
+                    )
+                    .map_err(anyhow::Error::msg)?;
+                    crate::session::fork::ensure_child_matches_parent_agent(
+                        Some(parent_agent),
+                        launched.name,
+                    )
+                    .map_err(anyhow::Error::msg)?;
+                }
                 instance.agent_session_id = Some(child_session_id);
                 instance.resume_intent = crate::session::ResumeIntent::Fork {
                     from: parent.session_id.clone(),
@@ -1415,6 +1432,53 @@ mod tests {
                 Some(Commands::Add(args)) => (profile, *args),
                 _ => panic!("expected an add invocation"),
             }
+        }
+
+        /// `add` builds the fork child itself rather than through the session
+        /// builder, so it needs its own identity comparison: a child asked for
+        /// under another agent must not fork a conversation it cannot resume.
+        #[tokio::test]
+        #[serial]
+        async fn add_refuses_a_fork_child_under_another_agent() {
+            let _guard = crate::session::test_support::isolate_app_dir();
+            let project = tempfile::tempdir().unwrap();
+            let parent_id = "parent-session-uuid";
+            crate::session::Storage::new_unwatched("real")
+                .unwrap()
+                .update(|rows, _| {
+                    let mut parent =
+                        crate::session::Instance::new("parent", project.path().to_str().unwrap());
+                    parent.id = parent_id.to_string();
+                    parent.tool = "claude".into();
+                    parent.command = "claude".into();
+                    parent.agent_session_id = Some("legacy-conversation-uuid".into());
+                    parent.agent_session_binding = Some(
+                        crate::session::ConversationBinding::unknown("legacy-conversation-uuid"),
+                    );
+                    *rows = vec![parent];
+                    Ok(())
+                })
+                .unwrap();
+
+            let (profile, args) = dispatch_argv(&[
+                "aoe",
+                "add",
+                project.path().to_str().unwrap(),
+                "--fork-from",
+                parent_id,
+                "--tool",
+                "codex",
+                "-p",
+                "real",
+            ]);
+            let msg = super::super::run(&profile, args)
+                .await
+                .expect_err("a fork under another agent must refuse")
+                .to_string();
+            assert!(
+                msg.contains("codex") && msg.contains("claude"),
+                "the refusal must name both agents, got: {msg}"
+            );
         }
 
         #[tokio::test]

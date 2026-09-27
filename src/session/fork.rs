@@ -12,6 +12,12 @@ pub enum ForkSeed {
     Terminal {
         parent: Box<crate::session::ConversationBinding>,
         child_session_id: String,
+        /// The parent row's own native agent when the parent's binding is
+        /// unattributed, so the surface building the child can hold the launch to
+        /// the parent's identity: the launch-time check skips an unattributed
+        /// binding, so nothing else would. `None` for a qualified binding, whose
+        /// identity the launch already checks.
+        unattributed_parent_agent: Option<String>,
     },
     /// Structured fork: send ACP `session/fork` against
     /// `parent_acp_session_id`; the adapter mints the child id.
@@ -153,6 +159,29 @@ pub fn terminal_agent_can_fork(agent: &str) -> bool {
     get_agent(agent).is_some_and(|a| !matches!(a.fork_strategy, ForkStrategy::Unsupported))
 }
 
+/// Hold a fork child to the parent's identity when the parent is an
+/// unattributed id, which the launch cannot identity-check. `launched` is the
+/// agent the child's own command and profile actually resolve to, not the
+/// tool label it was asked for: a declared wrapper or a direct native command
+/// names another agent, and only the resolution proves which. `Ok` for a
+/// qualified parent, whose identity the launch already checks.
+pub fn ensure_child_matches_parent_agent(
+    parent_agent: Option<&str>,
+    launched: &str,
+) -> Result<(), String> {
+    let Some(parent_agent) = parent_agent else {
+        return Ok(());
+    };
+    if parent_agent == launched {
+        return Ok(());
+    }
+    Err(format!(
+        "Nothing to fork: the new session would launch agent '{launched}', but the parent \
+         session runs agent '{parent_agent}', and a fork can only carry a conversation from the \
+         agent that recorded it."
+    ))
+}
+
 /// Decide whether a terminal session can be forked, and produce its one-shot seed.
 pub fn terminal_fork_seed(
     parent: Option<ForkParentRef<'_>>,
@@ -171,15 +200,18 @@ pub fn terminal_fork_seed(
     };
     // A qualified binding is the whole gate, and so is a binding a migration
     // left unattributed, which the resume path also accepts.
-    let (parent, agent) = match parent {
+    let (parent, agent, unattributed_parent_agent) = match parent {
         Some(ForkParentRef::Bound(parent)) if parent.is_known() => (
             parent,
             parent
                 .execution
                 .as_ref()
                 .map(|execution| execution.agent.as_str()),
+            None,
         ),
-        Some(ForkParentRef::Unattributed { binding, agent }) => (binding, Some(agent)),
+        Some(ForkParentRef::Unattributed { binding, agent }) => {
+            (binding, Some(agent), Some(agent.to_owned()))
+        }
         Some(ForkParentRef::Bound(parent)) => {
             return Err(unqualified(Some(parent), &parent.session_id));
         }
@@ -200,6 +232,7 @@ pub fn terminal_fork_seed(
     Ok(ForkSeed::Terminal {
         parent: Box::new(parent.clone()),
         child_session_id,
+        unattributed_parent_agent,
     })
 }
 

@@ -829,6 +829,7 @@ fn fork_seed_and_structured_fork_guard_agree_per_agent() {
             crate::session::ForkSeed::Terminal {
                 parent,
                 child_session_id,
+                ..
             } => {
                 assert_eq!(*parent, parent_binding);
                 assert!(crate::session::capture::is_valid_session_id(
