@@ -137,6 +137,19 @@ impl<'a> ForkParentRef<'a> {
         self.binding()
             .is_some_and(crate::session::ConversationBinding::is_known)
     }
+
+    /// How admissible this parent is as a fork source: a qualified binding
+    /// first, a row a migration left unattributed next, and a candidate
+    /// nothing qualifies last. Several rows can record one id, so ranking by
+    /// this before breaking ties on `id` keeps a refusal from being decided
+    /// by which row the store happened to return first.
+    pub fn admissibility(self) -> u8 {
+        match self {
+            Self::Bound(binding) if binding.is_known() => 0,
+            Self::Unattributed { .. } => 1,
+            _ => 2,
+        }
+    }
 }
 
 /// Process-wide default ACP registry, used only to answer "does this built-in tool have an ACP

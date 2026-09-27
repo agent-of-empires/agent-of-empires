@@ -944,17 +944,20 @@ fn fork_from_resolves_the_conversation_the_parent_carries() {
     );
 }
 
-/// When every row carrying the id is unqualified, the refusal names the same
-/// state whichever order the load returned them in, and the row it points at
-/// is the one holding the lowest `id`, not the one that arrived first.
+/// When every row carrying the id is one no fork can be dispatched from, the
+/// refusal names the same state whichever order the load returned them in, and
+/// the row it points at is the one holding the lowest `id`, not the one that
+/// arrived first.
 #[test]
-fn fork_from_unqualified_rows_is_refused_the_same_way_in_either_order() {
+fn fork_from_bare_and_degraded_rows_is_refused_the_same_way_in_either_order() {
     use crate::session::ConversationProvenance;
     let bare = parent_row_with_id("a-bare", "bare", None);
     let stale = parent_row_with_id(
         "b-stale",
         "stale",
-        Some(unqualified_parent_binding(ConversationProvenance::Unknown)),
+        Some(unqualified_parent_binding(
+            ConversationProvenance::Preallocated,
+        )),
     );
     for (parents, elected) in [
         (vec![bare.clone(), stale.clone()], 0),
@@ -969,6 +972,30 @@ fn fork_from_unqualified_rows_is_refused_the_same_way_in_either_order() {
                 },
                 Some(elected),
             ))
+        );
+    }
+}
+
+/// A row a migration left unattributed is forkable on its own agent, so it
+/// outranks a bare id that carries no evidence: a bare row holding the lower
+/// `id` must not decide the fork and refuse a seed that would have worked,
+/// whichever order the two arrive in.
+#[test]
+fn fork_from_an_unattributed_row_wins_over_a_bare_row_in_either_order() {
+    use crate::session::ConversationProvenance;
+    let bare = parent_row_with_id("a-bare", "bare", None);
+    let unattributed = parent_row_with_id(
+        "z-unattributed",
+        "unattributed",
+        Some(unqualified_parent_binding(ConversationProvenance::Unknown)),
+    );
+    for parents in [
+        vec![bare.clone(), unattributed.clone()],
+        vec![unattributed, bare],
+    ] {
+        assert!(
+            resolve_create_fork_seed("parent-uuid", false, &parents).is_ok(),
+            "an unattributed row is a forkable parent whatever the bare row's id"
         );
     }
 }
@@ -1003,11 +1030,11 @@ fn fork_from_rows_carrying_one_id_resolves_the_qualified_row_in_either_order() {
     }
 }
 
-/// Two rows disagreeing on provenance are refused the same way whichever order
-/// the load returned them in: only the row holding the lowest `id` has its
-/// evidence read, so what the refusal says cannot come from arrival.
+/// A row a migration left unattributed outranks one a degraded launch left
+/// unqualified, so the fork is decided on the row that can carry a
+/// conversation and cannot fall to whichever id is lower.
 #[test]
-fn fork_from_rows_disagreeing_on_provenance_refuses_the_lowest_id_row() {
+fn fork_from_an_unattributed_row_outranks_a_preallocated_one() {
     use crate::session::ConversationProvenance;
     let preallocated = parent_row_with_id(
         "a-pre",
@@ -1016,36 +1043,20 @@ fn fork_from_rows_disagreeing_on_provenance_refuses_the_lowest_id_row() {
             ConversationProvenance::Preallocated,
         )),
     );
-    let unknown = parent_row_with_id(
-        "b-unknown",
-        "unknown",
+    let unattributed = parent_row_with_id(
+        "b-unattributed",
+        "unattributed",
         Some(unqualified_parent_binding(ConversationProvenance::Unknown)),
     );
-    let mut denials = Vec::new();
     for parents in [
-        vec![preallocated.clone(), unknown.clone()],
-        vec![unknown, preallocated],
+        vec![preallocated.clone(), unattributed.clone()],
+        vec![unattributed, preallocated],
     ] {
-        let (denied, elected) = resolve_create_fork_seed("parent-uuid", false, &parents)
-            .expect_err("two unqualified rows naming one id are refused");
-        denials.push((
-            denied,
-            parents[elected.expect("a refusal names its row")]
-                .id
-                .clone(),
-        ));
-    }
-    assert_eq!(denials[0], denials[1], "the refusal cannot depend on order");
-    for (denied, elected) in &denials {
-        assert_eq!(
-            *denied,
-            crate::session::ForkDenied::UnqualifiedParent {
-                preallocated: true,
-                recorded: "parent-uuid".into(),
-            },
-            "the preallocated row holds the lowest id, so its evidence is the one read"
+        assert!(
+            resolve_create_fork_seed("parent-uuid", false, &parents).is_ok(),
+            "the preallocated row carries no conversation, so it cannot outrank an \
+             unattributed one however low its id"
         );
-        assert_eq!(elected, "a-pre", "the lowest id is the row refused");
     }
 }
 

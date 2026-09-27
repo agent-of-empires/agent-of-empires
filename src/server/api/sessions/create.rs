@@ -143,10 +143,11 @@ pub(super) fn resolve_create_fork_seed(
     // dropped without materialising anything.
     //
     // Several rows can record that one id, and `Storage::load()` returns them in
-    // file order, so what a refusal names cannot come from arrival: a qualified
-    // row outranks an unqualified one, ties break on the lowest `id` the store
-    // holds, and qualified rows naming different conversations refuse whichever
-    // of them the tie-break elects.
+    // file order, so what a refusal names cannot come from arrival: candidates
+    // are ranked by how admissible they are, a qualified row over an
+    // unattributed one over one nothing qualifies, ties break on the lowest
+    // `id` the store holds, and qualified rows naming different conversations
+    // refuse whichever of them the tie-break elects.
     let mut chosen: Option<(usize, crate::session::ForkParentRef<'_>)> = None;
     let mut disagreeing = false;
     for (index, parent) in parents.iter().enumerate() {
@@ -160,18 +161,18 @@ pub(super) fn resolve_create_fork_seed(
         else {
             continue;
         };
-        let known = candidate.is_known();
+        let admissible = candidate.admissibility();
         let Some((chosen_index, elected)) = chosen else {
             chosen = Some((index, candidate));
             continue;
         };
-        let elected_known = elected.is_known();
-        if known && elected_known {
+        let elected_admissible = elected.admissibility();
+        if admissible == 0 && elected_admissible == 0 {
             disagreeing |= candidate.binding().and_then(|binding| binding.key())
                 != elected.binding().and_then(|binding| binding.key());
         }
-        if (known && !elected_known)
-            || (known == elected_known && parent.id < parents[chosen_index].id)
+        if admissible < elected_admissible
+            || (admissible == elected_admissible && parent.id < parents[chosen_index].id)
         {
             chosen = Some((index, candidate));
         }
