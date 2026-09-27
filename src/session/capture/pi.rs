@@ -313,8 +313,11 @@ mod tests {
         };
         crate::hooks::write_session_id_via_guard(&inst.id, current, Some(launch)).unwrap();
         let scoped = pi_sidecar_poll_fn(inst.id.clone(), source, Some(active.clone()));
-        let observation = scoped().expect("a launch-scoped Pi ID is attributable without a path");
-        assert!(observation.source().is_none());
+        let observation = scoped().expect("the Pi ID is attributable before its path lands");
+        assert!(
+            observation.source().is_none(),
+            "a Pi ID with no validated transcript must not claim a conversation"
+        );
         assert_eq!(observation.execution.as_ref(), Some(&active));
         assert!(observation.transcript_path.is_none());
         assert!(observation.pi_session_path.is_none());

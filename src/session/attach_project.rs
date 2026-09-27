@@ -709,8 +709,11 @@ pub fn attach_planned(
     if plan.moves_session {
         match instance.flush_published_conversation(storage) {
             Some(crate::session::SidWrite::Applied) | None => {}
-            // Another row durably owns this sid, so no publication of ours is
-            // left pending: the flush reached its final verdict.
+            // The flush read this row's own publication and the owner keeps the
+            // sid, so the refusal is final: no publication of ours is waiting.
+            // (What the poller still has queued is invisible here: the callers
+            // hand `attach_planned` an instance loaded from disk, which carries
+            // no poller.)
             Some(crate::session::SidWrite::OwnershipConflict) => {
                 tracing::debug!(
                     target: "session.attach",
@@ -723,16 +726,6 @@ pub fn attach_planned(
                  clear the resume target before converting",
                 instance.title
             ),
-        }
-        // The flush reads the sidecar itself, so a refused or absent publication
-        // says nothing about what the poller still has queued. An observation
-        // the drain has not consumed would be applied after the move, carrying
-        // the pre-move cwd.
-        if instance.session_id_poller_has_undrained_observation() {
-            anyhow::bail!(
-                "'{}' has an undrained conversation publication; drain it before converting",
-                instance.title
-            );
         }
     }
     let prepared = execute(instance, plan)?;
