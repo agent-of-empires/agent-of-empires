@@ -56,8 +56,8 @@ fn apply_drained_lifecycle_if_unchanged(
     drained: &Instance,
     baseline: &SessionIdentityBaseline,
 ) {
-    let (_, _, _, _, _, baseline_generation, _) = baseline;
-    if live.lifecycle_generation == *baseline_generation {
+    let baseline_generation = baseline.5;
+    if live.lifecycle_generation == baseline_generation {
         live.lifecycle_generation = drained.lifecycle_generation;
         live.lifecycle_reservation = drained.lifecycle_reservation.clone();
     }
@@ -275,5 +275,34 @@ mod tests {
         live.lifecycle_generation = 1;
         apply_poller_runtime_if_unchanged(&mut live, &repaired, &baseline);
         assert_eq!(live.session_id_poller_retry_after, None);
+    }
+
+    #[test]
+    fn drained_lifecycle_reapply_keeps_a_concurrent_reservation() {
+        let baseline: SessionIdentityBaseline = (
+            Instance::new("session", "/tmp/project").conversation_state(),
+            None,
+            None,
+            None,
+            None,
+            0,
+            crate::session::Status::Idle,
+        );
+        let mut drained = Instance::new("session", "/tmp/project");
+        drained.lifecycle_generation = 7;
+
+        // Nothing moved under the guard, so the drained generation lands.
+        let mut quiet = Instance::new("session", "/tmp/project");
+        apply_drained_lifecycle_if_unchanged(&mut quiet, &drained, &baseline);
+        assert_eq!(quiet.lifecycle_generation, 7);
+
+        // A relaunch advanced the generation while the drain ran: copying the
+        // drained value would roll that reservation back, so it must not happen.
+        let mut relaunched = Instance::new("session", "/tmp/project");
+        relaunched.lifecycle_generation = 9;
+        let reservation = relaunched.lifecycle_reservation.clone();
+        apply_drained_lifecycle_if_unchanged(&mut relaunched, &drained, &baseline);
+        assert_eq!(relaunched.lifecycle_generation, 9);
+        assert_eq!(relaunched.lifecycle_reservation, reservation);
     }
 }
