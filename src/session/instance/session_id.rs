@@ -410,7 +410,7 @@ impl Instance {
             }
             _ => self.try_retroactive_capture()?,
         };
-        if self.is_capture_excluded(&observation.sid, observation.source.as_ref()) {
+        if self.is_capture_excluded(&observation.sid, observation.source()) {
             return None;
         }
         if self.agent_session_id.as_ref() == Some(&observation.sid)
@@ -741,12 +741,7 @@ impl Instance {
         });
 
         match outcome {
-            Ok(
-                write @ (SidWrite::Applied
-                | SidWrite::Skipped
-                | SidWrite::OwnershipConflict
-                | SidWrite::PinnedForeign),
-            ) => {
+            Ok(write @ (SidWrite::Applied | SidWrite::Skipped)) => {
                 if let Some(disk) = storage
                     .load()
                     .ok()
@@ -761,6 +756,15 @@ impl Instance {
             Ok(SidWrite::Failed) => {
                 tracing::warn!(target: "session.store",
                     "Resume-probe failure marker found no instance row for {}", self.id);
+                SidWrite::Failed
+            }
+            // The closure above writes a marker on the caller's own row, so it can
+            // neither lose a peer-owned sid nor meet a foreign pin. Fail closed if
+            // that ever stops holding rather than reloading a refusal we cannot act on.
+            Ok(refused @ (SidWrite::OwnershipConflict | SidWrite::PinnedForeign)) => {
+                tracing::warn!(target: "session.store",
+                    instance = %self.id, sid, ?refused,
+                    "Resume-probe failure marker hit an unexpected refusal");
                 SidWrite::Failed
             }
             Err(e) => {

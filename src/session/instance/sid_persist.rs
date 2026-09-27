@@ -10,8 +10,11 @@ pub(crate) enum SidWrite {
     /// Disk diverged (peer wrote between caller's read and this write);
     /// caller should reload the in-memory mirror from disk.
     Skipped,
-    /// A different durable row owns this SID in the observation namespace.
-    /// No write occurred; the capture observation can be acknowledged.
+    /// A different durable row already owns this sid, so the lease is not up
+    /// for grabs and no write occurred. The capture observation can be
+    /// acknowledged; the owner keeps the id until it releases it.
+    /// A pin confirmation stays `Skipped` instead: the launch that armed the pin
+    /// is still waiting to prove ownership.
     OwnershipConflict,
     /// I/O failure or row gone from disk; in-memory mirror is unchanged.
     Failed,
@@ -109,16 +112,12 @@ pub(super) fn persist_session_with_storage(
                 return Ok(SidWrite::Skipped);
             }
         }
-        if instance.is_capture_excluded(session_id, observation.source.as_ref()) {
+        if instance.is_capture_excluded(session_id, observation.source()) {
             return Ok(SidWrite::Skipped);
         }
         let owns = |sid: Option<&str>, owner: Option<&ConversationBinding>| {
             sid == Some(session_id)
-                && crate::session::capture::owner_excludes(
-                    observation.source.as_ref(),
-                    owner,
-                    session_id,
-                )
+                && crate::session::capture::owner_excludes(observation.source(), owner, session_id)
         };
         let confirms_pin = observation.confirms_omp_pin(&instance.resume_intent);
         let conflict = instances.iter().any(|peer| {
@@ -134,6 +133,8 @@ pub(super) fn persist_session_with_storage(
                 }))
         });
         if conflict {
+            // A pin confirmation is not a fresh claim: the row armed the pin and
+            // must be able to re-prove it, so it keeps the retryable outcome.
             return Ok(if confirms_pin {
                 SidWrite::Skipped
             } else {
@@ -589,7 +590,7 @@ mod tests {
         let mut observed =
             crate::session::poller::SessionIdObservation::omp(VALID_SID.into(), generation.into());
         observed.execution = claimant.active_execution.clone();
-        observed.source = Some(source);
+        observed.scope_to(source);
         assert!(observed.confirms_omp_pin(&claimant.resume_intent));
 
         assert_eq!(
@@ -660,7 +661,7 @@ mod tests {
             let (_tmp, _home, storage) = seeded(profile, &[&parked, &claimant]);
             let mut observed = observation(sid);
             observed.execution = claimant.active_execution.clone();
-            observed.source = Some(source);
+            observed.scope_to(source);
             assert_eq!(
                 persist_session_to_storage(
                     profile,
@@ -1100,7 +1101,7 @@ mod tests {
         let (_temp, _home, storage) = seeded(profile, &[&inst]);
         let observation = crate::session::poller::SessionIdObservation {
             execution: Some(active),
-            source: Some(binding(Some(true))),
+            claim: crate::session::poller::ConversationClaim::Scoped(binding(Some(true))),
             ..observation(VALID_SID)
         };
 

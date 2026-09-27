@@ -36,7 +36,7 @@ impl Instance {
         storage: &crate::session::storage::Storage,
     ) -> Option<SidWrite> {
         let observation = self.final_publication_observation()?;
-        if self.is_capture_excluded(&observation.sid, observation.source.as_ref()) {
+        if self.is_capture_excluded(&observation.sid, observation.source()) {
             return None;
         }
         let outcome = super::sid_persist::persist_session_with_storage(
@@ -353,11 +353,11 @@ impl Instance {
                 .context("session disappeared during stop")?;
             current.source_profile = profile.clone();
             let flushed = current.flush_published_conversation(&storage);
-            // A pinned-foreign publication is an explicit refusal, not a
-            // doubtful write: the user pinned another conversation and this
-            // pane's id must not overwrite it. Any other failure still keeps
-            // the hook evidence, but the sandbox container always stops: the
-            // store is a host bind, not container state.
+            // A pinned-foreign sid and a sid another row durably owns are both
+            // deliberate refusals rather than doubtful writes, so the teardown
+            // keeps no evidence to preserve. A real failure still keeps it, and
+            // the sandbox container always stops: the store is a host bind, not
+            // container state.
             let container_result = crate::session::worktree_edit::stop_sandbox_container(
                 &current.id,
                 current.is_sandboxed(),

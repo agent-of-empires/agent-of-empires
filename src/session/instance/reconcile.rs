@@ -94,7 +94,7 @@ impl Instance {
         if Some(fresh) == self.agent_session_id.as_ref() && self.agent_session_binding == binding {
             return;
         }
-        if self.is_capture_excluded(fresh, observation.source.as_ref()) {
+        if self.is_capture_excluded(fresh, observation.source()) {
             return;
         }
         let profile = self.effective_profile();
@@ -109,10 +109,10 @@ impl Instance {
             SidWrite::Applied => {
                 self.set_agent_conversation(Some(observation.sid), binding, None);
             }
-            // A pinned-foreign publication is a deliberate non-write; like a
-            // divergence skip, it carries no update worth reconciling.
+            // Nothing was written in any of these arms: a peer wrote between
+            // reconcile and CAS, a peer durably owns the sid, or the row pins
+            // another conversation. Reloading converges on all three.
             SidWrite::Skipped | SidWrite::OwnershipConflict | SidWrite::PinnedForeign => {
-                // Peer wrote between reconcile and CAS; reload to converge.
                 self.reconcile_from_disk();
             }
             SidWrite::Failed => {}
