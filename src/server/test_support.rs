@@ -217,6 +217,11 @@ pub fn attach_session_id_update_for_test(inst: &mut Instance, sid: &str) {
     inst.session_id_poller = Some(Arc::new(std::sync::Mutex::new(poller)));
 }
 
+/// The Contract Pack's recording entry point, re-exported because
+/// `runtime_ws` itself is crate-private and the recorder is an out-of-process
+/// tool: it rewrites committed transcripts, so it lives in `tests/`.
+pub use super::runtime_ws::{record_exchange, RecordedExchange, RecordedOwner, RecordingPins};
+
 pub fn seed_instances_on_disk_for_test(profile: &str, insts: Vec<Instance>) {
     let storage = Storage::new_unwatched(profile).expect("storage");
     storage

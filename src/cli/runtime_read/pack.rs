@@ -30,6 +30,10 @@ use clap::Parser as _;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
+mod schema;
+
+use self::schema::Schema;
+
 /// Manifest name. Covers every other physical file in the pack.
 pub const MANIFEST_NAME: &str = "MANIFEST.sha256";
 /// Canonical case index.
@@ -47,6 +51,11 @@ const ROLE_SERVER: u8 = 2;
 pub const ERROR_SCHEMA: &str = "error.schema.json";
 /// The published per-case expected result schema.
 pub const EXPECTED_SCHEMA: &str = "expected.schema.json";
+
+/// The published per-case Hello data schema.
+pub const HELLO_SCHEMA: &str = "hello.schema.json";
+/// The published per-case Snapshot data schema.
+pub const SNAPSHOT_SCHEMA: &str = "snapshot.schema.json";
 
 #[derive(Debug)]
 pub struct PackError(String);
@@ -285,12 +294,13 @@ fn expected_exits(phase: &str, code: Option<&str>) -> Option<&'static [u8]> {
     }
 }
 
-/// Whether every code the table names is one a scoped read can actually emit,
-/// and every phase one the table itself recognises. Both directions of that
-/// link are load-bearing: a new emitter asserts its code is in
-/// [`EMITTABLE_CODES`](super::EMITTABLE_CODES), and the table may not name a
-/// code outside it.
-fn table_is_reachable() -> bool {
+/// Direction: the table into the vocabulary. Every phase and code a table row
+/// names must be one the vocabulary recognises, or the pack would describe an
+/// outcome no code path can produce. This is the check `identifier_required`
+/// needed and did not have: a renderer that auto-detects tmux had removed the
+/// only emitter, and the frozen case kept passing because the table agreed with
+/// itself.
+fn table_names_only_reachable_vocabulary() -> bool {
     TABLE.iter().all(|(phase, codes, _)| {
         PHASES.contains(phase)
             && codes
@@ -299,20 +309,35 @@ fn table_is_reachable() -> bool {
     })
 }
 
-/// The other direction, which nothing asserted: every code a scoped read may
-/// emit needs a table row, or a pack that froze it has no phase or exits to
-/// verify against and the code escapes the contract entirely.
+/// Direction: the vocabulary into the table. Every code a scoped read may emit
+/// needs a table row, or a pack that froze it has no phase or exits to verify
+/// against and the code escapes the contract entirely. A code with no row
+/// fails here, which is the half the previous one-directional check could not
+/// see.
 fn every_emittable_code_has_a_row() -> bool {
     super::EMITTABLE_CODES
         .iter()
         .all(|code| TABLE.iter().any(|(_, codes, _)| codes.contains(code)))
 }
 
+/// Direction: the phase vocabulary into the table, the same link
+/// [`every_emittable_code_has_a_row`] makes for codes. A phase with no row is a
+/// place a read can stop that the pack cannot describe, so the two directions
+/// have to agree on what "described" means.
+fn every_phase_has_a_row() -> bool {
+    PHASES
+        .iter()
+        .all(|phase| TABLE.iter().any(|(row_phase, _, _)| row_phase == phase))
+}
+
 /// Whether a published schema enumerates exactly the pack's phase and code
-/// vocabulary, so a schema cannot drift away from the table either. The
-/// Schemas are human-readable documents rather than frozen artefacts, so only
-/// their vocabulary is gated, not their formatting.
-fn schema_vocabulary_is_reachable(root: &Path) -> Result<()> {
+/// vocabulary, so a schema cannot drift away from the table either. Both
+/// directions are enforced here, as set equality rather than as a subset
+/// test: a schema that names a phase the table does not, and a schema that
+/// omits a phase it does, are the same class of drift and must fail the same
+/// way. The schemas are human-readable documents rather than frozen artefacts,
+/// so only their vocabulary is gated, not their formatting or their order.
+fn schema_vocabulary_matches_the_table(root: &Path) -> Result<()> {
     for name in [ERROR_SCHEMA, EXPECTED_SCHEMA] {
         let value: serde_json::Value = serde_json::from_slice(&read(root, name)?)
             .map_err(|error| PackError(format!("{name} is not JSON: {error}")))?;
@@ -784,6 +809,103 @@ fn websocket_opcode(case_id: &str, direction: u8, payload: &[u8]) -> Result<u8> 
     Ok(opcode)
 }
 
+/// The two published wire schemas, compiled once per [`verify`] and applied to
+/// every application frame in the pack.
+struct WireSchemas {
+    hello: Schema,
+    snapshot: Schema,
+}
+
+fn load_wire_schemas(root: &Path) -> Result<WireSchemas> {
+    let load = |name: &str| -> Result<Schema> {
+        let document: serde_json::Value = serde_json::from_slice(&read(root, name)?)
+            .map_err(|error| PackError(format!("{name} is not JSON: {error}")))?;
+        Schema::compile(name, document).map_err(PackError)
+    };
+    Ok(WireSchemas {
+        hello: load(HELLO_SCHEMA)?,
+        snapshot: load(SNAPSHOT_SCHEMA)?,
+    })
+}
+
+/// One WebSocket record's opcode and its payload: the frame header is framing,
+/// not message, so validation sees the JSON the producer actually wrote.
+fn websocket_frame<'a>(case_id: &str, direction: u8, record: &'a [u8]) -> Result<(u8, &'a [u8])> {
+    let opcode = websocket_opcode(case_id, direction, record)?;
+    let mut cursor = 2usize;
+    match record[1] & 0x7F {
+        126 => cursor += 2,
+        127 => cursor += 8,
+        _ => {}
+    }
+    if direction == DIRECTION_CLIENT_TO_SERVER {
+        cursor += 4;
+    }
+    Ok((opcode, &record[cursor..]))
+}
+
+/// The gate that was missing: every server-to-client application frame in the
+/// pack must satisfy the schema published beside it.
+///
+/// Nothing compared the two before, so a producer that grew a field and a
+/// schema that did not follow both kept passing — `ProjectRead::registered` and
+/// the fractional timestamp both survived several reviews for exactly that
+/// reason. The cost is one JSON parse and one schema walk per application
+/// frame, in a debug-only gate over six cases, and no new dependency: the
+/// evaluator is a subset of the keywords the shipped documents use.
+///
+/// A refusal case is not exempt. `http-loopback-snapshot-schema-invalid` is
+/// invalid in a *semantic* field, and a semantic defect still has to be
+/// schema-shaped to be the defect the case claims, so the frame is held to the
+/// same document as a nominal one.
+fn verify_application_frames(
+    case_id: &str,
+    wire: &[WireRecord],
+    schemas: &WireSchemas,
+) -> Result<()> {
+    for record in wire.iter().filter(|record| record.is_server_to_client()) {
+        if is_http(record) {
+            continue;
+        }
+        // Only the JSON text frames are frames the schemas describe; the close
+        // handshake carries a status code, not a document.
+        let (opcode, payload) = websocket_frame(case_id, record.direction, &record.bytes)?;
+        if opcode != 0x1 {
+            continue;
+        }
+        let frame: serde_json::Value = serde_json::from_slice(payload).map_err(|error| {
+            PackError(format!(
+                "case {case_id} has a text frame that is not JSON: {error}"
+            ))
+        })?;
+        let kind = frame
+            .get("kind")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| PackError(format!("case {case_id} has a text frame with no kind")))?;
+        let (name, schema) = match kind {
+            "hello" => (HELLO_SCHEMA, &schemas.hello),
+            "snapshot" => (SNAPSHOT_SCHEMA, &schemas.snapshot),
+            other => {
+                return fail(format!(
+                    "case {case_id} has a {other:?} frame, which no published schema describes"
+                ))
+            }
+        };
+        let data = frame
+            .get("data")
+            .ok_or_else(|| PackError(format!("case {case_id} has a {kind} frame with no data")))?;
+        // The published documents describe the `data` member, which is the
+        // whole of what the producer builds; `kind` is the envelope tag that
+        // selects between them.
+        schema.validate(data).map_err(|reason| {
+            PackError(format!(
+                "case {case_id} {kind} frame does not satisfy {name}: {reason}"
+            ))
+        })?;
+    }
+    Ok(())
+}
+
 /// Verify a whole pack: safe root, manifest universe and digests, canonical
 /// `CASES.json`, per-case layout, and the expected/error closure.
 pub fn verify(root: &Path) -> Result<VerifiedPack> {
@@ -810,13 +932,21 @@ pub fn verify(root: &Path) -> Result<VerifiedPack> {
     // Reachability comes before anything is replayed: a table naming a code no
     // emitter can produce, or a published schema naming one the table does not
     // carry, is drift in the contract itself, not in a case.
-    if !table_is_reachable() {
+    if !table_names_only_reachable_vocabulary() {
         return fail("the phase/code/exit table names a code or phase no scoped read can produce");
     }
     if !every_emittable_code_has_a_row() {
         return fail("a code a scoped read can emit has no phase/code/exit table row");
     }
-    schema_vocabulary_is_reachable(root)?;
+    if !every_phase_has_a_row() {
+        return fail("a phase a scoped read can stop in has no phase/code/exit table row");
+    }
+    schema_vocabulary_matches_the_table(root)?;
+
+    // The wire schemas are compiled before any case is read, so a schema that
+    // uses a keyword this gate does not evaluate fails the whole pack rather
+    // than silently passing every frame it was meant to constrain.
+    let wire_schemas = load_wire_schemas(root)?;
 
     let cases_bytes = read(root, CASES_NAME)?;
     let value = check_canonical(&cases_bytes, CASES_NAME)?;
@@ -847,7 +977,7 @@ pub fn verify(root: &Path) -> Result<VerifiedPack> {
 
     let mut verified = Vec::with_capacity(cases.cases.len());
     for row in &cases.cases {
-        verified.push(verify_case(root, &physical, row)?);
+        verified.push(verify_case(root, &physical, row, &wire_schemas)?);
     }
     Ok(VerifiedPack { cases: verified })
 }
@@ -902,7 +1032,12 @@ fn verify_argv_contract(case_id: &str, row: &CaseRow) -> Result<()> {
     }
     Ok(())
 }
-fn verify_case(root: &Path, physical: &[String], row: &CaseRow) -> Result<VerifiedCase> {
+fn verify_case(
+    root: &Path,
+    physical: &[String],
+    row: &CaseRow,
+    wire_schemas: &WireSchemas,
+) -> Result<VerifiedCase> {
     let case_id = &row.case_id;
     if !COMMANDS.contains(&row.command.as_str())
         || row
@@ -1095,6 +1230,7 @@ fn verify_case(root: &Path, physical: &[String], row: &CaseRow) -> Result<Verifi
             "case {case_id} is UDS but records an HTTP exchange"
         ));
     }
+    verify_application_frames(case_id, &wire, wire_schemas)?;
 
     Ok(VerifiedCase {
         case_id: case_id.clone(),

@@ -60,6 +60,8 @@ mod cli_read_pack;
 #[cfg(debug_assertions)]
 mod cli_read_parity;
 #[cfg(debug_assertions)]
+mod cli_read_record;
+#[cfg(debug_assertions)]
 mod cli_read_server;
 // The local read is Linux-only: the admission re-derives process identity from
 // /proc, so the publisher refuses every other platform and there is nothing

@@ -33,8 +33,9 @@
     },
     "namespace": { "type": "string", "pattern": "^(debug|release):[a-z0-9._-]{1,200}$" },
     "timestamp": {
+      "description": "Grammar owned by the code, not by this document: `format_timestamp` in src/server/runtime_ws.rs emits chrono SecondsFormat::AutoSi in UTC with a `Z` zone, which is 0, 3, 6 or 9 fractional digits, and `valid_timestamp` in src/cli/runtime_read/dto.rs admits 1 to 9. A whole second or any RFC 3339 fraction is therefore a legal wire value; change this pattern only with those two functions. A control character, a numeric offset and a lowercase `t`/`z` stay refused because the separators and the `Z` are pinned here.",
       "type": "string",
-      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,9})?Z$"
     },
     "safe_text": {
       "type": "string",
@@ -152,7 +153,7 @@
     "project_read": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["name", "path", "scope", "default_base_branch"],
+      "required": ["name", "path", "scope", "default_base_branch", "registered"],
       "properties": {
         "name": { "$ref": "#/$defs/safe_text" },
         "path": { "$ref": "#/$defs/absolute_path" },
@@ -164,6 +165,10 @@
         },
         "default_base_branch": {
           "oneOf": [{ "$ref": "#/$defs/safe_text" }, { "type": "null" }]
+        },
+        "registered": {
+          "description": "Carried on every row the producer emits, so it is required, not optional. `ProjectRead::registered` in src/server/runtime_ws.rs serialises it unconditionally; the client defaults an absent flag to true (`registered_by_default` in src/cli/runtime_read/dto.rs) so a snapshot written before the field existed still renders. It is part of the row's identity, not a filter: `validate_projects` in src/cli/runtime_read/dto.rs keys uniqueness on name, path and this flag together, so a synthesized row that stands in for a session's project path and the registry row it stands in for are two identities. `registered: false` is legal only in a profile list, never in the global registry.",
+          "type": "boolean"
         }
       }
     },

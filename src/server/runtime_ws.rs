@@ -229,6 +229,94 @@ async fn run_read(
 }
 
 // ---------------------------------------------------------------------------
+// Contract Pack recording
+// ---------------------------------------------------------------------------
+
+/// A recorded exchange, with everything the recorder had to pin spelled out.
+#[cfg(any(test, debug_assertions))]
+#[doc(hidden)]
+pub struct RecordedExchange {
+    /// The Hello frame, as the producer's own serialiser wrote it.
+    pub hello: Vec<u8>,
+    /// The Snapshot frame, likewise.
+    pub snapshot: Vec<u8>,
+}
+
+/// Which transport the recorded exchange pretends to have arrived over. The
+/// local one declares the uid the peer would have; the remote one declares no
+/// uid at all, which is the whole difference between the two Hello frames.
+#[cfg(any(test, debug_assertions))]
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy)]
+pub enum RecordedOwner {
+    Local { uid: u32 },
+    Remote,
+}
+
+/// Everything a recording pins so the same store always yields the same bytes.
+///
+/// A transcript is a frozen artefact, so the two things the daemon mints per
+/// process or per instant — the three identity UUIDs and the freshness clock —
+/// are the only inputs a recorder may not take from the environment.
+#[cfg(any(test, debug_assertions))]
+#[doc(hidden)]
+pub struct RecordingPins {
+    pub runtime_epoch: String,
+    pub prebind_instance_id: String,
+    pub runtime_instance_id: String,
+    /// The instant the observed freshness is stamped with.
+    pub observed_at: DateTime<Utc>,
+}
+
+/// Serialise the two frames one read emits, from the same assembly path and the
+/// same serialisers [`run_read`] uses.
+///
+/// This is the recording half of the Contract Pack's wire gate, and it exists
+/// because there was no other way to re-record a transcript: the previous
+/// frames were typed by hand from the published schemas, which is precisely
+/// how `ProjectRead::registered` and the fractional timestamp came to be
+/// missing from every recorded case while the producer emitted both. A
+/// transcript recorded through here cannot disagree with the producer about
+/// which fields exist; `pack::verify` then holds the recorded bytes to the
+/// published schema, so neither side can drift alone again.
+#[cfg(any(test, debug_assertions))]
+#[doc(hidden)]
+pub fn record_exchange(
+    instances: &[Instance],
+    owner: RecordedOwner,
+    pins: &RecordingPins,
+) -> RecordedExchange {
+    let owner = match owner {
+        RecordedOwner::Local { uid } => Owner::local(uid),
+        RecordedOwner::Remote => Owner::remote(),
+    };
+    let runtime = RuntimeState {
+        identity: RuntimeIdentity {
+            runtime_epoch: pins.runtime_epoch.clone(),
+            prebind_instance_id: pins.prebind_instance_id.clone(),
+            runtime_instance_id: pins.runtime_instance_id.clone(),
+        },
+        sampler: Mutex::new(Sampler::default()),
+        flight: tokio::sync::Mutex::new(()),
+        pinned_now: Some(pins.observed_at),
+    };
+    let sampled = build_snapshot(&runtime, instances, owner);
+    let encode = |frame: Result<String, serde_json::Error>| {
+        frame.expect("a recorded frame encodes").into_bytes()
+    };
+    RecordedExchange {
+        hello: encode(serde_json::to_string(&HelloFrame {
+            kind: "hello",
+            data: &sampled.hello,
+        })),
+        snapshot: encode(serde_json::to_string(&SnapshotFrame {
+            kind: "snapshot",
+            data: &sampled.data,
+        })),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Runtime identity and the status-freshness sampler
 // ---------------------------------------------------------------------------
 
@@ -253,6 +341,10 @@ struct RuntimeState {
     identity: RuntimeIdentity,
     sampler: Mutex<Sampler>,
     flight: tokio::sync::Mutex<()>,
+    /// The clock `publish_freshness` reads. A seam and nothing more: `None` is
+    /// the wall clock, and a recording harness pins an instant so a transcript
+    /// is reproducible. The daemon itself never pins one.
+    pinned_now: Option<DateTime<Utc>>,
 }
 
 impl RuntimeState {
@@ -266,6 +358,7 @@ impl RuntimeState {
             },
             sampler: Mutex::new(Sampler::default()),
             flight: tokio::sync::Mutex::new(()),
+            pinned_now: None,
         }
     }
 }
@@ -301,7 +394,7 @@ fn publish_freshness(runtime: &RuntimeState) -> (StatusFreshness, u64) {
     (
         StatusFreshness::Observed {
             revision: next,
-            observed_at: format_timestamp(Utc::now()),
+            observed_at: format_timestamp(runtime.pinned_now.unwrap_or_else(Utc::now)),
         },
         cursor,
     )

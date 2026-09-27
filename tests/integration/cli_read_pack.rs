@@ -478,3 +478,180 @@ fn a_symlinked_case_file_is_refused() {
         "unexpected error: {error}"
     );
 }
+
+/// A recorded `wire.raw`, split into its records and re-emitted, so a test can
+/// change one record's bytes and let the framing headers be recomputed. The
+/// record length is part of the framing, so a test that edits a frame's JSON
+/// without fixing it would be refused for the wrong reason.
+fn retranscribe(bytes: &[u8], mut edit: impl FnMut(&[u8]) -> Vec<u8>) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut offset = 0usize;
+    let mut records = 0usize;
+    while offset < bytes.len() {
+        let length = u32::from_be_bytes(
+            bytes[offset + 2..offset + 6]
+                .try_into()
+                .expect("four bytes"),
+        ) as usize;
+        let payload = edit(&bytes[offset + 6..offset + 6 + length]);
+        out.extend_from_slice(&bytes[offset..offset + 2]);
+        out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        out.extend_from_slice(&payload);
+        offset += 6 + length;
+        records += 1;
+    }
+    assert!(records > 0, "the transcript has records to edit");
+    out
+}
+
+/// An unmasked server-to-client text frame, which is what the producer writes.
+fn text_frame(payload: &[u8]) -> Vec<u8> {
+    let mut out = vec![0x81];
+    if payload.len() < 126 {
+        out.push(payload.len() as u8);
+    } else {
+        out.push(126);
+        out.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+    }
+    out.extend_from_slice(payload);
+    out
+}
+
+/// Replace a string inside the JSON body of a recorded frame. The edit is on
+/// the body rather than on the record bytes because a WebSocket header is not
+/// text, and the edited body is re-framed rather than spliced in place because
+/// the header carries the body's length.
+fn splice_text(bytes: &[u8], from: &str, to: &str) -> Vec<u8> {
+    let mut seen = false;
+    let spliced = retranscribe(bytes, |payload| {
+        if !payload.first().is_some_and(|first| first & 0x0F == 0x1) {
+            return payload.to_vec();
+        }
+        let body = match payload[1] & 0x7F {
+            126 => &payload[4..],
+            127 => &payload[10..],
+            _ => &payload[2..],
+        };
+        let text = std::str::from_utf8(body).expect("a frame body is JSON text");
+        if !text.contains(from) {
+            return payload.to_vec();
+        }
+        seen = true;
+        text_frame(text.replace(from, to).as_bytes())
+    });
+    assert!(seen, "the transcript carries {from:?} to replace");
+    spliced
+}
+
+/// The concatenated bodies of a transcript's text frames, so a test can assert
+/// on a frame's JSON without decoding the binary framing around it.
+fn frame_bodies(bytes: &[u8]) -> String {
+    let mut text = String::new();
+    let mut offset = 0usize;
+    while offset < bytes.len() {
+        let length = u32::from_be_bytes(
+            bytes[offset + 2..offset + 6]
+                .try_into()
+                .expect("four bytes"),
+        ) as usize;
+        let payload = &bytes[offset + 6..offset + 6 + length];
+        if payload.first().is_some_and(|first| first & 0x0F == 0x1) {
+            let body = match payload[1] & 0x7F {
+                126 => &payload[4..],
+                127 => &payload[10..],
+                _ => &payload[2..],
+            };
+            text.push_str(std::str::from_utf8(body).expect("a frame body is JSON"));
+        }
+        offset += 6 + length;
+    }
+    text
+}
+
+/// The gate that was missing, proved in the accepting direction: a frame the
+/// producer emits and the published schemas once refused must now pass.
+///
+/// Two producer spellings were refused before this repair, and both are put
+/// back here. `registered` is the field `ProjectRead` has serialised on every
+/// row since it was added, and the fractional timestamp is exactly what
+/// chrono's `AutoSi` writes for an instant that is not on a second boundary —
+/// which is almost every real one. The recorded frames carry both.
+#[test]
+#[parallel]
+fn a_producer_frame_the_schema_once_refused_is_accepted() {
+    let (_dir, root) = staged_pack();
+    let path = case_dir(&root, "uds-list-nominal").join("wire.raw");
+    let recorded = fs::read(&path).expect("read the re-recorded transcript");
+    // The field is asserted on the frame body, not the whole record: a record
+    // carries a binary framing header around the JSON.
+    let body = frame_bodies(&recorded);
+    assert!(
+        body.contains(r#""registered":true"#),
+        "the recorded project row carries the field the stale schema omitted"
+    );
+    assert!(
+        body.contains(r#""observed_at":"2026-01-01T00:00:00Z""#),
+        "the recorded freshness is a whole second, the spelling both schemas admitted"
+    );
+
+    // The producer's own fractional spelling, nine digits and a `Z` zone.
+    let fractional = splice_text(
+        &recorded,
+        r#""2026-01-01T00:00:00Z""#,
+        r#""2026-01-01T00:00:00.123456789Z""#,
+    );
+    fs::write(&path, fractional).expect("rewrite wire.raw");
+    restage(&root);
+
+    pack::verify(&root).expect("a frame the producer emits is accepted");
+}
+
+/// And the refusing direction: the gate is not a rubber stamp. A field spelled
+/// as a string where the schema says boolean is what a producer that changed
+/// the type would emit, and it must be caught by the schema rather than by any
+/// later stage.
+#[test]
+#[parallel]
+fn a_frame_that_breaks_the_published_schema_is_still_refused() {
+    let (_dir, root) = staged_pack();
+    let path = case_dir(&root, "uds-list-nominal").join("wire.raw");
+    let recorded = fs::read(&path).expect("read the re-recorded transcript");
+    let broken = splice_text(&recorded, r#""registered":true"#, r#""registered":"yes""#);
+    fs::write(&path, broken).expect("rewrite wire.raw");
+    restage(&root);
+
+    let error = pack::verify(&root).expect_err("a mistyped field is refused");
+    assert!(
+        error
+            .to_string()
+            .contains("does not satisfy hello.schema.json"),
+        "unexpected error: {error}"
+    );
+}
+
+/// A timestamp outside the grammar both the producer and the client admit is
+/// refused for what it is: a bad timestamp, named as one. The `+00:00` zone is
+/// the offset form `valid_timestamp` refuses and `format_timestamp` never
+/// writes.
+#[test]
+#[parallel]
+fn a_timestamp_outside_the_producer_grammar_is_refused() {
+    let (_dir, root) = staged_pack();
+    let path = case_dir(&root, "uds-list-nominal").join("wire.raw");
+    let recorded = fs::read(&path).expect("read the re-recorded transcript");
+    let broken = splice_text(
+        &recorded,
+        r#""2026-01-01T00:00:00Z""#,
+        r#""2026-01-01T00:00:00.123456789+00:00""#,
+    );
+    fs::write(&path, broken).expect("rewrite wire.raw");
+    restage(&root);
+
+    let error = pack::verify(&root).expect_err("a numeric-offset timestamp is refused");
+    let reason = error.to_string();
+    assert!(
+        reason.contains("does not satisfy hello.schema.json")
+            && reason.contains(r#"2026-01-01T00:00:00.123456789+00:00"#),
+        "the refusal names the timestamp that broke the grammar: {reason}"
+    );
+}
