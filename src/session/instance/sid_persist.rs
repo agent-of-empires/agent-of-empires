@@ -1283,8 +1283,11 @@ mod tests {
             inst.status = Status::Stopped;
             seed(profile, &[&inst]);
 
-            let poller =
-                crate::session::poller::SessionPoller::new("unused-tmux".to_string(), None);
+            let poller = crate::session::poller::SessionPoller::new(
+                "unused-tmux".to_string(),
+                "claude".to_string(),
+                None,
+            );
             poller.inject_test_observation(
                 &inst.id,
                 crate::session::poller::SessionIdObservation::omp(

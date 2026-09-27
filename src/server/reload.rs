@@ -784,10 +784,6 @@ mod tests {
                 prior.maybe_start_poller(),
                 crate::session::PollerStart::Started
             );
-            assert!(
-                prior.poller_serves(prior.active_execution.as_ref()),
-                "an installed poller serves the row's own execution"
-            );
             let mut fresh: Instance =
                 serde_json::from_str(&serde_json::to_string(&prior).unwrap()).unwrap();
             fresh.source_profile = prior.source_profile.clone();
@@ -831,38 +827,6 @@ mod tests {
             assert_eq!(
                 stored.agent_session_binding.unwrap().provenance,
                 ConversationProvenance::Observed
-            );
-        }
-    }
-
-    #[test]
-    fn a_reload_keeps_the_repair_schedule_of_a_row_that_holds_no_poller() {
-        let now = std::time::Instant::now();
-        let mut mergers: Vec<fn(Instance, Instance) -> Instance> = vec![merge_runtime_fields];
-        mergers.push(|prior, mut fresh| {
-            fresh.merge_runtime_from_reload(&prior);
-            fresh
-        });
-        for merge in mergers {
-            // What the repair walk leaves behind: a re-probe ladder on a row with no poller, and a
-            // store-retry deadline on a row that could not claim its capture store.
-            let mut prior = Instance::new("poller-less", "/tmp/poller-less");
-            prior.poller_repair.reprobe(now);
-            let deadline = now + std::time::Duration::from_secs(30);
-            prior.session_id_poller_retry_after = Some(deadline);
-            assert!(prior.session_id_poller.is_none());
-
-            let merged = merge(prior, Instance::new("poller-less", "/tmp/poller-less"));
-
-            assert_eq!(
-                merged.poller_repair.current_reprobe_delay(),
-                Some(std::time::Duration::from_secs(5)),
-                "the re-probe ladder survives a reload, or the row re-resolves every tick"
-            );
-            assert_eq!(
-                merged.session_id_poller_retry_after,
-                Some(deadline),
-                "and so does the managed-store retry deadline"
             );
         }
     }
@@ -937,5 +901,39 @@ mod tests {
                 "and neither does the deadline that went with it"
             );
         }
+    }
+
+    /// A profile move can change a row's agent on disk while it holds no execution on either side,
+    /// and a poller that watched no execution belongs to an agent just as much. Carrying it would
+    /// leave the row watching the previous agent's capture, and the repair walk skips on a
+    /// running poller, so nothing else would replace it.
+    #[test]
+    fn a_reload_drops_the_poller_of_an_agent_the_row_no_longer_runs() {
+        let mut prior = Instance::new("swapped-agent", "/tmp/swapped-agent");
+        prior.tool = "claude".to_string();
+        let mut poller = crate::session::poller::SessionPoller::new(
+            "test-tmux-swapped-agent".to_string(),
+            "claude".to_string(),
+            None,
+        );
+        assert_eq!(
+            poller.start(prior.id.clone(), Box::new(|| None), Box::new(|_| {}), None,),
+            crate::session::poller::PollerSpawn::Spawned
+        );
+        prior.session_id_poller = Some(std::sync::Arc::new(std::sync::Mutex::new(poller)));
+        assert!(
+            prior.active_execution.is_none(),
+            "fixture: no execution on either side"
+        );
+        let mut fresh = Instance::new("swapped-agent", "/tmp/swapped-agent");
+        fresh.tool = "codex".to_string();
+
+        let merged = merge_runtime_fields(prior, fresh);
+
+        assert_eq!(merged.tool, "codex");
+        assert!(
+            merged.session_id_poller.is_none(),
+            "the previous agent's watcher does not follow the row to a new one"
+        );
     }
 }

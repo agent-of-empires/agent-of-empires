@@ -1647,7 +1647,11 @@ fn apply_post_restart_sync_propagates_agent_session_id() {
     started.status = Status::Starting;
     started.agent_session_id = Some("claude-uuid-restart".to_string());
     started.omp_capture_generation = Some("omp-generation-restart".to_string());
-    let mut poller = crate::session::poller::SessionPoller::new("omp-restarted".to_string(), None);
+    let mut poller = crate::session::poller::SessionPoller::new(
+        "omp-restarted".to_string(),
+        "claude".to_string(),
+        None,
+    );
     assert_eq!(
         poller.start(before.id.clone(), Box::new(|| None), Box::new(|_| {}), None,),
         crate::session::poller::PollerSpawn::Spawned
@@ -1713,7 +1717,11 @@ fn apply_post_restart_identity_sync_clears_the_live_poller_schedule() {
     // A relaunch stamps its start time next to the schedule it clears (start.rs).
     started.last_start_time = Some(std::time::Instant::now());
     started.poller_repair.reset();
-    let mut poller = crate::session::poller::SessionPoller::new("omp-restarted".to_string(), None);
+    let mut poller = crate::session::poller::SessionPoller::new(
+        "omp-restarted".to_string(),
+        "claude".to_string(),
+        None,
+    );
     assert_eq!(
         poller.start(before.id.clone(), Box::new(|| None), Box::new(|_| {}), None,),
         crate::session::poller::PollerSpawn::Spawned
@@ -1753,6 +1761,7 @@ fn apply_post_restart_identity_sync_clears_the_live_poller_schedule() {
     };
     let mut superseded_poller = crate::session::poller::SessionPoller::new(
         "omp-restarted".to_string(),
+        "claude".to_string(),
         Some(launch_2.clone()),
     );
     assert_eq!(

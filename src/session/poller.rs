@@ -500,8 +500,10 @@ fn poll_resolved_target<T>(
 /// Manages polling thread lifecycle and inter-thread communication via mpsc channels.
 pub struct SessionPoller {
     session_name: String,
-    /// The execution this poller watches. Its observations name it, so a row holding this
-    /// poller has to hold that execution.
+    /// The agent and the execution this poller watches. Its observations name the execution and
+    /// come from the agent, so a row holding this poller has to be that agent on that execution:
+    /// neither half alone identifies what the thread reads.
+    tool: String,
     execution: Option<crate::session::instance::ActiveExecution>,
     /// The budget this poller's thread is counted against, fixed at
     /// construction so the slot is returned to the budget it was taken from.
@@ -524,16 +526,19 @@ impl std::fmt::Debug for SessionPoller {
 }
 
 impl SessionPoller {
-    /// Build a poller for `execution`, the execution whose capture files it will read. `None` is
-    /// a real answer: a row can hold a poller while it has no execution of its own.
+    /// Build a poller for `tool` on `execution`, the agent and the execution whose capture files
+    /// it will read. `None` is a real answer for the execution: a row can hold a poller while it
+    /// has none of its own.
     pub(crate) fn new(
         session_name: String,
+        tool: String,
         execution: Option<crate::session::instance::ActiveExecution>,
     ) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::channel();
         let (result_tx, result_rx) = mpsc::channel();
         Self {
             session_name,
+            tool,
             execution,
             budget: current_budget(),
             cmd_tx,
@@ -804,12 +809,13 @@ impl SessionPoller {
         }
     }
 
-    /// Whether this poller watches `execution`.
+    /// Whether this poller watches `execution` for `tool`.
     pub(crate) fn serves(
         &self,
+        tool: &str,
         execution: Option<&crate::session::instance::ActiveExecution>,
     ) -> bool {
-        self.execution.as_ref() == execution
+        self.tool == tool && self.execution.as_ref() == execution
     }
 
     /// Check if the poller thread is running
@@ -966,7 +972,7 @@ mod tests {
         let budget = test_support::IsolatedBudget::with_ceiling(1);
         assert_eq!(session_id_poller_budget(), (0, 1));
 
-        let mut first = SessionPoller::new("iso-a".to_string(), None);
+        let mut first = SessionPoller::new("iso-a".to_string(), "test".to_string(), None);
         assert_eq!(
             first.start(
                 "iso-a".to_string(),
@@ -979,7 +985,7 @@ mod tests {
         assert_eq!(budget.active(), 1);
         assert_eq!(session_id_poller_budget(), (1, 1));
 
-        let mut second = SessionPoller::new("iso-b".to_string(), None);
+        let mut second = SessionPoller::new("iso-b".to_string(), "test".to_string(), None);
         assert_eq!(
             second.start(
                 "iso-b".to_string(),
@@ -992,7 +998,7 @@ mod tests {
         );
 
         let elsewhere = std::thread::spawn(|| {
-            let mut poller = SessionPoller::new("process".to_string(), None);
+            let mut poller = SessionPoller::new("process".to_string(), "test".to_string(), None);
             let outcome = poller.start(
                 "process".to_string(),
                 Box::new(|| Some("id".to_string())),
@@ -1265,7 +1271,7 @@ mod tests {
             lock_unpoisoned(&changed_ids_clone).push(id.to_string());
         });
 
-        let mut poller = SessionPoller::new("test-session".to_string(), None);
+        let mut poller = SessionPoller::new("test-session".to_string(), "test".to_string(), None);
         assert_eq!(
             poller.start(
                 "test-change".to_string(),
@@ -1292,7 +1298,7 @@ mod tests {
     fn test_thread_budget_cap() {
         let budget = test_support::IsolatedBudget::exhausted();
 
-        let mut poller = SessionPoller::new("test-session".to_string(), None);
+        let mut poller = SessionPoller::new("test-session".to_string(), "test".to_string(), None);
         let outcome = poller.start(
             "test-budget".to_string(),
             Box::new(|| Some("id".to_string())),
@@ -1326,7 +1332,7 @@ mod tests {
         let logs = crate::session::test_support::LogCapture::start();
         let _budget = test_support::IsolatedBudget::exhausted();
 
-        let mut poller = SessionPoller::new("test-session".to_string(), None);
+        let mut poller = SessionPoller::new("test-session".to_string(), "test".to_string(), None);
         let outcome = poller.start(
             "test-budget-quiet".to_string(),
             Box::new(|| Some("id".to_string())),
@@ -1348,7 +1354,7 @@ mod tests {
     #[test]
     fn test_duplicate_start_is_reported_not_spawned() {
         let _budget = test_support::IsolatedBudget::with_ceiling(1);
-        let mut poller = SessionPoller::new("test-session".to_string(), None);
+        let mut poller = SessionPoller::new("test-session".to_string(), "test".to_string(), None);
         assert_eq!(
             poller.start(
                 "test-dup".to_string(),
@@ -1379,7 +1385,7 @@ mod tests {
         let observed_sid = sid.clone();
         let (started_tx, started_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel::<()>();
-        let mut poller = SessionPoller::new("test-session".to_string(), None);
+        let mut poller = SessionPoller::new("test-session".to_string(), "test".to_string(), None);
         poller.cmd_tx.send(PollCommand::Stop).expect("queue stop");
         assert_eq!(
             poller.start(
@@ -1416,7 +1422,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_poller_publishes_before_waiting_for_commands() {
-        let mut poller = SessionPoller::new("test-session".to_string(), None);
+        let mut poller = SessionPoller::new("test-session".to_string(), "test".to_string(), None);
         let (cmd_tx, cmd_rx) = mpsc::channel();
         drop(cmd_tx);
         poller.cmd_rx = Some(cmd_rx);

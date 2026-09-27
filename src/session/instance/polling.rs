@@ -317,7 +317,7 @@ impl Instance {
             return PollerStart::NotApplicable;
         }
         if self.session_id_poller_is_running() {
-            if self.poller_serves(self.active_execution.as_ref()) {
+            if self.poller_serves(&self.tool, self.active_execution.as_ref()) {
                 return PollerStart::Started;
             }
             // A launch can replace the execution without tearing the poller down first, and the
@@ -461,7 +461,11 @@ impl Instance {
             None
         };
 
-        let mut poller = SessionPoller::new(tmux_session_name, self.active_execution.clone());
+        let mut poller = SessionPoller::new(
+            tmux_session_name,
+            self.tool.clone(),
+            self.active_execution.clone(),
+        );
         let instance_id = self.id.clone();
         let initial_known = self.agent_session_id.clone().filter(|_| {
             self.agent_session_binding
@@ -669,14 +673,14 @@ impl Instance {
         self.install_poller(poller, spawn)
     }
 
-    /// Whether the poller this row holds watches `execution`, the execution the row is taking on.
-    /// A row with no poller has none to watch, whatever it used to hold.
-    pub(crate) fn poller_serves(&self, execution: Option<&ActiveExecution>) -> bool {
+    /// Whether the poller this row holds watches `tool` on `execution`, which is what the row is
+    /// taking on. A row with no poller has none to watch, whatever it used to hold.
+    pub(crate) fn poller_serves(&self, tool: &str, execution: Option<&ActiveExecution>) -> bool {
         self.session_id_poller.as_ref().is_some_and(|poller| {
             poller
                 .lock()
-                .map(|guard| guard.serves(execution))
-                .unwrap_or_else(|poisoned| poisoned.into_inner().serves(execution))
+                .map(|guard| guard.serves(tool, execution))
+                .unwrap_or_else(|poisoned| poisoned.into_inner().serves(tool, execution))
         })
     }
 
@@ -687,7 +691,7 @@ impl Instance {
     /// Call once the row's own execution is settled, which is what the handoff may replace: asked
     /// against the execution the row still held, it would refuse the handoff's poller and stop it.
     pub(crate) fn adopt_poller(&mut self, handoff: &Self) {
-        if handoff.poller_serves(self.active_execution.as_ref()) {
+        if handoff.poller_serves(&self.tool, self.active_execution.as_ref()) {
             self.session_id_poller = handoff.session_id_poller.clone();
         } else {
             handoff.stop_poller();
@@ -709,19 +713,24 @@ impl Instance {
     /// for another execution reads files the row no longer owns, so its thread stops here rather
     /// than being reported as a start for this row.
     pub(crate) fn settle_poller_for(&mut self, execution: Option<&ActiveExecution>) {
-        if !self.poller_serves(execution) {
+        if !self.poller_serves(&self.tool, execution) {
             self.stop_poller();
             self.session_id_poller = None;
         }
     }
 
-    /// Drop the repair schedule when the relaunch replaced the pane it paced. The start-time
-    /// stamp is the only signal that separates a launch that got far enough to re-evaluate the
-    /// row from one that died earlier and says nothing about it; a relaunch that stamps may still
-    /// have installed no poller, and the schedule goes either way.
-    pub(crate) fn reset_poller_repair_for_replaced_pane(&mut self, before: &Self, launched: &Self) {
-        if launched.last_start_time != before.last_start_time {
+    /// Take everything a relaunch offers the row's poller state: the handle, and the timing the
+    /// launch measured for the execution the row now holds. Both timing writes share one gate,
+    /// because a launch only speaks for the row once it stamped its start, which it does after
+    /// re-evaluating the row's capture. An unstamped launch has not re-evaluated anything, and a
+    /// launch whose execution the row refused speaks for a pane this row does not have.
+    pub(crate) fn adopt_relaunch_poller_state(&mut self, before: &Self, launched: &Self) {
+        self.adopt_poller(launched);
+        if launched.last_start_time != before.last_start_time
+            && self.active_execution == launched.active_execution
+        {
             self.poller_repair.reset();
+            self.session_id_poller_retry_after = launched.session_id_poller_retry_after;
         }
     }
 
@@ -1010,6 +1019,10 @@ mod tests {
             .poller_repair
             .armed_at()
             .expect("a re-probe arms a deadline");
+        assert!(
+            !inst.poller_repair.due(std::time::Instant::now()),
+            "the armed window has not expired"
+        );
         let probing = probing.lock().unwrap().expect("the start path ran");
         assert_eq!(
             inst.poller_repair.current_reprobe_delay(),
@@ -1061,7 +1074,7 @@ mod tests {
         );
         assert!(
             inst.session_id_poller_retry_after.is_none(),
-            "nothing to poll borrows no managed-store deadline"
+            "fixture: this row has not reached a managed store, so it holds no deadline"
         );
 
         // Four more walks must leave the delay at its first value: a walk that reached the
@@ -1527,7 +1540,11 @@ mod tests {
         // Present but not running, so the running check does not
         // short-circuit and the handle stays observable.
         inst.session_id_poller = Some(std::sync::Arc::new(std::sync::Mutex::new(
-            crate::session::poller::SessionPoller::new("unstarted".to_string(), None),
+            crate::session::poller::SessionPoller::new(
+                "unstarted".to_string(),
+                "claude".to_string(),
+                None,
+            ),
         )));
 
         assert!(!inst.repair_session_id_poller_if_needed(&snapshot));
@@ -1844,6 +1861,7 @@ mod tests {
         let mut inst = Instance::new("foreign-poller", "/tmp/foreign-poller");
         let mut poller = crate::session::poller::SessionPoller::new(
             format!("test-tmux-{}", inst.id),
+            inst.tool.clone(),
             Some(execution()),
         );
         assert_eq!(

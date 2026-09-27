@@ -1078,8 +1078,7 @@ pub(super) fn apply_post_restart_identity_sync(
             live.adopt_active_execution(started);
         }
     }
-    live.adopt_poller(started);
-    live.reset_poller_repair_for_replaced_pane(before, started);
+    live.adopt_relaunch_poller_state(before, started);
     if generation_can_merge && marker_unchanged && live.agent_session_id == started.agent_session_id
     {
         live.resume_probe_failed_sid = started.resume_probe_failed_sid.clone();

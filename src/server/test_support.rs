@@ -174,6 +174,7 @@ pub async fn drain_session_id_updates_for_test(state: &Arc<AppState>) {
 pub fn attach_session_id_update_for_test(inst: &mut Instance, sid: &str) {
     let poller = crate::session::poller::SessionPoller::new(
         format!("test-tmux-{}", inst.id),
+        inst.tool.clone(),
         inst.active_execution.clone(),
     );
     poller.inject_test_update(&inst.id, sid);
