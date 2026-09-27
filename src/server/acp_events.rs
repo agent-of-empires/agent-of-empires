@@ -389,6 +389,7 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
         };
         let observed_for_save = observed.clone();
 
+        let observed_mirror = observed.clone();
         let mut canonical_changed = false;
         // Acquire `instances` once for both branches. Releases before
         // the (potentially blocking) sessions.json save.
@@ -434,16 +435,13 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
             let unread_profile =
                 should_mark_acp_unread(inst, old_status, crate::session::unread_enabled())
                     .then(|| inst.source_profile.clone());
-            // Stamped before `apply_acp_session_change`, whose same-id arm
-            // returns without touching the row: a first `session/load`
-            // reattaching a legacy session must still attest the route its
-            // launch observed.
-            let attested = inst.attest_launch_default_store(observed.as_ref());
-            canonical_changed |= attested;
             let profile_to_save =
                 apply_acp_session_change(inst, &frame.session_id, acp_change.as_ref());
             canonical_changed |= profile_to_save.is_some();
-            let attested_profile = attested.then(|| inst.source_profile.clone());
+            // An attestation alone still has to reach the disk: the durable
+            // write below stamps it, and the mirror is only allowed to show it
+            // once that write has landed.
+            let attested_profile = observed.as_ref().map(|_| inst.source_profile.clone());
             (profile_to_save, unread_profile, attested_profile)
         };
         if canonical_changed {
@@ -517,7 +515,15 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
             })
             .await;
             match save_result {
-                Ok(Ok(())) => {}
+                Ok(Ok(())) => {
+                    // The saved row is the durable one; the mirror may only
+                    // attest what has actually been written, never a marker the
+                    // next reload would drop.
+                    let mut instances = state.instances.write().await;
+                    if let Some(inst) = instances.iter_mut().find(|i| i.id == frame.session_id) {
+                        inst.attest_launch_default_store(observed_mirror.as_ref());
+                    }
+                }
                 Ok(Err(e)) => {
                     tracing::warn!(
                         target: "acp.event_listener",
