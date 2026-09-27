@@ -17,13 +17,15 @@ use tokio::sync::{broadcast, RwLock};
 
 static RUNTIME_ENV_LOCK: Mutex<()> = Mutex::new(());
 
-struct RuntimeEnvGuard {
+pub struct RuntimeEnvGuard {
     previous: Option<OsString>,
     _lock: MutexGuard<'static, ()>,
 }
 
 impl RuntimeEnvGuard {
-    fn set(value: &Path) -> Self {
+    /// Point `XDG_CONFIG_HOME` at `value` for as long as the guard lives, and
+    /// hold the environment lock so two writers cannot interleave.
+    pub fn set(value: &Path) -> Self {
         let lock = RUNTIME_ENV_LOCK
             .lock()
             .unwrap_or_else(PoisonError::into_inner);

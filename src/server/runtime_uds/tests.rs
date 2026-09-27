@@ -13,10 +13,12 @@ use std::path::{Path, PathBuf};
 use super::*;
 
 /// A private temporary XDG base plus the environment binding that points the
-/// app dir, and therefore both the publisher and the client, at it.
+/// app dir, and therefore both the publisher and the client, at it. The
+/// binding is the environment rather than a test-only override inside
+/// `get_app_dir`, which every other unit test in this process also reads.
 struct Namespace {
     base: tempfile::TempDir,
-    _guard: crate::session::test_support::RuntimeAppDirGuard,
+    _guard: crate::server::test_support::RuntimeEnvGuard,
 }
 
 impl Namespace {
@@ -51,9 +53,7 @@ fn namespace() -> Option<Namespace> {
         let Ok(base) = tempfile::tempdir_in(&base) else {
             continue;
         };
-        let guard = crate::session::test_support::RuntimeAppDirGuard::set(
-            &base.path().join(crate::session::APP_DIR_NAME_XDG),
-        );
+        let guard = crate::server::test_support::RuntimeEnvGuard::set(base.path());
         return Some(Namespace {
             base,
             _guard: guard,

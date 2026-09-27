@@ -1677,13 +1677,21 @@ pub(crate) enum MountResolve {
     Fallthrough,
 }
 
-pub(crate) fn container_workdir_for(project_path: &str, pinned: Option<&str>) -> String {
+pub(crate) fn container_workdir_for(
+    project_path: &str,
+    pinned: Option<&str>,
+    workspace_info: Option<&crate::session::WorkspaceInfo>,
+) -> String {
     if let Some(pinned) = pinned {
         return pinned.to_owned();
     }
-    compute_volume_paths(Path::new(project_path), project_path)
-        .map(|(_, wd)| wd)
-        .unwrap_or_else(|_| "/workspace".to_string())
+    let workdir = if let Some(workspace_info) = workspace_info {
+        compute_workspace_volume_paths(Path::new(project_path), workspace_info)
+            .map(|(_, workdir)| workdir)
+    } else {
+        compute_volume_paths(Path::new(project_path), project_path).map(|(_, workdir)| workdir)
+    };
+    workdir.unwrap_or_else(|_| "/workspace".to_string())
 }
 
 pub(crate) fn compute_volume_paths(
@@ -4313,6 +4321,36 @@ mod tests {
                 .find(|mount| mount.tool_name == "claude")
                 .unwrap()
         }
+    }
+
+    #[test]
+    fn workspace_workdir_uses_the_multi_repo_mount_layout() {
+        let workspace = crate::session::WorkspaceInfo {
+            branch: "main".into(),
+            workspace_dir: "/home/u/ws".into(),
+            repos: vec![crate::session::WorkspaceRepo {
+                name: "repo".into(),
+                source_path: "/mnt/repo".into(),
+                branch: "main".into(),
+                worktree_path: "/home/u/ws/repo".into(),
+                main_repo_path: "/mnt/repo".into(),
+                managed_by_aoe: true,
+                branch_preexisting: false,
+                base_branch: None,
+                base_branch_override: None,
+            }],
+            created_at: chrono::Utc::now(),
+            cleanup_on_delete: true,
+        };
+
+        assert_eq!(
+            container_workdir_for("/home/u/ws", None, Some(&workspace)),
+            "/workspace/home/u/ws"
+        );
+        assert_eq!(
+            container_workdir_for("/home/u/ws", Some("/pinned/workdir"), Some(&workspace)),
+            "/pinned/workdir"
+        );
     }
 
     #[test]
