@@ -776,10 +776,17 @@ mod tests {
                 false,
             )
             .expect("the Pi sidecar publishes a valid observation");
-            if !publish_transcript {
-                assert!(observed.conversation_key().is_none());
-                assert!(observed.conversation_binding().is_none());
-            }
+            // The two cases must differ, or the test would not pin the fix: only
+            // a published transcript qualifies the claim.
+            assert_eq!(
+                observed.conversation_key().is_some(),
+                publish_transcript,
+                "{case} must decide ownership from the transcript, not from the id"
+            );
+            assert_eq!(
+                observed.conversation_binding().is_some(),
+                publish_transcript
+            );
             assert_eq!(
                 persist_session_with_storage(
                     &storage,

@@ -394,10 +394,12 @@ fn drain_and_persist_session_ids_inner(
                 to_apply.push(update);
             }
             SidWrite::OwnershipConflict => {
-                // A durable owner keeps this id for good: re-arming the poller would
-                // rewrite the whole registry under flock on every tick for a claim
-                // that keeps losing. Acknowledge, and leave a trace: without one, a
-                // refused pane is indistinguishable from one that never published.
+                // The owner holds this sid until it releases it, and the loser
+                // only offers a new value when its pane publishes one, so
+                // re-arming here would rewrite the whole registry under flock on
+                // every tick for a claim that keeps losing. Acknowledge, and leave
+                // a trace: without one, a refused pane is indistinguishable from
+                // one that never published.
                 tracing::debug!(
                     target: "session.sync",
                     instance = %update.id,
