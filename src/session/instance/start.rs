@@ -220,6 +220,11 @@ impl Instance {
                 self.id
             );
         }
+
+        // A takeover can replace the pane without changing the agent or the execution, and a poller
+        // for either would then be watching the pane this launch is replacing.
+        self.stop_poller();
+        self.session_id_poller = None;
         if !self.is_sandboxed() {
             self.install_agent_status_hooks(self.status_agent(), prepared.execution.as_ref());
         }

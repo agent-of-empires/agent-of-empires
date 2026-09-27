@@ -107,6 +107,9 @@ impl Instance {
     /// it.
     pub(super) fn kill_clean_locked(&self) -> Result<()> {
         let session = self.tmux_session()?;
+        // The poller watches this pane, so it goes before the pane does, whether or not the pane
+        // is still there to kill.
+        self.stop_poller();
         if !session.exists() {
             return Ok(());
         }
@@ -665,5 +668,70 @@ mod tests {
         assert_eq!(row.resume_intent, ResumeIntent::Use(pinned.into()));
         assert_eq!(row.status, Status::Stopped);
         assert!(!sidecar.exists());
+    }
+
+    /// A takeover relaunch can replace the row's pane while its old poller keeps the same agent and
+    /// the same absence of execution, so identity alone accepts it. The pane is what tells the two
+    /// apart, and the poller goes before the pane does.
+    #[test]
+    #[serial_test::serial]
+    fn tearing_down_a_pane_stops_the_poller_watching_it() {
+        if crate::tmux::tmux_command()
+            .arg("-V")
+            .output()
+            .map(|o| !o.status.success())
+            .unwrap_or(true)
+        {
+            eprintln!("tmux not available; skipping");
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let profile = "pane-teardown-stops-poller";
+        let storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
+        let mut inst = Instance::new("pane-teardown", "/tmp/test");
+        inst.source_profile = profile.to_string();
+        storage
+            .update(|instances, _groups| {
+                instances.push(inst.clone());
+                Ok(())
+            })
+            .unwrap();
+
+        let name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
+        let _ = crate::tmux::tmux_command()
+            .args(["kill-session", "-t", &name])
+            .output();
+        let created = crate::tmux::tmux_command()
+            .args(["new-session", "-d", "-s", &name, "-x", "80", "-y", "24"])
+            .output()
+            .expect("tmux");
+        assert!(created.status.success(), "the test needs a real pane");
+
+        let mut poller = crate::session::poller::SessionPoller::new(
+            name.clone(),
+            inst.tool.clone(),
+            inst.active_execution.clone(),
+        );
+        assert_eq!(
+            poller.start(inst.id.clone(), Box::new(|| None), Box::new(|_| {}), None,),
+            crate::session::poller::PollerSpawn::Spawned
+        );
+        inst.session_id_poller = Some(std::sync::Arc::new(std::sync::Mutex::new(poller)));
+        assert!(
+            inst.session_id_poller_is_running(),
+            "fixture: it is running"
+        );
+        assert!(
+            inst.active_execution.is_none(),
+            "fixture: no execution on either side"
+        );
+
+        let _ = inst.kill_clean_locked();
+
+        assert!(
+            !inst.session_id_poller_is_running(),
+            "the poller stops before the pane it watches does"
+        );
     }
 }
