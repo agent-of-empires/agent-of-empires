@@ -10,6 +10,12 @@ pub(crate) enum SidWrite {
     /// Disk diverged (peer wrote between caller's read and this write);
     /// caller should reload the in-memory mirror from disk.
     Skipped,
+    /// A different durable row already owns this sid, so the lease is not up
+    /// for grabs and no write occurred. The capture observation can be
+    /// acknowledged; the owner keeps the id until it releases it.
+    /// A pin confirmation stays `Skipped` instead: the launch that armed the pin
+    /// is still waiting to prove ownership.
+    OwnershipConflict,
     /// I/O failure or row gone from disk; in-memory mirror is unchanged.
     Failed,
     /// Deterministic refusal, not a race: the row pins a different
@@ -106,17 +112,14 @@ pub(super) fn persist_session_with_storage(
                 return Ok(SidWrite::Skipped);
             }
         }
-        if instance.is_capture_excluded(session_id, observation.source.as_ref()) {
+        if instance.is_capture_excluded(session_id, observation.source()) {
             return Ok(SidWrite::Skipped);
         }
         let owns = |sid: Option<&str>, owner: Option<&ConversationBinding>| {
             sid == Some(session_id)
-                && crate::session::capture::owner_excludes(
-                    observation.source.as_ref(),
-                    owner,
-                    session_id,
-                )
+                && crate::session::capture::owner_excludes(observation.source(), owner, session_id)
         };
+        let confirms_pin = observation.confirms_omp_pin(&instance.resume_intent);
         let conflict = instances.iter().any(|peer| {
             peer.id != instance_id
                 && (owns(
@@ -130,21 +133,23 @@ pub(super) fn persist_session_with_storage(
                 }))
         });
         if conflict {
-            return Ok(SidWrite::Skipped);
+            // A pin confirmation is not a fresh claim: the row armed the pin and
+            // must be able to re-prove it, so it keeps the retryable outcome.
+            return Ok(if confirms_pin {
+                SidWrite::Skipped
+            } else {
+                SidWrite::OwnershipConflict
+            });
         }
+        let pi_session_path = instance.observed_pi_session_path(observation);
         let instance = &mut instances[index];
-        let confirms_pin = observation.confirms_omp_pin(&instance.resume_intent);
         // A source-less observation of the id the row already holds is not
         // evidence that a conversation qualified, nor that a failed resume now
         // works; keep the binding and the loop breaker.
         let establishes = binding.is_some();
         let new_conversation = instance.agent_session_id.as_deref() != Some(session_id);
         let binding = binding.or_else(|| instance.observed_binding(observation));
-        instance.set_agent_conversation(
-            Some(session_id.into()),
-            binding,
-            observation.pi_session_path.clone(),
-        );
+        instance.set_agent_conversation(Some(session_id.into()), binding, pi_session_path);
         if establishes || new_conversation {
             instance.resume_probe_failed_sid = None;
         }
@@ -379,7 +384,9 @@ impl Instance {
                 }
                 SidPersistOutcome::Published
             }
-            Ok(SidWrite::Skipped) | Ok(SidWrite::PinnedForeign) => match storage.load() {
+            Ok(SidWrite::Skipped)
+            | Ok(SidWrite::OwnershipConflict)
+            | Ok(SidWrite::PinnedForeign) => match storage.load() {
                 Ok(insts) => match insts.into_iter().find(|i| i.id == self.id) {
                     Some(disk) => {
                         self.adopt_conversation_state(disk.conversation_state());
@@ -543,13 +550,70 @@ mod tests {
 
     #[test]
     #[serial]
+    fn omp_pin_confirmation_keeps_retrying_an_ownership_conflict() {
+        use crate::session::instance::ActiveExecution;
+        use crate::session::{ConversationBinding, ConversationProvenance, ExecutionBinding};
+
+        let profile = "sid-omp-pin-conflict";
+        let generation = "019342ab-1234-7def-8901-999999999999";
+        let source = ExecutionBinding {
+            agent: "omp".into(),
+            stores: vec!["/tmp/omp-store".into()],
+            configuration: Vec::new(),
+            exported_default_store: Some(false),
+            cwd: "/tmp/x".into(),
+            cwd_filesystem: "host".into(),
+            filesystem: "host".into(),
+        };
+        let conversation = ConversationBinding {
+            session_id: VALID_SID.into(),
+            execution: Some(source.clone()),
+            provenance: ConversationProvenance::Observed,
+            transcript_path: None,
+        };
+        let mut owner = make_inst(profile, "owner");
+        owner.set_agent_conversation(Some(VALID_SID.into()), Some(conversation.clone()), None);
+        let mut claimant = make_inst(profile, "pin-confirmation");
+        claimant.tool = "omp".into();
+        claimant.agent_session_id = Some(VALID_SID.into());
+        claimant.agent_session_binding = Some(conversation.clone());
+        claimant.resume_intent = ResumeIntent::Use(VALID_SID.into());
+        claimant.resume_binding = Some(conversation);
+        claimant.omp_capture_generation = Some(generation.into());
+        claimant.active_execution = Some(ActiveExecution {
+            launch_id: generation.into(),
+            binding: source.clone(),
+            capture: None,
+            container: None,
+        });
+        let (_temp, _home, storage) = seeded(profile, &[&owner, &claimant]);
+        let mut observed =
+            crate::session::poller::SessionIdObservation::omp(VALID_SID.into(), generation.into());
+        observed.execution = claimant.active_execution.clone();
+        observed.scope_to(source);
+        assert!(observed.confirms_omp_pin(&claimant.resume_intent));
+
+        assert_eq!(
+            persist_session_with_storage(
+                &storage,
+                &claimant.id,
+                &observed,
+                &claimant.conversation_state(),
+            ),
+            SidWrite::Skipped,
+            "an unproven pin must remain retryable"
+        );
+    }
+
+    #[test]
+    #[serial]
     fn foreign_and_parked_owners_guard_published_sid_by_namespace() {
         use crate::session::instance::{ActiveExecution, PriorToolSession};
         use crate::session::{ConversationBinding, ConversationProvenance, ExecutionBinding};
         let sid = VALID_SID;
         for (namespace, expected) in [
-            ("same", SidWrite::Skipped),
-            ("unknown", SidWrite::Skipped),
+            ("same", SidWrite::OwnershipConflict),
+            ("unknown", SidWrite::OwnershipConflict),
             ("different", SidWrite::Applied),
         ] {
             let profile = "sid-parked-owner-namespace";
@@ -597,7 +661,7 @@ mod tests {
             let (_tmp, _home, storage) = seeded(profile, &[&parked, &claimant]);
             let mut observed = observation(sid);
             observed.execution = claimant.active_execution.clone();
-            observed.source = Some(source);
+            observed.scope_to(source);
             assert_eq!(
                 persist_session_to_storage(
                     profile,
@@ -625,19 +689,161 @@ mod tests {
         let mut owner = make_inst(profile, "owner");
         owner.agent_session_id = Some(sid.into());
         let claimant = make_inst(profile, "claimant");
-        let (_tmp, _home, _) = seeded(profile, &[&owner, &claimant]);
+        let (_tmp, _home, storage) = seeded(profile, &[&owner, &claimant]);
         assert_eq!(
-            persist_session_to_storage(
-                profile,
+            persist_session_with_storage(
+                &storage,
                 &claimant.id,
                 &observation(sid),
                 &claimant.conversation_state(),
-                &FileWatchService::noop()
             ),
-            SidWrite::Skipped
+            SidWrite::OwnershipConflict
         );
         assert_eq!(disk_sid(profile, &claimant.id), None);
         assert_eq!(disk_sid(profile, &owner.id).as_deref(), Some(sid));
+    }
+
+    #[test]
+    #[serial]
+    fn pi_ownership_is_stable_before_and_after_transcript_publication() {
+        use crate::session::instance::{ActiveExecution, CaptureContext, SessionSidecarSource};
+        use crate::session::{ConversationBinding, ConversationProvenance, ExecutionBinding};
+
+        let sid = VALID_SID;
+        let launch = "22222222-3333-4333-8444-555555555555";
+
+        for (case, publish_transcript) in [("id-only", false), ("with-transcript", true)] {
+            let (_hooks, _base, _hooks_tmp) = crate::hooks::test_support::BaseGuard::ready();
+            let profile = format!("sid-pi-{case}");
+            let root = tempdir().unwrap();
+            // The reader canonicalizes the published path, so the capture root must be canonical
+            // too: a symlinked TMPDIR otherwise fails the containment check.
+            let root = crate::session::capture::canonicalize_or_raw(root.path().to_str().unwrap());
+            let transcript_parent = root.join("sessions/project");
+            let transcript =
+                transcript_parent.join(format!("2026-01-01T00-00-00-000Z_{sid}.jsonl"));
+            std::fs::create_dir_all(&transcript_parent).unwrap();
+            std::fs::write(
+                &transcript,
+                format!("{}\n", serde_json::json!({"type": "session", "id": sid})),
+            )
+            .unwrap();
+            let binding = ExecutionBinding {
+                agent: "pi".into(),
+                stores: vec![root.clone()],
+                configuration: Vec::new(),
+                exported_default_store: Some(false),
+                cwd: root.clone(),
+                cwd_filesystem: "host".into(),
+                filesystem: "host".into(),
+            };
+            let owner_binding = ConversationBinding {
+                session_id: sid.into(),
+                execution: Some(ExecutionBinding {
+                    stores: vec![transcript_parent.clone()],
+                    ..binding.clone()
+                }),
+                provenance: ConversationProvenance::Observed,
+                transcript_path: Some(transcript.clone()),
+            };
+            let mut owner = make_inst(&profile, "owner");
+            owner.set_agent_conversation(Some(sid.into()), Some(owner_binding), None);
+            let mut claimant = make_inst(&profile, "claimant");
+            let sidecar_source = SessionSidecarSource::host_hooks(&claimant.id);
+            claimant.active_execution = Some(ActiveExecution {
+                launch_id: launch.into(),
+                binding: binding.clone(),
+                capture: Some(CaptureContext::Pi {
+                    source: sidecar_source.clone(),
+                    root: root.clone(),
+                }),
+                container: None,
+            });
+            let (_temp, _home, storage) = seeded(&profile, &[&owner, &claimant]);
+            crate::hooks::write_session_id_via_guard(&claimant.id, sid, Some(launch)).unwrap();
+            if publish_transcript {
+                let sidecar = crate::hooks::ensure_instance_dir_path(&claimant.id).unwrap();
+                std::fs::write(
+                    sidecar.join(format!("session_path.{launch}")),
+                    transcript.to_string_lossy().as_bytes(),
+                )
+                .unwrap();
+            }
+            let observed = crate::session::capture::read_pi_session_observation(
+                &claimant.id,
+                &sidecar_source,
+                claimant.active_execution.as_ref(),
+                false,
+            )
+            .expect("the Pi sidecar publishes a valid observation");
+            // The two cases must differ, or the test would not pin the fix: only
+            // a published transcript qualifies the claim.
+            assert_eq!(
+                observed.conversation_key().is_some(),
+                publish_transcript,
+                "{case} must decide ownership from the transcript, not from the id"
+            );
+            assert_eq!(
+                observed.conversation_binding().is_some(),
+                publish_transcript
+            );
+            assert_eq!(
+                persist_session_with_storage(
+                    &storage,
+                    &claimant.id,
+                    &observed,
+                    &claimant.conversation_state(),
+                ),
+                SidWrite::OwnershipConflict,
+                "{case} must not change the one-owner decision"
+            );
+            assert_eq!(disk_sid(&profile, &owner.id).as_deref(), Some(sid));
+            assert_eq!(disk_sid(&profile, &claimant.id), None);
+        }
+
+        let (_hooks, _base, _hooks_tmp) = crate::hooks::test_support::BaseGuard::ready();
+        let profile = "sid-pi-unclaimed";
+        let root = tempdir().unwrap();
+        let root = root.path().to_path_buf();
+        let binding = ExecutionBinding {
+            agent: "pi".into(),
+            stores: vec![root.clone()],
+            configuration: Vec::new(),
+            exported_default_store: Some(false),
+            cwd: root.clone(),
+            cwd_filesystem: "host".into(),
+            filesystem: "host".into(),
+        };
+        let mut claimant = make_inst(profile, "claimant");
+        let sidecar_source = SessionSidecarSource::host_hooks(&claimant.id);
+        claimant.active_execution = Some(ActiveExecution {
+            launch_id: launch.into(),
+            binding: binding.clone(),
+            capture: Some(CaptureContext::Pi {
+                source: sidecar_source.clone(),
+                root: root.clone(),
+            }),
+            container: None,
+        });
+        let (_temp, _home, storage) = seeded(profile, &[&claimant]);
+        crate::hooks::write_session_id_via_guard(&claimant.id, sid, Some(launch)).unwrap();
+        let observed = crate::session::capture::read_pi_session_observation(
+            &claimant.id,
+            &sidecar_source,
+            claimant.active_execution.as_ref(),
+            false,
+        )
+        .expect("the unclaimed Pi ID is capturable before publication");
+        assert_eq!(
+            persist_session_with_storage(
+                &storage,
+                &claimant.id,
+                &observed,
+                &claimant.conversation_state(),
+            ),
+            SidWrite::Applied,
+            "an unclaimed ID remains capturable before publication"
+        );
     }
 
     #[test]
@@ -902,7 +1108,7 @@ mod tests {
         let (_temp, _home, storage) = seeded(profile, &[&inst]);
         let observation = crate::session::poller::SessionIdObservation {
             execution: Some(active),
-            source: Some(binding(Some(true))),
+            claim: crate::session::poller::ConversationClaim::Scoped(binding(Some(true))),
             ..observation(VALID_SID)
         };
 

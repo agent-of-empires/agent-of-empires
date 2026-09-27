@@ -613,7 +613,7 @@ impl Instance {
             let mut observation =
                 crate::session::poller::SessionIdObservation::instance_sidecar(poll_fn()?, None);
             if let Some(active) = &active {
-                observation.source = Some(active.binding.clone());
+                observation.scope_to(active.binding.clone());
                 observation.execution = Some(active.clone());
             }
             Some(observation)

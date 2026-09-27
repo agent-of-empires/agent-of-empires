@@ -1395,6 +1395,12 @@ fn stage_receipt(
     if receipt.phase != Phase::Planned {
         return Ok(());
     }
+    let workspace_info = receipt
+        .retired_identity
+        .get("workspace_info")
+        .filter(|value| !value.is_null())
+        .map(|value| serde_json::from_value(value.clone()))
+        .transpose()?;
     let container_workdir = container_config::container_workdir_for(
         workspace
             .to_str()
@@ -1403,6 +1409,7 @@ fn stage_receipt(
             .retired_identity
             .pointer("/sandbox_info/container_workdir")
             .and_then(Value::as_str),
+        workspace_info.as_ref(),
     );
     for part in &mut receipt.roots {
         if let Some(published) = &part.published {
@@ -2085,6 +2092,12 @@ fn migrate_target(
             .context("sandbox row has no project path")?,
     );
     stage_receipt(app, &mut receipt, &path, home, &config, workspace)?;
+    #[cfg(test)]
+    AFTER_STAGE_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook(registry, id);
+        }
+    });
     transition = Some(crate::session::acquire_storage_flock(app, layout::LOCK)?);
     registries = Some(lock_registries(app)?);
     let fresh_config = crate::session::config::profile_config::resolve_config(&profile)?;
@@ -2118,6 +2131,7 @@ fn migrate_target(
         .any(|field| current.get(*field) != row.get(*field))
         || current.pointer("/sandbox_info/container_workdir")
             != row.pointer("/sandbox_info/container_workdir")
+        || current.get("workspace_info") != receipt.retired_identity.get("workspace_info")
     {
         // A container could have started after the stage was seeded, so the
         // seed is dropped with the plan it was made for.
@@ -2241,6 +2255,15 @@ struct TestReconcileProbes {
     running: fn(&str) -> Result<bool>,
     reap: fn(&str) -> Result<bool>,
     exposure: fn(&str) -> Result<Vec<PathBuf>>,
+}
+
+#[cfg(test)]
+type AfterStageHook = fn(&Path, &str);
+
+#[cfg(test)]
+thread_local! {
+    static AFTER_STAGE_HOOK: std::cell::RefCell<Option<AfterStageHook>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]
@@ -2443,6 +2466,74 @@ pub(crate) fn guard_preparation(
 mod tests {
     use super::*;
 
+    fn mutate_workspace_after_stage(registry: &Path, id: &str) {
+        let mut rows: Vec<Value> = serde_json::from_slice(&fs::read(registry).unwrap()).unwrap();
+        let row = rows
+            .iter_mut()
+            .find(|row| row.get("id").and_then(Value::as_str) == Some(id))
+            .unwrap();
+        row["workspace_info"]["repos"] = serde_json::json!([{"main_repo_path": "/new/repo"}]);
+        fs::write(registry, serde_json::to_vec(&rows).unwrap()).unwrap();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn workspace_change_after_staging_discards_the_stage() {
+        let temporary = tempfile::tempdir().unwrap();
+        let _environment = crate::session::test_support::isolate_app_dir_at(temporary.path());
+        let home = dirs::home_dir().unwrap();
+        let app = crate::session::get_app_dir().unwrap();
+        let project = temporary.path().join("project");
+        fs::create_dir_all(&project).unwrap();
+        let mut instance = crate::session::Instance::new("codex", project.to_str().unwrap());
+        instance.tool = "codex".into();
+        instance.agent_session_id = Some("old-native-context".into());
+        let config = crate::session::Config::default();
+        let roots = container_config::sandbox_content_roots(
+            "codex",
+            None,
+            &config.session,
+            &home,
+            &instance.id,
+        )
+        .unwrap();
+        let root = &roots[0].path;
+        fs::create_dir_all(root.join("sessions")).unwrap();
+        fs::write(root.join("sessions/original.jsonl"), b"PRIVATE_NATIVE").unwrap();
+        let mut row = serde_json::to_value(&instance).unwrap();
+        row["sandbox_info"] = serde_json::json!({
+            "enabled": true,
+            "image": "img",
+            "container_name": "aoe-sandbox-fixture",
+        });
+        row["workspace_info"] = serde_json::json!({
+            "branch": "main",
+            "workspace_dir": project.to_string_lossy(),
+            "repos": [],
+            "created_at": chrono::Utc::now().to_rfc3339(),
+            "cleanup_on_delete": true,
+        });
+        let registry = app.join("sessions.json");
+        fs::write(&registry, serde_json::to_vec(&vec![row]).unwrap()).unwrap();
+        AFTER_STAGE_HOOK.with(|hook| *hook.borrow_mut() = Some(mutate_workspace_after_stage));
+        let result = migrate_target(
+            &app,
+            &home,
+            (registry.as_path(), instance.id.as_str(), "codex"),
+            &|_| Ok(false),
+            &|_| Ok(true),
+            &|_| Ok(Vec::new()),
+        )
+        .unwrap();
+        AFTER_STAGE_HOOK.with(|hook| *hook.borrow_mut() = None);
+
+        assert!(!result, "workspace drift must invalidate the staged carry");
+        let receipt = read_receipt(&receipt_path(&app, &instance.id, "codex").unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(receipt.phase, Phase::Planned);
+        assert!(identity(&receipt.roots[0].stage).unwrap().is_none());
+    }
     struct SyncFailureGuard;
 
     impl Drop for SyncFailureGuard {
