@@ -770,7 +770,7 @@ pub fn build_instance(
                 if let Some(parent_agent) = unattributed_parent_agent.as_deref() {
                     let launched = Instance::execution_agent_for(
                         &instance.tool,
-                        &instance.command,
+                        instance.get_tool_command(),
                         &config.session,
                     )
                     .map_err(anyhow::Error::msg)?;

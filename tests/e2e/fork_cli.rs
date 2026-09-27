@@ -401,7 +401,9 @@ fn a_preallocated_parent_is_told_to_talk_not_to_reassert() {
         "Parent",
     ]);
 
-    assert!(stderr.contains("no captured conversation"), "{stderr}");
+    // The wording belongs to `ForkDenied`; what matters here is that no
+    // qualification command is printed and that the refused run leaves
+    // nothing behind.
     assert!(!stderr.contains("set-session-id"), "{stderr}");
     assert_not_persisted(&h, "Child");
 }

@@ -697,7 +697,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                 if let Some(parent_agent) = unattributed_parent_agent.as_deref() {
                     let launched = crate::session::Instance::execution_agent_for(
                         &instance.tool,
-                        &instance.command,
+                        instance.get_tool_command(),
                         &config.session,
                     )
                     .map_err(anyhow::Error::msg)?;
