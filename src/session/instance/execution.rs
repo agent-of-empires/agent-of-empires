@@ -1006,7 +1006,7 @@ pub(super) fn hook_session_observation(
     }
     let mut observation = crate::session::poller::SessionIdObservation::instance_sidecar(sid, None);
     observation.execution = Some(active.clone());
-    observation.source = Some(active.binding.clone());
+    observation.scope_to(active.binding.clone());
     Some(observation)
 }
 
@@ -2263,20 +2263,22 @@ impl Instance {
         })
     }
 
-    /// A Pi ID-only observation may refresh the SID without erasing the path
-    /// already published for that same conversation.
+    /// A sidecar observation that named no transcript may refresh the SID without
+    /// erasing the path already published for that same conversation.
     pub(super) fn observed_pi_session_path(
         &self,
         observation: &crate::session::poller::SessionIdObservation,
     ) -> Option<String> {
         observation.pi_session_path.clone().or_else(|| {
-            let id_only_pi = observation.source.is_none()
+            let id_only_sidecar = observation.source().is_none()
                 && matches!(
                     &observation.guard,
                     crate::session::poller::SessionIdGuard::InstanceSidecar { transcript: None }
                 )
                 && self.agent_session_id.as_deref() == Some(observation.sid.as_str());
-            id_only_pi.then(|| self.pi_session_path.clone()).flatten()
+            id_only_sidecar
+                .then(|| self.pi_session_path.clone())
+                .flatten()
         })
     }
 

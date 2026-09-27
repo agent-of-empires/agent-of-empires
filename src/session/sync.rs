@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 
 use crate::file_watch::FileWatchService;
 use crate::session::capture::validated_session_id;
+use crate::session::instance::ConversationKey;
 use crate::session::poller::{SessionIdGuard, SessionIdObservation};
 use crate::session::storage::Storage;
 use crate::session::{persist_session_to_storage, Instance, ResumeIntent, SidWrite, Status};
@@ -184,7 +185,7 @@ fn drain_and_persist_session_ids_inner(
                 filtered_ids.insert(inst.id.clone());
                 continue;
             }
-            if inst.is_capture_excluded(&sid, observation.source.as_ref()) {
+            if inst.is_capture_excluded(&sid, observation.source()) {
                 tracing::debug!(
                     target: "session.sync",
                     instance = %inst.id,
@@ -196,10 +197,7 @@ fn drain_and_persist_session_ids_inner(
                 continue;
             }
         }
-        let same_binding = match (
-            observation.source.as_ref(),
-            inst.agent_session_binding.as_ref(),
-        ) {
+        let same_binding = match (observation.source(), inst.agent_session_binding.as_ref()) {
             (Some(source), Some(binding)) => {
                 binding.session_id == sid
                     && binding.execution.as_ref() == Some(source)
@@ -228,45 +226,49 @@ fn drain_and_persist_session_ids_inner(
     }
 
     drop(sid_owners);
-    let mut claims = HashMap::new();
-    let mut raw_claims = HashMap::new();
-    let mut id_only_claims: HashMap<&str, usize> = HashMap::new();
-    for update in &updates {
-        if update.confirms_omp_pin {
-            continue;
-        }
-        let key = update.observation.conversation_key();
-        *claims.entry((update.sid.as_str(), key)).or_insert(0usize) += 1;
-        *raw_claims.entry(update.sid.as_str()).or_insert(0usize) += 1;
-        if key.is_none() {
-            *id_only_claims.entry(update.sid.as_str()).or_insert(0usize) += 1;
-        }
-    }
-    let collisions: HashSet<String> = updates
-        .iter()
-        .filter(|update| {
+    let collisions: HashSet<String> = {
+        let mut per_conversation: HashMap<(&str, ConversationKey), usize> = HashMap::new();
+        let mut qualified: HashMap<&str, usize> = HashMap::new();
+        let mut unqualified: HashMap<&str, usize> = HashMap::new();
+        for update in &updates {
             if update.confirms_omp_pin {
-                return false;
+                continue;
             }
-            let key = update.observation.conversation_key();
-            let same_key_claims = claims
-                .get(&(update.sid.as_str(), key))
-                .copied()
-                .unwrap_or(0);
-            let id_only_count = id_only_claims
-                .get(update.sid.as_str())
-                .copied()
-                .unwrap_or(0);
-            let raw_count = raw_claims.get(update.sid.as_str()).copied().unwrap_or(0);
-            if key.is_some() {
-                same_key_claims > 1
-            } else {
-                id_only_count > 1 || raw_count > id_only_count
+            match update.observation.conversation_key() {
+                Some(key) => {
+                    *per_conversation
+                        .entry((update.sid.as_str(), key))
+                        .or_default() += 1;
+                    *qualified.entry(update.sid.as_str()).or_default() += 1;
+                }
+                None => {
+                    *unqualified.entry(update.sid.as_str()).or_default() += 1;
+                }
             }
-        })
-        .map(|update| update.id.clone())
-        .collect();
-    drop((claims, raw_claims, id_only_claims));
+        }
+        updates
+            .iter()
+            .filter(|update| {
+                if update.confirms_omp_pin {
+                    return false;
+                }
+                let sid = update.sid.as_str();
+                match update.observation.conversation_key() {
+                    // Only another claim on the very same conversation competes with this one.
+                    Some(key) => per_conversation
+                        .get(&(sid, key))
+                        .is_some_and(|claims| *claims > 1),
+                    // An unqualified claim names no conversation, so it yields to every
+                    // peer claim on that id rather than race it.
+                    None => {
+                        unqualified.get(sid).is_some_and(|claims| *claims > 1)
+                            || qualified.contains_key(sid)
+                    }
+                }
+            })
+            .map(|update| update.id.clone())
+            .collect()
+    };
     updates.retain(|update| {
         if collisions.contains(&update.id) {
             acknowledge_poller_observation_for(instances, &update.id, &update.observation);
@@ -309,7 +311,6 @@ fn drain_and_persist_session_ids_inner(
     let mut to_rollback: Vec<Rollback> = Vec::with_capacity(updates.len());
 
     let mut capture_generations: Vec<(String, u64)> = Vec::with_capacity(updates.len());
-    let mut lifecycle_advanced: Vec<String> = Vec::with_capacity(updates.len());
     for update in &updates {
         let ownership: anyhow::Result<_> = if lifecycle_already_locked || update.confirms_omp_pin {
             Ok(None)
@@ -367,7 +368,6 @@ fn drain_and_persist_session_ids_inner(
             });
             match released {
                 Ok(true) => {
-                    lifecycle_advanced.push(update.id.clone());
                     capture_generations.push((update.id.clone(), generation));
                 }
                 Ok(false) => {
@@ -394,6 +394,16 @@ fn drain_and_persist_session_ids_inner(
                 to_apply.push(update);
             }
             SidWrite::OwnershipConflict => {
+                // A durable owner keeps this id for good: re-arming the poller would
+                // rewrite the whole registry under flock on every tick for a claim
+                // that keeps losing. Acknowledge, and leave a trace: without one, a
+                // refused pane is indistinguishable from one that never published.
+                tracing::debug!(
+                    target: "session.sync",
+                    instance = %update.id,
+                    sid = %update.sid,
+                    "capture claim refused: another row durably owns this sid",
+                );
                 acknowledge_poller_observation_for(instances, &update.id, &update.observation);
                 filtered_ids.insert(update.id.clone());
             }
@@ -486,7 +496,10 @@ fn drain_and_persist_session_ids_inner(
             .collect(),
         rolled_back: to_rollback.into_iter().map(|r| r.id).collect(),
         filtered: filtered_ids.into_iter().collect(),
-        lifecycle_advanced,
+        lifecycle_advanced: capture_generations
+            .iter()
+            .map(|(id, _)| id.clone())
+            .collect(),
     }
 }
 
@@ -828,10 +841,13 @@ mod tests {
             generation.to_owned(),
         );
         observation.execution = inst.active_execution.clone();
-        observation.source = inst
+        if let Some(binding) = inst
             .active_execution
             .as_ref()
-            .map(|active| active.binding.clone());
+            .map(|active| active.binding.clone())
+        {
+            observation.scope_to(binding);
+        }
         poller.inject_test_observation(&inst.id, observation);
         inst.session_id_poller = Some(Arc::new(Mutex::new(poller)));
     }
@@ -1459,7 +1475,7 @@ mod tests {
                     Some(path),
                 );
             qualified_observation.execution = qualified.active_execution.clone();
-            qualified_observation.source = Some(source);
+            qualified_observation.scope_to(source);
             qualified_poller.inject_test_observation(&qualified.id, qualified_observation);
             qualified.session_id_poller = Some(Arc::new(Mutex::new(qualified_poller)));
 
@@ -1745,7 +1761,7 @@ mod tests {
             Some(path.clone()),
         );
         observation.execution = Some(execution.clone());
-        observation.source = Some(execution.binding.clone());
+        observation.scope_to(execution.binding.clone());
         let poller = SessionPoller::new(format!("test-tmux-{}", inst.id));
         poller.inject_test_observation(&inst.id, observation);
         let poller = Arc::new(Mutex::new(poller));
@@ -1889,7 +1905,7 @@ mod tests {
             Some(stale_path),
         );
         observation.execution = Some(execution.clone());
-        observation.source = Some(execution.binding);
+        observation.scope_to(execution.binding);
         let poller = SessionPoller::new(format!("test-tmux-{}", inst.id));
         poller.inject_test_observation(&inst.id, observation);
         let old_poller = Arc::new(Mutex::new(poller));

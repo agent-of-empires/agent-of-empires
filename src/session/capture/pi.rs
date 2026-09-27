@@ -191,7 +191,7 @@ pub(crate) fn read_pi_session_observation(
             let mut binding = active.binding.clone();
             binding.stores = vec![physical.parent()?.to_path_buf()];
             observation.transcript_path = Some(physical);
-            observation.source = Some(binding);
+            observation.scope_to(binding);
         }
         observation.execution = Some(active.clone());
     }
@@ -314,7 +314,7 @@ mod tests {
         crate::hooks::write_session_id_via_guard(&inst.id, current, Some(launch)).unwrap();
         let scoped = pi_sidecar_poll_fn(inst.id.clone(), source, Some(active.clone()));
         let observation = scoped().expect("a launch-scoped Pi ID is attributable without a path");
-        assert!(observation.source.is_none());
+        assert!(observation.source().is_none());
         assert_eq!(observation.execution.as_ref(), Some(&active));
         assert!(observation.transcript_path.is_none());
         assert!(observation.pi_session_path.is_none());
@@ -326,7 +326,7 @@ mod tests {
             observation.transcript_path.as_deref(),
             Some(canonical_file.as_path())
         );
-        assert_eq!(observation.source.unwrap().stores, vec![canonical_root]);
+        assert_eq!(observation.source().unwrap().stores, vec![canonical_root]);
 
         let outside = tempfile::tempdir().unwrap();
         let foreign = outside

@@ -48,14 +48,14 @@ impl Instance {
                 )
                 .filter(|observation| {
                     !self
-                        .retroactive_capture_exclusion_set(observation.source.as_ref())
+                        .retroactive_capture_exclusion_set(observation.source())
                         .contains(&observation.sid)
                 })
             }
             crate::agents::SessionCaptureBackend::Pi => {
                 self.pi_published_conversation(true).filter(|observation| {
                     !self
-                        .retroactive_capture_exclusion_set(observation.source.as_ref())
+                        .retroactive_capture_exclusion_set(observation.source())
                         .contains(&observation.sid)
                 })
             }
@@ -108,7 +108,7 @@ impl Instance {
                 }
                 .filter(|observation| {
                     !self
-                        .retroactive_capture_exclusion_set(observation.source.as_ref())
+                        .retroactive_capture_exclusion_set(observation.source())
                         .contains(&observation.sid)
                 })
             }
