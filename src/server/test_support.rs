@@ -11,24 +11,29 @@ use crate::session::Storage;
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::Path;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, MutexGuard};
 use std::time::Duration;
 use tokio::sync::{broadcast, RwLock};
 
-static RUNTIME_ENV_LOCK: Mutex<()> = Mutex::new(());
-
-pub struct RuntimeEnvGuard {
+/// Point `XDG_CONFIG_HOME` at a path for as long as the guard lives. It holds
+/// the one process-wide environment lock, the same one every `session`
+/// test guard holds, so two writers of the same key cannot interleave and a
+/// `#[serial]` group is never what keeps them apart. `_lock` is the guard's
+/// claim on [`crate::test_env_lock`]; `None` means this thread is nested
+/// inside an outer guard and is excluded by that one.
+pub(crate) struct RuntimeEnvGuard {
     previous: Option<OsString>,
-    _lock: MutexGuard<'static, ()>,
+    _lock: Option<MutexGuard<'static, ()>>,
 }
 
 impl RuntimeEnvGuard {
     /// Point `XDG_CONFIG_HOME` at `value` for as long as the guard lives, and
     /// hold the environment lock so two writers cannot interleave.
-    pub fn set(value: &Path) -> Self {
-        let lock = RUNTIME_ENV_LOCK
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+    pub(crate) fn set(value: &Path) -> Self {
+        // SAFETY (staged for Rust 2024 edition migration): the lock taken
+        // above is held for the guard's whole lifetime, and the same
+        // invariant is documented on `session::test_support::restore_or_remove`.
+        let lock = crate::test_env_lock::acquire_env_lock(|| {});
         let previous = std::env::var_os("XDG_CONFIG_HOME");
         std::env::set_var("XDG_CONFIG_HOME", value);
         Self {
@@ -44,6 +49,7 @@ impl Drop for RuntimeEnvGuard {
             Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
             None => std::env::remove_var("XDG_CONFIG_HOME"),
         }
+        crate::test_env_lock::release_env_lock(self._lock.is_some());
     }
 }
 use tokio_util::sync::CancellationToken;
