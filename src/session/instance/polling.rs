@@ -317,7 +317,12 @@ impl Instance {
             return PollerStart::NotApplicable;
         }
         if self.session_id_poller_is_running() {
-            return PollerStart::Started;
+            if self.poller_serves(self.active_execution.as_ref()) {
+                return PollerStart::Started;
+            }
+            // A launch can replace the execution without tearing the poller down first, and the
+            // row would then keep a watcher for the launch it just gave up.
+            self.stop_poller();
         }
         self.session_id_poller = None;
         let Some((capture, context)) = self.source_session_support() else {
@@ -697,6 +702,16 @@ impl Instance {
     /// both hold no poller for [`Self::adopt_poller`] to answer.
     pub(crate) fn adopt_poller_repair(&mut self, prior: &Self) {
         self.poller_repair = prior.poller_repair.clone();
+    }
+
+    /// Keep the poller only while it watches `execution`, and clear the slot otherwise. A poller
+    /// for another execution reads files the row no longer owns, so its thread stops here rather
+    /// than being reported as a start for this row.
+    pub(crate) fn settle_poller_for(&mut self, execution: Option<&ActiveExecution>) {
+        if !self.poller_serves(execution) {
+            self.stop_poller();
+            self.session_id_poller = None;
+        }
     }
 
     /// Drop the repair schedule when the relaunch replaced the pane it paced. The start-time
@@ -1803,6 +1818,57 @@ mod tests {
         assert!(
             !inst.poller_repair.due(std::time::Instant::now()),
             "the decline is re-probed later: the live re-query that found no agent costs a fork"
+        );
+    }
+
+    /// A launch can replace the execution without tearing the poller down first. Reporting that
+    /// poller as this row's start would leave the row watching the launch it just gave up, and the
+    /// repair walk skips on a running poller, so nothing would ever replace it.
+    #[test]
+    fn a_start_does_not_report_another_execution_poller_as_started() {
+        let execution = || super::ActiveExecution {
+            launch_id: "launch-1".to_string(),
+            binding: crate::session::ExecutionBinding {
+                agent: "claude".into(),
+                stores: Vec::new(),
+                configuration: Vec::new(),
+                cwd: std::path::PathBuf::from("/tmp"),
+                cwd_filesystem: "host".into(),
+                filesystem: "host".into(),
+                exported_default_store: None,
+            },
+            capture: None,
+            container: None,
+        };
+        let mut inst = Instance::new("foreign-poller", "/tmp/foreign-poller");
+        let mut poller = crate::session::poller::SessionPoller::new(
+            format!("test-tmux-{}", inst.id),
+            Some(execution()),
+        );
+        assert_eq!(
+            poller.start(inst.id.clone(), Box::new(|| None), Box::new(|_| {}), None,),
+            crate::session::poller::PollerSpawn::Spawned
+        );
+        let stale = std::sync::Arc::new(std::sync::Mutex::new(poller));
+        inst.session_id_poller = Some(stale.clone());
+        assert!(stale.lock().unwrap().is_running());
+        // The launch that replaced the execution installed none of its own.
+        inst.active_execution = Some(super::ActiveExecution {
+            launch_id: "launch-2".to_string(),
+            ..execution()
+        });
+
+        inst.maybe_start_poller();
+
+        assert!(
+            !stale.lock().unwrap().is_running(),
+            "the poller for the superseded launch is stopped, not adopted as this row's"
+        );
+        assert!(
+            inst.session_id_poller
+                .as_ref()
+                .is_none_or(|held| !std::sync::Arc::ptr_eq(held, &stale)),
+            "and the row's slot does not still hold it"
         );
     }
 }

@@ -163,6 +163,7 @@ impl Instance {
         self.acp_load_session_capable = None;
         self.resume_probe_failed_sid = None;
         self.active_execution = None;
+        self.settle_poller_for(None);
         self.acp_effort = None;
         self.agent_model = None;
         self.import_pending = None;
@@ -1294,5 +1295,47 @@ mod tests {
             inst.swap_tool(new_tool);
             assert_eq!(inst.detect_as, expected, "{tool} -> {new_tool}");
         }
+    }
+
+    /// A tool swap gives the row no execution, so the poller it may still hold watches files the
+    /// row no longer owns. Left running, it would be reported as this row's own start forever.
+    #[test]
+    fn swap_tool_stops_the_poller_of_the_execution_it_drops() {
+        let mut inst = tool_instance("claude", "/home/user/project");
+        let execution = ActiveExecution {
+            launch_id: "launch-1".into(),
+            binding: crate::session::instance::ExecutionBinding {
+                agent: "claude".into(),
+                stores: Vec::new(),
+                configuration: Vec::new(),
+                cwd: PathBuf::from("/home/user/project"),
+                cwd_filesystem: "host".into(),
+                filesystem: "host".into(),
+                exported_default_store: None,
+            },
+            capture: None,
+            container: None,
+        };
+        let mut poller =
+            SessionPoller::new(format!("test-tmux-{}", inst.id), Some(execution.clone()));
+        assert_eq!(
+            poller.start(inst.id.clone(), Box::new(|| None), Box::new(|_| {}), None,),
+            crate::session::poller::PollerSpawn::Spawned
+        );
+        inst.active_execution = Some(execution);
+        inst.session_id_poller = Some(std::sync::Arc::new(std::sync::Mutex::new(poller)));
+        assert!(inst.session_id_poller_is_running());
+
+        inst.swap_tool("codex");
+
+        assert!(
+            inst.active_execution.is_none(),
+            "fixture: the swap dropped it"
+        );
+        assert!(
+            !inst.session_id_poller_is_running(),
+            "and the poller that watched it went with the execution"
+        );
+        assert!(inst.session_id_poller.is_none());
     }
 }
