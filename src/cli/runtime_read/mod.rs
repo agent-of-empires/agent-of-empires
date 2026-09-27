@@ -293,6 +293,17 @@ async fn execute_inner(
             }
         }
         SelectedEndpoint::Http { request } => {
+            // `~` in `aoe status --verbose` is a display convention meaning
+            // "this machine's home", the same shorthand the local command
+            // prints. A loopback host is therefore given one: a read aimed at
+            // 127.0.0.1 is normally this machine's own daemon over TCP, and it
+            // is the same daemon the socket transport reaches. The host string
+            // does not prove the peer shares this home — a forwarded
+            // 127.0.0.1 reaches another machine — and nothing here treats it
+            // as proof: the collapse only ever shows *less* than the wire
+            // carries, so a wrong assumption widens the output rather than
+            // narrowing it.
+            let local_home = loopback_home(&request);
             let connected = tokio::time::timeout_at(
                 establishment_deadline,
                 tokio_tungstenite::connect_async_with_config(
@@ -311,13 +322,29 @@ async fn execute_inner(
                 stream,
                 exchange_deadline,
                 ExpectedPeer::Remote,
-                None,
+                local_home.as_deref(),
                 command,
                 source,
             )
             .await
         }
     }
+}
+
+/// This machine's home, when the endpoint names a loopback host. The rule is
+/// the host, not the transport: direct loopback to the local daemon is the
+/// same peer the socket reaches, and its rows are this machine's paths.
+fn loopback_home(
+    request: &tokio_tungstenite::tungstenite::handshake::client::Request,
+) -> Option<std::path::PathBuf> {
+    let host = request.uri().host()?;
+    let is_loopback = match host {
+        "localhost" => true,
+        host => host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback()),
+    };
+    is_loopback.then(dirs::home_dir).flatten()
 }
 
 fn websocket_config() -> WebSocketConfig {

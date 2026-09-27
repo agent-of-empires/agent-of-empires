@@ -49,7 +49,7 @@ pub struct ListArgs {
         long,
         value_enum,
         default_value = "all",
-        long_help = "Filter by session state. Replaces the older --all, --archived and --trash flags: --state live is the default selection without --all, and --state trashed is --trash. The values are the same vocabulary the REST API's state filter takes."
+        long_help = "Filter by session state. Replaces the older --archived and --trash flags with --state archived and --state trashed. Without it every session is listed. Note that --all now means every profile, not every state. The values are the same vocabulary the REST API's state filter takes."
     )]
     pub(crate) state: StateFilter,
 }
