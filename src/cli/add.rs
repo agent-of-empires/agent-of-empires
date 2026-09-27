@@ -1494,7 +1494,20 @@ mod tests {
         #[tokio::test]
         #[serial]
         async fn add_refuses_a_fork_child_under_another_agent() {
-            let _guard = crate::session::test_support::isolate_app_dir();
+            let root = tempfile::tempdir().unwrap();
+            let _guard = crate::session::test_support::isolate_app_dir_at(root.path());
+            // The CLI resolves the requested tool's binary before the fork parent
+            // check, so both agents need a command on the path.
+            let _claude = crate::session::test_support::install_login_shell_path_command(
+                root.path(),
+                "claude",
+                "#!/bin/sh\nexit 1\n",
+            );
+            let _codex = crate::session::test_support::install_login_shell_path_command(
+                root.path(),
+                "codex",
+                "#!/bin/sh\nexit 1\n",
+            );
             let project = tempfile::tempdir().unwrap();
             let parent_id = "parent-session-uuid";
             crate::session::Storage::new_unwatched("real")
