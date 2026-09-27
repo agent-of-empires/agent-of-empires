@@ -1153,6 +1153,13 @@ mod tests {
     #[test]
     fn native_resume_requires_a_direct_local_builtin_launch() {
         const PROFILE: &str = "resume-custom-launch-test";
+        // The table resolves the agent through the profile config and the
+        // detection registry, both of which read the app dir and reinstall
+        // themselves; the serialised tests next door do the same. Without an
+        // app dir of its own this test reads whichever one a concurrent test
+        // left behind, and the resolution flips on cases that are decided by
+        // the environment rather than by the argv under test.
+        let _app = crate::session::test_support::isolate_app_dir();
         let _registry = install_aliases(PROFILE, &[("work-claude", "claude")]);
         // (tool, command, extra_args, supported)
         for (tool, command, extra, supported) in [

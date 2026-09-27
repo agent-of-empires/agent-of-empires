@@ -350,6 +350,10 @@ pub struct SessionFeed {
     task: Option<tokio::task::JoinHandle<()>>,
     grant: Arc<AtomicU64>,
     native_grant: Arc<AtomicU64>,
+    /// CityHall client mode is a handshake property rather than a per-revision
+    /// grant, so it is recorded once per connection and read by the local-write
+    /// gate on the home view.
+    cityhall: Arc<AtomicBool>,
     commands: Option<tokio::sync::mpsc::Sender<SessionCommand>>,
     pending: HashMap<String, PendingCommand>,
     pending_creations: HashMap<String, PendingCreation>,
@@ -374,6 +378,7 @@ impl SessionFeed {
             task: None,
             grant: Arc::new(AtomicU64::new(0)),
             native_grant: Arc::new(AtomicU64::new(0)),
+            cityhall: Arc::new(AtomicBool::new(false)),
             commands: None,
             pending: HashMap::new(),
             pending_creations: HashMap::new(),
@@ -398,6 +403,8 @@ impl SessionFeed {
         self.grant = grant.clone();
         let native_grant = Arc::new(AtomicU64::new(0));
         self.native_grant = native_grant.clone();
+        let cityhall = Arc::new(AtomicBool::new(false));
+        self.cityhall = cityhall.clone();
         let (commands, requests) = tokio::sync::mpsc::channel::<SessionCommand>(COMMAND_CAPACITY);
         self.commands = Some(commands);
         let (progress, progress_receiver) = tokio::sync::watch::channel(None);
@@ -414,6 +421,7 @@ impl SessionFeed {
                 )
                 .await?;
                 let epoch = connection.info().epoch.clone();
+                cityhall.store(connection.info().cityhall_mode, Ordering::SeqCst);
                 set_grant(&grant, connection.mutations_allowed());
                 set_grant(&native_grant, connection.native_interaction_allowed());
                 sender.send_replace(Some(SessionFeedResult::Snapshot(
@@ -462,6 +470,12 @@ impl SessionFeed {
                 .commands
                 .as_ref()
                 .is_some_and(|commands| !commands.is_closed())
+    }
+
+    /// True when the attached runtime serves a CityHall client, which enforces
+    /// a narrower mutation policy than the local owner this process runs as.
+    pub(crate) fn cityhall_mode(&self) -> bool {
+        self.cityhall.load(Ordering::SeqCst)
     }
 
     pub(crate) fn native_interaction_available(&self) -> bool {
@@ -1212,6 +1226,11 @@ impl SessionFeed {
     #[cfg(test)]
     pub(crate) fn set_native_permission_for_test(&self, allowed: bool) {
         set_grant(&self.native_grant, allowed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_cityhall_for_test(&self, cityhall: bool) {
+        self.cityhall.store(cityhall, Ordering::SeqCst);
     }
 }
 

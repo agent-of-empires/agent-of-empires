@@ -56,6 +56,7 @@ mod fork_rename_dialogs;
 mod keys_and_nav;
 mod live_send_boot_size_tests;
 mod live_send_mode;
+mod local_write_guard;
 mod permission_response_dialog;
 mod pickers_groups_sort;
 mod post_create_attach_mode;

@@ -153,6 +153,9 @@ impl HomeView {
             return false;
         }
         self.sidebar_source = source;
+        if source == SidebarSource::Daemon {
+            self.runtime_authoritative = true;
+        }
         if source != SidebarSource::Daemon {
             self.cancel_native_attachment();
             self.teardown_live_send();

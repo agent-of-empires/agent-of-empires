@@ -2466,6 +2466,14 @@ impl HomeView {
                         }
                     }
                     ProfilePickerAction::Created(name) => {
+                        // Profile creation and deletion are not in the runtime's
+                        // CityHall mutation policy, so a client this process
+                        // serves must not perform them on disk either.
+                        if let Some(reason) = self.local_write_block() {
+                            self.profile_picker_dialog = None;
+                            self.refuse_local_write(reason);
+                            return None;
+                        }
                         self.profile_picker_dialog = None;
                         match crate::session::create_profile(&name) {
                             Ok(()) => {
@@ -2482,6 +2490,11 @@ impl HomeView {
                         }
                     }
                     ProfilePickerAction::Deleted(name) => {
+                        if let Some(reason) = self.local_write_block() {
+                            self.profile_picker_dialog = None;
+                            self.refuse_local_write(reason);
+                            return None;
+                        }
                         match crate::session::delete_profile(&name) {
                             Ok(()) => {
                                 self.rewire_after_profile_delete(&name);

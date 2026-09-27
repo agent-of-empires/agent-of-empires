@@ -364,6 +364,7 @@ impl HomeView {
             ),
             session_feed: crate::tui::session_feed::SessionFeed::new(),
             sidebar_source: crate::tui::session_feed::SidebarSource::Disconnected,
+            runtime_authoritative: false,
             deletion_poller: DeletionPoller::new(),
             trash_poller: crate::tui::trash_poller::TrashPoller::new(),
             reconcile_poller: make_reconcile(),

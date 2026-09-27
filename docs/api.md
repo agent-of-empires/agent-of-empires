@@ -467,6 +467,15 @@ curl -sS \
   "http://localhost:7777/api/sessions/abc123/output?lines=80&format=text"
 ```
 
+## Session and group mutations from the TUI
+
+The TUI routes the session mutations this API exposes through the daemon,
+but group creation, collapse, move, delete, and the session and group
+renames still land in `sessions.json` and `groups.json` directly; that
+split is tracked in #2734. The matching daemon routes exist but are not
+part of the published surface, so the HTTP API stays the only way to
+reach them.
+
 ## Driving a session as a subagent
 
 Together, `send` and `output` are the minimum primitive needed to run

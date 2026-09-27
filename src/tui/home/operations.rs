@@ -415,6 +415,10 @@ impl HomeView {
     }
 
     pub(super) fn delete_selected_group(&mut self) -> anyhow::Result<()> {
+        if let Some(reason) = self.local_write_block() {
+            self.refuse_local_write(reason);
+            return Ok(());
+        }
         if let Some(group_path) = self.selected_group.take() {
             let owning_profile = self.selected_group_profile.take();
             let prefix = format!("{}/", group_path);
@@ -656,6 +660,10 @@ impl HomeView {
         new_group: Option<&str>,
         new_profile: Option<&str>,
     ) -> anyhow::Result<()> {
+        if let Some(reason) = self.local_write_block() {
+            self.refuse_local_write(reason);
+            return Ok(());
+        }
         let ctx = match self.group_rename_context.take() {
             Some(ctx) => ctx,
             None => return Ok(()),
@@ -1103,6 +1111,10 @@ impl HomeView {
         new_profile: Option<&str>,
         rename_branch: bool,
     ) -> anyhow::Result<()> {
+        if let Some(reason) = self.local_write_block() {
+            self.refuse_local_write(reason);
+            return Ok(());
+        }
         if let Some(id) = &self.selected_session {
             let id = id.clone();
 

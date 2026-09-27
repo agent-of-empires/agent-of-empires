@@ -4,7 +4,44 @@
 use super::*;
 
 impl HomeView {
+    /// The one gate for every write this process makes straight to
+    /// `sessions.json` / `groups.json`, as opposed to the mutations the
+    /// runtime routes for us. It returns the reason the write must not
+    /// happen, or `None` when the write is this process's to make.
+    ///
+    /// Before a daemon snapshot has been applied this process is the sole
+    /// writer of those files, so nothing is blocked. Afterwards the runtime
+    /// owns the rows: a read-only or unhealthy runtime, a lost connection, and
+    /// a CityHall client all refuse the local write, because a mirror write
+    /// the runtime does not know about is exactly the divergence the runtime
+    /// exists to prevent.
+    pub(in crate::tui::home) fn local_write_block(&self) -> Option<&'static str> {
+        if !self.runtime_authoritative {
+            return None;
+        }
+        if self.session_feed.cityhall_mode() {
+            return Some("The attached runtime serves a City Hall client, whose policy does not allow this process to write session or group data locally");
+        }
+        if !self.session_feed.mutations_available() {
+            return Some("The runtime is read-only or unreachable, so this process may not write session or group data locally");
+        }
+        None
+    }
+
+    /// Surface a refusal to the operator instead of dropping it.
+    pub(in crate::tui::home) fn refuse_local_write(&mut self, reason: &'static str) {
+        tracing::info!(target: "tui.home", reason, "Refused a local session/group write");
+        self.info_dialog = Some(crate::tui::dialogs::InfoDialog::new("Read-only", reason));
+    }
+
     pub fn save(&mut self) -> anyhow::Result<()> {
+        if let Some(reason) = self.local_write_block() {
+            // Every local write funnels through here, so this is the backstop
+            // for a caller that missed the guard at its entry point. Those
+            // entry points own the operator-facing refusal.
+            tracing::info!(target: "tui.home", reason, "Skipped local session/group write; the runtime owns this state");
+            return Ok(());
+        }
         let mut all_peer_deleted: Vec<String> = Vec::new();
 
         for (profile_name, storage) in &self.storages {

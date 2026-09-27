@@ -4106,6 +4106,9 @@ impl HomeView {
         let (runtime_label, runtime_color) = match self.sidebar_source {
             SidebarSource::Connecting => ("Connecting runtime", theme.dimmed),
             SidebarSource::Disconnected => ("Runtime disconnected", theme.error),
+            SidebarSource::Daemon if self.session_feed.cityhall_mode() => {
+                ("City Hall client", theme.dimmed)
+            }
             SidebarSource::Daemon if self.session_feed.native_interaction_available() => {
                 ("Runtime ready", theme.running)
             }

@@ -576,6 +576,11 @@ pub struct HomeView {
     // Canonical subscription and native command lane.
     pub(super) session_feed: super::session_feed::SessionFeed,
     pub(super) sidebar_source: super::session_feed::SidebarSource,
+    /// Set once a daemon snapshot has been applied. From that point the
+    /// runtime, not this process's mirror, owns the session and group rows, so
+    /// `local_write_block` starts refusing local writes. It never resets: a
+    /// later disconnect must not reopen a write path the runtime still owns.
+    pub(super) runtime_authoritative: bool,
     // Structured (ACP) rows also surface their pending approval nonces from
     // the daemon; the home permission dialog resolves them. See
     // `structured_approval_poller`.
