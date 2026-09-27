@@ -290,19 +290,30 @@ mod tests {
         );
         let mut drained = Instance::new("session", "/tmp/project");
         drained.lifecycle_generation = 7;
+        drained.lifecycle_reservation = Some(crate::session::LifecycleReservation {
+            op: crate::session::LifecycleOperation::Capture,
+            generation: 7,
+            at: chrono::Utc::now(),
+        });
 
-        // Nothing moved under the guard, so the drained generation lands.
+        // Nothing moved under the guard, so the drained values land.
         let mut quiet = Instance::new("session", "/tmp/project");
         apply_drained_lifecycle_if_unchanged(&mut quiet, &drained, &baseline);
         assert_eq!(quiet.lifecycle_generation, 7);
+        assert_eq!(quiet.lifecycle_reservation, drained.lifecycle_reservation);
 
         // A relaunch advanced the generation while the drain ran: copying the
-        // drained value would roll that reservation back, so it must not happen.
+        // drained values would roll that reservation back, so it must not happen.
         let mut relaunched = Instance::new("session", "/tmp/project");
+        let reservation = crate::session::LifecycleReservation {
+            op: crate::session::LifecycleOperation::Launch,
+            generation: 9,
+            at: chrono::Utc::now(),
+        };
         relaunched.lifecycle_generation = 9;
-        let reservation = relaunched.lifecycle_reservation.clone();
+        relaunched.lifecycle_reservation = Some(reservation.clone());
         apply_drained_lifecycle_if_unchanged(&mut relaunched, &drained, &baseline);
         assert_eq!(relaunched.lifecycle_generation, 9);
-        assert_eq!(relaunched.lifecycle_reservation, reservation);
+        assert_eq!(relaunched.lifecycle_reservation, Some(reservation));
     }
 }
