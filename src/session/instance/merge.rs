@@ -42,6 +42,12 @@ impl Instance {
         if src.lifecycle_generation < self.lifecycle_generation {
             return;
         }
+        // A relaunch snapshot describes the agent it launched. A swap moves neither the lifecycle
+        // counter nor the capture generation, so nothing else would keep this stale snapshot's
+        // execution, and the row's capture would then be resolved from the wrong agent.
+        if src.tool != self.tool {
+            return;
+        }
         self.merge_post_start(src);
         let generation_can_merge = self.omp_capture_generation == before.omp_capture_generation
             || self.omp_capture_generation == src.omp_capture_generation;
@@ -1408,5 +1414,56 @@ mod tests {
             "the old agent's watcher does not survive the swap, execution or not"
         );
         assert!(inst.session_id_poller.is_none());
+    }
+
+    /// A tool swap moves neither the lifecycle counter nor the capture generation, so a relaunch
+    /// snapshot for the previous agent still looks mergeable. Applying it would leave the row
+    /// holding that agent's execution, and its capture would be resolved from it.
+    #[test]
+    fn a_relaunch_snapshot_for_another_agent_is_refused() {
+        let execution = ActiveExecution {
+            launch_id: "launch-1".into(),
+            binding: crate::session::instance::ExecutionBinding {
+                agent: "claude".into(),
+                stores: Vec::new(),
+                configuration: Vec::new(),
+                cwd: PathBuf::from("/tmp/swapped-tool"),
+                cwd_filesystem: "host".into(),
+                filesystem: "host".into(),
+                exported_default_store: None,
+            },
+            capture: None,
+            container: None,
+        };
+        let mut before = Instance::new("swapped-tool", "/tmp/swapped-tool");
+        before.tool = "claude".to_string();
+        before.agent_session_id = Some("old-sid".to_string());
+        before.omp_capture_generation = Some("generation-a".to_string());
+        let mut relaunched = before.clone();
+        relaunched.agent_session_id = Some("launch-sid".to_string());
+        relaunched.omp_capture_generation = Some("generation-b".to_string());
+        relaunched.active_execution = Some(execution);
+        relaunched.last_start_time = Some(std::time::Instant::now());
+
+        // The row swapped agent while the launch was in flight, which cleared its conversation.
+        let mut live = before.clone();
+        live.swap_tool("codex");
+        assert_eq!(live.tool, "codex");
+        assert!(
+            live.active_execution.is_none(),
+            "fixture: the swap dropped the execution"
+        );
+
+        live.merge_post_restart_with_baseline(&before, &relaunched);
+
+        assert_eq!(live.tool, "codex");
+        assert!(
+            live.active_execution.is_none(),
+            "the previous agent's execution is not installed on a row that no longer runs it"
+        );
+        assert!(
+            !live.runs(&relaunched.tool, relaunched.active_execution.as_ref()),
+            "and the row does not end up on the runtime the relaunch described"
+        );
     }
 }

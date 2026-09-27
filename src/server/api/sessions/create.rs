@@ -1065,6 +1065,11 @@ pub(super) fn apply_post_restart_identity_sync(
     if started.lifecycle_generation < live.lifecycle_generation {
         return;
     }
+    // The snapshot describes the agent it launched, and a swap moves neither the lifecycle counter
+    // nor the capture generation: applying it would resolve this row's capture from another agent.
+    if started.tool != live.tool {
+        return;
+    }
     // A same-SID publication can still replace the native store or transcript.
     let generation_can_merge = live.omp_capture_generation == before.omp_capture_generation
         || live.omp_capture_generation == started.omp_capture_generation;

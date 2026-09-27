@@ -936,4 +936,52 @@ mod tests {
             "the previous agent's watcher does not follow the row to a new one"
         );
     }
+
+    /// The window a row armed is about the agent and the execution it armed it for. A row that has
+    /// nothing to poll holds neither, and keeps its window; a row another agent took over does not
+    /// inherit one paced for the previous agent.
+    #[test]
+    fn a_reload_keeps_the_repair_pacing_of_a_row_on_the_same_runtime() {
+        let now = std::time::Instant::now();
+        let mut mergers: Vec<fn(Instance, Instance) -> Instance> = vec![merge_runtime_fields];
+        mergers.push(|prior, mut fresh| {
+            fresh.merge_runtime_from_reload(&prior);
+            fresh
+        });
+        for merge in mergers {
+            let mut prior = Instance::new("poller-less", "/tmp/poller-less");
+            prior.poller_repair.reprobe(now);
+            let deadline = now + std::time::Duration::from_secs(30);
+            prior.session_id_poller_retry_after = Some(deadline);
+
+            let merged = merge(prior, Instance::new("poller-less", "/tmp/poller-less"));
+
+            assert_eq!(
+                merged.poller_repair.current_reprobe_delay(),
+                Some(std::time::Duration::from_secs(5)),
+                "the row keeps its window, or it re-resolves every tick"
+            );
+            assert_eq!(merged.session_id_poller_retry_after, Some(deadline));
+
+            // The same row, another agent: the window paces the previous agent's capture.
+            let mut prior = Instance::new("other-agent", "/tmp/other-agent");
+            prior.tool = "claude".to_string();
+            prior.poller_repair.reprobe(now);
+            prior.session_id_poller_retry_after = Some(now + std::time::Duration::from_secs(30));
+            let mut fresh = Instance::new("other-agent", "/tmp/other-agent");
+            fresh.tool = "codex".to_string();
+
+            let merged = merge(prior, fresh);
+
+            assert_eq!(merged.tool, "codex");
+            assert!(
+                merged.poller_repair.due(std::time::Instant::now()),
+                "a window armed for the previous agent does not hold this one back"
+            );
+            assert_eq!(
+                merged.session_id_poller_retry_after, None,
+                "and neither does the deadline that went with it"
+            );
+        }
+    }
 }

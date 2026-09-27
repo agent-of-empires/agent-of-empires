@@ -673,6 +673,13 @@ impl Instance {
         self.install_poller(poller, spawn)
     }
 
+    /// Whether this row runs `tool` on `execution`. State stamped for another agent or another
+    /// launch describes a row this one no longer is: a swap moves neither the lifecycle counter nor
+    /// the capture generation, so nothing else would say the two are different rows.
+    pub(crate) fn runs(&self, tool: &str, execution: Option<&ActiveExecution>) -> bool {
+        self.tool == tool && self.active_execution.as_ref() == execution
+    }
+
     /// Whether the poller this row holds watches `tool` on `execution`, which is what the row is
     /// taking on. A row with no poller has none to watch, whatever it used to hold.
     pub(crate) fn poller_serves(&self, tool: &str, execution: Option<&ActiveExecution>) -> bool {
@@ -703,7 +710,7 @@ impl Instance {
     /// on a poller, so a row with nothing to poll keeps its window, and a row whose execution
     /// another process replaced does not inherit a window armed for the old one.
     pub(crate) fn adopt_poller_repair(&mut self, prior: &Self) {
-        if self.active_execution == prior.active_execution {
+        if self.runs(&prior.tool, prior.active_execution.as_ref()) {
             self.poller_repair = prior.poller_repair.clone();
             self.session_id_poller_retry_after = prior.session_id_poller_retry_after;
         }
@@ -727,7 +734,7 @@ impl Instance {
     pub(crate) fn adopt_relaunch_poller_state(&mut self, before: &Self, launched: &Self) {
         self.adopt_poller(launched);
         if launched.last_start_time != before.last_start_time
-            && self.active_execution == launched.active_execution
+            && self.runs(&launched.tool, launched.active_execution.as_ref())
         {
             self.poller_repair.reset();
             self.session_id_poller_retry_after = launched.session_id_poller_retry_after;
