@@ -836,3 +836,88 @@ fn a_keyword_inside_a_one_of_branch_reaching_past_the_subset_is_refused() {
         "the refusal names the branch and the keyword: {reason}"
     );
 }
+
+/// A definition that reaches itself. The name is declared, so every other load
+/// check passes this document, and the evaluator then follows the reference
+/// until the stack gives out — which is an abort of `pack::verify` over a
+/// one-character edit, not the readable refusal every other malformation gets.
+/// A cycle is a schema this evaluator cannot read, so it is refused at load.
+#[test]
+#[parallel]
+fn a_reference_cycle_in_a_published_document_is_refused() {
+    let reason = refusal_after_a_document_edit(
+        "hello",
+        r#""namespace": { "type": "string", "pattern": "^(debug|release):[a-z0-9._-]{1,200}$" }"#,
+        r##""namespace": { "$ref": "#/$defs/namespace" }"##,
+    );
+    assert!(
+        reason.contains("#/$defs/namespace -> #/$defs/namespace")
+            && reason.contains("refused at load"),
+        "the refusal prints the cycle it found: {reason}"
+    );
+}
+
+/// A `not` written as the boolean subschema the draft permits. It means
+/// "always satisfied", and the evaluator has no branch for it: the `false`
+/// reached `check`, was reported as "the schema here is not an object", and
+/// every frame carrying that field was refused for a reason that described
+/// nothing the document had done. It is refused at load instead.
+#[test]
+#[parallel]
+fn a_boolean_not_in_a_published_document_is_refused() {
+    let reason = refusal_after_a_document_edit(
+        "hello",
+        r#""local_owner": { "type": "boolean" }"#,
+        r#""local_owner": { "not": false }"#,
+    );
+    assert!(
+        reason.contains("a subschema must be an object")
+            && reason.contains("/properties/local_owner"),
+        "the refusal names the position: {reason}"
+    );
+}
+
+/// The same for `items`, which is the other single-subschema keyword the
+/// evaluator reads by recursing. `items: false` means "no items allowed", and
+/// the evaluator would have refused every non-empty array by calling it a
+/// schema that is not an object.
+#[test]
+#[parallel]
+fn a_boolean_items_in_a_published_document_is_refused() {
+    let reason = refusal_after_a_document_edit(
+        "hello",
+        r##""profiles": { "type": "array", "items": { "$ref": "#/$defs/profile_read" } }"##,
+        r#""profiles": { "type": "array", "items": false }"#,
+    );
+    assert!(
+        reason.contains("a subschema must be an object") && reason.contains("/properties/profiles"),
+        "the refusal names the position: {reason}"
+    );
+}
+
+/// `enum` is the same identity test as `const`, and the two must agree on the
+/// spelling of a number: the draft defines both over the *value*, so
+/// `{"enum": [2.0]}` names the value every recorded `protocol_version` carries.
+/// `enum` once compared `Number` spellings structurally, which made this edit
+/// refuse every frame in the pack over a difference no document had written
+/// down.
+#[test]
+#[parallel]
+fn an_enumerated_number_names_the_value_and_not_its_spelling() {
+    let (_dir, root) = staged_pack();
+    let path = root.join("hello.schema.json");
+    let text = fs::read_to_string(&path).expect("read the published document");
+    let from = r#""protocol_version": { "const": 2 }"#;
+    assert!(
+        text.contains(from),
+        "the document carries the edited keyword"
+    );
+    fs::write(
+        &path,
+        text.replacen(from, r#""protocol_version": { "enum": [2.0] }"#, 1),
+    )
+    .expect("rewrite the document");
+    restage(&root);
+
+    pack::verify(&root).expect("`enum: [2.0]` names the value the frame carries");
+}
