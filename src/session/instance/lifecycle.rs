@@ -301,12 +301,33 @@ impl Instance {
             }
         };
         self.reconcile_from_disk();
+        if let Err(blocked) = self.ensure_startable() {
+            self.release_blocked_launch(storage);
+            return Err(blocked.into());
+        }
         if let Err(error) = hook_result {
             self.fail_reserved_launch(storage, &error, false);
             return Err(error);
         }
         self.ensure_reservation_current_or_fail(storage)?;
         Ok((title_lock, lifecycle_lock))
+    }
+
+    /// A peer archived or trashed the row while hooks ran: drop the launch reservation
+    /// without stamping an error, since the refusal is not a launch failure.
+    fn release_blocked_launch(&mut self, storage: &crate::session::storage::Storage) {
+        if !self.reservation_is_current(storage).unwrap_or(false) {
+            return;
+        }
+        let live_pane = self
+            .tmux_session()
+            .is_ok_and(|session| session.exists() && !session.is_pane_dead());
+        let status = if live_pane {
+            Status::Idle
+        } else {
+            Status::Stopped
+        };
+        let _ = self.commit_lifecycle_status(storage, LifecycleOperation::Launch, status);
     }
 
     fn lifecycle_reservation_is_current(
