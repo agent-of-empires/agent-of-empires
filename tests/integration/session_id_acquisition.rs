@@ -385,3 +385,115 @@ fn wait_until(check: impl Fn() -> bool) -> bool {
     }
     check()
 }
+
+/// Claude's Bash tool running `codex exec` fires Codex's `SessionStart` identity hook with the
+/// Claude pane's inherited `AOE_*` environment. The real `aoe __extract-session-id` must refuse a
+/// publisher that names another agent, or the pane would later resume a foreign conversation.
+#[test]
+#[serial]
+fn extract_session_id_refuses_a_different_agents_publisher() {
+    let _temp = setup_temp_home();
+    let aoe = env!("CARGO_BIN_EXE_aoe");
+    let euid = Command::new("id").arg("-u").output().unwrap();
+    let base = std::path::PathBuf::from(format!(
+        "/tmp/aoe-hooks-{}",
+        String::from_utf8_lossy(&euid.stdout).trim()
+    ));
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let sid = "019342ab-1234-7def-8901-abcdef0cafe1";
+    for (case, publisher, pane_agent, writes) in [
+        ("nested", "codex", "claude", false),
+        ("reverse", "claude", "codex", false),
+        ("own", "codex", "codex", true),
+    ] {
+        let id = format!("xagent-{case}-{nonce}");
+        let mut child = Command::new(aoe)
+            .args(["__extract-session-id", "--field", "session-id"])
+            .args(["--agent", publisher])
+            .env("AOE_INSTANCE_ID", &id)
+            .env("AOE_AGENT_BIN", pane_agent)
+            .env_remove("AOE_AGENT_PID")
+            .env_remove("AOE_SESSION_SOURCE")
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        std::io::Write::write_all(
+            &mut child.stdin.take().unwrap(),
+            format!(r#"{{"session_id":"{sid}"}}"#).as_bytes(),
+        )
+        .unwrap();
+        assert!(child.wait().unwrap().success(), "{case}");
+        let sidecar = base.join(&id).join("session_id");
+        let written = std::fs::read_to_string(&sidecar).ok();
+        let _ = std::fs::remove_dir_all(base.join(&id));
+        assert_eq!(
+            written.as_deref(),
+            writes.then_some(sid),
+            "{case}: {publisher} hook in a {pane_agent} pane"
+        );
+    }
+}
+
+/// `company-codex` can be Codex itself under another name (here a symlink), so the pane's outer
+/// process is not named `codex`. A nested `codex exec` below it must still be refused: the launch
+/// names its program in `AOE_AGENT_PROGRAM`, and the real hook binary counts it on the walk.
+#[test]
+#[serial]
+fn extract_session_id_refuses_a_nested_agent_under_a_renamed_launch() {
+    if !std::path::Path::new("/proc/self/cmdline").exists() {
+        return;
+    }
+    let temp = setup_temp_home();
+    let aoe = env!("CARGO_BIN_EXE_aoe");
+    let bin = temp.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    for name in ["company-codex", "codex"] {
+        std::os::unix::fs::symlink("/bin/sh", bin.join(name)).unwrap();
+    }
+    let euid = Command::new("id").arg("-u").output().unwrap();
+    let base = std::path::PathBuf::from(format!(
+        "/tmp/aoe-hooks-{}",
+        String::from_utf8_lossy(&euid.stdout).trim()
+    ));
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let sid = "019342ab-1234-7def-8901-abcdef0cafe2";
+    let publish = format!(
+        r#"printf '{{"session_id":"{sid}"}}' | {} __extract-session-id --field session-id --agent codex"#,
+        shell_words::quote(aoe)
+    );
+    // `$$` of the outer shell is the renamed agent the launch recorded as AOE_AGENT_PID.
+    let outer = |inner: &str| format!("export AOE_AGENT_PID=$$; {inner}; true");
+    let nested = format!(
+        "{} -c {}",
+        shell_words::quote(bin.join("codex").to_str().unwrap()),
+        shell_words::quote(&format!("{publish}; true"))
+    );
+    for (case, script, program, writes) in [
+        ("outer", outer(&publish), Some("company-codex"), true),
+        ("nested", outer(&nested), Some("company-codex"), false),
+        // Without the launched program's name the nested codex was the only one counted.
+        ("nested_unnamed", outer(&nested), None, true),
+    ] {
+        let id = format!("renamed-{case}-{nonce}");
+        let mut command = Command::new(bin.join("company-codex"));
+        command
+            .args(["-c", &script])
+            .env("AOE_INSTANCE_ID", &id)
+            .env("AOE_AGENT_BIN", "codex")
+            .env_remove("AOE_AGENT_PROGRAM")
+            .env_remove("AOE_SESSION_SOURCE");
+        if let Some(program) = program {
+            command.env("AOE_AGENT_PROGRAM", program);
+        }
+        assert!(command.status().unwrap().success(), "{case}");
+        let written = std::fs::read_to_string(base.join(&id).join("session_id")).ok();
+        let _ = std::fs::remove_dir_all(base.join(&id));
+        assert_eq!(written.as_deref(), writes.then_some(sid), "{case}");
+    }
+}

@@ -824,7 +824,16 @@ impl Instance {
             fallback_profile = self.effective_profile();
             &fallback_profile
         };
-        let mut env_prefix = status_hook_env_prefix(profile, &self.id, self.status_agent());
+        let program = parse_launch_command(self.get_tool_command()).and_then(|parsed| {
+            parsed.words.first().and_then(|word| {
+                Path::new(word)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .map(str::to_owned)
+            })
+        });
+        let mut env_prefix =
+            status_hook_env_prefix(profile, &self.id, self.status_agent(), program.as_deref());
         // The publisher is pane-scoped, including for safe Default wrappers.
         self.pi_extension_launched = false;
         if let Some((_, ref env)) = identity_extension {

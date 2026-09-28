@@ -120,14 +120,14 @@ pub(crate) fn replace_file_no_follow_as(
         &dir,
         tmp_name.as_str(),
         OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_CLOEXEC,
-        Mode::from_bits_truncate(mode),
+        Mode::from_bits_truncate(mode as libc::mode_t),
     )
     .with_context(|| format!("creating a temp file under {}", root.display()))?;
 
     let written = (|| -> Result<()> {
         let mut file = fs::File::from(tmp);
         file.write_all(content)?;
-        fchmod(&file, Mode::from_bits_truncate(mode))?;
+        fchmod(&file, Mode::from_bits_truncate(mode as libc::mode_t))?;
         file.sync_all()?;
         drop(file);
         renameat(&dir, tmp_name.as_str(), &dir, file_name)?;
