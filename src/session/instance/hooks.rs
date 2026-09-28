@@ -96,6 +96,15 @@ pub(crate) struct HostHookDisclosure {
     pub needs_codex_trust_note: bool,
 }
 
+/// The built-in agent a tool name stands for: itself when it names one, else
+/// whatever `agent_detect_as` maps it to, else the tool name unchanged.
+pub(crate) fn host_hook_agent_name(tool_name: &str, detect_as: Option<&str>) -> String {
+    crate::agents::get_agent(tool_name)
+        .or_else(|| detect_as.and_then(crate::agents::get_agent))
+        .map_or(tool_name, |agent| agent.name)
+        .to_string()
+}
+
 /// Resolve the disclosure for `tool_name`, which may be detected as `agent_name`.
 /// `profile` is the profile whose environment and session config decide the paths.
 pub(crate) fn host_hook_disclosure(

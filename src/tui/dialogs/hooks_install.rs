@@ -28,15 +28,15 @@ impl HooksInstallDialog {
     pub fn new_for_profile(tool_name: &str, profile: Option<&str>) -> Self {
         let profile_config =
             profile.map(crate::session::config::profile_config::resolve_config_or_warn);
-        let agent_name = crate::agents::get_agent(tool_name)
-            .or_else(|| {
-                profile_config
-                    .as_ref()
-                    .and_then(|config| config.session.agent_detect_as.get(tool_name))
-                    .and_then(|detect_as| crate::agents::get_agent(detect_as))
-            })
-            .map_or(tool_name, |agent| agent.name);
-        Self::new_for_profile_resolved(tool_name, agent_name, profile)
+        let detect_as = profile_config.as_ref().and_then(|config| {
+            config
+                .session
+                .agent_detect_as
+                .get(tool_name)
+                .map(String::as_str)
+        });
+        let agent_name = crate::session::host_hook_agent_name(tool_name, detect_as);
+        Self::new_for_profile_resolved(tool_name, &agent_name, profile)
     }
 
     pub fn new_for_profile_resolved(

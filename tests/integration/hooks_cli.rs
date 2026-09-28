@@ -148,6 +148,22 @@ fn hooks_approve_clears_the_launch_gate_for_every_path() {
         retry.all()
     );
 
+    // Status must read the state, not assume it: the same command reported
+    // "not approved" here and "approved" below.
+    let before = run_aoe(&home, &xdg, &stub, &socket, &["hooks", "status"]);
+    assert!(
+        before.stdout.contains("not approved"),
+        "status must report the unapproved install: {}",
+        before.stdout
+    );
+    assert!(
+        before
+            .stdout
+            .contains(&hook_path(&home).display().to_string()),
+        "status must disclose the codex hook path before approval: {}",
+        before.stdout
+    );
+
     // 3. Approving discloses what would be written, then unblocks the launch.
     let approve = run_aoe(&home, &xdg, &stub, &socket, &["hooks", "approve"]);
     assert_eq!(

@@ -140,7 +140,7 @@ Each command receives `AOE_SESSION_ID`, `AOE_SESSION_TITLE`, `AOE_PROJECT_PATH`,
 
 ## Agent status hooks
 
-`agent_status_hooks` (above) makes AoE write hook entries into the agent's own config under your home directory, so status comes from the agent reporting it rather than from reading its pane. That writes into files you own and runs a command on every prompt, so it is gated behind a one-time consent. The TUI offers it as a dialog the first time a host session would install hooks; `aoe hooks approve` is the same consent for a headless install, and `aoe hooks status` reports the current answer and the files a launch would write.
+`agent_status_hooks` (above) makes AoE write hook entries into the agent's own config under your home directory, so status comes from the agent reporting it rather than from reading its pane. That writes into files you own and runs a command on every prompt, so it is gated behind a one-time consent. The TUI offers it as a dialog the first time a host session would install hooks; `aoe hooks approve` is the same consent for a headless install, and `aoe hooks status` reports the current answer alongside the files and hook events a launch targets under the effective profile. That list is a disclosure, not a manifest: a launch that routes through a native store, or that merges into a selected agent, resolves its own target at launch time.
 
 The consent is per installation and covers every agent, because a launch resolves the agent from the session rather than from the consent. It is not the repo trust gate: `aoe add --trust-hooks` covers the hooks a repository declares in `.agent-of-empires/config.toml` and its project-local MCP servers, which are a separate decision. See [Hook trust](repo-config.md#hook-trust).
 
