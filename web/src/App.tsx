@@ -2368,7 +2368,7 @@ function AppContent({
               onCreateSession={handleCreateSession}
               onPinProject={projectsReady ? handlePinProject : undefined}
               onUnpinProject={projectsReady ? handleUnpinProject : undefined}
-              onEditProjectSettings={projectsReady ? handleEditProjectSettings : undefined}
+              onEditProjectSettings={handleEditProjectSettings}
               savedProjects={savedProjects}
               onAddProject={handleAddProject}
               onEditProject={handleEditProject}

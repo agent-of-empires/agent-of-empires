@@ -1415,7 +1415,7 @@ mod tests {
 
         crate::hooks::write_session_id_via_guard(&inst.id, CODEX_PUBLISHED, None).unwrap();
         // The launch order `start` follows: flush the publication, then acquire.
-        inst.reconcile_sidecar_into_disk();
+        inst.reconcile_sidecar_into_disk().unwrap();
         let _expected = inst.apply_fresh_launch_intent();
 
         assert_eq!(

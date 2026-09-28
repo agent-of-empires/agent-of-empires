@@ -2809,7 +2809,7 @@ mod tests {
         let root = crate::session::get_app_dir().unwrap();
         super::super::purge_owners::initialize(&root).unwrap();
         let profile = "purge-lost-commit-owner";
-        let mut storage = Storage::new_unwatched(profile).unwrap();
+        let storage = Storage::new_unwatched(profile).unwrap();
         let mut instance = create_test_instance();
         instance.source_profile = profile.into();
         let id = instance.id.clone();
