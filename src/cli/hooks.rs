@@ -1,9 +1,9 @@
 //! `aoe hooks` subcommands: inspect and grant AoE's consent to write agent
 //! status hooks into the host agent's own config.
 //!
-//! The consent is the same install-wide acknowledgement the TUI dialog writes,
-//! so both surfaces converge on one source of truth. `--trust-hooks` is a
-//! different surface: per-repository trust for hooks the repo declares itself.
+//! The consent is the same install-wide acknowledgement the TUI dialog writes.
+//! `--trust-hooks` is a different surface: per-repository trust for hooks the
+//! repo declares itself.
 
 use anyhow::Result;
 use clap::Subcommand;
@@ -12,7 +12,7 @@ use crate::session::{host_hook_agent_name, host_hook_disclosure, update_app_stat
 
 #[derive(Subcommand)]
 pub enum HooksCommands {
-    /// Show whether AoE may write agent status hooks, and the files it targets
+    /// Show whether AoE may write agent status hooks, and what it resolves
     Status,
     /// Allow AoE to write agent status hooks into the host agents' own config
     Approve,
@@ -26,9 +26,9 @@ pub fn run(profile: &str, command: HooksCommands) -> Result<()> {
     }
 }
 
-/// Whether the install already carries the acknowledgement. Reading it through
-/// `load` keeps a corrupt `state.toml` an error rather than a silent "not
-/// approved", which would send the user to approve something already approved.
+/// A corrupt `state.toml` is an error here rather than a silent "not approved".
+/// It also blocks `approve`, which parses the same file, so the raw toml error
+/// naming the path is the only way out.
 fn acknowledged() -> Result<bool> {
     Ok(Config::load()?.app_state.has_acknowledged_agent_hooks)
 }
@@ -78,57 +78,70 @@ fn print_disclosure(profile: &str) -> Result<()> {
     let disclosures: Vec<_> = tool_names
         .into_iter()
         .filter_map(|tool_name| {
-            let detect_as = config
-                .session
-                .agent_detect_as
+            let session = &config.session;
+            let execution_as = session
+                .agent_execution_as
                 .get(tool_name)
                 .map(String::as_str);
-            let agent_name = host_hook_agent_name(tool_name, detect_as);
+            let detect_as = session.agent_detect_as.get(tool_name).map(String::as_str);
+            let agent_name = host_hook_agent_name(tool_name, execution_as, detect_as);
             if !crate::agents::get_agent(&agent_name)
                 .is_some_and(|agent| crate::agents::hook_install_required(agent, status_hooks))
             {
                 return None;
             }
-            let disclosure = host_hook_disclosure(tool_name, &agent_name, Some(&profile));
+            let disclosure = host_hook_disclosure(tool_name, &agent_name, Some(&config));
             (!disclosure.settings_paths.is_empty()).then_some((tool_name, disclosure))
         })
         .collect();
 
-    println!("AoE installs status hooks into each agent's own config, to detect");
-    println!("session status (running/waiting/idle).");
+    let status_hooks_active = disclosures
+        .iter()
+        .all(|(_, disclosure)| disclosure.status_hooks_enabled);
+    if status_hooks_active {
+        println!("AoE installs status hooks into each agent's own config, to detect");
+        println!("session status (running/waiting/idle).");
+    } else {
+        println!("This profile has agent_status_hooks off, so AoE installs only the");
+        println!("identity hooks native resume needs, not the status hooks.");
+    }
     println!();
     println!("Profile: {profile}");
     println!();
-    if disclosures.is_empty() {
-        println!("Files AoE targets: (none, this profile installs no status hooks)");
-    } else {
-        println!("Files AoE targets:");
-        for (tool_name, disclosure) in &disclosures {
-            for path in &disclosure.settings_paths {
-                println!("  {tool_name}: {path}");
-            }
+    println!("Files AoE targets:");
+    for (tool_name, disclosure) in &disclosures {
+        for path in &disclosure.settings_paths {
+            println!("  {tool_name}: {path}");
         }
     }
 
-    if !disclosures.is_empty() {
-        println!();
-        println!("Hook events added:");
-        for (tool_name, disclosure) in &disclosures {
-            println!("  {tool_name}:");
-            for (event, status) in &disclosure.hook_commands {
-                println!("    {event} -> {status}");
-            }
+    println!();
+    println!("Hook events added:");
+    for (tool_name, disclosure) in &disclosures {
+        println!("  {tool_name}:");
+        for (event, effect) in &disclosure.hook_commands {
+            println!("    {event} -> {effect}");
         }
-        println!();
-        println!("Each of them runs:");
+    }
+    println!();
+    if status_hooks_active {
+        println!("A status event writes under this session's own directory:");
         println!(
             "  printf {{status}} > {}/$AOE_INSTANCE_ID/status",
             crate::hooks::hook_base_path().display()
         );
-        println!();
-        println!("Hooks are guarded by $AOE_INSTANCE_ID and are a");
-        println!("no-op outside of AoE sessions.");
+    } else {
+        println!("An identity event runs the pinned aoe binary to record the id:");
+        println!("  aoe __extract-session-id --field session-id");
     }
+    println!();
+    println!("Hooks are guarded by $AOE_INSTANCE_ID and are a");
+    println!("no-op outside of AoE sessions.");
+    println!();
+    println!("This is what the effective profile resolves, not a manifest of every");
+    println!("write a launch can make. A launch that routes through a native store,");
+    println!("merges into a selected agent, or targets a selected or recorded Claude");
+    println!("conversation store resolves that target at launch time.");
     if disclosures
         .iter()
         .any(|(_, disclosure)| disclosure.needs_codex_trust_note)

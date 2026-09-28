@@ -35,7 +35,7 @@ impl HooksInstallDialog {
                 .get(tool_name)
                 .map(String::as_str)
         });
-        let agent_name = crate::session::host_hook_agent_name(tool_name, detect_as);
+        let agent_name = crate::session::host_hook_agent_name(tool_name, None, detect_as);
         Self::new_for_profile_resolved(tool_name, &agent_name, profile)
     }
 
@@ -44,7 +44,9 @@ impl HooksInstallDialog {
         agent_name: &str,
         profile: Option<&str>,
     ) -> Self {
-        let disclosure = crate::session::host_hook_disclosure(tool_name, agent_name, profile);
+        let config = profile.map(crate::session::config::profile_config::resolve_config_or_warn);
+        let disclosure =
+            crate::session::host_hook_disclosure(tool_name, agent_name, config.as_ref());
         Self {
             settings_paths: disclosure.settings_paths,
             hook_commands: disclosure.hook_commands,

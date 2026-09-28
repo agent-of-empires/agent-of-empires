@@ -87,51 +87,56 @@ pub(crate) fn sidecar_host_config_path_for(
     home.join(sidecar.host_config_subpath)
 }
 
-/// What AoE would write into one agent's own host config, and what each hook
-/// does. Shared by the TUI approval dialog and `aoe hooks approve` so both
-/// disclose the same thing.
+/// What a launch would write into one agent's own host config, and what each
+/// hook does. Shared by the TUI approval dialog and `aoe hooks approve`, so
+/// both describe the same install from the same resolution.
 pub(crate) struct HostHookDisclosure {
     pub settings_paths: Vec<String>,
     pub hook_commands: Vec<(String, String)>,
     pub needs_codex_trust_note: bool,
+    /// False when the resolved events are identity-only, which is what
+    /// `agent_status_hooks = false` leaves behind.
+    pub status_hooks_enabled: bool,
 }
 
-/// The built-in agent a tool name stands for: itself when it names one, else
-/// whatever `agent_detect_as` maps it to, else the tool name unchanged.
-pub(crate) fn host_hook_agent_name(tool_name: &str, detect_as: Option<&str>) -> String {
-    crate::agents::get_agent(tool_name)
+/// The built-in agent a tool name stands for, in the order a launch resolves
+/// it: an explicit execution contract, then the tool name, then
+/// `agent_detect_as`. Falls back to the tool name when none names an agent.
+pub(crate) fn host_hook_agent_name(
+    tool_name: &str,
+    execution_as: Option<&str>,
+    detect_as: Option<&str>,
+) -> String {
+    execution_as
+        .and_then(crate::agents::get_agent)
+        .or_else(|| crate::agents::get_agent(tool_name))
         .or_else(|| detect_as.and_then(crate::agents::get_agent))
         .map_or(tool_name, |agent| agent.name)
         .to_string()
 }
 
-/// Resolve the disclosure for `tool_name`, which may be detected as `agent_name`.
-/// `profile` is the profile whose environment and session config decide the paths.
+/// Resolve the disclosure for `tool_name`, which a launch runs as `agent_name`.
+/// `config` is the profile-merged config whose environment and session config
+/// decide the paths and which events survive; `None` means an unconfigured
+/// install.
 pub(crate) fn host_hook_disclosure(
     tool_name: &str,
     agent_name: &str,
-    profile: Option<&str>,
+    config: Option<&crate::session::config::Config>,
 ) -> HostHookDisclosure {
-    let profile_config =
-        profile.map(crate::session::config::profile_config::resolve_config_or_warn);
     let mut disclosure = HostHookDisclosure {
         settings_paths: Vec::new(),
         hook_commands: Vec::new(),
         needs_codex_trust_note: false,
+        status_hooks_enabled: config.is_none_or(|config| config.session.agent_status_hooks),
     };
     let Some(agent) = crate::agents::get_agent(agent_name) else {
         return disclosure;
     };
-    let host_env = profile_config
-        .as_ref()
-        .map(|config| config.environment.clone())
-        .unwrap_or_default();
+    let host_env = config.map_or_else(Vec::new, |config| config.environment.clone());
     let home = host_home(&host_env).unwrap_or_else(|| std::path::PathBuf::from("~"));
-    let default_config = crate::session::config::SessionConfig::default();
-    let session_config = profile_config
-        .as_ref()
-        .map(|config| &config.session)
-        .unwrap_or(&default_config);
+    let default_session = crate::session::config::SessionConfig::default();
+    let session_config = config.map_or(&default_session, |config| &config.session);
 
     if let Some(hook_cfg) = &agent.hook_config {
         disclosure.needs_codex_trust_note = hook_cfg.format == crate::agents::HookFormat::CodexJson;
@@ -140,15 +145,6 @@ pub(crate) fn host_hook_disclosure(
                 .to_string_lossy()
                 .into_owned(),
         );
-        for event in hook_cfg.events {
-            disclosure.hook_commands.push((
-                event.name.to_string(),
-                match event.status {
-                    Some(status) => format!("writes \"{status}\""),
-                    None => "session lifecycle".to_string(),
-                },
-            ));
-        }
     } else if let Some(sidecar) = &agent.sidecar_hooks {
         disclosure.settings_paths.push(
             sidecar_host_config_path_for(
@@ -162,12 +158,24 @@ pub(crate) fn host_hook_disclosure(
             .to_string_lossy()
             .into_owned(),
         );
-        for event in sidecar.events {
-            disclosure.hook_commands.push((
-                event.name.to_string(),
-                format!("writes \"{}\"", event.status),
-            ));
-        }
+    } else {
+        return disclosure;
+    }
+
+    // The events come from the resolver the installer uses, so what is listed
+    // is what a launch writes: status_map overrides applied, and the status
+    // events dropped when status hooks are off.
+    let default_config = crate::session::config::Config::default();
+    let config = config.unwrap_or(&default_config);
+    for event in resolved_host_hook_events(agent, config, config.session.agent_status_hooks)
+        .unwrap_or_default()
+    {
+        let effect = match (&event.status, event.identity_field.is_some()) {
+            (Some(status), _) => format!("writes \"{status}\""),
+            (None, true) => "records the conversation id".to_string(),
+            (None, false) => "session lifecycle".to_string(),
+        };
+        disclosure.hook_commands.push((event.name, effect));
     }
     disclosure
 }

@@ -79,6 +79,89 @@ fn hook_path(home: &Path) -> PathBuf {
     home.join(".codex").join("hooks.json")
 }
 
+fn write_config(xdg: &Path, toml: &str) {
+    let app = xdg.join(if cfg!(debug_assertions) {
+        "agent-of-empires-dev"
+    } else {
+        "agent-of-empires"
+    });
+    std::fs::create_dir_all(&app).expect("create app dir");
+    std::fs::write(app.join("config.toml"), toml).expect("write config.toml");
+}
+
+/// The disclosure has to be derived from the effective config, not from
+/// defaults: a launch reads the profile environment, a declared
+/// `agent_config_dir`, and `agent_status_hooks` off, and each of those moves
+/// what lands in the file. A disclosure built from the wrong layer names a
+/// path the launch never writes while staying silent about the one it does.
+#[test]
+fn hooks_disclosure_follows_the_effective_config() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let home = tmp.path().join("home");
+    let xdg = tmp.path().join("xdg");
+    let stub = tmp.path().join("stub");
+    let routed = tmp.path().join("routed");
+    for dir in [&home, &xdg, &stub, &routed] {
+        std::fs::create_dir_all(dir).expect("create dir");
+    }
+    let socket = tmp.path().join("tmux.sock");
+
+    // (label, config, agent launched, path a launch must write, event to show)
+    let cases: [(&str, String, &str, PathBuf, Option<&str>); 3] = [
+        (
+            "profile environment reroutes the agent config dir",
+            format!(
+                "environment = [\"CLAUDE_CONFIG_DIR={}\"]\n\n[session]\nagent_status_hooks = true\n",
+                routed.display()
+            ),
+            "claude",
+            routed.join("settings.json"),
+            None,
+        ),
+        (
+            "a declared custom agent keeps its own config dir",
+            format!(
+                "[session.custom_agents]\ncorp = \"true\"\n\n[session.agent_detect_as]\ncorp = \"claude\"\n\n[session.agent_config_dir]\ncorp = \"{}\"\n",
+                home.join("corpdir").display()
+            ),
+            "corp",
+            home.join("corpdir").join("settings.json"),
+            None,
+        ),
+        (
+            "status hooks off leaves only the identity events",
+            "[session]\nagent_status_hooks = false\n".to_string(),
+            "claude",
+            home.join(".claude").join("settings.json"),
+            Some("records the conversation id"),
+        ),
+    ];
+
+    for (label, config, tool, expected, event) in cases {
+        write_config(&xdg, &config);
+        let status = run_aoe(&home, &xdg, &stub, &socket, &["hooks", "status"]);
+        assert_eq!(status.code, Some(0), "{label}: {}", status.all());
+        let disclosed = format!("  {tool}: {}", expected.display());
+        assert!(
+            status.stdout.contains(&disclosed),
+            "{label}: disclosure must name the file the launch writes.\nwant a line like {disclosed}\ngot:\n{}",
+            status.stdout
+        );
+        match event {
+            Some(event) => assert!(
+                status.stdout.contains(event),
+                "{label}: identity-only installs must disclose the identity event.\ngot:\n{}",
+                status.stdout
+            ),
+            None => assert!(
+                !status.stdout.contains("agent_status_hooks off"),
+                "{label}: status hooks are on, the header must not claim otherwise.\n{}",
+                status.stdout
+            ),
+        }
+    }
+}
+
 #[test]
 fn hooks_approve_clears_the_launch_gate_for_every_path() {
     if !tmux_available() {
