@@ -170,10 +170,14 @@ pub(crate) fn host_hook_disclosure(
     for event in resolved_host_hook_events(agent, config, config.session.agent_status_hooks)
         .unwrap_or_default()
     {
+        let publisher = event
+            .publisher
+            .map(|name| format!(" --agent {name}"))
+            .unwrap_or_default();
         let effect = match (&event.status, event.identity_field) {
             (Some(status), _) => format!("writes \"{status}\""),
             (None, Some(field)) => format!(
-                "runs aoe __extract-session-id --field {}",
+                "runs aoe __extract-session-id --field {}{publisher}",
                 crate::hooks::identity_field_name(field)
             ),
             (None, None) => "session lifecycle".to_string(),
