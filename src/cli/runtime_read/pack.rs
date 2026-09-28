@@ -18,7 +18,7 @@
 //! `cargo test --release --lib` rather than let an unverified fixture replay.
 //!
 //! `root-home` is a replay scratch path, never manifest-listed: a harness that
-//! materializes it must remove the subtree before calling [`verify`].
+//! materializes it must remove the subtree before calling `verify`.
 
 use std::collections::BTreeMap;
 use std::fmt;

@@ -35,10 +35,8 @@ pub(crate) fn env_selection_is_unset(value: &OsStr) -> bool {
 
 impl ReadRequestSource {
     /// Whether the environment names an endpoint. Read through
-    /// [`env_url_is_unset`] so a source built by hand (a test harness) and one
-    /// Whether the environment names an endpoint. Read through
-    /// [`env_selection_is_unset`] so a source built by hand (a test harness)
-    /// and one read from the process agree on what "unset" means.
+    /// `env_selection_is_unset`, which is crate-private, so a source built by
+    /// hand and one read from the process agree on what "unset" means.
     pub fn env_url_is_set(&self) -> bool {
         self.env_url
             .as_deref()
