@@ -243,7 +243,8 @@ pub struct SpawnRequest {
     /// Claude store selected by the conversation binding for a host Claude worker.
     pub claude_store_pin: Option<crate::session::capture::ClaudeStorePin>,
     /// Recheck the stored row right before launch, under its lifecycle lock, and refuse an
-    /// archived, trashed, or purged session (#4116).
+    /// archived, trashed, or purged session (#4116). Every production launch sets it; only
+    /// supervisor unit fixtures, which have no stored row, leave it off.
     pub durable_admission: bool,
 }
 

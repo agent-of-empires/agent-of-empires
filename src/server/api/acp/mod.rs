@@ -269,49 +269,21 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn launch_refuses_a_row_archived_while_the_before_session_hook_runs() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
+        use crate::server::test_support as support;
         let _app_dir = crate::session::test_support::isolate_app_dir();
         let barrier = tempfile::tempdir().unwrap();
         for endpoint in ["spawn", "switch"] {
-            let ready = barrier.path().join(format!("{endpoint}-ready"));
-            let release = barrier.path().join(format!("{endpoint}-release"));
-            let hook = format!(
-                ": > '{}'; while [ ! -e '{}' ]; do sleep 0.01; done",
-                ready.display(),
-                release.display()
-            );
-            crate::session::config::update_config(|global| {
-                global.host_hooks.before_session = vec![hook];
-            })
-            .unwrap();
-
+            let hook = support::install_blocking_before_session_hook(barrier.path(), endpoint);
             let mut inst =
                 crate::session::Instance::new("acp-4116-hook", barrier.path().to_str().unwrap());
             inst.id = format!("sess-4116-hook-{endpoint}");
             inst.view = crate::session::View::Structured;
             inst.status = crate::session::Status::Idle;
             let id = inst.id.clone();
-            let storage = crate::session::Storage::new_unwatched(&inst.source_profile).unwrap();
-            storage
-                .update(|rows, _| {
-                    *rows = vec![inst.clone()];
-                    Ok(())
-                })
-                .unwrap();
-            let launches = Arc::new(AtomicUsize::new(0));
-            let counted = Arc::clone(&launches);
-            let launcher: crate::acp::supervisor::Launcher = Arc::new(move |_config, _id| {
-                counted.fetch_add(1, Ordering::SeqCst);
-                Box::pin(async {
-                    Err::<crate::acp::acp_client::AcpClient, _>(
-                        crate::acp::acp_client::AcpError::Spawn("test launcher".into()),
-                    )
-                })
-            });
-            let state = crate::server::test_support::build_test_app_state_with_launcher(
-                vec![inst],
-                launcher,
-            );
+            let profile = inst.source_profile.clone();
+            support::seed_instances_on_disk_for_test(&profile, vec![inst.clone()]);
+            let (launcher, launches) = support::counting_failing_launcher();
+            let state = support::build_test_app_state_with_launcher(vec![inst], launcher);
 
             let handler = tokio::spawn({
                 let state = Arc::clone(&state);
@@ -345,42 +317,27 @@ mod tests {
                     }
                 }
             });
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-            while !ready.exists() && std::time::Instant::now() < deadline && !handler.is_finished()
-            {
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-            let hook_started = ready.exists();
-            if hook_started {
-                let _lock = storage.acquire_instance_lifecycle_lock(&id).unwrap();
-                storage
-                    .update(|rows, _| {
-                        rows[0].archive();
-                        Ok(())
-                    })
-                    .unwrap();
-            }
-            std::fs::write(&release, b"release").unwrap();
+            let archived =
+                support::archive_while_hook_waits(&hook, &profile, |row| row.id == id).await;
             let response = handler.await.unwrap();
 
             let status = response.status();
             let body = axum::body::to_bytes(response.into_body(), 4096)
                 .await
                 .unwrap();
+            let body = String::from_utf8_lossy(&body);
             assert!(
-                hook_started,
-                "{endpoint}: before_session hook did not run: {status} {}",
-                String::from_utf8_lossy(&body)
+                archived,
+                "{endpoint}: before_session hook did not run: {status} {body}"
             );
-            assert_eq!(
-                status,
-                StatusCode::CONFLICT,
-                "{endpoint}: {}",
-                String::from_utf8_lossy(&body)
-            );
-            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(status, StatusCode::CONFLICT, "{endpoint}: {body}");
+            let body: serde_json::Value = serde_json::from_str(&body).unwrap();
             assert_eq!(body["error"], "session_archived", "{endpoint}");
-            assert_eq!(launches.load(Ordering::SeqCst), 0, "{endpoint}: launched");
+            assert_eq!(
+                launches.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "{endpoint}: launched"
+            );
             assert!(!state.acp_supervisor.is_running(&id).await, "{endpoint}");
         }
     }
