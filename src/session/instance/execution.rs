@@ -279,6 +279,9 @@ pub(super) struct NativeExecution {
     pub(super) resolved_target_session_id: Option<String>,
     pub(super) pi_pinnable: bool,
     pub(super) opencode_preassign: bool,
+    /// A recorded store outranks the store a new session would use here, as
+    /// `(launch, new_session, source)`. The launch reports it once.
+    pub(super) store_override: Option<(PathBuf, PathBuf, &'static str)>,
 }
 pub(super) struct NativeLaunchInputs {
     pub(super) launch_id: String,
@@ -1315,6 +1318,7 @@ impl Instance {
         let mut pi_root = None;
         let mut pi_transcript_path = None;
         let mut namespace_arguments = Vec::new();
+        let mut store_override = None;
         let mut roots = match agent.name {
             "claude" => {
                 let recorded_execution = (inputs.container.is_none())
@@ -1330,11 +1334,41 @@ impl Instance {
                 // The same root is exported here and recorded on the binding
                 // below, and the binding canonicalizes it either way: resolve
                 // it now so the routed value and the stored one name one path,
-                // as the sibling namespaces already do.
-                let root = inputs.canonical_path(&absolute(recorded
-                    .or_else(|| declared.clone())
-                    .or_else(|| value("CLAUDE_CONFIG_DIR").filter(|value| !value.is_empty()).map(PathBuf::from))
-                    .unwrap_or_else(|| home.join(".claude"))))?;
+                // as the sibling namespaces already do. A new session takes
+                // that chain without the recorded store, and the difference
+                // between the two is a diagnostic, never what decides.
+                let ambient_raw = value("CLAUDE_CONFIG_DIR").filter(|value| !value.is_empty());
+                let declared_spelling = absolute(declared
+                    .clone()
+                    .or_else(|| ambient_raw.clone().map(PathBuf::from))
+                    .unwrap_or_else(|| home.join(".claude")));
+                let resolved = inputs.canonical_path(&declared_spelling);
+                let root = match recorded.as_ref() {
+                    Some(recorded) => {
+                        let root = inputs.canonical_path(&absolute(recorded.clone()))?;
+                        // A selector that cannot be resolved still differs
+                        // from where this launch runs, and that is the one
+                        // case a user can act on, so report the spelling they
+                        // wrote rather than dropping the line.
+                        let new_session = resolved
+                            .as_ref()
+                            .ok()
+                            .cloned()
+                            .unwrap_or_else(|| declared_spelling.clone());
+                        let source = if declared.is_some() {
+                            "agent_config_dir"
+                        } else if ambient_raw.is_some() {
+                            "environment"
+                        } else {
+                            "default"
+                        };
+                        store_override =
+                            (root != new_session).then_some((root.clone(), new_session, source));
+                        root
+                    }
+                    None => resolved
+                        .context("the configured Claude store cannot be resolved")?,
+                };
                 let default = crate::session::capture::is_default_claude_store(&root, &home);
                 let explicit = recorded_execution
                     .and_then(|execution| execution.exported_default_store)
@@ -1859,6 +1893,7 @@ impl Instance {
             resolved_target_session_id,
             pi_pinnable,
             opencode_preassign,
+            store_override,
         })
     }
 
@@ -2439,6 +2474,14 @@ mod tests {
         let host = binding(&real);
         let host_alias = binding(&alias);
         assert!(Instance::execution_identity_matches(&host, &host_alias));
+        // Identity is the whole location, not its last component: two distinct
+        // directories that happen to share a leaf name are different contexts.
+        let twin = temp.path().join("twin");
+        std::fs::create_dir_all(twin.join("store")).unwrap();
+        assert!(
+            !Instance::execution_identity_matches(&host, &binding(&twin)),
+            "a same-named directory elsewhere is a different execution context"
+        );
 
         let mut runtime_cwd = host.clone();
         runtime_cwd.cwd_filesystem = "runtime:docker:test".into();

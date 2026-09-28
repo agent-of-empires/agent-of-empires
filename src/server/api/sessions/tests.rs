@@ -2295,6 +2295,31 @@ async fn worker_stopping_handlers_wait_for_an_in_flight_submission() {
     }
 }
 
+/// A direct stop sets `Stopped` on the live in-memory row without going through
+/// `apply_status_intent`, which normally releases a plugin's pending revival mark on reaching
+/// a terminal status; `stop_session` must do the same itself, on that same in-memory row (the
+/// disk-persisted copy earlier in the handler is a fresh load, where the `#[serde(skip)]`
+/// field is always false regardless).
+#[tokio::test]
+async fn stop_session_clears_a_pending_plugin_revival() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let mut inst = make_test_instance();
+    inst.view = crate::session::View::Structured;
+    inst.plugin_revival_pending = true;
+    let id = inst.id.clone();
+    let state = crate::server::test_support::build_test_app_state(vec![inst]);
+
+    stop_session(State(std::sync::Arc::clone(&state)), Path(id.clone())).await;
+
+    let instances = state.instances.read().await;
+    let stopped = instances.iter().find(|i| i.id == id).unwrap();
+    assert_eq!(stopped.status, Status::Stopped);
+    assert!(
+        !stopped.plugin_revival_pending,
+        "a direct stop must release a stale pending mark"
+    );
+}
+
 /// #3651: `prompt_submission` auto-vivifies a registry entry for whatever id it
 /// is handed and nothing prunes it, so every externally reachable mutation must
 /// prove the session exists first, or an authenticated client can grow daemon
