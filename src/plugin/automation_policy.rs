@@ -325,4 +325,30 @@ mod tests {
         let denied = reopened.admit_turn("cron").expect_err("window persisted");
         assert_eq!(denied.data.as_ref().unwrap()["kind"], "rate_limited");
     }
+
+    /// `admit_create` must release the `reservations` lock before the fallible
+    /// `admit_windowed` call: if it held that guard across it instead, the `CreateReservation`
+    /// constructed just above would, on this denial's early return, try to re-lock the same
+    /// non-reentrant mutex from its own `Drop` and deadlock (hanging this test, not failing
+    /// it cleanly) rather than denying the 21st create in the rolling hour.
+    #[test]
+    fn admit_create_releases_the_reservation_lock_before_the_rate_limit_can_deny_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let policy = std::sync::Arc::new(
+            AutomationPolicy::open(&dir.path().join("plugin_events.db")).expect("open"),
+        );
+
+        // Each iteration takes and immediately drops its reservation, so only the
+        // creates/hour window is exercised here, never the concurrency cap.
+        for _ in 0..MAX_PLUGIN_CREATES_PER_HOUR {
+            policy.admit_create("cron", 0).expect("under the rate");
+        }
+
+        let denied = match policy.admit_create("cron", 0) {
+            Err(e) => e,
+            Ok(_) => panic!("the 21st create within the rolling hour must be denied"),
+        };
+        assert_eq!(denied.code, codes::RATE_LIMITED);
+        assert_eq!(denied.data.as_ref().unwrap()["kind"], "rate_limited");
+    }
 }

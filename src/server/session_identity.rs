@@ -5,6 +5,9 @@ use std::sync::Arc;
 
 use super::state::AppState;
 
+/// What the walk inspected before it ran, so a verdict can be dropped if the row moved. The last
+/// field is the agent: a tool swap changes it without moving the lifecycle counter, so the guard
+/// has to read it separately.
 pub(super) type SessionIdentityBaseline = (
     crate::session::ConversationState,
     Option<String>,
@@ -13,6 +16,7 @@ pub(super) type SessionIdentityBaseline = (
     Option<std::time::SystemTime>,
     u64,
     crate::session::Status,
+    String,
 );
 
 /// Preserve concurrent changes to any part of the native conversation.
@@ -21,7 +25,7 @@ pub(super) fn apply_drained_identity_if_unchanged(
     drained: &Instance,
     baseline: &SessionIdentityBaseline,
 ) {
-    let (baseline_conversation, baseline_marker, baseline_generation, _, _, _, _) = baseline;
+    let (baseline_conversation, baseline_marker, baseline_generation, _, _, _, _, _) = baseline;
     if baseline_conversation.matches(live) && live.omp_capture_generation == *baseline_generation {
         live.adopt_conversation_state(drained.conversation_state());
         live.omp_capture_generation = drained.omp_capture_generation.clone();
@@ -31,12 +35,30 @@ pub(super) fn apply_drained_identity_if_unchanged(
     }
 }
 
+/// Whether the row's lifecycle still matches the walk's baseline. A relaunch that lands while the
+/// walk runs on its clone moves the lifecycle, and the walk's schedule verdict is then dropped:
+/// a cleared row is due at once, which costs at most one extra repair walk on the next tick.
+fn apply_poller_repair_if_lifecycle_unchanged(
+    live: &mut Instance,
+    backoff: &crate::session::poller::PollerRepairBackoff,
+    baseline: &SessionIdentityBaseline,
+) {
+    if live.lifecycle_generation == baseline.5
+        && live.active_execution == baseline.0.active
+        && live.omp_capture_generation == baseline.2
+        && live.tool == baseline.7
+    {
+        live.poller_repair = backoff.clone();
+    }
+}
+
 fn apply_poller_runtime_if_unchanged(
     live: &mut Instance,
     repaired: &Instance,
     baseline: &SessionIdentityBaseline,
 ) {
-    if live.active_execution == repaired.active_execution
+    if live.tool == repaired.tool
+        && live.active_execution == repaired.active_execution
         && live.omp_capture_generation == repaired.omp_capture_generation
         && live.session_id_poller_retry_after == baseline.3
         && live.capture_started_at == baseline.4
@@ -82,6 +104,7 @@ pub(super) async fn drain_session_id_updates_in_state(state: &Arc<AppState>) {
                         inst.capture_started_at,
                         inst.lifecycle_generation,
                         inst.status,
+                        inst.tool.clone(),
                     ),
                 )
             })
@@ -127,12 +150,12 @@ pub(super) async fn drain_session_id_updates_in_state(state: &Arc<AppState>) {
                 let Some(dst) = guard.iter_mut().find(|i| i.id == src.id) else {
                     continue;
                 };
-                if let Some(backoff) = deferred.get(&src.id) {
-                    dst.poller_repair = backoff.clone();
-                }
                 let Some(identity_baseline) = baseline.get(&src.id) else {
                     continue;
                 };
+                if let Some(backoff) = deferred.get(&src.id) {
+                    apply_poller_repair_if_lifecycle_unchanged(dst, backoff, identity_baseline);
+                }
                 if touched.contains(src.id.as_str()) {
                     apply_drained_identity_if_unchanged(dst, src, identity_baseline);
                 }
@@ -164,8 +187,8 @@ fn repair_backoffs(
         .collect()
 }
 
-/// Rows whose poller-repair schedule the walk changed (a deferral recorded,
-/// or a reset after a successful start), keyed by id.
+/// Rows whose poller-repair schedule the walk changed (a deferral, a re-probe, or a reset),
+/// keyed by id.
 fn changed_repair_backoffs(
     before: &std::collections::HashMap<String, crate::session::poller::PollerRepairBackoff>,
     after: &[crate::session::Instance],
@@ -194,6 +217,7 @@ mod tests {
             None,
             0,
             crate::session::Status::Idle,
+            "claude".to_string(),
         );
         let mut drained = Instance::new("session", "/tmp/project");
         drained.agent_session_id = Some("captured-sid".to_string());
@@ -234,6 +258,48 @@ mod tests {
     }
 
     #[test]
+    fn a_relaunch_during_the_walk_keeps_its_schedule_clear() {
+        let mut live = Instance::new("session", "/tmp/project");
+        live.lifecycle_generation = 7;
+        let baseline: SessionIdentityBaseline = (
+            live.conversation_state(),
+            None,
+            None,
+            None,
+            None,
+            7,
+            crate::session::Status::Idle,
+            "claude".to_string(),
+        );
+        let mut walked = live.clone();
+        let now = std::time::Instant::now();
+        walked.poller_repair.reprobe(now);
+
+        // Same lifecycle: the walk's schedule lands.
+        live.poller_repair = Default::default();
+        apply_poller_repair_if_lifecycle_unchanged(&mut live, &walked.poller_repair, &baseline);
+        assert_eq!(
+            live.poller_repair.current_reprobe_delay(),
+            Some(std::time::Duration::from_secs(5))
+        );
+
+        // A relaunch landed: its clear stands, and the walk's verdict is dropped. The counter is
+        // moved here rather than by the merge below, which is the point: the guard reads it alone.
+        live.lifecycle_generation = 8;
+        let mut relaunched = live.clone();
+        // A relaunch that reached the launch stamp: new start time, cleared schedule.
+        relaunched.last_start_time = Some(std::time::Instant::now());
+        relaunched.poller_repair.reset();
+        live.merge_post_restart_with_baseline(&live.clone(), &relaunched);
+        apply_poller_repair_if_lifecycle_unchanged(&mut live, &walked.poller_repair, &baseline);
+        assert_eq!(
+            live.poller_repair.current_reprobe_delay(),
+            None,
+            "a lifecycle that moved under the walk discards its verdict"
+        );
+    }
+
+    #[test]
     fn poller_runtime_reapply_keeps_a_deferred_retry() {
         let baseline: SessionIdentityBaseline = (
             Instance::new("session", "/tmp/project").conversation_state(),
@@ -243,6 +309,7 @@ mod tests {
             None,
             0,
             crate::session::Status::Idle,
+            "claude".to_string(),
         );
         let mut live = Instance::new("session", "/tmp/project");
         let mut repaired = live.clone();
@@ -287,6 +354,7 @@ mod tests {
             None,
             0,
             crate::session::Status::Idle,
+            "claude".to_string(),
         );
         let mut drained = Instance::new("session", "/tmp/project");
         drained.lifecycle_generation = 7;
@@ -315,5 +383,98 @@ mod tests {
         apply_drained_lifecycle_if_unchanged(&mut relaunched, &drained, &baseline);
         assert_eq!(relaunched.lifecycle_generation, 9);
         assert_eq!(relaunched.lifecycle_reservation, Some(reservation));
+    }
+
+    /// A tool swap or a disk write can move a row's execution without moving its lifecycle counter,
+    /// because neither claims one. A walk that armed its window for the old execution must not
+    /// write it onto the new one.
+    #[test]
+    fn a_walk_verdict_is_dropped_when_the_execution_moved_under_it() {
+        let execution = |id: &str| {
+            Some(crate::session::ActiveExecution {
+                launch_id: id.to_string(),
+                binding: crate::session::ExecutionBinding {
+                    agent: "claude".into(),
+                    stores: Vec::new(),
+                    configuration: Vec::new(),
+                    cwd: "/tmp".into(),
+                    cwd_filesystem: "host".into(),
+                    filesystem: "host".into(),
+                    exported_default_store: None,
+                },
+                capture: None,
+                container: None,
+            })
+        };
+        let mut live = Instance::new("swapped", "/tmp/swapped");
+        live.lifecycle_generation = 7;
+        let baseline: SessionIdentityBaseline = (
+            live.conversation_state(),
+            None,
+            None,
+            None,
+            None,
+            7,
+            crate::session::Status::Idle,
+            "claude".to_string(),
+        );
+        let mut walked = live.clone();
+        walked.poller_repair.reprobe(std::time::Instant::now());
+
+        live.poller_repair = Default::default();
+        apply_poller_repair_if_lifecycle_unchanged(&mut live, &walked.poller_repair, &baseline);
+        assert_eq!(
+            live.poller_repair.current_reprobe_delay(),
+            Some(std::time::Duration::from_secs(5)),
+            "fixture: nothing moved, so the verdict lands"
+        );
+
+        // The row swapped tool under the walk: same lifecycle counter, different execution.
+        live.active_execution = execution("launch-2");
+        live.poller_repair = Default::default();
+        apply_poller_repair_if_lifecycle_unchanged(&mut live, &walked.poller_repair, &baseline);
+        assert_eq!(
+            live.poller_repair.current_reprobe_delay(),
+            None,
+            "a window armed for the execution the row gave up is not written onto the new one"
+        );
+    }
+
+    /// A tool swap moves the agent without the lifecycle counter, the execution or the capture
+    /// generation, so a walk that armed a window for the previous agent can still pass every
+    /// other check. The baseline's agent is what tells the two apart.
+    #[test]
+    fn a_walk_verdict_is_dropped_when_the_agent_moved_under_it() {
+        let mut live = Instance::new("swapped-agent", "/tmp/swapped-agent");
+        live.lifecycle_generation = 7;
+        let baseline: SessionIdentityBaseline = (
+            live.conversation_state(),
+            None,
+            None,
+            None,
+            None,
+            7,
+            crate::session::Status::Idle,
+            "claude".to_string(),
+        );
+        let mut walked = live.clone();
+        walked.poller_repair.reprobe(std::time::Instant::now());
+
+        live.poller_repair = Default::default();
+        apply_poller_repair_if_lifecycle_unchanged(&mut live, &walked.poller_repair, &baseline);
+        assert_eq!(
+            live.poller_repair.current_reprobe_delay(),
+            Some(std::time::Duration::from_secs(5)),
+            "fixture: nothing moved, so the verdict lands"
+        );
+
+        live.tool = "codex".to_string();
+        live.poller_repair = Default::default();
+        apply_poller_repair_if_lifecycle_unchanged(&mut live, &walked.poller_repair, &baseline);
+        assert_eq!(
+            live.poller_repair.current_reprobe_delay(),
+            None,
+            "a window armed for the previous agent is not written onto this one"
+        );
     }
 }

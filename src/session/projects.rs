@@ -660,6 +660,22 @@ pub fn find_by_canonical_path(profile: &str, path: &Path) -> Option<Project> {
         .find(|p| canonical_key(&p.path) == target)
 }
 
+/// Resolve the effective `smart_rename` override for a session: `session_cfg`'s resolved
+/// `scratch_smart_rename` for scratch sessions (which have no stable path to key a registry entry
+/// on, so the setting lives on `Config` instead), otherwise the registered project's override at
+/// `repo_path`, if any.
+pub fn resolve_smart_rename_override(
+    profile: &str,
+    scratch: bool,
+    repo_path: &Path,
+    session_cfg: &crate::session::config::SessionConfig,
+) -> Option<bool> {
+    if scratch {
+        return session_cfg.scratch_smart_rename.as_override();
+    }
+    find_by_canonical_path(profile, repo_path).and_then(|p| p.overrides.smart_rename)
+}
+
 /// Edit the override bundle on the entry matching `name_or_path` in the given scope, under the
 /// registry lock.
 pub fn update_overrides(
@@ -1062,6 +1078,51 @@ mod tests {
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].name, "second");
         assert_eq!(merged[0].scope, ProjectScope::Profile);
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_smart_rename_override_uses_session_cfg_for_scratch_sessions() -> Result<()> {
+        use crate::session::config::{ScratchSmartRenameMode, SessionConfig};
+
+        let temp = tempdir()?;
+        let _app_dir = isolate_app_dir_at(temp.path());
+        let repo = temp.path().join("demo");
+        let _ = git2::Repository::init(&repo);
+
+        add(
+            "default",
+            ProjectScope::Global,
+            Project::new("demo", repo.to_string_lossy(), ProjectScope::Global),
+            false,
+        )?;
+        update_overrides("default", ProjectScope::Global, "demo", |ov| {
+            ov.smart_rename = Some(false);
+        })?;
+
+        let mut session_cfg = SessionConfig {
+            scratch_smart_rename: ScratchSmartRenameMode::On,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            resolve_smart_rename_override("default", false, &repo, &session_cfg),
+            Some(false),
+            "non-scratch session resolves the registered project's override, ignoring session_cfg"
+        );
+        assert_eq!(
+            resolve_smart_rename_override("default", true, &repo, &session_cfg),
+            Some(true),
+            "scratch session ignores repo_path and resolves session_cfg's scratch_smart_rename instead"
+        );
+
+        session_cfg.scratch_smart_rename = ScratchSmartRenameMode::Inherit;
+        assert_eq!(
+            resolve_smart_rename_override("default", true, &repo, &session_cfg),
+            None,
+            "Inherit defers to the resolved smart_rename toggle"
+        );
         Ok(())
     }
 }

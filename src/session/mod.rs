@@ -58,7 +58,7 @@ pub use config::{
 };
 pub(crate) use environment::user_shell;
 pub use environment::{validate_env_entries, validate_env_entry};
-pub use fork::{ForkDenied, ForkSeed};
+pub use fork::{ForkDenied, ForkParentRef, ForkSeed};
 /// Shared by the sorter and the row renderer so a row is decorated as a
 /// favorite exactly when it is pinned as one.
 pub(crate) use groups::is_live_favorite;
@@ -75,6 +75,8 @@ pub use groups::{
 pub(crate) use instance::install_aliases;
 #[cfg(test)]
 pub(crate) use instance::test_helpers::publish_host_pi_transcript;
+#[cfg(test)]
+pub(crate) use instance::ActiveExecution;
 pub(crate) use instance::{
     duplicate_session_error, is_duplicate_session, PassiveStatusPatch, ResumeIntent, SidWrite,
     ToolLaunchUnavailable, NEWER_GENERATION_BUSY_REASON,
@@ -155,12 +157,14 @@ pub use config::repo_config::{
 pub use projects::{Project, ProjectOverrides, ProjectScope};
 pub use recovery::HookTimeoutScope;
 pub use scope::SessionScope;
+#[cfg(test)]
+pub(crate) use storage::migration_backups;
 pub(crate) use storage::{
     acquire_open_storage_flock, acquire_session_title_lock, acquire_storage_flock,
-    acquire_storage_shared_flock, atomic_write, read_file_no_follow, replace_file_no_follow,
-    resolve_symlink_chain, try_acquire_storage_flock, CaptureStorage, GroupMovePlan, LaunchConfig,
-    NativeStoreUnavailable, ProfileMoveRejected, SessionMutation, SessionStore, StorageFlock,
-    StorageTransition, STORAGE_LOCK_FILENAME,
+    acquire_storage_shared_flock, atomic_write, backup_before_migration, read_file_no_follow,
+    replace_file_no_follow, resolve_symlink_chain, try_acquire_storage_flock, CaptureStorage,
+    GroupMovePlan, LaunchConfig, NativeStoreUnavailable, ProfileMoveRejected, SessionMutation,
+    SessionStore, StorageFlock, StorageTransition, STORAGE_LOCK_FILENAME,
 };
 pub use storage::{
     load_recent_projects, load_workspace_ordering, recent_project_entry_for, record_recent_project,

@@ -232,9 +232,10 @@ pub(crate) enum ResumeIntent {
     #[serde(rename = "Cleared")]
     Cleared,
     /// One-shot fork seed: on the next (first) launch, resume `from` and fork
-    /// into a NEW session whose id was pre-pinned in `agent_session_id`.
-    /// Auto-promotes to `Default` after that launch, exactly like `Cleared`,
-    /// so later restarts resume the child's own id with a plain `--resume`.
+    /// into a NEW session whose id was preallocated (pre-pinned) in
+    /// `agent_session_id`. Auto-promotes to `Default` after that launch,
+    /// exactly like `Cleared`, so later restarts resume the child's own id with
+    /// a plain `--resume`.
     #[serde(rename = "Fork")]
     Fork { from: String },
 }

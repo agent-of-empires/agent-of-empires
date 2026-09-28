@@ -2231,7 +2231,8 @@ fn copy_tree_no_links(
         source,
         OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_RDONLY,
         Mode::empty(),
-    )?;
+    )
+    .with_context(|| format!("opening {}", source.display()))?;
     copy_tree_from_fd(
         fd,
         destination,
@@ -2241,6 +2242,7 @@ fn copy_tree_no_links(
         files_only,
         copied,
     )
+    .with_context(|| format!("copying {}", source.display()))
 }
 
 #[cfg(unix)]
@@ -2260,7 +2262,16 @@ fn copy_tree_from_fd(
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::PermissionsExt;
 
-    let mut dir = Dir::from_fd(fd)?;
+    // Errors name paths relative to the source root, which the caller names.
+    let listing = || {
+        let shown = if relative.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            relative
+        };
+        format!("listing {}", shown.display())
+    };
+    let mut dir = Dir::from_fd(fd).with_context(listing)?;
     let names: Result<Vec<std::ffi::OsString>> = dir
         .iter()
         .filter_map(|entry| match entry {
@@ -2272,12 +2283,14 @@ fn copy_tree_from_fd(
             Err(error) => Some(Err(error.into())),
         })
         .collect();
-    for name in names? {
+    for name in names.with_context(listing)? {
         let name = name.as_os_str();
         if excluded_children.is_some_and(|excluded| excluded.contains(name)) {
             continue;
         }
-        let stat = fstatat(&dir, name, AtFlags::AT_SYMLINK_NOFOLLOW)?;
+        let path = relative.join(name);
+        let stat = fstatat(&dir, name, AtFlags::AT_SYMLINK_NOFOLLOW)
+            .with_context(|| format!("inspecting {}", path.display()))?;
         let kind = stat.st_mode & nix::libc::S_IFMT;
         // A symlink at a shared root usually points into one of the
         // directories below, so carrying it would publish a dangler.
@@ -2286,34 +2299,41 @@ fn copy_tree_from_fd(
         }
         let target = destination.join(name);
         if kind == nix::libc::S_IFLNK {
-            let link = readlinkat(&dir, name)?;
+            let link = readlinkat(&dir, name)
+                .with_context(|| format!("reading link {}", path.display()))?;
             if !relative_symlink_stays_in_root(relative, Path::new(&link)) {
                 tracing::warn!(
                     "v027 skipping source symlink that escapes its sandbox root: {}",
-                    relative.join(name).display()
+                    path.display()
                 );
                 continue;
             }
             match fs::symlink_metadata(&target) {
                 Ok(_) if overwrite_newer && source_stat_is_newer(&stat, &target)? => {
-                    remove_tree_no_links(&target)?;
+                    remove_tree_no_links(&target)
+                        .with_context(|| format!("removing {}", target.display()))?;
                 }
                 Ok(_) if overwrite_newer => continue,
                 Ok(_) => bail!("v027 copy destination already exists: {}", target.display()),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error.into()),
+                Err(error) => {
+                    return Err(error).with_context(|| format!("inspecting {}", target.display()))
+                }
             }
-            std::os::unix::fs::symlink(&link, &target)?;
+            std::os::unix::fs::symlink(&link, &target)
+                .with_context(|| format!("creating {}", target.display()))?;
             #[cfg(not(target_os = "redox"))]
             {
-                let target_dir = fs::File::open(destination)?;
+                let setting_times = || format!("setting times on {}", target.display());
+                let target_dir = fs::File::open(destination).with_context(setting_times)?;
                 nix::sys::stat::utimensat(
                     &target_dir,
                     name,
                     &TimeSpec::new(stat.st_atime, stat.st_atime_nsec),
                     &TimeSpec::new(stat.st_mtime, stat.st_mtime_nsec),
                     nix::sys::stat::UtimensatFlags::NoFollowSymlink,
-                )?;
+                )
+                .with_context(setting_times)?;
             }
             continue;
         }
@@ -2323,7 +2343,8 @@ fn copy_tree_from_fd(
                 name,
                 OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_RDONLY,
                 Mode::empty(),
-            )?;
+            )
+            .with_context(|| format!("opening {}", path.display()))?;
             let existed = match fs::symlink_metadata(&target) {
                 Ok(metadata)
                     if overwrite_newer
@@ -2337,24 +2358,20 @@ fn copy_tree_from_fd(
                     target.display()
                 ),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    fs::create_dir(&target)?;
+                    fs::create_dir(&target)
+                        .with_context(|| format!("creating {}", target.display()))?;
                     false
                 }
-                Err(error) => return Err(error.into()),
+                Err(error) => {
+                    return Err(error).with_context(|| format!("inspecting {}", target.display()))
+                }
             };
-            copy_tree_from_fd(
-                child,
-                &target,
-                None,
-                &relative.join(name),
-                overwrite_newer,
-                false,
-                copied,
-            )?;
+            copy_tree_from_fd(child, &target, None, &path, overwrite_newer, false, copied)?;
             if !existed || source_stat_is_newer(&stat, &target)? {
                 // `st_mode` is u32 on Linux and u16 on Darwin, so the cast is
                 // a no-op on one and a widening on the other.
-                fs::set_permissions(&target, fs::Permissions::from_mode(stat.st_mode as u32))?;
+                fs::set_permissions(&target, fs::Permissions::from_mode(stat.st_mode as u32))
+                    .with_context(|| format!("setting permissions on {}", target.display()))?;
             }
         } else if kind == nix::libc::S_IFREG {
             let file = openat(
@@ -2362,10 +2379,14 @@ fn copy_tree_from_fd(
                 name,
                 OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_RDONLY | OFlag::O_NONBLOCK,
                 Mode::empty(),
-            )?;
-            let opened = fstat(&file)?;
+            )
+            .with_context(|| format!("opening {}", path.display()))?;
+            let opened = fstat(&file).with_context(|| format!("inspecting {}", path.display()))?;
             if (opened.st_mode & nix::libc::S_IFMT) != nix::libc::S_IFREG {
-                bail!("v027 source entry changed type during copy");
+                bail!(
+                    "v027 source entry changed type during copy: {}",
+                    path.display()
+                );
             }
             let mut input = fs::File::from(file);
             let target_exists = match fs::symlink_metadata(&target) {
@@ -2384,13 +2405,16 @@ fn copy_tree_from_fd(
                     target.display()
                 ),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-                Err(error) => return Err(error.into()),
+                Err(error) => {
+                    return Err(error).with_context(|| format!("inspecting {}", target.display()))
+                }
             };
             // A clone has to create its own destination, so an entry being
             // replaced is unlinked rather than truncated and both paths take
             // the same `create_new` route.
             if target_exists {
-                fs::remove_file(&target)?;
+                fs::remove_file(&target)
+                    .with_context(|| format!("removing {}", target.display()))?;
             }
             let output = match copied.clone.clone_file(&input, &opened, &target) {
                 Some(output) => {
@@ -2401,19 +2425,25 @@ fn copy_tree_from_fd(
                     let mut output = fs::OpenOptions::new()
                         .write(true)
                         .create_new(true)
-                        .open(&target)?;
-                    let bytes = std::io::copy(&mut input, &mut output)?;
+                        .open(&target)
+                        .with_context(|| format!("creating {}", target.display()))?;
+                    let bytes = std::io::copy(&mut input, &mut output)
+                        .with_context(|| format!("copying {}", path.display()))?;
                     copied.copied_file(bytes);
-                    output.set_permissions(fs::Permissions::from_mode(opened.st_mode as u32))?;
+                    output
+                        .set_permissions(fs::Permissions::from_mode(opened.st_mode as u32))
+                        .with_context(|| format!("setting permissions on {}", target.display()))?;
                     futimens(
                         &output,
                         &TimeSpec::new(opened.st_atime, opened.st_atime_nsec),
                         &TimeSpec::new(opened.st_mtime, opened.st_mtime_nsec),
-                    )?;
+                    )
+                    .with_context(|| format!("setting times on {}", target.display()))?;
                     output
                 }
             };
-            super::store_fs::sync_to_drive(&output)?;
+            super::store_fs::sync_to_drive(&output)
+                .with_context(|| format!("syncing {}", target.display()))?;
         }
     }
     Ok(())
@@ -2422,7 +2452,8 @@ fn copy_tree_from_fd(
 #[cfg(unix)]
 fn source_stat_is_newer(stat: &nix::libc::stat, target: &Path) -> Result<bool> {
     use std::os::unix::fs::MetadataExt;
-    let target = fs::symlink_metadata(target)?;
+    let target =
+        fs::symlink_metadata(target).with_context(|| format!("inspecting {}", target.display()))?;
     Ok((stat.st_mtime, stat.st_mtime_nsec) > (target.mtime(), target.mtime_nsec()))
 }
 
@@ -2454,16 +2485,19 @@ fn copy_tree_no_links(
     files_only: bool,
     copied: &mut CopyState,
 ) -> Result<()> {
-    for entry in fs::read_dir(source)? {
-        let entry = entry?;
+    let listing = || format!("listing {}", source.display());
+    for entry in fs::read_dir(source).with_context(listing)? {
+        let entry = entry.with_context(listing)?;
         if excluded_children.is_some_and(|excluded| excluded.contains(&entry.file_name())) {
             continue;
         }
-        let metadata = fs::symlink_metadata(entry.path())?;
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)
+            .with_context(|| format!("inspecting {}", path.display()))?;
         if metadata.file_type().is_symlink() {
             bail!(
                 "v027 cannot safely copy source symlink on this platform: {}",
-                entry.path().display()
+                path.display()
             );
         }
         if files_only && !metadata.is_file() {
@@ -2475,14 +2509,22 @@ fn copy_tree_no_links(
                 Ok(()) => {}
                 Err(error)
                     if overwrite_newer && error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(error) => return Err(error.into()),
+                Err(error) => {
+                    return Err(error).with_context(|| format!("creating {}", target.display()))
+                }
             }
-            copy_tree_no_links(&entry.path(), &target, None, overwrite_newer, false, copied)?;
-            fs::set_permissions(&target, metadata.permissions())?;
+            copy_tree_no_links(&path, &target, None, overwrite_newer, false, copied)?;
+            fs::set_permissions(&target, metadata.permissions())
+                .with_context(|| format!("setting permissions on {}", target.display()))?;
         } else if metadata.is_file() {
             let should_copy = match fs::symlink_metadata(&target) {
                 Ok(existing) if overwrite_newer && existing.is_file() => {
-                    metadata.modified()? > existing.modified()?
+                    metadata
+                        .modified()
+                        .with_context(|| format!("inspecting {}", path.display()))?
+                        > existing
+                            .modified()
+                            .with_context(|| format!("inspecting {}", target.display()))?
                 }
                 // Conflicting types are not evidence that the required
                 // configuration reached the destination. Fail closed.
@@ -2491,12 +2533,20 @@ fn copy_tree_no_links(
                     target.display()
                 ),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
-                Err(error) => return Err(error.into()),
+                Err(error) => {
+                    return Err(error).with_context(|| format!("inspecting {}", target.display()))
+                }
             };
             if should_copy {
-                copied.copied_file(fs::copy(entry.path(), &target)?);
-                fs::set_permissions(&target, metadata.permissions())?;
-                super::store_fs::sync_to_drive(&fs::File::open(&target)?)?;
+                copied.copied_file(
+                    fs::copy(&path, &target)
+                        .with_context(|| format!("copying {}", path.display()))?,
+                );
+                fs::set_permissions(&target, metadata.permissions())
+                    .with_context(|| format!("setting permissions on {}", target.display()))?;
+                fs::File::open(&target)
+                    .and_then(|output| super::store_fs::sync_to_drive(&output))
+                    .with_context(|| format!("syncing {}", target.display()))?;
             }
         }
     }
@@ -5056,6 +5106,29 @@ gemini = "{}"
                 & 0o777,
             0o555
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[serial_test::serial]
+    fn an_unreadable_source_file_fails_naming_its_path() {
+        use std::os::unix::fs::PermissionsExt;
+        // Root bypasses the mode, so the open would succeed.
+        if nix::unistd::geteuid().is_root() {
+            return;
+        }
+        let (_temp, _app_guard, app, home) = isolated();
+        let source = home.join(".gemini/sandbox");
+        fs::create_dir_all(source.join("skills/gstack")).unwrap();
+        let unreadable = source.join("skills/gstack/x.bun-build");
+        fs::write(&unreadable, b"").unwrap();
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000)).unwrap();
+        fs::write(app.join("sessions.json"), format!("[{}]", row("one"))).unwrap();
+
+        let error = run_in(&app, &home, &|_| Ok(false)).unwrap_err();
+
+        let chain = format!("{error:#}");
+        assert!(chain.contains("skills/gstack/x.bun-build"), "{chain}");
     }
 
     #[test]

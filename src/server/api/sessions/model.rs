@@ -417,11 +417,18 @@ impl ProjectRegistryCache {
             .map(|(_, p)| p)
     }
 
+    /// Scratch sessions have no stable path to key a registry entry on, so their override lives
+    /// on `session_cfg` (already resolved by the caller) instead of the project registry.
     pub(super) fn smart_rename_override(
         &mut self,
         profile: &str,
+        scratch: bool,
         project_path: &str,
+        session_cfg: &crate::session::config::SessionConfig,
     ) -> Option<bool> {
+        if scratch {
+            return session_cfg.scratch_smart_rename.as_override();
+        }
         self.find(profile, project_path)
             .and_then(|p| p.overrides.smart_rename)
     }

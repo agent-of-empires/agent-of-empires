@@ -1134,6 +1134,13 @@ async fn stop_with_commit(
             .map(Vec::as_slice)
             .unwrap_or_default();
         crate::server::pane::sample_panes(row, tools, panes.as_ref());
+        // A direct stop settles the row without going through
+        // `apply_status_intent`, which normally releases a plugin's pending revival
+        // mark on reaching a terminal status; release it here instead, on the same
+        // in-memory row a concurrent cap count reads. The committed row that was
+        // just adopted is a fresh disk load, where the `#[serde(skip)]` field is
+        // false whatever this row carried.
+        row.plugin_revival_pending = false;
         state
             .mutation_epoch
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);

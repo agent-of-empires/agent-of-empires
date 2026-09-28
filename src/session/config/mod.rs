@@ -909,6 +909,29 @@ pub struct AppStateConfig {
     pub web_ui_state: std::collections::BTreeMap<String, String>,
 }
 
+/// Whether a scratch session (no repo, so never repo-config-overridden) follows the global
+/// `smart_rename` toggle or forces its own value, since scratch sessions have no stable path to
+/// key a per-project override on the way a registered repo does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ScratchSmartRenameMode {
+    #[default]
+    Inherit,
+    On,
+    Off,
+}
+
+impl ScratchSmartRenameMode {
+    /// `None` defers to the resolved `smart_rename` toggle; `Some` forces it either way.
+    pub fn as_override(self) -> Option<bool> {
+        match self {
+            Self::Inherit => None,
+            Self::On => Some(true),
+            Self::Off => Some(false),
+        }
+    }
+}
+
 /// Session-related configuration defaults
 #[derive(Debug, Clone, Serialize, Deserialize, SettingsSection)]
 // `repo_default = "deny"`: most of this section is personal preference, but
@@ -1048,6 +1071,17 @@ pub struct SessionConfig {
     #[serde(default = "default_true")]
     #[setting(label = "Smart Session Rename", widget = "toggle", category = "Agents")]
     pub smart_rename: bool,
+
+    /// Override Smart Session Rename for scratch sessions specifically, since they have no repo
+    /// path to key a per-project override on the way a registered project does.
+    #[serde(default)]
+    #[setting(
+        label = "Smart Session Rename (Scratch)",
+        widget = "select",
+        options = "inherit:Use Smart Session Rename,on:On,off:Off",
+        category = "Agents"
+    )]
+    pub scratch_smart_rename: ScratchSmartRenameMode,
 
     /// Agent used for one-shot utility calls (the smart-rename title and the
     /// conversation summary). Empty means use the session's own agent. Set
@@ -1193,10 +1227,15 @@ pub struct SessionConfig {
 
     /// Config directory read by the session's agent instead of its built-in
     /// default. Host sessions use the directory directly. Sandboxed sessions
-    /// use its `sandbox` subdirectory, which AoE mounts at the resolved
-    /// built-in config path and uses for hooks, credentials, and native-session
-    /// capture. Native MCP discovery reads it too, so AoE reconciles the
-    /// servers the agent loads.
+    /// use a per-session `sandbox-v2/<instance id>` child of it, which AoE
+    /// mounts at the resolved built-in config path and uses for hooks,
+    /// credentials, and native-session capture. Every agent but Claude
+    /// re-reads this entry on the next launch, so a repointed entry moves the
+    /// session, except where an OMP profile or dotenv pins its own directory,
+    /// which refuses the launch instead. A Claude conversation keeps the store
+    /// its own binding recorded and resumes there, in the host and structured
+    /// views alike; this entry still owns that conversation's folder-trust
+    /// records.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[setting(
         label = "Agent Config Dir",
@@ -1776,6 +1815,7 @@ impl Default for SessionConfig {
             merge_hooks_into_selected_agent: true,
             conversation_summary: false,
             smart_rename: true,
+            scratch_smart_rename: ScratchSmartRenameMode::default(),
             smart_rename_agent: String::new(),
             smart_rename_model: HashMap::new(),
             auto_resume_on_restart: true,

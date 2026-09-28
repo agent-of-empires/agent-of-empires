@@ -36,8 +36,25 @@ impl Instance {
         } else {
             storage.storage().profile().to_owned()
         };
-        let prior = std::mem::replace(self, disk);
+        // The poller and the repair window both describe the launch this row was
+        // holding. A row the store now describes can run another one, so neither
+        // crosses over: a poller for the launch the row gives up keeps reading
+        // files this row no longer owns, and a window armed for it paces an
+        // attempt this row never made.
+        let mut prior = std::mem::replace(self, disk);
+        if !prior.poller_serves(&self.tool, self.active_execution.as_ref()) {
+            prior.stop_poller();
+            prior.session_id_poller = None;
+        }
+        let store_repair = (
+            self.poller_repair.clone(),
+            self.session_id_poller_retry_after,
+        );
+        let carries_repair = self.runs(&prior.tool, prior.active_execution.as_ref());
         self.inherit_runtime(prior, preserve_errors);
+        if !carries_repair {
+            (self.poller_repair, self.session_id_poller_retry_after) = store_repair;
+        }
         Ok(())
     }
 
@@ -50,13 +67,10 @@ impl Instance {
             self.absorb_published_pi_session_in(storage);
             return Ok(());
         }
-        if !matches!(
-            self.source_capture_backend(),
-            Some(
-                crate::agents::SessionCaptureBackend::Claude
-                    | crate::agents::SessionCaptureBackend::HookSidecar
-            )
-        ) || !matches!(self.resume_intent, ResumeIntent::Default)
+        // Any capture that reads the hook sidecar publishes into it; the backend
+        // list that used to gate this is only part of that answer.
+        if !self.capture_reads_hook_sidecar()
+            || !matches!(self.resume_intent, ResumeIntent::Default)
         {
             return Ok(());
         }

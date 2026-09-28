@@ -23,7 +23,7 @@ import { safeGetItem, safeRemoveItem } from "./lib/safeStorage";
 import { isAutomatedSession } from "./lib/onboarding";
 import { useWorkspaces } from "./hooks/useWorkspaces";
 import { useLastSessionRestore } from "./hooks/useLastSessionRestore";
-import { useRepoGroups } from "./hooks/useRepoGroups";
+import { SCRATCH_GROUP_ID, useRepoGroups } from "./hooks/useRepoGroups";
 import { useSessionGroups } from "./hooks/useSessionGroups";
 import { useNestedSidebarGroups } from "./hooks/useNestedSidebarGroups";
 import { useOrgGroups } from "./hooks/useOrgGroups";
@@ -147,6 +147,7 @@ import { ChromeCollapseHandle, CollapsibleRegion } from "./components/Collapsibl
 import { DiffFileViewer } from "./components/diff/DiffFileViewer";
 import { SettingsView } from "./components/SettingsView";
 import { ProjectFormModal } from "./components/ProjectFormModal";
+import { ScratchOverridesModal } from "./components/ScratchOverridesModal";
 import { HelpOverlay } from "./components/HelpOverlay";
 import { useTour } from "./hooks/useTour";
 import { useWelcomePhase } from "./hooks/useWelcomePhase";
@@ -1408,8 +1409,17 @@ function AppContent({
     [projects, requireProjectProfile],
   );
 
+  // The synthetic Scratch group has no repo path to register a project entry under, so it gets
+  // a dedicated settings modal instead of ProjectFormModal.
+  const [scratchSettingsOpen, setScratchSettingsOpen] = useState(false);
+
+  // A group with live sessions may be unregistered; register it globally before editing.
   const handleEditProjectSettings = useCallback(
     async (group: SidebarGroup) => {
+      if (group.id === SCRATCH_GROUP_ID) {
+        setScratchSettingsOpen(true);
+        return;
+      }
       const profile = requireProjectProfile();
       if (!profile) return;
       const registered = group.registeredProjects.find((project) => projects.includes(project));
@@ -2411,6 +2421,10 @@ function AppContent({
             onClose={() => setProjectForm(null)}
             onSaved={() => refreshProjects()}
           />
+        )}
+
+        {scratchSettingsOpen && (
+          <ScratchOverridesModal profile={serverAbout?.profile ?? ""} onClose={() => setScratchSettingsOpen(false)} />
         )}
 
         {welcome.showWelcome && <ThemeIntro onDone={welcome.dismissWelcome} />}

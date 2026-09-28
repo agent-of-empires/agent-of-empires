@@ -1317,7 +1317,13 @@ mod tests {
             inst.status = Status::Stopped;
             seed(profile, &[&inst]);
 
-            let poller = crate::session::poller::SessionPoller::new("unused-tmux".to_string());
+            // A poller only serves the row it watches: `settle_poller_for` stops a
+            // thread that watches another tool, so this one is built for the row's.
+            let poller = crate::session::poller::SessionPoller::new(
+                "unused-tmux".to_string(),
+                inst.tool.clone(),
+                None,
+            );
             poller.inject_test_observation(
                 &inst.id,
                 crate::session::poller::SessionIdObservation::omp(

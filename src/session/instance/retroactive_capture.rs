@@ -54,14 +54,14 @@ impl Instance {
             self.active_execution.as_ref().map(|active| &active.binding),
         )?;
         let observation = match backend {
-            crate::agents::SessionCaptureBackend::Claude
-            | crate::agents::SessionCaptureBackend::HookSidecar => {
-                super::execution::hook_session_observation(
-                    &self.id,
-                    self.active_execution.as_ref(),
-                    None,
-                )
-            }
+            // Decided by context before the backend, so a host Codex pane reads
+            // its sidecar instead of falling into a store-backed arm. Claude and
+            // the sidecar backend read it in every context, so they land here too.
+            _ if capture.reads_hook_sidecar(context) => super::execution::hook_session_observation(
+                &self.id,
+                self.active_execution.as_ref(),
+                None,
+            ),
             crate::agents::SessionCaptureBackend::Pi => self.pi_published_conversation(true),
             crate::agents::SessionCaptureBackend::Omp => {
                 let Some(tmux_session_name) = self.tmux_env_session_name().or_else(|| {
@@ -121,7 +121,10 @@ impl Instance {
                     .ok()
                 }
             }
-            crate::agents::SessionCaptureBackend::Codex
+            // Sidecar publishers returned above.
+            crate::agents::SessionCaptureBackend::Claude
+            | crate::agents::SessionCaptureBackend::HookSidecar
+            | crate::agents::SessionCaptureBackend::Codex
             | crate::agents::SessionCaptureBackend::Gemini
             | crate::agents::SessionCaptureBackend::Hermes
             | crate::agents::SessionCaptureBackend::Kimi

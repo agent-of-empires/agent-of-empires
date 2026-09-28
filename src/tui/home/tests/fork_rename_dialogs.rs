@@ -38,6 +38,7 @@ fn fork_from_selection_seeds_terminal_fork_and_inherits_parent_context() {
         crate::session::ForkSeed::Terminal {
             parent,
             child_session_id,
+            ..
         } => {
             assert_eq!(parent.session_id, "parent-1111-2222-3333-444444444444");
             assert_ne!(child_session_id, "parent-1111-2222-3333-444444444444");
@@ -48,6 +49,116 @@ fn fork_from_selection_seeds_terminal_fork_and_inherits_parent_context() {
         other => panic!("expected Terminal fork seed, got {other:?}"),
     }
     assert_eq!(dialog.path_value(), "/tmp/repo-worktrees/feature");
+}
+
+/// A launch that pre-pins a child id still records the execution it resolved,
+/// so the Fork row shows before any conversation is captured.
+#[test]
+#[serial]
+fn fork_row_offers_a_preallocated_parent() {
+    let mut env = create_test_env_empty();
+    let mut inst = observed_fork_parent("claude");
+    inst.agent_session_binding.as_mut().unwrap().provenance =
+        crate::session::ConversationProvenance::Preallocated;
+    let id = inst.id.clone();
+    env.view.add_instance(inst);
+    env.view.selected_session = Some(id.clone());
+
+    assert!(
+        env.view.session_can_fork(&id),
+        "a preallocated parent records its launch execution, so the row must show"
+    );
+}
+
+/// A recorded conversation AoE cannot fork is refused in two ways, and the
+/// dialog carries the shared wording: a preallocated id names no conversation to
+/// qualify, while a binding that never qualified, or one a degraded launch
+/// dropped, names a conversation to re-assert.
+#[test]
+#[serial]
+fn fork_from_selection_reports_why_the_conversation_cannot_be_forked() {
+    let recorded = "parent-1111-2222-3333-444444444444".to_string();
+    let cases = [
+        (
+            crate::session::ConversationProvenance::Preallocated,
+            crate::session::ForkDenied::UnqualifiedParent {
+                preallocated: true,
+                recorded: recorded.clone(),
+            },
+        ),
+        (
+            crate::session::ConversationProvenance::Unknown,
+            crate::session::ForkDenied::UnqualifiedParent {
+                preallocated: false,
+                recorded: recorded.clone(),
+            },
+        ),
+    ];
+    for (provenance, denied) in cases {
+        let mut env = create_test_env_empty();
+        let mut inst = observed_fork_parent("claude");
+        inst.agent_session_binding.as_mut().unwrap().provenance = provenance;
+        let title = inst.title.clone();
+        let id = inst.id.clone();
+        let profile = inst.effective_profile();
+        env.view.add_instance(inst);
+        env.view.selected_session = Some(id.clone());
+
+        env.view.open_fork_from_selection();
+
+        assert!(
+            env.view.new_dialog.is_none(),
+            "an unqualified parent must not open a fork dialog"
+        );
+        let dialog = env.view.info_dialog.as_ref().expect("info dialog");
+        assert_eq!(dialog.title(), "Conversation not qualified");
+        assert_eq!(dialog.message(), denied.user_message(&title, &id, &profile));
+    }
+}
+
+/// `set-session-id` opens only the store its profile names, so a remedy for a
+/// parent living in a non-default profile has to name that profile: run
+/// against the default it would qualify nothing.
+#[test]
+#[serial]
+fn the_qualification_remedy_names_the_profile_the_parent_lives_in() {
+    let mut env = create_test_env_empty();
+    let mut inst = observed_fork_parent("claude");
+    inst.source_profile = "client work".into();
+    inst.agent_session_binding.as_mut().unwrap().provenance =
+        crate::session::ConversationProvenance::Unknown;
+    let id = inst.id.clone();
+    env.view.add_instance(inst);
+    env.view.selected_session = Some(id.clone());
+
+    env.view.open_fork_from_selection();
+
+    let message = &env
+        .view
+        .info_dialog
+        .as_ref()
+        .expect("an unqualified parent is refused with a dialog")
+        .message()
+        .to_string();
+    let command = message
+        .split_once('`')
+        .and_then(|(_, rest)| rest.split_once('`'))
+        .map_or_else(
+            || panic!("one quoted remedy in: {message}"),
+            |(span, _)| span,
+        );
+    assert_eq!(
+        shell_words::split(command).expect("the remedy tokenizes"),
+        [
+            "aoe",
+            "-p",
+            "client work",
+            "session",
+            "set-session-id",
+            id.as_str(),
+            "parent-1111-2222-3333-444444444444",
+        ]
+    );
 }
 
 /// Unforkable parents get an explanatory info dialog instead of the fork form: a resume-only

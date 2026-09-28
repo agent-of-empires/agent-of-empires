@@ -113,14 +113,25 @@ const POLLER_REPAIR_MAX_DELAY: Duration = Duration::from_secs(60);
 /// At the capped delay, log a reminder every this many deferrals
 /// (60 s × 10 = one line per ten minutes per session).
 const POLLER_REPAIR_REMIND_EVERY: u32 = 10;
+/// First delay before re-probing a session that had nothing to poll.
+const POLLER_REPROBE_INITIAL_DELAY: Duration = Duration::from_secs(5);
 
-/// Retry schedule for one session whose session-id poller could not be (re)started — typically
-/// because the process-wide thread budget is spent.
+/// How long a row waits before trying its managed capture store again.
+pub(crate) const MANAGED_CAPTURE_RETRY_BACKOFF: Duration = Duration::from_secs(30);
+
+/// Ceiling for re-probing a session that has nothing to poll: no point re-probing a row more
+/// often than the store it shares would retry it.
+const POLLER_REPROBE_MAX_DELAY: Duration = MANAGED_CAPTURE_RETRY_BACKOFF;
+
+/// Retry schedule for one session whose session-id poller was not (re)started: it could not be
+/// spawned, or the session had nothing to poll yet. One row carries one armed deadline; which
+/// delay it holds is the writer's business, and neither outcome inherits the other's.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PollerRepairBackoff {
     next_attempt: Option<Instant>,
     delay: Option<Duration>,
     deferrals: u32,
+    reprobe_delay: Option<Duration>,
 }
 
 impl PollerRepairBackoff {
@@ -133,8 +144,11 @@ impl PollerRepairBackoff {
     }
 
     /// Record a failed (or skipped-for-budget) attempt at `now` and schedule the next one: 5 s,
-    /// then doubling to a 60 s ceiling.
+    /// then doubling to a 60 s ceiling. `None` when the schedule neither escalated nor reached
+    /// its reminder cadence. A failure ends any run of "nothing to poll", so that streak starts
+    /// its own delay over, counting and logging from its first deferral.
     pub fn defer(&mut self, now: Instant) -> Option<Duration> {
+        self.reprobe_delay = None;
         let previous = self.delay;
         let delay = match previous {
             None => POLLER_REPAIR_INITIAL_DELAY,
@@ -149,12 +163,32 @@ impl PollerRepairBackoff {
         (escalated || reminder).then_some(delay)
     }
 
-    /// Clear the schedule after a successful start.
+    /// Record an attempt at `now` that found nothing to poll: look again after 5 s, doubling to
+    /// 30 s. A past spawn failure stops governing the row.
+    pub fn reprobe(&mut self, now: Instant) {
+        self.delay = None;
+        self.deferrals = 0;
+        let delay = match self.reprobe_delay {
+            None => POLLER_REPROBE_INITIAL_DELAY,
+            Some(d) => (d * 2).min(POLLER_REPROBE_MAX_DELAY),
+        };
+        self.reprobe_delay = Some(delay);
+        self.next_attempt = Some(now + delay);
+    }
+
+    /// The delay before the next re-probe of a session that had nothing to poll, if any.
+    #[cfg(test)]
+    pub(crate) fn current_reprobe_delay(&self) -> Option<Duration> {
+        self.reprobe_delay
+    }
+
+    /// Clear the schedule: a poller started, a launch is re-evaluating the row, a relaunch
+    /// replaced its pane, or the managed store's own retry deadline now governs it.
     pub fn reset(&mut self) {
         *self = Self::default();
     }
 
-    /// Number of consecutive deferrals since the last reset.
+    /// Consecutive deferrals since the last reset or "nothing to poll" answer.
     pub fn deferrals(&self) -> u32 {
         self.deferrals
     }
@@ -162,6 +196,12 @@ impl PollerRepairBackoff {
     /// The delay scheduled by the most recent deferral, if any.
     pub fn current_delay(&self) -> Option<Duration> {
         self.delay
+    }
+
+    /// The instant the next attempt is armed for (tests assert where a deadline comes from).
+    #[cfg(test)]
+    pub(crate) fn armed_at(&self) -> Option<Instant> {
+        self.next_attempt
     }
 
     /// Make the next attempt due immediately without clearing the schedule
@@ -460,6 +500,11 @@ fn poll_resolved_target<T>(
 /// Manages polling thread lifecycle and inter-thread communication via mpsc channels.
 pub struct SessionPoller {
     session_name: String,
+    /// The agent and the execution this poller watches. Its observations name the execution and
+    /// come from the agent, so a row holding this poller has to be that agent on that execution:
+    /// neither half alone identifies what the thread reads.
+    tool: String,
+    execution: Option<crate::session::instance::ActiveExecution>,
     /// The budget this poller's thread is counted against, fixed at
     /// construction so the slot is returned to the budget it was taken from.
     budget: Arc<PollerBudget>,
@@ -481,12 +526,20 @@ impl std::fmt::Debug for SessionPoller {
 }
 
 impl SessionPoller {
-    /// Create a new poller (does not start the thread)
-    pub fn new(session_name: String) -> Self {
+    /// Build a poller for `tool` on `execution`, the agent and the execution whose capture files
+    /// it will read. `None` is a real answer for the execution: a row can hold a poller while it
+    /// has none of its own.
+    pub(crate) fn new(
+        session_name: String,
+        tool: String,
+        execution: Option<crate::session::instance::ActiveExecution>,
+    ) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::channel();
         let (result_tx, result_rx) = mpsc::channel();
         Self {
             session_name,
+            tool,
+            execution,
             budget: current_budget(),
             cmd_tx,
             cmd_rx: Some(cmd_rx),
@@ -756,18 +809,21 @@ impl SessionPoller {
         }
     }
 
+    /// Whether this poller watches `execution` for `tool`.
+    pub(crate) fn serves(
+        &self,
+        tool: &str,
+        execution: Option<&crate::session::instance::ActiveExecution>,
+    ) -> bool {
+        self.tool == tool && self.execution.as_ref() == execution
+    }
+
     /// Check if the poller thread is running
     pub fn is_running(&self) -> bool {
         match &self.handle {
             Some(handle) => !handle.is_finished(),
             None => false,
         }
-    }
-}
-
-impl Default for SessionPoller {
-    fn default() -> Self {
-        Self::new("default".to_string())
     }
 }
 
@@ -916,7 +972,7 @@ mod tests {
         let budget = test_support::IsolatedBudget::with_ceiling(1);
         assert_eq!(session_id_poller_budget(), (0, 1));
 
-        let mut first = SessionPoller::new("iso-a".to_string());
+        let mut first = SessionPoller::new("iso-a".to_string(), "test".to_string(), None);
         assert_eq!(
             first.start(
                 "iso-a".to_string(),
@@ -929,7 +985,7 @@ mod tests {
         assert_eq!(budget.active(), 1);
         assert_eq!(session_id_poller_budget(), (1, 1));
 
-        let mut second = SessionPoller::new("iso-b".to_string());
+        let mut second = SessionPoller::new("iso-b".to_string(), "test".to_string(), None);
         assert_eq!(
             second.start(
                 "iso-b".to_string(),
@@ -942,7 +998,7 @@ mod tests {
         );
 
         let elsewhere = std::thread::spawn(|| {
-            let mut poller = SessionPoller::new("process".to_string());
+            let mut poller = SessionPoller::new("process".to_string(), "test".to_string(), None);
             let outcome = poller.start(
                 "process".to_string(),
                 Box::new(|| Some("id".to_string())),
@@ -1011,6 +1067,55 @@ mod tests {
         assert_eq!(b, PollerRepairBackoff::default());
         assert!(b.due(now));
         assert_eq!(b.defer(now), Some(Duration::from_secs(5)), "restarts at 5s");
+    }
+
+    /// The two outcomes share one armed deadline and one escalation each, and neither inherits
+    /// the other's delay. The failure ladder itself is covered by
+    /// `repair_backoff_doubles_to_a_minute_reminds_at_the_cap_and_resets`.
+    #[test]
+    fn re_probes_back_off_to_their_own_ceiling_and_end_each_other_streaks() {
+        let mut b = PollerRepairBackoff::default();
+        let now = Instant::now();
+        // A failure first, so the reset below is a real transition and not the default value.
+        b.defer(now);
+        assert_eq!(b.deferrals(), 1, "fixture: one deferral on record");
+
+        let mut reprobe_delays = Vec::new();
+        for _ in 0..4 {
+            b.reprobe(now);
+            reprobe_delays.push(b.current_reprobe_delay().unwrap());
+        }
+        assert_eq!(
+            reprobe_delays,
+            vec![
+                Duration::from_secs(5),
+                Duration::from_secs(10),
+                Duration::from_secs(20),
+                POLLER_REPROBE_MAX_DELAY,
+            ],
+            "a re-probe backs off to the interval the managed store itself waits before retrying"
+        );
+        assert_eq!(b.deferrals(), 0, "and it never counts as a failed repair");
+
+        // A failure then starts its own ladder over, so it warns on its first deferral.
+        assert_eq!(
+            b.defer(now),
+            Some(Duration::from_secs(5)),
+            "a failure after a stretch with nothing to poll starts over and warns"
+        );
+        assert_eq!(b.deferrals(), 1);
+
+        // And the failure streak ends just the same: the next re-probe ignores that ceiling.
+        b.reprobe(now);
+        assert_eq!(
+            b.current_reprobe_delay(),
+            Some(POLLER_REPROBE_INITIAL_DELAY)
+        );
+        assert_eq!(
+            b.current_delay(),
+            None,
+            "the failure delay it escaped no longer governs the row"
+        );
     }
 
     #[test]
@@ -1166,7 +1271,7 @@ mod tests {
             lock_unpoisoned(&changed_ids_clone).push(id.to_string());
         });
 
-        let mut poller = SessionPoller::new("test-session".to_string());
+        let mut poller = SessionPoller::new("test-session".to_string(), "test".to_string(), None);
         assert_eq!(
             poller.start(
                 "test-change".to_string(),
@@ -1193,7 +1298,7 @@ mod tests {
     fn test_thread_budget_cap() {
         let budget = test_support::IsolatedBudget::exhausted();
 
-        let mut poller = SessionPoller::new("test-session".to_string());
+        let mut poller = SessionPoller::new("test-session".to_string(), "test".to_string(), None);
         let outcome = poller.start(
             "test-budget".to_string(),
             Box::new(|| Some("id".to_string())),
@@ -1227,7 +1332,7 @@ mod tests {
         let logs = crate::session::test_support::LogCapture::start();
         let _budget = test_support::IsolatedBudget::exhausted();
 
-        let mut poller = SessionPoller::new("test-session".to_string());
+        let mut poller = SessionPoller::new("test-session".to_string(), "test".to_string(), None);
         let outcome = poller.start(
             "test-budget-quiet".to_string(),
             Box::new(|| Some("id".to_string())),
@@ -1249,7 +1354,7 @@ mod tests {
     #[test]
     fn test_duplicate_start_is_reported_not_spawned() {
         let _budget = test_support::IsolatedBudget::with_ceiling(1);
-        let mut poller = SessionPoller::new("test-session".to_string());
+        let mut poller = SessionPoller::new("test-session".to_string(), "test".to_string(), None);
         assert_eq!(
             poller.start(
                 "test-dup".to_string(),
@@ -1280,7 +1385,7 @@ mod tests {
         let observed_sid = sid.clone();
         let (started_tx, started_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel::<()>();
-        let mut poller = SessionPoller::new("test-session".to_string());
+        let mut poller = SessionPoller::new("test-session".to_string(), "test".to_string(), None);
         poller.cmd_tx.send(PollCommand::Stop).expect("queue stop");
         assert_eq!(
             poller.start(
@@ -1320,7 +1425,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_poller_publishes_before_waiting_for_commands() {
-        let mut poller = SessionPoller::new("test-session".to_string());
+        let mut poller = SessionPoller::new("test-session".to_string(), "test".to_string(), None);
         let (cmd_tx, cmd_rx) = mpsc::channel();
         drop(cmd_tx);
         poller.cmd_rx = Some(cmd_rx);

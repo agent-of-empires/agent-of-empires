@@ -1828,6 +1828,15 @@ export async function listClaudeSessions(): Promise<ClaudeSessionSummary[]> {
   return (await fetchJson<ClaudeSessionSummary[]>("/api/claude-sessions")) ?? [];
 }
 
+/** Error bodies may be JSON `{message}` or plain text. */
+function parseApiErrorText(text: string, status: number): string {
+  try {
+    return JSON.parse(text).message || `Server error (${status})`;
+  } catch {
+    return text || `Server error (${status})`;
+  }
+}
+
 export async function createProject(body: {
   path: string;
   name?: string;
@@ -1845,16 +1854,7 @@ export async function createProject(body: {
       body: JSON.stringify(body),
     });
     if (!res.ok) {
-      const text = await res.text();
-      try {
-        const data = JSON.parse(text);
-        return {
-          ok: false,
-          error: data.message || `Server error (${res.status})`,
-        };
-      } catch {
-        return { ok: false, error: text || `Server error (${res.status})` };
-      }
+      return { ok: false, error: parseApiErrorText(await res.text(), res.status) };
     }
     const project = (await res.json()) as ProjectInfo;
     return { ok: true, project };

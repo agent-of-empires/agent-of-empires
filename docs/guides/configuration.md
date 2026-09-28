@@ -152,8 +152,7 @@ Notification = "waiting"
 | `agent_detect_as` | `{}` | Maps a custom agent to a built-in agent it inherits. Reuses that built-in's status heuristics and, when available, its ACP adapter. It never proves which native CLI owns a terminal conversation. Native [session resume](session-resume.md) is enabled when the command starts with that built-in's exact binary token, or is a single bare token, and contains no shell control syntax. Path-qualified scripts, remote launchers, redirections, pipes, and shell expansion fail closed. A bare token is resolved by the launch shell's `PATH`. |
 | `agent_execution_as` | `{}` | Explicit native-agent contract for an opaque terminal wrapper. Requires `agent_config_dir` naming its store. Trusted global/profile configuration only; repository overrides are refused. |
 | `agent_acp_cmd` | `{}` | ACP launch command for a custom agent, enabling it to run in structured view (for example, `{ "oc-superpowers" = "ocp run sp acp" }`). A custom agent with an entry here is structured view-capable; without one it stays tmux-only. Unlike `custom_agents`, the value is split into argv and run directly, with no shell. |
-| `agent_config_dir` | `{}` | Config directory an agent reads instead of its built-in default, keyed by the session's agent name. Host sessions use the directory directly. Each sandboxed session uses its own `sandbox-v2/<instance-id>` subdirectory, mounted at the resolved built-in config path for hooks, credentials, and native-session capture. [Native MCP discovery](mcp-servers.md) reads it too, so the servers AoE reconciles against are the ones the agent loads. Wins over the agent's config-dir environment variable, whether that comes from the profile's `environment`, a `before_session` hook, or the daemon's own environment. Two names pointing at the same agent are two accounts of it; a restart that swaps between them carries the session's conversation across, see [Session Resume](session-resume.md#swapping-the-engine-on-a-restart). Global/profile only. |
-
+| `agent_config_dir` | `{}` | Config directory an agent reads instead of its built-in default, keyed by the session's agent name. Host sessions use the directory directly. Each sandboxed session uses its own `sandbox-v2/<instance-id>` subdirectory, mounted at the resolved built-in config path for hooks, credentials, and native-session capture. [Native MCP discovery](mcp-servers.md) reads it too, so the servers AoE reconciles against are the ones the agent loads. Wins over the agent's config-dir environment variable, whether that comes from the profile's `environment`, a `before_session` hook, or the daemon's own environment. Two names pointing at the same agent are two accounts of it; a restart that swaps between them carries the session's conversation across. A resumed host or structured Claude conversation keeps the store it recorded, which outranks this entry; a sandboxed one keeps the store its container was created with and follows the entry only once that container is recreated, see [Session Resume](session-resume.md#swapping-the-engine-on-a-restart). Global/profile only. |
 Per-agent structured view defaults live under `[acp]`, not `[session]`:
 
 | Option | Default | Description |
@@ -236,8 +235,8 @@ A wrapper that runs the same CLI against a second login usually does it by
 exporting the agent's config-dir variable, which AoE cannot see: the wrapper
 sets it after AoE has already chosen which file to write. Name that directory
 in `agent_config_dir` so folder-trust records and native MCP discovery land on
-the config the agent will read, instead of the default one it never opens.
-
+the config the agent will read, instead of the default one it never opens, for as long
+as the conversation has not recorded a store of its own.
 ```toml
 [session.custom_agents]
 claude-personal = "claude-personal"      # a wrapper that exports CLAUDE_CONFIG_DIR
@@ -258,7 +257,11 @@ creates and mounts at the resolved built-in config path. Do not mount the
 `agent_config_dir` tree or one of its `sandbox-v2` children through
 `extra_volumes`: a shared manual mount bypasses per-instance isolation.
 The wrapper must read the resolved built-in config path inside the container.
-
+Once a host Claude conversation has recorded a store, repointing the entry moves new
+sessions only: the folder-trust record still lands in the directory named here, and a
+host terminal launch logs a warning naming both stores. See [Native Session
+Resume](session-resume.md#swapping-the-engine-on-a-restart) for the account swap that carries
+a conversation across.
 Host sessions still need `pre_trust_agent_folders`. Sandboxed sessions seed
 folder trust and install status and identity hooks in their own staged config
 tree, including Pi's pane-scoped identity extension.

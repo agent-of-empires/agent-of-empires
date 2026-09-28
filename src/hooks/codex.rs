@@ -25,17 +25,24 @@ pub(super) const CODEX_HOOK_EVENT_NAMES: &[&str] = &[
     "PostCompact",
 ];
 
-/// Install Codex JSON hooks unless the adjacent `config.toml` disables them.
-/// Empty events remove AoE hooks regardless. Sandbox config must be absent or
-/// safely readable without following links; an unreadable config aborts.
+/// Install Codex JSON hooks unless the adjacent `config.toml` disables them,
+/// reporting whether AoE hooks are present afterwards.
+///
+/// Empty events remove AoE hooks regardless. A disabled `hooks` feature removes
+/// them too rather than leaving the last install behind: Codex will not run
+/// them, so anything AoE wrote is dead weight in the user's file. Both cases
+/// report `false`, which is what tells the caller no identity publisher is
+/// live. Sandbox config must be absent or safely readable without following
+/// links; an unreadable config aborts.
 pub(crate) fn install_codex_json_hooks(
     hooks_path: &Path,
     events: impl AsRef<[ResolvedHookEvent]>,
     target: HookInstallTarget,
-) -> Result<()> {
+) -> Result<bool> {
     let events = events.as_ref();
     if events.is_empty() {
-        return super::install_hooks(hooks_path, events, target);
+        super::install_hooks(hooks_path, events, target)?;
+        return Ok(false);
     }
 
     let config_path = hooks_path.with_file_name("config.toml");
@@ -59,9 +66,11 @@ pub(crate) fn install_codex_json_hooks(
         },
     };
     if codex_hooks_feature_is_disabled(&config, &config_path) {
-        return Ok(());
+        super::install_hooks(hooks_path, &[], target)?;
+        return Ok(false);
     }
-    super::install_hooks(hooks_path, events, target)
+    super::install_hooks(hooks_path, events, target)?;
+    Ok(true)
 }
 
 /// Read `[hooks.state]` (Codex's hook trust records) under the config lock.
