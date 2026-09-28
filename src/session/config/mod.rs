@@ -909,6 +909,29 @@ pub struct AppStateConfig {
     pub web_ui_state: std::collections::BTreeMap<String, String>,
 }
 
+/// Whether a scratch session (no repo, so never repo-config-overridden) follows the global
+/// `smart_rename` toggle or forces its own value, since scratch sessions have no stable path to
+/// key a per-project override on the way a registered repo does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ScratchSmartRenameMode {
+    #[default]
+    Inherit,
+    On,
+    Off,
+}
+
+impl ScratchSmartRenameMode {
+    /// `None` defers to the resolved `smart_rename` toggle; `Some` forces it either way.
+    pub fn as_override(self) -> Option<bool> {
+        match self {
+            Self::Inherit => None,
+            Self::On => Some(true),
+            Self::Off => Some(false),
+        }
+    }
+}
+
 /// Session-related configuration defaults
 #[derive(Debug, Clone, Serialize, Deserialize, SettingsSection)]
 // `repo_default = "deny"`: most of this section is personal preference, but
@@ -1062,6 +1085,17 @@ pub struct SessionConfig {
     #[serde(default = "default_true")]
     #[setting(label = "Smart Session Rename", widget = "toggle", category = "Agents")]
     pub smart_rename: bool,
+
+    /// Override Smart Session Rename for scratch sessions specifically, since they have no repo
+    /// path to key a per-project override on the way a registered project does.
+    #[serde(default)]
+    #[setting(
+        label = "Smart Session Rename (Scratch)",
+        widget = "select",
+        options = "inherit:Use Smart Session Rename,on:On,off:Off",
+        category = "Agents"
+    )]
+    pub scratch_smart_rename: ScratchSmartRenameMode,
 
     /// Agent used for one-shot utility calls (the smart-rename title and the
     /// conversation summary). Empty means use the session's own agent. Set
@@ -1796,6 +1830,7 @@ impl Default for SessionConfig {
             merge_hooks_into_selected_agent: true,
             conversation_summary: false,
             smart_rename: true,
+            scratch_smart_rename: ScratchSmartRenameMode::default(),
             smart_rename_agent: String::new(),
             smart_rename_model: HashMap::new(),
             auto_resume_on_restart: true,

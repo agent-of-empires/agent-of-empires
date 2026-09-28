@@ -1248,19 +1248,22 @@ export async function listClaudeSessions(): Promise<ClaudeSessionSummary[]> {
   return (await fetchJson<ClaudeSessionSummary[]>("/api/claude-sessions")) ?? [];
 }
 
+/** Error bodies may be JSON `{message}` or plain text. */
+function parseApiErrorText(text: string, status: number): string {
+  try {
+    return JSON.parse(text).message || `Server error (${status})`;
+  } catch {
+    return text || `Server error (${status})`;
+  }
+}
+
 type ProjectResult = { ok: boolean; error?: string; project?: ProjectInfo };
 
-/** Error bodies may be JSON `{message}` or plain text. */
 async function projectRequest(url: string, init: RequestInit, returnsProject = true): Promise<ProjectResult> {
   try {
     const res = await fetch(url, init);
     if (!res.ok) {
-      const text = await res.text();
-      try {
-        return { ok: false, error: JSON.parse(text).message || `Server error (${res.status})` };
-      } catch {
-        return { ok: false, error: text || `Server error (${res.status})` };
-      }
+      return { ok: false, error: parseApiErrorText(await res.text(), res.status) };
     }
     return returnsProject ? { ok: true, project: (await res.json()) as ProjectInfo } : { ok: true };
   } catch (e) {

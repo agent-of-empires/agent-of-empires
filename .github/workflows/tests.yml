@@ -53,7 +53,7 @@ jobs:
           # toolchain hash, so successive pushes to the same PR reuse
           # the slot rather than thrashing the 10GB repo cache budget.
           save-if: true
-      - uses: taiki-e/install-action@3f74d7c16a4242f1c95561e98edc25d36adb4375 # v2.87.12
+      - uses: taiki-e/install-action@94c31af3204a9f15ab40b35ad084410b905bbc73 # v2.87.17
         if: matrix.leg != 'web-e2e'
         with:
           tool: cargo-nextest
@@ -310,7 +310,7 @@ jobs:
       - name: Install tmux
         if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci-macos')
         run: brew install tmux
-      - uses: taiki-e/install-action@3f74d7c16a4242f1c95561e98edc25d36adb4375 # v2.87.12
+      - uses: taiki-e/install-action@94c31af3204a9f15ab40b35ad084410b905bbc73 # v2.87.17
         if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci-macos')
         with:
           tool: cargo-nextest
@@ -368,7 +368,7 @@ jobs:
         run: sed -i 's|^SF:src/|SF:web/src/|' web/coverage/vitest/lcov.info
       - name: Upload to Codecov (vitest flag)
         if: ${{ !cancelled() }}
-        uses: codecov/codecov-action@0b35c9ecc4f0529d0eb674914510c22f85b196b4 # v7.1.0
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           # The codecov-action's `files` input is additive, not restrictive:
@@ -482,7 +482,7 @@ jobs:
         run: npm run coverage:merge
       - name: Upload to Codecov (playwright-mocked flag)
         if: ${{ !cancelled() }}
-        uses: codecov/codecov-action@0b35c9ecc4f0529d0eb674914510c22f85b196b4 # v7.1.0
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           # See the matching comment in the vitest upload step: without
@@ -599,7 +599,7 @@ jobs:
         run: npm run coverage:merge
       - name: Upload to Codecov (playwright-live flag)
         if: ${{ !cancelled() }}
-        uses: codecov/codecov-action@0b35c9ecc4f0529d0eb674914510c22f85b196b4 # v7.1.0
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           # See the matching comment in the vitest upload step: without

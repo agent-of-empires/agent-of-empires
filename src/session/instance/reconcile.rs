@@ -37,15 +37,13 @@ impl Instance {
             disk.last_error_check = self.last_error_check;
             disk.last_error = self.last_error.take();
         }
-        if self.active_execution != disk.active_execution {
+        if !self.poller_serves(&disk.tool, disk.active_execution.as_ref()) {
             self.stop_poller();
             self.session_id_poller = None;
         }
         disk.last_start_time = self.last_start_time;
         disk.session_id_poller = self.session_id_poller.take();
-        disk.session_id_poller_retry_after = self.session_id_poller_retry_after;
-        // Preserve the serde-skipped backoff so reloads cannot trigger an early retry.
-        disk.poller_repair = self.poller_repair.clone();
+        disk.adopt_poller_repair(self);
         disk.pane_dead_observed = self.pane_dead_observed;
         disk.force_fresh_next_launch = self.force_fresh_next_launch;
         disk.pending_host_env = std::mem::take(&mut self.pending_host_env);
@@ -70,13 +68,7 @@ impl Instance {
             self.absorb_published_pi_session();
             return;
         }
-        if !matches!(
-            self.source_capture_backend(),
-            Some(
-                crate::agents::SessionCaptureBackend::Claude
-                    | crate::agents::SessionCaptureBackend::HookSidecar
-            )
-        ) {
+        if !self.capture_reads_hook_sidecar() {
             return;
         }
         if !matches!(self.resume_intent, ResumeIntent::Default) {

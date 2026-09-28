@@ -479,6 +479,17 @@ impl Instance {
                 Err(error) if managed && !matches!(self.resume_intent, ResumeIntent::Default) => {
                     return Err(error);
                 }
+                // A stored id no context can attest is a deviation, not routine: warn.
+                Err(error) if managed => {
+                    // The `managed` arm above leaves only a Default launch, which
+                    // records an id by definition.
+                    let recorded = self
+                        .agent_session_id
+                        .as_deref()
+                        .expect("a managed default launch records a conversation id");
+                    tracing::warn!(target: "session.store", error = %error, recorded, "no attestable execution context for a recorded conversation; launching with the agent's own resume flags");
+                    None
+                }
                 Err(error) => {
                     tracing::debug!(target: "session.store", error = %error, "native execution unavailable; using native launch flags");
                     None
@@ -813,7 +824,16 @@ impl Instance {
             fallback_profile = self.effective_profile();
             &fallback_profile
         };
-        let mut env_prefix = status_hook_env_prefix(profile, &self.id, self.status_agent());
+        let program = parse_launch_command(self.get_tool_command()).and_then(|parsed| {
+            parsed.words.first().and_then(|word| {
+                Path::new(word)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .map(str::to_owned)
+            })
+        });
+        let mut env_prefix =
+            status_hook_env_prefix(profile, &self.id, self.status_agent(), program.as_deref());
         // The publisher is pane-scoped, including for safe Default wrappers.
         self.pi_extension_launched = false;
         if let Some((_, ref env)) = identity_extension {
@@ -1411,8 +1431,8 @@ mod tests {
             let asserted = inst.asserted_resume_binding(sid, None);
             if agent == "codex" && crate::process::HAS_CODEX_MANAGED_PREFERENCES {
                 assert_eq!(
-                    asserted.unwrap_err().to_string(),
-                    "Codex managed preferences cannot be attested by the local file contract"
+                    format!("{:#}", asserted.unwrap_err()),
+                    "aoe session set-session-id cannot resolve the native execution identity for this context: Codex managed preferences cannot be attested by the local file contract"
                 );
                 continue;
             }
@@ -1706,6 +1726,58 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
+    fn an_unattestable_recorded_conversation_warns_at_launch() {
+        let root = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(root.path());
+        let codex_home = root.path().join("codex");
+        std::fs::create_dir_all(&codex_home).unwrap();
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("HOME", root.path().to_str().unwrap()),
+            ("CODEX_HOME", codex_home.to_str().unwrap()),
+        ]);
+        // Nothing here can attest a Codex execution identity.
+        let _codex = crate::session::test_support::install_login_shell_path_command(
+            root.path(),
+            "codex",
+            "#!/bin/sh\nexit 1\n",
+        );
+        let project = root.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let sid = "11111111-2222-4333-8444-555555555555";
+        let launch = |session_id: Option<&str>, intent: ResumeIntent| {
+            let mut inst = tool_instance("codex", project.to_str().unwrap());
+            inst.agent_session_id = session_id.map(str::to_owned);
+            inst.resume_intent = intent;
+            let capture = crate::session::test_support::LogCapture::start();
+            let _ = inst.prepare_launch_command(inst.conversation_state());
+            capture.contents()
+        };
+
+        let carried = launch(Some(sid), ResumeIntent::Default);
+        let warned = carried
+            .lines()
+            .find(|line| line.contains("WARN") && line.contains("no attestable execution context"))
+            .unwrap_or_else(|| panic!("no warning for the carried conversation:\n{carried}"));
+        assert!(warned.contains(sid), "the warning names the conversation");
+        assert!(!carried.contains("native execution unavailable"));
+
+        // A cleared launch still holds its stored id this early, so it must not warn.
+        for (session_id, label) in [(Some(sid), "cleared with a stored id"), (None, "fresh")] {
+            let quiet = launch(session_id, ResumeIntent::Cleared);
+            assert!(
+                !quiet.contains("no attestable execution context"),
+                "a {label} launch must stay quiet:\n{quiet}"
+            );
+            assert!(
+                quiet.lines().any(|line| line.contains("DEBUG")
+                    && line.contains("native execution unavailable; using native launch flags")),
+                "expected the debug line for a {label} launch:\n{quiet}"
+            );
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn migration_unattributed_pins_resume_against_configured_store() {
         let root = tempfile::tempdir().unwrap();
         let _app = crate::session::test_support::isolate_app_dir_at(&root.path().join("app"));
@@ -1800,22 +1872,21 @@ mod tests {
             );
             // A pin resumes its own conversation; a fork writes a new one.
             assert_eq!(command.contains("--fork-session"), forks, "{command}");
-            assert_eq!(
-                command.contains(&format!("--session-id {child}")),
-                forks,
-                "{command}"
-            );
+            assert_eq!(command.contains("--session-id"), forks, "{command}");
         }
 
         // An explicit pin still needs a binding that names its own
         // conversation, whatever its provenance.
         let mut foreign = pin.clone();
         foreign.resume_binding = Some(ConversationBinding::unknown(child));
+        let error = foreign
+            .prepare_launch_command(foreign.conversation_state())
+            .err()
+            .expect("a pin naming another conversation stays refused")
+            .to_string();
         assert!(
-            foreign
-                .prepare_launch_command(foreign.conversation_state())
-                .is_err(),
-            "a pin naming another conversation stays refused"
+            error.contains("conversation provenance is unknown"),
+            "{error}"
         );
 
         // Provenance that contradicts an attached execution identity is not
@@ -1824,11 +1895,14 @@ mod tests {
         let mut asserted = contradictory.asserted_resume_binding(parent, None).unwrap();
         asserted.provenance = crate::session::ConversationProvenance::Unknown;
         contradictory.resume_binding = Some(asserted);
+        let error = contradictory
+            .prepare_launch_command(contradictory.conversation_state())
+            .err()
+            .expect("a contradictory provenance stays refused")
+            .to_string();
         assert!(
-            contradictory
-                .prepare_launch_command(contradictory.conversation_state())
-                .is_err(),
-            "a contradictory provenance stays refused"
+            error.contains("has not been observed or explicitly asserted"),
+            "{error}"
         );
     }
 

@@ -54,13 +54,8 @@ pub(super) fn load_all_instances(
 /// Carry over the in-memory-only fields from the prior `state.instances` entry into the
 /// freshly-loaded one.
 pub(super) fn merge_runtime_fields(prior: Instance, mut fresh: Instance) -> Instance {
-    if fresh.active_execution == prior.active_execution {
-        fresh.session_id_poller = prior.session_id_poller;
-        fresh.poller_repair = prior.poller_repair;
-        fresh.session_id_poller_retry_after = prior.session_id_poller_retry_after;
-    } else {
-        prior.stop_poller();
-    }
+    fresh.adopt_poller(&prior);
+    fresh.adopt_poller_repair(&prior);
     fresh.last_error_check = prior.last_error_check;
     fresh.last_start_time = prior.last_start_time;
     if fresh.status == Status::Error {
@@ -847,6 +842,160 @@ mod tests {
             assert_eq!(
                 stored.agent_session_binding.unwrap().provenance,
                 ConversationProvenance::Observed
+            );
+        }
+    }
+
+    /// The window a row armed is about the execution it armed it for. Both halves of that matter:
+    /// a row with nothing to poll holds no poller and no execution, and keeps its window, while a
+    /// row another process gave a new execution does not inherit one armed for the old.
+    #[test]
+    fn a_reload_keeps_the_repair_pacing_of_a_row_about_the_same_execution() {
+        let now = std::time::Instant::now();
+        let execution = |id: &str| {
+            Some(crate::session::ActiveExecution {
+                launch_id: id.to_string(),
+                binding: crate::session::ExecutionBinding {
+                    agent: "claude".into(),
+                    stores: Vec::new(),
+                    configuration: Vec::new(),
+                    cwd: std::path::PathBuf::from("/tmp"),
+                    cwd_filesystem: "host".into(),
+                    filesystem: "host".into(),
+                    exported_default_store: None,
+                },
+                capture: None,
+                container: None,
+            })
+        };
+        let mut mergers: Vec<fn(Instance, Instance) -> Instance> = vec![merge_runtime_fields];
+        mergers.push(|prior, mut fresh| {
+            fresh.merge_runtime_from_reload(&prior);
+            fresh
+        });
+        for merge in mergers {
+            // What the repair walk leaves behind on a row with no poller: a re-probe ladder and a
+            // store-retry deadline.
+            let mut prior = Instance::new("poller-less", "/tmp/poller-less");
+            prior.poller_repair.reprobe(now);
+            let deadline = now + std::time::Duration::from_secs(30);
+            prior.session_id_poller_retry_after = Some(deadline);
+            assert!(prior.session_id_poller.is_none());
+
+            let merged = merge(prior, Instance::new("poller-less", "/tmp/poller-less"));
+
+            assert_eq!(
+                merged.poller_repair.current_reprobe_delay(),
+                Some(std::time::Duration::from_secs(5)),
+                "the row keeps its window, or it re-resolves every tick"
+            );
+            assert_eq!(
+                merged.session_id_poller_retry_after,
+                Some(deadline),
+                "and so does its store-retry deadline"
+            );
+
+            // Another process gave the row a new execution while it was waiting: the window was
+            // armed for the old one and paces nothing this row can still use.
+            let mut prior = Instance::new("replaced", "/tmp/replaced");
+            prior.active_execution = execution("launch-1");
+            prior.poller_repair.reprobe(now);
+            let deadline = now + std::time::Duration::from_secs(30);
+            prior.session_id_poller_retry_after = Some(deadline);
+            let mut fresh = Instance::new("replaced", "/tmp/replaced");
+            fresh.active_execution = execution("launch-2");
+
+            let merged = merge(prior, fresh);
+
+            assert!(
+                merged.poller_repair.due(std::time::Instant::now()),
+                "a window armed for the superseded execution does not hold the new one back"
+            );
+            assert_eq!(
+                merged.session_id_poller_retry_after, None,
+                "and neither does the deadline that went with it"
+            );
+        }
+    }
+
+    /// A profile move can change a row's agent on disk while it holds no execution on either side,
+    /// and a poller that watched no execution belongs to an agent just as much. Carrying it would
+    /// leave the row watching the previous agent's capture, and the repair walk skips on a
+    /// running poller, so nothing else would replace it.
+    #[test]
+    fn a_reload_drops_the_poller_of_an_agent_the_row_no_longer_runs() {
+        let mut prior = Instance::new("swapped-agent", "/tmp/swapped-agent");
+        prior.tool = "claude".to_string();
+        let mut poller = crate::session::poller::SessionPoller::new(
+            "test-tmux-swapped-agent".to_string(),
+            "claude".to_string(),
+            None,
+        );
+        assert_eq!(
+            poller.start(prior.id.clone(), Box::new(|| None), Box::new(|_| {}), None,),
+            crate::session::poller::PollerSpawn::Spawned
+        );
+        prior.session_id_poller = Some(std::sync::Arc::new(std::sync::Mutex::new(poller)));
+        assert!(
+            prior.active_execution.is_none(),
+            "fixture: no execution on either side"
+        );
+        let mut fresh = Instance::new("swapped-agent", "/tmp/swapped-agent");
+        fresh.tool = "codex".to_string();
+
+        let merged = merge_runtime_fields(prior, fresh);
+
+        assert_eq!(merged.tool, "codex");
+        assert!(
+            merged.session_id_poller.is_none(),
+            "the previous agent's watcher does not follow the row to a new one"
+        );
+    }
+
+    /// The window a row armed is about the agent and the execution it armed it for. A row that has
+    /// nothing to poll holds neither, and keeps its window; a row another agent took over does not
+    /// inherit one paced for the previous agent.
+    #[test]
+    fn a_reload_keeps_the_repair_pacing_of_a_row_on_the_same_runtime() {
+        let now = std::time::Instant::now();
+        let mut mergers: Vec<fn(Instance, Instance) -> Instance> = vec![merge_runtime_fields];
+        mergers.push(|prior, mut fresh| {
+            fresh.merge_runtime_from_reload(&prior);
+            fresh
+        });
+        for merge in mergers {
+            let mut prior = Instance::new("poller-less", "/tmp/poller-less");
+            prior.poller_repair.reprobe(now);
+            let deadline = now + std::time::Duration::from_secs(30);
+            prior.session_id_poller_retry_after = Some(deadline);
+
+            let merged = merge(prior, Instance::new("poller-less", "/tmp/poller-less"));
+
+            assert_eq!(
+                merged.poller_repair.current_reprobe_delay(),
+                Some(std::time::Duration::from_secs(5)),
+                "the row keeps its window, or it re-resolves every tick"
+            );
+            assert_eq!(merged.session_id_poller_retry_after, Some(deadline));
+
+            // The same row, another agent: the window paces the previous agent's capture.
+            let mut prior = Instance::new("other-agent", "/tmp/other-agent");
+            prior.tool = "claude".to_string();
+            prior.poller_repair.reprobe(now);
+            prior.session_id_poller_retry_after = Some(now + std::time::Duration::from_secs(30));
+            let mut fresh = Instance::new("other-agent", "/tmp/other-agent");
+            fresh.tool = "codex".to_string();
+
+            let merged = merge(prior, fresh);
+
+            assert_eq!(merged.tool, "codex");
+            assert!(
+                merged.poller_repair.due(std::time::Instant::now()),
+                "a window armed for the previous agent does not hold this one back"
+            );
+            assert_eq!(
+                merged.session_id_poller_retry_after, None,
+                "and neither does the deadline that went with it"
             );
         }
     }

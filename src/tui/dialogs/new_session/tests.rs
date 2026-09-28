@@ -1191,6 +1191,7 @@ fn terminal_fork_hides_structured_despite_structured_default() {
             transcript_path: None,
         }),
         child_session_id: "child".into(),
+        unattributed_parent_agent: None,
     });
     assert!(!dialog.structured_capable);
     assert!(!dialog.structured_enabled);

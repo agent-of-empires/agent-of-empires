@@ -337,12 +337,8 @@ impl Instance {
             return None;
         }
         // Pane-scoped publishers confine Default/Cleared wrapper capture to this pane.
-        let self_attributing = matches!(
-            capture.backend,
-            crate::agents::SessionCaptureBackend::Claude
-                | crate::agents::SessionCaptureBackend::HookSidecar
-                | crate::agents::SessionCaptureBackend::Pi
-        );
+        let self_attributing = capture.reads_hook_sidecar(context)
+            || capture.backend == crate::agents::SessionCaptureBackend::Pi;
         let authorized = if self_attributing {
             native.is_none() || self.launch_can_carry_resume_selector(agent)
         } else {
@@ -370,6 +366,13 @@ impl Instance {
             capture.host
         };
         (context != crate::agents::SessionCaptureContext::Unsupported).then_some((capture, context))
+    }
+
+    /// Whether this pane's conversation id is published into its AoE hook sidecar. See
+    /// [`crate::agents::SessionCaptureSpec::reads_hook_sidecar`].
+    pub(super) fn capture_reads_hook_sidecar(&self) -> bool {
+        self.source_session_support()
+            .is_some_and(|(capture, context)| capture.reads_hook_sidecar(context))
     }
 
     pub(super) fn source_capture_backend(&self) -> Option<crate::agents::SessionCaptureBackend> {
@@ -562,7 +565,9 @@ impl Instance {
         self.view == View::Structured
     }
 
-    /// Keep only a store asserted by the user or captured from the live worker.
+    /// Move a structured row to the terminal view, keeping the store an
+    /// asserted binding or the live worker proved, and refusing to move at all
+    /// when neither did: the row then keeps its view and its ACP id.
     pub(crate) fn switch_to_terminal_keep_context(
         &mut self,
         worker: Option<&ExecutionBinding>,
@@ -584,12 +589,16 @@ impl Instance {
                         .is_some_and(|execution| execution.agent == "claude")
             })
             .cloned();
-        let binding = if asserted.is_some() {
-            asserted
-        } else {
-            worker.map_or(Ok(None), |worker| self.resolved_handoff_binding(&sid, worker))?
-        }
-        .context("ACP does not prove a native conversation store; bind its current ID with aoe session set-session-id SESSION ID --store /absolute/claude-store before switching to terminal")?;
+        let unresolved = "ACP does not prove a native conversation store; bind its current ID with aoe session set-session-id SESSION ID --store /absolute/claude-store before switching to terminal";
+        let resolved = match asserted {
+            Some(asserted) => Ok(Some(asserted)),
+            None => worker.map_or(Ok(None), |worker| {
+                self.resolved_handoff_binding(&sid, worker)
+            }),
+        };
+        let binding = resolved
+            .context(unresolved)?
+            .ok_or_else(|| anyhow::anyhow!(unresolved))?;
         self.adopt_conversation_state(ConversationState {
             session_id: Some(sid.clone()),
             binding: Some(binding.clone()),
@@ -760,6 +769,24 @@ mod tests {
             ),
             (None, None, None)
         );
+    }
+
+    /// A structured row with no asserted binding and no worker has proved no
+    /// store, so the switch is refused and names the command that would, and
+    /// the row keeps the view and the ACP id it had.
+    #[test]
+    #[serial_test::serial]
+    fn switch_to_terminal_keep_context_refuses_a_row_nothing_proved() {
+        let temp = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let mut inst = Instance::new("claude-unproved", "/tmp");
+        inst.view = View::Structured;
+        inst.acp_session_id = Some("sid-abc".into());
+
+        let error = inst.switch_to_terminal_keep_context(None).unwrap_err();
+        assert!(error.to_string().contains("set-session-id"));
+        assert_eq!(inst.view, View::Structured);
+        assert_eq!(inst.acp_session_id.as_deref(), Some("sid-abc"));
     }
 
     /// A legacy binding carries no route marker, and the marker it would be
@@ -1186,7 +1213,9 @@ mod tests {
         let error = inst
             .switch_to_terminal_keep_context(Some(&worker))
             .unwrap_err();
-        assert!(error.to_string().contains("--mcp-config"), "{error:#}");
+        let chain = format!("{error:#}");
+        assert!(chain.contains("set-session-id"), "{chain}");
+        assert!(chain.contains("--mcp-config"), "{chain}");
         assert_eq!(inst.view, View::Structured);
         assert_eq!(inst.acp_session_id.as_deref(), Some("sid-abc"));
     }

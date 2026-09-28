@@ -247,6 +247,7 @@ pub(crate) enum CaptureContext {
 
 use super::{Instance, ResumeIntent};
 use crate::agents::{AgentDef, AGENTS};
+use crate::session::fork::ForkParentRef;
 use anyhow::{bail, Context, Result};
 
 #[cfg(test)]
@@ -1166,16 +1167,41 @@ impl Instance {
 }
 
 impl Instance {
-    pub(crate) fn fork_parent_binding(&self) -> Option<&ConversationBinding> {
+    /// The conversation an explicit fork would carry, with the evidence for it:
+    /// `Bound` when a binding qualifies the recorded id, `Unattributed` when a
+    /// migration left the binding without an execution, `Recorded` when the id
+    /// stands alone, so an unqualified parent reaches `terminal_fork_seed` and
+    /// is refused as such rather than as a session with no conversation, and
+    /// `Unlaunched` for a fork whose launch has not happened. The row's own
+    /// native agent is resolved to decide a fork's capability, so a wrapper
+    /// whose identity cannot be resolved fails instead of forking.
+    pub(crate) fn fork_parent_ref(&self) -> Result<Option<ForkParentRef<'_>>> {
         let (sid, binding) = match &self.resume_intent {
-            ResumeIntent::Fork { .. } => return None,
+            ResumeIntent::Fork { .. } => return Ok(Some(ForkParentRef::Unlaunched)),
             ResumeIntent::Use(sid) => (Some(sid), self.resume_binding.as_ref()),
             _ => (
                 self.agent_session_id.as_ref(),
                 self.agent_session_binding.as_ref(),
             ),
         };
-        binding.filter(|binding| Some(&binding.session_id) == sid && binding.is_known())
+        let Some(sid) = sid else {
+            return Ok(None);
+        };
+        match binding {
+            Some(binding) if binding.session_id == *sid && binding.is_unattributed() => {
+                // The row's own agent decides the fork capability; the store comes
+                // from the context the child's launch resolves.
+                Ok(Some(ForkParentRef::Unattributed {
+                    binding,
+                    agent: self.execution_agent()?.name,
+                }))
+            }
+            Some(binding) if binding.session_id == *sid => Ok(Some(ForkParentRef::Bound(binding))),
+            // A binding naming a different conversation is an inconsistency,
+            // not a recorded id awaiting proof.
+            Some(_) => Ok(None),
+            None => Ok(Some(ForkParentRef::Recorded(sid))),
+        }
     }
 
     pub(super) fn execution_agent(&self) -> Result<&'static AgentDef> {
@@ -1434,11 +1460,13 @@ impl Instance {
                     configuration.push(file);
                 }
                 let auth_file = root.join("auth.json");
-                let bytes = inputs.read_native_file(&auth_file)?.context("Codex login may select cloud-managed requirements; a local API-key authentication contract is required")?;
+                let Some(bytes) = inputs.read_native_file(&auth_file)? else {
+                    bail!("Codex has no auth.json in its resolved configuration directory (session.agent_config_dir on a host launch, else CODEX_HOME, else ~/.codex); sign in with an OpenAI API key and re-run");
+                };
                 let auth: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(&bytes)?;
                 anyhow::ensure!(["tokens", "agent_identity", "personal_access_token"].iter().all(|key| auth.get(*key).is_none_or(serde_json::Value::is_null))
                     && auth.get("auth_mode").is_none_or(|mode| mode.is_null() || mode.as_str() == Some("apikey"))
-                    && auth.get("OPENAI_API_KEY").and_then(serde_json::Value::as_str).is_some_and(|key| !key.trim().is_empty()), "Codex authentication may select cloud-managed requirements; its namespace is unproven");
+                    && auth.get("OPENAI_API_KEY").and_then(serde_json::Value::as_str).is_some_and(|key| !key.trim().is_empty()), "Codex is not authenticated with a local OpenAI API key; set OPENAI_API_KEY in the auth.json of its resolved configuration directory (session.agent_config_dir on a host launch, else CODEX_HOME, else ~/.codex) and re-run");
                 configuration.push(auth_file);
                 let sqlite = inputs.canonical_path(&sqlite)?;
                 routing.push(("CODEX_HOME".into(), Some(root.to_str().context("Codex home is not UTF-8")?.into())));
@@ -1791,17 +1819,17 @@ impl Instance {
             inputs.cwd.clone()
         };
         let cwd = inputs.physical_location(&cwd);
-        let capture = if matches!(
-            agent
-                .session_support
-                .as_ref()
-                .and_then(|support| support.capture.as_ref())
-                .map(|capture| capture.backend),
-            Some(
-                crate::agents::SessionCaptureBackend::Claude
-                    | crate::agents::SessionCaptureBackend::HookSidecar
-            )
-        ) {
+        let capture = if agent
+            .session_support
+            .as_ref()
+            .and_then(|support| support.capture.as_ref())
+            .is_some_and(|capture| {
+                capture.reads_hook_sidecar(if inputs.container.is_some() {
+                    capture.sandbox
+                } else {
+                    capture.host
+                })
+            }) {
             inputs.hook_capture_context(&self.id)?
         } else if let Some(plan) = prime
             .take()
@@ -2284,7 +2312,9 @@ impl Instance {
         self.pi_session_path = pi_session_path.filter(|_| sid.is_some());
         self.agent_session_id = sid;
     }
-    /// An observation without a qualified source cannot qualify a conversation, so
+    /// The binding an observation is allowed to establish for this instance.
+    ///
+    /// An observation without launch evidence cannot qualify a conversation, so
     /// it may refresh the published id and transcript path but must keep the
     /// binding an earlier qualified publication established.
     pub(super) fn observed_binding(
@@ -2346,6 +2376,7 @@ impl Instance {
         .unwrap_or_else(|| {
             self.resolve_native_execution(None)
                 .map(|execution| execution.binding)
+                .context("aoe session set-session-id cannot resolve the native execution identity for this context")
         })?;
         anyhow::ensure!(
             crate::agents::get_agent(&execution.agent)
@@ -2416,14 +2447,22 @@ impl Instance {
     }
 
     pub(crate) fn adopt_conversation_state(&mut self, state: ConversationState) {
-        if self.active_execution != state.active {
-            self.stop_poller();
-            self.session_id_poller = None;
-        }
+        self.settle_poller_for(state.active.as_ref());
         self.set_agent_conversation(state.session_id, state.binding, state.pi_session_path);
         self.resume_intent = state.intent;
         self.resume_binding = state.resume_binding;
         self.active_execution = state.active;
+    }
+
+    /// Take on the execution `src` launched, settling the session-id poller with it.
+    ///
+    /// A poller is only usable by a row holding the execution it was installed for: the drain
+    /// erases an observation that names another execution, and a launch-scoped one reads the
+    /// other launch's file. A poller for another execution is stopped here; the repair walk
+    /// installs one for this pane once the relaunch that stamped it says the pane is new.
+    pub(crate) fn adopt_active_execution(&mut self, src: &Self) {
+        self.settle_poller_for(src.active_execution.as_ref());
+        self.active_execution = src.active_execution.clone();
     }
 
     pub(super) fn capture_store_dir(&self) -> Option<PathBuf> {
@@ -2841,6 +2880,79 @@ mod tests {
                 "{name} must refuse a valued verbosity override"
             );
         }
+    }
+
+    /// A recorded id must reach `terminal_fork_seed` whatever evidence stands
+    /// behind it: a binding a migration left unattributed forks on the row's
+    /// own agent, while a binding a degraded launch dropped is still refused as
+    /// unqualified, because nothing proves what it names.
+    #[test]
+    #[serial_test::serial]
+    fn fork_parent_ref_keeps_a_recorded_but_unqualified_conversation() {
+        let root = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(root.path());
+        let _claude = crate::session::test_support::install_login_shell_path_command(
+            root.path(),
+            "claude",
+            "#!/bin/sh\nexit 0\n",
+        );
+        let mut instance = Instance::new("parent", root.path().to_str().unwrap());
+        instance.tool = "claude".into();
+        instance.agent_session_id = Some("legacy-uuid".into());
+
+        instance.agent_session_binding = Some(ConversationBinding::unknown("legacy-uuid"));
+        assert!(matches!(
+            crate::session::fork::terminal_fork_seed(
+                instance.fork_parent_ref().unwrap(),
+                "child-uuid".into()
+            ),
+            Ok(crate::session::ForkSeed::Terminal { .. })
+        ));
+
+        instance.agent_session_binding = None;
+        assert_eq!(
+            crate::session::fork::terminal_fork_seed(
+                instance.fork_parent_ref().unwrap(),
+                "child-uuid".into()
+            ),
+            Err(crate::session::ForkDenied::UnqualifiedParent {
+                preallocated: false,
+                recorded: "legacy-uuid".into(),
+            })
+        );
+    }
+
+    /// A row whose own fork intent has not launched holds the parent's
+    /// conversation, not one of its own, so it is refused as the fork it is.
+    #[test]
+    fn fork_parent_ref_reports_a_child_whose_fork_has_not_launched() {
+        let mut instance = Instance::new("child", "/tmp");
+        instance.agent_session_id = Some("parent-uuid".into());
+        instance.agent_session_binding = Some(ConversationBinding {
+            session_id: "parent-uuid".into(),
+            execution: Some(ExecutionBinding {
+                agent: "claude".into(),
+                stores: vec!["/store".into()],
+                configuration: Vec::new(),
+                cwd: "/work".into(),
+                cwd_filesystem: "host".into(),
+                filesystem: "host".into(),
+                exported_default_store: None,
+            }),
+            provenance: ConversationProvenance::Observed,
+            transcript_path: None,
+        });
+        instance.resume_intent = ResumeIntent::Fork {
+            from: "parent-uuid".into(),
+        };
+
+        assert_eq!(
+            crate::session::fork::terminal_fork_seed(
+                instance.fork_parent_ref().unwrap(),
+                "child-uuid".into()
+            ),
+            Err(crate::session::ForkDenied::UnlaunchedFork)
+        );
     }
 
     /// The exported `CLAUDE_CONFIG_DIR` and the store recorded on the binding
