@@ -79,8 +79,8 @@ pub(crate) use instance::{
     NEWER_GENERATION_BUSY_REASON,
 };
 pub(crate) use instance::{
-    generic_host_config_path_for, resolved_agent_for, sidecar_host_config_path_for,
-    ConversationState, ResumeAttemptPolicy, TerminalContextResume,
+    host_hook_disclosure, resolved_agent_for, ConversationState, ResumeAttemptPolicy,
+    TerminalContextResume,
 };
 pub use instance::{
     is_valid_session_color, ConversationBinding, ConversationProvenance, DetectionState,

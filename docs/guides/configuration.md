@@ -90,7 +90,7 @@ sidebar_position = "left" # left | right; TUI session list
 | `sidebar_position` | `"left"` | TUI session sidebar position: `left` or `right`. Global only. Narrow terminals keep the stacked layout. |
 | `tie_workdir_to_name` | `true` | Keep a managed worktree session's directory named after its title. See [Worktrees](worktrees.md#naming). |
 | `pre_trust_agent_folders` | `false` | Pre-trust each host session's worktree in the agent's own config (Claude Code, Codex, Gemini) so it does not open on a folder-trust prompt. Config-dir overrides are honored, and an `agent_config_dir` entry wins over them. Trust also activates the repo's `.claude/settings.json`, hooks included, so enable it only for directories you would have trusted by hand. Sandboxed sessions always pre-trust their own staged config. |
-| `agent_status_hooks` | `true` | Install status-detection hooks into the agent's config; see [Adding a New Agent](../development/adding-agents.md#hook-format-reference). Disabling it leaves status to pane reading but keeps identity hooks used for native resume. |
+| `agent_status_hooks` | `true` | Install status-detection hooks into the agent's config; see [Agent status hooks](#agent-status-hooks) for the consent that gates it and [Adding a New Agent](../development/adding-agents.md#hook-format-reference) for the formats. Disabling it leaves status to pane reading but keeps identity hooks used for native resume. |
 | `opencode_preassign_session_id` | `false` | Pre-assign OpenCode's native session id before a host launch (about two seconds per session) so resume captures it. Unsupported for sandboxed OpenCode. |
 | `smart_rename` | `true` | Auto-rename a still-default-named structured session from its first turn, using the session's agent in one-shot mode. Title only; a session you named is never touched. Skipped for agents with no one-shot mode and command-overridden agents. Overridable per project. |
 | `smart_rename_agent` | `""` | Agent used for one-shot utility calls (the rename title and the conversation summary). Empty means the session's own agent. A sandboxed session only mounts its own agent's credentials, so a different value makes it ineligible instead of falling back. |
@@ -137,6 +137,14 @@ on_error = "notify-send -u critical -a aoe 'AoE: Error' \"$AOE_SESSION_TITLE err
 `on_starting`, `on_running`, `on_waiting`, `on_idle`, and `on_error` fire on that transition; `on_change` fires on every transition, after the status-specific command. A status must hold for a 100 ms debounce before a hook runs. Commands run in the session's project directory, are best-effort, and never block status updates or sounds.
 
 Each command receives `AOE_SESSION_ID`, `AOE_SESSION_TITLE`, `AOE_PROJECT_PATH`, `AOE_PROFILE`, `AOE_TOOL`, `AOE_GROUP_PATH`, `AOE_OLD_STATUS`, `AOE_NEW_STATUS`, and `AOE_STATUS_CHANGED_AT`.
+
+## Agent status hooks
+
+`agent_status_hooks` (above) makes AoE write hook entries into the agent's own config under your home directory, so status comes from the agent reporting it rather than from reading its pane. That writes into files you own and runs a command on every prompt, so it is gated behind a one-time consent. The TUI offers it as a dialog the first time a host session would install hooks; `aoe hooks approve` is the same consent for a headless install, and `aoe hooks status` reports the current answer and the files a launch would write.
+
+The consent is per installation and covers every agent, because a launch resolves the agent from the session rather than from the consent. It is not the repo trust gate: `aoe add --trust-hooks` covers the hooks a repository declares in `.agent-of-empires/config.toml` and its project-local MCP servers, which are a separate decision. See [Hook trust](repo-config.md#hook-trust).
+
+Turning `agent_status_hooks` off removes the need for consent for status detection, but identity hooks, which native resume depends on, stay installed and stay gated.
 
 ## Custom agents
 

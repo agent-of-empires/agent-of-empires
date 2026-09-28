@@ -44,86 +44,11 @@ impl HooksInstallDialog {
         agent_name: &str,
         profile: Option<&str>,
     ) -> Self {
-        let mut settings_paths = Vec::new();
-        let mut hook_commands = Vec::new();
-        let mut needs_codex_trust_note = false;
-
-        let profile_config =
-            profile.map(crate::session::config::profile_config::resolve_config_or_warn);
-        if let Some(agent) = crate::agents::get_agent(agent_name) {
-            if let Some(hook_cfg) = &agent.hook_config {
-                let host_env = profile_config
-                    .as_ref()
-                    .map(|config| config.environment.clone())
-                    .unwrap_or_default();
-                let profile_home =
-                    crate::session::environment::resolve_host_environment_value(&host_env, "HOME")
-                        .map(std::path::PathBuf::from)
-                        .or_else(dirs::home_dir)
-                        .unwrap_or_else(|| std::path::PathBuf::from("~"));
-                let default_config = crate::session::config::SessionConfig::default();
-                let session_config = profile_config
-                    .as_ref()
-                    .map(|config| &config.session)
-                    .unwrap_or(&default_config);
-                needs_codex_trust_note = hook_cfg.format == crate::agents::HookFormat::CodexJson;
-                settings_paths.push(
-                    crate::session::generic_host_config_path_for(
-                        tool_name,
-                        hook_cfg,
-                        &profile_home,
-                        session_config,
-                        &host_env,
-                    )
-                    .to_string_lossy()
-                    .into_owned(),
-                );
-                for event in hook_cfg.events {
-                    let label = match event.status {
-                        Some(status) => format!("writes \"{}\"", status),
-                        None => "session lifecycle".to_string(),
-                    };
-                    hook_commands.push((event.name.to_string(), label));
-                }
-            } else if let Some(sidecar) = &agent.sidecar_hooks {
-                let host_environment = profile_config
-                    .as_ref()
-                    .map(|config| config.environment.as_slice())
-                    .unwrap_or_default();
-                let home = crate::session::environment::resolve_host_environment_value(
-                    host_environment,
-                    "HOME",
-                )
-                .map(std::path::PathBuf::from)
-                .or_else(dirs::home_dir)
-                .unwrap_or_else(|| std::path::PathBuf::from("~"));
-                let default_config = crate::session::config::SessionConfig::default();
-                let session_config = profile_config
-                    .as_ref()
-                    .map(|config| &config.session)
-                    .unwrap_or(&default_config);
-                let path = crate::session::sidecar_host_config_path_for(
-                    tool_name,
-                    agent,
-                    sidecar,
-                    &home,
-                    session_config,
-                    host_environment,
-                );
-                settings_paths.push(path.to_string_lossy().into_owned());
-                for event in sidecar.events {
-                    hook_commands.push((
-                        event.name.to_string(),
-                        format!("writes \"{}\"", event.status),
-                    ));
-                }
-            }
-        }
-
+        let disclosure = crate::session::host_hook_disclosure(tool_name, agent_name, profile);
         Self {
-            settings_paths,
-            hook_commands,
-            needs_codex_trust_note,
+            settings_paths: disclosure.settings_paths,
+            hook_commands: disclosure.hook_commands,
+            needs_codex_trust_note: disclosure.needs_codex_trust_note,
             selected: true,
             scroll_offset: 0,
             accept_button_area: Rect::default(),
@@ -131,6 +56,7 @@ impl HooksInstallDialog {
             hover: HoverState::default(),
         }
     }
+
     pub fn handle_click(&self, col: u16, row: u16) -> Option<DialogResult<bool>> {
         let pos = ratatui::layout::Position::from((col, row));
         if self.accept_button_area.contains(pos) {

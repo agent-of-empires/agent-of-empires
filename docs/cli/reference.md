@@ -103,6 +103,9 @@ This document contains the help content for the `aoe` command-line program.
 * [`aoe skill adopt`↴](#aoe-skill-adopt)
 * [`aoe skill remove`↴](#aoe-skill-remove)
 * [`aoe skill sync`↴](#aoe-skill-sync)
+* [`aoe hooks`↴](#aoe-hooks)
+* [`aoe hooks status`↴](#aoe-hooks-status)
+* [`aoe hooks approve`↴](#aoe-hooks-approve)
 * [`aoe serve`↴](#aoe-serve)
 * [`aoe url`↴](#aoe-url)
 * [`aoe acp`↴](#aoe-acp)
@@ -161,6 +164,7 @@ Run without arguments to launch the TUI dashboard.
 * `telemetry` — Manage anonymous opt-in usage telemetry
 * `mcp` — Inspect the effective MCP server set (provenance, conflicts, drift)
 * `skill` — Query and manage agent skills
+* `hooks` — Inspect and grant AoE's consent to write agent status hooks into the host agent's own config
 * `serve` — Start the aoe daemon: REST/WebSocket API, plus the web dashboard in builds that embed it
 * `url` — Print the URL of a running `aoe serve` daemon
 * `acp` — Manage the ACP structured-view workers (doctor, ps, logs, prompt, approve, ...)
@@ -1557,6 +1561,35 @@ Copy AoE-managed skills into the agents' own skills directories
 * `--replace <DIRECTORY>` — Take over this skill in the agents' directories, overwriting a skill AoE does not manage or a propagated copy that was edited there. Repeatable. Without it a sync never overwrites anything it did not itself write
 * `--only <DIRECTORY>` — Reconcile only this skill. Repeatable. Defaults to every managed skill
 * `--json` — Output the per-skill outcomes as JSON
+
+
+
+## `aoe hooks`
+
+Inspect and grant AoE's consent to write agent status hooks into the host agent's own config
+
+**Usage:** `aoe hooks <COMMAND>`
+
+###### **Subcommands:**
+
+* `status` — Show whether AoE may write agent status hooks, and where it would write them
+* `approve` — Allow AoE to write agent status hooks into the host agents' own config
+
+
+
+## `aoe hooks status`
+
+Show whether AoE may write agent status hooks, and where it would write them
+
+**Usage:** `aoe hooks status`
+
+
+
+## `aoe hooks approve`
+
+Allow AoE to write agent status hooks into the host agents' own config
+
+**Usage:** `aoe hooks approve`
 
 
 

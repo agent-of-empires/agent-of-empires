@@ -87,6 +87,82 @@ pub(crate) fn sidecar_host_config_path_for(
     home.join(sidecar.host_config_subpath)
 }
 
+/// What AoE would write into one agent's own host config, and what each hook
+/// does. Shared by the TUI approval dialog and `aoe hooks approve` so both
+/// disclose the same thing.
+pub(crate) struct HostHookDisclosure {
+    pub settings_paths: Vec<String>,
+    pub hook_commands: Vec<(String, String)>,
+    pub needs_codex_trust_note: bool,
+}
+
+/// Resolve the disclosure for `tool_name`, which may be detected as `agent_name`.
+/// `profile` is the profile whose environment and session config decide the paths.
+pub(crate) fn host_hook_disclosure(
+    tool_name: &str,
+    agent_name: &str,
+    profile: Option<&str>,
+) -> HostHookDisclosure {
+    let profile_config =
+        profile.map(crate::session::config::profile_config::resolve_config_or_warn);
+    let mut disclosure = HostHookDisclosure {
+        settings_paths: Vec::new(),
+        hook_commands: Vec::new(),
+        needs_codex_trust_note: false,
+    };
+    let Some(agent) = crate::agents::get_agent(agent_name) else {
+        return disclosure;
+    };
+    let host_env = profile_config
+        .as_ref()
+        .map(|config| config.environment.clone())
+        .unwrap_or_default();
+    let home = host_home(&host_env).unwrap_or_else(|| std::path::PathBuf::from("~"));
+    let default_config = crate::session::config::SessionConfig::default();
+    let session_config = profile_config
+        .as_ref()
+        .map(|config| &config.session)
+        .unwrap_or(&default_config);
+
+    if let Some(hook_cfg) = &agent.hook_config {
+        disclosure.needs_codex_trust_note = hook_cfg.format == crate::agents::HookFormat::CodexJson;
+        disclosure.settings_paths.push(
+            generic_host_config_path_for(tool_name, hook_cfg, &home, session_config, &host_env)
+                .to_string_lossy()
+                .into_owned(),
+        );
+        for event in hook_cfg.events {
+            disclosure.hook_commands.push((
+                event.name.to_string(),
+                match event.status {
+                    Some(status) => format!("writes \"{status}\""),
+                    None => "session lifecycle".to_string(),
+                },
+            ));
+        }
+    } else if let Some(sidecar) = &agent.sidecar_hooks {
+        disclosure.settings_paths.push(
+            sidecar_host_config_path_for(
+                tool_name,
+                agent,
+                sidecar,
+                &home,
+                session_config,
+                &host_env,
+            )
+            .to_string_lossy()
+            .into_owned(),
+        );
+        for event in sidecar.events {
+            disclosure.hook_commands.push((
+                event.name.to_string(),
+                format!("writes \"{}\"", event.status),
+            ));
+        }
+    }
+    disclosure
+}
+
 impl Instance {
     pub(super) fn run_pre_launch_hooks(
         &mut self,
@@ -233,7 +309,8 @@ impl Instance {
         }
         if !host_hooks_acknowledged() {
             bail!(
-                "agent hook paths have not been acknowledged; approve them in the AoE TUI before launching this host session"
+                "agent hook paths have not been acknowledged; run `aoe hooks approve` \
+                 (or accept the dialog in the AoE TUI) before launching this host session"
             );
         }
         let profile_environment = self.profile_host_environment();
@@ -516,7 +593,7 @@ fn host_hook_config_path(
     })
 }
 
-pub(super) fn host_home(host_environment: &[String]) -> Option<std::path::PathBuf> {
+pub(crate) fn host_home(host_environment: &[String]) -> Option<std::path::PathBuf> {
     crate::session::environment::resolve_host_environment_value(host_environment, "HOME")
         .map(std::path::PathBuf::from)
         .or_else(dirs::home_dir)
