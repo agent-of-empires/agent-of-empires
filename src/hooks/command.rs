@@ -164,11 +164,17 @@ pub(crate) fn hook_command_session_id(
     }
 }
 
-fn hook_command_session_id_host(field: HookIdentityField, publisher: Option<&str>) -> String {
-    let field = match field {
+/// The `--field` value an identity hook extracts. Named here so the command
+/// and the consent disclosure cannot drift apart.
+pub(crate) fn identity_field_name(field: HookIdentityField) -> &'static str {
+    match field {
         HookIdentityField::SessionId => "session-id",
         HookIdentityField::ConversationIdOrSessionId => "conversation-id-or-session-id",
-    };
+    }
+}
+
+fn hook_command_session_id_host(field: HookIdentityField, publisher: Option<&str>) -> String {
+    let field = identity_field_name(field);
     let agent = publisher.map_or_else(String::new, |name| format!(" --agent {name}"));
     format!(
         "sh -c '[ -n \"$AOE_INSTANCE_ID\" ] || exit 0; \

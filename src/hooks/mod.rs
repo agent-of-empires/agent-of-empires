@@ -25,6 +25,7 @@ pub(crate) use codex::{
     install_codex_hooks_with_preserved_state, install_codex_json_hooks, restore_codex_hooks_state,
     snapshot_codex_hooks_state,
 };
+pub(crate) use command::identity_field_name;
 pub(crate) use command::HOOK_STATUS_BASE_IN_CONTAINER;
 #[cfg(test)]
 pub(crate) use command::{hook_command, hook_command_session_id, status_command_for_event};

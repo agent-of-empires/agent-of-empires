@@ -174,12 +174,7 @@ pub(crate) fn host_hook_disclosure(
             (Some(status), _) => format!("writes \"{status}\""),
             (None, Some(field)) => format!(
                 "runs aoe __extract-session-id --field {}",
-                match field {
-                    crate::agents::HookIdentityField::SessionId => "session-id",
-                    crate::agents::HookIdentityField::ConversationIdOrSessionId => {
-                        "conversation-id-or-session-id"
-                    }
-                }
+                crate::hooks::identity_field_name(field)
             ),
             (None, None) => "session lifecycle".to_string(),
         };
