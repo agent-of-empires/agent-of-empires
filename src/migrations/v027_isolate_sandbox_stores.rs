@@ -1933,7 +1933,8 @@ fn copy_tree_from_fd(
         }
         let target = destination.join(name);
         if kind == nix::libc::S_IFLNK {
-            let link = readlinkat(&dir, name)?;
+            let link = readlinkat(&dir, name)
+                .with_context(|| format!("reading {}", relative.join(name).display()))?;
             if !relative_symlink_stays_in_root(relative, Path::new(&link)) {
                 tracing::warn!(
                     "v027 skipping source symlink that escapes its sandbox root: {}",
@@ -1970,7 +1971,8 @@ fn copy_tree_from_fd(
                 name,
                 OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_RDONLY,
                 Mode::empty(),
-            )?;
+            )
+            .with_context(|| format!("reading {}", relative.join(name).display()))?;
             let existed = match fs::symlink_metadata(&target) {
                 Ok(metadata)
                     if overwrite_newer
@@ -2009,7 +2011,8 @@ fn copy_tree_from_fd(
                 name,
                 OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_RDONLY | OFlag::O_NONBLOCK,
                 Mode::empty(),
-            )?;
+            )
+            .with_context(|| format!("reading {}", relative.join(name).display()))?;
             let opened = fstat(&file)?;
             if (opened.st_mode & nix::libc::S_IFMT) != nix::libc::S_IFREG {
                 bail!("v027 source entry changed type during copy");
@@ -2141,7 +2144,9 @@ fn copy_tree_no_links(
                 Err(error) => return Err(error.into()),
             };
             if should_copy {
-                copied.copied_file(fs::copy(entry.path(), &target)?);
+                copied.copied_file(fs::copy(entry.path(), &target).with_context(|| {
+                    format!("copying {} to {}", entry.path().display(), target.display())
+                })?);
                 fs::set_permissions(&target, metadata.permissions())?;
                 super::store_fs::sync_to_drive(&fs::File::open(&target)?)?;
             }
@@ -4522,6 +4527,36 @@ gemini = "{}"
         assert_eq!(
             (copied.mtime(), copied.mtime_nsec()),
             (mtime.tv_sec(), mtime.tv_nsec())
+        );
+    }
+
+    /// Without the path, an unreadable file in a store reports only "Permission denied".
+    #[test]
+    #[cfg(unix)]
+    #[serial_test::serial]
+    fn unreadable_source_file_is_named_in_the_error() {
+        use std::os::unix::fs::PermissionsExt;
+        if nix::unistd::geteuid().is_root() {
+            eprintln!(
+                "unreadable_source_file_is_named_in_the_error: skipping (running as root; \
+                 uid 0 bypasses the mode check, so the open cannot be made to fail)"
+            );
+            return;
+        }
+        let (_temp, _app_guard, app, home) = isolated();
+        let source = home.join(".gemini/sandbox");
+        fs::create_dir_all(&source).unwrap();
+        let unreadable = source.join("stale.bun-build");
+        fs::write(&unreadable, b"").unwrap();
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000)).unwrap();
+        fs::write(app.join("sessions.json"), format!("[{}]", row("one"))).unwrap();
+
+        let error = run_in(&app, &home, &|_| Ok(false))
+            .expect_err("an unreadable source file must fail the store move");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("stale.bun-build"),
+            "the error must name the file it could not read: {rendered}"
         );
     }
 
