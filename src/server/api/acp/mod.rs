@@ -85,6 +85,10 @@ fn supervisor_error_response(context: &str, err: &SupervisorError) -> Response {
             StatusCode::CONFLICT,
             format!("spawn_cancelled: {context}: {err}"),
         ),
+        SupervisorError::Blocked(blocked) => {
+            return crate::server::api::start_blocked_response(*blocked)
+        }
+        SupervisorError::SessionGone(_) => return session_not_found(),
         SupervisorError::Acp(_) | SupervisorError::InvalidAgentCommand(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("{context}: {err}"),
@@ -124,6 +128,7 @@ fn spawn_request_for(
         ),
         seed_history_replay: instance.import_pending == Some(true),
         claude_store_pin: instance.selected_claude_store_pin(),
+        durable_admission: true,
     }
 }
 
@@ -256,6 +261,127 @@ mod tests {
                 assert_eq!(body["error"], want_code);
             }
             assert!(!state.acp_supervisor.is_running(&id).await);
+        }
+    }
+
+    /// #4116: a peer archive committed while the `before_session` hook runs (after the handler's
+    /// recheck) still refuses the launch, on both the spawn and the agent-switch endpoint.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn launch_refuses_a_row_archived_while_the_before_session_hook_runs() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let barrier = tempfile::tempdir().unwrap();
+        for endpoint in ["spawn", "switch"] {
+            let ready = barrier.path().join(format!("{endpoint}-ready"));
+            let release = barrier.path().join(format!("{endpoint}-release"));
+            let hook = format!(
+                ": > '{}'; while [ ! -e '{}' ]; do sleep 0.01; done",
+                ready.display(),
+                release.display()
+            );
+            crate::session::config::update_config(|global| {
+                global.host_hooks.before_session = vec![hook];
+            })
+            .unwrap();
+
+            let mut inst =
+                crate::session::Instance::new("acp-4116-hook", barrier.path().to_str().unwrap());
+            inst.id = format!("sess-4116-hook-{endpoint}");
+            inst.view = crate::session::View::Structured;
+            inst.status = crate::session::Status::Idle;
+            let id = inst.id.clone();
+            let storage = crate::session::Storage::new_unwatched(&inst.source_profile).unwrap();
+            storage
+                .update(|rows, _| {
+                    *rows = vec![inst.clone()];
+                    Ok(())
+                })
+                .unwrap();
+            let launches = Arc::new(AtomicUsize::new(0));
+            let counted = Arc::clone(&launches);
+            let launcher: crate::acp::supervisor::Launcher = Arc::new(move |_config, _id| {
+                counted.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async {
+                    Err::<crate::acp::acp_client::AcpClient, _>(
+                        crate::acp::acp_client::AcpError::Spawn("test launcher".into()),
+                    )
+                })
+            });
+            let state = crate::server::test_support::build_test_app_state_with_launcher(
+                vec![inst],
+                launcher,
+            );
+
+            let handler = tokio::spawn({
+                let state = Arc::clone(&state);
+                let id = id.clone();
+                async move {
+                    if endpoint == "spawn" {
+                        spawn_acp(
+                            State(state),
+                            Path(id),
+                            Ok(Json(worker::SpawnAcpRequest {
+                                agent: None,
+                                model: None,
+                                additional_dirs: Vec::new(),
+                                provider_env: Vec::new(),
+                            })),
+                        )
+                        .await
+                        .into_response()
+                    } else {
+                        switch_acp_agent(
+                            State(state),
+                            Path(id),
+                            Json(crate::acp::protocol::SwitchAgentRequest {
+                                target: "codex".to_string(),
+                                model: None,
+                                reason: None,
+                            }),
+                        )
+                        .await
+                        .into_response()
+                    }
+                }
+            });
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !ready.exists() && std::time::Instant::now() < deadline && !handler.is_finished()
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            let hook_started = ready.exists();
+            if hook_started {
+                let _lock = storage.acquire_instance_lifecycle_lock(&id).unwrap();
+                storage
+                    .update(|rows, _| {
+                        rows[0].archive();
+                        Ok(())
+                    })
+                    .unwrap();
+            }
+            std::fs::write(&release, b"release").unwrap();
+            let response = handler.await.unwrap();
+
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            assert!(
+                hook_started,
+                "{endpoint}: before_session hook did not run: {status} {}",
+                String::from_utf8_lossy(&body)
+            );
+            assert_eq!(
+                status,
+                StatusCode::CONFLICT,
+                "{endpoint}: {}",
+                String::from_utf8_lossy(&body)
+            );
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["error"], "session_archived", "{endpoint}");
+            assert_eq!(launches.load(Ordering::SeqCst), 0, "{endpoint}: launched");
+            assert!(!state.acp_supervisor.is_running(&id).await, "{endpoint}");
         }
     }
 

@@ -128,10 +128,17 @@ fn failing_start_state(
             })
         })
     });
-    let state = crate::server::test_support::build_test_app_state_with_launcher(
-        vec![structured_instance(id, false)],
-        launcher,
-    );
+    let inst = structured_instance(id, false);
+    // The launch admission rereads the stored row, as it exists in production.
+    crate::session::Storage::new_unwatched(&inst.source_profile)
+        .unwrap()
+        .update(|rows, _| {
+            rows.push(inst.clone());
+            Ok(())
+        })
+        .unwrap();
+    let state =
+        crate::server::test_support::build_test_app_state_with_launcher(vec![inst], launcher);
     (state, launches)
 }
 

@@ -388,6 +388,7 @@ async fn build_spawn_request(
         agent_command_override: command_override_for_spawn(&target.tool, &target.command),
         seed_history_replay,
         claude_store_pin,
+        durable_admission: true,
     })
 }
 

@@ -103,6 +103,9 @@ impl<S: BroadcastSink> Supervisor<S> {
             stored_id = ?config.stored_acp_session_id,
             "spawning structured view worker"
         );
+        // Held through the launcher so a peer archive or trash commits before this recheck or
+        // after the worker is up; never across the hooks above, which may re-enter aoe.
+        let _admission = admit_durable_launch(&req).await?;
         // Clear a partial replay from a failed import before session/load re-emits it.
         if config.seed_history_replay {
             self.sink.clear_session_events(session_id);
@@ -716,6 +719,41 @@ pub(super) fn publish_rejection(err: &AcpError, mut publish: impl FnMut(Event)) 
 }
 
 /// Run the profile's `before_session` host hooks and return the env they mint.
+/// The caller's dismissal check ran before `spawn_config` awaited the `before_session` hook, so
+/// recheck the stored row under its lifecycle lock. Returning an error drops the reservation.
+async fn admit_durable_launch(
+    req: &SpawnRequest,
+) -> Result<Option<crate::session::StorageFlock>, SupervisorError> {
+    if !req.durable_admission {
+        return Ok(None);
+    }
+    let profile = req.source_profile.clone().unwrap_or_default();
+    let session_id = req.session_id.clone();
+    let spawn_error = |e: anyhow::Error| {
+        SupervisorError::Acp(AcpError::Spawn(format!("launch admission: {e:#}")))
+    };
+    tokio::task::spawn_blocking(move || {
+        let storage = crate::session::Storage::new_unwatched(&profile).map_err(spawn_error)?;
+        let lock = storage
+            .acquire_instance_lifecycle_lock(&session_id)
+            .map_err(spawn_error)?;
+        let stored = storage
+            .load()
+            .map_err(spawn_error)?
+            .into_iter()
+            .find(|row| row.id == session_id);
+        match stored {
+            None => Err(SupervisorError::SessionGone(session_id)),
+            Some(row) => {
+                row.ensure_startable().map_err(SupervisorError::Blocked)?;
+                Ok(Some(lock))
+            }
+        }
+    })
+    .await
+    .map_err(|e| SupervisorError::Acp(AcpError::Spawn(format!("launch admission task: {e}"))))?
+}
+
 pub(super) async fn before_session_env(
     session_id: &str,
     tool: &str,

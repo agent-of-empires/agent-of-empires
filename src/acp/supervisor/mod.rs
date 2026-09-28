@@ -83,6 +83,10 @@ pub enum SupervisorError {
     /// The previous runner is not proven dead yet.
     #[error("session {0:?} is still stopping its previous structured view worker")]
     TeardownPending(String),
+    #[error(transparent)]
+    Blocked(crate::session::StartBlocked),
+    #[error("session {0:?} no longer exists")]
+    SessionGone(String),
 }
 
 /// What the caller does with prompt text after it was published.
@@ -238,6 +242,9 @@ pub struct SpawnRequest {
     pub seed_history_replay: bool,
     /// Claude store selected by the conversation binding for a host Claude worker.
     pub claude_store_pin: Option<crate::session::capture::ClaudeStorePin>,
+    /// Recheck the stored row right before launch, under its lifecycle lock, and refuse an
+    /// archived, trashed, or purged session (#4116).
+    pub durable_admission: bool,
 }
 
 impl<S: BroadcastSink> Supervisor<S> {

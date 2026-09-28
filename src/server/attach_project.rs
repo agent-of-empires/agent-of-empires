@@ -294,6 +294,7 @@ async fn spawn_worker(state: &Arc<AppState>, id: &str) -> WorkerOutcome {
             ),
             seed_history_replay: false,
             claude_store_pin: inst.selected_claude_store_pin(),
+            durable_admission: false,
         }
     };
 

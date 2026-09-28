@@ -496,6 +496,7 @@ pub(crate) async fn spawn_structured_session(
                             agent_command_override: command_override,
                             seed_history_replay,
                             claude_store_pin: None,
+                            durable_admission: false,
                         })
                         .await
                     {
