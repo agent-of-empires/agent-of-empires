@@ -611,6 +611,160 @@ async fn diff_comments_refuse_to_open_a_turn_another_submission_started() {
     )));
 }
 
+/// Seed the rate-limit state auto-resume acts on: prompt A interrupted by a
+/// limit whose park window has already elapsed, so `reap_rate_limit_resumes`
+/// would queue A. Backdated an hour, under the redelivery cap. `busy` adds a
+/// running turn, which is what makes B queue rather than dispatch.
+fn seed_elapsed_rate_limit_park(state: &AppState, id: &str, busy: bool) {
+    let store = &state.acp_event_store;
+    let long_ago = chrono::Utc::now() - chrono::Duration::hours(1);
+    let at = long_ago.timestamp_millis();
+    let mut events = vec![
+        Event::UserPromptSent {
+            text: "interrupted prompt A".into(),
+            attachments: Vec::new(),
+            prompt_id: None,
+            synthesized: false,
+        },
+        Event::RateLimit {
+            info: crate::acp::state::RateLimitInfo {
+                status: "limited".into(),
+                resets_at: Some(long_ago),
+                kind: "usage".into(),
+            },
+        },
+        Event::Stopped {
+            reason: "rate_limited".into(),
+        },
+    ];
+    if busy {
+        events.push(Event::ThinkingStarted);
+    }
+    for (seq, event) in events.iter().enumerate() {
+        store
+            .record_at(id, seq as u64 + 1, event, at)
+            .expect("seed the rate-limit park");
+    }
+    state
+        .acp_supervisor
+        .hydrate_seqs([(id.to_string(), store.highest_seq(id))]);
+    let park = store.rate_limit_park(id).expect("an armed park");
+    assert!(!park.cap_reached, "the fixture must stay under the cap");
+    assert!(
+        store.rate_limited_turn_prompt(id).is_some(),
+        "the fixture must leave a continuation to install"
+    );
+}
+
+/// The pending continuation as it stands on disk, which the in-memory slot
+/// can disagree with.
+fn persisted_pending_turn(id: &str) -> Option<crate::session::PendingInitialTurn> {
+    let storage = crate::session::Storage::new_unwatched("default").expect("open storage");
+    storage
+        .update(|instances, _groups| {
+            Ok(instances
+                .iter()
+                .find(|i| i.id == id)
+                .and_then(|i| i.pending_initial_turn.clone()))
+        })
+        .expect("read persisted sessions")
+}
+
+/// #4092: a manual prompt may not slip between a rate-limit continuation's
+/// store read and its installation. The producer holds the session's
+/// submission authority across that window, so B is provably serialized
+/// behind it rather than overtaking it and being overwritten.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_manual_prompt_cannot_overtake_a_continuation_install() {
+    // `queued` is the #4079 shape: a live worker with a turn in flight parks B
+    // on the server queue. `direct` has no turn, so B starts one.
+    for queued in [false, true] {
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let label = if queued { "queued" } else { "direct" };
+        let id = format!("sess-4092-{label}");
+        let state = structured_state(&id, false);
+        state
+            .acp_supervisor
+            .test_insert_worker_cmd_recording(&id)
+            .await;
+        seed_elapsed_rate_limit_park(&state, &id, queued);
+
+        let mut barrier = crate::server::acp_reconciler::arm_install_barrier();
+        let mut claims = state.session_service.watch_submission_claims();
+        let producer = tokio::spawn({
+            let state = Arc::clone(&state);
+            let id = id.clone();
+            async move {
+                crate::server::acp_reconciler::enqueue_rate_limit_continuation(&state, &id).await;
+            }
+        });
+        // Causal barrier: A has been read from the store and is not installed.
+        let (read_id, release) =
+            tokio::time::timeout(Duration::from_secs(10), barrier.reads.recv())
+                .await
+                .expect("the producer must reach the barrier")
+                .expect("the barrier tap outlives the producer");
+        assert_eq!(read_id, id, "{label}");
+        assert!(
+            state.instances.read().await[0]
+                .pending_initial_turn
+                .is_none(),
+            "{label}: the barrier must sit before the installation"
+        );
+
+        let prompt = {
+            let state = Arc::clone(&state);
+            let id = id.clone();
+            async move {
+                acp_prompt(State(state), Path(id), prompt_req("manual prompt B"))
+                    .await
+                    .into_response()
+            }
+        };
+        tokio::pin!(prompt);
+        // B reached its submission claim, so it is contending for the session
+        // the producer is holding. Its accepted decision must not land while
+        // that install is in progress; the deadline bounds the wait, the claim
+        // above is what establishes the contention.
+        assert!(futures_util::poll!(&mut prompt).is_pending());
+        assert_eq!(
+            claims.try_recv().expect("the prompt must reach its claim"),
+            id,
+            "{label}"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), &mut prompt)
+                .await
+                .is_err(),
+            "{label}: a submission must not land while the continuation install holds the session"
+        );
+
+        let _ = release.send(());
+        tokio::time::timeout(Duration::from_secs(10), producer)
+            .await
+            .expect("the producer must finish once released")
+            .expect("the producer must not panic");
+        let response = tokio::time::timeout(Duration::from_secs(30), prompt)
+            .await
+            .expect("the prompt must finish once the producer releases the session");
+        assert_eq!(response.status(), StatusCode::ACCEPTED, "{label}");
+
+        assert_eq!(
+            state.instances.read().await[0]
+                .pending_initial_turn
+                .as_ref()
+                .map(|t| t.text.as_str()),
+            None,
+            "{label}: B superseded A, so no continuation may survive it"
+        );
+        assert!(
+            persisted_pending_turn(&id).is_none(),
+            "{label}: the superseded continuation must not reach disk"
+        );
+    }
+}
+
 #[test]
 fn prompt_persist_tiers() {
     // The recency-only tier does not clear a peer's archive by itself.

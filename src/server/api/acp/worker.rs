@@ -93,6 +93,17 @@ pub async fn spawn_acp(
     if !instance_exists(&state, &id).await {
         return session_not_found();
     }
+    // The continuation install below requires the session's submission
+    // authority, claimed ahead of the instance lock as every other mutation
+    // surface does (#4092). It also proves the session exists, so neither lock
+    // registry gains an entry for a missing one.
+    let Some(_submission) = state
+        .session_service
+        .prompt_submission_for_session(&id)
+        .await
+    else {
+        return session_not_found();
+    };
     let inst_lock = state.instance_lock(&id).await;
     let _guard = inst_lock.lock().await;
     let Some(instance) = find_instance(&state, &id).await else {
@@ -142,10 +153,20 @@ pub async fn spawn_acp(
     }
     if let Some(resets_at) = rate_limit_resume_resets_at {
         // Continue the rate-limit-interrupted turn once the worker is live.
-        crate::server::acp_reconciler::enqueue_rate_limit_continuation(&state, &id).await;
-        state
-            .acp_supervisor
-            .publish_rate_limit_auto_resumed(&id, resets_at, true);
+        let outcome = crate::server::acp_reconciler::install_rate_limit_continuation(
+            &state,
+            &id,
+            _submission,
+        )
+        .await;
+        if matches!(
+            outcome,
+            crate::server::acp_reconciler::ContinuationOutcome::Stands
+        ) {
+            state
+                .acp_supervisor
+                .publish_rate_limit_auto_resumed(&id, resets_at, true);
+        }
     }
     Json(SpawnAcpResponse {
         session_id: id,
@@ -568,5 +589,58 @@ mod tests {
                 "{label}"
             );
         }
+    }
+
+    /// #4092: the manual resume installs a continuation under the session's
+    /// submission authority, so `/acp/spawn` must claim it ahead of the
+    /// instance lock, like every other mutation surface. Taking them the other
+    /// way round closes a cycle with any submission-then-instance-lock path.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn spawn_claims_the_submission_guard_before_the_instance_lock() {
+        use crate::session::test_support::isolate_app_dir;
+        let _app_dir = isolate_app_dir();
+        let mut inst = crate::session::Instance::new("sess-4092-spawn", "/tmp/aoe-4092-spawn");
+        inst.id = "sess-4092-spawn".to_string();
+        inst.view = crate::session::View::Structured;
+        let id = inst.id.clone();
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+
+        let _held = state
+            .session_service
+            .prompt_submission_for_session(&id)
+            .await
+            .expect("seeded session must admit a submission");
+        let mut claims = state.session_service.watch_submission_claims();
+        let spawn = {
+            let state = Arc::clone(&state);
+            let id = id.clone();
+            async move {
+                spawn_acp(
+                    State(state),
+                    Path(id),
+                    Ok(Json(SpawnAcpRequest {
+                        agent: None,
+                        model: None,
+                        additional_dirs: Vec::new(),
+                        provider_env: Vec::new(),
+                    })),
+                )
+                .await
+                .into_response()
+            }
+        };
+        tokio::pin!(spawn);
+        assert!(futures_util::poll!(&mut spawn).is_pending());
+        assert_eq!(
+            claims
+                .try_recv()
+                .expect("spawn reaches its submission claim"),
+            id
+        );
+        let instance_lock = state.instance_lock(&id).await;
+        let _instance_lock = instance_lock
+            .try_lock()
+            .expect("submission must precede the instance lock");
     }
 }

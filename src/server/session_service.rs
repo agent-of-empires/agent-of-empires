@@ -1213,11 +1213,35 @@ impl SessionService {
         if let Some(tap) = self.submission_claims.get() {
             let _ = tap.send(id.to_string());
         }
+        self.prompt_gate(id).await.lock_owned().await
+    }
+
+    /// [`Self::prompt_submission`] for a pass that treats contention as a
+    /// refusal rather than a queue, so it never stalls behind a long-running
+    /// submission (#4092). Not a claim: it does not report to
+    /// [`Self::watch_submission_claims`].
+    pub(crate) async fn try_prompt_submission(
+        &self,
+        id: &str,
+    ) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        let guard = self.prompt_gate(id).await.try_lock_owned().ok()?;
+        // `prompt_gate` vivifies an entry for an id it has not proved exists,
+        // and nothing prunes the registry but a delete, so a session that went
+        // away under this claim would leak one. Mirrors `admit_prompt_submission`.
+        if self.admits_turn(&SessionCaller::User, id).await.is_err() {
+            drop(guard);
+            self.forget_prompt_lock(id).await;
+            return None;
+        }
+        Some(guard)
+    }
+
+    async fn prompt_gate(&self, id: &str) -> Arc<tokio::sync::Mutex<()>> {
         let lock = {
             let guard = self.prompt_locks.read().await;
             guard.get(id).cloned()
         };
-        let lock = match lock {
+        match lock {
             Some(lock) => lock,
             None => self
                 .prompt_locks
@@ -1226,8 +1250,7 @@ impl SessionService {
                 .entry(id.to_string())
                 .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
                 .clone(),
-        };
-        lock.lock_owned().await
+        }
     }
 
     /// [`Self::prompt_submission`] for a caller that has not yet proved it may act on the
