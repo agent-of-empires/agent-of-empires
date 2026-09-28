@@ -14,7 +14,7 @@ use crate::session::{host_hook_agent_name, host_hook_disclosure, update_app_stat
 pub enum HooksCommands {
     /// Show whether AoE may write agent status hooks, and what it resolves
     Status,
-    /// Allow AoE to write agent status hooks into the host agents' own config
+    /// Allow AoE to write agent hooks for every agent, on every profile
     Approve,
 }
 
@@ -61,10 +61,8 @@ fn approve(profile: &str) -> Result<()> {
     Ok(())
 }
 
-/// Print the files and hook commands a launch targets under `profile`, for
-/// every tool the profile installs hooks for. A launch resolves more than this
-/// when it routes through a native store or merges into a selected agent, so
-/// the list is a disclosure, not an exhaustive manifest.
+/// Print the files and hook commands this profile resolves, for every tool it
+/// installs hooks for. The printed caveat is the bound on that list.
 fn print_disclosure(profile: &str) -> Result<()> {
     let profile = crate::session::config::effective_profile(profile);
     let config = crate::session::config::profile_config::resolve_config_or_warn(&profile);
@@ -130,9 +128,6 @@ fn print_disclosure(profile: &str) -> Result<()> {
             "  printf {{status}} > {}/$AOE_INSTANCE_ID/status",
             crate::hooks::hook_base_path().display()
         );
-    } else {
-        println!("An identity event runs the pinned aoe binary to record the id:");
-        println!("  aoe __extract-session-id --field session-id");
     }
     println!();
     println!("Hooks are guarded by $AOE_INSTANCE_ID and are a");
@@ -142,6 +137,9 @@ fn print_disclosure(profile: &str) -> Result<()> {
     println!("write a launch can make. A launch that routes through a native store,");
     println!("merges into a selected agent, or targets a selected or recorded Claude");
     println!("conversation store resolves that target at launch time.");
+    println!();
+    println!("The consent is per installation and is not bound to this profile, so");
+    println!("another profile resolves its own paths under the same approval.");
     if disclosures
         .iter()
         .any(|(_, disclosure)| disclosure.needs_codex_trust_note)

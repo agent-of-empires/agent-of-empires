@@ -99,17 +99,18 @@ pub(crate) struct HostHookDisclosure {
     pub status_hooks_enabled: bool,
 }
 
-/// The built-in agent a tool name stands for, in the order a launch resolves
-/// it: an explicit execution contract, then the tool name, then
-/// `agent_detect_as`. Falls back to the tool name when none names an agent.
+/// The built-in agent a tool name stands for. A tool that is itself a built-in
+/// is that built-in: a contradicting `agent_execution_as` makes
+/// `execution_agent_for` fail, and the launch falls back to the same answer.
+/// Otherwise an explicit execution contract wins over `agent_detect_as`, which
+/// only drives status detection. Falls back to the tool name unchanged.
 pub(crate) fn host_hook_agent_name(
     tool_name: &str,
     execution_as: Option<&str>,
     detect_as: Option<&str>,
 ) -> String {
-    execution_as
-        .and_then(crate::agents::get_agent)
-        .or_else(|| crate::agents::get_agent(tool_name))
+    crate::agents::get_agent(tool_name)
+        .or_else(|| execution_as.and_then(crate::agents::get_agent))
         .or_else(|| detect_as.and_then(crate::agents::get_agent))
         .map_or(tool_name, |agent| agent.name)
         .to_string()
@@ -162,18 +163,25 @@ pub(crate) fn host_hook_disclosure(
         return disclosure;
     }
 
-    // The events come from the resolver the installer uses, so what is listed
-    // is what a launch writes: status_map overrides applied, and the status
-    // events dropped when status hooks are off.
+    // Resolved through the installer's own resolver, so status_map overrides
+    // apply and the status events drop out with the setting.
     let default_config = crate::session::config::Config::default();
     let config = config.unwrap_or(&default_config);
     for event in resolved_host_hook_events(agent, config, config.session.agent_status_hooks)
         .unwrap_or_default()
     {
-        let effect = match (&event.status, event.identity_field.is_some()) {
+        let effect = match (&event.status, event.identity_field) {
             (Some(status), _) => format!("writes \"{status}\""),
-            (None, true) => "records the conversation id".to_string(),
-            (None, false) => "session lifecycle".to_string(),
+            (None, Some(field)) => format!(
+                "runs aoe __extract-session-id --field {}",
+                match field {
+                    crate::agents::HookIdentityField::SessionId => "session-id",
+                    crate::agents::HookIdentityField::ConversationIdOrSessionId => {
+                        "conversation-id-or-session-id"
+                    }
+                }
+            ),
+            (None, None) => "session lifecycle".to_string(),
         };
         disclosure.hook_commands.push((event.name, effect));
     }

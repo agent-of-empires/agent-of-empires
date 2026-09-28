@@ -348,13 +348,16 @@ fn resolve_hook_install_agent(
     tool_name: &str,
     session_config: &crate::session::config::SessionConfig,
 ) -> Option<&'static crate::agents::AgentDef> {
-    crate::agents::get_agent(tool_name)
-        .or_else(|| {
-            session_config
-                .agent_detect_as
-                .get(tool_name)
-                .and_then(|detect_as| crate::agents::get_agent(detect_as))
-        })
+    let execution_as = session_config
+        .agent_execution_as
+        .get(tool_name)
+        .map(String::as_str);
+    let detect_as = session_config
+        .agent_detect_as
+        .get(tool_name)
+        .map(String::as_str);
+    let name = crate::session::host_hook_agent_name(tool_name, execution_as, detect_as);
+    crate::agents::get_agent(&name)
         .filter(|agent| agent.hook_config.is_some() || agent.sidecar_hooks.is_some())
 }
 

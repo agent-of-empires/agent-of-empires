@@ -1573,7 +1573,7 @@ Inspect and grant AoE's consent to write agent status hooks into the host agent'
 ###### **Subcommands:**
 
 * `status` — Show whether AoE may write agent status hooks, and what it resolves
-* `approve` — Allow AoE to write agent status hooks into the host agents' own config
+* `approve` — Allow AoE to write agent hooks for every agent, on every profile
 
 
 
@@ -1587,7 +1587,7 @@ Show whether AoE may write agent status hooks, and what it resolves
 
 ## `aoe hooks approve`
 
-Allow AoE to write agent status hooks into the host agents' own config
+Allow AoE to write agent hooks for every agent, on every profile
 
 **Usage:** `aoe hooks approve`
 

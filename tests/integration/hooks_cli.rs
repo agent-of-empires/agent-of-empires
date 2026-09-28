@@ -133,7 +133,7 @@ fn hooks_disclosure_follows_the_effective_config() {
             "[session]\nagent_status_hooks = false\n".to_string(),
             "claude",
             home.join(".claude").join("settings.json"),
-            Some("records the conversation id"),
+            Some("aoe __extract-session-id --field session-id"),
         ),
     ];
 
@@ -148,11 +148,18 @@ fn hooks_disclosure_follows_the_effective_config() {
             status.stdout
         );
         match event {
-            Some(event) => assert!(
-                status.stdout.contains(event),
-                "{label}: identity-only installs must disclose the identity event.\ngot:\n{}",
-                status.stdout
-            ),
+            Some(command) => {
+                assert!(
+                    status.stdout.contains(command),
+                    "{label}: identity-only installs must disclose the command they run.\ngot:\n{}",
+                    status.stdout
+                );
+                assert!(
+                    !status.stdout.contains("writes \""),
+                    "{label}: no status event survives agent_status_hooks = false.\n{}",
+                    status.stdout
+                );
+            }
             None => assert!(
                 !status.stdout.contains("agent_status_hooks off"),
                 "{label}: status hooks are on, the header must not claim otherwise.\n{}",

@@ -9,6 +9,7 @@ use crate::tui::components::hover::{paint_hover_bg, HoverState};
 use crate::tui::styles::Theme;
 
 pub struct HooksInstallDialog {
+    status_hooks_enabled: bool,
     settings_paths: Vec<String>,
     hook_commands: Vec<(String, String)>,
     needs_codex_trust_note: bool,
@@ -51,6 +52,7 @@ impl HooksInstallDialog {
             settings_paths: disclosure.settings_paths,
             hook_commands: disclosure.hook_commands,
             needs_codex_trust_note: disclosure.needs_codex_trust_note,
+            status_hooks_enabled: disclosure.status_hooks_enabled,
             selected: true,
             scroll_offset: 0,
             accept_button_area: Rect::default(),
@@ -143,16 +145,23 @@ impl HooksInstallDialog {
         }
 
         lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            "Each hook runs:",
-            Style::default().bold(),
-        )));
-        // The euid shown matches the runtime path baked into the hook command,
-        // and is already exposed by `id -u`. A placeholder would mislead.
-        lines.push(Line::from(format!(
-            "  printf {{status}} > {}/$AOE_INSTANCE_ID/status",
-            crate::hooks::hook_base_path().display()
-        )));
+        if self.status_hooks_enabled {
+            lines.push(Line::from(Span::styled(
+                "Each hook runs:",
+                Style::default().bold(),
+            )));
+            // The euid shown matches the runtime path baked into the hook command,
+            // and is already exposed by `id -u`. A placeholder would mislead.
+            lines.push(Line::from(format!(
+                "  printf {{status}} > {}/$AOE_INSTANCE_ID/status",
+                crate::hooks::hook_base_path().display()
+            )));
+        } else {
+            lines.push(Line::from(
+                "Status hooks are off, so these record the conversation id for native",
+            ));
+            lines.push(Line::from("resume. Each event's command is listed above."));
+        }
 
         lines.push(Line::from(""));
         lines.push(Line::from(
@@ -192,9 +201,11 @@ impl HooksInstallDialog {
             ])
             .split(inner);
 
-        let header = Paragraph::new(
-            "AoE needs to install hooks into your agent's settings\nto detect session status (running/waiting/idle).",
-        )
+        let header = Paragraph::new(if self.status_hooks_enabled {
+            "AoE needs to install hooks into your agent's settings\nto detect session status (running/waiting/idle)."
+        } else {
+            "AoE needs to install identity hooks into your agent's settings\nfor native resume. Status hooks are off for this profile."
+        })
         .style(Style::default().fg(theme.text))
         .wrap(Wrap { trim: true });
         frame.render_widget(header, chunks[0]);
