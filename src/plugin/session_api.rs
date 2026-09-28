@@ -1304,6 +1304,41 @@ mod tests {
         }
     }
 
+    /// #4116: a peer that archived the stored row after the cap reservation still releases the
+    /// pending mark, so the refused revival does not hold a slot.
+    #[tokio::test]
+    async fn turn_send_releases_the_pending_mark_when_the_stored_row_was_archived() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let mut resting = Instance::new("parked-owned", "/tmp/aoe-4116-plugin");
+        resting.id = "sess-resting".to_string();
+        resting.source_profile = "default".to_string();
+        resting.view = crate::session::View::Structured;
+        resting.created_by_plugin = Some("cron".to_string());
+        resting.status = Status::Idle;
+        let mut peer = resting.clone();
+        peer.archive();
+        crate::session::Storage::new_unwatched("default")
+            .unwrap()
+            .update(|rows, _| {
+                *rows = vec![peer];
+                Ok(())
+            })
+            .unwrap();
+        let (deps, state, _dir) = test_deps_with_state(vec![resting]);
+
+        let err = dispatch(
+            &deps,
+            &ctx_with(&["session.prompt"]),
+            "sessions.turn.send",
+            &serde_json::json!({ "session_id": "sess-resting", "text": "wake up" }),
+        )
+        .await
+        .expect_err("a row archived on disk must not be woken");
+        assert_eq!(kind(&err), "session_archived");
+        let instances = state.instances.read().await;
+        assert!(!instances[0].plugin_revival_pending);
+    }
+
     /// The atomic property the pending mark exists for: a sibling revival already admitted
     /// (marked pending under the write lock, but not yet reflected in `status` since nothing
     /// in this synchronous test drives a real ACP event) must still fill the cap for a second,
