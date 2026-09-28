@@ -12,7 +12,7 @@ use crate::session::{host_hook_agent_name, host_hook_disclosure, update_app_stat
 
 #[derive(Subcommand)]
 pub enum HooksCommands {
-    /// Show whether AoE may write agent status hooks, and what it resolves
+    /// Show whether AoE may write agent hooks, and what they resolve for a profile
     Status,
     /// Allow AoE to write agent hooks for every agent, on every profile
     Approve,
@@ -26,20 +26,20 @@ pub fn run(profile: &str, command: HooksCommands) -> Result<()> {
     }
 }
 
-/// A corrupt `state.toml` is an error here rather than a silent "not approved".
-/// It also blocks `approve`, which parses the same file, so the raw toml error
-/// naming the path is the only way out.
+/// A corrupt `state.toml` is an error here rather than a silent "not approved",
+/// which would point the user at a re-approve that cannot succeed either. The
+/// parse error names the offending line but not the file it came from.
 fn acknowledged() -> Result<bool> {
     Ok(Config::load()?.app_state.has_acknowledged_agent_hooks)
 }
 
 fn print_status(profile: &str) -> Result<()> {
     if acknowledged()? {
-        println!("Agent status hooks: approved for this installation");
+        println!("Agent hooks: approved for this installation");
     } else {
-        println!("Agent status hooks: not approved");
+        println!("Agent hooks: not approved");
         println!("  Run `aoe hooks approve` to let AoE write them, or accept the");
-        println!("  dialog when the TUI offers it on the next launch.");
+        println!("  dialog the TUI shows when you create a host session.");
     }
     print_disclosure(profile)
 }
@@ -82,7 +82,8 @@ fn print_disclosure(profile: &str) -> Result<()> {
                 .get(tool_name)
                 .map(String::as_str);
             let detect_as = session.agent_detect_as.get(tool_name).map(String::as_str);
-            let agent_name = host_hook_agent_name(tool_name, execution_as, detect_as);
+            let namespaces = session.agent_config_dir.contains_key(tool_name);
+            let agent_name = host_hook_agent_name(tool_name, execution_as, detect_as, namespaces);
             if !crate::agents::get_agent(&agent_name)
                 .is_some_and(|agent| crate::agents::hook_install_required(agent, status_hooks))
             {
@@ -97,11 +98,12 @@ fn print_disclosure(profile: &str) -> Result<()> {
         .iter()
         .all(|(_, disclosure)| disclosure.status_hooks_enabled);
     if status_hooks_active {
-        println!("AoE installs status hooks into each agent's own config, to detect");
-        println!("session status (running/waiting/idle).");
+        println!("AoE installs agent hooks into each agent's own config. The status");
+        println!("hooks detect session status (running/waiting/idle); the identity hooks");
+        println!("record the conversation id native resume needs.");
     } else {
         println!("This profile has agent_status_hooks off, so AoE installs only the");
-        println!("identity hooks native resume needs, not the status hooks.");
+        println!("identity hooks native resume needs.");
     }
     println!();
     println!("Profile: {profile}");
@@ -146,7 +148,9 @@ fn print_disclosure(profile: &str) -> Result<()> {
     {
         println!();
         println!("Codex may ask you to review and trust these hooks in /hooks.");
-        println!("Until then, AoE falls back to pane-based status detection.");
+        if status_hooks_active {
+            println!("Until then, AoE falls back to pane-based status detection.");
+        }
     }
     Ok(())
 }

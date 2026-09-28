@@ -1,4 +1,4 @@
-//! Acknowledgment dialog for first-time status hook installation.
+//! Consent dialog for the first agent hook install.
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::prelude::*;
@@ -27,16 +27,17 @@ impl HooksInstallDialog {
     }
 
     pub fn new_for_profile(tool_name: &str, profile: Option<&str>) -> Self {
-        let profile_config =
-            profile.map(crate::session::config::profile_config::resolve_config_or_warn);
-        let detect_as = profile_config.as_ref().and_then(|config| {
-            config
-                .session
-                .agent_detect_as
-                .get(tool_name)
-                .map(String::as_str)
-        });
-        let agent_name = crate::session::host_hook_agent_name(tool_name, None, detect_as);
+        let config = profile.map(crate::session::config::profile_config::resolve_config_or_warn);
+        let session = config.as_ref().map(|config| &config.session);
+        let execution_as = session
+            .and_then(|s| s.agent_execution_as.get(tool_name))
+            .map(String::as_str);
+        let detect_as = session
+            .and_then(|s| s.agent_detect_as.get(tool_name))
+            .map(String::as_str);
+        let namespaces = session.is_some_and(|s| s.agent_config_dir.contains_key(tool_name));
+        let agent_name =
+            crate::session::host_hook_agent_name(tool_name, execution_as, detect_as, namespaces);
         Self::new_for_profile_resolved(tool_name, &agent_name, profile)
     }
 
@@ -140,8 +141,8 @@ impl HooksInstallDialog {
             "Hook events added:",
             Style::default().bold(),
         )));
-        for (event, status) in &self.hook_commands {
-            lines.push(Line::from(format!("  {} -> {}", event, status)));
+        for (event, effect) in &self.hook_commands {
+            lines.push(Line::from(format!("  {event} -> {effect}")));
         }
 
         lines.push(Line::from(""));
@@ -158,9 +159,9 @@ impl HooksInstallDialog {
             )));
         } else {
             lines.push(Line::from(
-                "Status hooks are off, so these record the conversation id for native",
+                "Status hooks are off, so these only record the session id for",
             ));
-            lines.push(Line::from("resume. Each event's command is listed above."));
+            lines.push(Line::from("native resume. Each event's command is above."));
         }
 
         lines.push(Line::from(""));
@@ -174,9 +175,11 @@ impl HooksInstallDialog {
             lines.push(Line::from(
                 "Codex may ask you to review and trust these hooks in /hooks.",
             ));
-            lines.push(Line::from(
-                "Until then, AoE falls back to pane-based status detection.",
-            ));
+            if self.status_hooks_enabled {
+                lines.push(Line::from(
+                    "Until then, AoE falls back to pane-based status detection.",
+                ));
+            }
         }
 
         lines
@@ -188,7 +191,12 @@ impl HooksInstallDialog {
 
         let dialog_width = 64.min(area.width.saturating_sub(4));
         let dialog_height = (content_height + 6).min(area.height.saturating_sub(4));
-        let block = super::toned_dialog_block(" Agent Status Hooks ", theme.accent, theme.accent);
+        let title = if self.status_hooks_enabled {
+            " Agent Hooks "
+        } else {
+            " Agent Identity Hooks "
+        };
+        let block = super::toned_dialog_block(title, theme.accent, theme.accent);
         let (_, inner) =
             super::render_dialog_frame(frame, area, dialog_width, dialog_height, block);
 
@@ -216,6 +224,9 @@ impl HooksInstallDialog {
             .collect();
         let content_paragraph = Paragraph::new(visible_lines)
             .style(Style::default().fg(theme.dimmed))
+            // A disclosed command is longer than the content width, so without
+            // this the tail of every identity event is cut off.
+            .wrap(Wrap { trim: true })
             .block(
                 Block::default()
                     .borders(Borders::TOP)

@@ -57,6 +57,15 @@ fn run_aoe(home: &Path, xdg: &Path, stub: &Path, socket: &Path, args: &[&str]) -
         .env("HOME", home)
         .env("XDG_CONFIG_HOME", xdg)
         .env("AOE_TMUX_SOCKET", socket)
+        // Hook path resolution falls back to AoE's own process environment
+        // (src/hooks/mod.rs), so an inherited config-dir variable would move
+        // the target out of this test's home and into the developer's.
+        .env_remove("CODEX_HOME")
+        .env_remove("CLAUDE_CONFIG_DIR")
+        .env_remove("CURSOR_CONFIG_DIR")
+        .env_remove("COPILOT_CONFIG_DIR")
+        .env_remove("KIRO_CONFIG_DIR")
+        .env_remove("AGENT_OF_EMPIRES_PROFILE")
         .output()
         .expect("run aoe");
     Fails {

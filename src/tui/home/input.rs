@@ -356,7 +356,8 @@ fn resolve_hook_install_agent(
         .agent_detect_as
         .get(tool_name)
         .map(String::as_str);
-    let name = crate::session::host_hook_agent_name(tool_name, execution_as, detect_as);
+    let namespaces = session_config.agent_config_dir.contains_key(tool_name);
+    let name = crate::session::host_hook_agent_name(tool_name, execution_as, detect_as, namespaces);
     crate::agents::get_agent(&name)
         .filter(|agent| agent.hook_config.is_some() || agent.sidecar_hooks.is_some())
 }
