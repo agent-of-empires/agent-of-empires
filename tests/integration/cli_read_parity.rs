@@ -70,11 +70,39 @@ impl Fixture {
     /// assertion that silently stops testing anything, so the named-home
     /// capability lives in its own `#[ignore]`d smoke run below instead.
     fn new() -> Self {
+        Self::new_with_registries(
+            serde_json::json!([
+                {"name": "registered", "path": "/srv/registered", "scope": "global"},
+            ]),
+            serde_json::json!([]),
+        )
+    }
+
+    /// The same store, with the caller supplying both project registries. A
+    /// registry may name one directory more than once, and the merged view has
+    /// to count that once whichever transport answers.
+    fn new_with_registries(global: serde_json::Value, profile: serde_json::Value) -> Self {
         let home = tempfile::tempdir().expect("temp home");
-        Self::seed(home.path().to_path_buf(), Some(home))
+        Self::seed_registries(home.path().to_path_buf(), Some(home), global, profile)
     }
 
     fn seed(home: PathBuf, owned: Option<tempfile::TempDir>) -> Self {
+        Self::seed_registries(
+            home,
+            owned,
+            serde_json::json!([]),
+            serde_json::json!([
+                {"name": "registered", "path": "/srv/registered", "scope": "global"},
+            ]),
+        )
+    }
+
+    fn seed_registries(
+        home: PathBuf,
+        owned: Option<tempfile::TempDir>,
+        global: serde_json::Value,
+        profile: serde_json::Value,
+    ) -> Self {
         let app_dir = home
             .join(".config")
             .join(agent_of_empires::session::APP_DIR_NAME_XDG);
@@ -87,8 +115,9 @@ impl Fixture {
             serde_json::to_vec_pretty(&sessions).expect("sessions"),
         )
         .expect("seed sessions");
-        // A registry group no session uses, and a registry project, so both
-        // inventories carry a row the sessions alone would never produce.
+        // A registry group no session uses, and the two project registries the
+        // caller asked for, so both inventories carry rows the sessions alone
+        // would never produce.
         std::fs::write(
             profile_dir.join("groups.json"),
             serde_json::to_vec_pretty(&serde_json::json!([
@@ -98,12 +127,16 @@ impl Fixture {
             .expect("groups"),
         )
         .expect("seed groups");
+        if !global.as_array().is_some_and(|rows| rows.is_empty()) {
+            std::fs::write(
+                app_dir.join("projects.json"),
+                serde_json::to_vec_pretty(&global).expect("global projects"),
+            )
+            .expect("seed global projects");
+        }
         std::fs::write(
             profile_dir.join("projects.json"),
-            serde_json::to_vec_pretty(&serde_json::json!([
-                {"name": "registered", "path": "/srv/registered", "scope": "global"},
-            ]))
-            .expect("projects"),
+            serde_json::to_vec_pretty(&profile).expect("projects"),
         )
         .expect("seed projects");
         // Two more empty profiles, one of them named `default`: the profile
@@ -400,7 +433,52 @@ async fn the_served_bytes_are_the_bytes_the_local_command_prints() {
     compare_both_transports(&fixture).await;
 }
 
+/// Which projects exist is the store's answer, not a rendering choice, so a
+/// registry that names one directory under two spellings must produce the same
+/// inventory on both transports. The local path merges on the canonical path;
+/// a renderer that matched the wire string instead reported both spellings as
+/// their own projects, and a global row and a profile row for one directory both
+/// survived where locally the profile one shadows the global one. Byte
+/// equality over the listing is the assertion, so the count, the surviving row
+/// and the `scope` it reports all have to agree.
+///
+/// The second spelling is a symlink, which is the reachable form of the
+/// duplicate: an ordinary absolute path that names a directory the other row
+/// already names, so it passes the wire's path grammar and still reaches the
+/// merge.
+#[tokio::test]
+#[serial_test::serial]
+async fn one_directory_under_two_spellings_is_one_project_on_both_transports() {
+    let base = tempfile::tempdir().expect("temp home");
+    let repo = base.path().join("code/dup");
+    std::fs::create_dir_all(&repo).expect("the registered directory");
+    let link = base.path().join("code/link");
+    std::os::unix::fs::symlink(&repo, &link).expect("the second spelling");
+    let fixture = Fixture::new_with_registries(
+        serde_json::json!([
+            {"name": "dup", "path": repo.to_string_lossy()},
+            {"name": "dup-symlink", "path": link.to_string_lossy()},
+        ]),
+        serde_json::json!([
+            {"name": "dup-trailing", "path": repo.to_string_lossy()},
+        ]),
+    );
+    compare_transports(
+        &fixture,
+        &[
+            &["project", "list", "--json"],
+            &["project", "list"],
+            &["project", "list", "--scope", "profile", "--json"],
+        ],
+    )
+    .await;
+}
+
 async fn compare_both_transports(fixture: &Fixture) {
+    compare_transports(fixture, &COMMANDS).await
+}
+
+async fn compare_transports(fixture: &Fixture, commands: &[&[&str]]) {
     let xdg_base = fixture.path().join(".config");
     let state = build_test_app_state_with_policy(
         daemon_instances(),
@@ -415,7 +493,7 @@ async fn compare_both_transports(fixture: &Fixture) {
     {
         let daemon = RuntimeUdsTestServer::start_in(&xdg_base, state)
             .expect("the fixture home is a trusted namespace");
-        for args in COMMANDS {
+        for args in commands {
             let args: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
             served.push((args.clone(), run(home.clone(), args).await));
         }

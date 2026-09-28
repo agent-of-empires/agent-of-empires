@@ -77,6 +77,7 @@ mod filewatch_config_editor_burst;
 mod log_filter_watcher_migration;
 mod no_stale_doc_refs;
 mod plugin_install;
+mod profile_selection_scope;
 #[cfg(debug_assertions)]
 mod project_create_dedupe;
 #[cfg(debug_assertions)]

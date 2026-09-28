@@ -23,6 +23,12 @@ pub struct ReadRequestSource {
 /// maps an empty profile name to the configured default, and an empty
 /// `AOE_DAEMON_URL` has always selected the local transport, so the served
 /// half may not invent a stricter rule than the local half has.
+///
+/// The rule is applied where each value is *read as a selection* — the URL
+/// when the endpoint is chosen, the profile by [`selected_profile_source`].
+/// It is not applied when a value is captured: a captured profile is also an
+/// input to decisions that are not reads, and dropping an empty one at
+/// capture time silently changes those.
 pub(crate) fn selection_is_unset(text: &str) -> bool {
     text.trim().is_empty()
 }
@@ -50,7 +56,14 @@ pub(crate) fn read_request_source(cli: &super::Cli) -> ReadRequestSource {
         env_url: std::env::var_os(URL_ENV).filter(|value| !env_selection_is_unset(value)),
         token: std::env::var_os(TOKEN_ENV),
         explicit_profile: cli.profile.clone(),
-        env_profile: std::env::var_os(PROFILE_ENV).filter(|value| !env_selection_is_unset(value)),
+        // Captured raw on purpose: this is the only record that the user named
+        // a profile at all, and `main` derives `profile_explicit` — the flag
+        // that decides whether `aoe project add` writes to the profile or the
+        // global registry — from the value that ends up in `cli.profile`. An
+        // empty variable is "no selection" for a read
+        // (`selected_profile_source`), which is not the same statement as "the
+        // user asked for no profile in particular" on a write path.
+        env_profile: std::env::var_os(PROFILE_ENV),
     }
 }
 
@@ -309,6 +322,7 @@ fn validate_path(path: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser as _;
 
     #[test]
     fn endpoint_grammar_is_literal_and_bounded() {
@@ -452,5 +466,35 @@ mod tests {
             selected_profile_source(&source),
             ProfileSource::Explicit("named")
         ));
+    }
+
+    /// What "empty is unset" decides is which sessions a *read* shows, so it
+    /// is applied when the profile is selected — and the capture keeps the raw
+    /// value, because `main` reads the same field to learn whether a profile
+    /// was named at all. An exported-but-empty variable is a selection that
+    /// resolves to the default, not the absence of one: dropping it here is
+    /// what moved `aoe project add` out of the profile registry and into the
+    /// global one.
+    #[test]
+    fn an_empty_profile_variable_is_captured_and_still_reads_as_the_default() {
+        let cli = {
+            // Parsed with the variable absent: `-p` is a flag, so nothing but
+            // the environment can put a value in `cli.profile`.
+            let _env = crate::session::test_support::EnvGuard::unset(&[PROFILE_ENV]);
+            super::super::Cli::parse_from(["aoe", "ps"])
+        };
+        for value in ["", "   "] {
+            let _env = crate::session::test_support::EnvGuard::set(&[(PROFILE_ENV, value)]);
+            let source = read_request_source(&cli);
+            assert_eq!(
+                source.env_profile.as_deref(),
+                Some(OsStr::new(value)),
+                "{value:?} must survive capture: `main` derives the write scope from it"
+            );
+            assert!(
+                matches!(selected_profile_source(&source), ProfileSource::Default),
+                "{value:?} must still select the default profile for a read"
+            );
+        }
     }
 }

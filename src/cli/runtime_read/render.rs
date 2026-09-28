@@ -656,6 +656,15 @@ fn render_projects(
             // profile rows that shadow them by path. A synthesized row is not a
             // registry entry, so it can neither shadow a global row nor add a
             // row of its own.
+            //
+            // Two rows are the same project when their paths name the same
+            // directory, which is `projects::canonical_key`'s rule and the one
+            // the local `load_merged` merges by. Keying on the wire string
+            // instead lets one directory spelled two ways in a registry file
+            // (`/repo`, `/repo/.`, `/repo/`) answer as two projects here and as
+            // one locally. The key decides identity only; the surviving row
+            // keeps the spelling it was stored with, so what either path
+            // prints for a registered project does not change.
             let mut merged: Vec<ProjectRead> = Vec::new();
             for project in snapshot
                 .global_projects
@@ -665,8 +674,19 @@ fn render_projects(
                 if !project.registered {
                     continue;
                 }
-                match merged.iter_mut().find(|row| row.path == project.path) {
-                    Some(row) => *row = project.clone(),
+                let key = crate::session::projects::canonical_key(&project.path);
+                match merged
+                    .iter()
+                    .position(|row| crate::session::projects::canonical_key(&row.path) == key)
+                {
+                    // Profile shadows global on a path collision, and only a
+                    // profile row shadows: a second global row for a path the
+                    // global registry already names is a duplicate the local
+                    // merge drops, not one that replaces the first.
+                    Some(index) if matches!(project.scope, ProjectScope::Profile) => {
+                        merged[index] = project.clone();
+                    }
+                    Some(_) => {}
                     None => merged.push(project.clone()),
                 }
             }
@@ -1158,5 +1178,59 @@ mod tests {
             })
             .collect();
         assert_eq!(listed, vec!["main", "zeta", "default"]);
+    }
+
+    /// A registry may hold the same directory under more than one spelling, and
+    /// `load_merged` counts that once. The merge here has to count it once for
+    /// the same reason, or `aoe project list` reports a different number of
+    /// projects depending on which transport answered — and a global row and a
+    /// profile row for one directory would both survive, where locally the
+    /// profile one shadows the global one.
+    ///
+    /// The second spelling is a symlink: an ordinary absolute path that names a
+    /// directory the other row already names, so the rows here are ones a real
+    /// publisher can send.
+    #[test]
+    fn two_spellings_of_one_directory_are_one_project_here_as_they_are_locally() {
+        let dir = tempfile::tempdir().expect("a real directory");
+        let plain = dir.path().join("repo");
+        let link = dir.path().join("link");
+        std::fs::create_dir_all(&plain).expect("the project directory");
+        std::os::unix::fs::symlink(&plain, &link).expect("the second spelling");
+
+        let mut value = snapshot(vec![]);
+        value.global_projects = vec![
+            project("global-plain", &plain, ProjectScope::Global),
+            project("global-link", &link, ProjectScope::Global),
+        ];
+        let mut main = value.profiles[0].clone();
+        main.projects = vec![project("profile-plain", &plain, ProjectScope::Profile)];
+        value.profiles = vec![main];
+
+        let output = render_projects(
+            &ProjectListArgs {
+                json: true,
+                scope: ScopeFilter::All,
+            },
+            &value,
+            &source(),
+        )
+        .expect("the merged listing renders");
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&output).expect("json rows");
+        let names: Vec<&str> = rows.iter().filter_map(|row| row["name"].as_str()).collect();
+        // `load_merged` keeps the first global row it sees, drops the second
+        // spelling of it, and lets the profile row replace the survivor.
+        assert_eq!(names, vec!["profile-plain"], "{output}");
+        assert_eq!(rows[0]["scope"], "profile", "{output}");
+    }
+
+    fn project(name: &str, path: &Path, scope: ProjectScope) -> ProjectRead {
+        ProjectRead {
+            name: name.into(),
+            path: path.to_string_lossy().to_string(),
+            scope,
+            default_base_branch: None,
+            registered: true,
+        }
     }
 }
