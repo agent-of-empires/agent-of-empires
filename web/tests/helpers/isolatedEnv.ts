@@ -60,6 +60,7 @@ export const HOST_STATE_VARS = new Set([
   // The session the runner was launched from, and its agent process and capture markers.
   "AOE_AGENT_BIN",
   "AOE_AGENT_PID",
+  "AOE_AGENT_PROGRAM",
   "AOE_CAPTURED_SESSION_ID",
   "AOE_INSTANCE_ID",
   "AOE_OMP_CAPTURE_META",

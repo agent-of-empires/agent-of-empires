@@ -44,6 +44,7 @@ const NON_SUFFIX_HOST_STATE: Record<string, string> = {
   AOE_GITHUB_CLONE_BASE: `file://${HOST}/plugins`,
   AOE_AGENT_BIN: "host-session",
   AOE_AGENT_PID: "host-session",
+  AOE_AGENT_PROGRAM: "host-session",
   AOE_INSTANCE_ID: "host-session",
   AOE_OMP_CAPTURE_META: "host-meta",
   AOE_OMP_CAPTURE_READY: "1",
