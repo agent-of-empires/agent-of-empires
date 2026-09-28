@@ -818,9 +818,9 @@ mod tests {
     /// `auto_resume_on_restart` recovery, and is not stamped as a recovery failure.
     #[test]
     #[serial_test::serial]
-    fn recovery_does_not_relaunch_a_row_dismissed_after_candidacy() {
+    fn recovery_does_not_relaunch_a_row_shelved_after_candidacy() {
         use crate::session::StartBlocked;
-        for (dismiss, want) in [
+        for (shelve, want) in [
             (
                 Instance::archive as fn(&mut Instance),
                 StartBlocked::Archived,
@@ -829,14 +829,14 @@ mod tests {
         ] {
             let temp = tempfile::tempdir().unwrap();
             let _home = crate::session::test_support::isolate_home(temp.path());
-            let profile = "recovery-dismissed";
-            let mut inst = Instance::new("dismissed", "/tmp/test");
+            let profile = "recovery-shelved";
+            let mut inst = Instance::new("shelved", "/tmp/test");
             inst.source_profile = profile.to_string();
             inst.status = super::super::Status::Error;
             inst.agent_session_id = Some("11111111-1111-4111-8111-111111111111".into());
             assert!(is_recovery_candidate(&inst));
             let mut peer = inst.clone();
-            dismiss(&mut peer);
+            shelve(&mut peer);
             super::super::Storage::new_unwatched(profile)
                 .unwrap()
                 .update(|rows, _| {

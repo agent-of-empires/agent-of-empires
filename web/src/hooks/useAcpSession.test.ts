@@ -278,7 +278,7 @@ describe("sendPrompt outcomes", () => {
       await flushAsync();
       expect(calls.filter((c) => c.method === "PATCH")).toHaveLength(0);
       expect(posts("/acp/prompt")).toHaveLength(0);
-      expect(result.current.state.lastError).toBe("This session is archived; unarchive it first.");
+      expect(result.current.state.lastError).toBe("session is archived; unarchive it first");
     });
 
     it("does not call wake endpoints for a live session", async () => {

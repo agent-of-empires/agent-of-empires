@@ -366,6 +366,12 @@ pub async fn ensure_container_terminal(
             Json(serde_json::json!({"status": "created"})),
         )
             .into_response(),
+        Ok(Err(e)) if e.downcast_ref::<crate::session::StartBlocked>().is_some() => {
+            crate::server::api::start_blocked_response(
+                *e.downcast_ref::<crate::session::StartBlocked>().unwrap(),
+            )
+        }
+        Ok(Err(e)) if e.downcast_ref::<crate::session::SessionGone>().is_some() => bare_not_found(),
         Ok(Err(e)) => {
             tracing::error!(target: "http.api.sessions", "Container terminal creation failed: {}", e);
             api_error(

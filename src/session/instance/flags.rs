@@ -20,7 +20,7 @@ pub enum SessionBucket {
     Trashed,
 }
 
-/// Why an archived or trashed session refuses to launch its agent.
+/// Why an archived or trashed session refuses to launch its agent or take input into a live pane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum StartBlocked {
     #[error("session is archived; unarchive it first")]
@@ -58,8 +58,8 @@ impl Instance {
         self.idle_dormant_since = None;
     }
 
-    /// Stamp recency after input reached a live pane. A web archive does not take the
-    /// lifecycle lock `lock_for_input` holds, so one may have landed since; never clear it.
+    /// Stamp recency after input reached a live pane. Callers stamp after releasing the lock
+    /// `lock_for_input` held, so an archive or trash may have landed since; never clear it.
     pub fn touch_after_input(&mut self) {
         if self.ensure_startable().is_ok() {
             self.touch_last_accessed();

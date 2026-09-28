@@ -75,9 +75,9 @@ async fn rate_limit_resume_probe(state: &AppState, id: &str) -> Option<DateTime<
 }
 
 /// The memory check runs before the handler's awaits, during which a peer such as
-/// `aoe session archive` or `aoe rm --purge` can dismiss or remove the stored row, so
+/// `aoe session archive` or `aoe rm --purge` can shelve or remove the stored row, so
 /// recheck it right before spawning.
-async fn refuse_if_stored_row_dismissed(
+async fn refuse_if_stored_row_shelved(
     state: &AppState,
     instance: &crate::session::Instance,
 ) -> Option<Response> {
@@ -158,7 +158,7 @@ pub async fn spawn_acp(
         model: req.model.or_else(|| instance.agent_model.clone()),
         ..spawn_request_for(&instance, agent.clone(), sandbox_info)
     };
-    if let Some(resp) = refuse_if_stored_row_dismissed(&state, &instance).await {
+    if let Some(resp) = refuse_if_stored_row_shelved(&state, &instance).await {
         return resp;
     }
     match state.acp_supervisor.spawn(request).await {
@@ -426,7 +426,7 @@ pub async fn switch_acp_agent(
         claude_store_pin: None,
         ..spawn_request_for(&instance, target.clone(), sandbox_info)
     };
-    if let Some(resp) = refuse_if_stored_row_dismissed(&state, &instance).await {
+    if let Some(resp) = refuse_if_stored_row_shelved(&state, &instance).await {
         return resp;
     }
     if let Err(e) = state.acp_supervisor.spawn(request).await {

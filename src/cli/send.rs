@@ -136,21 +136,21 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn send_does_not_revive_archived_or_trashed_session() {
-        let dismissals: [(fn(&mut Instance), &str); 2] = [
+        let shelves: [(fn(&mut Instance), &str); 2] = [
             (Instance::archive, "session is archived; unarchive it first"),
             (Instance::trash, "session is in trash; restore it first"),
         ];
-        for ((dismiss, message), structured) in
-            dismissals.into_iter().flat_map(|d| [(d, false), (d, true)])
+        for ((shelve, message), structured) in
+            shelves.into_iter().flat_map(|d| [(d, false), (d, true)])
         {
             let temp = tempfile::tempdir().unwrap();
             let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
             let profile = "send-blocked";
-            let mut inst = Instance::new("dismissed", "/tmp/x");
+            let mut inst = Instance::new("shelved", "/tmp/x");
             if structured {
                 inst.view = crate::session::View::Structured;
             }
-            dismiss(&mut inst);
+            shelve(&mut inst);
             let id = inst.id.clone();
             Storage::new_unwatched(profile)
                 .unwrap()

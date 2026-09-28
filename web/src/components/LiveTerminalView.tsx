@@ -104,7 +104,7 @@ export function LiveTerminalView({ session, active = true, surface = "agent", te
   }, []);
 
   // A refused ensure re-runs once the session is unarchived or restored.
-  const dismissed = !!session.archived_at || !!session.trashed_at;
+  const shelved = !!session.archived_at || !!session.trashed_at;
   useEffect(() => {
     if (lastEnsuredSessionIdRef.current === session.id) {
       if (consumePendingTerminalFocus(focusTarget)) focusSelf();
@@ -114,10 +114,7 @@ export function LiveTerminalView({ session, active = true, surface = "agent", te
     const ensure =
       surface === "agent"
         ? ensureSession(session.id, controller.signal)
-        : ensureTerminal(session.id, terminalIndex, surface === "paired-container").then((ok) => ({
-            ok,
-            message: null as string | null,
-          }));
+        : ensureTerminal(session.id, terminalIndex, surface === "paired-container");
     ensure.then((res) => {
       if (controller.signal.aborted) return;
       if (res.ok) {
@@ -127,11 +124,11 @@ export function LiveTerminalView({ session, active = true, surface = "agent", te
       } else {
         setEnsureState("error");
         setEnsureError(res.message ?? "Could not start session.");
-        setEnsureRetryable(!isStartRefusal("error" in res ? res.error : undefined));
+        setEnsureRetryable(!isStartRefusal(res.error));
       }
     });
     return () => controller.abort();
-  }, [session.id, dismissed, focusSelf, surface, focusTarget, terminalIndex]);
+  }, [session.id, shelved, focusSelf, surface, focusTarget, terminalIndex]);
 
   // Drain a pending focus latch once the pane is mounted.
   useEffect(() => {
@@ -159,10 +156,7 @@ export function LiveTerminalView({ session, active = true, surface = "agent", te
       const ensure =
         surface === "agent"
           ? ensureSession(session.id, controller.signal)
-          : ensureTerminal(session.id, terminalIndex, surface === "paired-container").then((ok) => ({
-              ok,
-              message: null as string | null,
-            }));
+          : ensureTerminal(session.id, terminalIndex, surface === "paired-container");
       ensure.then((res) => {
         if (controller.signal.aborted) return;
         if (res.ok) {
@@ -172,7 +166,7 @@ export function LiveTerminalView({ session, active = true, surface = "agent", te
         } else {
           setEnsureState("error");
           setEnsureError(res.message ?? "Could not start session.");
-          setEnsureRetryable(!isStartRefusal("error" in res ? res.error : undefined));
+          setEnsureRetryable(!isStartRefusal(res.error));
         }
       });
       return "pending";

@@ -128,7 +128,6 @@ fn spawn_request_for(
         ),
         seed_history_replay: instance.import_pending == Some(true),
         claude_store_pin: instance.selected_claude_store_pin(),
-        durable_admission: true,
     }
 }
 

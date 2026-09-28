@@ -316,9 +316,6 @@ impl Instance {
     /// A peer archived or trashed the row while hooks ran: drop the launch reservation
     /// without stamping an error, since the refusal is not a launch failure.
     fn release_blocked_launch(&mut self, storage: &crate::session::storage::Storage) {
-        if !self.reservation_is_current(storage).unwrap_or(false) {
-            return;
-        }
         let live_pane = self
             .tmux_session()
             .is_ok_and(|session| session.exists() && !session.is_pane_dead());
@@ -327,7 +324,16 @@ impl Instance {
         } else {
             Status::Stopped
         };
-        let _ = self.commit_lifecycle_status(storage, LifecycleOperation::Launch, status);
+        // The commit releases only a reservation this launch still owns.
+        if let Err(error) =
+            self.commit_lifecycle_status(storage, LifecycleOperation::Launch, status)
+        {
+            tracing::warn!(
+                target: "session.store",
+                session = %self.id,
+                "could not release the launch reservation of a refused start: {error:#}"
+            );
+        }
     }
 
     fn lifecycle_reservation_is_current(

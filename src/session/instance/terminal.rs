@@ -208,6 +208,8 @@ impl Instance {
         if !self.is_sandboxed() {
             anyhow::bail!("Cannot create container terminal for non-sandboxed session");
         }
+        // An archived or trashed session must not bring its container back (#4116).
+        drop(self.lock_for_input()?);
 
         let container = self.get_container_for_instance()?;
         let sandbox = self
@@ -247,6 +249,9 @@ impl Instance {
 
         // Values ride the protected env-file, never the host shell or runtime
         // process env. See [`crate::session::environment::DockerExecEnv`].
+        // Recheck under the lock archive takes, so an archive during the container start either
+        // refuses this shell or kills it with the session's other terminals.
+        let _lifecycle_lock = self.lock_for_input()?;
         let session = self.container_terminal_tmux_session_indexed(index)?;
         let is_new = !session.exists();
         if is_new {

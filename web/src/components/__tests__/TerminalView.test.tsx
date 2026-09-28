@@ -10,6 +10,7 @@ import { makeSession as baseSession } from "./fixtures";
 // to mount a real terminal or open a WebSocket.
 
 const ensureSession = vi.fn(async () => ({ ok: true }));
+const ensureTerminal = vi.fn(async () => ({ ok: true }));
 const mockedContainerRef = { current: null } as const;
 const mockedTermRef = { current: null } as const;
 const mockedManualReconnect = vi.fn();
@@ -20,7 +21,7 @@ const mockedCtrlActiveRef = { current: false };
 const mockedClearCtrlRef = { current: null };
 vi.mock("../../lib/api", () => ({
   ensureSession: (id: string, signal?: AbortSignal) => ensureSession(id, signal),
-  ensureTerminal: vi.fn(),
+  ensureTerminal: (id: string, index?: number, container?: boolean) => ensureTerminal(id, index, container),
   isStartRefusal: (code?: string) => code === "session_archived" || code === "session_trashed",
 }));
 
@@ -58,6 +59,7 @@ vi.mock("../../hooks/useMobileKeyboard", () => ({
 }));
 
 import { TerminalView } from "../TerminalView";
+import { LiveTerminalView } from "../LiveTerminalView";
 
 const makeSession = (overrides: Partial<SessionResponse> = {}) =>
   baseSession({ id: "sess-1", title: "test-session", project_path: "/tmp/test", status: "Running", ...overrides });
@@ -87,13 +89,16 @@ describe("TerminalView early-return states", () => {
   });
 
   // #4116: an archived or trashed session stays refused, so there is nothing to retry.
-  it("omits Retry when ensure refuses an archived or trashed session", async () => {
-    ensureSession.mockResolvedValueOnce({
+  it.each([
+    ["agent", ensureSession],
+    ["paired-container", ensureTerminal],
+  ] as const)("omits Retry when the %s ensure refuses an archived or trashed session", async (surface, ensure) => {
+    ensure.mockResolvedValueOnce({
       ok: false,
       error: "session_archived",
       message: "session is archived; unarchive it first",
     });
-    render(<TerminalView session={makeSession()} />);
+    render(<LiveTerminalView session={makeSession()} surface={surface} />);
     await waitFor(() => {
       expect(screen.getByText("session is archived; unarchive it first")).toBeDefined();
     });

@@ -1121,7 +1121,7 @@ pub async fn start_session(
     };
 
     // Only a stopped session has anything to start; otherwise return current,
-    // unless a peer has since dismissed or purged the stored row.
+    // unless a peer has since shelved or purged the stored row.
     if !is_stopped {
         match crate::server::api::load_persisted_instance(&state, &profile, &id).await {
             Ok(Some(stored)) => {

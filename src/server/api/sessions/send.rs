@@ -245,7 +245,7 @@ pub async fn send_message(
                 )
                     .into_response(),
                 SendKeysError::Blocked(blocked) => {
-                    // A peer dismissed the row after a revive launched: keep the launch identity.
+                    // A peer shelved the row after a revive launched: keep the launch identity.
                     if did_work {
                         let mut instances = state.instances.write().await;
                         if let Some(i) = instances.iter_mut().find(|i| i.id == id) {

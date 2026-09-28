@@ -1258,18 +1258,18 @@ mod tests {
         }
     }
 
-    /// #4116: a prompt never revives an archived or trashed target, so it neither consumes nor
-    /// is denied by the cap; it gets the dismissal refusal and leaves no pending mark.
+    /// #4116: a prompt never wakes an archived or trashed target. It neither consumes nor is
+    /// denied by the cap, leaves no pending mark, and leaves the row untouched.
     #[tokio::test]
-    async fn turn_send_ignores_the_cap_for_a_dismissed_target() {
+    async fn turn_send_refuses_a_shelved_target_without_touching_the_cap() {
         use crate::plugin::automation_policy::MAX_ACTIVE_PLUGIN_SESSIONS;
         let _home = crate::session::test_support::isolate_app_dir();
 
-        let dismissals: [(fn(&mut Instance), &str); 2] = [
+        let shelves: [(fn(&mut Instance), &str); 2] = [
             (Instance::archive, "session_archived"),
             (Instance::trash, "session_trashed"),
         ];
-        for (dismiss, want) in dismissals {
+        for (shelve, want) in shelves {
             let mut prior: Vec<Instance> = (0..MAX_ACTIVE_PLUGIN_SESSIONS)
                 .map(|n| {
                     let mut i = Instance::new("scheduled", "/tmp/aoe-4120-plugin");
@@ -1280,27 +1280,31 @@ mod tests {
                 })
                 .collect();
 
-            let mut dismissed = Instance::new("parked-owned", "/tmp/aoe-4120-plugin");
-            dismissed.id = "sess-dismissed".to_string();
-            dismissed.view = crate::session::View::Structured;
-            dismissed.agent_name = Some("aoe-no-such-agent-4120".to_string());
-            dismissed.created_by_plugin = Some("cron".to_string());
-            dismiss(&mut dismissed);
-            prior.push(dismissed);
+            let mut shelved = Instance::new("parked-owned", "/tmp/aoe-4120-plugin");
+            shelved.id = "sess-shelved".to_string();
+            shelved.view = crate::session::View::Structured;
+            shelved.agent_name = Some("aoe-no-such-agent-4120".to_string());
+            shelved.created_by_plugin = Some("cron".to_string());
+            shelve(&mut shelved);
+            prior.push(shelved.clone());
 
             let (deps, state, _dir) = test_deps_with_state(prior);
             let err = dispatch(
                 &deps,
                 &ctx_with(&["session.prompt"]),
                 "sessions.turn.send",
-                &serde_json::json!({ "session_id": "sess-dismissed", "text": "wake up" }),
+                &serde_json::json!({ "session_id": "sess-shelved", "text": "wake up" }),
             )
             .await
-            .expect_err("a dismissed session must not be woken");
+            .expect_err("a shelved session must not be woken");
             assert_eq!(kind(&err), want);
             let instances = state.instances.read().await;
-            let inst = instances.iter().find(|i| i.id == "sess-dismissed").unwrap();
+            let inst = instances.iter().find(|i| i.id == "sess-shelved").unwrap();
             assert!(!inst.plugin_revival_pending, "{want}");
+            assert_eq!(inst.archived_at, shelved.archived_at, "{want}");
+            assert_eq!(inst.trashed_at, shelved.trashed_at, "{want}");
+            assert_eq!(inst.last_accessed_at, shelved.last_accessed_at, "{want}");
+            assert!(!state.acp_supervisor.is_running("sess-shelved").await);
         }
     }
 
@@ -1432,40 +1436,6 @@ mod tests {
                 inst.plugin_revival_pending,
                 "a successful revival stays pending until a real status lands"
             ),
-        }
-    }
-
-    /// #4116: a prompt never wakes an archived or trashed session.
-    #[tokio::test]
-    async fn turn_send_refuses_an_archived_or_trashed_session() {
-        let _home = crate::session::test_support::isolate_app_dir();
-        let dismissals: [(fn(&mut Instance), &str); 2] = [
-            (Instance::archive, "session_archived"),
-            (Instance::trash, "session_trashed"),
-        ];
-        for (dismiss, want) in dismissals {
-            let mut inst = Instance::new("dismissed-owned", "/tmp/aoe-4116-plugin");
-            inst.id = "sess-4116".to_string();
-            inst.view = crate::session::View::Structured;
-            inst.created_by_plugin = Some("cron".to_string());
-            dismiss(&mut inst);
-            let (deps, state, _dir) = test_deps_with_state(vec![inst.clone()]);
-
-            let err = dispatch(
-                &deps,
-                &ctx_with(&["session.prompt"]),
-                "sessions.turn.send",
-                &serde_json::json!({ "session_id": "sess-4116", "text": "wake up" }),
-            )
-            .await
-            .expect_err("a dismissed session must not be woken");
-            assert_eq!(kind(&err), want);
-            let instances = state.instances.read().await;
-            let after = &instances[0];
-            assert_eq!(after.archived_at, inst.archived_at, "{want}");
-            assert_eq!(after.trashed_at, inst.trashed_at, "{want}");
-            assert_eq!(after.last_accessed_at, inst.last_accessed_at, "{want}");
-            assert!(!state.acp_supervisor.is_running("sess-4116").await);
         }
     }
 }

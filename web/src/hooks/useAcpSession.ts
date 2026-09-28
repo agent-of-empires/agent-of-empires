@@ -262,7 +262,7 @@ export function useAcpSession(
       if (!sessionId) return;
       // An archived session never starts on a prompt; the daemon refuses it too.
       if (archivedAtRef.current) {
-        dispatch({ kind: "error", message: "This session is archived; unarchive it first." });
+        dispatch({ kind: "error", message: "session is archived; unarchive it first" });
         return;
       }
       // The reconciler skips snoozed sessions, so wake them before sending.

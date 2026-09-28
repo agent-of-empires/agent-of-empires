@@ -1326,7 +1326,7 @@ mod tests {
     /// (the hook runs without the lifecycle flock) still stops both launch funnels.
     #[test]
     #[serial_test::serial]
-    fn launch_refuses_a_row_dismissed_while_hooks_run() {
+    fn launch_refuses_a_row_shelved_while_hooks_run() {
         use crate::session::{StartBlocked, Status};
         if !crate::tmux::tmux_command()
             .arg("-V")
@@ -1339,14 +1339,14 @@ mod tests {
         let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
         acknowledge_hooks();
 
-        let dismissals: [(fn(&mut Instance), StartBlocked); 2] = [
+        let shelves: [(fn(&mut Instance), StartBlocked); 2] = [
             (Instance::archive, StartBlocked::Archived),
             (Instance::trash, StartBlocked::Trashed),
         ];
-        for (dismiss, want) in dismissals {
+        for (shelve, want) in shelves {
             for restart in [false, true] {
                 let label = format!("{want:?}-{}", if restart { "restart" } else { "start" });
-                let profile = format!("dismissed-hook-{label}");
+                let profile = format!("shelved-hook-{label}");
                 let ready = temp.path().join(format!("{label}-ready"));
                 let release = temp.path().join(format!("{label}-release"));
                 let hook = format!(
@@ -1391,7 +1391,7 @@ mod tests {
                 if hook_started {
                     storage
                         .update(|instances, _groups| {
-                            dismiss(&mut instances[0]);
+                            shelve(&mut instances[0]);
                             Ok(())
                         })
                         .unwrap();
@@ -1404,7 +1404,7 @@ mod tests {
                 assert!(hook_started, "{label}: hook did not start");
                 let err = result.expect_err(&label);
                 assert_eq!(err.downcast_ref::<StartBlocked>(), Some(&want), "{label}");
-                assert!(!spawned, "{label}: launched a dismissed session");
+                assert!(!spawned, "{label}: launched a shelved session");
                 let stored = storage.load().unwrap().remove(0);
                 assert!(stored.ensure_startable() == Err(want), "{label}");
                 assert_eq!(stored.lifecycle_reservation, None, "{label}");

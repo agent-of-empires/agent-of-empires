@@ -3090,13 +3090,74 @@ async fn send_message_refreshes_instance_after_instance_lock() {
         StatusCode::NOT_FOUND
     );
 }
+/// #4116: a container terminal for an archived or trashed sandboxed session is refused before
+/// its container is started, and a purged row reads as gone.
+#[tokio::test]
+#[serial_test::serial]
+async fn container_terminal_refuses_archived_trashed_and_purged_sessions() {
+    use axum::body::to_bytes;
+    let _home = crate::session::test_support::isolate_app_dir();
+    type Case = (Option<fn(&mut Instance)>, StatusCode, &'static str);
+    let cases: [Case; 3] = [
+        (
+            Some(Instance::archive),
+            StatusCode::CONFLICT,
+            "session_archived",
+        ),
+        (
+            Some(Instance::trash),
+            StatusCode::CONFLICT,
+            "session_trashed",
+        ),
+        (None, StatusCode::NOT_FOUND, ""),
+    ];
+    for (shelve, status, code) in cases {
+        let mut inst = make_test_instance();
+        inst.sandbox_info = Some(crate::session::SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "ubuntu:latest".to_string(),
+            container_name: "aoe-4116-never-started".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            container_workdir: None,
+        });
+        let stored = match shelve {
+            Some(shelve) => {
+                let mut row = inst.clone();
+                shelve(&mut row);
+                vec![row]
+            }
+            None => Vec::new(),
+        };
+        crate::server::test_support::seed_instances_on_disk_for_test(&inst.source_profile, stored);
+        let id = inst.id.clone();
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+        let response = ensure_container_terminal(
+            State(state),
+            Path(id),
+            axum::extract::Query(crate::server::live_ws::TerminalIndexQuery { index: 0 }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), status, "{code}");
+        if !code.is_empty() {
+            let body: serde_json::Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), 1024).await.unwrap())
+                    .unwrap();
+            assert_eq!(body["error"], code);
+        }
+    }
+}
+
 /// #4116: the web start, attach-ensure and send-revive endpoints refuse to launch an archived or
 /// trashed session, and leave its status alone.
 #[tokio::test]
 async fn start_paths_refuse_archived_and_trashed_sessions() {
     use axum::body::to_bytes;
     let _home = crate::session::test_support::isolate_app_dir();
-    let dismissals: [(fn(&mut Instance), &str, &str); 2] = [
+    let shelves: [(fn(&mut Instance), &str, &str); 2] = [
         (
             Instance::archive,
             "session_archived",
@@ -3108,10 +3169,10 @@ async fn start_paths_refuse_archived_and_trashed_sessions() {
             "session is in trash; restore it first",
         ),
     ];
-    for (dismiss, code, message) in dismissals {
+    for (shelve, code, message) in shelves {
         for which in ["start", "ensure", "send"] {
             let mut inst = make_test_instance();
-            dismiss(&mut inst);
+            shelve(&mut inst);
             inst.status = Status::Stopped;
             let id = inst.id.clone();
             let state = crate::server::test_support::build_test_app_state(vec![inst]);
@@ -3146,7 +3207,7 @@ async fn start_paths_refuse_archived_and_trashed_sessions() {
     }
 }
 
-/// #4116: a peer (e.g. `aoe session archive`) can dismiss the stored row after the daemon's
+/// #4116: a peer (e.g. `aoe session archive`) can shelve the stored row after the daemon's
 /// memory check. Structured start and prompt-wake recheck that row inside their write, refuse,
 /// and leave `archived_at` in place.
 #[tokio::test]
@@ -3271,7 +3332,7 @@ async fn start_rechecks_the_stored_row() {
 /// purge of a session with a live pane refuses the keystrokes, and an archive survives the send.
 #[tokio::test]
 #[serial_test::serial]
-async fn send_refuses_a_live_pane_a_peer_dismissed() {
+async fn send_refuses_a_live_pane_a_peer_shelved() {
     if crate::tmux::tmux_command().arg("-V").output().is_err() {
         eprintln!("tmux not available; skipping");
         return;

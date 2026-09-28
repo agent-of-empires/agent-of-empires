@@ -233,6 +233,8 @@ pub struct SpawnRequest {
     pub fork_from: Option<String>,
     pub sandbox_continuation: SandboxContinuation,
     pub sandbox_info: Option<SandboxInfo>,
+    /// The stored row's profile. Every production launch sets it, and the launch rechecks that
+    /// row before and after the handshake (#4116).
     pub source_profile: Option<String>,
     pub yolo_mode: bool,
     /// Explicit ACP mode applied after the handshake; wins over `yolo_mode`.
@@ -242,10 +244,6 @@ pub struct SpawnRequest {
     pub seed_history_replay: bool,
     /// Claude store selected by the conversation binding for a host Claude worker.
     pub claude_store_pin: Option<crate::session::capture::ClaudeStorePin>,
-    /// Recheck the stored row right before launch, under its lifecycle lock, and refuse an
-    /// archived, trashed, or purged session (#4116). Every production launch sets it; only
-    /// supervisor unit fixtures, which have no stored row, leave it off.
-    pub durable_admission: bool,
 }
 
 impl<S: BroadcastSink> Supervisor<S> {

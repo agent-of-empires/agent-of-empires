@@ -678,7 +678,7 @@ mod tests {
                 _ => None,
             }),
         ];
-        let dismissals: &[(fn(&mut Instance), StartBlocked, &str)] = &[
+        let shelves: &[(fn(&mut Instance), StartBlocked, &str)] = &[
             (
                 Instance::archive,
                 StartBlocked::Archived,
@@ -690,7 +690,7 @@ mod tests {
                 "session is in trash; restore it first",
             ),
         ];
-        for (dismiss, want, message) in dismissals {
+        for (shelve, want, message) in shelves {
             for (label, launch) in launches {
                 let temp = tempfile::tempdir().unwrap();
                 let _home = crate::session::test_support::isolate_home(temp.path());
@@ -701,7 +701,7 @@ mod tests {
                 crate::session::storage::Storage::new_unwatched(profile)
                     .unwrap()
                     .update(|rows, _| {
-                        dismiss(&mut rows[0]);
+                        shelve(&mut rows[0]);
                         Ok(())
                     })
                     .unwrap();

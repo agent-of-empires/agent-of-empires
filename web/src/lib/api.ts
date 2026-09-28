@@ -176,9 +176,19 @@ export async function ensureSession(id: string, signal?: AbortSignal): Promise<E
   }
 }
 
-export function ensureTerminal(id: string, index = 0, container = false): Promise<boolean> {
+export async function ensureTerminal(id: string, index = 0, container = false): Promise<EnsureSessionResult> {
   const path = container ? "container-terminal" : "terminal";
-  return fetchOk(`/api/sessions/${id}/${path}?index=${index}`, { method: "POST" });
+  try {
+    const { ok, status, payload } = await send(`/api/sessions/${id}/${path}?index=${index}`, { method: "POST" });
+    if (ok) return { ok: true };
+    return {
+      ok: false,
+      error: stringField(payload, "error"),
+      message: stringField(payload, "message") ?? `Server error (${status})`,
+    };
+  } catch (e) {
+    return { ok: false, message: e instanceof Error ? e.message : "Network error" };
+  }
 }
 
 function fileToBase64(file: File): Promise<string> {

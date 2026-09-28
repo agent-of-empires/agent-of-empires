@@ -3800,23 +3800,23 @@ fn group_archive_takes_lifecycle_locks_in_sorted_order() {
 }
 
 /// #4116: the send dialog and live-send entry refuse an archived or trashed agent, even with its
-/// pane still live, with the CLI and web wording, and leave the session dismissed.
+/// pane still live, with the CLI and web wording, and leave the session shelved.
 #[test]
 #[serial]
-fn tui_send_refuses_a_dismissed_live_pane() {
+fn tui_send_refuses_a_shelved_live_pane() {
     if crate::tmux::tmux_command().arg("-V").output().is_err() {
         eprintln!("tmux not available; skipping");
         return;
     }
-    let dismissals: [(fn(&mut Instance), &str); 2] = [
+    let shelves: [(fn(&mut Instance), &str); 2] = [
         (Instance::archive, "session is archived; unarchive it first"),
         (Instance::trash, "session is in trash; restore it first"),
     ];
-    for (dismiss, message) in dismissals {
+    for (shelve, message) in shelves {
         for live_send in [false, true] {
             let mut env = create_test_env_with_sessions(1);
             let inst = env.view.instance_at(0).clone();
-            env.view.apply_user_action(&inst.id, dismiss).unwrap();
+            env.view.apply_user_action(&inst.id, shelve).unwrap();
             let pane = crate::tmux::Session::generate_name(&inst.id, &inst.title);
             let created = crate::tmux::tmux_command()
                 .args(["new-session", "-d", "-s", &pane, "sleep", "60"])
@@ -3846,7 +3846,7 @@ fn tui_send_refuses_a_dismissed_live_pane() {
                     .unwrap()
                     .ensure_startable()
                     .is_err(),
-                "live_send={live_send}: the session must stay dismissed"
+                "live_send={live_send}: the session must stay shelved"
             );
         }
     }
