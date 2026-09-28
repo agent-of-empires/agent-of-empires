@@ -3739,6 +3739,66 @@ fn archive_persists_under_the_lifecycle_lock() {
     }
 }
 
+/// Group archive takes lifecycle locks in sorted id order, so against startup cleanup (which
+/// holds the lowest id and waits for the rest) it blocks holding nothing, whatever the stored
+/// order. The peer holds the lowest id and, once the archive contends on it, records whether
+/// the archive already holds a higher one.
+#[test]
+#[serial]
+fn group_archive_takes_lifecycle_locks_in_sorted_order() {
+    let mut env = create_test_env_with_group_sessions();
+    env.view.instances.sort_by(|a, _, b, _| b.cmp(a));
+    let group_row = env
+        .view
+        .flat_items
+        .iter()
+        .position(|item| matches!(item, Item::Group { path, .. } if path == "work"))
+        .expect("work group row");
+    env.view.cursor = group_row;
+    env.view.update_selected();
+    let mut ids = env.view.active_sessions_in_selected_group();
+    assert!(ids.len() >= 2 && !ids.is_sorted(), "stored order: {ids:?}");
+    ids.sort();
+    let profile = env.view.get_instance(&ids[0]).unwrap().effective_profile();
+
+    let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let (contended_tx, contended_rx) = std::sync::mpsc::channel::<std::path::PathBuf>();
+    let peer = std::thread::spawn(move || {
+        let storage = Storage::new_unwatched(&profile).unwrap();
+        let lowest = storage.acquire_instance_lifecycle_lock(&ids[0]).unwrap();
+        held_tx.send(()).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let contended = loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            match contended_rx.recv_timeout(remaining) {
+                Ok(path) if path.to_string_lossy().contains(&ids[0]) => break true,
+                Ok(_) => continue,
+                Err(_) => break false,
+            }
+        };
+        let held_higher: Vec<String> = ids[1..]
+            .iter()
+            .filter(|id| storage.instance_lifecycle_lock_is_held_for_test(id))
+            .cloned()
+            .collect();
+        drop(lowest);
+        (contended, held_higher)
+    });
+    held_rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .unwrap();
+    let observer = crate::session::observe_lock_contention_for_test(contended_tx);
+    env.view.archive_selected_group().unwrap();
+    drop(observer);
+
+    let (contended, held_higher) = peer.join().unwrap();
+    assert!(contended, "the archive must wait on the lowest id's lock");
+    assert!(
+        held_higher.is_empty(),
+        "archive held {held_higher:?} while waiting for a lower id"
+    );
+}
+
 /// #4116: the send dialog and live-send entry refuse an archived or trashed agent, even with its
 /// pane still live, with the CLI and web wording, and leave the session dismissed.
 #[test]

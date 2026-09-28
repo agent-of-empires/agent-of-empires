@@ -2190,9 +2190,12 @@ impl HomeView {
             .collect();
         // Persist under every member's lifecycle lock so `aoe send` cannot relaunch or type
         // into one mid-archive, and tear down only after: a send that won the lock finishes
-        // first and its pane is then killed.
-        let mut lifecycle_locks = Vec::with_capacity(kill_targets.len());
-        for inst in &kill_targets {
+        // first and its pane is then killed. Locks go in sorted id order, like every other
+        // multi-lock holder (startup reservation cleanup), so two holders cannot close a cycle.
+        let mut lock_order: Vec<_> = kill_targets.iter().collect();
+        lock_order.sort_by(|a, b| a.id.cmp(&b.id));
+        let mut lifecycle_locks = Vec::with_capacity(lock_order.len());
+        for inst in lock_order {
             let storage = Storage::new(&inst.effective_profile(), self.file_watch.clone())?;
             lifecycle_locks.push(storage.acquire_instance_lifecycle_lock(&inst.id)?);
         }
