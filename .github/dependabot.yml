@@ -34,7 +34,7 @@ updates:
       interval: "monthly"
       time: "06:00"
       timezone: "Etc/UTC"
-    open-pull-requests-limit: 3
+    open-pull-requests-limit: 5
     labels:
       - "dependencies"
       - "docker"
@@ -89,6 +89,13 @@ updates:
       semver-minor-days: 14
       semver-major-days: 28
     groups:
+      react:
+        patterns:
+          - "react"
+          - "react-dom"
+          - "@types/react"
+          - "@types/react-dom"
+        update-types: ["minor", "patch"]
       tailwind:
         patterns:
           - "tailwindcss"
@@ -99,6 +106,8 @@ updates:
         exclude-patterns:
           - "react"
           - "react-dom"
+          - "@types/react"
+          - "@types/react-dom"
           - "tailwindcss"
           - "@tailwindcss/*"
           # Pre-1.0 packages: a minor bump is a breaking change by semver
@@ -122,6 +131,10 @@ updates:
       web-security:
         applies-to: security-updates
         patterns: ["*"]
+        exclude-patterns:
+          - "@assistant-ui/*"
+          - "eslint-plugin-react-refresh"
+          - "oxfmt"
         update-types: ["minor", "patch"]
     ignore:
       - dependency-name: "react"
@@ -210,7 +223,7 @@ updates:
       interval: "monthly"
       time: "06:00"
       timezone: "Etc/UTC"
-    open-pull-requests-limit: 3
+    open-pull-requests-limit: 5
     labels:
       - "dependencies"
       - "javascript"
@@ -238,7 +251,7 @@ updates:
       interval: "monthly"
       time: "06:00"
       timezone: "Etc/UTC"
-    open-pull-requests-limit: 3
+    open-pull-requests-limit: 5
     labels:
       - "dependencies"
       - "javascript"
