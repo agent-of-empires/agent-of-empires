@@ -82,18 +82,27 @@ fn fired_by_pane_agent() -> bool {
     let (Some(agent_pid), Some(agent_bin)) = (agent_pid, agent_bin) else {
         return true;
     };
+    // A launch under another name (`company-codex` running Codex) is the agent too.
+    let program = std::env::var("AOE_AGENT_PROGRAM")
+        .ok()
+        .filter(|program| !program.is_empty() && *program != agent_bin);
+    let names: Vec<&str> = std::iter::once(agent_bin.as_str())
+        .chain(program.as_deref())
+        .collect();
     walk_reaches_single_agent(
         std::os::unix::process::parent_id(),
         agent_pid,
-        &agent_bin,
+        &names,
         crate::process::parent_and_argv0,
     )
 }
 
+/// Whether the walk from the hook up to the launched agent meets at most one process named like
+/// the agent, i.e. the hook was fired by the pane's own agent rather than a nested copy.
 fn walk_reaches_single_agent(
     start: u32,
     agent_pid: u32,
-    agent_bin: &str,
+    agent_names: &[&str],
     parent_and_argv0: impl Fn(u32) -> Option<(u32, String)>,
 ) -> bool {
     let mut pid = start;
@@ -105,7 +114,7 @@ fn walk_reaches_single_agent(
         if std::path::Path::new(&argv0)
             .file_name()
             .and_then(|name| name.to_str())
-            == Some(agent_bin)
+            .is_some_and(|name| agent_names.contains(&name))
         {
             agents += 1;
         }
@@ -240,7 +249,68 @@ mod tests {
                 .collect();
             let lookup = |pid| table.get(&pid).cloned();
             assert_eq!(
-                walk_reaches_single_agent(10, agent_pid, "claude", lookup),
+                walk_reaches_single_agent(10, agent_pid, &["claude"], lookup),
+                owned,
+                "{name}"
+            );
+        }
+    }
+
+    /// `company-codex` can be Codex itself under another name. Its launch passes that name, so a
+    /// nested `codex exec` below it is the second agent on the walk, not the first.
+    #[test]
+    fn a_renamed_outer_agent_still_counts_on_the_walk() {
+        type Chain = &'static [(u32, u32, &'static str)];
+        let renamed: &[&str] = &["codex", "company-codex"];
+        let cases: [(&str, &[&str], u32, Chain, bool); 4] = [
+            (
+                "the renamed outer agent publishes",
+                renamed,
+                9,
+                &[(10, 9, "sh"), (9, 1, "/opt/bin/company-codex")],
+                true,
+            ),
+            (
+                "nested codex exec under the renamed outer agent",
+                renamed,
+                7,
+                &[
+                    (10, 9, "sh"),
+                    (9, 8, "codex"),
+                    (8, 7, "bash"),
+                    (7, 1, "/opt/bin/company-codex"),
+                ],
+                false,
+            ),
+            (
+                "a wrapper script that runs codex as a child",
+                renamed,
+                8,
+                &[(10, 9, "sh"), (9, 8, "codex"), (8, 1, "/bin/sh")],
+                true,
+            ),
+            (
+                // What the walk saw before the launch named its program.
+                "without the program name the nested codex passed",
+                &["codex"],
+                7,
+                &[
+                    (10, 9, "sh"),
+                    (9, 8, "codex"),
+                    (8, 7, "bash"),
+                    (7, 1, "/opt/bin/company-codex"),
+                ],
+                true,
+            ),
+        ];
+        for (name, names, agent_pid, chain, owned) in cases {
+            let table: std::collections::HashMap<u32, (u32, String)> = chain
+                .iter()
+                .map(|(pid, ppid, argv0)| (*pid, (*ppid, argv0.to_string())))
+                .collect();
+            let lookup = |pid| table.get(&pid).cloned();
+            assert_eq!(
+                walk_reaches_single_agent(10, agent_pid, names, lookup),
                 owned,
                 "{name}"
             );
