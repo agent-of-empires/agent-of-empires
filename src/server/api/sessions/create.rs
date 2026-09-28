@@ -122,31 +122,70 @@ pub(super) fn create_body_combines_scratch_and_worktree(body: &CreateSessionBody
     body.scratch && create_body_uses_worktree(body)
 }
 
-/// Resolve a one-shot fork seed from a uniquely identified parent binding.
+/// A fork refusal plus the index in `parents` of the row it is about, so the
+/// remedy names the row the refusal was decided on. `None` when no row
+/// carries the id.
+pub(super) type ForkDenial = (crate::session::ForkDenied, Option<usize>);
+
 pub(super) fn resolve_create_fork_seed(
     parent_id: &str,
     structured: bool,
     parents: &[crate::session::Instance],
-) -> Result<crate::session::ForkSeed, crate::session::ForkDenied> {
+) -> Result<crate::session::ForkSeed, ForkDenial> {
     if structured {
         return Ok(crate::session::ForkSeed::Structured {
             parent_acp_session_id: parent_id.to_string(),
         });
     }
-    let mut candidates = parents
-        .iter()
-        .filter_map(|parent| parent.fork_parent_binding())
-        .filter(|binding| binding.session_id == parent_id);
-    let parent = candidates
-        .next()
-        .ok_or(crate::session::ForkDenied::NoParentSession)?;
-    if candidates.any(|candidate| candidate.key() != parent.key()) {
-        return Err(crate::session::ForkDenied::NoParentSession);
+    // The candidate is the conversation the row carries, which for a pinned row
+    // is the pinned id, not the one `agent_session_id` still names, so the id is
+    // read off the candidate. A row carrying another id, or none of its own, is
+    // dropped without materialising anything.
+    //
+    // Several rows can record that one id, and `Storage::load()` returns them in
+    // file order, so what a refusal names cannot come from arrival: candidates
+    // are ranked by how admissible they are, a qualified row over an
+    // unattributed one over one nothing qualifies, ties break on the lowest
+    // `id` the store holds, and qualified rows naming different conversations
+    // refuse whichever of them the tie-break elects.
+    let mut chosen: Option<(usize, crate::session::ForkParentRef<'_>)> = None;
+    let mut disagreeing = false;
+    for (index, parent) in parents.iter().enumerate() {
+        // A row whose native identity cannot be resolved names no conversation
+        // a fork could name, so it is dropped like one carrying another id.
+        let Some(candidate) = parent
+            .fork_parent_ref()
+            .ok()
+            .flatten()
+            .filter(|candidate| candidate.session_id() == Some(parent_id))
+        else {
+            continue;
+        };
+        let admissible = candidate.admissibility();
+        let Some((chosen_index, elected)) = chosen else {
+            chosen = Some((index, candidate));
+            continue;
+        };
+        let elected_admissible = elected.admissibility();
+        if admissible == 0 && elected_admissible == 0 {
+            disagreeing |= candidate.binding().and_then(|binding| binding.key())
+                != elected.binding().and_then(|binding| binding.key());
+        }
+        if admissible < elected_admissible
+            || (admissible == elected_admissible && parent.id < parents[chosen_index].id)
+        {
+            chosen = Some((index, candidate));
+        }
+    }
+    let (index, parent) = chosen.ok_or((crate::session::ForkDenied::NoParentSession, None))?;
+    if disagreeing {
+        return Err((crate::session::ForkDenied::NoParentSession, Some(index)));
     }
     crate::session::fork::terminal_fork_seed(
         Some(parent),
         crate::session::capture::generate_session_uuid(),
     )
+    .map_err(|denied| (denied, Some(index)))
 }
 
 /// True when a create asks to both import and fork. The two seed from
@@ -848,11 +887,23 @@ pub async fn create_session(
             };
             match resolve_create_fork_seed(parent_id, structured, &parents) {
                 Ok(seed) => Some(seed),
-                Err(_) => {
+                // The remedy carries the id of the row the refusal is about, so
+                // it runs as printed. A refusal naming no row admits no remedy,
+                // so the requested id stands in for both.
+                Err((denied, index)) => {
+                    // The remedy names the profile the parent row lives in,
+                    // because `set-session-id` opens only that store.
+                    let parent_profile = match index {
+                        Some(index) => parents[index].effective_profile(),
+                        None => validation_profile.to_string(),
+                    };
+                    let (title, id) = index.map_or((parent_id, parent_id), |index| {
+                        (parents[index].title.as_str(), parents[index].id.as_str())
+                    });
                     return api_error(
                         StatusCode::BAD_REQUEST,
                         "fork_unsupported",
-                        "This agent or session cannot be forked",
+                        denied.user_message(title, id, &parent_profile),
                     );
                 }
             }
@@ -1065,6 +1116,11 @@ pub(super) fn apply_post_restart_identity_sync(
     if started.lifecycle_generation < live.lifecycle_generation {
         return;
     }
+    // The snapshot describes the agent it launched, and a swap moves neither the lifecycle counter
+    // nor the capture generation: applying it would resolve this row's capture from another agent.
+    if started.tool != live.tool {
+        return;
+    }
     // A same-SID publication can still replace the native store or transcript.
     let generation_can_merge = live.omp_capture_generation == before.omp_capture_generation
         || live.omp_capture_generation == started.omp_capture_generation;
@@ -1074,17 +1130,11 @@ pub(super) fn apply_post_restart_identity_sync(
         live.omp_capture_generation = started.omp_capture_generation.clone();
         if conversation_unchanged {
             live.adopt_conversation_state(started.conversation_state());
+        } else {
+            live.adopt_active_execution(started);
         }
     }
-    if live.active_execution == started.active_execution {
-        live.session_id_poller = started.session_id_poller.clone();
-        live.session_id_poller_retry_after = started.session_id_poller_retry_after;
-        if started.session_id_poller_is_running() {
-            live.poller_repair.reset();
-        }
-    } else {
-        started.stop_poller();
-    }
+    live.adopt_relaunch_poller_state(before, started);
     if generation_can_merge && marker_unchanged && live.agent_session_id == started.agent_session_id
     {
         live.resume_probe_failed_sid = started.resume_probe_failed_sid.clone();

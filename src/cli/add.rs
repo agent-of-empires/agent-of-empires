@@ -276,37 +276,21 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
 
     let fork_seed: Option<crate::session::ForkSeed> = if let Some(fork_ref) = &args.fork_from {
         let source = super::resolve_session(fork_ref, &instances)?;
-        if matches!(
-            source.resume_intent,
-            crate::session::ResumeIntent::Fork { .. }
-        ) {
-            bail!(
-                "Cannot fork from session '{}': its own fork has not launched yet. Start it once, then fork from the child conversation.",
-                source.title
-            );
-        }
         let user_chose_tool = args.tool.is_some() || args.command.is_some();
         if !user_chose_tool {
             resolved_tool = source.tool.clone();
         }
-        let parent_agent = source
-            .fork_parent_binding()
-            .and_then(|binding| binding.execution.as_ref())
-            .map(|execution| execution.agent.clone())
-            .unwrap_or_else(|| source.tool.clone());
+        // One rule on both surfaces: a row whose native identity cannot be
+        // resolved names no conversation a fork could carry, so it is not a
+        // candidate here either, exactly as the REST election drops it.
+        let parent_ref = source.fork_parent_ref().unwrap_or(None);
         let seed = crate::session::fork::terminal_fork_seed(
-            source.fork_parent_binding(),
+            parent_ref,
             crate::session::capture::generate_session_uuid(),
         )
-        .map_err(|denied| match denied {
-            crate::session::ForkDenied::AgentCannotFork => anyhow::anyhow!(
-                "Agent '{}' does not support forking. Forkable agents: claude, codex, opencode.",
-                parent_agent
-            ),
-            crate::session::ForkDenied::NoParentSession => anyhow::anyhow!(
-                "Nothing to fork: session '{}' has no captured agent session yet. Start a conversation in it first.",
-                source.title
-            ),
+        .map_err(|denied| {
+            let profile = source.effective_profile();
+            anyhow::Error::msg(denied.user_message(&source.title, &source.id, &profile))
         })?;
         Some(seed)
     } else {
@@ -705,7 +689,24 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
             crate::session::ForkSeed::Terminal {
                 parent,
                 child_session_id,
+                unattributed_parent_agent,
             } => {
+                // Only an unattributed parent needs this: the launch
+                // identity-checks a qualified one itself, and this path builds
+                // the child itself, so nothing else would hold it.
+                if let Some(parent_agent) = unattributed_parent_agent.as_deref() {
+                    let launched = crate::session::Instance::execution_agent_for(
+                        &instance.tool,
+                        instance.get_tool_command(),
+                        &config.session,
+                    )
+                    .map_err(anyhow::Error::msg)?;
+                    crate::session::fork::ensure_child_matches_parent_agent(
+                        Some(parent_agent),
+                        launched.name,
+                    )
+                    .map_err(anyhow::Error::msg)?;
+                }
                 instance.agent_session_id = Some(child_session_id);
                 instance.resume_intent = crate::session::ResumeIntent::Fork {
                     from: parent.session_id.clone(),
@@ -1437,6 +1438,114 @@ mod tests {
                 Some(Commands::Add(args)) => (profile, *args),
                 _ => panic!("expected an add invocation"),
             }
+        }
+
+        /// `add` builds the fork child itself rather than through the session
+        /// builder, so it needs its own identity comparison: a child asked for
+        /// under another agent must not fork a conversation it cannot resume.
+        /// A wrapper with no execution contract resolves to no agent, so the
+        /// row names no conversation a fork could carry and is not a candidate.
+        /// The REST election drops it; the CLI has to refuse it the same way
+        /// rather than propagating the resolution error the other surface hides.
+        #[tokio::test]
+        #[serial]
+        async fn add_refuses_an_unresolvable_parent_the_way_rest_drops_it() {
+            let _guard = crate::session::test_support::isolate_app_dir();
+            let project = tempfile::tempdir().unwrap();
+            let parent_id = "unresolvable-parent-uuid";
+            crate::session::Storage::new_unwatched("real")
+                .unwrap()
+                .update(|rows, _| {
+                    let mut parent =
+                        crate::session::Instance::new("parent", project.path().to_str().unwrap());
+                    parent.id = parent_id.to_string();
+                    parent.tool = "claude".into();
+                    parent.command = "ssh -t host claude".into();
+                    parent.agent_session_id = Some("legacy-conversation-uuid".into());
+                    parent.agent_session_binding = Some(
+                        crate::session::ConversationBinding::unknown("legacy-conversation-uuid"),
+                    );
+                    *rows = vec![parent];
+                    Ok(())
+                })
+                .unwrap();
+
+            let (profile, args) = dispatch_argv(&[
+                "aoe",
+                "add",
+                project.path().to_str().unwrap(),
+                "--fork-from",
+                parent_id,
+                "-p",
+                "real",
+            ]);
+            let msg = super::super::run(&profile, args)
+                .await
+                .expect_err("a parent whose agent cannot be resolved is not a candidate")
+                .to_string();
+            assert_eq!(
+                msg,
+                crate::session::ForkDenied::NoParentSession
+                    .user_message("parent", parent_id, "real"),
+                "the CLI and the REST election must refuse the row the same way"
+            );
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn add_refuses_a_fork_child_under_another_agent() {
+            let root = tempfile::tempdir().unwrap();
+            let _guard = crate::session::test_support::isolate_app_dir_at(root.path());
+            // The CLI resolves the requested tool's binary before the fork parent
+            // check, so both agents need a command on the path.
+            let _claude = crate::session::test_support::install_login_shell_path_command(
+                root.path(),
+                "claude",
+                "#!/bin/sh\nexit 1\n",
+            );
+            let _codex = crate::session::test_support::install_login_shell_path_command(
+                root.path(),
+                "codex",
+                "#!/bin/sh\nexit 1\n",
+            );
+            let project = tempfile::tempdir().unwrap();
+            let parent_id = "parent-session-uuid";
+            crate::session::Storage::new_unwatched("real")
+                .unwrap()
+                .update(|rows, _| {
+                    let mut parent =
+                        crate::session::Instance::new("parent", project.path().to_str().unwrap());
+                    parent.id = parent_id.to_string();
+                    parent.tool = "claude".into();
+                    parent.command = "claude".into();
+                    parent.agent_session_id = Some("legacy-conversation-uuid".into());
+                    parent.agent_session_binding = Some(
+                        crate::session::ConversationBinding::unknown("legacy-conversation-uuid"),
+                    );
+                    *rows = vec![parent];
+                    Ok(())
+                })
+                .unwrap();
+
+            let (profile, args) = dispatch_argv(&[
+                "aoe",
+                "add",
+                project.path().to_str().unwrap(),
+                "--fork-from",
+                parent_id,
+                "--tool",
+                "codex",
+                "-p",
+                "real",
+            ]);
+            let msg = super::super::run(&profile, args)
+                .await
+                .expect_err("a fork under another agent must refuse")
+                .to_string();
+            assert!(
+                msg.contains("codex") && msg.contains("claude"),
+                "the refusal must name both agents, got: {msg}"
+            );
         }
 
         #[tokio::test]

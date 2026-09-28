@@ -1,6 +1,7 @@
 import { memo, useEffect, useRef, useState } from "react";
 import { Folder } from "lucide-react";
 import { archivableWorkspaces, type SidebarGroup } from "../../lib/sidebarGroups";
+import { SCRATCH_GROUP_ID } from "../../hooks/useRepoGroups";
 import {
   REPO_COLOR_OPTIONS,
   repoColorStyle,
@@ -58,7 +59,9 @@ export const SidebarGroupHeader = memo(function SidebarGroupHeader(props: Props)
   const archivableCount = props.onArchiveAll ? archivableWorkspaces(group).length : 0;
   const canPin = !!props.onPin && group.capabilities.create === "repo" && !!group.repoPath && !group.pinned;
   const canUnpin = !!props.onUnpin && group.kind === "repo" && group.pinned;
-  const canEditProject = !!props.onEditProject && group.capabilities.create === "repo" && !!group.repoPath;
+  const canEditProject =
+    !!props.onEditProject &&
+    (group.id === SCRATCH_GROUP_ID || (group.capabilities.create === "repo" && !!group.repoPath));
   const hasMenu = canAppearance || archivableCount > 0 || canPin || canUnpin || canEditProject;
   const [renaming, setRenaming] = useState(false);
   const [renameValue, setRenameValue] = useState(group.alias ?? group.displayName);

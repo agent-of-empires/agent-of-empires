@@ -401,4 +401,42 @@ mod tests {
         );
         assert_eq!(get_current_version(), CURRENT_VERSION);
     }
+
+    #[test]
+    #[serial_test::serial]
+    fn oldest_migration_backup_of_an_upgrade_stays_readable_by_the_previous_release() {
+        // v1.16.1 typed both of these as plain strings.
+        #[derive(serde::Deserialize)]
+        struct Pre116 {
+            #[serde(default)]
+            retroactive_capture_excludes: std::collections::HashSet<String>,
+            pending_initial_turn: Option<String>,
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let app = crate::session::get_app_dir().unwrap();
+        fs::create_dir_all(&app).unwrap();
+        fs::write(app.join(VERSION_FILE), "28").unwrap();
+        fs::write(
+            app.join("sessions.json"),
+            r#"[{"retroactive_capture_excludes":["legacy-sid"],"pending_initial_turn":"go"}]"#,
+        )
+        .unwrap();
+
+        run_migrations().unwrap();
+
+        let backups = crate::session::migration_backups(&app.join("sessions.json")).unwrap();
+        assert!(
+            !backups.is_empty(),
+            "an upgrade that retypes a field must leave a migration backup"
+        );
+
+        let before: Vec<Pre116> =
+            serde_json::from_slice(&fs::read(&backups[0].1).unwrap()).unwrap();
+        assert!(before[0]
+            .retroactive_capture_excludes
+            .contains("legacy-sid"));
+        assert_eq!(before[0].pending_initial_turn.as_deref(), Some("go"));
+    }
 }

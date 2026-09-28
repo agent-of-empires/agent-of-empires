@@ -761,23 +761,64 @@ fn find_by_idempotency_key_matches_trashed_but_not_missing() {
     assert!(find_by_idempotency_key(&instances, "never-seen").is_none());
 }
 
+/// A parent whose conversation is qualified, as a capture leaves it.
+fn qualified_parent_binding() -> crate::session::ConversationBinding {
+    crate::session::ConversationBinding {
+        session_id: "parent-uuid".into(),
+        execution: Some(crate::session::ExecutionBinding {
+            agent: "claude".into(),
+            stores: vec!["/tmp/claude-store".into()],
+            configuration: Vec::new(),
+            exported_default_store: None,
+            cwd: "/tmp".into(),
+            cwd_filesystem: "host".into(),
+            filesystem: "host".into(),
+        }),
+        provenance: crate::session::ConversationProvenance::Observed,
+        transcript_path: None,
+    }
+}
+
+/// A parent binding that records the id without qualifying it: no execution
+/// stands behind it, so `is_known()` is false whatever the provenance claims.
+fn unqualified_parent_binding(
+    provenance: crate::session::ConversationProvenance,
+) -> crate::session::ConversationBinding {
+    crate::session::ConversationBinding {
+        execution: None,
+        provenance,
+        ..qualified_parent_binding()
+    }
+}
+
+/// A parent row labelled `label`, recording `parent-uuid` and still carrying
+/// `binding` when the row has one left.
+fn parent_row(
+    label: &str,
+    binding: Option<crate::session::ConversationBinding>,
+) -> crate::session::Instance {
+    let mut row = crate::session::Instance::new(label, "/tmp");
+    row.agent_session_id = Some("parent-uuid".into());
+    row.agent_session_binding = binding;
+    row
+}
+
+/// A parent row whose `id` the tie-break compares, so a test decides which
+/// row a refusal names instead of inheriting a generated one.
+fn parent_row_with_id(
+    id: &str,
+    label: &str,
+    binding: Option<crate::session::ConversationBinding>,
+) -> crate::session::Instance {
+    let mut row = parent_row(label, binding);
+    row.id = id.to_string();
+    row
+}
+
 #[test]
 fn fork_seed_and_structured_fork_guard_agree_per_agent() {
     {
-        let parent_binding = crate::session::ConversationBinding {
-            session_id: "parent-uuid".into(),
-            execution: Some(crate::session::ExecutionBinding {
-                agent: "claude".into(),
-                stores: vec!["/tmp/claude-store".into()],
-                configuration: Vec::new(),
-                exported_default_store: None,
-                cwd: "/tmp".into(),
-                cwd_filesystem: "host".into(),
-                filesystem: "host".into(),
-            }),
-            provenance: crate::session::ConversationProvenance::Observed,
-            transcript_path: None,
-        };
+        let parent_binding = qualified_parent_binding();
         let mut parent = crate::session::Instance::new("parent", "/tmp");
         parent.agent_session_id = Some(parent_binding.session_id.clone());
         parent.agent_session_binding = Some(parent_binding.clone());
@@ -788,6 +829,7 @@ fn fork_seed_and_structured_fork_guard_agree_per_agent() {
             crate::session::ForkSeed::Terminal {
                 parent,
                 child_session_id,
+                ..
             } => {
                 assert_eq!(*parent, parent_binding);
                 assert!(crate::session::capture::is_valid_session_id(
@@ -848,6 +890,256 @@ fn fork_seed_and_structured_fork_guard_agree_per_agent() {
             );
         }
     }
+}
+
+/// A binding migration left unattributed is enough to fork, because the row's
+/// own agent decides the capability, while a row with no binding at all names
+/// no agent and stays refused.
+#[test]
+fn fork_from_a_bindingless_parent_is_refused_as_unqualified() {
+    let mut unattributed = crate::session::Instance::new("parent", "/tmp");
+    unattributed.agent_session_id = Some("parent-uuid".into());
+    unattributed.agent_session_binding =
+        Some(crate::session::ConversationBinding::unknown("parent-uuid"));
+    assert!(matches!(
+        resolve_create_fork_seed("parent-uuid", false, &[unattributed]),
+        Ok(crate::session::ForkSeed::Terminal { .. })
+    ));
+
+    let mut bare = crate::session::Instance::new("parent", "/tmp");
+    bare.agent_session_id = Some("parent-uuid".into());
+    assert_eq!(
+        resolve_create_fork_seed("parent-uuid", false, &[bare]),
+        Err((
+            crate::session::ForkDenied::UnqualifiedParent {
+                preallocated: false,
+                recorded: "parent-uuid".into(),
+            },
+            Some(0),
+        ))
+    );
+}
+
+/// A pinned row carries the id it was pinned to, so the fork resolves on the
+/// conversation the row names, not the one `agent_session_id` still holds.
+#[test]
+fn fork_from_resolves_the_conversation_the_parent_carries() {
+    let carried = qualified_parent_binding();
+    let mut parent = crate::session::Instance::new("parent", "/tmp");
+    parent.agent_session_id = Some("pre-pin-uuid".into());
+    parent.resume_intent = crate::session::ResumeIntent::Use("parent-uuid".into());
+    parent.resume_binding = Some(carried.clone());
+
+    match resolve_create_fork_seed("parent-uuid", false, &[parent.clone()])
+        .expect("the pinned conversation is the one to fork")
+    {
+        crate::session::ForkSeed::Terminal { parent: seeded, .. } => assert_eq!(*seeded, carried),
+        crate::session::ForkSeed::Structured { .. } => panic!("expected Terminal seed"),
+    }
+    // The superseded id names no conversation the row carries, so it resolves
+    // nothing rather than a fork of the pinned one.
+    assert_eq!(
+        resolve_create_fork_seed("pre-pin-uuid", false, &[parent]),
+        Err((crate::session::ForkDenied::NoParentSession, None))
+    );
+}
+
+/// When every row carrying the id is one no fork can be dispatched from, the
+/// refusal names the same state whichever order the load returned them in, and
+/// the row it points at is the one holding the lowest `id`, not the one that
+/// arrived first.
+#[test]
+fn fork_from_bare_and_degraded_rows_is_refused_the_same_way_in_either_order() {
+    use crate::session::ConversationProvenance;
+    let bare = parent_row_with_id("a-bare", "bare", None);
+    let stale = parent_row_with_id(
+        "b-stale",
+        "stale",
+        Some(unqualified_parent_binding(
+            ConversationProvenance::Preallocated,
+        )),
+    );
+    for (parents, elected) in [
+        (vec![bare.clone(), stale.clone()], 0),
+        (vec![stale, bare], 1),
+    ] {
+        assert_eq!(
+            resolve_create_fork_seed("parent-uuid", false, &parents),
+            Err((
+                crate::session::ForkDenied::UnqualifiedParent {
+                    preallocated: false,
+                    recorded: "parent-uuid".into(),
+                },
+                Some(elected),
+            ))
+        );
+    }
+}
+
+/// A row a migration left unattributed is forkable on its own agent, so it
+/// outranks a bare id that carries no evidence: a bare row holding the lower
+/// `id` must not decide the fork and refuse a seed that would have worked,
+/// whichever order the two arrive in.
+#[test]
+fn fork_from_an_unattributed_row_wins_over_a_bare_row_in_either_order() {
+    use crate::session::ConversationProvenance;
+    let bare = parent_row_with_id("a-bare", "bare", None);
+    let unattributed = parent_row_with_id(
+        "z-unattributed",
+        "unattributed",
+        Some(unqualified_parent_binding(ConversationProvenance::Unknown)),
+    );
+    for parents in [
+        vec![bare.clone(), unattributed.clone()],
+        vec![unattributed, bare],
+    ] {
+        assert!(
+            resolve_create_fork_seed("parent-uuid", false, &parents).is_ok(),
+            "an unattributed row is a forkable parent whatever the bare row's id"
+        );
+    }
+}
+
+/// Resolution reads a qualified row first whatever the load order, so the one
+/// unqualified row sharing its id cannot steal the seed.
+/// A row whose native identity cannot be resolved names no conversation a fork
+/// could name, so the election drops it: the id is present and its binding
+/// names the conversation, yet nothing can be forked from that row.
+#[test]
+fn fork_from_a_parent_whose_agent_cannot_be_resolved_is_dropped() {
+    use crate::session::ConversationProvenance;
+    let row = parent_row_with_id(
+        "wrapper",
+        "wrapper",
+        Some(unqualified_parent_binding(ConversationProvenance::Unknown)),
+    );
+    let mut row = row;
+    row.tool = "claude".into();
+    row.command = "ssh -t host claude".into();
+    assert!(
+        row.fork_parent_ref().is_err(),
+        "a wrapper with no execution contract resolves to no agent"
+    );
+    assert_eq!(
+        resolve_create_fork_seed("parent-uuid", false, &[row]),
+        Err((crate::session::ForkDenied::NoParentSession, None))
+    );
+}
+
+#[test]
+fn fork_from_rows_carrying_one_id_resolves_the_qualified_row_in_either_order() {
+    let qualified = qualified_parent_binding();
+    let unqualified = parent_row(
+        "stale",
+        Some(unqualified_parent_binding(
+            crate::session::ConversationProvenance::Unknown,
+        )),
+    );
+    for parents in [
+        vec![
+            unqualified.clone(),
+            parent_row("qualified", Some(qualified.clone())),
+        ],
+        vec![
+            parent_row("qualified", Some(qualified.clone())),
+            unqualified,
+        ],
+    ] {
+        match resolve_create_fork_seed("parent-uuid", false, &parents)
+            .expect("the qualified row is the one to fork")
+        {
+            crate::session::ForkSeed::Terminal { parent, .. } => assert_eq!(*parent, qualified),
+            crate::session::ForkSeed::Structured { .. } => panic!("expected Terminal seed"),
+        }
+    }
+}
+
+/// A row a migration left unattributed outranks one a degraded launch left
+/// unqualified, so the fork is decided on the row that can carry a
+/// conversation and cannot fall to whichever id is lower.
+#[test]
+fn fork_from_an_unattributed_row_outranks_a_preallocated_one() {
+    use crate::session::ConversationProvenance;
+    let preallocated = parent_row_with_id(
+        "a-pre",
+        "pre",
+        Some(unqualified_parent_binding(
+            ConversationProvenance::Preallocated,
+        )),
+    );
+    let unattributed = parent_row_with_id(
+        "b-unattributed",
+        "unattributed",
+        Some(unqualified_parent_binding(ConversationProvenance::Unknown)),
+    );
+    for parents in [
+        vec![preallocated.clone(), unattributed.clone()],
+        vec![unattributed, preallocated],
+    ] {
+        assert!(
+            resolve_create_fork_seed("parent-uuid", false, &parents).is_ok(),
+            "the preallocated row carries no conversation, so it cannot outrank an \
+             unattributed one however low its id"
+        );
+    }
+}
+
+/// The disagreement scan is a qualified-row question, and it reads the rows
+/// before the tie-break elects between them: two qualified rows naming
+/// different conversations refuse whichever row the tie-break elects, even
+/// when the elected one only takes the seat after arriving.
+#[test]
+fn fork_from_contradictory_qualified_rows_refuses_whichever_row_wins_the_tie_break() {
+    let mut other_agent = qualified_parent_binding();
+    other_agent.execution.as_mut().unwrap().agent = "codex".into();
+    let low = parent_row_with_id("a-low", "claude", Some(qualified_parent_binding()));
+    let high = parent_row_with_id("z-high", "codex", Some(other_agent));
+    for (parents, elected) in [(vec![high.clone(), low.clone()], 1), (vec![low, high], 0)] {
+        assert_eq!(
+            resolve_create_fork_seed("parent-uuid", false, &parents),
+            Err((crate::session::ForkDenied::NoParentSession, Some(elected))),
+            "a row that only takes the seat by its id is still compared"
+        );
+    }
+}
+
+/// Two qualified rows naming the same conversation agree however they differ
+/// in provenance, and a row recording the same id with no binding to compare
+/// never makes them ambiguous.
+#[test]
+fn fork_from_qualified_rows_naming_one_conversation_is_allowed() {
+    use crate::session::ConversationProvenance;
+    let mut asserted = qualified_parent_binding();
+    asserted.provenance = ConversationProvenance::Asserted;
+    let observed = qualified_parent_binding();
+    for parents in [
+        vec![
+            parent_row("observed", Some(observed.clone())),
+            parent_row("asserted", Some(asserted.clone())),
+        ],
+        vec![
+            parent_row("asserted", Some(asserted)),
+            parent_row("observed", Some(observed.clone())),
+        ],
+    ] {
+        assert!(
+            resolve_create_fork_seed("parent-uuid", false, &parents).is_ok(),
+            "the same key under two provenances is one conversation"
+        );
+    }
+    assert!(
+        resolve_create_fork_seed(
+            "parent-uuid",
+            false,
+            &[
+                parent_row("first", Some(qualified_parent_binding())),
+                parent_row("second", Some(qualified_parent_binding())),
+                parent_row("bare", None),
+            ]
+        )
+        .is_ok(),
+        "a row with no binding records the same id and must not make the scan ambiguous"
+    );
 }
 
 #[test]
@@ -1647,7 +1939,11 @@ fn apply_post_restart_sync_propagates_agent_session_id() {
     started.status = Status::Starting;
     started.agent_session_id = Some("claude-uuid-restart".to_string());
     started.omp_capture_generation = Some("omp-generation-restart".to_string());
-    let mut poller = crate::session::poller::SessionPoller::new("omp-restarted".to_string());
+    let mut poller = crate::session::poller::SessionPoller::new(
+        "omp-restarted".to_string(),
+        "claude".to_string(),
+        None,
+    );
     assert_eq!(
         poller.start(before.id.clone(), Box::new(|| None), Box::new(|_| {}), None,),
         crate::session::poller::PollerSpawn::Spawned
@@ -1699,9 +1995,10 @@ fn apply_post_restart_sync_propagates_agent_session_id() {
 }
 
 #[test]
-fn apply_post_restart_identity_sync_clears_repair_backoff_when_restart_poller_runs() {
+fn apply_post_restart_identity_sync_clears_the_live_poller_schedule() {
     let mut before = make_test_instance();
     before.omp_capture_generation = Some("generation-a".to_string());
+    before.last_start_time = Some(std::time::Instant::now() - std::time::Duration::from_secs(60));
     let now = std::time::Instant::now();
     before.poller_repair.defer(now);
     before.poller_repair.defer(now);
@@ -1709,8 +2006,14 @@ fn apply_post_restart_identity_sync_clears_repair_backoff_when_restart_poller_ru
 
     let mut started = before.clone();
     started.omp_capture_generation = Some("generation-b".to_string());
+    // A relaunch stamps its start time next to the schedule it clears (start.rs).
+    started.last_start_time = Some(std::time::Instant::now());
     started.poller_repair.reset();
-    let mut poller = crate::session::poller::SessionPoller::new("omp-restarted".to_string());
+    let mut poller = crate::session::poller::SessionPoller::new(
+        "omp-restarted".to_string(),
+        "claude".to_string(),
+        None,
+    );
     assert_eq!(
         poller.start(before.id.clone(), Box::new(|| None), Box::new(|_| {}), None,),
         crate::session::poller::PollerSpawn::Spawned
@@ -1731,15 +2034,71 @@ fn apply_post_restart_identity_sync_clears_repair_backoff_when_restart_poller_ru
     apply_post_restart_identity_sync(&mut peer_relaunched, &before, &started);
     assert_eq!(peer_relaunched.poller_repair.deferrals(), 0);
 
-    let mut not_started = started.clone();
-    not_started.session_id_poller = None;
-    let mut live = before.clone();
-    apply_post_restart_identity_sync(&mut live, &before, &not_started);
-    assert_eq!(
-        live.poller_repair.deferrals(),
-        2,
-        "a restart without a running poller leaves the schedule alone"
+    // A relaunch that replaced the pane without installing a poller carries one that watches the
+    // superseded execution, which the row is about to give up: the applier stops it and hands
+    // back nothing.
+    let launch_2 = crate::session::ActiveExecution {
+        launch_id: "launch-2".into(),
+        binding: crate::session::ExecutionBinding {
+            agent: "claude".into(),
+            stores: Vec::new(),
+            configuration: Vec::new(),
+            cwd: PathBuf::from("/tmp"),
+            cwd_filesystem: "host".into(),
+            filesystem: "host".into(),
+            exported_default_store: None,
+        },
+        capture: None,
+        container: None,
+    };
+    let mut superseded_poller = crate::session::poller::SessionPoller::new(
+        "omp-restarted".to_string(),
+        "claude".to_string(),
+        Some(launch_2.clone()),
     );
+    assert_eq!(
+        superseded_poller.start(before.id.clone(), Box::new(|| None), Box::new(|_| {}), None,),
+        crate::session::poller::PollerSpawn::Spawned
+    );
+    let mut superseded = started.clone();
+    superseded.session_id_poller = Some(std::sync::Arc::new(std::sync::Mutex::new(
+        superseded_poller,
+    )));
+    superseded.active_execution = Some(crate::session::ActiveExecution {
+        launch_id: "launch-3".into(),
+        ..launch_2.clone()
+    });
+    let mut live = before.clone();
+    live.agent_session_id = Some("peer-sid".to_string());
+    live.active_execution = Some(launch_2);
+    live.session_id_poller = superseded.session_id_poller.clone();
+    apply_post_restart_identity_sync(&mut live, &before, &superseded);
+    assert_eq!(
+        live.active_execution.as_ref().map(|e| e.launch_id.as_str()),
+        Some("launch-3"),
+        "the row takes the execution the launch ran"
+    );
+    assert!(
+        !superseded.session_id_poller_is_running(),
+        "the poller for the superseded launch is stopped"
+    );
+    assert!(
+        live.session_id_poller.is_none(),
+        "and it is not handed back beside the execution it cannot watch"
+    );
+
+    // A relaunch that reached the launch stamp replaced the poller, so the schedule that paced it
+    // goes with it, even though the live row's own walk had gone deeper since.
+    let relaunched = started.clone();
+    let mut live = before.clone();
+    live.poller_repair.reprobe(now);
+    live.poller_repair.reprobe(now);
+    apply_post_restart_identity_sync(&mut live, &before, &relaunched);
+    assert!(
+        live.poller_repair.due(std::time::Instant::now()),
+        "the row is due at once rather than waiting out the re-probe the relaunch replaced"
+    );
+
     restarted_poller
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -2293,6 +2652,31 @@ async fn worker_stopping_handlers_wait_for_an_in_flight_submission() {
             .await
             .unwrap_or_else(|_| panic!("{which} must finish once the submission releases"));
     }
+}
+
+/// A direct stop sets `Stopped` on the live in-memory row without going through
+/// `apply_status_intent`, which normally releases a plugin's pending revival mark on reaching
+/// a terminal status; `stop_session` must do the same itself, on that same in-memory row (the
+/// disk-persisted copy earlier in the handler is a fresh load, where the `#[serde(skip)]`
+/// field is always false regardless).
+#[tokio::test]
+async fn stop_session_clears_a_pending_plugin_revival() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let mut inst = make_test_instance();
+    inst.view = crate::session::View::Structured;
+    inst.plugin_revival_pending = true;
+    let id = inst.id.clone();
+    let state = crate::server::test_support::build_test_app_state(vec![inst]);
+
+    stop_session(State(std::sync::Arc::clone(&state)), Path(id.clone())).await;
+
+    let instances = state.instances.read().await;
+    let stopped = instances.iter().find(|i| i.id == id).unwrap();
+    assert_eq!(stopped.status, Status::Stopped);
+    assert!(
+        !stopped.plugin_revival_pending,
+        "a direct stop must release a stale pending mark"
+    );
 }
 
 /// #3651: `prompt_submission` auto-vivifies a registry entry for whatever id it
@@ -3288,6 +3672,51 @@ async fn list_sessions_applies_project_smart_rename_override_to_worktree_session
         .map(|s| s["smart_rename"].as_str().unwrap())
         .collect();
     assert_eq!(states, ["inactive", "inactive", "pending"]);
+}
+
+// A scratch session has no stable path to key a project-registry override on, so its
+// smart-rename override lives on `session.scratch_smart_rename` in Config instead (#4138 review).
+#[tokio::test]
+#[serial_test::serial]
+async fn list_sessions_applies_scratch_smart_rename_setting_from_config() {
+    let tmp_home = tempfile::tempdir().expect("tempdir HOME");
+    let _home = crate::session::test_support::isolate_app_dir_at(tmp_home.path());
+
+    crate::session::config::update_config(|cfg| {
+        cfg.session.scratch_smart_rename = crate::session::config::ScratchSmartRenameMode::Off;
+    })
+    .unwrap();
+
+    let scratch_dir = tempfile::tempdir().expect("scratch dir");
+    let mut scratch_inst = Instance::new("Vikings", scratch_dir.path().to_str().unwrap());
+    scratch_inst.tool = "claude".to_string();
+    scratch_inst.source_profile = "default".to_string();
+    scratch_inst.view = crate::session::View::Structured;
+    scratch_inst.scratch = true;
+
+    let state = crate::server::test_support::build_test_app_state(vec![scratch_inst]);
+    let resp = list_sessions(
+        axum::extract::State(state),
+        axum::extract::Query(ListSessionsQuery { state: None }),
+    )
+    .await
+    .into_response();
+    let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let envelope: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let states: Vec<&str> = envelope["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["smart_rename"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        states,
+        ["inactive"],
+        "scratch_smart_rename=Off forces the override even though the global smart_rename \
+         toggle defaults on; a path-based project override would never match a scratch session"
+    );
 }
 
 /// #4084 review: deleting one session of a shared managed worktree, through

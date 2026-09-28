@@ -831,13 +831,21 @@ mod tests {
     }
 
     fn attach_poller_with_update(inst: &mut Instance, sid: &str) {
-        let poller = SessionPoller::new(format!("test-tmux-{}", inst.id));
+        let poller = SessionPoller::new(
+            format!("test-tmux-{}", inst.id),
+            inst.tool.clone(),
+            inst.active_execution.clone(),
+        );
         poller.inject_test_update(&inst.id, sid);
         inst.session_id_poller = Some(Arc::new(Mutex::new(poller)));
     }
 
     fn attach_poller_with_omp_update(inst: &mut Instance, sid: &str, generation: &str) {
-        let poller = SessionPoller::new(format!("test-tmux-{}", inst.id));
+        let poller = SessionPoller::new(
+            format!("test-tmux-{}", inst.id),
+            inst.tool.clone(),
+            inst.active_execution.clone(),
+        );
         let mut observation = crate::session::poller::SessionIdObservation::omp(
             sid.to_owned(),
             generation.to_owned(),
@@ -855,7 +863,11 @@ mod tests {
     }
 
     fn attach_poller_with_legacy_omp_update(inst: &mut Instance, sid: &str) {
-        let poller = SessionPoller::new(format!("test-tmux-{}", inst.id));
+        let poller = SessionPoller::new(
+            format!("test-tmux-{}", inst.id),
+            inst.tool.clone(),
+            inst.active_execution.clone(),
+        );
         poller.inject_test_omp_legacy_update(&inst.id, sid);
         inst.session_id_poller = Some(Arc::new(Mutex::new(poller)));
     }
@@ -1355,7 +1367,11 @@ mod tests {
         .expect("the Pi sidecar publishes an ID-only observation");
         assert!(observed.conversation_key().is_none());
 
-        let poller = SessionPoller::new(format!("test-tmux-{}", claimant.id));
+        let poller = SessionPoller::new(
+            format!("test-tmux-{}", claimant.id),
+            claimant.tool.clone(),
+            claimant.active_execution.clone(),
+        );
         poller.inject_test_observation(&claimant.id, observed);
         claimant.session_id_poller = Some(Arc::new(Mutex::new(poller)));
         let file_watch = FileWatchService::noop();
@@ -1415,7 +1431,11 @@ mod tests {
         });
         seed_instance_on_disk(profile, &inst);
 
-        let poller = SessionPoller::new(format!("test-tmux-{}", inst.id));
+        let poller = SessionPoller::new(
+            format!("test-tmux-{}", inst.id),
+            inst.tool.clone(),
+            inst.active_execution.clone(),
+        );
         let mut observation =
             crate::session::poller::SessionIdObservation::instance_sidecar(sid.into(), None);
         observation.execution = inst.active_execution.clone();
@@ -1470,7 +1490,11 @@ mod tests {
             id_only.active_execution = Some(active);
             seed_instances_on_disk(&profile, &[&qualified, &id_only]);
 
-            let qualified_poller = SessionPoller::new(format!("test-tmux-{}", qualified.id));
+            let qualified_poller = SessionPoller::new(
+                format!("test-tmux-{}", qualified.id),
+                qualified.tool.clone(),
+                qualified.active_execution.clone(),
+            );
             let mut qualified_observation =
                 crate::session::poller::SessionIdObservation::instance_sidecar(
                     sid.into(),
@@ -1481,7 +1505,11 @@ mod tests {
             qualified_poller.inject_test_observation(&qualified.id, qualified_observation);
             qualified.session_id_poller = Some(Arc::new(Mutex::new(qualified_poller)));
 
-            let id_only_poller = SessionPoller::new(format!("test-tmux-{}", id_only.id));
+            let id_only_poller = SessionPoller::new(
+                format!("test-tmux-{}", id_only.id),
+                id_only.tool.clone(),
+                id_only.active_execution.clone(),
+            );
             let mut id_only_observation =
                 crate::session::poller::SessionIdObservation::instance_sidecar(sid.into(), None);
             id_only_observation.execution = id_only.active_execution.clone();
@@ -1608,7 +1636,11 @@ mod tests {
         inst.mark_pi_extension_launched_for_test();
         seed_instance_on_disk(profile, &inst);
 
-        let poller = SessionPoller::new(format!("test-tmux-{}", inst.id));
+        let poller = SessionPoller::new(
+            format!("test-tmux-{}", inst.id),
+            inst.tool.clone(),
+            inst.active_execution.clone(),
+        );
         poller.inject_test_sidecar_update(&inst.id, "pi-new-conversation", None);
         inst.session_id_poller = Some(Arc::new(Mutex::new(poller)));
 
@@ -1656,7 +1688,11 @@ mod tests {
             inst.agent_session_id = Some(old.to_string());
 
             // No sidecar exists: only the observation carries the path.
-            let poller = SessionPoller::new(format!("test-tmux-{}", inst.id));
+            let poller = SessionPoller::new(
+                format!("test-tmux-{}", inst.id),
+                inst.tool.clone(),
+                inst.active_execution.clone(),
+            );
             poller.inject_test_sidecar_update(&inst.id, new, Some(&path));
             inst.session_id_poller = Some(Arc::new(Mutex::new(poller)));
             let file_watch = FileWatchService::noop();
@@ -1704,7 +1740,11 @@ mod tests {
         inst.agent_session_id = Some(sid.to_string());
         seed_instance_on_disk(profile, &inst);
 
-        let poller = SessionPoller::new(format!("test-tmux-{}", inst.id));
+        let poller = SessionPoller::new(
+            format!("test-tmux-{}", inst.id),
+            inst.tool.clone(),
+            inst.active_execution.clone(),
+        );
         poller.inject_test_sidecar_update(&inst.id, sid, Some(&path));
         let poller = Arc::new(Mutex::new(poller));
         inst.session_id_poller = Some(poller.clone());
@@ -1764,7 +1804,11 @@ mod tests {
         );
         observation.execution = Some(execution.clone());
         observation.scope_to(execution.binding.clone());
-        let poller = SessionPoller::new(format!("test-tmux-{}", inst.id));
+        let poller = SessionPoller::new(
+            format!("test-tmux-{}", inst.id),
+            inst.tool.clone(),
+            inst.active_execution.clone(),
+        );
         poller.inject_test_observation(&inst.id, observation);
         let poller = Arc::new(Mutex::new(poller));
         inst.session_id_poller = Some(poller.clone());
@@ -1833,7 +1877,11 @@ mod tests {
             Some(path.clone()),
         );
         observation.pi_session_path = Some(path.clone());
-        let poller = SessionPoller::new(format!("test-tmux-{}", inst.id));
+        let poller = SessionPoller::new(
+            format!("test-tmux-{}", inst.id),
+            inst.tool.clone(),
+            inst.active_execution.clone(),
+        );
         poller.inject_test_observation(&inst.id, observation);
         inst.session_id_poller = Some(Arc::new(Mutex::new(poller)));
 
@@ -1908,7 +1956,11 @@ mod tests {
         );
         observation.execution = Some(execution.clone());
         observation.scope_to(execution.binding);
-        let poller = SessionPoller::new(format!("test-tmux-{}", inst.id));
+        let poller = SessionPoller::new(
+            format!("test-tmux-{}", inst.id),
+            inst.tool.clone(),
+            inst.active_execution.clone(),
+        );
         poller.inject_test_observation(&inst.id, observation);
         let old_poller = Arc::new(Mutex::new(poller));
         inst.session_id_poller = Some(old_poller.clone());
@@ -1952,7 +2004,11 @@ mod tests {
 
         let published = "/home/u/.pi/agent/sessions/--proj--/2026-01-01T00-00-00-000Z_01a05234-8889-72e2-a7c9-7ebc27b25b78.jsonl";
         // The sidecar is already gone: only the observation carries the path.
-        let poller = SessionPoller::new(format!("test-tmux-{}", inst.id));
+        let poller = SessionPoller::new(
+            format!("test-tmux-{}", inst.id),
+            inst.tool.clone(),
+            inst.active_execution.clone(),
+        );
         poller.inject_test_sidecar_update(&inst.id, sid, Some(published));
         inst.session_id_poller = Some(Arc::new(Mutex::new(poller)));
 
@@ -1988,7 +2044,11 @@ mod tests {
         seed_instance_on_disk(profile, &inst);
 
         let fresh = "019342ab-1234-7def-8901-abcdef999999";
-        let poller = SessionPoller::new(format!("test-tmux-{}", inst.id));
+        let poller = SessionPoller::new(
+            format!("test-tmux-{}", inst.id),
+            inst.tool.clone(),
+            inst.active_execution.clone(),
+        );
         let poller = Arc::new(Mutex::new(poller));
         inst.session_id_poller = Some(poller.clone());
 
@@ -2037,7 +2097,11 @@ mod tests {
 
         let older = "019342ab-1234-7def-8901-aaaaaaaaaaaa";
         let newer = "019342ab-1234-7def-8901-bbbbbbbbbbbb";
-        let poller = SessionPoller::new(format!("test-tmux-{}", inst.id));
+        let poller = SessionPoller::new(
+            format!("test-tmux-{}", inst.id),
+            inst.tool.clone(),
+            inst.active_execution.clone(),
+        );
         poller.inject_test_update(&inst.id, older);
         poller.inject_test_update(&inst.id, newer);
         let poller = Arc::new(Mutex::new(poller));
@@ -2068,10 +2132,11 @@ mod tests {
 
         let sid = "019342ab-1234-7def-8901-cccccccccccc";
         let newer = "019342ab-1234-7def-8901-dddddddddddd";
-        let poller = Arc::new(Mutex::new(SessionPoller::new(format!(
-            "test-tmux-{}",
-            inst.id
-        ))));
+        let poller = Arc::new(Mutex::new(SessionPoller::new(
+            format!("test-tmux-{}", inst.id),
+            inst.tool.clone(),
+            inst.active_execution.clone(),
+        )));
         poller.lock().unwrap().inject_test_update(&inst.id, sid);
         inst.session_id_poller = Some(poller.clone());
 

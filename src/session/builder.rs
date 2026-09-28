@@ -761,7 +761,25 @@ pub fn build_instance(
             crate::session::ForkSeed::Terminal {
                 parent,
                 child_session_id,
+                unattributed_parent_agent,
             } => {
+                // Only an unattributed parent needs this: the launch
+                // identity-checks a qualified one itself. The parent's
+                // capability came from its own row's agent, so the child must
+                // actually launch that same agent.
+                if let Some(parent_agent) = unattributed_parent_agent.as_deref() {
+                    let launched = Instance::execution_agent_for(
+                        &instance.tool,
+                        instance.get_tool_command(),
+                        &config.session,
+                    )
+                    .map_err(anyhow::Error::msg)?;
+                    crate::session::fork::ensure_child_matches_parent_agent(
+                        Some(parent_agent),
+                        launched.name,
+                    )
+                    .map_err(anyhow::Error::msg)?;
+                }
                 instance.agent_session_id = Some(child_session_id);
                 instance.resume_intent = crate::session::ResumeIntent::Fork {
                     from: parent.session_id.clone(),
@@ -2069,6 +2087,7 @@ mod tests {
             fork_seed: Some(ForkSeed::Terminal {
                 parent: Box::new(parent.clone()),
                 child_session_id: "child-conversation".into(),
+                unattributed_parent_agent: None,
             }),
         };
         let inst = build_instance(params, &[], &[], "default")
@@ -2124,5 +2143,50 @@ mod tests {
                 "{label}: fork-seed build must restore the prior alias and compiled rule"
             );
         }
+    }
+
+    /// The parent's capability is checked against the parent row's own agent,
+    /// and the launch skips identity checking for an unattributed binding, so
+    /// a child that would launch another agent must be refused here rather
+    /// than fork a conversation it cannot resume.
+    #[test]
+    #[serial_test::serial]
+    fn a_fork_child_that_would_launch_another_agent_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(root.path());
+        let mut parent = crate::session::Instance::new("parent", root.path().to_str().unwrap());
+        parent.tool = "claude".into();
+        parent.agent_session_id = Some("legacy-uuid".into());
+        parent.agent_session_binding =
+            Some(crate::session::ConversationBinding::unknown("legacy-uuid"));
+        let seed = crate::session::fork::terminal_fork_seed(
+            parent.fork_parent_ref().unwrap(),
+            "child-uuid".into(),
+        )
+        .expect("an unattributed parent is admitted");
+
+        let mut same_agent = custom_agent_params(root.path(), "claude");
+        same_agent.command_override = "claude".into();
+        same_agent.fork_seed = Some(seed.clone());
+        assert_eq!(
+            build_instance(same_agent, &[], &[], "default")
+                .expect("a child launching the parent's own agent still forks")
+                .instance
+                .agent_session_id
+                .as_deref(),
+            Some("child-uuid")
+        );
+
+        let mut other_agent = custom_agent_params(root.path(), "codex");
+        other_agent.command_override = "codex".into();
+        other_agent.fork_seed = Some(seed);
+        let refused = match build_instance(other_agent, &[], &[], "default") {
+            Ok(_) => panic!("a child launching another agent cannot carry the conversation"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            refused.contains("codex") && refused.contains("claude"),
+            "the refusal must name both agents: {refused}"
+        );
     }
 }

@@ -479,6 +479,17 @@ impl Instance {
                 Err(error) if managed && !matches!(self.resume_intent, ResumeIntent::Default) => {
                     return Err(error);
                 }
+                // A stored id no context can attest is a deviation, not routine: warn.
+                Err(error) if managed => {
+                    // The `managed` arm above leaves only a Default launch, which
+                    // records an id by definition.
+                    let recorded = self
+                        .agent_session_id
+                        .as_deref()
+                        .expect("a managed default launch records a conversation id");
+                    tracing::warn!(target: "session.store", error = %error, recorded, "no attestable execution context for a recorded conversation; launching with the agent's own resume flags");
+                    None
+                }
                 Err(error) => {
                     tracing::debug!(target: "session.store", error = %error, "native execution unavailable; using native launch flags");
                     None
@@ -1411,8 +1422,8 @@ mod tests {
             let asserted = inst.asserted_resume_binding(sid, None);
             if agent == "codex" && crate::process::HAS_CODEX_MANAGED_PREFERENCES {
                 assert_eq!(
-                    asserted.unwrap_err().to_string(),
-                    "Codex managed preferences cannot be attested by the local file contract"
+                    format!("{:#}", asserted.unwrap_err()),
+                    "aoe session set-session-id cannot resolve the native execution identity for this context: Codex managed preferences cannot be attested by the local file contract"
                 );
                 continue;
             }
@@ -1706,6 +1717,58 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
+    fn an_unattestable_recorded_conversation_warns_at_launch() {
+        let root = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(root.path());
+        let codex_home = root.path().join("codex");
+        std::fs::create_dir_all(&codex_home).unwrap();
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("HOME", root.path().to_str().unwrap()),
+            ("CODEX_HOME", codex_home.to_str().unwrap()),
+        ]);
+        // Nothing here can attest a Codex execution identity.
+        let _codex = crate::session::test_support::install_login_shell_path_command(
+            root.path(),
+            "codex",
+            "#!/bin/sh\nexit 1\n",
+        );
+        let project = root.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let sid = "11111111-2222-4333-8444-555555555555";
+        let launch = |session_id: Option<&str>, intent: ResumeIntent| {
+            let mut inst = tool_instance("codex", project.to_str().unwrap());
+            inst.agent_session_id = session_id.map(str::to_owned);
+            inst.resume_intent = intent;
+            let capture = crate::session::test_support::LogCapture::start();
+            let _ = inst.prepare_launch_command(inst.conversation_state());
+            capture.contents()
+        };
+
+        let carried = launch(Some(sid), ResumeIntent::Default);
+        let warned = carried
+            .lines()
+            .find(|line| line.contains("WARN") && line.contains("no attestable execution context"))
+            .unwrap_or_else(|| panic!("no warning for the carried conversation:\n{carried}"));
+        assert!(warned.contains(sid), "the warning names the conversation");
+        assert!(!carried.contains("native execution unavailable"));
+
+        // A cleared launch still holds its stored id this early, so it must not warn.
+        for (session_id, label) in [(Some(sid), "cleared with a stored id"), (None, "fresh")] {
+            let quiet = launch(session_id, ResumeIntent::Cleared);
+            assert!(
+                !quiet.contains("no attestable execution context"),
+                "a {label} launch must stay quiet:\n{quiet}"
+            );
+            assert!(
+                quiet.lines().any(|line| line.contains("DEBUG")
+                    && line.contains("native execution unavailable; using native launch flags")),
+                "expected the debug line for a {label} launch:\n{quiet}"
+            );
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn migration_unattributed_pins_resume_against_configured_store() {
         let root = tempfile::tempdir().unwrap();
         let _app = crate::session::test_support::isolate_app_dir_at(&root.path().join("app"));
@@ -1800,22 +1863,21 @@ mod tests {
             );
             // A pin resumes its own conversation; a fork writes a new one.
             assert_eq!(command.contains("--fork-session"), forks, "{command}");
-            assert_eq!(
-                command.contains(&format!("--session-id {child}")),
-                forks,
-                "{command}"
-            );
+            assert_eq!(command.contains("--session-id"), forks, "{command}");
         }
 
         // An explicit pin still needs a binding that names its own
         // conversation, whatever its provenance.
         let mut foreign = pin.clone();
         foreign.resume_binding = Some(ConversationBinding::unknown(child));
+        let error = foreign
+            .prepare_launch_command(foreign.conversation_state())
+            .err()
+            .expect("a pin naming another conversation stays refused")
+            .to_string();
         assert!(
-            foreign
-                .prepare_launch_command(foreign.conversation_state())
-                .is_err(),
-            "a pin naming another conversation stays refused"
+            error.contains("conversation provenance is unknown"),
+            "{error}"
         );
 
         // Provenance that contradicts an attached execution identity is not
@@ -1824,11 +1886,14 @@ mod tests {
         let mut asserted = contradictory.asserted_resume_binding(parent, None).unwrap();
         asserted.provenance = crate::session::ConversationProvenance::Unknown;
         contradictory.resume_binding = Some(asserted);
+        let error = contradictory
+            .prepare_launch_command(contradictory.conversation_state())
+            .err()
+            .expect("a contradictory provenance stays refused")
+            .to_string();
         assert!(
-            contradictory
-                .prepare_launch_command(contradictory.conversation_state())
-                .is_err(),
-            "a contradictory provenance stays refused"
+            error.contains("has not been observed or explicitly asserted"),
+            "{error}"
         );
     }
 
@@ -1847,5 +1912,272 @@ mod tests {
         let mut row = row.clone();
         row.prepare_launch_command(row.conversation_state())
             .expect("a conversation migration left unattributed must resume")
+    }
+
+    /// A recorded store outranks `session.agent_config_dir`, so repointing the
+    /// entry switches the account for new sessions only. The launch has to say
+    /// so, or the edit is indistinguishable from doing nothing.
+    #[test]
+    #[serial_test::serial]
+    fn a_recorded_claude_store_overrides_a_repointed_agent_config_dir() {
+        let _app = crate::session::test_support::isolate_app_dir();
+        let stub = tempfile::tempdir().unwrap();
+        let _claude = crate::session::test_support::install_login_shell_path_command(
+            stub.path(),
+            "claude",
+            "#!/bin/sh\nexit 1\n",
+        );
+        let home = dirs::home_dir().unwrap();
+        let app = crate::session::get_app_dir().unwrap();
+        std::fs::create_dir_all(&app).unwrap();
+        let project = home.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let profile = crate::session::config::effective_profile("");
+        let _registry = crate::tmux::status_rules::ProfileRegistryGuard::take(&profile);
+        let sid = "11111111-2222-3333-4444-555555555555";
+        let declare = |store: &str| {
+            for root in [store, "source", "destination"] {
+                std::fs::create_dir_all(home.join(root)).unwrap();
+            }
+            std::fs::write(
+                app.join("config.toml"),
+                format!("[session.agent_config_dir]\nclaude = \"~/{store}\"\n"),
+            )
+            .unwrap();
+        };
+        let instance = || {
+            let mut inst = Instance::new("claude-store", project.to_str().unwrap());
+            inst.tool = "claude".into();
+            inst.command = "claude".into();
+            inst.source_profile = profile.clone();
+            inst
+        };
+        let resumed = |inst: &mut Instance, execution: crate::session::ExecutionBinding| {
+            let binding = crate::session::ConversationBinding {
+                session_id: sid.into(),
+                provenance: crate::session::ConversationProvenance::Asserted,
+                transcript_path: None,
+                execution: Some(execution),
+            };
+            inst.agent_session_id = Some(sid.into());
+            inst.agent_session_binding = Some(binding.clone());
+            inst.resume_intent = crate::session::ResumeIntent::Default;
+            let capture = crate::session::test_support::LogCapture::start();
+            let prepared = inst
+                .prepare_launch_command(inst.conversation_state())
+                .unwrap();
+            (prepared, capture.contents())
+        };
+
+        // The first launch attests the store the entry names.
+        declare("source");
+        let attested = instance().resolve_native_execution(None).unwrap();
+        assert_eq!(
+            attested.binding.stores[0],
+            home.join("source").canonicalize().unwrap()
+        );
+
+        // A real transcript in the recorded store, so the launch takes the
+        // resume path rather than starting a fresh conversation. Claude looks
+        // it up under the canonical working directory, not the stored one.
+        let transcript = home
+            .join("source/projects")
+            .join(crate::session::capture::encode_claude_project_path(
+                &crate::session::capture::canonicalize_or_raw(project.to_str().unwrap())
+                    .to_string_lossy(),
+            ))
+            .join(format!("{sid}.jsonl"));
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        std::fs::write(&transcript, "conversation\n").unwrap();
+
+        // Repointing the entry moves a targetless launch, so the divergence
+        // below is the recorded binding holding the store, not a stale config.
+        declare("destination");
+        let configured = home.join("destination").canonicalize().unwrap();
+        assert_eq!(
+            instance()
+                .resolve_native_execution(None)
+                .unwrap()
+                .binding
+                .stores[0],
+            configured
+        );
+
+        let (prepared, log) = resumed(&mut instance(), attested.binding.clone());
+        assert!(
+            prepared
+                .command
+                .as_deref()
+                .is_some_and(|command| command.contains(&format!("--resume {sid}"))),
+            "the conversation must still resume, in its recorded store"
+        );
+        let source = crate::session::instance::test_helpers::path_identity(&home.join("source"));
+        assert_eq!(
+            prepared.execution.as_ref().unwrap().binding.stores.first(),
+            Some(&source),
+            "the recorded store outranks the repointed entry"
+        );
+        // The resolver reports nothing itself: a restart resolves twice, so
+        // the launch is the only place that may emit.
+        assert_eq!(
+            prepared.execution.as_ref().unwrap().store_override.as_ref(),
+            Some(&(
+                source.clone(),
+                crate::session::instance::test_helpers::path_identity(&home.join("destination")),
+                "agent_config_dir"
+            )),
+            "the launch must name the store a new session would use and where it came from"
+        );
+        assert!(
+            !log.contains("launch_store="),
+            "resolution must stay silent so a restart cannot warn twice: {log}"
+        );
+
+        // Keyed on level, target and structured fields, not prose, so a
+        // reword cannot disarm them and a downgrade cannot hide the line.
+        let capture = crate::session::test_support::LogCapture::start();
+        let reporter = instance();
+        let reporting_id = reporter.id.clone();
+        reporter.report_store_override(prepared.execution.as_ref());
+        let line = capture.contents();
+        for expected in [
+            "WARN session.store:".to_string(),
+            // The line names the session that is reporting, so assert it on
+            // the instance that reports rather than on the one resolved.
+            format!("session={reporting_id}"),
+            format!("launch_store={}", source.display()),
+            format!(
+                "new_session_store={}",
+                crate::session::instance::test_helpers::path_identity(&home.join("destination"))
+                    .display()
+            ),
+            "new_session_store_source=agent_config_dir".to_string(),
+        ] {
+            assert!(line.contains(&expected), "{expected} missing from: {line}");
+        }
+
+        // A selector that cannot be resolved must not fail a launch the
+        // recorded store already decides, so the resume still goes through
+        // and nothing is reported.
+        let broken = home.join("broken");
+        std::os::unix::fs::symlink(home.join("absent"), &broken).unwrap();
+        std::fs::write(
+            app.join("config.toml"),
+            "[session.agent_config_dir]\nclaude = \"~/broken\"\n",
+        )
+        .unwrap();
+        let (unresolved, _) = resumed(&mut instance(), attested.binding.clone());
+        assert!(
+            unresolved
+                .command
+                .as_deref()
+                .is_some_and(|command| command.contains(&format!("--resume {sid}"))),
+            "a dangling selector must not block a recorded-store resume"
+        );
+        // It is still a divergence, and the one a user can act on: the
+        // launch is not on the store they wrote, so report that spelling.
+        let reported = unresolved
+            .execution
+            .as_ref()
+            .and_then(|execution| execution.store_override.as_ref())
+            .expect("an unresolvable selector is still a divergence")
+            .clone();
+        assert_eq!(reported.2, "agent_config_dir");
+        assert!(
+            reported.1.to_string_lossy().ends_with("broken"),
+            "the report must name the spelling the user wrote: {reported:?}"
+        );
+
+        // The other side of that bargain: with nothing recorded the selector
+        // does choose the root, so an unresolvable one must still refuse.
+        let bare = instance();
+        let refusal = match bare.resolve_native_execution(None) {
+            Err(refusal) => refusal,
+            Ok(_) => panic!("an unresolvable selector must refuse a launch it decides"),
+        };
+        let refusal = format!("{refusal:#}");
+        // The path, not the wording: it is this test's own input, and it is
+        // what a discarded error chain would take with it. Asserting the
+        // refusal's phrasing would couple this to a message in execution.rs
+        // that #4154 deliberately stopped freezing.
+        assert!(
+            refusal.contains(&*broken.to_string_lossy()),
+            "the refusal must keep the cause, which names the path: {refusal}"
+        );
+
+        // Same declaration as the recorded store: the common launch stays quiet.
+        declare("source");
+        let (uncontested, _) = resumed(&mut instance(), attested.binding.clone());
+        assert!(
+            uncontested
+                .execution
+                .as_ref()
+                .and_then(|execution| execution.store_override.as_ref())
+                .is_none(),
+            "an uncontested store must not be reported"
+        );
+
+        // A second spelling of the same directory is not a divergence: the
+        // entry is a symlink onto the store the conversation already uses.
+        let aliased = home.join("link");
+        std::os::unix::fs::symlink(&source, &aliased).unwrap();
+        declare("link");
+        let (spelled, _) = resumed(&mut instance(), attested.binding.clone());
+        assert!(
+            spelled
+                .execution
+                .as_ref()
+                .and_then(|execution| execution.store_override.as_ref())
+                .is_none(),
+            "a symlinked spelling of the recorded store must not be reported"
+        );
+
+        // The other two sources, which the guide tells a reader to key on:
+        // the session environment, then the default with nothing declared.
+        std::fs::write(app.join("config.toml"), "[session]\n").unwrap();
+        let env = EnvGuard::set(&[("CLAUDE_CONFIG_DIR", home.join("source"))]);
+        let (unreported, _) = resumed(&mut instance(), attested.binding.clone());
+        assert!(
+            unreported
+                .execution
+                .as_ref()
+                .and_then(|execution| execution.store_override.as_ref())
+                .is_none(),
+            "the environment naming the recorded store is not a divergence"
+        );
+        drop(env);
+        let other = home.join("elsewhere");
+        std::fs::create_dir_all(&other).unwrap();
+        let env = EnvGuard::set(&[("CLAUDE_CONFIG_DIR", &other)]);
+        let (from_env, _) = resumed(&mut instance(), attested.binding.clone());
+        assert_eq!(
+            from_env
+                .execution
+                .as_ref()
+                .and_then(|execution| execution.store_override.as_ref()),
+            Some(&(
+                crate::session::instance::test_helpers::path_identity(&source),
+                crate::session::instance::test_helpers::path_identity(&other),
+                "environment"
+            )),
+            "a session environment store must be named as the source"
+        );
+        drop(env);
+        // The session environment baselines on the process environment, so the
+        // default tier needs the variable removed, not merely undeclared.
+        let _env = EnvGuard::unset(&["CLAUDE_CONFIG_DIR"]);
+        let (from_default, _) = resumed(&mut instance(), attested.binding.clone());
+        assert_eq!(
+            from_default
+                .execution
+                .as_ref()
+                .and_then(|execution| execution.store_override.as_ref()),
+            Some(&(
+                crate::session::instance::test_helpers::path_identity(&source),
+                crate::session::instance::test_helpers::path_identity(&home.join(".claude")),
+                "default"
+            )),
+            "with no declaration and no environment the default store is the source"
+        );
     }
 }
