@@ -4,9 +4,11 @@
 //! store, and the renderer, which paints a snapshot the daemon published. This
 //! runs the real `aoe` binary twice per command against the *same* store — once
 //! with a daemon to answer, once with no daemon at all so the local command
-//! runs — and compares stdout byte for byte. A row, a glyph, a key or a
-//! timestamp that differs between the two shows up here as a diff, not as a
-//! note in someone's release notes.
+//! runs — and compares the exit code and both streams. A row, a glyph, a key
+//! or a timestamp that differs between the two shows up here as a diff, not as
+//! a note in someone's release notes. A command that *refuses* is compared the
+//! same way, because the refusal's exit code and its sentence are exactly the
+//! things a served read gets wrong.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -42,6 +44,32 @@ const COMMANDS: [&[&str]; 16] = [
     &["session", "show", "j-orphan"],
     &["session", "list-trash"],
 ];
+
+/// The commands a *refusing* read has to agree on too. A command that exits
+/// nonzero used to be unassertable here: `run_blocking` demanded success, so
+/// adding one of these panicked before anything was compared, and a command
+/// whose exit differs between the two transports could not be written down at
+/// all. The harness now carries the exit code beside both streams, so these
+/// are compared on exactly the same three fields as the succeeding rows above.
+///
+/// A one-character typo in a session id is the case this exists for: the local
+/// command exits 1 in the operator's own words, the served one exits 4 in
+/// `daemon read: <code>`, and nothing in the branch could see that they differ.
+const REFUSALS: [&[&str]; 3] = [
+    &["session", "show", "no-such-session"],
+    &["list", "-p", "ghost-profile"],
+    &["session", "show", "k-amb"],
+];
+
+/// One `aoe` invocation as the user sees it: the exit code and both streams.
+/// The three are what a refusal is made of, so they are what a comparison of a
+/// refusal has to be made of.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Run {
+    exit: i32,
+    stdout: String,
+    stderr: String,
+}
 
 /// The temporary home plus the environment binding that points both the
 /// daemon's own reads and the subprocesses at it, restored on drop.
@@ -303,6 +331,30 @@ fn fixture_sessions(home: &Path) -> Vec<serde_json::Value> {
             false,
             false,
         ),
+        // Two ids that share a prefix, so `session show k-amb` has more than
+        // one candidate and no full id tells the pair apart. No other fixture
+        // id starts with `k`, so the prefix is ambiguous on its own rather
+        // than one row among several. The local command prints the candidates;
+        // the served one refuses with `session_ambiguous` and discards them,
+        // which is only observable at all if the store holds the case.
+        row(
+            "k-amb-01",
+            idle,
+            "/srv/registered",
+            "",
+            "Ambiguous one",
+            false,
+            false,
+        ),
+        row(
+            "k-amb-02",
+            idle,
+            "/srv/registered",
+            "",
+            "Ambiguous two",
+            false,
+            false,
+        ),
     ];
     let mut rows: Vec<serde_json::Value> = rows;
     // A parent/child relation, spelled the way the store spells it.
@@ -396,13 +448,16 @@ fn daemon_instances() -> Vec<Instance> {
 /// The daemon lives in this process, so the command runs off the runtime's
 /// worker threads: a synchronous child would otherwise keep the task that
 /// answers the connection from ever being polled.
-async fn run(home: PathBuf, args: Vec<String>) -> String {
+async fn run(home: PathBuf, args: Vec<String>) -> Run {
     tokio::task::spawn_blocking(move || run_blocking(&home, &args))
         .await
         .expect("the command task joins")
 }
 
-fn run_blocking(home: &Path, args: &[String]) -> String {
+/// One invocation, whole. The exit code is carried rather than asserted: a
+/// command that refuses is a result the two transports have to agree on, and
+/// an assertion that it succeeded made such a command unwriteable here.
+fn run_blocking(home: &Path, args: &[String]) -> Run {
     let mut command = Command::new(env!("CARGO_BIN_EXE_aoe"));
     command
         .current_dir(home)
@@ -414,13 +469,50 @@ fn run_blocking(home: &Path, args: &[String]) -> String {
         .env_remove("AGENT_OF_EMPIRES_PROFILE")
         .args(args);
     let output = command.output().expect("the aoe binary runs");
-    assert!(
-        output.status.success(),
-        "`aoe {}` failed: {}",
-        args.join(" "),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8(output.stdout).expect("stdout is utf-8")
+    Run {
+        exit: output.status.code().unwrap_or(-1),
+        stdout: String::from_utf8(output.stdout).expect("stdout is utf-8"),
+        stderr: String::from_utf8(output.stderr).expect("stderr is utf-8"),
+    }
+}
+
+/// The whole comparison, as a value: what a served run and a local run for the
+/// same command must agree on, and where they do not. Returned rather than
+/// asserted so the harness's own coverage is testable — a comparison that
+/// quietly stopped looking at a command would otherwise be indistinguishable
+/// from one that passed.
+fn difference(args: &[String], served: &Run, local: &Run) -> Option<String> {
+    let label = args.join(" ");
+    if served.exit != local.exit {
+        return Some(format!(
+            "`aoe {label}` exits differently between the two transports:\n  served: {}\n  local:  {}\n  served stderr: {}\n  local stderr:  {}",
+            served.exit, local.exit, served.stderr, local.stderr,
+        ));
+    }
+    if served.stdout != local.stdout {
+        return Some(format!(
+            "`aoe {label}` differs between the two transports:\n  served: {}\n  local:  {}",
+            served.stdout, local.stdout,
+        ));
+    }
+    if served.stderr != local.stderr {
+        return Some(format!(
+            "`aoe {label}` reports differently between the two transports:\n  served: {}\n  local:  {}",
+            served.stderr, local.stderr,
+        ));
+    }
+    None
+}
+
+/// The assertion every command here ends in, refusing or not: the two
+/// transports must produce the same exit code and the same bytes on both
+/// streams. For a command that succeeds this is exactly the stdout equality
+/// the branch claims, with two more fields agreeing; for one that refuses it
+/// is the only assertion that can exist.
+fn assert_same(args: &[String], served: &Run, local: &Run) {
+    if let Some(difference) = difference(args, served, local) {
+        panic!("{difference}");
+    }
 }
 
 /// The two transports are the ones a user actually has: the local daemon's own
@@ -470,15 +562,24 @@ async fn one_directory_under_two_spellings_is_one_project_on_both_transports() {
             &["project", "list"],
             &["project", "list", "--scope", "profile", "--json"],
         ],
+        usize::MAX,
     )
     .await;
 }
 
 async fn compare_both_transports(fixture: &Fixture) {
-    compare_transports(fixture, &COMMANDS).await
+    let mut commands: Vec<&[&str]> = COMMANDS.to_vec();
+    commands.extend_from_slice(&REFUSALS);
+    compare_transports(fixture, &commands, COMMANDS.len()).await
 }
 
-async fn compare_transports(fixture: &Fixture, commands: &[&[&str]]) {
+/// `refusals_from` is the index at which the succeeding rows end; `usize::MAX`
+/// for a set with no refusal rows. Past it every row has to have actually
+/// refused on the served pass: a "refusal" that succeeded would be compared on
+/// stdout alone and would pass whether or not the two transports agreed about
+/// the refusal, which is exactly the gap this row set exists to close.
+
+async fn compare_transports(fixture: &Fixture, commands: &[&[&str]], refusals_from: usize) {
     let xdg_base = fixture.path().join(".config");
     let state = build_test_app_state_with_policy(
         daemon_instances(),
@@ -489,13 +590,21 @@ async fn compare_transports(fixture: &Fixture, commands: &[&[&str]]) {
     let shutdown = state.shutdown.clone();
     let home = fixture.path().to_path_buf();
 
-    let mut served: Vec<(Vec<String>, String)> = Vec::new();
+    let mut served: Vec<(Vec<String>, Run)> = Vec::new();
     {
         let daemon = RuntimeUdsTestServer::start_in(&xdg_base, state)
             .expect("the fixture home is a trusted namespace");
-        for args in commands {
+        for (index, args) in commands.iter().enumerate() {
             let args: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
-            served.push((args.clone(), run(home.clone(), args).await));
+            let result = run(home.clone(), args.clone()).await;
+            if index >= refusals_from {
+                assert_ne!(
+                    result.exit, 0,
+                    "`aoe {}` is a refusal row but exited 0, so nothing about the refusal was compared",
+                    args.join(" ")
+                );
+            }
+            served.push((args, result));
         }
         // The pass above is only worth comparing if it was served at all. With
         // the store emptied out from under the client, a local read would answer
@@ -511,8 +620,9 @@ async fn compare_transports(fixture: &Fixture, commands: &[&[&str]]) {
         let without_a_store = run(home.clone(), vec!["list".to_string()]).await;
         std::fs::write(&sessions, &store).expect("restore the store");
         assert!(
-            without_a_store.contains("long-session"),
-            "the served pass answered from the local store, not from the daemon:\n{without_a_store}"
+            without_a_store.stdout.contains("long-session"),
+            "the served pass answered from the local store, not from the daemon:\n{}",
+            without_a_store.stdout
         );
 
         // Shutdown retracts the publication, so the second pass really does
@@ -523,12 +633,7 @@ async fn compare_transports(fixture: &Fixture, commands: &[&[&str]]) {
 
     for (args, expected) in served {
         let local = run(home.clone(), args.clone()).await;
-        assert_eq!(
-            expected,
-            local,
-            "`aoe {}` differs between the two transports",
-            args.join(" ")
-        );
+        assert_same(&args, &expected, &local);
     }
 }
 
@@ -590,4 +695,54 @@ async fn the_named_home_produces_the_same_bytes_on_both_transports() {
     std::fs::create_dir_all(&home).expect("the named home");
     let fixture = Fixture::seed(home, None);
     compare_both_transports(&fixture).await;
+}
+
+/// The comparison itself, checked. Two in-session reviews found the same gap
+/// in this file — a command that refuses could not be compared at all — so the
+/// refusal rows are only worth anything if the comparison notices when two
+/// refusals differ. This is what pins that: a differing exit code, a differing
+/// sentence and a differing stdout are each reported, and identical runs are
+/// not.
+#[test]
+fn a_differing_refusal_is_reported_not_swallowed() {
+    let args: Vec<String> = ["session", "show", "no-such-session"]
+        .iter()
+        .map(|arg| arg.to_string())
+        .collect();
+    let refusal = Run {
+        exit: 4,
+        stdout: String::new(),
+        stderr: "daemon read: session_missing\n".to_string(),
+    };
+    assert_eq!(difference(&args, &refusal, &refusal), None);
+    let other_exit = Run {
+        exit: 1,
+        ..refusal.clone()
+    };
+    assert!(
+        difference(&args, &refusal, &other_exit)
+            .expect("a differing exit code is a difference")
+            .contains("exits differently"),
+        "the exit code must be part of the comparison"
+    );
+    let other_sentence = Run {
+        stderr: "No sessions found matching 'no-such-session'.\n".to_string(),
+        ..refusal.clone()
+    };
+    assert!(
+        difference(&args, &refusal, &other_sentence)
+            .expect("a differing sentence is a difference")
+            .contains("reports differently"),
+        "the refusal's own sentence must be part of the comparison"
+    );
+    let other_stdout = Run {
+        stdout: "a row".to_string(),
+        ..refusal.clone()
+    };
+    assert!(
+        difference(&args, &refusal, &other_stdout)
+            .expect("a differing stdout is a difference")
+            .contains("differs between the two transports"),
+        "stdout must stay part of the comparison"
+    );
 }

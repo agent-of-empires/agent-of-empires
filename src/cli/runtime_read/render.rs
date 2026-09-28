@@ -806,7 +806,7 @@ fn json_lines<T: Serialize>(value: &T) -> Result<String, ReadFailure> {
 fn render_json(rendered: serde_json::Result<String>) -> Result<String, ReadFailure> {
     rendered
         .map(|value| format!("{value}\n"))
-        .map_err(|_| ReadFailure::exit(1, "daemon read: renderer_internal\n"))
+        .map_err(|_| ReadFailure::exit_const(1, "daemon read: renderer_internal\n"))
 }
 
 /// The local verbose listing collapses a path under the owner's home, and only

@@ -140,7 +140,14 @@ const RENDERER_INTERNAL: &str = "renderer_internal";
 pub(crate) struct ReadFailure {
     code: &'static str,
     exit: i32,
-    exact: Option<&'static str>,
+    /// The sentence the renderer prints, when the refusal is the user's to
+    /// read rather than a wire code. Owned text, not a `&'static str`, for the
+    /// same reason the producer half owns its detail
+    /// (`server::runtime_uds::PublishError`): a refusal that has to name the
+    /// path it refused, or the candidates that would resolve it, cannot say so
+    /// out of a constant. The code stays `&'static str` — it is a member of
+    /// the Contract Pack's code set, and the set is compile-time.
+    exact: Option<String>,
     attempt_close: bool,
 }
 
@@ -173,7 +180,18 @@ impl ReadFailure {
     /// A refusal whose exit the renderer chooses: a user-facing message that is
     /// not a wire failure. The code stays the renderer's own, so the pack can
     /// still tell an internal fault (exit 1) from a refusal (exit 2).
-    pub(crate) fn exit(exit: i32, message: &'static str) -> Self {
+    pub(crate) fn exit(exit: i32, message: impl Into<String>) -> Self {
+        Self::exit_with(exit, message.into())
+    }
+
+    /// The same refusal from a constant, for the callers whose sentence is
+    /// fixed at compile time. One spelling, so there is a single construction
+    /// path and the owned field has exactly one writer.
+    pub(crate) fn exit_const(exit: i32, message: &'static str) -> Self {
+        Self::exit_with(exit, message.to_string())
+    }
+
+    fn exit_with(exit: i32, message: String) -> Self {
         Self {
             code: RENDERER_INTERNAL,
             exit,
@@ -196,10 +214,10 @@ pub struct ReadOutcome {
 
 impl From<ReadFailure> for ReadOutcome {
     fn from(error: ReadFailure) -> Self {
-        let message = error
-            .exact
-            .map(str::to_string)
-            .unwrap_or_else(|| format!("daemon read: {}\n", error.code));
+        let message = match error.exact {
+            Some(exact) => exact,
+            None => format!("daemon read: {}\n", error.code),
+        };
         Self {
             stdout: None,
             stderr: Some(message),
@@ -527,7 +545,7 @@ where
             return Err(ReadFailure {
                 code: error.code,
                 exit: error.exit,
-                exact: error.exact,
+                exact: error.exact.clone(),
                 attempt_close: false,
             });
         }
