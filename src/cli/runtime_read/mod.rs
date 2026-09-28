@@ -164,6 +164,17 @@ impl ReadFailure {
         Self::refusal(code, 4, false)
     }
 
+    /// A pre-admission refusal that says what to fix. The walk's refusal has
+    /// to name the component it refused, the mode it found and the command
+    /// that clears it, and none of that is a constant — the same reason
+    /// [`ReadFailure::exit`] owns its text. The code and the exit are exactly
+    /// the ones the refusal already carried, so saying more cannot widen it:
+    /// a diagnosis is not an admission.
+    pub(crate) fn pre_exact(code: &'static str, message: impl Into<String>) -> Self {
+        let mut failure = Self::refusal(code, 2, false);
+        failure.exact = Some(message.into());
+        failure
+    }
     fn refusal(code: &'static str, exit: i32, attempt_close: bool) -> Self {
         debug_assert!(
             EMITTABLE_CODES.contains(&code),
@@ -184,6 +195,20 @@ impl ReadFailure {
         Self::exit_with(exit, message.into())
     }
 
+    /// A refusal on the user's own state that keeps its own code. The three
+    /// user-input refusals (`profile_missing`, `session_missing`,
+    /// `session_ambiguous`) are not wire failures, so what they carry is the
+    /// local path's exit (1) and the local path's sentence — but the code is
+    /// still what says *which* refusal this was, so a caller can tell a
+    /// missing profile from a missing session from an internal fault. The code
+    /// is checked against the emittable set exactly as every other constructor
+    /// checks it.
+    pub(crate) fn refuse(code: &'static str, exit: i32, message: impl Into<String>) -> Self {
+        let mut failure = Self::refusal(code, exit, true);
+        failure.exact = Some(message.into());
+        failure
+    }
+
     /// The same refusal from a constant, for the callers whose sentence is
     /// fixed at compile time. One spelling, so there is a single construction
     /// path and the owned field has exactly one writer.
@@ -192,12 +217,7 @@ impl ReadFailure {
     }
 
     fn exit_with(exit: i32, message: String) -> Self {
-        Self {
-            code: RENDERER_INTERNAL,
-            exit,
-            exact: Some(message),
-            attempt_close: true,
-        }
+        Self::refuse(RENDERER_INTERNAL, exit, message)
     }
 
     pub(crate) fn code(&self) -> &str {

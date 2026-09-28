@@ -256,6 +256,14 @@ const TABLE: &[(&str, &[&str], &[u8])] = &[
         &[4],
     ),
     ("snapshot", &["schema_invalid"], &[4]),
+    // `health_degraded`, `freshness_unavailable` and `default_missing` are
+    // facts the exchange could not establish, so they leave 4. The three below
+    // them are refusals on the user's own state — a profile the store does not
+    // have, a session it does not, an identifier that names several — so the
+    // local command has always left 1 for them and the served half leaves the
+    // same 1, which is the exit the parity gate compares. A refusal on the
+    // user's own state is not a wire failure, so the row admits 1 as well as
+    // 4 rather than describing an exit nothing emits.
     (
         "semantic",
         &[
@@ -266,7 +274,7 @@ const TABLE: &[(&str, &[&str], &[u8])] = &[
             "session_missing",
             "session_ambiguous",
         ],
-        &[4],
+        &[1, 4],
     ),
     ("close", &["close_timeout"], &[4]),
     // The renderer chooses the exit itself: an internal fault leaves 1, and a

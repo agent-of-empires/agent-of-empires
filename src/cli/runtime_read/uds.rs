@@ -1,9 +1,10 @@
-use std::ffi::CString;
+use std::ffi::{CString, OsStr};
 use std::fs::File;
 use std::io::Read;
 use std::mem::MaybeUninit;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -29,6 +30,58 @@ const RETRY_INTERVAL: Duration = Duration::from_millis(50);
 pub(crate) enum TrustedPathError {
     Missing,
     Invalid,
+    /// A component of the walk that resolved and was still refused, with
+    /// everything the refusal has to say about it. The variant exists so the
+    /// operator is told *which* directory and *what* to do about it: the
+    /// refusal itself is unchanged, it only stops being silent.
+    Refused(RefusedComponent),
+}
+
+/// One refused directory of the walk, and the sentence the operator gets.
+///
+/// The path is the component as the walk reached it, the mode is the one read
+/// off the descriptor, and the remedy is the command that clears this
+/// particular cause. Both are static because they are the walk's own rules:
+/// there is a closed set of reasons a component can be refused for, and each
+/// one has one fix.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RefusedComponent {
+    path: PathBuf,
+    mode: String,
+    cause: &'static str,
+    remedy: &'static str,
+}
+
+impl RefusedComponent {
+    fn new(path: &Path, mode: u32, cause: &'static str, remedy: &'static str) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            mode: format!("{mode:04o}"),
+            cause,
+            remedy,
+        }
+    }
+
+    /// The refusal as the operator reads it: what was refused, what is wrong
+    /// with it, and the one command that fixes it. The mode is printed as
+    /// octal because that is the only spelling `chmod` accepts.
+    fn message(&self) -> String {
+        format!(
+            "refused to read the daemon's runtime state: {} is {} (mode {}).\n\
+             Fix it with: {}\n",
+            self.path.display(),
+            self.cause,
+            self.mode,
+            self.remedy
+                .replace("{path}", &shell_word(&self.path.to_string_lossy())),
+        )
+    }
+}
+
+/// A path quoted for the shell the remedy is typed into, so a home with a
+/// space in it is still one word.
+fn shell_word(value: &str) -> String {
+    format!("'{}'", value.replace('\'', r"'\''"))
 }
 
 pub(crate) struct OwnedNamespace {
@@ -179,6 +232,12 @@ fn trusted_path_failure(error: TrustedPathError) -> ReadFailure {
     match error {
         TrustedPathError::Missing => ReadFailure::pre("marker_missing"),
         TrustedPathError::Invalid => ReadFailure::pre("marker_invalid"),
+        // The same code and the same exit, with the operator's own sentence
+        // under them: the walk is not admitting anything it refused before, it
+        // is only saying which directory and which fix.
+        TrustedPathError::Refused(component) => {
+            ReadFailure::pre_exact("marker_invalid", component.message())
+        }
     }
 }
 
@@ -215,7 +274,7 @@ pub(crate) fn open_trusted_directory(path: &Path, euid: u32) -> Result<OwnedFd, 
         return Err(TrustedPathError::Invalid);
     }
     let root = open_dir(Path::new("/"))?;
-    validate_directory_stat(&root, euid, false, true)?;
+    validate_directory_stat(&root, euid, false, true, Path::new("/"))?;
     let components: Vec<CString> = path
         .components()
         .skip(1)
@@ -230,8 +289,13 @@ pub(crate) fn open_trusted_directory(path: &Path, euid: u32) -> Result<OwnedFd, 
 
     let mut current = root;
     let count = components.len();
+    // The path of the component the cursor is on, rebuilt as the walk
+    // descends, so a refusal names the directory that was refused rather than
+    // the walk it was refused in.
+    let mut walked = PathBuf::from("/");
     for (index, component) in components.into_iter().enumerate() {
         let final_component = index + 1 == count;
+        walked.push(Path::new(OsStr::from_bytes(component.as_bytes())));
         // A component that does not exist means the app directory does not
         // exist, wherever in the chain it is: a fresh home has no
         // `~/.local` to hold one. Every other errno keeps its own class, so
@@ -242,7 +306,7 @@ pub(crate) fn open_trusted_directory(path: &Path, euid: u32) -> Result<OwnedFd, 
                 if error.raw_os_error() == Some(libc::ENOENT) {
                     TrustedPathError::Missing
                 } else {
-                    TrustedPathError::Invalid
+                    unopenable_component(&walked, &error)
                 }
             })?;
         // Every component that resolves is verified by descriptor, whichever
@@ -250,10 +314,41 @@ pub(crate) fn open_trusted_directory(path: &Path, euid: u32) -> Result<OwnedFd, 
         // group/other-write allowance, the sticky-root ancestor rule and the
         // POSIX ACL are all read off the opened directory, never off the
         // path.
-        validate_directory_stat(&next, euid, final_component, true)?;
+        validate_directory_stat(&next, euid, final_component, true, &walked)?;
         current = next;
     }
     Ok(current)
+}
+
+/// A component that exists but could not be opened is a refusal, and the
+/// errno says which one: each of these has its own fix, and the operator is
+/// the one who has to apply it.
+fn unopenable_component(path: &Path, error: &std::io::Error) -> TrustedPathError {
+    let (cause, remedy) = match error.raw_os_error() {
+        Some(libc::ELOOP) => (
+            "a symlink, and the app directory may not be one",
+            "rm {path} && mkdir -p {path}",
+        ),
+        Some(libc::ENOTDIR) => (
+            "not a directory, where the walk needs one",
+            "rm {path} && mkdir -p {path}",
+        ),
+        Some(libc::EACCES) | Some(libc::EPERM) => (
+            "not readable or searchable by this user",
+            "chmod u+rwx {path}",
+        ),
+        _ => (
+            "not a directory this user may open",
+            "chown $(id -u) {path} && chmod u+rwx {path}",
+        ),
+    };
+    // The mode is read from the name itself, which is what the operator sees
+    // when they run `ls -ld`; a name that resolves to nothing usable has no
+    // better spelling than that.
+    let mode = std::fs::symlink_metadata(path)
+        .map(|meta| meta.permissions().mode() & 0o7777)
+        .unwrap_or(0);
+    TrustedPathError::Refused(RefusedComponent::new(path, mode, cause, remedy))
 }
 
 fn open_dir(path: &Path) -> Result<OwnedFd, TrustedPathError> {
@@ -296,28 +391,74 @@ fn fd_to_owned(fd: RawFd) -> std::io::Result<OwnedFd> {
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
+/// Verify one component of the walk by descriptor, naming the component and
+/// the fix in every refusal it raises.
+///
+/// `path` is the component as the walk reached it, which is what the operator
+/// can act on: the same directory reached through a symlinked prefix is
+/// reported at the path the walk took, because that is the one they can
+/// `chmod`.
 fn validate_directory_stat(
     file: &OwnedFd,
     euid: u32,
     final_component: bool,
     root_check: bool,
+    path: &Path,
 ) -> Result<(), TrustedPathError> {
     let stat = fstat(file.as_raw_fd())?;
-    if !directory_stat(&stat) || !group_other_writes_allowed(&stat, final_component) {
-        return Err(TrustedPathError::Invalid);
+    let mode = stat.st_mode & 0o7777;
+    if !directory_stat(&stat) {
+        return Err(TrustedPathError::Refused(RefusedComponent::new(
+            path,
+            mode,
+            "not a directory",
+            "rm {path} && mkdir -p {path}",
+        )));
+    }
+    if !group_other_writes_allowed(&stat, final_component) {
+        return Err(TrustedPathError::Refused(RefusedComponent::new(
+            path,
+            mode,
+            "writable by its group or by others",
+            "chmod go-w {path}",
+        )));
     }
     if root_check {
-        let root = stat.st_mode & 0o111 != 0;
-        let owner = if final_component {
+        let searchable = stat.st_mode & 0o111 != 0;
+        if !searchable {
+            return Err(TrustedPathError::Refused(RefusedComponent::new(
+                path,
+                mode,
+                "not searchable by its own owner",
+                "chmod u+x {path}",
+            )));
+        }
+        let owned = if final_component {
             stat.st_uid == euid
         } else {
             stat.st_uid == 0 || stat.st_uid == euid
         };
-        if !root || !owner {
-            return Err(TrustedPathError::Invalid);
+        if !owned {
+            return Err(TrustedPathError::Refused(RefusedComponent::new(
+                path,
+                mode,
+                "owned by another user",
+                "chown $(id -u) {path}",
+            )));
         }
     }
-    validate_posix_acl(file.as_raw_fd())?;
+    // The ACL check reports a named user or group holding a write the mode
+    // does not show, so the mode alone cannot explain this refusal; the
+    // component and its mode are still printed, because they are what tells
+    // the operator which directory now carries one.
+    validate_posix_acl(file.as_raw_fd()).map_err(|_| {
+        TrustedPathError::Refused(RefusedComponent::new(
+            path,
+            mode,
+            "carrying a POSIX ACL that grants a named user or group write access",
+            "setfacl -b {path}",
+        ))
+    })?;
     Ok(())
 }
 
@@ -1073,7 +1214,7 @@ mod tests {
         std::fs::create_dir(&world_child).expect("create");
         assert!(matches!(
             open_trusted_directory(&world_child, euid),
-            Err(TrustedPathError::Invalid)
+            Err(TrustedPathError::Refused(_))
         ));
     }
 
@@ -1109,7 +1250,7 @@ mod tests {
         assert!(
             matches!(
                 open_trusted_directory(&link.join("app-dir"), euid),
-                Err(TrustedPathError::Invalid)
+                Err(TrustedPathError::Refused(_))
             ),
             "a world-writable directory behind a symlink is still refused"
         );
@@ -1123,7 +1264,7 @@ mod tests {
         std::os::unix::fs::symlink(&target, &file_link).expect("file symlink");
         assert!(matches!(
             open_trusted_directory(&file_link.join("app-dir"), euid),
-            Err(TrustedPathError::Invalid)
+            Err(TrustedPathError::Refused(_))
         ));
 
         // And the final component is still pinned by O_NOFOLLOW.
@@ -1131,8 +1272,47 @@ mod tests {
         std::os::unix::fs::symlink(&app, &app_link).expect("app symlink");
         assert!(matches!(
             open_trusted_directory(&app_link, euid),
-            Err(TrustedPathError::Invalid)
+            Err(TrustedPathError::Refused(_))
         ));
+    }
+
+    /// A refused path has to say which directory it refused, what is wrong
+    /// with it and what clears it. The refusal itself is unchanged — same
+    /// code, same exit, still no admission — but `daemon read: marker_invalid`
+    /// names nothing an operator can act on, and the walk already knows the
+    /// component, its mode and the rule it broke.
+    #[test]
+    fn a_refused_component_names_its_path_its_mode_and_its_remedy() {
+        let euid = unsafe { libc::geteuid() };
+        let base = tempfile::tempdir().expect("temp base");
+        let app = base.path().join("app-dir");
+        std::fs::create_dir(&app).expect("create");
+        let mut permissions = std::fs::metadata(&app).expect("stat").permissions();
+        permissions.set_mode(0o770);
+        std::fs::set_permissions(&app, permissions).expect("chmod");
+
+        let failure =
+            trusted_path_failure(open_trusted_directory(&app, euid).expect_err("0770 refuses"));
+        assert_eq!(
+            failure.code(),
+            "marker_invalid",
+            "the refusal keeps its code; a diagnosis is not a different answer"
+        );
+        let outcome = super::super::ReadOutcome::from(failure);
+        let stderr = outcome.stderr.expect("a refusal always says something");
+        assert!(
+            stderr.contains(&app.display().to_string()),
+            "the refusal must name the path the operator has to fix: {stderr}"
+        );
+        assert!(
+            stderr.contains("0770"),
+            "the refusal must name the mode it found: {stderr}"
+        );
+        assert!(
+            stderr.contains(&format!("chmod go-w '{}'", app.display())),
+            "the refusal must name the command that clears this cause: {stderr}"
+        );
+        assert_eq!(outcome.exit, 2, "the refusal keeps its exit");
     }
 
     /// `/tmp` is world-writable and sticky, and the walk must still pass

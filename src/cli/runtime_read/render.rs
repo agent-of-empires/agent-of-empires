@@ -58,26 +58,71 @@ fn selected_profile<'a>(
 ) -> Result<&'a str, ReadFailure> {
     let selected = match selected_profile_source(source) {
         ProfileSource::Explicit(value) => value,
-        ProfileSource::Environment(value) => {
-            let value = value
-                .to_str()
-                .ok_or_else(|| ReadFailure::post("profile_missing"))?;
-            value
-        }
+        ProfileSource::Environment(value) => value.to_str().ok_or_else(|| {
+            // The local path reaches clap for this one (`main.rs` refuses an
+            // `AGENT_OF_EMPIRES_PROFILE` that is not UTF-8), and clap's exit
+            // is 2, so the served refusal leaves 2 as well rather than
+            // reporting a wire failure for the operator's own variable.
+            ReadFailure::exit(2, "error: AGENT_OF_EMPIRES_PROFILE must be valid UTF-8\n")
+        })?,
         ProfileSource::Default => snapshot
             .default_profile
             .as_deref()
             .ok_or_else(|| ReadFailure::post("default_missing"))?,
     };
     if selected.is_empty() {
-        return Err(ReadFailure::post("profile_missing"));
+        // `session::validate_profile_name` refuses an empty name with this
+        // exact sentence on the local path, and exits 1 for it.
+        return Err(ReadFailure::exit(
+            1,
+            "Error: Profile name cannot be empty\n",
+        ));
     }
     snapshot
         .profiles
         .iter()
         .find(|profile| profile.name == selected)
         .map(|profile| profile.name.as_str())
-        .ok_or_else(|| ReadFailure::post("profile_missing"))
+        .ok_or_else(|| profile_absent(selected))
+}
+
+/// A profile name the store does not have, refused the way the local command
+/// refuses it (`session::resolve_existing_profile`): exit 1, and the
+/// operator's own sentence including the half that tells them what to do
+/// next. This is the user's own state rather than a wire failure, so it is
+/// not a `daemon read: <code>` — the same mechanism the tmux refusals in this
+/// file use, and the same exit the local path leaves.
+fn profile_absent(name: &str) -> ReadFailure {
+    ReadFailure::refuse(
+        "profile_missing",
+        1,
+        format!(
+            "Error: Profile '{name}' does not exist. Create it with: aoe profile create {name}\n"
+        ),
+    )
+}
+
+/// An id prefix that names more than one session, refused with the local
+/// resolver's own sentence (`cli::resolve_session`): the candidate list is
+/// the only thing the operator can act on, and the order and the spelling are
+/// the local path's, sorted the way it sorts them, so the two transports say
+/// the same words about the same ambiguity.
+fn ambiguous_prefix(identifier: &str, candidates: &[&SessionRead]) -> ReadFailure {
+    let mut lines: Vec<String> = candidates
+        .iter()
+        .map(|session| format!("  {} ({})", session.id, session.title))
+        .collect();
+    lines.sort();
+    ReadFailure::refuse(
+        "session_ambiguous",
+        1,
+        format!(
+            "Error: Ambiguous session identifier {identifier:?} matches {} sessions:\n{}\n\
+             Use a longer prefix or the full ID.\n",
+            candidates.len(),
+            lines.join("\n")
+        ),
+    )
 }
 
 fn render_list(
@@ -483,7 +528,7 @@ fn find_session<'a>(
     if !prefix.is_empty() {
         return match prefix.as_slice() {
             [only] => Ok(*only),
-            _ => Err(ReadFailure::post("session_ambiguous")),
+            _ => Err(ambiguous_prefix(identifier, &prefix)),
         };
     }
     // The local resolver takes the **first** title match and the first
@@ -505,7 +550,13 @@ fn find_session<'a>(
     {
         return Ok(session);
     }
-    Err(ReadFailure::post("session_missing"))
+    // `cli::resolve_session`'s own sentence, and the local path's exit: this is
+    // the user's own state, not a wire failure.
+    Err(ReadFailure::refuse(
+        "session_missing",
+        1,
+        format!("Error: Session not found: {identifier}\n"),
+    ))
 }
 
 fn render_trash(
@@ -746,7 +797,7 @@ fn profile<'a>(snapshot: &'a SnapshotData, name: &str) -> Result<&'a ProfileRead
         .profiles
         .iter()
         .find(|profile| profile.name == name)
-        .ok_or_else(|| ReadFailure::post("profile_missing"))
+        .ok_or_else(|| profile_absent(name))
 }
 
 fn sessions_for_profile<'a>(
@@ -1101,20 +1152,34 @@ mod tests {
     }
 
     /// An ambiguous id prefix is the one ambiguity the local path refuses, and
-    /// it stays refused here.
+    /// it stays refused here — with the candidates. `cli::resolve_session`
+    /// lists them and says how to resolve the pair, and that list is the only
+    /// thing an operator can act on, so a refusal that dropped it would leave
+    /// them with a code and nothing to do. The order is the local path's, and
+    /// the snapshot hands them over unsorted on purpose.
     #[test]
-    fn an_ambiguous_id_prefix_is_refused_on_both_sides() {
-        let value = snapshot(vec![
-            session("a1", WireStatus::Idle),
-            session("a2", WireStatus::Idle),
-        ]);
+    fn an_ambiguous_id_prefix_is_refused_with_the_candidates() {
+        let mut first = session("a1", WireStatus::Idle);
+        first.title = "First".into();
+        let mut second = session("a2", WireStatus::Idle);
+        second.title = "Second".into();
+        let value = snapshot(vec![second, first]);
         let args = ShowArgs {
             identifier: Some("a".into()),
             json: false,
         };
         let failure =
             render_show(&args, &value, &source()).expect_err("an ambiguous prefix is refused");
-        assert_eq!(failure.code(), "session_ambiguous");
+        let outcome = super::super::ReadOutcome::from(failure);
+        assert_eq!(outcome.exit, 1, "the local path exits 1 for this refusal");
+        assert_eq!(
+            outcome.stderr.as_deref(),
+            Some(
+                "Error: Ambiguous session identifier \"a\" matches 2 sessions:\n  \
+                 a1 (First)\n  a2 (Second)\nUse a longer prefix or the full ID.\n"
+            ),
+            "the refusal must carry the local path's own candidates, in its order"
+        );
     }
 
     /// A parent that names no row is printed as the bare id, the way the local
