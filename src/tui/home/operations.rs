@@ -1849,6 +1849,10 @@ impl HomeView {
     /// CLI `empty-trash`, with force removal so a dirty worktree can't keep a
     /// row pinned.
     pub(super) fn empty_trash_all(&mut self) {
+        if let Some(reason) = self.local_write_block() {
+            self.refuse_local_write(reason);
+            return;
+        }
         let mut trashed: Vec<Instance> = self
             .instances
             .values()

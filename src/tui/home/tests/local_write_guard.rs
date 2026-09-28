@@ -344,3 +344,31 @@ fn restore_refuses_while_the_runtime_owns_the_rows() {
     );
     assert_eq!(info_title(&view), Some("Read-only"));
 }
+
+#[test]
+#[serial_test::serial]
+fn empty_trash_refuses_while_the_runtime_owns_the_rows() {
+    // Emptying the trash builds its own deletion requests instead of going
+    // through `delete_selected`, so it needs the guard of its own: without it
+    // the action still purges a canonical session the guard declares read-only.
+    let temp = TempDir::new().unwrap();
+    let _guard = setup_test_home(&temp);
+    let (mut view, id) = attached_runtime_view(|row| row.trash());
+
+    view.empty_trash_all();
+
+    assert_eq!(
+        disk_trashed_ids(),
+        vec![id.clone()],
+        "the durable row must still be marked trashed"
+    );
+    assert!(
+        view.get_instance(&id).is_some_and(|row| row.is_trashed()),
+        "the row must stay trashed in the view"
+    );
+    assert_eq!(
+        info_title(&view),
+        Some("Read-only"),
+        "a refused bulk purge must say so, not purge quietly"
+    );
+}
