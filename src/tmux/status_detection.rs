@@ -2945,6 +2945,64 @@ Final prose line.\n";
     }
 
     #[test]
+    fn test_detect_omp_status_waiting_on_standard_confirmation() {
+        let unicode = "\
+╭─ Confirm operation ─────────────────────────────────────╮
+│                                                         │
+│  ❯ Yes                                                  │
+│    No                                                   │
+│                                                         │
+│ ↑/↓ navigate  ⏎ select  ⎋ cancel                        │
+│                                                         │
+╰─────────────────────────────────────────────────────────╯";
+        let ascii = "\
++-- Continue? ---------------------------------------------+
+| > Yes                                                   |
+|   No                                                    |
+| up/down navigate  enter select  esc cancel             |
++---------------------------------------------------------+";
+        let composer = "╭── π > GPT-6-Sol ─╮\n╰─ ─╯";
+        let cases = [
+            ("live unicode", unicode.to_string(), Status::Waiting),
+            (
+                "live selector above blocked status band",
+                format!("{unicode}\n  ⎋ Waiting\n╭── ⠋ 16s > model status ─╮\n╰─"),
+                Status::Waiting,
+            ),
+            (
+                "new turn after selector",
+                format!("{unicode}\n  ⎋ Working…\n╭── ⠋ 16s > model status ─╮\n╰─"),
+                Status::Running,
+            ),
+            ("live ascii", ascii.to_string(), Status::Waiting),
+            (
+                "answered selector",
+                format!("{unicode}\n{composer}"),
+                Status::Idle,
+            ),
+            (
+                "running after selection",
+                format!("{unicode}\n⠸ Working… ⟦esc⟧\n{composer}"),
+                Status::Running,
+            ),
+            (
+                "unrelated yes/no prose",
+                format!("Yes or No?\n{composer}"),
+                Status::Idle,
+            ),
+            (
+                "incomplete selector",
+                "╭─ Confirm operation ─╮\n│ ❯ Yes │\n│ ↑/↓ navigate  ⏎ select  ⎋ cancel │\n╰─────╯"
+                    .to_string(),
+                Status::Idle,
+            ),
+        ];
+        for (name, pane, expected) in cases {
+            assert_eq!(detect_omp_status(&pane), expected, "case: {name}");
+        }
+    }
+
+    #[test]
     fn test_detect_omp_status_running_loaders() {
         let box_unicode = "╭── π ─╮\n╰─ ─╯";
         let box_ascii = "+-- pi ---+\n+- -------+";

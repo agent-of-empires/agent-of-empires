@@ -69,7 +69,7 @@ pub fn install_kiro_hooks_with_events(
             // Kiro has no stdin tool gate, so the plain status writer is used.
             let identity = event
                 .identity_field
-                .map(|field| hook_command_session_id(target, field));
+                .map(|field| hook_command_session_id(target, field, event.publisher));
             let status = event
                 .status
                 .map(|status| hook_command(status.as_str(), target));

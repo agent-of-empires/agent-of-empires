@@ -212,22 +212,26 @@ pub(crate) enum SendTurnError {
 
 /// Outcome of [`SessionService::touch_and_wake_on_prompt`].
 pub(crate) enum PromptTouch {
-    /// Touched (and woken, if archived/snoozed/idle-dormant); carries
+    /// Touched (and woken, if snoozed/idle-dormant); carries
     /// whether this specifically was the idle-dormant wake, the flag
     /// `prompt_dispatch_under_submission` and `send_turn` need.
     Touched { idle_dormant: bool },
-    /// `no_revive` was set and the session needed archived/snoozed/
-    /// idle-dormant revival to accept this prompt; refused before any
-    /// mutation.
+    /// `no_revive` was set and the session needed snoozed/idle-dormant
+    /// revival to accept this prompt; refused before any mutation.
     RevivalRefused,
+    /// The session is archived or trashed; refused before any mutation.
+    Blocked(crate::session::StartBlocked),
 }
 
 impl PromptTouch {
-    /// The idle-dormant flag for a `Touched` outcome. Only meaningful when
-    /// the caller passed `no_revive: false`, which never produces
-    /// `RevivalRefused`.
-    pub(crate) fn idle_dormant(&self) -> bool {
-        matches!(self, PromptTouch::Touched { idle_dormant: true })
+    /// The idle-dormant flag for a caller that never sets `no_revive`, so
+    /// never sees `RevivalRefused`.
+    pub(crate) fn idle_dormant(self) -> Result<bool, crate::session::StartBlocked> {
+        match self {
+            PromptTouch::Touched { idle_dormant } => Ok(idle_dormant),
+            PromptTouch::RevivalRefused => Ok(false),
+            PromptTouch::Blocked(blocked) => Err(blocked),
+        }
     }
 }
 
@@ -431,11 +435,11 @@ impl SessionService {
         }
     }
 
-    /// Record that a prompt is arriving. `no_revive` refuses atomically,
-    /// under the same per-session lock, rather than waking an
-    /// archived/snoozed/idle-dormant session (#4081 review: a client-side
-    /// liveness check before this call would race a concurrent archive,
-    /// snooze, or wake).
+    /// Record that a prompt is arriving. An archived or trashed session is
+    /// refused, never woken. `no_revive` refuses atomically, under the same
+    /// per-session lock, rather than waking a snoozed/idle-dormant session
+    /// (#4081 review: a client-side liveness check before this call would
+    /// race a concurrent archive, snooze, or wake).
     pub(crate) async fn touch_and_wake_on_prompt(&self, id: &str, no_revive: bool) -> PromptTouch {
         let inst_lock = self.instance_lock(id).await;
         let _guard = inst_lock.lock().await;
@@ -446,8 +450,11 @@ impl SessionService {
                     idle_dormant: false,
                 };
             };
+            if let Err(blocked) = inst.ensure_startable() {
+                return PromptTouch::Blocked(blocked);
+            }
             let was_idle_dormant = inst.is_idle_dormant();
-            let wake = inst.is_archived() || inst.is_snoozed() || was_idle_dormant;
+            let wake = inst.is_snoozed() || was_idle_dormant;
             if no_revive && wake {
                 return PromptTouch::RevivalRefused;
             }
@@ -466,15 +473,22 @@ impl SessionService {
             let id_clone = id.to_string();
             let outcome = tokio::task::spawn_blocking(move || {
                 storage.update(|instances, _groups| {
-                    if let Some(inst) = instances.iter_mut().find(|i| i.id == id_clone) {
-                        apply_prompt_persist_to_disk(inst, wake);
+                    let Some(inst) = instances.iter_mut().find(|i| i.id == id_clone) else {
+                        return Ok(None);
+                    };
+                    // A peer (e.g. the CLI) may have archived or trashed the row since the
+                    // memory check; waking it here would clear that.
+                    if let Err(blocked) = inst.ensure_startable() {
+                        return Ok(Some(blocked));
                     }
-                    Ok(())
+                    apply_prompt_persist_to_disk(inst, wake);
+                    Ok(None)
                 })
             })
             .await;
             match outcome {
-                Ok(Ok(())) => {}
+                Ok(Ok(None)) => {}
+                Ok(Ok(Some(blocked))) => return PromptTouch::Blocked(blocked),
                 Ok(Err(e)) => tracing::warn!(
                     target: "server.session_service",
                     session = %id,

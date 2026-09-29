@@ -61,7 +61,7 @@ const requestCases: RequestCase[] = [
     () => api.updateWorkspaceOrdering(["a", "b"]),
     { body: { order: ["a", "b"] }, result: true },
   ],
-  ["POST /api/sessions/s1/terminal?index=0", () => api.ensureTerminal("s1"), { result: true }],
+  ["POST /api/sessions/s1/terminal?index=0", () => api.ensureTerminal("s1"), { result: { ok: true } }],
   ["POST /api/sessions/s1/container-terminal?index=2", () => api.ensureTerminal("s1", 2, true)],
   ["DELETE /api/sessions/s1/terminal?index=2", () => api.killTerminal("s1", 2), { result: true }],
   [
@@ -346,7 +346,11 @@ const requestCases: RequestCase[] = [
   ],
   ["POST /api/sessions/s1/restore", () => api.restoreSession("s1"), { respond: json(session), result: session }],
   ["POST /api/sessions/s1/stop", () => api.stopSession("s1"), { respond: json(session), result: session }],
-  ["POST /api/sessions/s1/start", () => api.startSession("s1"), { respond: json(session), result: session }],
+  [
+    "POST /api/sessions/s1/start",
+    () => api.startSession("s1"),
+    { respond: json(session), result: { ok: true, session } },
+  ],
   ["PATCH /api/sessions/s1/snooze", () => api.setSessionSnooze("s1", 60), { body: { minutes: 60 } }],
   ["PATCH /api/sessions/s1/unread", () => api.setSessionUnread("s1", true), { body: { unread: true } }],
   [
@@ -551,7 +555,6 @@ const failureCases: [string, () => Promise<unknown>, unknown][] = [
   ["fetchSessions", () => api.fetchSessions(), null],
   ["searchConversations", () => api.searchConversations("q"), []],
   ["updateWorkspaceOrdering", () => api.updateWorkspaceOrdering([]), false],
-  ["ensureTerminal", () => api.ensureTerminal("s1"), false],
   ["getSessionFileContents", () => api.getSessionFileContents("s1", "a"), null],
   ["fetchThemes", () => api.fetchThemes(), []],
   ["fetchAcpAgents", () => api.fetchAcpAgents(), []],
@@ -611,6 +614,46 @@ describe("ensureSession", () => {
     expect(await api.ensureSession("s1")).toEqual({ ok: false, error: "aborted" });
     offline();
     expect(await api.ensureSession("s1")).toEqual({ ok: false, message: "offline" });
+  });
+});
+describe("ensureTerminal", () => {
+  it.each([
+    [
+      "container refusal",
+      json({ error: "session_archived", message: "session is archived; unarchive it first" }, 409),
+      { ok: false, error: "session_archived", message: "session is archived; unarchive it first" },
+    ],
+    ["empty error body", empty(500), { ok: false, message: "Server error (500)" }],
+  ])("%s", async (_name, response, expected) => {
+    fetchSpy.mockResolvedValueOnce(response);
+    expect(await api.ensureTerminal("s1", 0, true)).toEqual(expected);
+  });
+
+  it("reports a network failure", async () => {
+    offline();
+    expect(await api.ensureTerminal("s1")).toEqual({ ok: false, message: "offline" });
+  });
+});
+describe("startSession", () => {
+  it.each([
+    [
+      "archived refusal",
+      json({ error: "session_archived", message: "session is archived; unarchive it first" }, 409),
+      { ok: false, refused: true, message: "session is archived; unarchive it first" },
+    ],
+    [
+      "trashed refusal",
+      json({ error: "session_trashed", message: "session is in trash; restore it first" }, 409),
+      { ok: false, refused: true, message: "session is in trash; restore it first" },
+    ],
+    [
+      "restart failure",
+      json({ error: "restart_failed", message: "boom" }, 500),
+      { ok: false, refused: false, message: "boom" },
+    ],
+  ])("%s", async (_name, response, expected) => {
+    fetchSpy.mockResolvedValueOnce(response);
+    expect(await api.startSession("s1")).toEqual(expected);
   });
 });
 describe("acpDisable", () => {

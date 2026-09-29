@@ -176,9 +176,19 @@ export async function ensureSession(id: string, signal?: AbortSignal): Promise<E
   }
 }
 
-export function ensureTerminal(id: string, index = 0, container = false): Promise<boolean> {
+export async function ensureTerminal(id: string, index = 0, container = false): Promise<EnsureSessionResult> {
   const path = container ? "container-terminal" : "terminal";
-  return fetchOk(`/api/sessions/${id}/${path}?index=${index}`, { method: "POST" });
+  try {
+    const { ok, status, payload } = await send(`/api/sessions/${id}/${path}?index=${index}`, { method: "POST" });
+    if (ok) return { ok: true };
+    return {
+      ok: false,
+      error: stringField(payload, "error"),
+      message: stringField(payload, "message") ?? `Server error (${status})`,
+    };
+  } catch (e) {
+    return { ok: false, message: e instanceof Error ? e.message : "Network error" };
+  }
 }
 
 function fileToBase64(file: File): Promise<string> {
@@ -1601,8 +1611,22 @@ export function stopSession(id: string): Promise<SessionResponse | null> {
   return sessionUpdate(id, "stop", jsonInit("POST"));
 }
 
-export function startSession(id: string): Promise<SessionResponse | null> {
-  return sessionUpdate(id, "start", jsonInit("POST"));
+/** A 409 code for a start refused because the session is archived or trashed. */
+export const isStartRefusal = (code: string | undefined) => code === "session_archived" || code === "session_trashed";
+
+export type StartSessionResult =
+  | { ok: true; session: SessionResponse }
+  | { ok: false; refused: boolean; message?: string };
+
+/** `refused` marks a 409 for an archived or trashed session, which the server left untouched. */
+export async function startSession(id: string): Promise<StartSessionResult> {
+  const reply = await send(`/api/sessions/${id}/start`, jsonInit("POST")).catch(() => null);
+  if (reply?.ok && reply.payload) return { ok: true, session: reply.payload as unknown as SessionResponse };
+  return {
+    ok: false,
+    refused: isStartRefusal(stringField(reply?.payload, "error")),
+    message: stringField(reply?.payload, "message"),
+  };
 }
 
 /** `null` unsnoozes; otherwise 1..=43200 minutes, validated server-side. */

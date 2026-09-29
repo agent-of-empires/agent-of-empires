@@ -94,7 +94,7 @@ pub struct PromptRequest {
     /// optimistic transcript row by id.
     #[serde(default, alias = "id")]
     pub prompt_id: Option<String>,
-    /// Refuse rather than wake an archived/snoozed/idle-dormant session or
+    /// Refuse rather than wake a snoozed/idle-dormant session or
     /// queue behind a stopped worker. Set by `aoe send --no-revive`; other
     /// callers never set it and keep the default revive-as-needed behavior.
     #[serde(default)]
