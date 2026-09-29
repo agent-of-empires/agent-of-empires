@@ -657,17 +657,32 @@ fn seed_elapsed_rate_limit_park(state: &AppState, id: &str, busy: bool) {
 }
 
 /// The pending continuation as it stands on disk, which the in-memory slot
-/// can disagree with.
-fn persisted_pending_turn(id: &str) -> Option<crate::session::PendingInitialTurn> {
-    let storage = crate::session::Storage::new_unwatched("default").expect("open storage");
+/// can disagree with. Reads through the instance's own `source_profile`, so it
+/// resolves exactly as the writer does, and fails rather than returning `None`
+/// when the row is missing.
+async fn persisted_pending_turn(
+    state: &AppState,
+    id: &str,
+) -> Option<crate::session::PendingInitialTurn> {
+    let profile = state
+        .instances
+        .read()
+        .await
+        .iter()
+        .find(|i| i.id == id)
+        .expect("seeded session")
+        .source_profile
+        .clone();
+    let storage = crate::session::Storage::new_unwatched(&profile).expect("open storage");
     storage
         .update(|instances, _groups| {
             Ok(instances
                 .iter()
                 .find(|i| i.id == id)
-                .and_then(|i| i.pending_initial_turn.clone()))
+                .map(|i| i.pending_initial_turn.clone()))
         })
         .expect("read persisted sessions")
+        .expect("the session row must be on disk, or this assertion is vacuous")
 }
 
 /// #4092: a manual prompt may not slip between a rate-limit continuation's
@@ -683,12 +698,31 @@ async fn a_manual_prompt_cannot_overtake_a_continuation_install() {
         let _app_dir = crate::session::test_support::isolate_app_dir();
         let label = if queued { "queued" } else { "direct" };
         let id = format!("sess-4092-{label}");
-        let state = structured_state(&id, false);
+        let inst = structured_instance(&id, false);
+        // An empty profile resolves the same way for the seeder, the writer and
+        // the reader, so all three land on one sessions.json.
+        crate::server::test_support::seed_instances_on_disk_for_test(
+            &inst.source_profile,
+            vec![inst.clone()],
+        );
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
         state
             .acp_supervisor
             .test_insert_worker_cmd_recording(&id)
             .await;
         seed_elapsed_rate_limit_park(&state, &id, queued);
+        // Causal precondition: the durable read this test ends on is live.
+        state
+            .session_service
+            .set_pending_initial_turn(&id, "probe".into(), Vec::new())
+            .await;
+        assert_eq!(
+            persisted_pending_turn(&state, &id).await.map(|t| t.text),
+            Some("probe".to_string()),
+            "{label}: a probe turn must reach disk before absence means anything"
+        );
+        state.session_service.clear_pending_initial_turn(&id).await;
+        assert!(persisted_pending_turn(&state, &id).await.is_none());
 
         let mut barrier = crate::server::acp_reconciler::arm_install_barrier();
         let mut claims = state.session_service.watch_submission_claims();
@@ -696,7 +730,14 @@ async fn a_manual_prompt_cannot_overtake_a_continuation_install() {
             let state = Arc::clone(&state);
             let id = id.clone();
             async move {
-                crate::server::acp_reconciler::enqueue_rate_limit_continuation(&state, &id).await;
+                let Some(submission) = state.session_service.try_prompt_submission(&id).await
+                else {
+                    return;
+                };
+                crate::server::acp_reconciler::install_rate_limit_continuation(
+                    &state, &id, submission,
+                )
+                .await;
             }
         });
         // Causal barrier: A has been read from the store and is not installed.
@@ -759,7 +800,7 @@ async fn a_manual_prompt_cannot_overtake_a_continuation_install() {
             "{label}: B superseded A, so no continuation may survive it"
         );
         assert!(
-            persisted_pending_turn(&id).is_none(),
+            persisted_pending_turn(&state, &id).await.is_none(),
             "{label}: the superseded continuation must not reach disk"
         );
     }

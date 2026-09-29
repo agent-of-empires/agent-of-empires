@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::acp::protocol::{SwitchAgentRequest, SwitchAgentResponse};
-use crate::server::api::{find_instance, instance_exists};
+use crate::server::api::find_instance;
 
 use super::*;
 
@@ -89,14 +89,10 @@ pub async fn spawn_acp(
         Ok(j) => j,
         Err(rej) => return rej.into_response(),
     };
-    // Checked first so a missing session does not create an instance lock.
-    if !instance_exists(&state, &id).await {
-        return session_not_found();
-    }
-    // The continuation install below requires the session's submission
-    // authority, claimed ahead of the instance lock as every other mutation
-    // surface does (#4092). It also proves the session exists, so neither lock
-    // registry gains an entry for a missing one.
+    // The continuation install below needs the session's submission authority,
+    // claimed ahead of the instance lock like every other mutation surface
+    // (#4092). The claim also proves the session exists, so a missing one
+    // creates neither lock.
     let Some(_submission) = state
         .session_service
         .prompt_submission_for_session(&id)
@@ -593,8 +589,8 @@ mod tests {
 
     /// #4092: the manual resume installs a continuation under the session's
     /// submission authority, so `/acp/spawn` must claim it ahead of the
-    /// instance lock, like every other mutation surface. Taking them the other
-    /// way round closes a cycle with any submission-then-instance-lock path.
+    /// instance lock. The reverse order would close a cycle with every path
+    /// that takes the submission guard before the instance lock.
     #[tokio::test]
     #[serial_test::serial]
     async fn spawn_claims_the_submission_guard_before_the_instance_lock() {

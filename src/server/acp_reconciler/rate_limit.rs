@@ -49,84 +49,25 @@ fn rate_limit_unknown_reset_retry_at(recorded_at_ms: i64, redeliveries: i64) -> 
     DateTime::from_timestamp_millis(recorded_at_ms).unwrap_or_else(Utc::now) + retry_after
 }
 
-/// Test-only barrier armed between a continuation read and its installation,
-/// the one window a manual submission can overtake. Process-global, so the
-/// handle that arms it disarms it on drop.
-#[cfg(test)]
-static INSTALL_BARRIER: std::sync::Mutex<
-    Option<tokio::sync::mpsc::UnboundedSender<(String, tokio::sync::oneshot::Sender<()>)>>,
-> = std::sync::Mutex::new(None);
-
-/// Holds the barrier armed. Each producer read reports its session id to
-/// [`Self::reads`] and waits for the returned ack before it installs.
-#[cfg(test)]
-pub(crate) struct InstallBarrier {
-    pub(crate) reads:
-        tokio::sync::mpsc::UnboundedReceiver<(String, tokio::sync::oneshot::Sender<()>)>,
-}
-
-#[cfg(test)]
-impl Drop for InstallBarrier {
-    fn drop(&mut self) {
-        *INSTALL_BARRIER
-            .lock()
-            .expect("INSTALL_BARRIER mutex poisoned") = None;
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn arm_install_barrier() -> InstallBarrier {
-    let (tx, reads) = tokio::sync::mpsc::unbounded_channel();
-    *INSTALL_BARRIER
-        .lock()
-        .expect("INSTALL_BARRIER mutex poisoned") = Some(tx);
-    InstallBarrier { reads }
-}
-
-/// Report the read to an armed barrier and block installation on its ack. The
-/// deadline keeps a producer from parking forever when no test is left to
-/// release it.
-#[cfg(test)]
-async fn await_install_barrier(id: &str) {
-    let sender = INSTALL_BARRIER
-        .lock()
-        .expect("INSTALL_BARRIER mutex poisoned")
-        .clone();
-    let Some(tx) = sender else { return };
-    let (ack, released) = tokio::sync::oneshot::channel();
-    if tx.send((id.to_string(), ack)).is_ok() {
-        let _ = tokio::time::timeout(Duration::from_secs(30), released).await;
-    }
-}
-
 /// What the continuation producer decided for one session (#4092).
 pub(crate) enum ContinuationOutcome {
-    /// The interrupted prompt owns the next turn, or there was none to replay.
-    /// `RateLimitAutoResumed` is what the durable redelivery budget counts, so
-    /// only this outcome licenses the breadcrumb.
+    /// The interrupted prompt is the next turn, was already queued, or there
+    /// was nothing to replay. `RateLimitAutoResumed` is what the durable
+    /// redelivery budget counts, so only this outcome licenses the breadcrumb.
     Stands,
-    /// A queued prompt took the session. It has no other route to a worker, so
-    /// the caller still frees the respawn, but no breadcrumb.
+    /// A queued prompt owns the next turn. It has no other route to a worker,
+    /// so the caller still frees the respawn, but no breadcrumb.
     SupersededByQueue,
 }
 
-/// Queues the rate-limit-interrupted prompt as the next turn so a resume continues the work (#3028).
-/// `None` when a submission owns the session: the tick retries next cadence.
-pub(crate) async fn enqueue_rate_limit_continuation(
-    state: &Arc<AppState>,
-    id: &str,
-) -> Option<ContinuationOutcome> {
-    // Contention is a refusal, not a queue: the reconciler tick is one
-    // sequential pass over every session and must not stall behind a
-    // submission, exactly as the redelivery-cap CAS below refuses.
-    let submission = state.session_service.try_prompt_submission(id).await?;
-    Some(install_rate_limit_continuation(state, id, submission).await)
-}
-
-/// [`enqueue_rate_limit_continuation`] for a caller that already holds the
-/// session's submission guard, which `prompt_submission` cannot hand over: it
-/// is a plain mutex, so a second claim by the same task would deadlock. Taking
-/// the guard by value makes holding it the price of the call.
+/// Installs the rate-limit-interrupted prompt as the next turn so a resume
+/// continues the work (#3028).
+///
+/// Takes the session's submission authority by value: it cannot be handed
+/// over, because `prompt_submission` is a plain mutex and a second claim by
+/// the same task would deadlock. Holding it is the price of the call, and it
+/// is what stops a turn-accepting surface from slipping between the
+/// supersession checks and the install (#4092).
 ///
 /// Nothing below may consult park liveness for the supersession decision: see
 /// [`crate::acp::event_store::EventStore::rate_limit_park`], whose superseding
@@ -134,11 +75,8 @@ pub(crate) async fn enqueue_rate_limit_continuation(
 pub(crate) async fn install_rate_limit_continuation(
     state: &Arc<AppState>,
     id: &str,
-    submission: tokio::sync::OwnedMutexGuard<()>,
+    _submission: tokio::sync::OwnedMutexGuard<()>,
 ) -> ContinuationOutcome {
-    let _held = submission;
-    // Under the guard, so no turn-accepting surface can slip between a
-    // supersession check and the install (#4092).
     let Some(Some((text, attachments))) = query_store(
         &state.acp_event_store,
         id,
@@ -150,16 +88,20 @@ pub(crate) async fn install_rate_limit_continuation(
         return ContinuationOutcome::Stands;
     };
     #[cfg(test)]
-    await_install_barrier(id).await;
+    super::test_fixtures::await_install_barrier(id).await;
     // A queued prompt publishes no event, so no durable observable records the
-    // supersession. The queue row is the only state it must have changed.
-    if state
+    // supersession and the queue row is the only state it must have changed.
+    // It only supersedes while the slot is still free: a continuation an
+    // earlier cadence already installed is still the next turn, and the queue
+    // drains behind it.
+    let queue_owns_next_turn = state
         .instances
         .read()
         .await
         .iter()
-        .any(|i| i.id == id && !i.queued_prompts.is_empty())
-    {
+        .find(|i| i.id == id)
+        .is_some_and(|i| i.pending_initial_turn.is_none() && !i.queued_prompts.is_empty());
+    if queue_owns_next_turn {
         return ContinuationOutcome::SupersededByQueue;
     }
     state
@@ -169,11 +111,11 @@ pub(crate) async fn install_rate_limit_continuation(
     ContinuationOutcome::Stands
 }
 
-/// Releases rate-limit parks whose window elapsed: queue the interrupted prompt
-/// unless a prompt superseded it, publish the breadcrumb for a delivered
-/// continuation, and free the `attempted` slot so this tick respawns. The park
-/// and its times come from the durable event store (#3514). Returns the
-/// released ids so the resume loop does not re-hold them.
+/// Releases rate-limit parks whose window elapsed: install the interrupted
+/// prompt unless a queued one took the session, publish the breadcrumb for a
+/// delivered continuation, and free the `attempted` slot so this tick
+/// respawns. The park and its times come from the durable event store (#3514).
+/// Returns the released ids so the resume loop does not re-hold them.
 pub(super) async fn reap_rate_limit_resumes(
     state: &Arc<AppState>,
     attempted: &mut HashSet<String>,
@@ -295,7 +237,7 @@ pub(super) async fn reap_rate_limit_resumes(
             continue;
         };
         if streak >= RATE_LIMIT_AUTO_RESUME_MAX_REDELIVERIES {
-            // `/acp/spawn` holds this lock through its continuation enqueue, so
+            // `/acp/spawn` holds this lock through its continuation install, so
             // the CAS plus clear cannot interleave with it. `try_lock` because
             // blocking would stall the tick; contention is a refusal.
             let instance_lock = state.instance_lock(&id).await;
@@ -318,10 +260,13 @@ pub(super) async fn reap_rate_limit_resumes(
             }
             continue;
         }
-        let Some(outcome) = enqueue_rate_limit_continuation(state, &id).await else {
+        // Contention is a refusal, not a queue: this is one sequential pass over
+        // every session and must not stall behind a submission.
+        let Some(submission) = state.session_service.try_prompt_submission(&id).await else {
             skip("a prompt submission owns the session");
             continue;
         };
+        let outcome = install_rate_limit_continuation(state, &id, submission).await;
         match outcome {
             ContinuationOutcome::Stands => {
                 state
@@ -643,63 +588,73 @@ mod tests {
             .count()
     }
 
-    /// #4092: a prompt the user already accepted still owns the next turn when
-    /// the auto-resume pass runs. The queued shape publishes no event, so the
-    /// park reads live and the queue row is the only record of the
-    /// supersession; the pass must not replay the interrupted prompt ahead of
-    /// it, and must not spend a redelivery on a turn it never delivered.
+    /// #4092: a queued prompt owns the next turn only while the pending-turn
+    /// slot is still free. It publishes no event, so the queue row is the only
+    /// record of the supersession; once an earlier cadence has installed the
+    /// continuation, that turn is still next and the queue drains behind it, so
+    /// the resume must stand and its redelivery must still be charged.
     #[tokio::test]
     #[serial_test::serial]
-    async fn an_accepted_prompt_supersedes_the_continuation_of_a_live_park() {
-        let id = "sess-4092-queued-first";
-        let (_home, state, _project) = parked(id, 0).await;
-        assert!(
-            state
-                .session_service
-                .enqueue_prompt(
-                    id,
-                    "q-1".into(),
-                    "manual prompt B".into(),
-                    vec![],
-                    None,
-                    "t0".into(),
-                )
-                .await
-                .is_some(),
-            "the queue row must land, or the case asserts nothing"
-        );
-        assert!(
-            state.acp_event_store.rate_limit_park(id).is_some(),
-            "a queued prompt must leave the park standing"
-        );
-        let mut attempted: HashSet<String> = [id.to_string()].into();
+    async fn a_queued_prompt_supersedes_only_an_uninstalled_continuation() {
+        for installed in [false, true] {
+            let id = if installed {
+                "sess-4092-queued-and-installed"
+            } else {
+                "sess-4092-queued-first"
+            };
+            let (_home, state, _project) = parked(id, 0).await;
+            if installed {
+                state
+                    .session_service
+                    .set_pending_initial_turn(id, "run the nightly task".into(), Vec::new())
+                    .await;
+            }
+            assert!(
+                state
+                    .session_service
+                    .enqueue_prompt(
+                        id,
+                        "q-1".into(),
+                        "manual prompt B".into(),
+                        vec![],
+                        None,
+                        "t0".into(),
+                    )
+                    .await
+                    .is_some(),
+                "installed={installed}: the queue row must land, or the case asserts nothing"
+            );
+            assert!(
+                state.acp_event_store.rate_limit_park(id).is_some(),
+                "installed={installed}: a queued prompt must leave the park standing"
+            );
+            let mut attempted: HashSet<String> = [id.to_string()].into();
 
-        let released = reap_rate_limit_resumes(&state, &mut attempted, &HashSet::new()).await;
+            let released = reap_rate_limit_resumes(&state, &mut attempted, &HashSet::new()).await;
 
-        assert_eq!(
-            pending_turn(&state, id).await,
-            None,
-            "the accepted prompt owns the next turn"
-        );
-        assert_eq!(
-            auto_resumed_breadcrumbs(&state, id),
-            0,
-            "a refused continuation must not spend a redelivery"
-        );
-        assert!(
-            !attempted.contains(id) && released.contains(id),
-            "the queued prompt has no other route to a worker"
-        );
+            assert_eq!(
+                pending_turn(&state, id).await,
+                installed.then_some(true),
+                "installed={installed}: the queue supersedes only what is not queued"
+            );
+            assert_eq!(
+                auto_resumed_breadcrumbs(&state, id),
+                usize::from(installed),
+                "installed={installed}: a refused continuation must not spend a redelivery"
+            );
+            assert!(
+                !attempted.contains(id) && released.contains(id),
+                "installed={installed}: the queued prompt has no other route to a worker"
+            );
+        }
     }
 
-    /// A manual resume installs under the submission authority its own spawn
-    /// already holds. That spawn's worker publishes `AcpSessionAssigned`,
-    /// which retires the park without any prompt having superseded anything,
-    /// so the install must key on the interrupted prompt rather than on the
-    /// park still standing (#4092 review).
+    /// #4092: a spawn's own worker publishes `AcpSessionAssigned`, which
+    /// retires the park without any prompt having superseded anything, so the
+    /// install must key on the interrupted prompt rather than on park liveness.
     #[tokio::test]
     #[serial_test::serial]
-    async fn a_manual_resume_installs_after_its_own_worker_assigns_the_session() {
+    async fn a_manual_install_lands_after_its_own_worker_assigns_the_session() {
         let id = "sess-4092-assigned";
         let (_home, state, _project) = parked(id, 0).await;
         let next_seq = state.acp_event_store.highest_seq(id) + 1;

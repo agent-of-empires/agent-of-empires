@@ -1225,9 +1225,8 @@ impl SessionService {
         id: &str,
     ) -> Option<tokio::sync::OwnedMutexGuard<()>> {
         let guard = self.prompt_gate(id).await.try_lock_owned().ok()?;
-        // `prompt_gate` vivifies an entry for an id it has not proved exists,
-        // and nothing prunes the registry but a delete, so a session that went
-        // away under this claim would leak one. Mirrors `admit_prompt_submission`.
+        // A vanished session, as in `admit_prompt_submission`: forgetting
+        // keeps `prompt_locks` from leaking an entry nothing else prunes.
         if self.admits_turn(&SessionCaller::User, id).await.is_err() {
             drop(guard);
             self.forget_prompt_lock(id).await;
@@ -1236,6 +1235,7 @@ impl SessionService {
         Some(guard)
     }
 
+    /// The per-session submission gate, vivified on first use.
     async fn prompt_gate(&self, id: &str) -> Arc<tokio::sync::Mutex<()>> {
         let lock = {
             let guard = self.prompt_locks.read().await;
