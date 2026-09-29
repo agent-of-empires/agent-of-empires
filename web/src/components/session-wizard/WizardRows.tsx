@@ -117,8 +117,9 @@ export function FieldRow({ label, htmlFor, children }: { label: string; htmlFor?
   );
 }
 
+// 16px text keeps iOS from zooming on focus; the placeholder matches the rows' 14px sans.
 export const ROW_INPUT =
-  "w-full bg-transparent py-2 text-base md:text-sm font-mono text-text-primary placeholder:text-text-dim focus:outline-none";
+  "w-full min-w-0 bg-transparent py-2 text-base md:text-sm font-mono text-text-primary placeholder:font-sans placeholder:text-sm placeholder:text-text-dim focus:outline-none";
 
 /** Header of a sub-panel that replaces the main form, with a Back action. */
 export function PanelHeader({ title, onBack }: { title: string; onBack: () => void }) {

@@ -45,4 +45,25 @@ describe("Tooltip", () => {
     fireEvent.blur(button);
     expect(screen.queryByRole("tooltip")).toBeNull();
   });
+
+  it("stays closed through the emulated hover and focus of a tap, and opens again for a mouse", () => {
+    render(
+      <Tooltip text="New session">
+        <button type="button">+</button>
+      </Tooltip>,
+    );
+    const button = screen.getByRole("button");
+    const trigger = button.parentElement!;
+
+    fireEvent.pointerDown(button, { pointerType: "touch" });
+    fireEvent.mouseEnter(trigger);
+    fireEvent.focus(button);
+    // Present at all, visible or not: a re-shown tooltip is hidden until it re-measures.
+    expect(document.querySelector("[role=tooltip]")).toBeNull();
+
+    fireEvent.blur(button);
+    fireEvent.pointerEnter(trigger, { pointerType: "mouse" });
+    fireEvent.mouseEnter(trigger);
+    expect(document.querySelector("[role=tooltip]")).not.toBeNull();
+  });
 });

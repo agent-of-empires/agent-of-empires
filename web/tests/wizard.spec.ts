@@ -111,8 +111,24 @@ test.describe("essentials", () => {
     await page.setViewportSize({ width: 390, height: 844 });
     await page.goto("/");
     await openWizard(page);
-    const overlayZ = await wizard(page).evaluate((el) => Number(getComputedStyle(el.parentElement!).zIndex));
-    expect(overlayZ).toBeGreaterThan(50);
+    // Paint order, not the z-index value: a z-[60] inside the shell's fixed layers still
+    // ranks below a body-level z-50 tooltip.
+    const tooltipOnTop = await wizard(page).evaluate((sheet) => {
+      const tip = document.createElement("span");
+      tip.className = "fixed z-50";
+      const r = sheet.getBoundingClientRect();
+      Object.assign(tip.style, {
+        left: `${r.left + 10}px`,
+        top: `${r.top + r.height / 2}px`,
+        width: "40px",
+        height: "20px",
+      });
+      document.body.appendChild(tip);
+      const hit = document.elementFromPoint(r.left + 20, r.top + r.height / 2 + 10);
+      tip.remove();
+      return hit === tip;
+    });
+    expect(tooltipOnTop).toBe(false);
   });
 });
 
@@ -150,17 +166,34 @@ test.describe("create progress", () => {
 test.describe("mobile", () => {
   test.use({ hasTouch: true, isMobile: true, viewport: { width: 390, height: 844 } });
 
-  test("the wizard is a full-height sheet with Launch pinned and no shortcut hint", async ({ page }) => {
+  test("the wizard is a bottom sheet sized to its rows, with Launch right under them", async ({ page }) => {
     await mockWizardApis(page);
     await page.goto("/");
     await openWizard(page);
     await selectProject(page, "/tmp/example");
     const w = wizard(page);
-    const box = await w.boundingBox();
-    expect(box?.height).toBeGreaterThanOrEqual(840);
+    const viewport = page.viewportSize()!;
+    const box = (await w.boundingBox())!;
+    expect(Math.round(box.y + box.height)).toBe(viewport.height);
+    expect(box.height).toBeLessThan(viewport.height * 0.9);
     const launchBtn = w.getByRole("button", { name: /Launch session/ });
     await expect(launchBtn).toBeInViewport();
     await expect(launchBtn).not.toContainText("Enter");
+    // No dead band between the last row and Launch.
+    const group = (await w.getByLabel("Group").boundingBox())!;
+    const launch = (await launchBtn.boundingBox())!;
+    expect(launch.y - (group.y + group.height)).toBeLessThan(80);
+  });
+
+  test("a long panel grows the sheet and scrolls instead of overflowing", async ({ page }) => {
+    await mockWizardApis(page, {
+      projects: Array.from({ length: 30 }, (_, i) => ({ name: `proj-${i}`, path: `/tmp/proj-${i}`, scope: "global" })),
+    });
+    await page.goto("/");
+    await openWizard(page);
+    const box = (await wizard(page).boundingBox())!;
+    expect(box.y).toBeGreaterThanOrEqual(0);
+    await expect(wizard(page).getByRole("button", { name: "Done" })).toBeInViewport();
   });
 });
 

@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useReducer, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import type { CreateProgress, CreateSessionRequest, SessionResponse } from "../../lib/types";
 import {
   fetchAgents,
@@ -629,18 +630,19 @@ export function SessionWizard({ onClose, onCreated, onCreatedInBackground, prefi
 
   const creating = state.isSubmitting && showProgress && !globConfirm && !hooksTrust;
 
-  return (
-    <div className="fixed inset-0 z-[60] flex md:items-center md:justify-center">
+  // Portaled to the body: under the app shell's fixed layers its z-[60] would only rank
+  // inside theirs, and body-level z-50 layers (hover tooltips) would paint over it.
+  return createPortal(
+    <div className="fixed inset-0 z-[60] flex items-end md:items-center md:justify-center">
       <div className="absolute inset-0 bg-black/60" onClick={creating ? undefined : onClose} />
       <div
         data-testid="session-wizard"
         style={{ paddingBottom: keyboardHeight || undefined }}
-        className="relative w-full h-[100dvh] md:h-auto md:max-w-lg bg-surface-800 md:border md:border-surface-700/30 md:rounded-lg flex flex-col md:max-h-[min(720px,90vh)]"
+        // Phones get a bottom sheet sized to its content, so Launch sits under the last row
+        // within thumb reach; a long panel grows it to just below the notch and scrolls.
+        className="relative w-full max-h-[calc(100dvh-env(safe-area-inset-top))] md:max-w-lg bg-surface-800 border-t border-surface-700/30 rounded-t-lg md:border md:rounded-lg flex flex-col md:max-h-[min(720px,90vh)]"
       >
-        <div
-          className="flex items-center justify-between px-4 md:px-5 py-3 border-b border-surface-700/20"
-          style={{ paddingTop: "max(0.75rem, env(safe-area-inset-top))" }}
-        >
+        <div className="flex items-center justify-between px-4 md:px-5 py-3 border-b border-surface-700/20">
           <h1 className="text-sm font-medium text-text-secondary">{creating ? "Creating session" : "New session"}</h1>
           <button
             onClick={creating ? handleBackground : onClose}
@@ -705,6 +707,7 @@ export function SessionWizard({ onClose, onCreated, onCreatedInBackground, prefi
           onCancel={cancelPending}
         />
       )}
-    </div>
+    </div>,
+    document.body,
   );
 }

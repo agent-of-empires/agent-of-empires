@@ -16,6 +16,7 @@ export function Tooltip({
   const triggerRef = useRef<HTMLSpanElement>(null);
   const tipRef = useRef<HTMLSpanElement>(null);
   const [open, setOpen] = useState(false);
+  const touchRef = useRef(false);
   const [pos, setPos] = useState<{ x: number; y: number } | null>(null);
 
   const show = () => {
@@ -58,7 +59,22 @@ export function Tooltip({
   }, [open]);
 
   return (
-    <span ref={triggerRef} className="inline-flex" onMouseEnter={show} onMouseLeave={hide} onFocus={show} onBlur={hide}>
+    <span
+      ref={triggerRef}
+      className="inline-flex"
+      // A tap fires emulated mouseenter and focus but never the leave, stranding the
+      // tooltip over whatever opens next; a touch-started interaction shows nothing.
+      onPointerDown={(e) => {
+        touchRef.current = e.pointerType !== "mouse";
+      }}
+      onPointerEnter={(e) => {
+        if (e.pointerType === "mouse") touchRef.current = false;
+      }}
+      onMouseEnter={() => !touchRef.current && show()}
+      onMouseLeave={hide}
+      onFocus={() => !touchRef.current && show()}
+      onBlur={hide}
+    >
       {children}
       {open &&
         createPortal(
