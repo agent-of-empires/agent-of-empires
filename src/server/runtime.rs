@@ -514,9 +514,12 @@ async fn send_frame(socket: &mut WebSocket, state: &AppState, frame: Message) ->
 async fn send_creation_progress(
     socket: &mut WebSocket,
     state: &AppState,
-    progress: Vec<CreationProgress>,
+    progress: &Arc<Vec<CreationProgress>>,
 ) -> bool {
-    let frame = RuntimeFrame::<RuntimeSnapshot>::Creation(progress);
+    // One copy is inherent: the frame owns its payload. The caller's second
+    // copy is not, and the watch channel already holds the vector behind an
+    // `Arc` precisely so subscribers can share it.
+    let frame = RuntimeFrame::<RuntimeSnapshot>::Creation(progress.as_ref().clone());
     let Ok(frame) = serde_json::to_string(&frame) else {
         return false;
     };
@@ -565,7 +568,7 @@ async fn follow_runtime(
     }
     if progress_granted {
         let current = creation_progress.borrow_and_update().clone();
-        if !send_creation_progress(&mut socket, &state, (*current).clone()).await {
+        if !send_creation_progress(&mut socket, &state, &current).await {
             return;
         }
     }
@@ -592,7 +595,7 @@ async fn follow_runtime(
             changed = creation_progress.changed(), if progress_granted => {
                 if changed.is_err() { break; }
                 let current = creation_progress.borrow_and_update().clone();
-                if !send_creation_progress(&mut socket, &state, (*current).clone()).await { break; }
+                if !send_creation_progress(&mut socket, &state, &current).await { break; }
             }
             _ = heartbeat.tick() => {
                 if last_pong.elapsed() >= Duration::from_secs(90)

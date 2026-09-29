@@ -1823,37 +1823,19 @@ impl HomeView {
         if let Some(ref mut diff_view) = self.diff_view {
             let action = diff_view.handle_key(key);
             if let Some((session_id, new_override)) = diff_view.take_pending_override() {
-                let in_memory = self.apply_user_action(&session_id, |inst| {
-                    inst.base_branch_override = new_override.clone();
-                });
-                if let Err(e) = in_memory {
-                    tracing::warn!(
-                        target: "tui.home",
-                        "Failed to apply base_branch_override: {}",
-                        e
-                    );
-                }
-                // The diff view holds no runtime handle, so the owner persists:
-                // through the daemon when it owns the row, through the gated
-                // local mirror write when it does not.
-                let persist =
-                    if self.runtime_authoritative && self.session_feed.mutations_available() {
-                        self.session_feed.submit(
-                            session_id.clone(),
-                            crate::daemon::SessionMutation::DiffBase(
-                                crate::daemon::UpdateDiffBaseBody {
-                                    base_branch: new_override.clone(),
-                                    repo: None,
-                                },
-                            ),
-                        )
-                    } else {
-                        self.save()
-                    };
-                if let Err(e) = persist {
+                // Only canonical snapshots update the row, like every other
+                // single-field mutation: the diff view stages the change and
+                // this submits it, so nothing is written to disk from here.
+                if let Err(e) = self.session_feed.submit(
+                    session_id,
+                    crate::daemon::SessionMutation::DiffBase(crate::daemon::UpdateDiffBaseBody {
+                        base_branch: new_override,
+                        repo: None,
+                    }),
+                ) {
                     self.info_dialog = Some(InfoDialog::new(
                         "Diff Base Not Saved",
-                        &format!("Failed to persist the base branch: {e}"),
+                        &format!("Failed to set the base branch: {e}"),
                     ));
                 }
             }

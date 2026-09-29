@@ -517,6 +517,12 @@ impl HomeView {
         &mut self,
         options: &GroupDeleteOptions,
     ) -> anyhow::Result<()> {
+        if let Some(reason) = self.local_write_block() {
+            // Before the selection is consumed: the body writes groups.json and
+            // queues deletions, and neither can be unwound from here.
+            self.refuse_local_write(reason);
+            return Ok(());
+        }
         if let Some(group_path) = self.selected_group.take() {
             let owning_profile = self.selected_group_profile.take();
             let (member_ids, has_creating) = {

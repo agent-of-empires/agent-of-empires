@@ -300,8 +300,10 @@ pub async fn cancel_creation(
             Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
         }
     } else {
-        let code = crate::daemon::ApiErrorCode::CreationNotPending;
-        (code.status(), code.header()).into_response()
+        crate::server::api::api_error_with_code_header(
+            crate::daemon::ApiErrorCode::CreationNotPending,
+            "No creation is in flight for this request",
+        )
     }
 }
 
@@ -1212,12 +1214,16 @@ pub async fn create_session(
             // publishes through `created_session_response`.
             let _ = state.runtime.publish(&state).await;
             if e.is::<crate::server::session_service::CreationCancelled>() {
-                let code = crate::daemon::ApiErrorCode::CreationCancelled;
-                return (code.status(), code.header()).into_response();
+                return crate::server::api::api_error_with_code_header(
+                    crate::daemon::ApiErrorCode::CreationCancelled,
+                    "The creation was cancelled; nothing was provisioned",
+                );
             }
             if e.is::<CreationTrustChanged>() {
-                let code = crate::daemon::ApiErrorCode::CreationTrustChanged;
-                return (code.status(), code.header()).into_response();
+                return crate::server::api::api_error_with_code_header(
+                    crate::daemon::ApiErrorCode::CreationTrustChanged,
+                    "Repository hook configuration changed; review it again",
+                );
             }
             if e.is::<crate::session::NativeStoreUnavailable>() {
                 return StatusCode::SERVICE_UNAVAILABLE.into_response();

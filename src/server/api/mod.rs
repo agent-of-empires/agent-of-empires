@@ -170,6 +170,21 @@ pub(crate) fn api_error(
         .into_response()
 }
 
+/// [`api_error`] for a caller that switches on the code header: the header
+/// stays, and the body carries the same code and an actionable message, so a
+/// client that only reads the body still learns the cause.
+pub(crate) fn api_error_with_code_header(
+    code: crate::daemon::ApiErrorCode,
+    message: impl Into<String>,
+) -> axum::response::Response {
+    let mut response = api_error(code.status(), code.as_str(), message);
+    let (name, value) = code.header()[0];
+    if let Ok(value) = axum::http::HeaderValue::from_str(value) {
+        response.headers_mut().insert(name, value);
+    }
+    response
+}
+
 pub(crate) fn read_only_block(state: &AppState) -> Option<axum::response::Response> {
     state.read_only.then(read_only_response)
 }
