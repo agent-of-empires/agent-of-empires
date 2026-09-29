@@ -1,7 +1,7 @@
 //! Read-only runtime read endpoint: `GET /api/runtime/ws`, protocol version 2.
 //!
-//! One connection carries exactly two application frames — a Hello handshake and
-//! a Snapshot — and the server then sends `Close(1000)`. The handler only reads
+//! One connection carries exactly two application frames: a Hello handshake and
+//! a Snapshot: and the server then sends `Close(1000)`. The handler only reads
 //! session, profile, group and project state; it never mutates it and never
 //! consults a client-local filesystem.
 //!
@@ -31,8 +31,8 @@ use crate::session::{GroupTree, Instance, Storage};
 
 /// Wire protocol version. The client refuses anything else.
 const PROTOCOL_VERSION: u16 = 2;
-/// A stalled reader must not hold a connection slot — or a full disk rescan's
-/// worth of work — open indefinitely. Both transports spend this one budget,
+/// A stalled reader must not hold a connection slot: or a full disk rescan's
+/// worth of work: open indefinitely. Both transports spend this one budget,
 /// each for the whole connection from accept to close rather than per stage,
 /// and it matches the client's single read budget, so a peer that
 /// authenticates and then says nothing is bounded identically either way.
@@ -61,7 +61,7 @@ pub async fn runtime_ws(
     }
     // The whole read is one budget, as on the local socket: the two frames and
     // the close. The response that admits the upgrade is written by the
-    // extractor, so the bound has to wrap the upgraded task itself — a peer
+    // extractor, so the bound has to wrap the upgraded task itself: a peer
     // that authenticates, upgrades and then stops reading must not hold this
     // task, its connection slot and its sample for the life of the daemon.
     ws.on_upgrade(move |socket| async move {
@@ -256,8 +256,7 @@ pub enum RecordedOwner {
 /// Everything a recording pins so the same store always yields the same bytes.
 ///
 /// A transcript is a frozen artefact, so the two things the daemon mints per
-/// process or per instant — the three identity UUIDs and the freshness clock —
-/// are the only inputs a recorder may not take from the environment.
+/// process or per instant: the three identity UUIDs and the freshness clock /// are the only inputs a recorder may not take from the environment.
 #[cfg(any(test, debug_assertions))]
 #[doc(hidden)]
 pub struct RecordingPins {
@@ -329,7 +328,7 @@ pub(crate) struct RuntimeIdentity {
 
 /// Publication state of the freshness sampler. `successes` counts published
 /// samples: the public observed revision is that count and the snapshot cursor is
-/// that count plus one. `latched` is the overflow latch — once set no counter
+/// that count plus one. `latched` is the overflow latch: once set no counter
 /// moves again and the public projection stays unavailable.
 #[derive(Default)]
 struct Sampler {
@@ -597,7 +596,7 @@ fn build_snapshot(runtime: &RuntimeState, instances: &[Instance], owner: Owner) 
 /// The client's contract requires an absolute path, because a relative one is
 /// not a path any session row can reference. A hand-edited `projects.json` is
 /// the one way a row gets one, and refusing a whole snapshot over a single row
-/// would fail every read command on every profile — so the row goes, in the
+/// would fail every read command on every profile: so the row goes, in the
 /// same spirit as [`reconcile_legacy_rows`], and the client's own
 /// `valid_absolute_path` stays fail-closed.
 fn drop_unusable_projects(projects: &mut Vec<ProjectRead>) {
@@ -634,7 +633,7 @@ fn reconcile_legacy_rows(sessions: &mut [SessionRead]) {
     let severed = cycle_entries(&index, &mut parents);
     // A parent that names no row is left as stored: the local path keeps and
     // prints the id, and `rm --purge` of a parent is what makes one. What is
-    // cleared is what this projection cannot stand behind — a parent in another
+    // cleared is what this projection cannot stand behind: a parent in another
     // profile, and the members of a cycle.
     let resolved: Vec<bool> = sessions
         .iter()
@@ -1058,7 +1057,7 @@ fn wire_state(inst: &Instance) -> &'static str {
 
 /// One canonical timestamp spelling: RFC 3339 in UTC with the fractional part
 /// `AutoSi` keeps, spelled with `Z`. This is exactly how chrono's own
-/// `Serialize for DateTime<Utc>` writes a value — `to_rfc3339()` would instead
+/// `Serialize for DateTime<Utc>` writes a value: `to_rfc3339()` would instead
 /// spell the zone as `+00:00`, which is neither the wire grammar the client
 /// accepts nor the bytes the local command prints.
 fn format_timestamp(value: DateTime<Utc>) -> String {
@@ -1121,8 +1120,8 @@ mod tests {
             "the emitted order is the store's own, row for row"
         );
 
-        // The client half — a repeated (name, source_path) pair refused, any
-        // order accepted — is pinned in the client's own
+        // The client half: a repeated (name, source_path) pair refused, any
+        // order accepted: is pinned in the client's own
         // `workspace_repos_are_accepted_in_any_order_and_refused_when_repeated`.
     }
 
@@ -1176,7 +1175,7 @@ mod tests {
             .find(|profile| profile.name == "broken")
             .expect("the profile is still published");
         assert_eq!(
-            serde_json::to_value(&broken.health.profile_enumeration).expect("encodes"),
+            serde_json::to_value(broken.health.profile_enumeration).expect("encodes"),
             serde_json::json!({"kind": "degraded", "code": "profile_enumeration"}),
             "the bad profile says so, and the good one is untouched"
         );
@@ -1186,7 +1185,7 @@ mod tests {
             .find(|profile| profile.name == "main")
             .expect("the healthy profile is published");
         assert_eq!(
-            serde_json::to_value(&main.health.profile_enumeration).expect("encodes"),
+            serde_json::to_value(main.health.profile_enumeration).expect("encodes"),
             serde_json::json!({"kind": "healthy"})
         );
     }
@@ -1407,7 +1406,7 @@ mod tests {
 
     /// A stored row the read cannot fix is kept as it stands: a legacy
     /// trailing separator is spelled the way the store compares paths, and an
-    /// orphan parent is left pointing at a row that is not there — the state
+    /// orphan parent is left pointing at a row that is not there: the state
     /// `rm --purge` leaves behind, and the one the local path prints. The
     /// client then accepts the snapshot unchanged.
     #[test]
@@ -1495,7 +1494,7 @@ mod tests {
         let row = &sampled.data.sessions[0];
         assert_eq!(row.created_at, "2026-01-02T03:04:05.123456789Z");
         // `AutoSi` writes the smallest of 0, 3, 6 or 9 digits that keeps the
-        // instant, so `.5` comes back as `.500` — the same spelling the local
+        // instant, so `.5` comes back as `.500`: the same spelling the local
         // `DateTime<Utc>` serializer produces.
         assert_eq!(row.pinned_at.as_deref(), Some("2026-01-02T03:04:06.500Z"));
 

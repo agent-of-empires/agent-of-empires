@@ -372,9 +372,15 @@ fn a_case_id_that_is_not_one_component_is_rejected() {
     restage(&root);
 
     let error = pack::verify(&root).expect_err("traversing case_id is rejected");
+    // The published schema forbids a separator in a case id, so it refuses
+    // before the pack's own single-component check does. Either layer is a
+    // correct refusal, and the test must not pin which runs first, or making
+    // the published schema enforce its own pattern would break it.
+    let refused = error.to_string();
     assert!(
-        error.to_string().contains("not a single valid component"),
-        "unexpected error: {error}"
+        refused.contains("not a single valid component")
+            || refused.contains("does not satisfy cases.schema.json"),
+        "unexpected error: {refused}"
     );
 }
 
@@ -574,8 +580,7 @@ fn frame_bodies(bytes: &[u8]) -> String {
 /// Two producer spellings were refused before this repair, and both are put
 /// back here. `registered` is the field `ProjectRead` has serialised on every
 /// row since it was added, and the fractional timestamp is exactly what
-/// chrono's `AutoSi` writes for an instant that is not on a second boundary —
-/// which is almost every real one. The recorded frames carry both.
+/// chrono's `AutoSi` writes for an instant that is not on a second boundary /// which is almost every real one. The recorded frames carry both.
 #[test]
 #[parallel]
 fn a_producer_frame_the_schema_once_refused_is_accepted() {
@@ -739,8 +744,8 @@ fn a_pattern_inside_a_one_of_branch_is_enforced() {
     fs::write(&schema, text.replacen(&from, &to, 1)).expect("rewrite the document");
     restage(&root);
 
-    // Every recorded `default_profile` — "main" on the nominal frames, and
-    // the dangling "absent" on the schema-invalid one — is inside the pattern, so
+    // Every recorded `default_profile`: "main" on the nominal frames, and
+    // the dangling "absent" on the schema-invalid one: is inside the pattern, so
     // a compiled pattern inside a branch does not refuse a conforming frame.
     pack::verify(&root).expect("a frame the branch's pattern admits is accepted");
 
@@ -839,7 +844,7 @@ fn a_keyword_inside_a_one_of_branch_reaching_past_the_subset_is_refused() {
 
 /// A definition that reaches itself. The name is declared, so every other load
 /// check passes this document, and the evaluator then follows the reference
-/// until the stack gives out — which is an abort of `pack::verify` over a
+/// until the stack gives out: which is an abort of `pack::verify` over a
 /// one-character edit, not the readable refusal every other malformation gets.
 /// A cycle is a schema this evaluator cannot read, so it is refused at load.
 #[test]

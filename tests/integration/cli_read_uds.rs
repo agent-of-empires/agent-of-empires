@@ -291,7 +291,7 @@ async fn shutdown_retracts_the_socket_and_closes_admission() {
 
 /// A daemon that republishes while the client is admitting it leaves the
 /// markers describing a process that is no longer the one holding the socket.
-/// That is `marker_identity` — true for a state that lasts microseconds — so
+/// That is `marker_identity`: true for a state that lasts microseconds: so
 /// the client re-admits inside the establishment budget instead of refusing a
 /// read that a daemon restart or a fresh publication raced.
 #[tokio::test]
@@ -330,8 +330,8 @@ async fn a_republication_raced_mid_admission_still_serves_the_read() {
     server.join().await;
 }
 
-/// A home reached through a symlink is an ordinary setup — `/tmp` → `/private/tmp`
-/// on macOS, a linked `$HOME` on Linux — and the publisher used to refuse it
+/// A home reached through a symlink is an ordinary setup: `/tmp` → `/private/tmp`
+/// on macOS, a linked `$HOME` on Linux: and the publisher used to refuse it
 /// outright, so a daemon under a symlinked `XDG_CONFIG_HOME` published nothing
 /// and every read fell back to the local store. The walk follows a prefix
 /// symlink and verifies what it resolves to by descriptor, so this is served.

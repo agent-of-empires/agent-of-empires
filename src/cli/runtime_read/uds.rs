@@ -182,12 +182,12 @@ pub(crate) struct Admission {
 /// A single attempt turns a publication race into a refusal: a daemon that
 /// republishes between the client's walk and its marker read leaves the
 /// markers describing a process that is no longer the one holding the socket,
-/// which is `marker_identity` — a true statement about a state that lasts
+/// which is `marker_identity`: a true statement about a state that lasts
 /// microseconds. So that code alone is re-admitted rather than returned, and
 /// only an exhausted budget turns the last refusal into the answer. Every
 /// other code is final, including the `marker_invalid` that says the artifacts
 /// are present but not trustworthy, and including `marker_missing`, which is
-/// the one refusal the local command path is allowed to take over — it now
+/// the one refusal the local command path is allowed to take over: it now
 /// covers a provably dead publisher as well as an empty namespace, so "no
 /// daemon is publishing here".
 pub(crate) async fn connect(establishment_deadline: Instant) -> Result<UdsConnection, ReadFailure> {
@@ -365,8 +365,8 @@ fn open_dir(path: &Path) -> Result<OwnedFd, TrustedPathError> {
 /// Open one component of the walk.
 ///
 /// `O_NOFOLLOW` guards the final component only, the same convention the hook
-/// guard uses (`src/hooks/dir_guard.rs`): a prefix symlink — a home reached
-/// through one, or macOS `/tmp` → `/private/tmp` — is followed and the
+/// guard uses (`src/hooks/dir_guard.rs`): a prefix symlink: a home reached
+/// through one, or macOS `/tmp` → `/private/tmp`: is followed and the
 /// directory it resolves to is verified by descriptor, which is where the
 /// ownership, mode, sticky-root and ACL checks are read from. A symlinked
 /// *final* component stays a refusal, because that would let the app directory
@@ -527,7 +527,7 @@ fn xattr_value(fd: RawFd, name: &[u8]) -> Result<Vec<u8>, TrustedPathError> {
 }
 
 /// The kernel serves `system.posix_acl_access` in its text form, one entry per
-/// comma, each `tag[:id]:perms` with `perms` spelled in `rwx` letters — for
+/// comma, each `tag[:id]:perms` with `perms` spelled in `rwx` letters: for
 /// example `u::rw-,g::r--,o::r--,u:1002:rwx`. Only a *named* user or group
 /// holding `w` is refused here: the base owner, group and other entries are
 /// already reflected in the directory mode, and the mask entry applies to
@@ -634,8 +634,8 @@ async fn connect_admission(
     // it would spend the whole establishment budget to report the same thing
     // twice. A *live* publisher mid-republication cannot reach this branch: it
     // holds `LOCK_EX` while it writes, so the client's own `flock` above failed
-    // first with `marker_identity`. An unprovable state — an unreadable
-    // `/proc`, a malformed identity — stays `marker_identity` and keeps its
+    // first with `marker_identity`. An unprovable state: an unreadable
+    // `/proc`, a malformed identity: stays `marker_identity` and keeps its
     // retry, because that is a statement about liveness this client cannot make.
     match process_state(postbind.pid, &postbind.process_start_identity)? {
         ProcessState::Live => {}
@@ -1277,8 +1277,8 @@ mod tests {
     }
 
     /// A refused path has to say which directory it refused, what is wrong
-    /// with it and what clears it. The refusal itself is unchanged — same
-    /// code, same exit, still no admission — but `daemon read: marker_invalid`
+    /// with it and what clears it. The refusal itself is unchanged: same
+    /// code, same exit, still no admission: but `daemon read: marker_invalid`
     /// names nothing an operator can act on, and the walk already knows the
     /// component, its mode and the rule it broke.
     #[test]

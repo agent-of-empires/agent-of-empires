@@ -8,7 +8,7 @@
 //! compile the library with debug assertions but without `cfg(test)`. A lock
 //! that only one of them can reach is two locks in all but name, and a second
 //! mutex for the same key defeats the structural guarantee documented on
-//! [`crate::session::test_support::restore_or_remove`] — the process environment
+//! [`crate::session::test_support::restore_or_remove`]: the process environment
 //! is one slot per key, whatever the module boundaries say.
 //!
 //! Compiled under `any(test, debug_assertions)` because that is exactly the
@@ -93,7 +93,7 @@ mod tests {
     /// The first direction is the one that was broken: a `RuntimeEnvGuard`
     /// holding `XDG_CONFIG_HOME`, against a reader taking the lock the way
     /// every `session` test guard does. No `#[serial_test::serial]` group is
-    /// what makes this true — the guard is — which is exactly what an
+    /// what makes this true: the guard is: which is exactly what an
     /// unannotated `#[tokio::test]` relies on. `#[serial]` on the test itself
     /// only keeps the two directions in this module from writing the same
     /// environment key at each other.

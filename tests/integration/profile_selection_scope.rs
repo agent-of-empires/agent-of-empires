@@ -49,7 +49,7 @@ fn app_dir(home: &Path) -> PathBuf {
 }
 
 /// The rows in one scope's registry, or an empty inventory for a registry file
-/// that was never written — which is the other half of the assertion.
+/// that was never written: which is the other half of the assertion.
 fn registered(home: &Path, profile: Option<&str>) -> Vec<Value> {
     let path = match profile {
         Some(profile) => app_dir(home)

@@ -443,7 +443,7 @@ fn the_publisher_only_publishes_into_a_trusted_chain() {
 /// A home reached through a symlink is the ordinary case on macOS and a real
 /// one on Linux, and it is the case the walk is written for: the prefix symlink
 /// is followed, the directory it resolves to is verified by descriptor, and the
-/// descriptor the publisher keeps is that directory — not a second resolution
+/// descriptor the publisher keeps is that directory: not a second resolution
 /// of the path by name, which is the only way a swapped directory could be
 /// published into after the chain was validated.
 #[test]
@@ -564,8 +564,8 @@ fn set_named_user_write_acl(dir: &Path, uid: u32) -> bool {
 }
 
 /// A shutdown that happens while a client holds the namespace shared for its
-/// whole exchange still retracts. Asking for an exclusive lock to do it — which
-/// is what the old code did — could only ever fail while that client was
+/// whole exchange still retracts. Asking for an exclusive lock to do it: which
+/// is what the old code did: could only ever fail while that client was
 /// reading, so the three artifacts were stranded for as long as the daemon took
 /// to notice.
 #[tokio::test]

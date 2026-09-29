@@ -2,9 +2,9 @@
 //!
 //! Every read command has two implementations: the local one, which opens the
 //! store, and the renderer, which paints a snapshot the daemon published. This
-//! runs the real `aoe` binary twice per command against the *same* store — once
+//! runs the real `aoe` binary twice per command against the *same* store: once
 //! with a daemon to answer, once with no daemon at all so the local command
-//! runs — and compares the exit code and both streams. A row, a glyph, a key
+//! runs: and compares the exit code and both streams. A row, a glyph, a key
 //! or a timestamp that differs between the two shows up here as a diff, not as
 //! a note in someone's release notes. A command that *refuses* is compared the
 //! same way, because the refusal's exit code and its sentence are exactly the
@@ -320,8 +320,8 @@ fn fixture_sessions(home: &Path) -> Vec<serde_json::Value> {
             false,
         ),
         // A child whose parent is gone: the stored id is kept and printed by
-        // both paths, so a producer that cleared it — or a client that refused
-        // it — shows up here rather than in a reviewer's reading.
+        // both paths, so a producer that cleared it: or a client that refused
+        // it: shows up here rather than in a reviewer's reading.
         row(
             "j-orphan",
             idle,
@@ -478,7 +478,7 @@ fn run_blocking(home: &Path, args: &[String]) -> Run {
 
 /// The whole comparison, as a value: what a served run and a local run for the
 /// same command must agree on, and where they do not. Returned rather than
-/// asserted so the harness's own coverage is testable — a comparison that
+/// asserted so the harness's own coverage is testable: a comparison that
 /// quietly stopped looking at a command would otherwise be indistinguishable
 /// from one that passed.
 fn difference(args: &[String], served: &Run, local: &Run) -> Option<String> {
@@ -578,7 +578,6 @@ async fn compare_both_transports(fixture: &Fixture) {
 /// refused on the served pass: a "refusal" that succeeded would be compared on
 /// stdout alone and would pass whether or not the two transports agreed about
 /// the refusal, which is exactly the gap this row set exists to close.
-
 async fn compare_transports(fixture: &Fixture, commands: &[&[&str]], refusals_from: usize) {
     let xdg_base = fixture.path().join(".config");
     let state = build_test_app_state_with_policy(
@@ -698,7 +697,7 @@ async fn the_named_home_produces_the_same_bytes_on_both_transports() {
 }
 
 /// The comparison itself, checked. Two in-session reviews found the same gap
-/// in this file — a command that refuses could not be compared at all — so the
+/// in this file: a command that refuses could not be compared at all: so the
 /// refusal rows are only worth anything if the comparison notices when two
 /// refusals differ. This is what pins that: a differing exit code, a differing
 /// sentence and a differing stdout are each reported, and identical runs are

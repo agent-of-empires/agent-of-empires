@@ -142,7 +142,7 @@ pub(crate) struct ProjectRead {
     ///
     /// An absent flag means `true`, deliberately. The flag arrived with the
     /// synthesized-row contract, so a snapshot that does not name it predates
-    /// it, and every row such a snapshot carries is a registry row — the
+    /// it, and every row such a snapshot carries is a registry row: the
     /// renderer filters on this flag, so defaulting it to `false` would make
     /// those snapshots parse cleanly and then render an empty project
     /// inventory. A missing field must not be able to hide rows, which is the
@@ -594,7 +594,7 @@ pub(crate) fn validate_snapshot(snapshot: &SnapshotData) -> Result<(), &'static 
             // A parent that names no row is persisted state, not corruption: the
             // local path keeps and prints the stored id, and `rm --purge` of a
             // parent leaves the child pointing at nothing. So the graph rules
-            // that can still be stated apply to the part that is there — the
+            // that can still be stated apply to the part that is there: the
             // parent, when it is a row at all, sits in the same profile, and the
             // edges that do land on a row form no cycle.
             if let Some((parent_profile, _)) = parents.get(parent) {
@@ -773,8 +773,7 @@ fn validate_groups(groups: &[GroupRead]) -> Result<(), &'static str> {
     Ok(())
 }
 
-/// Projects in the producer's own registry order, and unique by identity —
-/// name, path and the registered flag together, so a synthesized row and the
+/// Projects in the producer's own registry order, and unique by identity /// name, path and the registered flag together, so a synthesized row and the
 /// registry row it stands in for are two identities rather than one repeated.
 fn validate_projects(projects: &[ProjectRead], scope: ProjectScope) -> Result<(), &'static str> {
     let mut identities = HashSet::new();
@@ -966,7 +965,7 @@ fn is_c1_c0(value: char) -> bool {
 /// `YYYY-MM-DDTHH:MM:SS[.f{1,9}]Z`: UTC, `Z` zoned, and either a whole
 /// second or the fractional part RFC 3339 allows. The fixed separators are
 /// checked by position and the value must parse, so a permissive length is
-/// the only thing that is relaxed — a control character, a numeric offset or a
+/// the only thing that is relaxed: a control character, a numeric offset or a
 /// lowercase `t`/`z` is still refused.
 fn valid_timestamp(value: &str) -> bool {
     let bytes = value.as_bytes();
@@ -1085,8 +1084,8 @@ mod tests {
         assert!(serde_json::from_str::<SnapshotHealth>(duplicate).is_err());
     }
 
-    /// A parent that names no row is persisted state — `rm --purge` of a parent
-    /// leaves the child pointing at nothing — and the local path keeps and
+    /// A parent that names no row is persisted state: `rm --purge` of a parent
+    /// leaves the child pointing at nothing: and the local path keeps and
     /// prints it, so the snapshot is accepted. The rules that can still be
     /// stated are the ones about parents that are rows: same profile, and no
     /// cycle.
@@ -1203,7 +1202,7 @@ mod tests {
     }
 
     /// The wire keeps the fractional part the local command serializes, so the
-    /// grammar accepts it — and still refuses every other spelling.
+    /// grammar accepts it: and still refuses every other spelling.
     #[test]
     fn a_timestamp_is_utc_z_or_a_utc_z_with_up_to_nine_fractional_digits() {
         assert!(valid_timestamp("2026-01-01T00:00:00Z"));

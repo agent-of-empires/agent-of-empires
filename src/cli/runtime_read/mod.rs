@@ -102,8 +102,6 @@ pub fn classify(command: Option<&Commands>) -> Option<ScopedCommand<'_>> {
 /// introduce a code the table does not describe; the pack verifier requires
 /// every code in its table to be in this set, so the table cannot describe a
 /// code no emitter produces. A code with no emitter is what left
-/// `identifier_required` frozen in the pack for a renderer that no longer
-/// exists.
 pub(crate) const EMITTABLE_CODES: &[&str] = &[
     // `parser_error` is clap's, raised before any read begins.
     "parser_error",
@@ -145,7 +143,7 @@ pub(crate) struct ReadFailure {
     /// same reason the producer half owns its detail
     /// (`server::runtime_uds::PublishError`): a refusal that has to name the
     /// path it refused, or the candidates that would resolve it, cannot say so
-    /// out of a constant. The code stays `&'static str` — it is a member of
+    /// out of a constant. The code stays `&'static str`: it is a member of
     /// the Contract Pack's code set, and the set is compile-time.
     exact: Option<String>,
     attempt_close: bool,
@@ -166,7 +164,7 @@ impl ReadFailure {
 
     /// A pre-admission refusal that says what to fix. The walk's refusal has
     /// to name the component it refused, the mode it found and the command
-    /// that clears it, and none of that is a constant — the same reason
+    /// that clears it, and none of that is a constant: the same reason
     /// [`ReadFailure::exit`] owns its text. The code and the exit are exactly
     /// the ones the refusal already carried, so saying more cannot widen it:
     /// a diagnosis is not an admission.
@@ -198,7 +196,7 @@ impl ReadFailure {
     /// A refusal on the user's own state that keeps its own code. The three
     /// user-input refusals (`profile_missing`, `session_missing`,
     /// `session_ambiguous`) are not wire failures, so what they carry is the
-    /// local path's exit (1) and the local path's sentence — but the code is
+    /// local path's exit (1) and the local path's sentence: but the code is
     /// still what says *which* refusal this was, so a caller can tell a
     /// missing profile from a missing session from an internal fault. The code
     /// is checked against the emittable set exactly as every other constructor
@@ -336,8 +334,8 @@ async fn execute_inner(
             // prints. A loopback host is therefore given one: a read aimed at
             // 127.0.0.1 is normally this machine's own daemon over TCP, and it
             // is the same daemon the socket transport reaches. The host string
-            // does not prove the peer shares this home — a forwarded
-            // 127.0.0.1 reaches another machine — and nothing here treats it
+            // does not prove the peer shares this home: a forwarded
+            // 127.0.0.1 reaches another machine: and nothing here treats it
             // as proof: the collapse only ever shows *less* than the wire
             // carries, so a wrong assumption widens the output rather than
             // narrowing it.
@@ -542,7 +540,7 @@ fn peer_gone() -> ReadFailure {
 
 /// Close the exchange and settle on the answer.
 ///
-/// A close that fails is still an error — the contract says the read reports
+/// A close that fails is still an error: the contract says the read reports
 /// one, and a peer that cannot be told to stop must not pass for a clean
 /// finish. It is not, however, allowed to become *the* error: a snapshot the
 /// client refused (`schema_invalid`), a profile the daemon does not have

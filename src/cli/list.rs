@@ -12,7 +12,12 @@ pub(crate) const TABLE_COL_PATH: usize = 40;
 pub(crate) const TABLE_COL_ID_DISPLAY: usize = 12;
 pub(crate) const TABLE_COL_STATE: usize = 9;
 
-/// The `aoe list --state=` vocabulary shared with the REST API.
+/// The `aoe list --state=` vocabulary. Mirrors the REST API's
+/// `SessionScope` (`GET /api/sessions?state=`) so the two vocabularies
+/// share one source of truth (#3350). Kept as a clap-facing enum here
+/// rather than deriving `ValueEnum` on the wire type: the API rejects
+/// unrecognized values via serde with a JSON 400, while clap wants its
+/// own `PossibleValue` list for `--help` and `--state=?` errors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 #[value(rename_all = "lowercase")]
 pub(crate) enum StateFilter {
@@ -44,13 +49,11 @@ pub struct ListArgs {
     #[arg(long)]
     pub(crate) all: bool,
 
-    /// Filter by session state
-    #[arg(
-        long,
-        value_enum,
-        default_value = "all",
-        long_help = "Filter by session state. Replaces the older --archived and --trash flags with --state archived and --state trashed. Without it every session is listed. Note that --all now means every profile, not every state. The values are the same vocabulary the REST API's state filter takes."
-    )]
+    /// Filter by session state. Defaults to `all`, every persisted session,
+    /// which is what `aoe list` has always shown. Pass `--state=live` to skip
+    /// trashed and archived rows; the vocabulary matches the REST API's
+    /// `GET /api/sessions?state=`.
+    #[arg(long, value_enum, default_value = "all")]
     pub(crate) state: StateFilter,
 }
 
@@ -65,7 +68,7 @@ pub(super) fn state_tag(inst: &Instance) -> &'static str {
 /// One timestamp spelling for every human line that shows one: RFC 3339 in UTC
 /// with the fractional part `AutoSi` keeps, zoned with `Z`. This is the same
 /// spelling `DateTime<Utc>` serializes to, so the human lines and the `--json`
-/// lines of one command agree — and so do the two transports.
+/// lines of one command agree, and so do the two transports.
 pub(crate) fn display_timestamp(value: chrono::DateTime<chrono::Utc>) -> String {
     value.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)
 }

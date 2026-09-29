@@ -56,6 +56,7 @@ pub const EXPECTED_SCHEMA: &str = "expected.schema.json";
 pub const HELLO_SCHEMA: &str = "hello.schema.json";
 /// The published per-case Snapshot data schema.
 pub const SNAPSHOT_SCHEMA: &str = "snapshot.schema.json";
+const CASES_SCHEMA: &str = "cases.schema.json";
 
 #[derive(Debug)]
 pub struct PackError(String);
@@ -258,8 +259,8 @@ const TABLE: &[(&str, &[&str], &[u8])] = &[
     ("snapshot", &["schema_invalid"], &[4]),
     // `health_degraded`, `freshness_unavailable` and `default_missing` are
     // facts the exchange could not establish, so they leave 4. The three below
-    // them are refusals on the user's own state — a profile the store does not
-    // have, a session it does not, an identifier that names several — so the
+    // them are refusals on the user's own state: a profile the store does not
+    // have, a session it does not, an identifier that names several: so the
     // local command has always left 1 for them and the served half leaves the
     // same 1, which is the exit the parity gate compares. A refusal on the
     // user's own state is not a wire failure, so the row admits 1 as well as
@@ -278,8 +279,8 @@ const TABLE: &[(&str, &[&str], &[u8])] = &[
     ),
     ("close", &["close_timeout"], &[4]),
     // The renderer chooses the exit itself: an internal fault leaves 1, and a
-    // refusal on the user's own state — no tmux session to read, or a pane
-    // that is not an Agent of Empires session — leaves 2.
+    // refusal on the user's own state: no tmux session to read, or a pane
+    // that is not an Agent of Empires session: leaves 2.
     ("renderer", &["renderer_internal"], &[1, 2]),
 ];
 
@@ -817,11 +818,13 @@ fn websocket_opcode(case_id: &str, direction: u8, payload: &[u8]) -> Result<u8> 
     Ok(opcode)
 }
 
-/// The two published wire schemas, compiled once per [`verify`] and applied to
-/// every application frame in the pack.
+/// The published schemas, compiled once per [`verify`]: the two the application
+/// frames are checked against, and the one the case index is checked against,
+/// so no published document is inert.
 struct WireSchemas {
     hello: Schema,
     snapshot: Schema,
+    cases: Schema,
 }
 
 fn load_wire_schemas(root: &Path) -> Result<WireSchemas> {
@@ -833,6 +836,7 @@ fn load_wire_schemas(root: &Path) -> Result<WireSchemas> {
     Ok(WireSchemas {
         hello: load(HELLO_SCHEMA)?,
         snapshot: load(SNAPSHOT_SCHEMA)?,
+        cases: load(CASES_SCHEMA)?,
     })
 }
 
@@ -856,7 +860,7 @@ fn websocket_frame<'a>(case_id: &str, direction: u8, record: &'a [u8]) -> Result
 /// pack must satisfy the schema published beside it.
 ///
 /// Nothing compared the two before, so a producer that grew a field and a
-/// schema that did not follow both kept passing — `ProjectRead::registered` and
+/// schema that did not follow both kept passing: `ProjectRead::registered` and
 /// the fractional timestamp both survived several reviews for exactly that
 /// reason. The cost is one JSON parse and one schema walk per application
 /// frame, in a debug-only gate over six cases, and no new dependency: the
@@ -958,6 +962,11 @@ pub fn verify(root: &Path) -> Result<VerifiedPack> {
 
     let cases_bytes = read(root, CASES_NAME)?;
     let value = check_canonical(&cases_bytes, CASES_NAME)?;
+    wire_schemas.cases.validate(&value).map_err(|reason| {
+        PackError(format!(
+            "{CASES_NAME} does not satisfy cases.schema.json: {reason}"
+        ))
+    })?;
     let cases: CasesFile = serde_json::from_value(value).map_err(|error| {
         PackError(format!(
             "{CASES_NAME} does not close over its contract: {error}"

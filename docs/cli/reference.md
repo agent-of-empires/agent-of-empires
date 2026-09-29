@@ -248,7 +248,7 @@ List all sessions
 
 * `--json` — Output as JSON
 * `--all` — List sessions from all profiles
-* `--state <STATE>` — Filter by session state. Replaces the older --archived and --trash flags with --state archived and --state trashed. Without it every session is listed. Note that --all now means every profile, not every state. The values are the same vocabulary the REST API's state filter takes.
+* `--state <STATE>` — Filter by session state. Defaults to `all`, every persisted session, which is what `aoe list` has always shown. Pass `--state=live` to skip trashed and archived rows; the vocabulary matches the REST API's `GET /api/sessions?state=`
 
   Default value: `all`
 
