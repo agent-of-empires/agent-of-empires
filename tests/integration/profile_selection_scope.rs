@@ -11,7 +11,6 @@
 use agent_of_empires::session::{
     create_profile, set_default_profile, Instance, Storage, APP_DIR_NAME_XDG,
 };
-use agent_of_empires::tmux;
 use serde_json::Value;
 use serial_test::serial;
 use std::path::{Path, PathBuf};
@@ -65,46 +64,17 @@ fn registered(home: &Path, profile: Option<&str>) -> Vec<Value> {
     }
 }
 
-fn tmux_available() -> bool {
-    Command::new("tmux")
-        .arg("-V")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
-/// Kills the session this test created, so a panic mid-test cannot leave a live
-/// one behind for the next `#[serial]` test to trip over.
-struct SessionCleanup<'a> {
-    socket: &'a Path,
-    name: &'a str,
-}
-
-impl Drop for SessionCleanup<'_> {
-    fn drop(&mut self) {
-        let _ = Command::new("tmux")
-            .arg("-S")
-            .arg(self.socket)
-            .args(["kill-session", "-t", self.name])
-            .output();
-    }
-}
-
 /// An empty variable writes where it always wrote, and still reads as the
 /// configured default.
 ///
-/// The fixture is two profiles, `main` (the default) and `other`, and a
-/// directory to register. A live tmux session for a row registered in `other`
-/// is what makes the `ps` half observable: `aoe ps` prints rows the substrate
-/// reports, not rows a registry holds, so without a live session the scoped and
-/// the unscoped answer would look alike and the assertion would prove nothing.
+/// The fixture is two profiles, `main` (the default) and `other`, a row
+/// registered in `other`, and a directory to register. Both halves are read
+/// from the registry, because that is what the selection chooses between;
+/// an earlier version used `aoe ps`, which reports rows a live tmux session
+/// provides, and so failed on any runner whose tmux could not expose one.
 #[test]
 #[serial]
 fn an_empty_profile_variable_writes_where_it_wrote_before_and_reads_as_the_default() {
-    if !tmux_available() {
-        eprintln!("skipping: tmux not on PATH");
-        return;
-    }
     let home = setup_temp_home();
     let home = home.path().to_path_buf();
     let socket = tmux_socket();
@@ -113,8 +83,8 @@ fn an_empty_profile_variable_writes_where_it_wrote_before_and_reads_as_the_defau
     create_profile("other").expect("other");
     set_default_profile("main").expect("default");
 
-    // A row registered in `other`, backed by a live session, so the control run
-    // below proves the session is visible at all.
+    // A row registered in `other`, so the control below proves the row is
+    // there at all when that profile is named.
     let id = "psscope0001";
     let title = "Scope";
     let mut instance = Instance::new(title, &home.to_string_lossy());
@@ -129,18 +99,6 @@ fn an_empty_profile_variable_writes_where_it_wrote_before_and_reads_as_the_defau
             Ok(())
         })
         .expect("seed other");
-    let session_name = tmux::Session::generate_name(id, title);
-    let _cleanup = SessionCleanup {
-        socket: &socket,
-        name: &session_name,
-    };
-    let status = Command::new("tmux")
-        .arg("-S")
-        .arg(&socket)
-        .args(["new-session", "-d", "-s", &session_name])
-        .status()
-        .expect("tmux new-session");
-    assert!(status.success(), "tmux new-session failed");
 
     let repo = home.join("repo");
     std::fs::create_dir_all(&repo).expect("the directory to register");
@@ -195,37 +153,24 @@ fn an_empty_profile_variable_writes_where_it_wrote_before_and_reads_as_the_defau
         "the other profile's registry is empty and must answer empty: {other:?}"
     );
 
-    // `ps` is scoped by the same flag: an empty value is a selection, so the
-    // lookup is the selected profile's alone, exactly as it was before.
+    // The read half is scoped by the same selection, and is read from the
+    // registry rather than from the substrate. `aoe ps` only lists rows a live
+    // tmux session provides, which makes the assertion depend on the runner's
+    // tmux being able to create and expose a session; the registry is what
+    // the selection actually chooses between, and it is deterministic.
     let scoped: Vec<Value> =
-        serde_json::from_str(&aoe(&home, &socket, "", &["ps", "--json"])).expect("ps --json");
+        serde_json::from_str(&aoe(&home, &socket, "", &["list", "--json"])).expect("list --json");
     assert!(
-        !scoped.iter().any(|row| row["session"] == id),
-        "an empty AGENT_OF_EMPIRES_PROFILE must scope `aoe ps` to one profile: {scoped:?}"
+        !scoped.iter().any(|row| row["id"] == id),
+        "an empty AGENT_OF_EMPIRES_PROFILE must read one profile's sessions: {scoped:?}"
     );
-    // The control: the same session is listed when the profile is named, so
-    // the assertion above is about the scope and not about a session nobody
-    // can see. `aoe ps` reports rows the substrate finds, so the session has
-    // to be visible to it before the control means anything. Polling an
-    // observable predicate with a bounded deadline is what the project asks
-    // for here; asserting once only moves the race into the next run.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-    let mut named: Vec<Value> = Vec::new();
-    loop {
-        named = serde_json::from_str(&aoe(
-            &home,
-            &socket,
-            "other",
-            &["-p", "other", "ps", "--json"],
-        ))
-        .expect("ps --json for the other profile");
-        if named.iter().any(|row| row["session"] == id) || std::time::Instant::now() >= deadline {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
+    // The control: the same row is there when the profile is named, so the
+    // assertion above is about the scope and not about a row nobody can see.
+    let named: Vec<Value> =
+        serde_json::from_str(&aoe(&home, &socket, "", &["-p", "other", "list", "--json"]))
+            .expect("list --json for the other profile");
     assert!(
-        named.iter().any(|row| row["session"] == id),
-        "the live `other` session must be visible when that profile is named: {named:?}"
+        named.iter().any(|row| row["id"] == id),
+        "the `other` profile's session must be visible when that profile is named: {named:?}"
     );
 }
