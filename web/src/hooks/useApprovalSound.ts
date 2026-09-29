@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { fetchSettings, fetchSounds, fetchSoundBlob } from "../lib/api";
+import { onSettingsChanged } from "../lib/settingsEvents";
 
 interface SoundSettings {
   enabled?: boolean;
@@ -22,7 +23,11 @@ let cachedSound: CachedSound | null = null;
 // The WS replays stored events on connect; don't chime for approvals that were already pending.
 const REPLAY_QUIET_MS = 1500;
 
+// Bumped on every clear, so a read started before a save cannot re-cache the old value.
+let cacheGeneration = 0;
+
 export function clearApprovalSoundCache(): void {
+  cacheGeneration++;
   cachedSettings = null;
   cachedSettingsAt = 0;
   if (cachedSound) {
@@ -31,16 +36,22 @@ export function clearApprovalSoundCache(): void {
   }
 }
 
+// A saved sound choice applies to the next chime, not after the cache expires.
+onSettingsChanged(clearApprovalSoundCache);
+
 async function loadSettings(): Promise<SoundSettings | null> {
   const now = Date.now();
   if (cachedSettings && now - cachedSettingsAt < SETTINGS_TTL_MS) {
     return cachedSettings;
   }
+  const generation = cacheGeneration;
   const data = await fetchSettings();
-  const sound = data?.sound as SoundSettings | undefined;
-  cachedSettings = sound ?? null;
-  cachedSettingsAt = now;
-  return cachedSettings;
+  const sound = (data?.sound as SoundSettings | undefined) ?? null;
+  if (generation === cacheGeneration) {
+    cachedSettings = sound;
+    cachedSettingsAt = now;
+  }
+  return sound;
 }
 
 async function resolveSoundName(sound: SoundSettings): Promise<string | null> {

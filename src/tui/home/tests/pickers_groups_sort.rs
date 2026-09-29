@@ -770,17 +770,28 @@ fn test_derived_group_collapsed_state_persists_to_config() {
     }
 }
 
-/// `<` / `>` step the list width by 5 from its default and clamp at the 10 / 80 bounds.
+/// `<` / `>` move the divider left / right by 5 from its default, so with the sidebar on
+/// the right they grow / shrink the list, and the width clamps at the 10 / 80 bounds.
 #[test]
 #[serial]
 fn test_list_width_steps_and_clamps() {
+    use crate::session::config::SidebarPosition;
+    // (sidebar position, width after `<`, width after `<` then `>` twice)
+    for (position, after_left, after_right) in [
+        (SidebarPosition::Left, 30, 40),
+        (SidebarPosition::Right, 40, 30),
+    ] {
+        let mut env = create_test_env_empty();
+        env.view.sidebar_position = position;
+        assert_eq!(env.view.list_width, 35);
+        env.view.handle_key(key(KeyCode::Char('<')), None);
+        assert_eq!(env.view.list_width, after_left, "{position:?}: `<`");
+        env.view.handle_key(key(KeyCode::Char('>')), None);
+        env.view.handle_key(key(KeyCode::Char('>')), None);
+        assert_eq!(env.view.list_width, after_right, "{position:?}: `>`");
+    }
+
     let mut env = create_test_env_empty();
-    assert_eq!(env.view.list_width, 35);
-    env.view.handle_key(key(KeyCode::Char('<')), None);
-    assert_eq!(env.view.list_width, 30);
-    env.view.handle_key(key(KeyCode::Char('>')), None);
-    env.view.handle_key(key(KeyCode::Char('>')), None);
-    assert_eq!(env.view.list_width, 40);
 
     env.view.list_width = 12;
     env.view.shrink_list();

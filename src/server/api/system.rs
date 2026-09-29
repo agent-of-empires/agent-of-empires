@@ -205,16 +205,56 @@ pub async fn list_agents(State(state): State<Arc<AppState>>) -> Json<Vec<AgentIn
 #[derive(Deserialize)]
 pub struct SettingsQuery {
     pub profile: Option<String>,
+    /// `machine` reads the machine-wide layer alone, for editors that show
+    /// where a value lives. Every other read gets the effective view.
+    pub layer: Option<String>,
 }
 
+/// The profile this server serves: its `--profile`, else the default profile,
+/// which a plain `aoe serve` follows at runtime.
+fn served_profile(state: &AppState) -> String {
+    crate::session::config::effective_profile(&state.profile)
+}
+
+/// `GET /api/settings` returns the settings as they apply: the served profile's
+/// overrides over the machine-wide values, or `?profile=` for another profile.
+/// A bare read was once the machine-wide layer, so a caller that forgot the
+/// profile silently ignored every profile override (#4144).
 pub async fn get_settings(
+    State(state): State<Arc<AppState>>,
     axum::extract::Query(query): axum::extract::Query<SettingsQuery>,
 ) -> impl IntoResponse {
-    let config_result = if let Some(ref profile_name) = query.profile {
-        crate::session::resolve_config(profile_name)
-    } else {
-        crate::session::Config::load()
+    let machine_only = match query.layer.as_deref() {
+        None => false,
+        Some("machine") if query.profile.is_none() => true,
+        Some("machine") => {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "validation_failed",
+                "`layer=machine` cannot be combined with `profile`",
+            )
+        }
+        Some(other) => {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "validation_failed",
+                format!("Unknown settings layer '{other}'"),
+            )
+        }
     };
+    let profile = query.profile.unwrap_or_else(|| served_profile(&state));
+    if let Err(e) = validate_profile_name(&profile) {
+        return api_error(StatusCode::BAD_REQUEST, "validation_failed", e);
+    }
+    let config_result = tokio::task::spawn_blocking(move || {
+        if machine_only {
+            crate::session::Config::load()
+        } else {
+            crate::session::resolve_config(&profile)
+        }
+    })
+    .await
+    .unwrap_or_else(|e| Err(anyhow::anyhow!(e)));
 
     match config_result {
         Ok(config) => match serde_json::to_value(&config) {
@@ -251,32 +291,201 @@ fn reject_response(rej: PatchRejection) -> axum::response::Response {
         .into_response()
 }
 
-/// Persist a global patch and apply side effects for the sections it changes.
+/// Split a patch into the leaves each layer owns. Profile-overridable fields
+/// go to the profile; the rest (global-only, plugin sections, and unknown
+/// leaves, which machine-wide validation then rejects) go machine-wide.
+fn split_patch_by_layer(
+    descriptors: &[crate::session::config::settings_schema::FieldDescriptor],
+    patch: serde_json::Map<String, serde_json::Value>,
+) -> (serde_json::Value, serde_json::Value) {
+    let mut machine = serde_json::Map::new();
+    let mut profile = serde_json::Map::new();
+    for (section, value) in patch {
+        let serde_json::Value::Object(fields) = value else {
+            machine.insert(section, value);
+            continue;
+        };
+        // An empty section still reaches validation, so `{"hooks": {}}` is refused.
+        if fields.is_empty() {
+            machine.insert(section, fields.into());
+            continue;
+        }
+        for (field, leaf) in fields {
+            let overridable = descriptors
+                .iter()
+                .any(|d| d.section == section && d.field == field && d.profile_overridable);
+            let target = if overridable {
+                &mut profile
+            } else {
+                &mut machine
+            };
+            target
+                .entry(section.clone())
+                .or_insert_with(|| serde_json::json!({}))
+                .as_object_mut()
+                .expect("inserted as an object")
+                .insert(field, leaf);
+        }
+    }
+    (machine.into(), profile.into())
+}
+
+fn first_leaf(patch: &serde_json::Value) -> String {
+    patch
+        .as_object()
+        .and_then(|obj| obj.iter().next())
+        .map(
+            |(section, value)| match value.as_object().and_then(|f| f.keys().next()) {
+                Some(field) => format!("{section}.{field}"),
+                None => section.clone(),
+            },
+        )
+        .unwrap_or_default()
+}
+
+fn is_empty_patch(patch: &serde_json::Value) -> bool {
+    patch.as_object().is_some_and(|obj| obj.is_empty())
+}
+
+/// Every machine-wide write needs elevation, as the whole route did before
+/// saves began routing by layer.
+fn machine_elevation_gate(
+    machine: &serde_json::Value,
+    elevated: bool,
+) -> Result<(), PatchRejection> {
+    if elevated || is_empty_patch(machine) {
+        return Ok(());
+    }
+    Err(PatchRejection::NeedsElevation {
+        path: first_leaf(machine),
+        reason: "machine-wide settings need a recent passphrase".into(),
+    })
+}
+
+/// `PATCH /api/settings` saves each field to the layer it belongs in: the
+/// served profile (or `?profile=`) for profile-overridable fields, machine-wide
+/// for the rest. Callers never pick a layer, so a save always lands where
+/// `GET /api/settings` reads it (#4144). `?layer=machine` writes every field
+/// machine-wide, for editors that set the inherited value on purpose.
+///
+/// The two parts keep their layer's gates: any machine-wide leaf needs
+/// elevation, as the whole route did before it began routing, while profile
+/// leaves need it only where the schema says so. Both are validated before
+/// either is written.
 pub async fn update_settings(
     State(state): State<Arc<AppState>>,
+    axum::extract::Query(query): axum::extract::Query<SettingsQuery>,
+    session: Option<axum::Extension<AuthenticatedSession>>,
+    loopback: Option<axum::Extension<LoopbackTrusted>>,
     body: Result<Json<serde_json::Value>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
-    // CityHall exposes only the theme control, which writes through
-    // `PATCH /api/theme`; the general settings PATCH stays fully closed (#7).
+    // CityHall also denies this route at its boundary; its trash toggles save
+    // through the profile endpoint's allowlist (#7).
     if let Some(resp) = super::cityhall_block(&state) {
         return resp;
     }
     if state.read_only {
         return read_only_response();
     }
-    let Json(mut body) = match body {
+    let Json(body) = match body {
         Ok(b) => b,
         Err(rej) => return rej.into_response(),
     };
-    // Strip host-execution surfaces (`local_only`) first, so a bundled or
-    // echoed-back patch keeps its safe leaves and drops the rest (#1692).
-    strip_local_only(&mut body);
-    // Validate every remaining leaf against the runtime schema (core plus
-    // active-plugin `plugin:<id>` sections). The auth middleware already
-    // elevation-gates this route, so anything reaching here counts as elevated.
-    if let Err(rej) = validate_patch_with(&runtime_schema(), &body, Scope::Global, true) {
-        return reject_response(rej);
+    let machine_only = match query.layer.as_deref() {
+        None => false,
+        Some("machine") if query.profile.is_none() => true,
+        Some("machine") => {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "validation_failed",
+                "`layer=machine` cannot be combined with `profile`",
+            )
+        }
+        Some(other) => {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "validation_failed",
+                format!("Unknown settings layer '{other}'"),
+            )
+        }
+    };
+    let serde_json::Value::Object(body) = body else {
+        return reject_response(PatchRejection::Malformed("(root)".into()));
+    };
+    let profile = query.profile.unwrap_or_else(|| served_profile(&state));
+    if let Err(e) = validate_profile_name(&profile) {
+        return api_error(StatusCode::BAD_REQUEST, "validation_failed", e);
     }
+    let schema = runtime_schema();
+    let (mut machine, mut overrides) = if machine_only {
+        (body.into(), serde_json::json!({}))
+    } else {
+        split_patch_by_layer(&schema, body)
+    };
+    let elevated = handler_elevated(&state, session.as_deref(), loopback.is_some()).await;
+
+    if !is_empty_patch(&machine) {
+        if let Err(rej) = machine_elevation_gate(&machine, elevated) {
+            return reject_response(rej);
+        }
+        // Strip host-execution surfaces (`local_only`) first, so a bundled or
+        // echoed-back patch keeps its safe leaves and drops the rest (#1692).
+        strip_local_only(&mut machine);
+        if let Err(rej) = validate_patch_with(&schema, &machine, Scope::Global, true) {
+            return reject_response(rej);
+        }
+    }
+    if !is_empty_patch(&overrides) {
+        // Validate scope before stripping, including global-only local fields.
+        if let Err(rej) = validate_patch(&overrides, Scope::Profile, elevated) {
+            return reject_response(rej);
+        }
+        strip_local_only(&mut overrides);
+    }
+
+    let profile_saved = !is_empty_patch(&overrides);
+    if profile_saved {
+        if let Err(resp) = write_profile_patch(profile.clone(), overrides).await {
+            return resp;
+        }
+    }
+    if !is_empty_patch(&machine) {
+        if let Err(resp) = write_machine_patch(&state, machine).await {
+            if !profile_saved {
+                return resp;
+            }
+            // Two files cannot be written atomically; say which half landed.
+            return api_error(
+                resp.status(),
+                "partially_saved",
+                "Profile changes were saved, but machine-wide changes failed; retry to finish",
+            );
+        }
+    }
+
+    let effective = tokio::task::spawn_blocking(move || crate::session::resolve_config(&profile))
+        .await
+        .unwrap_or_else(|e| Err(anyhow::anyhow!(e)))
+        .and_then(|config| Ok(serde_json::to_value(&config)?));
+    match effective {
+        Ok(val) => (StatusCode::OK, Json(val)).into_response(),
+        Err(e) => {
+            tracing::error!(target: "http.api.system", "Settings reload failed: {}", e);
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "load_failed",
+                "Saved, but failed to reload settings",
+            )
+        }
+    }
+}
+
+/// Persist a validated machine-wide patch and apply the side effects of the
+/// sections it changes.
+async fn write_machine_patch(
+    state: &AppState,
+    mut body: serde_json::Value,
+) -> Result<(), axum::response::Response> {
     // Record which plugins the patch touches BEFORE the rewrite folds them into
     // `plugins.<id>.settings.*`, so `plugin.settings.changed` can be emitted
     // after a successful write (#2897).
@@ -337,33 +546,23 @@ pub async fn update_settings(
                     host.emit_settings_changed(&plugin_changes).await;
                 }
             }
-            match serde_json::to_value(&config) {
-                Ok(val) => (StatusCode::OK, Json(val)).into_response(),
-                Err(e) => {
-                    tracing::error!(target: "http.api.system", "Settings serialization failed: {}", e);
-                    api_error(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "serialize_failed",
-                        "Failed to serialize settings",
-                    )
-                }
-            }
+            Ok(())
         }
         Ok(Err(e)) => {
             tracing::warn!(target: "http.api.system", "Settings update failed: {}", e);
-            api_error(
+            Err(api_error(
                 StatusCode::BAD_REQUEST,
                 "update_failed",
                 "Failed to update settings",
-            )
+            ))
         }
         Err(e) => {
             tracing::error!(target: "http.api.system", "Settings update panicked: {}", e);
-            api_error(
+            Err(api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "internal",
                 "Internal server error",
-            )
+            ))
         }
     }
 }
@@ -1354,6 +1553,7 @@ pub struct ServerAbout {
     /// CityHall client mode (`AOE_CITYHALL_MODE`), which drives the dashboard's
     /// locked-down end-user client. See #7.
     pub cityhall_mode: bool,
+    /// The profile this server serves, resolved even without `--profile`.
     pub profile: String,
     /// Resolved `acp.show_tool_durations`, driving the per-tool elapsed-time
     /// label in the web UI.
@@ -1407,7 +1607,7 @@ pub async fn get_about(State(state): State<Arc<AppState>>) -> Json<ServerAbout> 
         read_only: state.read_only,
         behind_tunnel: state.behind_tunnel,
         cityhall_mode: state.cityhall_mode,
-        profile: state.profile.clone(),
+        profile: served_profile(&state),
         acp_show_tool_durations,
         acp_replay_events,
         acp_compaction_reminder,
@@ -1758,6 +1958,24 @@ pub async fn update_profile_settings(
     // Validate scope before stripping, including global-only local fields.
     strip_local_only(&mut body);
 
+    match write_profile_patch(name, body).await {
+        Ok(config) => match serde_json::to_value(&config) {
+            Ok(val) => (StatusCode::OK, Json(val)).into_response(),
+            Err(e) => api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "serialize_failed",
+                e.to_string(),
+            ),
+        },
+        Err(resp) => resp,
+    }
+}
+
+/// Apply a validated patch onto a profile's sparse override file.
+async fn write_profile_patch(
+    name: String,
+    body: serde_json::Value,
+) -> Result<crate::session::ProfileConfig, axum::response::Response> {
     let result = tokio::task::spawn_blocking(move || {
         // Load, merge, and write under one profile lock: a concurrent PATCH (or a
         // TUI save) between our read and write would otherwise silently drop
@@ -1802,16 +2020,17 @@ pub async fn update_profile_settings(
     .await;
 
     match result {
-        Ok(Ok(config)) => match serde_json::to_value(&config) {
-            Ok(val) => (StatusCode::OK, Json(val)).into_response(),
-            Err(e) => api_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "serialize_failed",
-                e.to_string(),
-            ),
-        },
-        Ok(Err(e)) => api_error(StatusCode::BAD_REQUEST, "update_failed", e.to_string()),
-        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string()),
+        Ok(Ok(config)) => Ok(config),
+        Ok(Err(e)) => Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "update_failed",
+            e.to_string(),
+        )),
+        Err(e) => Err(api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            e.to_string(),
+        )),
     }
 }
 
@@ -1875,6 +2094,109 @@ mod tests {
     use super::*;
     use axum::body::to_bytes;
     use std::collections::HashMap;
+
+    #[test]
+    fn settings_save_routes_each_leaf_to_its_layer() {
+        use serde_json::json;
+        let schema = crate::session::config::settings_schema::schema();
+        let patch = json!({
+            "session": {"default_tool": "codex", "sidebar_position": "right"},
+            "plugin:demo": {"level": 3},
+            "nosuch": {"field": 1},
+            "theme": "flat",
+        });
+        let serde_json::Value::Object(patch) = patch else {
+            unreachable!()
+        };
+        let (machine, profile) = split_patch_by_layer(&schema, patch);
+        assert_eq!(profile, json!({"session": {"default_tool": "codex"}}));
+        assert_eq!(
+            machine,
+            json!({
+                "session": {"sidebar_position": "right"},
+                "plugin:demo": {"level": 3},
+                "nosuch": {"field": 1},
+                "theme": "flat",
+            })
+        );
+    }
+
+    /// End to end through the handler with login on: without a recent
+    /// passphrase a machine-wide leaf is refused, a plain profile leaf saves,
+    /// and a save mixing both writes neither.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn settings_save_elevates_only_machine_wide_leaves() {
+        use serde_json::json;
+        let home = tempfile::TempDir::new().unwrap();
+        let _home = crate::session::test_support::isolate_home(home.path());
+        let mut state = crate::server::test_support::build_test_app_state(Vec::new());
+        Arc::get_mut(&mut state).expect("fresh state").login_manager =
+            Arc::new(crate::server::login::LoginManager::new(Some("pw")));
+        let session = state
+            .login_manager
+            .create_session(b"bind", "127.0.0.1", "t")
+            .await;
+        let save = |body: serde_json::Value| {
+            let state = state.clone();
+            let session = session.clone();
+            async move {
+                update_settings(
+                    State(state),
+                    axum::extract::Query(SettingsQuery {
+                        profile: None,
+                        layer: None,
+                    }),
+                    Some(axum::Extension(AuthenticatedSession(session))),
+                    None,
+                    Ok(Json(body)),
+                )
+                .await
+                .into_response()
+                .status()
+            }
+        };
+        let machine_tool = || crate::session::Config::load().unwrap().session.default_tool;
+        let profile_tool = || {
+            let config = crate::session::load_profile_config("test").unwrap();
+            serde_json::to_value(config).unwrap()["session"]["default_tool"]
+                .as_str()
+                .map(str::to_owned)
+        };
+
+        let mixed = json!({"session": {"default_tool": "codex", "sidebar_position": "right"}});
+        assert_eq!(save(mixed).await, StatusCode::FORBIDDEN);
+        assert_eq!(profile_tool(), None, "a refused save writes neither layer");
+        let machine = json!({"session": {"sidebar_position": "right"}});
+        assert_eq!(save(machine.clone()).await, StatusCode::FORBIDDEN);
+
+        let profile = json!({"session": {"default_tool": "codex"}});
+        assert_eq!(save(profile).await, StatusCode::OK);
+        assert_eq!(profile_tool().as_deref(), Some("codex"));
+        assert_eq!(machine_tool(), None);
+
+        state.login_manager.elevate_session(&session).await;
+        assert_eq!(save(machine).await, StatusCode::OK);
+    }
+
+    #[test]
+    fn machine_wide_leaves_need_elevation() {
+        use serde_json::json;
+        let leaf = json!({"session": {"sidebar_position": "right"}});
+        // (machine part, elevated) -> rejected
+        let cases = [
+            (&leaf, false, true),
+            (&leaf, true, false),
+            (&json!({}), false, false),
+        ];
+        for (machine, elevated, rejected) in cases {
+            let verdict = machine_elevation_gate(machine, elevated);
+            assert_eq!(verdict.is_err(), rejected, "{machine} elevated={elevated}");
+            if let Err(rej) = verdict {
+                assert_eq!(rej.error_code(), "elevation_required");
+            }
+        }
+    }
 
     #[test]
     fn derive_sleep_inhibit_status_gates_held_on_backend() {

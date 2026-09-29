@@ -98,7 +98,7 @@ import { IdleDecayWindowContext, parseIdleDecayWindowMs } from "./lib/idleDecay"
 import { parseUnreadIndicatorEnabled, UnreadIndicatorContext, useUnreadIndicatorEnabled } from "./lib/unreadIndicator";
 import { parseSessionRowTagMode, SessionRowTagContext, type SessionRowTagMode } from "./lib/sessionRowTag";
 import { parseSessionColorsEnabled, SessionColorsContext } from "./lib/sessionColors";
-import { fetchActiveProfileSettings } from "./lib/appSettings";
+import { onSettingsChanged } from "./lib/settingsEvents";
 import { parseSystemHealthEnabled, SystemHealthEnabledContext } from "./lib/systemHealth";
 import { toastBus, reportError } from "./lib/toastBus";
 import { isAbsolutePath, resolveToRepoRelative, type FileRef } from "./lib/fileRef";
@@ -200,9 +200,15 @@ export default function App() {
     setSystemHealthEnabled(parseSystemHealthEnabled(settings));
   }, []);
 
+  // A save can land while an earlier read is in flight; only the latest applies.
+  const settingsReadSeq = useRef(0);
   const refreshAppSettings = useCallback(async () => {
-    applyAppSettings(await fetchActiveProfileSettings());
+    const seq = ++settingsReadSeq.current;
+    const settings = await fetchSettings();
+    if (seq === settingsReadSeq.current) applyAppSettings(settings);
   }, [applyAppSettings]);
+
+  useEffect(() => onSettingsChanged(() => void refreshAppSettings()), [refreshAppSettings]);
 
   useEffect(() => {
     const onTokenExpired = () => setTokenExpired(true);
@@ -288,12 +294,7 @@ export default function App() {
                 the plugin UI snapshot (usePluginPanes), so the provider can't live
                 inside its own return. */}
               <PluginUiProvider>
-                <AppContent
-                  loginRequired={loginRequired}
-                  onLogout={handleLogout}
-                  onSettingsRefresh={refreshAppSettings}
-                  resolvedTheme={resolvedTheme}
-                />
+                <AppContent loginRequired={loginRequired} onLogout={handleLogout} resolvedTheme={resolvedTheme} />
               </PluginUiProvider>
               <ElevationPrompt />
             </SystemHealthEnabledContext.Provider>
@@ -323,12 +324,10 @@ function isInsideEditable(target: EventTarget | null): boolean {
 function AppContent({
   loginRequired,
   onLogout,
-  onSettingsRefresh,
   resolvedTheme,
 }: {
   loginRequired: boolean;
   onLogout: () => void;
-  onSettingsRefresh: () => Promise<void> | void;
   resolvedTheme: ResolvedTheme | null;
 }) {
   useDashboardPresence();
@@ -1837,7 +1836,6 @@ function AppContent({
             navigate(`/settings/${t}${p ? `?profile=${encodeURIComponent(p)}` : ""}`);
           }}
           onServerAboutRefresh={refreshServerAbout}
-          onSettingsRefresh={onSettingsRefresh}
           profile={searchParams.get("profile")}
           onSelectProfile={(p) => {
             const next = new URLSearchParams(searchParams);

@@ -447,6 +447,13 @@
       "components": ["src/server/token.rs"]
     },
     {
+      "id": "settings.layers",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/lib/api.test.ts", "src/hooks/useApprovalSound.test.ts"],
+      "components": ["web/src/lib/api.ts", "web/src/lib/settingsEvents.ts", "web/src/hooks/useApprovalSound.ts"]
+    },
+    {
       "id": "settings.theme-persistence",
       "kind": "live-playwright",
       "risk": "high",
@@ -1338,13 +1345,13 @@
       "risk": "medium",
       "specs": [
         "src/lib/__tests__/systemHealth.test.ts",
-        "src/lib/__tests__/appSettings.test.ts",
+        "src/lib/api.test.ts",
         "src/components/__tests__/SystemHealthStrip.test.tsx"
       ],
       "components": [
         "web/src/lib/systemHealth.ts",
         "web/src/lib/sessionFlagGate.ts",
-        "web/src/lib/appSettings.ts",
+        "web/src/lib/settingsEvents.ts",
         "web/src/hooks/useSystemHealth.ts",
         "web/src/components/SystemHealthStrip.tsx"
       ]
@@ -1841,14 +1848,18 @@
       "risk": "low",
       "specs": [
         "src/components/__tests__/StopSessionDialog.test.tsx",
-        "src/components/__tests__/ScratchOverridesModal.test.tsx"
+        "src/components/__tests__/ScratchOverridesModal.test.tsx",
+        "src/components/__tests__/SessionGroupModal.test.tsx",
+        "src/components/__tests__/DeleteSessionDialog.test.tsx"
       ],
       "components": [
         "web/src/components/Dialog.tsx",
         "web/src/components/StopSessionDialog.tsx",
-        "web/src/components/ScratchOverridesModal.tsx"
+        "web/src/components/ScratchOverridesModal.tsx",
+        "web/src/components/SessionGroupModal.tsx",
+        "web/src/components/DeleteSessionDialog.tsx"
       ],
-      "notes": "The shared Dialog links its body as the accessible description; a form body such as ScratchOverridesModal opts out."
+      "notes": "The shared Dialog links its body as the accessible description; bodies with controls point it at their prompt, and ScratchOverridesModal opts out."
     },
     {
       "id": "acp.tool-group-chunking",
