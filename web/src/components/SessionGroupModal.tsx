@@ -33,6 +33,7 @@ export function SessionGroupModal({ sessionTitle, currentGroup, onSave, onClose 
     <Dialog
       id="session-group-modal"
       title="Edit group"
+      describeBody={false}
       bodyClassName="px-5 py-4 space-y-3"
       onDismiss={() => !saving && onClose()}
       footer={

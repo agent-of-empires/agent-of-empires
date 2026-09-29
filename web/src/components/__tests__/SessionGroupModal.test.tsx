@@ -37,6 +37,8 @@ describe("SessionGroupModal", () => {
     expect(container.textContent).toContain("alpha");
     expect(input.value).toBe("work/projects");
     expect(document.activeElement).toBe(input);
+    // A form body is not read out as the dialog's description.
+    expect(screen.getByRole("dialog").hasAttribute("aria-describedby")).toBe(false);
   });
 
   it.each([

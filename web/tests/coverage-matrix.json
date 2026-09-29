@@ -1834,14 +1834,18 @@
       "risk": "low",
       "specs": [
         "src/components/__tests__/StopSessionDialog.test.tsx",
-        "src/components/__tests__/ScratchOverridesModal.test.tsx"
+        "src/components/__tests__/ScratchOverridesModal.test.tsx",
+        "src/components/__tests__/SessionGroupModal.test.tsx",
+        "src/components/__tests__/DeleteSessionDialog.test.tsx"
       ],
       "components": [
         "web/src/components/Dialog.tsx",
         "web/src/components/StopSessionDialog.tsx",
-        "web/src/components/ScratchOverridesModal.tsx"
+        "web/src/components/ScratchOverridesModal.tsx",
+        "web/src/components/SessionGroupModal.tsx",
+        "web/src/components/DeleteSessionDialog.tsx"
       ],
-      "notes": "The shared Dialog links its body as the accessible description; a form body such as ScratchOverridesModal opts out."
+      "notes": "The shared Dialog links its body as the accessible description; form and list bodies opt out."
     },
     {
       "id": "acp.tool-group-chunking",

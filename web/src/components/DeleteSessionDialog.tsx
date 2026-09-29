@@ -107,6 +107,7 @@ export function DeleteSessionDialog({
       panelTestId="delete-session-dialog-panel"
       title={workspace ? "Delete Workspace" : "Delete Session"}
       titleClassName="text-status-error"
+      describeBody={false}
       bodyClassName="px-5 py-4 space-y-3"
       onDismiss={onCancel}
       footer={

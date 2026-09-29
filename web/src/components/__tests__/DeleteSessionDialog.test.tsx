@@ -102,6 +102,8 @@ describe("DeleteSessionDialog presentation", () => {
     expect(screen.getByRole("heading").textContent).toBe("Delete Workspace");
     expect(screen.getByTestId("delete-session-affected-count").textContent).toMatch(/all 2 sessions/);
     expect(screen.getByTestId("delete-session-affected-list").textContent).toBe("agent-alphaagent-beta");
+    // The session list and checkboxes are not read out as the dialog's description.
+    expect(screen.getByRole("dialog").hasAttribute("aria-describedby")).toBe(false);
     const text = container.textContent;
     expect(text).not.toMatch(/Delete my-session\?/);
     for (const copy of [
