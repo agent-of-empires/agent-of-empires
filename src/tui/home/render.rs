@@ -129,14 +129,32 @@ fn live_resize_retry_due(
 /// Matches tmux's default `history-limit` and the VT grid's `SCROLLBACK_LINES`.
 const READING_CAPTURE_LINES: u16 = 2000;
 
-/// Map a tmux pane cursor onto the preview's output rect for live-send.
-///
-/// `cursor.x`/`y` are pane relative; on a composite, add the pane origin from
+/// Screen cell showing the input pane's `(0, 0)`, unclipped and possibly outside
+/// `output`. On a composite this is pane 0's origin from
 /// [`crate::tmux::PaneCursor::composite_pane0`]. The renderer bottom-anchors captures that
 /// overflow `output`, so the row is `output.y + min(line_count, visible_rows) -
-/// pane_height + top + cursor.y`, while a short capture anchors at the top. That keeps the
-/// cursor on the same text row for the status-row offset (#3515) and the shorter-pane case
-/// (#2742). A hidden or out-of-bounds cursor yields `None`.
+/// pane_height + top`, while a short capture anchors at the top. Shared by the cursor
+/// painter and pointer mapping so a click on a painted cell reaches the same pane cell.
+pub(super) fn live_pane_origin(
+    output: Rect,
+    visible_rows: usize,
+    line_count: usize,
+    cursor: &crate::tmux::PaneCursor,
+) -> (i32, i32) {
+    let anchor = line_count.min(visible_rows) as i32;
+    let (left, top) = cursor
+        .composite_pane0
+        .map_or((0, 0), |rect| (rect.left as i32, rect.top as i32));
+    (
+        output.x as i32 + left,
+        output.y as i32 + (anchor - cursor.pane_height as i32) + top,
+    )
+}
+
+/// Map a tmux pane cursor onto the preview's output rect for live-send, from
+/// [`live_pane_origin`]. That keeps the cursor on the same text row for the status-row
+/// offset (#3515) and the shorter-pane case (#2742). A hidden or out-of-bounds cursor
+/// yields `None`.
 pub(super) fn map_live_preview_cursor(
     output: Rect,
     visible_rows: usize,
@@ -146,12 +164,9 @@ pub(super) fn map_live_preview_cursor(
     if !cursor.visible {
         return None;
     }
-    let anchor = line_count.min(visible_rows) as i32;
-    let (left, top) = cursor
-        .composite_pane0
-        .map_or((0, 0), |rect| (rect.left as i32, rect.top as i32));
-    let row = output.y as i32 + (anchor - cursor.pane_height as i32) + top + cursor.y as i32;
-    let col = output.x as i32 + left + cursor.x as i32;
+    let (x, y) = live_pane_origin(output, visible_rows, line_count, &cursor);
+    let row = y + cursor.y as i32;
+    let col = x + cursor.x as i32;
     if row < output.y as i32
         || row >= output.y as i32 + output.height as i32
         || col < output.x as i32
@@ -2490,6 +2505,15 @@ impl HomeView {
         };
     }
 
+    /// Whether the mounted structured transcript belongs to the selected session, so it
+    /// owns the preview pane rather than the tmux capture.
+    pub(super) fn structured_owns_pane(&self) -> bool {
+        self.structured_preview
+            .as_ref()
+            .zip(self.selected_session.as_deref())
+            .is_some_and(|(view, id)| view.session_id() == id)
+    }
+
     /// The preview cache backing whatever the pane shows, resolving the sandbox
     /// container-vs-host split for Terminal view. Shared by the scroll clamp, the scroll
     /// indicator and the drag-select copy so they read what the renderer painted.
@@ -2793,12 +2817,7 @@ impl HomeView {
             // on top (same `i` toggle as the terminal previews), streaming transcript
             // below, drag-select pointed at the painted rows.
             let selected_id = self.selected_session.clone();
-            let mounted_matches = self
-                .structured_preview
-                .as_ref()
-                .zip(selected_id.as_deref())
-                .is_some_and(|(v, id)| v.session_id() == id);
-            if mounted_matches {
+            if self.structured_owns_pane() {
                 // Take/put-back so the view's `&mut` render can't
                 // fight the instance lookup's shared borrow of self.
                 let mut view = self.structured_preview.take();
@@ -3125,10 +3144,11 @@ impl HomeView {
     /// underline a link whose text is not itself a URL is indistinguishable from the
     /// output around it. It is the affordance for `preview_link_at`.
     pub(super) fn paint_preview_links(&self, buf: &mut Buffer) {
-        // Same guard as `preview_link_at`: an overlay swallows the click, so underlining
-        // behind it would advertise nothing, and the dialog paints over these cells,
-        // leaving the backend to wrap its own text in OSC 8.
-        if self.has_non_live_send_overlay() {
+        // Same guards as `preview_link_at`, so an underline always marks a clickable
+        // link: an overlay swallows the click (and paints over these cells, leaving the
+        // backend to wrap its own text in OSC 8), and a mounted structured transcript's
+        // rows are not the capture's links.
+        if self.has_non_live_send_overlay() || self.structured_owns_pane() {
             return;
         }
         let view = self.preview_text_view;

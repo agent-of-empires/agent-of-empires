@@ -178,14 +178,9 @@ fn split_bracketed_paste(text: &str) -> Vec<live_send::TmuxKey> {
 /// the full rect would report a column past its right edge as though the pane were
 /// window-wide. A pointer outside pane 0 is dropped rather than clamped, which would
 /// synthesise a click on its border.
-///
-/// Pane 0 may have a non-zero origin in the composite. The TUI bottom-follows a composite
-/// taller than its output, clipping reserved rows above pane 0, so its first visible cell
-/// still starts at `pane.x`/`pane.y`; adding `rect.top` here would shift input below the
-/// displayed pane.
 fn mouse_target_rect(
     cursor: &crate::tmux::PaneCursor,
-    pane: ratatui::layout::Rect,
+    view: super::PreviewTextView,
     col: u16,
     row: u16,
 ) -> Option<ratatui::layout::Rect> {
@@ -193,32 +188,40 @@ fn mouse_target_rect(
     // (`hit_preview` gates the press) with `map_pane_cell` clamping, so this must not
     // start rejecting cells that used to clamp.
     if cursor.composite_pane0.is_none() {
-        return Some(pane);
+        return Some(view.pane);
     }
-    let pane0 = mouse_pane_rect(cursor, pane);
-    let inside = col >= pane0.x
-        && col < pane0.x.saturating_add(pane0.width)
-        && row >= pane0.y
-        && row < pane0.y.saturating_add(pane0.height);
-    inside.then_some(pane0)
+    let pane0 = mouse_pane_rect(cursor, view);
+    pane0.contains(Position::new(col, row)).then_some(pane0)
 }
 
 /// The input pane's rectangle within the preview, with no containment test: pane 0's
-/// sub-rectangle on a composited preview, else the whole preview rect. Split from
-/// [`mouse_target_rect`] for mid-gesture events, which are not position-gated so a drag
-/// that began on pane 0 completes even after the pointer wanders off it.
+/// visible slice on a composited preview, else the whole preview rect. Pane 0 is placed
+/// by [`super::render::live_pane_origin`], as the cursor is painted, then clipped to the
+/// preview. Split from [`mouse_target_rect`] for mid-gesture events, which are not
+/// position-gated so a drag that began on pane 0 completes even after the pointer
+/// wanders off it.
 fn mouse_pane_rect(
     cursor: &crate::tmux::PaneCursor,
-    pane: ratatui::layout::Rect,
+    view: super::PreviewTextView,
 ) -> ratatui::layout::Rect {
-    match cursor.composite_pane0 {
-        Some(rect) => ratatui::layout::Rect {
-            x: pane.x,
-            y: pane.y,
-            width: rect.width.min(pane.width),
-            height: rect.height.min(pane.height),
-        },
-        None => pane,
+    let pane = view.pane;
+    let Some(rect) = cursor.composite_pane0 else {
+        return pane;
+    };
+    let (x, y) =
+        super::render::live_pane_origin(pane, pane.height as usize, view.total_lines, cursor);
+    let clip = |start: i32, len: u16, lo: u16, hi: u16| {
+        let a = start.clamp(lo as i32, hi as i32);
+        let b = (start + len as i32).clamp(lo as i32, hi as i32);
+        (a as u16, (b - a) as u16)
+    };
+    let (x, width) = clip(x, rect.width, pane.x, pane.right());
+    let (y, height) = clip(y, rect.height, pane.y, pane.bottom());
+    ratatui::layout::Rect {
+        x,
+        y,
+        width,
+        height,
     }
 }
 
@@ -295,11 +298,11 @@ fn mouse_event_bytes(
 /// highlights content under the pointer reacts as it would over a direct attach.
 fn hover_forward_bytes(
     cursor: &crate::tmux::PaneCursor,
-    pane: ratatui::layout::Rect,
+    view: super::PreviewTextView,
     col: u16,
     row: u16,
 ) -> Option<Vec<u8>> {
-    let target = mouse_target_rect(cursor, pane, col, row)?;
+    let target = mouse_target_rect(cursor, view, col, row)?;
     (cursor.alternate_on && cursor.mouse_all)
         .then(|| mouse_event_bytes(3, false, true, cursor.mouse_sgr, target, col, row))
 }
@@ -315,7 +318,7 @@ const WHEEL_PAGE_STEP: usize = 1;
 fn wheel_forward_key(
     cursor: &crate::tmux::PaneCursor,
     up: bool,
-    pane: ratatui::layout::Rect,
+    view: super::PreviewTextView,
     col: u16,
     row: u16,
 ) -> Option<live_send::TmuxKey> {
@@ -324,7 +327,7 @@ fn wheel_forward_key(
     }
     // Outside pane 0 on a composited preview there is nothing to drive, and paging pane 0
     // because the wheel turned elsewhere would be a scroll the user did not aim.
-    let target = mouse_target_rect(cursor, pane, col, row)?;
+    let target = mouse_target_rect(cursor, view, col, row)?;
     if cursor.mouse_tracking {
         Some(live_send::TmuxKey::HexBytes(wheel_mouse_bytes(
             up,
@@ -2553,8 +2556,15 @@ impl HomeView {
                 self.mouse_pos = None;
                 self.update_selected();
             }
-            KeyCode::Char('<') => self.shrink_list(),
-            KeyCode::Char('>') => self.grow_list(),
+            // `<` and `>` move the divider in their on-screen direction.
+            KeyCode::Char('<') => match self.sidebar_position {
+                SidebarPosition::Left => self.shrink_list(),
+                SidebarPosition::Right => self.grow_list(),
+            },
+            KeyCode::Char('>') => match self.sidebar_position {
+                SidebarPosition::Left => self.grow_list(),
+                SidebarPosition::Right => self.shrink_list(),
+            },
             KeyCode::Enter => {
                 if self.selected_session.is_some() {
                     return self.activate_selected_session();
@@ -4139,8 +4149,7 @@ impl HomeView {
     fn forward_wheel_to_preview(&self, up: bool, col: u16, row: u16) -> bool {
         let cursor = self.active_preview_cursor();
         let Some(cursor) = cursor else { return false };
-        let Some(key) = wheel_forward_key(&cursor, up, self.preview_text_view.pane, col, row)
-        else {
+        let Some(key) = wheel_forward_key(&cursor, up, self.preview_text_view, col, row) else {
             return false;
         };
         self.send_to_preview_pane(key)
@@ -4156,8 +4165,7 @@ impl HomeView {
         let Some(cursor) = self.active_preview_cursor() else {
             return false;
         };
-        let Some(key) = wheel_forward_key(&cursor, up, self.preview_text_view.pane, col, row)
-        else {
+        let Some(key) = wheel_forward_key(&cursor, up, self.preview_text_view, col, row) else {
             return false;
         };
         self.send_to_preview_pane(key)
@@ -4247,7 +4255,7 @@ impl HomeView {
         // open a gesture: forwarding would report the click at a clamped cell pane 0 never
         // saw. Drags and releases stay ungated so a gesture begun on pane 0 completes.
         let press = !release && !motion;
-        if press && mouse_target_rect(&cursor, self.preview_text_view.pane, col, row).is_none() {
+        if press && mouse_target_rect(&cursor, self.preview_text_view, col, row).is_none() {
             self.mouse_forward_btn = None;
             return false;
         }
@@ -4257,7 +4265,7 @@ impl HomeView {
             release,
             motion,
             cursor.mouse_sgr,
-            mouse_pane_rect(&cursor, self.preview_text_view.pane),
+            mouse_pane_rect(&cursor, self.preview_text_view),
             col,
             row,
         );
@@ -4280,11 +4288,11 @@ impl HomeView {
         let Some(cursor) = self.active_preview_cursor() else {
             return false;
         };
-        let pane = self.preview_text_view.pane;
-        let Some(bytes) = hover_forward_bytes(&cursor, pane, col, row) else {
+        let view = self.preview_text_view;
+        let Some(bytes) = hover_forward_bytes(&cursor, view, col, row) else {
             return false;
         };
-        let cell = map_pane_cell(pane, col, row);
+        let cell = map_pane_cell(view.pane, col, row);
         if self.hover_forward_cell == Some(cell) {
             return false;
         }
@@ -5328,17 +5336,10 @@ impl HomeView {
         if self.has_non_live_send_overlay() {
             return None;
         }
-        // A mounted structured transcript owns the pane and supplies its own rows, but
-        // `active_preview_cache` still returns the tmux capture and `preview_text_view`
-        // came from the transcript's geometry. Resolving one against the other opens a URL
-        // from another session's output, with no underline to warn the user. Same
-        // line-source branch `extract_preview_selection_text` makes.
-        let structured_owns_pane = self
-            .structured_preview
-            .as_ref()
-            .zip(self.selected_session.as_deref())
-            .is_some_and(|(view, id)| view.session_id() == id);
-        if structured_owns_pane {
+        // `active_preview_cache` is the tmux capture while `preview_text_view` may come from
+        // the transcript's geometry; resolving one against the other opens a URL from
+        // another session's output. `paint_preview_links` skips the same case.
+        if self.structured_owns_pane() {
             return None;
         }
         let view = self.preview_text_view;
@@ -6579,6 +6580,15 @@ mod tests {
         }
     }
 
+    /// The live preview's text view over `pane`, showing `total_lines` captured rows.
+    fn view_of(pane: ratatui::layout::Rect, total_lines: usize) -> super::super::PreviewTextView {
+        super::super::PreviewTextView {
+            pane,
+            first_line: total_lines.saturating_sub(pane.height as usize),
+            total_lines,
+        }
+    }
+
     /// Forwarding needs a full-screen app: hover needs any-event tracking (1003) and is
     /// encoded like the app's reports; a tracking app gets wheel bytes; a normal-screen
     /// pane gets nothing, so the caller keeps its capture-window scroll.
@@ -6586,32 +6596,33 @@ mod tests {
     fn mouse_forwarding_requires_full_screen_tracking() {
         use ratatui::layout::Rect;
         let pane = Rect::new(0, 0, 80, 24);
+        let view = view_of(pane, 24);
         let mut all = cursor_for(true, true, true);
         all.mouse_all = true;
         // No-button motion is 3 + 32.
         assert_eq!(
-            hover_forward_bytes(&all, pane, 10, 5).as_deref(),
+            hover_forward_bytes(&all, view, 10, 5).as_deref(),
             Some(b"\x1b[<35;11;6M".as_slice())
         );
         all.mouse_sgr = false;
         assert_eq!(
-            hover_forward_bytes(&all, pane, 10, 5),
+            hover_forward_bytes(&all, view, 10, 5),
             Some(vec![0x1b, b'[', b'M', 35 + 32, 11 + 32, 6 + 32])
         );
         assert_eq!(
-            hover_forward_bytes(&cursor_for(true, true, true), pane, 10, 5),
+            hover_forward_bytes(&cursor_for(true, true, true), view, 10, 5),
             None,
             "button-only tracking gets no bare motion"
         );
         let mut normal = cursor_for(false, true, true);
         normal.mouse_all = true;
-        assert_eq!(hover_forward_bytes(&normal, pane, 10, 5), None);
+        assert_eq!(hover_forward_bytes(&normal, view, 10, 5), None);
 
-        match wheel_forward_key(&cursor_for(true, true, true), true, pane, 10, 10) {
+        match wheel_forward_key(&cursor_for(true, true, true), true, view, 10, 10) {
             Some(live_send::TmuxKey::HexBytes(b)) => assert_eq!(b[0], 0x1b),
             other => panic!("expected SGR HexBytes, got {other:?}"),
         }
-        match wheel_forward_key(&cursor_for(true, true, false), true, pane, 10, 10) {
+        match wheel_forward_key(&cursor_for(true, true, false), true, view, 10, 10) {
             Some(live_send::TmuxKey::HexBytes(b)) => {
                 assert_eq!(&b[..3], &[0x1b, b'[', b'M'])
             }
@@ -6621,7 +6632,7 @@ mod tests {
             cursor_for(false, false, false),
             cursor_for(false, true, true),
         ] {
-            assert_eq!(wheel_forward_key(&normal_screen, true, pane, 10, 10), None);
+            assert_eq!(wheel_forward_key(&normal_screen, true, view, 10, 10), None);
         }
     }
 
@@ -6634,6 +6645,7 @@ mod tests {
         use ratatui::layout::Rect;
         // An 80x24 preview showing a window split at column 40.
         let pane = Rect::new(0, 0, 80, 24);
+        let view = view_of(pane, 24);
         let mut split = cursor_for(true, true, true);
         split.mouse_all = true;
         split.composite_pane0 = Some(crate::tmux::PaneGeom {
@@ -6645,43 +6657,65 @@ mod tests {
 
         // Inside pane 0: maps as before, 1-based.
         assert_eq!(
-            hover_forward_bytes(&split, pane, 10, 5).as_deref(),
+            hover_forward_bytes(&split, view, 10, 5).as_deref(),
             Some(b"\x1b[<35;11;6M".as_slice())
         );
         // Over the neighbour: dropped, not clamped to pane 0's border, which
         // would synthesise a hover on a cell the pointer never touched.
-        assert_eq!(hover_forward_bytes(&split, pane, 60, 5), None);
-        assert_eq!(wheel_forward_key(&split, true, pane, 60, 5), None);
+        assert_eq!(hover_forward_bytes(&split, view, 60, 5), None);
+        assert_eq!(wheel_forward_key(&split, true, view, 60, 5), None);
         // The last column of pane 0 is still inside it; the first past it is not.
-        assert!(hover_forward_bytes(&split, pane, 39, 5).is_some());
-        assert_eq!(hover_forward_bytes(&split, pane, 40, 5), None);
+        assert!(hover_forward_bytes(&split, view, 39, 5).is_some());
+        assert_eq!(hover_forward_bytes(&split, view, 40, 5), None);
 
-        // In the bottom-follow layout the composite's top border row is clipped before
-        // painting, so `first_line == pane0.top == 1`. The cursor mapper adds `top` after
-        // its anchor delta while the mouse rect stays at the visible output origin, so a
-        // click on the painted cursor must round-trip to that cursor's 1-based app cell.
-        let mut bottom_follow = cursor_for(true, true, true);
-        bottom_follow.x = 10;
-        bottom_follow.y = 4;
-        bottom_follow.pane_height = 25;
-        bottom_follow.composite_pane0 = Some(crate::tmux::PaneGeom {
-            left: 0,
-            top: 1,
-            width: 40,
-            height: 24,
-        });
-        let painted = crate::tui::home::render::map_live_preview_cursor(
-            pane,
-            usize::from(pane.height),
-            25,
-            bottom_follow,
-        )
-        .expect("visible pane cursor");
-        assert_eq!(
-            map_pane_cell(mouse_pane_rect(&bottom_follow, pane), painted.x, painted.y,),
-            (bottom_follow.x + 1, bottom_follow.y + 1),
-            "clicking the painted cursor must report the same app cell"
-        );
+        // Pane 0 is projected through the visible composite slice, so a click on the
+        // painted cursor reaches the cursor's 1-based app cell, and a cell beside pane 0
+        // is dropped. (name, window height, pane 0, cursor, a cell outside pane 0)
+        let output = Rect::new(2, 3, 80, 24);
+        let geom = |left, top, width, height| crate::tmux::PaneGeom {
+            left,
+            top,
+            width,
+            height,
+        };
+        for (name, window_height, pane0, (x, y), outside) in [
+            // Side by side under `pane-border-status top`: bottom-follow clips the border
+            // row, so `top == first_line` cancels and pane 0 starts at the output origin.
+            ("side by side", 25, geom(0, 1, 40, 24), (10, 4), (42, 5)),
+            // Stacked: the split reads as no chrome, so the border row stays visible and
+            // pane 0 starts one row down.
+            ("stacked", 24, geom(0, 1, 80, 11), (5, 3), (10, 3)),
+            // Rotated or swapped: pane 0 sits right of another pane.
+            ("rotated", 24, geom(40, 0, 40, 24), (10, 4), (41, 5)),
+        ] {
+            let mut cursor = cursor_for(true, true, true);
+            cursor.mouse_all = true;
+            cursor.x = x;
+            cursor.y = y;
+            cursor.pane_height = window_height;
+            cursor.composite_pane0 = Some(pane0);
+            let lines = usize::from(window_height);
+            let painted = crate::tui::home::render::map_live_preview_cursor(
+                output,
+                usize::from(output.height),
+                lines,
+                cursor,
+            )
+            .expect("visible pane cursor");
+            let view = view_of(output, lines);
+            let target = mouse_target_rect(&cursor, view, painted.x, painted.y)
+                .unwrap_or_else(|| panic!("{name}: painted cursor is inside pane 0"));
+            assert_eq!(
+                map_pane_cell(target, painted.x, painted.y),
+                (x + 1, y + 1),
+                "{name}: clicking the painted cursor must report the same app cell"
+            );
+            assert_eq!(
+                mouse_target_rect(&cursor, view, outside.0, outside.1),
+                None,
+                "{name}: a cell outside pane 0 is dropped"
+            );
+        }
 
         // A no-mouse full-screen agent gets no page key from a wheel aimed at
         // the neighbour either, but keeps it over pane 0.
@@ -6692,8 +6726,8 @@ mod tests {
             width: 40,
             height: 24,
         });
-        assert_eq!(wheel_forward_key(&no_mouse, true, pane, 60, 5), None);
-        assert!(wheel_forward_key(&no_mouse, true, pane, 10, 5).is_some());
+        assert_eq!(wheel_forward_key(&no_mouse, true, view, 60, 5), None);
+        assert!(wheel_forward_key(&no_mouse, true, view, 10, 5).is_some());
 
         // Unsplit is unchanged: no composite extent, so the whole rect maps.
         let unsplit = {
@@ -6702,14 +6736,14 @@ mod tests {
             c
         };
         assert_eq!(
-            hover_forward_bytes(&unsplit, pane, 60, 5).as_deref(),
+            hover_forward_bytes(&unsplit, view, 60, 5).as_deref(),
             Some(b"\x1b[<35;61;6M".as_slice())
         );
         // An unsplit cell outside the rect must still clamp, not drop: the press is gated
         // by `hit_preview` and these helpers have always relied on `map_pane_cell`, so the
         // pane-0 containment test must not leak into the single-pane path.
         assert_eq!(
-            hover_forward_bytes(&unsplit, pane, 999, 999).as_deref(),
+            hover_forward_bytes(&unsplit, view, 999, 999).as_deref(),
             Some(b"\x1b[<35;80;24M".as_slice()),
             "unsplit coordinates clamp to the rect, they do not get dropped"
         );
@@ -6721,6 +6755,7 @@ mod tests {
     fn composite_pane_rect_clamps_to_the_preview() {
         use ratatui::layout::Rect;
         let pane = Rect::new(2, 3, 20, 10);
+        let view = view_of(pane, 24);
         let mut cursor = cursor_for(true, true, true);
         cursor.composite_pane0 = Some(crate::tmux::PaneGeom {
             left: 0,
@@ -6728,10 +6763,10 @@ mod tests {
             width: 999,
             height: 999,
         });
-        assert_eq!(mouse_pane_rect(&cursor, pane), pane);
+        assert_eq!(mouse_pane_rect(&cursor, view), pane);
         // And the origin is honored: a cell above/left of the rect is outside.
-        assert_eq!(mouse_target_rect(&cursor, pane, 1, 3), None);
-        assert!(mouse_target_rect(&cursor, pane, 2, 3).is_some());
+        assert_eq!(mouse_target_rect(&cursor, view, 1, 3), None);
+        assert!(mouse_target_rect(&cursor, view, 2, 3).is_some());
     }
 
     /// The fix for #2407: a full-screen pane with no mouse tracking must forward
@@ -6742,16 +6777,17 @@ mod tests {
     fn wheel_forward_key_no_mouse_alt_screen_is_page_key() {
         use ratatui::layout::Rect;
         let pane = Rect::new(0, 0, 80, 24);
+        let view = view_of(pane, 24);
         let cursor = cursor_for(true, false, false);
         assert_eq!(
-            wheel_forward_key(&cursor, true, pane, 10, 10),
+            wheel_forward_key(&cursor, true, view, 10, 10),
             Some(live_send::TmuxKey::NamedRepeat {
                 name: "PageUp".into(),
                 count: WHEEL_PAGE_STEP,
             })
         );
         assert_eq!(
-            wheel_forward_key(&cursor, false, pane, 10, 10),
+            wheel_forward_key(&cursor, false, view, 10, 10),
             Some(live_send::TmuxKey::NamedRepeat {
                 name: "PageDown".into(),
                 count: WHEEL_PAGE_STEP,

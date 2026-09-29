@@ -135,6 +135,42 @@ fn link_columns_are_underlined_so_the_text_reads_as_a_link() {
     );
 }
 
+/// A mounted structured transcript owns the pane, so the capture's links are neither
+/// clickable nor underlined; an underline with no click target misleads (#4015). A mount
+/// for another session leaves the capture in charge.
+#[test]
+#[serial]
+fn structured_transcript_owning_the_pane_suppresses_capture_links() {
+    use crate::tui::structured_view::embedded::EmbeddedView;
+    let underlined = |buf: &ratatui::buffer::Buffer| {
+        (0..60).any(|col| {
+            buf[(col, PANE.y)]
+                .modifier
+                .contains(ratatui::style::Modifier::UNDERLINED)
+        })
+    };
+    // (mounted session, link live)
+    for (mounted, live) in [("s-1", false), ("s-other", true)] {
+        let mut env = create_test_env_empty();
+        stage(
+            &mut env,
+            &["see the AoE repo now"],
+            vec![link("the AoE repo", "https://example.com/aoe")],
+        );
+        env.view.selected_session = Some("s-1".to_string());
+        env.view.structured_preview = Some(EmbeddedView::for_test(mounted));
+
+        let mut buf = ratatui::buffer::Buffer::empty(Rect::new(0, 0, 60, 10));
+        env.view.paint_preview_links(&mut buf);
+        assert_eq!(underlined(&buf), live, "{mounted}: underline");
+        assert_eq!(
+            env.view.preview_link_at(PANE.x + 4, PANE.y).is_some(),
+            live,
+            "{mounted}: click target"
+        );
+    }
+}
+
 #[test]
 #[serial]
 fn status_flash_shows_then_expires_without_acknowledgement() {
