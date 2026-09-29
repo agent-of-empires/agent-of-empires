@@ -922,6 +922,54 @@ fn cancelled_creation_is_not_revived_by_a_later_request() {
     );
 }
 
+/// Ctrl-C while on_create runs lets that hook finish but must not start on_launch.
+#[test]
+#[serial]
+fn cancel_during_on_create_skips_on_launch() {
+    let CreationTestEnv {
+        mut view,
+        storage,
+        project_dir,
+        _guard,
+        _temp,
+    } = setup_creation_test_env();
+    let Ok(sh) = which::which("sh") else {
+        eprintln!("skipping: sh not found on PATH");
+        return;
+    };
+    let _shell = crate::session::test_support::EnvGuard::set(&[("SHELL", sh)]);
+    // on_create signals that it started, then holds until the test releases it.
+    let hooks = crate::session::config::repo_config::ResolvedHooks::with_repo(
+        "default",
+        &project_dir,
+        crate::session::config::repo_config::HooksConfig {
+            on_create: vec!["touch create-started; i=0; while [ ! -e release ] && [ $i -lt 1000 ]; do sleep 0.01; i=$((i+1)); done; [ -e release ]".to_string()],
+            on_launch: vec!["touch launch-started".to_string()],
+            ..Default::default()
+        },
+    );
+    view.request_creation(creation_data(&project_dir, "Hooked", ""), hooks);
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !project_dir.join("create-started").exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "on_create never started"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    view.cancel_creation();
+    std::fs::write(project_dir.join("release"), b"").unwrap();
+
+    assert_eq!(drain_creation_result(&mut view), None);
+    assert!(!view.is_creation_pending());
+    assert!(
+        !project_dir.join("launch-started").exists(),
+        "on_launch must not start after a cancel during on_create"
+    );
+    assert!(storage.load().unwrap().is_empty());
+}
+
 /// A peer can commit the same title/path while the background builder waits for
 /// finalization. The duplicate rollback must preserve every resource the persisted winner
 /// references and its own pre-existing empty group, while discarding the losing stub's

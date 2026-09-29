@@ -214,6 +214,9 @@ impl CreationPoller {
                     return failed(&instance, format!("{:#}", e));
                 }
                 container_started = true;
+                if cancel.is_cancelled() {
+                    return cancelled(&instance);
+                }
                 if let Some(ref sandbox) = instance.sandbox_info {
                     let workdir = instance.container_workdir();
                     if let Err(e) = repo_config::execute_hooks_in_container_streamed(
@@ -240,6 +243,10 @@ impl CreationPoller {
         // Execute on_launch hooks in background too (non-fatal, like start_with_size).
         // This prevents blocking the UI thread when the session is first attached.
         if has_on_launch {
+            // A cancel during on_create must not start the next phase.
+            if cancel.is_cancelled() {
+                return cancelled(&instance);
+            }
             let hooks = hooks.as_ref().unwrap();
             if sandbox {
                 if !container_started {
@@ -252,6 +259,9 @@ impl CreationPoller {
                         let _ = progress_tx.send(HookProgress::Output(msg));
                     } else {
                         container_started = true;
+                        if cancel.is_cancelled() {
+                            return cancelled(&instance);
+                        }
                     }
                 }
                 if container_started {
