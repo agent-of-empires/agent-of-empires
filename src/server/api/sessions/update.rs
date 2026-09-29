@@ -154,6 +154,34 @@ pub(crate) async fn persist_session_update<F>(
 where
     F: FnOnce(&mut Vec<Instance>) + Send + 'static,
 {
+    persist_with(profile, label, file_watch, None, mutate).await
+}
+
+/// [`persist_session_update`] holding session `id`'s lifecycle lock across the write, which
+/// `aoe send` also holds while it types into a live pane.
+pub(crate) async fn persist_session_update_locked<F>(
+    profile: String,
+    label: &'static str,
+    file_watch: std::sync::Arc<crate::file_watch::FileWatchService>,
+    id: String,
+    mutate: F,
+) -> Result<(), ()>
+where
+    F: FnOnce(&mut Vec<Instance>) + Send + 'static,
+{
+    persist_with(profile, label, file_watch, Some(id), mutate).await
+}
+
+async fn persist_with<F>(
+    profile: String,
+    label: &'static str,
+    file_watch: std::sync::Arc<crate::file_watch::FileWatchService>,
+    lock_id: Option<String>,
+    mutate: F,
+) -> Result<(), ()>
+where
+    F: FnOnce(&mut Vec<Instance>) + Send + 'static,
+{
     let storage = match Storage::new(&profile, file_watch) {
         Ok(s) => s,
         Err(e) => {
@@ -165,10 +193,7 @@ where
         }
     };
     match tokio::task::spawn_blocking(move || {
-        storage.update(|instances, _groups| {
-            mutate(instances);
-            Ok(())
-        })
+        persist_blocking(&storage, lock_id.as_deref(), mutate)
     })
     .await
     {
@@ -188,6 +213,25 @@ where
             Err(())
         }
     }
+}
+
+/// The blocking write behind [`persist_session_update`]; `lock_id` also holds that session's
+/// lifecycle lock across it.
+pub(super) fn persist_blocking<F>(
+    storage: &Storage,
+    lock_id: Option<&str>,
+    mutate: F,
+) -> anyhow::Result<()>
+where
+    F: FnOnce(&mut Vec<Instance>),
+{
+    let _lifecycle_lock = lock_id
+        .map(|id| storage.acquire_instance_lifecycle_lock(id))
+        .transpose()?;
+    storage.update(|instances, _groups| {
+        mutate(instances);
+        Ok(())
+    })
 }
 
 /// 500 response for a `persist_session_update` failure. The body shape matches

@@ -6,7 +6,7 @@ import { MobileTerminalToolbar } from "./MobileTerminalToolbar";
 import { MobileLiveTerminal } from "./MobileLiveTerminal";
 import { KeyboardFab } from "./KeyboardFab";
 import { TerminalConnectionBanners } from "./TerminalConnectionBanners";
-import { ensureSession, ensureTerminal, pasteImage } from "../lib/api";
+import { ensureSession, ensureTerminal, isStartRefusal, pasteImage } from "../lib/api";
 import { armClipboardWrite, writeClipboard } from "../lib/clipboard";
 import type { ArmedClipboardWrite } from "../lib/clipboard";
 import type { SessionResponse } from "../lib/types";
@@ -51,6 +51,8 @@ export function LiveTerminalView({ session, active = true, surface = "agent", te
   const [ensureState, setEnsureState] = useState<"pending" | "ready" | "error">("pending");
   const [ensureWarning, setEnsureWarning] = useState<string | null>(null);
   const [ensureError, setEnsureError] = useState<string | null>(null);
+  // An archived or trashed session stays refused until unarchived or restored, so Retry is pointless.
+  const [ensureRetryable, setEnsureRetryable] = useState(true);
   const clipboardArmRef = useRef<ArmedClipboardWrite | null>(null);
   const receiveAgentClipboard = useCallback((text: string) => {
     const armed = clipboardArmRef.current;
@@ -101,6 +103,8 @@ export function LiveTerminalView({ session, active = true, surface = "agent", te
     return false;
   }, []);
 
+  // A refused ensure re-runs once the session is unarchived or restored.
+  const shelved = !!session.archived_at || !!session.trashed_at;
   useEffect(() => {
     if (lastEnsuredSessionIdRef.current === session.id) {
       if (consumePendingTerminalFocus(focusTarget)) focusSelf();
@@ -110,10 +114,7 @@ export function LiveTerminalView({ session, active = true, surface = "agent", te
     const ensure =
       surface === "agent"
         ? ensureSession(session.id, controller.signal)
-        : ensureTerminal(session.id, terminalIndex, surface === "paired-container").then((ok) => ({
-            ok,
-            message: null as string | null,
-          }));
+        : ensureTerminal(session.id, terminalIndex, surface === "paired-container");
     ensure.then((res) => {
       if (controller.signal.aborted) return;
       if (res.ok) {
@@ -123,10 +124,11 @@ export function LiveTerminalView({ session, active = true, surface = "agent", te
       } else {
         setEnsureState("error");
         setEnsureError(res.message ?? "Could not start session.");
+        setEnsureRetryable(!isStartRefusal(res.error));
       }
     });
     return () => controller.abort();
-  }, [session.id, focusSelf, surface, focusTarget, terminalIndex]);
+  }, [session.id, shelved, focusSelf, surface, focusTarget, terminalIndex]);
 
   // Drain a pending focus latch once the pane is mounted.
   useEffect(() => {
@@ -154,10 +156,7 @@ export function LiveTerminalView({ session, active = true, surface = "agent", te
       const ensure =
         surface === "agent"
           ? ensureSession(session.id, controller.signal)
-          : ensureTerminal(session.id, terminalIndex, surface === "paired-container").then((ok) => ({
-              ok,
-              message: null as string | null,
-            }));
+          : ensureTerminal(session.id, terminalIndex, surface === "paired-container");
       ensure.then((res) => {
         if (controller.signal.aborted) return;
         if (res.ok) {
@@ -167,6 +166,7 @@ export function LiveTerminalView({ session, active = true, surface = "agent", te
         } else {
           setEnsureState("error");
           setEnsureError(res.message ?? "Could not start session.");
+          setEnsureRetryable(!isStartRefusal(res.error));
         }
       });
       return "pending";
@@ -196,9 +196,14 @@ export function LiveTerminalView({ session, active = true, surface = "agent", te
         <span className="text-xs text-status-error max-w-md break-words">
           {ensureError ?? "Could not start session."}
         </span>
-        <button onClick={retryEnsure} className="text-xs text-brand-500 hover:text-brand-400 cursor-pointer underline">
-          Retry
-        </button>
+        {ensureRetryable && (
+          <button
+            onClick={retryEnsure}
+            className="text-xs text-brand-500 hover:text-brand-400 cursor-pointer underline"
+          >
+            Retry
+          </button>
+        )}
       </div>
     );
   }

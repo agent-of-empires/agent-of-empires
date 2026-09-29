@@ -102,6 +102,12 @@ impl HomeView {
         let boot_size = self.live_send_boot_size();
         match &target {
             live_send::LiveSendTarget::Agent => {
+                // An archived or trashed agent takes no input, even with a live pane.
+                if let Some(blocked) = self.start_blocked(session_id) {
+                    self.info_dialog =
+                        Some(InfoDialog::new("Live send failed", &blocked.to_string()));
+                    return Err(());
+                }
                 let outcome = self.try_mutate_instance_writeback_on_err(session_id, |inst| {
                     inst.ensure_pane_ready_with_size(boot_size)
                         .map_err(Into::into)

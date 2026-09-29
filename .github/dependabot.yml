@@ -4,8 +4,7 @@ updates:
   - package-ecosystem: "cargo"
     directory: "/"
     schedule:
-      interval: "weekly"
-      day: "monday"
+      interval: "monthly"
       time: "06:00"
       timezone: "Etc/UTC"
     open-pull-requests-limit: 10
@@ -23,16 +22,19 @@ updates:
       cargo-minor-patch:
         patterns: ["*"]
         update-types: ["minor", "patch"]
+      cargo-security:
+        applies-to: security-updates
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
 
   # docker
   - package-ecosystem: "docker"
     directory: "/docker"
     schedule:
-      interval: "weekly"
-      day: "monday"
+      interval: "monthly"
       time: "06:00"
       timezone: "Etc/UTC"
-    open-pull-requests-limit: 3
+    open-pull-requests-limit: 5
     labels:
       - "dependencies"
       - "docker"
@@ -46,8 +48,7 @@ updates:
   - package-ecosystem: "github-actions"
     directories: ["/", "/.github/actions/*"]
     schedule:
-      interval: "weekly"
-      day: "monday"
+      interval: "monthly"
       time: "06:00"
       timezone: "Etc/UTC"
     open-pull-requests-limit: 5
@@ -63,13 +64,16 @@ updates:
       actions-minor-patch:
         patterns: ["*"]
         update-types: ["minor", "patch"]
+      actions-security:
+        applies-to: security-updates
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
 
   # npm: web
   - package-ecosystem: "npm"
     directory: "/web"
     schedule:
-      interval: "weekly"
-      day: "monday"
+      interval: "monthly"
       time: "06:00"
       timezone: "Etc/UTC"
     open-pull-requests-limit: 10
@@ -85,6 +89,13 @@ updates:
       semver-minor-days: 14
       semver-major-days: 28
     groups:
+      react:
+        patterns:
+          - "react"
+          - "react-dom"
+          - "@types/react"
+          - "@types/react-dom"
+        update-types: ["minor", "patch"]
       tailwind:
         patterns:
           - "tailwindcss"
@@ -95,6 +106,8 @@ updates:
         exclude-patterns:
           - "react"
           - "react-dom"
+          - "@types/react"
+          - "@types/react-dom"
           - "tailwindcss"
           - "@tailwindcss/*"
           # Pre-1.0 packages: a minor bump is a breaking change by semver
@@ -103,6 +116,22 @@ updates:
           # its own PR, so one breaking library cannot hold the rest hostage.
           # In #3394, @assistant-ui/react 0.14 to 0.15 dropped three hooks and
           # blocked 15 unrelated bumps behind a red build.
+          - "@assistant-ui/*"
+          - "eslint-plugin-react-refresh"
+          - "oxfmt"
+        update-types: ["minor", "patch"]
+      # Patch bumps of the pre-1.0 packages above are safe to batch; their
+      # minor bumps still get one PR each.
+      web-pre1-patch:
+        patterns:
+          - "@assistant-ui/*"
+          - "eslint-plugin-react-refresh"
+          - "oxfmt"
+        update-types: ["patch"]
+      web-security:
+        applies-to: security-updates
+        patterns: ["*"]
+        exclude-patterns:
           - "@assistant-ui/*"
           - "eslint-plugin-react-refresh"
           - "oxfmt"
@@ -121,8 +150,7 @@ updates:
   - package-ecosystem: "npm"
     directory: "/acp-worker/aoe-agent"
     schedule:
-      interval: "weekly"
-      day: "monday"
+      interval: "monthly"
       time: "06:00"
       timezone: "Etc/UTC"
     open-pull-requests-limit: 10
@@ -151,10 +179,15 @@ updates:
           - "ai"
           - "@agentclientprotocol/*"
         update-types: ["minor", "patch"]
+      aoe-agent-security:
+        applies-to: security-updates
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
 
   # npm: acp-worker/adapters/* (one pinned ACP adapter per directory).
   # These pins are what `aoe acp doctor --fix` installs, so without
-  # dependabot the bundled adapter version rots by design (#1017).
+  # dependabot the bundled adapter version rots by design (#1017). Kept
+  # weekly, unlike the monthly entries, so users get upstream agent fixes.
   - package-ecosystem: "npm"
     directories:
       - "/acp-worker/adapters/claude-agent-acp"
@@ -177,16 +210,20 @@ updates:
       default-days: 7
       semver-minor-days: 14
       semver-major-days: 28
+    groups:
+      adapters-security:
+        applies-to: security-updates
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
 
   # npm: acp-worker/test-shim
   - package-ecosystem: "npm"
     directory: "/acp-worker/test-shim"
     schedule:
-      interval: "weekly"
-      day: "monday"
+      interval: "monthly"
       time: "06:00"
       timezone: "Etc/UTC"
-    open-pull-requests-limit: 3
+    open-pull-requests-limit: 5
     labels:
       - "dependencies"
       - "javascript"
@@ -202,6 +239,10 @@ updates:
       acp:
         patterns: ["@agentclientprotocol/*"]
         update-types: ["minor", "patch"]
+      test-shim-security:
+        applies-to: security-updates
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
 
   # npm: website
   - package-ecosystem: "npm"
@@ -210,7 +251,7 @@ updates:
       interval: "monthly"
       time: "06:00"
       timezone: "Etc/UTC"
-    open-pull-requests-limit: 3
+    open-pull-requests-limit: 5
     labels:
       - "dependencies"
       - "javascript"
@@ -232,6 +273,10 @@ updates:
         exclude-patterns:
           - "tailwindcss"
           - "@tailwindcss/*"
+        update-types: ["minor", "patch"]
+      website-security:
+        applies-to: security-updates
+        patterns: ["*"]
         update-types: ["minor", "patch"]
     ignore:
       - dependency-name: "tailwindcss"
