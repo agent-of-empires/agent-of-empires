@@ -156,6 +156,19 @@ fn session_json(inst: &Instance, profile: &str) -> SessionJson {
     }
 }
 
+/// The refusal an all-profiles listing gives, on either transport, when one
+/// profile's data cannot be read. The local command owns the wording, and the
+/// served renderer builds the identical string from here, so an operator reads
+/// one sentence whichever transport answered. Carried back as an `anyhow`
+/// error, which is how `main` prints it: it adds the `Error: ` prefix and the
+/// newline, and exits 1.
+pub(crate) fn unreadable_profile_message(profile: &str) -> String {
+    format!(
+        "Profile '{profile}' could not be read, so the answer would be incomplete.\n\
+         Fix or remove that profile, then run the command again."
+    )
+}
+
 fn workspace_repos_for(inst: &Instance) -> Vec<WorkspaceRepoJson> {
     inst.all_repos()
         .iter()
@@ -378,18 +391,28 @@ async fn run_all_profiles(json: bool, scope: SessionScope) -> Result<()> {
         return Ok(());
     }
 
+    // Every profile is opened before a byte is printed. Skipping one that will
+    // not open would print the rest, exit 0, and put a total on screen that
+    // counts the rows that happened to be readable rather than the sessions
+    // the store holds.
+    let mut loaded: Vec<(&str, Vec<Instance>)> = Vec::with_capacity(profiles.len());
+    for profile in &profiles {
+        let storage = Storage::open_unwatched(profile)
+            .map_err(|_| anyhow::anyhow!("{}", unreadable_profile_message(profile)))?;
+        let (instances, _) = storage
+            .load_with_groups()
+            .map_err(|_| anyhow::anyhow!("{}", unreadable_profile_message(profile)))?;
+        loaded.push((profile.as_str(), instances));
+    }
+
     if json {
         let mut all_sessions: Vec<SessionJson> = Vec::new();
-        for profile_name in &profiles {
-            if let Ok(storage) = Storage::open_unwatched(profile_name) {
-                if let Ok((instances, _)) = storage.load_with_groups() {
-                    for inst in &instances {
-                        if !SessionScope::matches(Some(scope), inst) {
-                            continue;
-                        }
-                        all_sessions.push(session_json(inst, profile_name));
-                    }
+        for (profile, instances) in &loaded {
+            for inst in instances {
+                if !SessionScope::matches(Some(scope), inst) {
+                    continue;
                 }
+                all_sessions.push(session_json(inst, profile));
             }
         }
         super::output::print_json(&all_sessions)?;
@@ -398,26 +421,22 @@ async fn run_all_profiles(json: bool, scope: SessionScope) -> Result<()> {
 
     let show_state = table_shows_state(scope);
     let mut total_sessions = 0;
-    for profile_name in &profiles {
-        if let Ok(storage) = Storage::open_unwatched(profile_name) {
-            if let Ok((all_instances, _)) = storage.load_with_groups() {
-                let instances: Vec<&Instance> = all_instances
-                    .iter()
-                    .filter(|inst| SessionScope::matches(Some(scope), inst))
-                    .collect();
-                if instances.is_empty() {
-                    continue;
-                }
-
-                println!("\n═══ Profile: {} ═══\n", profile_name);
-                print!("{}", table_header(show_state));
-                for (inst, depth) in nest_children(&instances) {
-                    print_table_row(inst, depth, show_state);
-                }
-                println!("({} sessions)", instances.len());
-                total_sessions += instances.len();
-            }
+    for (profile, instances) in &loaded {
+        let listed: Vec<&Instance> = instances
+            .iter()
+            .filter(|inst| SessionScope::matches(Some(scope), inst))
+            .collect();
+        if listed.is_empty() {
+            continue;
         }
+
+        println!("\n═══ Profile: {} ═══\n", profile);
+        print!("{}", table_header(show_state));
+        for (inst, depth) in nest_children(&listed) {
+            print_table_row(inst, depth, show_state);
+        }
+        println!("({} sessions)", listed.len());
+        total_sessions += listed.len();
     }
 
     println!("\n═══════════════════════════════════════");

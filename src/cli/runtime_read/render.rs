@@ -642,15 +642,15 @@ fn render_groups(
     Ok(output)
 }
 
+/// The picker prints profile names and the default marker, and reads nothing
+/// else. The global profile enumeration is the one component it cannot answer
+/// without: fail that and the list of names is incomplete. A profile's own
+/// components and the global project registry are not consulted here, so
+/// refusing on them would turn a working answer into a refusal, which is the
+/// same defect as the under-refusal the all-profiles listing had.
 fn render_profiles(snapshot: &SnapshotData) -> Result<String, ReadFailure> {
-    if !component_healthy(&snapshot.health.global_enumeration)
-        || !component_healthy(&snapshot.health.global_metadata)
-        || snapshot.profiles.iter().any(|profile| {
-            !profile_component_healthy(&profile.health.profile_enumeration)
-                || !profile_component_healthy(&profile.health.metadata)
-        })
-    {
-        return Err(ReadFailure::post("health_degraded"));
+    if !component_healthy(&snapshot.health.global_enumeration) {
+        return Err(unreadable("The profile registry"));
     }
     if snapshot.profiles.is_empty() {
         return Ok(
@@ -812,15 +812,52 @@ fn sessions_for_profile<'a>(
         .filter(move |session| session.profile == profile)
 }
 
+/// One profile the store could not be read from, refused the way the local
+/// command refuses it: exit 1, and the operator's own sentence naming the
+/// profile. The local path is the oracle for a user's own wording, so the
+/// sentence is built from there and only prefixed and newline-terminated
+/// here, which is what `main` does to the local copy. A state refusal rather
+/// than a wire one, so it is not a `daemon read: <code>`.
+fn profile_unreadable(name: &str) -> ReadFailure {
+    ReadFailure::refuse(
+        "health_degraded",
+        1,
+        format!(
+            "Error: {}\n",
+            crate::cli::list::unreadable_profile_message(name)
+        ),
+    )
+}
+
+/// The same refusal for a global component the read rests on, named as the
+/// thing it is rather than dressed up as a profile.
+fn unreadable(component: &str) -> ReadFailure {
+    ReadFailure::refuse(
+        "health_degraded",
+        1,
+        format!(
+            "Error: {component} could not be read, so the answer would be incomplete.\n\
+             Fix the app data directory, then run the command again.\n"
+        ),
+    )
+}
+
+/// `aoe list --all` prints every session in every profile, so one profile that
+/// will not open makes the count a lie. The name that comes back is the first
+/// such profile, which is the one the operator has to look at.
 fn require_list_all_health(snapshot: &SnapshotData) -> Result<(), ReadFailure> {
-    if !component_healthy(&snapshot.health.global_enumeration)
-        || !component_healthy(&snapshot.health.global_metadata)
-        || snapshot
-            .profiles
-            .iter()
-            .any(|profile| !require_profile_components(profile, true, true).is_ok())
-    {
-        return Err(ReadFailure::post("health_degraded"));
+    if !component_healthy(&snapshot.health.global_enumeration) {
+        return Err(unreadable("The profile registry"));
+    }
+    if !component_healthy(&snapshot.health.global_metadata) {
+        return Err(unreadable("The global project registry"));
+    }
+    for profile in &snapshot.profiles {
+        if !profile_component_healthy(&profile.health.profile_enumeration)
+            || !profile_component_healthy(&profile.health.profile_data)
+        {
+            return Err(profile_unreadable(&profile.name));
+        }
     }
     Ok(())
 }

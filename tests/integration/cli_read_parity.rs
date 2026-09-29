@@ -21,6 +21,14 @@ use agent_of_empires::session::{Instance, Status, View};
 
 const PROFILE: &str = "main";
 
+/// The profile the broken-store fixture holds. It is named so it sorts after
+/// `main`, the profile that carries the sessions: a local listing that
+/// printed what it could read and only then gave up would leave those rows on
+/// stdout, where a served refusal leaves none at all. The refusal is built
+/// before anything is printed, and this name is what makes the comparison
+/// prove that rather than happen not to notice it.
+const BROKEN: &str = "wrecked";
+
 /// The whole read surface, in the spelling a user types it. One assertion per
 /// command, all of them in the single test below. The command set carries the
 /// states that used to be invisible here: a human `session show` of a child
@@ -204,6 +212,32 @@ impl Fixture {
         }
         std::fs::create_dir_all(base.join(".config")).expect("xdg base");
         fixture
+    }
+
+    /// A profile the store cannot be read from, because its `groups.json` is
+    /// not the JSON array the store expects of it. Both transports have to
+    /// refuse it the same way: the daemon reports the profile's enumeration
+    /// degraded, and the local command fails to load it.
+    ///
+    /// The break is in `groups.json` rather than `sessions.json` for a
+    /// reason that is not cosmetic. Migrations run before every command and
+    /// read `sessions.json`, and a migration refuses a session registry that
+    /// is not a JSON array, so an unreadable `sessions.json` would be turned
+    /// away before the read this test is about and the two transports would
+    /// agree for the wrong reason. `groups.json` is not a migration's
+    /// business, and a store that will not load it is the same failure the
+    /// all-profiles listing has to survive.
+    fn write_broken_profile(&self) {
+        let dir = self
+            .path()
+            .join(".config")
+            .join(agent_of_empires::session::APP_DIR_NAME_XDG)
+            .join("profiles")
+            .join(BROKEN);
+        std::fs::create_dir_all(&dir).expect("the broken profile dir");
+        std::fs::write(dir.join("sessions.json"), b"[]").expect("seed the broken store");
+        std::fs::write(dir.join("groups.json"), br#"{"groups": []}"#)
+            .expect("seed the unreadable registry");
     }
 
     fn path(&self) -> &Path {
@@ -593,10 +627,67 @@ async fn one_directory_under_two_spellings_is_one_project_on_both_transports() {
     .await;
 }
 
+/// A store the reader cannot open in full has to fail closed on both
+/// transports, because a partial listing is a wrong answer wearing a zero
+/// exit. The served half already refused, so this is the local command that
+/// used to skip the unreadable profile, print the rest and exit 0: a script
+/// reading that total would have believed the store held fewer sessions than
+/// it does, and only when a daemon happened to be publishing, which is the
+/// recommended local setup.
+///
+/// The refusal has to name the profile, because the name is the only thing
+/// the operator can act on. The parity comparison has already proved the two
+/// transports printed the same bytes, so the served copy is the whole claim.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_profile_that_cannot_be_read_is_refused_by_both_transports() {
+    let fixture = Fixture::new();
+    fixture.write_broken_profile();
+    // The picker row comes first because `refusals_from` is the index the
+    // succeeding rows end at, and this set has one succeeding row.
+    let served = compare_transports(
+        &fixture,
+        &[
+            // The picker names profiles without opening them, so it still
+            // answers here. Refusing on a component it never consults is the
+            // over-refusal half of the same defect, and the local command is
+            // the oracle for what this one should print.
+            &["profile"],
+            &["list", "--all"],
+            &["list", "--json", "--all"],
+        ],
+        1,
+    )
+    .await;
+
+    assert_eq!(
+        served[0].exit, 0,
+        "the picker reads no profile's data, so a broken one does not refuse it: {:?}",
+        served[0].stderr
+    );
+    for refusal in served.iter().skip(1) {
+        assert_eq!(
+            refusal.exit, 1,
+            "an unreadable profile is the operator's own state, so it leaves 1: {:?}",
+            refusal.stderr
+        );
+        assert!(
+            refusal.stderr.contains(BROKEN),
+            "the refusal names the profile it could not read: {:?}",
+            refusal.stderr
+        );
+        assert!(
+            refusal.stdout.is_empty(),
+            "a refusal prints no rows on either transport: {:?}",
+            refusal.stdout
+        );
+    }
+}
+
 async fn compare_both_transports(fixture: &Fixture) {
     let mut commands: Vec<&[&str]> = COMMANDS.to_vec();
     commands.extend_from_slice(&REFUSALS);
-    compare_transports(fixture, &commands, COMMANDS.len()).await
+    let _ = compare_transports(fixture, &commands, COMMANDS.len()).await;
 }
 
 /// `refusals_from` is the index at which the succeeding rows end; `usize::MAX`
@@ -604,7 +695,11 @@ async fn compare_both_transports(fixture: &Fixture) {
 /// refused on the served pass: a "refusal" that succeeded would be compared on
 /// stdout alone and would pass whether or not the two transports agreed about
 /// the refusal, which is exactly the gap this row set exists to close.
-async fn compare_transports(fixture: &Fixture, commands: &[&[&str]], refusals_from: usize) {
+async fn compare_transports(
+    fixture: &Fixture,
+    commands: &[&[&str]],
+    refusals_from: usize,
+) -> Vec<Run> {
     let xdg_base = fixture.path().join(".config");
     let state = build_test_app_state_with_policy(
         daemon_instances(),
@@ -628,7 +723,7 @@ async fn compare_transports(fixture: &Fixture, commands: &[&[&str]], refusals_fr
                 eprintln!(
                     "skipping: the local runtime read is not defined on this platform ({reason})"
                 );
-                return;
+                return Vec::new();
             }
             Err(reason) => panic!("the fixture home is a trusted namespace: {reason}"),
         };
@@ -659,8 +754,8 @@ async fn compare_transports(fixture: &Fixture, commands: &[&[&str]], refusals_fr
         std::fs::write(&sessions, &store).expect("restore the store");
         assert!(
             without_a_store.stdout.contains("long-session"),
-            "the served pass answered from the local store, not from the daemon:\n{}",
-            without_a_store.stdout
+            "the served pass answered from the local store, not from the daemon:\n{}\nSTDERR: {}\nEXIT: {}",
+            without_a_store.stdout, without_a_store.stderr, without_a_store.exit
         );
 
         // Shutdown retracts the publication, so the second pass really does
@@ -669,10 +764,11 @@ async fn compare_transports(fixture: &Fixture, commands: &[&[&str]], refusals_fr
         daemon.join().await;
     }
 
-    for (args, expected) in served {
+    for (args, expected) in &served {
         let local = run(home.clone(), args.clone()).await;
-        assert_same(&args, &expected, &local);
+        assert_same(args, expected, &local);
     }
+    served.into_iter().map(|(_, run)| run).collect()
 }
 
 /// Hermeticity, asserted rather than intended: with the update check off in the
