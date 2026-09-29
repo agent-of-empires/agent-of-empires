@@ -1090,7 +1090,6 @@ export function enqueueServerPrompt(
   prompt: {
     id: string;
     text: string;
-    createdAt?: string;
     originDevice?: string;
     attachments?: QueueAttachmentUpload[];
   },
@@ -1100,7 +1099,6 @@ export function enqueueServerPrompt(
     jsonInit("POST", {
       id: prompt.id,
       text: prompt.text,
-      created_at: prompt.createdAt,
       origin_device: prompt.originDevice,
       attachments: (prompt.attachments ?? []).map((a) => ({
         kind: a.kind,
