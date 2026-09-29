@@ -2,7 +2,7 @@
 //! session ids to per-instance sidecar files. Events per agent are declared in
 //! `crate::agents`; pane reconciliation covers gaps hooks cannot see.
 
-pub(crate) mod codex;
+mod codex;
 mod command;
 mod config_io;
 mod dir_guard;
@@ -39,7 +39,7 @@ pub(crate) use status_file::{
     read_hook_session_id_within, read_hook_sidecar_at, SESSION_ID_SIDECAR_MAX_AGE,
 };
 pub(crate) const SESSION_SOURCE_ENV: &str = "AOE_SESSION_SOURCE";
-pub use hermes::{install_hermes_hooks_with_events, uninstall_hermes_hooks};
+pub use hermes::{install_hermes_hooks_with_events, uninstall_hermes_hooks, HERMES_ALLOWLIST_FILE};
 pub use json_settings::{
     install_cursor_hooks_with_events, install_hooks, uninstall_cursor_hooks, uninstall_hooks,
 };

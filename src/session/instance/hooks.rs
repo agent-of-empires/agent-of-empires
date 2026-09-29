@@ -94,6 +94,10 @@ pub(crate) struct HostHookDisclosure {
     pub settings_paths: Vec<String>,
     pub hook_commands: Vec<(String, String)>,
     pub needs_codex_trust_note: bool,
+    /// Files the installer writes beside `settings_paths`, as
+    /// `(what it holds, path)`. A consent covers a write, so a file the
+    /// installer creates belongs here even when no event lands in it.
+    pub extra_settings_paths: Vec<(String, String)>,
     /// False when the resolved events carry no status, which is what
     /// `agent_status_hooks = false` leaves behind, and what an agent that
     /// declares no status event leaves behind too.
@@ -126,13 +130,11 @@ pub(crate) fn host_hook_agent(
         })
 }
 
-/// The profile-merged config a hook disclosure must read to describe the install
-/// a launch will perform. It carries the repo layer, because the builder stores
-/// the session's
-/// `detect_as` from it and `status_agent` falls back to that stored alias;
-/// among the fields the disclosure reads a repo can move only
-/// `agent_detect_as`, so merging costs the paths nothing.
-pub(crate) fn host_hook_disclosure_config(
+/// The repo-merged config the creation dialog's disclosure must read. A repo
+/// can move `agent_detect_as`, which is where the launcher's agent comes from;
+/// the other fields the disclosure reads are repo-denied, so merging costs
+/// the paths nothing. `aoe hooks status` has no project and cannot use this.
+pub(crate) fn host_hook_disclosure_config_with_repo(
     profile: &str,
     project_path: &Path,
 ) -> crate::session::config::Config {
@@ -153,6 +155,7 @@ pub(crate) fn host_hook_disclosure(
         needs_codex_trust_note: false,
         status_hooks_enabled: false,
         disabled_by_agent: None,
+        extra_settings_paths: Vec::new(),
     };
     let host_env = config.environment.as_slice();
     let home = host_home(host_env).unwrap_or_else(|| std::path::PathBuf::from("~"));
@@ -172,6 +175,19 @@ pub(crate) fn host_hook_disclosure(
     disclosure
         .settings_paths
         .push(path.to_string_lossy().into_owned());
+    // An installer can write more than its config: Hermes pre-approves its
+    // shell hooks in a sibling allowlist under the same lock. Resolved from
+    // the same path, so a rerouted HOME or a declared config dir moves both.
+    if let (Some(sidecar), Some(dir)) = (agent.sidecar_hooks.as_ref(), path.parent()) {
+        disclosure
+            .extra_settings_paths
+            .extend(sidecar.sibling_settings.iter().map(|extra| {
+                (
+                    extra.label.to_string(),
+                    dir.join(extra.file).to_string_lossy().into_owned(),
+                )
+            }));
+    }
     // Only Codex reads a feature flag, and only beside its hooks.json. Kimi
     // and settl name their own `config.toml` but install their hooks whatever
     // it says, so probing them would drop events a launch still writes.
@@ -1291,6 +1307,54 @@ mod tests {
         }
     }
 
+    /// A consent covers a write. Hermes pre-approves its shell hooks in a
+    /// sibling allowlist under the same lock, so naming only `config.yaml`
+    /// would under-disclose the install.
+    #[test]
+    #[serial_test::serial]
+    fn a_sibling_file_the_installer_writes_is_disclosed_too() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(&tmp.path().join("app"));
+        let _home = crate::session::test_support::isolate_home(tmp.path());
+        let _env = EnvGuard::unset(&["CODEX_HOME", "CLAUDE_CONFIG_DIR"]);
+        let config = crate::session::config::Config::default();
+        let agent = crate::agents::get_agent("hermes").unwrap();
+
+        let disclosure = host_hook_disclosure("hermes", agent, &config);
+        assert_eq!(disclosure.extra_settings_paths.len(), 1);
+        let (label, allowlist) = &disclosure.extra_settings_paths[0];
+        assert!(label.contains("allowlist"), "{label}");
+        let allowlist = std::path::PathBuf::from(allowlist);
+        assert_eq!(
+            allowlist.file_name().unwrap(),
+            crate::hooks::HERMES_ALLOWLIST_FILE,
+        );
+        assert_eq!(
+            allowlist.parent().unwrap(),
+            std::path::Path::new(&disclosure.settings_paths[0])
+                .parent()
+                .unwrap(),
+            "the allowlist sits beside the config, so both move together"
+        );
+
+        let events = resolved_host_hook_events(agent, &config, config.session.agent_status_hooks)
+            .unwrap_or_default();
+        // Install where the disclosure says, so the two paths are compared.
+        let config_path = std::path::PathBuf::from(&disclosure.settings_paths[0]);
+        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        crate::hooks::install_hermes_hooks_with_events(
+            &config_path,
+            crate::hooks::HookInstallTarget::Host,
+            &events,
+        )
+        .expect("hermes hooks install");
+        assert!(
+            allowlist.exists(),
+            "the installer must write the file the disclosure names: {}",
+            allowlist.display()
+        );
+    }
+
     /// Only Codex reads a feature flag, and only beside its own hooks.json.
     /// Kimi and settl name a `config.toml` too, so a probe that reads it for
     /// every agent drops events their installer still writes.
@@ -1420,7 +1484,7 @@ mod tests {
 
         let profile_only =
             crate::session::config::profile_config::resolve_config_or_warn("repo-alias");
-        let with_repo = host_hook_disclosure_config("repo-alias", &repo);
+        let with_repo = host_hook_disclosure_config_with_repo("repo-alias", &repo);
 
         let by_profile = host_hook_agent(
             "corp",

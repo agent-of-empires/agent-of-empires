@@ -15,6 +15,7 @@ pub struct HooksInstallDialog {
     hook_commands: Vec<(String, String)>,
     needs_codex_trust_note: bool,
     disabled_by_agent: Option<PathBuf>,
+    extra_settings_paths: Vec<(String, String)>,
     selected: bool, // true = Accept, false = Cancel
     scroll_offset: u16,
     accept_button_area: Rect,
@@ -39,6 +40,7 @@ impl HooksInstallDialog {
             needs_codex_trust_note: disclosure.needs_codex_trust_note,
             disabled_by_agent: disclosure.disabled_by_agent,
             status_hooks_enabled: disclosure.status_hooks_enabled,
+            extra_settings_paths: disclosure.extra_settings_paths,
             selected: true,
             scroll_offset: 0,
             accept_button_area: Rect::default(),
@@ -117,6 +119,10 @@ impl HooksInstallDialog {
         for path in &self.settings_paths {
             lines.push(Line::from(format!("  {path}")));
         }
+        for (label, path) in &self.extra_settings_paths {
+            lines.push(Line::from(format!("  {path}")));
+            lines.push(Line::from(format!("    ({label})")));
+        }
         if let Some(config) = &self.disabled_by_agent {
             lines.push(Line::from(format!(
                 "  (this agent's own config turns its hooks off: {})",
@@ -147,6 +153,11 @@ impl HooksInstallDialog {
                 "  printf {{status}} > {}/$AOE_INSTANCE_ID/status",
                 crate::hooks::hook_base_path().display()
             )));
+        } else if self.hook_commands.is_empty() {
+            lines.push(Line::from(
+                "No status hook survives here, and this agent installs none:",
+            ));
+            lines.push(Line::from("its own config turns its hooks off."));
         } else {
             lines.push(Line::from(
                 "No status hook survives here, so these only publish the id",
@@ -163,15 +174,20 @@ impl HooksInstallDialog {
         lines.push(Line::from("no-op outside of AoE sessions."));
         lines.push(Line::from(""));
         lines.push(Line::from(
-            "This is what the effective config resolves, not a manifest of every",
+            "This is what the effective config resolves, not a manifest of",
         ));
         lines.push(Line::from(
-            "write a launch can make. A launch that routes through a native",
+            "every write a launch can make. A launch that routes through a",
         ));
-        lines.push(Line::from("store or merges into a selected agent resolves"));
-        lines.push(Line::from("that target at launch time."));
+        lines.push(Line::from(
+            "native store, merges into a selected agent, or targets a",
+        ));
+        lines.push(Line::from(
+            "selected or recorded Claude conversation store resolves that",
+        ));
+        lines.push(Line::from("target at launch time."));
 
-        if self.needs_codex_trust_note {
+        if self.needs_codex_trust_note && self.disabled_by_agent.is_none() {
             lines.push(Line::from(""));
             lines.push(Line::from(
                 "Codex may ask you to review and trust these hooks in /hooks.",
@@ -188,7 +204,8 @@ impl HooksInstallDialog {
 
     pub fn render(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
         let content_lines = self.build_content_lines();
-        let content_height = content_lines.len() as u16 + 6; // header + spacing + buttons
+        // 8 rows of chrome: 2 block borders, 3 header, 2 buttons, 1 content top border.
+        let content_height = content_lines.len() as u16 + 8;
 
         let dialog_width = 64.min(area.width.saturating_sub(4));
         let dialog_height = (content_height + 6).min(area.height.saturating_sub(4));

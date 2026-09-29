@@ -147,13 +147,18 @@ pub fn uninstall_hermes_hooks(config_path: &Path) -> Result<bool> {
 
 /// Render the allowlist with one approval per installed `(event, command)`.
 /// An existing pair keeps its `approved_at` (even `null`), so a reinstall of
+/// The consent allowlist Hermes reads beside its `config.yaml`. Declared here
+/// because only the installer knows the name; the consent disclosure names the
+/// same constant, so a rename cannot split the two.
+pub const HERMES_ALLOWLIST_FILE: &str = "shell-hooks-allowlist.json";
+
 /// current commands is byte-identical.
 fn render_hermes_allowlist(
     config_dir: &Path,
     target: HookInstallTarget,
     events: &[ResolvedHookEvent],
 ) -> Result<(PathBuf, String)> {
-    let allowlist_path = config_dir.join("shell-hooks-allowlist.json");
+    let allowlist_path = config_dir.join(HERMES_ALLOWLIST_FILE);
     let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
 
     let mut data: Value = if allowlist_path.exists() {

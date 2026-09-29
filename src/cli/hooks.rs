@@ -111,6 +111,10 @@ fn print_disclosure(profile: &str) {
         for path in &disclosure.settings_paths {
             println!("  {tool_name}: {path}");
         }
+        for (label, path) in &disclosure.extra_settings_paths {
+            println!("  {tool_name}: {path}");
+            println!("    ({label})");
+        }
         if let Some(config) = &disclosure.disabled_by_agent {
             println!(
                 "    (this agent's own config turns its hooks off: {})",
@@ -157,7 +161,7 @@ fn print_disclosure(profile: &str) {
     println!("another profile resolves its own paths under the same approval.");
     if disclosures
         .iter()
-        .any(|(_, disclosure)| disclosure.needs_codex_trust_note)
+        .any(|(_, d)| d.needs_codex_trust_note && d.disabled_by_agent.is_none())
     {
         println!();
         println!("Codex may ask you to review and trust these hooks in /hooks.");
