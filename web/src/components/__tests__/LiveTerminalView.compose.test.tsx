@@ -4,6 +4,7 @@ import type { RefObject } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { LiveTerminalView } from "../LiveTerminalView";
+import { HIDDEN_INPUT_SENTINEL } from "../../lib/hiddenInputDiff";
 import { toastBus } from "../../lib/toastBus";
 import { makeSession } from "./fixtures";
 
@@ -67,6 +68,17 @@ describe("LiveTerminalView compose", () => {
     expect(screen.queryByRole("dialog", { name: "Compose" })).toBeNull();
     expect(document.activeElement).toBe(screen.getByLabelText("Live terminal input"));
     expect(error).not.toHaveBeenCalled();
+  });
+
+  it("stops the hidden input shadowing text typed before the compose send", async () => {
+    live.sendPaste.mockReset().mockReturnValue(true);
+    render(<LiveTerminalView session={makeSession({ id: "compose-shadow" })} />);
+    const input = await screen.findByLabelText<HTMLTextAreaElement>("Live terminal input");
+    input.value = `${HIDDEN_INPUT_SENTINEL}abc`;
+    fireEvent.click(screen.getByRole("button", { name: "Compose" }));
+    fireEvent.input(screen.getByLabelText("Message"), { target: { value: "ship it" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+    expect(input.value).toBe(HIDDEN_INPUT_SENTINEL);
   });
 
   it("toasts an undelivered paste and keeps the sheet and draft", async () => {

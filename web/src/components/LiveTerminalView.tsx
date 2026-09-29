@@ -127,6 +127,13 @@ export function LiveTerminalView({ session, active = true, surface = "agent", te
     },
     [sendDataOrReport],
   );
+  const submitCompose = useCallback(
+    (text: string, submit: boolean) => {
+      invalidateRetainedImeContext(inputRef.current);
+      return sendPasteOrReport(text, submit);
+    },
+    [sendPasteOrReport],
+  );
   const { settings: webSettings } = useWebSettings();
   const openCompose = useCallback(() => flushSync(() => setComposeOpen(true)), []);
   const closeCompose = useCallback((refocusTerminal: boolean) => {
@@ -368,7 +375,7 @@ export function LiveTerminalView({ session, active = true, surface = "agent", te
         <TerminalComposeSheet
           draftKey={`${session.id}:${surface}:${terminalIndex}`}
           bottomInset={keyboardHeight}
-          onSubmit={sendPasteOrReport}
+          onSubmit={submitCompose}
           onClose={closeCompose}
         />
       )}
