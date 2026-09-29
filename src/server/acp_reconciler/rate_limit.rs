@@ -146,7 +146,9 @@ pub(crate) async fn install_rate_limit_continuation(
         if queue_supersedes(&minted_at_ms, limit_at_ms) {
             // A continuation an earlier cadence installed is no longer next.
             // `/queue` never clears the slot the way `acp_prompt` does, so this
-            // is the only place the user's newer word can clear it.
+            // is where a newer word takes it back. Only while the resume pass
+            // runs: it skips a session whose worker is already live, and that
+            // one drains the continuation ahead of the queue.
             state.session_service.clear_pending_initial_turn(id).await;
             return ContinuationOutcome::SupersededByQueue;
         }
