@@ -134,7 +134,6 @@ pub(crate) async fn load_persisted_instance(
     ))
 }
 
-/// 409 for a start or resume refused because the session is archived or trashed.
 /// A 404 for a session that is gone, without the daemon's own envelope: the
 /// callers answer from a store read that found nothing, not from a refusal.
 pub(super) fn bare_not_found() -> axum::response::Response {
@@ -146,6 +145,7 @@ pub(super) fn bare_not_found() -> axum::response::Response {
         .into_response()
 }
 
+/// 409 for a start or resume refused because the session is archived or trashed.
 pub(crate) fn start_blocked_response(
     blocked: crate::session::StartBlocked,
 ) -> axum::response::Response {

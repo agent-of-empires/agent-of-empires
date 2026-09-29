@@ -157,10 +157,10 @@ impl Instance {
             }
             Err(error) => return Err(error),
         }
-        // The reconcile reread the stored row under the lifecycle lock the CLI
-        // archive and trash contend on, so this is the same durable check
-        // `lock_for_input` makes: a shelved row is refused with its own code
-        // rather than as a busy or superseded lifecycle (#4116).
+        // Under the lock archive and trash contend on, so the refusal below
+        // answers with its own code rather than as a busy or superseded
+        // lifecycle (#4116). A launch keeps a fresh reservation for as long as
+        // it owns the row, which is what keeps a peer from shelving it.
         self.ensure_startable()?;
         anyhow::ensure!(
             !matches!(self.status, Status::Creating | Status::Deleting),

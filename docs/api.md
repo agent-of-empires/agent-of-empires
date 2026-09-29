@@ -418,6 +418,7 @@ submits the whole message.
 | `409` | `{"error": "session_not_running"}` | Session exists but the tmux pane is gone |
 | `409` | `{"error": "resume_failed", "message": "...", "resume_session_id": "..."}` | Auto-revive tried to resume a stored conversation, but the pane exited before AoE could prove the ID invalid. The ID is preserved for explicit retry or replacement. |
 | `409` | `{"error": "session_transient", "status": "..."}` | Session is mid-lifecycle and cannot accept input yet |
+| `409` | `{"error": "session_archived" \| "session_trashed", "message": "..."}` | Session is archived or trashed, even with a live pane or `revive: false`; unarchive or restore it first. `/start`, `/ensure`, `/container-terminal` and structured-view prompts refuse the same way. |
 | `500` | `{"error": "tmux_error"}` or `{"error": "internal"}` | Unexpected failure (logged server-side) |
 
 Concurrent POSTs to the same `id` are serialized server-side, so two
@@ -434,39 +435,6 @@ curl -sS -X POST \
   "http://localhost:7777/api/sessions/abc123/send"
 ```
 
-<<<<<<< HEAD
-||||||| af5598896
-| Status | Body | When |
-| --- | --- | --- |
-| `200` | `{"sent": true}` | Keys delivered to the tmux pane |
-| `400` | `{"error": "message_empty"}` | Empty or whitespace-only message |
-| `400` | `{"error": "acp_mode_unsupported"}` | Structured-view session, so no tmux pane |
-| `403` | `{"error": "read_only"}` | Server is read-only |
-| `404` | `{"error": "not_found"}` | No such session |
-| `409` | `{"error": "session_not_running"}` | The tmux pane is gone |
-| `409` | `{"error": "resume_failed", "message", "resume_session_id"}` | Auto-revive tried a stored conversation and the pane exited before AoE could prove the id invalid; the id is preserved for retry |
-| `409` | `{"error": "session_transient", "status"}` | Mid-lifecycle, cannot accept input yet |
-| `500` | `{"error": "tmux_error"}` / `{"error": "internal"}` | Logged server-side |
-
-Concurrent POSTs to the same id are serialized, so two orchestrators racing on one session cannot interleave keystrokes; different ids run in parallel.
-
-=======
-| Status | Body | When |
-| --- | --- | --- |
-| `200` | `{"sent": true}` | Keys delivered to the tmux pane |
-| `400` | `{"error": "message_empty"}` | Empty or whitespace-only message |
-| `400` | `{"error": "acp_mode_unsupported"}` | Structured-view session, so no tmux pane |
-| `403` | `{"error": "read_only"}` | Server is read-only |
-| `404` | `{"error": "not_found"}` | No such session |
-| `409` | `{"error": "session_not_running"}` | The tmux pane is gone |
-| `409` | `{"error": "resume_failed", "message", "resume_session_id"}` | Auto-revive tried a stored conversation and the pane exited before AoE could prove the id invalid; the id is preserved for retry |
-| `409` | `{"error": "session_transient", "status"}` | Mid-lifecycle, cannot accept input yet |
-| `409` | `{"error": "session_archived" \| "session_trashed", "message"}` | The session is archived or trashed, even with a live pane or `revive: false`; unarchive or restore it first. `/start`, `/ensure`, `/container-terminal`, and structured-view prompts refuse the same way |
-| `500` | `{"error": "tmux_error"}` / `{"error": "internal"}` | Logged server-side |
-
-Concurrent POSTs to the same id are serialized, so two orchestrators racing on one session cannot interleave keystrokes; different ids run in parallel.
-
->>>>>>> upstream/main
 ## GET /api/sessions/{id}/output
 
 Snapshot of the session's tmux pane. Use this after `send` to read
