@@ -377,6 +377,10 @@ function AppContent({
         toastBus.handler?.info(`"${session.title}" is ready`);
       },
       onFailed: (message) => toastBus.handler?.error(`Session was not created: ${message}`),
+      onUnsaved: () =>
+        toastBus.handler?.error(
+          "This browser could not save a session that is still being created; keep this tab open until it finishes.",
+        ),
     });
   }, [injectSession]);
   // Trash is a whole-workspace concern, so it is derived here from the

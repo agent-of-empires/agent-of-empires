@@ -1,7 +1,8 @@
-// Creates whose outcome is unknown: every response was lost, but the server's detached
-// create may still finish. Kept outside the wizard (and in localStorage, across reloads)
-// so the request is retried under its original idempotency key until the server answers,
-// instead of being dropped and relaunched under a new key.
+// Keyed creates whose outcome is not yet known. The record lives from the first request
+// until a definite server answer, in memory and mirrored to localStorage so a reload keeps
+// it, and the request is only ever retried under its original idempotency key. A wizard
+// working on a create claims it; unclaimed creates are retried here, past the wizard's
+// unmount, until the server answers.
 
 import { createSession } from "./api";
 import { safeGetItem, safeSetItem } from "./safeStorage";
@@ -16,6 +17,8 @@ export interface PendingCreate {
 export interface PendingCreateHandlers {
   onCreated: (session: SessionResponse | undefined, pending: PendingCreate) => void;
   onFailed: (message: string, pending: PendingCreate) => void;
+  /** Storage refused the record: it is still retried, but a reload would lose it. */
+  onUnsaved?: (pending: PendingCreate) => void;
 }
 
 const STORAGE_KEY = "aoe-pending-creates";
@@ -28,45 +31,52 @@ export const PENDING_CREATE_EXPIRED_MESSAGE =
   "Gave up waiting for the server to confirm this session; check the session list before relaunching.";
 
 let handlers: PendingCreateHandlers | null = null;
+// The source of truth; storage is a best-effort mirror of it.
+let registry: Map<string, PendingCreate> | null = null;
+// Keys a wizard is working on; the owner leaves them alone until released.
+const claimed = new Set<string>();
+const reconciling = new Set<string>();
+const reportedUnsaved = new Set<string>();
 
 const isExpired = (p: PendingCreate) => Date.now() - p.since >= PENDING_CREATE_MAX_AGE_MS;
-const reconciling = new Set<string>();
 
-/** Well-formed stored entries, expired or not; corrupt ones are dropped. */
-function loadValid(): PendingCreate[] {
+function isWellFormed(p: unknown): p is PendingCreate {
+  const c = p as PendingCreate | null;
+  return (
+    typeof c?.body?.idempotency_key === "string" &&
+    typeof c.body.path === "string" &&
+    typeof c.body.tool === "string" &&
+    typeof c.tool === "string" &&
+    typeof c.since === "number" &&
+    Number.isFinite(c.since)
+  );
+}
+
+function entries(): Map<string, PendingCreate> {
+  if (registry) return registry;
+  registry = new Map();
   try {
     const parsed: unknown = JSON.parse(safeGetItem(STORAGE_KEY) ?? "[]");
-    if (!Array.isArray(parsed)) return [];
-    return (parsed as PendingCreate[]).filter(
-      (p) =>
-        typeof p?.body?.idempotency_key === "string" &&
-        typeof p.body.path === "string" &&
-        typeof p.body.tool === "string" &&
-        typeof p.tool === "string" &&
-        typeof p.since === "number" &&
-        Number.isFinite(p.since),
-    );
+    if (Array.isArray(parsed)) {
+      for (const p of parsed) if (isWellFormed(p)) registry.set(p.body.idempotency_key, p);
+    }
   } catch {
-    return [];
+    // A corrupt mirror is dropped; nothing else can recover it.
+  }
+  return registry;
+}
+
+function persist(): void {
+  const list = [...entries().values()];
+  if (safeSetItem(STORAGE_KEY, JSON.stringify(list))) return;
+  for (const p of list) {
+    if (reportedUnsaved.has(p.body.idempotency_key)) continue;
+    reportedUnsaved.add(p.body.idempotency_key);
+    handlers?.onUnsaved?.(p);
   }
 }
 
-function load(): PendingCreate[] {
-  return loadValid().filter((p) => !isExpired(p));
-}
-
-function save(list: PendingCreate[]): void {
-  safeSetItem(STORAGE_KEY, JSON.stringify(list));
-}
-
-const isPending = (key: string) => load().some((p) => p.body.idempotency_key === key);
-
-/** Whether `key` is still in storage, aged out or not. */
-const isStored = (key: string) => loadValid().some((p) => p.body.idempotency_key === key);
-
-function remove(key: string): void {
-  save(loadValid().filter((p) => p.body.idempotency_key !== key));
-}
+const isOwned = (key: string) => entries().has(key) && !claimed.has(key);
 
 function waitUntilReachable(): Promise<void> {
   const ready = () =>
@@ -95,18 +105,17 @@ async function reconcile(pending: PendingCreate): Promise<void> {
         await waitUntilReachable();
         await new Promise((r) => setTimeout(r, Math.min(1000 * attempt, MAX_RETRY_DELAY_MS)));
       }
+      // Resolved, or claimed by a wizard, which answers for it until it releases it.
+      if (!isOwned(key)) return;
       if (isExpired(pending)) {
-        const stillOurs = isStored(key);
-        remove(key);
-        if (stillOurs) handlers?.onFailed(PENDING_CREATE_EXPIRED_MESSAGE, pending);
+        resolvePendingCreate(key);
+        handlers?.onFailed(PENDING_CREATE_EXPIRED_MESSAGE, pending);
         return;
       }
-      // Adopted by a reopened wizard: it answers for the outcome now.
-      if (!isPending(key)) return;
       const result = await createSession(pending.body);
       if (result.network) continue;
-      if (!isPending(key)) return;
-      remove(key);
+      if (!isOwned(key)) return;
+      resolvePendingCreate(key);
       if (result.ok) handlers?.onCreated(result.session, pending);
       else handlers?.onFailed(result.error || "Unknown error", pending);
       return;
@@ -116,25 +125,46 @@ async function reconcile(pending: PendingCreate): Promise<void> {
   }
 }
 
-/** Hand an unresolved create to the app-level owner, which retries it under its key. */
-export function trackPendingCreate(pending: PendingCreate): void {
-  save([...load().filter((p) => p.body.idempotency_key !== pending.body.idempotency_key), pending]);
-  void reconcile(pending);
+/** Record a create before its request goes out; `claimed` when a wizard is sending it. */
+export function registerPendingCreate(pending: PendingCreate, { claimed: isClaimed = false } = {}): void {
+  const key = pending.body.idempotency_key;
+  entries().set(key, pending);
+  if (isClaimed) claimed.add(key);
+  else claimed.delete(key);
+  persist();
+  if (!isClaimed) void reconcile(pending);
 }
 
-/** The oldest unresolved create, so a reopened wizard retries it rather than a new request. */
+/** The oldest create nobody is working on, so a reopened wizard retries it rather than a new request. */
 export function peekPendingCreate(): PendingCreate | null {
-  return load()[0] ?? null;
+  for (const p of entries().values()) {
+    if (!claimed.has(p.body.idempotency_key) && !isExpired(p)) return p;
+  }
+  return null;
 }
 
-/** Take ownership of `key` away from the app-level owner; the caller now answers for it. */
+/** A wizard takes over retrying `key`; the record stays until a definite answer. */
 export function claimPendingCreate(key: string): void {
-  remove(key);
+  claimed.add(key);
+}
+
+/** The wizard stops working on `key`; the owner resumes it if it is still unresolved. */
+export function releasePendingCreate(key: string): void {
+  claimed.delete(key);
+  const pending = entries().get(key);
+  if (pending) void reconcile(pending);
+}
+
+/** The server answered `key`: forget it. */
+export function resolvePendingCreate(key: string): void {
+  claimed.delete(key);
+  reportedUnsaved.delete(key);
+  if (entries().delete(key)) persist();
 }
 
 /** Register the app's outcome handlers and resume creates left unresolved by an earlier page. */
 export function startPendingCreates(next: PendingCreateHandlers): void {
   handlers = next;
   // `reconcile` reports one that aged out while no page was open.
-  for (const pending of loadValid()) void reconcile(pending);
+  for (const pending of entries().values()) void reconcile(pending);
 }

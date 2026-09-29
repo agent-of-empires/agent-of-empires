@@ -4448,3 +4448,57 @@ async fn a_failed_create_is_replayed_to_a_same_key_retry() {
     let (fresh, session) = post_create(&state, body("k2")).await;
     assert_eq!(fresh, axum::http::StatusCode::CREATED, "{session}");
 }
+
+/// A full replay map must not forget a live failure: its retry would run the create,
+/// and its hooks, a second time. New keyed creates are refused instead.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_full_failure_map_replays_its_oldest_key_and_refuses_new_ones() {
+    use crate::server::test_support as support;
+    let _home = crate::session::test_support::isolate_app_dir();
+    let marker = tempfile::tempdir().unwrap();
+    let runs = marker.path().join("runs");
+    let hook = format!("echo run >> '{}'; exit 1", runs.display());
+    let project = project_with_on_create_hooks(&[hook.as_str()]);
+    support::seed_instances_on_disk_for_test("test", Vec::new());
+    let (launcher, _launches) = support::counting_failing_launcher();
+    let state = support::build_test_app_state_with_launcher(Vec::new(), launcher);
+    let body = |key: &str| {
+        serde_json::json!({
+            "title": "hook-fails", "path": project.path(), "tool": "claude",
+            "view": "structured", "profile": "test", "trust_hooks": true,
+            "idempotency_key": key,
+        })
+    };
+    let hook_runs = || {
+        std::fs::read_to_string(&runs)
+            .unwrap_or_default()
+            .lines()
+            .count()
+    };
+
+    let (status, failed) = post_create(&state, body("oldest")).await;
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{failed}");
+    assert_eq!(hook_runs(), 1);
+
+    // More live failures than the map holds.
+    for n in 0..5000 {
+        state.create_progress.record_failure(
+            &format!("filler-{n}"),
+            crate::server::create_progress::CreateFailure {
+                status: axum::http::StatusCode::BAD_REQUEST,
+                code: "create_failed",
+                message: "filler".to_string(),
+            },
+        );
+    }
+
+    assert_eq!(post_create(&state, body("oldest")).await, (status, failed));
+    let (full, refused) = post_create(&state, body("fresh")).await;
+    assert_eq!(
+        full,
+        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        "{refused}"
+    );
+    assert_eq!(hook_runs(), 1, "neither retry may run the create again");
+}

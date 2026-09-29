@@ -26,7 +26,9 @@ import { useMobileKeyboard } from "../../hooks/useMobileKeyboard";
 import {
   claimPendingCreate,
   peekPendingCreate,
-  trackPendingCreate,
+  registerPendingCreate,
+  releasePendingCreate,
+  resolvePendingCreate,
   type PendingCreate,
 } from "../../lib/pendingCreates";
 import { hasFinePointer } from "../../lib/platform";
@@ -323,6 +325,9 @@ export function SessionWizard({ onClose, onCreated, onCreatedInBackground, prefi
   const runCreate = async (body: CreateSessionRequest, tool: string, since = Date.now()) => {
     setUnknownOutcome(null);
     setProgressKey(body.idempotency_key ?? null);
+    const key = body.idempotency_key;
+    // Recorded before the request goes out, so a reload mid-flight still has the key.
+    if (key) registerPendingCreate({ body: { ...body, idempotency_key: key }, tool, since }, { claimed: true });
     let result = await createSession(body);
     for (let attempt = 0; result.network && body.idempotency_key && attempt < NETWORK_RETRIES; attempt++) {
       await waitUntilOnline();
@@ -334,17 +339,17 @@ export function SessionWizard({ onClose, onCreated, onCreatedInBackground, prefi
     const background = backgroundRef.current;
     // No answer is not a refusal: the detached server create may still finish, so
     // keep the key and reconcile under it rather than report a failure.
-    if (result.network && body.idempotency_key) {
-      const pending = { body: { ...body, idempotency_key: body.idempotency_key }, tool, since };
+    if (result.network && key) {
       if (background) {
         // The wizard is gone, so the app-level owner keeps retrying under this key.
-        trackPendingCreate(pending);
+        releasePendingCreate(key);
       } else {
-        setUnknownOutcome(pending);
+        setUnknownOutcome({ body: { ...body, idempotency_key: key }, tool, since });
         dispatch({ type: "SUBMIT_ERROR", error: UNKNOWN_OUTCOME_ERROR });
       }
       return;
     }
+    if (key) resolvePendingCreate(key);
     if (result.ok) {
       dispatch({ type: "SUBMIT_SUCCESS" });
       if (ACP_CAPABLE_TOOLS.has(tool)) safeSetItem(LAST_USED_TOOL_KEY, tool);
@@ -392,13 +397,16 @@ export function SessionWizard({ onClose, onCreated, onCreatedInBackground, prefi
   };
 
   // Own the adopted create while open; on close, hand an unresolved create back to the
-  // app-level owner. A create still in flight at close reports through the background path.
+  // app-level owner. A create still in flight at close stays claimed by its request and
+  // reports through the background path.
   useEffect(() => {
+    // Setup restores foreground ownership: StrictMode runs setup, cleanup, setup on one mount.
+    backgroundRef.current = false;
     const adopted = unknownOutcomeRef.current;
     if (adopted) claimPendingCreate(adopted.body.idempotency_key);
     return () => {
       backgroundRef.current = true;
-      if (unknownOutcomeRef.current) trackPendingCreate(unknownOutcomeRef.current);
+      if (unknownOutcomeRef.current) releasePendingCreate(unknownOutcomeRef.current.body.idempotency_key);
     };
   }, []);
 

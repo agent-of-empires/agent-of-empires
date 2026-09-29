@@ -133,6 +133,17 @@ describe("SessionRow context menu", () => {
     expect(group.hidden).toBe(false);
   });
 
+  it("keeps Tab and Shift+Tab inside the sheet, skipping folded actions", () => {
+    const menu = openRowMenu(ws({ view: "structured" }), { expandMore: false });
+    const items = [...menu.querySelectorAll<HTMLElement>("button")].filter((el) => !el.closest("[hidden]"));
+    const [first, last] = [items[0]!, items[items.length - 1]!];
+    last.focus();
+    fireEvent.keyDown(last, { key: "Tab" });
+    expect(document.activeElement).toBe(first);
+    fireEvent.keyDown(first, { key: "Tab", shiftKey: true });
+    expect(document.activeElement).toBe(last);
+  });
+
   it("is a named modal sheet that takes focus, closes on Escape, and returns focus to the row", () => {
     const menu = openRowMenu(ws({ title: "Fix login" }), { expandMore: false });
     expect(menu.getAttribute("role")).toBe("dialog");

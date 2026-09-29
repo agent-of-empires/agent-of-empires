@@ -60,6 +60,21 @@ export function ContextMenu({
             e.preventDefault();
             onClose();
           }
+          // Modal sheet: Tab and Shift+Tab wrap instead of leaving for the page behind.
+          if (e.key === "Tab" && sheetOnMobile) {
+            const items = [...(menuRef.current?.querySelectorAll<HTMLElement>("button:not([disabled])") ?? [])].filter(
+              (el) => !el.closest("[hidden]"),
+            );
+            const first = items[0];
+            const last = items[items.length - 1];
+            const wrapTo = e.shiftKey
+              ? document.activeElement === first && last
+              : document.activeElement === last && first;
+            if (wrapTo) {
+              e.preventDefault();
+              wrapTo.focus();
+            }
+          }
         }}
         className={`fixed z-50 bg-surface-800 border border-surface-700 rounded-lg shadow-lg py-1 ${minWidth} overflow-y-auto${sheet}`}
         style={{ left: menu.x, top: menu.y, maxHeight: "calc(100dvh - 16px)" }}

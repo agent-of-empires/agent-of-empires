@@ -1,5 +1,6 @@
 // @vitest-environment jsdom
 
+import { StrictMode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 
@@ -261,6 +262,28 @@ describe("SessionWizard rows", () => {
         confirmSpy.mockRestore();
       }
     });
+  });
+});
+
+describe("SessionWizard under StrictMode", () => {
+  // The app root renders in StrictMode, whose dev setup/cleanup/setup must not leave the
+  // wizard thinking it was closed.
+  it("completes an ordinary Launch in the foreground", async () => {
+    const onCreated = vi.fn();
+    const onCreatedInBackground = vi.fn();
+    render(
+      <StrictMode>
+        <SessionWizard
+          onClose={vi.fn()}
+          onCreated={onCreated}
+          onCreatedInBackground={onCreatedInBackground}
+          prefill={{ path: "/tmp/proj", tool: "claude" }}
+        />
+      </StrictMode>,
+    );
+    await launch();
+    await waitFor(() => expect(onCreated).toHaveBeenCalledWith({ id: "s1" }));
+    expect(onCreatedInBackground).not.toHaveBeenCalled();
   });
 });
 

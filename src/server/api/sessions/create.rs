@@ -963,6 +963,15 @@ pub async fn create_session(
         if let Some(failure) = state.create_progress.recent_failure(key) {
             return api_error(failure.status, failure.code, failure.message);
         }
+        // Forgetting a live failure would let its retry run the create again, so a full
+        // replay map refuses new keyed creates instead.
+        if !state.create_progress.has_failure_capacity() {
+            return api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "create_failures_full",
+                "Too many recent failed session creates; try again later.",
+            );
+        }
         Some(guard)
     } else {
         None
