@@ -1796,6 +1796,29 @@
       "components": ["web/src/components/DeleteSessionDialog.tsx"]
     },
     {
+      "id": "modals.dialog-description",
+      "kind": "vitest",
+      "risk": "low",
+      "specs": [
+        "src/components/__tests__/StopSessionDialog.test.tsx",
+        "src/components/__tests__/ScratchOverridesModal.test.tsx"
+      ],
+      "components": [
+        "web/src/components/Dialog.tsx",
+        "web/src/components/StopSessionDialog.tsx",
+        "web/src/components/ScratchOverridesModal.tsx"
+      ],
+      "notes": "The shared Dialog links its body as the accessible description; a form body such as ScratchOverridesModal opts out."
+    },
+    {
+      "id": "acp.tool-group-chunking",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/components/acp/activityMessages.test.ts", "src/components/acp/ThreadMessages.test.tsx"],
+      "components": ["web/src/components/acp/ThreadMessages.tsx", "web/src/components/acp/GroupToolCards.tsx"],
+      "notes": "Long tool-call runs fold into groups of at most 10 whose ids anchor on each chunk's first child (#3477, #2802); a group card re-render does not re-parse an unchanged payload."
+    },
+    {
       "id": "session.stop-dialog-keyboard",
       "kind": "vitest",
       "risk": "low",
