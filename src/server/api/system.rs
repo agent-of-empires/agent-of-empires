@@ -1687,7 +1687,7 @@ pub async fn get_profile_settings(
 const CITYHALL_PROFILE_LEAVES: &[&str] = &[
     "session.delete_to_trash",
     "session.confirm_delete",
-    "session.trash_retention_days",
+    "session.trash_retention_minutes",
 ];
 
 /// Walk a sparse settings patch and return the first dotted leaf path not in
@@ -1912,7 +1912,7 @@ mod tests {
                 "session": {
                     "delete_to_trash": true,
                     "confirm_delete": false,
-                    "trash_retention_days": 30
+                    "trash_retention_minutes": 43200
                 }
             })),
             None

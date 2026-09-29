@@ -291,7 +291,8 @@ pub struct HomeView {
     pub(super) attach_project_in_flight: std::collections::HashSet<String>,
 
     pub(super) creation_poller: CreationPoller,
-    pub(super) creation_cancelled: bool,
+    /// Cancels the request behind `creating_stub_id`.
+    pub(super) creation_cancel: Option<tokio_util::sync::CancellationToken>,
     pub(super) on_launch_hooks_ran: HashSet<String>,
 
     pub(super) creating_hook_progress: HashMap<String, CreatingHookProgress>,

@@ -557,6 +557,58 @@ mod tests {
     }
 
     #[test]
+    fn only_the_launching_store_is_inventoried() {
+        for (owner, hardlink) in [
+            ("own", false),
+            ("own", true),
+            ("sibling", false),
+            ("sibling", true),
+            ("retired", false),
+            ("retired", true),
+        ] {
+            let temporary = tempfile::tempdir().unwrap();
+            let host = temporary.path().join("host");
+            let stores = host.join(super::super::SANDBOX_PRIVATE_SUBDIR);
+            let retired = temporary
+                .path()
+                .join(crate::migrations::v033_isolate_sandbox_content::RECOVERY)
+                .join("transaction/0/original");
+            for store in [stores.join("own"), stores.join("sibling"), retired.clone()] {
+                fs::create_dir_all(store.join("session-env/live")).unwrap();
+            }
+            let selected = fs::canonicalize(&host).unwrap().join("settings.json");
+            fs::write(&selected, b"AUTHORED_CONFIG").unwrap();
+            let foreign = stores.join("sibling/state.json");
+            fs::write(&foreign, b"OTHER_INSTANCE_STATE").unwrap();
+            let holder = match owner {
+                "retired" => retired.clone(),
+                store => stores.join(store),
+            };
+            if hardlink {
+                fs::hard_link(&selected, holder.join("linked")).unwrap();
+            } else {
+                symlink(&selected, holder.join("alias")).unwrap();
+            }
+            let mut boundary = NativeStateBoundary::for_source(&host, &stores.join("own")).unwrap();
+            boundary.add_storage_root(&host).unwrap();
+            let mut guard = ReadGuard::new(&boundary, ReadAccess::default()).unwrap();
+            let foreign = fs::canonicalize(foreign).unwrap();
+            assert!(!guard
+                .record_file(&foreign, &File::open(&foreign).unwrap())
+                .unwrap());
+            let published = guard
+                .record_file(&selected, &File::open(&selected).unwrap())
+                .unwrap();
+            assert_eq!(published, owner != "own", "{owner} hardlink={hardlink}");
+            // A running sibling rewrites its own links and directories.
+            fs::remove_dir(stores.join("sibling/session-env/live")).unwrap();
+            fs::remove_file(stores.join("sibling/alias")).ok();
+            symlink("state.json", stores.join("sibling/alias")).unwrap();
+            guard.validate().unwrap();
+        }
+    }
+
+    #[test]
     fn validation_rechecks_new_state_subdirectories() {
         for (origin, conflict) in [
             (StateOrigin::Native, true),
