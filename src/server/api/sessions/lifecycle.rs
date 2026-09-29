@@ -324,7 +324,15 @@ pub async fn touch_session_access(
         let Some(row) = instances.iter().find(|row| row.id == id) else {
             return crate::server::api::session_not_found();
         };
-        if row.is_trashed() || matches!(row.status, Status::Creating | Status::Deleting) {
+        if row.is_trashed() {
+            // A trashed row is not mid-lifecycle: it is shelved, and the rest
+            // of the surface answers that with its own code and a message the
+            // caller can act on rather than a generic busy.
+            return crate::server::api::start_blocked_response(
+                crate::session::StartBlocked::Trashed,
+            );
+        }
+        if matches!(row.status, Status::Creating | Status::Deleting) {
             return lifecycle_rejection(&state, &LifecycleTargetError::Busy.into())
                 .unwrap_or_else(|| StatusCode::CONFLICT.into_response());
         }
@@ -1434,7 +1442,21 @@ pub(super) async fn prepare_agent_session(
             .transpose()?;
         let mut outgoing = instance.clone();
         if worker_restart.is_some() {
-            outgoing.reconcile_from_store(&native)?;
+            // A row missing from the store and a reservation this row no longer
+            // owns are one error here; only the first is a session that is gone,
+            // so a peer that purged it while this request waited must not be
+            // told the lifecycle is busy. The extra read runs on that path
+            // alone. Mirrors `acquire_auxiliary_locks_in`.
+            if let Err(error) = outgoing.reconcile_from_store(&native) {
+                if matches!(
+                    error.downcast_ref::<crate::session::LifecycleReservationError>(),
+                    Some(crate::session::LifecycleReservationError::Superseded)
+                ) && native.load()?.iter().all(|row| row.id != instance.id)
+                {
+                    return Err(crate::session::SessionGone.into());
+                }
+                return Err(error);
+            }
         }
         let (account_swap, mut conversation_carry) = match worker_restart
             .as_ref()

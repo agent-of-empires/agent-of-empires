@@ -1823,14 +1823,38 @@ impl HomeView {
         if let Some(ref mut diff_view) = self.diff_view {
             let action = diff_view.handle_key(key);
             if let Some((session_id, new_override)) = diff_view.take_pending_override() {
-                if let Err(e) = self.apply_user_action(&session_id, |inst| {
+                let in_memory = self.apply_user_action(&session_id, |inst| {
                     inst.base_branch_override = new_override.clone();
-                }) {
+                });
+                if let Err(e) = in_memory {
                     tracing::warn!(
                         target: "tui.home",
-                        "Failed to persist base_branch_override: {}",
+                        "Failed to apply base_branch_override: {}",
                         e
                     );
+                }
+                // The diff view holds no runtime handle, so the owner persists:
+                // through the daemon when it owns the row, through the gated
+                // local mirror write when it does not.
+                let persist =
+                    if self.runtime_authoritative && self.session_feed.mutations_available() {
+                        self.session_feed.submit(
+                            session_id.clone(),
+                            crate::daemon::SessionMutation::DiffBase(
+                                crate::daemon::UpdateDiffBaseBody {
+                                    base_branch: new_override.clone(),
+                                    repo: None,
+                                },
+                            ),
+                        )
+                    } else {
+                        self.save()
+                    };
+                if let Err(e) = persist {
+                    self.info_dialog = Some(InfoDialog::new(
+                        "Diff Base Not Saved",
+                        &format!("Failed to persist the base branch: {e}"),
+                    ));
                 }
             }
             match action {
@@ -3539,7 +3563,6 @@ impl HomeView {
             profile,
             base_override,
             worktree_base,
-            self.file_watch.clone(),
         ) {
             Ok(view) => self.diff_view = Some(view),
             Err(e) => {

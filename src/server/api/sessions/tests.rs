@@ -896,6 +896,43 @@ async fn engagement_unsinks_archived_and_snoozed_row_in_one_canonical_commit() -
     assert!(published.snoozed_until.is_none());
     Ok(())
 }
+
+/// A trashed row is shelved, not mid-lifecycle: `/access` used to answer a
+/// generic `lifecycle_busy`, which the dashboard cannot act on, while every
+/// other entry point returned the row's own code.
+#[tokio::test]
+#[serial_test::serial]
+async fn access_refuses_a_trashed_row_with_its_own_code() -> anyhow::Result<()> {
+    use axum::body::to_bytes;
+    let _home = crate::session::test_support::isolate_app_dir();
+    let mut row = make_test_instance();
+    row.trash();
+    let id = row.id.clone();
+    let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
+    let storage = Storage::new("access-refusal", state.file_watch.clone())?;
+    storage.update(|rows, _| {
+        rows.push(row);
+        Ok(())
+    })?;
+    *state.canonical_metadata.write().await =
+        crate::server::reload::load_all_profiles(&state.file_watch)?.metadata;
+    state.runtime.publish(&state).await?;
+
+    let response = touch_session_access(State(state.clone()), Path(id.clone()))
+        .await
+        .into_response();
+
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body = to_bytes(response.into_body(), usize::MAX).await?;
+    let json: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(json["error"], "session_trashed");
+    let stored = storage.load()?;
+    assert!(
+        stored.iter().find(|row| row.id == id).unwrap().is_trashed(),
+        "a refused access must leave the row shelved"
+    );
+    Ok(())
+}
 #[tokio::test]
 #[serial_test::serial]
 async fn archive_and_trash_receipts_discard_killed_auxiliary_observations() -> anyhow::Result<()> {

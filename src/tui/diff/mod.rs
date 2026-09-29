@@ -6,9 +6,7 @@ mod split;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
 
-use crate::file_watch::FileWatchService;
 use crate::git::diff::{
     check_merge_base_status, compute_changed_files, compute_file_contents, compute_file_diff,
     get_default_base_ref, list_branches, DiffFile, FileContents, FileDiff, FileStatus,
@@ -95,11 +93,6 @@ pub struct DiffView {
     /// Keeps keyboard selection and mouse clicks aligned when the file list is
     /// taller than the visible panel.
     pub(crate) file_list_scroll_offset: usize,
-
-    /// Process-wide file-watch primitive, threaded through to per-session
-    /// `Storage` writes so the local in-process Local fast path fires when
-    /// the diff view persists a `base_branch_override`.
-    pub(crate) file_watch: Arc<FileWatchService>,
 }
 
 impl DiffView {
@@ -107,23 +100,21 @@ impl DiffView {
     /// branch through the picker only mutates in-memory state. Callers
     /// that have a session id should use `new_for_session` so the
     /// override persists.
-    pub fn new(repo_path: PathBuf, file_watch: Arc<FileWatchService>) -> anyhow::Result<Self> {
-        Self::new_for_session(repo_path, None, String::new(), None, None, file_watch)
+    pub fn new(repo_path: PathBuf) -> anyhow::Result<Self> {
+        Self::new_for_session(repo_path, None, String::new(), None, None)
     }
 
     /// Create a diff view bound to a session. `base_override` (the
     /// session's persisted `base_branch_override`) wins over the
     /// worktree's recorded base branch (`worktree_base`), which wins
-    /// over the profile default and auto-detection. Subsequent calls
-    /// to `select_branch` persist the new ref back to the session
-    /// record.
+    /// over the profile default and auto-detection. A later
+    /// `select_branch` stages the new ref for the owner to persist.
     pub fn new_for_session(
         repo_path: PathBuf,
         session_id: Option<String>,
         profile: String,
         base_override: Option<String>,
         worktree_base: Option<String>,
-        file_watch: Arc<FileWatchService>,
     ) -> anyhow::Result<Self> {
         // Use the profile-merged config so a per-profile Diff override (e.g.
         // split_view) is honored on open. The session-agnostic path (empty
@@ -180,7 +171,6 @@ impl DiffView {
             pending_override: None,
             file_list_inner: ratatui::layout::Rect::default(),
             file_list_scroll_offset: 0,
-            file_watch,
         };
 
         view.refresh_files()?;
@@ -340,29 +330,23 @@ impl DiffView {
         self.branch_select = None;
         self.warning_dialog = check_merge_base_status(&self.repo_path, &self.base_branch)
             .map(|msg| InfoDialog::new("Warning", &msg));
-        if let Err(e) = self.persist_base_override() {
-            self.error_message = Some(format!("Failed to persist base branch: {e}"));
+        if let Err(e) = self.stage_base_override() {
+            self.error_message = Some(format!("Failed to stage base branch: {e}"));
         }
         if let Err(e) = self.refresh_files() {
             self.error_message = Some(format!("Failed to refresh: {}", e));
         }
     }
 
-    fn persist_base_override(&mut self) -> anyhow::Result<()> {
+    /// Stage the new base branch for the owner to persist. This view holds no
+    /// runtime handle, so writing `sessions.json` from here would land behind
+    /// the daemon's back; `HomeView` submits the change through the runtime,
+    /// or through the gated local write when the runtime does not own the row.
+    fn stage_base_override(&mut self) -> anyhow::Result<()> {
         let Some(session_id) = self.session_id.clone() else {
             return Ok(());
         };
-        let storage = crate::session::Storage::new(&self.profile, self.file_watch.clone())?;
-        let new_override = Some(self.base_branch.clone());
-        let id_for_closure = session_id.clone();
-        let new_override_for_closure = new_override.clone();
-        storage.update(|instances, _groups| {
-            if let Some(inst) = instances.iter_mut().find(|i| i.id == id_for_closure) {
-                inst.base_branch_override = new_override_for_closure;
-            }
-            Ok(())
-        })?;
-        self.pending_override = Some((session_id, new_override));
+        self.pending_override = Some((session_id, Some(self.base_branch.clone())));
         Ok(())
     }
 
@@ -515,7 +499,6 @@ impl DiffView {
             pending_override: None,
             file_list_inner: ratatui::layout::Rect::default(),
             file_list_scroll_offset: 0,
-            file_watch: FileWatchService::noop(),
         }
     }
 }

@@ -936,6 +936,12 @@ impl HomeView {
         new_name: &str,
         rename_branch: bool,
     ) -> anyhow::Result<()> {
+        // The worktree move and the container discard below are not undoable from
+        // here, so the refusal has to happen before either runs. #4009.
+        if let Some(reason) = self.local_write_block() {
+            self.refuse_local_write(reason);
+            return Ok(());
+        }
         let Some(id) = self.selected_session.clone() else {
             return Ok(());
         };
@@ -1092,6 +1098,12 @@ impl HomeView {
         // session whose agent is deliberately stopped.
         if instance.is_trashed() {
             anyhow::bail!("This session is in the trash; restore it before attaching a project");
+        }
+        // The worker below opens its own storage and commits `workspace_info`,
+        // and it cannot be unwound from the view once `git worktree add` has
+        // run, so the refusal belongs here. #4009.
+        if let Some(reason) = self.local_write_block() {
+            anyhow::bail!(reason);
         }
         if instance.is_archived() {
             anyhow::bail!(

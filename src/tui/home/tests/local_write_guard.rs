@@ -345,6 +345,64 @@ fn restore_refuses_while_the_runtime_owns_the_rows() {
     assert_eq!(info_title(&view), Some("Read-only"));
 }
 
+/// Renaming a workdir moves a real git worktree and discards the session's
+/// container before it writes `project_path`, so the guard has to fire before
+/// any of that runs. Without it the directory moves and the row is rewritten
+/// while the runtime declares itself unable to mutate.
+#[test]
+#[serial]
+fn workdir_rename_refuses_while_the_runtime_owns_the_rows() {
+    let temp = TempDir::new().unwrap();
+    let _guard = setup_test_home(&temp);
+    let workdir = temp.path().join("wt").display().to_string();
+    let (mut view, id) = attached_runtime_view(|row| {
+        row.project_path = workdir.clone();
+        row.worktree_info = Some(crate::session::WorktreeInfo {
+            branch: "feature/foo".to_string(),
+            main_repo_path: temp.path().display().to_string(),
+            managed_by_aoe: true,
+            created_at: chrono::Utc::now(),
+            base_branch: None,
+        });
+    });
+    view.selected_session = Some(id.clone());
+
+    view.set_worktree_name_for_selected("renamed", false)
+        .unwrap();
+
+    assert_eq!(
+        view.get_instance(&id).map(|row| row.project_path.clone()),
+        Some(workdir.clone()),
+        "project_path was rewritten behind the runtime's back"
+    );
+    assert_eq!(info_title(&view), Some("Read-only"));
+}
+
+/// Attaching a repo runs `git worktree add`, a fetch and a submodule init on a
+/// worker, and that worker commits the row through its own storage handle. Once
+/// dispatched it cannot be unwound from the view, so the refusal belongs at the
+/// entry point rather than after the enqueue.
+#[test]
+#[serial]
+fn project_attach_refuses_while_the_runtime_owns_the_rows() {
+    let temp = TempDir::new().unwrap();
+    let _guard = setup_test_home(&temp);
+    let (mut view, id) = attached_runtime_view(|_| {});
+
+    let error = view
+        .add_project_to_session(&id, &temp.path().join("other"))
+        .expect_err("the attach must be refused");
+
+    assert!(
+        error.to_string().contains("may not write"),
+        "the refusal must name the read-only runtime, got: {error}"
+    );
+    assert!(
+        view.attach_project_in_flight.is_empty(),
+        "a worker was dispatched for a row the runtime owns"
+    );
+}
+
 #[test]
 #[serial_test::serial]
 fn empty_trash_refuses_while_the_runtime_owns_the_rows() {

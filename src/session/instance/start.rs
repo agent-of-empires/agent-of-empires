@@ -804,6 +804,50 @@ mod tests {
         }
     }
 
+    /// #4118: a row that a peer archived or trashed must not reach the
+    /// pre-launch hooks, even when the caller still holds a live in-memory
+    /// copy. The hooks start containers and can have side effects, so this
+    /// watches the hook actually running rather than only the error code.
+    #[test]
+    #[serial_test::serial]
+    fn start_refuses_a_stored_shelved_row_before_the_pre_launch_hooks() {
+        let temp = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_home(temp.path());
+        crate::session::config::update_app_state(|state| {
+            state.has_acknowledged_agent_hooks = true;
+        })
+        .expect("acknowledge the agent hook paths");
+        let witness = temp.path().join("before-session-ran");
+        crate::session::config::update_config(|global| {
+            global.host_hooks.before_session = vec![format!(": > '{}'", witness.display())];
+        })
+        .expect("install before_session hook");
+
+        let profile = "start-shelved-stored-row";
+        let mut inst = Instance::new("start", "/tmp/x");
+        inst.source_profile = profile.to_string();
+        crate::session::instance::test_helpers::seed_disk_for_sidecar_test(profile, &inst);
+        // Only the stored row is shelved: the instance keeps a live copy, which
+        // is the state a daemon cache holds when a peer shelves behind it.
+        crate::session::storage::Storage::new_unwatched(profile)
+            .unwrap()
+            .update(|rows, _| {
+                crate::session::instance::Instance::archive(&mut rows[0]);
+                Ok(())
+            })
+            .unwrap();
+
+        let blocked = inst
+            .start_with_size_opts(None, false)
+            .err()
+            .and_then(|error| error.downcast_ref::<StartBlocked>().copied());
+        assert_eq!(blocked, Some(StartBlocked::Archived));
+        assert!(
+            !witness.exists(),
+            "the pre-launch hook ran for a row already shelved in the store"
+        );
+    }
+
     fn instance_with_id(id: &str) -> Instance {
         let mut inst = Instance::new("tampered-id-test", "/tmp");
         inst.id = id.to_string();
