@@ -580,7 +580,8 @@ fn frame_bodies(bytes: &[u8]) -> String {
 /// Two producer spellings were refused before this repair, and both are put
 /// back here. `registered` is the field `ProjectRead` has serialised on every
 /// row since it was added, and the fractional timestamp is exactly what
-/// chrono's `AutoSi` writes for an instant that is not on a second boundary /// which is almost every real one. The recorded frames carry both.
+/// chrono's `AutoSi` writes for an instant that is not on a second boundary,
+/// which is almost every real one. The recorded frames carry both.
 #[test]
 #[parallel]
 fn a_producer_frame_the_schema_once_refused_is_accepted() {
@@ -714,6 +715,72 @@ fn a_profile_health_member_that_is_not_one_is_refused() {
     );
 }
 
+/// `error.json` is held to the document published beside it. It was not: the
+/// pack compiled `error.schema.json` and then only read its phase enum, so the
+/// per-case refusal was judged by the closed struct and never by the
+/// vocabulary the schema states. A code outside that vocabulary now has to be
+/// refused as a schema violation, which names the document and the value.
+#[test]
+#[parallel]
+fn a_case_error_that_leaves_the_published_vocabulary_is_refused_by_the_schema() {
+    let (_dir, root) = staged_pack();
+    let path = case_dir(&root, "http-loopback-unauthorized").join("error.json");
+    let text = fs::read_to_string(&path).expect("read error.json");
+    let from = r#""code":"unauthorized""#;
+    let to = r#""code":"not_a_published_code""#;
+    assert!(text.contains(from), "the error carries the code to replace");
+    fs::write(&path, text.replacen(from, to, 1)).expect("rewrite error.json");
+    restage(&root);
+
+    let reason = pack::verify(&root)
+        .expect_err("a code no published schema names is refused")
+        .to_string();
+    assert!(
+        reason.contains("does not satisfy error.schema.json")
+            && reason.contains("not_a_published_code"),
+        "the refusal names the document and the value it refuses: {reason}"
+    );
+}
+
+/// Every published document is pinned to the revision its data carries, in
+/// its `$id` and in the `artifact_revision` `const`. The evaluator ignores
+/// both, so a document left behind on an older revision would keep
+/// describing a pack that `CASES.json`, `expected.json` and `error.json` all
+/// refuse. Each edit is a document whose bytes the manifest and the case
+/// index have to be brought back into agreement with, so the failure being
+/// observed is the pin and not a digest.
+#[test]
+#[parallel]
+fn a_published_document_that_drops_the_revision_is_refused() {
+    for (name, from, to) in [
+        (
+            "error.schema.json",
+            r#""$id": "https://aoe.invalid/schemas/cli-read/v151/error.schema.json""#,
+            r#""$id": "https://aoe.invalid/schemas/cli-read/v150/error.schema.json""#,
+        ),
+        (
+            "expected.schema.json",
+            r#""artifact_revision": { "const": "v151" }"#,
+            r#""artifact_revision": { "const": "v150" }"#,
+        ),
+    ] {
+        let (_dir, root) = staged_pack();
+        let path = root.join(name);
+        let text = fs::read_to_string(&path).expect("read the published document");
+        assert!(text.contains(from), "{name} carries the pin to replace");
+        fs::write(&path, text.replacen(from, to, 1)).expect("rewrite the document");
+        restage(&root);
+
+        let reason = pack::verify(&root)
+            .expect_err("a document that names another revision is refused")
+            .to_string();
+        assert!(
+            reason.contains(name) && reason.contains("v150"),
+            "the refusal names the document and the revision it drifted to: {reason}"
+        );
+    }
+}
+
 /// A `pattern` written inside a `oneOf` branch, proved in both directions.
 ///
 /// Every published document leans on `oneOf`, and the load-time walk used to
@@ -744,8 +811,8 @@ fn a_pattern_inside_a_one_of_branch_is_enforced() {
     fs::write(&schema, text.replacen(&from, &to, 1)).expect("rewrite the document");
     restage(&root);
 
-    // Every recorded `default_profile`: "main" on the nominal frames, and
-    // the dangling "absent" on the schema-invalid one: is inside the pattern, so
+    // Every recorded `default_profile`, "main" on the nominal frames and the
+    // dangling "absent" on the schema-invalid one, is inside the pattern, so
     // a compiled pattern inside a branch does not refuse a conforming frame.
     pack::verify(&root).expect("a frame the branch's pattern admits is accepted");
 
@@ -844,7 +911,7 @@ fn a_keyword_inside_a_one_of_branch_reaching_past_the_subset_is_refused() {
 
 /// A definition that reaches itself. The name is declared, so every other load
 /// check passes this document, and the evaluator then follows the reference
-/// until the stack gives out: which is an abort of `pack::verify` over a
+/// until the stack gives out, which is an abort of `pack::verify` over a
 /// one-character edit, not the readable refusal every other malformation gets.
 /// A cycle is a schema this evaluator cannot read, so it is refused at load.
 #[test]

@@ -1,12 +1,11 @@
 //! The Contract Pack verifier: the sole gate that must pass before a
 //! `tests/fixtures/cli-read` fixture is replayed.
 //!
-//! The pack is unsigned integrity governance (P1-06 is an accepted residual
-//! risk), so everything here is about drift detection, not authenticity: the
-//! manifest universe must match the physical tree, every digest must match,
-//! `CASES.json` must be RFC 8785 canonical, each case directory must contain
-//! exactly the files its row declares, and the expected result must agree with
-//! the bytes on disk.
+//! The pack is unsigned, so everything here is about drift detection rather
+//! than authenticity: the manifest universe must match the physical tree,
+//! every digest must match, `CASES.json` must be RFC 8785 canonical, each
+//! case directory must contain exactly the files its row declares, and the
+//! expected result must agree with the bytes on disk.
 //!
 //! The JSON Schema documents shipped beside the fixtures are the published
 //! contract; the closed structs below enforce the same closure at run time, so
@@ -259,8 +258,8 @@ const TABLE: &[(&str, &[&str], &[u8])] = &[
     ("snapshot", &["schema_invalid"], &[4]),
     // `health_degraded`, `freshness_unavailable` and `default_missing` are
     // facts the exchange could not establish, so they leave 4. The three below
-    // them are refusals on the user's own state: a profile the store does not
-    // have, a session it does not, an identifier that names several: so the
+    // them are refusals on the user's own state, a profile the store does not
+    // have, a session it does not, an identifier that names several. The
     // local command has always left 1 for them and the served half leaves the
     // same 1, which is the exit the parity gate compares. A refusal on the
     // user's own state is not a wire failure, so the row admits 1 as well as
@@ -279,8 +278,8 @@ const TABLE: &[(&str, &[&str], &[u8])] = &[
     ),
     ("close", &["close_timeout"], &[4]),
     // The renderer chooses the exit itself: an internal fault leaves 1, and a
-    // refusal on the user's own state: no tmux session to read, or a pane
-    // that is not an Agent of Empires session: leaves 2.
+    // refusal on the user's own state, no tmux session to read or a pane that
+    // is not an Agent of Empires session, leaves 2.
     ("renderer", &["renderer_internal"], &[1, 2]),
 ];
 
@@ -288,10 +287,8 @@ const TABLE: &[(&str, &[&str], &[u8])] = &[
 /// table at all.
 ///
 /// A code that no emitter can produce is not in the table, so a pack that
-/// freezes one fails verification. That is the check `identifier_required`
-/// needed and did not have: a renderer that auto-detects tmux had removed the
-/// only emitter, and the frozen case kept passing because the table agreed with
-/// itself.
+/// freezes one fails verification, which is what
+/// [`table_names_only_reachable_vocabulary`] checks.
 fn expected_exits(phase: &str, code: Option<&str>) -> Option<&'static [u8]> {
     match (phase, code) {
         ("renderer", None) => Some(&[0]),
@@ -305,10 +302,9 @@ fn expected_exits(phase: &str, code: Option<&str>) -> Option<&'static [u8]> {
 
 /// Direction: the table into the vocabulary. Every phase and code a table row
 /// names must be one the vocabulary recognises, or the pack would describe an
-/// outcome no code path can produce. This is the check `identifier_required`
-/// needed and did not have: a renderer that auto-detects tmux had removed the
-/// only emitter, and the frozen case kept passing because the table agreed with
-/// itself.
+/// outcome no code path can produce. A renderer that auto-detects tmux once
+/// removed the only emitter of one row, and the frozen case kept passing
+/// because the table agreed with itself.
 fn table_names_only_reachable_vocabulary() -> bool {
     TABLE.iter().all(|(phase, codes, _)| {
         PHASES.contains(phase)
@@ -390,6 +386,38 @@ fn schema_vocabulary_matches_the_table(root: &Path) -> Result<()> {
                 "{name} enumerates {codes:?}, which is not the emittable code set"
             ));
         }
+    }
+    Ok(())
+}
+
+/// Every published document names the revision the pack's data carries, in
+/// its `$id` and, where it describes that field, in the `artifact_revision`
+/// `const`. The evaluator ignores both, so a document left on an older
+/// revision would keep describing a pack nothing else here would accept.
+fn schemas_pin_the_revision(name: &str, document: &serde_json::Value) -> Result<()> {
+    let id = document
+        .get("$id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if !id.split('/').any(|segment| segment == ARTIFACT_REVISION) {
+        return fail(format!(
+            "{name} has $id {id:?}, which does not name revision {ARTIFACT_REVISION}"
+        ));
+    }
+    let Some(revision) = document
+        .get("properties")
+        .and_then(|value| value.get("artifact_revision"))
+    else {
+        return Ok(());
+    };
+    let pinned = revision
+        .get("const")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if pinned != ARTIFACT_REVISION {
+        return fail(format!(
+            "{name} pins artifact_revision to {pinned:?}, not {ARTIFACT_REVISION}"
+        ));
     }
     Ok(())
 }
@@ -818,25 +846,32 @@ fn websocket_opcode(case_id: &str, direction: u8, payload: &[u8]) -> Result<u8> 
     Ok(opcode)
 }
 
-/// The published schemas, compiled once per [`verify`]: the two the application
-/// frames are checked against, and the one the case index is checked against,
-/// so no published document is inert.
+/// The five published schemas, compiled once per [`verify`]. Three are
+/// compiled so a document this evaluator cannot read fails the pack rather
+/// than passing every instance it was meant to constrain, and the two
+/// metadata schemas are applied to each case's `expected.json` and
+/// `error.json`.
 struct WireSchemas {
     hello: Schema,
     snapshot: Schema,
     cases: Schema,
+    error: Schema,
+    expected: Schema,
 }
 
 fn load_wire_schemas(root: &Path) -> Result<WireSchemas> {
     let load = |name: &str| -> Result<Schema> {
         let document: serde_json::Value = serde_json::from_slice(&read(root, name)?)
             .map_err(|error| PackError(format!("{name} is not JSON: {error}")))?;
+        schemas_pin_the_revision(name, &document)?;
         Schema::compile(name, document).map_err(PackError)
     };
     Ok(WireSchemas {
         hello: load(HELLO_SCHEMA)?,
         snapshot: load(SNAPSHOT_SCHEMA)?,
         cases: load(CASES_SCHEMA)?,
+        error: load(ERROR_SCHEMA)?,
+        expected: load(EXPECTED_SCHEMA)?,
     })
 }
 
@@ -860,11 +895,10 @@ fn websocket_frame<'a>(case_id: &str, direction: u8, record: &'a [u8]) -> Result
 /// pack must satisfy the schema published beside it.
 ///
 /// Nothing compared the two before, so a producer that grew a field and a
-/// schema that did not follow both kept passing: `ProjectRead::registered` and
-/// the fractional timestamp both survived several reviews for exactly that
-/// reason. The cost is one JSON parse and one schema walk per application
-/// frame, in a debug-only gate over six cases, and no new dependency: the
-/// evaluator is a subset of the keywords the shipped documents use.
+/// schema that did not follow both kept passing. `ProjectRead::registered`
+/// and the fractional timestamp both survived several reviews for exactly
+/// that reason. The cost is one JSON parse and one schema walk per application
+/// frame, in a debug-only gate over six cases, and no new dependency.
 ///
 /// A refusal case is not exempt. `http-loopback-snapshot-schema-invalid` is
 /// invalid in a *semantic* field, and a semantic defect still has to be
@@ -1161,6 +1195,14 @@ fn verify_case(
     let expected_bytes = read(root, &format!("{prefix}expected.json"))?;
     let expected_value =
         check_canonical(&expected_bytes, &format!("case {case_id} expected.json"))?;
+    wire_schemas
+        .expected
+        .validate(&expected_value)
+        .map_err(|reason| {
+            PackError(format!(
+                "case {case_id} expected.json does not satisfy {EXPECTED_SCHEMA}: {reason}"
+            ))
+        })?;
     let expected: ExpectedFile = serde_json::from_value(expected_value).map_err(|error| {
         PackError(format!(
             "case {case_id} expected.json does not close over its contract: {error}"
@@ -1208,6 +1250,11 @@ fn verify_case(
         (_, true) => {
             let bytes = fs::read(&error_path).expect("error.json was just stat'ed");
             let value = check_canonical(&bytes, &format!("case {case_id} error.json"))?;
+            wire_schemas.error.validate(&value).map_err(|reason| {
+                PackError(format!(
+                    "case {case_id} error.json does not satisfy {ERROR_SCHEMA}: {reason}"
+                ))
+            })?;
             let error: ErrorFile = serde_json::from_value(value).map_err(|parse| {
                 PackError(format!(
                     "case {case_id} error.json does not close over its contract: {parse}"

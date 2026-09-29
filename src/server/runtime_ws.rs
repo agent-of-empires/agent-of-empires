@@ -1,9 +1,9 @@
 //! Read-only runtime read endpoint: `GET /api/runtime/ws`, protocol version 2.
 //!
-//! One connection carries exactly two application frames: a Hello handshake and
-//! a Snapshot: and the server then sends `Close(1000)`. The handler only reads
-//! session, profile, group and project state; it never mutates it and never
-//! consults a client-local filesystem.
+//! One connection carries exactly two application frames, a Hello handshake
+//! and a Snapshot, and the server then sends `Close(1000)`. The handler only
+//! reads session, profile, group and project state; it never mutates it and
+//! never consults a client-local filesystem.
 //!
 //! Authentication for the HTTP route is the router's existing credential gate, so
 //! a caller without a valid credential never reaches the upgrade. The same two
@@ -30,8 +30,8 @@ use crate::session::{GroupTree, Instance, Storage};
 
 /// Wire protocol version. The client refuses anything else.
 const PROTOCOL_VERSION: u16 = 2;
-/// A stalled reader must not hold a connection slot: or a full disk rescan's
-/// worth of work: open indefinitely. Both transports spend this one budget,
+/// A stalled reader must not hold a connection slot, or a full disk rescan's
+/// worth of work, open indefinitely. Both transports spend this one budget,
 /// each for the whole connection from accept to close rather than per stage,
 /// and it matches the client's single read budget, so a peer that
 /// authenticates and then says nothing is bounded identically either way.
@@ -255,7 +255,8 @@ pub enum RecordedOwner {
 /// Everything a recording pins so the same store always yields the same bytes.
 ///
 /// A transcript is a frozen artefact, so the two things the daemon mints per
-/// process or per instant: the three identity UUIDs and the freshness clock /// are the only inputs a recorder may not take from the environment.
+/// process or per instant, the three identity UUIDs and the freshness clock,
+/// are the only inputs a recorder may not take from the environment.
 #[cfg(any(test, debug_assertions))]
 #[doc(hidden)]
 pub struct RecordingPins {
@@ -1122,8 +1123,8 @@ mod tests {
             "the emitted order is the store's own, row for row"
         );
 
-        // The client half: a repeated (name, source_path) pair refused, any
-        // order accepted: is pinned in the client's own
+        // The client half, a repeated (name, source_path) pair refused and any
+        // order accepted, is pinned in the client's own
         // `workspace_repos_are_accepted_in_any_order_and_refused_when_repeated`.
     }
 

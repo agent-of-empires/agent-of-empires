@@ -2,9 +2,9 @@
 //!
 //! Every read command has two implementations: the local one, which opens the
 //! store, and the renderer, which paints a snapshot the daemon published. This
-//! runs the real `aoe` binary twice per command against the *same* store: once
-//! with a daemon to answer, once with no daemon at all so the local command
-//! runs: and compares the exit code and both streams. A row, a glyph, a key
+//! runs the real `aoe` binary twice per command against the *same* store, once
+//! with a daemon to answer and once with no daemon at all so the local command
+//! runs, and compares the exit code and both streams. A row, a glyph, a key
 //! or a timestamp that differs between the two shows up here as a diff, not as
 //! a note in someone's release notes. A command that *refuses* is compared the
 //! same way, because the refusal's exit code and its sentence are exactly the
@@ -320,8 +320,8 @@ fn fixture_sessions(home: &Path) -> Vec<serde_json::Value> {
             false,
         ),
         // A child whose parent is gone: the stored id is kept and printed by
-        // both paths, so a producer that cleared it: or a client that refused
-        // it: shows up here rather than in a reviewer's reading.
+        // both paths, so a producer that cleared it, or a client that refused
+        // it, shows up here rather than in a reviewer's reading.
         row(
             "j-orphan",
             idle,
@@ -710,7 +710,7 @@ async fn the_named_home_produces_the_same_bytes_on_both_transports() {
 }
 
 /// The comparison itself, checked. Two in-session reviews found the same gap
-/// in this file: a command that refuses could not be compared at all: so the
+/// in this file, a command that refuses could not be compared at all, so the
 /// refusal rows are only worth anything if the comparison notices when two
 /// refusals differ. This is what pins that: a differing exit code, a differing
 /// sentence and a differing stdout are each reported, and identical runs are

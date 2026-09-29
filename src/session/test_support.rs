@@ -231,8 +231,8 @@ fn restore_or_remove(key: &str, prev: Option<OsString>) {
     // call as long as no other thread is concurrently reading or writing
     // the same env key. The invariant is enforced by:
     //   1. Every `EnvGuard` (and `AppDirGuard`, which delegates to it)
-    //      holds `crate::test_env_lock::ENV_LOCK`: the single lock for the
-    //      whole process, shared with the server's `RuntimeEnvGuard`: for
+    //      holds `crate::test_env_lock::ENV_LOCK`, the single lock for the
+    //      whole process, shared with the server's `RuntimeEnvGuard`, for
     //      its whole lifetime, so the whole call sequence (snapshot ->
     //      set_var -> test body -> Drop -> restore_or_remove) is linearized
     //      against every other guard in

@@ -394,10 +394,11 @@ fn const_holds(instance: &Value, expected: &Value) -> bool {
 }
 
 /// JSON Schema equality on numbers. `serde_json`'s own `Number` equality is
-/// structural: `2` is a `PosInt` and `2.0` a `Float`, so they compare unequal /// so the spellings are reconciled here. Two *integral* values are compared
-/// exactly: `as_f64` would report `9007199254740993` and `9007199254740992` as
-/// the same number, and a `const` that admits a value it does not name is a
-/// hole rather than a strictness bug.
+/// structural, since `2` is a `PosInt` and `2.0` a `Float` and they compare
+/// unequal, so the spellings are reconciled here. Two *integral* values are
+/// compared exactly: `as_f64` would report `9007199254740993` and
+/// `9007199254740992` as the same number, and a `const` that admits a value
+/// it does not name is a hole rather than a strictness bug.
 fn numbers_equal(left: &Number, right: &Number) -> bool {
     match (integral(left), integral(right)) {
         (Some(left), Some(right)) => left == right,
@@ -501,8 +502,8 @@ const SUBSCHEMAS: &[&str] = &["additionalProperties", "items", "not"];
 /// The one keyword whose `false` form is a *value* rather than a schema.
 /// `additionalProperties: false` says "no member beyond the declared ones", and
 /// the evaluator reads it with an explicit `Bool(false)` branch of its own.
-/// `not: false` and `items: false` are boolean subschemas: "always satisfied"
-/// and "no items allowed": which the evaluator has no branch for: it would
+/// `not: false` and `items: false` are boolean subschemas, "always satisfied"
+/// and "no items allowed", and the evaluator has no branch for them. It would
 /// hand the `false` to `check`, be told the schema there is not an object, and
 /// refuse every instance in the subtree for a reason that misdescribes the
 /// document. So the boolean form is supported for `additionalProperties` alone,
@@ -719,8 +720,8 @@ fn check_plain(
 
 /// Every `$ref` the document uses must name a definition the document carries.
 /// Resolved after the walk so a reference into a `$defs` the document never
-/// declares is a load failure, which is what stops a typo: or a 2019-09
-/// `#/definitions/uuid`: from turning the whole document into a no-op behind a
+/// declares is a load failure, which is what stops a typo, or a 2019-09
+/// `#/definitions/uuid`, from turning the whole document into a no-op behind a
 /// green gate.
 fn resolve_references(name: &str, root: &Value, references: &References<'_>) -> Result<(), String> {
     let defs = root.get("$defs").and_then(Value::as_object);
@@ -888,8 +889,9 @@ mod tests {
         );
     }
 
-    /// The likeliest author error: a draft-2019-09 spelling. The skipped, which turned every reference in the document into a no-op
-    /// behind a green gate.
+    /// The likeliest author error, a draft-2019-09 spelling. The loader
+    /// refuses it by name, so every reference it leaves behind fails rather
+    /// than resolving to nothing.
     #[test]
     fn a_definitions_reference_is_refused_by_name() {
         let error = refused(
@@ -999,10 +1001,10 @@ mod tests {
     }
 
     /// `const` is an identity test on the value, so `2` and `2.0` are one
-    /// constant: but two large integers that share an `f64` rounding are not,
-    /// and widening them would let a value through a `const` that never named
-    /// it. `enum` is the same identity question asked of each of its values,
-    /// and the two must agree on both: `enum` once compared `Number` spellings
+    /// constant. Two large integers that share an `f64` rounding are not, and
+    /// widening them would let a value through a `const` that never named it.
+    /// `enum` is the same identity question asked of each of its values, and
+    /// the two must agree on both: `enum` once compared `Number` spellings
     /// structurally, so `{"enum": [2]}` refused the `2.0` that `{"const": 2}`
     /// admitted, and a gate that answered one keyword over the spelling of a
     /// number and the other over its value was refusing frames for a difference
@@ -1044,8 +1046,8 @@ mod tests {
     /// The value identity a `const` states is the value, and `enum` states the
     /// same identity, so the `2` and `2.0` spellings are one value in both
     /// keywords and in both directions. `enum` once compared `Number` spellings
-    /// structurally, so `{"enum": [2]}` refused a frame `{"const": 2}` admitted
-    ///: a gate refusing over the spelling of a number no document had written
+    /// structurally, so `{"enum": [2]}` refused a frame `{"const": 2}` admitted,
+    /// a gate refusing over the spelling of a number no document had written
     /// down.
     #[test]
     fn a_constant_and_an_enumerated_value_are_one_number() {
@@ -1127,9 +1129,10 @@ mod tests {
     /// The `false` form of a single-subschema keyword.
     /// `additionalProperties: false` is a *value* the evaluator reads with a
     /// branch of its own, and every published document uses it. `not: false`
-    /// and `items: false` are boolean subschemas, and the evaluator had no
-    /// branch for them: it handed the `false` to `check`, was told the schema
-    /// there was not an object, and so refused every instance in the subtree /// which for `not: false`, always satisfied by the draft, refuses
+    /// and `items: false` are boolean subschemas, and the evaluator has no
+    /// branch for them. It would hand the `false` to `check`, be told the
+    /// schema there was not an object, and so refuse every instance in the
+    /// subtree, which for `not: false`, always satisfied by the draft, refuses
     /// everything, and for `items: false`, which forbids items, refuses every
     /// non-empty array for a reason that misdescribes it. Both are refused at
     /// load with every other non-object node.
@@ -1165,8 +1168,8 @@ mod tests {
     /// Every position the evaluator recurses through, carrying a pattern that
     /// must have been compiled by the walk. The compiled set is keyed by the
     /// position of the node that holds the pattern, so a position the walk
-    /// skipped arrives here as a *miss*: a refusal naming the position rather
-    /// than a silent pass: and a position spelled two different ways by the
+    /// skipped arrives here as a *miss*, a refusal naming the position rather
+    /// than a silent pass, and a position spelled two different ways by the
     /// two sides is the same miss. This test is what says the two agree today.
     #[test]
     fn a_pattern_is_compiled_at_every_position_the_evaluator_reaches() {

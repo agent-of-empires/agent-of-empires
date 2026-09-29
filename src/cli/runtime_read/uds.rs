@@ -364,8 +364,8 @@ fn open_dir(path: &Path) -> Result<OwnedFd, TrustedPathError> {
 /// Open one component of the walk.
 ///
 /// `O_NOFOLLOW` guards the final component only, the same convention the hook
-/// guard uses (`src/hooks/dir_guard.rs`): a prefix symlink: a home reached
-/// through one, or macOS `/tmp` → `/private/tmp`: is followed and the
+/// guard uses (`src/hooks/dir_guard.rs`). A prefix symlink, a home reached
+/// through one or macOS `/tmp` → `/private/tmp`, is followed and the
 /// directory it resolves to is verified by descriptor, which is where the
 /// ownership, mode, sticky-root and ACL checks are read from. A symlinked
 /// *final* component stays a refusal, because that would let the app directory
@@ -648,8 +648,8 @@ async fn connect_admission(
     // it would spend the whole establishment budget to report the same thing
     // twice. A *live* publisher mid-republication cannot reach this branch: it
     // holds `LOCK_EX` while it writes, so the client's own `flock` above failed
-    // first with `marker_identity`. An unprovable state: an unreadable
-    // `/proc`, a malformed identity: stays `marker_identity` and keeps its
+    // first with `marker_identity`. An unprovable state, an unreadable
+    // `/proc` or a malformed identity, stays `marker_identity` and keeps its
     // retry, because that is a statement about liveness this client cannot make.
     match process_state(postbind.pid, &postbind.process_start_identity)? {
         ProcessState::Live => {}
@@ -1292,7 +1292,7 @@ mod tests {
 
     /// A refused path has to say which directory it refused, what is wrong
     /// with it and what clears it. The refusal itself is unchanged: same
-    /// code, same exit, still no admission: but `daemon read: marker_invalid`
+    /// code, same exit, still no admission. But `daemon read: marker_invalid`
     /// names nothing an operator can act on, and the walk already knows the
     /// component, its mode and the rule it broke.
     #[test]
@@ -1448,7 +1448,7 @@ mod tests {
         };
         let Err(error) = connect_admission(
             namespace,
-            Instant::now() + crate::cli::runtime_read::ESTABLISHMENT_BUDGET,
+            Instant::now() + crate::server::runtime_ws::CONNECTION_BUDGET,
         )
         .await
         else {
@@ -1507,7 +1507,7 @@ mod tests {
         };
         let Err(error) = connect_admission(
             namespace,
-            Instant::now() + crate::cli::runtime_read::ESTABLISHMENT_BUDGET,
+            Instant::now() + crate::server::runtime_ws::CONNECTION_BUDGET,
         )
         .await
         else {

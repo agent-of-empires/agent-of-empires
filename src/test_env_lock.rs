@@ -92,9 +92,9 @@ mod tests {
     ///
     /// The first direction is the one that was broken: a `RuntimeEnvGuard`
     /// holding `XDG_CONFIG_HOME`, against a reader taking the lock the way
-    /// every `session` test guard does. No `#[serial_test::serial]` group is
-    /// what makes this true: the guard is: which is exactly what an
-    /// unannotated `#[tokio::test]` relies on. `#[serial]` on the test itself
+    /// every `session` test guard does. The guard is what makes this true, not
+    /// a `#[serial_test::serial]` group, which is exactly what an unannotated
+    /// `#[tokio::test]` relies on. `#[serial]` on the test itself
     /// only keeps the two directions in this module from writing the same
     /// environment key at each other.
     #[test]

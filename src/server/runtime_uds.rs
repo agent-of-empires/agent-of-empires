@@ -33,9 +33,6 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 
 use super::runtime_ws;
-/// The budget both transports spend on one read, declared once beside the read
-/// it bounds: a stalled reader must not hold a connection slot: or a full
-/// disk rescan: open indefinitely on either route.
 use super::runtime_ws::CONNECTION_BUDGET;
 use super::AppState;
 
@@ -438,10 +435,10 @@ fn peer_uid(_: &UnixStream) -> Option<u32> {
 fn reap_retained_state(dir: RawFd) -> Result<(), PublishError> {
     let retained = retained_names(dir)?;
     // A retained temporary name is a half-written marker. One whose writer is
-    // still running is publication in progress and is left alone; anything else
-    //: including the body a crash between the exclusive create and the rename
-    // leaves behind, which does not parse: is unlinked before any final name
-    // is judged, so a torn temporary cannot refuse publication forever.
+    // still running is publication in progress and is left alone. Anything
+    // else, including the body a crash between the exclusive create and the
+    // rename leaves behind, which does not parse, is unlinked before any final
+    // name is judged, so a torn temporary cannot refuse publication forever.
     for name in retained.iter().filter(|name| is_temporary_name(name)) {
         if temporary_is_live(dir, name)? {
             return Err(PublishError::new(
@@ -590,7 +587,7 @@ fn directory_entries(dir: RawFd) -> Result<Vec<String>, PublishError> {
 /// The client is the enforcing boundary for which directories a local read may
 /// live in, so the producer runs the client's own walk
 /// (`cli::runtime_read::uds::open_trusted_directory`) rather than a copy of
-/// it: a prefix symlink: a home reached through one: is followed and the
+/// it. A prefix symlink, a home reached through one, is followed and the
 /// directory it resolves to is verified by descriptor, a symlinked app
 /// directory is a refusal, and every resolved component must satisfy the
 /// ownership, group/other-write, sticky-root and POSIX-ACL rules.
@@ -610,8 +607,8 @@ fn open_trusted_app_dir(path: &Path) -> Result<OwnedFd, PublishError> {
     })
 }
 
-/// The client's walk, error collapsed: both of its refusals: an unreadable
-/// chain and one that does not exist: mean the same thing to a producer,
+/// The client's walk, error collapsed: both of its refusals, an unreadable
+/// chain and one that does not exist, mean the same thing to a producer,
 /// which cannot offer a read the client would refuse.
 #[cfg(target_os = "linux")]
 fn client_trusted_directory(path: &Path) -> Result<OwnedFd, ()> {

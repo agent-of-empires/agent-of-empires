@@ -408,6 +408,9 @@ impl RuntimeUdsTestServer {
     }
 }
 
+/// Install a global `before_session` hook that creates `<label>-ready` in `dir` and blocks
+/// until `<label>-release` exists, so a test can commit a peer write inside a launch's hook
+/// window. Returns `(ready, release)`.
 #[cfg(test)]
 pub(crate) fn install_blocking_before_session_hook(
     dir: &std::path::Path,
@@ -427,6 +430,7 @@ pub(crate) fn install_blocking_before_session_hook(
     (ready, release)
 }
 
+/// A launcher that counts its calls and fails every launch.
 #[cfg(test)]
 pub(crate) fn counting_failing_launcher() -> (
     crate::acp::supervisor::Launcher,
@@ -445,6 +449,9 @@ pub(crate) fn counting_failing_launcher() -> (
     (launcher, launches)
 }
 
+/// Once the blocking hook signals `ready`, archive the stored rows matching `is_target` under
+/// their lifecycle lock, as `aoe session archive --no-kill` does, then release the hook.
+/// Returns whether the hook ran and a row was archived; the hook is released either way.
 #[cfg(test)]
 pub(crate) async fn archive_while_hook_waits(
     (ready, release): &(std::path::PathBuf, std::path::PathBuf),

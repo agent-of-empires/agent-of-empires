@@ -50,13 +50,13 @@ use super::session::ShowArgs;
 use super::status::StatusArgs;
 use super::{Cli, Commands};
 
-/// How long a read may take end to end, admission included. The daemon bounds
-/// its own side of the same window with the same constant
-/// (`server::runtime_ws::CONNECTION_BUDGET`), so one stalled peer can never
-/// hold a client task and a server task open at once, and a read has exactly
-/// one budget: the exchange deadline is the establishment deadline, never a
-/// second window opened after it.
-pub(crate) const ESTABLISHMENT_BUDGET: Duration = Duration::from_secs(15);
+// The producer's own budget for one connection, so the client's exchange
+// deadline and the daemon's server-side bound are the same number rather
+// than two literals that happen to agree today. One stalled peer can never
+// hold a client task and a server task open at once, and a read has exactly
+// one budget: the exchange deadline is the establishment deadline, never a
+// second window opened after it.
+use crate::server::runtime_ws::CONNECTION_BUDGET;
 const CLOSE_BUDGET: Duration = Duration::from_millis(200);
 pub(crate) const APPLICATION_LIMIT: usize = 16 * 1024 * 1024;
 
@@ -101,7 +101,6 @@ pub fn classify(command: Option<&Commands>) -> Option<ScopedCommand<'_>> {
 /// asserts that the code it was handed is in this set, so a new emitter cannot
 /// introduce a code the table does not describe; the pack verifier requires
 /// every code in its table to be in this set, so the table cannot describe a
-/// code no emitter produces. A code with no emitter is what left
 pub(crate) const EMITTABLE_CODES: &[&str] = &[
     // `parser_error` is clap's, raised before any read begins.
     "parser_error",
@@ -143,8 +142,8 @@ pub(crate) struct ReadFailure {
     /// same reason the producer half owns its detail
     /// (`server::runtime_uds::PublishError`): a refusal that has to name the
     /// path it refused, or the candidates that would resolve it, cannot say so
-    /// out of a constant. The code stays `&'static str`: it is a member of
-    /// the Contract Pack's code set, and the set is compile-time.
+    /// out of a constant. The code stays `&'static str` because it is checked
+    /// against [`EMITTABLE_CODES`].
     exact: Option<String>,
     attempt_close: bool,
 }
@@ -164,7 +163,7 @@ impl ReadFailure {
 
     /// A pre-admission refusal that says what to fix. The walk's refusal has
     /// to name the component it refused, the mode it found and the command
-    /// that clears it, and none of that is a constant: the same reason
+    /// that clears it, and none of that is a constant, for the same reason
     /// [`ReadFailure::exit`] owns its text. The code and the exit are exactly
     /// the ones the refusal already carried, so saying more cannot widen it:
     /// a diagnosis is not an admission.
@@ -196,7 +195,7 @@ impl ReadFailure {
     /// A refusal on the user's own state that keeps its own code. The three
     /// user-input refusals (`profile_missing`, `session_missing`,
     /// `session_ambiguous`) are not wire failures, so what they carry is the
-    /// local path's exit (1) and the local path's sentence: but the code is
+    /// local path's exit (1) and the local path's sentence, but the code is
     /// still what says *which* refusal this was, so a caller can tell a
     /// missing profile from a missing session from an internal fault. The code
     /// is checked against the emittable set exactly as every other constructor
@@ -292,7 +291,7 @@ async fn execute_inner(
     source: &ReadRequestSource,
 ) -> Result<render::Projection, ReadFailure> {
     let endpoint = endpoint::select_endpoint(source)?;
-    let establishment_deadline = Instant::now() + ESTABLISHMENT_BUDGET;
+    let establishment_deadline = Instant::now() + CONNECTION_BUDGET;
     match endpoint {
         SelectedEndpoint::Local => {
             #[cfg(target_os = "linux")]
@@ -334,9 +333,9 @@ async fn execute_inner(
             // prints. A loopback host is therefore given one: a read aimed at
             // 127.0.0.1 is normally this machine's own daemon over TCP, and it
             // is the same daemon the socket transport reaches. The host string
-            // does not prove the peer shares this home: a forwarded
-            // 127.0.0.1 reaches another machine: and nothing here treats it
-            // as proof: the collapse only ever shows *less* than the wire
+            // does not prove the peer shares this home, since a forwarded
+            // 127.0.0.1 reaches another machine, and nothing here treats it
+            // as proof. The collapse only ever shows *less* than the wire
             // carries, so a wrong assumption widens the output rather than
             // narrowing it.
             let local_home = loopback_home(&request);
@@ -540,10 +539,10 @@ fn peer_gone() -> ReadFailure {
 
 /// Close the exchange and settle on the answer.
 ///
-/// A close that fails is still an error: the contract says the read reports
-/// one, and a peer that cannot be told to stop must not pass for a clean
-/// finish. It is not, however, allowed to become *the* error: a snapshot the
-/// client refused (`schema_invalid`), a profile the daemon does not have
+/// A close that fails is still an error, because the contract says the read
+/// reports one, and a peer that cannot be told to stop must not pass for a
+/// clean finish. It is not, however, allowed to become *the* error: a snapshot
+/// the client refused (`schema_invalid`), a profile the daemon does not have
 /// (`profile_missing`) and a freshness the daemon never observed
 /// (`freshness_unavailable`) are the facts the exit code is about, and
 /// replacing any of them with `close_timeout` would report a transport hiccup
@@ -731,7 +730,7 @@ mod tests {
     #[tokio::test]
     async fn a_failed_close_never_replaces_the_failure_that_caused_it() {
         let mut stream = broken_stream().await;
-        let deadline = Instant::now() + ESTABLISHMENT_BUDGET;
+        let deadline = Instant::now() + CONNECTION_BUDGET;
         for code in ["schema_invalid", "profile_missing", "freshness_unavailable"] {
             let error = finish_with_close(&mut stream, deadline, Err(ReadFailure::post(code)))
                 .await
@@ -746,7 +745,7 @@ mod tests {
     #[tokio::test]
     async fn a_failed_close_is_the_answer_when_the_read_otherwise_succeeded() {
         let mut stream = broken_stream().await;
-        let deadline = Instant::now() + ESTABLISHMENT_BUDGET;
+        let deadline = Instant::now() + CONNECTION_BUDGET;
         let projection = render::Projection {
             stdout: "rows\n".into(),
             session_table: false,

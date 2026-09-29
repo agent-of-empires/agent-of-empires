@@ -90,8 +90,8 @@ fn selected_profile<'a>(
 /// refuses it (`session::resolve_existing_profile`): exit 1, and the
 /// operator's own sentence including the half that tells them what to do
 /// next. This is the user's own state rather than a wire failure, so it is
-/// not a `daemon read: <code>`: the same mechanism the tmux refusals in this
-/// file use, and the same exit the local path leaves.
+/// not a `daemon read: <code>`. It uses the same mechanism the tmux refusals
+/// in this file use, and leaves the same exit the local path leaves.
 fn profile_absent(name: &str) -> ReadFailure {
     ReadFailure::refuse(
         "profile_missing",
@@ -1076,8 +1076,8 @@ mod tests {
         assert_eq!(collapse_home("/remote/home", None), "/remote/home");
     }
 
-    /// A degraded profile is the profile's own answer, not the snapshot's: a
-    /// command that never reads that profile: the global project list: is
+    /// A degraded profile is the profile's own answer, not the snapshot's. A
+    /// command that never reads that profile, the global project list, is
     /// still answerable, and the command that does read it says degraded.
     #[test]
     fn a_degraded_profile_does_not_refuse_a_profile_independent_read() {
@@ -1158,7 +1158,7 @@ mod tests {
     }
 
     /// An ambiguous id prefix is the one ambiguity the local path refuses, and
-    /// it stays refused here: with the candidates. `cli::resolve_session`
+    /// it stays refused here, with the candidates. `cli::resolve_session`
     /// lists them and says how to resolve the pair, and that list is the only
     /// thing an operator can act on, so a refusal that dropped it would leave
     /// them with a code and nothing to do. The order is the local path's, and
@@ -1207,7 +1207,8 @@ mod tests {
         );
     }
 
-    /// `aoe profile` is a picker, so a profile named `default` is listed last /// the local `list_profiles_for_display` order: while the wire keeps the
+    /// `aoe profile` is a picker, so a profile named `default` is listed last,
+    /// in the local `list_profiles_for_display` order, while the wire keeps the
     /// plain alphabetical enumeration `aoe list --all` prints.
     #[test]
     fn the_profile_listing_uses_picker_order() {
@@ -1252,7 +1253,7 @@ mod tests {
     /// A registry may hold the same directory under more than one spelling, and
     /// `load_merged` counts that once. The merge here has to count it once for
     /// the same reason, or `aoe project list` reports a different number of
-    /// projects depending on which transport answered: and a global row and a
+    /// projects depending on which transport answered, and a global row and a
     /// profile row for one directory would both survive, where locally the
     /// profile one shadows the global one.
     ///

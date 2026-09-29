@@ -773,7 +773,8 @@ fn validate_groups(groups: &[GroupRead]) -> Result<(), &'static str> {
     Ok(())
 }
 
-/// Projects in the producer's own registry order, and unique by identity /// name, path and the registered flag together, so a synthesized row and the
+/// Projects in the producer's own registry order, and unique by identity:
+/// name, path and the registered flag together, so a synthesized row and the
 /// registry row it stands in for are two identities rather than one repeated.
 fn validate_projects(projects: &[ProjectRead], scope: ProjectScope) -> Result<(), &'static str> {
     let mut identities = HashSet::new();
@@ -1088,7 +1089,7 @@ mod tests {
     }
 
     /// A parent that names no row is persisted state: `rm --purge` of a parent
-    /// leaves the child pointing at nothing: and the local path keeps and
+    /// leaves the child pointing at nothing, and the local path keeps and
     /// prints it, so the snapshot is accepted. The rules that can still be
     /// stated are the ones about parents that are rows: same profile, and no
     /// cycle.
@@ -1205,7 +1206,7 @@ mod tests {
     }
 
     /// The wire keeps the fractional part the local command serializes, so the
-    /// grammar accepts it: and still refuses every other spelling.
+    /// grammar accepts it and still refuses every other spelling.
     #[test]
     fn a_timestamp_is_utc_z_or_a_utc_z_with_up_to_nine_fractional_digits() {
         assert!(valid_timestamp("2026-01-01T00:00:00Z"));
