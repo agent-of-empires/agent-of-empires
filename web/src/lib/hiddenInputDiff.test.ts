@@ -33,13 +33,13 @@ describe("stepHiddenInput", () => {
       S,
     ],
     [
-      "a word delete sends one DEL per code point",
+      "a word delete sends one DEL per character",
       [S + "git status", S + "git "],
       "git status\x7f\x7f\x7f\x7f\x7f\x7f",
       S + "git ",
     ],
     ["a word delete past the typed text", [S + "ls", S.slice(1)], "ls\x7f\x7f\x7f", S],
-    ["an emoji is deleted as one code point", [S + "hi\u{1F642}", S + "hi"], "hi\u{1F642}\x7f", S + "hi"],
+    ["an emoji is deleted as one character", [S + "hi\u{1F642}", S + "hi"], "hi\u{1F642}\x7f", S + "hi"],
     // Two emoji sharing a high surrogate must not diff inside the pair.
     [
       "an emoji replaced by its neighbour",
@@ -47,6 +47,16 @@ describe("stepHiddenInput", () => {
       "\u{1F642}\x7f\u{1F643}",
       S + "\u{1F643}",
     ],
+    // One Backspace per visible character, as a hardware keyboard sends it.
+    ["a skin-tone emoji is one DEL", [S + "a\u{1F44D}\u{1F3FD}", S + "a"], "a\u{1F44D}\u{1F3FD}\x7f", S + "a"],
+    [
+      "a joined family emoji is one DEL",
+      [S + "\u{1F468}\u200D\u{1F469}\u200D\u{1F467}", S],
+      "\u{1F468}\u200D\u{1F469}\u200D\u{1F467}\x7f",
+      S,
+    ],
+    // A combining mark joins the character before it, so that character is retyped with it.
+    ["a combining accent retypes its base", [S + "e", S + "e\u0301"], "e\x7fe\u0301", S + "e\u0301"],
     // SwiftKey (#3746) re-wraps the typed word in a composition that commits the same or a longer word.
     ["a composition commit that adopts the typed word", [S + "tes", S + "test", S + "test"], "test", S + "test"],
     ["a composition commit that stands on its own", [S + "a", S + "a日本"], "a日本", S + "a日本"],
