@@ -257,11 +257,10 @@ pub(crate) fn existing_app_namespace() -> Result<OwnedNamespace, TrustedPathErro
     let (path, home) = app_path_and_home()?;
     let euid = unsafe { libc::geteuid() };
     let dir = open_trusted_directory(&path, euid)?;
-    let name = if cfg!(debug_assertions) {
-        "debug:agent-of-empires-dev"
-    } else {
-        "release:agent-of-empires"
-    };
+    // The producer's own constant, not a second spelling of it: a divergence
+    // would send this client to a directory nobody published into, which
+    // arrives as `marker_missing` and silently answers from the local store.
+    let name = crate::server::runtime_ws::NAMESPACE;
     Ok(OwnedNamespace {
         name: name.to_string(),
         home,

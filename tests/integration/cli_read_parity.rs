@@ -591,8 +591,21 @@ async fn compare_transports(fixture: &Fixture, commands: &[&[&str]], refusals_fr
 
     let mut served: Vec<(Vec<String>, Run)> = Vec::new();
     {
-        let daemon = RuntimeUdsTestServer::start_in(&xdg_base, state)
-            .expect("the fixture home is a trusted namespace");
+        // The local admission walk is defined on Linux, so the producer
+        // refuses with `unsupported_platform` before it touches the
+        // filesystem. That is neither a broken fixture nor an untrusted base,
+        // so skip rather than panic on a message that would send a reader
+        // auditing the wrong subsystem.
+        let daemon = match RuntimeUdsTestServer::start_in(&xdg_base, state) {
+            Ok(daemon) => daemon,
+            Err(reason) if reason.contains("unsupported_platform") => {
+                eprintln!(
+                    "skipping: the local runtime read is not defined on this platform ({reason})"
+                );
+                return;
+            }
+            Err(reason) => panic!("the fixture home is a trusted namespace: {reason}"),
+        };
         for (index, args) in commands.iter().enumerate() {
             let args: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
             let result = run(home.clone(), args.clone()).await;
