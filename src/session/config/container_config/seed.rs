@@ -260,7 +260,7 @@ impl NativeStateBoundary {
             && physical
                 .ancestors()
                 .skip(1)
-                .any(|parent| self.store_roots.iter().any(|root| root == parent) && !ours(parent))
+                .any(|parent| self.store_roots.iter().any(|root| root == parent))
     }
 
     fn add_state_rule(

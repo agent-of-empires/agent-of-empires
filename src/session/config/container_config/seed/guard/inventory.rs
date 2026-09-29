@@ -176,9 +176,6 @@ impl<'a> Inventory<'a> {
         origin: StateOrigin,
         linked: bool,
     ) -> Result<()> {
-        if self.skip(directory.path(), origin) {
-            return Ok(());
-        }
         let (device, inode) = directory.identity()?;
         #[cfg(target_os = "macos")]
         let device = device as u64;

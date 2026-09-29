@@ -558,7 +558,12 @@ mod tests {
 
     #[test]
     fn only_the_launching_store_is_inventoried() {
-        for owner in ["own", "sibling"] {
+        for (owner, hardlink) in [
+            ("own", false),
+            ("own", true),
+            ("sibling", false),
+            ("sibling", true),
+        ] {
             let temporary = tempfile::tempdir().unwrap();
             let host = temporary.path().join("host");
             let stores = host.join(super::super::SANDBOX_PRIVATE_SUBDIR);
@@ -569,7 +574,11 @@ mod tests {
             fs::write(&selected, b"AUTHORED_CONFIG").unwrap();
             let foreign = stores.join("sibling/state.json");
             fs::write(&foreign, b"OTHER_INSTANCE_STATE").unwrap();
-            symlink(&selected, stores.join(owner).join("alias")).unwrap();
+            if hardlink {
+                fs::hard_link(&selected, stores.join(owner).join("linked")).unwrap();
+            } else {
+                symlink(&selected, stores.join(owner).join("alias")).unwrap();
+            }
             let mut boundary = NativeStateBoundary::for_source(&host, &stores.join("own")).unwrap();
             boundary.add_storage_root(&host).unwrap();
             let mut guard = ReadGuard::new(&boundary, ReadAccess::default()).unwrap();
@@ -580,7 +589,7 @@ mod tests {
             let published = guard
                 .record_file(&selected, &File::open(&selected).unwrap())
                 .unwrap();
-            assert_eq!(published, owner == "sibling", "{owner}");
+            assert_eq!(published, owner == "sibling", "{owner} hardlink={hardlink}");
             // A running sibling rewrites its own links and directories.
             fs::remove_dir(stores.join("sibling/session-env/live")).unwrap();
             fs::remove_file(stores.join("sibling/alias")).ok();
