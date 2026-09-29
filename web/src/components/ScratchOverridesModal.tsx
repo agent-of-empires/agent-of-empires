@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { fetchSettings, getProfileSettings, updateProfileSettings, updateSettings } from "../lib/api";
+import { fetchMachineSettings, getProfileSettings, updateMachineSettings, updateProfileSettings } from "../lib/api";
 import { BRAND_BUTTON, CancelButton, ConfirmButton, Dialog } from "./Dialog";
 import { useConfirmKeys, useDialogFocus } from "./dialogHooks";
 
@@ -42,7 +42,7 @@ export function ScratchOverridesModal({ profile, onClose }: Props) {
 
   useEffect(() => {
     let cancelled = false;
-    const load = scope === "global" ? fetchSettings() : getProfileSettings(profile);
+    const load = scope === "global" ? fetchMachineSettings() : getProfileSettings(profile);
     void load.then((settings) => {
       if (cancelled) return;
       if (settings === null) {
@@ -75,7 +75,7 @@ export function ScratchOverridesModal({ profile, onClose }: Props) {
     setSubmitting(true);
     setError(null);
     const patch = { session: { scratch_smart_rename: choice === "default" ? null : choice } };
-    const ok = scope === "global" ? await updateSettings(patch) : await updateProfileSettings(profile, patch);
+    const ok = scope === "global" ? await updateMachineSettings(patch) : await updateProfileSettings(profile, patch);
     if (!ok) {
       setSubmitting(false);
       setError("Update failed");

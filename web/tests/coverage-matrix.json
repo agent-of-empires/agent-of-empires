@@ -440,6 +440,13 @@
       "components": ["src/server/token.rs"]
     },
     {
+      "id": "settings.layers",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/lib/api.test.ts", "src/hooks/useApprovalSound.test.ts"],
+      "components": ["web/src/lib/api.ts", "web/src/lib/settingsEvents.ts", "web/src/hooks/useApprovalSound.ts"]
+    },
+    {
       "id": "settings.theme-persistence",
       "kind": "live-playwright",
       "risk": "high",
@@ -1331,13 +1338,13 @@
       "risk": "medium",
       "specs": [
         "src/lib/__tests__/systemHealth.test.ts",
-        "src/lib/__tests__/appSettings.test.ts",
+        "src/lib/api.test.ts",
         "src/components/__tests__/SystemHealthStrip.test.tsx"
       ],
       "components": [
         "web/src/lib/systemHealth.ts",
         "web/src/lib/sessionFlagGate.ts",
-        "web/src/lib/appSettings.ts",
+        "web/src/lib/settingsEvents.ts",
         "web/src/hooks/useSystemHealth.ts",
         "web/src/components/SystemHealthStrip.tsx"
       ]
