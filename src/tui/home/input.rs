@@ -350,7 +350,6 @@ fn resolve_hook_install_agent(
     session_config: &crate::session::config::SessionConfig,
 ) -> Option<&'static crate::agents::AgentDef> {
     crate::session::host_hook_agent(tool_name, command, session_config)
-        .filter(|agent| agent.hook_config.is_some() || agent.sidecar_hooks.is_some())
 }
 
 pub(super) fn parse_hotkey(s: &str) -> Option<(KeyCode, KeyModifiers)> {
@@ -2018,10 +2017,10 @@ impl HomeView {
                         data.tool.clone()
                     };
 
-                    let resolved_config =
-                        crate::session::config::profile_config::resolve_config_or_warn(
-                            &data.profile,
-                        );
+                    let resolved_config = crate::session::host_hook_gate_config(
+                        &data.profile,
+                        std::path::Path::new(&data.path),
+                    );
                     // The wizard's command field wins over the config, the same
                     // order the builder applies, so the dialog describes this
                     // session and not the one the config would produce.
@@ -2040,7 +2039,12 @@ impl HomeView {
                             .map(|c| c.app_state.has_acknowledged_agent_hooks)
                             .unwrap_or(false);
 
-                        if crate::agents::hook_install_required(hook_agent, hooks_enabled)
+                        // A sandboxed session stages its hooks in its own
+                        // container config and the launch gate never asks, so
+                        // asking here would consent to a write that cannot
+                        // happen.
+                        if !data.sandbox
+                            && crate::agents::hook_install_required(hook_agent, hooks_enabled)
                             && !acknowledged
                         {
                             self.hooks_install_dialog = Some(HooksInstallDialog::new(
@@ -6499,7 +6503,7 @@ impl HomeView {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::config::{SessionConfig, ToolSessionConfig};
+    use crate::session::config::ToolSessionConfig;
 
     /// Wheel and button reports in both encodings: SGR is 1-based `<b;x;yM|m`, legacy X10
     /// adds 32 to each byte and clamps coordinates at 223; cells clamp to the pane rect.

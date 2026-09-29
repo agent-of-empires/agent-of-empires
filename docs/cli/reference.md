@@ -164,7 +164,7 @@ Run without arguments to launch the TUI dashboard.
 * `telemetry` — Manage anonymous opt-in usage telemetry
 * `mcp` — Inspect the effective MCP server set (provenance, conflicts, drift)
 * `skill` — Query and manage agent skills
-* `hooks` — Inspect and grant AoE's consent to write agent hooks into each agent's own config
+* `hooks` — Record your consent for AoE to write agent hooks into each agent's own config
 * `serve` — Start the aoe daemon: REST/WebSocket API, plus the web dashboard in builds that embed it
 * `url` — Print the URL of a running `aoe serve` daemon
 * `acp` — Manage the ACP structured-view workers (doctor, ps, logs, prompt, approve, ...)
@@ -1566,7 +1566,7 @@ Copy AoE-managed skills into the agents' own skills directories
 
 ## `aoe hooks`
 
-Inspect and grant AoE's consent to write agent hooks into each agent's own config
+Record your consent for AoE to write agent hooks into each agent's own config
 
 **Usage:** `aoe hooks <COMMAND>`
 

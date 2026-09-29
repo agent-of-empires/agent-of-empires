@@ -30,7 +30,7 @@ impl HooksInstallDialog {
         agent: &'static crate::agents::AgentDef,
         config: &crate::session::config::Config,
     ) -> Self {
-        let disclosure = crate::session::host_hook_disclosure(tool_name, agent, Some(config));
+        let disclosure = crate::session::host_hook_disclosure(tool_name, agent, config);
         Self {
             settings_paths: disclosure.settings_paths,
             hook_commands: disclosure.hook_commands,
@@ -133,18 +133,18 @@ impl HooksInstallDialog {
                 "A status event runs:",
                 Style::default().bold(),
             )));
-            // The euid shown matches the runtime path baked into the hook command,
-            // and is already exposed by `id -u`. A placeholder would mislead.
+            // The path is the runtime one baked into the hook command,
+            // and a placeholder would mislead.
             lines.push(Line::from(format!(
                 "  printf {{status}} > {}/$AOE_INSTANCE_ID/status",
                 crate::hooks::hook_base_path().display()
             )));
         } else {
             lines.push(Line::from(
-                "No status hook survives here, so these only record the session id",
+                "No status hook survives here, so these only publish the id",
             ));
             lines.push(Line::from(
-                "for native resume. Each event's command is above.",
+                "AoE resumes from. Each event's command is above.",
             ));
         }
 

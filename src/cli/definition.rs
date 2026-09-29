@@ -213,8 +213,8 @@ pub enum Commands {
         command: SkillCommands,
     },
 
-    /// Inspect and grant AoE's consent to write agent hooks into each agent's
-    /// own config
+    /// Record your consent for AoE to write agent hooks into each agent's own
+    /// config
     Hooks {
         #[command(subcommand)]
         command: HooksCommands,

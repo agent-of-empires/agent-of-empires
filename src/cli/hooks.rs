@@ -27,8 +27,7 @@ pub fn run(profile: &str, command: HooksCommands) -> Result<()> {
 }
 
 /// A corrupt `state.toml` is an error here rather than a silent "not approved",
-/// which would point the user at a re-approve that cannot succeed either. The
-/// parse error names the offending line but not the file it came from.
+/// which would point the user at a re-approve that cannot succeed either.
 fn acknowledged() -> Result<bool> {
     Ok(Config::load()?.app_state.has_acknowledged_agent_hooks)
 }
@@ -85,18 +84,23 @@ fn print_disclosure(profile: &str) {
             if !crate::agents::hook_install_required(agent, status_hooks) {
                 return None;
             }
-            let disclosure = host_hook_disclosure(tool_name, agent, Some(&config));
+            let disclosure = host_hook_disclosure(tool_name, agent, &config);
             (!disclosure.settings_paths.is_empty()).then_some((tool_name, disclosure))
         })
         .collect();
 
-    let status_hooks_active = status_hooks && !disclosures.is_empty();
-    if status_hooks_active {
+    let status_hooks_active = disclosures
+        .iter()
+        .any(|(_, disclosure)| disclosure.status_hooks_enabled);
+    if disclosures.is_empty() {
+        println!("No agent under this profile installs hooks, so there is nothing to");
+        println!("approve.");
+    } else if status_hooks_active {
         println!("AoE installs agent hooks into each agent's own config. The status");
         println!("hooks detect session status (running/waiting/idle); the identity hooks");
         println!("record the conversation id native resume needs.");
     } else {
-        println!("This profile has agent_status_hooks off, so AoE installs only the");
+        println!("No status hook survives this profile, so AoE installs only the");
         println!("identity hooks native resume needs.");
     }
     println!();
@@ -119,7 +123,7 @@ fn print_disclosure(profile: &str) {
     }
     println!();
     if status_hooks_active {
-        println!("A status event writes under this session's own directory:");
+        println!("A status event writes under the session's own directory, named by");
         println!(
             "  printf {{status}} > {}/$AOE_INSTANCE_ID/status",
             crate::hooks::hook_base_path().display()

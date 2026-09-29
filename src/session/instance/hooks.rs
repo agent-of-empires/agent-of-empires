@@ -37,7 +37,7 @@ pub(super) fn status_hook_env_prefix(
     }
 }
 
-pub(crate) fn generic_host_config_path_for(
+fn generic_host_config_path_for(
     tool_name: &str,
     hook_cfg: &crate::agents::AgentHookConfig,
     home: &Path,
@@ -59,7 +59,7 @@ pub(crate) fn generic_host_config_path_for(
     }
 }
 
-pub(crate) fn sidecar_host_config_path_for(
+fn sidecar_host_config_path_for(
     tool_name: &str,
     agent: &crate::agents::AgentDef,
     sidecar: &crate::agents::SidecarHooks,
@@ -101,15 +101,12 @@ pub(crate) struct HostHookDisclosure {
 }
 
 /// The built-in agent a launch resolves for `tool_name` running `command`.
-/// Delegates to [`Instance::execution_agent_for`] rather than repeating its
-/// precedence, which is what let the disclosure drift from the launcher: that
-/// function matches the command's first word against the built-in binaries
-/// before it reads `agent_execution_as`, and a copy of the precedence that
-/// cannot see the command misses that. The fallback chain is
-/// `Instance::status_agent`'s, so a contract the launch rejects falls through
-/// to the tool name and then to the `agent_detect_as` alias the same way.
-/// A stored session whose alias has since drifted from the config still
-/// installs under the stored alias; the disclosure always follows the config.
+/// Delegates to `execution_agent_for` rather than repeating its precedence,
+/// which matches the command's first word against the built-in binaries
+/// before it reads `agent_execution_as`; a copy that cannot see the command
+/// misses that. The fallbacks are `Instance::status_agent`'s, and the last of
+/// them reads the session's stored alias, which can have drifted from the
+/// config this reads.
 pub(crate) fn host_hook_agent(
     tool_name: &str,
     command: &str,
@@ -126,13 +123,25 @@ pub(crate) fn host_hook_agent(
         })
 }
 
+/// The config a consent gate must read to describe the install a launch will
+/// perform. It carries the repo layer, because the builder stores the session's
+/// `detect_as` from it and `status_agent` falls back to that stored alias;
+/// among the fields the disclosure reads a repo can move only
+/// `agent_detect_as`, so merging costs the paths nothing.
+pub(crate) fn host_hook_gate_config(
+    profile: &str,
+    project_path: &Path,
+) -> crate::session::config::Config {
+    crate::session::resolve_config_with_repo_or_warn(profile, project_path)
+}
+
 /// Resolve the disclosure for `tool_name`, which a launch runs as `agent`.
 /// `config` is the profile-merged config whose environment and session config
-/// decide the paths; `None` means an unconfigured install.
+/// decide the paths.
 pub(crate) fn host_hook_disclosure(
     tool_name: &str,
     agent: &'static crate::agents::AgentDef,
-    config: Option<&crate::session::config::Config>,
+    config: &crate::session::config::Config,
 ) -> HostHookDisclosure {
     let mut disclosure = HostHookDisclosure {
         settings_paths: Vec::new(),
@@ -140,8 +149,6 @@ pub(crate) fn host_hook_disclosure(
         needs_codex_trust_note: false,
         status_hooks_enabled: false,
     };
-    let default_config = crate::session::config::Config::default();
-    let config = config.unwrap_or(&default_config);
     let host_env = config.environment.as_slice();
     let home = host_home(host_env).unwrap_or_else(|| std::path::PathBuf::from("~"));
     let session_config = &config.session;
@@ -194,13 +201,19 @@ pub(crate) fn host_hook_disclosure(
             effects.push(format!("writes \"{status}\""));
         }
         if !effects.is_empty() {
+            // The matcher is part of what the installed entry contains, and it
+            // is what separates two entries sharing an event name.
+            let label = match &event.matcher {
+                Some(matcher) => format!("{} ({matcher})", event.name),
+                None => event.name.clone(),
+            };
             disclosure
                 .hook_commands
-                .push((event.name, effects.join(", and ")));
+                .push((label, effects.join(", and ")));
         }
     }
-    // The profile setting decides which events survive, but what survives is
-    // what this install actually runs, and that is what the two surfaces say.
+    // What survives the setting is what this install runs, and that is what
+    // both surfaces say.
     disclosure.status_hooks_enabled = status_events > 0;
     disclosure
 }
@@ -351,7 +364,7 @@ impl Instance {
         }
         if !host_hooks_acknowledged() {
             bail!(
-                "agent hook paths have not been acknowledged; run `aoe hooks approve` \
+                "agent hook paths have not been approved; run `aoe hooks approve` \
                  before launching this host session"
             );
         }
@@ -1218,7 +1231,7 @@ mod tests {
 
         for tool in ["claude", "codex", "cursor"] {
             let agent = crate::agents::get_agent(tool).unwrap();
-            let disclosure = host_hook_disclosure(tool, agent, Some(&config));
+            let disclosure = host_hook_disclosure(tool, agent, &config);
             let events =
                 resolved_host_hook_events(agent, &config, config.session.agent_status_hooks)
                     .unwrap_or_default();
@@ -1274,13 +1287,10 @@ mod tests {
         }
     }
 
-    /// #4159: the disclosed agent is the one `execution_agent_for` resolves,
-    /// which matches the command's first word against the built-in binaries
-    /// before it reads `agent_execution_as`. Asserting the disclosure against
-    /// `status_agent` would compare two paths through that same function and
-    /// stay green if the `direct` lookup were removed, so each row is checked
-    /// against the agent *and* the file the resolver's own rules name, and
-    /// against the path a forbidden shape must not reach.
+    /// Checked against the agent the resolver names and the file that
+    /// resolver's own rules pick, never against `status_agent`, which routes
+    /// through the same function and would stay green if the direct lookup
+    /// were removed.
     #[test]
     #[serial_test::serial]
     fn disclosed_agent_follows_the_resolver_that_picks_the_launch_agent() {
@@ -1334,7 +1344,7 @@ mod tests {
                 "{label}"
             );
 
-            let disclosure = host_hook_disclosure("corp", agent.expect("resolved"), Some(&config));
+            let disclosure = host_hook_disclosure("corp", agent.expect("resolved"), &config);
             let disclosed = disclosure.settings_paths.join(" ");
             let expected = expected_file.replace("CORPDIR", &corpdir.display().to_string());
             assert!(
@@ -1342,6 +1352,48 @@ mod tests {
                 "{label}: disclosed {disclosed}"
             );
         }
+    }
+
+    /// A repository may set `session.agent_detect_as`, and the launcher's
+    /// agent comes from the repo-merged config. The consent gate must read
+    /// the same layer, or it describes a different agent than the one that
+    /// installs. The two assertions are the two layers, so a gate that
+    /// reverted to the profile alone would name the wrong one.
+    #[test]
+    #[serial_test::serial]
+    fn the_gate_reads_the_same_repo_layer_the_launcher_does() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(&tmp.path().join("app"));
+        let _home_guard = crate::session::test_support::isolate_home(tmp.path());
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(repo.join(".agent-of-empires")).unwrap();
+        std::fs::write(
+            repo.join(".agent-of-empires").join("config.toml"),
+            "[session]\nagent_detect_as = { corp = \"codex\" }\n",
+        )
+        .unwrap();
+        write_profile(
+            "repo-alias",
+            "[session.custom_agents]\ncorp = \"acme-wrapper\"\n\n\
+             [session.agent_detect_as]\ncorp = \"claude\"\n",
+        );
+
+        let profile_only =
+            crate::session::config::profile_config::resolve_config_or_warn("repo-alias");
+        let with_repo = host_hook_gate_config("repo-alias", &repo);
+
+        let by_profile = host_hook_agent(
+            "corp",
+            &profile_only.session.launch_command_for("corp"),
+            &profile_only.session,
+        );
+        let by_repo = host_hook_agent(
+            "corp",
+            &with_repo.session.launch_command_for("corp"),
+            &with_repo.session,
+        );
+        assert_eq!(by_profile.map(|a| a.name), Some("claude"));
+        assert_eq!(by_repo.map(|a| a.name), Some("codex"));
     }
 
     #[test]
@@ -1383,7 +1435,7 @@ mod tests {
             inst.install_agent_status_hooks(agent, None);
 
             let gate_ok = match &gate {
-                Err(error) => refused && error.to_string().contains("have not been acknowledged"),
+                Err(error) => refused && error.to_string().contains("have not been approved"),
                 Ok(()) => !refused,
             };
             if !gate_ok || tmp.path().join(hooks_file).exists() || inst.identity_publisher_launched
