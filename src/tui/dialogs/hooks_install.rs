@@ -1,8 +1,9 @@
-//! Consent dialog for the first agent hook install.
+//! Approval dialog for the first agent hook install.
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::prelude::*;
 use ratatui::widgets::*;
+use std::path::PathBuf;
 
 use super::DialogResult;
 use crate::tui::components::hover::{paint_hover_bg, HoverState};
@@ -13,6 +14,7 @@ pub struct HooksInstallDialog {
     settings_paths: Vec<String>,
     hook_commands: Vec<(String, String)>,
     needs_codex_trust_note: bool,
+    disabled_by_agent: Option<PathBuf>,
     selected: bool, // true = Accept, false = Cancel
     scroll_offset: u16,
     accept_button_area: Rect,
@@ -35,6 +37,7 @@ impl HooksInstallDialog {
             settings_paths: disclosure.settings_paths,
             hook_commands: disclosure.hook_commands,
             needs_codex_trust_note: disclosure.needs_codex_trust_note,
+            disabled_by_agent: disclosure.disabled_by_agent,
             status_hooks_enabled: disclosure.status_hooks_enabled,
             selected: true,
             scroll_offset: 0,
@@ -112,19 +115,24 @@ impl HooksInstallDialog {
             Style::default().bold(),
         )));
         for path in &self.settings_paths {
-            lines.push(Line::from(format!("  {}", path)));
+            lines.push(Line::from(format!("  {path}")));
         }
-        lines.push(Line::from(
-            "  Also includes selected or recorded Claude conversation stores.",
-        ));
+        if let Some(config) = &self.disabled_by_agent {
+            lines.push(Line::from(format!(
+                "  (this agent's own config turns its hooks off: {})",
+                config.display()
+            )));
+        }
 
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            "Hook events added:",
-            Style::default().bold(),
-        )));
-        for (event, effect) in &self.hook_commands {
-            lines.push(Line::from(format!("  {event} -> {effect}")));
+        if !self.hook_commands.is_empty() {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "Hook events added:",
+                Style::default().bold(),
+            )));
+            for (event, effect) in &self.hook_commands {
+                lines.push(Line::from(format!("  {event} -> {effect}")));
+            }
         }
 
         lines.push(Line::from(""));
@@ -205,7 +213,7 @@ impl HooksInstallDialog {
         let header = Paragraph::new(if self.status_hooks_enabled {
             "AoE needs to install hooks into your agent's settings\nto detect session status (running/waiting/idle)."
         } else {
-            "AoE needs to install identity hooks into your agent's settings\nfor native resume. No status hook survives for this profile."
+            "AoE needs to install identity hooks into your agent's settings\nfor native resume. No status hook survives for this config."
         })
         .style(Style::default().fg(theme.text))
         .wrap(Wrap { trim: true });

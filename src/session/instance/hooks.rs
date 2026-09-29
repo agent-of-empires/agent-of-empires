@@ -99,7 +99,7 @@ pub(crate) struct HostHookDisclosure {
     /// declares no status event leaves behind too.
     pub status_hooks_enabled: bool,
     /// The agent's own config that turns its hooks off, naming it so the
-    /// consent can say which file decides.
+    /// the disclosure can say which file decides.
     pub disabled_by_agent: Option<std::path::PathBuf>,
 }
 
@@ -126,12 +126,13 @@ pub(crate) fn host_hook_agent(
         })
 }
 
-/// The config a consent gate must read to describe the install a launch will
-/// perform. It carries the repo layer, because the builder stores the session's
+/// The profile-merged config a hook disclosure must read to describe the install
+/// a launch will perform. It carries the repo layer, because the builder stores
+/// the session's
 /// `detect_as` from it and `status_agent` falls back to that stored alias;
 /// among the fields the disclosure reads a repo can move only
 /// `agent_detect_as`, so merging costs the paths nothing.
-pub(crate) fn host_hook_gate_config(
+pub(crate) fn host_hook_disclosure_config(
     profile: &str,
     project_path: &Path,
 ) -> crate::session::config::Config {
@@ -163,24 +164,28 @@ pub(crate) fn host_hook_disclosure(
     else {
         return disclosure;
     };
-    disclosure.needs_codex_trust_note = agent
+    let is_codex_json = agent
         .hook_config
         .as_ref()
         .is_some_and(|hook_cfg| hook_cfg.format == crate::agents::HookFormat::CodexJson);
+    disclosure.needs_codex_trust_note = is_codex_json;
     disclosure
         .settings_paths
         .push(path.to_string_lossy().into_owned());
-    // Codex skips AoE's hooks when its own config turns the feature off, while
-    // still opening the file, so the target stands and the events do not.
-    disclosure.disabled_by_agent = crate::hooks::codex_hooks_disabled_at(&path);
+    // Only Codex reads a feature flag, and only beside its hooks.json. Kimi
+    // and settl name their own `config.toml` but install their hooks whatever
+    // it says, so probing them would drop events a launch still writes.
+    disclosure.disabled_by_agent = is_codex_json
+        .then(|| crate::hooks::codex_hooks_disabled_at(&path))
+        .flatten();
 
     // Resolved through the installer's own resolver, so status_map overrides
     // apply and the status events drop out with the setting. An event can
     // install both an identity extractor and a status writer, so both effects
     // are disclosed; an event with neither installs nothing and is not listed.
     let mut status_events = 0;
-    // An agent that turns its own hooks off installs none, so none is listed;
-    // the target stays because the installer still opens the file.
+    // A Codex that turned its hooks off installs none, so none is listed; the
+    // target stays because the installer still opens the file.
     if disclosure.disabled_by_agent.is_none() {
         for event in resolved_host_hook_events(agent, config, config.session.agent_status_hooks)
             .unwrap_or_default()
@@ -752,7 +757,7 @@ fn hook_target_identity(path: &std::path::Path) -> std::path::PathBuf {
     })
 }
 
-/// Whether the consented hook path and the resolved one name the same file.
+/// Whether the disclosed hook path and the resolved one name the same file.
 ///
 /// Compared by resolved target rather than by literal path: an account
 /// switcher driven from `before_session` points `CLAUDE_CONFIG_DIR` (or
@@ -763,7 +768,7 @@ fn hook_target_identity(path: &std::path::Path) -> std::path::PathBuf {
 ///
 /// A `before_session` that redirects the install into a genuinely different
 /// file still resolves differently and is still refused, which is the property
-/// the consent gate exists for.
+/// the approval check exists for.
 fn same_hook_target(disclosed: &std::path::Path, resolved: &std::path::Path) -> bool {
     disclosed == resolved || hook_target_identity(disclosed) == hook_target_identity(resolved)
 }
@@ -821,11 +826,11 @@ mod tests {
         .unwrap();
     }
 
-    /// The consent gate compares which FILE gets written, not which string
+    /// The approval check compares which FILE gets written, not which string
     /// names it. An account switcher driven from `before_session` points the
     /// agent's config dir at a per-account directory whose settings file is a
     /// symlink back to the shared one; those two paths differ as strings and
-    /// must still count as consented. A redirect onto a genuinely different
+    /// must still count as the same. A redirect onto a genuinely different
     /// file must still be refused, which is the whole point of the gate.
     #[test]
     fn same_hook_target_follows_symlinks_but_not_distinct_files() {
@@ -1225,6 +1230,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let _app = crate::session::test_support::isolate_app_dir_at(&tmp.path().join("app"));
         let _home_guard = crate::session::test_support::isolate_home(tmp.path());
+        let _env = EnvGuard::unset(&["CODEX_HOME", "CLAUDE_CONFIG_DIR"]);
         let config = crate::session::config::Config::default();
 
         for tool in ["claude", "codex", "cursor"] {
@@ -1281,6 +1287,41 @@ mod tests {
                 disclosed.len(),
                 written.len(),
                 "{tool}: one disclosed effect per installed command"
+            );
+        }
+    }
+
+    /// Only Codex reads a feature flag, and only beside its own hooks.json.
+    /// Kimi and settl name a `config.toml` too, so a probe that reads it for
+    /// every agent drops events their installer still writes.
+    #[test]
+    #[serial_test::serial]
+    fn only_codex_reads_a_feature_flag_beside_its_hooks() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(&tmp.path().join("app"));
+        let _home = crate::session::test_support::isolate_home(tmp.path());
+        let _env = EnvGuard::unset(&["CODEX_HOME", "CLAUDE_CONFIG_DIR"]);
+        let config = crate::session::config::Config::default();
+
+        for (tool, file) in [
+            ("codex", ".codex/hooks.json"),
+            ("kimi", ".kimi-code/config.toml"),
+            ("settl", ".settl/config.toml"),
+        ] {
+            let host = tmp.path().join(file).parent().unwrap().to_path_buf();
+            std::fs::create_dir_all(&host).unwrap();
+            std::fs::write(host.join("config.toml"), "[features]\nhooks = false\n").unwrap();
+
+            let agent = crate::agents::get_agent(tool).unwrap();
+            let disclosure = host_hook_disclosure(tool, agent, &config);
+            assert_eq!(
+                disclosure.disabled_by_agent.is_some(),
+                tool == "codex",
+                "{tool}: only codex honours a feature flag beside its hooks"
+            );
+            assert!(
+                !disclosure.hook_commands.is_empty() || tool == "codex",
+                "{tool}: its events must stay listed"
             );
         }
     }
@@ -1353,7 +1394,7 @@ mod tests {
     }
 
     /// A repository may set `session.agent_detect_as`, and the launcher's
-    /// agent comes from the repo-merged config. The consent gate must read
+    /// agent comes from the repo-merged config. The disclosure must read
     /// the same layer, or it describes a different agent than the one that
     /// installs. The two assertions are the two layers, so a gate that
     /// reverted to the profile alone would name the wrong one.
@@ -1363,6 +1404,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let _app = crate::session::test_support::isolate_app_dir_at(&tmp.path().join("app"));
         let _home_guard = crate::session::test_support::isolate_home(tmp.path());
+        let _env = EnvGuard::unset(&["CODEX_HOME", "CLAUDE_CONFIG_DIR"]);
         let repo = tmp.path().join("repo");
         std::fs::create_dir_all(repo.join(".agent-of-empires")).unwrap();
         std::fs::write(
@@ -1378,7 +1420,7 @@ mod tests {
 
         let profile_only =
             crate::session::config::profile_config::resolve_config_or_warn("repo-alias");
-        let with_repo = host_hook_gate_config("repo-alias", &repo);
+        let with_repo = host_hook_disclosure_config("repo-alias", &repo);
 
         let by_profile = host_hook_agent(
             "corp",
@@ -1415,6 +1457,7 @@ mod tests {
             let tmp = tempfile::TempDir::new().unwrap();
             let _app = crate::session::test_support::isolate_app_dir_at(&tmp.path().join("app"));
             let _home_guard = crate::session::test_support::isolate_home(tmp.path());
+            let _env = EnvGuard::unset(&["CODEX_HOME", "CLAUDE_CONFIG_DIR"]);
             let mut inst = hook_inst(tool);
             if sandboxed {
                 inst.sandbox_info = Some(crate::session::instance::test_helpers::test_sandbox(

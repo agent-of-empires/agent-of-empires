@@ -1640,7 +1640,7 @@ impl HomeView {
                     data.tool.clone()
                 };
 
-                let resolved_config = crate::session::host_hook_gate_config(
+                let resolved_config = crate::session::host_hook_disclosure_config(
                     &data.profile,
                     std::path::Path::new(&data.path),
                 );

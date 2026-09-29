@@ -27,7 +27,7 @@ pub(super) const CODEX_HOOK_EVENT_NAMES: &[&str] = &[
 
 /// The `config.toml` beside `hooks_path` that turns Codex's own hooks off, or
 /// `None` when the feature is on or the file is absent. Read exactly the way
-/// [`install_codex_json_hooks`] reads it, so the consent disclosure and the
+/// [`install_codex_json_hooks`] reads it, so the disclosure and the
 /// installer cannot disagree about the same file. Silent, unlike the install
 /// path: a query and a skip want different log lines.
 pub(crate) fn codex_hooks_disabled_at(hooks_path: &Path) -> Option<PathBuf> {

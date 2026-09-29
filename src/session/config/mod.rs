@@ -1946,10 +1946,11 @@ impl SessionConfig {
             .unwrap_or_default()
     }
 
-    /// The command a session runs when it carries no per-session override: the
-    /// built-in's binary, else the config's override. The builder gives a
-    /// per-session `command_override` absolute priority over both, so a
-    /// session can differ from this; a surface without the session uses this.
+    /// The command a launch runs for `tool` when the session carries no
+    /// per-session override: `agent_command_override`, else `custom_agents`,
+    /// else the built-in's binary, else empty. A surface with no session to
+    /// ask names the agent from this, so it describes the launch instead of a
+    /// second derivation of it.
     pub fn launch_command_for(&self, tool: &str) -> String {
         let resolved = self.resolve_tool_command(tool);
         if !resolved.is_empty() {

@@ -27,13 +27,13 @@ pub fn run(profile: &str, command: HooksCommands) -> Result<()> {
 }
 
 /// A corrupt `state.toml` is an error here rather than a silent "not approved",
-/// which would point the user at a re-approve that cannot succeed either.
-fn acknowledged() -> Result<bool> {
+/// which would point the user at an approve that cannot succeed either.
+fn approved() -> Result<bool> {
     Ok(Config::load()?.app_state.has_acknowledged_agent_hooks)
 }
 
 fn print_status(profile: &str) -> Result<()> {
-    if acknowledged()? {
+    if approved()? {
         println!("Agent hooks: approved for this installation");
     } else {
         println!("Agent hooks: not approved");
@@ -48,7 +48,7 @@ fn approve(profile: &str) -> Result<()> {
     // Always disclose, even on a repeat run, so the output can be used to
     // review what the standing approval covers for another profile.
     print_disclosure(profile);
-    if acknowledged()? {
+    if approved()? {
         println!();
         println!("Agent hooks already approved for this installation");
         return Ok(());
