@@ -68,6 +68,9 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
             get(api::session_diff_file_raw),
         )
         .route("/api/sessions/{id}/file", get(api::session_file))
+        .route("/api/sessions/{id}/file/raw", get(api::session_file_raw))
+        // Read-only runtime read: one Hello, one Snapshot, one clean close.
+        .route("/api/runtime/ws", get(runtime_ws::runtime_ws))
         .route(
             "/api/sessions/{id}/artifacts/{*path}",
             get(api::serve_session_artifact),
@@ -278,8 +281,6 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
             "/api/telemetry/structured-interaction",
             post(api::post_telemetry_structured_interaction),
         )
-        // Read-only runtime read: one Hello, one Snapshot, one clean close.
-        .route("/api/runtime/ws", get(runtime_ws::runtime_ws))
         // Terminal WebSockets (capture-streaming live view; the agent pane and
         // the paired host/container shells). The xterm PTY relay was removed.
         .route("/sessions/{id}/live-ws", get(live_ws::live_terminal_ws))

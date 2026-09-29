@@ -14,6 +14,16 @@
 //! Modules behind `#[cfg(debug_assertions)]` use test hooks and helpers that
 //! only debug builds compile, so release test builds (the Nix checks) skip them.
 
+#[cfg(debug_assertions)]
+mod cli_read_pack;
+#[cfg(debug_assertions)]
+mod cli_read_parity;
+#[cfg(debug_assertions)]
+mod cli_read_record;
+#[cfg(debug_assertions)]
+mod cli_read_server;
+#[cfg(all(target_os = "linux", debug_assertions))]
+mod cli_read_uds;
 mod common;
 mod home_isolation;
 
@@ -23,6 +33,7 @@ mod hidden_env_batch;
 mod hooks_config;
 mod migration_pipeline;
 mod profile_management;
+mod profile_selection_scope;
 mod recovery_hook_timeout;
 mod repo_config;
 mod session_id_acquisition;
@@ -31,6 +42,7 @@ mod status_detection;
 mod storage_concurrency;
 mod terminal_smart_rename;
 mod tmux_reachability;
+mod tmux_send_keys;
 mod tui_attach_detach;
 mod update_command;
 mod worktree_integration;
@@ -56,28 +68,12 @@ mod agent_lifecycle_cli;
 mod build_cache_config;
 mod build_version_rerun;
 #[cfg(debug_assertions)]
-mod cli_read_pack;
-#[cfg(debug_assertions)]
-mod cli_read_parity;
-#[cfg(debug_assertions)]
-mod cli_read_record;
-#[cfg(debug_assertions)]
-mod cli_read_server;
-// The local read is Linux-only: the admission re-derives process identity from
-// /proc, so the publisher refuses every other platform and there is nothing
-// for these tests to admit there.
-// The read transports themselves are debug-assertion-gated, so these modules
-// cannot compile without them either.
-#[cfg(all(target_os = "linux", debug_assertions))]
-mod cli_read_uds;
-#[cfg(debug_assertions)]
 mod daemon_core_web_optional;
 mod filewatch_config_editor_burst;
 #[cfg(debug_assertions)]
 mod log_filter_watcher_migration;
 mod no_stale_doc_refs;
 mod plugin_install;
-mod profile_selection_scope;
 #[cfg(debug_assertions)]
 mod project_create_dedupe;
 #[cfg(debug_assertions)]
