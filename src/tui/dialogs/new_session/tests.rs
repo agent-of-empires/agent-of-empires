@@ -833,45 +833,39 @@ fn the_structured_row_appears_only_for_an_acp_capable_tool() {
 fn clicks_focus_and_act_on_a_row_while_hover_only_tints_it() {
     assert!(single_tool_dialog().handle_click(5, 5).is_none());
 
-    // A checkbox row toggles on click.
-    let mut dialog = single_tool_dialog();
-    dialog
-        .focusable_rects
-        .push((2, ratatui::layout::Rect::new(0, 5, 30, 1)));
-    let before = dialog.yolo_mode;
-    assert!(matches!(
-        dialog.handle_click(10, 5),
-        Some(DialogResult::Continue)
-    ));
-    assert_eq!(dialog.focused_field, 2);
-    assert_eq!(dialog.yolo_mode, !before);
-
-    // A text row only takes focus.
-    let mut dialog = single_tool_dialog();
-    dialog
-        .focusable_rects
-        .push((0, ratatui::layout::Rect::new(0, 3, 30, 1)));
-    dialog.focused_field = 1;
-    let path = dialog.path.value().to_string();
-    assert!(matches!(
-        dialog.handle_click(10, 3),
-        Some(DialogResult::Continue)
-    ));
-    assert_eq!(dialog.focused_field, 0);
-    assert_eq!(dialog.path.value(), path);
-
-    // A cycler row advances.
-    let mut dialog = multi_tool_dialog();
-    dialog
-        .focusable_rects
-        .push((2, ratatui::layout::Rect::new(0, 5, 30, 1)));
-    let before = dialog.tool_index;
-    dialog.handle_click(10, 5);
-    assert_eq!(
-        dialog.tool_index,
-        (before + 1) % dialog.available_tools.len()
-    );
-    assert_eq!(dialog.focused_field, 2);
+    // (dialog, clicked field): a checkbox toggles, a text row only takes
+    // focus, a cycler advances.
+    let cases: [(fn() -> NewSessionDialog, usize); 3] = [
+        (single_tool_dialog, 2),
+        (single_tool_dialog, 0),
+        (multi_tool_dialog, 2),
+    ];
+    for (make, field) in cases {
+        let mut dialog = make();
+        dialog.focused_field = 1;
+        let rect = ratatui::layout::Rect::new(0, 5, 30, 1);
+        dialog.focusable_rects.push((field, rect));
+        let (yolo, tool, path) = (
+            dialog.yolo_mode,
+            dialog.tool_index,
+            dialog.path.value().to_string(),
+        );
+        assert!(matches!(
+            dialog.handle_click(10, 5),
+            Some(DialogResult::Continue)
+        ));
+        assert_eq!(dialog.focused_field, field);
+        assert_eq!(dialog.path.value(), path);
+        let tools = dialog.available_tools.len();
+        let toggled = field == 2 && tools == 1;
+        assert_eq!(dialog.yolo_mode, yolo != toggled);
+        let cycled = if field == 2 && tools > 1 {
+            (tool + 1) % tools
+        } else {
+            tool
+        };
+        assert_eq!(dialog.tool_index, cycled);
+    }
 
     // Hover tints the row but never steals focus from the field being typed
     // into, nor toggles anything.

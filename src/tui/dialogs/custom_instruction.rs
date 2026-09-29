@@ -55,10 +55,8 @@ impl CustomInstructionDialog {
         DialogResult::Submit((!text.trim().is_empty()).then_some(text))
     }
 
-    /// Route a left-click: Save submits and Cancel cancels, like Enter on the
-    /// focused button. A click in the text area focuses it without touching
-    /// the text. `None` when the click landed outside the dialog, so the
-    /// caller decides whether to swallow it.
+    /// Save and Cancel act like Enter on them; a text-area click only focuses
+    /// it. `None` outside the dialog.
     pub fn handle_click(&mut self, col: u16, row: u16) -> Option<DialogResult<Option<String>>> {
         let pos = Position::from((col, row));
         if self.save_button_area.contains(pos) {

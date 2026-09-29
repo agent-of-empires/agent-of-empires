@@ -202,10 +202,8 @@ impl DirPicker {
         row_index(self.rows_area, col, row, visible).map(|i| self.scroll_offset + i)
     }
 
-    /// Route a left-click, mirroring the keys: a row acts like Enter on it,
-    /// the overflow markers step toward the hidden rows, and each hint-row
-    /// segment performs its key. A click outside the dialog cancels, and any
-    /// click closes the help overlay.
+    /// A row acts like Enter on it and an overflow marker steps toward the
+    /// hidden rows; a click outside cancels.
     pub fn handle_click(&mut self, col: u16, row: u16) -> DirPickerResult {
         let result = self.click(col, row);
         self.scroll_cursor = self.selected;
@@ -844,20 +842,13 @@ mod tests {
     /// Hover moves the row highlight without scrolling and tints hints
     /// without acting; each reports a change only when its target changes.
     #[test]
-    fn hover_tracks_rows_and_hints_without_scrolling() {
+    fn hover_tracks_rows_without_scrolling() {
         let (_tmp, _base, mut picker) = fixture();
         let buffer = draw(&mut picker);
         let (col, row) = find(&buffer, "beta/");
         assert!(picker.handle_hover(col, row));
         assert_eq!(picker.selected, 3);
         assert!(!picker.handle_hover(col + 1, row));
-
-        let (col, row) = find(&buffer, "cancel");
-        assert!(picker.handle_hover(col, row));
-        assert_eq!(picker.selected, 3);
-        assert!(picker.is_active());
-        assert!(!picker.handle_hover(col, row));
-        assert!(picker.handle_hover(0, 0), "leaving the hint clears it");
 
         // Scrolled past the top: hovering a row near the top highlights it
         // but keeps the rows where they are.

@@ -882,61 +882,61 @@ mod tests {
     }
 
     fn draw(view: &ServeView) -> ratatui::buffer::Buffer {
-        let mut term = Terminal::new(TestBackend::new(100, 40)).unwrap();
-        term.draw(|f| render(view, f, f.area(), &Theme::default()))
-            .unwrap();
-        term.backend().buffer().clone()
+        draw_at(view, 100)
+    }
+
+    fn draw_at(view: &ServeView, width: u16) -> ratatui::buffer::Buffer {
+        crate::tui::dialogs::test_render::draw(width, 40, |f, _| {
+            render(view, f, f.area(), &Theme::default())
+        })
     }
 
     #[test]
-    fn active_screen_hints_click_and_values_are_copy_targets() {
+    fn values_are_copy_targets_and_hints_click() {
         use crate::tui::dialogs::test_render::find;
-        let url = "https://host.example.ts.net/?token=abc123";
-        let mut view = view(ServeViewState::Active {
-            mode: ServeMode::Tunnel,
-            transport: None,
-            urls: vec![ServeUrl {
-                label: None,
-                url: url.to_string(),
-            }],
-            url_index: 0,
-            passphrase: Some("correct-horse".to_string()),
-            opened_at: Instant::now(),
-            log_offset: 0,
-        });
-        let buf = draw(&view);
-        let copies: Vec<(String, String)> = view
-            .mouse
-            .borrow()
-            .copies
-            .iter()
-            .map(|((label, value), r)| {
-                let drawn: String = (r.x..r.right()).map(|x| buf[(x, r.y)].symbol()).collect();
-                assert_eq!(&drawn, value, "{label} rect covers its drawn value");
-                (label.to_string(), value.clone())
-            })
-            .collect();
-        assert_eq!(
-            copies,
-            [("URL", url), ("Passphrase", "correct-horse")].map(|(l, v)| (l.into(), v.into()))
-        );
-
-        let (x, y) = find(&buf, "R: restart");
-        assert!(view.handle_hover(x, y));
-        assert_eq!(
-            view.handle_click(x, y).map(|k| k.code),
-            Some(KeyCode::Char('R'))
-        );
-
-        view.show_help = true;
-        draw(&view);
-        assert_eq!(view.handle_click(0, 0).map(|k| k.code), Some(KeyCode::Esc));
-    }
-
-    #[test]
-    fn a_wrapped_url_row_still_copies_the_whole_url() {
         let url = "https://host.example.ts.net/?token=abcdefghijklmnopqrstuvwxyz0123456789";
-        let view = view(ServeViewState::Active {
+        let token = split_url_and_token(url).1.unwrap();
+        // At 60 columns the URL splits onto a Token row, yet its row still
+        // copies the whole URL.
+        let cases: [(u16, &[(&str, &str)]); 2] = [
+            (100, &[("URL", url), ("Passphrase", "correct-horse")]),
+            (
+                60,
+                &[
+                    ("URL", url),
+                    ("Token", token),
+                    ("Passphrase", "correct-horse"),
+                ],
+            ),
+        ];
+        for (width, want) in cases {
+            let view = view(ServeViewState::Active {
+                mode: ServeMode::Tunnel,
+                transport: None,
+                urls: vec![ServeUrl {
+                    label: None,
+                    url: url.to_string(),
+                }],
+                url_index: 0,
+                passphrase: Some("correct-horse".to_string()),
+                opened_at: Instant::now(),
+                log_offset: 0,
+            });
+            let buf = draw_at(&view, width);
+            let mouse = view.mouse.borrow();
+            let got: Vec<(&str, &str)> = mouse
+                .copies
+                .iter()
+                .map(|((label, value), r)| {
+                    let drawn: String = (r.x..r.right()).map(|x| buf[(x, r.y)].symbol()).collect();
+                    assert!(!drawn.is_empty() && value.starts_with(&drawn), "{label}");
+                    (*label, value.as_str())
+                })
+                .collect();
+            assert_eq!(got, want, "width {width}");
+        }
+
+        let mut view = view(ServeViewState::Active {
             mode: ServeMode::Local,
             transport: None,
             urls: vec![ServeUrl {
@@ -948,24 +948,15 @@ mod tests {
             opened_at: Instant::now(),
             log_offset: 0,
         });
-        let mut term = Terminal::new(TestBackend::new(60, 40)).unwrap();
-        term.draw(|f| render(&view, f, f.area(), &Theme::default()))
-            .unwrap();
-        let copies: Vec<(&str, String)> = view
-            .mouse
-            .borrow()
-            .copies
-            .iter()
-            .map(|((label, value), _)| (*label, value.clone()))
-            .collect();
-        let (_, token) = split_url_and_token(url);
+        let (x, y) = find(&draw(&view), "R: restart");
+        assert!(view.handle_hover(x, y));
         assert_eq!(
-            copies,
-            [
-                ("URL", url.to_string()),
-                ("Token", token.unwrap().to_string())
-            ]
+            view.handle_click(x, y).map(|k| k.code),
+            Some(KeyCode::Char('R'))
         );
+        view.show_help = true;
+        draw(&view);
+        assert_eq!(view.handle_click(0, 0).map(|k| k.code), Some(KeyCode::Esc));
     }
 
     #[test]

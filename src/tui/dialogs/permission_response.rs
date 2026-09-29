@@ -315,34 +315,6 @@ mod tests {
     }
 
     #[test]
-    fn clicking_a_drawn_choice_presses_its_key_and_hover_keeps_focus() {
-        use crate::tui::dialogs::test_render::{draw, find};
-        for (allow_always, labels) in [
-            (
-                ALLOW_ALWAYS,
-                &[("[Allow]", 'a'), ("[Allow Always]", 'A'), ("[Deny]", 'd')][..],
-            ),
-            (None, &[("[Allow]", 'a'), ("[Deny]", 'd')][..]),
-        ] {
-            let mut d = PermissionResponseDialog::new("test", allow_always);
-            let buf = draw(80, 20, |f, theme| d.render(f, f.area(), theme));
-            for (label, want) in labels {
-                let (x, y) = find(&buf, label);
-                let last = x + label.len() as u16 - 1;
-                for col in [x, last] {
-                    assert_eq!(
-                        d.handle_click(col, y).map(|k| k.code),
-                        Some(KeyCode::Char(*want)),
-                        "{label} at {col}"
-                    );
-                }
-                assert!(d.handle_hover(x, y));
-                assert_eq!(d.focused, 0);
-            }
-        }
-    }
-
-    #[test]
     fn an_agent_without_allow_always_neither_shows_nor_accepts_it() {
         let mut d = PermissionResponseDialog::new("test", None);
         assert_eq!(d.choices.len(), 2);

@@ -55,9 +55,7 @@ impl DiffView {
         self.warning_dialog.is_some() || self.show_help || self.branch_select.is_some()
     }
 
-    /// Route a left-click. An open modal takes it: a click inside the
-    /// warning dismisses it (outside is swallowed), any click closes help.
-    /// Otherwise a file-list row selects that file.
+    /// An open modal takes every click; otherwise a file-list row selects.
     pub fn handle_click(&mut self, col: u16, row: u16) {
         if let Some(dialog) = &self.warning_dialog {
             if dialog.handle_click(col, row).is_some() {
@@ -102,9 +100,7 @@ impl DiffView {
         }
     }
 
-    /// Highlight the warning dialog's button under the cursor. Hover does
-    /// not move the file-list selection: j/k after a stray drift would
-    /// otherwise advance from whichever file the cursor last crossed.
+    /// Hover never moves the file-list selection, which j/k advance from.
     pub fn handle_hover(&mut self, col: u16, row: u16) -> bool {
         if self.branch_select.is_some() {
             let rects = self.branch_mouse.rects();

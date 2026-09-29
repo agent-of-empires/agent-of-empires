@@ -231,9 +231,8 @@ pub struct SettingsView {
     pub(super) mouse_pos: Option<(u16, u16)>,
     /// Expanded list editor hit rects; empty while no list is open.
     pub(super) list_edit_hits: ListEditHits,
-    /// The hovered list row or header action. Visual only: `(d)elete` acts
-    /// on the selected row, so the pointer crossing rows on its way to the
-    /// header must not retarget it.
+    /// Visual only: `(d)elete` acts on the selection, which the pointer must
+    /// not retarget on its way to the header.
     pub(super) list_hover: crate::tui::components::hover::HoverState,
 
     /// The command palette's plugin manager, hosted inline in the Plugins

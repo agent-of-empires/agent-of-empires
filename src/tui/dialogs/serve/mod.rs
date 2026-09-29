@@ -225,9 +225,8 @@ impl ServeView {
         }
     }
 
-    /// A click on a hint or card returns its key for the caller to press
-    /// through `handle_key`; a click on the URL, token or passphrase copies
-    /// it. Any click closes the help overlay, like any key.
+    /// Hints and cards return their key; the URL, token and passphrase copy
+    /// on click. Any click closes help, like any key.
     pub fn handle_click(&mut self, col: u16, row: u16) -> Option<KeyEvent> {
         if self.show_help {
             return Some(KeyEvent::from(KeyCode::Esc));

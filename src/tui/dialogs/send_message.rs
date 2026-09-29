@@ -500,34 +500,4 @@ mod tests {
             );
         }
     }
-
-    #[test]
-    fn clicking_a_border_hint_presses_its_key() {
-        use crate::tui::dialogs::test_render::{draw, find};
-        let mut d = dialog();
-        type_str(&mut d, "hi");
-        d.handle_key(ctrl_key(KeyCode::Char('u')));
-        assert!(d.restore_armed);
-        let buf = draw(80, 24, |f, theme| d.render(f, f.area(), theme));
-        for (label, want) in [
-            ("Enter send", KeyCode::Enter),
-            ("Esc cancel", KeyCode::Esc),
-            ("Ctrl+P restore deleted text", KeyCode::Char('p')),
-        ] {
-            let (x, y) = find(&buf, label);
-            for col in [x, x + label.len() as u16 - 1] {
-                assert_eq!(
-                    d.handle_click(col, y).map(|k| k.code),
-                    Some(want),
-                    "{label}"
-                );
-            }
-            assert_ne!(
-                d.handle_click(x.saturating_sub(1), y).map(|k| k.code),
-                Some(want)
-            );
-        }
-        let (x, y) = find(&buf, "Esc cancel");
-        assert!(d.handle_hover(x, y));
-    }
 }

@@ -68,9 +68,7 @@ impl ProfilePickerDialog {
         }
     }
 
-    /// A click on a profile row selects it and returns Enter to switch; a
-    /// click on a button or footer hint returns the key it stands for. The
-    /// caller presses the key through `handle_key`.
+    /// A row click switches to that profile.
     pub fn handle_click(&mut self, col: u16, row: u16) -> Option<KeyEvent> {
         match self.mode {
             Mode::List => {

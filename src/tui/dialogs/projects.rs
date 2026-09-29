@@ -129,9 +129,7 @@ impl ProjectsDialog {
         }
     }
 
-    /// A click on a project row selects it and on an add-form row focuses it,
-    /// flipping toggles like Space. A footer hint returns its key for the
-    /// caller to press through `handle_key`.
+    /// Rows select; add-form rows take focus and flip toggles like Space.
     pub fn handle_click(&mut self, col: u16, row: u16) -> Option<KeyEvent> {
         if let Some(notice) = &self.non_git_notice {
             return notice

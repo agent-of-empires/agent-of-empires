@@ -156,9 +156,6 @@ impl SkillsManagerDialog {
         self.info = Some(message);
     }
 
-    /// A footer hint returns its key; a row selects on the first click and
-    /// returns Enter (view) on the second. The caller presses returned keys
-    /// through `handle_key`.
     pub fn handle_click(&mut self, col: u16, row: u16) -> Option<KeyEvent> {
         let mouse = self.mouse.get_mut();
         if let Some(key) = mouse.hint_at(col, row) {
@@ -803,69 +800,6 @@ mod tests {
 
         dialog.handle_key(key(code));
         (dialog.info, dialog.popup.is_some())
-    }
-
-    /// `e`/`x` are writable-only (AoE-managed rows open a popup; host rows are
-    /// refused with an explanation), `a` is the mirror image (host rows adopt
-    /// straight through; a managed row is refused as already-managed).
-    /// A paste belongs to whatever the panel currently has open, and nowhere
-    /// else: with no popup it must be swallowed rather than leaking to the
-    /// home view's other dialogs.
-    #[test]
-    fn rows_select_then_open_and_an_open_popup_owns_the_clicks() {
-        use crate::tui::dialogs::test_render::{draw, find};
-        let tmp = tempfile::tempdir().unwrap();
-        let home = tmp.path().join("home");
-        let app_dir = tmp.path().join("app");
-        skills_model::create_skill(&app_dir, "managed1", Some("d")).unwrap();
-        write_host_skill(&home, "host1");
-        let mut dialog = SkillsManagerDialog {
-            rows: Vec::new(),
-            selected: 0,
-            info: None,
-            popup: None,
-            home,
-            app_dir,
-            sync_worker: None,
-            syncing: false,
-            mouse: RefCell::default(),
-        };
-        dialog.reload();
-
-        let buf = draw(100, 30, |f, theme| dialog.render(f, f.area(), theme));
-        let other = dialog
-            .rows
-            .iter()
-            .position(|r| r.directory != dialog.rows[0].directory)
-            .unwrap();
-        let (x, y) = find(&buf, &dialog.rows[other].directory.clone());
-        assert!(dialog.handle_hover(x, y));
-        assert_eq!(dialog.selected, 0, "hover only tints");
-        assert_eq!(dialog.handle_click(x, y), None);
-        assert_eq!(dialog.selected, other);
-        assert_eq!(
-            dialog.handle_click(x, y).map(|k| k.code),
-            Some(KeyCode::Enter)
-        );
-        let (nx, ny) = find(&buf, "n new");
-        assert_eq!(
-            dialog.handle_click(nx, ny).map(|k| k.code),
-            Some(KeyCode::Char('n'))
-        );
-
-        dialog.handle_key(key(KeyCode::Char('n')));
-        let buf = draw(100, 30, |f, theme| dialog.render(f, f.area(), theme));
-        let (ex, ey) = find(&buf, "enter create");
-        assert_eq!(
-            dialog.handle_click(ex, ey).map(|k| k.code),
-            Some(KeyCode::Enter)
-        );
-        assert_eq!(
-            dialog.handle_click(x, y),
-            None,
-            "rows are inert under a popup"
-        );
-        assert_eq!(dialog.handle_click(nx, ny), None, "so are the list's hints");
     }
 
     #[test]

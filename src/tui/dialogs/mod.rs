@@ -125,10 +125,9 @@ pub fn target_rects<K>(targets: &[(K, Rect)]) -> Vec<Rect> {
     targets.iter().map(|(_, rect)| *rect).collect()
 }
 
-/// Left edge of a `width`-cell line that ratatui centers in `area`. Ratatui
-/// offsets by `area.width / 2 - width / 2`, which is a cell off from
-/// `(area.width - width) / 2` whenever the two widths differ in parity, so hit
-/// rects must use this or miss the last glyph.
+/// Left edge of a `width`-cell line ratatui centers in `area`. Ratatui uses
+/// `area.width / 2 - width / 2`, a cell off from `(area.width - width) / 2`
+/// when the parities differ.
 pub fn centered_x(area: Rect, width: u16) -> u16 {
     area.x + (area.width / 2).saturating_sub(width / 2)
 }

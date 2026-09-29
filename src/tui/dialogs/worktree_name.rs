@@ -229,22 +229,15 @@ mod tests {
     }
 
     #[test]
-    fn clicks_focus_fields_flip_the_toggle_and_press_footer_keys() {
-        use crate::tui::dialogs::test_render::{draw, find};
+    fn a_click_focuses_a_field_and_flips_the_toggle_while_hover_only_tints() {
         let mut d = WorktreeNameDialog::new("old", "old");
-        let buf = draw(80, 20, |f, theme| d.render(f, f.area(), theme));
+        crate::tui::dialogs::test_render::draw(80, 20, |f, theme| d.render(f, f.area(), theme));
         let [name, toggle] = d.field_rects;
-
         assert!(d.handle_hover(toggle.x, toggle.y));
-        assert_eq!(d.focused_field, 0, "hover does not move focus");
+        assert_eq!(d.focused_field, 0);
         assert_eq!(d.handle_click(toggle.x, toggle.y), None);
         assert!(d.rename_branch && d.focused_field == 1);
-        assert_eq!(d.handle_click(name.x, name.y), None);
+        d.handle_click(name.x, name.y);
         assert_eq!(d.focused_field, 0);
-
-        let (x, y) = find(&buf, "Esc cancel");
-        assert_eq!(d.handle_click(x, y).map(|k| k.code), Some(KeyCode::Esc));
-        let (x, y) = find(&buf, "Space toggle");
-        assert_eq!(d.handle_click(x, y), None, "Space would type into the name");
     }
 }

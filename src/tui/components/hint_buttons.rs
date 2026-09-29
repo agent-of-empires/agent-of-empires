@@ -1,8 +1,6 @@
-//! Footer key hints that double as buttons: clicking `Esc close` presses Esc.
-//!
-//! Keyboard-driven dialogs render their actions as hints; routing a click on
-//! a hint through the dialog's own `handle_key` gives mouse users the same
-//! actions without a second code path.
+//! Footer key hints that double as buttons. A keyboard-driven dialog's
+//! `handle_click` returns the clicked hint's key, and the caller presses it
+//! through the dialog's `handle_key`, so clicks share the keyboard's handling.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::buffer::Buffer;
@@ -13,11 +11,10 @@ use crate::tui::components::hover::{paint_hover_bg, HoverState};
 use crate::tui::dialogs::{centered_x, hit, row_index, target_rects};
 use crate::tui::styles::Theme;
 
-/// One hint: the key label shown, the action label, and the key it presses.
-/// `KeyCode::Null` draws the hint without making it clickable: for keys whose
-/// meaning depends on focus (Space types into a text field), and for Enter in
-/// lists whose hover moves the selection, where the pointer would cross rows
-/// on its way to the hint (a row click picks it directly).
+/// `(key label, action label, key pressed)`. `KeyCode::Null` is display-only:
+/// for focus-dependent keys (Space types into a text field), and for Enter in
+/// lists whose hover moves the selection, where reaching the hint would cross
+/// rows.
 pub type Hint<'a> = (&'a str, &'a str, KeyCode);
 
 const GAP: u16 = 2;
@@ -98,10 +95,9 @@ impl HintButtons {
     }
 }
 
-/// Mouse state for a panel of one-row list items over a `·`-separated
-/// footer, as the plugin and skills managers draw. Rows hover-tint only:
-/// footer actions act on the selected row, so the pointer crossing rows on its
-/// way to a hint must not retarget them.
+/// Mouse state for a list over a `·`-separated footer (plugin and skills
+/// managers). Rows only tint on hover: footer actions act on the selection,
+/// which the pointer must not retarget on its way to a hint.
 #[derive(Default)]
 pub struct ListMouse {
     list: Rect,
@@ -184,11 +180,9 @@ impl ListMouse {
     }
 }
 
-/// Hit rects for an already drawn `key action · key action` footer in `area`.
-/// Each segment presses its leading key token (`enter`, `esc`, `space`,
-/// `tab`, `ctrl+s`, or a single character); segments led by anything else,
-/// like `j/k`, stay inert. Reading the cells follows whatever wrapping the
-/// renderer did.
+/// Targets for a drawn `key action · key action` footer, following its
+/// wrapping. A segment led by `enter`, `esc`, `space`, `tab`, `ctrl+x` or a
+/// single character presses that key; others (`j/k`) stay inert.
 pub fn scan_dot_hints(buf: &Buffer, area: Rect) -> Vec<(KeyEvent, Rect)> {
     let area = area.intersection(buf.area);
     let mut hints = Vec::new();
@@ -215,10 +209,9 @@ pub fn scan_dot_hints(buf: &Buffer, area: Rect) -> Vec<(KeyEvent, Rect)> {
     hints
 }
 
-/// Hit rects for an already drawn hint row whose hints are separated by two
-/// or more spaces: `[L] Local    [Enter] confirm`, `[Esc close]  [S stop]`
-/// or `R: restart  Esc: close`. The leading token, stripped of brackets and a
-/// trailing colon, is the key, as in [`scan_dot_hints`].
+/// Like [`scan_dot_hints`] for hints separated by two or more spaces, as in
+/// `[L] Local`, `[Esc close]` or `R: restart`; brackets and a trailing colon
+/// are stripped from the key token.
 pub fn scan_spaced_hints(buf: &Buffer, area: Rect) -> Vec<(KeyEvent, Rect)> {
     let area = area.intersection(buf.area);
     let mut hints = Vec::new();
@@ -280,140 +273,89 @@ fn single_char(s: &str) -> Option<char> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tui::styles::load_theme;
-    use ratatui::backend::TestBackend;
-    use ratatui::Terminal;
+    use crate::tui::dialogs::test_render::{draw, find};
 
     #[test]
-    fn clicks_press_the_hint_under_the_cursor_for_every_alignment() {
-        let theme = load_theme("empire");
+    fn hint_rects_cover_the_drawn_labels_for_every_alignment() {
         let hints: &[Hint] = &[
+            ("Space", "toggle", KeyCode::Null),
             ("Enter", "select", KeyCode::Enter),
             ("Esc", "close", KeyCode::Esc),
         ];
+        // (width, alignment); 26 fits only the first two hints.
         for (width, alignment) in [
-            (40, Alignment::Left),
-            (40, Alignment::Center),
-            (41, Alignment::Center),
-            (40, Alignment::Right),
+            (50, Alignment::Left),
+            (50, Alignment::Center),
+            (51, Alignment::Center),
+            (50, Alignment::Right),
+            (26, Alignment::Left),
         ] {
             let mut buttons = HintButtons::default();
-            let mut terminal = Terminal::new(TestBackend::new(width, 1)).unwrap();
-            terminal
-                .draw(|f| buttons.render(f, f.area(), &theme, hints, alignment))
-                .unwrap();
-            let buf = terminal.backend().buffer().clone();
-            let row: String = (0..width).map(|x| buf[(x, 0)].symbol()).collect();
-            for (label, code) in [
-                ("Enter select", KeyCode::Enter),
-                ("Esc close", KeyCode::Esc),
-            ] {
-                let start = row.find(label).unwrap() as u16;
-                let end = start + label.len() as u16 - 1;
-                for x in [start, end] {
-                    assert_eq!(
-                        buttons.key_at(x, 0).map(|k| k.code),
-                        Some(code),
-                        "{alignment:?} width {width} col {x}"
-                    );
-                }
-                assert!(buttons.key_at(end + 1, 0).map(|k| k.code) != Some(code));
+            let buf = draw(width, 1, |f, theme| {
+                buttons.render(f, f.area(), theme, hints, alignment)
+            });
+            let (x, _) = find(&buf, "Space toggle");
+            assert_eq!(buttons.key_at(x, 0), None, "a Null hint is display-only");
+            let (x, _) = find(&buf, "Enter select");
+            for col in [x, x + 11] {
+                assert_eq!(buttons.key_at(col, 0).map(|k| k.code), Some(KeyCode::Enter));
             }
-            assert!(buttons.handle_hover(row.find("Esc").unwrap() as u16, 0));
-            assert!(buttons.handle_hover(0, 5));
+            assert_eq!(buttons.key_at(x + 12, 0), None, "{alignment:?} {width}");
+            let fits = width > 26;
+            assert_eq!(buttons.targets.len(), 1 + usize::from(fits), "{width}");
+            assert!(buttons.handle_hover(x, 0));
         }
     }
 
     #[test]
-    fn only_hints_that_fit_and_press_a_key_are_clickable() {
-        let theme = load_theme("empire");
-        let hints: &[Hint] = &[
-            ("Enter", "select", KeyCode::Enter),
-            ("Esc", "close", KeyCode::Esc),
+    fn scanned_hints_map_each_drawn_segment_to_its_key() {
+        use ratatui::widgets::Wrap;
+        let ctrl_s = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL);
+        let key = |c: KeyCode| KeyEvent::from(c);
+        type Scan = fn(&Buffer, Rect) -> Vec<(KeyEvent, Rect)>;
+        type Case<'a> = (&'a [&'a str], u16, Scan, Vec<(u16, u16, u16, KeyEvent)>);
+        // (lines, width, scanner, expected (x, y, width, key)); inert tokens
+        // such as `j/k` and `[←/→]` produce nothing, and wrapping is followed.
+        let cases: [Case; 2] = [
+            (
+                &["enter view · ctrl+s save · j/k scroll · A always · esc close"],
+                40,
+                scan_dot_hints,
+                vec![
+                    (0, 0, 10, key(KeyCode::Enter)),
+                    (13, 0, 11, ctrl_s),
+                    (0, 1, 8, key(KeyCode::Char('A'))),
+                    (11, 1, 9, key(KeyCode::Esc)),
+                ],
+            ),
+            (
+                &[
+                    "[←/→] choose    [L] Local    [Enter] confirm",
+                    "Elapsed: 5s    [Esc close]  [S stop]",
+                    "Tab: URL  ?: help",
+                ],
+                50,
+                scan_spaced_hints,
+                vec![
+                    (16, 0, 9, key(KeyCode::Char('L'))),
+                    (29, 0, 15, key(KeyCode::Enter)),
+                    (15, 1, 11, key(KeyCode::Esc)),
+                    (28, 1, 8, key(KeyCode::Char('S'))),
+                    (0, 2, 8, key(KeyCode::Tab)),
+                    (10, 2, 7, key(KeyCode::Char('?'))),
+                ],
+            ),
         ];
-        let mut buttons = HintButtons::default();
-        let mut terminal = Terminal::new(TestBackend::new(14, 1)).unwrap();
-        terminal
-            .draw(|f| buttons.render(f, f.area(), &theme, hints, Alignment::Left))
-            .unwrap();
-        assert_eq!(buttons.targets.len(), 1);
-        assert_eq!(buttons.key_at(13, 0), None);
-
-        let inert: &[Hint] = &[
-            ("Space", "toggle", KeyCode::Null),
-            ("Esc", "close", KeyCode::Esc),
-        ];
-        terminal
-            .draw(|f| buttons.render(f, f.area(), &theme, inert, Alignment::Left))
-            .unwrap();
-        assert_eq!(buttons.key_at(0, 0), None, "a Null hint is display-only");
-    }
-
-    #[test]
-    fn dot_hints_map_each_drawn_segment_to_its_key() {
-        let text = "enter view · ctrl+s save · j/k scroll · A always · esc close";
-        let mut terminal = Terminal::new(TestBackend::new(40, 2)).unwrap();
-        terminal
-            .draw(|f| {
-                f.render_widget(
-                    Paragraph::new(text).wrap(ratatui::widgets::Wrap { trim: true }),
-                    f.area(),
-                )
-            })
-            .unwrap();
-        let hints = scan_dot_hints(terminal.backend().buffer(), Rect::new(0, 0, 40, 2));
-        let got: Vec<(u16, u16, u16, KeyEvent)> =
-            hints.iter().map(|(k, r)| (r.x, r.y, r.width, *k)).collect();
-        assert_eq!(
-            got,
-            vec![
-                (0, 0, 10, KeyEvent::from(KeyCode::Enter)),
-                (
-                    13,
-                    0,
-                    11,
-                    KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL)
-                ),
-                (0, 1, 8, KeyEvent::from(KeyCode::Char('A'))),
-                (11, 1, 9, KeyEvent::from(KeyCode::Esc)),
-            ],
-            "j/k is inert and wrapping is followed"
-        );
-    }
-
-    #[test]
-    fn spaced_hints_accept_every_serve_style() {
-        let rows = [
-            "[←/→] choose    [L] Local    [Enter] confirm",
-            "Elapsed: 5s    [Esc close]  [S stop]",
-            "Tab: URL  ?: help  Esc: close",
-        ];
-        let mut terminal = Terminal::new(TestBackend::new(50, 3)).unwrap();
-        terminal
-            .draw(|f| {
-                f.render_widget(
-                    Paragraph::new(rows.iter().map(|r| Line::from(*r)).collect::<Vec<_>>()),
-                    f.area(),
-                )
-            })
-            .unwrap();
-        let hints = scan_spaced_hints(terminal.backend().buffer(), Rect::new(0, 0, 50, 3));
-        let got: Vec<(u16, u16, u16, KeyCode)> = hints
-            .iter()
-            .map(|(k, r)| (r.x, r.y, r.width, k.code))
-            .collect();
-        assert_eq!(
-            got,
-            vec![
-                (16, 0, 9, KeyCode::Char('L')),
-                (29, 0, 15, KeyCode::Enter),
-                (15, 1, 11, KeyCode::Esc),
-                (28, 1, 8, KeyCode::Char('S')),
-                (0, 2, 8, KeyCode::Tab),
-                (10, 2, 7, KeyCode::Char('?')),
-                (19, 2, 10, KeyCode::Esc),
-            ],
-            "arrows and plain text stay inert"
-        );
+        for (lines, width, scan, want) in cases {
+            let text: Vec<Line> = lines.iter().map(|l| Line::from(*l)).collect();
+            let buf = draw(width, 3, |f, _| {
+                f.render_widget(Paragraph::new(text).wrap(Wrap { trim: true }), f.area())
+            });
+            let got: Vec<_> = scan(&buf, buf.area)
+                .into_iter()
+                .map(|(k, r)| (r.x, r.y, r.width, k))
+                .collect();
+            assert_eq!(got, want, "{lines:?}");
+        }
     }
 }

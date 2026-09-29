@@ -37,9 +37,7 @@ pub fn render(
     active: bool,
 ) -> TranscriptGeometry {
     let layout = compute_layout(area, state);
-    // Each frame recaptures its mouse targets. The previous picker's window
-    // start is kept so hovering a row cannot scroll it out from under the
-    // pointer.
+    // Keep the previous window start so hover cannot scroll rows away.
     let prev_picker = state.mouse_targets.take().picker;
 
     let geometry = render_transcript(frame, layout.transcript, theme, state, active);

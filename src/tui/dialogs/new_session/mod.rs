@@ -1055,10 +1055,8 @@ pub(crate) fn project_picker_label(p: &crate::session::Project) -> String {
 
 /// Key of the first rect containing `(col, row)`.
 impl NewSessionDialog {
-    /// Route a left-click: the active picker first, then the open config
-    /// overlay, then the main form. Rows act as Space or Enter would on them
-    /// (checkboxes and cyclers advance, collapsed lists expand); text fields
-    /// only take focus. `None` when a main-form click missed every target.
+    /// Picker, then config overlay, then main form. Rows act as Space or Enter
+    /// would; text fields only take focus. `None` when nothing was hit.
     pub fn handle_click(&mut self, col: u16, row: u16) -> Option<DialogResult<NewSessionData>> {
         if self.show_help {
             self.show_help = false;
@@ -1165,10 +1163,8 @@ impl NewSessionDialog {
         }
     }
 
-    /// Pickers move their row highlight to the pointer; everywhere else hover
-    /// only tints the row under it. Never moves form focus, so a drifting
-    /// cursor cannot steal the field being typed into. Returns whether the
-    /// highlight changed.
+    /// Pickers move their highlight to the pointer; elsewhere hover only tints,
+    /// so a drifting cursor never steals the field being typed into.
     pub fn handle_hover(&mut self, col: u16, row: u16) -> bool {
         let picker_changed = if self.dir_picker.is_active() {
             Some(self.dir_picker.handle_hover(col, row))

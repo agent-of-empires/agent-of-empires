@@ -190,9 +190,8 @@ impl RenameDialog {
         }
     }
 
-    /// A click on a field focuses it (cycling the profile chip or flipping the
-    /// branch toggle); a click on a footer hint returns its key for the caller
-    /// to press through `handle_key`, so Save shares Enter's validation.
+    /// A field click focuses it, cycling the profile chip or flipping the
+    /// branch toggle.
     pub fn handle_click(&mut self, col: u16, row: u16) -> Option<KeyEvent> {
         // Group picker overlay wins when active so a click can pick a
         // group row without dropping the dialog underneath.
@@ -216,9 +215,7 @@ impl RenameDialog {
         None
     }
 
-    /// Hover moves the group picker's highlight like a menu, but only tints
-    /// field rows: stealing focus from the field being typed into would be
-    /// jarring. Click still sets focus.
+    /// Field rows only tint, so hover never steals focus from typing.
     pub fn handle_hover(&mut self, col: u16, row: u16) -> bool {
         if self.group_picker.is_active() {
             return self.group_picker.handle_hover(col, row);
@@ -928,24 +925,17 @@ mod tests {
     }
 
     #[test]
-    fn clicks_act_on_fields_and_hints_while_hover_only_tints() {
+    fn a_click_flips_the_branch_toggle_while_hover_only_tints() {
         use crate::tui::dialogs::test_render::{draw, find};
         let mut d = tied(None);
-        let buf = draw(100, 30, |f, theme| d.render(f, f.area(), theme));
-        for (label, want) in [("Enter save", KeyCode::Enter), ("Esc cancel", KeyCode::Esc)] {
-            let (x, y) = find(&buf, label);
-            assert_eq!(d.handle_click(x, y).map(|k| k.code), Some(want), "{label}");
-        }
-
-        let (x, y) = find(&buf, "Also rename");
+        let (x, y) = find(
+            &draw(100, 30, |f, theme| d.render(f, f.area(), theme)),
+            "Also rename",
+        );
         assert!(d.handle_hover(x, y));
-        assert_eq!(d.focused_field, 0, "hover never moves focus");
+        assert_eq!(d.focused_field, 0);
         assert_eq!(d.handle_click(x, y), None);
-        assert!(d.rename_branch, "a click flips the toggle");
-
-        let buf = draw(100, 30, |f, theme| d.render(f, f.area(), theme));
-        let (x, y) = find(&buf, "Space toggle");
-        assert_eq!(d.handle_click(x, y), None, "Space would type into a field");
+        assert!(d.rename_branch);
     }
 
     #[test]

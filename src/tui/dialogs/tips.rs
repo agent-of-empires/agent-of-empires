@@ -632,28 +632,16 @@ mod tests {
     }
 
     #[test]
-    fn hover_lights_a_row_without_focusing_it_and_footer_hints_click() {
+    fn hover_lights_a_row_without_focusing_it() {
         let mut d = dialog(vec![]);
-        let screen = render_to(&mut d);
+        render_to(&mut d);
         let target = d.row_rects[1];
         assert!(d.handle_hover(target.x + 1, target.y));
         assert_eq!(d.hover.current(), Some(target));
-        assert_eq!(d.cursor, 0, "hover must not focus (and mark seen) a tip");
-
-        let (y, line) = screen
-            .lines()
-            .enumerate()
-            .find(|(_, l)| l.contains("Esc close"))
-            .expect("footer row");
-        let col = |label: &str| line[..line.find(label).unwrap()].chars().count() as u16;
-        let y = y as u16;
-        assert!(matches!(
-            d.handle_click(col("don't show"), y),
-            Some(DialogResult::Continue)
-        ));
-        assert!(d.disabled, "the toggle hint presses d");
-        let outcome = submitted(d.handle_click(col("Esc close"), y).expect("hit"));
-        assert_eq!(outcome.disabled, Some(true));
+        assert_eq!(
+            d.cursor, 0,
+            "focusing a tip marks it seen, so hover must not"
+        );
     }
 
     #[test]

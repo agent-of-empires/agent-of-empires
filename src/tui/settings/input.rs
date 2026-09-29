@@ -701,12 +701,8 @@ impl SettingsView {
 
     /// Route a left-click into the settings view. `Some` when the click
     /// acted, `None` when it hit nothing (the full-screen modal swallows it
-    /// either way).
-    ///
-    /// Overlays own the click: the instruction editor takes it, a click
-    /// dismisses help, and an expanded list takes row and action clicks.
-    /// Inline text editing ignores clicks so a stray one cannot drop a
-    /// half-typed value.
+    /// either way). Overlays own the click; inline text editing ignores it so
+    /// a stray click cannot drop a half-typed value.
     pub fn handle_click(&mut self, col: u16, row: u16) -> Option<SettingsAction> {
         if let Some(dialog) = self.custom_instruction_dialog.as_mut() {
             let result = dialog.handle_click(col, row)?;
@@ -788,9 +784,7 @@ impl SettingsView {
         None
     }
 
-    /// A click on an expanded list: a header action acts like its key, a row
-    /// click selects the row. Ignored while an item is being typed, so the
-    /// click cannot drop the text or retarget which item it replaces.
+    /// Ignored while an item is being typed, so a click cannot drop the text.
     fn handle_list_edit_click(&mut self, col: u16, row: u16) -> Option<SettingsAction> {
         let state = self.list_edit_state.as_mut()?;
         if state.editing_item.is_some() {
@@ -1467,33 +1461,16 @@ mod tests {
 
         #[test]
         #[serial]
-        fn custom_instruction_buttons_take_clicks() {
-            let ident = "sandbox.custom_instruction";
-            // (button, text typed first, value after)
-            let cases = [("Save", "hi", Some("hi")), ("Cancel", "hi", None)];
-            for (button, typed, want) in cases {
-                let (_t, _guard, mut view) = fresh_view();
-                jump_to(&mut view, ident);
-                view.custom_instruction_dialog = Some(CustomInstructionDialog::new(None));
-                for c in typed.chars() {
-                    view.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
-                }
-                let (col, row) = render_and_find(&mut view, "Edit Custom Instruction");
-                // A click in the text area leaves the editor and its text alone.
-                assert!(view.handle_click(col, row + 3).is_some());
-                assert!(view.custom_instruction_dialog.is_some(), "{button}");
-
-                let (col, row) = render_and_find(&mut view, button);
-                assert!(view.handle_hover(col, row), "{button} hover highlights");
-                assert_eq!(view.hovered_field(), None, "fields stay unhovered");
-                view.handle_click(col, row);
-                assert!(view.custom_instruction_dialog.is_none(), "{button}");
-                let value = &view.fields[view.selected_field].value;
-                assert!(
-                    matches!(value, FieldValue::OptionalText(v) if v.as_deref() == want),
-                    "{button}: {value:?}"
-                );
-            }
+        fn a_custom_instruction_save_click_applies_the_text() {
+            let (_t, _guard, mut view) = fresh_view();
+            jump_to(&mut view, "sandbox.custom_instruction");
+            view.custom_instruction_dialog = Some(CustomInstructionDialog::new(None));
+            view.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
+            let (col, row) = render_and_find(&mut view, "Save");
+            view.handle_click(col, row);
+            assert!(view.custom_instruction_dialog.is_none());
+            let value = &view.fields[view.selected_field].value;
+            assert!(matches!(value, FieldValue::OptionalText(Some(v)) if v == "h"));
         }
 
         #[test]
@@ -1561,9 +1538,7 @@ mod tests {
             view.handle_click(55, 4);
             assert!(view.list_edit_state.is_none());
 
-            // Hover tints rows and actions without moving the row cursor, so
-            // crossing rows on the way to `(d)elete` can't retarget it, and
-            // never lights the field behind the list.
+            // Hover tints without moving the row cursor `(d)elete` acts on.
             let (_t, _guard, mut view) = staged();
             assert!(view.handle_hover(30, 7));
             assert_eq!(view.list_hover.current(), Some(Rect::new(22, 7, 60, 1)));

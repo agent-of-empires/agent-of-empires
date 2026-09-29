@@ -993,60 +993,24 @@ mod tests {
             picker: kind.map(picker),
             buttons: vec![(Rect::new(50, 17, 6, 1), deny.clone())],
         };
+        use Focus::{Composer, Pane, Transcript};
+        let (choice, slash, mention) = (
+            Some(PickerKind::Choice),
+            Some(PickerKind::Slash),
+            Some(PickerKind::Mention),
+        );
         let cases = [
-            (
-                Some(PickerKind::Choice),
-                10,
-                16,
-                Focus::Composer,
-                Intent::ChoicePick(4),
-            ),
-            (
-                Some(PickerKind::Slash),
-                10,
-                18,
-                Focus::Composer,
-                Intent::SlashPick(6),
-            ),
-            (
-                Some(PickerKind::Mention),
-                37,
-                17,
-                Focus::Composer,
-                Intent::MentionPick(5),
-            ),
+            (choice, 10, 16, Composer, Intent::ChoicePick(4)),
+            (slash, 10, 18, Composer, Intent::SlashPick(6)),
+            (mention, 37, 17, Composer, Intent::MentionPick(5)),
             // Border and padding cells pick nothing and never reach the pane.
-            (
-                Some(PickerKind::Choice),
-                10,
-                15,
-                Focus::Composer,
-                Intent::Ignore,
-            ),
-            (
-                Some(PickerKind::Choice),
-                1,
-                17,
-                Focus::Composer,
-                Intent::Ignore,
-            ),
+            (choice, 10, 15, Composer, Intent::Ignore),
+            (choice, 1, 17, Composer, Intent::Ignore),
             // An open picker still owns clicks under the pane overlay.
-            (
-                Some(PickerKind::Choice),
-                10,
-                16,
-                Focus::Pane,
-                Intent::ChoicePick(4),
-            ),
-            (None, 52, 17, Focus::Composer, deny.clone()),
-            (
-                None,
-                49,
-                17,
-                Focus::Transcript,
-                Intent::SetFocus(Focus::Transcript),
-            ),
-            (None, 49, 17, Focus::Pane, Intent::Ignore),
+            (choice, 10, 16, Pane, Intent::ChoicePick(4)),
+            (None, 52, 17, Composer, deny.clone()),
+            (None, 49, 17, Transcript, Intent::SetFocus(Transcript)),
+            (None, 49, 17, Pane, Intent::Ignore),
         ];
         let click = MouseEventKind::Down(MouseButton::Left);
         for (kind, col, row, focus, want) in cases {

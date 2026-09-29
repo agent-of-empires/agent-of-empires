@@ -425,9 +425,6 @@ impl PluginManagerDialog {
         self.popup_user_scrolled = false;
     }
 
-    /// A footer hint returns its key; a list row selects on the first click
-    /// and returns Enter (details, or install in discovery) on the second.
-    /// The caller presses returned keys through `handle_key`.
     pub fn handle_click(&mut self, col: u16, row: u16) -> Option<KeyEvent> {
         if let Some(key) = self.mouse.get_mut().hint_at(col, row) {
             return Some(key);
