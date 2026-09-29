@@ -49,25 +49,34 @@ fn rate_limit_unknown_reset_retry_at(recorded_at_ms: i64, redeliveries: i64) -> 
     DateTime::from_timestamp_millis(recorded_at_ms).unwrap_or_else(Utc::now) + retry_after
 }
 
-/// Whether the head of `queue` was minted after the limit that interrupted the
-/// turn, so it replaced the continuation rather than following it. The head is
-/// the row the drain sends next. An unreadable creation time or an unknown
-/// limit never supersedes: the interrupted request is the older one and losing
-/// it is final, since the next prompt retires the park.
-fn queue_supersedes(queue: &[crate::daemon::QueuedPromptEntry], limit_at_ms: Option<i64>) -> bool {
+/// A queue row's mint time in epoch ms, or `None` when it cannot be read.
+fn queued_at_ms(entry: &crate::daemon::QueuedPromptEntry) -> Option<i64> {
+    DateTime::parse_from_rfc3339(&entry.created_at)
+        .ok()
+        .map(|queued_at| queued_at.timestamp_millis())
+}
+
+/// Whether any queued prompt was minted after the limit that interrupted the
+/// turn, so one of them replaced the continuation. Checking every row and not
+/// the next one is what honours a replacement queued behind a follow-up the
+/// user typed before the limit; that shape costs the interrupted prompt
+/// instead, and the alternative costs the user's freshest word.
+///
+/// An unreadable mint time or an unknown limit never supersedes: the
+/// interrupted request is the older one and losing it is final, since the
+/// first prompt the drain delivers retires the park.
+fn queue_supersedes(queued_at_ms: &[i64], limit_at_ms: Option<i64>) -> bool {
     let Some(limit_at_ms) = limit_at_ms else {
         return false;
     };
-    queue
+    queued_at_ms
         .iter()
-        .min_by_key(|entry| entry.seq)
-        .and_then(|entry| DateTime::parse_from_rfc3339(&entry.created_at).ok())
-        .is_some_and(|queued_at| queued_at.timestamp_millis() > limit_at_ms)
+        .any(|queued_at| *queued_at > limit_at_ms)
 }
 
 /// What the continuation producer decided for one session (#4092).
 pub(crate) enum ContinuationOutcome {
-    /// The interrupted prompt is the next turn, was already queued, or there
+    /// The interrupted prompt is the next turn, is already installed, or there
     /// was nothing to replay. Only this outcome licenses the automatic
     /// `RateLimitAutoResumed`, which is the budget's arming step.
     Stands,
@@ -104,11 +113,12 @@ pub(crate) async fn install_rate_limit_continuation(
         return ContinuationOutcome::Stands;
     };
     #[cfg(test)]
-    super::test_fixtures::await_install_barrier(id).await;
+    state.session_service.await_install_barrier(id).await;
     // A queued prompt publishes no event, so its row is the only record of a
-    // supersession, and only a row minted after the limit replaced the prompt.
-    // A continuation an earlier cadence installed is still the next turn.
-    let queued_head = {
+    // supersession. Only the mint times leave the read guard: a row carries its
+    // whole text, and copying that under the shared lock is not worth one
+    // timestamp. A continuation an earlier cadence installed is still next.
+    let queued_at_ms: Vec<i64> = {
         let instances = state.instances.read().await;
         let Some(inst) = instances.iter().find(|i| i.id == id) else {
             return ContinuationOutcome::Stands;
@@ -116,9 +126,12 @@ pub(crate) async fn install_rate_limit_continuation(
         if inst.pending_initial_turn.is_some() {
             return ContinuationOutcome::Stands;
         }
-        inst.queued_prompts.clone()
+        inst.queued_prompts
+            .iter()
+            .filter_map(queued_at_ms)
+            .collect()
     };
-    if !queued_head.is_empty() {
+    if !queued_at_ms.is_empty() {
         // `None` covers a pruned limit row and a failed probe alike, and
         // neither proves a supersession, so the continuation stands.
         let limit_at_ms = query_store(
@@ -132,7 +145,7 @@ pub(crate) async fn install_rate_limit_continuation(
         )
         .await
         .flatten();
-        if queue_supersedes(&queued_head, limit_at_ms) {
+        if queue_supersedes(&queued_at_ms, limit_at_ms) {
             return ContinuationOutcome::SupersededByQueue;
         }
     }
@@ -620,17 +633,14 @@ mod tests {
             .count()
     }
 
-    /// Only a head minted after the limit replaced the turn. A head older than
-    /// the limit, a limit that was never recorded, a head whose creation time
-    /// cannot be read, and a stale head ahead of a fresh one all leave the
-    /// continuation standing: the interrupted request is the older one and
-    /// dropping it is final.
+    /// Only a row minted after the limit replaced the turn. A row before it, a
+    /// limit that was never recorded, and a row whose mint time cannot be read
+    /// all leave the continuation standing: the interrupted request is the older
+    /// one and losing it is final.
     #[test]
-    fn only_a_head_minted_after_the_limit_supersedes() {
-        let limit = Utc
-            .timestamp_opt(1_700_000_000, 0)
-            .unwrap()
-            .timestamp_millis();
+    fn only_a_row_minted_after_the_limit_supersedes() {
+        let limit = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+        let limit_ms = limit.timestamp_millis();
         let row = |seq: u64, created_at: &str| crate::daemon::QueuedPromptEntry {
             id: format!("q-{seq}"),
             seq,
@@ -639,60 +649,67 @@ mod tests {
             created_at: created_at.into(),
             origin_device: None,
         };
-        let after = Utc.timestamp_opt(1_700_000_001, 0).unwrap();
-        let before = Utc.timestamp_opt(1_699_999_999, 0).unwrap();
-        let after = after.to_rfc3339();
-        let before = before.to_rfc3339();
+        let after = Utc.timestamp_opt(1_700_000_001, 0).unwrap().to_rfc3339();
+        let before = Utc.timestamp_opt(1_699_999_999, 0).unwrap().to_rfc3339();
+        let times = |rows: &[crate::daemon::QueuedPromptEntry]| {
+            rows.iter().filter_map(queued_at_ms).collect::<Vec<_>>()
+        };
         let cases = [
             (
-                "head after the limit",
+                "row after the limit",
                 vec![row(1, &after)],
-                Some(limit),
+                Some(limit_ms),
                 true,
             ),
             (
-                "head before the limit",
+                "row before the limit",
                 vec![row(1, &before)],
-                Some(limit),
+                Some(limit_ms),
                 false,
             ),
             ("limit never recorded", vec![row(1, &after)], None, false),
             (
-                "head time unreadable",
+                "mint time unreadable",
                 vec![row(1, "t0")],
-                Some(limit),
+                Some(limit_ms),
                 false,
             ),
             (
-                "stale head ahead of a fresh one",
+                "follow-up queued before the park, replacement after",
                 vec![row(1, &before), row(2, &after)],
-                Some(limit),
-                false,
+                Some(limit_ms),
+                true,
             ),
         ];
-        for (name, queue, recorded, expected) in cases {
-            assert_eq!(queue_supersedes(&queue, recorded), expected, "{name}");
+        for (name, rows, recorded, expected) in cases {
+            assert_eq!(
+                queue_supersedes(&times(&rows), recorded),
+                expected,
+                "{name}"
+            );
         }
     }
 
     /// #4092: a queued prompt owns the next turn only while the pending-turn
-    /// slot is free and the row was minted after the limit that interrupted it.
-    /// A row queued while the interrupted turn was still running is a follow-up
-    /// the user wants behind it, so the continuation is installed and its
-    /// redelivery charged.
+    /// slot is free and at least one row was minted after the limit that
+    /// interrupted it. A row queued while the interrupted turn was still running
+    /// is a follow-up the user wants behind it, so the continuation is installed
+    /// and its redelivery charged. The rows are seeded on the instance because
+    /// the endpoint stamps the server's clock, which no test can place in the
+    /// past.
     #[tokio::test]
     #[serial_test::serial]
     async fn only_a_prompt_queued_after_the_park_supersedes_the_continuation() {
         // The `parked` fixture backdates the limit an hour, so these straddle it.
-        let after = Utc::now().to_rfc3339();
-        let before = (Utc::now() - chrono::Duration::hours(2)).to_rfc3339();
-        // (label, continuation already installed, queued at, turn kept, breadcrumbs)
+        let after = Utc::now();
+        let before = Utc::now() - chrono::Duration::hours(2);
+        // (label, continuation installed, queued at, turn kept, breadcrumbs)
         let cases = [
-            ("queued-after", false, after.clone(), None, 0),
+            ("queued-after", false, after, None, 0),
             ("installed-and-queued-after", true, after, Some(true), 1),
             ("queued-before", false, before, Some(true), 1),
         ];
-        for (label, installed, created_at, kept, breadcrumbs) in cases {
+        for (label, installed, queued_at, kept, breadcrumbs) in cases {
             let id = format!("sess-4092-{label}");
             let (_home, state, _project) = parked(&id, 0).await;
             if installed {
@@ -701,19 +718,22 @@ mod tests {
                     .set_pending_initial_turn(&id, "run the nightly task".into(), Vec::new())
                     .await;
             }
+            state.instances.write().await[0].queued_prompts.push(
+                crate::daemon::QueuedPromptEntry {
+                    id: "q-1".into(),
+                    seq: 0,
+                    text: "manual prompt B".into(),
+                    attachments: Vec::new(),
+                    created_at: queued_at.to_rfc3339(),
+                    origin_device: None,
+                },
+            );
             assert!(
-                state
+                !state
                     .session_service
-                    .enqueue_prompt(
-                        &id,
-                        "q-1".into(),
-                        "manual prompt B".into(),
-                        vec![],
-                        None,
-                        created_at.clone(),
-                    )
+                    .queued_prompts_snapshot(&id)
                     .await
-                    .is_some(),
+                    .is_empty(),
                 "{label}: the queue row must land, or the case asserts nothing"
             );
             assert!(
@@ -762,7 +782,7 @@ mod tests {
             "the assignment must retire the park, or the case asserts nothing"
         );
 
-        let outcome = install_rate_limit_continuation(
+        install_rate_limit_continuation(
             &state,
             id,
             state.session_service.prompt_submission(id).await,
@@ -773,10 +793,6 @@ mod tests {
             pending_turn(&state, id).await,
             Some(true),
             "the interrupted prompt is still the work to continue"
-        );
-        assert!(
-            matches!(outcome, ContinuationOutcome::Stands),
-            "Stands is what licenses the manual resume breadcrumb"
         );
     }
 

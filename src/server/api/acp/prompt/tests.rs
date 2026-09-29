@@ -521,14 +521,7 @@ async fn a_direct_prompt_and_the_queue_drain_cannot_both_own_the_same_turn() {
         .await;
     state
         .session_service
-        .enqueue_prompt(
-            &id,
-            "q1".into(),
-            "queued follow-up".into(),
-            vec![],
-            None,
-            "t0".into(),
-        )
+        .enqueue_prompt(&id, "q1".into(), "queued follow-up".into(), vec![], None)
         .await
         .expect("session exists");
 
@@ -718,7 +711,7 @@ async fn a_manual_prompt_cannot_overtake_a_continuation_install() {
         state.session_service.clear_pending_initial_turn(&id).await;
         assert!(persisted_pending_turn(&state, &id).await.is_none());
 
-        let mut barrier = crate::server::acp_reconciler::arm_install_barrier();
+        let mut barrier = state.session_service.arm_install_barrier();
         let mut claims = state.session_service.watch_submission_claims();
         let producer = tokio::spawn({
             let state = Arc::clone(&state);
@@ -735,11 +728,10 @@ async fn a_manual_prompt_cannot_overtake_a_continuation_install() {
             }
         });
         // Causal barrier: A has been read from the store and is not installed.
-        let (read_id, release) =
-            tokio::time::timeout(Duration::from_secs(10), barrier.reads.recv())
-                .await
-                .expect("the producer must reach the barrier")
-                .expect("the barrier tap outlives the producer");
+        let (read_id, release) = tokio::time::timeout(Duration::from_secs(10), barrier.recv())
+            .await
+            .expect("the producer must reach the barrier")
+            .expect("the barrier tap outlives the producer");
         assert_eq!(read_id, id, "{label}");
         assert!(
             state.instances.read().await[0]

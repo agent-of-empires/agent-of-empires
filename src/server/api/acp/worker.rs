@@ -90,8 +90,8 @@ pub async fn spawn_acp(
         Ok(j) => j,
         Err(rej) => return rej.into_response(),
     };
-    // Claimed ahead of the instance lock like every other mutation surface
-    // (#4092); the claim also proves the session exists.
+    // Submission authority before `instance_lock`, as the permanent DELETE
+    // path takes them (#4092); the claim also proves the session exists.
     let Some(_submission) = state
         .session_service
         .prompt_submission_for_session(&id)

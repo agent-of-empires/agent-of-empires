@@ -152,6 +152,13 @@ pub struct SessionService {
     /// reaches `prompt_locks`. See [`SessionService::watch_submission_claims`].
     #[cfg(test)]
     submission_claims: std::sync::OnceLock<tokio::sync::mpsc::UnboundedSender<String>>,
+    /// Holds a continuation install between its store read and its write, so a
+    /// test can admit a prompt in that window. Per service, like
+    /// `created_instance_gate`, so it cannot leak into another test.
+    #[cfg(test)]
+    pub(crate) install_barrier: std::sync::Mutex<
+        Option<tokio::sync::mpsc::UnboundedSender<(String, tokio::sync::oneshot::Sender<()>)>>,
+    >,
     #[cfg(test)]
     pub(super) created_instance_gate: std::sync::Mutex<
         Option<(
@@ -299,6 +306,8 @@ impl SessionService {
             prompt_locks: RwLock::new(HashMap::new()),
             #[cfg(test)]
             submission_claims: std::sync::OnceLock::new(),
+            #[cfg(test)]
+            install_barrier: std::sync::Mutex::new(None),
             #[cfg(test)]
             created_instance_gate: std::sync::Mutex::new(None),
         }
@@ -882,7 +891,6 @@ impl SessionService {
         text: String,
         attachments: Vec<crate::daemon::PromptAttachmentRef>,
         origin_device: Option<String>,
-        created_at: String,
     ) -> Option<crate::daemon::QueuedPromptEntry> {
         self.mutate_instance_persisted(id, move |inst| {
             inst.last_accessed_at = inst.last_accessed_at.max(Some(chrono::Utc::now()));
@@ -898,7 +906,10 @@ impl SessionService {
                 seq,
                 text: text.clone(),
                 attachments: attachments.clone(),
-                created_at: created_at.clone(),
+                // The server's clock, drawn in the same critical section that
+                // assigns `seq`, so row order and stamp order agree and the
+                // resume admission can order rows against the park (#4092).
+                created_at: chrono::Utc::now().to_rfc3339(),
                 origin_device: origin_device.clone(),
             };
             inst.queued_prompts.push(entry.clone());
@@ -1349,6 +1360,36 @@ impl SessionService {
 
     /// Report every [`Self::prompt_submission`] claim at the one moment a deletion-race
     /// test can use.
+    /// Arm the install barrier for one test. Each producer read reports its
+    /// session id to the receiver and waits for the returned ack before it
+    /// installs; dropping the receiver disarms the gate with the service.
+    #[cfg(test)]
+    pub(crate) fn arm_install_barrier(
+        &self,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<(String, tokio::sync::oneshot::Sender<()>)> {
+        let (tx, reads) = tokio::sync::mpsc::unbounded_channel();
+        *self
+            .install_barrier
+            .lock()
+            .expect("install_barrier mutex poisoned") = Some(tx);
+        reads
+    }
+
+    /// Block an armed install until the test releases it.
+    #[cfg(test)]
+    pub(super) async fn await_install_barrier(&self, id: &str) {
+        let sender = self
+            .install_barrier
+            .lock()
+            .expect("install_barrier mutex poisoned")
+            .clone();
+        let Some(tx) = sender else { return };
+        let (ack, released) = tokio::sync::oneshot::channel();
+        if tx.send((id.to_string(), ack)).is_ok() {
+            let _ = released.await;
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn watch_submission_claims(&self) -> tokio::sync::mpsc::UnboundedReceiver<String> {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1874,7 +1915,6 @@ mod tests {
                         size: 9,
                     }],
                     None,
-                    "t0".into(),
                 )
                 .await
                 .expect("session exists");
@@ -1912,14 +1952,7 @@ mod tests {
         // Deliverable text, so the drain reaches `send_turn` rather than
         // retiring an undeliverable husk on the way.
         service
-            .enqueue_prompt(
-                "sess-3621",
-                "q1".into(),
-                "follow-up".into(),
-                vec![],
-                None,
-                "t0".into(),
-            )
+            .enqueue_prompt("sess-3621", "q1".into(), "follow-up".into(), vec![], None)
             .await
             .expect("session exists");
 
@@ -1984,14 +2017,7 @@ mod tests {
         inst.status = crate::session::Status::Idle;
         let service = service_for(vec![inst]);
         service
-            .enqueue_prompt(
-                "sess-mut",
-                "q1".into(),
-                "original".into(),
-                vec![],
-                None,
-                "t0".into(),
-            )
+            .enqueue_prompt("sess-mut", "q1".into(), "original".into(), vec![], None)
             .await
             .expect("session exists");
 
@@ -2169,7 +2195,6 @@ mod tests {
                 "follow-up behind a live turn".into(),
                 vec![],
                 None,
-                "t0".into(),
             )
             .await
             .expect("session exists");
@@ -2232,7 +2257,6 @@ mod tests {
                     format!("prompt {i}"),
                     vec![],
                     None,
-                    "t".into(),
                 )
                 .await
             }));
@@ -2286,7 +2310,7 @@ mod tests {
                 false,
                 |s| {
                     Box::pin(async move {
-                        s.enqueue_prompt("s", "p".into(), "t".into(), vec![], None, "t0".into())
+                        s.enqueue_prompt("s", "p".into(), "t".into(), vec![], None)
                             .await;
                     })
                 },
@@ -2357,25 +2381,11 @@ mod tests {
 
         // Enqueue two.
         let a = service
-            .enqueue_prompt(
-                "sess-q",
-                "a".into(),
-                "first".into(),
-                vec![],
-                None,
-                "t0".into(),
-            )
+            .enqueue_prompt("sess-q", "a".into(), "first".into(), vec![], None)
             .await
             .expect("session exists");
         let b = service
-            .enqueue_prompt(
-                "sess-q",
-                "b".into(),
-                "second".into(),
-                vec![],
-                None,
-                "t1".into(),
-            )
+            .enqueue_prompt("sess-q", "b".into(), "second".into(), vec![], None)
             .await
             .expect("session exists");
         assert_eq!((a.seq, b.seq), (0, 1));
@@ -2387,14 +2397,7 @@ mod tests {
 
         // Re-enqueue by the same id is an idempotent update, not a duplicate.
         let a2 = service
-            .enqueue_prompt(
-                "sess-q",
-                "a".into(),
-                "first edited".into(),
-                vec![],
-                None,
-                "t2".into(),
-            )
+            .enqueue_prompt("sess-q", "a".into(), "first edited".into(), vec![], None)
             .await
             .expect("session exists");
         assert_eq!(a2.seq, 0, "re-enqueue keeps the original seq");
@@ -2443,14 +2446,7 @@ mod tests {
 
         // A gone session is a None/no-op, never a panic.
         assert!(service
-            .enqueue_prompt(
-                "sess-gone",
-                "z".into(),
-                "x".into(),
-                vec![],
-                None,
-                "t".into()
-            )
+            .enqueue_prompt("sess-gone", "z".into(), "x".into(), vec![], None)
             .await
             .is_none());
     }

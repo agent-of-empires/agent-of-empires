@@ -20,8 +20,6 @@ use crate::session::Instance;
 
 pub(crate) use rate_limit::install_rate_limit_continuation;
 pub(crate) use resume::{command_override_for_spawn, trigger_resume_background, ResumeTrigger};
-#[cfg(test)]
-pub(crate) use test_fixtures::arm_install_barrier;
 
 use resume::{resume_one, ResumeTarget};
 
