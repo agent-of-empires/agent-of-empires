@@ -1946,6 +1946,20 @@ impl SessionConfig {
             .unwrap_or_default()
     }
 
+    /// The command a session runs when it carries no per-session override: the
+    /// built-in's binary, else the config's override. The builder gives a
+    /// per-session `command_override` absolute priority over both, so a
+    /// session can differ from this; a surface without the session uses this.
+    pub fn launch_command_for(&self, tool: &str) -> String {
+        let resolved = self.resolve_tool_command(tool);
+        if !resolved.is_empty() {
+            return resolved;
+        }
+        crate::agents::get_agent(tool)
+            .map(|agent| agent.binary.to_string())
+            .unwrap_or_default()
+    }
+
     /// The `agent_config_dir` entry for `tool`, with a leading `~` expanded.
     ///
     /// `tool` is the name the session runs, so a custom agent is looked up

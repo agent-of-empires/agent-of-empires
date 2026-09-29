@@ -31,19 +31,19 @@ fn tmux_available() -> bool {
         .unwrap_or(false)
 }
 
-struct Fails {
+struct Run {
     code: Option<i32>,
     stdout: String,
     stderr: String,
 }
 
-impl Fails {
+impl Run {
     fn all(&self) -> String {
         format!("{}{}", self.stdout, self.stderr)
     }
 }
 
-fn run_aoe(home: &Path, xdg: &Path, stub: &Path, socket: &Path, args: &[&str]) -> Fails {
+fn run_aoe(home: &Path, xdg: &Path, stub: &Path, socket: &Path, args: &[&str]) -> Run {
     let out = Command::new(env!("CARGO_BIN_EXE_aoe"))
         .args(args)
         .env(
@@ -68,7 +68,7 @@ fn run_aoe(home: &Path, xdg: &Path, stub: &Path, socket: &Path, args: &[&str]) -
         .env_remove("AGENT_OF_EMPIRES_PROFILE")
         .output()
         .expect("run aoe");
-    Fails {
+    Run {
         code: out.status.code(),
         stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
@@ -116,7 +116,7 @@ fn hooks_disclosure_follows_the_effective_config() {
     let socket = tmp.path().join("tmux.sock");
 
     // (label, config, agent launched, path a launch must write, event to show)
-    let cases: [(&str, String, &str, PathBuf, Option<&str>); 3] = [
+    let cases: [(&str, String, &str, PathBuf, Option<&str>); 4] = [
         (
             "profile environment reroutes the agent config dir",
             format!(
@@ -143,6 +143,14 @@ fn hooks_disclosure_follows_the_effective_config() {
             "claude",
             home.join(".claude").join("settings.json"),
             Some("aoe __extract-session-id --field session-id"),
+        ),
+        (
+            "a command that is a built-in binary resolves to that binary, not the alias",
+            "[session.custom_agents]\ncorp = \"claude\"\n\n[session.agent_detect_as]\ncorp = \"codex\"\n"
+                .to_string(),
+            "corp",
+            home.join(".claude").join("settings.json"),
+            None,
         ),
     ];
 

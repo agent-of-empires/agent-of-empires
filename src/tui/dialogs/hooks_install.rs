@@ -22,33 +22,15 @@ pub struct HooksInstallDialog {
 }
 
 impl HooksInstallDialog {
-    pub fn new(tool_name: &str) -> Self {
-        Self::new_for_profile(tool_name, None)
-    }
-
-    pub fn new_for_profile(tool_name: &str, profile: Option<&str>) -> Self {
-        let config = profile.map(crate::session::config::profile_config::resolve_config_or_warn);
-        let session = config.as_ref().map(|config| &config.session);
-        let execution_as = session
-            .and_then(|s| s.agent_execution_as.get(tool_name))
-            .map(String::as_str);
-        let detect_as = session
-            .and_then(|s| s.agent_detect_as.get(tool_name))
-            .map(String::as_str);
-        let namespaces = session.is_some_and(|s| s.agent_config_dir.contains_key(tool_name));
-        let agent_name =
-            crate::session::host_hook_agent_name(tool_name, execution_as, detect_as, namespaces);
-        Self::new_for_profile_resolved(tool_name, &agent_name, profile)
-    }
-
-    pub fn new_for_profile_resolved(
+    /// `agent` is the one the gate resolved for this session, and `config` the
+    /// one the gate read, so the dialog describes the same install the launch
+    /// would install rather than a second derivation of it.
+    pub fn new(
         tool_name: &str,
-        agent_name: &str,
-        profile: Option<&str>,
+        agent: &'static crate::agents::AgentDef,
+        config: &crate::session::config::Config,
     ) -> Self {
-        let config = profile.map(crate::session::config::profile_config::resolve_config_or_warn);
-        let disclosure =
-            crate::session::host_hook_disclosure(tool_name, agent_name, config.as_ref());
+        let disclosure = crate::session::host_hook_disclosure(tool_name, agent, Some(config));
         Self {
             settings_paths: disclosure.settings_paths,
             hook_commands: disclosure.hook_commands,
@@ -126,7 +108,7 @@ impl HooksInstallDialog {
         let mut lines = Vec::new();
 
         lines.push(Line::from(Span::styled(
-            "Modified files:",
+            "Files AoE targets:",
             Style::default().bold(),
         )));
         for path in &self.settings_paths {
@@ -148,7 +130,7 @@ impl HooksInstallDialog {
         lines.push(Line::from(""));
         if self.status_hooks_enabled {
             lines.push(Line::from(Span::styled(
-                "Each hook runs:",
+                "A status event runs:",
                 Style::default().bold(),
             )));
             // The euid shown matches the runtime path baked into the hook command,
@@ -159,9 +141,11 @@ impl HooksInstallDialog {
             )));
         } else {
             lines.push(Line::from(
-                "Status hooks are off, so these only record the session id for",
+                "No status hook survives here, so these only record the session id",
             ));
-            lines.push(Line::from("native resume. Each event's command is above."));
+            lines.push(Line::from(
+                "for native resume. Each event's command is above.",
+            ));
         }
 
         lines.push(Line::from(""));
@@ -212,7 +196,7 @@ impl HooksInstallDialog {
         let header = Paragraph::new(if self.status_hooks_enabled {
             "AoE needs to install hooks into your agent's settings\nto detect session status (running/waiting/idle)."
         } else {
-            "AoE needs to install identity hooks into your agent's settings\nfor native resume. Status hooks are off for this profile."
+            "AoE needs to install identity hooks into your agent's settings\nfor native resume. No status hook survives for this profile."
         })
         .style(Style::default().fg(theme.text))
         .wrap(Wrap { trim: true });
@@ -301,20 +285,36 @@ mod tests {
             .join("\n")
     }
 
+    /// Build the dialog the way the gate does: resolve the agent from the
+    /// config, then describe it, so the tests stay on the production path
+    /// instead of a second resolution.
+    fn hook_dialog(tool_name: &str, profile: Option<&str>) -> HooksInstallDialog {
+        let config = profile
+            .map(crate::session::config::profile_config::resolve_config_or_warn)
+            .unwrap_or_default();
+        let agent = crate::session::host_hook_agent(
+            tool_name,
+            &config.session.launch_command_for(tool_name),
+            &config.session,
+        )
+        .or_else(|| crate::agents::get_agent(tool_name))
+        .unwrap_or_else(|| panic!("{tool_name} must name a known agent"));
+        HooksInstallDialog::new(tool_name, agent, &config)
+    }
     #[test]
     fn the_accept_and_cancel_keys_decide_the_dialog() {
         assert!(
-            HooksInstallDialog::new("claude").selected,
+            hook_dialog("claude", None).selected,
             "Accept is focused by default"
         );
         assert!(matches!(
-            HooksInstallDialog::new("claude").handle_key(key(KeyCode::Char('y'))),
+            hook_dialog("claude", None).handle_key(key(KeyCode::Char('y'))),
             DialogResult::Submit(true)
         ));
         for code in [KeyCode::Char('n'), KeyCode::Esc] {
             assert!(
                 matches!(
-                    HooksInstallDialog::new("claude").handle_key(key(code)),
+                    hook_dialog("claude", None).handle_key(key(code)),
                     DialogResult::Cancel
                 ),
                 "{code:?}"
@@ -322,11 +322,11 @@ mod tests {
         }
 
         // Tab flips which button Enter takes.
-        let mut dialog = HooksInstallDialog::new("claude");
+        let mut dialog = hook_dialog("claude", None);
         for (selected, submits) in [(false, false), (true, true)] {
             dialog.handle_key(key(KeyCode::Tab));
             assert_eq!(dialog.selected, selected);
-            let mut probe = HooksInstallDialog::new("claude");
+            let mut probe = hook_dialog("claude", None);
             probe.selected = selected;
             assert_eq!(
                 matches!(
@@ -340,7 +340,7 @@ mod tests {
 
     #[test]
     fn hover_highlights_a_button_without_changing_the_selection() {
-        let mut dialog = HooksInstallDialog::new("claude");
+        let mut dialog = hook_dialog("claude", None);
         dialog.accept_button_area = Rect::new(2, 5, 12, 1);
         dialog.cancel_button_area = Rect::new(20, 5, 14, 1);
         for (col, want) in [
@@ -362,7 +362,7 @@ mod tests {
         // `CLAUDE_CONFIG_DIR` exported would otherwise see their own path.
         let _overrides = EnvGuard::unset(&["CLAUDE_CONFIG_DIR", "CODEX_HOME"]);
 
-        let claude = content_text(&HooksInstallDialog::new("claude"));
+        let claude = content_text(&hook_dialog("claude", None));
         assert!(claude.contains(".claude/settings.json"));
         for event in ["PreToolUse", "Stop", "Notification"] {
             assert!(claude.contains(event), "{event} missing from {claude}");
@@ -383,9 +383,9 @@ mod tests {
         assert!(!claude.contains("trust these hooks in /hooks"));
         assert!(!claude.contains("pane-based status detection"));
 
-        assert!(content_text(&HooksInstallDialog::new("cursor")).contains(".cursor/hooks.json"));
+        assert!(content_text(&hook_dialog("cursor", None)).contains(".cursor/hooks.json"));
 
-        let codex = content_text(&HooksInstallDialog::new("codex"));
+        let codex = content_text(&hook_dialog("codex", None));
         assert!(codex.contains(".codex/hooks.json"));
         assert!(!codex.contains(".codex/config.toml"));
         assert!(codex.contains("trust these hooks in /hooks"));
@@ -397,7 +397,7 @@ mod tests {
     fn codex_home_moves_the_hooks_file_without_dragging_the_config_along() {
         let tmp = TempDir::new().unwrap();
         let _guard = EnvGuard::set(&[("CODEX_HOME", tmp.path())]);
-        let text = content_text(&HooksInstallDialog::new("codex"));
+        let text = content_text(&hook_dialog("codex", None));
         assert!(text.contains(&tmp.path().join("hooks.json").display().to_string()));
         assert!(!text.contains(&tmp.path().join("config.toml").display().to_string()));
     }
@@ -429,7 +429,7 @@ mod tests {
             ("claude", ".claude/settings.json"),
             ("codex", ".codex/hooks.json"),
         ] {
-            let dialog = HooksInstallDialog::new_for_profile(agent, Some("profile-home"));
+            let dialog = hook_dialog(agent, Some("profile-home"));
             assert_eq!(
                 dialog.settings_paths,
                 vec![profile_home.join(relative).to_string_lossy()],
@@ -452,7 +452,7 @@ mod tests {
             ("claude", &claude_root, "settings.json"),
             ("codex", &codex_root, "hooks.json"),
         ] {
-            let dialog = HooksInstallDialog::new_for_profile(agent, Some("declared-hook-roots"));
+            let dialog = hook_dialog(agent, Some("declared-hook-roots"));
             assert_eq!(
                 dialog.settings_paths,
                 vec![root.join(file).to_string_lossy()],
@@ -467,10 +467,7 @@ mod tests {
             "codex-profile",
             format!("environment = [\"CODEX_HOME={}\"]\n", codex_home.display()),
         );
-        let text = content_text(&HooksInstallDialog::new_for_profile(
-            "codex",
-            Some("codex-profile"),
-        ));
+        let text = content_text(&hook_dialog("codex", Some("codex-profile")));
         assert!(text.contains(&codex_home.join("hooks.json").display().to_string()));
         assert!(!text.contains(&codex_home.join("config.toml").display().to_string()));
     }
@@ -488,7 +485,7 @@ mod tests {
                 .to_string(),
         );
 
-        let dialog = HooksInstallDialog::new_for_profile("corp-cursor", Some("work"));
+        let dialog = hook_dialog("corp-cursor", Some("work"));
         assert_eq!(
             dialog.settings_paths,
             vec![custom.join("hooks.json").to_string_lossy()]

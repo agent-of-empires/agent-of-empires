@@ -117,7 +117,7 @@ pub(crate) use types::{
 
 // Sibling items the submodules reach through `use super::*`.
 use hooks::status_hook_env_prefix;
-pub(crate) use hooks::{host_hook_agent_name, host_hook_disclosure};
+pub(crate) use hooks::{host_hook_agent, host_hook_disclosure};
 use launch_command::{
     append_resume_flags, build_fork_flags, parse_launch_command, shell_stdin_command,
     splice_subcommand_or_append, PreparedLaunch,

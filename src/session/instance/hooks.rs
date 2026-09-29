@@ -94,61 +94,62 @@ pub(crate) struct HostHookDisclosure {
     pub settings_paths: Vec<String>,
     pub hook_commands: Vec<(String, String)>,
     pub needs_codex_trust_note: bool,
-    /// False when the resolved events are identity-only, which is what
-    /// `agent_status_hooks = false` leaves behind.
+    /// False when the resolved events carry no status, which is what
+    /// `agent_status_hooks = false` leaves behind, and what an agent that
+    /// declares no status event leaves behind too.
     pub status_hooks_enabled: bool,
 }
 
-/// The built-in agent a tool name stands for, in the order a launch resolves
-/// it. A tool that is itself a built-in is that built-in: a contradicting
-/// `agent_execution_as` makes `execution_agent_for` fail, and the launch falls
-/// back to the same answer. For anything else, `agent_execution_as` is honored
-/// only where the launch could honor it, which is when the tool carries its own
-/// `agent_config_dir`; without one, `execution_agent_for` rejects any wrapper
-/// and the launch falls through to `agent_detect_as`. `namespaces_config_dir`
-/// is that precondition, the one a disclosure can evaluate without the
-/// session's command.
-pub(crate) fn host_hook_agent_name(
+/// The built-in agent a launch resolves for `tool_name` running `command`.
+/// Delegates to [`Instance::execution_agent_for`] rather than repeating its
+/// precedence, which is what let the disclosure drift from the launcher: that
+/// function matches the command's first word against the built-in binaries
+/// before it reads `agent_execution_as`, and a copy of the precedence that
+/// cannot see the command misses that. The fallback chain is
+/// `Instance::status_agent`'s, so a contract the launch rejects falls through
+/// to the tool name and then to the `agent_detect_as` alias the same way.
+/// A stored session whose alias has since drifted from the config still
+/// installs under the stored alias; the disclosure always follows the config.
+pub(crate) fn host_hook_agent(
     tool_name: &str,
-    execution_as: Option<&str>,
-    detect_as: Option<&str>,
-    namespaces_config_dir: bool,
-) -> String {
-    let contract = namespaces_config_dir.then_some(execution_as).flatten();
-    crate::agents::get_agent(tool_name)
-        .or_else(|| contract.and_then(crate::agents::get_agent))
-        .or_else(|| detect_as.and_then(crate::agents::get_agent))
-        .map_or(tool_name, |agent| agent.name)
-        .to_string()
+    command: &str,
+    session: &crate::session::config::SessionConfig,
+) -> Option<&'static crate::agents::AgentDef> {
+    Instance::execution_agent_for(tool_name, command, session)
+        .ok()
+        .or_else(|| crate::agents::get_agent(tool_name))
+        .or_else(|| {
+            session
+                .agent_detect_as
+                .get(tool_name)
+                .and_then(|alias| crate::agents::get_agent(alias))
+        })
 }
 
-/// Resolve the disclosure for `tool_name`, which a launch runs as `agent_name`.
+/// Resolve the disclosure for `tool_name`, which a launch runs as `agent`.
 /// `config` is the profile-merged config whose environment and session config
-/// decide the paths and which events survive; `None` means an unconfigured
-/// install.
+/// decide the paths; `None` means an unconfigured install.
 pub(crate) fn host_hook_disclosure(
     tool_name: &str,
-    agent_name: &str,
+    agent: &'static crate::agents::AgentDef,
     config: Option<&crate::session::config::Config>,
 ) -> HostHookDisclosure {
     let mut disclosure = HostHookDisclosure {
         settings_paths: Vec::new(),
         hook_commands: Vec::new(),
         needs_codex_trust_note: false,
-        status_hooks_enabled: config.is_none_or(|config| config.session.agent_status_hooks),
+        status_hooks_enabled: false,
     };
-    let Some(agent) = crate::agents::get_agent(agent_name) else {
-        return disclosure;
-    };
-    let host_env = config.map_or_else(Vec::new, |config| config.environment.clone());
-    let home = host_home(&host_env).unwrap_or_else(|| std::path::PathBuf::from("~"));
-    let default_session = crate::session::config::SessionConfig::default();
-    let session_config = config.map_or(&default_session, |config| &config.session);
+    let default_config = crate::session::config::Config::default();
+    let config = config.unwrap_or(&default_config);
+    let host_env = config.environment.as_slice();
+    let home = host_home(host_env).unwrap_or_else(|| std::path::PathBuf::from("~"));
+    let session_config = &config.session;
 
     if let Some(hook_cfg) = &agent.hook_config {
         disclosure.needs_codex_trust_note = hook_cfg.format == crate::agents::HookFormat::CodexJson;
         disclosure.settings_paths.push(
-            generic_host_config_path_for(tool_name, hook_cfg, &home, session_config, &host_env)
+            generic_host_config_path_for(tool_name, hook_cfg, &home, session_config, host_env)
                 .to_string_lossy()
                 .into_owned(),
         );
@@ -160,7 +161,7 @@ pub(crate) fn host_hook_disclosure(
                 sidecar,
                 &home,
                 session_config,
-                &host_env,
+                host_env,
             )
             .to_string_lossy()
             .into_owned(),
@@ -173,8 +174,7 @@ pub(crate) fn host_hook_disclosure(
     // apply and the status events drop out with the setting. An event can
     // install both an identity extractor and a status writer, so both effects
     // are disclosed; an event with neither installs nothing and is not listed.
-    let default_config = crate::session::config::Config::default();
-    let config = config.unwrap_or(&default_config);
+    let mut status_events = 0;
     for event in resolved_host_hook_events(agent, config, config.session.agent_status_hooks)
         .unwrap_or_default()
     {
@@ -190,6 +190,7 @@ pub(crate) fn host_hook_disclosure(
             ));
         }
         if let Some(status) = event.status {
+            status_events += 1;
             effects.push(format!("writes \"{status}\""));
         }
         if !effects.is_empty() {
@@ -198,6 +199,9 @@ pub(crate) fn host_hook_disclosure(
                 .push((event.name, effects.join(", and ")));
         }
     }
+    // The profile setting decides which events survive, but what survives is
+    // what this install actually runs, and that is what the two surfaces say.
+    disclosure.status_hooks_enabled = status_events > 0;
     disclosure
 }
 
@@ -1214,7 +1218,7 @@ mod tests {
 
         for tool in ["claude", "codex", "cursor"] {
             let agent = crate::agents::get_agent(tool).unwrap();
-            let disclosure = host_hook_disclosure(tool, tool, Some(&config));
+            let disclosure = host_hook_disclosure(tool, agent, Some(&config));
             let events =
                 resolved_host_hook_events(agent, &config, config.session.agent_status_hooks)
                     .unwrap_or_default();
@@ -1270,45 +1274,73 @@ mod tests {
         }
     }
 
-    /// #4159: the disclosed agent must be the one a launch resolves, which
-    /// `status_agent` owns. The wrapper shape is the one that diverged: a
-    /// declared execution contract the launch cannot satisfy makes it fall
-    /// through to `agent_detect_as`, and the disclosure has to fall with it.
+    /// #4159: the disclosed agent is the one `execution_agent_for` resolves,
+    /// which matches the command's first word against the built-in binaries
+    /// before it reads `agent_execution_as`. Asserting the disclosure against
+    /// `status_agent` would compare two paths through that same function and
+    /// stay green if the `direct` lookup were removed, so each row is checked
+    /// against the agent *and* the file the resolver's own rules name, and
+    /// against the path a forbidden shape must not reach.
     #[test]
     #[serial_test::serial]
-    fn disclosed_agent_matches_the_one_a_launch_resolves() {
+    fn disclosed_agent_follows_the_resolver_that_picks_the_launch_agent() {
         let tmp = tempfile::TempDir::new().unwrap();
         let _app = crate::session::test_support::isolate_app_dir_at(&tmp.path().join("app"));
         let _home_guard = crate::session::test_support::isolate_home(tmp.path());
+        let corpdir = tmp.path().join("corpdir");
 
-        for (label, extra) in [
-            ("unsatisfiable contract", ""),
+        // (label, custom command, extra session config, expected agent, expected file)
+        let cases = [
             (
-                "namespaced contract",
-                "[session.agent_config_dir]\ncorp = \"/tmp/corpdir\"\n",
+                "a command that is a built-in binary resolves to that binary, not the alias",
+                "claude",
+                "",
+                "claude",
+                ".claude/settings.json",
             ),
-        ] {
+            (
+                "a declared contract the launch rejects falls through to the alias",
+                "acme-wrapper",
+                "[session.agent_execution_as]\ncorp = \"claude\"\n",
+                "codex",
+                ".codex/hooks.json",
+            ),
+            (
+                "a namespaced wrapper honors the declared contract",
+                "acme-wrapper",
+                "[session.agent_execution_as]\ncorp = \"claude\"\n\
+                 [session.agent_config_dir]\ncorp = \"CORPDIR\"\n",
+                "claude",
+                "CORPDIR/settings.json",
+            ),
+        ];
+
+        for (label, command, extra, expected_agent, expected_file) in cases {
             write_profile(
                 "disclosed-agent",
                 &format!(
-                    "[session.custom_agents]\ncorp = \"acme-wrapper\"\n\n[session.agent_execution_as]\ncorp = \"claude\"\n\n[session.agent_detect_as]\ncorp = \"codex\"\n{extra}"
-                ),
+                    "[session.custom_agents]\ncorp = \"{command}\"\n\n\
+                     [session.agent_detect_as]\ncorp = \"codex\"\n\n{extra}"
+                )
+                .replace("CORPDIR", &corpdir.display().to_string()),
             );
             let config =
                 crate::session::config::profile_config::resolve_config_or_warn("disclosed-agent");
             let session = &config.session;
-            let mut inst = hook_inst("corp");
-            inst.source_profile = "disclosed-agent".to_string();
-            inst.detect_as = "codex".to_string();
-            let launched = inst.status_agent().map_or("corp", |agent| agent.name);
-
-            let disclosed = host_hook_agent_name(
-                "corp",
-                session.agent_execution_as.get("corp").map(String::as_str),
-                session.agent_detect_as.get("corp").map(String::as_str),
-                session.agent_config_dir.contains_key("corp"),
+            let agent = host_hook_agent("corp", &session.launch_command_for("corp"), session);
+            assert_eq!(
+                agent.map(|agent| agent.name),
+                Some(expected_agent),
+                "{label}"
             );
-            assert_eq!(disclosed, launched, "{label}");
+
+            let disclosure = host_hook_disclosure("corp", agent.expect("resolved"), Some(&config));
+            let disclosed = disclosure.settings_paths.join(" ");
+            let expected = expected_file.replace("CORPDIR", &corpdir.display().to_string());
+            assert!(
+                disclosed.ends_with(&expected),
+                "{label}: disclosed {disclosed}"
+            );
         }
     }
 

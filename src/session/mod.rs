@@ -79,7 +79,7 @@ pub(crate) use instance::{
     NEWER_GENERATION_BUSY_REASON,
 };
 pub(crate) use instance::{
-    host_hook_agent_name, host_hook_disclosure, resolved_agent_for, ConversationState,
+    host_hook_agent, host_hook_disclosure, resolved_agent_for, ConversationState,
     ResumeAttemptPolicy, TerminalContextResume,
 };
 pub use instance::{

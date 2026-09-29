@@ -8,7 +8,7 @@
 use anyhow::Result;
 use clap::Subcommand;
 
-use crate::session::{host_hook_agent_name, host_hook_disclosure, update_app_state, Config};
+use crate::session::{host_hook_agent, host_hook_disclosure, update_app_state, Config};
 
 #[derive(Subcommand)]
 pub enum HooksCommands {
@@ -18,7 +18,7 @@ pub enum HooksCommands {
     Approve,
 }
 
-#[tracing::instrument(target = "cli.hooks", skip_all)]
+#[tracing::instrument(target = "cli.hooks", skip_all, fields(profile = %profile))]
 pub fn run(profile: &str, command: HooksCommands) -> Result<()> {
     match command {
         HooksCommands::Status => print_status(profile),
@@ -41,29 +41,30 @@ fn print_status(profile: &str) -> Result<()> {
         println!("  Run `aoe hooks approve` to let AoE write them, or accept the");
         println!("  dialog the TUI shows when you create a host session.");
     }
-    print_disclosure(profile)
+    print_disclosure(profile);
+    Ok(())
 }
 
 fn approve(profile: &str) -> Result<()> {
     // Always disclose, even on a repeat run, so the output can be used to
     // review what the standing consent covers for another profile.
-    print_disclosure(profile)?;
+    print_disclosure(profile);
     if acknowledged()? {
         println!();
-        println!("Agent status hooks already approved for this installation");
+        println!("Agent hooks already approved for this installation");
         return Ok(());
     }
     update_app_state(|state| {
         state.has_acknowledged_agent_hooks = true;
     })?;
     println!();
-    println!("✓ Agent status hooks approved for this installation");
+    println!("✓ Agent hooks approved for this installation");
     Ok(())
 }
 
 /// Print the files and hook commands this profile resolves, for every tool it
 /// installs hooks for. The printed caveat is the bound on that list.
-fn print_disclosure(profile: &str) -> Result<()> {
+fn print_disclosure(profile: &str) {
     let profile = crate::session::config::effective_profile(profile);
     let config = crate::session::config::profile_config::resolve_config_or_warn(&profile);
     let status_hooks = config.session.agent_status_hooks;
@@ -76,27 +77,20 @@ fn print_disclosure(profile: &str) -> Result<()> {
     let disclosures: Vec<_> = tool_names
         .into_iter()
         .filter_map(|tool_name| {
-            let session = &config.session;
-            let execution_as = session
-                .agent_execution_as
-                .get(tool_name)
-                .map(String::as_str);
-            let detect_as = session.agent_detect_as.get(tool_name).map(String::as_str);
-            let namespaces = session.agent_config_dir.contains_key(tool_name);
-            let agent_name = host_hook_agent_name(tool_name, execution_as, detect_as, namespaces);
-            if !crate::agents::get_agent(&agent_name)
-                .is_some_and(|agent| crate::agents::hook_install_required(agent, status_hooks))
-            {
+            let agent = host_hook_agent(
+                tool_name,
+                &config.session.launch_command_for(tool_name),
+                &config.session,
+            )?;
+            if !crate::agents::hook_install_required(agent, status_hooks) {
                 return None;
             }
-            let disclosure = host_hook_disclosure(tool_name, &agent_name, Some(&config));
+            let disclosure = host_hook_disclosure(tool_name, agent, Some(&config));
             (!disclosure.settings_paths.is_empty()).then_some((tool_name, disclosure))
         })
         .collect();
 
-    let status_hooks_active = disclosures
-        .iter()
-        .all(|(_, disclosure)| disclosure.status_hooks_enabled);
+    let status_hooks_active = status_hooks && !disclosures.is_empty();
     if status_hooks_active {
         println!("AoE installs agent hooks into each agent's own config. The status");
         println!("hooks detect session status (running/waiting/idle); the identity hooks");
@@ -140,6 +134,9 @@ fn print_disclosure(profile: &str) -> Result<()> {
     println!("merges into a selected agent, or targets a selected or recorded Claude");
     println!("conversation store resolves that target at launch time.");
     println!();
+    println!("A session launched with its own command resolves the file that command");
+    println!("names; the creation dialog describes such a session exactly.");
+    println!();
     println!("The consent is per installation and is not bound to this profile, so");
     println!("another profile resolves its own paths under the same approval.");
     if disclosures
@@ -152,5 +149,4 @@ fn print_disclosure(profile: &str) -> Result<()> {
             println!("Until then, AoE falls back to pane-based status detection.");
         }
     }
-    Ok(())
 }

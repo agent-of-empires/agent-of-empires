@@ -144,7 +144,7 @@ Each command receives `AOE_SESSION_ID`, `AOE_SESSION_TITLE`, `AOE_PROJECT_PATH`,
 
 The consent is per installation and is not bound to a profile, so every profile resolves its own paths under it. There is no revoke command: set `has_acknowledged_agent_hooks = false` in `<app_dir>/state.toml` to take it back. A sandboxed session stages its hooks inside its own container config and is never gated. It is not the repo trust gate: `aoe add --trust-hooks` covers the hooks a repository declares in `.agent-of-empires/config.toml` and its project-local MCP servers, which are a separate decision. See [Hook trust](repo-config.md#hook-trust).
 
-Turning `agent_status_hooks` off removes the need for consent for status detection, but identity hooks, which native resume depends on, stay installed and stay gated.
+Turning `agent_status_hooks` off stops AoE installing status hooks, but it does not end the gate: identity hooks, which native resume depends on, stay installed. How many agents remain gated then depends on which ones declare an identity event, so check `aoe hooks status` for the list under a given profile. A session launched with its own command resolves the file that command names, which the TUI creation dialog describes exactly; `aoe hooks status` has no session and resolves from the profile config, so it can differ for a wrapper.
 
 ## Custom agents
 
