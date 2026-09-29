@@ -272,9 +272,9 @@ fn wheel_mouse_bytes(up: bool, sgr: bool, (cx, cy): (u16, u16)) -> Vec<u8> {
     }
 }
 
-/// Build the bytes for one forwarded mouse button event at the app's 1-based cell. `base_button` is the SGR low-bits code (left=0, middle=1,
-/// right=2), `release` a button-up, `motion` a drag. Mirrors `wheel_mouse_bytes`, which
-/// covers the wheel buttons.
+/// Build the bytes for one forwarded mouse button event at the app's 1-based cell.
+/// `base_button` is the SGR low-bits code (left=0, middle=1, right=2), `release` a
+/// button-up, `motion` a drag. Mirrors `wheel_mouse_bytes`, which covers the wheel buttons.
 fn mouse_event_bytes(
     base_button: u16,
     release: bool,
