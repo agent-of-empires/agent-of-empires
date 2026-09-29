@@ -316,6 +316,25 @@ fn find_process_in_group(pgrp: u32) -> Option<u32> {
     None
 }
 
+/// Whether `pid` has already terminated, which for a child of this process means
+/// it is waiting to be reaped rather than still running.
+///
+/// A zombie holds nothing: it cannot write, it holds no file descriptors open
+/// on a checkout, and its process group is dead. Treating it as alive makes a
+/// torn-down runner unprovable forever. The repo's own descendant wait already
+/// uses this rule (`process::mod` test helper: "exited or a terminated zombie").
+pub(super) fn is_terminated(pid: u32) -> bool {
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    // The state letter follows `comm`, which may itself contain spaces and
+    // parentheses, so anchor on the last `)`.
+    let Some(close_paren) = stat.rfind(')') else {
+        return false;
+    };
+    stat[close_paren + 1..].trim_start().starts_with('Z')
+}
+
 pub(super) fn parent_and_argv0(pid: u32) -> Option<(u32, String)> {
     let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let ppid = u32::try_from(parse_stat_field(&stat, 3)?).ok()?;

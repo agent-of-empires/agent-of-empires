@@ -13,6 +13,7 @@ pub enum LifecycleOperation {
     Purge,
     Restore,
     Trash,
+    Attach,
 }
 
 impl LifecycleOperation {

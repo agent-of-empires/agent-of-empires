@@ -22,24 +22,114 @@ const TEARDOWN_RETRY_CAP: u32 = 30;
 /// A teardown claimed this long without settling lost its driver; the retry pass takes over.
 const TEARDOWN_ORPHAN_GRACE: Duration = Duration::from_secs(15);
 
+/// What the caller does with the session's worktree once the gate returns.
+///
+/// A resume that has not installed yet has published nothing, but the launcher
+/// has already started its agent with the working directory set to the
+/// checkout, so whether that epoch is safe depends on this, not on the runner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorktreeIntent {
+    /// The worktree is being removed with the session, which is the user's
+    /// explicit request, so a launcher still inside it holds nothing kept.
+    Remove,
+    /// The worktree survives, to be relocated, re-keyed or opened as a pane, so
+    /// a launcher may still be using it and `Starting` is not "no runner".
+    Keep,
+}
+
 impl<S: BroadcastSink> Supervisor<S> {
     /// Stop a worker, keeping its agent-side transcript resumable.
     pub async fn shutdown(&self, session_id: &str) -> Result<(), SupervisorError> {
         self.shutdown_with_reason(session_id, "user_stopped", false)
             .await
+            .map(|_| ())
     }
 
     /// Stop a worker reclaimed for inactivity.
     pub async fn shutdown_idle(&self, session_id: &str) -> Result<(), SupervisorError> {
         self.shutdown_with_reason(session_id, "idle_auto_stop", false)
             .await
+            .map(|_| ())
     }
 
-    /// Stop a worker being permanently discarded, releasing agent-side state
-    /// via `session/delete`. Reversible stops must not use this.
-    pub async fn shutdown_and_delete(&self, session_id: &str) -> Result<(), SupervisorError> {
-        self.shutdown_with_reason(session_id, "user_stopped", true)
+    /// Stop a worker being permanently discarded, asking the agent to release
+    /// agent-side state via `session/delete`. Reversible stops must not use this.
+    ///
+    /// Refuses with [`SupervisorError::TeardownPending`] unless the runner is
+    /// proven dead, the sole exception being a resume that has not installed:
+    /// this caller deletes the session and its worktree together, so no
+    /// checkout is left for a starting agent to hold. The `session/delete`
+    /// request goes out before that proof and the retry pass never re-sends
+    /// it, so a refusal does not mean the agent-side transcript survived.
+    pub async fn shutdown_and_delete(
+        &self,
+        session_id: &str,
+        worktree: WorktreeIntent,
+    ) -> Result<(), SupervisorError> {
+        let settlement = self
+            .shutdown_with_reason(session_id, "user_stopped", true)
+            .await?;
+        self.gate_on_proven_death(session_id, settlement, worktree)
             .await
+    }
+
+    /// Stop a worker and refuse to report success while its runner is not
+    /// proven dead, including a resume that has not installed yet: every
+    /// caller relocates or re-keys the worktree, which a starting agent
+    /// already holds open. Callers that keep the checkout must use this rather
+    /// than a plain [`Self::shutdown`]; a caller that also wants the agent-side
+    /// transcript released uses [`Self::shutdown_and_delete`] and states its own
+    /// [`WorktreeIntent`].
+    pub async fn shutdown_and_require_dead(&self, session_id: &str) -> Result<(), SupervisorError> {
+        let settlement = self
+            .shutdown_with_reason(session_id, "user_stopped", false)
+            .await?;
+        self.gate_on_proven_death(session_id, settlement, WorktreeIntent::Keep)
+            .await
+    }
+
+    /// Gate a destructive caller on the absence of a runner that could still be
+    /// writing the ACP event store.
+    ///
+    /// The threat this guards is a *live runner*. A resume that has not
+    /// installed yet publishes nothing — nothing drains the ACP connection
+    /// before `install`, and `begin_stop` has already posted the cancel that
+    /// stops it from ever installing one — so whether such an epoch is safe
+    /// depends on what the caller does next, which is [`Self::WorktreeIntent`].
+    ///
+    /// So the answer is read, not waited for: only a runner this call could not
+    /// prove dead blocks the caller, and it blocks with the same retryable
+    /// refusal rather than a delay.
+    async fn gate_on_proven_death(
+        &self,
+        session_id: &str,
+        settlement: Option<Settlement>,
+        intent: WorktreeIntent,
+    ) -> Result<(), SupervisorError> {
+        match settlement {
+            Some(Settlement::Proven) => Ok(()),
+            Some(Settlement::Unproven(identity)) => {
+                warn!(
+                    target: "acp.supervisor",
+                    session = %session_id,
+                    pid = identity.pid,
+                    "refusing to release agent-side state: the runner is not proven dead"
+                );
+                Err(SupervisorError::TeardownPending(session_id.to_string()))
+            }
+            // No settlement of our own. Either a spawn that never installed, or a
+            // teardown another task already owns. A respawn counts as the second
+            // case too: the worker it replaces may still be alive.
+            None => {
+                let removable = matches!(intent, WorktreeIntent::Remove)
+                    && lock_recover(&self.lifecycle).spawn_without_runner(session_id);
+                if removable {
+                    Ok(())
+                } else {
+                    Err(SupervisorError::TeardownPending(session_id.to_string()))
+                }
+            }
+        }
     }
 
     /// `shutdown`, then wait for the resume/teardown to settle and the runner
@@ -91,12 +181,15 @@ impl<S: BroadcastSink> Supervisor<S> {
         Ok(())
     }
 
+    /// `None` when this call established no settlement of its own — the stop
+    /// was a cancel, or a teardown is already parked. Destructive callers must
+    /// treat that as "not proven dead" and leave their work to the retry pass.
     async fn shutdown_with_reason(
         &self,
         session_id: &str,
         stop_reason: &str,
         delete_adapter_state: bool,
-    ) -> Result<(), SupervisorError> {
+    ) -> Result<Option<Settlement>, SupervisorError> {
         // Same lock order as `begin_resume`, so a resume cannot slip between
         // the decision and the handle removal.
         let mut workers = self.workers.lock().await;
@@ -108,7 +201,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                 worker_registry::clear_restart_marker(session_id);
                 let Some(handle) = handle else {
                     self.settle(&lease, Settlement::Proven);
-                    return Ok(());
+                    return Ok(Some(Settlement::Proven));
                 };
                 if delete_adapter_state {
                     try_session_delete(&handle.client, session_id).await;
@@ -146,7 +239,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                         },
                     );
                 }
-                Ok(())
+                Ok(Some(settlement))
             }
             StopDecision::CancelRequested => {
                 drop(workers);
@@ -156,9 +249,11 @@ impl<S: BroadcastSink> Supervisor<S> {
                     session = %session_id,
                     "shutdown: resume in flight; it will tear down what it builds"
                 );
-                Ok(())
+                Ok(None)
             }
-            StopDecision::AlreadyStopping => Ok(()),
+            // The destructive gates wait for this teardown to conclude, so a
+            // refusal is only final once that wait runs out.
+            StopDecision::AlreadyStopping => Ok(None),
             StopDecision::NotOwned => {
                 // A runner from a previous daemon may still be on disk.
                 let Some(record) = worker_registry::load(session_id).ok().flatten() else {
@@ -181,7 +276,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                 if let Some(lease) = lease {
                     self.settle(&lease, settlement);
                 }
-                Ok(())
+                Ok(Some(settlement))
             }
         }
     }
@@ -350,7 +445,6 @@ impl<S: BroadcastSink> Supervisor<S> {
             },
         );
         let _ = handle.client.shutdown().await;
-        handle.drain_task.abort();
         Some(is_restart)
     }
 }
@@ -978,7 +1072,9 @@ mod tests {
         let (client, purge) = register("s-del");
         sup.test_install_handle("s-del", client, WorkerKind::Stdio, None)
             .await;
-        sup.shutdown_and_delete("s-del").await.expect("delete ok");
+        sup.shutdown_and_delete("s-del", WorktreeIntent::Remove)
+            .await
+            .expect("delete ok");
         assert!(
             purge.load(Ordering::SeqCst),
             "permanent removal sends session/delete"
@@ -1115,6 +1211,126 @@ mod tests {
             sup.begin_resume("s-imm", ResumeKind::Spawn).await.unwrap(),
             ResumeReservationOutcome::Reserved(_)
         ));
+    }
+
+    /// A runner that survives SIGKILL still owns its worktree and transcript,
+    /// so the destructive stops must report a blocking result instead of Ok.
+    #[tokio::test(start_paused = true)]
+    #[serial_test::serial]
+    async fn a_destructive_stop_blocks_until_the_runner_is_proven_dead() {
+        let _home = isolate_home();
+        let control = Arc::new(FakeProcessControl::default());
+        control.immortal(8181);
+        let sup = Supervisor::new(VecSink::new()).with_process_control(control.clone());
+        save_record("s-live", 8181, 5);
+        let socket = worker_registry::socket_path_for("s-live").unwrap();
+        sup.test_install_runner(
+            "s-live",
+            runner_config(socket),
+            Some(RunnerIdentity {
+                pid: 8181,
+                generation: 5,
+            }),
+        )
+        .await;
+
+        assert!(
+            matches!(
+                sup.shutdown_and_delete("s-live", WorktreeIntent::Remove)
+                    .await,
+                Err(SupervisorError::TeardownPending(_))
+            ),
+            "permanent removal must not report success beside a live runner"
+        );
+        assert!(
+            matches!(
+                sup.shutdown_and_require_dead("s-live").await,
+                Err(SupervisorError::TeardownPending(_))
+            ),
+            "destructive callers must not see a stop as settled either"
+        );
+        assert_eq!(sup.worker_state("s-live").await, AcpWorkerState::Stopping);
+        assert!(
+            worker_registry::load("s-live").unwrap().is_some(),
+            "the unproven runner keeps its record so the retry pass can settle it"
+        );
+
+        control.exit(8181);
+        sup.retry_pending_teardowns().await;
+        assert_eq!(sup.worker_state("s-live").await, AcpWorkerState::Absent);
+        assert!(worker_registry::load("s-live").unwrap().is_none());
+        assert!(
+            matches!(
+                sup.begin_resume("s-live", ResumeKind::Spawn).await.unwrap(),
+                ResumeReservationOutcome::Reserved(_)
+            ),
+            "the retry pass settles the teardown, so the session admits a resume again"
+        );
+    }
+
+    /// A resume that never installed a worker publishes nothing, so a caller
+    /// that also removes the worktree — the purge — may proceed: refusing made
+    /// deleting a session the daemon was still starting a permanent conflict.
+    /// A caller that relocates the worktree instead must refuse, because the
+    /// agent was launched with that working directory before `install`.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_purge_passes_a_resume_that_never_installed_but_a_worktree_move_does_not() {
+        let _home = isolate_home();
+        let sup = Supervisor::new(VecSink::new());
+        let reservation = reserve(sup.begin_resume("s-move", ResumeKind::Spawn).await);
+
+        assert!(
+            matches!(
+                sup.shutdown_and_require_dead("s-move").await,
+                Err(SupervisorError::TeardownPending(_))
+            ),
+            "a starting agent already holds the checkout, so a worktree move must wait"
+        );
+        drop(reservation);
+
+        let reservation = reserve(sup.begin_resume("s-starting", ResumeKind::Spawn).await);
+        assert!(
+            sup.shutdown_and_delete("s-starting", WorktreeIntent::Remove)
+                .await
+                .is_ok(),
+            "a spawn that installed no runner publishes nothing, so destroying its state is safe"
+        );
+        drop(reservation);
+    }
+
+    /// The case a live scratch delete exercises: a runner that is installed and
+    /// actually dies. A kill the process control reports as complete must settle
+    /// as Proven, or the gate refuses every destructive call on that session.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_purge_succeeds_once_the_installed_runner_is_gone() {
+        use crate::acp::runner_lifecycle::test_support::FakeProcessControl;
+        use std::sync::Arc;
+
+        let _home = isolate_home();
+        let control = Arc::new(FakeProcessControl::default());
+        control.alive(4242);
+        let sup = Supervisor::new(VecSink::new()).with_process_control(control.clone());
+        let socket = worker_registry::socket_path_for("s-dies").unwrap();
+        sup.test_install_runner(
+            "s-dies",
+            runner_config(socket),
+            Some(RunnerIdentity {
+                pid: 4242,
+                generation: 1,
+            }),
+        )
+        .await;
+
+        // The runner is gone by the time the purge asks.
+        control.exit(4242);
+        assert!(
+            sup.shutdown_and_delete("s-dies", WorktreeIntent::Remove)
+                .await
+                .is_ok(),
+            "a dead runner settles as Proven, so the purge proceeds instead of refusing"
+        );
     }
 
     #[tokio::test]

@@ -116,6 +116,20 @@ async fn quiesce_structured_worker_for_worktree_move(
     }
 }
 
+/// The worktree rename hit a live `Attach` reservation. A distinct marker so
+/// the async boundary can map this one expected conflict to a retryable 409 and
+/// leave every other failure a 500.
+#[derive(Debug)]
+struct AttachInProgress;
+
+impl std::fmt::Display for AttachInProgress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("session is attaching a project")
+    }
+}
+
+impl std::error::Error for AttachInProgress {}
+
 /// Release a sandboxed session's hold on its worktree mount ahead of a
 /// `git worktree move`, on the blocking pool, and report whether the worktree is
 /// still held.
@@ -254,7 +268,7 @@ pub async fn rename_session(
     let (_session_title_lock, _lifecycle_lock, storage, disk_instances) =
         match tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
             let session_title_lock = crate::session::acquire_session_title_lock(&lock_id)?;
-            let storage = Storage::new(&lock_profile, lock_file_watch)?;
+            let storage = Storage::open(&lock_profile, lock_file_watch)?;
             let lifecycle_lock = storage.acquire_instance_lifecycle_lock(&lock_id)?;
             let instances = storage.load()?;
             Ok((session_title_lock, lifecycle_lock, storage, instances))
@@ -667,15 +681,37 @@ pub async fn set_worktree_name(
     let lock_file_watch = state.file_watch.clone();
     let (_lifecycle_lock, storage, authoritative_instances) = match tokio::task::spawn_blocking(
         move || -> anyhow::Result<_> {
-            let storage = Storage::new(&lock_profile, lock_file_watch)?;
+            let storage = Storage::open(&lock_profile, lock_file_watch)?;
             let lifecycle = storage.acquire_instance_lifecycle_lock(&lock_id)?;
             let instances = storage.load()?;
+            if instances.iter().any(|instance| {
+                instance.id == lock_id
+                    && instance
+                        .lifecycle_reservation
+                        .as_ref()
+                        .is_some_and(|reservation| {
+                            reservation.op == crate::session::LifecycleOperation::Attach
+                                && instance.has_fresh_lifecycle_reservation(chrono::Utc::now())
+                        })
+            }) {
+                // An expected lifecycle conflict, not a defect: the caller
+                // retries once the attach settles.
+                return Err(AttachInProgress.into());
+            }
             Ok((lifecycle, storage, instances))
         },
     )
     .await
     {
         Ok(Ok(locked)) => locked,
+        Ok(Err(error)) if error.downcast_ref::<AttachInProgress>().is_some() => {
+            tracing::info!(target: "http.api.sessions", session = %id, "worktree rename refused: the session is attaching a project");
+            return api_error(
+                StatusCode::CONFLICT,
+                "lifecycle_busy",
+                "This session is attaching a project; retry once the attach settles.",
+            );
+        }
         Ok(Err(error)) => {
             tracing::error!(target: "http.api.sessions", session = %id, %error, "Failed to lock or load worktree rename");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();

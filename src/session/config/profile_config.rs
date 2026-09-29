@@ -8,7 +8,6 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 
 use super::Config;
-use crate::session::get_profile_dir;
 
 /// Profile-specific settings, stored as a sparse override tree (#1692).
 ///
@@ -48,10 +47,16 @@ impl ProfileConfig {
 /// not pollute `profiles/` with a stub directory.
 pub fn load_profile_config(profile: &str) -> Result<ProfileConfig> {
     let path = crate::session::get_profile_dir_path(profile)?.join("config.toml");
+    read_profile_config_at(&path)
+}
+
+/// Read and type-check `profiles/<name>/config.toml`. A missing or empty file
+/// is an empty config, not an error.
+fn read_profile_config_at(path: &std::path::Path) -> Result<ProfileConfig> {
     if !path.exists() {
         return Ok(ProfileConfig::default());
     }
-    let content = fs::read_to_string(&path)?;
+    let content = fs::read_to_string(path)?;
     if content.trim().is_empty() {
         return Ok(ProfileConfig::default());
     }
@@ -62,6 +67,40 @@ pub fn load_profile_config(profile: &str) -> Result<ProfileConfig> {
     // the caller warns and falls back to defaults.
     validate_overrides_typecheck(&config.overrides_value())?;
     Ok(config)
+}
+
+/// The sparse override tree exactly as stored, without type-checking. A
+/// missing or empty file is `{}`.
+fn read_raw_overrides_at(path: &std::path::Path) -> Result<serde_json::Value> {
+    let content = match fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(serde_json::Value::Object(Default::default()))
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if content.trim().is_empty() {
+        return Ok(serde_json::Value::Object(Default::default()));
+    }
+    let overrides: serde_json::Value = toml::from_str(&content)?;
+    Ok(overrides)
+}
+
+/// Drop keys whose value is `null`.
+///
+/// In a sparse override tree `null` means "unset", and TOML cannot store one,
+/// so a null left in the tree is always a caller that meant to clear the leaf
+/// rather than to set it. Removing them here is what lets a PATCH repair a
+/// value the loader would otherwise refuse to deserialize.
+fn strip_nulls(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            map.retain(|_, v| !v.is_null());
+            map.values_mut().for_each(strip_nulls);
+        }
+        serde_json::Value::Array(items) => items.iter_mut().for_each(strip_nulls),
+        _ => {}
+    }
 }
 
 /// Merge a sparse override object onto a full serialized `Config::default()`,
@@ -115,20 +154,73 @@ pub(crate) fn overrides_ignored_keys(overrides: &serde_json::Value) -> Vec<Strin
     ignored
 }
 
-/// Save profile-specific config
-pub fn save_profile_config(profile: &str, config: &ProfileConfig) -> Result<()> {
-    let path = get_profile_config_path(profile)?;
-    let content = toml::to_string_pretty(config)?;
-    crate::session::atomic_write(&path, content.as_bytes())?;
-    Ok(())
+/// Run `f` with the `config.toml` path of a profile while holding that
+/// profile's write locks: identity, profile-namespace, in-process save mutex,
+/// then the profile storage flock. The profile is materialised only after the
+/// namespace lock is held, and the lock every rename and delete also takes, so
+/// a config write can neither slip between resolution and the write nor
+/// resurrect a directory outside that window.
+fn with_profile_config_locked<T>(
+    profile: &str,
+    f: impl FnOnce(&std::path::Path) -> Result<T>,
+) -> Result<T> {
+    let _identity_lock = crate::session::acquire_session_identity_lock()?;
+    let _namespace_lock = crate::session::storage::acquire_profile_namespace_lock()?;
+    let profile_name = crate::session::resolve_profile_name(profile)?;
+    let dir = crate::session::get_profile_dir_locked(&profile_name)?;
+    // Match Storage::update: in-process save mutex first, then the cross-process flock.
+    let save_lock = crate::session::storage::save_lock_for(&profile_name);
+    let _save_lock = save_lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _profile_storage_lock = crate::session::storage::acquire_storage_flock(
+        &dir,
+        crate::session::storage::STORAGE_LOCK_FILENAME,
+    )?;
+    f(&dir.join("config.toml"))
 }
 
-/// Get the path to a profile's config file. This goes through the
-/// creating [`get_profile_dir`] because the only remaining caller is
-/// [`save_profile_config`], which needs the directory to exist before
-/// the atomic write.
+/// Write `config` to a profile's `config.toml`, replacing it whole. The
+/// profile directory is created under the profile locks when absent.
+pub fn save_profile_config(profile: &str, config: &ProfileConfig) -> Result<()> {
+    let content = toml::to_string_pretty(config)?;
+    with_profile_config_locked(profile, |path| {
+        crate::session::atomic_write(path, content.as_bytes())
+    })
+}
+
+/// Locked read-modify-write over a profile's sparse override tree.
+///
+/// `mutate` receives the current on-disk overrides as a JSON object (absent or
+/// empty file ⇒ `{}`) and edits them in place; the result is written back and
+/// returned. The read and the write happen under one profile lock, so
+/// concurrent PATCHes from the web UI, the TUI, and other processes compose
+/// instead of clobbering each other's leaves. `mutate` sees the same JSON shape
+/// [`ProfileConfig`] deserializes from, minus nothing: `description` is a
+/// top-level key like any other.
+pub fn update_profile_config(
+    profile: &str,
+    mutate: impl FnOnce(&mut serde_json::Value) -> Result<()>,
+) -> Result<ProfileConfig> {
+    with_profile_config_locked(profile, |path| {
+        // Read the raw overrides, not a typed config: a file whose value does
+        // not type-check is exactly what a PATCH setting that value to `null`
+        // has to repair, and deserializing it first would make the profile
+        // unmanageable from every UI. Type-check the *result* instead.
+        let mut merged = read_raw_overrides_at(path)?;
+        mutate(&mut merged)?;
+        strip_nulls(&mut merged);
+        validate_overrides_typecheck(&merged)?;
+        let merged: ProfileConfig = serde_json::from_value(merged)?;
+        let content = toml::to_string_pretty(&merged)?;
+        crate::session::atomic_write(path, content.as_bytes())?;
+        Ok(merged)
+    })
+}
+
+/// Get the path to a profile's config file, without creating the profile.
 pub fn get_profile_config_path(profile: &str) -> Result<std::path::PathBuf> {
-    Ok(get_profile_dir(profile)?.join("config.toml"))
+    Ok(crate::session::get_profile_dir_path(profile)?.join("config.toml"))
 }
 
 /// Check if a profile has any overrides set
@@ -681,5 +773,88 @@ mod tests {
         apply_cityhall_overrides(&mut on);
         assert_eq!(on.acp.max_concurrent_workers, 50);
         assert!(on.worktree.enabled);
+    }
+
+    /// The read and the write of an update share one profile lock, so two
+    /// concurrent writers touching different leaves both land. An unlocked
+    /// load-then-save would let the second writer overwrite the first's leaf.
+    #[test]
+    #[serial_test::serial]
+    fn update_profile_config_keeps_both_concurrent_leaves() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let _guard = crate::session::test_support::isolate_app_dir_at(temp.path());
+        crate::session::create_profile("rmw").unwrap();
+
+        // Each writer announces from inside its read-modify-write window, so an
+        // announcement proves that writer already read the overrides. The
+        // profile lock keeps the peer out, so exactly one of the two waits runs
+        // out: the deadline bounds that wait, it does not stand in for the
+        // interleaving this test guards.
+        let (first_tx, first_rx) = std::sync::mpsc::channel::<()>();
+        let (second_tx, second_rx) = std::sync::mpsc::channel::<()>();
+        let rendezvous = std::time::Duration::from_secs(2);
+        let writers: Vec<_> = [
+            ("auto_resume_on_restart", first_tx, second_rx),
+            ("tie_workdir_to_name", second_tx, first_rx),
+        ]
+        .into_iter()
+        .map(|(leaf, announce, wait_for_peer)| {
+            std::thread::spawn(move || {
+                update_profile_config("rmw", |current| {
+                    // The peer may have given up and dropped its receiver
+                    // already; only a delivered announcement proves its read.
+                    let _announced = announce.send(());
+                    let _peer_announced = wait_for_peer.recv_timeout(rendezvous);
+                    current
+                        .as_object_mut()
+                        .expect("profile config is a JSON object")
+                        .entry("session".to_string())
+                        .or_insert_with(|| json!({}))
+                        .as_object_mut()
+                        .expect("session section is a JSON object")
+                        .insert(leaf.to_string(), json!(false));
+                    Ok(())
+                })
+                .expect("locked update succeeds");
+            })
+        })
+        .collect();
+        for writer in writers {
+            writer.join().expect("writer thread panicked");
+        }
+
+        let overrides = load_profile_config("rmw").expect("reload").overrides;
+        assert_eq!(overrides["session"]["auto_resume_on_restart"], json!(false));
+        assert_eq!(overrides["session"]["tie_workdir_to_name"], json!(false));
+    }
+
+    /// A PATCH that nulls a badly-typed leaf is the only way back: reading the
+    /// file as a typed config first made the 400 unrecoverable, and no reset
+    /// endpoint exists.
+    #[test]
+    #[serial_test::serial]
+    fn a_patch_repairs_an_invalid_leaf() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let _guard = crate::session::test_support::isolate_app_dir_at(temp.path());
+        crate::session::create_profile("repair").unwrap();
+        let path = crate::session::get_profile_dir_path("repair")
+            .unwrap()
+            .join("config.toml");
+        std::fs::write(&path, "[worktree]\nenabled = \"yes\"\n").unwrap();
+        assert!(
+            load_profile_config("repair").is_err(),
+            "the invalid leaf is what the load rejects"
+        );
+
+        update_profile_config("repair", |current| {
+            current
+                .as_object_mut()
+                .expect("overrides are a JSON object")
+                .insert("worktree".to_string(), json!({ "enabled": null }));
+            Ok(())
+        })
+        .expect("the PATCH must be able to repair the profile");
+
+        load_profile_config("repair").expect("the repaired file type-checks");
     }
 }

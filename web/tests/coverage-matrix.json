@@ -3,6 +3,13 @@
   "description": "Surface/flow coverage matrix for the agent-of-empires web dashboard. Every component file under web/src/components/** must appear in at least one entry's `components` list (covered, deferred, or out-of-scope), or in coverage-matrix.exempt.json. CI validates this on every PR via tests/validate-coverage-matrix.mjs.",
   "surfaces": [
     {
+      "id": "session.workspace-delete-teardown-pending",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": ["src/lib/__tests__/trashActions.test.ts", "src/lib/api.test.ts"],
+      "components": ["web/src/lib/trashActions.ts", "web/src/lib/api.ts"]
+    },
+    {
       "id": "terminal.paired-shell",
       "kind": "vitest",
       "risk": "medium",

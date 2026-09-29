@@ -99,7 +99,9 @@ pub fn claim_idle_stop(
     now: DateTime<Utc>,
     threshold_secs: u32,
 ) -> anyhow::Result<Option<Instance>> {
-    let storage = Storage::new(profile, file_watch)?;
+    // Strict, for the same reason as the ACP idle reconciler: a deleted
+    // profile must not come back from a stale reap candidate.
+    let storage = Storage::open(profile, file_watch)?;
     storage.update(|instances, _groups| {
         let Some(inst) = instances.iter_mut().find(|i| i.id == session_id) else {
             return Ok(None);

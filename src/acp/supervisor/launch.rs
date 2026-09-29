@@ -736,7 +736,8 @@ async fn admit_durable_launch(req: &SpawnRequest) -> Result<(), SupervisorError>
         SupervisorError::Acp(AcpError::Spawn(format!("launch admission: {e:#}")))
     };
     tokio::task::spawn_blocking(move || {
-        let storage = crate::session::Storage::new_unwatched(&profile).map_err(spawn_error)?;
+        // Strict: launch admission locks a row that already exists.
+        let storage = crate::session::Storage::open_unwatched(&profile).map_err(spawn_error)?;
         let _lock = storage
             .acquire_instance_lifecycle_lock(&session_id)
             .map_err(spawn_error)?;

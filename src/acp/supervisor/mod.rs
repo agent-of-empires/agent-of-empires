@@ -8,6 +8,8 @@ mod publish;
 mod requests;
 mod sink;
 mod teardown;
+
+pub use teardown::WorktreeIntent;
 #[cfg(test)]
 mod test_support;
 

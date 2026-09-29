@@ -188,6 +188,7 @@ mod tests {
     fn sidebar_position_ignores_profile_overrides_on_startup_and_reload() {
         let temp = tempfile::TempDir::new().unwrap();
         let _guard = crate::session::test_support::isolate_app_dir_at(temp.path());
+        crate::session::create_profile("test").unwrap();
         let save_positions = |global_position, profile_position| {
             update_config(|config| config.session.sidebar_position = global_position).unwrap();
             let profile = serde_json::from_value(serde_json::json!({

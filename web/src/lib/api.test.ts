@@ -874,14 +874,25 @@ describe("deleteWorkspace errors", () => {
     });
   });
 
+  it("marks a teardown_pending conflict as pending, not failed", async () => {
+    const failed = [{ id: "a", error: "still tearing down", retryable: true }];
+    fetchSpy.mockResolvedValueOnce(json({ error: "teardown_pending", message: "still tearing down", failed }, 409));
+    expect(await api.deleteWorkspace(["a"])).toEqual({
+      ok: false,
+      pending: true,
+      error: "still tearing down",
+      failed,
+    });
+  });
+
   it("maps server and network errors", async () => {
     const failed = [{ id: "a", error: "dirty" }];
     fetchSpy.mockResolvedValueOnce(json({ message: "dirty", failed }, 500));
-    expect(await api.deleteWorkspace(["a"])).toEqual({ ok: false, error: "dirty", failed });
+    expect(await api.deleteWorkspace(["a"])).toEqual({ ok: false, pending: false, error: "dirty", failed });
     fetchSpy.mockResolvedValueOnce(empty(500));
-    expect(await api.deleteWorkspace(["a"])).toEqual({ ok: false, error: "Server error (500)" });
+    expect(await api.deleteWorkspace(["a"])).toEqual({ ok: false, pending: false, error: "Server error (500)" });
     offline();
-    expect(await api.deleteWorkspace(["a"])).toEqual({ ok: false, error: "Network error: offline" });
+    expect(await api.deleteWorkspace(["a"])).toEqual({ ok: false, pending: false, error: "Network error: offline" });
   });
 });
 

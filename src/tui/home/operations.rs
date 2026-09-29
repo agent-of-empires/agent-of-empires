@@ -3,12 +3,14 @@
 use crate::session::builder::{self, InstanceParams};
 use crate::session::conversation_carry;
 use crate::session::{
-    acquire_session_identity_lock, duplicate_session_error, is_duplicate_session, list_profiles,
-    GroupMovePlan, Instance, Item, LifecycleOperation, StartBlocked, Status, Storage,
+    acquire_session_identity_lock, acquire_session_workspace_claim_lock, duplicate_session_error,
+    is_duplicate_session, list_profiles, GroupMovePlan, Instance, Item, LifecycleOperation,
+    StartBlocked, Status, Storage,
 };
 use crate::tui::deletion_poller::DeletionRequest;
 use crate::tui::dialogs::{DeleteOptions, GroupDeleteOptions, InfoDialog, NewSessionData};
 use crate::tui::restart_poller::RestartRequest;
+use std::path::PathBuf;
 
 use super::HomeView;
 
@@ -251,20 +253,92 @@ impl HomeView {
             &target_profile,
         )?;
         let mut instance = build_result.instance;
+        let created_worktree = build_result.created_worktree;
+        let created_workspace_worktrees = build_result.created_workspace_worktrees;
         instance.source_profile = target_profile.clone();
         if structured {
             builder::structured::apply_structured_choice(&mut instance);
         }
         let session_id = instance.id.clone();
-
-        // Ensure target profile storage exists
-        if !self.storages.contains_key(&target_profile) {
-            self.storages.insert(
-                target_profile.clone(),
-                Storage::new(&target_profile, self.file_watch.clone())?,
+        let manages_worktree = instance
+            .worktree_info
+            .as_ref()
+            .is_some_and(|worktree| worktree.managed_by_aoe)
+            || instance.workspace_info.is_some();
+        let _workspace_claim_lock = match acquire_session_workspace_claim_lock() {
+            Ok(lock) => lock,
+            Err(error) => {
+                builder::cleanup_instance_locked(
+                    &instance,
+                    created_worktree.as_ref(),
+                    &created_workspace_worktrees,
+                    None,
+                );
+                return Err(error);
+            }
+        };
+        let _identity_lock = match acquire_session_identity_lock() {
+            Ok(lock) => lock,
+            Err(error) => {
+                // Only the workspace-claim flock is held; release it so the
+                // cleanup path can take the pair itself.
+                drop(_workspace_claim_lock);
+                builder::cleanup_instance_locked(
+                    &instance,
+                    created_worktree.as_ref(),
+                    &created_workspace_worktrees,
+                    None,
+                );
+                return Err(error);
+            }
+        };
+        if let Err(error) = crate::session::validate_managed_workspace(&instance) {
+            builder::cleanup_instance(
+                &instance,
+                created_worktree.as_ref(),
+                &created_workspace_worktrees,
+                None,
             );
+            return Err(anyhow::anyhow!(
+                "Managed workspace validation failed before the session was persisted: {error}"
+            ));
+        }
+        if manages_worktree {
+            let mut candidate_paths = vec![PathBuf::from(&instance.project_path)];
+            candidate_paths.extend(
+                instance
+                    .all_repos()
+                    .iter()
+                    .map(|repo| PathBuf::from(&repo.worktree_path)),
+            );
+            if let Err(error) =
+                crate::session::deletion::ensure_unclaimed_paths(&instance.id, &candidate_paths)
+            {
+                builder::cleanup_instance(
+                    &instance,
+                    created_worktree.as_ref(),
+                    &created_workspace_worktrees,
+                    None,
+                );
+                return Err(anyhow::anyhow!(
+                    "Session path is already claimed by another session: {error}"
+                ));
+            }
         }
 
+        let storage = match Storage::open(&target_profile, self.file_watch.clone()) {
+            Ok(storage) => storage,
+            Err(error) => {
+                builder::cleanup_instance(
+                    &instance,
+                    created_worktree.as_ref(),
+                    &created_workspace_worktrees,
+                    None,
+                );
+                return Err(error);
+            }
+        };
+        self.storages.insert(target_profile.clone(), storage);
         self.add_instance(instance.clone());
         self.rebuild_group_trees();
         if !instance.group_path.is_empty() {
@@ -272,7 +346,13 @@ impl HomeView {
                 tree.create_group(&instance.group_path);
             }
         }
-        self.save()?;
+        self.save_with_storage()?;
+        // `reload()` reconciles cross-profile duplicates, and a journal-driven repair
+        // re-acquires the identity flock. Releasing both here keeps the publication
+        // path inside one lock window, the same way `apply_creation_results` does
+        // for a delivered creation result.
+        drop(_workspace_claim_lock);
+        drop(_identity_lock);
 
         self.reload()?;
         // reload()'s selection fallback lands on the nearest index, often the new
@@ -392,12 +472,12 @@ impl HomeView {
 
         // Identity-changing edits follow the global lock order: app-wide identity, then
         // session title and source lifecycle. Hold both through the profile transaction.
-        let profile_move_identity = if profile_move_target.is_some() {
+        let mut profile_move_identity = if profile_move_target.is_some() {
             Some(acquire_session_identity_lock()?)
         } else {
             None
         };
-        let profile_move_guards = if profile_move_target.is_some() {
+        let mut profile_move_guards = if profile_move_target.is_some() {
             Some(self.lock_session_mutation_and_reload(&id)?)
         } else {
             None
@@ -478,7 +558,16 @@ impl HomeView {
                     carry.retarget(conversation_carry::conversation_ids(moved));
                 }
             }
+            // `reload()` reconciles cross-profile duplicates, and a journal-driven
+            // repair re-acquires identity, then title, then lifecycle — the very
+            // flocks held here, so the reload would wait on its own lock. All three
+            // guards go first; they are reacquired in the canonical order, and the
+            // row is re-read from the committed profile before the save below.
+            drop(profile_move_guards);
+            drop(profile_move_identity);
             self.reload_preserving_profile_move_runtime(std::slice::from_ref(&id))?;
+            profile_move_identity = Some(acquire_session_identity_lock()?);
+            profile_move_guards = Some(self.lock_session_mutation_and_reload(&id)?);
         } else {
             // Outside Attention sort, restart on a snoozed row clears the
             // snooze flag so persisted state matches the visible restart.
@@ -520,9 +609,9 @@ impl HomeView {
         // Persist profile/tool/command and the access timestamp while the durable row
         // still carries its prior lifecycle. The worker owns the Starting reservation;
         // publishing that status here would make it reject its own request.
-        self.save()?;
-        // The canonical profile locks are already released; publish the final launch
-        // edit while identity, title and lifecycle are still guarded.
+        self.save_with_storage()?;
+        // Both flocks were released for the profile-move reload and reacquired in
+        // the canonical order, so the save above runs under them again.
         drop(profile_move_identity);
         drop(profile_move_guards);
 
@@ -1088,9 +1177,12 @@ impl HomeView {
                     },
                 )?;
             }
-            self.reload_preserving_profile_move_runtime(&affected_ids)?;
+            // `reload()` reconciles cross-profile duplicates, and a journal-driven
+            // repair re-acquires the identity, title and lifecycle flocks these guards
+            // hold. The transaction above is already committed, so release them first.
             drop(identity_guard);
             drop(mutation_guards);
+            self.reload_preserving_profile_move_runtime(&affected_ids)?;
             return Ok(());
         }
 
@@ -1180,7 +1272,7 @@ impl HomeView {
             .ok_or_else(|| anyhow::anyhow!("Session not found"))?;
         let source_profile = live.source_profile.clone();
         let _identity_lock = acquire_session_identity_lock()?;
-        let storage = Storage::new(&source_profile, self.file_watch.clone())?;
+        let storage = Storage::open(&source_profile, self.file_watch.clone())?;
         let _lifecycle_lock = storage.acquire_instance_lifecycle_lock(&id)?;
         let authoritative_instances = storage.load()?;
         let mut authoritative = authoritative_instances
@@ -1624,10 +1716,18 @@ impl HomeView {
                         Ok(())
                     },
                 )?;
-                self.reload_preserving_profile_move_runtime(std::slice::from_ref(&id))?;
-                drop(_identity_lock);
-                let tmux_warning = rekey_tmux_after_persist(&id, &current_title, &effective_title);
+                // `reload()` reconciles cross-profile duplicates, and a journal-driven
+                // repair re-acquires identity, then title, then lifecycle — the very
+                // flocks still held here, so the reload would wait on its own lock.
+                // Every guard goes first and the canonical order is restored after
+                // it; the tmux rekey is tmux-side, so it runs with the guards back.
                 drop(_mutation_guards);
+                drop(_identity_lock);
+                self.reload_preserving_profile_move_runtime(std::slice::from_ref(&id))?;
+                let _identity_lock = acquire_session_identity_lock()?;
+                let _mutation_guards = self.lock_session_mutation_and_reload(&id)?;
+                let tmux_warning = rekey_tmux_after_persist(&id, &current_title, &effective_title);
+                drop((_identity_lock, _mutation_guards));
                 if let Some(warning) = tmux_warning {
                     self.info_dialog = Some(InfoDialog::new("Rename Saved with Warning", &warning));
                 }
@@ -1830,7 +1930,9 @@ impl HomeView {
         // through the archive so `aoe send` cannot relaunch or type into the session between.
         let lifecycle_lock = match self.instances.get(&id) {
             Some(inst) => {
-                let storage = Storage::new(&inst.effective_profile(), self.file_watch.clone())?;
+                // Strict: taking a lock for a row that exists must not create the
+                // profile it names, or a deleted profile comes back empty.
+                let storage = Storage::open(&inst.effective_profile(), self.file_watch.clone())?;
                 let lock = storage.acquire_instance_lifecycle_lock(&id)?;
                 inst.stop_all_tmux_sessions_locked(&storage);
                 Some(lock)
@@ -1907,7 +2009,24 @@ impl HomeView {
             return;
         };
         let acquisition = (|| -> anyhow::Result<_> {
+            let _identity_lock = acquire_session_identity_lock()?;
+            let storage = &storage.reopen_preserving_watch()?;
             let _lifecycle_lock = storage.acquire_instance_lifecycle_lock(id)?;
+            if request_instance.has_managed_worktree_or_workspace() {
+                let mut candidate_paths =
+                    vec![std::path::PathBuf::from(&request_instance.project_path)];
+                if let Some(workspace) = &request_instance.workspace_info {
+                    candidate_paths.push(std::path::PathBuf::from(&workspace.workspace_dir));
+                }
+                candidate_paths.extend(
+                    request_instance
+                        .all_repos()
+                        .iter()
+                        .map(|repo| std::path::PathBuf::from(&repo.worktree_path)),
+                );
+                crate::session::deletion::ensure_unclaimed_paths(id, &candidate_paths)
+                    .map_err(|error| anyhow::anyhow!("{error}"))?;
+            }
             storage.update(|instances, _groups| {
                 let stored = instances
                     .iter_mut()
@@ -2196,7 +2315,8 @@ impl HomeView {
         lock_order.sort_by(|a, b| a.id.cmp(&b.id));
         let mut lifecycle_locks = Vec::with_capacity(lock_order.len());
         for inst in lock_order {
-            let storage = Storage::new(&inst.effective_profile(), self.file_watch.clone())?;
+            // Strict, for the same reason as the single-row archive above.
+            let storage = Storage::open(&inst.effective_profile(), self.file_watch.clone())?;
             lifecycle_locks.push(storage.acquire_instance_lifecycle_lock(&inst.id)?);
         }
         self.bulk_apply_user_action(&ids, |inst| inst.archive())?;
@@ -2250,6 +2370,21 @@ fn restore_from_trash_with_storage(
     id: &str,
     owned_trash_generation: Option<u64>,
 ) -> RestoreFromTrash {
+    let _identity_lock = match acquire_session_identity_lock() {
+        Ok(lock) => lock,
+        Err(error) => {
+            tracing::warn!(target: "tui.home", id = %id, "restore identity lock failed: {error}");
+            return RestoreFromTrash::PersistFailed;
+        }
+    };
+    let profile = storage.profile().to_string();
+    let storage = match Storage::open_unwatched(&profile) {
+        Ok(storage) => storage,
+        Err(error) => {
+            tracing::warn!(target: "tui.home", id = %id, "restore profile open failed: {error}");
+            return RestoreFromTrash::PersistFailed;
+        }
+    };
     let _lifecycle_lock = match storage.acquire_instance_lifecycle_lock(id) {
         Ok(lock) => lock,
         Err(error) => {

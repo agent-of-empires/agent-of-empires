@@ -548,6 +548,35 @@ fn signal_process_tree(pid: u32, signal: Signal) {
 mod tests {
     use super::*;
 
+    /// A child that exited but has not been reaped is a zombie: it holds
+    /// nothing and cannot touch a checkout, so it must not read as alive. The
+    /// supervisor otherwise finds a torn-down runner unprovable forever and
+    /// refuses every destructive call on that session.
+    #[test]
+    #[cfg(unix)]
+    fn a_zombie_child_is_not_alive() {
+        let child = Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .expect("spawn a child that exits at once");
+        let pid = child.id();
+        // Never call try_wait: that is what reaps. Poll the state instead, so
+        // the pid stays a zombie for the assertions below.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !linux::is_terminated(pid) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "child never became a zombie"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !worker::is_pid_alive(pid) && !worker::is_pid_alive_and_ours(pid),
+            "a zombie holds nothing, so neither liveness probe may call it alive"
+        );
+        drop(child);
+    }
+
     #[test]
     fn processes_matching_empty_input_is_empty() {
         assert!(processes_matching(&[], &[], &[]).is_empty());

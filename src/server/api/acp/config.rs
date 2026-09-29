@@ -94,7 +94,7 @@ async fn persist_selector(
         selector.apply(inst, value.to_string());
         inst.source_profile.clone()
     };
-    match crate::session::Storage::new(&profile, state.file_watch.clone()) {
+    match crate::session::Storage::open(&profile, state.file_watch.clone()) {
         Ok(storage) => {
             if let Err(e) = storage.update(|instances, _groups| {
                 if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {

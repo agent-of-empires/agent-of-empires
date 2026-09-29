@@ -1759,44 +1759,45 @@ pub async fn update_profile_settings(
     strip_local_only(&mut body);
 
     let result = tokio::task::spawn_blocking(move || {
-        let config = crate::session::load_profile_config(&name).unwrap_or_default();
-        let mut current = serde_json::to_value(&config)?;
-        // Apply each validated leaf onto the sparse override object: null
-        // clears it, anything else sets it. Sections are created lazily so a
-        // single-field patch never wipes its siblings.
-        if let Some(update_obj) = body.as_object() {
-            for (key, value) in update_obj {
-                match value {
-                    serde_json::Value::Object(fields) => {
-                        for (field, fval) in fields {
-                            if fval.is_null() {
-                                clear_path(&mut current, key, field);
-                            } else if let Some(root) = current.as_object_mut() {
-                                let section = root
-                                    .entry(key.clone())
-                                    .or_insert_with(|| serde_json::json!({}));
-                                if let Some(sec) = section.as_object_mut() {
-                                    sec.insert(field.clone(), fval.clone());
+        // Load, merge, and write under one profile lock: a concurrent PATCH (or a
+        // TUI save) between our read and write would otherwise silently drop
+        // the leaves it wrote.
+        crate::session::update_profile_config(&name, |current| {
+            // Apply each validated leaf onto the sparse override object: null
+            // clears it, anything else sets it. Sections are created lazily so a
+            // single-field patch never wipes its siblings.
+            if let Some(update_obj) = body.as_object() {
+                for (key, value) in update_obj {
+                    match value {
+                        serde_json::Value::Object(fields) => {
+                            for (field, fval) in fields {
+                                if fval.is_null() {
+                                    clear_path(&mut *current, key, field);
+                                } else if let Some(root) = current.as_object_mut() {
+                                    let section = root
+                                        .entry(key.clone())
+                                        .or_insert_with(|| serde_json::json!({}));
+                                    if let Some(sec) = section.as_object_mut() {
+                                        sec.insert(field.clone(), fval.clone());
+                                    }
                                 }
                             }
                         }
-                    }
-                    serde_json::Value::Null => {
-                        if let Some(root) = current.as_object_mut() {
-                            root.remove(key);
+                        serde_json::Value::Null => {
+                            if let Some(root) = current.as_object_mut() {
+                                root.remove(key);
+                            }
                         }
-                    }
-                    other => {
-                        if let Some(root) = current.as_object_mut() {
-                            root.insert(key.clone(), other.clone());
+                        other => {
+                            if let Some(root) = current.as_object_mut() {
+                                root.insert(key.clone(), other.clone());
+                            }
                         }
                     }
                 }
             }
-        }
-        let config: crate::session::ProfileConfig = serde_json::from_value(current)?;
-        crate::session::save_profile_config(&name, &config)?;
-        Ok::<_, anyhow::Error>(config)
+            Ok(())
+        })
     })
     .await;
 

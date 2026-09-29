@@ -1822,6 +1822,9 @@ async fn worktree_edits_quiesce_structured_worker_only_when_its_cwd_moves() {
         // (#2260). The quiesce precedes the git edit, so the assertion holds even
         // though the edit then fails on a fixture with no real worktree.
         let _app_dir = crate::session::test_support::isolate_app_dir();
+        // save_profile_config never creates a profile directory, so the
+        // override below needs one to exist first.
+        crate::session::create_profile("test").unwrap();
         // set_worktree_name refuses a tied managed worktree (tied callers must
         // go through rename_session), so untie the profile to reach the worker
         // gate that this test exercises.
@@ -2654,6 +2657,195 @@ async fn worker_stopping_handlers_wait_for_an_in_flight_submission() {
     }
 }
 
+/// The identity and lifecycle flocks are process-wide files, so holding them
+/// across the ACP stop froze every creation, rename, reconciliation and purge
+/// for as long as the teardown grace lasted. An independent identity mutation
+/// must therefore advance while the stop is still running.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_trash_stop_does_not_hold_the_identity_lock() {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let temp = tempfile::tempdir().unwrap();
+    let _app_dir = crate::session::test_support::isolate_app_dir_at(temp.path());
+    let profile = "trash-lock";
+    crate::session::create_profile(profile).unwrap();
+    let mut inst = crate::session::Instance::new("stuck", temp.path().to_str().unwrap());
+    inst.id = "stuck-runner".to_string();
+    inst.source_profile = profile.to_string();
+    inst.view = crate::session::View::Structured;
+    let id = inst.id.clone();
+    crate::session::Storage::new_unwatched(profile)
+        .unwrap()
+        .update(|all, _| {
+            all.push(inst.clone());
+            Ok(())
+        })
+        .unwrap();
+
+    use crate::acp::runner_lifecycle::test_support::FakeProcessControl;
+    let control = Arc::new(FakeProcessControl::default());
+    control.immortal(9311);
+    let state = crate::server::test_support::build_test_app_state_with_process_control(
+        vec![inst],
+        control.clone(),
+    );
+    state
+        .acp_supervisor
+        .test_install_attached(
+            &id,
+            crate::acp::runner_lifecycle::RunnerIdentity {
+                pid: 9311,
+                generation: 1,
+            },
+        )
+        .await;
+
+    let trash = tokio::spawn({
+        let state = Arc::clone(&state);
+        let id = id.clone();
+        async move {
+            trash_session(State(state), Path(id), None)
+                .await
+                .into_response()
+        }
+    });
+    // The teardown grace is ~2.5s; an independent mutation must not queue
+    // behind it.
+    tokio::time::timeout(Duration::from_millis(1500), async {
+        while state.acp_supervisor.worker_state(&id).await
+            != crate::daemon::AcpWorkerState::Stopping
+        {
+            tokio::task::yield_now().await;
+        }
+        tokio::task::spawn_blocking(crate::session::acquire_session_identity_lock)
+            .await
+            .unwrap()
+            .expect("the identity lock is free while the ACP stop runs");
+    })
+    .await
+    .expect("the identity lock must not wait on the ACP teardown");
+
+    control.exit(9311);
+    tokio::time::timeout(Duration::from_secs(20), trash)
+        .await
+        .expect("the trash must finish, not deadlock on the locks it reacquires")
+        .unwrap();
+}
+
+/// A live `Attach` reservation is an expected lifecycle conflict, so the
+/// worktree rename answers a retryable 409 and changes nothing, rather than a
+/// 500 the client cannot act on.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_worktree_rename_during_an_attach_is_a_retryable_conflict() {
+    use crate::session::LifecycleOperation;
+
+    let _app_dir = crate::session::test_support::isolate_app_dir();
+    crate::session::create_profile("test").unwrap();
+    let paths = tempfile::tempdir().unwrap();
+    let project_path = paths.path().join("attaching");
+    let mut inst = Instance::new("Original", project_path.to_str().unwrap());
+    inst.id = "sw-attaching".to_string();
+    inst.source_profile = "test".to_string();
+    inst.worktree_info = Some(worktree(
+        "attaching",
+        paths
+            .path()
+            .join("missing-repo")
+            .to_string_lossy()
+            .into_owned(),
+        None,
+    ));
+    let id = inst.id.clone();
+
+    let storage = Storage::new_unwatched("test").unwrap();
+    storage
+        .update(|instances, _groups| {
+            *instances = vec![inst.clone()];
+            Ok(())
+        })
+        .unwrap();
+    // The reservation must survive the row rewrite, so stamp it after.
+    storage
+        .update(|instances, _groups| {
+            let row = instances.iter_mut().find(|row| row.id == id).unwrap();
+            row.try_acquire_lifecycle_reservation(
+                LifecycleOperation::Attach,
+                Instance::LIFECYCLE_RESERVATION_TTL,
+                chrono::Utc::now(),
+            )
+            .unwrap();
+            Ok(())
+        })
+        .unwrap();
+    let state = crate::server::test_support::build_test_app_state(vec![inst]);
+
+    let refused = set_worktree_name(
+        State(state.clone()),
+        Path(id.clone()),
+        Ok(Json(SetWorktreeNameBody {
+            name: "renamed".to_string(),
+            rename_branch: false,
+        })),
+    )
+    .await
+    .into_response();
+    assert_eq!(refused.status(), StatusCode::CONFLICT);
+    let body: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(refused.into_body(), 64 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap()
+            .to_lowercase()
+            .contains("retry"),
+        "the refusal must tell the client to retry: {body}"
+    );
+    assert_eq!(
+        storage
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.id == id)
+            .unwrap()
+            .project_path,
+        project_path.to_string_lossy(),
+        "a refused rename must not have touched the session"
+    );
+
+    storage
+        .update(|instances, _groups| {
+            let row = instances.iter_mut().find(|row| row.id == id).unwrap();
+            row.release_lifecycle_reservation_if_owned(
+                LifecycleOperation::Attach,
+                row.lifecycle_generation,
+            );
+            Ok(())
+        })
+        .unwrap();
+    let released = set_worktree_name(
+        State(state.clone()),
+        Path(id.clone()),
+        Ok(Json(SetWorktreeNameBody {
+            name: "renamed".to_string(),
+            rename_branch: false,
+        })),
+    )
+    .await
+    .into_response();
+    assert_ne!(
+        released.status(),
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "once the attach settles the same call must not fault"
+    );
+}
+
 /// A direct stop sets `Stopped` on the live in-memory row without going through
 /// `apply_status_intent`, which normally releases a plugin's pending revival mark on reaching
 /// a terminal status; `stop_session` must do the same itself, on that same in-memory row (the
@@ -2678,7 +2870,6 @@ async fn stop_session_clears_a_pending_plugin_revival() {
         "a direct stop must release a stale pending mark"
     );
 }
-
 /// #3651: `prompt_submission` auto-vivifies a registry entry for whatever id it
 /// is handed and nothing prunes it, so every externally reachable mutation must
 /// prove the session exists first, or an authenticated client can grow daemon

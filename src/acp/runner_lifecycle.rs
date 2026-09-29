@@ -504,6 +504,24 @@ impl LifecycleTable {
         }
     }
 
+    /// Whether the session holds a spawn that has not installed a worker yet.
+    ///
+    /// Narrower than [`WorkerPhase::Resuming`] on purpose. A respawn's previous
+    /// worker may still be alive, and an `Attach` epoch is by construction a live
+    /// runner re-dialled from disk, which is why `occupied_slots` and
+    /// `counts_registry_record` both special-case that kind. Only a first spawn
+    /// has no runner at all, and nothing drains the ACP connection before
+    /// `install`, so only a first spawn is publishing nothing.
+    pub fn spawn_without_runner(&self, session_id: &str) -> bool {
+        matches!(
+            self.entries.get(session_id).map(|e| &e.phase),
+            Some(Phase::Starting {
+                kind: ResumeKind::Spawn,
+                ..
+            })
+        )
+    }
+
     pub fn snapshot(&self) -> HashMap<String, WorkerPhase> {
         self.entries
             .keys()
@@ -624,6 +642,40 @@ mod tests {
 
     fn identity(pid: u32, generation: u64) -> RunnerIdentity {
         RunnerIdentity { pid, generation }
+    }
+
+    /// `spawn_without_runner` must not answer for a respawn, whose previous
+    /// worker may still be alive, nor for an attach, which re-dials a runner
+    /// that never stopped: a destructive caller reading either as "no runner"
+    /// would remove the ACP event store and the managed worktree under it.
+    #[test]
+    fn spawn_without_runner_excludes_an_installed_worker_a_respawn_and_an_attach() {
+        let mut table = LifecycleTable::new(1);
+        let lease = table.admit(ID, ResumeKind::Spawn).expect("admitted");
+        assert!(table.spawn_without_runner(ID), "a spawn has no runner yet");
+
+        table
+            .install(&lease, Some(identity(4242, 1)))
+            .expect("installed");
+        assert!(
+            !table.spawn_without_runner(ID),
+            "an installed worker is a runner"
+        );
+
+        table.begin_respawn(&lease).expect("respawn");
+        assert!(
+            !table.spawn_without_runner(ID),
+            "a respawn is not a spawn: the previous worker may still be alive"
+        );
+
+        let mut attach = LifecycleTable::new(1);
+        attach
+            .admit("attached", ResumeKind::Attach)
+            .expect("admitted");
+        assert!(
+            !attach.spawn_without_runner("attached"),
+            "an attach epoch re-dials a live runner, so it is never runner-less"
+        );
     }
 
     #[test]

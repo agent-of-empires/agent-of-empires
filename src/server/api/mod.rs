@@ -102,7 +102,9 @@ pub(crate) async fn load_persisted_instance(
     let file_watch = state.file_watch.clone();
     let persisted = tokio::task::spawn_blocking(
         move || -> anyhow::Result<Option<crate::session::Instance>> {
-            let storage = crate::session::Storage::new(&profile_for_load, file_watch)?;
+            // Strict: reading a row before a switch must not create the profile it
+            // names, or a deleted profile comes back empty.
+            let storage = crate::session::Storage::open(&profile_for_load, file_watch)?;
             Ok(storage
                 .load()?
                 .into_iter()

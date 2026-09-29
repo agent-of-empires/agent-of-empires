@@ -498,6 +498,7 @@ async fn archive_session(profile: &str, args: ArchiveArgs) -> Result<()> {
 }
 
 async fn restore_session(profile: &str, args: SessionIdArgs) -> Result<()> {
+    let _identity_lock = acquire_session_identity_lock()?;
     let storage = Storage::open_unwatched(profile)?;
 
     let (instances, _groups) = storage.load_with_groups()?;
@@ -968,6 +969,7 @@ async fn import_sessions(profile: &str, args: ImportArgs) -> Result<()> {
     }
 
     let group = args.group.clone().unwrap_or_default();
+    let _identity_lock = acquire_session_identity_lock()?;
     let session_configs: Vec<_> = to_import
         .iter()
         .map(|s| {
@@ -996,6 +998,7 @@ async fn import_sessions(profile: &str, args: ImportArgs) -> Result<()> {
         }
         Ok(ids)
     })?;
+    drop(_identity_lock);
 
     println!("✓ Imported {} session(s).", created_ids.len());
 
@@ -2425,6 +2428,16 @@ async fn set_worktree_name(profile: &str, args: SetWorktreeNameArgs) -> Result<(
         .iter()
         .find(|instance| instance.id == id)
         .ok_or_else(|| anyhow::anyhow!("Session not found: {}", id))?;
+    if inst
+        .lifecycle_reservation
+        .as_ref()
+        .is_some_and(|reservation| {
+            reservation.op == LifecycleOperation::Attach
+                && inst.has_fresh_lifecycle_reservation(chrono::Utc::now())
+        })
+    {
+        bail!("Session is attaching a project; wait for the attach to finish before renaming its worktree");
+    }
     let mut inst = inst.clone();
     if let Err(error) = crate::session::worktree_reconcile::reconcile_and_persist(
         &storage,

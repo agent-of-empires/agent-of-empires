@@ -105,9 +105,22 @@ pub fn reconcile_and_persist(
             let id = inst.id.clone();
             let stale = inst.project_path.clone();
             let new_path = found.to_string_lossy().into_owned();
-            // Both guards below need the storage lock the git lookup ran
-            // without, so they live inside the update rather than beside it.
+            // The ownership scan below and the compare-and-set inside the
+            // update each read their own unlocked snapshot, so a session
+            // recorded between them is seen by neither. The scan is a preflight,
+            // not a reservation of the path.
             let mut claimed_by: Option<String> = None;
+            if let Err(error) =
+                crate::session::deletion::ensure_unclaimed_paths(&id, std::slice::from_ref(found))
+            {
+                tracing::warn!(
+                    target: "session.worktree",
+                    session = %id,
+                    candidate = %found.display(),
+                    "worktree ownership could not be verified; refusing to adopt it: {error}"
+                );
+                return Ok(WorktreePathResolution::Current);
+            }
             let applied = storage.update(|instances, _groups| {
                 // Never adopt a checkout another session already records.
                 if let Some(owner) = instances.iter().find(|c| {
@@ -180,6 +193,13 @@ pub fn reconcile_and_persist(
 
 /// Reconcile every session in one profile against git's worktree listing.
 pub fn reconcile_profile(profile: &str) -> bool {
+    let _identity_lock = match crate::session::acquire_session_identity_lock() {
+        Ok(lock) => lock,
+        Err(error) => {
+            tracing::warn!(target: "session.worktree", profile = %profile, "identity lock failed: {error}");
+            return false;
+        }
+    };
     let storage = match Storage::open_unwatched(profile) {
         Ok(storage) => storage,
         Err(error) => {

@@ -127,6 +127,20 @@ describe("deleteWorkspaceSessions (#2536)", () => {
     expect(d.notify.error).toHaveBeenCalledWith("dirty");
   });
 
+  it("keeps a pending teardown out of Error so the same delete can be retried", async () => {
+    deleteMock.mockResolvedValue({ ok: false, pending: true, error: "still tearing down" });
+    const d = deps();
+
+    await deleteWorkspaceSessions(sessions("a", "b"), {}, "b", d);
+
+    expect(d.purgeLocal).not.toHaveBeenCalled();
+    expect(d.setStatus).not.toHaveBeenCalledWith("a", "Error");
+    expect(d.setStatus).not.toHaveBeenCalledWith("b", "Error");
+    expect(d.setStatus).toHaveBeenCalledWith("a", "Stopped");
+    expect(d.notify.error).toHaveBeenCalledWith("still tearing down");
+    expect(d.notify.info).not.toHaveBeenCalled();
+  });
+
   it("navigates home only when the open session was deleted, not when it failed", async () => {
     for (const [result, navigations] of [
       [ok({ deleted: ["a", "b"] }), 1],
@@ -149,6 +163,39 @@ describe("deleteWorkspaceSessions (#2536)", () => {
     expect(d.purgeLocal).toHaveBeenCalledWith("a");
     expect(d.setStatus).toHaveBeenCalledWith("b", "Error");
     expect(d.notify.error).toHaveBeenCalledWith("Some sessions could not be deleted");
+  });
+
+  it("restores each row's own status on a pending teardown and on a retryable partial failure", async () => {
+    const running = { id: "run", status: "Running" } as unknown as SessionResponse;
+    const idle = { id: "idle", status: "Idle" } as unknown as SessionResponse;
+
+    deleteMock.mockResolvedValue({ ok: false, pending: true, error: "still tearing down" });
+    const pending = deps();
+    await deleteWorkspaceSessions([running, idle], {}, null, pending);
+    expect(pending.setStatus).toHaveBeenCalledWith("run", "Running");
+    expect(pending.setStatus).toHaveBeenCalledWith("idle", "Idle");
+    expect(pending.setStatus).not.toHaveBeenCalledWith("run", "Stopped");
+    expect(pending.setStatus).not.toHaveBeenCalledWith("idle", "Stopped");
+
+    deleteMock.mockResolvedValue(
+      ok({
+        deleted: ["gone"],
+        failed: [
+          { id: "run", error: "tearing down", retryable: true },
+          { id: "idle", error: "boom" },
+        ],
+      }),
+    );
+    const partial = deps();
+    await deleteWorkspaceSessions(
+      [{ id: "gone", status: "Stopped" }, running, idle] as unknown as SessionResponse[],
+      {},
+      null,
+      partial,
+    );
+    expect(partial.purgeLocal).toHaveBeenCalledWith("gone");
+    expect(partial.setStatus).toHaveBeenCalledWith("run", "Running");
+    expect(partial.setStatus).toHaveBeenCalledWith("idle", "Error");
   });
 
   it("surfaces a server message and handles a single-session workspace", async () => {

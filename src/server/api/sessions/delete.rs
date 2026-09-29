@@ -1,6 +1,7 @@
 //! Session and workspace deletion, plus worktree/trash reconciliation.
 
 use super::*;
+use crate::acp::supervisor::WorktreeIntent;
 
 // --- Delete session ---
 
@@ -31,6 +32,61 @@ async fn mark_delete_error(state: &AppState, id: &str, message: String) {
     }
 }
 
+/// Show a row as `Deleting` for polling clients, returning the status it had.
+/// The overlay is memory-only, so a caller that ends up deleting nothing has to
+/// put that status back rather than leave the row stuck greyed-out.
+async fn mark_delete_in_progress(state: &AppState, id: &str) -> Option<Status> {
+    let mut instances = state.instances.write().await;
+    let inst = instances.iter_mut().find(|i| i.id == id)?;
+    Some(std::mem::replace(&mut inst.status, Status::Deleting))
+}
+
+async fn restore_delete_status(state: &AppState, id: &str, status: Status) {
+    let mut instances = state.instances.write().await;
+    if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
+        inst.status = status;
+    }
+}
+
+/// Why a purge could not complete. `Retryable` is a transient conflict the
+/// client can retry (a runner that is still being torn down); `Fatal` is a
+/// hard failure. Collapsing the two would report a live runner as a server
+/// error and leave the row marked failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PurgeRefusal {
+    Retryable(String),
+    Fatal(String),
+}
+
+impl PurgeRefusal {
+    fn message(&self) -> &str {
+        match self {
+            Self::Retryable(message) | Self::Fatal(message) => message,
+        }
+    }
+
+    fn is_retryable(&self) -> bool {
+        matches!(self, Self::Retryable(_))
+    }
+}
+
+impl From<String> for PurgeRefusal {
+    fn from(message: String) -> Self {
+        Self::Fatal(message)
+    }
+}
+
+/// Whether this purge destroys the session's own checkout, which is the
+/// question the worktree gate asks.
+///
+/// Not the same as "is a managed git worktree on the list": a scratch session has
+/// none, so the web client always sends `delete_worktree: false`, yet the purge
+/// still removes the scratch directory unless it was kept. Reading the same
+/// inputs the deletion core reads keeps the gate and the deletion from drifting.
+fn destroys_its_checkout(instance: &crate::session::Instance, body: &DeleteSessionBody) -> bool {
+    body.delete_worktree || (instance.scratch && !body.keep_scratch)
+}
+
 /// Permanently purge a session: irreversible ACP teardown, optional sidecar
 /// cleanup per `body`, and removal from both `sessions.json` and the in-memory
 /// list. Shared by `DELETE /api/sessions/{id}` and the retention auto-purge
@@ -47,13 +103,36 @@ async fn purge_session_artifacts(
     instance: Instance,
     body: &DeleteSessionBody,
     recent_entry: Option<crate::session::RecentProjectEntry>,
-) -> Result<(bool, Vec<String>), String> {
+) -> Result<(bool, Vec<String>), PurgeRefusal> {
+    // The overlay lives here rather than in the three callers, because only this
+    // function knows whether anything was removed. A caller that set it had to
+    // remember to take it back on every exit that removed nothing, and one such
+    // exit was missed once already.
+    let previous_status = mark_delete_in_progress(state, id).await;
+    let outcome = purge_session_artifacts_inner(state, id, instance, body, recent_entry).await;
+    if !matches!(outcome, Ok((true, _))) {
+        if let Some(status) = previous_status {
+            restore_delete_status(state, id, status).await;
+        }
+    }
+    outcome
+}
+
+/// The purge proper. The caller owns the `Deleting` overlay; this only reports
+/// what it removed.
+async fn purge_session_artifacts_inner(
+    state: &Arc<AppState>,
+    id: &str,
+    instance: Instance,
+    body: &DeleteSessionBody,
+    recent_entry: Option<crate::session::RecentProjectEntry>,
+) -> Result<(bool, Vec<String>), PurgeRefusal> {
     let profile = instance.source_profile.clone();
     if profile.is_empty() {
-        return Err(
+        return Err(PurgeRefusal::Fatal(
             "Session has no source profile; refusing to acquire a default-profile purge lock"
                 .to_string(),
-        );
+        ));
     }
     let delete_request = crate::session::deletion::DeletionRequest {
         session_id: id.to_string(),
@@ -67,12 +146,28 @@ async fn purge_session_artifacts(
     };
     let file_watch = state.file_watch.clone();
     let reserve_profile = profile.clone();
-    let reservation = tokio::task::spawn_blocking(move || {
-        let storage = Storage::new(&reserve_profile, file_watch)
-            .map_err(|e| format!("Storage init failed before session teardown: {e}"))?;
-        crate::session::deletion::PurgeTransaction::reserve(storage, delete_request)
-            .map_err(|e| format!("Failed to reserve session purge: {e}"))
-    })
+    let reservation = tokio::task::spawn_blocking(
+        move || -> Result<crate::session::deletion::PurgeReservation, String> {
+            let storage = Storage::open(&reserve_profile, file_watch)
+                .map_err(|e| format!("Storage init failed before session teardown: {e}"))?;
+            let reservation =
+                crate::session::deletion::PurgeTransaction::reserve(storage, delete_request)
+                    .map_err(|e| format!("Failed to reserve session purge: {e}"))?;
+            match reservation {
+                crate::session::deletion::PurgeReservation::Reserved(transaction) => {
+                    match transaction.preflight_ownership() {
+                        Ok(transaction) => Ok(
+                            crate::session::deletion::PurgeReservation::Reserved(transaction),
+                        ),
+                        Err(result) => Ok(crate::session::deletion::PurgeReservation::Rejected(
+                            *result,
+                        )),
+                    }
+                }
+                rejected => Ok(rejected),
+            }
+        },
+    )
     .await
     .map_err(|e| format!("Deletion reservation task failed: {e}"))??;
     let transaction = match reservation {
@@ -90,27 +185,72 @@ async fn purge_session_artifacts(
                     Ok((true, result.messages))
                 }
                 crate::session::deletion::DeletionDisposition::KeptRestored => {
-                    Err("Session is being restored, so it was not purged".to_string())
+                    Err(PurgeRefusal::Fatal(
+                        "Session is being restored, so it was not purged".to_string(),
+                    ))
                 }
-                crate::session::deletion::DeletionDisposition::Busy => {
-                    Err(result.errors.first().cloned().unwrap_or_else(|| {
+                crate::session::deletion::DeletionDisposition::Busy => Err(PurgeRefusal::Fatal(
+                    result.errors.first().cloned().unwrap_or_else(|| {
                         "Session is busy with another lifecycle operation, so it was not purged"
                             .to_string()
-                    }))
-                }
+                    }),
+                )),
                 crate::session::deletion::DeletionDisposition::Failed
                 | crate::session::deletion::DeletionDisposition::Removed => {
-                    Err(result.errors.join("; "))
+                    Err(PurgeRefusal::Fatal(result.errors.join("; ")))
                 }
             };
         }
     };
+    let transcript_purged = transaction.instance().is_structured();
+
+    // A structured purge destroys state a still-running runner is using, so it
+    // waits for proven settlement. Doing this before the irreversible commit
+    // means an unproven runner leaves the durable row intact instead of
+    // stranding a live session with no record and no transcript.
+    //
+    // It must also run before the hooks. `on_destroy` scripts are the user's
+    // and are not guaranteed idempotent, so a refusal that drops this
+    // transaction must not have run one: the scheduled `purge_expired_trash`
+    // re-reserves and would replay it. The wait is ~2.5s, so the process-wide
+    // flocks are released across it — the durable reservation stays, and
+    // `run_hooks` and the commit reacquire the canonical order.
+    let transaction = transaction.release_locks_for_teardown();
+    if transcript_purged {
+        // What matters is whether this purge destroys the directory the session's
+        // agent runs in, not whether a *managed git worktree* is on the list: a
+        let worktree = if destroys_its_checkout(&instance, body) {
+            WorktreeIntent::Remove
+        } else {
+            // The checkout stays, so a launcher still starting is a live
+            // process inside a directory we are about to hand back.
+            WorktreeIntent::Keep
+        };
+        match state.acp_supervisor.shutdown_and_delete(id, worktree).await {
+            Ok(()) | Err(crate::acp::supervisor::SupervisorError::UnknownSession(_)) => {}
+            Err(crate::acp::supervisor::SupervisorError::TeardownPending(_)) => {
+                return Err(PurgeRefusal::Retryable(format!(
+                    "Session {id} is still being torn down; its record was kept, but the agent-side transcript may already have been released. Retry after the runner exits."
+                )));
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "acp.supervisor",
+                    session = %id,
+                    "shutdown during purge failed: {e}"
+                );
+            }
+        }
+    }
+
     let transaction = tokio::task::spawn_blocking(move || transaction.run_hooks())
         .await
         .map_err(|e| format!("Deletion hook task failed: {e}"))?;
 
-    let transcript_purged = instance.is_structured();
+    // The runner is settled and the hooks have run; from here the purge
+    // proceeds to its irreversible commit.
 
+    let mut post_commit_error: Option<String> = None;
     let deletion_result = if transcript_purged {
         // Commit the row removal before deleting the ACP transcript, so a lost
         // restore/generation race leaves both intact and a successful commit
@@ -121,34 +261,29 @@ async fn purge_session_artifacts(
         match committed {
             Err(result) => *result,
             Ok(committed) => {
-                // Remove the local mirror before awaiting ACP so the reconciler
-                // cannot surface a durable row that no longer exists. The epoch
-                // bump is under the same lock: ACP teardown is slow, and a
-                // reload landing inside it would otherwise restore the row.
+                // Drop the local mirror under the same lock as the epoch bump,
+                // so a reload cannot surface a durable row that no longer
+                // exists while the transcript and sidecars are torn down.
                 remove_instance(
                     &mut *state.instances.write().await,
                     id,
                     &state.mutation_epoch,
                 );
 
-                // The worker may still use the worktree, so ACP teardown stays
-                // ahead of sidecar cleanup.
-                match state.acp_supervisor.shutdown_and_delete(id).await {
-                    Ok(()) | Err(crate::acp::supervisor::SupervisorError::UnknownSession(_)) => {}
-                    Err(e) => {
-                        tracing::warn!(
-                            target: "acp.supervisor",
-                            session = %id,
-                            "shutdown during purge failed: {e}"
-                        );
-                    }
-                }
+                let event_error = state
+                    .acp_event_store
+                    .delete_session(id)
+                    .err()
+                    .map(|error| format!("ACP event deletion failed: {error}"));
+                // The durable row is committed and the runner is proven dead, so the local mirror
+                // and ACP transcript can now go before the sidecar teardown.
                 state.acp_supervisor.forget_session(id);
-                state.acp_event_store.delete_session(id);
 
-                tokio::task::spawn_blocking(move || committed.finish())
+                let cleanup = tokio::task::spawn_blocking(move || committed.finish())
                     .await
-                    .map_err(|e| format!("Deletion cleanup task failed: {e}"))?
+                    .map_err(|e| format!("Deletion cleanup task failed: {e}"))?;
+                post_commit_error = event_error;
+                cleanup
             }
         }
     } else {
@@ -174,7 +309,7 @@ async fn purge_session_artifacts(
             } else {
                 deletion_result.errors.join("; ")
             };
-            return Err(errs);
+            return Err(PurgeRefusal::Fatal(errs));
         }
         crate::session::deletion::DeletionDisposition::Removed
         | crate::session::deletion::DeletionDisposition::AlreadyGone => {}
@@ -186,7 +321,7 @@ async fn purge_session_artifacts(
             deletion_result.errors.join("; ")
         };
         if !transcript_purged {
-            return Err(errs);
+            return Err(PurgeRefusal::Fatal(errs));
         }
         tracing::warn!(
             target: "http.api.sessions",
@@ -215,6 +350,18 @@ async fn purge_session_artifacts(
             tracing::warn!(target: "http.api.sessions",
                 "recording recent project after delete failed: {e}");
         }
+    }
+    if let Some(error) = post_commit_error {
+        // The row is already gone, so this is a leftover, not a failed delete.
+        // Name it in the response: the ACP transcript is still on disk.
+        tracing::warn!(
+            target: "http.api.sessions",
+            session = %id,
+            "session purged but its ACP transcript was left behind: {error}"
+        );
+        messages.push(format!(
+            "Session removed, but its ACP transcript was not purged: {error}"
+        ));
     }
     Ok((true, messages))
 }
@@ -260,6 +407,7 @@ pub(crate) async fn reconcile_worktree_paths(state: &Arc<AppState>) {
                 !instance.source_profile.is_empty(),
                 "session has no source profile; refusing worktree path reconciliation"
             );
+            let _identity_lock = crate::session::acquire_session_identity_lock()?;
             let storage = crate::session::Storage::open_unwatched(&instance.source_profile)?;
             let resolution = crate::session::worktree_reconcile::reconcile_and_persist(
                 &storage,
@@ -427,7 +575,7 @@ pub(crate) async fn purge_expired_trash(state: &Arc<AppState>) {
             Err(e) => tracing::warn!(
                 target: "http.api.sessions",
                 session = %id,
-                "auto-purge of expired trash failed: {e}"
+                "auto-purge of expired trash failed: {e:?}"
             ),
         }
     }
@@ -483,14 +631,8 @@ pub async fn delete_session(
         let _guard = guard;
         let _submission = submission;
 
-        // Mark as Deleting so polling clients see the status change
-        {
-            let mut instances = state.instances.write().await;
-            if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
-                inst.status = Status::Deleting;
-            }
-        }
-
+        // `purge_session_artifacts` owns the `Deleting` overlay and takes it
+        // back itself on every exit that removes nothing.
         match purge_session_artifacts(&state, &id, instance, &body, recent_entry).await {
             Ok((removed, messages)) => (
                 StatusCode::OK,
@@ -501,7 +643,20 @@ pub async fn delete_session(
                     "messages": messages,
                 })),
             ),
-            Err(msg) => {
+            Err(refusal) if refusal.is_retryable() => {
+                // A runner that is still tearing down is a transient conflict,
+                // not a server error: nothing was removed and the overlay is
+                // already back, so the row is not marked failed either.
+                (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({
+                        "error": "teardown_pending",
+                        "message": refusal.message(),
+                    })),
+                )
+            }
+            Err(refusal) => {
+                let msg = refusal.message().to_string();
                 mark_delete_error(&state, &id, msg.clone()).await;
                 tracing::error!(target: "http.api.sessions", "delete failed: {msg}");
                 (
@@ -556,6 +711,8 @@ pub struct DeleteWorkspaceBody {
 pub(super) struct WorkspaceDeleteFailure {
     pub(super) id: String,
     pub(super) error: String,
+    /// The runner is still tearing down, so the client can retry unchanged.
+    pub(super) retryable: bool,
 }
 
 /// Drop duplicate session ids, preserving first-seen order. With
@@ -693,6 +850,8 @@ pub(super) async fn purge_workspace_artifacts(
                 failed.push(WorkspaceDeleteFailure {
                     id: owner_id,
                     error: format!("Workspace: {msg}"),
+                    // A dirty worktree is the user's call, not a transient race.
+                    retryable: false,
                 });
                 return (deleted, failed, messages);
             }
@@ -720,13 +879,8 @@ pub(super) async fn purge_workspace_artifacts(
             continue;
         };
 
-        {
-            let mut instances = state.instances.write().await;
-            if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
-                inst.status = Status::Deleting;
-            }
-        }
-
+        // The overlay is owned by `purge_session_artifacts`; only a fatal
+        // refusal has anything left to record on the row.
         let recent_entry = crate::session::recent_project_entry_for(&instance);
         match purge_session_artifacts(state, &id, instance, &body, recent_entry).await {
             Ok((removed, mut msgs)) => {
@@ -738,11 +892,17 @@ pub(super) async fn purge_workspace_artifacts(
                     deleted.push(id.clone());
                 }
             }
-            Err(msg) => {
-                mark_delete_error(state, &id, msg.clone()).await;
+            Err(refusal) => {
+                let msg = refusal.message().to_string();
+                // A retryable refusal removed nothing and already put the status
+                // back; marking it failed would be a lie the user has to undo.
+                if !refusal.is_retryable() {
+                    mark_delete_error(state, &id, msg.clone()).await;
+                }
                 failed.push(WorkspaceDeleteFailure {
                     id: id.clone(),
                     error: msg,
+                    retryable: refusal.is_retryable(),
                 });
                 // Stop before the remaining plan entries. The owner is last, so
                 // a sibling failure leaves the shared worktree intact with its
@@ -831,6 +991,20 @@ pub async fn delete_workspace(
                     .map(|f| f.error.clone())
                     .collect::<Vec<_>>()
                     .join("; ");
+                // Nothing was removed and every refusal is transient, so this
+                // is a retryable conflict rather than a server error.
+                if failed.iter().all(|f| f.retryable) {
+                    tracing::warn!(target: "http.api.sessions", "workspace delete still settling: {msg}");
+                    return (
+                        StatusCode::CONFLICT,
+                        Json(serde_json::json!({
+                            "error": "teardown_pending",
+                            "message": msg,
+                            "failed": failed,
+                        })),
+                    )
+                        .into_response();
+                }
                 tracing::error!(target: "http.api.sessions", "workspace delete failed: {msg}");
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -862,5 +1036,237 @@ pub async fn delete_workspace(
                 "Workspace deletion task failed",
             )
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::server::test_support::build_test_app_state;
+
+    async fn status_of(state: &AppState, id: &str) -> Option<Status> {
+        state
+            .instances
+            .read()
+            .await
+            .iter()
+            .find(|instance| instance.id == id)
+            .map(|instance| instance.status)
+    }
+
+    /// A scratch session has no managed worktree, so the web client always sends
+    /// `delete_worktree: false`, yet the purge still removes the scratch
+    /// directory. The gate must see that as a destroy, or deleting a session the
+    /// daemon is still starting returns 409 forever.
+    #[test]
+    fn a_scratch_purge_counts_as_destroying_its_checkout() {
+        for (scratch, keep_scratch, delete_worktree, expected) in [
+            (true, false, false, WorktreeIntent::Remove),
+            (true, true, false, WorktreeIntent::Keep),
+            (false, false, true, WorktreeIntent::Remove),
+            (false, false, false, WorktreeIntent::Keep),
+        ] {
+            let body = DeleteSessionBody {
+                keep_scratch,
+                delete_worktree,
+                ..Default::default()
+            };
+            let mut instance = crate::session::Instance::new("s", "/tmp/p");
+            instance.scratch = scratch;
+            let intent = if destroys_its_checkout(&instance, &body) {
+                WorktreeIntent::Remove
+            } else {
+                WorktreeIntent::Keep
+            };
+            assert_eq!(
+                intent, expected,
+                "scratch={scratch} keep={keep_scratch} rm_wt={delete_worktree}"
+            );
+        }
+    }
+
+    /// A purge that removes nothing must put the memory-only `Deleting`
+    /// overlay back, whichever way it declines. The overlay is applied inside
+    /// `purge_session_artifacts`, so this drives the handler end to end and
+    /// checks the property that matters: the row is never left in `Deleting`.
+    ///
+    /// The refusal a concurrent restore wins is not reproducible without
+    /// orchestrating a generation race; the refactor is what removes that exit
+    /// from the set of things a caller has to remember.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_refused_purge_never_leaves_the_row_greyed_out() {
+        use crate::session::LifecycleOperation;
+
+        let temp = tempfile::tempdir().unwrap();
+        let _app_dir = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let profile = "overlay-busy";
+        crate::session::create_profile(profile).unwrap();
+
+        let mut instance = crate::session::Instance::new("Session", temp.path().to_str().unwrap());
+        instance.id = "overlay-busy".to_string();
+        instance.source_profile = profile.to_string();
+        instance.status = Status::Idle;
+        let id = instance.id.clone();
+        let storage = crate::session::Storage::new_unwatched(profile).unwrap();
+        storage
+            .update(|instances, _| {
+                instances.push(instance.clone());
+                Ok(())
+            })
+            .unwrap();
+        // A reservation of another operation makes the purge decline as busy.
+        storage
+            .update(|instances, _| {
+                let row = instances.iter_mut().find(|i| i.id == id).unwrap();
+                row.try_acquire_lifecycle_reservation(
+                    LifecycleOperation::Trash,
+                    crate::session::Instance::LIFECYCLE_RESERVATION_TTL,
+                    chrono::Utc::now(),
+                )
+                .unwrap();
+                Ok(())
+            })
+            .unwrap();
+
+        let state = build_test_app_state(vec![instance]);
+        let response = super::delete_session(
+            axum::extract::State(state.clone()),
+            axum::extract::Path(id.clone()),
+            Some(axum::Json(super::DeleteSessionBody::default())),
+        )
+        .await;
+        assert!(
+            !response.into_response().status().is_success(),
+            "a row held by another lifecycle operation must not be purged"
+        );
+        assert_ne!(
+            status_of(&state, &id).await,
+            Some(Status::Deleting),
+            "a refused purge removes nothing, so the row must not stay greyed-out"
+        );
+    }
+
+    /// `on_destroy` scripts are the user's and are not idempotent, so a purge
+    /// refused beside a live runner must not have run one: the scheduled
+    /// `purge_expired_trash` re-reserves the row and would replay the script on
+    /// every attempt.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_refused_purge_never_runs_the_on_destroy_hook() {
+        use crate::acp::runner_lifecycle::test_support::FakeProcessControl;
+        use std::sync::Arc;
+
+        let temp = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let counter = temp.path().join("hook-runs");
+        crate::session::create_profile("hooked").unwrap();
+        std::fs::write(
+            crate::session::get_app_dir()
+                .unwrap()
+                .join("profiles/hooked/config.toml"),
+            format!(
+                "[hooks]\non_destroy = [\"echo run >> {}\"]\n",
+                counter.display()
+            ),
+        )
+        .unwrap();
+
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let mut instance = crate::session::Instance::new("Hooked", project.to_str().unwrap());
+        instance.id = "hooked-purge".to_string();
+        instance.source_profile = "hooked".to_string();
+        instance.view = crate::session::View::Structured;
+        let storage = Storage::new_unwatched("hooked").unwrap();
+        storage
+            .update(|instances, _groups| {
+                instances.push(instance.clone());
+                Ok(())
+            })
+            .unwrap();
+
+        let control = Arc::new(FakeProcessControl::default());
+        control.immortal(9151);
+        let state = crate::server::test_support::build_test_app_state_with_process_control(
+            vec![instance.clone()],
+            control.clone(),
+        );
+        state
+            .acp_supervisor
+            .test_install_attached(
+                "hooked-purge",
+                crate::acp::runner_lifecycle::RunnerIdentity {
+                    pid: 9151,
+                    generation: 1,
+                },
+            )
+            .await;
+
+        let refused = purge_session_artifacts(
+            &state,
+            "hooked-purge",
+            instance.clone(),
+            &DeleteSessionBody::default(),
+            None,
+        )
+        .await;
+        assert!(
+            matches!(&refused, Err(PurgeRefusal::Retryable(_))),
+            "a live runner must keep the purge retryable, got {refused:?}"
+        );
+
+        // The refused transaction released its reservation from `Drop`, on a
+        // detached thread, so a retry this soon can still meet it held. Either
+        // refusal is the point: the hook must not have run for either.
+        let again = purge_session_artifacts(
+            &state,
+            "hooked-purge",
+            instance.clone(),
+            &DeleteSessionBody::default(),
+            None,
+        )
+        .await;
+        assert!(
+            again.is_err(),
+            "the runner is still live, so it still refuses"
+        );
+        assert!(
+            !counter.exists(),
+            "a refused purge must not run the user's on_destroy script"
+        );
+
+        // A refused transaction releases its reservation from `Drop`, on a
+        // detached thread. The deadline bounds this wait; the predicate, not the
+        // clock, establishes that the reservation is gone.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while storage
+            .load()
+            .unwrap()
+            .iter()
+            .any(|row| row.lifecycle_reservation.is_some())
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the refused purge never released its reservation"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        control.exit(9151);
+        state.acp_supervisor.retry_pending_teardowns().await;
+        purge_session_artifacts(
+            &state,
+            "hooked-purge",
+            instance.clone(),
+            &DeleteSessionBody::default(),
+            None,
+        )
+        .await
+        .expect("the purge lands once the runner exits");
+        assert_eq!(
+            std::fs::read_to_string(&counter).unwrap().lines().count(),
+            1,
+            "the retry runs the script exactly once"
+        );
     }
 }
