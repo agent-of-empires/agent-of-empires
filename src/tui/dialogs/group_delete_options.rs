@@ -53,13 +53,7 @@ impl GroupDeleteOptionsDialog {
     }
 
     pub fn handle_click(&mut self, col: u16, row: u16) -> Option<DialogResult<GroupDeleteOptions>> {
-        let pos = ratatui::layout::Position::from((col, row));
-        let hit = self
-            .focusable_rects
-            .iter()
-            .find(|(_, rect)| rect.contains(pos))
-            .map(|(field, _)| *field)?;
-        self.focused_field = hit;
+        self.focused_field = super::hit(&self.focusable_rects, col, row)?;
         self.toggle_focused_field();
         Some(DialogResult::Continue)
     }

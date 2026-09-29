@@ -70,13 +70,7 @@ pub fn render_buttons(
     if area.width < row_width || area.height == 0 {
         return (Rect::default(), Rect::default());
     }
-    // Ratatui's `get_line_offset` centers with `width / 2 - line_width / 2`,
-    // which is NOT `(width - line_width) / 2`: the two disagree by a cell
-    // whenever the row is odd and the area even (a 13-cell "[Yes]    [No]"
-    // in a 48-wide dialog, say). Mirror ratatui exactly so the rects land on
-    // the glyphs the user sees and a click on the last bracket registers.
-    let left_pad = (area.width / 2).saturating_sub(row_width / 2);
-    let yes_x = area.x + left_pad;
+    let yes_x = crate::tui::dialogs::centered_x(area, row_width);
     let no_x = yes_x + yes_width + BUTTON_GAP;
     let yes_rect = Rect::new(yes_x, area.y, yes_width, 1);
     let no_rect = Rect::new(no_x, area.y, no_width, 1);

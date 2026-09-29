@@ -164,6 +164,42 @@ fn opt_in_lifecycle_and_do_not_track() {
     unsafe { std::env::remove_var("DO_NOT_TRACK") };
 }
 
+/// `aoe telemetry disable` as the first command after an upgrade migrates
+/// before it rewrites config.toml, so a legacy key a pending migration carries
+/// (here v034's keep-forever `trash_retention_days = 0`) is not dropped.
+#[test]
+#[serial]
+fn telemetry_toggle_migrates_before_rewriting_config() {
+    let _tmp = isolate();
+    let app = agent_of_empires::session::get_app_dir().expect("app dir");
+    std::fs::write(app.join(".schema_version"), "33").expect("write version");
+    std::fs::write(
+        app.join("config.toml"),
+        "[session]\ntrash_retention_days = 0\n",
+    )
+    .expect("write config");
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_aoe"))
+        .args(["telemetry", "disable"])
+        .output()
+        .expect("run aoe telemetry disable");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let config: toml::Table = std::fs::read_to_string(app.join("config.toml"))
+        .expect("read config")
+        .parse()
+        .expect("parse config");
+    assert_eq!(
+        config["session"]["trash_retention_minutes"].as_integer(),
+        Some(0)
+    );
+    assert_eq!(config["telemetry"]["enabled"].as_bool(), Some(false));
+}
+
 /// The snapshot payload carries only allowlisted buckets: a custom agent
 /// command and project path collapse to `custom`, never the raw strings.
 #[test]

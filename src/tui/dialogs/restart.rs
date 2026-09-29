@@ -113,12 +113,7 @@ impl RestartDialog {
         // any other click is swallowed so a stray click on the (now-hidden)
         // selectors underneath can't cycle them.
         if self.tool_config_mode {
-            if let Some(hit) = self
-                .tool_config_rects
-                .iter()
-                .find(|(_, rect)| rect.contains(pos))
-                .map(|(f, _)| *f)
-            {
+            if let Some(hit) = super::hit(&self.tool_config_rects, col, row) {
                 self.tool_config_focused_field = hit;
             }
             return Some(DialogResult::Continue);

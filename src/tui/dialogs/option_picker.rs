@@ -6,6 +6,7 @@ use ratatui::widgets::*;
 
 use super::DialogResult;
 use crate::session::config::{GroupByMode, SortOrder};
+use crate::tui::components::hint_buttons::HintButtons;
 use crate::tui::styles::Theme;
 
 pub struct OptionPickerDialog<T: 'static> {
@@ -16,6 +17,7 @@ pub struct OptionPickerDialog<T: 'static> {
     current: T,
     list_area: Rect,
     dialog_area: Rect,
+    footer: HintButtons,
 }
 
 pub type SortPickerDialog = OptionPickerDialog<SortOrder>;
@@ -56,12 +58,16 @@ impl<T: Copy + PartialEq> OptionPickerDialog<T> {
             current,
             list_area: Rect::default(),
             dialog_area: Rect::default(),
+            footer: HintButtons::default(),
         }
     }
 
     pub fn handle_click(&mut self, col: u16, row: u16) -> DialogResult<T> {
         if !super::contains(self.dialog_area, col, row) {
             return DialogResult::Cancel;
+        }
+        if let Some(key) = self.footer.key_at(col, row) {
+            return self.handle_key(key);
         }
         match super::row_index(self.list_area, col, row, self.options.len()) {
             Some(idx) => {
@@ -74,7 +80,7 @@ impl<T: Copy + PartialEq> OptionPickerDialog<T> {
 
     pub fn handle_hover(&mut self, col: u16, row: u16) -> bool {
         let hovered = super::row_index(self.list_area, col, row, self.options.len());
-        super::hover_select(&mut self.selected, hovered)
+        self.footer.handle_hover(col, row) | super::hover_select(&mut self.selected, hovered)
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> DialogResult<T> {
@@ -131,8 +137,16 @@ impl<T: Copy + PartialEq> OptionPickerDialog<T> {
             .collect();
         self.list_area = list;
         frame.render_widget(Paragraph::new(lines), list);
-        let hints = super::hint_line(theme, &[("Enter", "select"), ("Esc", "close")]);
-        frame.render_widget(Paragraph::new(hints), hint);
+        self.footer.render(
+            frame,
+            hint,
+            theme,
+            &[
+                ("Enter", "select", KeyCode::Null),
+                ("Esc", "close", KeyCode::Esc),
+            ],
+            Alignment::Left,
+        );
     }
 }
 

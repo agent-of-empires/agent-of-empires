@@ -291,7 +291,8 @@ pub struct HomeView {
     pub(super) attach_project_in_flight: std::collections::HashSet<String>,
 
     pub(super) creation_poller: CreationPoller,
-    pub(super) creation_cancelled: bool,
+    /// Cancels the request behind `creating_stub_id`.
+    pub(super) creation_cancel: Option<tokio_util::sync::CancellationToken>,
     pub(super) on_launch_hooks_ran: HashSet<String>,
 
     pub(super) creating_hook_progress: HashMap<String, CreatingHookProgress>,
@@ -317,7 +318,7 @@ pub struct HomeView {
     pub(super) shelf_inner_area: Rect,
     pub(super) collapse_button_area: Rect,
     pub(super) expand_strip_area: Rect,
-    pub(super) footer_buttons: Vec<(Rect, crossterm::event::KeyEvent)>,
+    pub(super) footer_buttons: Vec<(crossterm::event::KeyEvent, Rect)>,
     pub(super) footer_hover: Option<crossterm::event::KeyEvent>,
     pub(super) mouse_pos: Option<(u16, u16)>,
     pub(super) last_click: Option<(std::time::Instant, u16, u16)>,

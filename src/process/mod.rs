@@ -5,6 +5,8 @@ use std::io::Read;
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::time::{Duration, Instant};
 
+use tokio_util::sync::CancellationToken;
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use nix::errno::Errno;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -78,7 +80,7 @@ pub fn wait_with_timeout(
     child: &mut Child,
     timeout: Duration,
 ) -> std::io::Result<Option<ExitStatus>> {
-    wait_with_timeout_inner(child, timeout, false)
+    wait_with_timeout_inner(child, timeout, false, None)
 }
 
 /// With `kill_process_group`, `child` must be a process-group leader, or the kill
@@ -87,6 +89,7 @@ fn wait_with_timeout_inner(
     child: &mut Child,
     timeout: Duration,
     kill_process_group: bool,
+    cancel: Option<&CancellationToken>,
 ) -> std::io::Result<Option<ExitStatus>> {
     let deadline = Instant::now() + timeout;
     let termination_grace = (timeout / 4).min(PROCESS_GROUP_TERMINATION_GRACE);
@@ -106,7 +109,7 @@ fn wait_with_timeout_inner(
             termination_requested = true;
             continue;
         }
-        if now >= deadline {
+        if now >= deadline || cancel.is_some_and(CancellationToken::is_cancelled) {
             if kill_process_group {
                 platform::kill_process_group(child);
             }
@@ -122,7 +125,16 @@ fn wait_with_timeout_inner(
 /// Output goes to temp files, so a full pipe or a descendant holding the handles cannot
 /// wedge capture. Returns `Ok(None)` on timeout.
 pub fn run_with_timeout(cmd: &mut Command, timeout: Duration) -> std::io::Result<Option<Output>> {
-    run_with_timeout_inner(cmd, timeout, false)
+    run_with_timeout_inner(cmd, timeout, false, None)
+}
+
+/// [`run_with_timeout`] that also kills the child once `cancel` fires, returning `Ok(None)`.
+pub fn run_until_cancelled(
+    cmd: &mut Command,
+    timeout: Duration,
+    cancel: &CancellationToken,
+) -> std::io::Result<Option<Output>> {
+    run_with_timeout_inner(cmd, timeout, false, Some(cancel))
 }
 
 pub fn run_with_timeout_process_group(
@@ -134,6 +146,7 @@ pub fn run_with_timeout_process_group(
         cmd,
         timeout,
         cfg!(any(target_os = "linux", target_os = "macos")),
+        None,
     )
 }
 
@@ -141,6 +154,7 @@ fn run_with_timeout_inner(
     cmd: &mut Command,
     timeout: Duration,
     kill_process_group: bool,
+    cancel: Option<&CancellationToken>,
 ) -> std::io::Result<Option<Output>> {
     let mut stdout_file = tempfile::NamedTempFile::new()?;
     let mut stderr_file = tempfile::NamedTempFile::new()?;
@@ -148,7 +162,8 @@ fn run_with_timeout_inner(
     cmd.stderr(Stdio::from(stderr_file.reopen()?));
     let mut child = cmd.spawn()?;
 
-    let Some(status) = wait_with_timeout_inner(&mut child, timeout, kill_process_group)? else {
+    let Some(status) = wait_with_timeout_inner(&mut child, timeout, kill_process_group, cancel)?
+    else {
         return Ok(None);
     };
     let mut stdout = Vec::new();
@@ -929,43 +944,52 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn run_with_timeout_kills_child_that_outlives_deadline() {
+    fn run_with_timeout_kills_child_on_deadline_or_cancel() {
         use std::io::Read;
         use std::os::fd::AsRawFd;
         use std::os::unix::{net::UnixStream, process::CommandExt};
 
-        let (mut pid_reader, pid_writer) = UnixStream::pair().unwrap();
-        pid_reader
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
-        let mut cmd = Command::new("sleep");
-        cmd.arg("5");
-        unsafe {
-            cmd.pre_exec(move || {
-                let pid = libc::getpid().to_ne_bytes();
-                let written = libc::write(pid_writer.as_raw_fd(), pid.as_ptr().cast(), pid.len());
-                if written != pid.len() as isize {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
+        for cancelled in [false, true] {
+            let (mut pid_reader, pid_writer) = UnixStream::pair().unwrap();
+            pid_reader
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut cmd = Command::new("sleep");
+            cmd.arg("5");
+            unsafe {
+                cmd.pre_exec(move || {
+                    let pid = libc::getpid().to_ne_bytes();
+                    let written =
+                        libc::write(pid_writer.as_raw_fd(), pid.as_ptr().cast(), pid.len());
+                    if written != pid.len() as isize {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
 
-        let start = Instant::now();
-        let result = run_with_timeout(&mut cmd, Duration::from_millis(300)).unwrap();
-        let mut pid = [0; std::mem::size_of::<libc::pid_t>()];
-        pid_reader
-            .read_exact(&mut pid)
-            .expect("child must publish its PID before exec");
-        assert_child_reaped(libc::pid_t::from_ne_bytes(pid) as u32);
-        assert!(
-            result.is_none(),
-            "expected the timeout to fire and kill the child"
-        );
-        assert!(
-            start.elapsed() < Duration::from_secs(4),
-            "wait should return promptly after the deadline, not block on the child"
-        );
+            let start = Instant::now();
+            let result = if cancelled {
+                let cancel = CancellationToken::new();
+                cancel.cancel();
+                run_until_cancelled(&mut cmd, Duration::from_secs(60), &cancel).unwrap()
+            } else {
+                run_with_timeout(&mut cmd, Duration::from_millis(300)).unwrap()
+            };
+            let mut pid = [0; std::mem::size_of::<libc::pid_t>()];
+            pid_reader
+                .read_exact(&mut pid)
+                .expect("child must publish its PID before exec");
+            assert_child_reaped(libc::pid_t::from_ne_bytes(pid) as u32);
+            assert!(
+                result.is_none(),
+                "cancelled={cancelled}: child must be killed"
+            );
+            assert!(
+                start.elapsed() < Duration::from_secs(4),
+                "cancelled={cancelled}: wait should return promptly, not block on the child"
+            );
+        }
     }
 
     #[test]

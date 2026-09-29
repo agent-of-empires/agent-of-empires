@@ -795,26 +795,42 @@ pub fn reconcile_trashed_transition(inst: &mut Instance) -> anyhow::Result<bool>
 }
 
 /// True when a trashed session is past its retention window and should be auto-purged.
-pub fn is_expired(instance: &Instance, retention_days: u32, now: DateTime<Utc>) -> bool {
-    if retention_days == 0 {
+pub fn is_expired(instance: &Instance, retention_minutes: u32, now: DateTime<Utc>) -> bool {
+    if retention_minutes == 0 {
         return false;
     }
     match instance.trashed_at {
-        Some(trashed_at) => now >= trashed_at + chrono::Duration::days(retention_days as i64),
+        Some(trashed_at) => {
+            now >= trashed_at + chrono::Duration::minutes(i64::from(retention_minutes))
+        }
         None => false,
     }
+}
+
+/// Shortest wait between daemon retention sweeps, and how often the daemon
+/// re-reads the windows so a shortened one applies within a minute.
+pub const SWEEP_RECHECK: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Wait between daemon retention sweeps: a tenth of the shortest nonzero
+/// window in minutes, clamped to [`SWEEP_RECHECK`] through one hour, so a
+/// purge lags its window by at most that much.
+pub fn sweep_interval(retention_minutes: impl IntoIterator<Item = u32>) -> std::time::Duration {
+    const MAX_SECS: u64 = 60 * 60;
+    let shortest = retention_minutes.into_iter().filter(|m| *m > 0).min();
+    let secs = shortest.map_or(MAX_SECS, |minutes| u64::from(minutes) * 6);
+    std::time::Duration::from_secs(secs.clamp(SWEEP_RECHECK.as_secs(), MAX_SECS))
 }
 
 /// Ids of every trashed session whose retention window has elapsed, in the order they appear in
 /// `instances`.
 pub fn expired_trashed_ids(
     instances: &[Instance],
-    retention_days: u32,
+    retention_minutes: u32,
     now: DateTime<Utc>,
 ) -> Vec<String> {
     instances
         .iter()
-        .filter(|i| is_expired(i, retention_days, now))
+        .filter(|i| is_expired(i, retention_minutes, now))
         .map(|i| i.id.clone())
         .collect()
 }
@@ -832,16 +848,26 @@ mod tests {
     #[test]
     fn is_expired_cases() {
         let now = Utc::now();
-        // (case, trashed days ago, retention days, expected)
+        const DAY: u32 = 24 * 60;
+        // (case, trashed minutes ago, retention minutes, expected)
         let cases = [
-            ("retention 0 keeps forever", Some(9999), 0, false),
-            ("never trashed", None, 30, false),
-            ("at the retention window", Some(30), 30, true),
-            ("one day inside the window", Some(29), 30, false),
+            ("retention 0 keeps forever", Some(9999 * 1440), 0, false),
+            ("never trashed", None, 30 * DAY, false),
+            ("at the retention window", Some(30 * 1440), 30 * DAY, true),
+            (
+                "one day inside the window",
+                Some(29 * 1440),
+                30 * DAY,
+                false,
+            ),
+            ("past a sub-hour window", Some(16), 15, true),
+            ("inside a sub-hour window", Some(14), 15, false),
+            ("past a two-hour window", Some(121), 120, true),
         ];
-        for (case, trashed_days, retention, expected) in cases {
+        for (case, trashed_minutes, retention, expected) in cases {
             let mut inst = Instance::new("s", "/tmp/x");
-            inst.trashed_at = trashed_days.map(|days| now - chrono::Duration::days(days));
+            inst.trashed_at =
+                trashed_minutes.map(|minutes| now - chrono::Duration::minutes(minutes));
             assert_eq!(is_expired(&inst, retention, now), expected, "{case}");
         }
         let fresh = trashed_days_ago(1);
@@ -850,10 +876,31 @@ mod tests {
         let old_b = trashed_days_ago(31);
         let instances = vec![fresh, old_a.clone(), live, old_b.clone()];
         assert_eq!(
-            expired_trashed_ids(&instances, 30, now),
+            expired_trashed_ids(&instances, 30 * DAY, now),
             vec![old_a.id, old_b.id],
             "filters and preserves order"
         );
+    }
+
+    #[test]
+    fn sweep_interval_tracks_the_shortest_window() {
+        use std::time::Duration;
+        // (case, windows in minutes, expected seconds)
+        let cases: [(&str, &[u32], u64); 6] = [
+            ("no profiles", &[], 3600),
+            ("keep forever only", &[0, 0], 3600),
+            ("30 days", &[43200], 3600),
+            ("two hours", &[43200, 120], 720),
+            ("sub-hour window", &[0, 30], 180),
+            ("floor of a minute", &[5], 60),
+        ];
+        for (case, windows, secs) in cases {
+            assert_eq!(
+                sweep_interval(windows.iter().copied()),
+                Duration::from_secs(secs),
+                "{case}"
+            );
+        }
     }
 
     #[test]

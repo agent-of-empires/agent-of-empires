@@ -137,7 +137,7 @@ const CITYHALL_TAB_IDS = new Set<TabId>(["theme", "session", "mcp", "telemetry",
 // The only `session` fields the curated Sessions tab renders, and the `theme`
 // fields it drops. Shared with `curateCityhallSchema` below so the search index
 // and the rendered tabs cannot drift apart.
-const CITYHALL_SESSION_FIELDS = ["delete_to_trash", "confirm_delete", "trash_retention_days"];
+const CITYHALL_SESSION_FIELDS = ["delete_to_trash", "confirm_delete", "trash_retention_minutes"];
 const CITYHALL_THEME_HIDDEN = ["color_mode", "idle_decay_minutes"];
 
 /** `session.*` fields the app shell reads into its own state and hands down by

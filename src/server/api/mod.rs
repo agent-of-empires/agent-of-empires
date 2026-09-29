@@ -60,7 +60,7 @@ pub use skills::{
 // Not route handlers: used by the daemon's background loops.
 pub(crate) use sessions::{
     persist_session_update, purge_expired_trash, reconcile_trashed_worktrees,
-    reconcile_worktree_paths,
+    reconcile_worktree_paths, trash_sweep_interval,
 };
 pub use system::{
     browse_filesystem, create_profile, default_profile, delete_profile, dismiss_update,

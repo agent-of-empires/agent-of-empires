@@ -8,6 +8,8 @@ use tui_input::backend::crossterm::EventHandler;
 use tui_input::Input;
 
 use super::DialogResult;
+use crate::tui::components::hint_buttons::HintButtons;
+use crate::tui::components::hover::{paint_hover_bg, HoverState};
 use crate::tui::components::render_text_field;
 use crate::tui::styles::Theme;
 
@@ -24,6 +26,10 @@ pub struct WorktreeNameDialog {
     rename_branch: bool,
     /// 0 = name input, 1 = "rename branch" toggle.
     focused_field: usize,
+    field_rects: [Rect; 2],
+    /// The hovered toggle row. Visual only; never moves focus.
+    hover: HoverState,
+    footer: HintButtons,
 }
 
 impl WorktreeNameDialog {
@@ -34,6 +40,9 @@ impl WorktreeNameDialog {
             new_name: Input::default(),
             rename_branch: false,
             focused_field: 0,
+            field_rects: [Rect::default(); 2],
+            hover: HoverState::default(),
+            footer: HintButtons::default(),
         }
     }
 
@@ -74,6 +83,25 @@ impl WorktreeNameDialog {
                 DialogResult::Continue
             }
         }
+    }
+
+    /// A click on a field focuses it (and flips the toggle); a click on a
+    /// footer hint returns the key it stands for, for the caller to press.
+    pub fn handle_click(&mut self, col: u16, row: u16) -> Option<KeyEvent> {
+        let pos = ratatui::layout::Position::from((col, row));
+        if let Some(field) = self.field_rects.iter().position(|r| r.contains(pos)) {
+            self.focused_field = field;
+            if field == 1 {
+                self.rename_branch = !self.rename_branch;
+            }
+            return None;
+        }
+        self.footer.key_at(col, row)
+    }
+
+    pub fn handle_hover(&mut self, col: u16, row: u16) -> bool {
+        let toggle = self.hover.update(col, row, &self.field_rects[1..]);
+        self.footer.handle_hover(col, row) | toggle
     }
 
     pub fn handle_paste(&mut self, text: &str) {
@@ -122,6 +150,7 @@ impl WorktreeNameDialog {
             chunks[1],
         );
 
+        self.field_rects = [chunks[3], chunks[4]];
         render_text_field(
             frame,
             chunks[3],
@@ -146,17 +175,22 @@ impl WorktreeNameDialog {
             chunks[4],
         );
 
-        let hint = Line::from(vec![
-            Span::styled("Tab", Style::default().fg(theme.hint)),
-            Span::raw(" switch  "),
-            Span::styled("Space", Style::default().fg(theme.hint)),
-            Span::raw(" toggle  "),
-            Span::styled("Enter", Style::default().fg(theme.hint)),
-            Span::raw(" save  "),
-            Span::styled("Esc", Style::default().fg(theme.hint)),
-            Span::raw(" cancel"),
-        ]);
-        frame.render_widget(Paragraph::new(hint), chunks[6]);
+        if let Some(rect) = self.hover.current_in(&self.field_rects[1..]) {
+            paint_hover_bg(frame, rect, theme.selection);
+        }
+
+        self.footer.render(
+            frame,
+            chunks[6],
+            theme,
+            &[
+                ("Tab", "switch", KeyCode::Tab),
+                ("Space", "toggle", KeyCode::Null),
+                ("Enter", "save", KeyCode::Enter),
+                ("Esc", "cancel", KeyCode::Esc),
+            ],
+            Alignment::Left,
+        );
     }
 }
 
@@ -192,5 +226,18 @@ mod tests {
             };
             assert_eq!(got, want.map(|(n, r)| (n.to_string(), r)), "{keys:?}");
         }
+    }
+
+    #[test]
+    fn a_click_focuses_a_field_and_flips_the_toggle_while_hover_only_tints() {
+        let mut d = WorktreeNameDialog::new("old", "old");
+        crate::tui::dialogs::test_render::draw(80, 20, |f, theme| d.render(f, f.area(), theme));
+        let [name, toggle] = d.field_rects;
+        assert!(d.handle_hover(toggle.x, toggle.y));
+        assert_eq!(d.focused_field, 0);
+        assert_eq!(d.handle_click(toggle.x, toggle.y), None);
+        assert!(d.rename_branch && d.focused_field == 1);
+        d.handle_click(name.x, name.y);
+        assert_eq!(d.focused_field, 0);
     }
 }
