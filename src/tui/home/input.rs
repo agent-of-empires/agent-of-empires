@@ -169,44 +169,59 @@ fn split_bracketed_paste(text: &str) -> Vec<live_send::TmuxKey> {
     vec![live_send::TmuxKey::Paste(out)]
 }
 
-/// The rectangle mouse coordinates map into, or `None` when the pointer is not over the
+/// The visible part of the pane that receives input, and how many of its rows are
+/// clipped above the preview, so a cell maps to the pane row actually painted there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PaneSlice {
+    visible: ratatui::layout::Rect,
+    clipped_rows: u16,
+}
+
+impl PaneSlice {
+    /// The forwarded app's 1-based cell under screen `(col, row)`, clamped into the
+    /// visible slice.
+    fn cell(self, col: u16, row: u16) -> (u16, u16) {
+        let (cx, cy) = map_pane_cell(self.visible, col, row);
+        (cx, cy.saturating_add(self.clipped_rows))
+    }
+}
+
+/// The slice mouse coordinates map into, or `None` when the pointer is not over the
 /// pane that receives input.
 ///
-/// Normally the previewed pane is sized to the preview output rect, so the rect is the
+/// Normally the previewed pane is sized to the preview output rect, so the slice is the
 /// pane. On a composited preview the rect is the whole window while input still goes to
-/// pane 0 alone (#435, #488), so pane 0's sub-rectangle is the target: mapping against
-/// the full rect would report a column past its right edge as though the pane were
-/// window-wide. A pointer outside pane 0 is dropped rather than clamped, which would
-/// synthesise a click on its border.
-fn mouse_target_rect(
+/// pane 0 alone (#435, #488), so pane 0's slice is the target: mapping against the full
+/// rect would report a column past its right edge as though the pane were window-wide.
+/// A pointer outside pane 0 is dropped rather than clamped, which would synthesise a
+/// click on its border.
+fn mouse_target(
     cursor: &crate::tmux::PaneCursor,
     view: super::PreviewTextView,
     col: u16,
     row: u16,
-) -> Option<ratatui::layout::Rect> {
-    // Unsplit: the rect is the pane, and containment stays the caller's business
-    // (`hit_preview` gates the press) with `map_pane_cell` clamping, so this must not
-    // start rejecting cells that used to clamp.
-    if cursor.composite_pane0.is_none() {
-        return Some(view.pane);
-    }
-    let pane0 = mouse_pane_rect(cursor, view);
-    pane0.contains(Position::new(col, row)).then_some(pane0)
+) -> Option<PaneSlice> {
+    let slice = mouse_pane(cursor, view);
+    // Unsplit: containment stays the caller's business (`hit_preview` gates the press)
+    // with `map_pane_cell` clamping, so this must not start rejecting cells that used to
+    // clamp.
+    (cursor.composite_pane0.is_none() || slice.visible.contains(Position::new(col, row)))
+        .then_some(slice)
 }
 
-/// The input pane's rectangle within the preview, with no containment test: pane 0's
-/// visible slice on a composited preview, else the whole preview rect. Pane 0 is placed
-/// by [`super::render::live_pane_origin`], as the cursor is painted, then clipped to the
-/// preview. Split from [`mouse_target_rect`] for mid-gesture events, which are not
+/// The input pane's slice within the preview, with no containment test: pane 0 on a
+/// composited preview, else the whole preview rect. Pane 0 is placed by
+/// [`super::render::live_pane_origin`], as the cursor is painted, then clipped to the
+/// preview. Split from [`mouse_target`] for mid-gesture events, which are not
 /// position-gated so a drag that began on pane 0 completes even after the pointer
 /// wanders off it.
-fn mouse_pane_rect(
-    cursor: &crate::tmux::PaneCursor,
-    view: super::PreviewTextView,
-) -> ratatui::layout::Rect {
+fn mouse_pane(cursor: &crate::tmux::PaneCursor, view: super::PreviewTextView) -> PaneSlice {
     let pane = view.pane;
     let Some(rect) = cursor.composite_pane0 else {
-        return pane;
+        return PaneSlice {
+            visible: pane,
+            clipped_rows: 0,
+        };
     };
     let (x, y) =
         super::render::live_pane_origin(pane, pane.height as usize, view.total_lines, cursor);
@@ -215,13 +230,16 @@ fn mouse_pane_rect(
         let b = (start + len as i32).clamp(lo as i32, hi as i32);
         (a as u16, (b - a) as u16)
     };
-    let (x, width) = clip(x, rect.width, pane.x, pane.right());
-    let (y, height) = clip(y, rect.height, pane.y, pane.bottom());
-    ratatui::layout::Rect {
-        x,
-        y,
-        width,
-        height,
+    let (vx, width) = clip(x, rect.width, pane.x, pane.right());
+    let (vy, height) = clip(y, rect.height, pane.y, pane.bottom());
+    PaneSlice {
+        visible: ratatui::layout::Rect {
+            x: vx,
+            y: vy,
+            width,
+            height,
+        },
+        clipped_rows: (vy as i32 - y).clamp(0, u16::MAX as i32) as u16,
     }
 }
 
@@ -241,14 +259,7 @@ fn map_pane_cell(pane: ratatui::layout::Rect, col: u16, row: u16) -> (u16, u16) 
 /// Build the mouse-wheel bytes to forward to a full-screen app under the live preview.
 /// `up` selects wheel-up (button 64) over wheel-down (65); `sgr` selects the SGR (1006)
 /// encoding over legacy X10, matching whatever the app enabled.
-fn wheel_mouse_bytes(
-    up: bool,
-    sgr: bool,
-    pane: ratatui::layout::Rect,
-    col: u16,
-    row: u16,
-) -> Vec<u8> {
-    let (cx, cy) = map_pane_cell(pane, col, row);
+fn wheel_mouse_bytes(up: bool, sgr: bool, (cx, cy): (u16, u16)) -> Vec<u8> {
     let button: u16 = if up { 64 } else { 65 };
     if sgr {
         // SGR (1006): textual, press marker `M`. No coordinate limit.
@@ -261,8 +272,7 @@ fn wheel_mouse_bytes(
     }
 }
 
-/// Build the bytes for one forwarded mouse button event at screen cell `(col, row)`,
-/// mapped into the app's pane. `base_button` is the SGR low-bits code (left=0, middle=1,
+/// Build the bytes for one forwarded mouse button event at the app's 1-based cell. `base_button` is the SGR low-bits code (left=0, middle=1,
 /// right=2), `release` a button-up, `motion` a drag. Mirrors `wheel_mouse_bytes`, which
 /// covers the wheel buttons.
 fn mouse_event_bytes(
@@ -270,11 +280,8 @@ fn mouse_event_bytes(
     release: bool,
     motion: bool,
     sgr: bool,
-    pane: ratatui::layout::Rect,
-    col: u16,
-    row: u16,
+    (cx, cy): (u16, u16),
 ) -> Vec<u8> {
-    let (cx, cy) = map_pane_cell(pane, col, row);
     // The motion bit (32) rides on press/drag reports in both encodings.
     let cb = base_button + if motion { 32 } else { 0 };
     if sgr {
@@ -302,9 +309,9 @@ fn hover_forward_bytes(
     col: u16,
     row: u16,
 ) -> Option<Vec<u8>> {
-    let target = mouse_target_rect(cursor, view, col, row)?;
+    let target = mouse_target(cursor, view, col, row)?;
     (cursor.alternate_on && cursor.mouse_all)
-        .then(|| mouse_event_bytes(3, false, true, cursor.mouse_sgr, target, col, row))
+        .then(|| mouse_event_bytes(3, false, true, cursor.mouse_sgr, target.cell(col, row)))
 }
 
 /// Page presses per wheel notch for a no-mouse full-screen app: such apps scroll on
@@ -327,14 +334,12 @@ fn wheel_forward_key(
     }
     // Outside pane 0 on a composited preview there is nothing to drive, and paging pane 0
     // because the wheel turned elsewhere would be a scroll the user did not aim.
-    let target = mouse_target_rect(cursor, view, col, row)?;
+    let target = mouse_target(cursor, view, col, row)?;
     if cursor.mouse_tracking {
         Some(live_send::TmuxKey::HexBytes(wheel_mouse_bytes(
             up,
             cursor.mouse_sgr,
-            target,
-            col,
-            row,
+            target.cell(col, row),
         )))
     } else {
         // No mouse tracking: send `PageUp`/`PageDown`, not arrows, which a full-screen
@@ -935,11 +940,7 @@ impl HomeView {
         let structured_lines = self
             .structured_preview
             .as_ref()
-            .filter(|v| {
-                self.selected_session
-                    .as_deref()
-                    .is_some_and(|id| id == v.session_id())
-            })
+            .filter(|_| self.structured_transcript_painted)
             .map(|v| v.selection_text(width));
         let lines = match structured_lines.as_ref() {
             Some(text) => text,
@@ -4255,7 +4256,7 @@ impl HomeView {
         // open a gesture: forwarding would report the click at a clamped cell pane 0 never
         // saw. Drags and releases stay ungated so a gesture begun on pane 0 completes.
         let press = !release && !motion;
-        if press && mouse_target_rect(&cursor, self.preview_text_view, col, row).is_none() {
+        if press && mouse_target(&cursor, self.preview_text_view, col, row).is_none() {
             self.mouse_forward_btn = None;
             return false;
         }
@@ -4265,9 +4266,7 @@ impl HomeView {
             release,
             motion,
             cursor.mouse_sgr,
-            mouse_pane_rect(&cursor, self.preview_text_view),
-            col,
-            row,
+            mouse_pane(&cursor, self.preview_text_view).cell(col, row),
         );
         self.send_to_preview_pane(live_send::TmuxKey::HexBytes(bytes))
     }
@@ -5339,7 +5338,7 @@ impl HomeView {
         // `active_preview_cache` is the tmux capture while `preview_text_view` may come from
         // the transcript's geometry; resolving one against the other opens a URL from
         // another session's output. `paint_preview_links` skips the same case.
-        if self.structured_owns_pane() {
+        if self.structured_transcript_painted {
             return None;
         }
         let view = self.preview_text_view;
@@ -6532,7 +6531,7 @@ mod tests {
         ];
         for (up, sgr, rect, x, y, want) in wheel_cases {
             assert_eq!(
-                wheel_mouse_bytes(up, sgr, rect, x, y),
+                wheel_mouse_bytes(up, sgr, map_pane_cell(rect, x, y)),
                 want,
                 "wheel up={up} sgr={sgr} ({x},{y})"
             );
@@ -6552,7 +6551,7 @@ mod tests {
         ];
         for (button, release, drag, sgr, want) in event_cases {
             assert_eq!(
-                mouse_event_bytes(button, release, drag, sgr, pane, 10, 5),
+                mouse_event_bytes(button, release, drag, sgr, map_pane_cell(pane, 10, 5)),
                 want,
                 "button={button} release={release} drag={drag} sgr={sgr}"
             );
@@ -6687,6 +6686,9 @@ mod tests {
             ("stacked", 24, geom(0, 1, 80, 11), (5, 3), (10, 3)),
             // Rotated or swapped: pane 0 sits right of another pane.
             ("rotated", 24, geom(40, 0, 40, 24), (10, 4), (41, 5)),
+            // A window taller than the preview (another client pins its size):
+            // bottom-follow clips six of pane 0's rows off the top.
+            ("clipped top", 30, geom(0, 0, 40, 30), (10, 10), (42, 5)),
         ] {
             let mut cursor = cursor_for(true, true, true);
             cursor.mouse_all = true;
@@ -6703,15 +6705,15 @@ mod tests {
             )
             .expect("visible pane cursor");
             let view = view_of(output, lines);
-            let target = mouse_target_rect(&cursor, view, painted.x, painted.y)
+            let target = mouse_target(&cursor, view, painted.x, painted.y)
                 .unwrap_or_else(|| panic!("{name}: painted cursor is inside pane 0"));
             assert_eq!(
-                map_pane_cell(target, painted.x, painted.y),
+                target.cell(painted.x, painted.y),
                 (x + 1, y + 1),
                 "{name}: clicking the painted cursor must report the same app cell"
             );
             assert_eq!(
-                mouse_target_rect(&cursor, view, outside.0, outside.1),
+                mouse_target(&cursor, view, outside.0, outside.1),
                 None,
                 "{name}: a cell outside pane 0 is dropped"
             );
@@ -6763,10 +6765,10 @@ mod tests {
             width: 999,
             height: 999,
         });
-        assert_eq!(mouse_pane_rect(&cursor, view), pane);
+        assert_eq!(mouse_pane(&cursor, view).visible, pane);
         // And the origin is honored: a cell above/left of the rect is outside.
-        assert_eq!(mouse_target_rect(&cursor, view, 1, 3), None);
-        assert!(mouse_target_rect(&cursor, view, 2, 3).is_some());
+        assert_eq!(mouse_target(&cursor, view, 1, 3), None);
+        assert!(mouse_target(&cursor, view, 2, 3).is_some());
     }
 
     /// The fix for #2407: a full-screen pane with no mouse tracking must forward

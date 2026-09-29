@@ -236,6 +236,9 @@ pub struct HomeView {
     pub(in crate::tui) structured_preview:
         Option<crate::tui::structured_view::embedded::EmbeddedView>,
     pub(in crate::tui) structured_preview_pending: bool,
+    /// The last frame painted the mounted structured transcript into the preview, so
+    /// `preview_text_view` maps transcript rows rather than the tmux capture.
+    pub(super) structured_transcript_painted: bool,
     pub(super) pending_force_remove_session: Option<String>,
     pub(super) pending_trash_session: Option<String>,
     pub(super) pending_dialog_click_action: Option<crate::tui::app::Action>,

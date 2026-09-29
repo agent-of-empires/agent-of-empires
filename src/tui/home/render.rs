@@ -2505,15 +2505,6 @@ impl HomeView {
         };
     }
 
-    /// Whether the mounted structured transcript belongs to the selected session, so it
-    /// owns the preview pane rather than the tmux capture.
-    pub(super) fn structured_owns_pane(&self) -> bool {
-        self.structured_preview
-            .as_ref()
-            .zip(self.selected_session.as_deref())
-            .is_some_and(|(view, id)| view.session_id() == id)
-    }
-
     /// The preview cache backing whatever the pane shows, resolving the sandbox
     /// container-vs-host split for Terminal view. Shared by the scroll clamp, the scroll
     /// indicator and the drag-select copy so they read what the renderer painted.
@@ -2560,6 +2551,7 @@ impl HomeView {
 
     /// Paint the preview and refresh geometry used by selection and live-send.
     fn render_preview(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
+        self.structured_transcript_painted = false;
         if self.system_health_open {
             self.preview_outer_area = area;
             self.preview_area = area;
@@ -2817,7 +2809,12 @@ impl HomeView {
             // on top (same `i` toggle as the terminal previews), streaming transcript
             // below, drag-select pointed at the painted rows.
             let selected_id = self.selected_session.clone();
-            if self.structured_owns_pane() {
+            let mounted_matches = self
+                .structured_preview
+                .as_ref()
+                .zip(selected_id.as_deref())
+                .is_some_and(|(v, id)| v.session_id() == id);
+            if mounted_matches {
                 // Take/put-back so the view's `&mut` render can't
                 // fight the instance lookup's shared borrow of self.
                 let mut view = self.structured_preview.take();
@@ -2843,6 +2840,7 @@ impl HomeView {
                     .as_mut()
                     .and_then(|v| v.render(frame, layout.output, theme));
                 self.structured_preview = view;
+                self.structured_transcript_painted = true;
                 self.preview_pane_area = layout.output;
                 if let Some(g) = geometry {
                     self.preview_visible_rows = g.text_area.height as usize;
@@ -3146,9 +3144,9 @@ impl HomeView {
     pub(super) fn paint_preview_links(&self, buf: &mut Buffer) {
         // Same guards as `preview_link_at`, so an underline always marks a clickable
         // link: an overlay swallows the click (and paints over these cells, leaving the
-        // backend to wrap its own text in OSC 8), and a mounted structured transcript's
-        // rows are not the capture's links.
-        if self.has_non_live_send_overlay() || self.structured_owns_pane() {
+        // backend to wrap its own text in OSC 8), and transcript rows are not the
+        // capture's links.
+        if self.has_non_live_send_overlay() || self.structured_transcript_painted {
             return;
         }
         let view = self.preview_text_view;
