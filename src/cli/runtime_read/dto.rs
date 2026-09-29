@@ -1009,7 +1009,10 @@ fn valid_group_path(value: &str) -> bool {
         })
 }
 
-fn valid_absolute_path(value: &str) -> bool {
+/// The grammar a wire path must satisfy, shared with the producer: it drops a
+/// stored row the client would otherwise refuse, because one such row fails the
+/// whole snapshot and therefore every read command on every profile.
+pub(crate) fn valid_absolute_path(value: &str) -> bool {
     value == "/"
         || (value.starts_with('/')
             && value.split('/').skip(1).all(|component| {

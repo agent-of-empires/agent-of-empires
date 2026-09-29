@@ -21,7 +21,6 @@ use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use chrono::{DateTime, SecondsFormat, Utc};
 use futures_util::{SinkExt, StreamExt};
-use std::path::Path;
 
 use serde::Serialize;
 use tokio_tungstenite::tungstenite;
@@ -600,7 +599,10 @@ fn build_snapshot(runtime: &RuntimeState, instances: &[Instance], owner: Owner) 
 /// same spirit as [`reconcile_legacy_rows`], and the client's own
 /// `valid_absolute_path` stays fail-closed.
 fn drop_unusable_projects(projects: &mut Vec<ProjectRead>) {
-    projects.retain(|project| Path::new(&project.path).is_absolute());
+    // The client's own grammar, not a weaker local one: `is_absolute` admits
+    // `/a//b`, `/a/./b` and `/a/../x`, all of which the client then refuses,
+    // and one refused row fails the whole snapshot.
+    projects.retain(|project| crate::cli::runtime_read::dto::valid_absolute_path(&project.path));
 }
 
 /// Reconcile the stored rows against the rules a read projects under, field by
