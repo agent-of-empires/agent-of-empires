@@ -1,6 +1,7 @@
 use super::*;
 use crate::session::{merge_configs, Config, ProfileConfig};
 use crate::tui::dialogs::test_keys::{alt_key, ctrl_key, key, shift_key};
+use crate::tui::dialogs::test_render::find;
 use std::fs;
 
 const TEST_PATH: &str = ".";
@@ -62,6 +63,10 @@ fn screen_of(dialog: &mut NewSessionDialog, width: u16, height: u16) -> String {
         .iter()
         .map(|cell| cell.symbol())
         .collect()
+}
+
+fn draw(dialog: &mut NewSessionDialog) -> ratatui::buffer::Buffer {
+    crate::tui::dialogs::test_render::draw(100, 40, |f, theme| dialog.render(f, f.area(), theme))
 }
 
 #[test]
@@ -825,7 +830,7 @@ fn the_structured_row_appears_only_for_an_acp_capable_tool() {
 
 #[test]
 #[serial_test::serial]
-fn clicks_focus_a_row_and_act_on_it_while_hover_does_neither() {
+fn clicks_focus_and_act_on_a_row_while_hover_only_tints_it() {
     assert!(single_tool_dialog().handle_click(5, 5).is_none());
 
     // A checkbox row toggles on click.
@@ -868,19 +873,156 @@ fn clicks_focus_a_row_and_act_on_it_while_hover_does_neither() {
     );
     assert_eq!(dialog.focused_field, 2);
 
-    // Hover must never steal focus from the field being typed into, nor
-    // toggle anything, on or off the rects.
+    // Hover tints the row but never steals focus from the field being typed
+    // into, nor toggles anything.
     let mut dialog = single_tool_dialog();
-    dialog
-        .focusable_rects
-        .push((2, ratatui::layout::Rect::new(0, 5, 30, 1)));
     let yolo = dialog.yolo_mode;
-    let focus = dialog.focused_field;
-    assert_ne!(focus, 2);
-    assert!(!dialog.handle_hover(10, 5));
-    assert!(!dialog.handle_hover(80, 80));
-    assert_eq!(dialog.focused_field, focus);
+    let (col, row) = find(&draw(&mut dialog), "YOLO Mode:");
+    assert!(dialog.handle_hover(col, row));
+    assert!(!dialog.handle_hover(col + 3, row), "same row, no change");
+    let buffer = draw(&mut dialog);
+    let theme = crate::tui::styles::Theme::default();
+    assert_eq!(buffer[(col, row)].bg, theme.selection);
+    assert_ne!(
+        buffer[(col, row + 1)].bg,
+        theme.selection,
+        "spacer untinted"
+    );
+    assert_eq!(dialog.focused_field, 0);
     assert_eq!(dialog.yolo_mode, yolo);
+    assert!(dialog.handle_hover(0, 0));
+    assert_eq!(dialog.hover.current(), None);
+}
+
+#[test]
+fn the_create_directory_prompt_choices_are_clickable() {
+    // Each answer acts like its key: `[y]es` creates and submits, `[N]o`
+    // backs out to the path field.
+    for (choice, creates) in [("[y]es", true), ("[N]o", false)] {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let path = tmp.path().join("new/project");
+        let mut dialog =
+            NewSessionDialog::new_with_tools(vec!["claude"], path.to_string_lossy().to_string());
+        dialog.focused_field = 1;
+        dialog.confirm_create_dir = Some(false);
+        let (col, row) = find(&draw(&mut dialog), choice);
+        let result = dialog.handle_click(col, row);
+        assert_eq!(
+            matches!(result, Some(DialogResult::Submit(_))),
+            creates,
+            "{choice}"
+        );
+        assert_eq!(path.exists(), creates, "{choice}");
+        assert!(dialog.confirm_create_dir.is_none());
+        if !creates {
+            assert_eq!(dialog.focused_field, dialog.path_field());
+        }
+    }
+}
+
+#[test]
+fn config_overlay_clicks_act_like_their_keys() {
+    // Sandbox: a collapsed list expands like Enter, an entry row selects it,
+    // and leaving the list collapses it like Esc would.
+    let mut dialog = sandboxed_dialog();
+    dialog.sandbox_config_mode = true;
+    dialog.extra_env = vec!["ALPHA=1".into(), "BETA=2".into()];
+    let (col, row) = find(&draw(&mut dialog), "Environment:");
+    dialog.handle_click(col, row);
+    assert_eq!(dialog.sandbox_focused_field, SANDBOX_ENV_FIELD);
+    assert!(dialog.env_list_expanded);
+    let (col, row) = find(&draw(&mut dialog), "BETA=2");
+    dialog.handle_click(col, row);
+    assert_eq!(dialog.env_selected_index, 1);
+    let (col, row) = find(&draw(&mut dialog), "Image:");
+    dialog.handle_click(col, row);
+    assert_eq!(dialog.sandbox_focused_field, SANDBOX_IMAGE_FIELD);
+    assert!(!dialog.env_list_expanded);
+
+    // Worktree: the checkbox toggles, text rows only focus, and while an
+    // entry is being typed every click waits for Enter or Esc.
+    let mut dialog = worktree_config_dialog(TEST_PATH.to_string());
+    dialog.workspace_repos = vec!["/repo/one".into(), "/repo/two".into()];
+    let before = dialog.create_new_branch;
+    let (col, row) = find(&draw(&mut dialog), "New Branch:");
+    dialog.handle_click(col, row);
+    assert_eq!(dialog.worktree_config_focused_field, WT_NEW_BRANCH_FIELD);
+    assert_eq!(dialog.create_new_branch, !before);
+    let (col, row) = find(&draw(&mut dialog), "Base:");
+    dialog.handle_click(col, row);
+    assert_eq!(dialog.worktree_config_focused_field, WT_BASE_BRANCH_FIELD);
+    assert_eq!(dialog.create_new_branch, !before);
+    let (col, row) = find(&draw(&mut dialog), "Extra Repos:");
+    dialog.handle_click(col, row);
+    assert!(dialog.workspace_repos_expanded);
+    let (col, row) = find(&draw(&mut dialog), "/repo/two");
+    dialog.handle_click(col, row);
+    assert_eq!(dialog.workspace_repo_selected_index, 1);
+
+    dialog.handle_key(key(KeyCode::Enter));
+    assert!(dialog.workspace_repo_editing_input.is_some());
+    let (col, row) = find(&draw(&mut dialog), "Name:");
+    assert!(!dialog.handle_hover(col, row), "nothing hoverable mid-edit");
+    dialog.handle_click(col, row);
+    assert_eq!(dialog.worktree_config_focused_field, WT_EXTRA_REPOS_FIELD);
+    assert!(dialog.workspace_repo_editing_input.is_some());
+
+    // Hover tints an overlay row without moving its focus.
+    let mut dialog = worktree_config_dialog(TEST_PATH.to_string());
+    let (col, row) = find(&draw(&mut dialog), "Base:");
+    assert!(dialog.handle_hover(col, row));
+    assert!(dialog.hover.current().is_some());
+    assert_eq!(dialog.worktree_config_focused_field, WT_NAME_FIELD);
+}
+
+#[test]
+#[serial_test::serial]
+fn the_directory_browser_takes_clicks_in_both_of_its_hosts() {
+    // `isolate_home` keeps `persist_last_browse_dir` off the real config.
+    let temp_home = tempfile::tempdir().expect("temp home");
+    let _home = crate::session::test_support::isolate_home(temp_home.path());
+    let base = temp_home.path().join("projects");
+    fs::create_dir_all(base.join("alpha")).unwrap();
+    let alpha = base.join("alpha").to_string_lossy().to_string();
+
+    // From the path field: navigate into a row, then pick it with `./`.
+    let mut dialog = single_tool_dialog();
+    dialog.path = Input::new(base.to_string_lossy().to_string());
+    dialog.handle_key(ctrl_key(KeyCode::Char('p')));
+    let (col, row) = find(&draw(&mut dialog), "alpha/");
+    assert!(dialog.handle_hover(col, row));
+    dialog.handle_click(col, row);
+    let (col, row) = find(&draw(&mut dialog), "> ./");
+    dialog.handle_click(col, row);
+    assert!(!dialog.dir_picker.is_active());
+    assert_eq!(dialog.path.value(), alpha);
+
+    // From an extra-repo entry, opened over the worktree overlay. Keys must
+    // reach the browser too, not the entry being typed underneath it.
+    for by_click in [true, false] {
+        let mut dialog = worktree_config_dialog(TEST_PATH.to_string());
+        dialog.worktree_config_focused_field = WT_EXTRA_REPOS_FIELD;
+        dialog.workspace_repos_expanded = true;
+        dialog.workspace_repo_adding_new = true;
+        dialog.workspace_repo_editing_input = Some(Input::new(alpha.clone()));
+        dialog.handle_key(ctrl_key(KeyCode::Char('p')));
+        assert!(dialog.dir_picker.is_active());
+        if by_click {
+            let (col, row) = find(&draw(&mut dialog), "> ./");
+            dialog.handle_click(col, row);
+        } else {
+            dialog.handle_key(key(KeyCode::Enter));
+        }
+        assert!(!dialog.dir_picker.is_active(), "click={by_click}");
+        assert!(!dialog.workspace_repo_dir_picker_active);
+        assert!(dialog.worktree_config_mode);
+        let editing = dialog
+            .workspace_repo_editing_input
+            .as_ref()
+            .map(Input::value);
+        assert_eq!(editing, Some(alpha.as_str()), "click={by_click}");
+        assert!(dialog.workspace_repos.is_empty(), "click={by_click}");
+    }
 }
 
 #[test]
@@ -1043,8 +1185,6 @@ fn branch_picker_mouse_selection_routes_to_the_focused_field() {
     // A branch picked with the mouse lands in the field a keyboard pick would,
     // so opening from Base and clicking a row must not overwrite Name. Needs a
     // real render: the picker learns its clickable area while drawing.
-    use ratatui::{backend::TestBackend, Terminal};
-
     let temp_home = tempfile::tempdir().expect("temp home");
     let _home = crate::session::test_support::isolate_home(temp_home.path());
     let repo = branch_picker_repo_in(temp_home.path());
@@ -1054,27 +1194,14 @@ fn branch_picker_mouse_selection_routes_to_the_focused_field() {
     dialog.handle_key(ctrl_key(KeyCode::Char('p')));
     assert!(dialog.branch_picker.is_active());
 
-    let mut terminal = Terminal::new(TestBackend::new(100, 40)).expect("terminal");
-    let theme = crate::tui::styles::Theme::default();
-    terminal
-        .draw(|frame| dialog.render(frame, frame.area(), &theme))
-        .expect("render");
-
+    let buffer = draw(&mut dialog);
     let branch = dialog
         .branch_picker
         .filtered_items()
         .first()
         .map(|s| (*s).clone())
         .expect("repo should expose a branch");
-    let buffer = terminal.backend().buffer().clone();
-    let (col, row) = (0..buffer.area.height)
-        .find_map(|row| {
-            let line: String = (0..buffer.area.width)
-                .map(|col| buffer[(col, row)].symbol())
-                .collect();
-            line.find(&branch).map(|idx| (idx as u16, row))
-        })
-        .expect("branch row should be rendered");
+    let (col, row) = find(&buffer, &format!("> {branch}"));
 
     dialog.handle_click(col, row);
 

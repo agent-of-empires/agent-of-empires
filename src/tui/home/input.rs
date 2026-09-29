@@ -427,8 +427,10 @@ impl HomeView {
     /// Whether the full-screen Settings takeover is showing. The wheel scroll gate in
     /// `app.rs` uses this so the whole screen counts as a scroll target, since the
     /// list/preview hit rects it replaced are stale.
-    pub fn is_settings_open(&self) -> bool {
-        self.settings_view.is_some()
+    /// Full-screen surfaces that own the wheel wherever the pointer is, over
+    /// list and preview rects that are stale beneath them.
+    pub fn owns_wheel(&self) -> bool {
+        self.settings_view.is_some() || self.show_help
     }
 
     pub fn hit_preview(&self, col: u16, row: u16) -> bool {
@@ -442,16 +444,10 @@ impl HomeView {
         self.pending_intro_theme.take()
     }
 
+    /// The diff pane, or the whole screen while a diff modal is open.
     pub fn hit_diff(&self, col: u16, row: u16) -> bool {
-        self.diff_area.contains(Position::from((col, row)))
-    }
-
-    /// Forward a left-click to the diff view's file-list panel. No-op
-    /// when no diff view is open.
-    pub fn handle_diff_click(&mut self, col: u16, row: u16) {
-        if let Some(view) = &mut self.diff_view {
-            view.handle_click(col, row);
-        }
+        self.diff_view.as_ref().is_some_and(DiffView::has_modal)
+            || self.diff_area.contains(Position::from((col, row)))
     }
 
     /// Forward a hover event to the diff view's file-list panel.
@@ -1160,6 +1156,9 @@ impl HomeView {
         if let Some(dialog) = &mut self.intro_dialog {
             let click = dialog.handle_click(col, row);
             let preview = dialog.take_pending_preview();
+            if let Some(url) = dialog.take_pending_link() {
+                self.open_link(url);
+            }
             if let Some(result) = click {
                 match result {
                     DialogResult::Continue => {}
@@ -1223,25 +1222,21 @@ impl HomeView {
         }
         if let Some(dialog) = &mut self.new_dialog {
             if let Some(result) = dialog.handle_click(col, row) {
-                match result {
-                    DialogResult::Continue => {}
-                    DialogResult::Cancel => {
-                        self.new_dialog = None;
-                    }
-                    DialogResult::Submit(_data) => {
-                        // Defensive: the new-session dialog submits only from the
-                        // Enter path, while clicks return Continue.
-                    }
-                }
+                self.pending_dialog_click_action = self.apply_new_dialog_result(result);
             }
-            // Always swallow clicks while the new-session dialog is
-            // open so the underlying list / preview don't react.
+            // Swallow every click while the dialog is open so the list and
+            // preview underneath don't react.
+            return true;
+        }
+        if let Some(serve) = &mut self.serve_view {
+            let key = serve.handle_click(col, row);
+            self.press_dialog_key(key);
             return true;
         }
         // The confirm dialog floats over settings, so it wins click routing the same way
         // the keyboard path checks `settings_close_confirm` before `settings_view`;
         // otherwise a click on Yes / No goes into settings and never reaches the modal.
-        if let Some(dialog) = &self.confirm_dialog {
+        if let Some(dialog) = &mut self.confirm_dialog {
             if let Some(result) = dialog.handle_click(col, row) {
                 let action = dialog.action().to_string();
                 match result {
@@ -1295,6 +1290,12 @@ impl HomeView {
             // it, hit or miss; `handle_click` mutates focus on hits and returns None
             // otherwise, and the click is swallowed either way.
             let _ = view.handle_click(col, row);
+            return true;
+        }
+        // The diff view is a full-screen takeover: it owns every click, since the
+        // stale list rect underneath would otherwise outrank `hit_diff` in `app.rs`.
+        if let Some(view) = &mut self.diff_view {
+            view.handle_click(col, row);
             return true;
         }
         if let Some(dialog) = &self.info_dialog {
@@ -1407,14 +1408,13 @@ impl HomeView {
             return true;
         }
         if let Some(dialog) = &mut self.rename_dialog {
-            // The rename dialog's click handler only returns Continue (submitting needs
-            // Enter on a valid input), so always swallow the click.
-            let _ = dialog.handle_click(col, row);
+            let key = dialog.handle_click(col, row);
+            self.press_dialog_key(key);
             return true;
         }
-        if self.worktree_name_dialog.is_some() {
-            // Keyboard-driven dialog; swallow clicks so the list underneath
-            // doesn't react while it's open.
+        if let Some(dialog) = &mut self.worktree_name_dialog {
+            let key = dialog.handle_click(col, row);
+            self.press_dialog_key(key);
             return true;
         }
         if let Some(dialog) = &mut self.restart_dialog {
@@ -1524,7 +1524,7 @@ impl HomeView {
             }
             return true;
         }
-        if let Some(dialog) = &self.volume_ignores_glob_dialog {
+        if let Some(dialog) = &mut self.volume_ignores_glob_dialog {
             if let Some(result) = dialog.handle_click(col, row) {
                 let dont_ask_again = dialog.dont_ask_again();
                 match result {
@@ -1590,9 +1590,111 @@ impl HomeView {
             }
             return true;
         }
+        if let Some(dialog) = &mut self.skills_manager_dialog {
+            let key = dialog.handle_click(col, row);
+            self.press_dialog_key(key);
+            return true;
+        }
+        if let Some(dialog) = &mut self.plugin_manager_dialog {
+            let key = dialog.handle_click(col, row);
+            self.press_dialog_key(key);
+            return true;
+        }
+        if let Some(dialog) = &mut self.projects_dialog {
+            let key = dialog.handle_click(col, row);
+            self.press_dialog_key(key);
+            return true;
+        }
+        if let Some(dialog) = &mut self.profile_picker_dialog {
+            let key = dialog.handle_click(col, row);
+            self.press_dialog_key(key);
+            return true;
+        }
+        if let Some(dialog) = &self.send_message_dialog {
+            let key = dialog.handle_click(col, row);
+            self.press_dialog_key(key);
+            return true;
+        }
+        if let Some(dialog) = &self.permission_response_dialog {
+            let key = dialog.handle_click(col, row);
+            self.press_dialog_key(key);
+            return true;
+        }
+        if self.show_help {
+            // The overlay has no targets; a click closes it like Esc.
+            self.press_dialog_key(Some(KeyEvent::from(KeyCode::Esc)));
+            return true;
+        }
         // Other dialogs swallow clicks through the `has_dialog()` gates in the list,
         // preview and divider handlers.
         false
+    }
+
+    /// Act on a new-session dialog result, from a key or a click.
+    fn apply_new_dialog_result(&mut self, result: DialogResult<NewSessionData>) -> Option<Action> {
+        match result {
+            DialogResult::Continue => None,
+            DialogResult::Cancel => {
+                // If creation is pending, mark it as cancelled
+                if self.is_creation_pending() {
+                    self.cancel_creation();
+                } else {
+                    self.new_dialog = None;
+                    // Backing out of `n` with a selection is the most contextual
+                    // moment for the new-from-selection tip; queue it (a no-op until
+                    // earned). Submit skips the pop so creation isn't interrupted and
+                    // the badge still carries it. See #2262.
+                    self.queue_earned_tip_pop();
+                }
+                None
+            }
+            DialogResult::Submit(data) => {
+                // Check if the tool uses hooks and user hasn't acknowledged yet
+                let tool_name = if data.tool.is_empty() {
+                    "claude".to_string()
+                } else {
+                    data.tool.clone()
+                };
+
+                let resolved_config = crate::session::resolve_config_with_repo_or_warn(
+                    &data.profile,
+                    std::path::Path::new(&data.path),
+                );
+                if let Some(hook_agent) =
+                    resolve_hook_install_agent(&tool_name, &resolved_config.session)
+                {
+                    let config = crate::session::config::load_config().ok().flatten();
+                    let hooks_enabled = resolved_config.session.agent_status_hooks;
+                    let acknowledged = config
+                        .as_ref()
+                        .map(|c| c.app_state.has_acknowledged_agent_hooks)
+                        .unwrap_or(false);
+
+                    if crate::agents::hook_install_required(hook_agent, hooks_enabled)
+                        && !acknowledged
+                    {
+                        self.hooks_install_dialog =
+                            Some(HooksInstallDialog::new_for_profile_resolved(
+                                &tool_name,
+                                hook_agent.name,
+                                Some(&data.profile),
+                            ));
+                        self.pending_hooks_install_data = Some(data);
+                        return None;
+                    }
+                }
+
+                self.maybe_confirm_volume_ignores_globs(data)
+            }
+        }
+    }
+
+    /// Replay a click that a keyboard-driven dialog mapped to a key through
+    /// `handle_key`, so mouse and keyboard share one result handler.
+    fn press_dialog_key(&mut self, key: Option<KeyEvent>) {
+        if let Some(key) = key {
+            self.pending_dialog_click_action = self.handle_key(key, None);
+        }
     }
 
     pub fn handle_key(
@@ -1994,67 +2096,12 @@ impl HomeView {
             return None;
         }
 
-        let dialog_result = self
+        if let Some(result) = self
             .new_dialog
             .as_mut()
-            .map(|dialog| dialog.handle_key(key));
-
-        if let Some(result) = dialog_result {
-            match result {
-                DialogResult::Continue => {}
-                DialogResult::Cancel => {
-                    // If creation is pending, mark it as cancelled
-                    if self.is_creation_pending() {
-                        self.cancel_creation();
-                    } else {
-                        self.new_dialog = None;
-                        // Backing out of `n` with a selection is the most contextual
-                        // moment for the new-from-selection tip; queue it (a no-op until
-                        // earned). Submit skips the pop so creation isn't interrupted and
-                        // the badge still carries it. See #2262.
-                        self.queue_earned_tip_pop();
-                    }
-                }
-                DialogResult::Submit(data) => {
-                    // Check if the tool uses hooks and user hasn't acknowledged yet
-                    let tool_name = if data.tool.is_empty() {
-                        "claude".to_string()
-                    } else {
-                        data.tool.clone()
-                    };
-
-                    let resolved_config = crate::session::resolve_config_with_repo_or_warn(
-                        &data.profile,
-                        std::path::Path::new(&data.path),
-                    );
-                    if let Some(hook_agent) =
-                        resolve_hook_install_agent(&tool_name, &resolved_config.session)
-                    {
-                        let config = crate::session::config::load_config().ok().flatten();
-                        let hooks_enabled = resolved_config.session.agent_status_hooks;
-                        let acknowledged = config
-                            .as_ref()
-                            .map(|c| c.app_state.has_acknowledged_agent_hooks)
-                            .unwrap_or(false);
-
-                        if crate::agents::hook_install_required(hook_agent, hooks_enabled)
-                            && !acknowledged
-                        {
-                            self.hooks_install_dialog =
-                                Some(HooksInstallDialog::new_for_profile_resolved(
-                                    &tool_name,
-                                    hook_agent.name,
-                                    Some(&data.profile),
-                                ));
-                            self.pending_hooks_install_data = Some(data);
-                            return None;
-                        }
-                    }
-
-                    return self.maybe_confirm_volume_ignores_globs(data);
-                }
-            }
-            return None;
+            .map(|dialog| dialog.handle_key(key))
+        {
+            return self.apply_new_dialog_result(result);
         }
 
         if let Some(dialog) = &mut self.confirm_dialog {
@@ -4300,6 +4347,10 @@ impl HomeView {
         if let Some(view) = &mut self.settings_view {
             return view.handle_wheel_scroll(true);
         }
+        if self.show_help {
+            self.help_scroll = self.help_scroll.saturating_sub(STEP);
+            return true;
+        }
         if self.system_health_open && self.hit_preview(col, row) {
             self.system_health_scroll = self.system_health_scroll.saturating_sub(3);
             return true;
@@ -4307,6 +4358,9 @@ impl HomeView {
         // A preview selection is anchored to absolute scrollback lines, not screen cells,
         // so scrolling does not invalidate it and it is deliberately not cleared here.
         if let Some(ref mut diff) = self.diff_view {
+            if diff.has_modal() {
+                return false;
+            }
             diff.scroll_up(STEP);
             return true;
         }
@@ -5422,6 +5476,12 @@ impl HomeView {
         if let Some(dialog) = &mut self.confirm_dialog {
             overlay_changed |= dialog.handle_hover(col, row);
         }
+        if let Some(dialog) = &mut self.volume_ignores_glob_dialog {
+            overlay_changed |= dialog.handle_hover(col, row);
+        }
+        if let Some(dialog) = &mut self.tips_dialog {
+            overlay_changed |= dialog.handle_hover(col, row);
+        }
         if let Some(dialog) = &mut self.update_confirm_dialog {
             overlay_changed |= dialog.handle_hover(col, row);
         }
@@ -5447,6 +5507,30 @@ impl HomeView {
             overlay_changed |= dialog.handle_hover(col, row);
         }
         if let Some(dialog) = &mut self.restart_dialog {
+            overlay_changed |= dialog.handle_hover(col, row);
+        }
+        if let Some(dialog) = &mut self.worktree_name_dialog {
+            overlay_changed |= dialog.handle_hover(col, row);
+        }
+        if let Some(dialog) = &mut self.send_message_dialog {
+            overlay_changed |= dialog.handle_hover(col, row);
+        }
+        if let Some(dialog) = &mut self.profile_picker_dialog {
+            overlay_changed |= dialog.handle_hover(col, row);
+        }
+        if let Some(dialog) = &mut self.projects_dialog {
+            overlay_changed |= dialog.handle_hover(col, row);
+        }
+        if let Some(dialog) = &mut self.plugin_manager_dialog {
+            overlay_changed |= dialog.handle_hover(col, row);
+        }
+        if let Some(dialog) = &mut self.skills_manager_dialog {
+            overlay_changed |= dialog.handle_hover(col, row);
+        }
+        if let Some(serve) = &mut self.serve_view {
+            overlay_changed |= serve.handle_hover(col, row);
+        }
+        if let Some(dialog) = &mut self.permission_response_dialog {
             overlay_changed |= dialog.handle_hover(col, row);
         }
         if let Some(dialog) = &mut self.hooks_install_dialog {
@@ -5525,6 +5609,11 @@ impl HomeView {
         if let Some(view) = &mut self.settings_view {
             return view.handle_wheel_scroll(false);
         }
+        if self.show_help {
+            // HelpOverlay::render clamps this to the real max scroll.
+            self.help_scroll = self.help_scroll.saturating_add(STEP);
+            return true;
+        }
         if self.system_health_open && self.hit_preview(col, row) {
             let visible_rows = crate::tui::components::diagnostics::agent_table_visible_rows(
                 self.preview_area.height,
@@ -5536,6 +5625,9 @@ impl HomeView {
         // Mirror handle_scroll_up: the selection is anchored to scrollback
         // lines, so it survives the scroll and is left in place.
         if let Some(ref mut diff) = self.diff_view {
+            if diff.has_modal() {
+                return false;
+            }
             diff.scroll_down(STEP);
             return true;
         }

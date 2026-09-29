@@ -4,7 +4,7 @@
 //! GitHub discovery, update, re-approve a stale grant, uninstall), each behind
 //! the consent popup the CLI and web modals render. The twin of `aoe plugin`.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::io::{Read as _, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -21,6 +21,7 @@ use crate::plugin::install::{
     InstallConsent, LiveRestart, LiveToggle, ReapproveConsent, UpdateConsent, UpdatePreview,
 };
 use crate::plugin::update_check::UpdateStatus;
+use crate::tui::components::hint_buttons::ListMouse;
 use crate::tui::styles::Theme;
 
 /// An open update review popup. Every update shows its changelog; `consent` is
@@ -126,6 +127,8 @@ pub struct PluginManagerDialog {
     popup_scroll: Cell<u16>,
     /// Once the user scrolls, a following popup stops chasing its tail.
     popup_user_scrolled: bool,
+    /// Recorded through a `RefCell`: the settings screen renders by `&self`.
+    mouse: RefCell<ListMouse>,
 }
 
 impl Default for PluginManagerDialog {
@@ -346,6 +349,7 @@ impl PluginManagerDialog {
             popup: None,
             popup_scroll: Cell::new(0),
             popup_user_scrolled: false,
+            mouse: RefCell::default(),
         };
         dialog.reload();
         dialog.mutated = false; // Initial load is not a user mutation.
@@ -419,6 +423,38 @@ impl PluginManagerDialog {
         self.popup = Some(popup);
         self.popup_scroll.set(0);
         self.popup_user_scrolled = false;
+    }
+
+    /// A footer hint returns its key; a list row selects on the first click
+    /// and returns Enter (details, or install in discovery) on the second.
+    /// The caller presses returned keys through `handle_key`.
+    pub fn handle_click(&mut self, col: u16, row: u16) -> Option<KeyEvent> {
+        if let Some(key) = self.mouse.get_mut().hint_at(col, row) {
+            return Some(key);
+        }
+        if self.popup.is_some() || self.query_editing {
+            return None;
+        }
+        let len = self.list_len();
+        let selected = if self.mode == Mode::Discover {
+            &mut self.discover_selected
+        } else {
+            &mut self.selected
+        };
+        self.mouse.get_mut().click_row(col, row, len, selected)
+    }
+
+    pub fn handle_hover(&mut self, col: u16, row: u16) -> bool {
+        let (len, rows_live) = (self.list_len(), self.popup.is_none());
+        self.mouse.get_mut().handle_hover(col, row, len, rows_live)
+    }
+
+    fn list_len(&self) -> usize {
+        if self.mode == Mode::Discover {
+            self.discover_rows.len()
+        } else {
+            self.rows.len()
+        }
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> DialogResult<()> {
@@ -1262,6 +1298,7 @@ impl PluginManagerDialog {
             .padding(Padding::horizontal(1));
         let inner = block.inner(rect);
         f.render_widget(block, rect);
+        self.mouse.borrow_mut().reset();
         self.render_browse(f, inner, theme);
         match &self.popup {
             Some(Popup::Review(review)) => self.render_review(f, rect, theme, review),
@@ -1274,6 +1311,9 @@ impl PluginManagerDialog {
             Some(Popup::Progress(progress)) => self.render_progress(f, rect, theme, progress),
             None => {}
         }
+        self.mouse
+            .borrow()
+            .paint_hover(f, theme, self.list_len(), self.popup.is_none());
     }
 
     fn render_review(&self, f: &mut Frame, area: Rect, theme: &Theme, review: &Review) {
@@ -1808,6 +1848,8 @@ impl PluginManagerDialog {
             .clamp(1, area.height);
         let rect = centered_rect(area, width, height);
         f.render_widget(Clear, rect);
+        // The popup owns the keyboard, so only its own hints are clickable.
+        self.mouse.borrow_mut().clear_hints();
         let block = Block::default()
             .title(title.to_string())
             .borders(Borders::ALL)
@@ -1857,6 +1899,9 @@ impl PluginManagerDialog {
                 Paragraph::new(footer).wrap(Wrap { trim: true }),
                 footer_area,
             );
+            self.mouse
+                .borrow_mut()
+                .record_hints(f.buffer_mut(), footer_area);
         }
     }
 
@@ -1933,6 +1978,7 @@ impl PluginManagerDialog {
             Some(self.selected)
         });
         f.render_stateful_widget(list, chunks[0], &mut state);
+        self.record_list(chunks[0], state.offset());
 
         if !self.load_errors.is_empty() {
             let errors = Paragraph::new(self.load_errors.join("; "))
@@ -2003,10 +2049,16 @@ impl PluginManagerDialog {
         let mut state = ListState::default();
         state.select(Some(self.discover_selected));
         f.render_stateful_widget(list, list_area, &mut state);
+        self.record_list(list_area, state.offset());
+    }
+
+    fn record_list(&self, area: Rect, offset: usize) {
+        self.mouse.borrow_mut().record_list(area, offset);
     }
 
     fn render_footer(&self, f: &mut Frame, area: Rect, theme: &Theme) {
         // A running task wins, then a transient message, then the key hints.
+        let showing_hints = self.loading.is_none() && self.error.is_none() && self.info.is_none();
         let (text, color) = if let Some(loading) = self.loading {
             (loading.to_string(), theme.waiting)
         } else if let Some(e) = self.error.as_deref() {
@@ -2060,6 +2112,9 @@ impl PluginManagerDialog {
             .style(Style::default().fg(color))
             .wrap(Wrap { trim: true });
         f.render_widget(footer, area);
+        if showing_hints {
+            self.mouse.borrow_mut().record_hints(f.buffer_mut(), area);
+        }
     }
 }
 
@@ -2091,5 +2146,63 @@ mod wrapped_rows_tests {
         }
         let lines = [line("alpha bravo"), line(""), line("x")];
         assert_eq!(wrapped_rows_total(&lines, 7), 4);
+    }
+}
+
+#[cfg(test)]
+mod mouse_tests {
+    use super::*;
+    use crate::tui::dialogs::test_render::{draw, find};
+
+    fn result(slug: &str) -> DiscoveryResult {
+        DiscoveryResult {
+            slug: slug.to_string(),
+            html_url: String::new(),
+            description: None,
+            stars: 0,
+            badge: DiscoveryBadge::Unvetted,
+            featured: false,
+            install_command: String::new(),
+            source_avatar_url: String::new(),
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn rows_select_then_open_and_only_the_open_popup_s_hints_click() {
+        let temp = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_home(temp.path());
+        let mut d = PluginManagerDialog::new();
+        d.mode = Mode::Discover;
+        d.discover_rows = vec![result("owner/alpha"), result("owner/beta")];
+
+        let buf = draw(100, 30, |f, theme| d.render(f, f.area(), theme));
+        let (x, y) = find(&buf, "owner/beta");
+        assert!(d.handle_hover(x, y));
+        assert_eq!(d.discover_selected, 0, "hover only tints");
+        assert_eq!(d.handle_click(x, y), None, "the first click selects");
+        assert_eq!(d.discover_selected, 1);
+        assert_eq!(d.handle_click(x, y).map(|k| k.code), Some(KeyCode::Enter));
+        let (x, y) = find(&buf, "/ search");
+        assert_eq!(
+            d.handle_click(x, y).map(|k| k.code),
+            Some(KeyCode::Char('/'))
+        );
+        let (hint_x, hint_y) = find(&buf, "d re-search");
+
+        d.open_popup(Popup::ConfirmUninstall {
+            id: "owner/beta".to_string(),
+        });
+        let buf = draw(100, 30, |f, theme| d.render(f, f.area(), theme));
+        let (x, y) = find(&buf, "y uninstall");
+        assert_eq!(
+            d.handle_click(x, y).map(|k| k.code),
+            Some(KeyCode::Char('y'))
+        );
+        assert_eq!(
+            d.handle_click(hint_x, hint_y),
+            None,
+            "the list's hints are inert under a popup"
+        );
     }
 }

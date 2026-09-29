@@ -112,6 +112,27 @@ pub fn row_index(list: Rect, col: u16, row: u16, len: usize) -> Option<usize> {
     (idx < len).then_some(idx)
 }
 
+/// Key of the `(key, rect)` click target under `(col, row)`, if any.
+pub fn hit<K: Copy>(targets: &[(K, Rect)], col: u16, row: u16) -> Option<K> {
+    targets
+        .iter()
+        .find(|(_, rect)| contains(*rect, col, row))
+        .map(|(key, _)| *key)
+}
+
+/// The rects of `(key, rect)` click targets, for a `HoverState`.
+pub fn target_rects<K>(targets: &[(K, Rect)]) -> Vec<Rect> {
+    targets.iter().map(|(_, rect)| *rect).collect()
+}
+
+/// Left edge of a `width`-cell line that ratatui centers in `area`. Ratatui
+/// offsets by `area.width / 2 - width / 2`, which is a cell off from
+/// `(area.width - width) / 2` whenever the two widths differ in parity, so hit
+/// rects must use this or miss the last glyph.
+pub fn centered_x(area: Rect, width: u16) -> u16 {
+    area.x + (area.width / 2).saturating_sub(width / 2)
+}
+
 /// Rounded, accent-bordered dialog block with a bold `theme.title` title.
 pub fn dialog_block<'a>(title: impl Into<Line<'a>>, theme: &Theme) -> Block<'a> {
     toned_dialog_block(title, theme.accent, theme.title)
@@ -145,20 +166,6 @@ pub fn render_dialog_frame(
     let inner = block.inner(dialog);
     frame.render_widget(block, dialog);
     (dialog, inner)
-}
-
-/// Footer hint such as `Enter select  Esc close`, keys in `theme.hint`.
-pub fn hint_line(theme: &Theme, hints: &[(&str, &str)]) -> Line<'static> {
-    let mut spans = Vec::with_capacity(hints.len() * 2);
-    for (i, (key, label)) in hints.iter().enumerate() {
-        let sep = if i + 1 < hints.len() { "  " } else { "" };
-        spans.push(Span::styled(
-            key.to_string(),
-            Style::default().fg(theme.hint),
-        ));
-        spans.push(Span::raw(format!(" {label}{sep}")));
-    }
-    Line::from(spans)
 }
 
 /// Apply Up/k, Down/j, Home and End to a list cursor. Returns whether the key was a navigation key.
@@ -206,5 +213,36 @@ pub(crate) mod test_keys {
 
     pub fn alt_key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::ALT)
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_render {
+    use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
+    use ratatui::prelude::*;
+    use ratatui::Terminal;
+
+    use crate::tui::styles::{load_theme, Theme};
+
+    /// Draw once at `width` x `height` and return the buffer.
+    pub fn draw(width: u16, height: u16, render: impl FnOnce(&mut Frame, &Theme)) -> Buffer {
+        let theme = load_theme("empire");
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|f| render(f, &theme)).unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    /// Cell of the first occurrence of `needle`, for clicking what was drawn.
+    /// Scans by cell, so wide glyphs earlier in the row don't skew the column.
+    pub fn find(buf: &Buffer, needle: &str) -> (u16, u16) {
+        let area = buf.area;
+        (0..area.height)
+            .flat_map(|y| (0..area.width).map(move |x| (x, y)))
+            .find(|&(x, y)| {
+                let tail: String = (x..area.width).map(|c| buf[(c, y)].symbol()).collect();
+                tail.starts_with(needle)
+            })
+            .unwrap_or_else(|| panic!("{needle:?} not drawn"))
     }
 }

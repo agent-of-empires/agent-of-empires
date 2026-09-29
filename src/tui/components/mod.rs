@@ -6,6 +6,7 @@ mod cycler;
 pub(crate) mod diagnostics;
 mod dir_picker;
 mod help;
+pub(crate) mod hint_buttons;
 pub(crate) mod hover;
 mod list_picker;
 pub(crate) mod preview;

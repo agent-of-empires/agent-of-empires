@@ -8,7 +8,10 @@ use ratatui::widgets::*;
 use tui_input::backend::crossterm::EventHandler;
 use tui_input::Input;
 
+use super::hint_buttons::{Hint, HintButtons};
+use super::scroll::calculate_scroll;
 use super::text_input::set_prefixed_input_cursor_position;
+use crate::tui::dialogs::{contains, hover_select, row_index};
 use crate::tui::styles::Theme;
 
 pub enum DirPickerResult {
@@ -17,16 +20,34 @@ pub enum DirPickerResult {
     Selected(String),
 }
 
+const HINTS: [Hint; 4] = [
+    ("Enter", "open/select", KeyCode::Null),
+    ("\u{2190}", "back", KeyCode::Left),
+    ("?", "help", KeyCode::Char('?')),
+    ("Esc", "cancel", KeyCode::Esc),
+];
+
 pub struct DirPicker {
     active: bool,
     filter: Input,
     selected: usize,
+    /// The row the list scrolls to keep visible. Follows `selected` except
+    /// on hover, so the rows never shift under a still pointer.
+    scroll_cursor: usize,
     cwd: PathBuf,
     dirs: Vec<String>,
     /// True when read_dir failed (e.g. permission denied)
     read_error: bool,
     show_hidden: bool,
     show_help: bool,
+    /// Hit areas from the last render; the list rows cover only the rendered
+    /// items, starting at `scroll_offset`.
+    dialog_area: Rect,
+    rows_area: Rect,
+    scroll_offset: usize,
+    more_above_area: Rect,
+    more_below_area: Rect,
+    footer: HintButtons,
 }
 
 impl Default for DirPicker {
@@ -41,11 +62,18 @@ impl DirPicker {
             active: false,
             filter: Input::default(),
             selected: 0,
+            scroll_cursor: 0,
             cwd: PathBuf::new(),
             dirs: Vec::new(),
             read_error: false,
             show_hidden: false,
             show_help: false,
+            dialog_area: Rect::default(),
+            rows_area: Rect::default(),
+            scroll_offset: 0,
+            more_above_area: Rect::default(),
+            more_below_area: Rect::default(),
+            footer: HintButtons::default(),
         }
     }
 
@@ -69,6 +97,7 @@ impl DirPicker {
         self.cwd = path;
         self.filter = Input::default();
         self.selected = 0;
+        self.scroll_cursor = 0;
         self.show_help = false;
         self.refresh_dirs();
         self.active = true;
@@ -143,7 +172,87 @@ impl DirPicker {
         self.refresh_dirs();
     }
 
+    /// Act on the highlighted row: `./` selects the current directory and
+    /// closes, any other row navigates into it.
+    fn open_selected(&mut self) -> DirPickerResult {
+        let filtered = self.filtered_dirs();
+        if filtered.is_empty() {
+            return DirPickerResult::Continue;
+        }
+        let name = &filtered[self.selected.min(filtered.len() - 1)];
+        if name == "./" {
+            self.active = false;
+            DirPickerResult::Selected(self.cwd.to_string_lossy().to_string())
+        } else {
+            let path = self.resolve_path(name);
+            self.navigate_to(path);
+            DirPickerResult::Continue
+        }
+    }
+
+    fn go_up(&mut self) {
+        if let Some(parent) = self.cwd.parent() {
+            self.navigate_to(parent.to_path_buf());
+        }
+    }
+
+    /// Filtered-list index of the rendered row under `(col, row)`.
+    fn row_at(&self, col: u16, row: u16) -> Option<usize> {
+        let visible = self.rows_area.height as usize;
+        row_index(self.rows_area, col, row, visible).map(|i| self.scroll_offset + i)
+    }
+
+    /// Route a left-click, mirroring the keys: a row acts like Enter on it,
+    /// the overflow markers step toward the hidden rows, and each hint-row
+    /// segment performs its key. A click outside the dialog cancels, and any
+    /// click closes the help overlay.
+    pub fn handle_click(&mut self, col: u16, row: u16) -> DirPickerResult {
+        let result = self.click(col, row);
+        self.scroll_cursor = self.selected;
+        result
+    }
+
+    fn click(&mut self, col: u16, row: u16) -> DirPickerResult {
+        if self.show_help {
+            self.show_help = false;
+            return DirPickerResult::Continue;
+        }
+        if !contains(self.dialog_area, col, row) {
+            self.active = false;
+            return DirPickerResult::Cancelled;
+        }
+        if let Some(idx) = self.row_at(col, row) {
+            self.selected = idx;
+            return self.open_selected();
+        }
+        if contains(self.more_above_area, col, row) {
+            self.selected = self.scroll_offset.saturating_sub(1);
+        } else if contains(self.more_below_area, col, row) {
+            self.selected = self.scroll_offset + self.rows_area.height as usize;
+        } else if let Some(key) = self.footer.key_at(col, row) {
+            return self.apply_key(key);
+        }
+        DirPickerResult::Continue
+    }
+
+    /// Move the row highlight under the pointer and track the hovered hint.
+    /// Leaves the scroll alone. Returns whether anything changed.
+    pub fn handle_hover(&mut self, col: u16, row: u16) -> bool {
+        if self.show_help {
+            return false;
+        }
+        let hint_changed = self.footer.handle_hover(col, row);
+        let hovered = self.row_at(col, row);
+        hover_select(&mut self.selected, hovered) | hint_changed
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent) -> DirPickerResult {
+        let result = self.apply_key(key);
+        self.scroll_cursor = self.selected;
+        result
+    }
+
+    fn apply_key(&mut self, key: KeyEvent) -> DirPickerResult {
         if self.show_help {
             if matches!(key.code, KeyCode::Esc | KeyCode::Char('?')) {
                 self.show_help = false;
@@ -158,35 +267,16 @@ impl DirPicker {
             return DirPickerResult::Continue;
         }
 
-        let filtered = self.filtered_dirs();
-        let filtered_len = filtered.len();
+        let filtered_len = self.filtered_dirs().len();
 
         match key.code {
             KeyCode::Esc => {
                 self.active = false;
                 DirPickerResult::Cancelled
             }
-            KeyCode::Enter | KeyCode::Right => {
-                if filtered_len == 0 {
-                    return DirPickerResult::Continue;
-                }
-                let idx = self.selected.min(filtered_len - 1);
-                let name = &filtered[idx];
-                if name == "./" {
-                    // Select current directory and close picker
-                    self.active = false;
-                    DirPickerResult::Selected(self.cwd.to_string_lossy().to_string())
-                } else {
-                    // Navigate into directory (including ../)
-                    let path = self.resolve_path(name);
-                    self.navigate_to(path);
-                    DirPickerResult::Continue
-                }
-            }
+            KeyCode::Enter | KeyCode::Right => self.open_selected(),
             KeyCode::Left => {
-                if let Some(parent) = self.cwd.parent() {
-                    self.navigate_to(parent.to_path_buf());
-                }
+                self.go_up();
                 DirPickerResult::Continue
             }
             KeyCode::Up => {
@@ -203,9 +293,7 @@ impl DirPicker {
             }
             KeyCode::Backspace => {
                 if self.filter.value().is_empty() {
-                    if let Some(parent) = self.cwd.parent() {
-                        self.navigate_to(parent.to_path_buf());
-                    }
+                    self.go_up();
                 } else {
                     self.filter.handle_event(&crossterm::event::Event::Key(key));
                     self.selected = 0;
@@ -244,7 +332,7 @@ impl DirPicker {
         format!("{}{}", ellipsis, tail)
     }
 
-    pub fn render(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
+    pub fn render(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
         let filtered = self.filtered_dirs();
         let max_visible: usize = 10;
         let list_height = filtered.len().min(max_visible) as u16;
@@ -253,6 +341,7 @@ impl DirPicker {
         let dialog_width: u16 = 60.min(area.width.saturating_sub(4));
 
         let dialog_area = crate::tui::dialogs::centered_rect(area, dialog_width, dialog_height);
+        self.dialog_area = dialog_area;
         frame.render_widget(Clear, dialog_area);
 
         // " Browse: <path> " with border chars leaves dialog_width - 2 for content,
@@ -292,7 +381,36 @@ impl DirPicker {
         set_prefixed_input_cursor_position(frame, chunks[0], "Filter: ", &self.filter);
 
         let visible_height = chunks[2].height as usize;
-        let scroll = super::scroll::calculate_scroll(filtered.len(), self.selected, visible_height);
+        let scroll = calculate_scroll(filtered.len(), self.scroll_cursor, visible_height);
+        let list = chunks[2];
+        let line_at = |offset: u16, height: u16| {
+            let y = list.y + offset;
+            Rect::new(
+                list.x,
+                y,
+                list.width,
+                height.min(list.bottom().saturating_sub(y)),
+            )
+        };
+        let above = u16::from(scroll.has_more_above);
+        let has_rows = !self.read_error && !filtered.is_empty();
+        let visible = if has_rows {
+            scroll.list_visible as u16
+        } else {
+            0
+        };
+        self.scroll_offset = scroll.scroll_offset;
+        self.rows_area = line_at(above, visible);
+        self.more_above_area = if has_rows && scroll.has_more_above {
+            line_at(0, 1)
+        } else {
+            Rect::default()
+        };
+        self.more_below_area = if has_rows && scroll.has_more_below {
+            line_at(above + visible, 1)
+        } else {
+            Rect::default()
+        };
 
         let mut lines: Vec<Line> = Vec::new();
         if self.read_error {
@@ -348,18 +466,8 @@ impl DirPicker {
         }
         frame.render_widget(Paragraph::new(lines), chunks[2]);
 
-        // Hint line
-        let hint_line = Line::from(vec![
-            Span::styled("Enter", Style::default().fg(theme.hint)),
-            Span::raw(" open/select  "),
-            Span::styled("\u{2190}", Style::default().fg(theme.hint)),
-            Span::raw(" back  "),
-            Span::styled("?", Style::default().fg(theme.hint)),
-            Span::raw(" help  "),
-            Span::styled("Esc", Style::default().fg(theme.hint)),
-            Span::raw(" cancel"),
-        ]);
-        frame.render_widget(Paragraph::new(hint_line), chunks[3]);
+        self.footer
+            .render(frame, chunks[3], theme, &HINTS, Alignment::Left);
 
         if self.show_help {
             self.render_help_overlay(frame, area, theme);
@@ -427,6 +535,7 @@ impl DirPicker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::dialogs::test_render::find;
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -662,6 +771,119 @@ mod tests {
         picker.refresh_dirs();
         assert!(picker.read_error);
         assert!(picker.dirs.is_empty());
+    }
+
+    fn draw(picker: &mut DirPicker) -> ratatui::buffer::Buffer {
+        crate::tui::dialogs::test_render::draw(80, 30, |f, theme| picker.render(f, f.area(), theme))
+    }
+
+    /// A click on a row does what Enter on it would, each hint segment does
+    /// what its key would, and a click outside the dialog cancels.
+    #[test]
+    fn clicks_mirror_the_keys_for_rows_and_hints() {
+        enum Want {
+            Selected,
+            Cwd(&'static str),
+            Cancelled,
+            Help,
+        }
+        let cases = [
+            // Prefixed so a `...`-truncated path in the title cannot match.
+            ("> ./", Want::Selected),
+            ("  ../", Want::Cwd("..")),
+            ("alpha/", Want::Cwd("alpha")),
+            // Inert: hover moves the selection, so a row click picks instead.
+            ("open/select", Want::Cwd("")),
+            ("back", Want::Cwd("..")),
+            ("help", Want::Help),
+            ("cancel", Want::Cancelled),
+            ("Filter:", Want::Cwd("")),
+        ];
+        for (target, want) in cases {
+            let (_tmp, base, mut picker) = fixture();
+            let (col, row) = find(&draw(&mut picker), target);
+            let result = picker.handle_click(col, row);
+            match want {
+                Want::Selected => {
+                    assert_eq!(selected_path(result, target), base.to_string_lossy());
+                    assert!(!picker.is_active(), "{target}");
+                }
+                Want::Cwd(rel) => {
+                    assert!(matches!(result, DirPickerResult::Continue), "{target}");
+                    let expected = match rel {
+                        ".." => base.parent().unwrap().to_path_buf(),
+                        _ => base.join(rel),
+                    };
+                    assert_eq!(picker.cwd, expected, "{target}");
+                }
+                Want::Cancelled => {
+                    assert!(matches!(result, DirPickerResult::Cancelled), "{target}");
+                    assert!(!picker.is_active(), "{target}");
+                }
+                Want::Help => {
+                    assert!(picker.show_help, "{target}");
+                    // Any click closes the overlay and nothing else.
+                    assert!(matches!(
+                        picker.handle_click(0, 0),
+                        DirPickerResult::Continue
+                    ));
+                    assert!(!picker.show_help && picker.is_active());
+                }
+            }
+        }
+
+        let (_tmp, _base, mut picker) = fixture();
+        draw(&mut picker);
+        assert!(matches!(
+            picker.handle_click(0, 0),
+            DirPickerResult::Cancelled
+        ));
+        assert!(!picker.is_active());
+    }
+
+    /// Hover moves the row highlight without scrolling and tints hints
+    /// without acting; each reports a change only when its target changes.
+    #[test]
+    fn hover_tracks_rows_and_hints_without_scrolling() {
+        let (_tmp, _base, mut picker) = fixture();
+        let buffer = draw(&mut picker);
+        let (col, row) = find(&buffer, "beta/");
+        assert!(picker.handle_hover(col, row));
+        assert_eq!(picker.selected, 3);
+        assert!(!picker.handle_hover(col + 1, row));
+
+        let (col, row) = find(&buffer, "cancel");
+        assert!(picker.handle_hover(col, row));
+        assert_eq!(picker.selected, 3);
+        assert!(picker.is_active());
+        assert!(!picker.handle_hover(col, row));
+        assert!(picker.handle_hover(0, 0), "leaving the hint clears it");
+
+        // Scrolled past the top: hovering a row near the top highlights it
+        // but keeps the rows where they are.
+        let names: Vec<String> = (0..20).map(|i| format!("d{i:02}")).collect();
+        let (_tmp, _base, mut picker) =
+            picker_over(&names.iter().map(String::as_str).collect::<Vec<_>>());
+        press(&mut picker, &[KeyCode::Down; 15]);
+        let buffer = draw(&mut picker);
+        let offset = picker.scroll_offset;
+        assert!(offset > 0);
+        let first = &picker.filtered_dirs()[offset];
+        let (col, row) = find(&buffer, &format!("{first}/"));
+        assert!(picker.handle_hover(col, row));
+        assert_eq!(picker.selected, offset);
+        draw(&mut picker);
+        assert_eq!(picker.scroll_offset, offset);
+
+        // The overflow markers step onto the hidden rows, scrolling to them.
+        let (col, row) = find(&buffer, "more below]");
+        picker.handle_click(col, row);
+        let below = picker.selected;
+        draw(&mut picker);
+        assert!(picker.scroll_offset + (picker.rows_area.height as usize) > below);
+        let (col, row) = find(&draw(&mut picker), "more above]");
+        picker.handle_click(col, row);
+        assert_eq!(picker.selected, picker.scroll_offset - 1);
     }
 
     /// Long paths are cut from the left, keeping the tail, and never split a

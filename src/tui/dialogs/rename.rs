@@ -7,6 +7,8 @@ use tui_input::backend::crossterm::EventHandler;
 use tui_input::Input;
 
 use super::DialogResult;
+use crate::tui::components::hint_buttons::{Hint, HintButtons};
+use crate::tui::components::hover::{paint_hover_bg, HoverState};
 use crate::tui::components::{
     render_text_field, render_text_field_with_ghost, GroupGhostCompletion, ListPicker,
     ListPickerResult,
@@ -52,6 +54,9 @@ pub struct RenameDialog {
     /// Hit rect per focusable field (title / group / profile), set by
     /// `render`. Drives click + hover routing.
     focusable_rects: Vec<(usize, Rect)>,
+    /// The hovered field row. Visual only; never moves focus.
+    hover: HoverState,
+    footer: HintButtons,
     /// Set for a tied aoe-managed worktree session via
     /// [`Self::with_worktree_branch`]. When present, the dialog grows a
     /// fourth focusable field: an "Also rename git branch" toggle. The
@@ -108,6 +113,8 @@ impl RenameDialog {
             group_ghost: None,
             validation_error: None,
             focusable_rects: Vec::new(),
+            hover: HoverState::default(),
+            footer: HintButtons::default(),
             worktree_branch: None,
             rename_branch: false,
         }
@@ -152,6 +159,8 @@ impl RenameDialog {
             group_ghost: None,
             validation_error: None,
             focusable_rects: Vec::new(),
+            hover: HoverState::default(),
+            footer: HintButtons::default(),
             worktree_branch: None,
             rename_branch: false,
         }
@@ -181,50 +190,43 @@ impl RenameDialog {
         }
     }
 
-    pub fn handle_click(&mut self, col: u16, row: u16) -> Option<DialogResult<RenameData>> {
+    /// A click on a field focuses it (cycling the profile chip or flipping the
+    /// branch toggle); a click on a footer hint returns its key for the caller
+    /// to press through `handle_key`, so Save shares Enter's validation.
+    pub fn handle_click(&mut self, col: u16, row: u16) -> Option<KeyEvent> {
         // Group picker overlay wins when active so a click can pick a
         // group row without dropping the dialog underneath.
         if self.group_picker.is_active() {
-            match self.group_picker.handle_click(col, row) {
-                ListPickerResult::Continue => return Some(DialogResult::Continue),
-                ListPickerResult::Cancelled => return Some(DialogResult::Continue),
-                ListPickerResult::Selected(value) => {
-                    self.new_group = Input::new(value);
-                    // Mirror the keyboard picker path: the ghost
-                    // autocomplete state goes stale once the user
-                    // commits to a value via the picker, so drop it.
-                    self.group_ghost = None;
-                    return Some(DialogResult::Continue);
-                }
+            if let ListPickerResult::Selected(value) = self.group_picker.handle_click(col, row) {
+                self.new_group = Input::new(value);
+                // The ghost goes stale once a value is picked, as on the keyboard path.
+                self.group_ghost = None;
             }
+            return None;
         }
-        let pos = ratatui::layout::Position::from((col, row));
-        let hit = self
-            .focusable_rects
-            .iter()
-            .find(|(_, rect)| rect.contains(pos))
-            .map(|(f, _)| *f)?;
-        self.focused_field = hit;
-        // Cycle the profile chip on click; flip the branch toggle on click;
-        // text fields just take focus.
+        if let Some(key) = self.footer.key_at(col, row) {
+            return Some(key);
+        }
+        self.focused_field = super::hit(&self.focusable_rects, col, row)?;
         if self.is_profile_field() && !self.available_profiles.is_empty() {
             self.profile_index = (self.profile_index + 1) % self.available_profiles.len();
         } else if self.is_branch_toggle_field() {
             self.rename_branch = !self.rename_branch;
         }
-        Some(DialogResult::Continue)
+        None
     }
 
-    /// Hover only updates the group-picker overlay highlight (menu-style
-    /// behavior the user expects). It deliberately does NOT move focus
-    /// between the title / group / profile rows: stealing focus from the
-    /// field the user is typing into just because the mouse cursor
-    /// drifts across the dialog is jarring. Click still sets focus.
+    /// Hover moves the group picker's highlight like a menu, but only tints
+    /// field rows: stealing focus from the field being typed into would be
+    /// jarring. Click still sets focus.
     pub fn handle_hover(&mut self, col: u16, row: u16) -> bool {
         if self.group_picker.is_active() {
             return self.group_picker.handle_hover(col, row);
         }
-        false
+        let field = self
+            .hover
+            .update(col, row, &super::target_rects(&self.focusable_rects));
+        self.footer.handle_hover(col, row) | field
     }
 
     fn is_profile_field(&self) -> bool {
@@ -736,29 +738,29 @@ impl RenameDialog {
         frame.render_widget(Paragraph::new(profile_line), area);
     }
 
-    fn render_hints(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
-        let mut hint_spans = vec![
-            Span::styled("Tab", Style::default().fg(theme.hint)),
-            Span::raw(" switch  "),
-        ];
+    fn render_hints(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
+        if let Some(rect) = self
+            .hover
+            .current_in(&super::target_rects(&self.focusable_rects))
+        {
+            paint_hover_bg(frame, rect, theme.selection);
+        }
+        let mut hints: Vec<Hint> = vec![("Tab", "switch", KeyCode::Tab)];
         if self.is_branch_toggle_field() {
-            hint_spans.push(Span::styled("Space", Style::default().fg(theme.hint)));
-            hint_spans.push(Span::raw(" toggle  "));
+            hints.push(("Space", "toggle", KeyCode::Null));
         }
         if self.is_group_field() && !self.existing_groups.is_empty() {
             if self.group_ghost_text().is_some() {
-                hint_spans.push(Span::styled("→", Style::default().fg(theme.hint)));
-                hint_spans.push(Span::raw(" accept  "));
+                hints.push(("→", "accept", KeyCode::Right));
             }
-            hint_spans.push(Span::styled("C-p", Style::default().fg(theme.hint)));
-            hint_spans.push(Span::raw(" groups  "));
+            hints.push(("C-p", "groups", KeyCode::Null));
         }
-        hint_spans.push(Span::styled("Enter", Style::default().fg(theme.hint)));
-        hint_spans.push(Span::raw(" save  "));
-        hint_spans.push(Span::styled("Esc", Style::default().fg(theme.hint)));
-        hint_spans.push(Span::raw(" cancel"));
-        let hint = Line::from(hint_spans);
-        frame.render_widget(Paragraph::new(hint), area);
+        hints.extend([
+            ("Enter", "save", KeyCode::Enter),
+            ("Esc", "cancel", KeyCode::Esc),
+        ]);
+        self.footer
+            .render(frame, area, theme, &hints, Alignment::Left);
     }
 }
 
@@ -923,6 +925,27 @@ mod tests {
         // Current values survive editing without submitting.
         assert_eq!(d.current_title, "Old Title");
         assert_eq!(d.current_group, "old-group");
+    }
+
+    #[test]
+    fn clicks_act_on_fields_and_hints_while_hover_only_tints() {
+        use crate::tui::dialogs::test_render::{draw, find};
+        let mut d = tied(None);
+        let buf = draw(100, 30, |f, theme| d.render(f, f.area(), theme));
+        for (label, want) in [("Enter save", KeyCode::Enter), ("Esc cancel", KeyCode::Esc)] {
+            let (x, y) = find(&buf, label);
+            assert_eq!(d.handle_click(x, y).map(|k| k.code), Some(want), "{label}");
+        }
+
+        let (x, y) = find(&buf, "Also rename");
+        assert!(d.handle_hover(x, y));
+        assert_eq!(d.focused_field, 0, "hover never moves focus");
+        assert_eq!(d.handle_click(x, y), None);
+        assert!(d.rename_branch, "a click flips the toggle");
+
+        let buf = draw(100, 30, |f, theme| d.render(f, f.area(), theme));
+        let (x, y) = find(&buf, "Space toggle");
+        assert_eq!(d.handle_click(x, y), None, "Space would type into a field");
     }
 
     #[test]

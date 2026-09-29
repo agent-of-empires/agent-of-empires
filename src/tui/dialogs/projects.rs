@@ -10,6 +10,8 @@ use super::{DialogResult, InfoDialog};
 use crate::session::config::update_app_state;
 use crate::session::projects;
 use crate::session::{Project, ProjectScope};
+use crate::tui::components::hint_buttons::HintButtons;
+use crate::tui::components::hover::{paint_hover_bg, HoverState};
 use crate::tui::components::set_prefixed_input_cursor_position;
 use crate::tui::styles::Theme;
 
@@ -42,6 +44,13 @@ pub struct ProjectsDialog {
     non_git_notice: Option<InfoDialog>,
     /// Close the dialog when Esc cancels the add form opened from a direct flow.
     close_on_add_cancel: bool,
+    /// `(item index, rect)` per drawn project row.
+    row_rects: Vec<(usize, Rect)>,
+    /// Add-form rows, indexed like `add_focused`.
+    field_rects: Vec<Rect>,
+    /// Visual only: `d` removes `selected`, so hover must not retarget it.
+    hover: HoverState,
+    footer: HintButtons,
 }
 
 impl ProjectsDialog {
@@ -62,6 +71,10 @@ impl ProjectsDialog {
             info: None,
             non_git_notice: None,
             close_on_add_cancel: false,
+            row_rects: Vec::new(),
+            field_rects: Vec::new(),
+            hover: HoverState::default(),
+            footer: HintButtons::default(),
         };
         dialog.reload();
         dialog
@@ -113,6 +126,55 @@ impl ProjectsDialog {
         match self.mode {
             Mode::Browse => self.handle_browse_key(key),
             Mode::Adding => self.handle_add_key(key),
+        }
+    }
+
+    /// A click on a project row selects it and on an add-form row focuses it,
+    /// flipping toggles like Space. A footer hint returns its key for the
+    /// caller to press through `handle_key`.
+    pub fn handle_click(&mut self, col: u16, row: u16) -> Option<KeyEvent> {
+        if let Some(notice) = &self.non_git_notice {
+            return notice
+                .handle_click(col, row)
+                .map(|_| KeyEvent::from(KeyCode::Esc));
+        }
+        match self.mode {
+            Mode::Browse => {
+                if let Some(idx) = super::hit(&self.row_rects, col, row) {
+                    self.selected = idx;
+                    return None;
+                }
+            }
+            Mode::Adding => {
+                if let Some(field) = self
+                    .field_rects
+                    .iter()
+                    .position(|r| super::contains(*r, col, row))
+                {
+                    self.add_focused = field;
+                    if field >= 2 {
+                        self.handle_add_key(KeyEvent::from(KeyCode::Char(' ')));
+                    }
+                    return None;
+                }
+            }
+        }
+        self.footer.key_at(col, row)
+    }
+
+    pub fn handle_hover(&mut self, col: u16, row: u16) -> bool {
+        if let Some(notice) = &mut self.non_git_notice {
+            return notice.handle_hover(col, row);
+        }
+        let rects = self.hover_rects();
+        let target = self.hover.update(col, row, &rects);
+        self.footer.handle_hover(col, row) | target
+    }
+
+    fn hover_rects(&self) -> Vec<Rect> {
+        match self.mode {
+            Mode::Browse => super::target_rects(&self.row_rects),
+            Mode::Adding => self.field_rects.clone(),
         }
     }
 
@@ -348,6 +410,8 @@ impl ProjectsDialog {
             .constraints(constraints)
             .split(inner);
 
+        self.row_rects.clear();
+        self.field_rects.clear();
         if self.items.is_empty() {
             let p = Paragraph::new("No registered projects. Press 'a' to add one.")
                 .style(Style::default().fg(theme.dimmed));
@@ -386,6 +450,10 @@ impl ProjectsDialog {
                 })
                 .collect();
             frame.render_widget(Paragraph::new(lines), chunks[0]);
+            let list = chunks[0];
+            self.row_rects = (0..self.items.len().min(list.height as usize))
+                .map(|i| (i, Rect::new(list.x, list.y + i as u16, list.width, 1)))
+                .collect();
         }
 
         frame.render_widget(
@@ -526,13 +594,13 @@ impl ProjectsDialog {
                     )));
                 }
                 frame.render_widget(Paragraph::new(lines), chunks[2]);
-                // Each field owns a row in chunks[2], so offset the cursor rect
-                // by the field's line index.
+                // Each field owns a row in chunks[2], offset by its index.
                 let row = |offset: u16| Rect {
                     y: chunks[2].y.saturating_add(offset),
                     height: 1,
                     ..chunks[2]
                 };
+                self.field_rects = (0..6).map(row).collect();
                 if self.add_focused == 0 {
                     set_prefixed_input_cursor_position(frame, row(0), "Path: ", &self.add_input);
                 } else if self.add_focused == 1 {
@@ -546,29 +614,26 @@ impl ProjectsDialog {
             }
         }
 
-        let hint_spans: Vec<Span> = match self.mode {
-            Mode::Browse => vec![
-                Span::styled("a", Style::default().fg(theme.hint)),
-                Span::raw(" add  "),
-                Span::styled("d", Style::default().fg(theme.hint)),
-                Span::raw(" remove  "),
-                Span::styled("j/k", Style::default().fg(theme.hint)),
-                Span::raw(" move  "),
-                Span::styled("q/Esc", Style::default().fg(theme.hint)),
-                Span::raw(" close"),
+        if let Some(rect) = self.hover.current_in(&self.hover_rects()) {
+            paint_hover_bg(frame, rect, theme.selection);
+        }
+
+        let hints: &[(&str, &str, KeyCode)] = match self.mode {
+            Mode::Browse => &[
+                ("a", "add", KeyCode::Char('a')),
+                ("d", "remove", KeyCode::Char('d')),
+                ("j/k", "move", KeyCode::Null),
+                ("q/Esc", "close", KeyCode::Esc),
             ],
-            Mode::Adding => vec![
-                Span::styled("Tab", Style::default().fg(theme.hint)),
-                Span::raw(" next  "),
-                Span::styled("Space/←/→", Style::default().fg(theme.hint)),
-                Span::raw(" toggle  "),
-                Span::styled("Enter", Style::default().fg(theme.hint)),
-                Span::raw(" save  "),
-                Span::styled("Esc", Style::default().fg(theme.hint)),
-                Span::raw(" cancel"),
+            Mode::Adding => &[
+                ("Tab", "next", KeyCode::Tab),
+                ("Space/←/→", "toggle", KeyCode::Null),
+                ("Enter", "save", KeyCode::Enter),
+                ("Esc", "cancel", KeyCode::Esc),
             ],
         };
-        frame.render_widget(Paragraph::new(Line::from(hint_spans)), chunks[3]);
+        self.footer
+            .render(frame, chunks[3], theme, hints, Alignment::Left);
 
         // Rendered last so the notice sits on top of the dialog body.
         if let Some(notice) = &mut self.non_git_notice {
@@ -671,6 +736,48 @@ mod tests {
             dialog.non_git_notice.is_some(),
             "notice should show when the latch can't be read"
         );
+    }
+
+    #[test]
+    #[serial]
+    fn clicks_select_rows_toggle_form_fields_and_press_hints() {
+        use crate::tui::dialogs::test_render::{draw, find};
+        let temp = tempdir().unwrap();
+        let _home = isolate_home(temp.path());
+        for name in ["alpha", "beta"] {
+            let dir = temp.path().join(name);
+            std::fs::create_dir_all(dir.join(".git")).unwrap();
+            let mut d = ProjectsDialog::new("test");
+            add_dir(&mut d, &dir);
+        }
+
+        let mut d = ProjectsDialog::new("test");
+        let buf = draw(100, 40, |f, theme| d.render(f, f.area(), theme));
+        let (x, y) = find(&buf, "beta [");
+        assert!(d.handle_hover(x, y));
+        assert_eq!(d.selected, 0, "hover never retargets `d remove`");
+        assert_eq!(d.handle_click(x, y), None);
+        assert_eq!(d.selected, 1);
+        let (x, y) = find(&buf, "a add");
+        assert_eq!(
+            d.handle_click(x, y).map(|k| k.code),
+            Some(KeyCode::Char('a'))
+        );
+
+        d.handle_key(key(KeyCode::Char('a')));
+        let buf = draw(100, 40, |f, theme| d.render(f, f.area(), theme));
+        let (x, y) = find(&buf, "Scope:");
+        assert_eq!(d.handle_click(x, y), None);
+        assert_eq!(d.add_focused, 2);
+        assert!(
+            d.add_scope == ProjectScope::Profile,
+            "a click flips like Space"
+        );
+        let (x, y) = find(&buf, "Path:");
+        d.handle_click(x, y);
+        assert_eq!(d.add_focused, 0);
+        let (x, y) = find(&buf, "Esc cancel");
+        assert_eq!(d.handle_click(x, y).map(|k| k.code), Some(KeyCode::Esc));
     }
 
     #[test]

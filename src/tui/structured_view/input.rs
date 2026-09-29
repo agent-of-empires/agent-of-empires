@@ -10,8 +10,9 @@
 //! accept those keys.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use ratatui::layout::Position;
 
-use super::state::ViewLayout;
+use super::state::{MouseTargets, PickerKind, ViewLayout};
 use crate::acp::protocol::ApprovalDecisionWire;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,12 +63,16 @@ pub enum Intent {
     SlashMove(i32),
     /// Insert the highlighted slash command into the composer.
     SlashAccept,
+    /// Highlight slash row N (0-based) and insert it: a click on that row.
+    SlashPick(usize),
     /// Dismiss the slash picker without inserting, latching the query.
     SlashDismiss,
     /// Move the `@`-mention picker highlight by N rows (positive = down).
     MentionNavigate(i32),
     /// Insert the highlighted mention and close the picker.
     MentionAccept,
+    /// Highlight mention row N (0-based) and insert it: a click on that row.
+    MentionPick(usize),
     /// Close the mention picker without inserting.
     MentionClose,
     /// Open the permission-mode picker (transcript `m`, when the agent
@@ -78,8 +83,8 @@ pub enum Intent {
     AnswerElicitation,
     /// Move the open choice picker's highlight by N rows.
     ChoiceNavigate(i32),
-    /// Pick option N (0-based) in a numbered choice picker and accept it in one
-    /// keystroke (the `1`-`9` hotkeys on the plugin-link picker).
+    /// Pick option N (0-based) and accept it in one step: the `1`-`9` hotkeys
+    /// on the numbered plugin-link picker, or a click on any picker row.
     ChoicePick(usize),
     /// Accept the choice picker's highlighted option.
     ChoiceAccept,
@@ -185,29 +190,62 @@ const WHEEL_SCROLL_LINES: i32 = 3;
 const PAGE_SCROLL_LINES: i32 = 10;
 
 /// Translate a mouse event into an [`Intent`]. The wheel always scrolls the
-/// focused scrollback, whatever pane the pointer is over; a left click moves
-/// focus to the pane under it. `layout` is the last-drawn frame's geometry, so
-/// before the first draw clicks are ignored. While the modal plugin pane overlay
-/// is up (#2467) clicks are swallowed rather than routed to a hidden pane.
-pub fn dispatch_mouse(mouse: &MouseEvent, focus: Focus, layout: Option<&ViewLayout>) -> Intent {
+/// focused scrollback, whatever pane the pointer is over. A left click on a
+/// popup row or button fires what its keyboard equivalent would, a click
+/// elsewhere on a popup is swallowed, and any other click moves focus to the
+/// pane under it. `layout` and `targets` come from the last-drawn frame, so
+/// before the first draw clicks are ignored. While the modal plugin pane
+/// overlay is up (#2467) only its own targets respond.
+pub fn dispatch_mouse(
+    mouse: &MouseEvent,
+    focus: Focus,
+    layout: Option<&ViewLayout>,
+    targets: &MouseTargets,
+) -> Intent {
+    let pos = Position::new(mouse.column, mouse.row);
     match mouse.kind {
         MouseEventKind::ScrollUp => Intent::Scroll(-WHEEL_SCROLL_LINES),
         MouseEventKind::ScrollDown => Intent::Scroll(WHEEL_SCROLL_LINES),
-        MouseEventKind::Down(MouseButton::Left) if matches!(focus, Focus::Pane) => Intent::Ignore,
-        MouseEventKind::Down(MouseButton::Left) => match layout {
-            Some(layout) if layout.approval.contains((mouse.column, mouse.row).into()) => {
-                Intent::SetFocus(Focus::Approval)
+        MouseEventKind::Down(MouseButton::Left) => {
+            if over_picker(targets, pos) {
+                return match picker_row_at(targets, pos) {
+                    Some((PickerKind::Choice, idx)) => Intent::ChoicePick(idx),
+                    Some((PickerKind::Slash, idx)) => Intent::SlashPick(idx),
+                    Some((PickerKind::Mention, idx)) => Intent::MentionPick(idx),
+                    None => Intent::Ignore,
+                };
             }
-            Some(layout) if layout.composer.contains((mouse.column, mouse.row).into()) => {
-                Intent::SetFocus(Focus::Composer)
+            if let Some((_, intent)) = targets.buttons.iter().find(|(r, _)| r.contains(pos)) {
+                return intent.clone();
             }
-            Some(layout) if layout.transcript.contains((mouse.column, mouse.row).into()) => {
-                Intent::SetFocus(Focus::Transcript)
+            match layout {
+                _ if matches!(focus, Focus::Pane) => Intent::Ignore,
+                Some(layout) if layout.approval.contains(pos) => Intent::SetFocus(Focus::Approval),
+                Some(layout) if layout.composer.contains(pos) => Intent::SetFocus(Focus::Composer),
+                Some(layout) if layout.transcript.contains(pos) => {
+                    Intent::SetFocus(Focus::Transcript)
+                }
+                _ => Intent::Ignore,
             }
-            _ => Intent::Ignore,
-        },
+        }
         _ => Intent::Ignore,
     }
+}
+
+/// Whether `pos` is on the floating picker, which covers whatever is under it.
+pub(super) fn over_picker(targets: &MouseTargets, pos: Position) -> bool {
+    targets.picker.is_some_and(|p| p.area.contains(pos))
+}
+
+/// The picker item under `pos`, as `(kind, absolute index)`.
+pub(super) fn picker_row_at(targets: &MouseTargets, pos: Position) -> Option<(PickerKind, usize)> {
+    let picker = targets.picker?;
+    picker.rows.contains(pos).then(|| {
+        (
+            picker.kind,
+            picker.first + usize::from(pos.y - picker.rows.y),
+        )
+    })
 }
 
 fn composer_keys(key: &KeyEvent, ctx: InputContext) -> Intent {
@@ -865,8 +903,9 @@ mod tests {
             ),
             (MouseEventKind::ScrollUp, 0, 0, None, -WHEEL_SCROLL_LINES),
         ];
+        let none = MouseTargets::default();
         for (kind, col, row, layout, delta) in cases {
-            let got = dispatch_mouse(&mouse(kind, col, row), Focus::Transcript, layout);
+            let got = dispatch_mouse(&mouse(kind, col, row), Focus::Transcript, layout, &none);
             assert_eq!(got, Intent::Scroll(delta), "{kind:?} at {col},{row}");
         }
     }
@@ -897,8 +936,9 @@ mod tests {
             (10, 10, Focus::Transcript, None, Intent::Ignore),
             (10, 22, Focus::Pane, Some(&l), Intent::Ignore),
         ];
+        let none = MouseTargets::default();
         for (col, row, focus, layout, want) in cases {
-            let got = dispatch_mouse(&mouse(click, col, row), focus, layout);
+            let got = dispatch_mouse(&mouse(click, col, row), focus, layout, &none);
             assert_eq!(got, want, "click at {col},{row} under {focus:?}");
         }
         // The overlay still lets the wheel through; the view routes the delta.
@@ -906,6 +946,7 @@ mod tests {
             &mouse(MouseEventKind::ScrollDown, 10, 5),
             Focus::Pane,
             Some(&l),
+            &none,
         );
         assert_eq!(got, Intent::Scroll(WHEEL_SCROLL_LINES));
     }
@@ -921,10 +962,96 @@ mod tests {
             MouseEventKind::Moved,
         ] {
             assert_eq!(
-                dispatch_mouse(&mouse(kind, 5, 5), Focus::Transcript, Some(&l)),
+                dispatch_mouse(
+                    &mouse(kind, 5, 5),
+                    Focus::Transcript,
+                    Some(&l),
+                    &MouseTargets::default()
+                ),
                 Intent::Ignore,
                 "{kind:?}"
             );
+        }
+    }
+
+    /// Popup targets sit above the panes: a click on a picker row picks that
+    /// row, a click on the rest of the popup is swallowed, and a button fires
+    /// its key's intent. Only an overlay's own targets respond under it.
+    #[test]
+    fn left_click_on_popup_targets_fires_their_intent() {
+        use super::super::state::PickerTarget;
+        let l = layout();
+        // Popup rows 15-19 (border at 15 and 19), items 4, 5, 6 on rows 16-18.
+        let picker = |kind| PickerTarget {
+            kind,
+            area: Rect::new(0, 15, 40, 5),
+            rows: Rect::new(2, 16, 36, 3),
+            first: 4,
+        };
+        let deny = Intent::ResolveApproval(ApprovalDecisionWire::Deny);
+        let targets = |kind: Option<PickerKind>| MouseTargets {
+            picker: kind.map(picker),
+            buttons: vec![(Rect::new(50, 17, 6, 1), deny.clone())],
+        };
+        let cases = [
+            (
+                Some(PickerKind::Choice),
+                10,
+                16,
+                Focus::Composer,
+                Intent::ChoicePick(4),
+            ),
+            (
+                Some(PickerKind::Slash),
+                10,
+                18,
+                Focus::Composer,
+                Intent::SlashPick(6),
+            ),
+            (
+                Some(PickerKind::Mention),
+                37,
+                17,
+                Focus::Composer,
+                Intent::MentionPick(5),
+            ),
+            // Border and padding cells pick nothing and never reach the pane.
+            (
+                Some(PickerKind::Choice),
+                10,
+                15,
+                Focus::Composer,
+                Intent::Ignore,
+            ),
+            (
+                Some(PickerKind::Choice),
+                1,
+                17,
+                Focus::Composer,
+                Intent::Ignore,
+            ),
+            // An open picker still owns clicks under the pane overlay.
+            (
+                Some(PickerKind::Choice),
+                10,
+                16,
+                Focus::Pane,
+                Intent::ChoicePick(4),
+            ),
+            (None, 52, 17, Focus::Composer, deny.clone()),
+            (
+                None,
+                49,
+                17,
+                Focus::Transcript,
+                Intent::SetFocus(Focus::Transcript),
+            ),
+            (None, 49, 17, Focus::Pane, Intent::Ignore),
+        ];
+        let click = MouseEventKind::Down(MouseButton::Left);
+        for (kind, col, row, focus, want) in cases {
+            let got = dispatch_mouse(&mouse(click, col, row), focus, Some(&l), &targets(kind));
+            assert_eq!(got, want, "{kind:?} click at {col},{row} under {focus:?}");
         }
     }
 }

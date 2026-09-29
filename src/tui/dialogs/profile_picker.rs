@@ -7,6 +7,9 @@ use tui_input::backend::crossterm::EventHandler;
 use tui_input::Input;
 
 use super::DialogResult;
+use crate::tui::components::buttons::render_yes_no;
+use crate::tui::components::hint_buttons::HintButtons;
+use crate::tui::components::hover::{paint_hover_bg, HoverState};
 use crate::tui::components::set_prefixed_input_cursor_position;
 use crate::tui::styles::Theme;
 
@@ -35,6 +38,14 @@ pub struct ProfilePickerDialog {
     name_input: Input,
     error: Option<String>,
     confirm_selected: bool,
+    /// `(profile index, rect)` for each drawn list row.
+    row_rects: Vec<(usize, Rect)>,
+    /// `[Yes]` / `[No]` in the delete confirm.
+    confirm_rects: (Rect, Rect),
+    /// The hovered row or confirm button. Visual only: a footer action acts
+    /// on `selected`, so the pointer crossing rows must not retarget it.
+    hover: HoverState,
+    footer: HintButtons,
 }
 
 impl ProfilePickerDialog {
@@ -50,6 +61,46 @@ impl ProfilePickerDialog {
             name_input: Input::default(),
             error: None,
             confirm_selected: false,
+            row_rects: Vec::new(),
+            confirm_rects: (Rect::default(), Rect::default()),
+            hover: HoverState::default(),
+            footer: HintButtons::default(),
+        }
+    }
+
+    /// A click on a profile row selects it and returns Enter to switch; a
+    /// click on a button or footer hint returns the key it stands for. The
+    /// caller presses the key through `handle_key`.
+    pub fn handle_click(&mut self, col: u16, row: u16) -> Option<KeyEvent> {
+        match self.mode {
+            Mode::List => {
+                if let Some(idx) = super::hit(&self.row_rects, col, row) {
+                    self.selected = idx;
+                    return Some(KeyEvent::from(KeyCode::Enter));
+                }
+            }
+            Mode::ConfirmDelete => {
+                let (yes, no) = self.confirm_rects;
+                if let Some(key) = super::hit(&[('y', yes), ('n', no)], col, row) {
+                    return Some(KeyEvent::from(KeyCode::Char(key)));
+                }
+            }
+            Mode::CreateInput => {}
+        }
+        self.footer.key_at(col, row)
+    }
+
+    pub fn handle_hover(&mut self, col: u16, row: u16) -> bool {
+        let rects = self.hover_rects();
+        let target = self.hover.update(col, row, &rects);
+        self.footer.handle_hover(col, row) | target
+    }
+
+    fn hover_rects(&self) -> Vec<Rect> {
+        match self.mode {
+            Mode::List => super::target_rects(&self.row_rects),
+            Mode::ConfirmDelete => vec![self.confirm_rects.0, self.confirm_rects.1],
+            Mode::CreateInput => Vec::new(),
         }
     }
 
@@ -193,7 +244,9 @@ impl ProfilePickerDialog {
         None
     }
 
-    pub fn render(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
+    pub fn render(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
+        self.row_rects.clear();
+        self.confirm_rects = (Rect::default(), Rect::default());
         match self.mode {
             Mode::List => self.render_list(frame, area, theme),
             Mode::CreateInput => self.render_create(frame, area, theme),
@@ -201,7 +254,7 @@ impl ProfilePickerDialog {
         }
     }
 
-    fn render_list(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
+    fn render_list(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
         let max_visible: usize = 8;
         let list_height = self.profiles.len().min(max_visible) as u16;
         // list + hint (1) + borders (2) + margin (2)
@@ -265,31 +318,30 @@ impl ProfilePickerDialog {
             }
 
             lines.push(Line::from(spans));
+            self.row_rects.push((
+                abs_idx,
+                Rect::new(chunks[0].x, chunks[0].y + i as u16, chunks[0].width, 1),
+            ));
         }
 
         frame.render_widget(Paragraph::new(lines), chunks[0]);
-
-        // Hint line
-        let mut hint_spans = vec![
-            Span::styled("n", Style::default().fg(theme.hint)),
-            Span::raw(" new  "),
-        ];
-        if self.can_delete_selected() {
-            hint_spans.extend([
-                Span::styled("d", Style::default().fg(theme.hint)),
-                Span::raw(" delete  "),
-            ]);
+        if let Some(rect) = self.hover.current_in(&self.hover_rects()) {
+            paint_hover_bg(frame, rect, theme.selection);
         }
-        hint_spans.extend([
-            Span::styled("Enter", Style::default().fg(theme.hint)),
-            Span::raw(" switch  "),
-            Span::styled("Esc", Style::default().fg(theme.hint)),
-            Span::raw(" close"),
+
+        let mut hints = vec![("n", "new", KeyCode::Char('n'))];
+        if self.can_delete_selected() {
+            hints.push(("d", "delete", KeyCode::Char('d')));
+        }
+        hints.extend([
+            ("Enter", "switch", KeyCode::Enter),
+            ("Esc", "close", KeyCode::Esc),
         ]);
-        frame.render_widget(Paragraph::new(Line::from(hint_spans)), chunks[1]);
+        self.footer
+            .render(frame, chunks[1], theme, &hints, Alignment::Left);
     }
 
-    fn render_create(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
+    fn render_create(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
         let has_error = self.error.is_some();
         let dialog_width: u16 = 40;
         // inner width = dialog_width - borders(2) - margin(2) = 36
@@ -346,16 +398,19 @@ impl ProfilePickerDialog {
             chunk_idx += 1;
         }
 
-        let hint_line = Line::from(vec![
-            Span::styled("Enter", Style::default().fg(theme.hint)),
-            Span::raw(" confirm  "),
-            Span::styled("Esc", Style::default().fg(theme.hint)),
-            Span::raw(" cancel"),
-        ]);
-        frame.render_widget(Paragraph::new(hint_line), chunks[chunk_idx]);
+        self.footer.render(
+            frame,
+            chunks[chunk_idx],
+            theme,
+            &[
+                ("Enter", "confirm", KeyCode::Enter),
+                ("Esc", "cancel", KeyCode::Esc),
+            ],
+            Alignment::Left,
+        );
     }
 
-    fn render_confirm_delete(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
+    fn render_confirm_delete(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
         let dialog_height: u16 = 8;
         let dialog_width: u16 = 40;
 
@@ -384,26 +439,14 @@ impl ProfilePickerDialog {
             );
         }
 
-        let yes_style = if self.confirm_selected {
-            Style::default().fg(theme.error).bold()
-        } else {
-            Style::default().fg(theme.dimmed)
-        };
-        let no_style = if !self.confirm_selected {
-            Style::default().fg(theme.running).bold()
-        } else {
-            Style::default().fg(theme.dimmed)
-        };
-
-        let buttons = Line::from(vec![
-            Span::raw("  "),
-            Span::styled("[Yes]", yes_style),
-            Span::raw("    "),
-            Span::styled("[No]", no_style),
-        ]);
-        frame.render_widget(
-            Paragraph::new(buttons).alignment(Alignment::Center),
+        // No footer here; drop the list's hint rects so they can't be clicked.
+        self.footer.clear();
+        self.confirm_rects = render_yes_no(
+            frame,
             chunks[1],
+            theme,
+            self.confirm_selected,
+            self.hover.current(),
         );
     }
 }
@@ -550,5 +593,43 @@ mod tests {
             d.handle_key(key(KeyCode::Char('y'))),
             DialogResult::Submit(ProfilePickerAction::Deleted(name)) if name == "work"
         ));
+    }
+
+    #[test]
+    fn clicks_and_hover_drive_every_mode() {
+        use crate::tui::dialogs::test_render::{draw, find};
+        let press = |d: &mut ProfilePickerDialog, label: &str| {
+            let buf = draw(80, 24, |f, theme| d.render(f, f.area(), theme));
+            let (x, y) = find(&buf, label);
+            d.handle_click(x, y).map(|k| k.code)
+        };
+
+        let mut d = dialog();
+        let buf = draw(80, 24, |f, theme| d.render(f, f.area(), theme));
+        let (x, y) = find(&buf, "personal");
+        assert!(d.handle_hover(x, y));
+        assert_eq!(d.selected, 0, "hover tints but never retargets `d`");
+        let (x, y) = find(&buf, "work");
+        assert_eq!(d.handle_click(x, y).map(|k| k.code), Some(KeyCode::Enter));
+        assert_eq!(d.selected, 1, "the clicked row is what Enter switches to");
+
+        // The table: (label clicked, key pressed), each followed by that key.
+        for (label, want) in [
+            ("d delete", KeyCode::Char('d')),
+            ("[No]", KeyCode::Char('n')),
+            ("n new", KeyCode::Char('n')),
+            ("Esc cancel", KeyCode::Esc),
+            ("d delete", KeyCode::Char('d')),
+            ("[Yes]", KeyCode::Char('y')),
+        ] {
+            assert_eq!(press(&mut d, label), Some(want), "{label}");
+            let result = d.handle_key(KeyEvent::from(want));
+            if label == "[Yes]" {
+                assert!(matches!(
+                    result,
+                    DialogResult::Submit(ProfilePickerAction::Deleted(name)) if name == "work"
+                ));
+            }
+        }
     }
 }

@@ -14,6 +14,8 @@ use ratatui::widgets::*;
 
 use super::{centered_rect, DialogResult};
 use crate::tips::Tip;
+use crate::tui::components::hint_buttons::HintButtons;
+use crate::tui::components::hover::{paint_hover_bg, HoverState};
 use crate::tui::home::bindings::{self, ActionId};
 use crate::tui::styles::Theme;
 
@@ -52,6 +54,9 @@ pub struct TipsDialog {
     row_rects: Vec<Rect>,
     /// The modal's outer rect; a click outside it closes the overlay.
     dialog_rect: Rect,
+    /// The hovered row. Visual only: focusing a tip marks it seen.
+    hover: HoverState,
+    footer: HintButtons,
 }
 
 impl TipsDialog {
@@ -70,6 +75,8 @@ impl TipsDialog {
             seen_collapsed: has_unseen,
             row_rects: Vec::new(),
             dialog_rect: Rect::default(),
+            hover: HoverState::default(),
+            footer: HintButtons::default(),
         };
         // Focusing a tip counts as viewing it, so the one shown on open is seen.
         dialog.mark_current_seen();
@@ -245,6 +252,9 @@ impl TipsDialog {
         if !self.dialog_rect.contains(pos) {
             return Some(DialogResult::Submit(self.outcome()));
         }
+        if let Some(key) = self.footer.key_at(col, row) {
+            return Some(self.handle_key(key));
+        }
         let hit = self
             .row_rects
             .iter()
@@ -264,6 +274,12 @@ impl TipsDialog {
             }
         }
         Some(DialogResult::Continue)
+    }
+
+    /// Highlight the row or footer hint under the cursor; true when it changed.
+    pub fn handle_hover(&mut self, col: u16, row: u16) -> bool {
+        let rows = self.hover.update(col, row, &self.row_rects);
+        self.footer.handle_hover(col, row) | rows
     }
 
     pub fn render(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
@@ -337,19 +353,21 @@ impl TipsDialog {
         }
 
         let toggle_label = if self.disabled {
-            " show me tips  "
+            "show me tips"
         } else {
-            " don't show me tips  "
+            "don't show me tips"
         };
-        let footer = Line::from(vec![
-            Span::styled("↑/↓", Style::default().fg(theme.hint)),
-            Span::styled(" browse  ", Style::default().fg(theme.dimmed)),
-            Span::styled("d", Style::default().fg(theme.hint)),
-            Span::styled(toggle_label, Style::default().fg(theme.dimmed)),
-            Span::styled("Esc", Style::default().fg(theme.hint)),
-            Span::styled(" close", Style::default().fg(theme.dimmed)),
-        ]);
-        frame.render_widget(Paragraph::new(footer), chunks[3]);
+        self.footer.render(
+            frame,
+            chunks[3],
+            theme,
+            &[
+                ("↑/↓", "browse", KeyCode::Down),
+                ("d", toggle_label, KeyCode::Char('d')),
+                ("Esc", "close", KeyCode::Esc),
+            ],
+            Alignment::Left,
+        );
     }
 
     fn render_list(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
@@ -418,6 +436,9 @@ impl TipsDialog {
                 }
             };
             frame.render_widget(Paragraph::new(line), rect);
+        }
+        if let Some(rect) = self.hover.current_in(&self.row_rects) {
+            paint_hover_bg(frame, rect, theme.selection);
         }
     }
 }
@@ -608,6 +629,31 @@ mod tests {
             None => panic!("an outside click should close the overlay"),
         };
         assert!(!outcome.newly_seen.is_empty());
+    }
+
+    #[test]
+    fn hover_lights_a_row_without_focusing_it_and_footer_hints_click() {
+        let mut d = dialog(vec![]);
+        let screen = render_to(&mut d);
+        let target = d.row_rects[1];
+        assert!(d.handle_hover(target.x + 1, target.y));
+        assert_eq!(d.hover.current(), Some(target));
+        assert_eq!(d.cursor, 0, "hover must not focus (and mark seen) a tip");
+
+        let (y, line) = screen
+            .lines()
+            .enumerate()
+            .find(|(_, l)| l.contains("Esc close"))
+            .expect("footer row");
+        let col = |label: &str| line[..line.find(label).unwrap()].chars().count() as u16;
+        let y = y as u16;
+        assert!(matches!(
+            d.handle_click(col("don't show"), y),
+            Some(DialogResult::Continue)
+        ));
+        assert!(d.disabled, "the toggle hint presses d");
+        let outcome = submitted(d.handle_click(col("Esc close"), y).expect("hit"));
+        assert_eq!(outcome.disabled, Some(true));
     }
 
     #[test]

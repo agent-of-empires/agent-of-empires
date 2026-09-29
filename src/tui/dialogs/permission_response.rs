@@ -12,6 +12,7 @@ use ratatui::prelude::*;
 use ratatui::widgets::*;
 
 use super::DialogResult;
+use crate::tui::components::hover::{paint_hover_bg, HoverState};
 use crate::tui::styles::{has_min_contrast, Theme};
 
 /// Contrast floor for the focused choice against the dialog background. The
@@ -60,6 +61,10 @@ pub struct PermissionResponseDialog {
     /// approved and drops the terminal-only "raw keystrokes" guidance, which
     /// does not hold on the ACP path.
     detail: Option<StructuredApprovalDetail>,
+    /// Click rects parallel to `choices`.
+    choice_rects: Vec<Rect>,
+    /// The hovered choice. Visual only; never moves `focused`.
+    hover: HoverState,
 }
 
 const ALL_CHOICES: [(&str, PermissionResponseChoice); 3] = [
@@ -111,7 +116,25 @@ impl PermissionResponseDialog {
             focused: 0,
             supports_allow_always,
             detail,
+            choice_rects: Vec::new(),
+            hover: HoverState::default(),
         }
+    }
+
+    /// The direct key for the clicked choice, for the caller to press.
+    pub fn handle_click(&self, col: u16, row: u16) -> Option<KeyEvent> {
+        let pos = Position::from((col, row));
+        let idx = self.choice_rects.iter().position(|r| r.contains(pos))?;
+        let key = match self.choices[idx].1 {
+            PermissionResponseChoice::Allow => 'a',
+            PermissionResponseChoice::AllowAlways => 'A',
+            PermissionResponseChoice::Deny => 'd',
+        };
+        Some(KeyEvent::from(KeyCode::Char(key)))
+    }
+
+    pub fn handle_hover(&mut self, col: u16, row: u16) -> bool {
+        self.hover.update(col, row, &self.choice_rects)
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> DialogResult<PermissionResponseChoice> {
@@ -189,11 +212,18 @@ impl PermissionResponseDialog {
         let header = Paragraph::new(header_lines).wrap(Wrap { trim: false });
         frame.render_widget(header, chunks[0]);
 
+        const GAP: u16 = 3;
         let mut spans = Vec::new();
+        let mut offsets = Vec::with_capacity(self.choices.len());
+        let mut used: u16 = 0;
         for (i, (label, _)) in self.choices.iter().enumerate() {
             if i > 0 {
-                spans.push(Span::raw("   "));
+                spans.push(Span::raw(" ".repeat(GAP as usize)));
+                used += GAP;
             }
+            let width = label.len() as u16 + 2;
+            offsets.push((used, width));
+            used += width;
             let style = if i == self.focused {
                 focused_choice_style(theme)
             } else {
@@ -205,6 +235,18 @@ impl PermissionResponseDialog {
             Paragraph::new(Line::from(spans)).alignment(Alignment::Center),
             chunks[1],
         );
+        let row = chunks[1];
+        self.choice_rects.clear();
+        if row.width >= used && row.height > 0 {
+            let left = super::centered_x(row, used);
+            self.choice_rects = offsets
+                .into_iter()
+                .map(|(x, w)| Rect::new(left + x, row.y, w, 1))
+                .collect();
+        }
+        if let Some(rect) = self.hover.current_in(&self.choice_rects) {
+            paint_hover_bg(frame, rect, theme.selection);
+        }
 
         let mut hint = String::from("a=allow");
         if self.supports_allow_always {
@@ -270,6 +312,34 @@ mod tests {
             dialog().handle_key(key(KeyCode::Esc)),
             DialogResult::Cancel
         ));
+    }
+
+    #[test]
+    fn clicking_a_drawn_choice_presses_its_key_and_hover_keeps_focus() {
+        use crate::tui::dialogs::test_render::{draw, find};
+        for (allow_always, labels) in [
+            (
+                ALLOW_ALWAYS,
+                &[("[Allow]", 'a'), ("[Allow Always]", 'A'), ("[Deny]", 'd')][..],
+            ),
+            (None, &[("[Allow]", 'a'), ("[Deny]", 'd')][..]),
+        ] {
+            let mut d = PermissionResponseDialog::new("test", allow_always);
+            let buf = draw(80, 20, |f, theme| d.render(f, f.area(), theme));
+            for (label, want) in labels {
+                let (x, y) = find(&buf, label);
+                let last = x + label.len() as u16 - 1;
+                for col in [x, last] {
+                    assert_eq!(
+                        d.handle_click(col, y).map(|k| k.code),
+                        Some(KeyCode::Char(*want)),
+                        "{label} at {col}"
+                    );
+                }
+                assert!(d.handle_hover(x, y));
+                assert_eq!(d.focused, 0);
+            }
+        }
     }
 
     #[test]

@@ -6,6 +6,7 @@ use ratatui::widgets::*;
 use ratatui_textarea::TextArea;
 
 use super::DialogResult;
+use crate::tui::components::hover::{paint_hover_bg, HoverState};
 use crate::tui::responsive;
 use crate::tui::styles::Theme;
 
@@ -15,7 +16,16 @@ pub struct SendMessageDialog {
     /// Set for one keystroke after a kill that actually wrote to the yank
     /// buffer, while the footer offers Ctrl+P to paste it back.
     restore_armed: bool,
+    /// Rects of the border hints, with the key each one presses.
+    hint_rects: Vec<(KeyEvent, Rect)>,
+    hover: HoverState,
 }
+
+/// Border hints as `(key, label, code)`; a click presses `code`.
+const SEND_HINTS: [(&str, &str, KeyCode); 2] = [
+    ("Enter", "send", KeyCode::Enter),
+    ("Esc", "cancel", KeyCode::Esc),
+];
 
 impl SendMessageDialog {
     pub fn new(session_title: &str) -> Self {
@@ -26,6 +36,8 @@ impl SendMessageDialog {
             session_title: session_title.to_string(),
             text_area,
             restore_armed: false,
+            hint_rects: Vec::new(),
+            hover: HoverState::default(),
         }
     }
 
@@ -112,12 +124,22 @@ impl SendMessageDialog {
         }
     }
 
+    /// The key a click on a border hint stands for, for the caller to press.
+    pub fn handle_click(&self, col: u16, row: u16) -> Option<KeyEvent> {
+        super::hit(&self.hint_rects, col, row)
+    }
+
+    pub fn handle_hover(&mut self, col: u16, row: u16) -> bool {
+        self.hover
+            .update(col, row, &super::target_rects(&self.hint_rects))
+    }
+
     pub fn handle_paste(&mut self, text: &str) {
         self.restore_armed = false;
         self.text_area.insert_str(text);
     }
 
-    pub fn render(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
+    pub fn render(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
         // 2 for borders + 1 per content line, min 3 (single line), max 12,
         // capped to viewport so the popover never paints under the iOS soft
         // keyboard if Event::Resize lands mid-render.
@@ -134,14 +156,36 @@ impl SendMessageDialog {
             theme.accent,
         )
         .title_bottom(
-            Line::from(vec![
-                Span::styled(" Enter", Style::default().fg(theme.accent)),
-                Span::styled(" send ", Style::default().fg(theme.dimmed)),
-                Span::styled("Esc", Style::default().fg(theme.accent)),
-                Span::styled(" cancel ", Style::default().fg(theme.dimmed)),
-            ])
+            Line::from(
+                SEND_HINTS
+                    .iter()
+                    .flat_map(|(key, label, _)| {
+                        [
+                            Span::styled(format!(" {key}"), Style::default().fg(theme.accent)),
+                            Span::styled(format!(" {label}"), Style::default().fg(theme.dimmed)),
+                        ]
+                    })
+                    .chain([Span::raw(" ")])
+                    .collect::<Vec<_>>(),
+            )
             .right_aligned(),
         );
+
+        // Titles sit between the corners: right-aligned ones end one cell in,
+        // left-aligned ones start one cell in, each with a leading space.
+        self.hint_rects.clear();
+        let bottom = dialog_area.bottom().saturating_sub(1);
+        let widths: Vec<u16> = SEND_HINTS
+            .iter()
+            .map(|(key, label, _)| (key.len() + 1 + label.len()) as u16)
+            .collect();
+        let total: u16 = widths.iter().map(|w| w + 1).sum::<u16>() + 1;
+        let mut x = dialog_area.right().saturating_sub(1 + total) + 1;
+        for ((_, _, code), width) in SEND_HINTS.iter().zip(widths) {
+            self.hint_rects
+                .push((KeyEvent::from(*code), Rect::new(x, bottom, width, 1)));
+            x += width + 1;
+        }
 
         if self.restore_armed {
             block = block.title_bottom(
@@ -151,6 +195,11 @@ impl SendMessageDialog {
                 ])
                 .left_aligned(),
             );
+            let width = "Ctrl+P restore deleted text".len() as u16;
+            self.hint_rects.push((
+                KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+                Rect::new(dialog_area.x + 2, bottom, width, 1),
+            ));
         }
 
         let inner = block.inner(dialog_area);
@@ -161,6 +210,13 @@ impl SendMessageDialog {
         text_area_clone.set_cursor_style(Style::default().fg(theme.background).bg(theme.accent));
 
         frame.render_widget(&text_area_clone, inner);
+
+        if let Some(rect) = self
+            .hover
+            .current_in(&super::target_rects(&self.hint_rects))
+        {
+            paint_hover_bg(frame, rect, theme.selection);
+        }
 
         if inner.width > 0 && inner.height > 0 {
             let cursor = text_area_clone.screen_cursor();
@@ -188,7 +244,7 @@ mod tests {
         }
     }
 
-    fn render_cursor_position(dialog: &SendMessageDialog, width: u16, height: u16) -> Position {
+    fn render_cursor_position(dialog: &mut SendMessageDialog, width: u16, height: u16) -> Position {
         use crate::tui::styles::load_theme;
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
@@ -438,7 +494,40 @@ mod tests {
         for text in ["hi", "你"] {
             let mut d = dialog();
             type_str(&mut d, text);
-            assert_eq!(render_cursor_position(&d, 80, 24), Position::new(11, 11));
+            assert_eq!(
+                render_cursor_position(&mut d, 80, 24),
+                Position::new(11, 11)
+            );
         }
+    }
+
+    #[test]
+    fn clicking_a_border_hint_presses_its_key() {
+        use crate::tui::dialogs::test_render::{draw, find};
+        let mut d = dialog();
+        type_str(&mut d, "hi");
+        d.handle_key(ctrl_key(KeyCode::Char('u')));
+        assert!(d.restore_armed);
+        let buf = draw(80, 24, |f, theme| d.render(f, f.area(), theme));
+        for (label, want) in [
+            ("Enter send", KeyCode::Enter),
+            ("Esc cancel", KeyCode::Esc),
+            ("Ctrl+P restore deleted text", KeyCode::Char('p')),
+        ] {
+            let (x, y) = find(&buf, label);
+            for col in [x, x + label.len() as u16 - 1] {
+                assert_eq!(
+                    d.handle_click(col, y).map(|k| k.code),
+                    Some(want),
+                    "{label}"
+                );
+            }
+            assert_ne!(
+                d.handle_click(x.saturating_sub(1), y).map(|k| k.code),
+                Some(want)
+            );
+        }
+        let (x, y) = find(&buf, "Esc cancel");
+        assert!(d.handle_hover(x, y));
     }
 }

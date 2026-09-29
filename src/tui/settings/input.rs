@@ -4,7 +4,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use tui_input::backend::crossterm::EventHandler;
 use tui_input::Input;
 
-use crate::tui::dialogs::{CustomInstructionDialog, DialogResult};
+use crate::tui::dialogs::{hit, CustomInstructionDialog, DialogResult};
 
 use super::fields::ListItemValidation;
 use super::{
@@ -27,24 +27,9 @@ impl SettingsView {
         self.mouse_pos = None;
 
         if let Some(ref mut dialog) = self.custom_instruction_dialog {
-            match dialog.handle_key(key) {
-                DialogResult::Submit(value) => {
-                    let field = &mut self.fields[self.selected_field];
-                    if let FieldValue::OptionalText(ref mut v) = field.value {
-                        *v = value;
-                    }
-                    self.apply_field_to_config(self.selected_field);
-                    self.custom_instruction_dialog = None;
-                    return SettingsAction::Continue;
-                }
-                DialogResult::Cancel => {
-                    self.custom_instruction_dialog = None;
-                    return SettingsAction::Continue;
-                }
-                DialogResult::Continue => {
-                    return SettingsAction::Continue;
-                }
-            }
+            let result = dialog.handle_key(key);
+            self.finish_custom_instruction(result);
+            return SettingsAction::Continue;
         }
 
         if self.show_help {
@@ -363,6 +348,22 @@ impl SettingsView {
             }
 
             _ => SettingsAction::Continue,
+        }
+    }
+
+    /// Apply the instruction editor's outcome, from a key or a click.
+    fn finish_custom_instruction(&mut self, result: DialogResult<Option<String>>) {
+        match result {
+            DialogResult::Submit(value) => {
+                let field = &mut self.fields[self.selected_field];
+                if let FieldValue::OptionalText(ref mut v) = field.value {
+                    *v = value;
+                }
+                self.apply_field_to_config(self.selected_field);
+                self.custom_instruction_dialog = None;
+            }
+            DialogResult::Cancel => self.custom_instruction_dialog = None,
+            DialogResult::Continue => {}
         }
     }
 
@@ -698,19 +699,28 @@ impl SettingsView {
         }
     }
 
-    /// Route a left-click into the settings view. `Some` when the click moved
-    /// focus, scope or selection, `None` when it hit nothing (the full-screen
-    /// modal swallows it either way).
+    /// Route a left-click into the settings view. `Some` when the click
+    /// acted, `None` when it hit nothing (the full-screen modal swallows it
+    /// either way).
     ///
-    /// Editing modes skip click routing so a stray click during composition
-    /// cannot reset focus or drop a half-typed value; Esc / Enter remain the
-    /// way out of them.
+    /// Overlays own the click: the instruction editor takes it, a click
+    /// dismisses help, and an expanded list takes row and action clicks.
+    /// Inline text editing ignores clicks so a stray one cannot drop a
+    /// half-typed value.
     pub fn handle_click(&mut self, col: u16, row: u16) -> Option<SettingsAction> {
-        if self.editing_input.is_some()
-            || self.list_edit_state.is_some()
-            || self.custom_instruction_dialog.is_some()
-            || self.show_help
-        {
+        if let Some(dialog) = self.custom_instruction_dialog.as_mut() {
+            let result = dialog.handle_click(col, row)?;
+            self.finish_custom_instruction(result);
+            return Some(SettingsAction::Continue);
+        }
+        if self.show_help {
+            self.show_help = false;
+            return Some(SettingsAction::Continue);
+        }
+        if self.list_edit_state.is_some() {
+            return self.handle_list_edit_click(col, row);
+        }
+        if self.editing_input.is_some() {
             return None;
         }
         let pos = ratatui::layout::Position::from((col, row));
@@ -793,10 +803,43 @@ impl SettingsView {
         None
     }
 
-    /// Track the mouse so the renderer can paint a hover highlight. Hover
-    /// never moves the keyboard cursor; editing and help modes clear it so it
-    /// cannot bleed behind the overlay.
+    /// A click on an expanded list: a header action acts like its key, a row
+    /// click selects the row. Ignored while an item is being typed, so the
+    /// click cannot drop the text or retarget which item it replaces.
+    fn handle_list_edit_click(&mut self, col: u16, row: u16) -> Option<SettingsAction> {
+        let state = self.list_edit_state.as_mut()?;
+        if state.editing_item.is_some() {
+            return None;
+        }
+        let hits = &self.list_edit_hits;
+        if let Some(code) = hit(&hits.actions, col, row) {
+            return Some(self.handle_list_edit_key(KeyEvent::from(code)));
+        }
+        state.selected_index = hit(&hits.rows, col, row)?;
+        Some(SettingsAction::Continue)
+    }
+
+    /// Hover on an expanded list tints the row or header action under the
+    /// pointer without moving the row cursor. True when the tint moved.
+    fn handle_list_edit_hover(&mut self, col: u16, row: u16) -> bool {
+        let editing = self
+            .list_edit_state
+            .as_ref()
+            .is_none_or(|state| state.editing_item.is_some());
+        if editing {
+            return false;
+        }
+        self.list_hover
+            .update(col, row, &self.list_edit_hits.rects())
+    }
+
+    /// Track the mouse so the renderer can paint a hover highlight. Field
+    /// hover never moves the keyboard cursor; editing and help modes clear it
+    /// so it cannot bleed behind the overlay.
     pub fn handle_hover(&mut self, col: u16, row: u16) -> bool {
+        if let Some(dialog) = self.custom_instruction_dialog.as_mut() {
+            return dialog.handle_hover(col, row);
+        }
         if self.search_input.is_some() {
             let pos = ratatui::layout::Position::from((col, row));
             if !self.search_popup_area.contains(pos) {
@@ -815,16 +858,18 @@ impl SettingsView {
             || self.list_edit_state.is_some()
             || self.custom_instruction_dialog.is_some()
             || self.show_help;
+        let list_changed = self.handle_list_edit_hover(col, row);
         let new_pos = if suppress { None } else { Some((col, row)) };
         if self.mouse_pos == new_pos {
-            return false;
+            return list_changed;
         }
         // Redraw only when the resolved hover target changes.
         let prev_scope = self.hovered_scope();
         let prev_cat = self.hovered_category();
         let prev_field = self.hovered_field();
         self.mouse_pos = new_pos;
-        prev_scope != self.hovered_scope()
+        list_changed
+            || prev_scope != self.hovered_scope()
             || prev_cat != self.hovered_category()
             || prev_field != self.hovered_field()
     }
@@ -1411,6 +1456,136 @@ mod tests {
             // a highlight there would mislead about what a click does.
             view.editing_input = Some(tui_input::Input::new(String::new()));
             view.handle_hover(25, 5);
+            assert_eq!(view.hovered_field(), None);
+        }
+
+        /// Park the cursor on the field `ident` through the search jump.
+        fn jump_to(view: &mut SettingsView, ident: &str) {
+            view.open_search();
+            view.search_selected = view
+                .search_hits
+                .iter()
+                .position(|h| h.field_ident == ident)
+                .unwrap_or_else(|| panic!("{ident} should be searchable"));
+            view.jump_to_selected_search_hit();
+            assert_eq!(view.fields[view.selected_field].ident(), ident);
+        }
+
+        /// Screen position of the first cell of `text` in the rendered view.
+        fn render_and_find(view: &mut SettingsView, text: &str) -> (u16, u16) {
+            use crate::tui::dialogs::test_render::{draw, find};
+            find(
+                &draw(120, 40, |f, theme| view.render(f, f.area(), theme)),
+                text,
+            )
+        }
+
+        #[test]
+        #[serial]
+        fn custom_instruction_buttons_take_clicks() {
+            let ident = "sandbox.custom_instruction";
+            // (button, text typed first, value after)
+            let cases = [("Save", "hi", Some("hi")), ("Cancel", "hi", None)];
+            for (button, typed, want) in cases {
+                let (_t, _guard, mut view) = fresh_view();
+                jump_to(&mut view, ident);
+                view.custom_instruction_dialog = Some(CustomInstructionDialog::new(None));
+                for c in typed.chars() {
+                    view.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+                }
+                let (col, row) = render_and_find(&mut view, "Edit Custom Instruction");
+                // A click in the text area leaves the editor and its text alone.
+                assert!(view.handle_click(col, row + 3).is_some());
+                assert!(view.custom_instruction_dialog.is_some(), "{button}");
+
+                let (col, row) = render_and_find(&mut view, button);
+                assert!(view.handle_hover(col, row), "{button} hover highlights");
+                assert_eq!(view.hovered_field(), None, "fields stay unhovered");
+                view.handle_click(col, row);
+                assert!(view.custom_instruction_dialog.is_none(), "{button}");
+                let value = &view.fields[view.selected_field].value;
+                assert!(
+                    matches!(value, FieldValue::OptionalText(v) if v.as_deref() == want),
+                    "{button}: {value:?}"
+                );
+            }
+        }
+
+        #[test]
+        #[serial]
+        fn help_overlay_is_dismissed_by_click_and_blocks_the_wheel() {
+            let (_t, _guard, mut view) = fresh_view();
+            view.fields_viewport_height = 1;
+            view.scrollbar_area = Rect::new(100, 5, 1, 20);
+            view.show_help = true;
+            assert!(!view.handle_wheel_scroll(false));
+            assert_eq!(view.fields_scroll_offset, 0);
+            assert!(!view.hit_scrollbar(100, 10));
+
+            view.field_rects.push((1, Rect::new(20, 5, 50, 2)));
+            let before = view.selected_field;
+            assert!(view.handle_click(25, 6).is_some());
+            assert!(!view.show_help, "a click closes help");
+            assert_eq!(view.selected_field, before, "without reaching the field");
+            assert!(view.hit_scrollbar(100, 10));
+        }
+
+        #[test]
+        #[serial]
+        fn expanded_list_rows_and_actions_take_the_mouse() {
+            let staged = || {
+                let (t, guard, mut view) = fresh_view();
+                jump_to(&mut view, "sandbox.environment");
+                let items = ["A=1", "B=2", "C=3"].map(str::to_string).to_vec();
+                view.fields[view.selected_field].value = FieldValue::List(items);
+                view.list_edit_state = Some(ListEditState::default());
+                view.list_edit_hits.actions = vec![
+                    (KeyCode::Char('a'), Rect::new(27, 4, 5, 1)),
+                    (KeyCode::Char('d'), Rect::new(33, 4, 8, 1)),
+                    (KeyCode::Esc, Rect::new(54, 4, 10, 1)),
+                ];
+                view.list_edit_hits.rows = (0..3)
+                    .map(|i| (i, Rect::new(22, 5 + i as u16, 60, 1)))
+                    .collect();
+                (t, guard, view)
+            };
+            let items = |view: &SettingsView| match &view.fields[view.selected_field].value {
+                FieldValue::List(items) => items.clone(),
+                other => panic!("{other:?}"),
+            };
+
+            // A row click selects; the delete action then removes that row.
+            let (_t, _guard, mut view) = staged();
+            view.handle_click(30, 6);
+            assert_eq!(view.list_edit_state.as_ref().unwrap().selected_index, 1);
+            view.handle_click(35, 4);
+            assert_eq!(items(&view), ["A=1", "C=3"]);
+
+            // The add action opens the prompt, which then swallows clicks.
+            let (_t, _guard, mut view) = staged();
+            view.handle_click(28, 4);
+            let state = view.list_edit_state.as_ref().unwrap();
+            assert!(state.adding_new && state.editing_item.is_some());
+            assert!(view.handle_click(30, 5).is_none());
+            assert!(!view.handle_hover(30, 7));
+            let state = view.list_edit_state.as_ref().unwrap();
+            assert!(state.editing_item.is_some() && state.selected_index == 0);
+
+            // The close action closes the list.
+            let (_t, _guard, mut view) = staged();
+            view.handle_click(55, 4);
+            assert!(view.list_edit_state.is_none());
+
+            // Hover tints rows and actions without moving the row cursor, so
+            // crossing rows on the way to `(d)elete` can't retarget it, and
+            // never lights the field behind the list.
+            let (_t, _guard, mut view) = staged();
+            assert!(view.handle_hover(30, 7));
+            assert_eq!(view.list_hover.current(), Some(Rect::new(22, 7, 60, 1)));
+            assert!(!view.handle_hover(40, 7), "same row, no redraw");
+            assert!(view.handle_hover(35, 4));
+            assert_eq!(view.list_hover.current(), Some(Rect::new(33, 4, 8, 1)));
+            assert_eq!(view.list_edit_state.as_ref().unwrap().selected_index, 0);
             assert_eq!(view.hovered_field(), None);
         }
     }
