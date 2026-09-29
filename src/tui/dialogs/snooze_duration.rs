@@ -43,11 +43,7 @@ impl SnoozeDurationDialog {
     }
 
     pub fn handle_click(&self, col: u16, row: u16) -> Option<DialogResult<u32>> {
-        let pos = ratatui::layout::Position::from((col, row));
-        self.row_rects
-            .iter()
-            .find(|(_, rect)| rect.contains(pos))
-            .map(|(minutes, _)| DialogResult::Submit(*minutes))
+        super::hit(&self.row_rects, col, row).map(DialogResult::Submit)
     }
 
     pub fn handle_hover(&mut self, col: u16, row: u16) -> bool {
