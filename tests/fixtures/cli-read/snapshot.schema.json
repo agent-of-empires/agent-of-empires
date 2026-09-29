@@ -167,7 +167,7 @@
           "oneOf": [{ "$ref": "#/$defs/safe_text" }, { "type": "null" }]
         },
         "registered": {
-          "description": "Carried on every row the producer emits, so it is required, not optional. `ProjectRead::registered` in src/server/runtime_ws.rs serialises it unconditionally; the client defaults an absent flag to true (`registered_by_default` in src/cli/runtime_read/dto.rs) so a snapshot written before the field existed still renders. It is part of the row's identity, not a filter: `validate_projects` in src/cli/runtime_read/dto.rs keys uniqueness on name, path and this flag together, so a synthesized row that stands in for a session's project path and the registry row it stands in for are two identities. `registered: false` is legal only in a profile list, never in the global registry.",
+          "description": "Carried on every row the producer emits, so it is required, not optional. `ProjectRead::registered` in src/server/runtime_ws.rs serialises it unconditionally; the client decoder requires it too (`ProjectRead::registered` in src/cli/runtime_read/dto.rs), so an absent flag is refused rather than guessed. It is part of the row's identity, not a filter: `validate_projects` in src/cli/runtime_read/dto.rs keys uniqueness on name, path and this flag together, so a synthesized row that stands in for a session's project path and the registry row it stands in for are two identities. `registered: false` is legal only in a profile list, never in the global registry.",
           "type": "boolean"
         }
       }
