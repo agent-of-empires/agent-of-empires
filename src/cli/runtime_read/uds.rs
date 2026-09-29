@@ -617,7 +617,22 @@ async fn connect_admission(
         Err(error) => return Err(error),
     };
     let Some(postbind) = postbind else {
-        if prebind.is_some() || runtime_entry_present(dir) {
+        // A publication killed part-way leaves the prebind and the socket with
+        // no postbind, and only a daemon that starts again reaps that shape.
+        // The prebind already carries the pid and its start identity, so the
+        // same liveness proof that makes a complete dead pair an absence is
+        // available here: a provably dead publisher is absent and the local
+        // store answers, while a live one is mid-publication and keeps its
+        // retry, and an unreadable `/proc` stays `marker_identity` because
+        // that is a statement about liveness this client cannot make.
+        if let Some(prebind) = &prebind {
+            if let ProcessState::Dead = process_state(prebind.pid, &prebind.process_start_identity)?
+            {
+                return Err(ReadFailure::pre("marker_missing"));
+            }
+            return Err(ReadFailure::pre("marker_identity"));
+        }
+        if runtime_entry_present(dir) {
             return Err(ReadFailure::pre("marker_identity"));
         }
         return Err(ReadFailure::pre("marker_missing"));
@@ -1444,6 +1459,65 @@ mod tests {
             error.code(),
             "marker_missing",
             "a provably dead publisher is an absence, not a retryable identity fault"
+        );
+    }
+
+    /// A daemon killed between the prebind write and the postbind write leaves
+    /// the pair half-published, and only a daemon that starts again reaps that
+    /// shape. The prebind alone already carries the pid and its start identity,
+    /// so the same proof that makes a complete dead pair an absence applies
+    /// here: the read must be handed to the local store rather than retried
+    /// until the establishment budget runs out.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_half_published_dead_publisher_is_an_absence_too() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("namespace");
+        let lock = dir.path().join(LOCK_FILE);
+        std::fs::write(&lock, b"").expect("lock");
+        std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+
+        let dead_pid = 4_194_302u32;
+        let identity = format!(
+            "linux:v1:{}:1",
+            std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+                .expect("boot id")
+                .trim()
+        );
+        let instance = "2c9d1a6e-7f4b-4d2a-9e5c-1b8f0a3d6c72";
+        let namespace_name = "debug:agent-of-empires-dev";
+        let prebind = serde_json::json!({
+            "schema": 1,
+            "pid": dead_pid,
+            "process_start_identity": identity,
+            "prebind_instance_id": instance,
+            "namespace": namespace_name,
+        });
+        let path = dir.path().join(PREBIND_FILE);
+        std::fs::write(&path, prebind.to_string()).expect("prebind");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+        // The socket the publisher binds before it writes the postbind.
+        std::fs::write(dir.path().join(SOCKET_FILE), b"").expect("socket");
+
+        let opened = std::fs::File::open(dir.path()).expect("open namespace");
+        let namespace = OwnedNamespace {
+            name: namespace_name.to_string(),
+            home: dir.path().to_path_buf(),
+            dir: OwnedFd::from(opened),
+        };
+        let Err(error) = connect_admission(
+            namespace,
+            Instant::now() + crate::cli::runtime_read::ESTABLISHMENT_BUDGET,
+        )
+        .await
+        else {
+            panic!("a half-published dead publisher admits nothing");
+        };
+        assert_eq!(
+            error.code(),
+            "marker_missing",
+            "a half-published dead publisher is an absence, not a retryable identity"
         );
     }
 
