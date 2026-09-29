@@ -81,6 +81,8 @@ enum Phase {
 struct Entry {
     epoch: u64,
     phase: Phase,
+    /// The session was forgotten while this epoch was in flight; its owner still settles it.
+    forgotten: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -225,8 +227,16 @@ impl LifecycleTable {
         self.stale_cancels.remove(session_id);
     }
 
+    /// Drop the session's bookkeeping. An in-flight resume, respawn or teardown keeps its entry
+    /// until its owner settles it, so a runner it built is still torn down and an unproven
+    /// teardown still parks for retry.
     pub fn forget(&mut self, session_id: &str) {
-        self.entries.remove(session_id);
+        match self.entries.get_mut(session_id) {
+            Some(entry) if !matches!(entry.phase, Phase::Running { .. }) => entry.forgotten = true,
+            _ => {
+                self.entries.remove(session_id);
+            }
+        }
         self.last_generation.remove(session_id);
         self.stale_cancels.remove(session_id);
     }
@@ -253,6 +263,7 @@ impl LifecycleTable {
             Entry {
                 epoch,
                 phase: Phase::Starting { kind, cancel: None },
+                forgotten: false,
             },
         );
         Ok(self.lease(session_id, epoch))
@@ -294,8 +305,9 @@ impl LifecycleTable {
             Phase::Starting { cancel, .. } | Phase::Respawning { cancel } => cancel.clone(),
             _ => return false,
         };
+        let forgotten = entry.forgotten;
         self.entries.remove(&lease.session_id);
-        if let Some(reason) = cancel {
+        if let Some(reason) = cancel.filter(|_| !forgotten) {
             self.stale_cancels.insert(lease.session_id.clone(), reason);
         }
         true
@@ -354,6 +366,7 @@ impl LifecycleTable {
                     attempts: 0,
                     since: Instant::now(),
                 },
+                forgotten: false,
             },
         );
         Some(self.lease(session_id, epoch))
@@ -856,6 +869,52 @@ mod tests {
             table.admit(ID, ResumeKind::Spawn).is_ok(),
             "the stop is honored once; a later resume proceeds"
         );
+    }
+
+    /// #4212: a purge forgets the session while its respawn is in flight or its teardown is
+    /// pending; the owner must still convert and settle, and a forgotten stop is not carried over.
+    #[test]
+    fn forget_keeps_in_flight_ownership_until_settled() {
+        let mut table = LifecycleTable::new(1);
+        let lease = table.admit(ID, ResumeKind::Spawn).unwrap();
+        table.install(&lease, Some(identity(7, 1))).unwrap();
+        let (respawn, _) = table.begin_respawn(&lease).unwrap();
+        assert!(matches!(
+            table.begin_stop(ID, "user_stopped"),
+            StopDecision::CancelRequested
+        ));
+        table.forget(ID);
+        assert!(
+            table.convert_to_stopping(&respawn),
+            "the respawn still owns the replacement it built"
+        );
+        table.forget(ID);
+        table.settle(&respawn, Settlement::Unproven(identity(8, respawn.epoch())));
+        assert_eq!(
+            table.retry_ids_after(Duration::MAX),
+            vec![ID.to_string()],
+            "an unproven teardown parks for retry"
+        );
+        let claim = table.claim_retry(ID, Duration::MAX).unwrap();
+        table.settle(&claim.lease, Settlement::Proven);
+        assert_eq!(table.phase(ID), WorkerPhase::Absent);
+
+        let start = table.admit(ID, ResumeKind::Attach).unwrap();
+        assert!(matches!(
+            table.begin_stop(ID, "user_stopped"),
+            StopDecision::CancelRequested
+        ));
+        table.forget(ID);
+        assert!(table.abandon(&start));
+        assert!(
+            table.admit(ID, ResumeKind::Spawn).is_ok(),
+            "a stop asked of a forgotten session does not refuse its next admit"
+        );
+
+        let running = table.admit("s-2", ResumeKind::Spawn).unwrap();
+        table.install(&running, None).unwrap();
+        table.forget("s-2");
+        assert_eq!(table.phase("s-2"), WorkerPhase::Absent);
     }
 
     #[test]

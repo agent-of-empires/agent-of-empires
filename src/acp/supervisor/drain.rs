@@ -649,9 +649,14 @@ impl<S: BroadcastSink> Drain<S> {
                     generation: r.generation,
                 })
         });
-        if launched.is_some() && lock_recover(&self.lifecycle).convert_to_stopping(respawn_lease) {
+        if launched.is_some() {
+            // Closing the connection does not end the process, so terminate it even when a
+            // peer's stop already took the lease.
+            let owned = lock_recover(&self.lifecycle).convert_to_stopping(respawn_lease);
             let settlement = tear_down_runner(&*self.process_control, session_id, launched).await;
-            settle_lease(&self.lifecycle, &self.notify, respawn_lease, settlement);
+            if owned {
+                settle_lease(&self.lifecycle, &self.notify, respawn_lease, settlement);
+            }
         }
         self.publish(match refused {
             SupervisorError::Blocked(blocked) => Event::Stopped {
@@ -1246,6 +1251,75 @@ mod tests {
             }
         }
         let _ = std::fs::remove_file(app_dir.join("config.toml"));
+    }
+
+    /// #4212: a purge during the respawn handshake runs `shutdown_and_delete` then
+    /// `forget_session`; the refused replacement must still be terminated and its record cleared.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn crash_respawn_retires_the_replacement_when_purged_during_the_handshake() {
+        let _home = isolate_home();
+        let control =
+            Arc::new(crate::acp::runner_lifecycle::test_support::FakeProcessControl::default());
+        control.alive(4242).alive(4343);
+        let gate = Gate::default();
+        let sup = Arc::new(
+            Supervisor::new(VecSink::new())
+                .with_process_control(control.clone())
+                .with_launcher(gated_launcher(&gate, 4343)),
+        );
+        let mut inst = crate::session::Instance::new("s-purged", "/tmp");
+        inst.id = "s-purged".into();
+        let storage = crate::session::Storage::new_unwatched(&inst.source_profile).unwrap();
+        storage
+            .update(|rows, _| {
+                *rows = vec![inst.clone()];
+                Ok(())
+            })
+            .unwrap();
+        save_record("s-purged", 4242, 0);
+        let mut config = runner_config(worker_registry::socket_path_for("s-purged").unwrap());
+        config.source_profile = Some(inst.source_profile.clone());
+        let lease = sup
+            .test_install_runner(
+                "s-purged",
+                config,
+                Some(RunnerIdentity {
+                    pid: 4242,
+                    generation: 0,
+                }),
+            )
+            .await;
+        let (inbound_tx, inbound_rx) = mpsc::channel::<Event>(4);
+        let drain = sup.start_drain_task("s-purged".into(), lease, inbound_rx, None);
+        drop(inbound_tx);
+
+        gate.entered.notified().await;
+        storage
+            .update(|rows, _| {
+                rows.clear();
+                Ok(())
+            })
+            .unwrap();
+        sup.shutdown_and_delete("s-purged").await.unwrap();
+        sup.forget_session("s-purged");
+        gate.open.notify_one();
+
+        tokio::time::timeout(Duration::from_secs(10), drain)
+            .await
+            .expect("drain task must finish")
+            .unwrap();
+        assert!(
+            control.signals().contains(&(4343, "TERM")),
+            "the replacement is terminated: {:?}",
+            control.signals()
+        );
+        assert!(
+            worker_registry::load("s-purged").unwrap().is_none(),
+            "the replacement's record is cleared"
+        );
+        assert_eq!(sup.worker_state("s-purged").await, AcpWorkerState::Absent);
+        assert!(sup.take_respawned_in_place().is_empty());
     }
 
     /// The reconciler reads this flag to remind the agent its `Monitor` died.
