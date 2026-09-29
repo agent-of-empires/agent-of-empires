@@ -140,21 +140,10 @@ pub(crate) struct ProjectRead {
     /// row may be absent from both registries, and a session row of the same
     /// profile must justify it.
     ///
-    /// An absent flag means `true`, deliberately. The flag arrived with the
-    /// synthesized-row contract, so a snapshot that does not name it predates
-    /// it, and every row such a snapshot carries is a registry row: the
-    /// renderer filters on this flag, so defaulting it to `false` would make
-    /// those snapshots parse cleanly and then render an empty project
-    /// inventory. A missing field must not be able to hide rows, which is the
-    /// one direction a permissive default is safe in and the one this takes.
-    #[serde(default = "registered_by_default")]
+    /// Required, and not defaulted, because both published schemas already
+    /// list it. A missing flag is a missing answer, and the only direction a
+    /// default here could be safe in would be one that hides rows.
     pub registered: bool,
-}
-
-/// The default for [`ProjectRead::registered`], kept as a named function so
-/// the serde attribute and its rationale read in one place.
-fn registered_by_default() -> bool {
-    true
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -1284,33 +1273,33 @@ mod tests {
         assert_eq!(WireStatus::Creating.as_str(), "Creating");
     }
 
-    /// A snapshot written before the flag existed names no `registered`, and
-    /// every row in it is a registry row. Defaulting the absent flag to
-    /// `false` would let such a snapshot parse and then render an empty
-    /// project inventory, so the default is the one that keeps the rows the
-    /// daemon published.
+    /// `registered` was the one field the decoder defaulted, and both published
+    /// schemas already list it as required, so a snapshot that omitted it
+    /// decoded to a guess while the schema would have refused it. No shipped
+    /// producer can omit the field; the gap was that the client was more
+    /// permissive than the contract it publishes.
     #[test]
-    fn an_absent_registered_flag_keeps_the_row_it_describes() {
-        let project: ProjectRead = serde_json::from_value(json!({
+    fn an_absent_registered_flag_is_refused_rather_than_guessed() {
+        let absent = json!({
             "name": "alpha",
             "path": "/srv/alpha",
             "scope": {"kind": "profile"},
             "default_base_branch": null,
-        }))
-        .expect("a row without the flag deserializes");
-        assert!(project.registered, "absent means registered, not hidden");
+        });
+        assert!(
+            serde_json::from_value::<ProjectRead>(absent.clone()).is_err(),
+            "the decoder must not supply a value the schema requires"
+        );
 
-        let mut value = snapshot();
-        value.health.profiles.insert("main".into(), health());
-        value.profiles[0].projects = vec![project];
-        value.global_projects = vec![ProjectRead {
-            name: "beta".into(),
-            path: "/srv/beta".into(),
-            scope: ProjectScope::Global,
-            default_base_branch: None,
-            registered: true,
-        }];
-        assert_eq!(validate_snapshot(&value), Ok(()));
+        // A registry row and a synthesized row are the two answers the flag
+        // distinguishes, and both still decode when it is present.
+        for registered in [true, false] {
+            let mut value = absent.clone();
+            value["registered"] = json!(registered);
+            let project: ProjectRead =
+                serde_json::from_value(value).expect("a row that names the flag deserializes");
+            assert_eq!(project.registered, registered);
+        }
     }
 
     /// Repos are accepted in any order, like every other collection here: the
