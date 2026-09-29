@@ -153,10 +153,9 @@ pub struct SessionService {
     #[cfg(test)]
     submission_claims: std::sync::OnceLock<tokio::sync::mpsc::UnboundedSender<String>>,
     /// Holds a continuation install between its store read and its write, so a
-    /// test can admit a prompt in that window. Per service, like
-    /// `created_instance_gate`, so it cannot leak into another test.
+    /// test can admit a prompt in that window.
     #[cfg(test)]
-    pub(crate) install_barrier: std::sync::Mutex<
+    install_barrier: std::sync::Mutex<
         Option<tokio::sync::mpsc::UnboundedSender<(String, tokio::sync::oneshot::Sender<()>)>>,
     >,
     #[cfg(test)]
@@ -1358,8 +1357,6 @@ impl SessionService {
         self.prompt_locks.read().await.len()
     }
 
-    /// Report every [`Self::prompt_submission`] claim at the one moment a deletion-race
-    /// test can use.
     /// Arm the install barrier for one test. Each producer read reports its
     /// session id to the receiver and waits for the returned ack before it
     /// installs; dropping the receiver disarms the gate with the service.
@@ -1390,6 +1387,8 @@ impl SessionService {
         }
     }
 
+    /// Report every [`Self::prompt_submission`] claim at the one moment a deletion-race
+    /// test can use.
     #[cfg(test)]
     pub(crate) fn watch_submission_claims(&self) -> tokio::sync::mpsc::UnboundedReceiver<String> {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();

@@ -43,9 +43,6 @@ pub struct EnqueueRequest {
     /// server row and a retry does not double-queue.
     pub id: String,
     pub text: String,
-    // Enqueue time is the server's, stamped where the row is written: the
-    // resume admission orders queue rows against the rate-limit park, so a
-    // client clock must not reach it (#4092).
     /// Optional provenance: which device queued it.
     #[serde(default)]
     pub origin_device: Option<String>,

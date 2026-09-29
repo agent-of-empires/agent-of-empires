@@ -148,7 +148,7 @@ pub async fn spawn_acp(
     }
     if let Some(resets_at) = rate_limit_resume_resets_at {
         // Continue the rate-limit-interrupted turn once the worker is live.
-        install_rate_limit_continuation(&state, &id, _submission).await;
+        let _outcome = install_rate_limit_continuation(&state, &id, _submission).await;
         // The manual breadcrumb is the budget's disarm step, so it fires
         // whether or not a queued prompt superseded the continuation.
         state

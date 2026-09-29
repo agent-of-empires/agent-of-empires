@@ -721,7 +721,7 @@ async fn a_manual_prompt_cannot_overtake_a_continuation_install() {
                 else {
                     return;
                 };
-                crate::server::acp_reconciler::install_rate_limit_continuation(
+                let _outcome = crate::server::acp_reconciler::install_rate_limit_continuation(
                     &state, &id, submission,
                 )
                 .await;
