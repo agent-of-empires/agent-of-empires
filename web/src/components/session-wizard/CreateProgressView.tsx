@@ -11,12 +11,15 @@ const STAGE_LABEL: Record<CreateProgress["stage"], string> = {
 /** Live stage and hook output of an in-flight create, like the TUI's Running Hooks dialog. */
 export function CreateProgressView({ progress }: { progress: CreateProgress | null }) {
   const outputRef = useRef<HTMLPreElement | null>(null);
+  // Set while the reader sits at the bottom; scrolling up to read stops the follow.
+  const followRef = useRef(true);
   const lines = progress?.output ?? [];
 
+  // Keyed on the snapshot, not the line count: a full window keeps its length while the tail changes.
   useEffect(() => {
     const el = outputRef.current;
-    if (el) el.scrollTop = el.scrollHeight;
-  }, [lines.length]);
+    if (el && followRef.current) el.scrollTop = el.scrollHeight;
+  }, [progress]);
 
   return (
     <div data-testid="create-progress" className="flex flex-col gap-3 min-h-0 h-full">
@@ -38,6 +41,10 @@ export function CreateProgressView({ progress }: { progress: CreateProgress | nu
       {lines.length > 0 && (
         <pre
           ref={outputRef}
+          onScroll={(e) => {
+            const el = e.currentTarget;
+            followRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 24;
+          }}
           data-testid="create-progress-output"
           className="flex-1 min-h-[8rem] max-h-[50vh] overflow-auto bg-surface-950 border border-surface-700/40 rounded-md p-2 text-[11px] leading-snug font-mono text-text-dim whitespace-pre-wrap break-all"
         >

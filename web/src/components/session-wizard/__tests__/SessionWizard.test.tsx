@@ -6,6 +6,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import { SessionWizard, type WizardPrefill } from "../SessionWizard";
 import { fetchAgents, fetchCreateProgress, fetchIsGitRepo, fetchProfiles, fetchSettings } from "../../../lib/api";
 import { agent } from "./fixtures";
+import { toastBus } from "../../../lib/toastBus";
 
 const createSession = vi.fn();
 
@@ -311,5 +312,63 @@ describe("SessionWizard create progress", () => {
     await waitFor(() => expect(onCreated).toHaveBeenCalledWith({ id: "s1" }), { timeout: 3000 });
     expect(createSession).toHaveBeenCalledTimes(2);
     expect(payload(1).idempotency_key).toBe(payload(0).idempotency_key);
+  });
+});
+
+describe("SessionWizard unknown create outcome", () => {
+  const LOST = { ok: false, error: "Network error: offline", network: true };
+  const toastError = vi.fn();
+
+  beforeEach(() => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    toastBus.handler = { push: vi.fn(), error: toastError, info: vi.fn(), openLink: vi.fn() };
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    toastBus.handler = null;
+    toastError.mockReset();
+  });
+
+  // Every response lost: the server may still have created the session.
+  const loseEveryResponse = async () => {
+    createSession.mockResolvedValue(LOST);
+    await launch();
+    await vi.advanceTimersByTimeAsync(60_000);
+  };
+
+  it("keeps the key and retries the same request from Launch", async () => {
+    const { onCreated } = renderWizard();
+    await loseEveryResponse();
+    await waitFor(() => expect(screen.getByText(/may still be created/)).toBeTruthy());
+    const calls = createSession.mock.calls.length;
+    expect(new Set(createSession.mock.calls.map(([body]) => body.idempotency_key)).size).toBe(1);
+
+    createSession.mockResolvedValue({ ok: true, session: { id: "s1" } });
+    await launch();
+    await waitFor(() => expect(onCreated).toHaveBeenCalledWith({ id: "s1" }));
+    expect(payload(calls).idempotency_key).toBe(payload(0).idempotency_key);
+  });
+
+  it("reconciles under the same key when the connection returns", async () => {
+    const { onCreated } = renderWizard();
+    await loseEveryResponse();
+    await waitFor(() => expect(screen.getByText(/may still be created/)).toBeTruthy());
+    createSession.mockResolvedValue({ ok: true, session: { id: "s1" } });
+    window.dispatchEvent(new Event("online"));
+    await waitFor(() => expect(onCreated).toHaveBeenCalledWith({ id: "s1" }));
+    expect(payload(createSession.mock.calls.length - 1).idempotency_key).toBe(payload(0).idempotency_key);
+  });
+
+  it("does not report a backgrounded create as failed when no response arrives", async () => {
+    createSession.mockResolvedValue(LOST);
+    const { onCreatedInBackground } = renderWizard();
+    await launch();
+    fireEvent.click(await screen.findByText("Continue in background", undefined, { timeout: 3000 }));
+    await vi.advanceTimersByTimeAsync(15 * 60_000);
+    await waitFor(() => expect(toastError).toHaveBeenCalled());
+    expect(toastError.mock.calls[0]![0]).toMatch(/may still appear/);
+    expect(toastError.mock.calls[0]![0]).not.toMatch(/not created/);
+    expect(onCreatedInBackground).not.toHaveBeenCalled();
+    expect(new Set(createSession.mock.calls.map(([body]) => body.idempotency_key)).size).toBe(1);
   });
 });

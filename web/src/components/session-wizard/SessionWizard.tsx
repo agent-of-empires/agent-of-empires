@@ -106,11 +106,21 @@ const PROGRESS_DELAY_MS = 800;
 const PROGRESS_POLL_MS = 700;
 // Retries after a dropped connection; the idempotency key makes them join the running create.
 const NETWORK_RETRIES = 3;
+// A backgrounded create has no Launch button to retry from, so it keeps reconciling longer.
+const BACKGROUND_NETWORK_RETRIES = 20;
+const MAX_RETRY_DELAY_MS = 30_000;
+const UNKNOWN_OUTCOME_ERROR =
+  "Lost connection while creating. The session may still be created; Launch retries the same request.";
 
 function newIdempotencyKey(): string {
   // randomUUID needs a secure context, which a LAN or tunnel dashboard may not be.
   if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") return crypto.randomUUID();
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`;
+}
+
+function waitUntilOnline(): Promise<void> {
+  if (typeof navigator === "undefined" || navigator.onLine !== false) return Promise.resolve();
+  return new Promise((resolve) => window.addEventListener("online", () => resolve(), { once: true }));
 }
 
 function waitUntilVisible(): Promise<void> {
@@ -162,6 +172,8 @@ export function SessionWizard({ onClose, onCreated, onCreatedInBackground, prefi
   const [progress, setProgress] = useState<CreateProgress | null>(null);
   const [progressKey, setProgressKey] = useState<string | null>(null);
   const [showProgress, setShowProgress] = useState(false);
+  // A create whose response never arrived; Launch and reconnects retry it under its key.
+  const [unknownOutcome, setUnknownOutcome] = useState<{ body: CreateSessionRequest; tool: string } | null>(null);
   // Set once the user leaves a create running, so its outcome is reported, not navigated to.
   const backgroundRef = useRef(false);
   const { keyboardHeight } = useMobileKeyboard();
@@ -299,15 +311,29 @@ export function SessionWizard({ onClose, onCreated, onCreatedInBackground, prefi
   };
 
   const runCreate = async (body: CreateSessionRequest, tool: string) => {
+    setUnknownOutcome(null);
     setProgressKey(body.idempotency_key ?? null);
     let result = await createSession(body);
-    for (let attempt = 0; result.network && body.idempotency_key && attempt < NETWORK_RETRIES; attempt++) {
+    const retries = () => (backgroundRef.current ? BACKGROUND_NETWORK_RETRIES : NETWORK_RETRIES);
+    for (let attempt = 0; result.network && body.idempotency_key && attempt < retries(); attempt++) {
+      await waitUntilOnline();
       await waitUntilVisible();
-      await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)));
+      await new Promise((r) => setTimeout(r, Math.min(1000 * (attempt + 1), MAX_RETRY_DELAY_MS)));
       result = await createSession(body);
     }
     setProgressKey(null);
     const background = backgroundRef.current;
+    // No answer is not a refusal: the detached server create may still finish, so
+    // keep the key and reconcile under it rather than report a failure.
+    if (result.network && body.idempotency_key) {
+      if (background) {
+        toastBus.handler?.error("Lost connection while creating a session; it may still appear in the sidebar.");
+      } else {
+        setUnknownOutcome({ body, tool });
+        dispatch({ type: "SUBMIT_ERROR", error: UNKNOWN_OUTCOME_ERROR });
+      }
+      return;
+    }
     if (result.ok) {
       dispatch({ type: "SUBMIT_SUCCESS" });
       if (ACP_CAPABLE_TOOLS.has(tool)) safeSetItem(LAST_USED_TOOL_KEY, tool);
@@ -328,6 +354,10 @@ export function SessionWizard({ onClose, onCreated, onCreatedInBackground, prefi
 
   const handleSubmit = async () => {
     dispatch({ type: "SUBMIT_START" });
+    if (unknownOutcome) {
+      await runCreate(unknownOutcome.body, unknownOutcome.tool);
+      return;
+    }
     const d = state.data;
     const body = {
       ...buildCreateRequest(
@@ -349,6 +379,19 @@ export function SessionWizard({ onClose, onCreated, onCreatedInBackground, prefi
     }
     await runCreate(body, d.tool);
   };
+
+  // Reconnecting reconciles an unknown outcome without waiting for another Launch.
+  useEffect(() => {
+    if (!unknownOutcome || state.isSubmitting) return;
+    const retry = () => {
+      dispatch({ type: "SUBMIT_START" });
+      void runCreate(unknownOutcome.body, unknownOutcome.tool);
+    };
+    window.addEventListener("online", retry);
+    return () => window.removeEventListener("online", retry);
+    // runCreate is recreated each render; the outcome and submit state are what matter.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [unknownOutcome, state.isSubmitting]);
 
   const cancelPending = () => {
     setGlobConfirm(null);

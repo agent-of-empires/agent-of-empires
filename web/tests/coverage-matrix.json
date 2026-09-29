@@ -969,7 +969,8 @@
       "specs": [
         "tests/wizard.spec.ts",
         "src/components/session-wizard/__tests__/SessionWizard.test.tsx",
-        "src/lib/api.test.ts"
+        "src/lib/api.test.ts",
+        "src/components/session-wizard/__tests__/CreateProgressView.test.tsx"
       ],
       "components": [
         "web/src/components/session-wizard/CreateProgressView.tsx",
