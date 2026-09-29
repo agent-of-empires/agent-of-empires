@@ -25,7 +25,7 @@ export function Dialog({
   titleClassName?: string;
   panelTestId?: string;
   bodyClassName?: string;
-  /** Link the body as the dialog's description; turn off for form bodies. */
+  /** Link the body as the dialog's description; turn off for form or list bodies. */
   describeBody?: boolean;
   onDismiss: () => void;
   footer: ReactNode;
