@@ -72,9 +72,11 @@ pub struct Cli {
     /// `AOE_DAEMON_PASSPHRASE` does not work here yet; it works for
     /// `aoe acp <verb>` against the same `AOE_DAEMON_URL`. The local socket is
     /// Linux-only, so on any other platform those seven reads always come from
-    /// the local store while this route is unaffected. At the no-subcommand
-    /// `aoe` invocation (the TUI dashboard) the same URL attaches the whole
-    /// session list instead.
+    /// the local store while this route is unaffected. A served answer is the
+    /// daemon's own view of the store, so a session started moments ago can
+    /// report a null `agent_session_id` here. At the no-subcommand `aoe`
+    /// invocation (the TUI dashboard) the same URL attaches the whole session
+    /// list instead.
     // As with `-p`, no `env` attribute: `read_request_source` reads
     // `AOE_DAEMON_URL` itself and keeps it distinct from an explicit
     // `--daemon-url`, so the flag can win and an empty variable can still mean

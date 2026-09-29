@@ -254,7 +254,8 @@ pub enum ScopedRead {
     Answered(ReadOutcome),
     /// No local daemon has published a runtime read. Only ever returned for the
     /// local transport, so the caller runs the command against the local store
-    /// exactly as it did before the read existed.
+    /// exactly as it did before the read existed, including its best-effort
+    /// `agent_session_id` backfill, which an answered read does not run.
     NoLocalPublication,
 }
 

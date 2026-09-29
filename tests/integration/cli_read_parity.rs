@@ -26,7 +26,7 @@ const PROFILE: &str = "main";
 /// states that used to be invisible here: a human `session show` of a child
 /// whose parent was purged, and a `profile` listing over a profile named
 /// `default`.
-const COMMANDS: [&[&str]; 16] = [
+const COMMANDS: [&[&str]; 18] = [
     &["list"],
     &["list", "--state", "all"],
     &["list", "--all"],
@@ -43,6 +43,11 @@ const COMMANDS: [&[&str]; 16] = [
     &["session", "show", "--json", "long-session-id-01"],
     &["session", "show", "j-orphan"],
     &["session", "list-trash"],
+    // The terminal row with no `agent_session_id`, named directly, so the local
+    // self-heal and the served projection are compared on the one row where
+    // they can answer differently.
+    &["session", "show", "--json", "l-terminal"],
+    &["session", "show", "l-terminal"],
 ];
 
 /// The commands a *refusing* read has to agree on too. A command that exits
@@ -355,6 +360,27 @@ fn fixture_sessions(home: &Path) -> Vec<serde_json::Value> {
             false,
             false,
         ),
+        // A terminal row with no `agent_session_id`: the local command's
+        // self-heal backfills one, the served projection reports the daemon's
+        // own view, so this is the row that can see a served answer and a
+        // local one disagree. `Stopped` is required rather than incidental:
+        // the probe returns before the tmux read for Stopped, so the local
+        // pass stays probe-inert. This must be the only Terminal row, or the
+        // comparison starts depending on whether a tmux server is running.
+        {
+            let mut value = row(
+                "l-terminal",
+                stopped,
+                "/srv/terminal",
+                "terminal",
+                "Terminal",
+                false,
+                false,
+            );
+            value["view"] = serde_json::json!(View::Terminal);
+            value["agent_session_id"] = serde_json::Value::Null;
+            value
+        },
     ];
     let mut rows: Vec<serde_json::Value> = rows;
     // A parent/child relation, spelled the way the store spells it.
