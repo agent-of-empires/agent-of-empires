@@ -746,15 +746,18 @@ pub fn is_expired(instance: &Instance, retention_minutes: u32, now: DateTime<Utc
     }
 }
 
+/// Shortest wait between daemon retention sweeps, and how often the daemon
+/// re-reads the windows so a shortened one applies within a minute.
+pub const SWEEP_RECHECK: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Wait between daemon retention sweeps: a tenth of the shortest nonzero
-/// window in minutes, clamped to one minute through one hour, so a purge lags
-/// its window by at most that much without polling faster than once a minute.
+/// window in minutes, clamped to [`SWEEP_RECHECK`] through one hour, so a
+/// purge lags its window by at most that much.
 pub fn sweep_interval(retention_minutes: impl IntoIterator<Item = u32>) -> std::time::Duration {
-    const MIN_SECS: u64 = 60;
     const MAX_SECS: u64 = 60 * 60;
     let shortest = retention_minutes.into_iter().filter(|m| *m > 0).min();
     let secs = shortest.map_or(MAX_SECS, |minutes| u64::from(minutes) * 6);
-    std::time::Duration::from_secs(secs.clamp(MIN_SECS, MAX_SECS))
+    std::time::Duration::from_secs(secs.clamp(SWEEP_RECHECK.as_secs(), MAX_SECS))
 }
 
 /// Ids of every trashed session whose retention window has elapsed, in the order they appear in

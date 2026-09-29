@@ -8,6 +8,8 @@ use std::path::Path;
 use tracing::info;
 
 const MINUTES_PER_DAY: i64 = 24 * 60;
+/// The new field's validator max (3650 days, the old field's UI cap).
+const MAX_MINUTES: i64 = 3650 * MINUTES_PER_DAY;
 
 pub fn run() -> Result<()> {
     run_in(&crate::session::get_app_dir()?)
@@ -21,18 +23,20 @@ fn run_in(app_dir: &Path) -> Result<()> {
 }
 
 fn migrate_config_file(path: &Path) -> Result<()> {
-    config_file::rewrite_strict(path, "trash_retention_minutes", |doc| {
+    config_file::rewrite_strict(path, "v034", |doc| {
         let Some(session) = doc.get_mut("session").and_then(toml::Value::as_table_mut) else {
             return false;
         };
         let Some(days) = session.remove("trash_retention_days") else {
             return false;
         };
-        // An out-of-range value never loaded before either; dropping it keeps the default.
+        // A negative or non-integer value never loaded, so it keeps the default.
+        // A huge one loaded as "effectively forever"; capping it keeps that
+        // meaning, where dropping it would fall back to 30 days.
         let minutes = days
             .as_integer()
-            .filter(|days| (0..=i64::from(u32::MAX) / MINUTES_PER_DAY).contains(days))
-            .map(|days| days * MINUTES_PER_DAY);
+            .filter(|days| (0..=i64::from(u32::MAX)).contains(days))
+            .map(|days| (days * MINUTES_PER_DAY).min(MAX_MINUTES));
         let converted = match minutes {
             Some(minutes) if !session.contains_key("trash_retention_minutes") => {
                 session.insert("trash_retention_minutes".into(), minutes.into());
@@ -74,6 +78,11 @@ mod tests {
                 (
                     Some("[session]\ntrash_retention_days = 3\ntrash_retention_minutes = 90\n"),
                     Some("[session]\ntrash_retention_minutes = 90\n"),
+                ),
+                // A window past the new max is capped, not reset to 30 days.
+                (
+                    Some("[session]\ntrash_retention_days = 9999999\n"),
+                    Some("[session]\ntrash_retention_minutes = 5256000\n"),
                 ),
                 // A value the old field could not hold is dropped.
                 (

@@ -435,20 +435,25 @@ pub(crate) async fn purge_expired_trash(state: &Arc<AppState>) {
 }
 
 /// Next retention sweep delay, from the global window and every profile's, so
-/// a session trashed into any profile is honored within its slack. Resolves
-/// quietly: [`purge_expired_trash`] already warns about a broken profile.
+/// a session trashed into any profile is honored within its slack. Merges
+/// without [`resolve_config`](crate::session::config::profile_config::resolve_config),
+/// which reinstalls and re-warns about status rules on every call.
 pub(crate) fn trash_sweep_interval() -> std::time::Duration {
-    let global = crate::session::config::Config::load()
-        .ok()
-        .map(|config| config.session.trash_retention_minutes);
+    use crate::session::config::profile_config::{load_profile_config, merge_configs};
+    let Ok(global) = crate::session::config::Config::load() else {
+        return crate::session::trash::sweep_interval([]);
+    };
     let profiles = crate::session::list_profiles().unwrap_or_default();
-    crate::session::trash::sweep_interval(global.into_iter().chain(profiles.iter().filter_map(
-        |profile| {
-            crate::session::config::profile_config::resolve_config(profile)
-                .ok()
-                .map(|config| config.session.trash_retention_minutes)
-        },
-    )))
+    let windows = profiles.iter().filter_map(|profile| {
+        load_profile_config(profile).ok().map(|pc| {
+            merge_configs(global.clone(), &pc)
+                .session
+                .trash_retention_minutes
+        })
+    });
+    crate::session::trash::sweep_interval(
+        std::iter::once(global.session.trash_retention_minutes).chain(windows),
+    )
 }
 
 pub async fn delete_session(
