@@ -22,7 +22,8 @@ function route(url: string, init?: RequestInit): Response {
   if (SETTINGS_URL.test(url) && method === "GET") {
     return jsonResponse({ description: "", hooks: { on_create: ["echo seeded"] } });
   }
-  if (url === "/api/settings" || url.startsWith("/api/settings?")) {
+  // Inherited hooks come from the machine-wide layer, not the effective view.
+  if (url === "/api/settings?layer=machine") {
     return jsonResponse({ hooks: { on_launch: ["echo global"] } });
   }
   if (method !== "GET") return jsonResponse({ ok: true });

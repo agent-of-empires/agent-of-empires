@@ -1,0 +1,22 @@
+name: Bug
+description: Something is broken
+labels: ["bug"]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      placeholder: Steps, expected, actual
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: aoe version and OS
+    validations:
+      required: true
+  - type: input
+    id: ai
+    attributes:
+      label: AI usage
+      placeholder: "None, or which parts are AI-written"

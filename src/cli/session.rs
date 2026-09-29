@@ -846,6 +846,7 @@ fn build_import_instance(
     s: &crate::session::claude_import::ClaudeSessionSummary,
     structured: bool,
     group: &str,
+    session_config: &crate::session::config::SessionConfig,
 ) -> Instance {
     let title = s.title.clone().unwrap_or_else(|| {
         let short = s.session_id.get(..8).unwrap_or(s.session_id.as_str());
@@ -853,6 +854,7 @@ fn build_import_instance(
     });
     let mut inst = Instance::new(&title, &s.cwd);
     inst.tool = "claude".to_string();
+    crate::session::builder::apply_agent_launch_config(&mut inst, session_config, "", "", None);
     if !group.is_empty() {
         inst.group_path = group.to_string();
     }
@@ -966,14 +968,24 @@ async fn import_sessions(profile: &str, args: ImportArgs) -> Result<()> {
     }
 
     let group = args.group.clone().unwrap_or_default();
+    let session_configs: Vec<_> = to_import
+        .iter()
+        .map(|s| {
+            crate::session::config::repo_config::resolve_config_with_repo_or_warn(
+                profile,
+                std::path::Path::new(&s.cwd),
+            )
+            .session
+        })
+        .collect();
     let storage = Storage::open_unwatched(profile)?;
     let created_ids = storage.update(|all_instances, groups| {
         let mut ids = Vec::new();
-        for s in &to_import {
+        for (s, session_config) in to_import.iter().zip(&session_configs) {
             if already_imported(all_instances, &s.session_id) {
                 continue;
             }
-            let inst = build_import_instance(s, structured, &group);
+            let inst = build_import_instance(s, structured, &group, session_config);
             ids.push(inst.id.clone());
             all_instances.push(inst.clone());
             if !inst.group_path.is_empty() {
@@ -1157,8 +1169,16 @@ async fn restart_all_sessions(profile: &str, parallel: usize) -> Result<()> {
     let mut failed: Vec<(String, String)> = Vec::new();
     let mut fresh_after_failed_resume: Vec<(String, String)> = Vec::new();
     let mut restarted: Vec<crate::session::Instance> = Vec::new();
+    let mut skipped: Vec<(String, String)> = Vec::new();
     while let Some(joined) = join_set.join_next().await {
         let (title, inst_opt, result) = joined.expect("JoinSet shouldn't panic on join itself");
+        // Archived or trashed after selection: the launch refused before touching anything.
+        if let Err(e) = &result {
+            if let Some(blocked) = e.downcast_ref::<crate::session::StartBlocked>() {
+                skipped.push((title, blocked.to_string()));
+                continue;
+            }
+        }
         let id = inst_opt.as_ref().map(|i| i.id.clone()).unwrap_or_default();
         if let Some(inst) = inst_opt {
             restarted.push(inst);
@@ -1219,6 +1239,12 @@ async fn restart_all_sessions(profile: &str, parallel: usize) -> Result<()> {
             println!("  · {}", title);
         }
     }
+    if !skipped.is_empty() {
+        println!("⏭ {} skipped:", skipped.len());
+        for (title, reason) in &skipped {
+            println!("  · {}: {}", title, reason);
+        }
+    }
     if !failed.is_empty() {
         println!("✗ {} failed:", failed.len());
         for (title, err) in &failed {
@@ -1235,9 +1261,25 @@ fn pick_targets_for_restart_all(instances: &[crate::session::Instance]) -> Vec<S
     instances
         .iter()
         .filter(|i| !matches!(i.status, Status::Deleting | Status::Creating))
-        .filter(|i| !i.is_structured())
+        .filter(|i| !i.is_structured() && i.ensure_startable().is_ok())
         .map(|i| i.id.clone())
         .collect()
+}
+
+/// Type the restart wake message under the input lock, so an archive or trash that landed after
+/// the relaunch wins and nothing is typed into the shelved pane.
+fn send_restart_wake(
+    working: &Instance,
+    tmux_session: &crate::tmux::Session,
+    wake_msg: &str,
+) -> Result<bool> {
+    if !tmux_session.exists() {
+        return Ok(false);
+    }
+    let _input_lock = working.lock_for_input()?;
+    let delay = crate::agents::send_keys_enter_delay(&working.tool);
+    tmux_session.send_keys_with_delay(wake_msg, delay)?;
+    Ok(true)
 }
 
 async fn restart_session(profile: &str, args: SessionIdArgs) -> Result<()> {
@@ -1270,16 +1312,9 @@ async fn restart_session(profile: &str, args: SessionIdArgs) -> Result<()> {
             crate::agents::ready_marker(&tool),
         );
 
-        if tmux_session.exists() {
-            let delay = crate::agents::send_keys_enter_delay(&tool);
-            match tmux_session.send_keys_with_delay(&wake_msg, delay) {
-                Ok(()) => {
-                    wake_succeeded = true;
-                }
-                Err(e) => {
-                    eprintln!("Warning: failed to send wake-up message: {}", e);
-                }
-            }
+        match send_restart_wake(&working, &tmux_session, &wake_msg) {
+            Ok(sent) => wake_succeeded = sent,
+            Err(e) => eprintln!("Warning: failed to send wake-up message: {}", e),
         }
     }
 
@@ -1298,7 +1333,7 @@ async fn restart_session(profile: &str, args: SessionIdArgs) -> Result<()> {
         if let Some(stored) = instances.iter_mut().find(|i| i.id == session_id) {
             stored.merge_post_restart(&working);
             if wake_succeeded {
-                stored.touch_last_accessed();
+                stored.touch_after_input();
             }
             Ok(true)
         } else {
@@ -2976,7 +3011,7 @@ mod target_filter_tests {
     use crate::session::{Instance, Status};
 
     #[test]
-    fn restart_all_skips_deleting_and_creating() {
+    fn restart_all_skips_transient_archived_and_trashed() {
         let instance = |id: &str, status: Status| {
             let mut inst = Instance::new(id, "/tmp");
             inst.id = id.to_string();
@@ -2993,6 +3028,16 @@ mod target_filter_tests {
             instance("unknown", Status::Unknown),
             instance("deleting", Status::Deleting),
             instance("creating", Status::Creating),
+            {
+                let mut inst = instance("archived", Status::Idle);
+                inst.archive();
+                inst
+            },
+            {
+                let mut inst = instance("trashed", Status::Stopped);
+                inst.trash();
+                inst
+            },
         ];
         let mut picked = pick_targets_for_restart_all(&instances);
         picked.sort();
@@ -3001,6 +3046,103 @@ mod target_filter_tests {
             ["error", "idle", "running", "starting", "stopped", "unknown", "waiting"]
         );
         assert!(pick_targets_for_restart_all(&[]).is_empty());
+    }
+}
+
+/// #4116: CLI start and restart refuse an archived or trashed session.
+#[cfg(test)]
+mod start_blocked_tests {
+    use super::{restart_session, send_restart_wake, start_session, SessionIdArgs};
+    use crate::session::{Instance, Storage};
+    use serial_test::serial;
+
+    /// The restart wake runs after the relaunch released its locks; a peer archive that landed
+    /// since wins, so nothing is typed into the pane and the row stays archived.
+    #[test]
+    #[serial]
+    fn restart_wake_is_not_typed_into_a_row_archived_since_the_relaunch() {
+        if crate::tmux::tmux_command().arg("-V").output().is_err() {
+            eprintln!("tmux not available; skipping");
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let profile = "restart-wake-archived";
+        let mut working = Instance::new("restart-wake", "/tmp/x");
+        working.source_profile = profile.to_string();
+        let mut peer = working.clone();
+        peer.archive();
+        Storage::new_unwatched(profile)
+            .unwrap()
+            .update(|rows, _| {
+                *rows = vec![peer];
+                Ok(())
+            })
+            .unwrap();
+        let pane = crate::tmux::Session::generate_name(&working.id, &working.title);
+        let created = crate::tmux::tmux_command()
+            .args(["new-session", "-d", "-s", &pane, "cat"])
+            .status();
+        if !created.map(|s| s.success()).unwrap_or(false) {
+            eprintln!("tmux new-session failed; skipping");
+            return;
+        }
+        crate::tmux::refresh_session_cache();
+
+        let session = crate::tmux::Session::new(&working.id, &working.title).unwrap();
+        let result = send_restart_wake(&working, &session, "wake-4116");
+        let captured = crate::tmux::tmux_command()
+            .args(["capture-pane", "-p", "-t", &pane])
+            .output()
+            .unwrap();
+        let _ = crate::tmux::tmux_command()
+            .args(["kill-session", "-t", &pane])
+            .output();
+
+        let err = result.expect_err("an archived row takes no wake message");
+        assert_eq!(err.to_string(), "session is archived; unarchive it first");
+        assert!(!String::from_utf8_lossy(&captured.stdout).contains("wake-4116"));
+        let stored = Storage::new_unwatched(profile).unwrap().load().unwrap();
+        assert!(stored[0].is_archived());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn start_and_restart_refuse_archived_and_trashed_sessions() {
+        let shelves: [(fn(&mut Instance), &str); 2] = [
+            (Instance::archive, "session is archived; unarchive it first"),
+            (Instance::trash, "session is in trash; restore it first"),
+        ];
+        for (shelve, message) in shelves {
+            for restart in [false, true] {
+                let temp = tempfile::tempdir().unwrap();
+                let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+                let profile = "start-blocked";
+                let mut inst = Instance::new("shelved", "/tmp/x");
+                shelve(&mut inst);
+                let id = inst.id.clone();
+                Storage::new_unwatched(profile)
+                    .unwrap()
+                    .update(|rows, _| {
+                        *rows = vec![inst.clone()];
+                        Ok(())
+                    })
+                    .unwrap();
+
+                let args = SessionIdArgs {
+                    identifier: id.clone(),
+                };
+                let err = if restart {
+                    restart_session(profile, args).await
+                } else {
+                    start_session(profile, args).await
+                }
+                .unwrap_err();
+                assert_eq!(err.to_string(), message, "restart={restart}");
+                let tmux = crate::tmux::Session::new(&id, &inst.title).unwrap();
+                assert!(!tmux.exists());
+            }
+        }
     }
 }
 
@@ -3180,14 +3322,18 @@ mod import_tests {
 
     #[test]
     fn build_import_instance_pins_the_replay_target_for_each_view() {
+        let defaults = crate::session::config::SessionConfig::default();
         let terminal = build_import_instance(
             &summary("abc123-def456", "/home/me/proj", Some("Fix bug")),
             false,
             "",
+            &defaults,
         );
         assert_eq!(terminal.tool, "claude");
         assert_eq!(terminal.project_path, "/home/me/proj");
         assert_eq!(terminal.title, "Fix bug");
+        assert!(terminal.extra_args.is_empty() && terminal.command.is_empty());
+        assert!(!terminal.yolo_mode);
         assert_eq!(
             terminal.resume_intent,
             ResumeIntent::Use("abc123-def456".to_string())
@@ -3197,16 +3343,41 @@ mod import_tests {
             &summary("abcdef12-3456-7890", "/home/me/proj", None),
             false,
             "team/imports",
+            &defaults,
         );
         assert_eq!(untitled.title, "Claude import abcdef12");
         assert_eq!(untitled.group_path, "team/imports");
 
-        let structured =
-            build_import_instance(&summary("sid-1", "/home/me/proj", Some("x")), true, "");
+        let structured = build_import_instance(
+            &summary("sid-1", "/home/me/proj", Some("x")),
+            true,
+            "",
+            &defaults,
+        );
         assert!(structured.is_structured());
         assert_eq!(structured.acp_session_id.as_deref(), Some("sid-1"));
         assert_eq!(structured.import_pending, Some(true));
         assert_eq!(structured.resume_intent, ResumeIntent::Default);
+
+        let mut configured = crate::session::config::SessionConfig::default();
+        configured
+            .agent_extra_args
+            .insert("claude".into(), "--remote-control".into());
+        configured
+            .agent_command_override
+            .insert("claude".into(), "claude-wrapper".into());
+        configured.yolo_mode_default = true;
+        for view_structured in [false, true] {
+            let inst = build_import_instance(
+                &summary("sid-2", "/home/me/proj", None),
+                view_structured,
+                "",
+                &configured,
+            );
+            assert_eq!(inst.extra_args, "--remote-control", "{view_structured}");
+            assert_eq!(inst.command, "claude-wrapper", "{view_structured}");
+            assert!(inst.yolo_mode, "{view_structured}");
+        }
     }
 
     #[test]

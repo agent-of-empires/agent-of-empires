@@ -824,7 +824,16 @@ impl Instance {
             fallback_profile = self.effective_profile();
             &fallback_profile
         };
-        let mut env_prefix = status_hook_env_prefix(profile, &self.id, self.status_agent());
+        let program = parse_launch_command(self.get_tool_command()).and_then(|parsed| {
+            parsed.words.first().and_then(|word| {
+                Path::new(word)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .map(str::to_owned)
+            })
+        });
+        let mut env_prefix =
+            status_hook_env_prefix(profile, &self.id, self.status_agent(), program.as_deref());
         // The publisher is pane-scoped, including for safe Default wrappers.
         self.pi_extension_launched = false;
         if let Some((_, ref env)) = identity_extension {
@@ -927,17 +936,6 @@ mod tests {
         let agent = crate::agents::get_agent(&inst.tool);
         inst.build_host_command(agent, None).unwrap().0.unwrap()
     }
-    fn admit_fixture_content(inst: &Instance) {
-        let app = crate::session::get_app_dir().unwrap();
-        for root in crate::migrations::v033_isolate_sandbox_content::instance_roots(inst).unwrap() {
-            std::fs::create_dir_all(&root.path).unwrap();
-            let roles: Vec<&str> = root.roles.iter().map(String::as_str).collect();
-            crate::migrations::v033_isolate_sandbox_content::certify_test_content(
-                &app, &inst.id, &root.path, &roles,
-            )
-            .unwrap();
-        }
-    }
 
     // The sidecar env var has to survive into the docker argv; no CI container would catch it.
     #[test]
@@ -955,7 +953,7 @@ mod tests {
             "PI_CODING_AGENT_SESSION_DIR=/root/.pi/agent/sessions".to_string(),
         ]);
         inst.sandbox_info = Some(sandbox);
-        admit_fixture_content(&inst);
+        admit_sandbox_fixture(&inst);
         let config = inst.build_container_config().unwrap();
         let _transport =
             install_container_transport(temp_home.path(), "aoe-pi-argv", &config.volumes);

@@ -7,7 +7,7 @@ use std::collections::VecDeque;
 use ratatui::layout::Rect;
 use ratatui_textarea::TextArea;
 
-use super::input::Focus;
+use super::input::{Focus, Intent};
 use super::queue::QueueMirror;
 use super::reducer::AcpTranscript;
 use super::slash;
@@ -16,6 +16,7 @@ use crate::acp::session_paths::SessionPathRoots;
 use crate::acp::state::AvailableCommand;
 use crate::daemon::QueuedPromptEntry;
 use crate::plugin::ui_state::{Notification, UiSnapshot};
+use crate::tui::components::hover::HoverState;
 use crate::tui::plugin_ui;
 
 /// Most plugin notifications buffered awaiting a free toast slot. The daemon
@@ -91,6 +92,11 @@ pub struct StructuredViewState {
     /// Pane rectangles of the most recent draw, so mouse events hit-test against
     /// what is on screen. `None` until the first frame renders.
     pub layout: Option<ViewLayout>,
+    /// Clickable popup rows and buttons painted by the most recent draw.
+    /// Interior-mutable because the render borrows the state immutably.
+    pub mouse_targets: std::cell::RefCell<MouseTargets>,
+    /// The button under the pointer. Visual only; never moves keyboard focus.
+    pub hover: HoverState,
     /// Floating single-choice picker: the permission-mode picker (Shift+Tab), or
     /// the auto-opened answer menu for a pending single-select question. While
     /// open it owns Up/Down/Enter/Esc, whatever the focus.
@@ -162,6 +168,33 @@ pub struct ViewLayout {
     pub approval: Rect,
     pub queue: Rect,
     pub composer: Rect,
+}
+
+/// Which floating picker a [`PickerTarget`] belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PickerKind {
+    Choice,
+    Slash,
+    Mention,
+}
+
+/// A floating picker as last drawn: `area` is the whole popup (a click there
+/// never falls through to the pane under it) and `rows` covers the item rows,
+/// whose top row shows item `first`.
+#[derive(Debug, Clone, Copy)]
+pub struct PickerTarget {
+    pub kind: PickerKind,
+    pub area: Rect,
+    pub rows: Rect,
+    pub first: usize,
+}
+
+/// Mouse targets captured during render, topmost first: the floating picker,
+/// then buttons, each firing the intent of its keyboard equivalent.
+#[derive(Debug, Clone, Default)]
+pub struct MouseTargets {
+    pub picker: Option<PickerTarget>,
+    pub buttons: Vec<(Rect, Intent)>,
 }
 
 /// Tracks which plugin notifications have been shown and buffers any awaiting a
@@ -261,6 +294,8 @@ impl StructuredViewState {
             pane_scroll: 0,
             last_pane_scroll_max: std::cell::Cell::new(0),
             layout: None,
+            mouse_targets: Default::default(),
+            hover: HoverState::default(),
             choice: None,
             auto_presented_elicitation: None,
             last_scroll_max: std::cell::Cell::new(0),

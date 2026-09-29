@@ -98,16 +98,16 @@ import { IdleDecayWindowContext, parseIdleDecayWindowMs } from "./lib/idleDecay"
 import { parseUnreadIndicatorEnabled, UnreadIndicatorContext, useUnreadIndicatorEnabled } from "./lib/unreadIndicator";
 import { parseSessionRowTagMode, SessionRowTagContext, type SessionRowTagMode } from "./lib/sessionRowTag";
 import { parseSessionColorsEnabled, SessionColorsContext } from "./lib/sessionColors";
-import { fetchActiveProfileSettings } from "./lib/appSettings";
+import { onSettingsChanged } from "./lib/settingsEvents";
 import { parseSystemHealthEnabled, SystemHealthEnabledContext } from "./lib/systemHealth";
 import { toastBus, reportError } from "./lib/toastBus";
 import { isAbsolutePath, resolveToRepoRelative, type FileRef } from "./lib/fileRef";
 import { NAVIGATE_EVENT, OPEN_SESSION_EVENT } from "./lib/sessionRoute";
 import { dispatchFocusTerminal, requestSessionInputFocus, setPendingTerminalFocus } from "./lib/terminalFocus";
 import {
+  bindHiddenInput,
   clearMobileKeyboardProxyInput,
   deliverMobileKeyboardProxyInput,
-  forwardTerminalBeforeInput,
 } from "./lib/mobileKeyboardProxy";
 import { hydrateWebUiStateFromServer, initWebUiSync } from "./lib/webUiSync";
 import { WorkspaceSidebar } from "./components/WorkspaceSidebar";
@@ -169,6 +169,7 @@ import { DisconnectBanner } from "./components/DisconnectBanner";
 import { ElevationPrompt } from "./components/ElevationPrompt";
 import { UpdateBanner } from "./components/UpdateBanner";
 import { DashboardUpdateBanner } from "./components/DashboardUpdateBanner";
+import { PushHealthBanner } from "./components/PushHealthBanner";
 
 // Pre-#1832 per-browser tour-seen flag. Read once on load to migrate users who
 // already dismissed the tour to the backend; no longer written.
@@ -199,9 +200,15 @@ export default function App() {
     setSystemHealthEnabled(parseSystemHealthEnabled(settings));
   }, []);
 
+  // A save can land while an earlier read is in flight; only the latest applies.
+  const settingsReadSeq = useRef(0);
   const refreshAppSettings = useCallback(async () => {
-    applyAppSettings(await fetchActiveProfileSettings());
+    const seq = ++settingsReadSeq.current;
+    const settings = await fetchSettings();
+    if (seq === settingsReadSeq.current) applyAppSettings(settings);
   }, [applyAppSettings]);
+
+  useEffect(() => onSettingsChanged(() => void refreshAppSettings()), [refreshAppSettings]);
 
   useEffect(() => {
     const onTokenExpired = () => setTokenExpired(true);
@@ -287,12 +294,7 @@ export default function App() {
                 the plugin UI snapshot (usePluginPanes), so the provider can't live
                 inside its own return. */}
               <PluginUiProvider>
-                <AppContent
-                  loginRequired={loginRequired}
-                  onLogout={handleLogout}
-                  onSettingsRefresh={refreshAppSettings}
-                  resolvedTheme={resolvedTheme}
-                />
+                <AppContent loginRequired={loginRequired} onLogout={handleLogout} resolvedTheme={resolvedTheme} />
               </PluginUiProvider>
               <ElevationPrompt />
             </SystemHealthEnabledContext.Provider>
@@ -322,12 +324,10 @@ function isInsideEditable(target: EventTarget | null): boolean {
 function AppContent({
   loginRequired,
   onLogout,
-  onSettingsRefresh,
   resolvedTheme,
 }: {
   loginRequired: boolean;
   onLogout: () => void;
-  onSettingsRefresh: () => Promise<void> | void;
   resolvedTheme: ResolvedTheme | null;
 }) {
   useDashboardPresence();
@@ -808,17 +808,17 @@ function AppContent({
   const diffComments = useDiffComments(activeSessionId);
   const commentsEnabled = activeSession?.view === "structured";
   // Sending does not require a live worker: the diff-comments handler runs the
-  // same auto-wake as a plain composer prompt (touch_on_prompt_and_wake_if_sunk +
-  // trigger_resume_background, #1748), so an archived / snoozed / idle-dormant
-  // session respawns its worker on send instead of sinking the prompt. A
-  // trashed session is the one exception: the reconciler never resumes it, so
-  // there is nothing to drain into.
-  const commentSendEnabled = commentsEnabled && !activeSession?.trashed_at;
+  // same auto-wake as a plain composer prompt, so a snoozed or idle-dormant
+  // session respawns its worker on send. Archived and trashed sessions never
+  // start on a prompt (#4116); they must be unarchived or restored first.
+  const commentSendEnabled = commentsEnabled && !activeSession?.trashed_at && !activeSession?.archived_at;
   // Every disabled state names its cause and what the user can do about it: a
   // tooltip that only says "unavailable" leaves them staring at a dead button.
   const commentSendDisabledReason = !commentsEnabled
     ? "Diff comments can only be sent from the agent view. Switch this session to the agent view first."
-    : "This session is in the trash. Restore it to send comments to the agent.";
+    : activeSession?.trashed_at
+      ? "This session is in the trash. Restore it to send comments to the agent."
+      : "This session is archived. Unarchive it to send comments to the agent.";
   const commentsIsMultiRepo = (activeSession?.workspace_repos.length ?? 0) > 0;
   const [sendDialogOpen, setSendDialogOpen] = useState(false);
 
@@ -914,7 +914,6 @@ function AppContent({
     if (keyboardProxySessionIdRef.current === nextSessionId && keyboardProxyViewRef.current === nextView) return;
     keyboardProxySessionIdRef.current = nextSessionId;
     keyboardProxyViewRef.current = nextView;
-    if (keyboardProxyRef.current) keyboardProxyRef.current.value = "";
     clearMobileKeyboardProxyInput();
   }, []);
 
@@ -926,9 +925,7 @@ function AppContent({
   useEffect(() => {
     const proxy = keyboardProxy;
     if (!proxy) return;
-    const onBeforeInput = (e: InputEvent) => forwardTerminalBeforeInput(e, deliverMobileKeyboardProxyInput);
-    proxy.addEventListener("beforeinput", onBeforeInput);
-    return () => proxy.removeEventListener("beforeinput", onBeforeInput);
+    return bindHiddenInput(proxy, deliverMobileKeyboardProxyInput, "proxy");
   }, [keyboardProxy]);
 
   // Selecting a session in the sidebar should land focus on its canonical
@@ -1312,12 +1309,13 @@ function AppContent({
       // Optimistic Starting; the status poller reconciles to the real state.
       setSessionStatus(sessionId, "Starting");
       const result = await startSession(sessionId);
-      if (!result) {
-        setSessionStatus(sessionId, "Error");
-        toastBus.handler?.error("Failed to start session");
+      if (!result.ok) {
+        // A refused start (archived or trashed) left the session as it was.
+        setSessionStatus(sessionId, result.refused ? "Stopped" : "Error");
+        toastBus.handler?.error(result.message ?? "Failed to start session");
         return;
       }
-      toastBus.handler?.info(result.message ?? "Session started");
+      toastBus.handler?.info(result.session.message ?? "Session started");
     },
     [setSessionStatus],
   );
@@ -1838,7 +1836,6 @@ function AppContent({
             navigate(`/settings/${t}${p ? `?profile=${encodeURIComponent(p)}` : ""}`);
           }}
           onServerAboutRefresh={refreshServerAbout}
-          onSettingsRefresh={onSettingsRefresh}
           profile={searchParams.get("profile")}
           onSelectProfile={(p) => {
             const next = new URLSearchParams(searchParams);
@@ -2254,7 +2251,7 @@ function AppContent({
   // before caps.cityhall settles. Early return (matching the other loading
   // gates) rather than a wrapper so the shell markup stays unindented. See #7.
   if (!serverAboutLoaded) {
-    return <div className="h-dvh bg-surface-900 safe-area-inset" />;
+    return <div className="h-(--app-height) bg-surface-900 safe-area-inset" />;
   }
 
   // The header collapse is a phone affordance for the conversation view only:
@@ -2269,7 +2266,7 @@ function AppContent({
 
   return (
     <AcpPrefsProvider value={acpPrefs}>
-      <div className="h-dvh flex flex-col bg-surface-900 text-text-primary overflow-hidden safe-area-inset">
+      <div className="h-(--app-height) flex flex-col bg-surface-900 text-text-primary overflow-hidden safe-area-inset">
         {/* Wrapped unconditionally, not behind the `headerCollapsible`
             ternary: swapping the element type at this position would remount
             `TopBar` (and reset its overflow menu) every time the boundary
@@ -2307,6 +2304,7 @@ function AppContent({
         <DisconnectBanner />
         <UpdateBanner />
         <DashboardUpdateBanner />
+        <PushHealthBanner />
 
         {/* Below the banners, not directly under the bar: the handle is
             absolutely positioned at the top-right, and hanging it off the bar
@@ -2516,9 +2514,9 @@ function AppContent({
           // This matches the live terminal's hidden input geometry.
           className="fixed bottom-0 left-0 w-px h-px opacity-0 pointer-events-none"
           style={{ caretColor: "transparent", color: "transparent" }}
-          // Typed text now stays in this textarea as IME context (see
-          // forwardTerminalBeforeInput), so keep the OS from rewriting it
-          // the way the live terminal's own hidden input already does.
+          // Typed text stays in this textarea as IME context (see
+          // bindHiddenInput), so keep the OS from rewriting it the way the
+          // live terminal's own hidden input already does.
           autoCapitalize="off"
           autoCorrect="off"
           autoComplete="off"

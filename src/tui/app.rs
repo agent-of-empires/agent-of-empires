@@ -345,11 +345,8 @@ impl App {
         })
     }
 
-    /// Must run after any handler that may open or close a surface counted by
-    /// `HomeView::wants_text_selection`.
     fn sync_mouse_capture(&mut self, terminal: &mut Terminal<TuiBackend>) -> Result<()> {
-        let desired =
-            self.mouse_capture_allowed && !self.mosh_active && !self.home.wants_text_selection();
+        let desired = self.mouse_capture_allowed && !self.mosh_active;
         if desired == self.mouse_captured {
             return Ok(());
         }
@@ -530,8 +527,6 @@ impl App {
         crate::tmux::spawn_snapshot_poller();
 
         crate::tui::clear_terminal(terminal)?;
-        // Before the first paint, so onboarding surfaces get native selection on frame 1.
-        self.sync_mouse_capture(terminal)?;
         self.draw(terminal)?;
         #[cfg(feature = "e2e-tests")]
         e2e_render_ack(true)?;
@@ -729,7 +724,7 @@ impl App {
                                                 let hit_scroll_target = hit_diff
                                                     || hit_list
                                                     || hit_preview
-                                                    || self.home.is_settings_open();
+                                                    || self.home.owns_wheel();
                                                 match mouse.kind {
                                                     MouseEventKind::ScrollUp if hit_scroll_target => { self.home.handle_scroll_up(mouse.column, mouse.row); }
                                                     MouseEventKind::ScrollDown if hit_scroll_target => { self.home.handle_scroll_down(mouse.column, mouse.row); }
@@ -760,7 +755,6 @@ impl App {
                                         }
                                     }
                                 }
-                                self.sync_mouse_capture(terminal)?;
                                 if !self.needs_redraw {
                                     self.draw(terminal)?;
                                 }
@@ -771,7 +765,6 @@ impl App {
                             }
 
                             self.handle_key(key, terminal).await?;
-                            self.sync_mouse_capture(terminal)?;
 
                             let live_after = self.home.live_send.is_some();
                             if live_after {
@@ -858,7 +851,6 @@ impl App {
                                 {
                                     let _ = self.home.clear_preview_selection();
                                     self.handle_key(key, terminal).await?;
-                                    self.sync_mouse_capture(terminal)?;
                                     if !self.needs_redraw {
                                         self.draw(terminal)?;
                                     }
@@ -882,7 +874,6 @@ impl App {
                                 {
                                     self.open_structured_view(&session_id).await?;
                                 }
-                                self.sync_mouse_capture(terminal)?;
                                 if self.should_quit {
                                     break;
                                 }
@@ -899,16 +890,7 @@ impl App {
                                 if let Some(url) =
                                     self.home.preview_link_at(mouse.column, mouse.row)
                                 {
-                                    // Over SSH no visible browser opens; OSC 52
-                                    // still reaches the user's clipboard.
-                                    let status = match crate::tui::open_url::open_url(&url) {
-                                        Ok(()) => format!("opened {url}"),
-                                        Err(e) => {
-                                            crate::tui::clipboard::copy_to_clipboard(&url);
-                                            format!("{e}; copied {url}")
-                                        }
-                                    };
-                                    self.home.flash_status(status);
+                                    self.home.open_link(&url);
                                     let _ = self.home.clear_preview_selection();
                                     // Otherwise clicking the link again counts as a double-click.
                                     self.home.forget_preview_click();
@@ -933,14 +915,14 @@ impl App {
                             let hit_preview = self.home.hit_preview(mouse.column, mouse.row);
                             let hit_diff = self.home.is_diff_open()
                                 && self.home.hit_diff(mouse.column, mouse.row);
-                            // Settings covers the stale list/preview rects.
+                            // Full-screen overlays cover the stale list/preview rects.
                             let hit_scroll_target = hit_diff
                                 || hit_list
                                 || hit_preview
-                                || self.home.is_settings_open();
-                            // Left-click priority: context menu, dialog, sidebar
-                            // toggle, diagnostics, tips badge, drag start, list
-                            // row, diff file list.
+                                || self.home.owns_wheel();
+                            // Left-click priority: context menu, dialog (the diff
+                            // view included), sidebar toggle, diagnostics, tips
+                            // badge, drag start, list row.
                             let click_action = if matches!(
                                 mouse.kind,
                                 MouseEventKind::Down(MouseButton::Left)
@@ -958,7 +940,6 @@ impl App {
                                     if let Some(name) = self.home.take_pending_intro_theme() {
                                         self.set_theme(&name);
                                     }
-                                    self.sync_mouse_capture(terminal)?;
                                     self.draw(terminal)?;
                                     None
                                 } else if self
@@ -994,11 +975,6 @@ impl App {
                                     }
                                     self.draw(terminal)?;
                                     action
-                                } else if hit_diff {
-                                    let _ = self.home.clear_preview_selection();
-                                    self.home.handle_diff_click(mouse.column, mouse.row);
-                                    self.draw(terminal)?;
-                                    None
                                 } else if self.home.clear_preview_selection() {
                                     self.draw(terminal)?;
                                     None
@@ -1040,6 +1016,9 @@ impl App {
                                         changed |= self
                                             .home
                                             .handle_diff_hover(mouse.column, mouse.row);
+                                    }
+                                    if let Some(view) = self.home.structured_preview.as_mut() {
+                                        changed |= view.handle_hover(mouse.column, mouse.row);
                                     }
                                     changed
                                 }
@@ -2628,6 +2607,9 @@ impl App {
             needs_restart,
             "attach_session: restart decision"
         );
+        if needs_restart && self.home.refuse_start_if_shelved(session_id) {
+            return Ok(());
+        }
         if needs_restart {
             // Warn once when the agent can't take the sandbox's custom instruction.
             if instance.is_sandboxed() {

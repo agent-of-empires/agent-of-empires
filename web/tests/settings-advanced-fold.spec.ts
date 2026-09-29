@@ -111,10 +111,11 @@ async function installFoldMocks(page: Page): Promise<FoldMockHandle> {
   };
 
   await mockSettingsApis(page, { schema: SCHEMA, settings: () => handle.settings });
+  // The settings page saves through one call; the server picks the layer.
   await page.route(
-    (url) => /^\/api\/profiles\/[^/]+\/settings$/.test(url.pathname),
+    (url) => url.pathname === "/api/settings",
     (route) => {
-      if (route.request().method() !== "PATCH") return route.fulfill({ json: handle.settings });
+      if (route.request().method() !== "PATCH") return route.fallback();
       const body = route.request().postDataJSON() as Record<string, Record<string, unknown>>;
       handle.patches.push(body);
       for (const [section, fields] of Object.entries(body)) {

@@ -16,7 +16,9 @@ use std::io::Stdout;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use crossterm::event::{Event as CrosstermEvent, EventStream, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    Event as CrosstermEvent, EventStream, KeyEventKind, KeyModifiers, MouseEventKind,
+};
 use futures_util::StreamExt;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
@@ -24,8 +26,8 @@ use tokio::time::Instant;
 
 use self::input::{Focus, InputContext, Intent};
 use self::state::{
-    ChoicePicker, ChoicePurpose, FileIndex, MentionSession, StructuredViewState, ToastBanner,
-    ToastKind,
+    ChoicePicker, ChoicePurpose, FileIndex, MentionSession, PickerKind, StructuredViewState,
+    ToastBanner, ToastKind,
 };
 use crate::acp::client::{
     require_daemon, ws_connect_with, DaemonEndpoint, HttpClient, HttpError, ManagerError,
@@ -410,6 +412,14 @@ pub async fn run_for_endpoint(
                     crate::tui::app::e2e_render_ack(false)?;
                     continue;
                 }
+                if let CrosstermEvent::Mouse(m) = &evt {
+                    if m.kind == MouseEventKind::Moved {
+                        if handle_hover(&mut state, m.column, m.row) {
+                            redraw(terminal, theme, &mut state)?;
+                        }
+                        continue;
+                    }
+                }
                 let should_exit = handle_terminal_event(&mut state, evt, &mut toast_deadline).await?;
                 if should_exit {
                     return Ok(());
@@ -678,9 +688,12 @@ async fn handle_terminal_event(
             ensure_files_loaded(state, toast_deadline).await;
             return Ok(false);
         }
-        CrosstermEvent::Mouse(mouse) => {
-            input::dispatch_mouse(&mouse, state.focus, state.layout.as_ref())
-        }
+        CrosstermEvent::Mouse(mouse) => input::dispatch_mouse(
+            &mouse,
+            state.focus,
+            state.layout.as_ref(),
+            &state.mouse_targets.borrow(),
+        ),
         // Resize needs no bookkeeping: the next frame recomputes the layout.
         _ => return Ok(false),
     };
@@ -731,6 +744,11 @@ async fn handle_terminal_event(
             state.accept_selected_slash();
             Ok(false)
         }
+        Intent::SlashPick(idx) => {
+            state.slash_selected = idx;
+            state.accept_selected_slash();
+            Ok(false)
+        }
         Intent::SlashDismiss => {
             state.dismiss_slash();
             Ok(false)
@@ -740,6 +758,13 @@ async fn handle_terminal_event(
             Ok(false)
         }
         Intent::MentionAccept => {
+            accept_mention(state);
+            Ok(false)
+        }
+        Intent::MentionPick(idx) => {
+            if let Some(session) = state.mention.as_mut() {
+                session.selected = idx;
+            }
             accept_mention(state);
             Ok(false)
         }
@@ -984,6 +1009,39 @@ async fn handle_terminal_event(
             Ok(false)
         }
     }
+}
+
+/// Track the pointer over the last frame's mouse targets: a picker row takes
+/// the highlight, as the arrow keys would, while a button only gets painted.
+/// Returns whether anything visible changed, so callers redraw only then.
+pub(super) fn handle_hover(state: &mut StructuredViewState, col: u16, row: u16) -> bool {
+    let pos = ratatui::layout::Position::new(col, row);
+    let (picker_row, buttons) = {
+        let targets = state.mouse_targets.borrow();
+        // The picker covers any button drawn under it.
+        let buttons: Vec<_> = if input::over_picker(&targets, pos) {
+            Vec::new()
+        } else {
+            targets.buttons.iter().map(|(rect, _)| *rect).collect()
+        };
+        (input::picker_row_at(&targets, pos), buttons)
+    };
+    let mut changed = state.hover.update(col, row, &buttons);
+    let hovered = picker_row.map(|(_, idx)| idx);
+    changed |= match picker_row.map(|(kind, _)| kind) {
+        Some(PickerKind::Choice) => state
+            .choice
+            .as_mut()
+            .is_some_and(|picker| crate::tui::dialogs::hover_select(&mut picker.selected, hovered)),
+        Some(PickerKind::Slash) => {
+            crate::tui::dialogs::hover_select(&mut state.slash_selected, hovered)
+        }
+        Some(PickerKind::Mention) => state.mention.as_mut().is_some_and(|session| {
+            crate::tui::dialogs::hover_select(&mut session.selected, hovered)
+        }),
+        None => false,
+    };
+    changed
 }
 
 /// Async pull from the structured view WebSocket. `None` when no ws handle is
@@ -2172,5 +2230,142 @@ mod tests {
             "blank picker title: {:?}",
             picker.title
         );
+    }
+
+    fn draw(state: &mut StructuredViewState) {
+        let theme = Theme::default();
+        let backend = ratatui::backend::TestBackend::new(60, 20);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|f| {
+                state.layout = Some(render::compute_layout(f.area(), state));
+                render::render(f, f.area(), &theme, state, true);
+            })
+            .expect("draw");
+    }
+
+    fn left_click(column: u16, row: u16) -> CrosstermEvent {
+        CrosstermEvent::Mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        })
+    }
+
+    /// Each picker's rows, as drawn, take the highlight on hover (reporting a
+    /// change only when it moves) and accept on click the way Enter would.
+    /// The choice picker's click is `ChoicePick`, covered by the dispatcher.
+    #[tokio::test]
+    async fn picker_rows_follow_hover_and_accept_on_click() {
+        let slash = || {
+            let mut state = test_state();
+            state.transcript.available_commands = ["compact", "clear", "cost"]
+                .iter()
+                .map(|name| crate::acp::state::AvailableCommand {
+                    name: (*name).into(),
+                    description: String::new(),
+                    accepts_input: false,
+                })
+                .collect();
+            state.composer.insert_str("/c");
+            state
+        };
+        let mention = || {
+            let mut state = test_state();
+            state.file_index = FileIndex::Loaded {
+                files: vec!["a.rs".into(), "b.rs".into(), "c.rs".into()],
+                truncated: false,
+            };
+            state.composer.insert_str("@");
+            refresh_mention(&mut state);
+            state
+        };
+        let choice = || {
+            let mut state = test_state();
+            open_link_picker(
+                &mut state,
+                ["x", "y", "z"]
+                    .iter()
+                    .map(|l| (format!("https://{l}"), (*l).to_string()))
+                    .collect(),
+            );
+            state
+        };
+        let selected = |state: &StructuredViewState, kind| match kind {
+            PickerKind::Choice => state.choice.as_ref().map(|c| c.selected),
+            PickerKind::Slash => Some(state.slash_selected),
+            PickerKind::Mention => state.mention.as_ref().map(|m| m.selected),
+        };
+        let cases: [(PickerKind, &dyn Fn() -> StructuredViewState); 3] = [
+            (PickerKind::Slash, &slash),
+            (PickerKind::Mention, &mention),
+            (PickerKind::Choice, &choice),
+        ];
+        for (kind, setup) in cases {
+            let mut state = setup();
+            draw(&mut state);
+            let target = state.mouse_targets.borrow().picker.expect("picker drawn");
+            assert_eq!((target.kind, target.first), (kind, 0));
+            let (x, y) = (target.rows.x + 1, target.rows.y);
+            assert!(handle_hover(&mut state, x, y + 1), "{kind:?}");
+            assert_eq!(selected(&state, kind), Some(1), "{kind:?}");
+            assert!(!handle_hover(&mut state, x + 1, y + 1), "{kind:?} same row");
+            // The border row is not a row.
+            assert!(!handle_hover(&mut state, x, target.area.y), "{kind:?}");
+            assert_eq!(selected(&state, kind), Some(1), "{kind:?}");
+
+            // The third row, as ranked on screen.
+            let want = match kind {
+                PickerKind::Slash => format!("/{} ", state.slash_matches()[2].name),
+                PickerKind::Mention => format!(":file[{}] ", filtered_mention_files(&state)[2]),
+                PickerKind::Choice => continue,
+            };
+            let mut deadline = None;
+            handle_terminal_event(&mut state, left_click(x, y + 2), &mut deadline)
+                .await
+                .expect("click");
+            assert_eq!(composer_text(&state), want, "{kind:?}");
+            assert!(state.mention.is_none(), "{kind:?}");
+        }
+    }
+
+    /// Approval buttons paint under the pointer without moving focus or the
+    /// selection, and go inert while a choice picker owns the keyboard.
+    #[test]
+    fn approval_buttons_hover_is_visual_only() {
+        let mut state = test_state();
+        state
+            .transcript
+            .pending_approvals
+            .push(pending_approval(false, Vec::new()));
+        state.reconcile_selection();
+        state.focus = Focus::Composer;
+        draw(&mut state);
+        let buttons = state.mouse_targets.borrow().buttons.clone();
+        let intents: Vec<_> = buttons.iter().map(|(_, i)| i.clone()).collect();
+        assert_eq!(
+            intents,
+            vec![
+                Intent::ResolveApproval(ApprovalDecisionWire::Allow),
+                Intent::ResolveApproval(ApprovalDecisionWire::AllowAlways),
+                Intent::ResolveApproval(ApprovalDecisionWire::Deny),
+                Intent::CancelInFlight,
+            ]
+        );
+        let deny = buttons[2].0;
+        assert!(handle_hover(&mut state, deny.x, deny.y));
+        assert_eq!(state.hover.current(), Some(deny));
+        assert!(!handle_hover(&mut state, deny.right() - 1, deny.y));
+        assert_eq!(state.focus, Focus::Composer);
+        assert!(handle_hover(&mut state, 0, 0));
+        assert_eq!(state.hover.current(), None);
+
+        state.choice = Some(approval_option_picker(&pending_approval(
+            true,
+            answer_options(ApprovalOptionKind::AllowOnce),
+        )));
+        draw(&mut state);
+        assert!(state.mouse_targets.borrow().buttons.is_empty());
     }
 }

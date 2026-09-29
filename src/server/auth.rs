@@ -266,10 +266,8 @@ fn requires_elevation(method: &axum::http::Method, path: &str) -> bool {
         return false;
     }
 
-    // Settings + profile mutations.
-    if path == "/api/settings" && method == Method::PATCH {
-        return true;
-    }
+    // Settings + profile mutations. Settings saves gate in the handler, which
+    // elevates the machine-wide leaves and only the profile leaves that need it.
     if path == "/api/default-profile" && method == Method::PATCH {
         return true;
     }
@@ -1155,18 +1153,17 @@ mod tests {
         );
     }
 
-    /// The passphrase wall gates settings, profile management and device/login-session
-    /// management. `PATCH /api/profiles/{name}/settings` is body-gated inside
-    /// `update_profile_settings` instead, which re-issues the same 403 per leaf.
+    /// The passphrase wall gates profile management and device/login-session
+    /// management. Settings saves are body-gated in their handlers instead, which
+    /// re-issue the same 403 per leaf.
     #[test]
     fn requires_elevation_paths() {
         use axum::http::Method;
 
         let gated = [
-            (Method::PATCH, "/api/settings"),
-            // A trailing slash must not bypass the gate.
-            (Method::PATCH, "/api/settings/"),
             (Method::PATCH, "/api/default-profile"),
+            // A trailing slash must not bypass the gate.
+            (Method::PATCH, "/api/default-profile/"),
             (Method::POST, "/api/profiles"),
             (Method::PATCH, "/api/profiles/work/rename"),
             (Method::DELETE, "/api/profiles/work"),
@@ -1178,6 +1175,7 @@ mod tests {
         }
 
         let ungated = [
+            (Method::PATCH, "/api/settings"),
             (Method::PATCH, "/api/profiles/work/settings"),
             (Method::PATCH, "/api/profiles/work/settings/"),
             // Session traffic: attach, prompt, approve, spawn, delete.

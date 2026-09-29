@@ -3,23 +3,34 @@
 use super::*;
 use anyhow::bail;
 
+/// `program` is the basename of the executable the launch runs. A bare-token wrapper such as
+/// `company-codex` can be the agent itself under another name (a symlink or copy), so the identity
+/// hook's ancestor walk must count that name too: otherwise a nested `codex exec` is the only
+/// process named like the agent and passes as the pane's own.
 pub(super) fn status_hook_env_prefix(
     profile: &str,
     instance_id: &str,
     agent: Option<&crate::agents::AgentDef>,
+    program: Option<&str>,
 ) -> String {
     let has_hooks = agent.is_some_and(|a| a.hook_config.is_some() || a.sidecar_hooks.is_some());
 
     if has_hooks {
         let hook_bin = std::env::current_exe()
             .expect("current executable is required for host identity hooks");
+        let agent_bin = agent.map_or("", |agent| agent.binary);
+        let program = program
+            .filter(|name| !name.is_empty() && *name != agent_bin)
+            .map_or_else(String::new, |name| {
+                format!("AOE_AGENT_PROGRAM={} ", shell_escape(name))
+            });
         // `$$` is the launch shell, which `exec`s into the agent.
         format!(
-            "AOE_PROFILE={} AOE_INSTANCE_ID={} AOE_HOOK_BIN={} AOE_AGENT_PID=$$ AOE_AGENT_BIN={} ",
+            "AOE_PROFILE={} AOE_INSTANCE_ID={} AOE_HOOK_BIN={} AOE_AGENT_PID=$$ AOE_AGENT_BIN={} {program}",
             shell_escape(profile),
             shell_escape(instance_id),
             shell_escape(&hook_bin.to_string_lossy()),
-            shell_escape(agent.map_or("", |agent| agent.binary))
+            shell_escape(agent_bin)
         )
     } else {
         String::new()
@@ -361,7 +372,7 @@ impl Instance {
                     events,
                     crate::hooks::HookInstallTarget::Host,
                 ) {
-                    Ok(()) => true,
+                    Ok(installed) => installed,
                     Err(error) => {
                         tracing::warn!(target: "session.store", "Failed to install Codex hooks: {}", error);
                         false
@@ -934,8 +945,8 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn codex_hook_installer_follows_detect_as_and_profile_hook_setting() {
-        // (tool, profile config, global hooks off, expect hooks.json)
-        for (tool, profile, global_off, installed) in [
+        // (tool, profile config, global hooks off, expect status hooks)
+        for (tool, profile, global_off, status_hooks) in [
             ("my-codex-wrapper", None, false, true),
             (
                 "codex",
@@ -969,10 +980,29 @@ mod tests {
             inst.install_agent_status_hooks(crate::agents::get_agent(&inst.detect_as), None);
 
             let hooks = tmp.path().join(".codex").join("hooks.json");
-            if installed {
+            // The publisher names Codex, the pane's `AOE_AGENT_BIN`, even under a wrapper.
+            assert!(
+                std::fs::read_to_string(&hooks)
+                    .unwrap()
+                    .contains("__extract-session-id --field session-id --agent codex"),
+                "{tool} {profile:?}"
+            );
+            if status_hooks {
                 assert_aoe_codex_hooks(&hooks);
             } else {
-                assert!(!hooks.exists(), "{tool} {profile:?}");
+                // The `SessionStart` identity publisher is not optional; only it remains.
+                let parsed: serde_json::Value =
+                    serde_json::from_str(&std::fs::read_to_string(&hooks).unwrap()).unwrap();
+                assert!(
+                    parsed["hooks"]["PreToolUse"].is_null(),
+                    "{tool} {profile:?}"
+                );
+                assert!(
+                    parsed["hooks"]["SessionStart"]
+                        .to_string()
+                        .contains("__extract-session-id"),
+                    "{tool} {profile:?}"
+                );
             }
             assert!(!tmp.path().join(".codex").join("config.toml").exists());
         }
@@ -1292,18 +1322,141 @@ mod tests {
         }
     }
 
+    /// #4116: a peer that archives or trashes the row while a pre-launch hook runs
+    /// (the hook runs without the lifecycle flock) still stops both launch funnels.
+    #[test]
+    #[serial_test::serial]
+    fn launch_refuses_a_row_shelved_while_hooks_run() {
+        use crate::session::{StartBlocked, Status};
+        if !crate::tmux::tmux_command()
+            .arg("-V")
+            .output()
+            .is_ok_and(|output| output.status.success())
+        {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+        acknowledge_hooks();
+
+        let shelves: [(fn(&mut Instance), StartBlocked); 2] = [
+            (Instance::archive, StartBlocked::Archived),
+            (Instance::trash, StartBlocked::Trashed),
+        ];
+        for (shelve, want) in shelves {
+            for restart in [false, true] {
+                let label = format!("{want:?}-{}", if restart { "restart" } else { "start" });
+                let profile = format!("shelved-hook-{label}");
+                let ready = temp.path().join(format!("{label}-ready"));
+                let release = temp.path().join(format!("{label}-release"));
+                let hook = format!(
+                    ": > {}; while [ ! -e {} ]; do sleep 0.01; done",
+                    super::shell_escape(&ready.to_string_lossy()),
+                    super::shell_escape(&release.to_string_lossy()),
+                );
+                crate::session::config::update_config(|global| {
+                    global.hooks.on_launch = vec![hook];
+                })
+                .unwrap();
+
+                let storage = crate::session::storage::Storage::new_unwatched(&profile).unwrap();
+                let mut instance = Instance::new(&label, temp.path().to_str().unwrap());
+                instance.source_profile = profile.clone();
+                instance.command = "sleep 30".to_string();
+                storage
+                    .update(|instances, _groups| {
+                        instances.push(instance.clone());
+                        Ok(())
+                    })
+                    .unwrap();
+                let session = instance.tmux_session().unwrap();
+                if restart {
+                    session
+                        .create(temp.path().to_str().unwrap(), Some("sleep 30"), &profile)
+                        .unwrap();
+                }
+
+                let launch = std::thread::spawn(move || {
+                    if restart {
+                        instance.restart_with_size_opts(None, false).map(|_| ())
+                    } else {
+                        instance.start_with_size_opts(None, false).map(|_| ())
+                    }
+                });
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+                while !ready.exists() && std::time::Instant::now() < deadline {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                let hook_started = ready.exists();
+                if hook_started {
+                    storage
+                        .update(|instances, _groups| {
+                            shelve(&mut instances[0]);
+                            Ok(())
+                        })
+                        .unwrap();
+                }
+                std::fs::write(&release, b"release").unwrap();
+                let result = launch.join().unwrap();
+                let spawned = !restart && session.exists();
+                let _ = session.kill();
+
+                assert!(hook_started, "{label}: hook did not start");
+                let err = result.expect_err(&label);
+                assert_eq!(err.downcast_ref::<StartBlocked>(), Some(&want), "{label}");
+                assert!(!spawned, "{label}: launched a shelved session");
+                let stored = storage.load().unwrap().remove(0);
+                assert!(stored.ensure_startable() == Err(want), "{label}");
+                assert_eq!(stored.lifecycle_reservation, None, "{label}");
+                assert_eq!(stored.last_error, None, "{label}");
+                let parked = if restart {
+                    Status::Idle
+                } else {
+                    Status::Stopped
+                };
+                assert_eq!(stored.status, parked, "{label}");
+            }
+        }
+    }
+
     #[test]
     fn status_hook_env_prefix_is_set_for_hook_agents_only() {
         for agent in ["codex", "hermes", "settl", "claude", "kiro", "kimi"] {
-            assert_eq!(
-                status_hook_env_prefix("work", "abc123", crate::agents::get_agent(agent)),
-                expected_status_prefix("work", "abc123", agent)
-            );
+            let binary = crate::agents::get_agent(agent).unwrap().binary;
+            for program in [None, Some(binary)] {
+                assert_eq!(
+                    status_hook_env_prefix(
+                        "work",
+                        "abc123",
+                        crate::agents::get_agent(agent),
+                        program
+                    ),
+                    expected_status_prefix("work", "abc123", agent)
+                );
+            }
         }
         assert_eq!(
-            status_hook_env_prefix("work", "abc123", crate::agents::get_agent("opencode")),
+            status_hook_env_prefix("work", "abc123", crate::agents::get_agent("opencode"), None),
             ""
         );
+    }
+
+    /// A renamed launch (`company-codex` running Codex) tells the identity hook its name, so the
+    /// hook's ancestor walk counts the outer agent and refuses a nested `codex exec`.
+    #[test]
+    fn status_hook_env_prefix_names_a_renamed_launched_program() {
+        let prefix = status_hook_env_prefix(
+            "work",
+            "abc123",
+            crate::agents::get_agent("codex"),
+            Some("company-codex"),
+        );
+        let expected = format!(
+            "AOE_AGENT_BIN={} AOE_AGENT_PROGRAM={} ",
+            shell_escape("codex"),
+            shell_escape("company-codex")
+        );
+        assert!(prefix.ends_with(&expected), "{prefix}");
     }
 
     #[test]

@@ -1,4 +1,5 @@
 import type { AgentLifecycleInfo } from "./agentProfiles";
+import { notifySettingsChanged } from "./settingsEvents";
 import { clientFormFactor } from "./formFactor";
 import type {
   SessionResponse,
@@ -176,9 +177,19 @@ export async function ensureSession(id: string, signal?: AbortSignal): Promise<E
   }
 }
 
-export function ensureTerminal(id: string, index = 0, container = false): Promise<boolean> {
+export async function ensureTerminal(id: string, index = 0, container = false): Promise<EnsureSessionResult> {
   const path = container ? "container-terminal" : "terminal";
-  return fetchOk(`/api/sessions/${id}/${path}?index=${index}`, { method: "POST" });
+  try {
+    const { ok, status, payload } = await send(`/api/sessions/${id}/${path}?index=${index}`, { method: "POST" });
+    if (ok) return { ok: true };
+    return {
+      ok: false,
+      error: stringField(payload, "error"),
+      message: stringField(payload, "message") ?? `Server error (${status})`,
+    };
+  } catch (e) {
+    return { ok: false, message: e instanceof Error ? e.message : "Network error" };
+  }
 }
 
 function fileToBase64(file: File): Promise<string> {
@@ -247,6 +258,12 @@ export function getSessionFile(id: string, filePath: string): Promise<SessionFil
   return fetchJson<SessionFileResponse>(`/api/sessions/${id}/file?${params.toString()}`);
 }
 
+/** URL of a session file's raw bytes, confined like {@link getSessionFile}, for opening in a new tab. */
+export function sessionRawFileUrl(id: string, filePath: string): string {
+  const params = new URLSearchParams({ path: filePath });
+  return `/api/sessions/${id}/file/raw?${params.toString()}`;
+}
+
 // --- Settings ---
 
 export interface SettingsResponse {
@@ -285,9 +302,23 @@ export function fetchSystemHealth(): Promise<SystemHealth | null> {
   return fetchJson<SystemHealth>("/api/system/health");
 }
 
+/** Settings as they apply: the served profile's overrides over the
+ *  machine-wide values, or `profile`'s when named. */
 export function fetchSettings(profile?: string): Promise<SettingsResponse | null> {
   const params = profile ? `?profile=${encodeURIComponent(profile)}` : "";
   return fetchJson<SettingsResponse>(`/api/settings${params}`);
+}
+
+/** The machine-wide layer alone, for editors that show or set the value a
+ *  profile inherits. Anything honoring a setting reads `fetchSettings`. */
+export function fetchMachineSettings(): Promise<SettingsResponse | null> {
+  return fetchJson<SettingsResponse>("/api/settings?layer=machine");
+}
+
+async function announceSave(save: Promise<boolean>): Promise<boolean> {
+  const ok = await save;
+  if (ok) notifySettingsChanged();
+  return ok;
 }
 
 /** This install's CityHall config bundle as TOML; throws with the server's message. */
@@ -707,8 +738,18 @@ export function invokePluginCommand(fqid: string, sessionId: string): Promise<bo
   );
 }
 
-export function updateSettings(updates: Record<string, unknown>): Promise<boolean> {
-  return fetchOk("/api/settings", jsonInit("PATCH", updates));
+/** Save settings; the server puts each field in the layer `fetchSettings`
+ *  reads it from: `profile` (default: the served one) where it may override,
+ *  machine-wide otherwise. */
+export function updateSettings(updates: Record<string, unknown>, profile?: string): Promise<boolean> {
+  const params = profile ? `?profile=${encodeURIComponent(profile)}` : "";
+  return announceSave(fetchOk(`/api/settings${params}`, jsonInit("PATCH", updates)));
+}
+
+/** Set the machine-wide value of every field in `updates`, for editors that
+ *  set the value a profile inherits. */
+export function updateMachineSettings(updates: Record<string, unknown>): Promise<boolean> {
+  return announceSave(fetchOk("/api/settings?layer=machine", jsonInit("PATCH", updates)));
 }
 
 // Theme, tour, tips and acknowledgement flags use dedicated endpoints so these
@@ -803,7 +844,8 @@ export function renameProfile(name: string, newName: string): Promise<boolean> {
 }
 
 export function setDefaultProfile(name: string): Promise<boolean> {
-  return fetchOk("/api/default-profile", jsonInit("PATCH", { name }));
+  // Without `--profile` the server serves the default, so its settings change too.
+  return announceSave(fetchOk("/api/default-profile", jsonInit("PATCH", { name })));
 }
 
 export function getProfileSettings(name: string): Promise<ProfileSettingsResponse | null> {
@@ -829,7 +871,7 @@ export async function updateProfileSettings(name: string, updates: Record<string
       return false;
     }
   }
-  return fetchOk(`/api/profiles/${encodeURIComponent(name)}/settings`, jsonInit("PATCH", updates));
+  return announceSave(fetchOk(`/api/profiles/${encodeURIComponent(name)}/settings`, jsonInit("PATCH", updates)));
 }
 
 // --- Themes & Sounds ---
@@ -1599,8 +1641,22 @@ export function stopSession(id: string): Promise<SessionResponse | null> {
   return sessionUpdate(id, "stop", jsonInit("POST"));
 }
 
-export function startSession(id: string): Promise<SessionResponse | null> {
-  return sessionUpdate(id, "start", jsonInit("POST"));
+/** A 409 code for a start refused because the session is archived or trashed. */
+export const isStartRefusal = (code: string | undefined) => code === "session_archived" || code === "session_trashed";
+
+export type StartSessionResult =
+  | { ok: true; session: SessionResponse }
+  | { ok: false; refused: boolean; message?: string };
+
+/** `refused` marks a 409 for an archived or trashed session, which the server left untouched. */
+export async function startSession(id: string): Promise<StartSessionResult> {
+  const reply = await send(`/api/sessions/${id}/start`, jsonInit("POST")).catch(() => null);
+  if (reply?.ok && reply.payload) return { ok: true, session: reply.payload as unknown as SessionResponse };
+  return {
+    ok: false,
+    refused: isStartRefusal(stringField(reply?.payload, "error")),
+    message: stringField(reply?.payload, "message"),
+  };
 }
 
 /** `null` unsnoozes; otherwise 1..=43200 minutes, validated server-side. */

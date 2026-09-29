@@ -215,7 +215,7 @@ With `api_version >= 9` a worker can discover ACP capabilities and create host-o
 
 **Ownership.** `sessions.turn.send` reaches only a session the calling plugin created.
 
-**Busy sessions.** A turn aimed at an agent already running a non-steerable turn (or cancelling, or compacting) is refused with a retryable `agent_busy` rather than dropped. A stopped or dormant session is not busy: the host wakes it the way a user prompt does, closes any turn the previous worker left open, resumes the worker, and waits.
+**Busy sessions.** A turn aimed at an agent already running a non-steerable turn (or cancelling, or compacting) is refused with a retryable `agent_busy` rather than dropped. A stopped or dormant session is not busy: the host wakes it the way a user prompt does, closes any turn the previous worker left open, resumes the worker, and waits. An archived or trashed session is never woken; the turn fails with `session_archived` or `session_trashed`.
 
 **Idempotency.** `sessions.create` takes a plugin-scoped `idempotency_key`: retrying with the same key and payload returns the existing session (`created: false`), while a different payload under that key is a conflict.
 
@@ -307,6 +307,8 @@ The payload is capped at 64 KiB. Everything but `blocks` is validated strictly; 
 | `comment` | one of `author` / `body` | `path`, `line`, `resolved`, `href` |
 
 `tone` is one of `neutral` / `info` / `success` / `warn` / `danger`. `color` is a validated `#rgb` / `#rrggbb` literal for a hue no tone names (a merged PR's purple); anything else is ignored.
+
+An `href` renders as a link only when it is an `http(s)` URL or a path starting with a single `/` and containing no backslash, tab or line break. A link to a dashboard route navigates in place; any other link opens in a new tab, including a path that normalizes to `//host` such as `/..//evil.com`, which opens on the dashboard's own origin.
 
 **`row`** lays out at most two lines: `prefix` (mono, tone-tinted) and `label` lead the first with `value` pinned right; `sublabel` leads the second with `badges` (`{ text?, icon?, tone?, tooltip? }`) pinned right. `value_tone` colors the trailing token independently of the row, and `mono` monospaces the row's text. A `method` makes the row body a button firing that worker method, and an `href` alongside it becomes a separate trailing link-out; with `href` alone the whole row is the link. `selected` marks the row as the pane's current subject.
 

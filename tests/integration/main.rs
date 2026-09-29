@@ -31,6 +31,7 @@ mod status_detection;
 mod storage_concurrency;
 mod terminal_smart_rename;
 mod tmux_reachability;
+mod tmux_send_keys;
 mod tui_attach_detach;
 mod update_command;
 mod worktree_integration;
@@ -74,6 +75,8 @@ mod serve_disk_reload_helper_equivalence;
 mod serve_dynamic_profile_rewire;
 #[cfg(debug_assertions)]
 mod serve_filewatch_propagation;
+#[cfg(debug_assertions)]
+mod serve_settings_layers;
 #[cfg(debug_assertions)]
 mod serve_settings_logging;
 mod telemetry;

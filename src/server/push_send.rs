@@ -22,10 +22,49 @@ pub const VAPID_EXP_SECS: u64 = 60 * 60 * 12;
 pub enum SendOutcome {
     /// 2xx from the push endpoint.
     Delivered,
-    /// 410 Gone or 404 Not Found.
+    /// 404 or 410: the subscription no longer exists.
     Gone,
-    /// Any other failure: timeout, connection error, 5xx, 429, etc.
+    /// The subscription is bound to a different VAPID key, so no send with ours can succeed.
+    KeyMismatch,
+    /// Any other 4xx except 429: the push service refused this request.
+    Rejected,
+    /// Timeout, connection error, 429 or 5xx; may succeed later.
     Failed,
+}
+
+impl SendOutcome {
+    /// Whether the subscription can never be delivered again and should be dropped.
+    pub fn is_dead(self) -> bool {
+        matches!(self, Self::Gone | Self::KeyMismatch)
+    }
+
+    /// Stable name reported to the client by `/api/push/status`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Delivered => "delivered",
+            Self::Gone => "gone",
+            Self::KeyMismatch => "key-mismatch",
+            Self::Rejected => "rejected",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// Classify a push service response. Apple reports the failure `reason` in a JSON body
+/// (VapidPkHashMismatch is a 403); FCM reports a key mismatch as a 403 with prose.
+pub fn classify_response(status: u16, body: &str) -> SendOutcome {
+    match status {
+        200..=299 => SendOutcome::Delivered,
+        404 | 410 => SendOutcome::Gone,
+        403 if body.contains("VapidPkHashMismatch")
+            || body.contains("does not correspond to the sender") =>
+        {
+            SendOutcome::KeyMismatch
+        }
+        429 => SendOutcome::Failed,
+        400..=499 => SendOutcome::Rejected,
+        _ => SendOutcome::Failed,
+    }
 }
 
 #[derive(Serialize)]
@@ -35,7 +74,7 @@ struct VapidClaims {
     sub: String,
 }
 
-/// The body shape the service worker expects from `event.data.json()`.
+/// Payload for status-driven pushes; the service worker reads it via `event.data.json()`.
 #[derive(Serialize)]
 pub struct PushPayload {
     pub title: String,
@@ -172,13 +211,14 @@ pub fn encrypt_aes128gcm(subscription: &Subscription, plaintext: &[u8]) -> Resul
 }
 
 /// Send a single push notification.
-pub async fn send_one(
+pub async fn send_one<T: Serialize>(
     client: &reqwest::Client,
     state: &PushState,
     subscription: &Subscription,
-    payload: &PushPayload,
+    payload: &T,
+    ttl_secs: u32,
 ) -> SendOutcome {
-    match send_one_inner(client, state, subscription, payload).await {
+    match send_one_inner(client, state, subscription, payload, ttl_secs).await {
         Ok(outcome) => outcome,
         Err(e) => {
             tracing::warn!(target: "http.middleware",
@@ -191,11 +231,12 @@ pub async fn send_one(
     }
 }
 
-async fn send_one_inner(
+async fn send_one_inner<T: Serialize>(
     client: &reqwest::Client,
     state: &PushState,
     subscription: &Subscription,
-    payload: &PushPayload,
+    payload: &T,
+    ttl_secs: u32,
 ) -> Result<SendOutcome> {
     let plaintext = serde_json::to_vec(payload).context("serialize push payload")?;
     let encrypted = encrypt_aes128gcm(subscription, &plaintext)?;
@@ -206,7 +247,7 @@ async fn send_one_inner(
         .header("Authorization", authorization)
         .header("Content-Type", "application/octet-stream")
         .header("Content-Encoding", "aes128gcm")
-        .header("TTL", PUSH_TTL_SECS.to_string())
+        .header("TTL", ttl_secs.to_string())
         .body(encrypted)
         .send()
         .await
@@ -214,22 +255,21 @@ async fn send_one_inner(
 
     let status = resp.status();
     if status.is_success() {
-        Ok(SendOutcome::Delivered)
-    } else if status == reqwest::StatusCode::GONE || status == reqwest::StatusCode::NOT_FOUND {
-        Ok(SendOutcome::Gone)
-    } else {
-        let text = resp
-            .text()
-            .await
-            .unwrap_or_else(|_| String::from("(body unreadable)"));
-        tracing::warn!(target: "http.middleware",
-            endpoint = %subscription.endpoint,
-            status = %status,
-            body = %text,
-            "push: non-success response"
-        );
-        Ok(SendOutcome::Failed)
+        return Ok(SendOutcome::Delivered);
     }
+    let text = resp
+        .text()
+        .await
+        .unwrap_or_else(|_| String::from("(body unreadable)"));
+    let outcome = classify_response(status.as_u16(), &text);
+    tracing::warn!(target: "http.middleware",
+        endpoint = %subscription.endpoint,
+        status = %status,
+        body = %text,
+        outcome = outcome.as_str(),
+        "push: non-success response"
+    );
+    Ok(outcome)
 }
 
 /// URL-safe base64 without padding, for things that aren't subscription keys.
@@ -258,6 +298,33 @@ mod tests {
         );
         assert!(endpoint_origin("not-a-url").is_err());
         assert!(endpoint_origin("data:text/plain,hi").is_err());
+    }
+
+    #[test]
+    fn classify_response_separates_dead_rejected_and_transient() {
+        use SendOutcome::*;
+        let cases: &[(u16, &str, SendOutcome)] = &[
+            (201, "", Delivered),
+            (410, r#"{"reason":"Unregistered"}"#, Gone),
+            (404, "", Gone),
+            (403, r#"{"reason":"VapidPkHashMismatch"}"#, KeyMismatch),
+            (
+                403,
+                "the key in the authorization header does not correspond to the sender ID used to subscribe this user",
+                KeyMismatch,
+            ),
+            (403, r#"{"reason":"BadJwtToken"}"#, Rejected),
+            (400, r#"{"reason":"BadWebPushRequest"}"#, Rejected),
+            (413, r#"{"reason":"PayloadTooLarge"}"#, Rejected),
+            (429, r#"{"reason":"TooManyRequests"}"#, Failed),
+            (500, "", Failed),
+            (503, r#"{"reason":"ServiceUnavailable"}"#, Failed),
+        ];
+        for (status, body, want) in cases {
+            assert_eq!(classify_response(*status, body), *want, "{status} {body}");
+        }
+        assert!(Gone.is_dead() && KeyMismatch.is_dead());
+        assert!(!Rejected.is_dead() && !Failed.is_dead() && !Delivered.is_dead());
     }
 
     #[test]

@@ -236,6 +236,9 @@ pub struct HomeView {
     pub(in crate::tui) structured_preview:
         Option<crate::tui::structured_view::embedded::EmbeddedView>,
     pub(in crate::tui) structured_preview_pending: bool,
+    /// The last frame painted the mounted structured transcript into the preview, so
+    /// `preview_text_view` maps transcript rows rather than the tmux capture.
+    pub(super) structured_transcript_painted: bool,
     pub(super) pending_force_remove_session: Option<String>,
     pub(super) pending_trash_session: Option<String>,
     pub(super) pending_dialog_click_action: Option<crate::tui::app::Action>,
@@ -291,7 +294,8 @@ pub struct HomeView {
     pub(super) attach_project_in_flight: std::collections::HashSet<String>,
 
     pub(super) creation_poller: CreationPoller,
-    pub(super) creation_cancelled: bool,
+    /// Cancels the request behind `creating_stub_id`.
+    pub(super) creation_cancel: Option<tokio_util::sync::CancellationToken>,
     pub(super) on_launch_hooks_ran: HashSet<String>,
 
     pub(super) creating_hook_progress: HashMap<String, CreatingHookProgress>,
@@ -317,7 +321,7 @@ pub struct HomeView {
     pub(super) shelf_inner_area: Rect,
     pub(super) collapse_button_area: Rect,
     pub(super) expand_strip_area: Rect,
-    pub(super) footer_buttons: Vec<(Rect, crossterm::event::KeyEvent)>,
+    pub(super) footer_buttons: Vec<(crossterm::event::KeyEvent, Rect)>,
     pub(super) footer_hover: Option<crossterm::event::KeyEvent>,
     pub(super) mouse_pos: Option<(u16, u16)>,
     pub(super) last_click: Option<(std::time::Instant, u16, u16)>,

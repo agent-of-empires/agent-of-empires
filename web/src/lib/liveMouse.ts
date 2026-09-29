@@ -78,3 +78,27 @@ export function pointerPaneCell(
     row: Math.min(rows, Math.max(1, compositeRow - top + 1)),
   };
 }
+
+/**
+ * Map a rendered row (0-based, may be a wrap continuation) and 1-based column back to the unwrapped grid:
+ * a 0-based row relative to the screen's first line and a 1-based column. `rowWidth` is a rendered row's
+ * cell width; rows outside `source` extrapolate one line per row.
+ */
+export function unwrapPointer(
+  visualRow: number,
+  visualCol: number,
+  source: ReadonlyArray<{ line: number; wrap: number }>,
+  rowWidth: (visualRow: number) => number,
+  screenTopLine: number,
+): { compositeRow: number; compositeCol: number } {
+  const last = source.length - 1;
+  if (last < 0 || visualRow < 0) return { compositeRow: visualRow - screenTopLine, compositeCol: visualCol };
+  if (visualRow > last) {
+    return { compositeRow: source[last]!.line + visualRow - last - screenTopLine, compositeCol: visualCol };
+  }
+  const { line, wrap } = source[visualRow]!;
+  // Earlier wraps may end short of the render width when a wide glyph moved down, so sum their real widths.
+  let offset = 0;
+  for (let k = 1; k <= wrap; k++) offset += rowWidth(visualRow - k);
+  return { compositeRow: line - screenTopLine, compositeCol: visualCol + offset };
+}

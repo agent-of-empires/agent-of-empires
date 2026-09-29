@@ -29,14 +29,11 @@ self.addEventListener("activate", (e) => {
 // renotify:true on showNotification is required for iOS to re-buzz the
 // lock screen when a notification with a matching tag is already present.
 //
-// Focused-client suppression: if any PWA window is currently visible
-// and focused when the push arrives, we skip the OS notification and
-// postMessage the payload to the client so it can show an in-app toast
-// instead. userVisibleOnly demands SOMETHING user-visible per push;
-// iOS may warn if it stays silent indefinitely, but in practice a
-// focused tab is rare enough for pushes that revocation hasn't been
-// an issue. If it becomes one, fall back to showing the notification
-// anyway and let the client suppress its own toast.
+// Focused-client suppression: when a PWA window is visible and focused, the
+// payload goes to it as an in-app toast instead of an OS notification. Not on
+// Apple's push service: WebKit revokes the subscription after a few pushes that
+// show no notification, so those always show one. The server likewise never
+// sends silent "clear" pushes to Apple endpoints.
 // Per-tag high-water mark of the latest seq we've shown or cleared. Lets an
 // out-of-order older notify (delivered AFTER a newer clear) be dropped instead
 // of resurrecting a handled request's notification: getNotifications only sees
@@ -55,6 +52,18 @@ function recordSeq(tag, seq) {
   if (seq == null || !tag) return;
   const hw = seqHighWater.get(tag);
   if (hw == null || seq > hw) seqHighWater.set(tag, seq);
+}
+
+// Unknown counts as Apple: a needless OS notification beats a revoked subscription.
+async function mustShowNotification() {
+  try {
+    const sub = await self.registration.pushManager.getSubscription();
+    if (!sub) return true;
+    const host = new URL(sub.endpoint).hostname;
+    return host === "push.apple.com" || host.endsWith(".push.apple.com");
+  } catch {
+    return true;
+  }
 }
 
 self.addEventListener("push", (event) => {
@@ -99,7 +108,23 @@ self.addEventListener("push", (event) => {
   // Drop an out-of-order notify that is older than a clear (or newer notify)
   // already seen for this tag: the request it announces was already handled.
   const tag = payload.tag || "aoe";
-  if (isStaleSeq(tag, payload.seq)) return;
+  if (isStaleSeq(tag, payload.seq)) {
+    // Apple revokes after silent pushes, so there the stale notice is shown under its own tag, keeping the newer
+    // one, and closed at once.
+    event.waitUntil(
+      (async () => {
+        if (!(await mustShowNotification())) return;
+        const staleTag = `${tag}:stale`;
+        await self.registration.showNotification(payload.title || "Agent of Empires", { tag: staleTag, silent: true });
+        try {
+          for (const n of await self.registration.getNotifications({ tag: staleTag })) n.close();
+        } catch {
+          /* getNotifications may be unsupported; the notice then stays until dismissed */
+        }
+      })(),
+    );
+    return;
+  }
   recordSeq(tag, payload.seq);
 
   const title = payload.title || "Agent of Empires";
@@ -121,10 +146,7 @@ self.addEventListener("push", (event) => {
         includeUncontrolled: true,
       });
       const focused = clientList.find((c) => c.visibilityState === "visible" && c.focused);
-      if (focused) {
-        // User is already in the app, forward the payload for an in-app
-        // toast, skip the OS notification. If the client has no handler,
-        // the message is silently dropped which is fine.
+      if (focused && !(await mustShowNotification())) {
         try {
           focused.postMessage({ type: "aoe-push", payload });
         } catch {

@@ -20,11 +20,13 @@ export function isAllowedHref(href: unknown): href is string {
 }
 
 /** Whether `href` resolves to aoe's own origin, so it should be a client-side
- *  navigation instead of a new browser tab. Assumes `isAllowedHref(href)`. */
+ *  navigation instead of a new browser tab. Assumes `isAllowedHref(href)`.
+ *  Rejects a path that normalizes to `//host` (e.g. `/..//evil.com`), since the
+ *  router would read that as a protocol-relative URL. */
 export function isInternalHref(href: string): boolean {
-  if (isRelativePath(href)) return true;
   try {
-    return new URL(href, window.location.origin).origin === window.location.origin;
+    const url = new URL(href, window.location.origin);
+    return url.origin === window.location.origin && !url.pathname.startsWith("//");
   } catch {
     return false;
   }

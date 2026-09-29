@@ -167,7 +167,8 @@ impl HomeView {
         // Close the dialog
         self.new_dialog = None;
 
-        self.creation_cancelled = false;
+        let cancel = tokio_util::sync::CancellationToken::new();
+        self.creation_cancel = Some(cancel.clone());
         // Filter out the stub from existing instances so the builder doesn't
         // treat its placeholder title as a duplicate to auto-increment.
         let existing_instances: Vec<Instance> = self
@@ -180,14 +181,15 @@ impl HomeView {
             data,
             existing_instances,
             hooks,
+            cancel,
         };
         self.creation_poller.request_creation(request);
     }
 
-    /// Mark the current creation operation as cancelled
+    /// Cancel the current creation; the worker stops at its next step and rolls back.
     pub fn cancel_creation(&mut self) {
-        if self.creation_poller.is_pending() {
-            self.creation_cancelled = true;
+        if let Some(cancel) = self.creation_cancel.take() {
+            cancel.cancel();
         }
         // Remove the stub instance
         if let Some(stub_id) = self.creating_stub_id.take() {
@@ -206,24 +208,12 @@ impl HomeView {
     pub fn apply_creation_results(&mut self) -> Option<String> {
         use crate::tui::creation_poller::CreationResult;
 
-        let result = self.creation_poller.try_recv_result()?;
+        let outcome = self.creation_poller.try_recv_result()?;
+        let result = outcome.result;
 
-        // Clean up the stub and progress tracking
-        let stub_id = self.creating_stub_id.take();
-        // Taken, not borrowed, so every early return leaves the field empty: the
-        // provisional group paths belong to this stub alone and must not carry into the
-        // next creation.
-        let provisional_group_paths = std::mem::take(&mut self.creating_provisional_group_paths);
-        if let Some(ref id) = stub_id {
-            self.creating_hook_progress.remove(id);
-        }
-
-        // Check if the user cancelled while waiting
-        if self.creation_cancelled {
-            self.creation_cancelled = false;
-            if let Some(id) = &stub_id {
-                self.remove_instance(id);
-            }
+        // A cancelled request's stub is already gone; the fields below may belong to a
+        // newer request, so leave them alone.
+        if outcome.cancelled || matches!(result, CreationResult::Cancelled) {
             if let CreationResult::Success {
                 ref instance,
                 ref created_worktree,
@@ -238,10 +228,17 @@ impl HomeView {
                     None,
                 );
             }
-            self.rebuild_group_trees();
-            self.rebuild_flat_items();
-            self.update_selected();
             return None;
+        }
+
+        self.creation_cancel = None;
+        let stub_id = self.creating_stub_id.take();
+        // Taken, not borrowed, so every early return leaves the field empty: the
+        // provisional group paths belong to this stub alone and must not carry into the
+        // next creation.
+        let provisional_group_paths = std::mem::take(&mut self.creating_provisional_group_paths);
+        if let Some(ref id) = stub_id {
+            self.creating_hook_progress.remove(id);
         }
 
         match result {
@@ -464,6 +461,8 @@ impl HomeView {
                 }
                 None
             }
+            // Returned early above.
+            CreationResult::Cancelled => None,
         }
     }
 
@@ -552,31 +551,38 @@ impl HomeView {
         if !self.creation_poller.is_pending() {
             return;
         }
-        self.creation_cancelled = true;
+        if let Some(cancel) = self.creation_cancel.take() {
+            cancel.cancel();
+        }
         if let Some(stub_id) = self.creating_stub_id.take() {
             self.remove_instance(&stub_id);
             self.creating_hook_progress.remove(&stub_id);
         }
 
-        // Wait briefly for the background thread to finish
-        let result = self
-            .creation_poller
-            .recv_result_timeout(std::time::Duration::from_secs(2));
-
-        if let Some(crate::tui::creation_poller::CreationResult::Success {
-            ref instance,
-            ref created_worktree,
-            ref created_workspace_worktrees,
-            ..
-        }) = result
-        {
-            cleanup_creation_resources(
-                instance,
-                created_worktree.as_ref(),
-                created_workspace_worktrees,
-                None,
-            );
-            tracing::info!(target: "tui.home", "Cleaned up cancelled session on exit");
+        // Every request is cancelled now, so each one rolls back unless it finished first.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while self.creation_poller.is_pending() {
+            let Some(outcome) = self
+                .creation_poller
+                .recv_result_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+            else {
+                break;
+            };
+            if let crate::tui::creation_poller::CreationResult::Success {
+                ref instance,
+                ref created_worktree,
+                ref created_workspace_worktrees,
+                ..
+            } = outcome.result
+            {
+                cleanup_creation_resources(
+                    instance,
+                    created_worktree.as_ref(),
+                    created_workspace_worktrees,
+                    None,
+                );
+                tracing::info!(target: "tui.home", "Cleaned up cancelled session on exit");
+            }
         }
     }
 }

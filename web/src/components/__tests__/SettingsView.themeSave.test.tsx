@@ -52,7 +52,7 @@ const THEME_SCHEMA = [
 ];
 
 const updateTheme = vi.fn(() => Promise.resolve(true));
-const updateProfileSettings = vi.fn(() => Promise.resolve(true));
+const updateSettings = vi.fn(() => Promise.resolve(true));
 
 vi.mock("../../lib/api", () => ({
   fetchProfiles: vi.fn(() => Promise.resolve(PROFILES)),
@@ -63,7 +63,7 @@ vi.mock("../../lib/api", () => ({
   createProfile: vi.fn(() => Promise.resolve(true)),
   renameProfile: vi.fn(() => Promise.resolve(true)),
   deleteProfile: vi.fn(() => Promise.resolve(true)),
-  updateProfileSettings: (name: string, updates: Record<string, unknown>) => updateProfileSettings(name, updates),
+  updateSettings: (updates: Record<string, unknown>, profile?: string) => updateSettings(updates, profile),
   updateTheme: (patch: Record<string, unknown>) => updateTheme(patch),
   fetchThemes: vi.fn(() => Promise.resolve(["empire", "dracula"])),
 }));
@@ -76,7 +76,7 @@ vi.mock("../../hooks/useResolvedTheme", () => ({
 afterEach(() => {
   cleanup();
   updateTheme.mockClear();
-  updateProfileSettings.mockClear();
+  updateSettings.mockClear();
   dispatchThemePickerChanged.mockClear();
 });
 
@@ -109,7 +109,7 @@ describe("SettingsView theme tab save routing", () => {
       target: { value: "dracula" },
     });
     await waitFor(() => expect(updateTheme).toHaveBeenCalledWith({ name: "dracula" }));
-    expect(updateProfileSettings).not.toHaveBeenCalled();
+    expect(updateSettings).not.toHaveBeenCalled();
   });
 
   // Ported from live settings-theme-color-mode.spec.ts.
@@ -121,7 +121,7 @@ describe("SettingsView theme tab save routing", () => {
     });
     await waitFor(() => expect(updateTheme).toHaveBeenCalledWith({ color_mode: "palette" }));
     expect(dispatchThemePickerChanged).not.toHaveBeenCalled();
-    expect(updateProfileSettings).not.toHaveBeenCalled();
+    expect(updateSettings).not.toHaveBeenCalled();
 
     // Positive control: a theme-name pick through the same tab does dispatch,
     // proving the spy is wired and the gating is per-field, not global.
@@ -133,7 +133,7 @@ describe("SettingsView theme tab save routing", () => {
     expect(dispatchThemePickerChanged).toHaveBeenCalledTimes(1);
   });
 
-  it("routes a profile-overridable row (idle decay) to the profile, not /api/theme", async () => {
+  it("routes a profile-overridable row (idle decay) through the settings save, not /api/theme", async () => {
     renderThemeTab();
     await screen.findByText("Idle Decay (minutes)");
     const idle = inputByLabel("Idle Decay (minutes)");
@@ -141,11 +141,7 @@ describe("SettingsView theme tab save routing", () => {
     fireEvent.focus(idle);
     fireEvent.change(idle, { target: { value: "5" } });
     fireEvent.blur(idle);
-    await waitFor(() =>
-      expect(updateProfileSettings).toHaveBeenCalledWith("main", {
-        theme: { idle_decay_minutes: 5 },
-      }),
-    );
+    await waitFor(() => expect(updateSettings).toHaveBeenCalledWith({ theme: { idle_decay_minutes: 5 } }, "main"));
     expect(updateTheme).not.toHaveBeenCalled();
   });
 });

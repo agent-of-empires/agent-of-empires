@@ -3,6 +3,7 @@ use super::error::{sanitize_stderr, DockerError, Result};
 use std::collections::HashSet;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
+use tokio_util::sync::CancellationToken;
 
 /// `docker pull` has no timeout of its own; this only fires on a wedged pull.
 const PULL_TIMEOUT: Duration = Duration::from_secs(600);
@@ -184,14 +185,22 @@ impl RuntimeBase {
     }
 
     pub fn pull_image(&self, image: &str) -> Result<()> {
+        self.pull_until_cancelled(image, &CancellationToken::new())
+    }
+
+    fn pull_until_cancelled(&self, image: &str, cancel: &CancellationToken) -> Result<()> {
         let mut cmd = self.command();
         cmd.args(self.pull_prefix);
         cmd.arg(image);
         cmd.stdin(Stdio::null());
         let start = Instant::now();
         tracing::info!(target: "containers.image", runtime = %self.name, %image, "pulling image");
-        let output = match crate::process::run_with_timeout(&mut cmd, PULL_TIMEOUT)? {
+        let output = match crate::process::run_until_cancelled(&mut cmd, PULL_TIMEOUT, cancel)? {
             Some(output) => output,
+            None if cancel.is_cancelled() => {
+                tracing::info!(target: "containers.image", runtime = %self.name, %image, "image pull cancelled");
+                return Err(DockerError::Cancelled(format!("pull of {image}")));
+            }
             None => {
                 let dur_ms = start.elapsed().as_millis() as u64;
                 tracing::warn!(
@@ -238,14 +247,14 @@ impl RuntimeBase {
         Ok(())
     }
 
-    pub fn ensure_image(&self, image: &str) -> Result<()> {
+    pub fn ensure_image(&self, image: &str, cancel: &CancellationToken) -> Result<()> {
         if self.image_exists_locally(image) {
             tracing::info!(target: "containers.runtime", "Using local {} image '{}'", self.name, image);
             return Ok(());
         }
 
         tracing::info!(target: "containers.runtime", "Pulling {} image '{}'", self.name, image);
-        self.pull_image(image)
+        self.pull_until_cancelled(image, cancel)
     }
 
     pub fn default_sandbox_image(&self) -> &'static str {

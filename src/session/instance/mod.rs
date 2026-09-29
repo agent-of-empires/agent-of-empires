@@ -66,14 +66,14 @@ pub(crate) const SESSION_IDENTITY_EXTENSION: &str =
     include_str!("../../../assets/session/aoe-session-id.js");
 
 pub(crate) use accessors::resolved_agent_for;
-pub use flags::{is_valid_session_color, SessionBucket, SESSION_COLORS};
+pub use flags::{is_valid_session_color, SessionBucket, StartBlocked, SESSION_COLORS};
 #[cfg(test)]
 pub(crate) use identity_sidecar::FAIL_PI_PATH_WRITES;
 pub(crate) use lifecycle::NEWER_GENERATION_BUSY_REASON;
 pub use lifecycle::{LifecycleOperation, LifecycleReservation, LifecycleReservationError};
 
 pub use polling::PollerStart;
-pub use ready::{EnsureReadyError, EnsureReadyOutcome};
+pub use ready::{EnsureReadyError, EnsureReadyOutcome, SessionGone};
 pub(crate) use resume::ResumeAttemptPolicy;
 pub(crate) use sid_persist::{persist_session_to_storage, SidPersistOutcome, SidWrite};
 pub use start::{LaunchSidOutcome, StartOutcome};

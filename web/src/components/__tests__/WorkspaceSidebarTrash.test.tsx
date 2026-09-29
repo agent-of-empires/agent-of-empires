@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 
 import { WorkspaceSidebar } from "../WorkspaceSidebar";
 import { buildSessionGroups } from "../../lib/sidebarGroups";
@@ -92,6 +92,58 @@ describe("WorkspaceSidebar Trash control", () => {
     expect(props.onRestoreSession).toHaveBeenCalledWith(["s1"]);
     click("sidebar-trash-purge");
     expect(props.onDeleteSession).toHaveBeenCalledWith(["s1"]);
+  });
+
+  // #4116: right-clicking a trashed row offers the same actions as its buttons.
+  it("right-click on a trashed row opens a menu with Open, Restore, and Delete permanently", () => {
+    const props = withTrash();
+    const openMenu = () => {
+      click("sidebar-trash-toggle");
+      fireEvent.contextMenu(screen.getByTestId("sidebar-trash-row"));
+    };
+
+    openMenu();
+    expect(
+      Array.from(screen.getByTestId("sidebar-trash-context-menu").querySelectorAll("button")).map((b) => b.textContent),
+    ).toEqual(["Open", "Restore", "Delete permanently"]);
+    // A press inside the portaled menu must not dismiss the panel first.
+    fireEvent.mouseDown(screen.getByTestId("sidebar-trash-context-menu-restore"));
+    click("sidebar-trash-context-menu-restore");
+    expect(props.onRestoreSession).toHaveBeenCalledWith(["s1"]);
+    expect(query("sidebar-trash-context-menu")).toBeNull();
+    expect(query("sidebar-trash-menu")).not.toBeNull();
+
+    fireEvent.contextMenu(screen.getByTestId("sidebar-trash-row"));
+    click("sidebar-trash-context-menu-delete");
+    expect(props.onDeleteSession).toHaveBeenCalledWith(["s1"]);
+    expect(query("sidebar-trash-menu")).toBeNull();
+
+    openMenu();
+    click("sidebar-trash-context-menu-open");
+    expect(props.onSelect).toHaveBeenCalledWith("trashed-ws", "s1");
+    expect(query("sidebar-trash-menu")).toBeNull();
+  });
+
+  it("a second right-click moves the menu to the other row", async () => {
+    const a = trashed("a-ws", "a1");
+    const b = trashed("b-ws", "b1");
+    const props = renderSidebar([a, b], { trashedWorkspaces: [a, b] });
+    click("sidebar-trash-toggle");
+    const [first, second] = screen.getAllByTestId("sidebar-trash-row");
+    fireEvent.contextMenu(first!);
+    // The menu arms its document listeners on the next frame.
+    await act(() => new Promise((resolve) => requestAnimationFrame(resolve)));
+    fireEvent.contextMenu(second!);
+    click("sidebar-trash-context-menu-restore");
+    expect(props.onRestoreSession).toHaveBeenCalledTimes(1);
+    expect(props.onRestoreSession).toHaveBeenCalledWith([second!.textContent?.startsWith("a-ws") ? "a1" : "b1"]);
+  });
+
+  it("offers only Open in the trashed-row menu when read-only", () => {
+    withTrash({ readOnly: true });
+    click("sidebar-trash-toggle");
+    fireEvent.contextMenu(screen.getByTestId("sidebar-trash-row"));
+    expect(screen.getByTestId("sidebar-trash-context-menu").textContent).toBe("Open");
   });
 
   it("orders rows newest-trashed first", () => {
@@ -200,5 +252,14 @@ describe("WorkspaceSidebar row actions on a group slice (#4019)", () => {
     expect(onStartSession).toHaveBeenCalledWith("a1");
     act("beta", "delete");
     expect(props.onDeleteSession).toHaveBeenCalledWith(["b1", "b2"]);
+  });
+
+  // #4116: an archived session must be unarchived before it can start.
+  it("offers Unarchive but not Start on a stopped archived row", () => {
+    renderSidebar([workspace("archived-ws", [{ id: "a1", archived_at: TRASHED }])], { onStartSession: vi.fn() });
+    fireEvent.click(screen.getByTestId("sidebar-sunk-toggle"));
+    fireEvent.contextMenu(screen.getByTestId("sidebar-session-row"));
+    expect(query("sidebar-context-menu-start")).toBeNull();
+    expect(screen.getByTestId("sidebar-context-menu-archive").textContent).toBe("Unarchive");
   });
 });

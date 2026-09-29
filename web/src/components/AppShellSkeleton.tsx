@@ -40,7 +40,7 @@ export function MainPaneSkeleton() {
 /** Full-frame skeleton: TopBar strip + sidebar (md+) + main-pane placeholder. */
 export function AppShellSkeleton() {
   return (
-    <div className="h-dvh flex flex-col bg-surface-900 text-text-primary overflow-hidden safe-area-inset">
+    <div className="h-(--app-height) flex flex-col bg-surface-900 text-text-primary overflow-hidden safe-area-inset">
       <div className="h-12 shrink-0 flex items-center gap-2 bg-surface-850 px-3">
         <div className={`${BLOCK} h-6 w-6`} />
         <div className={`${BLOCK} h-4 w-32`} />

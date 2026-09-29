@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, RefObject } from "react";
 import type { AnsiSegment } from "../lib/ansi";
-import { LineParseCache, wrapLine } from "../lib/liveTermLines";
-import { cursorLineIndex, pointerPaneCell } from "../lib/liveMouse";
+import { LineParseCache, textWidth, wrapLine } from "../lib/liveTermLines";
+import { cursorLineIndex, pointerPaneCell, unwrapPointer } from "../lib/liveMouse";
 import type { LiveFrame, LiveStats } from "../hooks/useLiveTerminal";
 import { useWebSettings } from "../hooks/useWebSettings";
 import { useIsCoarsePointer } from "../hooks/useIsCoarsePointer";
@@ -13,6 +13,7 @@ import { FORWARD_TOUCH_GAIN, useForwardInput } from "./live-terminal/useForwardI
 import { Row } from "./live-terminal/TermRow";
 import { LIVE_WINDOW_SCREENS, useLiveEdgeScroll } from "./live-terminal/useLiveEdgeScroll";
 import { useTerminalInput } from "./live-terminal/useTerminalInput";
+import { InputTraceOverlay } from "./live-terminal/InputTraceOverlay";
 import { StrokeIcon } from "./icons";
 
 // Renders a tmux pane from streamed `capture-pane` frames (src/server/live_ws.rs) as DOM text in a natively
@@ -30,6 +31,9 @@ const FLICK_MAX_VELOCITY = 1.5;
 /** A lift this long (ms) after the last move does not coast. */
 const FLICK_MAX_PAUSE_MS = 80;
 const FLICK_VELOCITY_WINDOW_MS = 100;
+/** A forward-mode touch that stays within this travel (px) and time (ms) is a click, not a swipe. */
+const TAP_SLOP_PX = 8;
+const TAP_MAX_MS = 350;
 
 // `?livedebug=1` shows the geometry and wire stats the view is working from.
 const LIVE_DEBUG = typeof location !== "undefined" && new URLSearchParams(location.search).has("livedebug");
@@ -52,8 +56,7 @@ export interface MobileLiveTerminalProps {
   returnToLive: (rows: number) => void;
   /** Returns whether the pane will receive the data. */
   sendData: (data: string) => boolean;
-  /** Shared IME word run; `sendData` clears it. */
-  typedWordRef: React.RefObject<string>;
+  sendPaste: (text: string, submit: boolean) => boolean;
   /** Uploads a pasted image and resolves to a path the pane can read, or null. */
   uploadPastedImage: (file: File) => Promise<string | null>;
   forwardWheel: (up: boolean, sgr: boolean, col: number, row: number) => void;
@@ -75,6 +78,15 @@ export interface MobileLiveTerminalProps {
   bottomAlign: boolean;
   /** The soft keyboard occludes the viewport; defers the row latch so keyboard-shrunk rows never reach tmux. */
   keyboardOpen: boolean;
+}
+
+/** Heights behind the iOS standalone bottom band: the app root should reach `screen` in portrait. */
+function viewportDebugLine(): string {
+  const html = document.documentElement;
+  const root = document.getElementById("root")?.getBoundingClientRect().bottom ?? 0;
+  const inset = getComputedStyle(html).getPropertyValue("--safe-area-bottom").trim();
+  const flags = ["data-ios-standalone", "data-editing"].filter((a) => html.hasAttribute(a)).join(",");
+  return `vp inner=${innerHeight} vv=${Math.round(visualViewport?.height ?? 0)} root=${Math.round(root)} screen=${screen.height} sab=${inset} ${flags}`;
 }
 
 /** A frame's rows; `lines` is authoritative when present, and `content` ends with a newline that is not a row. */
@@ -105,7 +117,7 @@ export function MobileLiveTerminal({
   enterReading,
   returnToLive,
   sendData: sendDataRaw,
-  typedWordRef,
+  sendPaste,
   uploadPastedImage,
   forwardWheel,
   forwardButton,
@@ -117,7 +129,8 @@ export function MobileLiveTerminal({
   keyboardOpen,
 }: MobileLiveTerminalProps) {
   const { settings, update } = useWebSettings();
-  const fontKey = useIsCoarsePointer() ? "mobileFontSize" : "desktopFontSize";
+  const coarse = useIsCoarsePointer();
+  const fontKey = coarse ? "mobileFontSize" : "desktopFontSize";
   const configuredFontSize = settings[fontKey];
   // Quotes are stripped so a stray `"` cannot produce an ignored font-family.
   const termFontFamily = (settings.terminalFontFamily ?? "").trim().replace(/"/g, "");
@@ -210,7 +223,7 @@ export function MobileLiveTerminal({
   const forwardGestures = forwardMode && !selectionHeld;
   const touchForwardYRef = useRef<number | null>(null);
   // WebKit may synthesize a click after a custom forward-mode drag; a moved touch must not raise the keyboard.
-  const touchStartRef = useRef<{ x: number; y: number } | null>(null);
+  const touchStartRef = useRef<{ x: number; y: number; t: number } | null>(null);
   const suppressTouchClickRef = useRef(false);
   useEffect(() => {
     rowsRef.current = screenRows || rowsRef.current;
@@ -330,16 +343,25 @@ export function MobileLiveTerminal({
       if (!el || charW <= 0 || lineH <= 0) return { col: 1, row: 1 };
       const r = el.getBoundingClientRect();
       const gridTop = el.querySelector<HTMLElement>("[data-live-content]")?.getBoundingClientRect().top ?? r.top;
+      // An unsplit frame sends no width, and the pane may be wider than the wrapped render, so columns go unclamped.
       const pane0 = frame?.pane0 ?? {
-        cols: renderCols > 0 ? renderCols : 1,
+        cols: Number.POSITIVE_INFINITY,
         rows: Math.max(1, screenRows || rowsRef.current),
       };
-      const compositeCol = Math.floor((clientX - r.left) / charW) + 1;
+      const visualCol = Math.floor((clientX - r.left) / charW) + 1;
       const visualRow = Math.floor((clientY - gridTop) / lineH) - effectiveSpacerLines;
-      const screenTopVisual = visual.lineStartRow[Math.max(0, lines.length - screenRows)] ?? 0;
-      return pointerPaneCell(compositeCol, visualRow - screenTopVisual, pane0);
+      const rowWidth = (i: number) => visual.rows[i]!.reduce((n, s) => n + textWidth(s.text), 0);
+      const screenTopLine = Math.max(0, lines.length - screenRows);
+      const { compositeRow, compositeCol } = unwrapPointer(
+        visualRow,
+        visualCol,
+        visual.source,
+        rowWidth,
+        screenTopLine,
+      );
+      return pointerPaneCell(compositeCol, compositeRow, pane0);
     },
-    [charW, lineH, renderCols, screenRows, effectiveSpacerLines, lines.length, visual, frame?.pane0],
+    [charW, lineH, screenRows, effectiveSpacerLines, lines.length, visual, frame?.pane0],
   );
   // Touch wheels report at pane 0's middle row: position-aware apps ignore wheels over their input box.
   const inputPaneMiddleRow = useCallback(
@@ -395,7 +417,9 @@ export function MobileLiveTerminal({
   const trackForwardDrag = (touch: { clientX: number; clientY: number }) => {
     const dy = touch.clientY - touchForwardYRef.current!;
     const start = touchStartRef.current;
-    if (start && Math.hypot(touch.clientX - start.x, touch.clientY - start.y) > 8) suppressTouchClickRef.current = true;
+    if (start && Math.hypot(touch.clientX - start.x, touch.clientY - start.y) > TAP_SLOP_PX) {
+      suppressTouchClickRef.current = true;
+    }
     touchForwardYRef.current = touch.clientY;
     pushFlickSample(flickSamplesRef.current, { x: touch.clientX, y: touch.clientY, t: performance.now() });
     // Finger down reveals older content, a wheel up, hence the negation.
@@ -418,7 +442,7 @@ export function MobileLiveTerminal({
       return;
     }
     if (e.touches.length !== 1) return;
-    touchStartRef.current = { x: a.clientX, y: a.clientY };
+    touchStartRef.current = { x: a.clientX, y: a.clientY, t: performance.now() };
     suppressTouchClickRef.current = false;
     if (forwardModeRef.current) {
       touchForwardYRef.current = a.clientY;
@@ -454,9 +478,27 @@ export function MobileLiveTerminal({
   };
   const onTouchEnd = (e: React.TouchEvent) => {
     if (e.touches.length === 0) {
-      if (forwardModeRef.current && touchForwardYRef.current != null) {
+      const finalTouch = e.changedTouches[0];
+      const start = touchStartRef.current;
+      // A link keeps its native tap.
+      const tap =
+        finalTouch &&
+        start &&
+        forwardModeRef.current &&
+        touchForwardYRef.current != null &&
+        !suppressTouchClickRef.current &&
+        Math.hypot(finalTouch.clientX - start.x, finalTouch.clientY - start.y) <= TAP_SLOP_PX &&
+        performance.now() - start.t < TAP_MAX_MS &&
+        !(e.target as Element | null)?.closest?.("a[href]")
+          ? finalTouch
+          : null;
+      if (tap) {
+        // Cancelling touchend stops the compatibility mouse events and click that would raise the keyboard.
+        e.preventDefault();
+        suppressTouchClickRef.current = true;
+        forward.forwardTap(tap.clientX, tap.clientY);
+      } else if (forwardModeRef.current && touchForwardYRef.current != null) {
         // A quick iOS swipe can coalesce every move into touchend.
-        const finalTouch = e.changedTouches[0];
         if (finalTouch && finalTouch.clientY !== touchForwardYRef.current) trackForwardDrag(finalTouch);
         const samples = flickSamplesRef.current;
         const first = samples[0];
@@ -574,10 +616,10 @@ export function MobileLiveTerminal({
   const input = useTerminalInput({
     active,
     inputRef,
-    typedWordRef,
     ctrlActiveRef,
     clearCtrl,
     sendData,
+    sendPaste,
     uploadPastedImage,
   });
 
@@ -682,16 +724,19 @@ export function MobileLiveTerminal({
             } resyncs=${liveStats?.resyncs ?? "-"} wire=${
               liveStats ? `${(liveStats.wireBytes / 1024).toFixed(1)}k` : "-"
             }`,
+            viewportDebugLine(),
           ].join("\n")}
         </div>
       )}
+      {LIVE_DEBUG && <InputTraceOverlay inputRef={inputRef} active={active} />}
 
       {(reading || selectionHeld) && (
+        // On touch the joystick stacks above the keyboard button, so this sits left of the keyboard button.
         <button
           type="button"
           onClick={jumpToLatest}
           aria-label="Back to live"
-          className="absolute right-3 bottom-16 z-10 w-10 h-10 rounded-full bg-surface-800/90 border border-surface-700/30 text-text-secondary flex items-center justify-center shadow-lg backdrop-blur-sm active:scale-95 motion-safe:animate-[fadeIn_200ms_ease-out]"
+          className={`absolute ${coarse ? "right-[60px] bottom-3" : "right-3 bottom-16"} z-10 w-10 h-10 rounded-full bg-surface-800/90 border border-surface-700/30 text-text-secondary flex items-center justify-center shadow-lg backdrop-blur-sm active:scale-95 motion-safe:animate-[fadeIn_200ms_ease-out]`}
         >
           <StrokeIcon size={16} strokeWidth="2" hidden>
             <polyline points="6 9 12 15 18 9" />
@@ -721,8 +766,7 @@ export function MobileLiveTerminal({
         onKeyDown={(e) => input.onKeyDown(e.nativeEvent)}
         onPaste={(e) => input.onPaste(e.nativeEvent)}
         onCompositionStart={() => input.onCompositionStart()}
-        onCompositionUpdate={(e) => input.onCompositionUpdate(e.nativeEvent)}
-        onCompositionEnd={(e) => input.onCompositionEnd(e.nativeEvent)}
+        onCompositionEnd={() => input.onCompositionEnd()}
       />
     </div>
   );

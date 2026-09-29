@@ -7,9 +7,14 @@ import { usePushSubscription, type PushState } from "./usePushSubscription";
 
 type Hook = ReturnType<typeof usePushSubscription>;
 
-function makeSubscription(endpoint = "https://push.example/abc") {
+// SERVER_KEY is base64url for the bytes of "ABC".
+const SERVER_KEY = "QUJD";
+const keyBytes = (s: string) => new TextEncoder().encode(s).buffer;
+
+function makeSubscription(endpoint = "https://push.example/abc", key: ArrayBuffer | null = null) {
   return {
     endpoint,
+    options: { applicationServerKey: key },
     toJSON: () => ({ endpoint, keys: { p256dh: "key", auth: "auth" } }),
     unsubscribe: vi.fn(async () => true),
   };
@@ -38,6 +43,7 @@ interface FetchOverrides {
   vapid?: number;
   subscribe?: number;
   test?: number;
+  testBody?: unknown;
 }
 
 function installFetch(overrides: FetchOverrides = {}) {
@@ -52,9 +58,12 @@ function installFetch(overrides: FetchOverrides = {}) {
         return new Response(JSON.stringify(o.body), { status: o.ok ? 200 : 500 });
       }
       if (url.includes("/vapid-public-key")) {
-        return new Response(JSON.stringify({ public_key: "QUJD" }), { status: overrides.vapid ?? 200 });
+        return new Response(JSON.stringify({ public_key: SERVER_KEY }), { status: overrides.vapid ?? 200 });
       }
-      const status = url.includes("/subscribe") ? overrides.subscribe : url.includes("/test") ? overrides.test : 200;
+      if (url.includes("/test")) {
+        return new Response(JSON.stringify(overrides.testBody ?? {}), { status: overrides.test ?? 200 });
+      }
+      const status = url.includes("/subscribe") ? overrides.subscribe : 200;
       return new Response("{}", { status: status ?? 200 });
     }),
   );
@@ -88,6 +97,7 @@ const originalDescriptors = {
 };
 
 beforeEach(() => {
+  localStorage.clear();
   currentSub = makeSubscription();
   subscribeImpl = async () => (currentSub = makeSubscription());
   const pushManager = { getSubscription: vi.fn(async () => currentSub), subscribe: vi.fn(() => subscribeImpl()) };
@@ -236,11 +246,116 @@ describe("usePushSubscription disable() and sendTest()", () => {
   });
 });
 
-describe("usePushSubscription resubscribe()", () => {
-  it("resubscribe disables then enables", async () => {
+describe("usePushSubscription enable() with an existing subscription", () => {
+  it.each<[string, ArrayBuffer | null, boolean]>([
+    ["keeps one bound to the server key", keyBytes("ABC"), false],
+    ["replaces one bound to another key", keyBytes("XYZ"), true],
+    ["replaces one whose key the browser hides", null, true],
+  ])("%s", async (_label, key, replaced) => {
+    const existing = makeSubscription("https://push.example/old", key);
+    currentSub = existing;
     const { result } = await mountAndSettle();
     calls.length = 0;
-    expect(await act_(result, "resubscribe")).toEqual({ kind: "enabled" });
-    expect(called("/api/push/unsubscribe") && called("/api/push/subscribe")).toBe(true);
+    expect(await act_(result, "enable")).toEqual({ kind: "enabled" });
+    expect(existing.unsubscribe).toHaveBeenCalledTimes(replaced ? 1 : 0);
+    expect(called("/api/push/unsubscribe")).toBe(replaced);
+    expect(called("/api/push/subscribe")).toBe(true);
+  });
+
+  it("skips requestPermission when already granted, since WebKit denies a gestureless request", async () => {
+    const { result } = await mountAndSettle();
+    await act_(result, "enable");
+    expect(Notification.requestPermission).not.toHaveBeenCalled();
+  });
+});
+
+const statusWith = (subscription: unknown) => ({
+  status: { ok: true, body: { enabled: true, public_key: SERVER_KEY, subscription } },
+});
+const serverSub = (over: object = {}) => ({
+  registered: true,
+  owned: true,
+  last_success_at: null,
+  last_failure_at: null,
+  last_failure: null,
+  ...over,
+});
+
+describe("usePushSubscription health", () => {
+  it.each<[string, () => void, string, boolean]>([
+    ["a healthy subscription", () => installFetch(statusWith(serverSub())), "healthy", false],
+    [
+      "a subscription the server forgot, re-posted silently",
+      () => installFetch(statusWith(serverSub({ registered: false }))),
+      "healthy",
+      true,
+    ],
+    [
+      "a revoked subscription the user still wants",
+      () => {
+        localStorage.setItem("aoe.push.wanted", "1");
+        noSubscription();
+      },
+      "revoked",
+      false,
+    ],
+    ["no subscription and no intent", noSubscription, "not-wanted", false],
+    [
+      "a subscription bound to an old server key",
+      () => {
+        currentSub = makeSubscription(undefined, keyBytes("XYZ"));
+        installFetch(statusWith(serverSub()));
+      },
+      "key-mismatch",
+      false,
+    ],
+    [
+      "a push the service rejected",
+      () => installFetch(statusWith(serverSub({ last_failure: "rejected", last_failure_at: "2026-09-01T10:00:00Z" }))),
+      "delivery-failed",
+      false,
+    ],
+  ])("classifies %s", async (_label, arrange, health, reposted) => {
+    arrange();
+    const { result } = await mountAndSettle();
+    expect(result.current.health).toBe(health);
+    expect(called("/api/push/subscribe")).toBe(reposted);
+    expect(called(`/api/push/status?endpoint=${encodeURIComponent("https://push.example/abc")}`)).toBe(
+      currentSub?.endpoint === "https://push.example/abc",
+    );
+  });
+
+  it("records intent on enable, clears it on disable, and treats an existing subscription as wanted", async () => {
+    const { result } = await mountAndSettle();
+    expect(localStorage.getItem("aoe.push.wanted")).toBe("1");
+    await act_(result, "disable");
+    expect(localStorage.getItem("aoe.push.wanted")).toBeNull();
+    expect(result.current.health).toBe("not-wanted");
+    await act_(result, "enable");
+    expect(localStorage.getItem("aoe.push.wanted")).toBe("1");
+    expect(result.current.health).toBe("healthy");
+  });
+
+  it("re-checks when the app becomes visible", async () => {
+    localStorage.setItem("aoe.push.wanted", "1");
+    const { result } = await mountAndSettle();
+    expect(result.current.health).toBe("healthy");
+    noSubscription();
+    await act(async () => {
+      document.dispatchEvent(new Event("visibilitychange"));
+      for (let i = 0; i < 10; i++) await Promise.resolve();
+    });
+    expect(result.current.health).toBe("revoked");
+  });
+
+  it.each([
+    ["key-mismatch", "The push service rejected this device's key. Enable notifications again."],
+    ["gone", "This device's subscription has expired. Enable notifications again."],
+    ["rejected", "The push service did not deliver the test (rejected)."],
+  ])("sendTest surfaces an undelivered %s test", async (reason, message) => {
+    const { result } = await mountAndSettle();
+    installFetch({ testBody: { delivered: 0, reason } });
+    expect(await act_(result, "sendTest")).toEqual(error(message));
+    expect(result.current.health).toBe("delivery-failed");
   });
 });

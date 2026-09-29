@@ -249,6 +249,31 @@
       ]
     },
     {
+      "id": "terminal.compose-and-keys",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": [
+        "tests/live-terminal-compose.spec.ts",
+        "tests/live/acp-stories/mobile-toolbar-keys.spec.ts",
+        "src/components/__tests__/TerminalComposeSheet.test.tsx",
+        "src/components/__tests__/LiveTerminalView.compose.test.tsx",
+        "src/components/__tests__/MobileTerminalToolbar.test.tsx",
+        "src/components/__tests__/ArrowJoystick.test.tsx",
+        "src/components/settings/__tests__/MobileKeysSettings.test.tsx"
+      ],
+      "components": [
+        "web/src/components/TerminalComposeSheet.tsx",
+        "web/src/components/LiveTerminalView.tsx",
+        "web/src/components/MobileTerminalToolbar.tsx",
+        "web/src/components/ArrowJoystick.tsx",
+        "web/src/components/settings/MobileKeysSettings.tsx",
+        "web/src/components/TerminalSettings.tsx",
+        "web/src/hooks/useHoldRepeat.ts",
+        "web/src/lib/terminalToolbarKeys.ts",
+        "web/src/lib/arrowJoystick.ts"
+      ]
+    },
+    {
       "id": "terminal.selection-hold",
       "kind": "mocked-playwright",
       "risk": "high",
@@ -336,7 +361,8 @@
       "specs": [
         "src/lib/__tests__/liveMouse.test.ts",
         "src/components/__tests__/MobileLiveTerminal.forward.test.tsx",
-        "src/hooks/useLiveTerminal.test.ts"
+        "src/hooks/useLiveTerminal.test.ts",
+        "tests/live-tap-forward.spec.ts"
       ],
       "components": [
         "web/src/lib/liveMouse.ts",
@@ -412,6 +438,13 @@
       "risk": "high",
       "specs": ["tests/live/auth.spec.ts"],
       "components": ["src/server/token.rs"]
+    },
+    {
+      "id": "settings.layers",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/lib/api.test.ts", "src/hooks/useApprovalSound.test.ts"],
+      "components": ["web/src/lib/api.ts", "web/src/lib/settingsEvents.ts", "web/src/hooks/useApprovalSound.ts"]
     },
     {
       "id": "settings.theme-persistence",
@@ -691,8 +724,15 @@
       "id": "notifications.push-subscription",
       "kind": "vitest",
       "risk": "medium",
-      "specs": ["src/hooks/usePushSubscription.test.ts"],
-      "components": ["web/src/hooks/usePushSubscription.ts"]
+      "specs": ["src/hooks/usePushSubscription.test.ts", "src/lib/pushHealth.test.ts"],
+      "components": ["web/src/hooks/usePushSubscription.ts", "web/src/lib/pushHealth.ts"]
+    },
+    {
+      "id": "notifications.push-health-banner",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/components/__tests__/PushHealthBanner.test.tsx"],
+      "components": ["web/src/components/PushHealthBanner.tsx"]
     },
     {
       "id": "settings.security-readonly",
@@ -1298,13 +1338,13 @@
       "risk": "medium",
       "specs": [
         "src/lib/__tests__/systemHealth.test.ts",
-        "src/lib/__tests__/appSettings.test.ts",
+        "src/lib/api.test.ts",
         "src/components/__tests__/SystemHealthStrip.test.tsx"
       ],
       "components": [
         "web/src/lib/systemHealth.ts",
         "web/src/lib/sessionFlagGate.ts",
-        "web/src/lib/appSettings.ts",
+        "web/src/lib/settingsEvents.ts",
         "web/src/hooks/useSystemHealth.ts",
         "web/src/components/SystemHealthStrip.tsx"
       ]
@@ -1378,6 +1418,44 @@
       "risk": "medium",
       "specs": ["src/components/__tests__/WorkspaceSidebarTrash.test.tsx"],
       "components": ["web/src/components/WorkspaceSidebar.tsx", "web/src/components/sidebar/TrashMenu.tsx"]
+    },
+    {
+      "id": "sidebar.trash-row-context-menu",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": ["tests/session-trash.spec.ts"],
+      "components": ["web/src/components/sidebar/TrashMenu.tsx"]
+    },
+    {
+      "id": "sidebar.trash-row-context-menu.handlers",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/components/__tests__/WorkspaceSidebarTrash.test.tsx"],
+      "components": ["web/src/components/sidebar/TrashMenu.tsx"]
+    },
+    {
+      "id": "session.start-refused-when-archived-or-trashed",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": ["tests/acp-structured-view.spec.ts"],
+      "components": ["web/src/components/acp/StructuredView.tsx"]
+    },
+    {
+      "id": "session.start-refused-when-archived-or-trashed.handlers",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": [
+        "src/components/__tests__/WorkspaceSidebarTrash.test.tsx",
+        "src/components/__tests__/TerminalView.test.tsx",
+        "src/hooks/useAcpSession.test.ts",
+        "src/lib/api.test.ts"
+      ],
+      "components": [
+        "web/src/components/sidebar/rowModel.ts",
+        "web/src/components/LiveTerminalView.tsx",
+        "web/src/hooks/useAcpSession.ts",
+        "web/src/lib/api.ts"
+      ]
     },
     {
       "id": "sidebar.trash-order",
@@ -1758,6 +1836,33 @@
       "components": ["web/src/components/DeleteSessionDialog.tsx"]
     },
     {
+      "id": "modals.dialog-description",
+      "kind": "vitest",
+      "risk": "low",
+      "specs": [
+        "src/components/__tests__/StopSessionDialog.test.tsx",
+        "src/components/__tests__/ScratchOverridesModal.test.tsx",
+        "src/components/__tests__/SessionGroupModal.test.tsx",
+        "src/components/__tests__/DeleteSessionDialog.test.tsx"
+      ],
+      "components": [
+        "web/src/components/Dialog.tsx",
+        "web/src/components/StopSessionDialog.tsx",
+        "web/src/components/ScratchOverridesModal.tsx",
+        "web/src/components/SessionGroupModal.tsx",
+        "web/src/components/DeleteSessionDialog.tsx"
+      ],
+      "notes": "The shared Dialog links its body as the accessible description; bodies with controls point it at their prompt, and ScratchOverridesModal opts out."
+    },
+    {
+      "id": "acp.tool-group-chunking",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/components/acp/activityMessages.test.ts", "src/components/acp/ThreadMessages.test.tsx"],
+      "components": ["web/src/components/acp/activityMessages.ts", "web/src/components/acp/ThreadMessages.tsx"],
+      "notes": "Long tool-call runs fold into groups of at most 10 whose ids anchor on each chunk's first child (#3477, #2802); a group card re-render does not re-parse an unchanged payload."
+    },
+    {
       "id": "session.stop-dialog-keyboard",
       "kind": "vitest",
       "risk": "low",
@@ -1784,12 +1889,12 @@
       "kind": "vitest",
       "risk": "low",
       "specs": [
-        "src/components/diff/__tests__/DiffFileContextMenu.test.tsx",
+        "src/components/diff/__tests__/FileContextMenu.test.tsx",
         "src/components/diff/__tests__/DiffFileList.test.tsx",
         "src/components/acp/__tests__/artifactMedia.test.tsx"
       ],
       "components": [
-        "web/src/components/diff/DiffFileContextMenu.tsx",
+        "web/src/components/diff/FileContextMenu.tsx",
         "web/src/components/diff/DiffFileList.tsx",
         "web/src/lib/clipboard.ts",
         "web/src/lib/openInNewTab.ts",
@@ -1802,7 +1907,7 @@
       "kind": "live-playwright",
       "risk": "medium",
       "specs": ["tests/live/right-panel.spec.ts"],
-      "components": ["web/src/components/diff/DiffFileContextMenu.tsx", "web/src/lib/openInNewTab.ts"]
+      "components": ["web/src/components/diff/FileContextMenu.tsx", "web/src/lib/openInNewTab.ts"]
     },
     {
       "id": "right-panel.diff",
@@ -1847,6 +1952,13 @@
         "web/src/components/diff/FileContentViewer.tsx",
         "web/src/components/diff/FullFileViewer.tsx"
       ]
+    },
+    {
+      "id": "right-panel.files-open-file",
+      "kind": "live-playwright",
+      "risk": "medium",
+      "specs": ["tests/live/right-panel.spec.ts"],
+      "components": ["web/src/components/FilesPane.tsx", "web/src/components/diff/FileContextMenu.tsx"]
     },
     {
       "id": "right-panel.files-pane-live",

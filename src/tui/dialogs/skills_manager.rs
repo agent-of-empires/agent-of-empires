@@ -5,6 +5,7 @@
 //! `home`/`app_dir` resolve once at construction, so the mutating helpers take
 //! no resolution path of their own and a test can hand them a tempdir.
 
+use std::cell::RefCell;
 use std::path::PathBuf;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -14,6 +15,7 @@ use ratatui_textarea::TextArea;
 
 use super::{centered_rect, DialogResult};
 use crate::session::skills_model::{self, DiscoveredSkill, SkillError, SyncOutcome, SyncStatus};
+use crate::tui::components::hint_buttons::ListMouse;
 use crate::tui::styles::Theme;
 use crate::tui::worker::Worker;
 
@@ -55,6 +57,7 @@ pub struct SkillsManagerDialog {
     /// walks and digests whole packages, which would freeze the draw loop.
     sync_worker: Option<Worker<SyncRequest, Vec<SyncOutcome>>>,
     syncing: bool,
+    mouse: RefCell<ListMouse>,
 }
 
 impl Default for SkillsManagerDialog {
@@ -122,6 +125,7 @@ impl SkillsManagerDialog {
             app_dir,
             sync_worker: None,
             syncing: false,
+            mouse: RefCell::default(),
         };
         dialog.reload();
         dialog
@@ -150,6 +154,22 @@ impl SkillsManagerDialog {
     fn reload_after(&mut self, message: String) {
         self.reload();
         self.info = Some(message);
+    }
+
+    pub fn handle_click(&mut self, col: u16, row: u16) -> Option<KeyEvent> {
+        let mouse = self.mouse.get_mut();
+        if let Some(key) = mouse.hint_at(col, row) {
+            return Some(key);
+        }
+        if self.popup.is_some() {
+            return None;
+        }
+        mouse.click_row(col, row, self.rows.len(), &mut self.selected)
+    }
+
+    pub fn handle_hover(&mut self, col: u16, row: u16) -> bool {
+        let (len, rows_live) = (self.rows.len(), self.popup.is_none());
+        self.mouse.get_mut().handle_hover(col, row, len, rows_live)
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> DialogResult<()> {
@@ -467,6 +487,7 @@ impl SkillsManagerDialog {
             .padding(Padding::horizontal(1));
         let inner = block.inner(rect);
         f.render_widget(block, rect);
+        self.mouse.borrow_mut().reset();
         self.render_list(f, inner, theme);
         match &self.popup {
             Some(Popup::View { content, scroll }) => {
@@ -482,6 +503,9 @@ impl SkillsManagerDialog {
             }
             None => {}
         }
+        self.mouse
+            .borrow()
+            .paint_hover(f, theme, self.rows.len(), self.popup.is_none());
     }
 
     fn render_list(&self, f: &mut Frame, area: Rect, theme: &Theme) {
@@ -533,6 +557,9 @@ impl SkillsManagerDialog {
             let mut state = ListState::default();
             state.select(Some(self.selected));
             f.render_stateful_widget(list, chunks[0], &mut state);
+            self.mouse
+                .borrow_mut()
+                .record_list(chunks[0], state.offset());
         }
 
         self.render_footer(f, chunks[1], theme);
@@ -558,6 +585,9 @@ impl SkillsManagerDialog {
             .style(Style::default().fg(color))
             .wrap(Wrap { trim: true });
         f.render_widget(footer, area);
+        if self.info.is_none() {
+            self.mouse.borrow_mut().record_hints(f.buffer_mut(), area);
+        }
     }
 
     fn render_view(&self, f: &mut Frame, area: Rect, theme: &Theme, content: &str, scroll: u16) {
@@ -582,6 +612,9 @@ impl SkillsManagerDialog {
             Paragraph::new("j/k scroll · esc close").style(Style::default().fg(theme.dimmed)),
             chunks[1],
         );
+        self.mouse
+            .borrow_mut()
+            .record_hints(f.buffer_mut(), chunks[1]);
     }
 
     fn render_edit(
@@ -625,6 +658,9 @@ impl SkillsManagerDialog {
             Paragraph::new("ctrl+s save · esc cancel").style(Style::default().fg(theme.dimmed)),
             chunks[1],
         );
+        self.mouse
+            .borrow_mut()
+            .record_hints(f.buffer_mut(), chunks[1]);
     }
 
     fn render_create(&self, f: &mut Frame, area: Rect, theme: &Theme, name: &str) {
@@ -702,6 +738,15 @@ impl SkillsManagerDialog {
         let inner = block.inner(rect);
         f.render_widget(block, rect);
         f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
+        // The footer is the notice's last line.
+        let footer_row = Rect {
+            y: inner.bottom().saturating_sub(1),
+            height: 1,
+            ..inner
+        };
+        self.mouse
+            .borrow_mut()
+            .record_hints(f.buffer_mut(), footer_row);
     }
 }
 
@@ -744,6 +789,7 @@ mod tests {
             app_dir,
             sync_worker: None,
             syncing: false,
+            mouse: RefCell::default(),
         };
         dialog.reload();
         dialog.selected = dialog
@@ -756,12 +802,6 @@ mod tests {
         (dialog.info, dialog.popup.is_some())
     }
 
-    /// `e`/`x` are writable-only (AoE-managed rows open a popup; host rows are
-    /// refused with an explanation), `a` is the mirror image (host rows adopt
-    /// straight through; a managed row is refused as already-managed).
-    /// A paste belongs to whatever the panel currently has open, and nowhere
-    /// else: with no popup it must be swallowed rather than leaking to the
-    /// home view's other dialogs.
     #[test]
     fn paste_lands_in_the_open_popup_only() {
         let tmp = tempfile::tempdir().unwrap();
@@ -777,6 +817,7 @@ mod tests {
             app_dir,
             sync_worker: None,
             syncing: false,
+            mouse: RefCell::default(),
         };
         dialog.reload();
 

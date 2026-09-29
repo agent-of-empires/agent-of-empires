@@ -3,10 +3,11 @@
 
 import { describe, expect, it, vi } from "vitest";
 import { act, fireEvent, waitFor } from "@testing-library/react";
+import { HIDDEN_INPUT_SENTINEL as S } from "../../lib/hiddenInputDiff";
 import {
+  bindHiddenInput,
   clearMobileKeyboardProxyInput,
   deliverMobileKeyboardProxyInput,
-  forwardTerminalBeforeInput,
 } from "../../lib/mobileKeyboardProxy";
 import { installResizeObserver, renderLiveTerminal } from "./liveTerminalHarness";
 
@@ -23,15 +24,17 @@ installResizeObserver();
 function renderTerm(uploadPastedImage: (f: File) => Promise<string | null> = vi.fn(async () => null), ctrl = false) {
   const ctrlActiveRef = { current: ctrl };
   const sendData = vi.fn<(data: string) => boolean>(() => true);
+  const sendPaste = vi.fn<(text: string, submit: boolean) => boolean>(() => true);
   const view = renderLiveTerminal({
     sendData,
+    sendPaste,
     uploadPastedImage,
     ctrlActiveRef,
     clearCtrl: () => {
       ctrlActiveRef.current = false;
     },
   });
-  return { input: view.input(), sendData, unmount: view.unmount };
+  return { input: view.input(), sendData, sendPaste, unmount: view.unmount };
 }
 
 const imageItem = (file: File) =>
@@ -53,12 +56,12 @@ const withProxy = (value: string, run: (proxy: HTMLTextAreaElement) => void) => 
 };
 
 describe("MobileLiveTerminal paste", () => {
-  it("lets Ctrl+V reach the native paste event, which sends a bracketed paste (#2384)", () => {
-    const { input, sendData } = renderTerm();
+  it("lets Ctrl+V reach the native paste event, which sends a tmux paste (#2384)", () => {
+    const { input, sendData, sendPaste } = renderTerm();
     expect(fireEvent.keyDown(input, { key: "v", ctrlKey: true })).toBe(true);
     expect(sendData).not.toHaveBeenCalledWith("\x16");
     fireEvent.paste(input, clipboard("hello world"));
-    expect(sendData).toHaveBeenCalledWith("\x1b[200~hello world\x1b[201~");
+    expect(sendPaste).toHaveBeenCalledWith("hello world", false);
   });
 
   it.each([
@@ -72,24 +75,25 @@ describe("MobileLiveTerminal paste", () => {
     ["clipboard text beside the path", "look at", "/repo/x.png", " look at /repo/x.png "],
   ])("pastes %s", async (_n, text, path, pasted) => {
     const upload = vi.fn(async () => path);
-    const { input, sendData } = renderTerm(upload);
+    const { input, sendPaste } = renderTerm(upload);
     const file = png();
     fireEvent.paste(input, clipboard(text, [imageItem(file)]));
     expect(upload).toHaveBeenCalledWith(file);
-    await vi.waitFor(() => expect(sendData).toHaveBeenCalledWith(`\x1b[200~${pasted}\x1b[201~`));
+    await vi.waitFor(() => expect(sendPaste).toHaveBeenCalledWith(pasted, false));
   });
 
   it("sends nothing when the image upload fails", async () => {
     const upload = vi.fn(async () => null);
-    const { input, sendData } = renderTerm(upload);
+    const { input, sendData, sendPaste } = renderTerm(upload);
     fireEvent.paste(input, clipboard("", [imageItem(png())]));
     await vi.waitFor(() => expect(upload).toHaveBeenCalled());
     expect(sendData).not.toHaveBeenCalled();
+    expect(sendPaste).not.toHaveBeenCalled();
   });
 
   it("drops a retained syllable from both shadows when a paste bypasses the textarea", () => {
     withProxy("한", (proxy) => {
-      const { input, sendData } = renderTerm();
+      const { input, sendPaste } = renderTerm();
       input.value = "한";
       fireEvent(
         input,
@@ -100,16 +104,16 @@ describe("MobileLiveTerminal paste", () => {
           data: "ls -al",
         }),
       );
-      expect(sendData).toHaveBeenCalledWith(expect.stringContaining("ls -al"));
-      expect(input.value).toBe("");
-      expect(proxy.value).toBe("");
+      expect(sendPaste).toHaveBeenCalledWith("ls -al", false);
+      expect(input.value).toBe(S);
+      expect(proxy.value).toBe(S);
     });
   });
 
   it("does not touch another session's proxy after the uploading terminal unmounts", async () => {
     let finish!: (path: string) => void;
     const pending = new Promise<string>((resolve) => (finish = resolve));
-    const { input, sendData, unmount } = renderTerm(() => pending);
+    const { input, sendPaste, unmount } = renderTerm(() => pending);
     fireEvent.paste(input, clipboard("", [imageItem(png("shot.png"))]));
     unmount();
     const proxy = document.createElement("textarea");
@@ -122,30 +126,26 @@ describe("MobileLiveTerminal paste", () => {
         await pending;
       });
       expect(proxy.value).toBe("ㅎ");
-      expect(sendData).not.toHaveBeenCalled();
+      expect(sendPaste).not.toHaveBeenCalled();
     } finally {
       proxy.remove();
     }
   });
 
-  it("retains accepted replay after a Ctrl chord for the next Korean rewrite", () => {
+  it("replays buffered proxy edits through the Ctrl latch and drops the refused text", () => {
     clearMobileKeyboardProxyInput();
-    withProxy("cㅎ", (proxy) => {
-      deliverMobileKeyboardProxyInput({ inputType: "insertText", data: "c", isComposing: false });
-      deliverMobileKeyboardProxyInput({ inputType: "insertText", data: "ㅎ", isComposing: false });
+    withProxy(S + "cㅎ", (proxy) => {
+      deliverMobileKeyboardProxyInput({ inputType: "edit", deleted: 0, data: "c" });
+      deliverMobileKeyboardProxyInput({ inputType: "edit", deleted: 0, data: "ㅎ" });
       const { sendData } = renderTerm(undefined, true);
       const sent = () => sendData.mock.calls.map(([data]) => data).join("");
       expect(sent()).toBe("\x03ㅎ");
-      expect(proxy.value).toBe("ㅎ");
-      proxy.addEventListener("beforeinput", (event) =>
-        forwardTerminalBeforeInput(event as InputEvent, deliverMobileKeyboardProxyInput),
-      );
-      const input = (init: InputEventInit) =>
-        proxy.dispatchEvent(new InputEvent("beforeinput", { bubbles: true, cancelable: true, ...init }));
-      expect(input({ inputType: "deleteContentBackward" })).toBe(true);
-      proxy.value = "";
-      expect(input({ inputType: "insertText", data: "하" })).toBe(true);
-      expect(sent()).toBe("\x03ㅎ\x7f하");
+      expect(proxy.value).toBe(S);
+      const unbind = bindHiddenInput(proxy, deliverMobileKeyboardProxyInput, "proxy");
+      proxy.value = S + "하";
+      proxy.dispatchEvent(new InputEvent("input", { inputType: "insertText", data: "하" }));
+      expect(sent()).toBe("\x03ㅎ하");
+      unbind();
     });
     clearMobileKeyboardProxyInput();
   });
@@ -180,6 +180,8 @@ describe("MobileLiveTerminal key sequences", () => {
 
   it.each([
     ["Meta navigation", { key: "ArrowLeft", metaKey: true }],
+    // The native edit reaches the pane through the textarea diff, which keeps iOS autorepeat alive.
+    ["plain Backspace", { key: "Backspace" }],
     ["macOS dead keys", { key: "Dead", code: "KeyE", altKey: true }],
     ["Ctrl+Alt printable chords (AltGr)", { key: "v", ctrlKey: true, altKey: true }],
   ])("leaves %s to the browser", (_n, init) => {
