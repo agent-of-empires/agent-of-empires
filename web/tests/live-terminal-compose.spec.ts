@@ -55,17 +55,32 @@ test.describe("Live terminal mobile controls", () => {
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
   });
 
-  test("the key row runs to the screen edge and keeps 16px less than the home-indicator inset", async ({ page }) => {
+  test("the key row sits low and inset from the corners without a keyboard, and keeps the full inset with one", async ({
+    page,
+  }) => {
     const cdp = await page.context().newCDPSession(page);
     await cdp.send("Emulation.setSafeAreaInsetsOverride" as never, { insets: { bottom: 34 } } as never);
     await openLiveTerminal(page, { mobile: true });
-    const layout = await page.getByRole("button", { name: "Escape" }).evaluate((key) => ({
-      barBottom: key.parentElement!.getBoundingClientRect().bottom,
-      keyBottom: key.getBoundingClientRect().bottom,
-      viewport: window.innerHeight,
-    }));
-    expect(layout.barBottom).toBe(layout.viewport);
-    expect(layout.viewport - layout.keyBottom).toBe(18);
+    const esc = page.getByRole("button", { name: "Escape" });
+    const layout = () =>
+      esc.evaluate((key) => {
+        const bar = key.parentElement!.getBoundingClientRect();
+        const cap = key.getBoundingClientRect();
+        return {
+          barGap: innerHeight - bar.bottom,
+          keyGap: innerHeight - cap.bottom,
+          left: cap.left,
+          height: cap.height,
+        };
+      });
+    // 34 - 22 below the keys, and 0.7 * 34 in from each corner.
+    const closed = await layout();
+    expect(closed).toMatchObject({ barGap: 0, keyGap: 12, height: 36 });
+    expect(closed.left).toBeCloseTo(23.8, 0);
+
+    await page.getByLabel("Live terminal input").focus();
+    await expect.poll(async () => (await layout()).keyGap).toBe(40);
+    expect(await layout()).toMatchObject({ barGap: 0, left: 8, height: 40 });
   });
 
   test("dragging the joystick sends arrows and never opens the sidebar", async ({ page }) => {

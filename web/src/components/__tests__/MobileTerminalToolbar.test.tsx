@@ -32,6 +32,7 @@ function renderToolbar(
       onCompose={onCompose}
       inputElRef={{ current: opts.inputEl ?? null }}
       keyboardOpen={opts.keyboardOpen ?? false}
+      compact={false}
       ctrlActive={false}
       onCtrlToggle={vi.fn()}
     />,
@@ -195,6 +196,7 @@ function CtrlLatchHarness({ sendData }: { sendData: (data: string) => boolean })
       onCompose={vi.fn()}
       inputElRef={{ current: null }}
       keyboardOpen={false}
+      compact={false}
       ctrlActive={ctrlActive}
       onCtrlToggle={() => setCtrlActive((v) => !v)}
     />

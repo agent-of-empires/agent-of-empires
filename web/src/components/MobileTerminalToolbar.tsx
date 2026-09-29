@@ -22,6 +22,8 @@ interface Props {
   /** Opens the compose sheet, also the fallback when the clipboard cannot be read. */
   onCompose: () => void;
   keyboardOpen: boolean;
+  /** No soft keyboard: sit lower, smaller, and inset from the rounded screen corners. */
+  compact: boolean;
   ctrlActive: boolean;
   onCtrlToggle: () => void;
   /** The live view's hidden input element, which owns keyboard focus. */
@@ -75,6 +77,7 @@ export function MobileTerminalToolbar({
   sendPaste,
   onCompose,
   keyboardOpen,
+  compact,
   ctrlActive,
   onCtrlToggle,
   inputElRef,
@@ -201,10 +204,16 @@ export function MobileTerminalToolbar({
   if (keys.length === 0) return null;
   return (
     <div
-      // The parent drops its home-indicator padding for this bar (index.css .home-indicator-clearance), which runs
-      // to the screen edge and keeps 16px less than the inset below its keys; that still clears the indicator.
+      // The parent drops its home-indicator padding for this bar (index.css .home-indicator-clearance), so the bar
+      // runs to the screen edge and owns the clearance. With the keyboard up iOS may still report the inset, so the
+      // keys keep all of it. Without, they drop to 22px less than the inset and move in from the rounded corners.
       data-terminal-toolbar
-      className="shrink-0 flex items-center gap-1.5 px-2 pt-1.5 pb-[max(0.375rem,calc(env(safe-area-inset-bottom)-1rem))] bg-surface-900 border-t border-surface-700/50"
+      data-compact={compact || undefined}
+      className={`shrink-0 flex items-center gap-1.5 pt-1.5 bg-surface-900 border-t border-surface-700/50 ${
+        compact
+          ? "px-[max(0.5rem,calc(env(safe-area-inset-bottom)*0.7))] pb-[max(0.375rem,calc(env(safe-area-inset-bottom)-1.375rem))] [&_button]:h-9 [&_svg]:size-4 [&_span]:text-[11px]"
+          : "px-2 pb-[calc(env(safe-area-inset-bottom)+0.375rem)]"
+      }`}
       // Prevent toolbar taps from stealing focus away from the proxy input.
       onMouseDown={(e) => e.preventDefault()}
     >
