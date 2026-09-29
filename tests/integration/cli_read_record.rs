@@ -44,6 +44,15 @@ const AFFECTED: [(&str, RecordedOwner); 3] = [
 /// admits, and the gate proves it against a deliberately malformed frame.
 const RECORDED_AT: &str = "2026-01-01T00:00:00Z";
 
+/// A case the producer does not emit on its own either: a snapshot whose
+/// resolved default names a profile the store does not have. It is recorded
+/// from the live producer with a store seeded that way, and it carries the
+/// refusal that state draws, which is the local resolver's own sentence at
+/// exit 1 rather than a wire code naming nothing.
+const DEFAULT_MISSING: &str = "http-loopback-default-missing";
+/// The default the recorded store resolves to and does not have.
+const MISSING_DEFAULT: &str = "retired";
+
 struct TempAppDir {
     _dir: tempfile::TempDir,
     previous: Option<std::ffi::OsString>,
@@ -76,7 +85,18 @@ impl Drop for TempAppDir {
 /// `registered: true`, and a row synthesized for a session's project path is
 /// the only source of `false`.
 fn seed() -> Vec<Instance> {
+    seed_with_default("main")
+}
+
+/// The same store with a resolved default the store does not have, which is
+/// the one state the producer publishes and the client has to refuse by name.
+fn seed_with_default(default: &str) -> Vec<Instance> {
     session::create_profile("main").expect("create the recorded profile");
+    fs::write(
+        session::get_app_dir().expect("app dir").join("config.toml"),
+        format!("default_profile = \"{default}\"\n"),
+    )
+    .expect("seed the resolved default");
     let profile_dir = session::get_app_dir()
         .expect("app dir")
         .join("profiles")
@@ -364,16 +384,16 @@ fn splice_text(bytes: &[u8], from: &str, to: &str) -> Vec<u8> {
 #[ignore = "rewrites the committed transcripts; run deliberately"]
 fn re_record_the_affected_transcripts() {
     let root = pack::pack_root();
+    let pins = || RecordingPins {
+        runtime_epoch: "3f2b1c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d".into(),
+        prebind_instance_id: "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d".into(),
+        runtime_instance_id: "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5e".into(),
+        observed_at: RECORDED_AT.parse().expect("recorded instant"),
+    };
     for (case, owner) in AFFECTED {
         let _app_dir = TempAppDir::new();
         let instances = seed();
-        let pins = RecordingPins {
-            runtime_epoch: "3f2b1c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d".into(),
-            prebind_instance_id: "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d".into(),
-            runtime_instance_id: "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5e".into(),
-            observed_at: RECORDED_AT.parse().expect("recorded instant"),
-        };
-        let exchange = record_exchange(&instances, owner, &pins);
+        let exchange = record_exchange(&instances, owner, &pins());
 
         let path = root.join("cases").join(case).join("wire.raw");
         let previous = fs::read(&path).expect("read the recorded transcript");
@@ -385,6 +405,95 @@ fn re_record_the_affected_transcripts() {
         fs::write(&path, &recorded).expect("write the re-recorded transcript");
         println!("{case}: {} bytes", recorded.len());
     }
+    record_default_missing(&root, pins());
     restage(&root);
     pack::verify(&root).expect("the re-sealed pack verifies");
+}
+
+/// The stale-default case, recorded rather than typed: the store is seeded
+/// with a resolved default it does not have and the frames come from the same
+/// [`record_exchange`] the other cases use. The transport records are carried
+/// over from the nominal `status` case, which is the same HTTP upgrade and the
+/// same WebSocket handshake, so nothing about the handshake is invented here.
+/// The refusal is the one the local resolver prints for the same state, and
+/// that sentence is the whole claim.
+fn record_default_missing(root: &Path, pins: RecordingPins) {
+    let _app_dir = TempAppDir::new();
+    let instances = seed_with_default(MISSING_DEFAULT);
+    let exchange = record_exchange(&instances, RecordedOwner::Remote, &pins);
+    let template = fs::read(root.join("cases/http-loopback-status-nominal/wire.raw"))
+        .expect("read the nominal transcript");
+    let recorded = splice(DEFAULT_MISSING, &template, &exchange);
+
+    let dir = root.join("cases").join(DEFAULT_MISSING);
+    fs::create_dir_all(&dir).expect("the new case directory");
+    fs::write(dir.join("wire.raw"), &recorded).expect("write the transcript");
+    let stderr = format!(
+        "Error: Profile '{MISSING_DEFAULT}' does not exist. Create it with: aoe profile create {MISSING_DEFAULT}\n"
+    );
+    fs::write(dir.join("expected.stdout"), b"").expect("a refusal prints no rows");
+    fs::write(dir.join("expected.stderr"), &stderr).expect("write the refusal");
+    fs::write(
+        dir.join("expected.json"),
+        canonical(&serde_json::json!({
+            "artifact_revision": pack::ARTIFACT_REVISION,
+            "case_id": DEFAULT_MISSING,
+            "code": "default_missing",
+            "exit": 1,
+            "phase": "semantic",
+            "stderr_sha256": digest(stderr.as_bytes()),
+            "stdout_sha256": digest(b""),
+            "wire_frames": 2,
+        }))
+        .as_bytes(),
+    )
+    .expect("write the expected result");
+    fs::write(
+        dir.join("error.json"),
+        canonical(&serde_json::json!({
+            "artifact_revision": pack::ARTIFACT_REVISION,
+            "code": "default_missing",
+            "message": stderr,
+            "phase": "semantic",
+        }))
+        .as_bytes(),
+    )
+    .expect("write the refusal metadata");
+
+    // The index row carries placeholder refs; `restage` reads every file on
+    // disk and rewrites them, exactly as it does for the cases already listed.
+    let ref_for = |name: &str| {
+        serde_json::json!({
+            "path": format!("cases/{DEFAULT_MISSING}/{name}"),
+            "sha256": "0".repeat(64),
+            "bytes": 0,
+        })
+    };
+    let refs = |names: &[&str]| names.iter().map(|name| ref_for(name)).collect::<Vec<_>>();
+    let cases_path = root.join(pack::CASES_NAME);
+    let mut index: serde_json::Value =
+        serde_json::from_slice(&fs::read(&cases_path).expect("read CASES.json"))
+            .expect("parse CASES.json");
+    let cases = index["cases"].as_array_mut().expect("cases array");
+    cases.retain(|case| case["case_id"] != serde_json::json!(DEFAULT_MISSING));
+    cases.push(serde_json::json!({
+        "alias": serde_json::Value::Null,
+        "all_files": refs(&[
+            "error.json", "expected.json", "expected.stderr",
+            "expected.stdout", "wire.raw",
+        ]),
+        "argv": ["aoe", "status"],
+        "auth": "bearer_valid",
+        "case_id": DEFAULT_MISSING,
+        "command": "status",
+        "input_files": refs(&["wire.raw"]),
+        "output_files": refs(&[
+            "error.json", "expected.json", "expected.stderr", "expected.stdout",
+        ]),
+        "parse": "ok",
+        "replay_role": "server_mode",
+        "transport": "http_loopback",
+    }));
+    fs::write(&cases_path, canonical(&index).as_bytes()).expect("rewrite CASES.json");
+    println!("{DEFAULT_MISSING}: {} bytes", recorded.len());
 }

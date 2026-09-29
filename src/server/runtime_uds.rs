@@ -33,7 +33,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 
 use super::runtime_ws;
-use super::runtime_ws::CONNECTION_BUDGET;
+use super::runtime_ws::{CONNECTION_BUDGET, MESSAGE_LIMIT};
 use super::AppState;
 
 pub(crate) const LOCK_FILE: &str = "lifetime.lock";
@@ -51,9 +51,10 @@ pub(crate) const TEMPORARY_SEPARATOR: &str = ".tmp.";
 /// Backoff after an accept error, so a failing accept cannot spin the loop.
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(50);
 /// The client's frame ceiling, applied to what this endpoint reads. tungstenite
-/// consults it on the receive path only, so it does not bound the snapshot this
-/// producer serialises, which has no cap of its own.
-const FRAME_LIMIT: usize = crate::cli::runtime_read::APPLICATION_LIMIT;
+/// consults it on the receive path only, so it bounds nothing written here; the
+/// frames this endpoint's reader would send are capped by
+/// [`MESSAGE_LIMIT`], which is checked before a frame leaves.
+const FRAME_LIMIT: usize = MESSAGE_LIMIT;
 
 /// Why a daemon could not publish. Each code is a distinct operator-visible
 /// condition, and every one of them leaves a foreign publication untouched.

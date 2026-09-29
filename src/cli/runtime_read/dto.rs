@@ -17,7 +17,7 @@ pub(crate) struct HelloData {
     pub owner: Owner,
     pub local_owner: bool,
     pub health: AggregateHealth,
-    pub profiles: Vec<ProfileRead>,
+    pub profiles: Vec<ProfileHello>,
     pub status_freshness: StatusFreshness,
 }
 
@@ -28,6 +28,11 @@ pub(crate) struct SnapshotData {
     pub cursor: Cursor,
     pub health: SnapshotHealth,
     pub default_profile: Option<String>,
+    /// What the daemon resolved as the default, published whether or not the
+    /// snapshot carries it. `default_profile` says whether that name resolves;
+    /// this says which name, so a client that has to refuse can name the
+    /// profile the user has to create.
+    pub resolved_default_profile: Option<String>,
     pub profiles: Vec<ProfileRead>,
     pub sessions: Vec<SessionRead>,
     pub global_projects: Vec<ProjectRead>,
@@ -109,6 +114,17 @@ pub(crate) enum StatusFreshness {
         revision: Option<u64>,
         observed_at: Option<String>,
     },
+}
+
+/// What the Hello says about one profile: its name, and whether the daemon
+/// could read it at all. The inventory is not repeated, because the Snapshot
+/// that follows carries every group and project of every profile and each of
+/// them is validated there.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProfileHello {
+    pub name: String,
+    pub health: ProfileHealth,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -442,7 +458,7 @@ pub(crate) fn validate_hello(hello: &HelloData) -> Result<(), &'static str> {
         (false, OwnerKind::Remote, None) => {}
         _ => return Err("schema_invalid"),
     }
-    validate_profiles(&hello.profiles)?;
+    validate_profile_hellos(&hello.profiles)?;
     validate_freshness(&hello.status_freshness)?;
     if let AggregateHealth::Degraded { code } = hello.health {
         validate_health_code(code, &hello_health_codes())?;
@@ -474,6 +490,9 @@ pub(crate) fn validate_snapshot(snapshot: &SnapshotData) -> Result<(), &'static 
         }
         validate_profile_health(&profile.health)?;
     }
+    // `default_profile` names a row this snapshot carries or names nothing.
+    // The resolved name beside it may name no row, and that is not a schema
+    // fault: it is the state a client reports by name.
     if let Some(default) = &snapshot.default_profile {
         if !snapshot
             .profiles
@@ -482,6 +501,9 @@ pub(crate) fn validate_snapshot(snapshot: &SnapshotData) -> Result<(), &'static 
         {
             return Err("schema_invalid");
         }
+    }
+    if let Some(resolved) = &snapshot.resolved_default_profile {
+        validate_safe_text(resolved)?;
     }
 
     validate_freshness(&snapshot.status_freshness)?;
@@ -661,6 +683,23 @@ fn validate_profiles(profiles: &[ProfileRead]) -> Result<(), &'static str> {
         validate_profile_health(&profile.health)?;
         validate_groups(&profile.groups)?;
         validate_projects(&profile.projects, ProjectScope::Profile)?;
+    }
+    Ok(())
+}
+
+/// The Hello's half of the same rule. Everything the handshake needs in order
+/// to fail closed before the much larger Snapshot is accepted is here: unique
+/// names, a name that is safe to print, and per-profile health. The inventory
+/// itself belongs to the Snapshot, which carries it and validates every group
+/// and project in it.
+fn validate_profile_hellos(profiles: &[ProfileHello]) -> Result<(), &'static str> {
+    let mut names = HashSet::new();
+    for profile in profiles {
+        if !names.insert(profile.name.as_str()) {
+            return Err("schema_invalid");
+        }
+        validate_safe_text(&profile.name)?;
+        validate_profile_health(&profile.health)?;
     }
     Ok(())
 }
@@ -1043,6 +1082,7 @@ mod tests {
                 profiles: BTreeMap::new(),
             },
             default_profile: Some("main".into()),
+            resolved_default_profile: Some("main".into()),
             profiles: vec![ProfileRead {
                 name: "main".into(),
                 groups: vec![],

@@ -65,10 +65,20 @@ fn selected_profile<'a>(
             // reporting a wire failure for the operator's own variable.
             ReadFailure::exit(2, "error: AGENT_OF_EMPIRES_PROFILE must be valid UTF-8\n")
         })?,
-        ProfileSource::Default => snapshot
-            .default_profile
-            .as_deref()
-            .ok_or_else(|| ReadFailure::post("default_missing"))?,
+        ProfileSource::Default => match snapshot.default_profile.as_deref() {
+            Some(value) => value,
+            // The daemon resolved a name, published it, and this snapshot
+            // carries no such profile. The local path resolves the same name
+            // and refuses with this sentence, so both transports answer it the
+            // same way instead of one naming nothing and the other naming a
+            // profile.
+            None => match &snapshot.resolved_default_profile {
+                Some(name) => return Err(profile_absent("default_missing", name)),
+                // Nothing was resolved, because resolving would have created
+                // the profile this read has to stay out of.
+                None => return Err(ReadFailure::post("default_missing")),
+            },
+        },
     };
     if selected.is_empty() {
         // `session::validate_profile_name` refuses an empty name with this
@@ -83,7 +93,7 @@ fn selected_profile<'a>(
         .iter()
         .find(|profile| profile.name == selected)
         .map(|profile| profile.name.as_str())
-        .ok_or_else(|| profile_absent(selected))
+        .ok_or_else(|| profile_absent("profile_missing", selected))
 }
 
 /// A profile name the store does not have, refused the way the local command
@@ -92,9 +102,13 @@ fn selected_profile<'a>(
 /// next. This is the user's own state rather than a wire failure, so it is
 /// not a `daemon read: <code>`. It uses the same mechanism the tmux refusals
 /// in this file use, and leaves the same exit the local path leaves.
-fn profile_absent(name: &str) -> ReadFailure {
+///
+/// `code` says which of the two ways the client arrived here it did: a profile
+/// the caller named by hand, or the daemon's own resolved default naming one
+/// the store does not have. The sentence and the exit are the same either way.
+fn profile_absent(code: &'static str, name: &str) -> ReadFailure {
     ReadFailure::refuse(
-        "profile_missing",
+        code,
         1,
         format!(
             "Error: Profile '{name}' does not exist. Create it with: aoe profile create {name}\n"
@@ -799,7 +813,7 @@ fn profile<'a>(snapshot: &'a SnapshotData, name: &str) -> Result<&'a ProfileRead
         .profiles
         .iter()
         .find(|profile| profile.name == name)
-        .ok_or_else(|| profile_absent(name))
+        .ok_or_else(|| profile_absent("profile_missing", name))
 }
 
 fn sessions_for_profile<'a>(
@@ -983,6 +997,7 @@ mod tests {
                 profiles: BTreeMap::from([("main".into(), health())]),
             },
             default_profile: Some("main".into()),
+            resolved_default_profile: Some("main".into()),
             profiles: vec![profile],
             sessions,
             global_projects: vec![],

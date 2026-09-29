@@ -630,7 +630,7 @@ fn a_frame_that_breaks_the_published_schema_is_still_refused() {
     assert!(
         error
             .to_string()
-            .contains("does not satisfy hello.schema.json"),
+            .contains("does not satisfy snapshot.schema.json"),
         "unexpected error: {error}"
     );
 }
@@ -789,6 +789,11 @@ fn a_published_document_that_drops_the_revision_is_refused() {
 /// added, so the test states the whole claim: the pattern inside the branch is
 /// compiled, it accepts the frame the producer emits, and it refuses the frame
 /// that breaks it.
+/// The property whose one-line `oneOf` over a string and a null this test
+/// edits: it is present, its name is unique in the document, and the value the
+/// producer emits for it is a string the edited pattern must refuse.
+const DEFAULT_PROFILE_PROPERTY: &str = "resolved_default_profile";
+
 #[test]
 #[parallel]
 fn a_pattern_inside_a_one_of_branch_is_enforced() {
@@ -796,24 +801,28 @@ fn a_pattern_inside_a_one_of_branch_is_enforced() {
     let schema = root.join("snapshot.schema.json");
     let text = fs::read_to_string(&schema).expect("read the published document");
     let branch = r##""oneOf": [{ "$ref": "#/$defs/safe_text" }, { "type": "null" }]"##;
-    // `default_profile` is the only property in this document whose `oneOf` over
-    // a string and a null is spelled on one line, and the property name is what
-    // makes the edit unique.
-    let from = format!("\"default_profile\": {{\n      {branch}\n    }}");
-    let to = from.replace(
-        r##"{ "$ref": "#/$defs/safe_text" }"##,
-        r##"{ "$ref": "#/$defs/safe_text", "pattern": "^(main|absent)$" }"##,
+
+    // The property names the branch, and the first `oneOf` under it is the one
+    // the test edits, so a description added to the property cannot move it.
+    let anchor = format!("\"{DEFAULT_PROFILE_PROPERTY}\": {{");
+    let (head, tail) = text
+        .split_once(&anchor)
+        .expect("the document names the property");
+    let to = tail.replacen(
+        branch,
+        &branch.replace(
+            r##"{ "$ref": "#/$defs/safe_text" }"##,
+            r##"{ "$ref": "#/$defs/safe_text", "pattern": "^(main|absent|retired)$" }"##,
+        ),
+        1,
     );
-    assert!(
-        text.contains(&from),
-        "the document carries the edited branch"
-    );
-    fs::write(&schema, text.replacen(&from, &to, 1)).expect("rewrite the document");
+    fs::write(&schema, format!("{head}{anchor}{to}")).expect("rewrite the document");
     restage(&root);
 
-    // Every recorded `default_profile`, "main" on the nominal frames and the
-    // dangling "absent" on the schema-invalid one, is inside the pattern, so
-    // a compiled pattern inside a branch does not refuse a conforming frame.
+    // Every recorded resolved default is inside the pattern: "main" on the
+    // nominal frames, the dangling "absent" on the schema-invalid one and
+    // "retired" on the stale-default one. So a compiled pattern inside a branch
+    // does not refuse a conforming frame.
     pack::verify(&root).expect("a frame the branch's pattern admits is accepted");
 
     // And it refuses the frame that breaks it, which is the half the old walk
@@ -822,8 +831,8 @@ fn a_pattern_inside_a_one_of_branch_is_enforced() {
     let recorded = fs::read(&wire).expect("read the re-recorded transcript");
     let broken = splice_text(
         &recorded,
-        r#""default_profile":"main""#,
-        r#""default_profile":"other""#,
+        r#""resolved_default_profile":"main""#,
+        r#""resolved_default_profile":"other""#,
     );
     fs::write(&wire, broken).expect("rewrite wire.raw");
     restage(&root);
@@ -833,7 +842,7 @@ fn a_pattern_inside_a_one_of_branch_is_enforced() {
         .to_string();
     assert!(
         reason.contains("does not satisfy snapshot.schema.json")
-            && reason.contains(r#"does not match ^(main|absent)$"#),
+            && reason.contains(r#"does not match ^(main|absent|retired)$"#),
         "the refusal quotes the pattern that fired: {reason}"
     );
 }
@@ -900,7 +909,7 @@ fn a_node_that_is_not_a_schema_in_a_published_document_is_refused() {
 fn a_keyword_inside_a_one_of_branch_reaching_past_the_subset_is_refused() {
     let reason = refusal_after_a_document_edit(
         "hello",
-        r##"{ "$ref": "#/$defs/safe_text" }, { "type": "null" }]"##,
+        r##"{ "$ref": "#/$defs/timestamp" }, { "type": "null" }]"##,
         r##"{ "allOf": [] }, { "type": "null" }]"##,
     );
     assert!(
@@ -958,7 +967,7 @@ fn a_boolean_not_in_a_published_document_is_refused() {
 fn a_boolean_items_in_a_published_document_is_refused() {
     let reason = refusal_after_a_document_edit(
         "hello",
-        r##""profiles": { "type": "array", "items": { "$ref": "#/$defs/profile_read" } }"##,
+        r##""profiles": { "type": "array", "items": { "$ref": "#/$defs/profile_hello" } }"##,
         r#""profiles": { "type": "array", "items": false }"#,
     );
     assert!(

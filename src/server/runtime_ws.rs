@@ -38,11 +38,12 @@ pub(crate) const PROTOCOL_VERSION: u16 = 2;
 /// and it matches the client's single read budget, so a peer that
 /// authenticates and then says nothing is bounded identically either way.
 pub(crate) const CONNECTION_BUDGET: Duration = Duration::from_secs(15);
-/// The message ceiling both transports hand tungstenite. tungstenite 0.29.0
-/// defaults to 64 MiB for a message and 16 MiB for a frame, so the frame
-/// ceiling already matched `APPLICATION_LIMIT` on both routes while the WS
-/// route was accepting a message four times what the UDS route accepted. One
-/// constant, so the two routes cannot drift apart again.
+/// The message ceiling both transports hand tungstenite, and the ceiling this
+/// module refuses to send past. tungstenite 0.29.0 defaults to 64 MiB for a
+/// message and 16 MiB for a frame, so the frame ceiling already matched
+/// `APPLICATION_LIMIT` on both routes while the WS route was accepting a
+/// message four times what the UDS route accepted. One constant, so the two
+/// routes cannot drift apart again.
 pub(crate) const MESSAGE_LIMIT: usize = crate::cli::runtime_read::APPLICATION_LIMIT;
 /// The trusted namespace this build publishes for itself, and the name the
 /// UDS marker files carry.
@@ -234,6 +235,20 @@ async fn run_read(
     for frame in frames {
         match frame {
             Ok(encoded) => {
+                // Measured on what is about to go out, because that is the
+                // `String` the client's `max_message_size` counts. A frame
+                // past it is refused by the client after this daemon has done
+                // the work to build it, and the only honest alternative to
+                // sending it whole is a partial listing.
+                if encoded.len() > MESSAGE_LIMIT {
+                    tracing::warn!(
+                        target: "runtime.ws",
+                        bytes = encoded.len(),
+                        "runtime frame is over the client's message ceiling; closing without sending"
+                    );
+                    socket.close().await;
+                    return;
+                }
                 if socket.send_text(&encoded).await.is_err() {
                     return;
                 }
@@ -588,18 +603,23 @@ fn build_snapshot(
     let aggregate = aggregate_health(&snapshot_health);
     // The resolved default, not the daemon's active profile: `aoe profile` marks
     // the resolved one, and a client that resolved a different name would mark
-    // a different row. Resolution is skipped when there is no profile at all,
-    // so a read never bootstraps one. A resolved name that names no profile is
-    // published as no default rather than replaced by another: the local path
-    // refuses it (`resolve_existing_profile`), and silently serving some other
-    // profile's sessions under this profile's name is the worst thing a
-    // transport can do.
-    let default_profile = if names.is_empty() {
-        None
-    } else {
-        let resolved = crate::session::config::resolve_default_profile();
-        names.contains(&resolved).then_some(resolved)
-    };
+    // a different row.
+    //
+    // `default_profile` names a row this snapshot carries, or names nothing:
+    // the client's rule, and one it can check against the rows beside it. The
+    // resolved name is published beside it whatever it is, so a client that
+    // has to refuse can name the profile the user has to create instead of
+    // saying only that no default exists. Replacing it with some other
+    // profile's name would be the worst thing a transport can do.
+    //
+    // Resolving is skipped when there is no profile at all, because
+    // resolution bootstraps one and a read must not write to the store. That
+    // is the one state with no name to publish, and it publishes none.
+    let resolved = (!names.is_empty()).then(crate::session::config::resolve_default_profile);
+    let default_profile = resolved
+        .as_ref()
+        .filter(|name| names.contains(*name))
+        .cloned();
 
     Sampled {
         hello: HelloData {
@@ -613,7 +633,13 @@ fn build_snapshot(
             owner,
             local_owner,
             health: aggregate,
-            profiles: profile_reads.clone(),
+            profiles: profile_reads
+                .iter()
+                .map(|profile| ProfileHello {
+                    name: profile.name.clone(),
+                    health: profile.health,
+                })
+                .collect(),
             status_freshness: freshness.clone(),
         },
         data: SnapshotData {
@@ -624,6 +650,7 @@ fn build_snapshot(
             },
             health: snapshot_health,
             default_profile,
+            resolved_default_profile: resolved,
             profiles: profile_reads,
             sessions,
             global_projects,
@@ -857,7 +884,7 @@ struct HelloData {
     owner: Owner,
     local_owner: bool,
     health: AggregateHealth,
-    profiles: Vec<ProfileRead>,
+    profiles: Vec<ProfileHello>,
     status_freshness: StatusFreshness,
 }
 
@@ -867,10 +894,25 @@ struct SnapshotData {
     cursor: Cursor,
     health: SnapshotHealth,
     default_profile: Option<String>,
+    /// The name the daemon resolved as the default, published whatever
+    /// `default_profile` says and absent only when resolving would have
+    /// bootstrapped a profile, so a client can name the profile a stale
+    /// default points at.
+    resolved_default_profile: Option<String>,
     profiles: Vec<ProfileRead>,
     sessions: Vec<SessionRead>,
     global_projects: Vec<ProjectRead>,
     status_freshness: StatusFreshness,
+}
+
+/// What the Hello says about one profile: its name, and whether this daemon
+/// could read it at all. The inventory is not repeated, because the Snapshot
+/// that follows carries every group and project of every profile and the
+/// client validates each of them there.
+#[derive(Serialize, Clone)]
+struct ProfileHello {
+    name: String,
+    health: ProfileHealth,
 }
 
 #[derive(Serialize)]
