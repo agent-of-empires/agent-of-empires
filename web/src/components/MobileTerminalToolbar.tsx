@@ -201,7 +201,10 @@ export function MobileTerminalToolbar({
   if (keys.length === 0) return null;
   return (
     <div
-      className="shrink-0 flex items-center gap-1.5 px-2 py-1.5 bg-surface-900 border-t border-surface-700/50"
+      // The parent drops its home-indicator padding for this bar (index.css .home-indicator-clearance), which runs
+      // to the screen edge and keeps 16px less than the inset below its keys; that still clears the indicator.
+      data-terminal-toolbar
+      className="shrink-0 flex items-center gap-1.5 px-2 pt-1.5 pb-[max(0.375rem,calc(env(safe-area-inset-bottom)-1rem))] bg-surface-900 border-t border-surface-700/50"
       // Prevent toolbar taps from stealing focus away from the proxy input.
       onMouseDown={(e) => e.preventDefault()}
     >

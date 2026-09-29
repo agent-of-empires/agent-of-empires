@@ -138,10 +138,7 @@ export function MobileMainPane({
             </Suspense>
           ) : (
             // Clear the home indicator without changing the keyboard-open lift.
-            <div
-              className="flex-1 flex flex-col min-h-0 overflow-hidden"
-              style={{ paddingBottom: "env(safe-area-inset-bottom)" }}
-            >
+            <div className="home-indicator-clearance flex-1 flex flex-col min-h-0 overflow-hidden">
               <TerminalSessionStack
                 active={view === "agent"}
                 activeSessionId={activeSessionId!}
@@ -156,10 +153,9 @@ export function MobileMainPane({
         {pairedMounted && (
           // Match the agent terminal’s home-indicator clearance.
           <div
-            className={layerClass(view === "paired")}
+            className={`home-indicator-clearance ${layerClass(view === "paired")}`}
             inert={view !== "paired"}
             data-testid="mobile-paired-layer"
-            style={{ paddingBottom: "env(safe-area-inset-bottom)" }}
           >
             <PairedShellPane session={activeSession} sessionId={activeSessionId} active={view === "paired"} />
           </div>

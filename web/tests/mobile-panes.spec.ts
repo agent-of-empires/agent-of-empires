@@ -32,7 +32,10 @@ async function simulateKeyboardOpen(page: Page, keyboardPx: number) {
 /** The picked pane must reserve the home-indicator inset the App root no longer
  *  does (moved per-surface; see index.css .safe-area-inset). */
 async function expectSafeAreaInset(page: Page, testId: string) {
-  const inset = await page.getByTestId(testId).evaluate((el) => (el as HTMLElement).style.paddingBottom);
+  const layer = page.getByTestId(testId);
+  // Terminal layers clear it through a class the mobile key row can turn off.
+  if (await layer.evaluate((el) => el.classList.contains("home-indicator-clearance"))) return;
+  const inset = await layer.evaluate((el) => (el as HTMLElement).style.paddingBottom);
   expect(inset).toContain("safe-area-inset-bottom");
 }
 

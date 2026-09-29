@@ -642,6 +642,15 @@ select:focus-visible,
   outline-offset: 2px;
 }
 
+/* Terminal layers clear the home indicator, except around the mobile key row, which runs to the screen edge and
+   holds its own smaller clearance. */
+.home-indicator-clearance {
+  padding-bottom: env(safe-area-inset-bottom);
+}
+.home-indicator-clearance:has([data-terminal-toolbar]) {
+  padding-bottom: 0;
+}
+
 .safe-area-inset {
   /* Top/right/left only. The BOTTOM inset is intentionally NOT reserved here:
      the App root is `overflow-hidden`, so a bottom-anchored child (the ACP
