@@ -3308,3 +3308,79 @@ fn a_failed_reload_keeps_the_repair_pending_and_the_gate_shut() {
         assert!(!view.pending_reconcile_reload);
     }
 }
+
+/// #4116: the send dialog and live-send entry refuse an archived or trashed agent, even with its
+/// pane still live, with the CLI and web wording, and leave the session shelved.
+#[test]
+#[serial]
+fn tui_send_refuses_a_shelved_live_pane() {
+    if crate::tmux::tmux_command().arg("-V").output().is_err() {
+        eprintln!("tmux not available; skipping");
+        return;
+    }
+    let shelves: [(fn(&mut Instance), crate::session::StartBlocked); 2] = [
+        (Instance::archive, crate::session::StartBlocked::Archived),
+        (Instance::trash, crate::session::StartBlocked::Trashed),
+    ];
+    for (shelve, shelved_block) in shelves {
+        for live_send in [false, true] {
+            let mut env = create_test_env_with_sessions(1);
+            let inst = env.view.instance_at(0).clone();
+            env.view.apply_user_action(&inst.id, shelve).unwrap();
+            let pane = crate::tmux::Session::generate_name(&inst.id, &inst.title);
+            let created = crate::tmux::tmux_command()
+                .args(["new-session", "-d", "-s", &pane, "sleep", "60"])
+                .status();
+            if !created.map(|s| s.success()).unwrap_or(false) {
+                eprintln!("tmux new-session failed; skipping");
+                return;
+            }
+            crate::tmux::refresh_session_cache();
+
+            // The branch submits a message through the daemon feed and starts
+            // a live send through `enter_live_send_with`, neither of which is
+            // the upstream helper this test was written against. So drive the
+            // two refusals the branch actually implements: the visible one a
+            // start raises, and the classification a live send reads.
+            if live_send {
+                assert_eq!(
+                    env.view.start_blocked(&inst.id),
+                    Some(shelved_block),
+                    "a live send must classify why the agent takes no input"
+                );
+            } else {
+                assert!(
+                    env.view.refuse_start_if_shelved(&inst.id),
+                    "a shelved row must refuse a start visibly"
+                );
+                let (title, way_out) = match shelved_block {
+                    crate::session::StartBlocked::Archived => ("Session archived", "unarchive"),
+                    crate::session::StartBlocked::Trashed => ("Session in trash", "restore"),
+                };
+                let dialog = env.view.info_dialog.as_ref().expect("refusal dialog");
+                assert_eq!(dialog.title(), title, "live_send={live_send}");
+                assert!(
+                    dialog.message().contains(way_out),
+                    "live_send={live_send}: the dialog must name the way out, got {:?}",
+                    dialog.message()
+                );
+            }
+            let _ = crate::tmux::tmux_command()
+                .args(["kill-session", "-t", &pane])
+                .output();
+            assert!(
+                env.view
+                    .get_instance(&inst.id)
+                    .unwrap()
+                    .ensure_startable()
+                    .is_err(),
+                "live_send={live_send}: the session must stay shelved"
+            );
+        }
+    }
+}
+
+// The archive lifecycle-lock invariant this file used to pin here now lives on the daemon
+// side, which owns the archive write: `sessions::tests::archive_persists_under_the_lifecycle_lock`
+// and `sessions::tests::group_archive_gates_each_member_on_its_own_lifecycle_lock`
+// (`src/server/api/sessions/tests.rs`).

@@ -231,6 +231,7 @@ impl Instance {
         if self.is_structured() {
             return Ok(StartOutcome::Fresh);
         }
+        self.ensure_startable()?;
         if !restart && self.tmux_session()?.exists() {
             return Ok(StartOutcome::Fresh);
         }

@@ -1380,6 +1380,44 @@
       "components": ["web/src/components/WorkspaceSidebar.tsx", "web/src/components/sidebar/TrashMenu.tsx"]
     },
     {
+      "id": "sidebar.trash-row-context-menu",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": ["tests/session-trash.spec.ts"],
+      "components": ["web/src/components/sidebar/TrashMenu.tsx"]
+    },
+    {
+      "id": "sidebar.trash-row-context-menu.handlers",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/components/__tests__/WorkspaceSidebarTrash.test.tsx"],
+      "components": ["web/src/components/sidebar/TrashMenu.tsx"]
+    },
+    {
+      "id": "session.start-refused-when-archived-or-trashed",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": ["tests/acp-structured-view.spec.ts"],
+      "components": ["web/src/components/acp/StructuredView.tsx"]
+    },
+    {
+      "id": "session.start-refused-when-archived-or-trashed.handlers",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": [
+        "src/components/__tests__/WorkspaceSidebarTrash.test.tsx",
+        "src/components/__tests__/TerminalView.test.tsx",
+        "src/hooks/useAcpSession.test.ts",
+        "src/lib/api.test.ts"
+      ],
+      "components": [
+        "web/src/components/sidebar/rowModel.ts",
+        "web/src/components/LiveTerminalView.tsx",
+        "web/src/hooks/useAcpSession.ts",
+        "web/src/lib/api.ts"
+      ]
+    },
+    {
       "id": "sidebar.trash-order",
       "kind": "vitest",
       "risk": "low",

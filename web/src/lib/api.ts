@@ -134,15 +134,21 @@ export async function ensureSession(id: string, signal?: AbortSignal): Promise<E
   }
 }
 
-export async function ensureTerminal(id: string, index = 0, container = false): Promise<boolean> {
+export async function ensureTerminal(id: string, index = 0, container = false): Promise<EnsureSessionResult> {
   const path = container ? "container-terminal" : "terminal";
   try {
     const res = await fetch(`/api/sessions/${id}/${path}?index=${index}`, {
       method: "POST",
     });
-    return res.ok;
-  } catch {
-    return false;
+    if (res.ok) return { ok: true };
+    const body = await res.json().catch(() => ({}));
+    return {
+      ok: false,
+      error: typeof body.error === "string" ? body.error : undefined,
+      message: typeof body.message === "string" ? body.message : `Server error (${res.status})`,
+    };
+  } catch (e) {
+    return { ok: false, message: e instanceof Error ? e.message : "Network error" };
   }
 }
 
@@ -2621,19 +2627,31 @@ export async function stopSession(id: string): Promise<SessionResponse | null> {
   }
 }
 
-/** Start (resume) a stopped session, the inverse of stopSession: restarts a
- *  plain session's pane or un-parks a structured session so its worker
- *  respawns. Returns null on failure. */
-export async function startSession(id: string): Promise<SessionResponse | null> {
+/** A 409 code for a start refused because the session is archived or trashed. */
+export const isStartRefusal = (code: string | undefined) => code === "session_archived" || code === "session_trashed";
+
+export type StartSessionResult =
+  | { ok: true; session: SessionResponse }
+  | { ok: false; refused: boolean; message?: string };
+
+/**
+ * Start (resume) a stopped session, the inverse of stopSession: restarts a
+ * plain session's pane or un-parks a structured session so its worker
+ * respawns. `refused` marks a 409 for an archived or trashed session, which
+ * the server left untouched.
+ */
+export async function startSession(id: string): Promise<StartSessionResult> {
   try {
-    const res = await fetch(`/api/sessions/${id}/start`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-    });
-    if (!res.ok) return null;
-    return (await res.json()) as SessionResponse;
-  } catch {
-    return null;
+    const res = await fetch(`/api/sessions/${id}/start`, { method: "POST" });
+    if (res.ok) return { ok: true, session: (await res.json()) as SessionResponse };
+    const body = await res.json().catch(() => ({}));
+    return {
+      ok: false,
+      refused: isStartRefusal(typeof body.error === "string" ? body.error : undefined),
+      message: typeof body.message === "string" ? body.message : undefined,
+    };
+  } catch (e) {
+    return { ok: false, refused: false, message: e instanceof Error ? e.message : "Network error" };
   }
 }
 

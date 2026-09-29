@@ -9,7 +9,7 @@ Runtime conversation changes such as `/clear`, `/new`, fork, continue, or a fres
 | Agent | Host terminal | Sandboxed terminal | Authoritative source |
 |-------|---------------|--------------------|----------------------|
 | Claude Code | Yes | Yes | Pane-scoped native hook |
-| Codex | Yes | Yes | Pane-scoped native hook (host), isolated managed store (sandbox) |
+| Codex | Yes | Yes | Pane-scoped native hook (host), isolated managed store (sandbox). On a macOS host the capture is unbound: no launch binding and no final flush at teardown; see [Codex](#supported-managed-contexts). |
 | Cursor Agent | Yes | Yes | `beforeSubmitPrompt` hook `conversation_id` |
 | Pi | Yes | Yes | Pane-scoped AoE extension |
 | OMP | Yes | Yes | Pane-scoped routed terminal store |

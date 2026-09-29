@@ -103,6 +103,8 @@ impl<S: BroadcastSink> Supervisor<S> {
             stored_id = ?config.stored_acp_session_id,
             "spawning structured view worker"
         );
+        // The hooks above may re-enter aoe, so the lifecycle lock is taken only for each check.
+        admit_durable_launch(&req).await?;
         // Clear a partial replay from a failed import before session/load re-emits it.
         if config.seed_history_replay {
             self.sink.clear_session_events(session_id);
@@ -130,6 +132,13 @@ impl<S: BroadcastSink> Supervisor<S> {
                 return Err(SupervisorError::Acp(err));
             }
         };
+
+        // A peer that archived or trashed the row during the handshake wins: retire the runner.
+        if let Err(refused) = admit_durable_launch(&req).await {
+            drop(client);
+            self.reap_failed_launch(&lease).await;
+            return Err(refused);
+        }
 
         if warmup_guard.is_some() {
             lock_recover(&self.warmed_up_agents).insert(req.agent.clone());
@@ -716,6 +725,36 @@ pub(super) fn publish_rejection(err: &AcpError, mut publish: impl FnMut(Event)) 
     true
 }
 
+/// Recheck the stored row under its lifecycle lock: the caller's check ran before
+/// `spawn_config` awaited the `before_session` hook. Refuses an archived or trashed row, or one
+/// purged since. A request without a source profile has no stored row to check.
+async fn admit_durable_launch(req: &SpawnRequest) -> Result<(), SupervisorError> {
+    let Some(profile) = req.source_profile.clone() else {
+        return Ok(());
+    };
+    let session_id = req.session_id.clone();
+    let spawn_error = |e: anyhow::Error| {
+        SupervisorError::Acp(AcpError::Spawn(format!("launch admission: {e:#}")))
+    };
+    tokio::task::spawn_blocking(move || {
+        let storage = crate::session::Storage::new_unwatched(&profile).map_err(spawn_error)?;
+        let _lock = storage
+            .acquire_instance_lifecycle_lock(&session_id)
+            .map_err(spawn_error)?;
+        let stored = storage
+            .load()
+            .map_err(spawn_error)?
+            .into_iter()
+            .find(|row| row.id == session_id);
+        match stored {
+            None => Err(SupervisorError::SessionGone(session_id)),
+            Some(row) => row.ensure_startable().map_err(SupervisorError::Blocked),
+        }
+    })
+    .await
+    .map_err(|e| SupervisorError::Acp(AcpError::Spawn(format!("launch admission task: {e}"))))?
+}
+
 /// Run the profile's `before_session` host hooks and return the env they mint.
 pub(super) async fn before_session_env(
     session_id: &str,
@@ -1140,6 +1179,67 @@ mod tests {
         assert!(
             !explicit,
             "a resolved default effort must not read as a session pin"
+        );
+    }
+
+    /// #4116: the handshake holds no lifecycle lock, so an archive (which a TUI takes on its
+    /// input thread) commits without waiting; the post-handshake recheck retires the runner.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn spawn_retires_a_runner_whose_row_was_archived_during_the_handshake() {
+        let _home = isolate_home();
+        let control = Arc::new(FakeProcessControl::default());
+        control.alive(4545);
+        let gate = Gate::default();
+        let sup = Arc::new(
+            Supervisor::new(VecSink::new())
+                .with_process_control(control.clone())
+                .with_launcher(gated_launcher(&gate, 4545)),
+        );
+        let mut inst = crate::session::Instance::new("s-archived", "/tmp");
+        inst.id = "s-archived".into();
+        let storage = crate::session::Storage::new_unwatched(&inst.source_profile).unwrap();
+        storage
+            .update(|rows, _| {
+                *rows = vec![inst.clone()];
+                Ok(())
+            })
+            .unwrap();
+        let mut req = spawn_request("s-archived");
+        req.source_profile = Some(inst.source_profile.clone());
+        let spawner = {
+            let sup = Arc::clone(&sup);
+            tokio::spawn(async move { sup.spawn(req).await })
+        };
+        gate.entered.notified().await;
+
+        assert!(
+            !storage.instance_lifecycle_lock_is_held_for_test("s-archived"),
+            "the handshake must not hold the lifecycle lock"
+        );
+        {
+            let _lock = storage
+                .acquire_instance_lifecycle_lock("s-archived")
+                .unwrap();
+            storage
+                .update(|rows, _| {
+                    rows[0].archive();
+                    Ok(())
+                })
+                .unwrap();
+        }
+        gate.open.notify_one();
+
+        assert!(matches!(
+            spawner.await.unwrap(),
+            Err(SupervisorError::Blocked(
+                crate::session::StartBlocked::Archived
+            ))
+        ));
+        assert_eq!(sup.worker_state("s-archived").await, AcpWorkerState::Absent);
+        assert!(
+            control.signals().iter().any(|(pid, _)| *pid == 4545),
+            "the runner launched for the archived row must be torn down"
         );
     }
 

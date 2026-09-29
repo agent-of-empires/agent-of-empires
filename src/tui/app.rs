@@ -3740,7 +3740,16 @@ impl App {
             needs_restart,
             "attach_session: restart decision"
         );
-        if needs_restart || instance.status == crate::session::Status::Stopped {
+        // A row about to be started must not be one the user shelved: the
+        // trashed/archived agent stays stopped, so refuse visibly and point at
+        // the restore key instead of letting the runtime reject the start
+        // (#4118). The predicate is this branch's own, so the Stopped case the
+        // thin-client rework added to it is refused the same way.
+        let starts_agent = needs_restart || instance.status == crate::session::Status::Stopped;
+        if starts_agent && self.home.refuse_start_if_shelved(session_id) {
+            return Ok(());
+        }
+        if starts_agent {
             // Show warning (once) if custom instruction is configured for an unsupported agent
             if instance.is_sandboxed() {
                 let has_instruction = instance

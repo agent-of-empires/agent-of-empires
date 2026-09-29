@@ -319,3 +319,45 @@ async fn clear_sandbox_pins(state: &Arc<AppState>, id: &str) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::server::test_support as support;
+
+    /// #4116: an archive committed while the restarted worker's `before_session` hook runs
+    /// refuses the respawn instead of launching the archived row.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn worker_restart_refuses_a_row_archived_while_the_hook_runs() {
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let barrier = tempfile::tempdir().unwrap();
+        let hook = support::install_blocking_before_session_hook(barrier.path(), "attach");
+        let mut inst =
+            crate::session::Instance::new("attach-4116", barrier.path().to_str().unwrap());
+        inst.view = crate::session::View::Structured;
+        inst.status = crate::session::Status::Idle;
+        let id = inst.id.clone();
+        let profile = inst.source_profile.clone();
+        support::seed_instances_on_disk_for_test(&profile, vec![inst.clone()]);
+        let (launcher, launches) = support::counting_failing_launcher();
+        let state = support::build_test_app_state_with_launcher(vec![inst], launcher);
+
+        let restart = tokio::spawn({
+            let state = Arc::clone(&state);
+            let id = id.clone();
+            async move { spawn_worker(&state, &id).await }
+        });
+        let archived = support::archive_while_hook_waits(&hook, &profile, |row| row.id == id).await;
+        let outcome = restart.await.unwrap();
+
+        assert!(archived, "before_session hook did not run");
+        match outcome {
+            WorkerOutcome::RestartFailed(error) => {
+                assert!(error.contains("archived"), "{error}")
+            }
+            _ => panic!("an archived row must not restart its worker"),
+        }
+        assert_eq!(launches.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+}

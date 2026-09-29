@@ -339,12 +339,45 @@ impl Instance {
             self.fail_reserved_launch(storage, generation, &error, false);
             return Err(error);
         }
+        // The hooks ran without the lifecycle lock, so a peer may have archived or trashed the
+        // row meanwhile. The reconcile above reread it under the lock we just took back.
+        if let Err(blocked) = self.ensure_startable() {
+            self.release_blocked_launch(storage, generation);
+            return Err(blocked.into());
+        }
         if let Err(error) = hook_result {
             self.fail_reserved_launch(storage, generation, &error, false);
             return Err(error);
         }
         self.ensure_reservation_current_or_fail(storage, generation)?;
         Ok((title_lock, lifecycle_lock))
+    }
+
+    /// A peer archived or trashed the row while hooks ran: drop the launch reservation
+    /// without stamping an error, since the refusal is not a launch failure.
+    fn release_blocked_launch(
+        &mut self,
+        storage: &dyn crate::session::SessionStore,
+        generation: u64,
+    ) {
+        let live_pane = self
+            .tmux_session()
+            .is_ok_and(|session| session.exists() && !session.is_pane_dead());
+        let status = if live_pane {
+            Status::Idle
+        } else {
+            Status::Stopped
+        };
+        // The commit releases only a reservation this launch still owns.
+        if let Err(error) =
+            self.commit_lifecycle_status(storage, LifecycleOperation::Launch, generation, status)
+        {
+            tracing::warn!(
+                target: "session.store",
+                session = %self.id,
+                "could not release the launch reservation of a refused start: {error:#}"
+            );
+        }
     }
 
     fn lifecycle_reservation_is_current(

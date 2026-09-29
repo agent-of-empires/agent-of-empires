@@ -892,6 +892,9 @@ pub(super) enum LifecycleTargetError {
     CityHall,
     #[error("session lifecycle is busy or superseded")]
     Busy,
+    /// An archived or trashed session refuses to launch or resume (#4116).
+    #[error(transparent)]
+    Blocked(#[from] crate::session::StartBlocked),
 }
 
 pub(crate) fn lifecycle_rejection(
@@ -910,6 +913,25 @@ pub(crate) fn lifecycle_rejection(
             return Some(crate::server::api::cityhall_response())
         }
         _ => {}
+    }
+    if let Some(blocked) = error
+        .downcast_ref::<LifecycleTargetError>()
+        .and_then(|error| match error {
+            LifecycleTargetError::Blocked(blocked) => Some(*blocked),
+            _ => None,
+        })
+        .or_else(|| {
+            error
+                .downcast_ref::<crate::session::StartBlocked>()
+                .copied()
+        })
+    {
+        return Some(crate::server::api::start_blocked_response(blocked));
+    }
+    // A row a peer purged between the memory check and this write: the caller
+    // is talking to a session that no longer exists, not to a busy one.
+    if error.is::<crate::session::SessionGone>() {
+        return Some(crate::server::api::session_not_found());
     }
     if matches!(
         error.downcast_ref::<LifecycleTargetError>(),
@@ -1258,9 +1280,10 @@ fn admit_restart(
     account_swap: bool,
 ) -> anyhow::Result<()> {
     let now = chrono::Utc::now();
-    if row.is_trashed()
-        || row.is_archived()
-        || matches!(row.status, Status::Creating | Status::Deleting)
+    if let Err(blocked) = row.ensure_startable() {
+        return Err(LifecycleTargetError::Blocked(blocked).into());
+    }
+    if matches!(row.status, Status::Creating | Status::Deleting)
         || row.has_fresh_lifecycle_reservation(now)
     {
         return Err(LifecycleTargetError::Busy.into());
@@ -1356,6 +1379,15 @@ pub(super) async fn prepare_agent_session(
     }
     if state.cityhall_mode && !instance.is_structured() {
         return crate::server::api::cityhall_response();
+    }
+    // #4116: a shelved row refuses every start path with its own code, decided on
+    // the row this request reloaded. It answers before the lifecycle reservation,
+    // before the store write that would report it missing, and before the
+    // pre-launch hooks, so a shelved row never comes back `lifecycle_busy` or
+    // `not_found`. The write below still rechecks the row under the lock, for a
+    // peer that shelves it while this request waits.
+    if let Err(blocked) = instance.ensure_startable() {
+        return crate::server::api::start_blocked_response(blocked);
     }
     let body = match body {
         Ok(body) => body.map(|Json(body)| body).unwrap_or_default(),
@@ -1488,9 +1520,13 @@ pub(super) async fn prepare_agent_session(
                     return Ok(Some(row.clone()));
                 }
                 let now = chrono::Utc::now();
-                if row.is_trashed()
-                    || row.is_archived()
-                    || matches!(row.status, Status::Creating | Status::Deleting)
+                // Re-read from the store under the lifecycle lock, so a peer
+                // that archived or trashed the row while this request waited
+                // is refused with its own code, not a generic busy (#4116).
+                if let Err(blocked) = row.ensure_startable() {
+                    return Err(LifecycleTargetError::Blocked(blocked).into());
+                }
+                if matches!(row.status, Status::Creating | Status::Deleting)
                     || row.has_fresh_lifecycle_reservation(now)
                 {
                     return Err(LifecycleTargetError::Busy.into());

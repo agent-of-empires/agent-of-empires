@@ -229,6 +229,28 @@ all = [
   ] },
 ]
 
+# Standard OMP confirmation selectors use Yes/No regardless of their title.
+# A blocked panel can retain a status band beneath its navigation footer.
+[[rules]]
+id = "yes_no_panel"
+state = "waiting"
+priority = 970
+positional = true
+max_position = 6
+region = "bottom_non_empty_lines(8)"
+visible = true
+line_regex = ['(?i)^\s*[│|].*(?:up/down|↑/↓|\^/v)\s+navigate\s+(?:enter|⏎)\s+select\s+(?:esc|⎋)\s+cancel\s*[│|]\s*$']
+any = [
+  { region = "bottom_non_empty_lines(3)", line_regex = ['(?i)^\s*[│|].*(?:up/down|↑/↓|\^/v)\s+navigate\s+(?:enter|⏎)\s+select\s+(?:esc|⎋)\s+cancel\s*[│|]\s*$'] },
+  { region = "bottom_non_empty_lines(3)", line_regex = ['(?i)^\s*(?:⎋|\x{f12b7}|esc)\s+waiting\s*$'] },
+]
+all = [
+  { region = "bottom_non_empty_lines(12)", line_regex = [
+    '(?i)^\s*[│|]\s*(?:[\x{276F}\x{f054}>]\s*)?yes\s*[│|]?\s*$',
+    '(?i)^\s*[│|]\s*(?:[\x{276F}\x{f054}>]\s*)?no\s*[│|]?\s*$',
+  ] },
+]
+
 # The plan panel: its footer decides the position, but only when the panel is
 # really on screen, which is its three options plus a cursor on one of them.
 [[rules]]

@@ -603,8 +603,14 @@ pub(crate) async fn spawn_structured_session(
             Ok(())
         })();
         if let Err(error) = post_hooks {
-            rollback(native, instance, false);
-            return Err(error);
+            // A peer that shelved the row while the launch hooks ran does not
+            // destroy the creation: the row is persisted, its reservation is
+            // released, and the detached spawn refuses the launch with its own
+            // code. Any other failure still rolls the creation back. #4116.
+            if !error.is::<crate::session::StartBlocked>() {
+                rollback(native, instance, false);
+                return Err(error);
+            }
         }
 
         Ok::<_, anyhow::Error>((
@@ -704,12 +710,20 @@ pub(crate) async fn spawn_structured_session(
                                 .acquire_instance_lifecycle_lock(&check_id)?;
                             (&native as &dyn SessionStore).launch_configuration(&cwd)?;
                             let rows = native.load()?;
+                            let row = rows
+                                .iter()
+                                .find(|row| row.id == check_id)
+                                .ok_or(crate::session::LifecycleReservationError::Superseded)?;
+                            // A peer archived or trashed the row while the
+                            // `before_session` hook ran: the reservation is
+                            // still ours, but the session may no longer
+                            // launch (#4116).
+                            row.ensure_startable()?;
                             anyhow::ensure!(
-                                rows.iter().any(|row| row.id == check_id
-                                    && row.lifecycle_reservation_is_owned(
-                                        LifecycleOperation::Launch,
-                                        generation
-                                    )),
+                                row.lifecycle_reservation_is_owned(
+                                    LifecycleOperation::Launch,
+                                    generation
+                                ),
                                 crate::session::LifecycleReservationError::Superseded
                             );
                             Ok(())
@@ -917,5 +931,80 @@ mod tests {
             serde_json::from_slice(&std::fs::read(app.join("pending-purge-owners.json")).unwrap())
                 .unwrap();
         assert!(owners["owners"].as_array().unwrap().is_empty());
+    }
+
+    /// #4116: the detached spawn after a create runs once the row is persisted and published,
+    /// so an archive committed while its `before_session` hook runs must refuse the launch.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn create_spawn_refuses_a_row_archived_while_the_hook_runs() {
+        use crate::server::test_support as support;
+        use axum::extract::{Query, State};
+        use axum::response::IntoResponse;
+        use axum::Json;
+
+        let _home = crate::session::test_support::isolate_app_dir();
+        // The create runs the launch hooks inline, so a host session needs the agent hook
+        // paths acknowledged first, as the creation-receipt test does. Without it the
+        // create itself is refused and the detached spawn never reaches the hook.
+        crate::session::config::update_app_state(|state| {
+            state.has_acknowledged_agent_hooks = true;
+        })
+        .expect("acknowledge the agent hook paths");
+        let barrier = tempfile::tempdir().unwrap();
+        let hook = support::install_blocking_before_session_hook(barrier.path(), "create");
+        support::seed_instances_on_disk_for_test("test", Vec::new());
+        let (launcher, launches) = support::counting_failing_launcher();
+        let state = support::build_test_app_state_with_launcher(Vec::new(), launcher);
+        // The canonical store publishes a profile's rows only after the profile
+        // is in its metadata, so a create for `test` is refused outright
+        // ("committed profile is missing from canonical metadata") until the
+        // runtime has reloaded the profile list. Same prerequisite the
+        // rollback test above sets.
+        support::refresh_canonical_metadata_for_test(&state).await;
+        let body: crate::daemon::CreateSessionBody = serde_json::from_value(serde_json::json!({
+            "title": "created-4116", "path": "", "tool": "claude",
+            "scratch": true, "view": "structured", "profile": "test",
+        }))
+        .unwrap();
+        let create = tokio::spawn({
+            let state = state.clone();
+            async move {
+                crate::server::api::sessions::create_session(
+                    State(state),
+                    Query(crate::server::api::sessions::CreateSessionQuery { wait: None }),
+                    None,
+                    Ok(Json(body)),
+                )
+                .await
+                .into_response()
+            }
+        });
+        let archived =
+            support::archive_while_hook_waits(&hook, "test", |row| row.title == "created-4116")
+                .await;
+        let response = create.await.unwrap();
+        assert!(archived, "before_session hook did not run");
+        assert_eq!(response.status(), axum::http::StatusCode::CREATED);
+        let id = support::load_instances_from_disk_for_test("test")
+            .into_iter()
+            .find(|inst| inst.title == "created-4116")
+            .expect("create persisted its row")
+            .id;
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while !state
+                .acp_event_store
+                .replay_from(&id, 0)
+                .iter()
+                .any(|(_, event)| matches!(event, crate::acp::Event::AgentStartupError { .. }))
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the refused spawn reports a startup error");
+        assert_eq!(launches.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(!state.acp_supervisor.is_running(&id).await);
     }
 }

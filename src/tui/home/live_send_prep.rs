@@ -104,6 +104,16 @@ impl HomeView {
         if !lease.is_valid() || !self.session_feed.native_interaction_available() {
             return Err(());
         }
+        // An archived or trashed agent takes no input, even with a live pane
+        // (#4118). The runtime refuses the prepare before this point, so the
+        // check only decides which refusal the operator reads; what it reads
+        // is the runtime's own committed snapshot, not a local guess.
+        if matches!(target, live_send::LiveSendTarget::Agent) {
+            if let Some(blocked) = self.start_blocked(session_id) {
+                self.info_dialog = Some(InfoDialog::new("Live send failed", &blocked.to_string()));
+                return Err(());
+            }
+        }
         let inst = match self.get_instance(session_id) {
             Some(inst) => inst.clone(),
             None => {

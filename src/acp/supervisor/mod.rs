@@ -83,6 +83,10 @@ pub enum SupervisorError {
     /// The previous runner is not proven dead yet.
     #[error("session {0:?} is still stopping its previous structured view worker")]
     TeardownPending(String),
+    #[error(transparent)]
+    Blocked(crate::session::StartBlocked),
+    #[error("session {0:?} no longer exists")]
+    SessionGone(String),
 }
 
 /// What the caller does with prompt text after it was published.
@@ -229,6 +233,8 @@ pub struct SpawnRequest {
     pub fork_from: Option<String>,
     pub sandbox_continuation: SandboxContinuation,
     pub sandbox_info: Option<SandboxInfo>,
+    /// The stored row's profile. Every production launch sets it, and the launch rechecks that
+    /// row before and after the handshake (#4116).
     pub source_profile: Option<String>,
     pub yolo_mode: bool,
     /// Explicit ACP mode applied after the handshake; wins over `yolo_mode`.

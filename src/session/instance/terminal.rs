@@ -140,9 +140,30 @@ impl Instance {
         let title = crate::session::storage::acquire_session_title_lock(&self.id)?;
         let lifecycle = store.storage().acquire_instance_lifecycle_lock(&self.id)?;
         store.check_available()?;
-        self.reconcile_from_store(store)?;
+        match self.reconcile_from_store(store) {
+            Ok(()) => {}
+            // A row missing from the store and a generation this row no longer
+            // owns are one error here; only the first is a session that is
+            // gone, so it must not answer as a busy lifecycle. The extra read
+            // runs on the refusal path alone. #4116.
+            Err(error)
+                if error.downcast_ref::<LifecycleReservationError>()
+                    == Some(&LifecycleReservationError::Superseded) =>
+            {
+                if store.load()?.iter().all(|row| row.id != self.id) {
+                    return Err(crate::session::SessionGone.into());
+                }
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        }
+        // The reconcile reread the stored row under the lifecycle lock the CLI
+        // archive and trash contend on, so this is the same durable check
+        // `lock_for_input` makes: a shelved row is refused with its own code
+        // rather than as a busy or superseded lifecycle (#4116).
+        self.ensure_startable()?;
         anyhow::ensure!(
-            !self.is_trashed() && !matches!(self.status, Status::Creating | Status::Deleting),
+            !matches!(self.status, Status::Creating | Status::Deleting),
             LifecycleReservationError::Superseded
         );
         if self.has_fresh_lifecycle_reservation(Utc::now()) {

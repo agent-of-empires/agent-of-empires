@@ -91,9 +91,9 @@ pub use instance::{
     ConversationProvenance, DetectionState, EnsureReadyError, EnsureReadyOutcome, ExecutionBinding,
     ExecutionLocation, Instance, LaunchSidOutcome, LifecycleOperation, LifecycleReservation,
     LifecycleReservationError, PaneObservation, PanePresence, PendingInitialTurn,
-    PluginCreateIdempotency, PollerStart, SandboxInfo, SessionBucket, StartOutcome, Status,
-    TerminalInfo, View, WorkspaceInfo, WorkspaceRepo, WorktreeInfo, SESSION_COLORS,
-    TMUX_SERVER_UNREACHABLE_ERROR, TMUX_SESSION_GONE_ERROR,
+    PluginCreateIdempotency, PollerStart, SandboxInfo, SessionBucket, SessionGone, StartBlocked,
+    StartOutcome, Status, TerminalInfo, View, WorkspaceInfo, WorkspaceRepo, WorktreeInfo,
+    SESSION_COLORS, TMUX_SERVER_UNREACHABLE_ERROR, TMUX_SESSION_GONE_ERROR,
 };
 #[cfg(test)]
 pub(crate) use move_journal::{
@@ -101,7 +101,7 @@ pub(crate) use move_journal::{
 };
 pub(crate) use storage::acquire_session_identity_lock;
 #[cfg(test)]
-pub(crate) use storage::observe_lock_contention_for_test;
+pub(crate) use storage::{observe_lock_contention_for_test, observe_updates_for_test};
 pub(crate) use storage::{reconcile_profile_duplicates, DuplicateIdReport};
 
 use std::sync::atomic::{AtomicBool, Ordering};

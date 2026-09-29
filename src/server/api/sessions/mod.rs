@@ -29,7 +29,7 @@ use crate::session::{
 
 use super::validate_no_shell_injection;
 use super::AppState;
-use super::{api_error, session_not_found, validate_display_label};
+use super::{api_error, bare_not_found, session_not_found, validate_display_label};
 
 mod artifacts;
 mod create;

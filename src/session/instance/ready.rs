@@ -28,8 +28,19 @@ pub enum EnsureReadyError {
     Transient(Status),
     /// Instance is structured view-mode (no backing tmux pane); send is not supported.
     StructuredView,
+    /// The pane needed a start, but the session is archived or trashed.
+    Blocked(StartBlocked),
     /// Underlying tmux operation failed.
     Tmux(anyhow::Error),
+}
+
+impl From<anyhow::Error> for EnsureReadyError {
+    fn from(error: anyhow::Error) -> Self {
+        match error.downcast_ref::<StartBlocked>() {
+            Some(blocked) => EnsureReadyError::Blocked(*blocked),
+            None => EnsureReadyError::Tmux(error),
+        }
+    }
 }
 
 impl std::fmt::Display for EnsureReadyError {
@@ -45,12 +56,18 @@ impl std::fmt::Display for EnsureReadyError {
                 f,
                 "Acp-mode sessions have no tmux pane; send is not supported"
             ),
+            EnsureReadyError::Blocked(blocked) => write!(f, "{blocked}"),
             EnsureReadyError::Tmux(e) => write!(f, "{e}"),
         }
     }
 }
 
 impl std::error::Error for EnsureReadyError {}
+
+/// A peer purged the stored row while a caller still held its cached copy.
+#[derive(Debug, thiserror::Error)]
+#[error("session no longer exists")]
+pub struct SessionGone;
 
 impl Instance {
     /// Smart-send precondition: bring this session's tmux pane to a state
@@ -123,9 +140,8 @@ impl Instance {
             // keep trying to preserve agent context regardless of
             // `auto_resume_on_restart`, which only scopes explicit
             // restart/reattach. See #2609.
-            let outcome = self
-                .start_with_resume_fallback(size, false, ResumeAttemptPolicy::Allow)
-                .map_err(EnsureReadyError::Tmux)?;
+            let outcome =
+                self.start_with_resume_fallback(size, false, ResumeAttemptPolicy::Allow)?;
             match outcome {
                 StartOutcome::ResumeFailed { sid } => {
                     return Ok(EnsureReadyOutcome::ResumeFailed { sid });
@@ -138,9 +154,8 @@ impl Instance {
             return Ok(EnsureReadyOutcome::Started);
         }
         if session.is_pane_dead() {
-            let outcome = self
-                .restart_with_resume_policy(size, false, ResumeAttemptPolicy::Allow)
-                .map_err(EnsureReadyError::Tmux)?;
+            let outcome =
+                self.restart_with_resume_policy(size, false, ResumeAttemptPolicy::Allow)?;
             match outcome {
                 StartOutcome::ResumeFailed { sid } => {
                     return Ok(EnsureReadyOutcome::ResumeFailed { sid });
@@ -153,6 +168,23 @@ impl Instance {
             return Ok(EnsureReadyOutcome::Respawned);
         }
         Ok(EnsureReadyOutcome::AlreadyAlive)
+    }
+
+    /// Keystrokes into a live pane are refused for an archived or trashed session, like a start.
+    /// Rechecks the stored row under the lifecycle lock, which CLI archive and trash also take;
+    /// hold the returned guard until the send lands. `ensure_pane_ready` takes the same lock, so
+    /// call this after it.
+    pub(crate) fn lock_for_input(&self) -> Result<crate::session::storage::StorageFlock> {
+        let storage = crate::session::storage::Storage::new(
+            &self.effective_profile(),
+            self.resolve_file_watch(),
+        )?;
+        let lock = storage.acquire_instance_lifecycle_lock(&self.id)?;
+        let Some(row) = storage.load()?.into_iter().find(|row| row.id == self.id) else {
+            return Err(SessionGone.into());
+        };
+        row.ensure_startable()?;
+        Ok(lock)
     }
 
     /// Best-effort wait for a freshly-started pane to settle past its initial

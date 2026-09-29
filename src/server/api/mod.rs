@@ -78,6 +78,7 @@ pub use telemetry::{
     set_telemetry_consent,
 };
 
+/// A clone of the live instance with this id.
 pub(crate) async fn find_instance(
     state: &std::sync::Arc<AppState>,
     id: &str,
@@ -98,6 +99,61 @@ pub(crate) async fn instance_exists(state: &std::sync::Arc<AppState>, id: &str) 
         .await
         .iter()
         .any(|instance| instance.id == id)
+}
+
+/// The stored row, which can differ from the daemon's cache when a peer such as the CLI
+/// archived, trashed, or purged it.
+pub(crate) async fn load_persisted_instance(
+    state: &AppState,
+    profile: &str,
+    id: &str,
+) -> Result<Option<crate::session::Instance>, axum::response::Response> {
+    let id_for_load = id.to_string();
+    let profile_for_load = profile.to_string();
+    let file_watch = state.file_watch.clone();
+    let persisted = tokio::task::spawn_blocking(
+        move || -> anyhow::Result<Option<crate::session::Instance>> {
+            let storage = crate::session::Storage::new(&profile_for_load, file_watch)?;
+            Ok(storage
+                .load()?
+                .into_iter()
+                .find(|candidate| candidate.id == id_for_load))
+        },
+    )
+    .await;
+    let error = match persisted {
+        Ok(Ok(found)) => return Ok(found),
+        Ok(Err(error)) => format!("{error:#}"),
+        Err(join_error) => join_error.to_string(),
+    };
+    tracing::error!(target: "http.api", session = %id, "load persisted session: {error}");
+    Err(api_error(
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        "internal",
+        "failed to read session state",
+    ))
+}
+
+/// 409 for a start or resume refused because the session is archived or trashed.
+/// A 404 for a session that is gone, without the daemon's own envelope: the
+/// callers answer from a store read that found nothing, not from a refusal.
+pub(super) fn bare_not_found() -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+    (
+        axum::http::StatusCode::NOT_FOUND,
+        axum::Json(serde_json::json!({ "error": "not_found" })),
+    )
+        .into_response()
+}
+
+pub(crate) fn start_blocked_response(
+    blocked: crate::session::StartBlocked,
+) -> axum::response::Response {
+    api_error(
+        axum::http::StatusCode::CONFLICT,
+        blocked.code(),
+        blocked.to_string(),
+    )
 }
 
 pub(crate) fn api_error(
