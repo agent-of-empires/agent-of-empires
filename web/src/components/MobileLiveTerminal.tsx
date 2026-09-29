@@ -80,6 +80,15 @@ export interface MobileLiveTerminalProps {
   keyboardOpen: boolean;
 }
 
+/** Heights behind the iOS standalone bottom band: the app root should reach `screen` in portrait. */
+function viewportDebugLine(): string {
+  const html = document.documentElement;
+  const root = document.getElementById("root")?.getBoundingClientRect().bottom ?? 0;
+  const inset = getComputedStyle(html).getPropertyValue("--safe-area-bottom").trim();
+  const flags = ["data-ios-standalone", "data-editing"].filter((a) => html.hasAttribute(a)).join(",");
+  return `vp inner=${innerHeight} vv=${Math.round(visualViewport?.height ?? 0)} root=${Math.round(root)} screen=${screen.height} sab=${inset} ${flags}`;
+}
+
 /** A frame's rows; `lines` is authoritative when present, and `content` ends with a newline that is not a row. */
 function frameLines(frame: LiveFrame): string[] {
   if (frame.lines) return frame.lines;
@@ -120,7 +129,8 @@ export function MobileLiveTerminal({
   keyboardOpen,
 }: MobileLiveTerminalProps) {
   const { settings, update } = useWebSettings();
-  const fontKey = useIsCoarsePointer() ? "mobileFontSize" : "desktopFontSize";
+  const coarse = useIsCoarsePointer();
+  const fontKey = coarse ? "mobileFontSize" : "desktopFontSize";
   const configuredFontSize = settings[fontKey];
   // Quotes are stripped so a stray `"` cannot produce an ignored font-family.
   const termFontFamily = (settings.terminalFontFamily ?? "").trim().replace(/"/g, "");
@@ -714,17 +724,19 @@ export function MobileLiveTerminal({
             } resyncs=${liveStats?.resyncs ?? "-"} wire=${
               liveStats ? `${(liveStats.wireBytes / 1024).toFixed(1)}k` : "-"
             }`,
+            viewportDebugLine(),
           ].join("\n")}
         </div>
       )}
       {LIVE_DEBUG && <InputTraceOverlay inputRef={inputRef} active={active} />}
 
       {(reading || selectionHeld) && (
+        // On touch the joystick stacks above the keyboard button, so this sits left of the keyboard button.
         <button
           type="button"
           onClick={jumpToLatest}
           aria-label="Back to live"
-          className="absolute right-3 bottom-16 z-10 w-10 h-10 rounded-full bg-surface-800/90 border border-surface-700/30 text-text-secondary flex items-center justify-center shadow-lg backdrop-blur-sm active:scale-95 motion-safe:animate-[fadeIn_200ms_ease-out]"
+          className={`absolute ${coarse ? "right-[60px] bottom-3" : "right-3 bottom-16"} z-10 w-10 h-10 rounded-full bg-surface-800/90 border border-surface-700/30 text-text-secondary flex items-center justify-center shadow-lg backdrop-blur-sm active:scale-95 motion-safe:animate-[fadeIn_200ms_ease-out]`}
         >
           <StrokeIcon size={16} strokeWidth="2" hidden>
             <polyline points="6 9 12 15 18 9" />

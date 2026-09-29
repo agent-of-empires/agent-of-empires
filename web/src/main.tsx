@@ -9,6 +9,7 @@ import App from "./App";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { ToastBusBridge, ToastProvider } from "./components/Toasts";
 import { installFetchErrorToasts } from "./lib/fetchInterceptor";
+import { installEditingFocus } from "./lib/editingFocus";
 import "./index.css";
 
 if ("serviceWorker" in navigator) {
@@ -16,6 +17,7 @@ if ("serviceWorker" in navigator) {
 }
 
 installFetchErrorToasts();
+installEditingFocus();
 
 createRoot(document.getElementById("root")!).render(
   <StrictMode>

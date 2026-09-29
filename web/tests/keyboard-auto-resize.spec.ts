@@ -169,15 +169,17 @@ test.describe("Keyboard auto-resize (#1432)", () => {
     await openSession(page, handle);
 
     const layout = await page.evaluate(() => {
-      const root = document.querySelector<HTMLElement>("div.h-dvh.flex.flex-col");
+      const root = document.querySelector<HTMLElement>('div[class~="h-(--app-height)"].flex.flex-col');
       const panel = document.querySelector('[data-term="agent"]');
       const padded = panel?.closest<HTMLElement>("div.flex-1.flex.flex-col");
       return {
+        rootFound: root != null,
         rootInlineHeight: root?.style?.height ?? "",
         paddingBottom: padded ? getComputedStyle(padded).paddingBottom : "",
       };
     });
     // The live view wants the natural dvh shrink; only the single-pane paired shell pins the height.
+    expect(layout.rootFound).toBe(true);
     expect(layout.rootInlineHeight, "live sessions must keep the natural 100dvh root").toBe("");
     expect(["0px", "", "auto"]).toContain(layout.paddingBottom);
     expect(extractResizes(handle).length).toBeGreaterThan(0);

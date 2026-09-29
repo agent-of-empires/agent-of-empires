@@ -100,7 +100,7 @@ export function ArrowJoystick({ onArrow }: { onArrow: (sequence: string) => void
       role="group"
       aria-label="Arrow keys joystick"
       data-arrow-joystick
-      className="absolute right-[60px] bottom-2 z-10 w-12 h-12 rounded-full bg-surface-800/90 border border-surface-700/30 shadow-lg backdrop-blur-sm flex items-center justify-center select-none [-webkit-touch-callout:none]"
+      className="absolute right-2 bottom-[60px] z-10 w-12 h-12 rounded-full bg-surface-800/90 border border-surface-700/30 shadow-lg backdrop-blur-sm flex items-center justify-center select-none [-webkit-touch-callout:none]"
       // No scroll, pinch, or double-tap zoom may start on the pad.
       style={{ touchAction: "none" }}
       // Keep focus on the terminal input, so the keyboard stays as it was.
