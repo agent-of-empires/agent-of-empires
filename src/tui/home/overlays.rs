@@ -61,19 +61,6 @@ impl HomeView {
         changed
     }
 
-    /// Whether the visible surface holds text worth copying. The App releases
-    /// mouse capture then so native drag-to-select works; only add dialogs
-    /// meant to be copied from, since it also disables wheel scroll.
-    pub fn wants_text_selection(&self) -> bool {
-        self.serve_view.is_some()
-            || self.info_dialog.is_some()
-            || self.changelog_dialog.is_some()
-            || self
-                .intro_dialog
-                .as_ref()
-                .is_some_and(|d| d.wants_text_selection())
-    }
-
     /// `has_dialog()` minus live-send. List clicks must keep working in live
     /// mode (to switch the live target), and the preview-only fast path is
     /// exactly what live-send wants, so both gate on this instead.
@@ -132,6 +119,19 @@ impl HomeView {
     /// Show `text` in the status bar for a few seconds.
     pub(in crate::tui) fn flash_status(&mut self, text: impl Into<String>) {
         self.status_flash = Some((text.into(), Instant::now() + FLASH_WINDOW));
+    }
+
+    /// Open `url` in the browser. aoe captures the mouse, so the host terminal
+    /// can't; over SSH no browser opens, so the URL is copied via OSC 52 instead.
+    pub(in crate::tui) fn open_link(&mut self, url: &str) {
+        let status = match crate::tui::open_url::open_url(url) {
+            Ok(()) => format!("opened {url}"),
+            Err(e) => {
+                crate::tui::clipboard::copy_to_clipboard(url);
+                format!("{e}; copied {url}")
+            }
+        };
+        self.flash_status(status);
     }
 
     pub(in crate::tui) fn status_flash_text(&self) -> Option<&str> {

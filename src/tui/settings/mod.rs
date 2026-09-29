@@ -86,6 +86,23 @@ pub struct ListEditState {
     pub adding_new: bool,
 }
 
+/// Clickable parts of the expanded list editor, captured by render.
+#[derive(Default)]
+pub(super) struct ListEditHits {
+    /// Item index and screen rect per visible item row.
+    pub rows: Vec<(usize, ratatui::layout::Rect)>,
+    /// Header actions; a click acts like pressing the key.
+    pub actions: Vec<(crossterm::event::KeyCode, ratatui::layout::Rect)>,
+}
+
+impl ListEditHits {
+    pub fn rects(&self) -> Vec<ratatui::layout::Rect> {
+        let mut rects = crate::tui::dialogs::target_rects(&self.actions);
+        rects.extend(crate::tui::dialogs::target_rects(&self.rows));
+        rects
+    }
+}
+
 /// A field that matched the settings-search query, plus where it lives.
 #[derive(Debug, Clone)]
 pub(super) struct SearchHit {
@@ -212,6 +229,11 @@ pub struct SettingsView {
     /// Last hovered cell, kept apart from `selected_*` so the mouse never
     /// disturbs the keyboard cursor. Cleared on every keypress.
     pub(super) mouse_pos: Option<(u16, u16)>,
+    /// Expanded list editor hit rects; empty while no list is open.
+    pub(super) list_edit_hits: ListEditHits,
+    /// Visual only: `(d)elete` acts on the selection, which the pointer must
+    /// not retarget on its way to the header.
+    pub(super) list_hover: crate::tui::components::hover::HoverState,
 
     /// The command palette's plugin manager, hosted inline in the Plugins
     /// category.
@@ -296,6 +318,8 @@ impl SettingsView {
             field_rects: Vec::new(),
             scrollbar_area: ratatui::layout::Rect::default(),
             mouse_pos: None,
+            list_edit_hits: ListEditHits::default(),
+            list_hover: Default::default(),
             plugin_manager: crate::tui::dialogs::PluginManagerDialog::embedded(),
             plugins_fields_focus: false,
         };
@@ -370,31 +394,19 @@ impl SettingsView {
     /// selection.
     pub(super) fn hovered_scope(&self) -> Option<SettingsScope> {
         let (col, row) = self.mouse_pos?;
-        let pos = ratatui::layout::Position::from((col, row));
-        self.scope_tab_rects
-            .iter()
-            .find(|(_, rect)| rect.contains(pos))
-            .map(|(scope, _)| *scope)
+        crate::tui::dialogs::hit(&self.scope_tab_rects, col, row)
     }
 
     /// Category-row index under the mouse cursor, if any.
     pub(super) fn hovered_category(&self) -> Option<usize> {
         let (col, row) = self.mouse_pos?;
-        let pos = ratatui::layout::Position::from((col, row));
-        self.category_rects
-            .iter()
-            .find(|(_, rect)| rect.contains(pos))
-            .map(|(idx, _)| *idx)
+        crate::tui::dialogs::hit(&self.category_rects, col, row)
     }
 
     /// Field-row index under the mouse cursor, if any.
     pub(super) fn hovered_field(&self) -> Option<usize> {
         let (col, row) = self.mouse_pos?;
-        let pos = ratatui::layout::Position::from((col, row));
-        self.field_rects
-            .iter()
-            .find(|(_, rect)| rect.contains(pos))
-            .map(|(idx, _)| *idx)
+        crate::tui::dialogs::hit(&self.field_rects, col, row)
     }
 
     /// The category at `selected_category`, by invariant always a
@@ -632,6 +644,12 @@ impl SettingsView {
             .saturating_sub(self.fields_viewport_height)
     }
 
+    /// Whether the help overlay or instruction editor covers the panels, so
+    /// wheel and scrollbar input must not move the fields behind it.
+    pub(super) fn has_overlay(&self) -> bool {
+        self.show_help || self.custom_instruction_dialog.is_some()
+    }
+
     /// Move the fields viewport by the wheel. `up` scrolls toward the top.
     /// When the search popup is open the wheel drives its ranked-hit
     /// cursor instead, matching the Up/Down keys. Returns true when
@@ -647,6 +665,9 @@ impl SettingsView {
         // step lands mid-row and reads as jumpy. Line granularity keeps
         // the panel gliding.
         const STEP: u16 = 1;
+        if self.has_overlay() {
+            return false;
+        }
         if self.search_input.is_some() {
             if up {
                 if self.search_selected > 0 {
@@ -681,7 +702,7 @@ impl SettingsView {
     /// further left.
     pub fn hit_scrollbar(&self, col: u16, row: u16) -> bool {
         let bar = self.scrollbar_area;
-        if bar.width == 0 {
+        if bar.width == 0 || self.has_overlay() {
             return false;
         }
         let left = bar.x.saturating_sub(1);

@@ -223,8 +223,7 @@ impl TelemetryConsentDialog {
             self.decline_button_area = Rect::default();
             return;
         }
-        let left_pad = (area.width - row_width) / 2;
-        let enable_x = area.x + left_pad;
+        let enable_x = super::centered_x(area, row_width);
         let decline_x = enable_x + (enable_label.len() + gap.len()) as u16;
         self.enable_button_area = Rect::new(enable_x, area.y, enable_label.len() as u16, 1);
         self.decline_button_area = Rect::new(decline_x, area.y, decline_label.len() as u16, 1);
@@ -260,9 +259,16 @@ mod tests {
         let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
         let mut d = TelemetryConsentDialog::new();
         term.draw(|f| d.render(f, f.area(), &theme)).unwrap();
-        // Clicking the rendered [Enable] / [Not now] glyphs commits directly.
+        // The rects cover the drawn labels, so both brackets are clickable.
         let enable = d.enable_button_area;
         let decline = d.decline_button_area;
+        let buf = term.backend().buffer();
+        for (rect, label) in [(enable, "[Enable]"), (decline, "[Not now]")] {
+            let drawn: String = (rect.x..rect.right())
+                .map(|x| buf[(x, rect.y)].symbol())
+                .collect();
+            assert_eq!(drawn, label);
+        }
         assert!(matches!(
             d.handle_click(enable.x, enable.y),
             Some(DialogResult::Submit(true))

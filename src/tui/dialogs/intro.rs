@@ -9,6 +9,7 @@ use ratatui::widgets::*;
 
 use super::DialogResult;
 use crate::session::AttachMode;
+use crate::tui::components::hover::paint_hover_bg;
 use crate::tui::styles::{available_themes, Theme};
 
 /// Outcome of the intro wizard. Each field is `Some` only when the user
@@ -39,6 +40,16 @@ enum HoverButton {
     Back,
     Next,
 }
+
+/// Label and URL for each link row on the Welcome page, in render order.
+const WELCOME_LINKS: [(&str, &str); 3] = [
+    (
+        "  Docs:      ",
+        "https://www.agent-of-empires.com/docs/quick-start",
+    ),
+    ("  Tutorials: ", "https://www.youtube.com/@agent-of-empires"),
+    ("  Discord:   ", "https://discord.gg/5N3QKX3f6s"),
+];
 
 impl Page {
     fn all() -> &'static [Page] {
@@ -91,6 +102,12 @@ pub struct IntroDialog {
     telemetry_option_areas: [Rect; 2],
     /// Hovered option on the Telemetry page.
     hovered_telemetry_idx: Option<usize>,
+
+    /// URL rects on the Welcome page, empty elsewhere.
+    link_areas: Vec<(&'static str, Rect)>,
+    hovered_link: Option<usize>,
+    /// Clicked URL for the home view to open.
+    pending_link: Option<&'static str>,
 }
 
 impl IntroDialog {
@@ -122,19 +139,20 @@ impl IntroDialog {
             telemetry_visited: false,
             telemetry_option_areas: [Rect::default(), Rect::default()],
             hovered_telemetry_idx: None,
+            link_areas: Vec::new(),
+            hovered_link: None,
+            pending_link: None,
         }
+    }
+
+    /// URL clicked since the last call, for the caller to open.
+    pub fn take_pending_link(&mut self) -> Option<&'static str> {
+        self.pending_link.take()
     }
 
     /// Theme to preview now, if the cursor moved since the last call.
     pub fn take_pending_preview(&mut self) -> Option<String> {
         self.pending_preview.take()
-    }
-
-    /// True on every page, so xterm mouse tracking stays off and the terminal
-    /// can drag-select the URLs. The trade is keyboard-only navigation, which
-    /// each page's hint advertises.
-    pub fn wants_text_selection(&self) -> bool {
-        true
     }
 
     fn current_page(&self) -> Page {
@@ -322,10 +340,13 @@ impl IntroDialog {
         } else {
             None
         };
+        let new_link = self.link_areas.iter().position(|(_, a)| a.contains(pos));
         let changed = self.hovered_button != new_button
             || self.hovered_theme_row != new_theme
             || self.hovered_attach_idx != new_attach
-            || self.hovered_telemetry_idx != new_telemetry;
+            || self.hovered_telemetry_idx != new_telemetry
+            || self.hovered_link != new_link;
+        self.hovered_link = new_link;
         self.hovered_button = new_button;
         self.hovered_theme_row = new_theme;
         self.hovered_attach_idx = new_attach;
@@ -338,6 +359,8 @@ impl IntroDialog {
     /// so a stale hover would paint at the wrong coords until the next
     /// mouse-move event recomputes things.
     fn clear_page_hover(&mut self) {
+        self.link_areas.clear();
+        self.hovered_link = None;
         self.hovered_theme_row = None;
         self.hovered_attach_idx = None;
         self.hovered_telemetry_idx = None;
@@ -357,6 +380,10 @@ impl IntroDialog {
         }
         if self.next_button_area.contains(pos) {
             return Some(self.advance().unwrap_or(DialogResult::Continue));
+        }
+        if let Some(url) = super::hit(&self.link_areas, col, row) {
+            self.pending_link = Some(url);
+            return Some(DialogResult::Continue);
         }
         if self.current_page() == Page::ThemePicker {
             for (idx, area) in self.theme_row_areas.iter().enumerate() {
@@ -410,6 +437,7 @@ impl IntroDialog {
             .constraints([Constraint::Min(1), Constraint::Length(2)])
             .split(inner);
 
+        self.link_areas.clear();
         match self.current_page() {
             Page::Welcome => self.render_welcome(frame, chunks[0], theme),
             Page::Telemetry => self.render_telemetry(frame, chunks[0], theme),
@@ -422,8 +450,8 @@ impl IntroDialog {
         self.render_footer(frame, chunks[1], theme);
     }
 
-    fn render_welcome(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
-        let lines = vec![
+    fn render_welcome(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
+        let mut lines = vec![
             Line::from(Span::styled(
                 "Agent of Empires (aoe) runs many AI coding agents side by side.",
                 Style::default().fg(theme.text),
@@ -442,27 +470,17 @@ impl IntroDialog {
                 Style::default().fg(theme.text),
             )),
             Line::from(""),
+        ];
+        let links_row = lines.len();
+        lines.extend(WELCOME_LINKS.iter().map(|(label, url)| {
             Line::from(vec![
-                Span::styled("  Docs:      ", Style::default().fg(theme.dimmed)),
-                Span::styled(
-                    "https://www.agent-of-empires.com/docs/quick-start",
-                    Style::default().fg(theme.accent),
-                ),
-            ]),
-            Line::from(vec![
-                Span::styled("  Tutorials: ", Style::default().fg(theme.dimmed)),
-                Span::styled(
-                    "https://www.youtube.com/@agent-of-empires",
-                    Style::default().fg(theme.accent),
-                ),
-            ]),
-            Line::from(vec![
-                Span::styled("  Discord:   ", Style::default().fg(theme.dimmed)),
-                Span::styled(
-                    "https://discord.gg/5N3QKX3f6s",
-                    Style::default().fg(theme.accent),
-                ),
-            ]),
+                Span::styled(*label, Style::default().fg(theme.dimmed)),
+                Span::styled(*url, Style::default().fg(theme.accent).underlined()),
+            ])
+        }));
+        // Link rows are only hit-testable while nothing above them wraps.
+        let unwrapped = lines.iter().all(|l| l.width() <= area.width as usize);
+        lines.extend([
             Line::from(""),
             Line::from(Span::styled(
                 "This walkthrough covers starting a session, picking how you drive",
@@ -477,13 +495,26 @@ impl IntroDialog {
                 "→/Enter forward, ← back, Esc skip.",
                 Style::default().fg(theme.hint).italic(),
             )),
-            Line::from(Span::styled(
-                "Drag to select the URLs above; your terminal handles the copy.",
+        ]);
+        if unwrapped {
+            lines.push(Line::from(Span::styled(
+                "Click a link above to open it in your browser.",
                 Style::default().fg(theme.hint).italic(),
-            )),
-        ];
+            )));
+            for (i, (label, url)) in WELCOME_LINKS.iter().enumerate() {
+                let y = area.y + (links_row + i) as u16;
+                if y >= area.bottom() {
+                    break;
+                }
+                let rect = Rect::new(area.x + label.len() as u16, y, url.len() as u16, 1);
+                self.link_areas.push((url, rect));
+            }
+        }
         let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
         frame.render_widget(paragraph, area);
+        if let Some((_, rect)) = self.hovered_link.and_then(|i| self.link_areas.get(i)) {
+            paint_hover_bg(frame, *rect, theme.selection);
+        }
     }
 
     fn render_telemetry(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
@@ -1133,14 +1164,26 @@ mod tests {
     }
 
     #[test]
-    fn every_page_keeps_mouse_capture_off_so_urls_drag_copy() {
-        // Flipping this for clickable buttons would regress the copy flow on
-        // the docs / YouTube / Discord URLs, so it should be a conscious call.
+    fn welcome_links_click_only_while_they_render_unwrapped() {
+        use crate::tui::dialogs::test_render::{draw, find};
+        let url = WELCOME_LINKS[0].1;
         let mut dialog = IntroDialog::new("zinc");
-        for _ in 0..6 {
-            assert!(dialog.wants_text_selection());
-            dialog.handle_key(key(KeyCode::Right));
-        }
+        let buf = draw(100, 30, |f, theme| dialog.render(f, f.area(), theme));
+        find(&buf, "Click a link above");
+        let (x, y) = find(&buf, url);
+        assert!(dialog.handle_hover(x, y));
+        assert!(matches!(
+            dialog.handle_click(x, y),
+            Some(DialogResult::Continue)
+        ));
+        assert_eq!(dialog.take_pending_link(), Some(url));
+
+        // Too narrow: the links wrap, so they are neither targets nor advertised.
+        let mut dialog = IntroDialog::new("zinc");
+        let buf = draw(50, 40, |f, theme| dialog.render(f, f.area(), theme));
+        assert!(dialog.link_areas.is_empty());
+        let text: String = buf.content().iter().map(|c| c.symbol()).collect();
+        assert!(!text.contains("Click a link"));
     }
 
     #[test]

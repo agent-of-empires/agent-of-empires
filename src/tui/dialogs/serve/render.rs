@@ -5,10 +5,15 @@ use std::time::Duration;
 use ratatui::prelude::*;
 use ratatui::widgets::*;
 
+use crossterm::event::{KeyCode, KeyEvent};
+
 use super::daemon::error_mentions_tailscale;
 use super::{
-    Flash, PendingConfirm, ServeMode, ServeView, ServeViewState, TransportStatus, TunnelTransport,
+    Flash, PendingConfirm, ServeMode, ServeMouse, ServeView, ServeViewState, TransportStatus,
+    TunnelTransport, FLASH_TTL,
 };
+use crate::tui::components::hint_buttons::scan_spaced_hints;
+use crate::tui::components::hover::paint_hover_bg;
 use crate::tui::dialogs::centered_rect;
 use crate::tui::styles::Theme;
 
@@ -18,6 +23,9 @@ const API_ONLY_NOTICE: &str =
 const API_ONLY_ROWS: u16 = 2;
 
 pub(super) fn render(view: &ServeView, frame: &mut Frame, area: Rect, theme: &Theme) {
+    let mut mouse = view.mouse.borrow_mut();
+    mouse.keys.clear();
+    mouse.copies.clear();
     match &view.state {
         ServeViewState::ModePicker {
             selected,
@@ -28,6 +36,7 @@ pub(super) fn render(view: &ServeView, frame: &mut Frame, area: Rect, theme: &Th
             frame,
             area,
             theme,
+            &mut mouse,
             *selected,
             (*local_available, *tunnel_available),
             flash_text(flash),
@@ -41,21 +50,40 @@ pub(super) fn render(view: &ServeView, frame: &mut Frame, area: Rect, theme: &Th
             frame,
             area,
             theme,
+            &mut mouse,
             *selected,
             (*tailscale, *cloudflare),
             flash_text(flash),
         ),
         ServeViewState::Starting {
             mode, started_at, ..
-        } => render_starting(frame, area, theme, *mode, started_at.elapsed()),
+        } => render_starting(frame, area, theme, &mut mouse, *mode, started_at.elapsed()),
         ServeViewState::Active { mode, .. } => {
-            render_active(view, frame, area, theme);
+            render_active(view, frame, area, theme, &mut mouse);
             if view.show_help {
+                // Any click closes the overlay, so nothing beneath is a target.
+                mouse.keys.clear();
+                mouse.copies.clear();
                 render_help_overlay(frame, area, theme, *mode);
             }
         }
-        ServeViewState::Error(msg) => render_error(frame, area, theme, msg),
+        ServeViewState::Error(msg) => render_error(frame, area, theme, &mut mouse, msg),
     }
+    if let Some(rect) = mouse.hover.current_in(&mouse.rects()) {
+        paint_hover_bg(frame, rect, theme.selection);
+    }
+}
+
+/// Record the hints drawn in `area` as click targets.
+fn record_hints(frame: &mut Frame, mouse: &mut ServeMouse, area: Rect) {
+    mouse
+        .keys
+        .extend(scan_spaced_hints(frame.buffer_mut(), area));
+}
+
+/// A card click selects it, and a second click on the selected card confirms.
+fn card_key(selected: bool, select: KeyCode) -> KeyEvent {
+    KeyEvent::from(if selected { KeyCode::Enter } else { select })
 }
 
 fn flash_text(flash: &Flash) -> &str {
@@ -144,6 +172,7 @@ fn render_mode_picker(
     frame: &mut Frame,
     area: Rect,
     theme: &Theme,
+    mouse: &mut ServeMouse,
     selected: ServeMode,
     (local_available, tunnel_available): (bool, bool),
     flash: &str,
@@ -196,6 +225,13 @@ fn render_mode_picker(
         ),
     ];
     for (card_area, title, mode, available, headline, body_lines, unavailable_note) in cards {
+        let select = match mode {
+            ServeMode::Local => KeyCode::Char('h'),
+            ServeMode::Tunnel => KeyCode::Char('l'),
+        };
+        mouse
+            .keys
+            .push((card_key(selected == mode, select), card_area));
         let (card_inner, body) =
             render_card(frame, card_area, theme, title, selected == mode, available);
         let headline_color = if available {
@@ -226,15 +262,17 @@ fn render_mode_picker(
     centered_line(
         frame,
         keys,
-        "[←/→] choose    [L] Local    [T] Tunnel    [Enter] confirm    [Esc] cancel",
+        "[←/→] choose   [L] Local   [T] Tunnel   [Enter] confirm   [Esc] cancel",
         Style::default().fg(theme.dimmed),
     );
+    record_hints(frame, mouse, keys);
 }
 
 fn render_confirm(
     frame: &mut Frame,
     area: Rect,
     theme: &Theme,
+    mouse: &mut ServeMouse,
     selected: TunnelTransport,
     (tailscale, cloudflare): (TransportStatus, TransportStatus),
     flash: &str,
@@ -246,7 +284,7 @@ fn render_confirm(
         theme.accent,
         theme.accent,
     );
-    let (head, [ts_area, cf_area], flash_area, keys) = card_page(inner, (82, 19), 7, 8);
+    let (head, [ts_area, cf_area], flash_area, keys) = card_page(inner, (88, 19), 7, 8);
     let [risk_area, pick_area] =
         Layout::vertical([Constraint::Length(6), Constraint::Length(1)]).areas(head);
 
@@ -306,6 +344,13 @@ fn render_confirm(
         ),
     ];
     for (card_area, title, transport, status, body_lines, not_installed) in cards {
+        let select = match transport {
+            TunnelTransport::Tailscale => KeyCode::Char('h'),
+            TunnelTransport::Cloudflare => KeyCode::Char('l'),
+        };
+        mouse
+            .keys
+            .push((card_key(selected == transport, select), card_area));
         let ready = status == TransportStatus::Ready;
         let (card_inner, body) =
             render_card(frame, card_area, theme, title, selected == transport, ready);
@@ -346,12 +391,14 @@ fn render_confirm(
         "[←/→] select  [T] Tailscale  [C] Cloudflare  [R] refresh  [Enter] confirm  [Esc] cancel",
         Style::default().fg(theme.dimmed),
     );
+    record_hints(frame, mouse, keys);
 }
 
 fn render_starting(
     frame: &mut Frame,
     area: Rect,
     theme: &Theme,
+    mouse: &mut ServeMouse,
     mode: ServeMode,
     elapsed: Duration,
 ) {
@@ -379,10 +426,17 @@ fn render_starting(
             Style::default().fg(theme.dimmed),
         ),
     ];
+    let banner_area = centered_rect(inner, inner.width, 5);
     frame.render_widget(
         Paragraph::new(banner).alignment(Alignment::Center),
-        centered_rect(inner, inner.width, 5),
+        banner_area,
     );
+    let keys_row = Rect {
+        y: banner_area.bottom().saturating_sub(1),
+        height: 1,
+        ..banner_area
+    };
+    record_hints(frame, mouse, keys_row);
 }
 
 /// The scannable block for `url`. Empty without the dashboard bundle: a scan would reach no page.
@@ -407,7 +461,13 @@ fn render_qr(_url: &str) -> String {
     String::new()
 }
 
-fn render_active(view: &ServeView, frame: &mut Frame, area: Rect, theme: &Theme) {
+fn render_active(
+    view: &ServeView,
+    frame: &mut Frame,
+    area: Rect,
+    theme: &Theme,
+    mouse: &mut ServeMouse,
+) {
     let ServeViewState::Active {
         mode,
         urls,
@@ -424,6 +484,7 @@ fn render_active(view: &ServeView, frame: &mut Frame, area: Rect, theme: &Theme)
             frame,
             area,
             theme,
+            mouse,
             "Daemon started but no URL available yet.",
         );
         return;
@@ -468,6 +529,12 @@ fn render_active(view: &ServeView, frame: &mut Frame, area: Rect, theme: &Theme)
             Style::default().fg(theme.waiting),
         ));
     }
+    if let Some((label, _)) = view.copied.filter(|(_, at)| at.elapsed() < FLASH_TTL) {
+        header_spans.push(Span::styled(
+            format!("  copied {label}"),
+            Style::default().fg(theme.running),
+        ));
+    }
     frame.render_widget(Paragraph::new(Line::from(header_spans)), header_inner);
 
     let url = active_url.url.as_str();
@@ -484,9 +551,12 @@ fn render_active(view: &ServeView, frame: &mut Frame, area: Rect, theme: &Theme)
         ]))
     };
 
-    let mut rows: Vec<(u16, Paragraph)> = vec![(
+    // Each row may carry `(label, drawn value width, value a click copies)`.
+    type Copy = Option<(&'static str, u16, String)>;
+    let mut rows: Vec<(u16, Paragraph, Copy)> = vec![(
         qr_lines.len() as u16,
         Paragraph::new(qr_lines).alignment(Alignment::Center),
+        None,
     )];
     if !cfg!(feature = "web") {
         rows.push((
@@ -495,47 +565,70 @@ fn render_active(view: &ServeView, frame: &mut Frame, area: Rect, theme: &Theme)
                 .style(dimmed)
                 .wrap(Wrap { trim: true })
                 .alignment(Alignment::Center),
+            None,
         ));
     }
-    rows.push((1, Paragraph::new("")));
+    rows.push((1, Paragraph::new(""), None));
     if let Some(label) = &active_url.label {
         rows.push((
             1,
             center(Line::styled(format!("via {}", label), dimmed.italic())),
+            None,
         ));
     }
     let url_fits =
         "URL: ".len() + url.chars().count() <= content.width.saturating_sub(2).max(1) as usize;
     let (base_url, token) = split_url_and_token(url);
-    if url_fits {
-        rows.push((1, labeled("URL: ", url.to_string(), accent)));
-    } else {
-        rows.push((1, labeled("URL: ", base_url, accent)));
-        if let Some(token) = token {
-            rows.push((1, labeled("Token: ", token.to_string(), accent)));
-        }
+    let width = |s: &str| s.chars().count() as u16;
+    // The full URL is copied even when it wraps onto a token row.
+    let shown_url = if url_fits { url.to_string() } else { base_url };
+    rows.push((
+        1,
+        labeled("URL: ", shown_url.clone(), accent),
+        Some(("URL: ", width(&shown_url), url.to_string())),
+    ));
+    if let Some(token) = token.filter(|_| !url_fits) {
+        rows.push((
+            1,
+            labeled("Token: ", token.to_string(), accent),
+            Some(("Token: ", width(token), token.to_string())),
+        ));
     }
     if is_tunnel {
-        let (value, style) = match passphrase {
-            Some(pp) => (pp.clone(), accent.bold()),
+        let (value, style, copy) = match passphrase {
+            Some(pp) => (
+                pp.clone(),
+                accent.bold(),
+                Some(("Passphrase: ", width(pp), pp.clone())),
+            ),
             None => (
                 "(set when the daemon started; check the shell that ran `aoe serve`)".to_string(),
                 dimmed,
+                None,
             ),
         };
-        rows.push((1, labeled("Passphrase: ", value, style)));
+        rows.push((1, labeled("Passphrase: ", value, style), copy));
     }
 
-    let total: u16 = rows.iter().map(|(h, _)| h).sum();
+    let total: u16 = rows.iter().map(|(h, _, _)| h).sum();
     let top_pad = Constraint::Length(content.height.saturating_sub(total) / 2);
     let constraints = std::iter::once(top_pad)
-        .chain(rows.iter().map(|(h, _)| Constraint::Length(*h)))
+        .chain(rows.iter().map(|(h, _, _)| Constraint::Length(*h)))
         .chain(std::iter::once(Constraint::Min(0)));
     let chunks = Layout::vertical(constraints)
         .horizontal_margin(1)
         .split(content);
-    for ((_, row), chunk) in rows.into_iter().zip(chunks.iter().skip(1)) {
+    for ((_, row, copy), chunk) in rows.into_iter().zip(chunks.iter().skip(1)) {
         frame.render_widget(row, *chunk);
+        if let Some((label, value_w, value)) = copy {
+            let label_w = label.len() as u16;
+            let x = crate::tui::dialogs::centered_x(*chunk, label_w + value_w) + label_w;
+            let width = value_w.min(chunk.right().saturating_sub(x));
+            let what = label.trim_end_matches([':', ' ']);
+            mouse
+                .copies
+                .push(((what, value), Rect::new(x, chunk.y, width, 1)));
+        }
     }
 
     let footer_block = Block::default()
@@ -576,6 +669,7 @@ fn render_active(view: &ServeView, frame: &mut Frame, area: Rect, theme: &Theme)
         Paragraph::new(footer_line).alignment(Alignment::Center),
         footer_inner,
     );
+    record_hints(frame, mouse, footer_inner);
 }
 
 fn render_help_overlay(frame: &mut Frame, area: Rect, theme: &Theme, mode: ServeMode) {
@@ -655,7 +749,7 @@ fn split_url_and_token(url: &str) -> (String, Option<&str>) {
     (url.to_string(), None)
 }
 
-fn render_error(frame: &mut Frame, area: Rect, theme: &Theme, msg: &str) {
+fn render_error(frame: &mut Frame, area: Rect, theme: &Theme, mouse: &mut ServeMouse, msg: &str) {
     let inner = render_page(frame, area, " Serve failed ", theme.error, theme.error);
     let [body, keys] = Layout::vertical([Constraint::Min(1), Constraint::Length(1)])
         .margin(1)
@@ -672,6 +766,7 @@ fn render_error(frame: &mut Frame, area: Rect, theme: &Theme, msg: &str) {
         "[S] Force-stop daemon    [Enter] Close"
     };
     centered_line(frame, keys, keybinds, Style::default().fg(theme.dimmed));
+    record_hints(frame, mouse, keys);
 }
 
 fn format_elapsed(d: Duration) -> String {
@@ -739,6 +834,8 @@ mod tests {
             pending_passphrase: String::new(),
             pending_confirm: None,
             show_help: false,
+            mouse: Default::default(),
+            copied: None,
         };
         let mut term = Terminal::new(TestBackend::new(72, 26)).unwrap();
         term.draw(|f| render(&view, f, f.area(), &Theme::default()))
@@ -771,5 +868,119 @@ mod tests {
                 "{needle:?}\n{screen}"
             );
         }
+    }
+
+    fn view(state: ServeViewState) -> ServeView {
+        ServeView {
+            state,
+            pending_passphrase: String::new(),
+            pending_confirm: None,
+            show_help: false,
+            mouse: Default::default(),
+            copied: None,
+        }
+    }
+
+    fn draw(view: &ServeView) -> ratatui::buffer::Buffer {
+        draw_at(view, 100)
+    }
+
+    fn draw_at(view: &ServeView, width: u16) -> ratatui::buffer::Buffer {
+        crate::tui::dialogs::test_render::draw(width, 40, |f, _| {
+            render(view, f, f.area(), &Theme::default())
+        })
+    }
+
+    #[test]
+    fn values_are_copy_targets_and_hints_click() {
+        use crate::tui::dialogs::test_render::find;
+        let url = "https://host.example.ts.net/?token=abcdefghijklmnopqrstuvwxyz0123456789";
+        let token = split_url_and_token(url).1.unwrap();
+        // At 60 columns the URL splits onto a Token row, yet its row still
+        // copies the whole URL.
+        let cases: [(u16, &[(&str, &str)]); 2] = [
+            (100, &[("URL", url), ("Passphrase", "correct-horse")]),
+            (
+                60,
+                &[
+                    ("URL", url),
+                    ("Token", token),
+                    ("Passphrase", "correct-horse"),
+                ],
+            ),
+        ];
+        for (width, want) in cases {
+            let view = view(ServeViewState::Active {
+                mode: ServeMode::Tunnel,
+                transport: None,
+                urls: vec![ServeUrl {
+                    label: None,
+                    url: url.to_string(),
+                }],
+                url_index: 0,
+                passphrase: Some("correct-horse".to_string()),
+                opened_at: Instant::now(),
+                log_offset: 0,
+            });
+            let buf = draw_at(&view, width);
+            let mouse = view.mouse.borrow();
+            let got: Vec<(&str, &str)> = mouse
+                .copies
+                .iter()
+                .map(|((label, value), r)| {
+                    let drawn: String = (r.x..r.right()).map(|x| buf[(x, r.y)].symbol()).collect();
+                    assert!(!drawn.is_empty() && value.starts_with(&drawn), "{label}");
+                    (*label, value.as_str())
+                })
+                .collect();
+            assert_eq!(got, want, "width {width}");
+        }
+
+        let mut view = view(ServeViewState::Active {
+            mode: ServeMode::Local,
+            transport: None,
+            urls: vec![ServeUrl {
+                label: None,
+                url: url.to_string(),
+            }],
+            url_index: 0,
+            passphrase: None,
+            opened_at: Instant::now(),
+            log_offset: 0,
+        });
+        let (x, y) = find(&draw(&view), "R: restart");
+        assert!(view.handle_hover(x, y));
+        assert_eq!(
+            view.handle_click(x, y).map(|k| k.code),
+            Some(KeyCode::Char('R'))
+        );
+        view.show_help = true;
+        draw(&view);
+        assert_eq!(view.handle_click(0, 0).map(|k| k.code), Some(KeyCode::Esc));
+    }
+
+    #[test]
+    fn a_card_click_selects_it_then_confirms_it() {
+        let mut view = view(ServeViewState::ModePicker {
+            selected: ServeMode::Local,
+            tunnel_available: true,
+            local_available: true,
+            flash: None,
+        });
+        let buf = draw(&view);
+        let (x, y) = crate::tui::dialogs::test_render::find(&buf, "Internet (HTTPS)");
+        assert_eq!(
+            view.handle_click(x, y).map(|k| k.code),
+            Some(KeyCode::Char('l'))
+        );
+        view.handle_key(KeyEvent::from(KeyCode::Char('l')));
+        draw(&view);
+        assert_eq!(
+            view.handle_click(x, y).map(|k| k.code),
+            Some(KeyCode::Enter)
+        );
+        let buf = draw(&view);
+        let (x, y) = crate::tui::dialogs::test_render::find(&buf, "[Esc] cancel");
+        assert_eq!(view.handle_click(x, y).map(|k| k.code), Some(KeyCode::Esc));
     }
 }

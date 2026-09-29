@@ -4024,13 +4024,13 @@ impl HomeView {
             match key {
                 Some(key) => {
                     self.footer_buttons.push((
+                        key,
                         Rect {
                             x: col,
                             y: area.y,
                             width,
                             height: area.height,
                         },
-                        key,
                     ));
                     if self.footer_hover == Some(key) {
                         for s in group {
