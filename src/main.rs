@@ -357,10 +357,7 @@ async fn run(
                 ThemeCommands::Dir => cli::theme::run_dir(),
             });
         }
-        // Both arms return their exit code, so a served read carries the same
-        // status the local handler would have produced.
         Some(Commands::Settings { command }) => return exit_zero(cli::settings::run(command)),
-        Some(Commands::Telemetry { command }) => return exit_zero(cli::telemetry::run(command)),
         Some(Commands::Mcp { command }) => {
             let profile = cli.profile.clone().unwrap_or_default();
             return exit_zero(cli::mcp::run(&profile, command).await);
@@ -427,7 +424,7 @@ async fn run(
         Some(Commands::Cityhall { command }) => cli::cityhall::run(command),
         // After migrations: enable/disable rewrite config.toml through the
         // current schema, which drops any key a pending migration would carry.
-        Some(Commands::Telemetry { command }) => cli::telemetry::run(command),
+        Some(Commands::Telemetry { command }) => return exit_zero(cli::telemetry::run(command)),
         Some(Commands::Serve(args)) => cli::serve::run(&profile, args).await,
         Some(Commands::Url(args)) => cli::url::run(args),
         Some(Commands::Sandbox { command }) => cli::sandbox::run(command),
