@@ -316,6 +316,34 @@ pub async fn reload_tmux_applied_for_test(
     .await
 }
 
+/// A temporary XDG base whose whole ancestor chain satisfies the client's
+/// trusted walk, with the environment bound to it, so a test that publishes or
+/// reads never touches the developer's real app directory. `None` means this
+/// host has no such chain, which a caller reports rather than passes over.
+#[cfg(test)]
+pub(crate) fn trusted_namespace() -> Option<(tempfile::TempDir, RuntimeEnvGuard)> {
+    let euid = unsafe { libc::geteuid() };
+    let mut candidates = Vec::new();
+    if let Some(base) = std::env::var_os("XDG_CONFIG_HOME").map(std::path::PathBuf::from) {
+        candidates.push(base);
+    }
+    candidates.push(std::env::temp_dir());
+    if let Some(home) = dirs::home_dir() {
+        candidates.push(home);
+    }
+    for base in candidates {
+        if crate::cli::runtime_read::uds::open_trusted_directory(&base, euid).is_err() {
+            continue;
+        }
+        let Ok(base) = tempfile::tempdir_in(&base) else {
+            continue;
+        };
+        let guard = RuntimeEnvGuard::set(base.path());
+        return Some((base, guard));
+    }
+    None
+}
+
 /// A live local runtime read, in a namespace of the test's own.
 ///
 /// The producer resolves the app dir from the environment, so the harness

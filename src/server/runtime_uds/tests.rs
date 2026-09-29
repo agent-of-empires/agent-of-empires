@@ -38,28 +38,8 @@ fn client_admits(path: &Path) -> bool {
 /// walk. `None` means this host has no such directory, which is reported rather
 /// than silently passed.
 fn namespace() -> Option<Namespace> {
-    let mut candidates = Vec::new();
-    if let Some(base) = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from) {
-        candidates.push(base);
-    }
-    candidates.push(std::env::temp_dir());
-    if let Some(home) = dirs::home_dir() {
-        candidates.push(home);
-    }
-    for base in candidates {
-        if !client_admits(&base) {
-            continue;
-        }
-        let Ok(base) = tempfile::tempdir_in(&base) else {
-            continue;
-        };
-        let guard = crate::server::test_support::RuntimeEnvGuard::set(base.path());
-        return Some(Namespace {
-            base,
-            _guard: guard,
-        });
-    }
-    None
+    let (base, _guard) = crate::server::test_support::trusted_namespace()?;
+    Some(Namespace { base, _guard })
 }
 
 fn namespace_or_skip() -> Option<Namespace> {
@@ -300,6 +280,77 @@ async fn an_unreadable_proc_entry_refuses_publication_and_keeps_the_artifacts() 
         "the retained marker must survive a refused publication"
     );
     assert!(!dir.join(PREBIND_FILE).exists(), "nothing was published");
+}
+
+/// A marker this half cannot read the schema of is still retained state, and
+/// the schema says nothing about who wrote it. Only a writer proven gone makes
+/// it reapable; a live one, or one this half cannot place, still owns the
+/// namespace and is refused, with the schema named as the reason.
+#[test]
+#[serial_test::serial]
+fn a_foreign_schema_marker_is_reaped_only_from_a_writer_proven_dead() {
+    let Some(namespace) = namespace_or_skip() else {
+        return;
+    };
+    let dir = app_dir(&namespace);
+    let pid = std::process::id();
+    let live = process_start_identity(pid).expect("this process has a start identity");
+    // (schema, identity, the code publication is refused with; `None` is the
+    // retained state a new daemon is expected to reap)
+    let cases: [(u8, String, Option<&str>); 4] = [
+        // Another boot ended, so the writer is gone whatever its body says.
+        (
+            SCHEMA + 1,
+            "linux:v1:00000000-0000-0000-0000-000000000000:1".to_string(),
+            None,
+        ),
+        // An identity this half cannot place proves nothing at all.
+        (
+            SCHEMA + 1,
+            format!("darwin:v1:{}:1", boot_id().expect("boot id")),
+            Some("marker_foreign"),
+        ),
+        // A writer this process can see is publishing right now.
+        (SCHEMA + 1, live.clone(), Some("marker_foreign")),
+        // The same writer on a schema this half does speak: still refused, but
+        // as a busy namespace rather than as a foreign body.
+        (SCHEMA, live.clone(), Some("namespace_busy")),
+    ];
+    for (schema, identity, refused) in cases {
+        let path = dir.join(PREBIND_FILE);
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "schema": schema,
+                "pid": pid,
+                "process_start_identity": identity,
+                "prebind_instance_id": "11111111-2222-3333-4444-555555555555",
+            })
+            .to_string(),
+        )
+        .expect("retained marker");
+
+        let opened = open_trusted_app_dir(&dir).expect("open the namespace directory");
+        let reaped = reap_retained_state(opened.as_raw_fd());
+        match refused {
+            Some(code) => {
+                let error = reaped.expect_err("a writer this half cannot place owns the namespace");
+                assert_eq!(error.code(), code, "{identity} is refused as {code}");
+                assert!(
+                    path.exists(),
+                    "{identity} must be left in place, not reaped"
+                );
+                std::fs::remove_file(&path).expect("clear the refused artifact");
+            }
+            None => {
+                reaped.expect("a proven dead writer's artifact is retained state");
+                assert!(
+                    !path.exists(),
+                    "a dead writer's foreign marker is reaped like any other"
+                );
+            }
+        }
+    }
 }
 
 /// Shutdown removes this daemon's artifacts, and only those.

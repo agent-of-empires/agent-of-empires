@@ -28,8 +28,10 @@ use tokio_tungstenite::tungstenite;
 use super::AppState;
 use crate::session::{GroupTree, Instance, Storage};
 
-/// Wire protocol version. The client refuses anything else.
-const PROTOCOL_VERSION: u16 = 2;
+/// Wire protocol version. The client refuses anything else and imports this
+/// constant, because a version the two halves spell differently is a handshake
+/// that fails closed for no reason anyone can see.
+pub(crate) const PROTOCOL_VERSION: u16 = 2;
 /// A stalled reader must not hold a connection slot, or a full disk rescan's
 /// worth of work, open indefinitely. Both transports spend this one budget,
 /// each for the whole connection from accept to close rather than per stage,

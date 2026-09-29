@@ -41,8 +41,13 @@ pub(crate) const PREBIND_FILE: &str = "runtime.prebind.json";
 pub(crate) const POSTBIND_FILE: &str = "runtime.postbind.json";
 pub(crate) const SOCKET_FILE: &str = "runtime.sock";
 
-/// Marker schema version. The client refuses anything else.
-const SCHEMA: u8 = 1;
+/// Marker schema version. The client refuses anything else, and imports this
+/// constant rather than spelling the number a second time.
+pub(crate) const SCHEMA: u8 = 1;
+/// What a create-then-rename marker is called before its rename: the final
+/// name, this, and the prebind instance id the write belongs to. The client
+/// refuses these names, so both halves have to spell them the one way.
+pub(crate) const TEMPORARY_SEPARATOR: &str = ".tmp.";
 /// Backoff after an accept error, so a failing accept cannot spin the loop.
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(50);
 /// The client's frame ceiling, applied to what this endpoint reads. tungstenite
@@ -253,8 +258,14 @@ fn publish_locked(dir: OwnedFd, lock: File) -> Result<PublishedRuntime, PublishE
                 POSTBIND_FILE,
                 PREBIND_FILE,
                 SOCKET_FILE,
-                &format!("{POSTBIND_FILE}.tmp.{}", published.prebind_instance_id),
-                &format!("{PREBIND_FILE}.tmp.{}", published.prebind_instance_id),
+                &format!(
+                    "{POSTBIND_FILE}{TEMPORARY_SEPARATOR}{}",
+                    published.prebind_instance_id
+                ),
+                &format!(
+                    "{PREBIND_FILE}{TEMPORARY_SEPARATOR}{}",
+                    published.prebind_instance_id
+                ),
             ] {
                 let _ = unlink_entry(raw, name);
             }
@@ -448,9 +459,10 @@ fn reap_retained_state(dir: RawFd) -> Result<(), PublishError> {
         }
         unlink_entry(dir, name)?;
     }
-    // A marker a live process wrote means that process is publishing right
-    // now, and a marker this half cannot prove dead proves nothing at all, so
-    // both leave everything in place.
+    // Only a marker proven gone is reaped. A live writer is publishing right
+    // now and a marker this half cannot place proves nothing at all, so both
+    // leave everything in place, and the refusal names whichever of the two
+    // reasons applies.
     for name in retained.iter().filter(|name| !is_temporary_name(name)) {
         // The socket carries no identity of its own: a live daemon always has a
         // postbind marker beside it, so an unmarked socket is retained state.
@@ -460,17 +472,18 @@ fn reap_retained_state(dir: RawFd) -> Result<(), PublishError> {
         let Some(probe) = read_probe(dir, name)? else {
             continue;
         };
-        if probe.schema != SCHEMA {
-            return Err(PublishError::new(
-                "marker_foreign",
-                format!("{name} is not a schema {SCHEMA} marker"),
-            ));
-        }
         if process_liveness(&probe) != ProcessLiveness::Dead {
-            return Err(PublishError::new(
-                "namespace_busy",
-                format!("{name} belongs to process {}", probe.pid),
-            ));
+            return Err(if probe.schema == SCHEMA {
+                PublishError::new(
+                    "namespace_busy",
+                    format!("{name} belongs to process {}", probe.pid),
+                )
+            } else {
+                PublishError::new(
+                    "marker_foreign",
+                    format!("{name} is not a schema {SCHEMA} marker"),
+                )
+            });
         }
     }
     for name in &retained {
@@ -479,10 +492,17 @@ fn reap_retained_state(dir: RawFd) -> Result<(), PublishError> {
     Ok(())
 }
 
+/// Whether `name` is a create-then-rename marker of `file` that has not been
+/// renamed yet. One definition, because the client refuses these names and a
+/// second spelling would be a name the client does not recognise.
+pub(crate) fn is_temporary_of(name: &str, file: &str) -> bool {
+    name.strip_prefix(file)
+        .is_some_and(|rest| rest.starts_with(TEMPORARY_SEPARATOR))
+}
+
 /// A create-then-rename marker's temporary name.
 fn is_temporary_name(name: &str) -> bool {
-    name.starts_with(&format!("{PREBIND_FILE}.tmp."))
-        || name.starts_with(&format!("{POSTBIND_FILE}.tmp."))
+    is_temporary_of(name, PREBIND_FILE) || is_temporary_of(name, POSTBIND_FILE)
 }
 
 /// Whether a retained temporary marker still has a live writer. A body that
@@ -539,8 +559,7 @@ fn retained_names(dir: RawFd) -> Result<Vec<String>, PublishError> {
         let is_runtime = [PREBIND_FILE, POSTBIND_FILE, SOCKET_FILE]
             .iter()
             .any(|name| entry == *name)
-            || entry.starts_with(&format!("{PREBIND_FILE}.tmp."))
-            || entry.starts_with(&format!("{POSTBIND_FILE}.tmp."));
+            || is_temporary_name(&entry);
         if is_runtime {
             found.push(entry);
         }

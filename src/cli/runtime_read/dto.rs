@@ -4,7 +4,7 @@ use std::fmt;
 use serde::de::{self, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 
-pub(crate) const PROTOCOL_VERSION: u16 = 2;
+use crate::server::runtime_ws::PROTOCOL_VERSION;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]

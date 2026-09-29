@@ -14,11 +14,11 @@ use tokio::time::Instant;
 
 use super::dto::{valid_namespace, valid_uuid};
 use super::ReadFailure;
+use crate::server::runtime_uds::{
+    is_temporary_of, LOCK_FILE, POSTBIND_FILE, PREBIND_FILE, SCHEMA, SOCKET_FILE,
+    TEMPORARY_SEPARATOR,
+};
 
-const LOCK_FILE: &str = "lifetime.lock";
-const PREBIND_FILE: &str = "runtime.prebind.json";
-const POSTBIND_FILE: &str = "runtime.postbind.json";
-const SOCKET_FILE: &str = "runtime.sock";
 const MARKER_LIMIT: u64 = 64 * 1024;
 /// How long the client waits before re-admitting after a republication it
 /// caught mid-flight. Short enough that a read which raced a publication is
@@ -708,9 +708,7 @@ fn directory_contains_temp_marker(dir: RawFd) -> bool {
             break;
         }
         let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) }.to_string_lossy();
-        if name.starts_with("runtime.prebind.json.tmp.")
-            || name.starts_with("runtime.postbind.json.tmp.")
-        {
+        if temporary_kind(&name).is_some() {
             found = true;
             break;
         }
@@ -719,11 +717,17 @@ fn directory_contains_temp_marker(dir: RawFd) -> bool {
     found
 }
 
+/// A marker the producer spells with a schema this client does not speak is
+/// no publication this client can read, which is exactly what
+/// `marker_missing` means here, and it returns at once because only
+/// `marker_identity` buys a retry. Everything else about the body is judged
+/// on its own: an id or a namespace that is not well formed is
+/// `marker_invalid`, an artifact that is present and untrustworthy.
 fn validate_prebind(marker: &PrebindMarker, namespace: &str) -> Result<(), ReadFailure> {
-    if marker.schema != 1 || !valid_uuid(&marker.prebind_instance_id) {
-        return Err(ReadFailure::pre("marker_invalid"));
+    if marker.schema != SCHEMA {
+        return Err(ReadFailure::pre("marker_missing"));
     }
-    if !valid_namespace(&marker.namespace) {
+    if !valid_uuid(&marker.prebind_instance_id) || !valid_namespace(&marker.namespace) {
         return Err(ReadFailure::pre("marker_invalid"));
     }
     if marker.namespace != namespace || !valid_process_identity(&marker.process_start_identity) {
@@ -733,14 +737,14 @@ fn validate_prebind(marker: &PrebindMarker, namespace: &str) -> Result<(), ReadF
 }
 
 fn validate_postbind(marker: &PostbindMarker, namespace: &str) -> Result<(), ReadFailure> {
-    if marker.schema != 1
-        || !valid_uuid(&marker.prebind_instance_id)
+    if marker.schema != SCHEMA {
+        return Err(ReadFailure::pre("marker_missing"));
+    }
+    if !valid_uuid(&marker.prebind_instance_id)
         || !valid_uuid(&marker.runtime_instance_id)
         || !valid_uuid(&marker.runtime_epoch)
+        || !valid_namespace(&marker.namespace)
     {
-        return Err(ReadFailure::pre("marker_invalid"));
-    }
-    if !valid_namespace(&marker.namespace) {
         return Err(ReadFailure::pre("marker_invalid"));
     }
     if marker.namespace != namespace
@@ -806,8 +810,8 @@ fn scan_temporary_markers(entries: *mut libc::DIR) -> Result<(), ReadFailure> {
             if name == PREBIND_FILE || name == POSTBIND_FILE || name == SOCKET_FILE {
                 continue;
             }
-            if name.starts_with("runtime.prebind.json")
-                || name.starts_with("runtime.postbind.json")
+            if name.starts_with(PREBIND_FILE)
+                || name.starts_with(POSTBIND_FILE)
                 || name.starts_with(SOCKET_FILE)
             {
                 return Err(ReadFailure::pre("marker_invalid"));
@@ -815,7 +819,7 @@ fn scan_temporary_markers(entries: *mut libc::DIR) -> Result<(), ReadFailure> {
             continue;
         };
         let suffix = name
-            .rsplit_once(".tmp.")
+            .rsplit_once(TEMPORARY_SEPARATOR)
             .map(|(_, value)| value)
             .unwrap_or_default();
         if !valid_uuid(suffix) {
@@ -825,7 +829,7 @@ fn scan_temporary_markers(entries: *mut libc::DIR) -> Result<(), ReadFailure> {
         let (content_uuid, pid, process_identity) = match kind {
             TempKind::Prebind => match serde_json::from_slice::<PrebindMarker>(&bytes) {
                 Ok(value)
-                    if value.schema == 1
+                    if value.schema == SCHEMA
                         && valid_namespace(&value.namespace)
                         && valid_uuid(&value.prebind_instance_id) =>
                 {
@@ -840,7 +844,7 @@ fn scan_temporary_markers(entries: *mut libc::DIR) -> Result<(), ReadFailure> {
             },
             TempKind::Postbind => match serde_json::from_slice::<PostbindMarker>(&bytes) {
                 Ok(value)
-                    if value.schema == 1
+                    if value.schema == SCHEMA
                         && valid_namespace(&value.namespace)
                         && valid_uuid(&value.prebind_instance_id) =>
                 {
@@ -857,7 +861,11 @@ fn scan_temporary_markers(entries: *mut libc::DIR) -> Result<(), ReadFailure> {
         if content_uuid != suffix {
             return Err(ReadFailure::pre("marker_invalid"));
         }
-        if process_state(pid, &process_identity)? != ProcessState::Dead {
+        // The same rule the marker paths get from `validate_prebind`: an
+        // identity this half cannot place is not a writer that is gone.
+        if !valid_process_identity(&process_identity)
+            || process_state(pid, &process_identity)? != ProcessState::Dead
+        {
             return Err(ReadFailure::pre("marker_identity"));
         }
     }
@@ -870,9 +878,9 @@ enum TempKind {
 }
 
 fn temporary_kind(name: &str) -> Option<TempKind> {
-    if name.starts_with("runtime.prebind.json.tmp.") {
+    if is_temporary_of(name, PREBIND_FILE) {
         Some(TempKind::Prebind)
-    } else if name.starts_with("runtime.postbind.json.tmp.") {
+    } else if is_temporary_of(name, POSTBIND_FILE) {
         Some(TempKind::Postbind)
     } else {
         None
@@ -1546,7 +1554,7 @@ mod tests {
         let dir_file = File::open(dir.path()).expect("open namespace");
         let path_stat = fstatat(dir_file.as_raw_fd(), SOCKET_FILE).expect("stat socket");
         let marker = PostbindMarker {
-            schema: 1,
+            schema: SCHEMA,
             pid: std::process::id(),
             process_start_identity: String::new(),
             prebind_instance_id: String::new(),
@@ -1568,5 +1576,58 @@ mod tests {
         )
         .is_ok());
         drop(client);
+    }
+
+    /// A marker this client cannot speak the schema of is no publication it
+    /// can read, which is `marker_missing` and returns at once; a marker that
+    /// *is* one of ours but carries an id or a namespace that is not well
+    /// formed is `marker_invalid`, because the artifact is there and cannot be
+    /// trusted. Both refusals are compared, because swapping them would send a
+    /// stale namespace through the retry loop instead of answering from it.
+    #[test]
+    fn a_marker_schema_and_a_marker_body_are_two_different_refusals() {
+        let namespace = crate::server::runtime_ws::NAMESPACE;
+        let good_uuid = "11111111-2222-3333-4444-555555555555";
+        let identity = "linux:v1:aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee:1";
+        let prebind = |schema: u8, instance: &str| PrebindMarker {
+            schema,
+            pid: std::process::id(),
+            process_start_identity: identity.to_string(),
+            prebind_instance_id: instance.to_string(),
+            namespace: namespace.to_string(),
+        };
+        let postbind = |schema: u8, instance: &str| PostbindMarker {
+            schema,
+            pid: std::process::id(),
+            process_start_identity: identity.to_string(),
+            prebind_instance_id: instance.to_string(),
+            runtime_instance_id: "22222222-2222-3333-4444-555555555555".to_string(),
+            runtime_epoch: "33333333-2222-3333-4444-555555555555".to_string(),
+            namespace: namespace.to_string(),
+            socket_path: SOCKET_FILE.to_string(),
+            owner_uid: unsafe { libc::geteuid() },
+            socket_device: 1,
+            socket_inode: 1,
+            socket_creator_pid: std::process::id(),
+        };
+        let bad_uuid = "not-a-uuid";
+        let cases: [(u8, &str, &str); 2] = [
+            (SCHEMA + 1, good_uuid, "marker_missing"),
+            (SCHEMA, bad_uuid, "marker_invalid"),
+        ];
+        for (schema, instance, code) in cases {
+            assert_eq!(
+                validate_prebind(&prebind(schema, instance), namespace)
+                    .expect_err("schema {schema} with {instance}")
+                    .code(),
+                code
+            );
+            assert_eq!(
+                validate_postbind(&postbind(schema, instance), namespace)
+                    .expect_err("schema {schema} with {instance}")
+                    .code(),
+                code
+            );
+        }
     }
 }

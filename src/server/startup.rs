@@ -707,29 +707,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     // The local runtime read shares this AppState: one producer, two
     // transports. A daemon that cannot own the namespace simply does not
     // offer it, and the HTTP route is unaffected either way.
-    let runtime_uds = match super::runtime_uds::publish() {
-        Ok(published) => {
-            info!(
-                target: "runtime.uds",
-                namespace = super::runtime_ws::NAMESPACE,
-                "local runtime read published"
-            );
-            Some(crate::task_util::spawn_supervised(
-                "runtime.uds.serve",
-                crate::task_util::PanicPolicy::Log,
-                super::runtime_uds::serve(state.clone(), published),
-            ))
-        }
-        Err(error) => {
-            tracing::warn!(
-                target: "runtime.uds",
-                code = error.code(),
-                %error,
-                "local runtime read not published; the HTTP route is unaffected"
-            );
-            None
-        }
-    };
+    let runtime_uds = publish_runtime_uds(&state);
 
     // GC the recently_restarted suppression map periodically; the TTL check on read filters
     // but does not remove entries.
@@ -998,6 +976,45 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Publish the local runtime read and serve it, unless this daemon is in a mode
+/// that must leave nothing on disk.
+///
+/// CityHall client mode is exactly that: its route refuses the read with the
+/// mode's own 403, so publishing a namespace it will never serve would leave
+/// a lock, two markers and a 0600 socket behind for nothing.
+fn publish_runtime_uds(state: &Arc<AppState>) -> Option<tokio::task::JoinHandle<()>> {
+    if state.cityhall_mode {
+        info!(
+            target: "runtime.uds",
+            "not publishing the local runtime read while CityHall lockdown is on"
+        );
+        return None;
+    }
+    match super::runtime_uds::publish() {
+        Ok(published) => {
+            info!(
+                target: "runtime.uds",
+                namespace = super::runtime_ws::NAMESPACE,
+                "local runtime read published"
+            );
+            Some(crate::task_util::spawn_supervised(
+                "runtime.uds.serve",
+                crate::task_util::PanicPolicy::Log,
+                super::runtime_uds::serve(state.clone(), published),
+            ))
+        }
+        Err(error) => {
+            tracing::warn!(
+                target: "runtime.uds",
+                code = error.code(),
+                %error,
+                "local runtime read not published; the HTTP route is unaffected"
+            );
+            None
+        }
+    }
+}
+
 /// Best-effort launch of `url` in the user's default browser.
 pub(super) fn maybe_open_browser(url: &str) {
     if let Err(e) = crate::tui::open_url::open_url(url) {
@@ -1087,6 +1104,34 @@ async fn remote_rotation_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The mode exists to leave as little as possible on disk, and the local
+    /// read is a lock, two markers and a 0600 socket it refuses to serve, so
+    /// nothing may be published and nothing left behind to retract.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn cityhall_mode_publishes_no_local_runtime_read() {
+        use crate::server::runtime_uds::{LOCK_FILE, POSTBIND_FILE, PREBIND_FILE, SOCKET_FILE};
+
+        let Some((base, _env)) = crate::server::test_support::trusted_namespace() else {
+            eprintln!("skipping: no private ancestor chain exists for the trusted app dir walk");
+            return;
+        };
+        let app_dir = base.path().join(crate::session::APP_DIR_NAME_XDG);
+        std::fs::create_dir_all(&app_dir).expect("app dir");
+        let state = crate::server::test_support::build_test_app_state_cityhall(Vec::new());
+
+        assert!(
+            publish_runtime_uds(&state).is_none(),
+            "the mode must not offer a local read it refuses to serve"
+        );
+        for name in [LOCK_FILE, PREBIND_FILE, POSTBIND_FILE, SOCKET_FILE] {
+            assert!(
+                !app_dir.join(name).exists(),
+                "{name} exists: the mode published what it will not serve"
+            );
+        }
+    }
 
     /// The sweep fires at its interval, not the next recheck, and a window
     /// shortened mid-wait applies at the next recheck.
