@@ -132,7 +132,7 @@ pub(crate) const EMITTABLE_CODES: &[&str] = &[
 
 /// The code a caller-chosen-exit refusal carries: the renderer refused on the
 /// user's own state, not on the wire.
-const RENDERER_INTERNAL: &str = "renderer_internal";
+pub(crate) const RENDERER_INTERNAL: &str = "renderer_internal";
 
 #[derive(Debug)]
 pub(crate) struct ReadFailure {

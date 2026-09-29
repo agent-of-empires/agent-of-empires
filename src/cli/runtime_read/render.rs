@@ -488,9 +488,10 @@ fn tmux_session_id(sessions: &[&SessionRead]) -> Result<String, ReadFailure> {
         .ok()
         .and_then(|_| crate::tmux::get_current_session_name())
         .ok_or_else(|| {
-            ReadFailure::exit(
-                2,
-                "Not in a tmux session. Specify a session ID or run inside tmux.\n",
+            ReadFailure::refuse(
+                super::RENDERER_INTERNAL,
+                1,
+                "Error: Not in a tmux session. Specify a session ID or run inside tmux.\n",
             )
         })?;
     sessions
@@ -498,9 +499,10 @@ fn tmux_session_id(sessions: &[&SessionRead]) -> Result<String, ReadFailure> {
         .find(|session| crate::tmux::agent_session_belongs_to(&name, &session.id))
         .map(|session| session.id.clone())
         .ok_or_else(|| {
-            ReadFailure::exit(
-                2,
-                "Current tmux session is not an Agent of Empires session\n",
+            ReadFailure::refuse(
+                super::RENDERER_INTERNAL,
+                1,
+                "Error: Current tmux session is not an Agent of Empires session\n",
             )
         })
 }
@@ -1026,10 +1028,14 @@ mod tests {
         .unwrap_err();
         let outcome = crate::cli::runtime_read::ReadOutcome::from(error);
         assert_eq!(outcome.stdout, None);
-        assert_eq!(outcome.exit, 2);
+        assert_eq!(
+            outcome.exit, 1,
+            "the local path leaves 1, so the served path must too"
+        );
         assert_eq!(
             outcome.stderr.as_deref(),
-            Some("Not in a tmux session. Specify a session ID or run inside tmux.\n")
+            Some("Error: Not in a tmux session. Specify a session ID or run inside tmux.\n"),
+            "the local path prints the sentence through main's Error: prefix"
         );
     }
 
