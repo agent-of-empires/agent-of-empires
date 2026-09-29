@@ -95,9 +95,9 @@ Force stop restarts the worker and kills the whole command tree. The agent resum
 
 ## Timeline card grouping
 
-Two kinds of runs fold into single collapsible cards:
+Two kinds of runs fold into collapsible cards:
 
-- **Silent tool work**: three or more consecutive tool calls with no agent text between them collapse into one "actions" card.
+- **Silent tool work**: three or more consecutive tool calls with no agent text between them collapse into an "actions" card of at most ten; a longer run splits into several cards.
 - **Consecutive TodoWrite updates**: three or more back-to-back todo updates fold into one card titled "updated N times", showing the latest list while collapsed.
 
 Folding only fires on an unbroken run of the same shape, and the threshold is three, so a status update between two real actions stays inline as its own card.

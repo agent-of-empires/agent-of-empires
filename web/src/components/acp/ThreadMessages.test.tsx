@@ -87,6 +87,14 @@ describe("AssistantMessage group parts", () => {
     ["tool group", TOOL_GROUP_NAME, [start("t1"), start("t2"), start("t3")]],
     ["todo group", TODO_GROUP_NAME, [todo("td1"), todo("td2"), todo("td3")]],
     ["subagent", SUBAGENT_TASK_NAME, [task, child("c1"), child("c2")]],
+    [
+      "async subagent",
+      SUBAGENT_TASK_NAME,
+      [
+        task,
+        { id: "done-task-1", kind: "tool_complete", text: "launched", at, toolCallId: "task-1", asyncSubagent: true },
+      ],
+    ],
   ])("does not re-parse an unchanged %s payload when the message re-renders", (_label, toolName, tools) => {
     const messages = (reply: string) =>
       activityToThreadMessages(

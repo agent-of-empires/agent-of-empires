@@ -1815,7 +1815,7 @@
       "kind": "vitest",
       "risk": "medium",
       "specs": ["src/components/acp/activityMessages.test.ts", "src/components/acp/ThreadMessages.test.tsx"],
-      "components": ["web/src/components/acp/ThreadMessages.tsx", "web/src/components/acp/GroupToolCards.tsx"],
+      "components": ["web/src/components/acp/activityMessages.ts", "web/src/components/acp/ThreadMessages.tsx"],
       "notes": "Long tool-call runs fold into groups of at most 10 whose ids anchor on each chunk's first child (#3477, #2802); a group card re-render does not re-parse an unchanged payload."
     },
     {
