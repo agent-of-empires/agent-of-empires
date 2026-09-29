@@ -378,6 +378,14 @@ pub(crate) fn get_profile_dir_locked(profile: &str) -> Result<PathBuf> {
     } else {
         profile
     };
+    // The traversal guard has to sit next to the join it protects, spelled as
+    // a `contains`: the taint analysis recognises that check and no other, so
+    // moving it behind a helper or a fallible validator leaves the sinks below
+    // unproven. `validate_profile_name` then decides the full grammar.
+    if profile_name.contains("..") || profile_name.contains('/') || profile_name.contains('\\') {
+        anyhow::bail!("Profile name cannot contain path separators");
+    }
+    validate_profile_name(profile_name)?;
     let dir = base.join("profiles").join(profile_name);
     if !dir.exists() {
         // Only a name about to be created runs the strict grammar; an existing
@@ -399,6 +407,12 @@ pub fn get_profile_dir_path(profile: &str) -> Result<PathBuf> {
     } else {
         profile
     };
+    // Same guard as the locked variant: this path feeds the existing-directory
+    // shortcut in `get_profile_dir`, which runs before any other check.
+    if profile_name.contains("..") || profile_name.contains('/') || profile_name.contains('\\') {
+        anyhow::bail!("Profile name cannot contain path separators");
+    }
+    validate_profile_name(profile_name)?;
     Ok(base.join("profiles").join(profile_name))
 }
 
@@ -1362,6 +1376,23 @@ mod tests {
                 .err()
                 .unwrap_or_else(|| panic!("expected {bad:?} to be rejected"));
         }
+    }
+
+    /// The path builders reject a traversing name even when its target already
+    /// exists, which is what made `Path::join` resolve outside `profiles/`.
+    #[test]
+    fn profile_dir_path_rejects_traversal_regardless_of_existing_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let escaped = temp.path().join("outside");
+        std::fs::create_dir_all(&escaped).unwrap();
+        let name = format!("../../{}", escaped.file_name().unwrap().to_str().unwrap());
+
+        for bad in [name.as_str(), "a/b", "a\\b", ".."] {
+            get_profile_dir_path(bad)
+                .err()
+                .unwrap_or_else(|| panic!("expected {bad:?} to be rejected before the join"));
+        }
+        assert!(get_profile_dir_path("work").is_ok());
     }
 
     #[test]

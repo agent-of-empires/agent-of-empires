@@ -446,20 +446,27 @@ pub(crate) async fn spawn_structured_session(
         if let Err(e) = persist_and_start() {
             // The row was already committed, so leaving it behind would point a
             // listed session at a scratch directory this branch is about to
-            // remove. Take the row back out before the directory goes.
-            let stored_id = instance.id.clone();
-            let stored_profile = profile.clone();
-            let file_watch_for_revoke = file_watch_for_create.clone();
-            let revoke = std::thread::spawn(move || {
+            // remove. Take the row back out first, and drop the directory only
+            // once the row is really gone: a revoked row that failed silently
+            // would leave a listed session pointing at a deleted path.
+            let revoked = {
                 let _identity_lock = crate::session::acquire_session_identity_lock();
-                let Ok(storage) = Storage::open(&stored_profile, file_watch_for_revoke) else {
-                    return;
-                };
-                let _ = storage.update(|all, _groups| {
-                    all.retain(|row| row.id != stored_id);
-                    Ok(())
-                });
-            });
+                Storage::open(&profile, file_watch_for_create.clone()).and_then(|storage| {
+                    storage.update(|all, _groups| {
+                        all.retain(|row| row.id != instance.id);
+                        Ok(())
+                    })
+                })
+            };
+            if let Err(revoke_error) = revoked {
+                tracing::warn!(
+                    target: "http.api.sessions",
+                    "Kept scratch dir for {}: the committed row could not be revoked: {:#}",
+                    instance.id,
+                    revoke_error
+                );
+                return Err(e);
+            }
             // Guarded the same way as the deletion path.
             if instance.scratch {
                 let scratch_path = std::path::PathBuf::from(&instance.project_path);
@@ -474,7 +481,6 @@ pub(crate) async fn spawn_structured_session(
                     }
                 }
             }
-            let _ = revoke.join();
             return Err(e);
         }
 
