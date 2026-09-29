@@ -344,14 +344,6 @@ fn wheel_forward_key(
     }
 }
 
-fn resolve_hook_install_agent(
-    tool_name: &str,
-    command: &str,
-    session_config: &crate::session::config::SessionConfig,
-) -> Option<&'static crate::agents::AgentDef> {
-    crate::session::host_hook_agent(tool_name, command, session_config)
-}
-
 pub(super) fn parse_hotkey(s: &str) -> Option<(KeyCode, KeyModifiers)> {
     let (modifier, key) = s.split_once('+')?;
     if !modifier.eq_ignore_ascii_case("alt") {
@@ -2029,9 +2021,11 @@ impl HomeView {
                     } else {
                         data.command_override.clone()
                     };
-                    if let Some(hook_agent) =
-                        resolve_hook_install_agent(&tool_name, &command, &resolved_config.session)
-                    {
+                    if let Some(hook_agent) = crate::session::host_hook_agent(
+                        &tool_name,
+                        &command,
+                        &resolved_config.session,
+                    ) {
                         let config = crate::session::config::load_config().ok().flatten();
                         let hooks_enabled = resolved_config.session.agent_status_hooks;
                         let acknowledged = config

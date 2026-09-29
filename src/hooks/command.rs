@@ -173,9 +173,16 @@ pub(crate) fn identity_field_name(field: HookIdentityField) -> &'static str {
     }
 }
 
+/// The `--agent NAME` qualifier an identity command carries, empty when the
+/// event declares no publisher. Named here so the command and the consent
+/// disclosure cannot drift.
+pub(crate) fn identity_publisher_arg(publisher: Option<&str>) -> String {
+    publisher.map_or_else(String::new, |name| format!(" --agent {name}"))
+}
+
 fn hook_command_session_id_host(field: HookIdentityField, publisher: Option<&str>) -> String {
     let field = identity_field_name(field);
-    let agent = publisher.map_or_else(String::new, |name| format!(" --agent {name}"));
+    let agent = identity_publisher_arg(publisher);
     format!(
         "sh -c '[ -n \"$AOE_INSTANCE_ID\" ] || exit 0; \
          [ -n \"$AOE_HOOK_BIN\" ] || exit 0; \

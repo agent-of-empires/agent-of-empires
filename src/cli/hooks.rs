@@ -1,7 +1,7 @@
-//! `aoe hooks` subcommands: inspect and grant AoE's consent to write agent
-//! status hooks into the host agent's own config.
+//! `aoe hooks` subcommands: record your approval for AoE to write agent hooks
+//! into each agent's own config, and show what that approval covers.
 //!
-//! The consent is the same install-wide acknowledgement the TUI dialog writes.
+//! The approval is the same install-wide flag the TUI dialog writes.
 //! `--trust-hooks` is a different surface: per-repository trust for hooks the
 //! repo declares itself.
 
@@ -14,7 +14,7 @@ use crate::session::{host_hook_agent, host_hook_disclosure, update_app_state, Co
 pub enum HooksCommands {
     /// Show whether AoE may write agent hooks, and what they resolve for a profile
     Status,
-    /// Allow AoE to write agent hooks for every agent, on every profile
+    /// Let AoE write agent hooks for every agent, on every profile
     Approve,
 }
 
@@ -46,7 +46,7 @@ fn print_status(profile: &str) -> Result<()> {
 
 fn approve(profile: &str) -> Result<()> {
     // Always disclose, even on a repeat run, so the output can be used to
-    // review what the standing consent covers for another profile.
+    // review what the standing approval covers for another profile.
     print_disclosure(profile);
     if acknowledged()? {
         println!();
@@ -68,7 +68,7 @@ fn print_disclosure(profile: &str) {
     let config = crate::session::config::profile_config::resolve_config_or_warn(&profile);
     let status_hooks = config.session.agent_status_hooks;
 
-    let mut tool_names: Vec<&str> = crate::agents::AGENTS.iter().map(|a| a.name).collect();
+    let mut tool_names = crate::agents::agent_names();
     tool_names.extend(config.session.custom_agents.keys().map(String::as_str));
     tool_names.sort_unstable();
     tool_names.dedup();
@@ -111,18 +111,30 @@ fn print_disclosure(profile: &str) {
         for path in &disclosure.settings_paths {
             println!("  {tool_name}: {path}");
         }
-    }
-
-    println!();
-    println!("Hook events added:");
-    for (tool_name, disclosure) in &disclosures {
-        println!("  {tool_name}:");
-        for (event, effect) in &disclosure.hook_commands {
-            println!("    {event} -> {effect}");
+        if let Some(config) = &disclosure.disabled_by_agent {
+            println!(
+                "    (this agent's own config turns its hooks off: {})",
+                config.display()
+            );
         }
     }
-    println!();
+
+    let events: Vec<_> = disclosures
+        .iter()
+        .filter(|(_, disclosure)| !disclosure.hook_commands.is_empty())
+        .collect();
+    if !events.is_empty() {
+        println!();
+        println!("Hook events added:");
+        for (tool_name, disclosure) in events {
+            println!("  {tool_name}:");
+            for (event, effect) in &disclosure.hook_commands {
+                println!("    {event} -> {effect}");
+            }
+        }
+    }
     if status_hooks_active {
+        println!();
         println!("A status event writes under the session's own directory, named by");
         println!(
             "  printf {{status}} > {}/$AOE_INSTANCE_ID/status",
@@ -141,7 +153,7 @@ fn print_disclosure(profile: &str) {
     println!("A session launched with its own command resolves the file that command");
     println!("names; the creation dialog describes such a session exactly.");
     println!();
-    println!("The consent is per installation and is not bound to this profile, so");
+    println!("The approval is per installation and is not bound to this profile, so");
     println!("another profile resolves its own paths under the same approval.");
     if disclosures
         .iter()

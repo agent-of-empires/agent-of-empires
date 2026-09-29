@@ -115,8 +115,9 @@ fn hooks_disclosure_follows_the_effective_config() {
     }
     let socket = tmp.path().join("tmux.sock");
 
-    // (label, config, agent launched, path a launch must write, event to show)
-    let cases: [(&str, String, &str, PathBuf, Option<&str>); 4] = [
+    // (label, config, agent launched, path a launch must write, identity fields
+    // to see when status hooks are off)
+    let cases: [(&str, String, &str, PathBuf, Option<(&str, &str)>); 4] = [
         (
             "profile environment reroutes the agent config dir",
             format!(
@@ -142,7 +143,10 @@ fn hooks_disclosure_follows_the_effective_config() {
             "[session]\nagent_status_hooks = false\n".to_string(),
             "claude",
             home.join(".claude").join("settings.json"),
-            Some("aoe __extract-session-id --field session-id"),
+            Some((
+                "aoe __extract-session-id --field session-id",
+                "aoe __extract-session-id --field conversation-id-or-session-id",
+            )),
         ),
         (
             "a command that is a built-in binary resolves to that binary, not the alias",
@@ -165,10 +169,15 @@ fn hooks_disclosure_follows_the_effective_config() {
             status.stdout
         );
         match event {
-            Some(command) => {
+            Some((command, other_command)) => {
                 assert!(
                     status.stdout.contains(command),
                     "{label}: identity-only installs must disclose the command they run.\ngot:\n{}",
+                    status.stdout
+                );
+                assert!(
+                    status.stdout.contains(other_command),
+                    "{label}: the identity field is per agent, so the other field must appear too.\ngot:\n{}",
                     status.stdout
                 );
                 assert!(
@@ -177,11 +186,20 @@ fn hooks_disclosure_follows_the_effective_config() {
                     status.stdout
                 );
             }
-            None => assert!(
-                !status.stdout.contains("agent_status_hooks off"),
-                "{label}: status hooks are on, the header must not claim otherwise.\n{}",
-                status.stdout
-            ),
+            None => {
+                assert!(
+                    status.stdout.contains("detect session status"),
+                    "{label}: status hooks are on, the header must say so.\n{}",
+                    status.stdout
+                );
+                assert!(
+                    status
+                        .stdout
+                        .contains("A status event writes under the session"),
+                    "{label}: the status writer command must be disclosed.\n{}",
+                    status.stdout
+                );
+            }
         }
     }
 }

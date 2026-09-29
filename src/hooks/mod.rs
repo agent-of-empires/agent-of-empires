@@ -2,7 +2,7 @@
 //! session ids to per-instance sidecar files. Events per agent are declared in
 //! `crate::agents`; pane reconciliation covers gaps hooks cannot see.
 
-mod codex;
+pub(crate) mod codex;
 mod command;
 mod config_io;
 mod dir_guard;
@@ -22,13 +22,13 @@ use std::path::{Path, PathBuf};
 
 pub use codex::uninstall_codex_hooks;
 pub(crate) use codex::{
-    install_codex_hooks_with_preserved_state, install_codex_json_hooks, restore_codex_hooks_state,
-    snapshot_codex_hooks_state,
+    codex_hooks_disabled_at, install_codex_hooks_with_preserved_state, install_codex_json_hooks,
+    restore_codex_hooks_state, snapshot_codex_hooks_state,
 };
-pub(crate) use command::identity_field_name;
 pub(crate) use command::HOOK_STATUS_BASE_IN_CONTAINER;
 #[cfg(test)]
 pub(crate) use command::{hook_command, hook_command_session_id, status_command_for_event};
+pub(crate) use command::{identity_field_name, identity_publisher_arg};
 pub(crate) use config_io::with_config_lock_policy;
 pub use config_io::SymlinkPolicy;
 pub(crate) use dir_guard::{

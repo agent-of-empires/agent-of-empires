@@ -153,6 +153,15 @@ impl HooksInstallDialog {
             "Hooks are guarded by $AOE_INSTANCE_ID and are a",
         ));
         lines.push(Line::from("no-op outside of AoE sessions."));
+        lines.push(Line::from(""));
+        lines.push(Line::from(
+            "This is what the effective config resolves, not a manifest of every",
+        ));
+        lines.push(Line::from(
+            "write a launch can make. A launch that routes through a native",
+        ));
+        lines.push(Line::from("store or merges into a selected agent resolves"));
+        lines.push(Line::from("that target at launch time."));
 
         if self.needs_codex_trust_note {
             lines.push(Line::from(""));

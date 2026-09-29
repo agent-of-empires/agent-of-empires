@@ -1,7 +1,7 @@
 //! Codex hooks: `hooks.json` installs gated on `config.toml`, and the legacy
 //! `config.toml` hook tables that migrations still rewrite.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use toml_edit::{DocumentMut, Item, TableLike};
@@ -24,6 +24,17 @@ pub(super) const CODEX_HOOK_EVENT_NAMES: &[&str] = &[
     "PreCompact",
     "PostCompact",
 ];
+
+/// The `config.toml` beside `hooks_path` that turns Codex's own hooks off, or
+/// `None` when the feature is on or the file is absent. Read exactly the way
+/// [`install_codex_json_hooks`] reads it, so the consent disclosure and the
+/// installer cannot disagree about the same file. Silent, unlike the install
+/// path: a query and a skip want different log lines.
+pub(crate) fn codex_hooks_disabled_at(hooks_path: &Path) -> Option<PathBuf> {
+    let config_path = hooks_path.with_file_name("config.toml");
+    let config = read_codex_config(&config_path, SymlinkPolicy::Follow).ok()?;
+    codex_hooks_feature_is_disabled(&config, &config_path).then_some(config_path)
+}
 
 /// Install Codex JSON hooks unless the adjacent `config.toml` disables them,
 /// reporting whether AoE hooks are present afterwards.

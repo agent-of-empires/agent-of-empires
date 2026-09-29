@@ -98,6 +98,9 @@ pub(crate) struct HostHookDisclosure {
     /// `agent_status_hooks = false` leaves behind, and what an agent that
     /// declares no status event leaves behind too.
     pub status_hooks_enabled: bool,
+    /// The agent's own config that turns its hooks off, naming it so the
+    /// consent can say which file decides.
+    pub disabled_by_agent: Option<std::path::PathBuf>,
 }
 
 /// The built-in agent a launch resolves for `tool_name` running `command`.
@@ -148,68 +151,63 @@ pub(crate) fn host_hook_disclosure(
         hook_commands: Vec::new(),
         needs_codex_trust_note: false,
         status_hooks_enabled: false,
+        disabled_by_agent: None,
     };
     let host_env = config.environment.as_slice();
     let home = host_home(host_env).unwrap_or_else(|| std::path::PathBuf::from("~"));
     let session_config = &config.session;
 
-    if let Some(hook_cfg) = &agent.hook_config {
-        disclosure.needs_codex_trust_note = hook_cfg.format == crate::agents::HookFormat::CodexJson;
-        disclosure.settings_paths.push(
-            generic_host_config_path_for(tool_name, hook_cfg, &home, session_config, host_env)
-                .to_string_lossy()
-                .into_owned(),
-        );
-    } else if let Some(sidecar) = &agent.sidecar_hooks {
-        disclosure.settings_paths.push(
-            sidecar_host_config_path_for(
-                tool_name,
-                agent,
-                sidecar,
-                &home,
-                session_config,
-                host_env,
-            )
-            .to_string_lossy()
-            .into_owned(),
-        );
-    } else {
+    // The installer picks the target through this function, sidecar first, so
+    // the disclosure cannot name a different file than the one written.
+    let Some(path) = host_hook_config_path(tool_name, agent, &home, session_config, host_env)
+    else {
         return disclosure;
-    }
+    };
+    disclosure.needs_codex_trust_note = agent
+        .hook_config
+        .as_ref()
+        .is_some_and(|hook_cfg| hook_cfg.format == crate::agents::HookFormat::CodexJson);
+    disclosure
+        .settings_paths
+        .push(path.to_string_lossy().into_owned());
+    // Codex skips AoE's hooks when its own config turns the feature off, while
+    // still opening the file, so the target stands and the events do not.
+    disclosure.disabled_by_agent = crate::hooks::codex_hooks_disabled_at(&path);
 
     // Resolved through the installer's own resolver, so status_map overrides
     // apply and the status events drop out with the setting. An event can
     // install both an identity extractor and a status writer, so both effects
     // are disclosed; an event with neither installs nothing and is not listed.
     let mut status_events = 0;
-    for event in resolved_host_hook_events(agent, config, config.session.agent_status_hooks)
-        .unwrap_or_default()
-    {
-        let mut effects = Vec::new();
-        if let Some(field) = event.identity_field {
-            let publisher = event
-                .publisher
-                .map(|name| format!(" --agent {name}"))
-                .unwrap_or_default();
-            effects.push(format!(
-                "runs aoe __extract-session-id --field {}{publisher}",
-                crate::hooks::identity_field_name(field)
-            ));
-        }
-        if let Some(status) = event.status {
-            status_events += 1;
-            effects.push(format!("writes \"{status}\""));
-        }
-        if !effects.is_empty() {
-            // The matcher is part of what the installed entry contains, and it
-            // is what separates two entries sharing an event name.
-            let label = match &event.matcher {
-                Some(matcher) => format!("{} ({matcher})", event.name),
-                None => event.name.clone(),
-            };
-            disclosure
-                .hook_commands
-                .push((label, effects.join(", and ")));
+    // An agent that turns its own hooks off installs none, so none is listed;
+    // the target stays because the installer still opens the file.
+    if disclosure.disabled_by_agent.is_none() {
+        for event in resolved_host_hook_events(agent, config, config.session.agent_status_hooks)
+            .unwrap_or_default()
+        {
+            let mut effects = Vec::new();
+            if let Some(field) = event.identity_field {
+                effects.push(format!(
+                    "runs aoe __extract-session-id --field {}{}",
+                    crate::hooks::identity_field_name(field),
+                    crate::hooks::identity_publisher_arg(event.publisher),
+                ));
+            }
+            if let Some(status) = event.status {
+                status_events += 1;
+                effects.push(format!("writes \"{status}\""));
+            }
+            if !effects.is_empty() {
+                // The matcher is part of what the installed entry contains, and
+                // it is what separates two entries sharing an event name.
+                let label = match &event.matcher {
+                    Some(matcher) => format!("{} ({matcher})", event.name),
+                    None => event.name.clone(),
+                };
+                disclosure
+                    .hook_commands
+                    .push((label, effects.join(", and ")));
+            }
         }
     }
     // What survives the setting is what this install runs, and that is what
@@ -391,7 +389,7 @@ impl Instance {
         if let (Some(disclosed), Some(resolved)) = (disclosed, resolved) {
             if !same_hook_target(&disclosed, &resolved) {
                 bail!(
-                    "before_session changed the agent hook path from {} to {}; declare the override in the profile environment before consenting",
+                    "before_session changed the agent hook path from {} to {}; declare the override in the profile environment before approving",
                     disclosed.display(),
                     resolved.display()
                 );
@@ -421,7 +419,7 @@ impl Instance {
             tracing::warn!(
                 target: "hooks.install",
                 instance = %self.id,
-                "skipping host hook installation until the user acknowledges the hook paths"
+                "skipping host hook installation until the user approves the hook paths"
             );
             return;
         }

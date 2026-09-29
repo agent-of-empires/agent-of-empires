@@ -36,7 +36,7 @@ pub use execution::{
     ConversationBinding, ConversationProvenance, ExecutionBinding, ExecutionLocation,
 };
 mod flags;
-pub(crate) mod hooks;
+mod hooks;
 mod identity_sidecar;
 mod kill;
 mod launch_command;
