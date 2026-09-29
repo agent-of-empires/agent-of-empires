@@ -407,3 +407,72 @@ impl RuntimeUdsTestServer {
         let _ = self.listener.await;
     }
 }
+
+#[cfg(test)]
+pub(crate) fn install_blocking_before_session_hook(
+    dir: &std::path::Path,
+    label: &str,
+) -> (std::path::PathBuf, std::path::PathBuf) {
+    let ready = dir.join(format!("{label}-ready"));
+    let release = dir.join(format!("{label}-release"));
+    let hook = format!(
+        ": > '{}'; while [ ! -e '{}' ]; do sleep 0.01; done",
+        ready.display(),
+        release.display()
+    );
+    crate::session::config::update_config(|global| {
+        global.host_hooks.before_session = vec![hook];
+    })
+    .expect("install before_session hook");
+    (ready, release)
+}
+
+#[cfg(test)]
+pub(crate) fn counting_failing_launcher() -> (
+    crate::acp::supervisor::Launcher,
+    Arc<std::sync::atomic::AtomicUsize>,
+) {
+    let launches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = Arc::clone(&launches);
+    let launcher: crate::acp::supervisor::Launcher = Arc::new(move |_config, _id| {
+        counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Box::pin(async {
+            Err::<crate::acp::acp_client::AcpClient, _>(crate::acp::acp_client::AcpError::Spawn(
+                "test launcher".into(),
+            ))
+        })
+    });
+    (launcher, launches)
+}
+
+#[cfg(test)]
+pub(crate) async fn archive_while_hook_waits(
+    (ready, release): &(std::path::PathBuf, std::path::PathBuf),
+    profile: &str,
+    is_target: impl Fn(&Instance) -> bool,
+) -> bool {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !ready.exists() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let storage = Storage::new_unwatched(profile).expect("storage");
+    let target = ready
+        .exists()
+        .then(|| storage.load().expect("load rows"))
+        .and_then(|rows| rows.into_iter().find(|row| is_target(row)));
+    if let Some(target) = &target {
+        let _lock = storage
+            .acquire_instance_lifecycle_lock(&target.id)
+            .expect("lifecycle lock");
+        storage
+            .update(|rows, _| {
+                if let Some(row) = rows.iter_mut().find(|row| row.id == target.id) {
+                    row.archive();
+                }
+                Ok(())
+            })
+            .expect("archive stored row");
+    }
+    std::fs::write(release, b"release").expect("release hook");
+    target.is_some()
+}
