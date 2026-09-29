@@ -1328,14 +1328,11 @@ pub struct SessionConfig {
     pub confirm_delete: bool,
 
     /// Minutes a session stays in the trash before it is automatically
-    /// purged, measured from when it was trashed. The default is 30 days
-    /// (43200); `0` keeps trashed sessions forever (manual purge only). A
-    /// trashed session keeps its container and volumes, so a short window
-    /// frees that disk sooner. Auto-purge is enforced by the `aoe serve`
-    /// daemon, which sweeps at startup and then every tenth of the shortest
-    /// configured window, between once a minute and once an hour. Without a
-    /// running daemon, expired trash is purged on the next daemon start or by
-    /// an explicit manual purge (`aoe rm --purge`, `aoe session empty-trash`).
+    /// purged, measured from when it was trashed. Default 43200 (30 days);
+    /// `0` keeps trashed sessions forever. Trashed sessions keep their
+    /// container and volumes, so a shorter window frees disk sooner. Enforced
+    /// by the `aoe serve` daemon; without one, expired trash waits for the
+    /// next daemon start or a manual purge (`aoe session empty-trash`).
     #[serde(default = "default_trash_retention_minutes")]
     #[setting(
         label = "Trash Retention (minutes)",

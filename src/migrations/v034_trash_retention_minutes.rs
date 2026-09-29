@@ -1,6 +1,6 @@
 //! Migration v034: replace `session.trash_retention_days` with
-//! `session.trash_retention_minutes` so retention can be shorter than a day
-//! (#4070). A carried value is converted, never over an existing minutes key.
+//! `session.trash_retention_minutes` so retention can be shorter than a day.
+//! A carried value is converted, never over an existing minutes key.
 
 use super::config_file;
 use anyhow::Result;
@@ -33,13 +33,16 @@ fn migrate_config_file(path: &Path) -> Result<()> {
             .as_integer()
             .filter(|days| (0..=i64::from(u32::MAX) / MINUTES_PER_DAY).contains(days))
             .map(|days| days * MINUTES_PER_DAY);
-        if let Some(minutes) = minutes {
-            session
-                .entry("trash_retention_minutes")
-                .or_insert(toml::Value::Integer(minutes));
-        }
+        let converted = match minutes {
+            Some(minutes) if !session.contains_key("trash_retention_minutes") => {
+                session.insert("trash_retention_minutes".into(), minutes.into());
+                true
+            }
+            _ => false,
+        };
         info!(
-            "v034: converted session.trash_retention_days to trash_retention_minutes in {}",
+            "v034: {} session.trash_retention_days in {}",
+            if converted { "converted" } else { "dropped" },
             path.display()
         );
         true
