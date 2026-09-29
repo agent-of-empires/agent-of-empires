@@ -205,14 +205,25 @@ fn an_empty_profile_variable_writes_where_it_wrote_before_and_reads_as_the_defau
     );
     // The control: the same session is listed when the profile is named, so
     // the assertion above is about the scope and not about a session nobody
-    // can see.
-    let named: Vec<Value> = serde_json::from_str(&aoe(
-        &home,
-        &socket,
-        "other",
-        &["-p", "other", "ps", "--json"],
-    ))
-    .expect("ps --json for the other profile");
+    // can see. `aoe ps` reports rows the substrate finds, so the session has
+    // to be visible to it before the control means anything. Polling an
+    // observable predicate with a bounded deadline is what the project asks
+    // for here; asserting once only moves the race into the next run.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let mut named: Vec<Value> = Vec::new();
+    loop {
+        named = serde_json::from_str(&aoe(
+            &home,
+            &socket,
+            "other",
+            &["-p", "other", "ps", "--json"],
+        ))
+        .expect("ps --json for the other profile");
+        if named.iter().any(|row| row["session"] == id) || std::time::Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
     assert!(
         named.iter().any(|row| row["session"] == id),
         "the live `other` session must be visible when that profile is named: {named:?}"
