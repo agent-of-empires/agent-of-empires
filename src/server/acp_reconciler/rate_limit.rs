@@ -49,14 +49,30 @@ fn rate_limit_unknown_reset_retry_at(recorded_at_ms: i64, redeliveries: i64) -> 
     DateTime::from_timestamp_millis(recorded_at_ms).unwrap_or_else(Utc::now) + retry_after
 }
 
+/// Whether the head of `queue` was minted after the limit that interrupted the
+/// turn, so it replaced the continuation rather than following it. The head is
+/// the row the drain sends next. An unreadable creation time or an unknown
+/// limit never supersedes: the interrupted request is the older one and losing
+/// it is final, since the next prompt retires the park.
+fn queue_supersedes(queue: &[crate::daemon::QueuedPromptEntry], limit_at_ms: Option<i64>) -> bool {
+    let Some(limit_at_ms) = limit_at_ms else {
+        return false;
+    };
+    queue
+        .iter()
+        .min_by_key(|entry| entry.seq)
+        .and_then(|entry| DateTime::parse_from_rfc3339(&entry.created_at).ok())
+        .is_some_and(|queued_at| queued_at.timestamp_millis() > limit_at_ms)
+}
+
 /// What the continuation producer decided for one session (#4092).
 pub(crate) enum ContinuationOutcome {
     /// The interrupted prompt is the next turn, was already queued, or there
-    /// was nothing to replay. `RateLimitAutoResumed` is what the durable
-    /// redelivery budget counts, so only this outcome licenses the breadcrumb.
+    /// was nothing to replay. Only this outcome licenses the automatic
+    /// `RateLimitAutoResumed`, which is the budget's arming step.
     Stands,
     /// A queued prompt owns the next turn. It has no other route to a worker,
-    /// so the caller still frees the respawn, but no breadcrumb.
+    /// so the caller still frees the respawn, but no automatic breadcrumb.
     SupersededByQueue,
 }
 
@@ -69,9 +85,9 @@ pub(crate) enum ContinuationOutcome {
 /// is what stops a turn-accepting surface from slipping between the
 /// supersession checks and the install (#4092).
 ///
-/// Nothing below may consult park liveness for the supersession decision: see
-/// [`crate::acp::event_store::EventStore::rate_limit_park`], whose superseding
-/// set includes the `AcpSessionAssigned` a fresh worker publishes.
+/// Park liveness is not a supersession oracle here
+/// ([`crate::acp::event_store::EventStore::rate_limit_park`]): a fresh worker
+/// publishes `AcpSessionAssigned`, which retires its own park.
 pub(crate) async fn install_rate_limit_continuation(
     state: &Arc<AppState>,
     id: &str,
@@ -89,20 +105,36 @@ pub(crate) async fn install_rate_limit_continuation(
     };
     #[cfg(test)]
     super::test_fixtures::await_install_barrier(id).await;
-    // A queued prompt publishes no event, so no durable observable records the
-    // supersession and the queue row is the only state it must have changed.
-    // It only supersedes while the slot is still free: a continuation an
-    // earlier cadence already installed is still the next turn, and the queue
-    // drains behind it.
-    let queue_owns_next_turn = state
-        .instances
-        .read()
+    // A queued prompt publishes no event, so its row is the only record of a
+    // supersession, and only a row minted after the limit replaced the prompt.
+    // A continuation an earlier cadence installed is still the next turn.
+    let queued_head = {
+        let instances = state.instances.read().await;
+        let Some(inst) = instances.iter().find(|i| i.id == id) else {
+            return ContinuationOutcome::Stands;
+        };
+        if inst.pending_initial_turn.is_some() {
+            return ContinuationOutcome::Stands;
+        }
+        inst.queued_prompts.clone()
+    };
+    if !queued_head.is_empty() {
+        // `None` covers a pruned limit row and a failed probe alike, and
+        // neither proves a supersession, so the continuation stands.
+        let limit_at_ms = query_store(
+            &state.acp_event_store,
+            id,
+            "rate-limit supersession",
+            |s, id| {
+                s.latest_rate_limit_event(id)
+                    .map(|(_, recorded_at_ms)| recorded_at_ms)
+            },
+        )
         .await
-        .iter()
-        .find(|i| i.id == id)
-        .is_some_and(|i| i.pending_initial_turn.is_none() && !i.queued_prompts.is_empty());
-    if queue_owns_next_turn {
-        return ContinuationOutcome::SupersededByQueue;
+        .flatten();
+        if queue_supersedes(&queued_head, limit_at_ms) {
+            return ContinuationOutcome::SupersededByQueue;
+        }
     }
     state
         .session_service
@@ -588,63 +620,119 @@ mod tests {
             .count()
     }
 
+    /// Only a head minted after the limit replaced the turn. A head older than
+    /// the limit, a limit that was never recorded, a head whose creation time
+    /// cannot be read, and a stale head ahead of a fresh one all leave the
+    /// continuation standing: the interrupted request is the older one and
+    /// dropping it is final.
+    #[test]
+    fn only_a_head_minted_after_the_limit_supersedes() {
+        let limit = Utc
+            .timestamp_opt(1_700_000_000, 0)
+            .unwrap()
+            .timestamp_millis();
+        let row = |seq: u64, created_at: &str| crate::daemon::QueuedPromptEntry {
+            id: format!("q-{seq}"),
+            seq,
+            text: String::new(),
+            attachments: Vec::new(),
+            created_at: created_at.into(),
+            origin_device: None,
+        };
+        let after = Utc.timestamp_opt(1_700_000_001, 0).unwrap();
+        let before = Utc.timestamp_opt(1_699_999_999, 0).unwrap();
+        let after = after.to_rfc3339();
+        let before = before.to_rfc3339();
+        let cases = [
+            (
+                "head after the limit",
+                vec![row(1, &after)],
+                Some(limit),
+                true,
+            ),
+            (
+                "head before the limit",
+                vec![row(1, &before)],
+                Some(limit),
+                false,
+            ),
+            ("limit never recorded", vec![row(1, &after)], None, false),
+            (
+                "head time unreadable",
+                vec![row(1, "t0")],
+                Some(limit),
+                false,
+            ),
+            (
+                "stale head ahead of a fresh one",
+                vec![row(1, &before), row(2, &after)],
+                Some(limit),
+                false,
+            ),
+        ];
+        for (name, queue, recorded, expected) in cases {
+            assert_eq!(queue_supersedes(&queue, recorded), expected, "{name}");
+        }
+    }
+
     /// #4092: a queued prompt owns the next turn only while the pending-turn
-    /// slot is still free. It publishes no event, so the queue row is the only
-    /// record of the supersession; once an earlier cadence has installed the
-    /// continuation, that turn is still next and the queue drains behind it, so
-    /// the resume must stand and its redelivery must still be charged.
+    /// slot is free and the row was minted after the limit that interrupted it.
+    /// A row queued while the interrupted turn was still running is a follow-up
+    /// the user wants behind it, so the continuation is installed and its
+    /// redelivery charged.
     #[tokio::test]
     #[serial_test::serial]
-    async fn a_queued_prompt_supersedes_only_an_uninstalled_continuation() {
-        for installed in [false, true] {
-            let id = if installed {
-                "sess-4092-queued-and-installed"
-            } else {
-                "sess-4092-queued-first"
-            };
-            let (_home, state, _project) = parked(id, 0).await;
+    async fn only_a_prompt_queued_after_the_park_supersedes_the_continuation() {
+        // The `parked` fixture backdates the limit an hour, so these straddle it.
+        let after = Utc::now().to_rfc3339();
+        let before = (Utc::now() - chrono::Duration::hours(2)).to_rfc3339();
+        // (label, continuation already installed, queued at, turn kept, breadcrumbs)
+        let cases = [
+            ("queued-after", false, after.clone(), None, 0),
+            ("installed-and-queued-after", true, after, Some(true), 1),
+            ("queued-before", false, before, Some(true), 1),
+        ];
+        for (label, installed, created_at, kept, breadcrumbs) in cases {
+            let id = format!("sess-4092-{label}");
+            let (_home, state, _project) = parked(&id, 0).await;
             if installed {
                 state
                     .session_service
-                    .set_pending_initial_turn(id, "run the nightly task".into(), Vec::new())
+                    .set_pending_initial_turn(&id, "run the nightly task".into(), Vec::new())
                     .await;
             }
             assert!(
                 state
                     .session_service
                     .enqueue_prompt(
-                        id,
+                        &id,
                         "q-1".into(),
                         "manual prompt B".into(),
                         vec![],
                         None,
-                        "t0".into(),
+                        created_at.clone(),
                     )
                     .await
                     .is_some(),
-                "installed={installed}: the queue row must land, or the case asserts nothing"
+                "{label}: the queue row must land, or the case asserts nothing"
             );
             assert!(
-                state.acp_event_store.rate_limit_park(id).is_some(),
-                "installed={installed}: a queued prompt must leave the park standing"
+                state.acp_event_store.rate_limit_park(&id).is_some(),
+                "{label}: a queued prompt must leave the park standing"
             );
-            let mut attempted: HashSet<String> = [id.to_string()].into();
+            let mut attempted: HashSet<String> = [id.clone()].into();
 
             let released = reap_rate_limit_resumes(&state, &mut attempted, &HashSet::new()).await;
 
+            assert_eq!(pending_turn(&state, &id).await, kept, "{label}");
             assert_eq!(
-                pending_turn(&state, id).await,
-                installed.then_some(true),
-                "installed={installed}: the queue supersedes only what is not queued"
-            );
-            assert_eq!(
-                auto_resumed_breadcrumbs(&state, id),
-                usize::from(installed),
-                "installed={installed}: a refused continuation must not spend a redelivery"
+                auto_resumed_breadcrumbs(&state, &id),
+                breadcrumbs,
+                "{label}: a refused continuation must not spend a redelivery"
             );
             assert!(
-                !attempted.contains(id) && released.contains(id),
-                "installed={installed}: the queued prompt has no other route to a worker"
+                !attempted.contains(&id) && released.contains(&id),
+                "{label}: the queued prompt has no other route to a worker"
             );
         }
     }
@@ -701,10 +789,19 @@ mod tests {
     async fn the_pass_refuses_while_a_prompt_submission_owns_the_session() {
         let id = "sess-4092-contended";
         let (_home, state, _project) = parked(id, 0).await;
+        assert!(
+            state.acp_event_store.rate_limit_park(id).is_some(),
+            "the fixture must arm a park, or the pass skips it for an unrelated reason"
+        );
         let _submission = state.session_service.prompt_submission(id).await;
         let mut attempted: HashSet<String> = [id.to_string()].into();
 
-        let released = reap_rate_limit_resumes(&state, &mut attempted, &HashSet::new()).await;
+        let released = tokio::time::timeout(
+            Duration::from_secs(5),
+            reap_rate_limit_resumes(&state, &mut attempted, &HashSet::new()),
+        )
+        .await
+        .expect("a contended submission guard must not block the tick");
 
         assert!(
             attempted.contains(id),

@@ -4,7 +4,7 @@ mod idle;
 mod rate_limit;
 mod resume;
 #[cfg(test)]
-pub(crate) mod test_fixtures;
+mod test_fixtures;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -18,7 +18,7 @@ use crate::acp::event_store::EventStore;
 use crate::daemon::AcpWorkerState;
 use crate::session::Instance;
 
-pub(crate) use rate_limit::{install_rate_limit_continuation, ContinuationOutcome};
+pub(crate) use rate_limit::install_rate_limit_continuation;
 pub(crate) use resume::{command_override_for_spawn, trigger_resume_background, ResumeTrigger};
 #[cfg(test)]
 pub(crate) use test_fixtures::arm_install_barrier;

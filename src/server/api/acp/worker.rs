@@ -4,6 +4,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::acp::protocol::{SwitchAgentRequest, SwitchAgentResponse};
+use crate::server::acp_reconciler::install_rate_limit_continuation;
 use crate::server::api::find_instance;
 
 use super::*;
@@ -89,10 +90,8 @@ pub async fn spawn_acp(
         Ok(j) => j,
         Err(rej) => return rej.into_response(),
     };
-    // The continuation install below needs the session's submission authority,
-    // claimed ahead of the instance lock like every other mutation surface
-    // (#4092). The claim also proves the session exists, so a missing one
-    // creates neither lock.
+    // Claimed ahead of the instance lock like every other mutation surface
+    // (#4092); the claim also proves the session exists.
     let Some(_submission) = state
         .session_service
         .prompt_submission_for_session(&id)
@@ -149,20 +148,12 @@ pub async fn spawn_acp(
     }
     if let Some(resets_at) = rate_limit_resume_resets_at {
         // Continue the rate-limit-interrupted turn once the worker is live.
-        let outcome = crate::server::acp_reconciler::install_rate_limit_continuation(
-            &state,
-            &id,
-            _submission,
-        )
-        .await;
-        if matches!(
-            outcome,
-            crate::server::acp_reconciler::ContinuationOutcome::Stands
-        ) {
-            state
-                .acp_supervisor
-                .publish_rate_limit_auto_resumed(&id, resets_at, true);
-        }
+        install_rate_limit_continuation(&state, &id, _submission).await;
+        // The manual breadcrumb is the budget's disarm step, so it fires
+        // whether or not a queued prompt superseded the continuation.
+        state
+            .acp_supervisor
+            .publish_rate_limit_auto_resumed(&id, resets_at, true);
     }
     Json(SpawnAcpResponse {
         session_id: id,

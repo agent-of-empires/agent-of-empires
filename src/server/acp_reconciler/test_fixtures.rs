@@ -42,7 +42,7 @@ pub(crate) fn arm_install_barrier() -> InstallBarrier {
 /// Report a producer read to an armed barrier and block its installation on
 /// the ack. The deadline keeps a producer from parking forever when no test is
 /// left to release it.
-pub(crate) async fn await_install_barrier(id: &str) {
+pub(super) async fn await_install_barrier(id: &str) {
     let sender = INSTALL_BARRIER
         .lock()
         .expect("INSTALL_BARRIER mutex poisoned")

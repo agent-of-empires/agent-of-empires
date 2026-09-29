@@ -611,10 +611,10 @@ async fn diff_comments_refuse_to_open_a_turn_another_submission_started() {
     )));
 }
 
-/// Seed the rate-limit state auto-resume acts on: prompt A interrupted by a
-/// limit whose park window has already elapsed, so `reap_rate_limit_resumes`
-/// would queue A. Backdated an hour, under the redelivery cap. `busy` adds a
-/// running turn, which is what makes B queue rather than dispatch.
+/// Seed the rate-limit state a resume acts on: prompt A interrupted by a limit
+/// whose park window has already elapsed, the state the install reads.
+/// Backdated an hour, under the redelivery cap. `busy` adds a running turn,
+/// which is what makes B queue rather than dispatch.
 fn seed_elapsed_rate_limit_park(state: &AppState, id: &str, busy: bool) {
     let store = &state.acp_event_store;
     let long_ago = chrono::Utc::now() - chrono::Duration::hours(1);
@@ -656,10 +656,9 @@ fn seed_elapsed_rate_limit_park(state: &AppState, id: &str, busy: bool) {
     );
 }
 
-/// The pending continuation as it stands on disk, which the in-memory slot
-/// can disagree with. Reads through the instance's own `source_profile`, so it
-/// resolves exactly as the writer does, and fails rather than returning `None`
-/// when the row is missing.
+/// The pending continuation as it stands on disk, which the in-memory slot can
+/// disagree with. Reads the profile the writer resolved, and fails rather than
+/// returning `None` when the row is missing.
 async fn persisted_pending_turn(
     state: &AppState,
     id: &str,
@@ -673,16 +672,11 @@ async fn persisted_pending_turn(
         .expect("seeded session")
         .source_profile
         .clone();
-    let storage = crate::session::Storage::new_unwatched(&profile).expect("open storage");
-    storage
-        .update(|instances, _groups| {
-            Ok(instances
-                .iter()
-                .find(|i| i.id == id)
-                .map(|i| i.pending_initial_turn.clone()))
-        })
-        .expect("read persisted sessions")
+    crate::server::test_support::load_instances_from_disk_for_test(&profile)
+        .into_iter()
+        .find(|i| i.id == id)
         .expect("the session row must be on disk, or this assertion is vacuous")
+        .pending_initial_turn
 }
 
 /// #4092: a manual prompt may not slip between a rate-limit continuation's
