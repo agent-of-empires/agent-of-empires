@@ -1451,7 +1451,7 @@ async fn show_session(profile: &str, args: ShowArgs) -> Result<()> {
             println!(
                 "  State:   {} ({})",
                 super::list::state_tag(&inst),
-                at.to_rfc3339()
+                super::list::display_timestamp(at)
             );
         }
         println!("  Profile: {}", storage.profile());
