@@ -3,6 +3,7 @@ import { useCallback, useSyncExternalStore } from "react";
 import { DEFAULT_CONVERSATION_FONT_SIZE, normalizeConversationFontSize } from "../lib/conversationFontSize";
 import { DEFAULT_PERSISTENT_TERMINALS, normalizePersistentTerminalLimit } from "../lib/persistentTerminals";
 import { safeGetItem, safeSetItem } from "../lib/safeStorage";
+import { DEFAULT_TOOLBAR_KEYS, normalizeToolbarKeys, type ToolbarKeyId } from "../lib/terminalToolbarKeys";
 
 const STORAGE_KEY = "aoe-web-settings";
 
@@ -24,6 +25,9 @@ export interface WebSettings {
   autoOpenDiffPane: boolean;
   autoOpenTerminalPane: boolean;
   autoOpenPluginPanes: boolean;
+  /** Ordered key row above the soft keyboard in the live terminal. */
+  mobileToolbarKeys: ToolbarKeyId[];
+  showArrowJoystick: boolean;
 }
 
 function getDefaults(): WebSettings {
@@ -45,6 +49,8 @@ function getDefaults(): WebSettings {
     autoOpenDiffPane: true,
     autoOpenTerminalPane: true,
     autoOpenPluginPanes: false,
+    mobileToolbarKeys: [...DEFAULT_TOOLBAR_KEYS],
+    showArrowJoystick: true,
   };
 }
 
@@ -64,6 +70,8 @@ function normalizeSnapshot(settings: WebSettings): WebSettings {
     autoOpenDiffPane: normalizeBool(settings.autoOpenDiffPane, defaults.autoOpenDiffPane),
     autoOpenTerminalPane: normalizeBool(settings.autoOpenTerminalPane, defaults.autoOpenTerminalPane),
     autoOpenPluginPanes: normalizeBool(settings.autoOpenPluginPanes, defaults.autoOpenPluginPanes),
+    mobileToolbarKeys: normalizeToolbarKeys(settings.mobileToolbarKeys),
+    showArrowJoystick: normalizeBool(settings.showArrowJoystick, defaults.showArrowJoystick),
     markdownPreview:
       settings.markdownPreview === "rendered" || settings.markdownPreview === "raw"
         ? settings.markdownPreview

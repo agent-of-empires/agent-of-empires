@@ -89,7 +89,8 @@ export function useLiveTerminal(
   }>({ resize: null, window: null, fast: true });
   const readingRef = useRef(false);
   const telemetrySeenRef = useRef(false);
-  const pendingInputRef = useRef<Uint8Array<ArrayBuffer>[]>([]);
+  // Binary keystrokes and JSON paste messages, in send order.
+  const pendingInputRef = useRef<(Uint8Array<ArrayBuffer> | string)[]>([]);
   // Hold input until the server confirms this connection owns the pane.
   const ownerKnownRef = useRef(false);
 
@@ -372,27 +373,34 @@ export function useLiveTerminal(
     };
   }, [sessionId, wsPath, setState, read, setWindowInternal]);
 
-  const typedWordRef = useRef("");
-
-  const sendData = useCallback(
-    (data: string): boolean => {
-      typedWordRef.current = "";
+  /** Whether `message` was sent or queued for the owner confirmation. */
+  const sendInput = useCallback(
+    (message: Uint8Array<ArrayBuffer> | string): boolean => {
       const ws = wsRef.current;
       const isOwner = read().isOwner;
       if (ownerKnownRef.current && isOwner && ws?.readyState === WebSocket.OPEN) {
-        ws.send(new TextEncoder().encode(data));
+        ws.send(message);
         return true;
       }
       // A confirmed non-owner must not queue keystrokes for a later takeover.
       if (ownerKnownRef.current && !isOwner) return false;
-      const bytes = new TextEncoder().encode(data);
+      const size = (item: Uint8Array | string) =>
+        typeof item === "string" ? new TextEncoder().encode(item).byteLength : item.byteLength;
       const pending = pendingInputRef.current;
-      const used = pending.reduce((total, item) => total + item.byteLength, 0);
-      if (bytes.byteLength > MAX_PENDING_INPUT_BYTES - used) return false;
-      pending.push(bytes);
+      const used = pending.reduce((total, item) => total + size(item), 0);
+      if (size(message) > MAX_PENDING_INPUT_BYTES - used) return false;
+      pending.push(message);
       return true;
     },
     [read],
+  );
+
+  const sendData = useCallback((data: string) => sendInput(new TextEncoder().encode(data)), [sendInput]);
+
+  /** tmux pastes `text` (bracketed only if the pane asked for it), then presses Enter when `submit`. */
+  const sendPaste = useCallback(
+    (text: string, submit: boolean) => sendInput(JSON.stringify({ type: "paste", text, submit })),
+    [sendInput],
   );
 
   const claim = useCallback(() => sendIfOpen(JSON.stringify({ type: "claim" })), [sendIfOpen]);
@@ -473,7 +481,7 @@ export function useLiveTerminal(
   return {
     state,
     sendData,
-    typedWordRef,
+    sendPaste,
     forwardWheel,
     forwardButton,
     sendResize,

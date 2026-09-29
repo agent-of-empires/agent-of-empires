@@ -249,6 +249,31 @@
       ]
     },
     {
+      "id": "terminal.compose-and-keys",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": [
+        "tests/live-terminal-compose.spec.ts",
+        "tests/live/acp-stories/mobile-toolbar-keys.spec.ts",
+        "src/components/__tests__/TerminalComposeSheet.test.tsx",
+        "src/components/__tests__/LiveTerminalView.compose.test.tsx",
+        "src/components/__tests__/MobileTerminalToolbar.test.tsx",
+        "src/components/__tests__/ArrowJoystick.test.tsx",
+        "src/components/settings/__tests__/MobileKeysSettings.test.tsx"
+      ],
+      "components": [
+        "web/src/components/TerminalComposeSheet.tsx",
+        "web/src/components/LiveTerminalView.tsx",
+        "web/src/components/MobileTerminalToolbar.tsx",
+        "web/src/components/ArrowJoystick.tsx",
+        "web/src/components/settings/MobileKeysSettings.tsx",
+        "web/src/components/TerminalSettings.tsx",
+        "web/src/hooks/useHoldRepeat.ts",
+        "web/src/lib/terminalToolbarKeys.ts",
+        "web/src/lib/arrowJoystick.ts"
+      ]
+    },
+    {
       "id": "terminal.selection-hold",
       "kind": "mocked-playwright",
       "risk": "high",
@@ -336,7 +361,8 @@
       "specs": [
         "src/lib/__tests__/liveMouse.test.ts",
         "src/components/__tests__/MobileLiveTerminal.forward.test.tsx",
-        "src/hooks/useLiveTerminal.test.ts"
+        "src/hooks/useLiveTerminal.test.ts",
+        "tests/live-tap-forward.spec.ts"
       ],
       "components": [
         "web/src/lib/liveMouse.ts",
@@ -691,8 +717,15 @@
       "id": "notifications.push-subscription",
       "kind": "vitest",
       "risk": "medium",
-      "specs": ["src/hooks/usePushSubscription.test.ts"],
-      "components": ["web/src/hooks/usePushSubscription.ts"]
+      "specs": ["src/hooks/usePushSubscription.test.ts", "src/lib/pushHealth.test.ts"],
+      "components": ["web/src/hooks/usePushSubscription.ts", "web/src/lib/pushHealth.ts"]
+    },
+    {
+      "id": "notifications.push-health-banner",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/components/__tests__/PushHealthBanner.test.tsx"],
+      "components": ["web/src/components/PushHealthBanner.tsx"]
     },
     {
       "id": "settings.security-readonly",

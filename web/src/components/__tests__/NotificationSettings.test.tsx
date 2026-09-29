@@ -4,38 +4,39 @@ import { describe, expect, it, vi } from "vitest";
 import { fireEvent, render } from "@testing-library/react";
 
 import type { PushState } from "../../hooks/usePushSubscription";
+import type { PushHealth } from "../../lib/pushHealth";
 
 const enable = vi.fn();
 const disable = vi.fn();
 const sendTest = vi.fn();
-const resubscribe = vi.fn();
 const refresh = vi.fn();
 let currentState: PushState = { kind: "off" };
+let currentHealth: PushHealth = "unknown";
 
 vi.mock("../../hooks/usePushSubscription", () => ({
   usePushSubscription: () => ({
     state: currentState,
+    health: currentHealth,
     enable,
     disable,
     sendTest,
-    resubscribe,
     refresh,
   }),
 }));
 
 import { NotificationSettings } from "../NotificationSettings";
 
-function setState(s: PushState) {
+function setState(s: PushState, health: PushHealth = "unknown") {
   currentState = s;
+  currentHealth = health;
   enable.mockClear();
   disable.mockClear();
   sendTest.mockClear();
-  resubscribe.mockClear();
   refresh.mockClear();
 }
 
-function renderFor(state: PushState) {
-  setState(state);
+function renderFor(state: PushState, health?: PushHealth) {
+  setState(state, health);
   return render(<NotificationSettings />).container;
 }
 
@@ -64,8 +65,20 @@ describe("NotificationSettings", () => {
     fireEvent.click(buttonByText(container, "Re-subscribe")!);
     fireEvent.click(buttonByText(container, "Turn off")!);
     expect(sendTest).toHaveBeenCalledTimes(1);
-    expect(resubscribe).toHaveBeenCalledTimes(1);
+    expect(enable).toHaveBeenCalledTimes(1);
     expect(disable).toHaveBeenCalledTimes(1);
+  });
+
+  it.each<[PushState, PushHealth, string | null]>([
+    [{ kind: "off" }, "revoked", "this device dropped its subscription"],
+    [{ kind: "enabled" }, "key-mismatch", "old server key"],
+    [{ kind: "enabled" }, "delivery-failed", "refused the last notification"],
+    [{ kind: "denied" }, "permission-denied", "Notifications are blocked"],
+    [{ kind: "enabled" }, "healthy", null],
+  ])("surfaces %o with health %s", (state, health, text) => {
+    const container = renderFor(state, health);
+    const warning = container.querySelector("p.text-status-waiting");
+    expect(warning?.textContent ?? null).toEqual(text ? expect.stringContaining(text) : null);
   });
 
   it.each([

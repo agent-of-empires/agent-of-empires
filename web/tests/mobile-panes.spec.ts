@@ -103,8 +103,8 @@ test.describe("Desktop right panel split is unchanged (#1452)", () => {
     await expect(page.getByTestId("activity-bar")).toBeVisible();
     await expect(page.getByRole("button", { name: "Toggle panels" })).toHaveCount(0);
     await expect(picker(page)).toHaveCount(0);
-    await expect(page.getByRole("button", { name: "Arrow up" })).toHaveCount(0);
-    await expect(page.getByRole("button", { name: "Ctrl+C interrupt" })).toHaveCount(0);
+    await expect(page.getByRole("button", { name: "Compose", exact: true })).toHaveCount(0);
+    await expect(page.getByRole("group", { name: "Arrow keys joystick" })).toHaveCount(0);
   });
 });
 

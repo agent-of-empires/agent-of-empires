@@ -14,6 +14,7 @@ function loadSw() {
   const showNotification = vi.fn();
   const getNotifications = vi.fn().mockResolvedValue([]);
   const matchAll = vi.fn().mockResolvedValue([]);
+  const getSubscription = vi.fn().mockResolvedValue({ endpoint: "https://fcm.googleapis.com/fcm/send/x" });
   const self = {
     addEventListener: (type: string, fn: Handler) => {
       const list = handlers.get(type) ?? [];
@@ -23,10 +24,10 @@ function loadSw() {
     skipWaiting: vi.fn(),
     location: { origin: "https://aoe.test" },
     clients: { matchAll, claim: vi.fn(), openWindow: vi.fn() },
-    registration: { showNotification, getNotifications },
+    registration: { showNotification, getNotifications, pushManager: { getSubscription } },
   };
-  vm.runInNewContext(swSource, { self, caches: { keys: vi.fn(), delete: vi.fn() } });
-  return { handlers, showNotification, getNotifications, matchAll };
+  vm.runInNewContext(swSource, { self, URL, caches: { keys: vi.fn(), delete: vi.fn() } });
+  return { handlers, showNotification, getNotifications, matchAll, getSubscription };
 }
 
 async function dispatchPush(handlers: Map<string, Handler[]>, payload: unknown) {
@@ -61,14 +62,20 @@ describe("service worker push handler (#2491)", () => {
     expect(getNotifications).not.toHaveBeenCalled();
   });
 
-  it("forwards a normal payload to a focused client instead of showing", async () => {
-    const { handlers, showNotification, matchAll } = loadSw();
+  // WebKit revokes subscriptions whose pushes show nothing, so Apple endpoints always show.
+  it.each<[string, unknown, boolean]>([
+    ["an FCM subscription", { endpoint: "https://fcm.googleapis.com/fcm/send/x" }, false],
+    ["an Apple subscription", { endpoint: "https://web.push.apple.com/QGuQ" }, true],
+    ["no readable subscription", null, true],
+  ])("with a focused client and %s", async (_label, sub, shows) => {
+    const { handlers, showNotification, matchAll, getSubscription } = loadSw();
+    getSubscription.mockResolvedValue(sub);
     const postMessage = vi.fn();
     matchAll.mockResolvedValue([{ visibilityState: "visible", focused: true, postMessage }]);
     const payload = { kind: "notify", title: "t", tag: APPROVAL_TAG, seq: 1 };
     await dispatchPush(handlers, payload);
-    expect(postMessage).toHaveBeenCalledWith({ type: "aoe-push", payload });
-    expect(showNotification).not.toHaveBeenCalled();
+    expect(showNotification).toHaveBeenCalledTimes(shows ? 1 : 0);
+    expect(postMessage.mock.calls).toEqual(shows ? [] : [[{ type: "aoe-push", payload }]]);
   });
 
   it("closes only notifications older than the clear's seq, for the cleared tag alone", async () => {

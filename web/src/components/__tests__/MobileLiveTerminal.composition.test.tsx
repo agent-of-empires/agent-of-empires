@@ -1,9 +1,10 @@
 // @vitest-environment jsdom
-// Android IME word handling (#3746): SwiftKey re-wraps an already typed word in a composition, so only the
-// part the pane has not seen may be sent.
+// The hidden input sends its value's diff, so an IME or dictation rewriting text the pane already has sends only
+// what changed (#3746 SwiftKey word commits, iOS dictation hypotheses).
 
 import { describe, expect, it, vi } from "vitest";
 import { fireEvent } from "@testing-library/react";
+import { invalidateRetainedImeContext } from "../../lib/mobileKeyboardProxy";
 import { installResizeObserver, renderLiveTerminal } from "./liveTerminalHarness";
 
 vi.mock("../../hooks/useWebSettings", () => ({
@@ -14,13 +15,13 @@ installResizeObserver();
 interface Term {
   /** Plain edits, one per character, as a soft keyboard sends them. */
   type: (text: string) => void;
-  /** A retroactive composition: its first update carries the word already
-   *  typed, as SwiftKey's trace on #3746 does, then it ends with `data`. */
+  /** A retroactive composition: SwiftKey (#3746) re-wraps the word before the caret and commits `data`. */
   compose: (data: string) => void;
-  /** A composition whose first update carries `first`, which is what decides
-   *  whether it read as taking over the typed word or standing on its own. */
-  composeUpdating: (first: string, data: string) => void;
-  input: (inputType: string) => void;
+  /** A composition that starts at the caret. */
+  composeFresh: (data: string) => void;
+  /** iOS dictation: each hypothesis replaces the previous one in place. */
+  dictate: (hypotheses: string[]) => void;
+  input: (inputType: "deleteContentBackward" | "insertParagraph") => void;
   /** A toolbar button, which writes past this component to live.sendData. */
   toolbar: (data: string) => void;
   sent: () => string[];
@@ -29,36 +30,41 @@ interface Term {
 // `accepted` models useLiveTerminal.sendData's contract: false is a keystroke
 // the pane never receives (a confirmed non-owner, or a full pending queue).
 function renderTerm(accepted = true): Term {
-  // The hook clears the shared word on every write; that is what makes a toolbar button invalidate the run.
-  const typedWordRef = { current: "" };
-  const sendData = vi.fn((_data: string) => {
-    typedWordRef.current = "";
-    return accepted;
-  });
-  const input = renderLiveTerminal({ sendData, typedWordRef }).input();
-  const beforeInput = (inputType: string, data: string | null) =>
-    input.dispatchEvent(new InputEvent("beforeinput", { inputType, data, bubbles: true, cancelable: true }));
+  const sendData = vi.fn((_data: string) => accepted);
+  const input = renderLiveTerminal({ sendData }).input();
+  // Edits land as the browser applies them: the value changes, then `input` fires.
+  const edit = (inputType: string, value: string, isComposing = false) => {
+    input.value = value;
+    input.dispatchEvent(new InputEvent("input", { inputType, isComposing, bubbles: true }));
+  };
+  const composeOver = (from: number, data: string) => {
+    fireEvent.compositionStart(input);
+    edit("insertCompositionText", input.value.slice(0, from) + data, true);
+    fireEvent.compositionEnd(input, { data });
+  };
   return {
     type: (text) => {
-      for (const ch of text) beforeInput("insertText", ch);
+      for (const ch of text) edit("insertText", input.value + ch);
     },
-    compose: (data) => {
-      fireEvent.compositionStart(input);
-      fireEvent.compositionUpdate(input, { data: typedWordRef.current });
-      fireEvent.compositionEnd(input, { data });
+    compose: (data) => composeOver(input.value.length - (/\S*$/.exec(input.value)?.[0].length ?? 0), data),
+    composeFresh: (data) => composeOver(input.value.length, data),
+    dictate: (hypotheses) => {
+      const from = input.value.length;
+      for (const h of hypotheses) edit("insertReplacementText", input.value.slice(0, from) + h);
     },
-    composeUpdating: (first, data) => {
-      fireEvent.compositionStart(input);
-      fireEvent.compositionUpdate(input, { data: first });
-      fireEvent.compositionEnd(input, { data });
+    input: (inputType) => {
+      if (inputType === "deleteContentBackward") edit(inputType, Array.from(input.value).slice(0, -1).join(""));
+      else input.dispatchEvent(new InputEvent("beforeinput", { inputType, bubbles: true, cancelable: true }));
     },
-    input: (inputType) => beforeInput(inputType, null),
-    toolbar: (data) => sendData(data),
+    toolbar: (data) => {
+      invalidateRetainedImeContext(input);
+      sendData(data);
+    },
     sent: () => sendData.mock.calls.map(([d]: [string]) => d),
   };
 }
 
-describe("MobileLiveTerminal Android IME word commits", () => {
+describe("MobileLiveTerminal IME and dictation rewrites", () => {
   const cases: { name: string; accepted?: boolean; run: (t: Term) => void; sent: string[] }[] = [
     {
       name: "sends a SwiftKey word once when the composition repeats it",
@@ -137,19 +143,9 @@ describe("MobileLiveTerminal Android IME word commits", () => {
       name: "sends a fresh composition that merely shares the typed prefix",
       run: (t) => {
         t.type("a");
-        t.composeUpdating("n", "android");
+        t.composeFresh("android");
       },
       sent: ["a", "android"],
-    },
-    {
-      // A suggestion tap corrects the word in the same breath as adopting it, so the first update carries more
-      // than the run.
-      name: "strips an adopting composition that corrects as it takes over",
-      run: (t) => {
-        t.type("tes");
-        t.composeUpdating("test", "test");
-      },
-      sent: ["t", "e", "s", "t"],
     },
     {
       // The toolbar writes past this component straight to live.sendData.
@@ -166,7 +162,7 @@ describe("MobileLiveTerminal Android IME word commits", () => {
       name: "sends a composed word that does not continue what was typed",
       run: (t) => {
         t.type("a");
-        t.compose("日本");
+        t.composeFresh("日本");
       },
       sent: ["a", "日本"],
     },
@@ -175,8 +171,8 @@ describe("MobileLiveTerminal Android IME word commits", () => {
       // pane whole even when it repeats it.
       name: "sends a character composed twice in a row",
       run: (t) => {
-        t.composeUpdating("a", "a");
-        t.composeUpdating("a", "a");
+        t.composeFresh("a");
+        t.composeFresh("a");
       },
       sent: ["a", "a"],
     },
@@ -198,6 +194,24 @@ describe("MobileLiveTerminal Android IME word commits", () => {
         t.compose("tes");
       },
       sent: ["t", "e", "s", "t", "\x7f"],
+    },
+    {
+      name: "sends an iOS Korean syllable rewrite as DEL and the new syllable",
+      run: (t) => {
+        t.type("ㅎ");
+        t.input("deleteContentBackward");
+        t.type("하");
+      },
+      sent: ["ㅎ", "\x7f", "하"],
+    },
+    {
+      // The pane received "thithisthis is..." when each hypothesis was forwarded whole.
+      name: "sends each dictation hypothesis once, and a final correction as DELs and the retyped tail",
+      run: (t) => {
+        t.type("ok ");
+        t.dictate(["thi", "this", "this is", "this is a test", "This is a test."]);
+      },
+      sent: ["o", "k", " ", "thi", "s", " is", " a test", "\x7f".repeat(14) + "This is a test."],
     },
   ];
 

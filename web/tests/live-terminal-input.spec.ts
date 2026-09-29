@@ -294,8 +294,7 @@ test.describe("Live terminal link taps (mobile)", () => {
   test.use(iPhone13);
 
   test("a real tap on a printed URL opens it in a new tab", async ({ page }) => {
-    // Touch never enters the forwarding path (it is gated to pointerType
-    // "mouse"), but the same anchor has to work under a finger.
+    // Tap-to-click skips links, so the anchor still opens under a finger.
     await setupLink(page, true);
     const [x, y] = await hittableCentre(page, `a[href="${LINK}"]`);
     const [popup] = await Promise.all([page.context().waitForEvent("page"), page.touchscreen.tap(x, y)]);

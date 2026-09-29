@@ -2,9 +2,9 @@
 
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import {
+  bindHiddenInput,
   clearMobileKeyboardProxyInput,
   deliverMobileKeyboardProxyInput,
-  forwardTerminalBeforeInput,
 } from "../../lib/mobileKeyboardProxy";
 import type { RightPanelView } from "../../lib/rightPanelView";
 
@@ -35,7 +35,6 @@ export function useKeyboardProxy(activeSessionId: string | null, visibleView: Ri
     if (sessionIdRef.current === nextSessionId && viewRef.current === nextView) return;
     sessionIdRef.current = nextSessionId;
     viewRef.current = nextView;
-    if (proxyRef.current) proxyRef.current.value = "";
     clearMobileKeyboardProxyInput();
   }, []);
 
@@ -45,9 +44,7 @@ export function useKeyboardProxy(activeSessionId: string | null, visibleView: Ri
 
   useEffect(() => {
     if (!proxy) return;
-    const onBeforeInput = (e: InputEvent) => forwardTerminalBeforeInput(e, deliverMobileKeyboardProxyInput);
-    proxy.addEventListener("beforeinput", onBeforeInput);
-    return () => proxy.removeEventListener("beforeinput", onBeforeInput);
+    return bindHiddenInput(proxy, deliverMobileKeyboardProxyInput, "proxy");
   }, [proxy]);
 
   return { setProxyElement, focus, close, transition };

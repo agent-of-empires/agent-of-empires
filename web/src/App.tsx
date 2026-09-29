@@ -105,9 +105,9 @@ import { isAbsolutePath, resolveToRepoRelative, type FileRef } from "./lib/fileR
 import { NAVIGATE_EVENT, OPEN_SESSION_EVENT } from "./lib/sessionRoute";
 import { dispatchFocusTerminal, requestSessionInputFocus, setPendingTerminalFocus } from "./lib/terminalFocus";
 import {
+  bindHiddenInput,
   clearMobileKeyboardProxyInput,
   deliverMobileKeyboardProxyInput,
-  forwardTerminalBeforeInput,
 } from "./lib/mobileKeyboardProxy";
 import { hydrateWebUiStateFromServer, initWebUiSync } from "./lib/webUiSync";
 import { WorkspaceSidebar } from "./components/WorkspaceSidebar";
@@ -169,6 +169,7 @@ import { DisconnectBanner } from "./components/DisconnectBanner";
 import { ElevationPrompt } from "./components/ElevationPrompt";
 import { UpdateBanner } from "./components/UpdateBanner";
 import { DashboardUpdateBanner } from "./components/DashboardUpdateBanner";
+import { PushHealthBanner } from "./components/PushHealthBanner";
 
 // Pre-#1832 per-browser tour-seen flag. Read once on load to migrate users who
 // already dismissed the tour to the backend; no longer written.
@@ -914,7 +915,6 @@ function AppContent({
     if (keyboardProxySessionIdRef.current === nextSessionId && keyboardProxyViewRef.current === nextView) return;
     keyboardProxySessionIdRef.current = nextSessionId;
     keyboardProxyViewRef.current = nextView;
-    if (keyboardProxyRef.current) keyboardProxyRef.current.value = "";
     clearMobileKeyboardProxyInput();
   }, []);
 
@@ -926,9 +926,7 @@ function AppContent({
   useEffect(() => {
     const proxy = keyboardProxy;
     if (!proxy) return;
-    const onBeforeInput = (e: InputEvent) => forwardTerminalBeforeInput(e, deliverMobileKeyboardProxyInput);
-    proxy.addEventListener("beforeinput", onBeforeInput);
-    return () => proxy.removeEventListener("beforeinput", onBeforeInput);
+    return bindHiddenInput(proxy, deliverMobileKeyboardProxyInput, "proxy");
   }, [keyboardProxy]);
 
   // Selecting a session in the sidebar should land focus on its canonical
@@ -2307,6 +2305,7 @@ function AppContent({
         <DisconnectBanner />
         <UpdateBanner />
         <DashboardUpdateBanner />
+        <PushHealthBanner />
 
         {/* Below the banners, not directly under the bar: the handle is
             absolutely positioned at the top-right, and hanging it off the bar
@@ -2516,9 +2515,9 @@ function AppContent({
           // This matches the live terminal's hidden input geometry.
           className="fixed bottom-0 left-0 w-px h-px opacity-0 pointer-events-none"
           style={{ caretColor: "transparent", color: "transparent" }}
-          // Typed text now stays in this textarea as IME context (see
-          // forwardTerminalBeforeInput), so keep the OS from rewriting it
-          // the way the live terminal's own hidden input already does.
+          // Typed text stays in this textarea as IME context (see
+          // bindHiddenInput), so keep the OS from rewriting it the way the
+          // live terminal's own hidden input already does.
           autoCapitalize="off"
           autoCorrect="off"
           autoComplete="off"

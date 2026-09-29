@@ -8,7 +8,7 @@ Three status events, each independently toggleable in Settings and overridable p
 
 Two more, **approval** and **question** ([AskUserQuestion](structured-view/controls.md#questions-askuserquestion)), fire immediately and bypass the suppression rules below: with the dashboard or TUI foregrounded you still get an in-app toast, plus the browser chime described in [Sound effects](sounds.md).
 
-Status notifications are suppressed while you are already looking at aoe: a focused dashboard tab shows an in-app toast instead of an OS notification (per device), and keyboard, paste, or mouse input in a TUI suppresses pushes for 30 seconds across every device. An unattended TUI does not silence your phone, and background polling does not count as foregrounded.
+Status notifications are suppressed while you are already looking at aoe: a focused dashboard tab shows an in-app toast instead of an OS notification (per device; Safari and iPhone always get the OS notification, because WebKit revokes a subscription whose pushes show nothing), and keyboard, paste, or mouse input in a TUI suppresses pushes for 30 seconds across every device. An unattended TUI does not silence your phone, and background polling does not count as foregrounded.
 
 ## A stable HTTPS origin first
 
@@ -30,8 +30,8 @@ Operators can disable push server-wide with `web.notifications_enabled = false` 
 
 - **"Enable notifications" does nothing on iPhone**: open the app from the Home Screen, not Safari.
 - **Test says delivered but nothing appears**: check Focus modes, Do Not Disturb, and the app's notification allowances in iOS Settings.
-- **"Delivery failing" badge**: the server cannot reach the push endpoint, usually no outbound HTTPS or a push service outage. Click Diagnose for the last error.
+- **"Notifications stopped on this device" banner**: the device asked for notifications but the browser dropped its subscription, it is bound to an old server key (for example after `push.vapid.json` was deleted), or the push service refused the last send. Tap **Re-enable**. If notifications are blocked, the banner says where to allow them instead.
 - **"Disabled by the server"**: ask the operator about `web.notifications_enabled`.
-- **Notifications stop after a while**: token rotation drops stale subscriptions. With `--remote` the token rotates every four hours, so grab a fresh dashboard URL and re-enable.
+- **Notifications stop after a while**: token rotation drops stale subscriptions. Opening the dashboard with the current token re-registers the device automatically; with `--remote` the token rotates every four hours.
 - **A notification opens the wrong host or port**: payloads carry the origin recorded at subscribe time, so after changing `--host`, `--port`, or your remote URL, click **Re-subscribe** on the affected device. Subscriptions created before origin tracking are skipped on send and Re-subscribe upgrades them.
 - **Push stops after an upgrade**: the new service worker activates on the next PWA open. Open the installed app, let it reload, then send a test.

@@ -48,7 +48,7 @@ export function liveProps(over: Partial<MobileLiveTerminalProps> = {}): MobileLi
     enterReading: vi.fn(),
     returnToLive: vi.fn(),
     sendData: vi.fn(),
-    typedWordRef: { current: "" },
+    sendPaste: vi.fn(() => true),
     uploadPastedImage: vi.fn(async () => null),
     forwardWheel: vi.fn(),
     forwardButton: vi.fn(),

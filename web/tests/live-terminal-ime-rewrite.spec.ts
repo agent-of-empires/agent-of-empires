@@ -2,17 +2,22 @@ import { test, expect } from "./helpers/mockedTest";
 import { devices, type Page } from "@playwright/test";
 import { mockTerminalApis, type MockHandle } from "./helpers/terminal-mocks";
 import { clickSidebarSession, openMobileSidebar } from "./helpers/sidebar";
+import { HIDDEN_INPUT_SENTINEL as S } from "../src/lib/hiddenInputDiff";
 
 // iOS Korean input (WebKit bug 274700) rewrites the last syllable as deleteContentBackward + insertText with no
-// composition events, and emits no delete for an empty textarea, so the hidden input retains typed text.
-// Chromium fires no beforeinput for execCommand or CDP deletes, so edits are synthesized and default actions mirrored.
+// composition events, and iOS dictation replaces its hypothesis in place, so the hidden input retains typed text and
+// sends the diff of its value. Edits are synthesized as the browser applies them: beforeinput, the value change, input.
+
+/** What the PTY receives for one socket message: input bytes, a paste as the server brackets it, or nothing. */
+function ptyBytes(message: Buffer) {
+  const text = message.toString("utf8");
+  if (!text.startsWith("{")) return text;
+  const msg = JSON.parse(text) as { type?: string; text?: string };
+  return msg.type === "paste" ? `\x1b[200~${msg.text}\x1b[201~` : "";
+}
 
 function textBytes(handle: MockHandle, start: number) {
-  return handle.liveMessages
-    .slice(start)
-    .map((msg) => msg.toString("utf8"))
-    .filter((s) => !s.startsWith("{"))
-    .join("");
+  return handle.liveMessages.slice(start).map(ptyBytes).join("");
 }
 
 const INPUT = 'textarea[aria-label="Live terminal input"]';
@@ -21,12 +26,14 @@ const PROXY = "textarea[data-keyboard-proxy]";
 
 async function softKey(
   page: Page,
-  inputType: "insertText" | "deleteContentBackward",
+  inputType: "insertText" | "deleteContentBackward" | "insertReplacementText",
   data: string | null = null,
   selector = INPUT,
+  /** For insertReplacementText: how many trailing characters the replacement covers. */
+  replaces = 0,
 ) {
   await page.evaluate(
-    ({ selector, inputType, data }) => {
+    ({ selector, inputType, data, replaces }) => {
       const ta = document.querySelector<HTMLTextAreaElement>(selector);
       if (!ta) throw new Error("live terminal input not found");
       ta.focus();
@@ -34,10 +41,11 @@ async function softKey(
       const ev = new InputEvent("beforeinput", { inputType, data, bubbles: true, cancelable: true });
       if (!ta.dispatchEvent(ev)) return;
       const end = ta.value.length;
-      if (inputType === "insertText") ta.setRangeText(data ?? "", end, end, "end");
-      else ta.setRangeText("", Math.max(0, end - 1), end, "end");
+      if (inputType === "deleteContentBackward") ta.setRangeText("", Math.max(0, end - 1), end, "end");
+      else ta.setRangeText(data ?? "", end - replaces, end, "end");
+      ta.dispatchEvent(new InputEvent("input", { inputType, data, bubbles: true }));
     },
-    { selector, inputType, data },
+    { selector, inputType, data, replaces },
   );
 }
 
@@ -69,9 +77,26 @@ test.describe("Live terminal IME syllable rewrite", () => {
     await softKey(page, "deleteContentBackward");
     await softKey(page, "insertText", "한");
 
-    await expect(page.locator(INPUT)).toHaveValue("한");
+    await expect(page.locator(INPUT)).toHaveValue(S + "한");
     // The PTY sees each rewrite as delete + reinsert.
     await expect.poll(() => textBytes(handle, start), { timeout: 5_000 }).toBe("ㅎ\x7f하\x7f한");
+  });
+
+  test("dictation hypotheses replaced in place reach the PTY once", async ({ page }) => {
+    const handle = await mockTerminalApis(page);
+    await openSession(page, handle);
+
+    const start = handle.liveMessages.length;
+    let previous = 0;
+    for (const hypothesis of ["thi", "this", "this is", "this is a test", "This is a test."]) {
+      await softKey(page, "insertReplacementText", hypothesis, INPUT, previous);
+      previous = hypothesis.length;
+    }
+
+    await expect(page.locator(INPUT)).toHaveValue(S + "This is a test.");
+    await expect
+      .poll(() => textBytes(handle, start), { timeout: 5_000 })
+      .toBe("this is a test" + "\x7f".repeat(14) + "This is a test.");
   });
 
   test("Enter submits and drops the retained IME context", async ({ page }) => {
@@ -84,7 +109,7 @@ test.describe("Live terminal IME syllable rewrite", () => {
       .locator(INPUT)
       .dispatchEvent("keydown", { key: "Enter", code: "Enter", bubbles: true, cancelable: true });
 
-    await expect(page.locator(INPUT)).toHaveValue("");
+    await expect(page.locator(INPUT)).toHaveValue(S);
     await expect.poll(() => textBytes(handle, start), { timeout: 5_000 }).toBe("한\r");
   });
 
@@ -97,7 +122,7 @@ test.describe("Live terminal IME syllable rewrite", () => {
     await page.locator('button[aria-label="Ctrl"]').click();
     await softKey(page, "insertText", "c");
 
-    expect(await valueOf(page, INPUT)).toBe("");
+    expect(await valueOf(page, INPUT)).toBe(S);
     await expect.poll(() => textBytes(handle, start), { timeout: 5_000 }).toBe("\x03");
 
     await softKey(page, "insertText", "ㅎ");
@@ -110,13 +135,13 @@ test.describe("Live terminal IME syllable rewrite", () => {
     await openSession(page, handle);
 
     await softKey(page, "insertText", "ㅎ", PROXY);
-    expect(await valueOf(page, PROXY)).toBe("ㅎ");
+    expect(await valueOf(page, PROXY)).toBe(S + "ㅎ");
 
     await openMobileSidebar(page);
     await clickSidebarSession(page, "other");
     await page.locator("[data-live-terminal]").waitFor({ state: "visible", timeout: 10_000 });
 
-    expect(await valueOf(page, PROXY)).toBe("");
+    expect(await valueOf(page, PROXY)).toBe(S);
   });
 
   // #3885: a Ctrl-latched chord also clears a non-empty shadow.
@@ -130,7 +155,7 @@ test.describe("Live terminal IME syllable rewrite", () => {
     await softKey(page, "insertText", "c");
     await expect.poll(() => textBytes(handle, start), { timeout: 5_000 }).toBe("한\x03");
 
-    expect(await valueOf(page, INPUT)).toBe("");
+    expect(await valueOf(page, INPUT)).toBe(S);
     await softKey(page, "insertText", "ㅎ");
     await expect.poll(() => textBytes(handle, start), { timeout: 5_000 }).toBe("한\x03ㅎ");
   });
@@ -150,15 +175,15 @@ test.describe("Live terminal IME syllable rewrite", () => {
       ta.dispatchEvent(new ClipboardEvent("paste", { clipboardData: dt, bubbles: true, cancelable: true }));
     });
     await softKey(page, "insertText", "ㅎ");
-    await expect(page.locator(INPUT)).toHaveValue("ㅎ");
+    await expect(page.locator(INPUT)).toHaveValue(S + "ㅎ");
 
     await page.evaluate(() => {
       const w = window as unknown as { releasePasteImage?: () => void };
       w.releasePasteImage?.();
     });
     await expect.poll(() => textBytes(handle, start), { timeout: 5_000 }).toContain("/tmp/paste");
-    expect(await valueOf(page, INPUT)).toBe("");
-    await expect.poll(() => valueOf(page, PROXY)).toBe("");
+    expect(await valueOf(page, INPUT)).toBe(S);
+    await expect.poll(() => valueOf(page, PROXY)).toBe(S);
   });
 
   test("refused composition commits cannot seed the next rewrite", async ({ page }) => {
@@ -171,12 +196,12 @@ test.describe("Live terminal IME syllable rewrite", () => {
         const input = element as HTMLTextAreaElement;
         input.focus();
         input.dispatchEvent(new CompositionEvent("compositionstart", { bubbles: true }));
-        input.value = "c";
+        input.value += "c";
         input.dispatchEvent(new CompositionEvent("compositionupdate", { data: "c", bubbles: true }));
         input.dispatchEvent(new CompositionEvent("compositionend", { data: "c", bubbles: true }));
       });
-      expect(await valueOf(page, selector)).toBe("");
-      await softKey(page, "deleteContentBackward", null, selector);
+      // Nothing is left for the IME to rewrite, so the next syllable is a plain insert.
+      expect(await valueOf(page, selector)).toBe(S);
       await softKey(page, "insertText", "ㅎ", selector);
       await expect.poll(() => textBytes(handle, start)).toBe("\x03ㅎ");
     }
@@ -186,10 +211,9 @@ test.describe("Live terminal IME syllable rewrite", () => {
     const writes: Record<string, string> = {};
     const handle = await mockTerminalApis(page, {
       onLiveMessage: (url, message) => {
-        const text = message.toString("utf8");
-        if (text.startsWith("{")) return;
+        const bytes = ptyBytes(message);
         const path = new URL(url).pathname;
-        writes[path] = (writes[path] ?? "") + text;
+        if (bytes) writes[path] = (writes[path] ?? "") + bytes;
       },
     });
     await openSession(page, handle);
@@ -197,12 +221,10 @@ test.describe("Live terminal IME syllable rewrite", () => {
     await page.getByRole("button", { name: "Toggle panels", exact: true }).click();
     await page.getByTestId("mobile-right-panel-pick-paired").click();
     await expect(page.locator('[data-term="paired"]')).toBeVisible();
-    expect(await valueOf(page, PROXY)).toBe("");
-    await softKey(page, "deleteContentBackward", null, PROXY);
+    expect(await valueOf(page, PROXY)).toBe(S);
     await softKey(page, "insertText", "ㅏ", PROXY);
     await page.getByTestId("mobile-back-to-agent").click();
-    expect(await valueOf(page, PROXY)).toBe("");
-    await softKey(page, "deleteContentBackward", null, PROXY);
+    expect(await valueOf(page, PROXY)).toBe(S);
     await softKey(page, "insertText", "ㄴ", PROXY);
     await page.locator(PROXY).dispatchEvent("keydown", { key: "Enter", bubbles: true, cancelable: true });
     await expect
@@ -219,10 +241,9 @@ test.describe("Live terminal IME syllable rewrite", () => {
     const handle = await mockTerminalApis(page, {
       pendingPaste: true,
       onLiveMessage: (url, message) => {
-        const text = message.toString("utf8");
-        if (text.startsWith("{")) return;
+        const bytes = ptyBytes(message);
         const path = new URL(url).pathname;
-        writes[path] = (writes[path] ?? "") + text;
+        if (bytes) writes[path] = (writes[path] ?? "") + bytes;
       },
     });
     await openSession(page, handle);
@@ -242,8 +263,8 @@ test.describe("Live terminal IME syllable rewrite", () => {
     await expect
       .poll(() => writes["/sessions/pinch-test/terminal/live-ws"])
       .toBe("ㄱ\x1b[200~ /tmp/paste/shot.png \x1b[201~");
-    expect(await valueOf(page, pairedInput)).toBe("");
-    expect(await valueOf(page, PROXY)).toBe("ㅎ");
+    expect(await valueOf(page, pairedInput)).toBe(S);
+    expect(await valueOf(page, PROXY)).toBe(S + "ㅎ");
     await softKey(page, "deleteContentBackward", null, PROXY);
     await softKey(page, "insertText", "하", PROXY);
     await expect.poll(() => writes["/sessions/pinch-test/live-ws"]).toBe("ㅎ\x7f하");

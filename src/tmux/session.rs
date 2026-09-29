@@ -995,9 +995,11 @@ impl Session {
 
         // Anything beyond a few characters goes via bracketed paste: an Enter right
         // after literal keystrokes can land inside the agent's burst window and insert
-        // a newline instead of submitting.
+        // a newline instead of submitting. `send-keys -l` also drops a trailing `;` as a
+        // command separator (#1942).
         const PASTE_BYTE_THRESHOLD: usize = 16;
-        let use_paste_buffer = byte_len >= PASTE_BYTE_THRESHOLD || text.contains('\n');
+        let use_paste_buffer =
+            byte_len >= PASTE_BYTE_THRESHOLD || text.contains('\n') || text.ends_with(';');
 
         tracing::debug!(target: "tmux.command",
             "send_keys_with_delay: bytes={} lines={} max_line={} use_paste_buffer={} target={}",
