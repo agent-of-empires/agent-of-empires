@@ -44,8 +44,8 @@ pub(super) struct NativeStateBoundary {
     stopped_original: Option<PathBuf>,
     /// The per-instance store this launch publishes into.
     own_store: PathBuf,
-    /// Directories whose children are per-instance stores.
-    store_roots: Vec<PathBuf>,
+    /// Directories holding per-instance stores or retired originals.
+    opaque_roots: Vec<PathBuf>,
     paths: Vec<(PathBuf, StateOrigin)>,
     patterns: Vec<(PathBuf, Arc<NativeRule>, StateOrigin)>,
     routes: Vec<(PathBuf, PathBuf)>,
@@ -61,7 +61,7 @@ impl NativeStateBoundary {
             private_stage,
             stopped_original: None,
             own_store: canonical_expected_path(destination)?,
-            store_roots: Vec::new(),
+            opaque_roots: Vec::new(),
             paths: Vec::new(),
             patterns: Vec::new(),
             routes: Vec::new(),
@@ -226,28 +226,30 @@ impl NativeStateBoundary {
 
     fn add_storage_root(&mut self, root: &Path) -> Result<()> {
         let canonical = canonical_expected_path(root)?;
+        let recovery = crate::migrations::v033_isolate_sandbox_content::RECOVERY;
         for parent in [root.parent(), canonical.parent()].into_iter().flatten() {
-            self.add_classified_path(
-                parent.join(crate::migrations::v033_isolate_sandbox_content::RECOVERY),
-                StateOrigin::Storage,
-            );
+            self.add_classified_path(parent.join(recovery), StateOrigin::Storage);
         }
         for name in [SANDBOX_SUBDIR, SANDBOX_PRIVATE_SUBDIR] {
             self.add_classified_path(root.join(name), StateOrigin::Storage);
             self.add_classified_path(canonical.join(name), StateOrigin::Storage);
         }
-        let stores = canonical_expected_path(&canonical.join(SANDBOX_PRIVATE_SUBDIR))?;
-        if !self.store_roots.contains(&stores) {
-            self.store_roots.push(stores);
+        let stores = canonical.join(SANDBOX_PRIVATE_SUBDIR);
+        let retired = canonical.parent().map(|parent| parent.join(recovery));
+        for opaque in std::iter::once(stores).chain(retired) {
+            let opaque = canonical_expected_path(&opaque)?;
+            if !self.opaque_roots.contains(&opaque) {
+                self.opaque_roots.push(opaque);
+            }
         }
         Ok(())
     }
 
-    /// Whether `physical` lies in another instance's store, which storage inventory
-    /// treats as opaque. Its container can link only within its own mount, so
-    /// it holds no alias of a source or of this launch's store, and path
-    /// refusal of the whole store root still fences it. Stores nested in a
-    /// tree this launch reads or writes are container-written and stay walked.
+    /// Whether `physical` lies in another instance's store or a retired
+    /// original, which storage inventory treats as opaque. A container links
+    /// only within one mount, and any mount wide enough to reach such a tree
+    /// can read and write it directly, so inode identity there proves nothing;
+    /// path refusal still fences it. Trees this launch reads or writes stay walked.
     fn foreign_store(&self, physical: &Path) -> bool {
         let ours = |path: &Path| {
             path.starts_with(&self.own_store)
@@ -260,7 +262,7 @@ impl NativeStateBoundary {
             && physical
                 .ancestors()
                 .skip(1)
-                .any(|parent| self.store_roots.iter().any(|root| root == parent))
+                .any(|parent| self.opaque_roots.iter().any(|root| root == parent))
     }
 
     fn add_state_rule(
