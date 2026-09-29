@@ -348,7 +348,8 @@ pub(crate) async fn reconcile_trashed_worktrees(state: &Arc<AppState>) {
 }
 
 /// Auto-purge trashed sessions past their retention window
-/// (`trashed_at + session.trash_retention_days`), on daemon startup and hourly.
+/// (`trashed_at + session.trash_retention_minutes`), on daemon startup and
+/// every [`trash_sweep_interval`].
 /// Routed through [`purge_session_artifacts`] so it matches `DELETE` exactly.
 /// Each candidate is per-instance locked and re-validated under the lock, so a
 /// concurrent restore wins the race and is never purged (#2489).
@@ -375,7 +376,7 @@ pub(crate) async fn purge_expired_trash(state: &Arc<AppState>) {
             .or_insert_with(|| {
                 crate::session::config::profile_config::resolve_config_or_warn(&profile)
                     .session
-                    .trash_retention_days
+                    .trash_retention_minutes
             });
         if retention == 0 {
             continue;
@@ -431,6 +432,23 @@ pub(crate) async fn purge_expired_trash(state: &Arc<AppState>) {
             ),
         }
     }
+}
+
+/// Next retention sweep delay, from the global window and every profile's, so
+/// a session trashed in any profile is honored within its slack.
+pub(crate) fn trash_sweep_interval() -> std::time::Duration {
+    use crate::session::config::profile_config::resolve_config_or_warn;
+    let global = crate::session::config::Config::load()
+        .ok()
+        .map(|config| config.session.trash_retention_minutes);
+    let profiles = crate::session::list_profiles().unwrap_or_default();
+    crate::session::trash::sweep_interval(global.into_iter().chain(profiles.iter().map(
+        |profile| {
+            resolve_config_or_warn(profile)
+                .session
+                .trash_retention_minutes
+        },
+    )))
 }
 
 pub async fn delete_session(

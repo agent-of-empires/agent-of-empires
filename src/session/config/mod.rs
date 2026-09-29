@@ -1327,21 +1327,24 @@ pub struct SessionConfig {
     #[setting(label = "Confirm Before Delete", widget = "toggle")]
     pub confirm_delete: bool,
 
-    /// Days a session stays in the trash before it is automatically purged,
-    /// measured from when it was trashed. `0` keeps trashed sessions
-    /// forever (manual purge only). Auto-purge is enforced by the `aoe serve`
-    /// daemon (a startup sweep plus an hourly tick); without a running daemon,
-    /// expired trash is purged on the next daemon start or by an explicit
-    /// manual purge (`aoe rm --purge`, `aoe session empty-trash`).
-    #[serde(default = "default_trash_retention_days")]
+    /// Minutes a session stays in the trash before it is automatically
+    /// purged, measured from when it was trashed. The default is 30 days
+    /// (43200); `0` keeps trashed sessions forever (manual purge only). A
+    /// trashed session keeps its container and volumes, so a short window
+    /// frees that disk sooner. Auto-purge is enforced by the `aoe serve`
+    /// daemon, which sweeps at startup and then every tenth of the shortest
+    /// configured window, between once a minute and once an hour. Without a
+    /// running daemon, expired trash is purged on the next daemon start or by
+    /// an explicit manual purge (`aoe rm --purge`, `aoe session empty-trash`).
+    #[serde(default = "default_trash_retention_minutes")]
     #[setting(
-        label = "Trash Retention (days)",
+        label = "Trash Retention (minutes)",
         widget = "number",
         min = 0,
-        max = 3650,
-        validate = "range:0:3650"
+        max = 5256000,
+        validate = "range:0:5256000"
     )]
-    pub trash_retention_days: u32,
+    pub trash_retention_minutes: u32,
 
     /// Seconds of inactivity after which a plain TUI/tmux session that has
     /// been `Idle` this long is auto-stopped (its tmux session and any
@@ -1847,7 +1850,7 @@ impl Default for SessionConfig {
             session_id_poller_max_threads: default_session_id_poller_max_threads(),
             delete_to_trash: true,
             confirm_delete: true,
-            trash_retention_days: default_trash_retention_days(),
+            trash_retention_minutes: default_trash_retention_minutes(),
             auto_stop_idle_secs: default_auto_stop_idle_secs(),
             prevent_sleep_when_active: false,
             prevent_sleep_idle_grace_minutes: default_prevent_sleep_idle_grace_minutes(),
@@ -1877,8 +1880,8 @@ fn default_session_id_poller_max_threads() -> u32 {
     crate::session::poller::DEFAULT_SESSION_ID_POLLER_MAX_THREADS
 }
 
-fn default_trash_retention_days() -> u32 {
-    30
+fn default_trash_retention_minutes() -> u32 {
+    30 * 24 * 60
 }
 
 fn default_restart_wake_message() -> String {

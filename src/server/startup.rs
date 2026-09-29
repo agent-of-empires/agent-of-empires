@@ -710,23 +710,25 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
                 crate::server::api::reconcile_trashed_worktrees(&sweep_state).await;
                 // Same one-shot startup slot.
                 crate::server::api::reconcile_worktree_paths(&sweep_state).await;
-                let mut interval = tokio::time::interval(std::time::Duration::from_secs(60 * 60));
-                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 loop {
-                    tokio::select! {
-                        _ = interval.tick() => {
-                            crate::server::api::purge_expired_trash(&sweep_state).await;
-                            // Q5.
-                            let store = sweep_state.acp_event_store.clone();
-                            let pruned = tokio::task::spawn_blocking(move || {
-                                store.prune_pending_attachments_older_than(PENDING_ATTACHMENT_TTL)
-                            })
+                    crate::server::api::purge_expired_trash(&sweep_state).await;
+                    // Q5.
+                    let store = sweep_state.acp_event_store.clone();
+                    let pruned = tokio::task::spawn_blocking(move || {
+                        store.prune_pending_attachments_older_than(PENDING_ATTACHMENT_TTL)
+                    })
+                    .await
+                    .unwrap_or(0);
+                    if pruned > 0 {
+                        tracing::info!(target: "acp.queue", pruned, "pruned stale queued-prompt attachments past TTL");
+                    }
+                    // Re-read each pass so a retention change lands by the next wake.
+                    let delay =
+                        tokio::task::spawn_blocking(crate::server::api::trash_sweep_interval)
                             .await
-                            .unwrap_or(0);
-                            if pruned > 0 {
-                                tracing::info!(target: "acp.queue", pruned, "pruned stale queued-prompt attachments past TTL");
-                            }
-                        }
+                            .unwrap_or(std::time::Duration::from_secs(60 * 60));
+                    tokio::select! {
+                        _ = tokio::time::sleep(delay) => {}
                         _ = shutdown.cancelled() => break,
                     }
                 }
