@@ -706,9 +706,9 @@ pub(crate) fn transition_in_flight(app_dir: &Path) -> Result<bool> {
 
 /// Whether a row is parked: trashed or archived. Such a session is not going
 /// to be started, and a trashed one is usually deleted within
-/// `trash_retention_days`, so copying its store buys nothing and costs a full
-/// store per row. Parked rows keep their shared store and migrate on the start
-/// that follows a restore or unarchive.
+/// `trash_retention_minutes`, so copying its store buys nothing and costs a
+/// full store per row. Parked rows keep their shared store and migrate on the
+/// start that follows a restore or unarchive.
 ///
 /// A parked row still blocks retirement of the shared source it reads, via
 /// `defer_source_retirement`: retiring underneath it would leave a restored

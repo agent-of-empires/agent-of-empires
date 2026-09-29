@@ -58,6 +58,33 @@ pub(super) fn remote_serve_url_contents(
     format!("{remote_url}\nlocalhost\t{loopback_url}\n")
 }
 
+/// Sleep until the retention sweep started at `swept_at` is due again, waking
+/// at least every [`SWEEP_RECHECK`](crate::session::trash::SWEEP_RECHECK) to
+/// re-read `interval`: a shortened window comes from the TUI or a hand edit as
+/// often as from this daemon. False on shutdown.
+async fn wait_for_trash_sweep<F, Fut>(
+    swept_at: tokio::time::Instant,
+    mut interval: F,
+    shutdown: &CancellationToken,
+) -> bool
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Duration>,
+{
+    let mut due = swept_at + interval().await;
+    loop {
+        let recheck = tokio::time::Instant::now() + crate::session::trash::SWEEP_RECHECK;
+        tokio::select! {
+            _ = tokio::time::sleep_until(due.min(recheck)) => {}
+            _ = shutdown.cancelled() => return false,
+        }
+        due = swept_at + interval().await;
+        if tokio::time::Instant::now() >= due {
+            return true;
+        }
+    }
+}
+
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
 /// Post-signal shutdown: cancel the shared token, arm the force-exit
@@ -879,34 +906,37 @@ pub(crate) async fn start_server(
         let sweep_state = state.clone();
         let shutdown = state.shutdown.clone();
         state.runtime.work.spawn("server.trash_retention_sweep", async move {
-            // One-shot startup backfill: relocate trashed worktrees still
-            // in the active dir (rows trashed before relocation existed)
-            // and heal any pointer a crash left stale. See #2522.
+            // One-shot startup backfill: relocate trashed worktrees still in
+            // the active dir (rows trashed before relocation existed) and heal
+            // any pointer a crash left stale. See #2522.
             crate::server::api::reconcile_trashed_worktrees(&sweep_state).await;
-            // Same one-shot startup slot: repoint any managed worktree
-            // whose directory was moved outside aoe. See #2002.
+            // Same one-shot startup slot: repoint any managed worktree whose
+            // directory was moved outside aoe. See #2002.
             crate::server::api::reconcile_worktree_paths(&sweep_state).await;
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60 * 60));
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
-                tokio::select! {
-                    _ = interval.tick() => {
-                        crate::server::api::purge_expired_trash(&sweep_state).await;
-                        // Q5: reclaim attachment bytes buffered for a queued
-                        // prompt that never drained (a session that never went
-                        // idle again). Removal/clear/drain/session-delete drop
-                        // these already, so this only catches the stranded tail.
-                        let store = sweep_state.acp_event_store.clone();
-                        let pruned = tokio::task::spawn_blocking(move || {
-                            store.prune_pending_attachments_older_than(PENDING_ATTACHMENT_TTL)
-                        })
+                let swept_at = tokio::time::Instant::now();
+                crate::server::api::purge_expired_trash(&sweep_state).await;
+                // Q5: reclaim attachment bytes buffered for a queued prompt that
+                // never drained. Removal/clear/drain/session-delete drop these
+                // already, so this only catches the stranded tail.
+                let store = sweep_state.acp_event_store.clone();
+                let pruned = tokio::task::spawn_blocking(move || {
+                    store.prune_pending_attachments_older_than(PENDING_ATTACHMENT_TTL)
+                })
+                .await
+                .unwrap_or(0);
+                if pruned > 0 {
+                    tracing::info!(target: "acp.queue", pruned, "pruned stale queued-prompt attachments past TTL");
+                }
+                // The cadence follows the configured retention, so a sub-hour
+                // window is honoured instead of waiting out a fixed hour.
+                let interval = || async {
+                    tokio::task::spawn_blocking(crate::server::api::trash_sweep_interval)
                         .await
-                        .unwrap_or(0);
-                        if pruned > 0 {
-                            tracing::info!(target: "acp.queue", pruned, "pruned stale queued-prompt attachments past TTL");
-                        }
-                    }
-                    _ = shutdown.cancelled() => break,
+                        .unwrap_or(Duration::from_secs(60 * 60))
+                };
+                if !wait_for_trash_sweep(swept_at, interval, &shutdown).await {
+                    break;
                 }
             }
         });
@@ -1262,6 +1292,39 @@ async fn remote_rotation_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The sweep fires at its interval, not the next recheck, and a window
+    /// shortened mid-wait applies at the next recheck.
+    #[tokio::test(start_paused = true)]
+    async fn trash_sweep_wakes_at_the_interval_or_the_next_recheck() {
+        let secs = Duration::from_secs;
+        // (case, interval on each read, expected wait)
+        let cases: [(&str, &[u64], Duration); 3] = [
+            ("15-minute window", &[90], secs(90)),
+            ("shortened mid-wait", &[3600, 60], secs(60)),
+            ("shortened below elapsed", &[3600, 3600, 90], secs(120)),
+        ];
+        for (case, reads, expected) in cases {
+            let shutdown = CancellationToken::new();
+            let mut reads = reads.iter().copied().map(secs);
+            let mut last = secs(0);
+            let start = tokio::time::Instant::now();
+            let interval = || {
+                last = reads.next().unwrap_or(last);
+                std::future::ready(last)
+            };
+            assert!(
+                wait_for_trash_sweep(start, interval, &shutdown).await,
+                "{case}"
+            );
+            assert_eq!(start.elapsed(), expected, "{case}");
+        }
+
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+        let never = || std::future::ready(secs(3600));
+        assert!(!wait_for_trash_sweep(tokio::time::Instant::now(), never, &shutdown).await);
+    }
 
     // Every arm of the mode -> gate mapping, including the two that
     // were never the reported bug: a mode may only start when the gate

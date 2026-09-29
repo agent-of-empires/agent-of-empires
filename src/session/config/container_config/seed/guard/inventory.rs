@@ -72,6 +72,7 @@ impl<'a> Inventory<'a> {
     fn skip(&self, physical: &Path, origin: StateOrigin) -> bool {
         origin == StateOrigin::Storage
             && (physical.starts_with(&self.boundary.private_stage.path)
+                || self.boundary.foreign_store(physical)
                 || (self.skip_original
                     && self
                         .boundary
@@ -142,6 +143,10 @@ impl<'a> Inventory<'a> {
                 self.inodes.insert(identity(&stat));
             }
         } else if mode == libc::S_IFDIR {
+            // Decide before opening, so churn in a skipped tree cannot raise `Changed`.
+            if self.skip(&directory.path().join(leaf), origin) {
+                return Ok(());
+            }
             let child = directory.child(leaf).map_err(|error| {
                 if missing(&error) {
                     Changed(format!(
@@ -171,9 +176,6 @@ impl<'a> Inventory<'a> {
         origin: StateOrigin,
         linked: bool,
     ) -> Result<()> {
-        if self.skip(directory.path(), origin) {
-            return Ok(());
-        }
         let (device, inode) = directory.identity()?;
         #[cfg(target_os = "macos")]
         let device = device as u64;

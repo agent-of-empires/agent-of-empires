@@ -58,11 +58,12 @@ pub use sessions::{
 };
 pub(crate) use sessions::{
     lifecycle_rejection, persist_session_update, purge_expired_trash, reconcile_trashed_worktrees,
-    reconcile_worktree_paths,
+    reconcile_worktree_paths, trash_sweep_interval,
 };
 pub use skills::{
     adopt_skill, create_skill, delete_skill, edit_skill, list_skills, read_skill, sync_skills,
 };
+
 pub use system::{
     browse_filesystem, create_profile, default_profile, delete_profile, dismiss_update,
     docker_status, filesystem_home, get_about, get_cityhall_bundle, get_current_theme,

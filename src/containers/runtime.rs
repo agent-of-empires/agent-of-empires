@@ -98,8 +98,12 @@ impl ContainerRuntime {
         self.base.pull_image(image)
     }
 
-    pub fn ensure_image(&self, image: &str) -> Result<()> {
-        self.base.ensure_image(image)
+    pub fn ensure_image(
+        &self,
+        image: &str,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<()> {
+        self.base.ensure_image(image, cancel)
     }
 
     pub fn default_sandbox_image(&self) -> &'static str {
@@ -989,7 +993,7 @@ mod tests {
         let (_env, runtimes) = available_runtimes();
         for rt in runtimes {
             assert!(!rt.image_exists_locally(MISSING_IMAGE));
-            assert!(rt.ensure_image(MISSING_IMAGE).is_err());
+            assert!(rt.ensure_image(MISSING_IMAGE, &Default::default()).is_err());
         }
     }
 

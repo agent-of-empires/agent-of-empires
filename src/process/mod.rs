@@ -5,6 +5,8 @@ use std::io::Read;
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::time::{Duration, Instant};
 
+use tokio_util::sync::CancellationToken;
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use nix::errno::Errno;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -104,7 +106,7 @@ pub fn wait_with_timeout(
     child: &mut Child,
     timeout: Duration,
 ) -> std::io::Result<Option<ExitStatus>> {
-    wait_with_timeout_inner(child, timeout, false, false, || false)
+    wait_with_timeout_inner(child, timeout, false, false, None)
 }
 
 /// When `kill_process_group` is true, the caller MUST have configured `child`
@@ -115,7 +117,7 @@ fn wait_with_timeout_inner(
     timeout: Duration,
     kill_process_group: bool,
     cleanup_on_exit: bool,
-    cancelled: impl Fn() -> bool,
+    cancel: Option<&CancellationToken>,
 ) -> std::io::Result<Option<ExitStatus>> {
     let mut deadline = Instant::now() + timeout;
     let termination_grace = (timeout / 4).min(PROCESS_GROUP_TERMINATION_GRACE);
@@ -135,7 +137,7 @@ fn wait_with_timeout_inner(
             }
         }
         let now = Instant::now();
-        if !termination_requested && cancelled() {
+        if !termination_requested && cancel.is_some_and(CancellationToken::is_cancelled) {
             deadline = deadline.min(now + termination_grace);
             terminate_at = now;
         }
@@ -144,6 +146,9 @@ fn wait_with_timeout_inner(
             termination_requested = true;
             continue;
         }
+        // A cancellation has already shortened the deadline above, so reaching
+        // it here is the escalation step; testing the token again would skip
+        // the SIGTERM the group is entitled to and its traps.
         if now >= deadline {
             if kill_process_group {
                 platform::kill_process_group(child);
@@ -166,7 +171,16 @@ fn wait_with_timeout_inner(
 /// The caller keeps control of stdin; pipe it to null when the child might
 /// prompt (SSH passphrases, credential helpers).
 pub fn run_with_timeout(cmd: &mut Command, timeout: Duration) -> std::io::Result<Option<Output>> {
-    run_with_timeout_inner(cmd, timeout, false)
+    run_with_timeout_inner(cmd, timeout, false, None)
+}
+
+/// [`run_with_timeout`] that also kills the child once `cancel` fires, returning `Ok(None)`.
+pub fn run_until_cancelled(
+    cmd: &mut Command,
+    timeout: Duration,
+    cancel: &CancellationToken,
+) -> std::io::Result<Option<Output>> {
+    run_with_timeout_inner(cmd, timeout, false, Some(cancel))
 }
 
 /// [`run_with_timeout`] variant that makes the child a process-group leader
@@ -182,6 +196,7 @@ pub fn run_with_timeout_process_group(
         cmd,
         timeout,
         cfg!(any(target_os = "linux", target_os = "macos")),
+        None,
     )
 }
 
@@ -191,9 +206,9 @@ pub fn run_with_timeout_process_group(
 pub(crate) fn run_status_with_timeout_process_group(
     cmd: &mut Command,
     timeout: Duration,
-    cancelled: impl Fn() -> bool,
+    cancel: Option<&CancellationToken>,
 ) -> std::io::Result<Option<ExitStatus>> {
-    if cancelled() {
+    if cancel.is_some_and(CancellationToken::is_cancelled) {
         return Ok(None);
     }
     platform::configure_process_group(cmd);
@@ -203,7 +218,7 @@ pub(crate) fn run_status_with_timeout_process_group(
         timeout,
         cfg!(any(target_os = "linux", target_os = "macos")),
         true,
-        cancelled,
+        cancel,
     )
 }
 
@@ -211,6 +226,7 @@ fn run_with_timeout_inner(
     cmd: &mut Command,
     timeout: Duration,
     kill_process_group: bool,
+    cancel: Option<&CancellationToken>,
 ) -> std::io::Result<Option<Output>> {
     let mut stdout_file = tempfile::NamedTempFile::new()?;
     let mut stderr_file = tempfile::NamedTempFile::new()?;
@@ -219,7 +235,7 @@ fn run_with_timeout_inner(
     let mut child = cmd.spawn()?;
 
     let Some(status) =
-        wait_with_timeout_inner(&mut child, timeout, kill_process_group, false, || false)?
+        wait_with_timeout_inner(&mut child, timeout, kill_process_group, false, cancel)?
     else {
         return Ok(None);
     };
@@ -1163,43 +1179,52 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn run_with_timeout_kills_child_that_outlives_deadline() {
+    fn run_with_timeout_kills_child_on_deadline_or_cancel() {
         use std::io::Read;
         use std::os::fd::AsRawFd;
         use std::os::unix::{net::UnixStream, process::CommandExt};
 
-        let (mut pid_reader, pid_writer) = UnixStream::pair().unwrap();
-        pid_reader
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
-        let mut cmd = Command::new("sleep");
-        cmd.arg("5");
-        unsafe {
-            cmd.pre_exec(move || {
-                let pid = libc::getpid().to_ne_bytes();
-                let written = libc::write(pid_writer.as_raw_fd(), pid.as_ptr().cast(), pid.len());
-                if written != pid.len() as isize {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
+        for cancelled in [false, true] {
+            let (mut pid_reader, pid_writer) = UnixStream::pair().unwrap();
+            pid_reader
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut cmd = Command::new("sleep");
+            cmd.arg("5");
+            unsafe {
+                cmd.pre_exec(move || {
+                    let pid = libc::getpid().to_ne_bytes();
+                    let written =
+                        libc::write(pid_writer.as_raw_fd(), pid.as_ptr().cast(), pid.len());
+                    if written != pid.len() as isize {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
 
-        let start = Instant::now();
-        let result = run_with_timeout(&mut cmd, Duration::from_millis(300)).unwrap();
-        let mut pid = [0; std::mem::size_of::<libc::pid_t>()];
-        pid_reader
-            .read_exact(&mut pid)
-            .expect("child must publish its PID before exec");
-        assert_child_reaped(libc::pid_t::from_ne_bytes(pid) as u32);
-        assert!(
-            result.is_none(),
-            "expected the timeout to fire and kill the child"
-        );
-        assert!(
-            start.elapsed() < Duration::from_secs(4),
-            "wait should return promptly after the deadline, not block on the child"
-        );
+            let start = Instant::now();
+            let result = if cancelled {
+                let cancel = CancellationToken::new();
+                cancel.cancel();
+                run_until_cancelled(&mut cmd, Duration::from_secs(60), &cancel).unwrap()
+            } else {
+                run_with_timeout(&mut cmd, Duration::from_millis(300)).unwrap()
+            };
+            let mut pid = [0; std::mem::size_of::<libc::pid_t>()];
+            pid_reader
+                .read_exact(&mut pid)
+                .expect("child must publish its PID before exec");
+            assert_child_reaped(libc::pid_t::from_ne_bytes(pid) as u32);
+            assert!(
+                result.is_none(),
+                "cancelled={cancelled}: child must be killed"
+            );
+            assert!(
+                start.elapsed() < Duration::from_secs(4),
+                "cancelled={cancelled}: wait should return promptly, not block on the child"
+            );
+        }
     }
 
     #[test]
@@ -1218,15 +1243,42 @@ mod tests {
         .arg(&pid_path)
         .arg(&term_path);
 
-            let result = if cancel {
-                run_status_with_timeout_process_group(&mut cmd, Duration::from_secs(30), || {
-                    pid_path.exists()
+            let token = CancellationToken::new();
+            // Cancel once the descendant's pid is on disk, so the wait has
+            // something to tear down. The wait runs on its own thread because
+            // the child is only spawned once the call below starts, and it is
+            // bounded so a shell that never reports its pid fails the test
+            // instead of hanging it.
+            let canceler = cancel.then(|| {
+                let token = token.clone();
+                let pid_path = pid_path.clone();
+                std::thread::spawn(move || {
+                    let deadline = Instant::now() + Duration::from_secs(10);
+                    while !pid_path.exists() {
+                        if Instant::now() >= deadline {
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    token.cancel();
                 })
+            });
+            let result = if cancel {
+                run_status_with_timeout_process_group(
+                    &mut cmd,
+                    Duration::from_secs(30),
+                    Some(&token),
+                )
             } else {
                 run_with_timeout_process_group(&mut cmd, Duration::from_secs(2))
                     .map(|output| output.map(|output| output.status))
             }
             .unwrap();
+            // The canceler has fired by the time the call returns; join it so
+            // the test does not outlive its own helper thread.
+            if let Some(canceler) = canceler {
+                canceler.join().unwrap();
+            }
             assert!(result.is_none(), "process group must be interrupted");
             assert_eq!(
                 std::fs::read_to_string(term_path).expect("SIGTERM trap should run"),
@@ -1269,7 +1321,7 @@ mod tests {
             .args(["-c", r#"sleep 30 & printf %s $! > "$1""#, "sh"])
             .arg(&pid_path);
         let result =
-            run_status_with_timeout_process_group(&mut command, Duration::from_secs(2), || false)
+            run_status_with_timeout_process_group(&mut command, Duration::from_secs(2), None)
                 .unwrap();
         assert!(result.unwrap().success());
         let pid: i32 = std::fs::read_to_string(pid_path).unwrap().parse().unwrap();

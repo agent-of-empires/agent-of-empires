@@ -128,34 +128,56 @@ impl Instance {
     }
 
     pub fn get_container_for_instance(&mut self) -> Result<containers::DockerContainer> {
+        self.get_container_until_cancelled(&tokio_util::sync::CancellationToken::new())
+    }
+
+    /// [`Self::get_container_for_instance`] that stops before each costly step, and
+    /// kills an image pull, once `cancel` fires.
+    pub fn get_container_until_cancelled(
+        &mut self,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<containers::DockerContainer> {
         let storage = Storage::new(&self.effective_profile(), self.resolve_file_watch())?;
-        self.ensure_container_in(&storage)
+        self.ensure_container_with_hook_in(&storage, cancel, Self::mint_before_start_env)
     }
 
     pub(crate) fn ensure_container_in(
         &mut self,
         store: &dyn SessionStore,
     ) -> Result<containers::DockerContainer> {
-        self.ensure_container_with_hook_in(store, Self::mint_before_start_env)
+        self.ensure_container_with_hook_in(
+            store,
+            &tokio_util::sync::CancellationToken::new(),
+            Self::mint_before_start_env,
+        )
     }
 
     pub(super) fn ensure_container_with_hook_in(
         &mut self,
         store: &dyn SessionStore,
+        cancel: &tokio_util::sync::CancellationToken,
         mut run_hook: impl FnMut(&mut Self, &crate::session::LaunchConfig) -> Result<()>,
     ) -> Result<containers::DockerContainer> {
         let launch_config = store.launch_configuration(Path::new(&self.project_path))?;
         let global_config = &launch_config.global;
         let profile_config = &launch_config.profile;
+        let checkpoint = || {
+            if cancel.is_cancelled() {
+                anyhow::bail!("sandbox start cancelled");
+            }
+            Ok(())
+        };
+        // Owned, because the pull below reads it after `self` is borrowed
+        // mutably again by the reconciliation steps in between.
         let image = self
             .sandbox_info
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Cannot ensure container for non-sandboxed session"))?
             .image
-            .as_str();
+            .clone();
         let container = DockerContainer::new(
             &self.id,
-            image,
+            &image,
             global_config.sandbox.container_runtime.into(),
         );
         // Migration takes the transition lock exclusively, before the shared guard below.
@@ -307,7 +329,12 @@ impl Instance {
             }
         }
 
-        container.ensure_image()?;
+        // Ensure image is available (always pulls to get latest), aborting the
+        // pull when the start was cancelled.
+        checkpoint()?;
+        let runtime = containers::get_container_runtime();
+        runtime.ensure_image(&image, cancel)?;
+        checkpoint()?;
 
         // Mint before building the container config so the docker-run env also
         // carries the values (leak-safe via the inherit path in run_create).
@@ -327,6 +354,7 @@ impl Instance {
         );
         container.remove_stranded_named_ignore_volumes(&self.id, &stranded);
         container_config::place_shadowed_credential_mountpoints(&config);
+        checkpoint()?;
         let container_id = container.create(&config)?;
         self.identity_publisher_launched = config.identity_publisher_installed
             && identity_publisher_dependencies_available(&container)

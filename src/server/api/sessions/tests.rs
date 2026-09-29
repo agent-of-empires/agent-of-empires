@@ -4503,7 +4503,7 @@ async fn the_retention_purge_takes_submission_before_the_instance_lock() {
     let _home = crate::session::test_support::isolate_app_dir();
     std::fs::write(
         crate::session::get_app_dir().unwrap().join("config.toml"),
-        "[session]\ntrash_retention_days = 1\n",
+        "[session]\ntrash_retention_minutes = 60\n",
     )
     .unwrap();
     let mut inst = make_test_instance();

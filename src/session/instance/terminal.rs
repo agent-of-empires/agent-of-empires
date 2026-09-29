@@ -384,22 +384,27 @@ impl Instance {
         let generation =
             self.acquire_lifecycle_reservation(store, LifecycleOperation::Launch, None)?;
         let result = (|| {
-            let container = self.ensure_container_with_hook_in(store, |instance, config| {
-                drop(ownership.take());
-                let result = run_hook(instance, config);
-                let title = crate::session::acquire_session_title_lock(&instance.id)?;
-                let lifecycle = store
-                    .storage()
-                    .acquire_instance_lifecycle_lock(&instance.id)?;
-                ownership = Some((title, lifecycle));
-                store.check_available()?;
-                instance.reconcile_from_store(store)?;
-                anyhow::ensure!(
-                    instance.lifecycle_reservation_is_owned(LifecycleOperation::Launch, generation),
-                    LifecycleReservationError::Superseded
-                );
-                result
-            })?;
+            let container = self.ensure_container_with_hook_in(
+                store,
+                &tokio_util::sync::CancellationToken::new(),
+                |instance, config| {
+                    drop(ownership.take());
+                    let result = run_hook(instance, config);
+                    let title = crate::session::acquire_session_title_lock(&instance.id)?;
+                    let lifecycle = store
+                        .storage()
+                        .acquire_instance_lifecycle_lock(&instance.id)?;
+                    ownership = Some((title, lifecycle));
+                    store.check_available()?;
+                    instance.reconcile_from_store(store)?;
+                    anyhow::ensure!(
+                        instance
+                            .lifecycle_reservation_is_owned(LifecycleOperation::Launch, generation),
+                        LifecycleReservationError::Superseded
+                    );
+                    result
+                },
+            )?;
             let sandbox = self
                 .sandbox_info
                 .as_ref()

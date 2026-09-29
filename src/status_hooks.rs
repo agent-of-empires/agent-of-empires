@@ -345,7 +345,7 @@ fn run_hook_command_blocking(
     match crate::process::run_status_with_timeout_process_group(
         &mut build_command(command, context, project_path),
         HOOK_COMMAND_TIMEOUT,
-        || shutdown.is_cancelled(),
+        Some(shutdown),
     )? {
         Some(status) if status.success() => Ok(()),
         Some(status) => Err(std::io::Error::other(format!(

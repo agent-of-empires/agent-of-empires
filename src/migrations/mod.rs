@@ -47,6 +47,7 @@ mod v030_global_only_profile_settings;
 mod v031_conversation_provenance;
 mod v032_bound_capture_exclusions;
 pub(crate) mod v033_isolate_sandbox_content;
+mod v034_trash_retention_minutes;
 mod v035_serve_passphrase_policy;
 mod v036_pending_purge_owners;
 mod v037_capture_purge_runners;
@@ -91,6 +92,8 @@ use anyhow::Result;
 use std::fs;
 use tracing::{debug, info};
 
+// v034 is upstream's trash-retention migration; it fills the gap the branch
+// left between 33 and 35, so the current version is unchanged at 38.
 const CURRENT_VERSION: u32 = 38;
 const VERSION_FILE: &str = ".schema_version";
 
@@ -265,6 +268,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 33,
         name: "isolate_sandbox_content",
         run: v033_isolate_sandbox_content::run,
+    },
+    Migration {
+        version: 34,
+        name: "trash_retention_minutes",
+        run: v034_trash_retention_minutes::run,
     },
     Migration {
         version: 35,

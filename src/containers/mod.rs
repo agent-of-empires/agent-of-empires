@@ -175,10 +175,6 @@ impl DockerContainer {
         Self::new(session_id, "", get_container_runtime())
     }
 
-    pub fn ensure_image(&self) -> Result<()> {
-        self.runtime.ensure_image(&self.image)
-    }
-
     pub(crate) fn runtime(&self) -> &ContainerRuntime {
         &self.runtime
     }
