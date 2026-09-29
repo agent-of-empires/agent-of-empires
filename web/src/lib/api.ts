@@ -13,6 +13,7 @@ import type {
   ProjectInfo,
   ProjectOverrides,
   DockerStatusResponse,
+  CreateProgress,
   CreateSessionRequest,
   ClaudeSessionSummary,
   SettingsFieldDescriptor,
@@ -1373,6 +1374,8 @@ export async function createSession(body: CreateSessionRequest): Promise<{
   error?: string;
   session?: SessionResponse;
   hooksNeedTrust?: HooksNeedTrust;
+  /** The request never got an answer, so the create may still be running. */
+  network?: boolean;
 }> {
   try {
     const res = await fetch("/api/sessions", jsonInit("POST", body));
@@ -1396,7 +1399,17 @@ export async function createSession(body: CreateSessionRequest): Promise<{
       return { ok: false, error: `Server error (${res.status}): ${text.slice(0, 200)}` };
     }
   } catch (e) {
-    return { ok: false, error: networkError(e) };
+    return { ok: false, error: networkError(e), network: true };
+  }
+}
+
+/** Progress of an in-flight create sent with `key`; null once it has finished. */
+export async function fetchCreateProgress(key: string): Promise<CreateProgress | null> {
+  try {
+    const res = await fetch(`/api/sessions/create-progress/${encodeURIComponent(key)}`);
+    return res.ok ? ((await res.json()) as CreateProgress) : null;
+  } catch {
+    return null;
   }
 }
 

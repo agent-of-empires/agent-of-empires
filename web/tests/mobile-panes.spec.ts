@@ -207,31 +207,29 @@ test.describe("Mobile fullscreen-agent layout", () => {
   });
 });
 
-// #1430: the old settings header crammed Back, the title and ProfileSelector
-// into one h-12 row, with the selector in a `flex-1 justify-center` wrapper
-// that squeezed the back affordance and title to the left edge at mobile
-// widths. The header now wraps the selector onto a second row below md.
-test.describe("Mobile settings header", () => {
+// #1430: Back and the title share a row, and nothing pushes the header past the
+// viewport. Settings opens on a grouped section list; a section's Back returns to it.
+test.describe("Mobile settings", () => {
   test.use(iPhone13);
 
-  test("Back and title sit on a row above the ProfileSelector and the header never overflows", async ({ page }) => {
+  test("opens on a grouped list, pushes a section, and Back returns to the list", async ({ page }) => {
     await page.goto("/settings");
+    const list = page.getByTestId("settings-section-list");
+    await expect(list.getByText("Dashboard", { exact: true })).toBeVisible();
     const backBtn = page.getByRole("button", { name: /Back/ });
-    const profileLabel = page.getByText("Profile", { exact: true });
-    await expect(backBtn).toBeVisible();
-    await expect(profileLabel).toBeVisible();
-
     const backBox = (await backBtn.boundingBox())!;
-    const profileBox = (await profileLabel.boundingBox())!;
     const titleBox = (await page.getByText("Settings", { exact: true }).first().boundingBox())!;
-    // The selector wraps onto its own row.
-    expect(profileBox.y).toBeGreaterThanOrEqual(backBox.y + backBox.height - 1);
-    // gap-x-3 on the header (12px); anything above 6px proves the
-    // cramped-against-left-edge regression is gone.
+    expect(Math.abs(titleBox.y - backBox.y)).toBeLessThan(backBox.height);
     expect(titleBox.x - (backBox.x + backBox.width)).toBeGreaterThan(6);
 
-    // Overflow inside the ProfileSelector row is allowed via overflow-x-auto,
-    // but the header container itself must not push past the viewport edge.
+    await list.getByRole("button", { name: /Notifications/ }).click();
+    await expect(page).toHaveURL(/\/settings\/notifications$/);
+    await expect(page.getByRole("heading", { name: "Notifications", level: 2 })).toBeVisible();
+    await expect(list).toHaveCount(0);
+    await page.getByRole("button", { name: /All settings/ }).click();
+    await expect(page).toHaveURL(/\/settings$/);
+    await expect(list).toBeVisible();
+
     const header = page.getByTestId("settings-header");
     for (const width of [390, 320]) {
       await page.setViewportSize({ width, height: 640 });

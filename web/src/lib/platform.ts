@@ -9,3 +9,7 @@ export const isStandalone = (): boolean => {
   const displayMode = window.matchMedia?.("(display-mode: standalone)").matches;
   return ios || !!displayMode;
 };
+
+/** A precise hovering pointer, taken as a sign of a physical keyboard. */
+export const hasFinePointer = (): boolean =>
+  typeof window !== "undefined" && !!window.matchMedia?.("(hover: hover) and (pointer: fine)").matches;

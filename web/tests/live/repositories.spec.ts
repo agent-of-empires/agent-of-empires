@@ -63,8 +63,7 @@ test.describe("clone URL tab", () => {
     await page.locator("#clone-dest").fill(dest);
     await cloneBtn.click();
 
-    await expect(page.getByText("Selected project")).toBeVisible({ timeout: 30_000 });
-    await expect(page.getByText(dest, { exact: false })).toBeVisible();
+    await expect(page.getByTestId("wizard-project-row")).toContainText(dest, { timeout: 30_000 });
     expect(existsSync(join(dest, ".git"))).toBe(true);
     await expect(launchButton(page)).toBeEnabled();
   });
@@ -82,9 +81,8 @@ test.describe("clone URL tab", () => {
     await expect(page.locator('input[type="checkbox"]').first()).toBeDisabled();
     await page.getByRole("button", { name: "Clone repository" }).click();
 
-    await expect(page.getByText("Selected project")).toBeVisible({ timeout: 30_000 });
     const mainPath = join(dest, "main");
-    await expect(page.getByText(mainPath, { exact: false })).toBeVisible();
+    await expect(page.getByTestId("wizard-project-row")).toContainText(mainPath, { timeout: 30_000 });
     for (const path of [join(dest, ".bare"), join(dest, ".git"), mainPath, join(mainPath, ".git")]) {
       expect(existsSync(path)).toBe(true);
     }

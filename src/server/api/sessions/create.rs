@@ -438,13 +438,16 @@ pub(crate) fn resolve_create_hook_plan(
 }
 
 /// Record pending trust and run the planned `on_create` hooks (#2066), after
-/// the worktree exists. Output is streamed to a discarded channel so the shared
-/// executor's terminal-detach (credential-prompt suppression) still applies.
+/// the worktree exists. Output is forwarded to `progress` when a caller polls
+/// it, else discarded; either way the executor's terminal-detach (credential
+/// prompt suppression) still applies.
 pub(crate) fn run_create_hooks(
     instance: &mut Instance,
     plan: &CreateHookPlan,
     project_path: &std::path::Path,
+    progress: Option<&crate::server::create_progress::CreateProgress>,
 ) -> anyhow::Result<()> {
+    use crate::server::create_progress::CreateStage;
     use crate::session::config::repo_config;
 
     if let Some((hooks_hash, mcp_hash)) = &plan.trust_write {
@@ -456,32 +459,47 @@ pub(crate) fn run_create_hooks(
     }
 
     let hook_env = repo_config::lifecycle_env_vars(instance);
-    // No live consumer: drop the receiver so sends no-op while the executor's
-    // detach-tty behavior and error-tail capture still apply.
     let (progress_tx, progress_rx) = std::sync::mpsc::channel::<repo_config::HookProgress>();
-    drop(progress_rx);
 
-    if instance.sandbox_info.is_some() {
-        instance.get_container_for_instance()?;
-        let workdir = instance.container_workdir();
-        if let Some(sandbox) = instance.sandbox_info.as_ref() {
-            repo_config::execute_hooks_in_container_streamed(
+    std::thread::scope(|scope| {
+        match progress {
+            Some(progress) => {
+                scope.spawn(move || {
+                    for event in progress_rx {
+                        progress.record(event);
+                    }
+                });
+            }
+            None => drop(progress_rx),
+        }
+        // Moved in so the forwarder's loop ends when the hooks finish.
+        let progress_tx = progress_tx;
+
+        if instance.sandbox_info.is_some() {
+            if let Some(progress) = progress {
+                progress.set_stage(CreateStage::StartingContainer);
+            }
+            instance.get_container_for_instance()?;
+            let workdir = instance.container_workdir();
+            if let Some(sandbox) = instance.sandbox_info.as_ref() {
+                repo_config::execute_hooks_in_container_streamed(
+                    plan.on_create(),
+                    &sandbox.container_name,
+                    &workdir,
+                    &progress_tx,
+                    &hook_env,
+                )?;
+            }
+        } else {
+            repo_config::execute_hooks_streamed(
                 plan.on_create(),
-                &sandbox.container_name,
-                &workdir,
+                std::path::Path::new(&instance.project_path),
                 &progress_tx,
                 &hook_env,
             )?;
         }
-    } else {
-        repo_config::execute_hooks_streamed(
-            plan.on_create(),
-            std::path::Path::new(&instance.project_path),
-            &progress_tx,
-            &hook_env,
-        )?;
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 /// CityHall structured-target gate for per-session routes. CityHall only
@@ -948,6 +966,12 @@ pub async fn create_session(
     };
 
     let profile = body.profile.unwrap_or_else(|| state.profile.clone());
+    // Registered after the idempotency lock, so a retry waiting on it cannot
+    // replace the entry the in-flight create is writing to.
+    let progress = body
+        .idempotency_key
+        .as_deref()
+        .map(|key| state.create_progress.register(key));
 
     let spec = crate::server::session_spawn::StructuredSessionSpec {
         title: body.title,
@@ -988,13 +1012,29 @@ pub async fn create_session(
         agent_effort: body.agent_effort,
         import_acp_session_id: body.import_acp_session_id,
         fork_seed,
+        progress: progress.as_ref().map(|p| Arc::clone(&p.progress)),
     };
 
-    match state
-        .session_service
-        .create_structured_session(spec, None, None, None)
-        .await
-    {
+    // Detached so a client that drops the connection mid-create (a backgrounded
+    // mobile tab) cannot cancel it between persisting and publishing. The guard
+    // and registration move with it, so a retry with the same key waits for
+    // this create and then finds its session.
+    let service = Arc::clone(&state.session_service);
+    let created = tokio::spawn(async move {
+        let _idempotency_guard = _idempotency_guard;
+        let _progress = progress;
+        service
+            .create_structured_session(spec, None, None, None)
+            .await
+    })
+    .await
+    .unwrap_or_else(|e| {
+        Err(anyhow::Error::new(
+            crate::server::session_spawn::SessionBuildPanicked(e.to_string()),
+        ))
+    });
+
+    match created {
         Ok((outcome, _created)) => {
             let instance = outcome.instance;
             let mut resp = SessionResponse::from_instance(
@@ -1072,6 +1112,18 @@ pub async fn create_session(
                 public_create_session_error(&e),
             )
         }
+    }
+}
+
+/// `GET /api/sessions/create-progress/{key}`: stage and hook output of an
+/// in-flight create sent with this `idempotency_key`. 404 when none is running.
+pub async fn create_session_progress(
+    State(state): State<Arc<AppState>>,
+    Path(key): Path<String>,
+) -> impl IntoResponse {
+    match state.create_progress.snapshot(&key) {
+        Some(snapshot) => Json(snapshot).into_response(),
+        None => bare_not_found(),
     }
 }
 

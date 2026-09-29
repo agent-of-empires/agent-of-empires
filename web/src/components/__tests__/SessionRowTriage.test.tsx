@@ -103,8 +103,8 @@ describe("SessionRow unread", () => {
   });
 
   it.each([
-    [false, "Mark as unread", true],
-    [true, "Mark as read", false],
+    [false, "Unread", true],
+    [true, "Read", false],
   ])("unread=%s offers %j and PATCHes { unread: %s }", async (unread, text, next) => {
     openRowMenu(ws({ id: "sess-u", unread }));
     expect(testId("sidebar-context-menu-unread")!.textContent).toContain(text);
@@ -121,12 +121,20 @@ describe("SessionRow unread", () => {
 });
 
 describe("SessionRow context menu", () => {
+  it("keeps the rarer actions folded under More until it is opened", () => {
+    openRowMenu(ws({ view: "structured" }), { expandMore: false });
+    expect(testId("sidebar-context-menu-switch-agent")).toBeNull();
+    expect(testId("sidebar-context-menu-rename")).not.toBeNull();
+    click("sidebar-context-menu-more");
+    expect(testId("sidebar-context-menu-switch-agent")).not.toBeNull();
+  });
+
   it.each([
     // Archiving or snoozing a pinned session clears the pin server-side, as in the TUI.
     ["pinned", { pinned_at: PAST }, ["Unpin", "Archive", "Snooze"], []],
     ["archived", { archived_at: PAST }, ["Unarchive"], ["Pin", "Snooze"]],
     ["snoozed", { snoozed_until: inMinutes(60) }, ["Unsnooze"], ["Pin", "Archive"]],
-    ["live", {}, ["Pin", "Archive", "Snooze…"], []],
+    ["live", {}, ["Pin", "Archive", "Snooze"], []],
   ] as [string, Partial<SessionResponse>, string[], string[]][])("%s row triage items", (_n, over, has, lacks) => {
     const text = openRowMenu(ws(over)).textContent;
     for (const t of has) expect(text).toContain(t);

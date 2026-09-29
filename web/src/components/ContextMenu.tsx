@@ -6,23 +6,34 @@ export function ContextMenu({
   menuRef,
   testId,
   minWidth = "min-w-[190px]",
+  sheetOnMobile = false,
   children,
 }: {
   menu: { x: number; y: number };
   menuRef: RefObject<HTMLDivElement | null>;
   testId: string;
   minWidth?: string;
+  /** Below `md`, dock to the bottom edge over a backdrop instead of floating at the pointer. */
+  sheetOnMobile?: boolean;
   children: ReactNode;
 }) {
+  // `!` overrides the pointer position and height cap set inline.
+  const sheet = sheetOnMobile
+    ? " max-md:!left-0 max-md:!top-auto max-md:bottom-0 max-md:w-full max-md:!max-h-[85dvh] max-md:rounded-b-none max-md:border-x-0 max-md:border-b-0 max-md:pb-[max(0.5rem,env(safe-area-inset-bottom))]"
+    : "";
   return createPortal(
-    <div
-      ref={menuRef}
-      data-testid={testId}
-      className={`fixed z-50 bg-surface-800 border border-surface-700 rounded-lg shadow-lg py-1 ${minWidth} overflow-y-auto`}
-      style={{ left: menu.x, top: menu.y, maxHeight: "calc(100dvh - 16px)" }}
-    >
-      {children}
-    </div>,
+    <>
+      {/* Taps on the backdrop fall through to the hook's outside-click close. */}
+      {sheetOnMobile && <div className="md:hidden fixed inset-0 z-50 bg-black/50" aria-hidden="true" />}
+      <div
+        ref={menuRef}
+        data-testid={testId}
+        className={`fixed z-50 bg-surface-800 border border-surface-700 rounded-lg shadow-lg py-1 ${minWidth} overflow-y-auto${sheet}`}
+        style={{ left: menu.x, top: menu.y, maxHeight: "calc(100dvh - 16px)" }}
+      >
+        {children}
+      </div>
+    </>,
     document.body,
   );
 }

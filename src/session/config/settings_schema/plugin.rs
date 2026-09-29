@@ -123,6 +123,7 @@ pub fn plugin_field_descriptors(
                 profile_overridable: false,
                 validation,
                 advanced: s.advanced,
+                tui_only: false,
                 default: s
                     .default
                     .as_ref()

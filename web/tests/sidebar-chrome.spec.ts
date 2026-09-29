@@ -165,6 +165,7 @@ test.describe("row chips and naming actions", () => {
     await openSidebar(page, [structured("sess-1", "Fix login bug", false)]);
     for (const item of ["auto-name", "summarize"]) {
       await openMenu(page, "Fix login bug");
+      await page.getByTestId("sidebar-context-menu-more").click();
       await page.getByTestId(`sidebar-context-menu-${item}`).click();
     }
     await expect.poll(() => posted).toEqual(["/api/sessions/sess-1/smart-rename", "/api/sessions/sess-1/summarize"]);

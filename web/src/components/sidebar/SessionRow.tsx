@@ -227,7 +227,7 @@ export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
         </div>
       </a>
       {menu && (
-        <ContextMenu menu={menu} menuRef={menuRef} testId="sidebar-context-menu" minWidth="min-w-[180px]">
+        <ContextMenu menu={menu} menuRef={menuRef} testId="sidebar-context-menu" minWidth="min-w-[240px]" sheetOnMobile>
           {menu.scope.kind === "bulk" ? (
             <BulkTriageMenuItems
               count={menu.scope.count}

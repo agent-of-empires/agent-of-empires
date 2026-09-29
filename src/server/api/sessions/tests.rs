@@ -3907,6 +3907,34 @@ fn resolve_hook_plan_refuses_untrusted_repo_hooks_until_trusted() {
     }
 }
 
+#[test]
+#[serial_test::serial]
+fn run_create_hooks_forwards_the_running_hook_and_its_output_to_progress() {
+    let temp_home = tempfile::tempdir().unwrap();
+    let _home = crate::session::test_support::isolate_app_dir_at(temp_home.path());
+    let project = project_with_on_create_hooks(&["echo from-the-hook"]);
+    let plan = resolve_create_hook_plan("default", project.path(), false, true).unwrap();
+    let registry = crate::server::create_progress::CreateProgressRegistry::default();
+    let registration = registry.register("key");
+    let mut instance = Instance::new("hooked", project.path().to_str().unwrap());
+
+    run_create_hooks(
+        &mut instance,
+        &plan,
+        project.path(),
+        Some(&registration.progress),
+    )
+    .unwrap();
+
+    let snapshot = registry.snapshot("key").unwrap();
+    assert_eq!(snapshot.hook.as_deref(), Some("echo from-the-hook"));
+    assert!(
+        snapshot.output.iter().any(|l| l.contains("from-the-hook")),
+        "{:?}",
+        snapshot.output
+    );
+}
+
 /// None of these refuse a create. A scratch session has no repo config anchor,
 /// so it skips the repo trust check entirely (matching the CLI scratch branch),
 /// and an untrusted `.mcp.json` is gated by the supervisor at spawn rather than

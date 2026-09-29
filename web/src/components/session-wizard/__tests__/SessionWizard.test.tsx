@@ -4,11 +4,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 
 import { SessionWizard, type WizardPrefill } from "../SessionWizard";
-import { fetchSettings } from "../../../lib/api";
+import { fetchAgents, fetchCreateProgress, fetchIsGitRepo, fetchProfiles, fetchSettings } from "../../../lib/api";
+import { agent } from "./fixtures";
 
 const createSession = vi.fn();
 
 vi.mock("../../../lib/api", () => ({
+  fetchCreateProgress: vi.fn().mockResolvedValue(null),
   fetchSettings: vi.fn().mockResolvedValue({}),
   fetchAgents: vi.fn().mockResolvedValue([]),
   fetchIsGitRepo: vi.fn().mockResolvedValue(true),
@@ -27,12 +29,12 @@ vi.mock("../../../lib/api", () => ({
 }));
 
 const INSTRUCTION_KEY = "aoe-new-session-last-instruction";
-const MORE_OPTIONS_KEY = "aoe-new-session-more-options-open";
 
 beforeEach(() => {
   vi.clearAllMocks();
   localStorage.clear();
   createSession.mockResolvedValue({ ok: true, session: { id: "s1" } });
+  vi.mocked(fetchIsGitRepo).mockImplementation(async (path) => path !== "/tmp/plain");
 });
 
 afterEach(() => {
@@ -42,8 +44,17 @@ afterEach(() => {
 
 function renderWizard(prefill: WizardPrefill = { path: "/tmp/proj", tool: "claude" }) {
   const onCreated = vi.fn();
-  render(<SessionWizard onClose={() => {}} onCreated={onCreated} prefill={prefill} />);
-  return { onCreated };
+  const onClose = vi.fn();
+  const onCreatedInBackground = vi.fn();
+  render(
+    <SessionWizard
+      onClose={onClose}
+      onCreated={onCreated}
+      onCreatedInBackground={onCreatedInBackground}
+      prefill={prefill}
+    />,
+  );
+  return { onCreated, onClose, onCreatedInBackground };
 }
 
 // Launch stays disabled until the profile defaults settle, as for a real click.
@@ -60,10 +71,7 @@ describe("SessionWizard structured view payload", () => {
     [true, "terminal"],
   ])("opting out=%s sends view %s", async (optOut, view) => {
     renderWizard();
-    if (optOut) {
-      fireEvent.click(screen.getByText("More options"));
-      fireEvent.click(screen.getByRole("switch", { name: "Use structured view" }));
-    }
+    if (optOut) fireEvent.click(screen.getByRole("switch", { name: "Use structured view" }));
     await launch();
     await waitFor(() => expect(createSession).toHaveBeenCalled());
     expect(payload()).toMatchObject({ tool: "claude", view });
@@ -87,9 +95,8 @@ describe("SessionWizard structured view payload", () => {
       sandbox: {},
     } as never);
     renderWizard({ path: "/tmp/proj" });
-    fireEvent.click(screen.getByText("More options"));
-    // The resolved launch command shows opencode once the defaults have applied.
-    await waitFor(() => expect(screen.getAllByText(/opencode/).length).toBeGreaterThan(0));
+    // The Agent row names opencode once the defaults have applied.
+    await waitFor(() => expect(screen.getByTestId("wizard-agent-row").textContent).toContain("opencode"));
     await launch();
     await waitFor(() => expect(createSession).toHaveBeenCalled());
     expect(payload()).toMatchObject({
@@ -113,11 +120,12 @@ describe("SessionWizard last instruction memory", () => {
 
   it.each(["review for security", ""])("stores the submitted instruction %j", async (text) => {
     localStorage.setItem(INSTRUCTION_KEY, "stale text");
-    localStorage.setItem(MORE_OPTIONS_KEY, "true");
     renderWizard();
+    fireEvent.click(screen.getByTestId("wizard-agent-row"));
     fireEvent.change(screen.getByPlaceholderText("Custom instructions for this session..."), {
       target: { value: text },
     });
+    fireEvent.click(screen.getByRole("button", { name: "Done" }));
     await launch();
     await waitFor(() => expect(createSession).toHaveBeenCalledTimes(1));
     expect(payload().custom_instruction).toBe(text || undefined);
@@ -170,5 +178,121 @@ describe("SessionWizard hooks trust", () => {
     fireEvent.click(screen.getByTestId("hooks-trust-proceed"));
     await waitFor(() => expect(createSession).toHaveBeenCalledTimes(2));
     await waitFor(() => expect(screen.getByText("Repository hooks require trust.")).toBeTruthy());
+  });
+});
+
+describe("SessionWizard rows", () => {
+  const viewSwitch = () => screen.getByRole("switch", { name: "Use structured view" }) as HTMLButtonElement;
+
+  it.each([
+    ["claude", undefined, false, /plan, tool calls and diffs/],
+    ["aider", [agent("aider", { acp_capable: false })], true, /no ACP adapter/],
+    ["helper", [agent("helper", { kind: "custom", acp_capable: false })], true, /needs agent_acp_cmd/],
+    ["claude", [agent("claude", { acp_allowed: false })], true, /not on the allowed agents list/],
+  ])("gates the structured view for %s", async (tool, agents, disabled, summary) => {
+    if (agents) vi.mocked(fetchAgents).mockResolvedValueOnce(agents);
+    renderWizard({ path: "/tmp/proj", tool });
+    await waitFor(() => expect(viewSwitch().disabled).toBe(disabled));
+    expect(viewSwitch().closest("div")!.textContent).toMatch(summary);
+  });
+
+  it.each([
+    [{ scratch: true }, "not for scratch sessions"],
+    [{ path: "/tmp/plain" }, "not a git repository"],
+  ])("disables the worktree switch with a reason: %o", async (prefill, reason) => {
+    renderWizard(prefill);
+    await waitFor(() => expect(screen.getByTestId("wizard-worktree-row").textContent).toContain(reason));
+    expect((screen.getByRole("switch", { name: "Create a worktree" }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("opens the project picker with no project, and returns to the form on a pick", async () => {
+    renderWizard({});
+    fireEvent.click((await screen.findByText("/tmp/proj")).closest("button")!);
+    expect(screen.getByTestId("wizard-project-row").textContent).toContain("/tmp/proj");
+  });
+
+  describe("profile", () => {
+    const PROFILES = [
+      { name: "default", is_default: true, description: "Stock setup" },
+      { name: "work", is_default: false },
+    ];
+
+    it("picks a profile in its panel and applies its defaults", async () => {
+      vi.mocked(fetchProfiles).mockResolvedValue(PROFILES);
+      renderWizard();
+      fireEvent.click(await screen.findByText("Profile"));
+      fireEvent.click(screen.getByRole("radio", { name: /work/ }));
+      await waitFor(() => expect(fetchSettings).toHaveBeenCalledWith("work"));
+      await launch();
+      await waitFor(() => expect(createSession).toHaveBeenCalled());
+      expect(payload()).toMatchObject({ profile: "work" });
+    });
+
+    it("confirms before a profile overwrites edits", async () => {
+      vi.mocked(fetchProfiles).mockResolvedValue(PROFILES);
+      const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(false);
+      try {
+        renderWizard();
+        fireEvent.click(await screen.findByRole("switch", { name: "Auto-approve actions" }));
+        fireEvent.click(screen.getByText("Profile"));
+        fireEvent.click(screen.getByRole("radio", { name: /work/ }));
+        expect(confirmSpy).toHaveBeenCalled();
+        expect(fetchSettings).not.toHaveBeenCalledWith("work");
+      } finally {
+        confirmSpy.mockRestore();
+      }
+    });
+  });
+});
+
+describe("SessionWizard create progress", () => {
+  const deferred = () => {
+    let resolve!: (v: unknown) => void;
+    const promise = new Promise((r) => (resolve = r));
+    return { promise, resolve };
+  };
+
+  it("shows hook output while a slow create runs, polled by its idempotency key", async () => {
+    const pending = deferred();
+    createSession.mockReturnValueOnce(pending.promise);
+    vi.mocked(fetchCreateProgress).mockResolvedValue({
+      stage: "running_hooks",
+      hook: "npm install",
+      output: ["added 12 packages"],
+    });
+    const { onCreated } = renderWizard();
+    await launch();
+    const key = payload().idempotency_key;
+    expect(key).toBeTruthy();
+    await waitFor(() => expect(screen.getByTestId("create-progress-hook").textContent).toContain("npm install"), {
+      timeout: 3000,
+    });
+    expect(screen.getByTestId("create-progress-output").textContent).toContain("added 12 packages");
+    expect(fetchCreateProgress).toHaveBeenCalledWith(key);
+    pending.resolve({ ok: true, session: { id: "s1" } });
+    await waitFor(() => expect(onCreated).toHaveBeenCalledWith({ id: "s1" }));
+  });
+
+  it("hands a backgrounded create to onCreatedInBackground instead of navigating", async () => {
+    const pending = deferred();
+    createSession.mockReturnValueOnce(pending.promise);
+    const { onClose, onCreated, onCreatedInBackground } = renderWizard();
+    await launch();
+    fireEvent.click(await screen.findByText("Continue in background", undefined, { timeout: 3000 }));
+    expect(onClose).toHaveBeenCalled();
+    pending.resolve({ ok: true, session: { id: "s1" } });
+    await waitFor(() => expect(onCreatedInBackground).toHaveBeenCalledWith({ id: "s1" }));
+    expect(onCreated).not.toHaveBeenCalled();
+  });
+
+  it("retries a dropped request with the same idempotency key", async () => {
+    createSession
+      .mockResolvedValueOnce({ ok: false, error: "Network error", network: true })
+      .mockResolvedValueOnce({ ok: true, session: { id: "s1" } });
+    const { onCreated } = renderWizard();
+    await launch();
+    await waitFor(() => expect(onCreated).toHaveBeenCalledWith({ id: "s1" }), { timeout: 3000 });
+    expect(createSession).toHaveBeenCalledTimes(2);
+    expect(payload(1).idempotency_key).toBe(payload(0).idempotency_key);
   });
 });

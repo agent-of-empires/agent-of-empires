@@ -1835,6 +1835,10 @@ function AppContent({
             const p = searchParams.get("profile");
             navigate(`/settings/${t}${p ? `?profile=${encodeURIComponent(p)}` : ""}`);
           }}
+          onShowList={() => {
+            const p = searchParams.get("profile");
+            navigate(`/settings${p ? `?profile=${encodeURIComponent(p)}` : ""}`);
+          }}
           onServerAboutRefresh={refreshServerAbout}
           profile={searchParams.get("profile")}
           onSelectProfile={(p) => {
@@ -2387,6 +2391,11 @@ function AppContent({
               }
               setShowSessionWizard(false);
               setWizardPrefill(undefined);
+            }}
+            onCreatedInBackground={(session?: SessionResponse) => {
+              if (!session) return;
+              injectSession(session);
+              toastBus.handler?.info(`"${session.title}" is ready`);
             }}
             prefill={wizardPrefill}
             nameOnly={caps.nameOnlyWizard}

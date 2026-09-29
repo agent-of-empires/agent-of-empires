@@ -257,6 +257,9 @@ pub struct FieldDescriptor {
     /// Shown under an "Advanced" fold on both surfaces.
     #[serde(default)]
     pub advanced: bool,
+    /// Read only by the TUI; the web folds it apart from dashboard settings.
+    #[serde(default)]
+    pub tui_only: bool,
     /// Manifest default for plugin fields; core fields always have a value in `Config`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default: Option<serde_json::Value>,

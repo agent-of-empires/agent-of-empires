@@ -822,7 +822,16 @@ describe("createSession errors", () => {
     fetchSpy.mockResolvedValueOnce(new Response("boom", { status: 500 }));
     expect(await api.createSession(body)).toEqual({ ok: false, error: "Server error (500): boom" });
     offline();
-    expect(await api.createSession(body)).toEqual({ ok: false, error: "Network error: offline" });
+    expect(await api.createSession(body)).toEqual({ ok: false, error: "Network error: offline", network: true });
+  });
+
+  it("reads create progress, null once the create has finished", async () => {
+    const progress = { stage: "running_hooks", hook: "npm ci", output: ["ok"] };
+    fetchSpy.mockResolvedValueOnce(json(progress));
+    expect(await api.fetchCreateProgress("k/1")).toEqual(progress);
+    expect(lastCall().url).toBe("/api/sessions/create-progress/k%2F1");
+    fetchSpy.mockResolvedValueOnce(empty(404));
+    expect(await api.fetchCreateProgress("k")).toBeNull();
   });
 });
 
