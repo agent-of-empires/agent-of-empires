@@ -730,7 +730,13 @@ pub(crate) struct ProfileCatalogueTransaction {
 
 impl ProfileCatalogueTransaction {
     fn acquire() -> Result<Self> {
-        Self::with_transaction(crate::daemon::lifecycle::Transaction::acquire_blocking()?)
+        // Bounded on purpose: the daemon holds this lock for as long as a start
+        // or stop takes, and the caller is the TUI key handler, so the full
+        // minute would freeze the whole UI with nothing to show for it. The
+        // message names the transition instead.
+        Self::with_transaction(crate::daemon::lifecycle::Transaction::acquire_blocking_for(
+            std::time::Duration::from_secs(2),
+        )?)
     }
 
     // Native callers acquire namespace exclusion first.

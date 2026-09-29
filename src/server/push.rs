@@ -1064,6 +1064,25 @@ pub async fn subscribe(
         return Err(StatusCode::BAD_REQUEST.into_response());
     }
 
+    // The daemon POSTs to whatever is stored here, so an unvalidated endpoint
+    // turns this route into a request forwarder into anything the daemon can
+    // reach. A push service is always https, and never a literal loopback,
+    // private or link-local address: same address rules as callbacks, which
+    // `callback::validate_callback_url` already encodes.
+    let endpoint_url =
+        reqwest::Url::parse(&body.endpoint).map_err(|_| StatusCode::BAD_REQUEST.into_response())?;
+    if endpoint_url.scheme() != "https" {
+        return Err(StatusCode::BAD_REQUEST.into_response());
+    }
+    if let Some(host) = endpoint_url.host_str() {
+        let host = host.trim_start_matches('[').trim_end_matches(']');
+        if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+            if crate::server::callback::is_forbidden_target(ip) {
+                return Err(StatusCode::BAD_REQUEST.into_response());
+            }
+        }
+    }
+
     let user_agent = headers
         .get(axum::http::header::USER_AGENT)
         .and_then(|v| v.to_str().ok())

@@ -172,7 +172,7 @@ fn is_forbidden_v4(v4: std::net::Ipv4Addr) -> bool {
 /// addresses are pinned onto the client (`build_pinned_client`), so a DNS
 /// rebinding answer cannot redirect the connect to a target this never
 /// approved.
-fn is_forbidden_target(ip: IpAddr) -> bool {
+pub(crate) fn is_forbidden_target(ip: IpAddr) -> bool {
     // Judge any embedded IPv4 by the IPv4 rules first. `Ipv6Addr::is_loopback()`
     // only matches `::1`, so a mapped/NAT64/compatible loopback or metadata
     // address would otherwise clear every v6 check below while the OS still

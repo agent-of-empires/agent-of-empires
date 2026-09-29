@@ -40,30 +40,12 @@ fn open_lock(name: &str) -> Result<File> {
 }
 
 impl Transaction {
-    pub(crate) fn acquire_blocking() -> Result<Self> {
-        let file = open_lock("transaction.lock")?;
-        let deadline = Instant::now() + Duration::from_secs(60);
-        loop {
-            match file.try_lock_exclusive() {
-                Ok(()) => return Ok(Self(file)),
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    anyhow::ensure!(
-                        Instant::now() < deadline,
-                        "Daemon lifecycle transaction timed out"
-                    );
-                    std::thread::sleep(Duration::from_millis(25));
-                }
-                Err(error) => return Err(error.into()),
-            }
-        }
-    }
-
     /// Acquire the transaction, giving up after `wait`.
     ///
-    /// Short-waiting counterpart of `acquire_blocking`: a daemon transition
-    /// holds the lock for as long as it takes to start or stop, so a caller
-    /// that has no business waiting out a full lifecycle needs a bound and a
-    /// message naming the transition that is in the way.
+    /// The only blocking acquisition: a daemon transition holds the lock for as
+    /// long as it takes to start or stop, so a caller needs a bound and a message
+    /// naming the transition that is in the way. Its only caller is the TUI key
+    /// handler, where an unbounded wait would freeze the whole UI.
     pub(crate) fn acquire_blocking_for(wait: Duration) -> Result<Self> {
         let file = open_lock("transaction.lock")?;
         let deadline = Instant::now() + wait;
