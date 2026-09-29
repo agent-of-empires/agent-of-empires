@@ -721,10 +721,16 @@ async fn a_manual_prompt_cannot_overtake_a_continuation_install() {
                 else {
                     return;
                 };
-                let _outcome = crate::server::acp_reconciler::install_rate_limit_continuation(
+                // B is blocked on the guard, so the queue is still empty here
+                // and the producer must decide the continuation stands.
+                let outcome = crate::server::acp_reconciler::install_rate_limit_continuation(
                     &state, &id, submission,
                 )
                 .await;
+                assert!(matches!(
+                    outcome,
+                    crate::server::acp_reconciler::ContinuationOutcome::Stands
+                ));
             }
         });
         // Causal barrier: A has been read from the store and is not installed.

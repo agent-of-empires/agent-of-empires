@@ -61,14 +61,14 @@ fn row_minted_at_ms(entry: &crate::daemon::QueuedPromptEntry) -> Option<i64> {
 /// user typed before the limit; that shape costs the interrupted prompt
 /// instead, and the alternative costs the user's freshest word.
 ///
-/// An unreadable mint time or an unknown limit never supersedes: the
-/// interrupted request is the older one and losing it is final, since the
-/// first prompt the drain delivers retires the park.
-fn queue_supersedes(queued_at_ms: &[i64], limit_at_ms: Option<i64>) -> bool {
+/// An unknown limit never supersedes: the interrupted request is the older one
+/// and losing it is final, since the first prompt the drain delivers retires
+/// the park.
+fn queue_supersedes(minted_at_ms: &[i64], limit_at_ms: Option<i64>) -> bool {
     let Some(limit_at_ms) = limit_at_ms else {
         return false;
     };
-    queued_at_ms
+    minted_at_ms
         .iter()
         .any(|queued_at| *queued_at > limit_at_ms)
 }
@@ -81,7 +81,7 @@ pub(crate) enum ContinuationOutcome {
     /// `RateLimitAutoResumed`, which is the budget's arming step.
     Stands,
     /// A queued prompt owns the next turn, and any continuation an earlier
-    /// cadence installed is retracted. That prompt has no other route to a
+    /// cadence installed is cleared. That prompt has no other route to a
     /// worker, so the caller still frees the respawn, but no automatic
     /// breadcrumb.
     SupersededByQueue,
@@ -119,7 +119,7 @@ pub(crate) async fn install_rate_limit_continuation(
     // supersession. Only the mint times leave the read guard: a row carries its
     // whole text, and copying that under the shared lock is not worth one
     // timestamp.
-    let queued_at_ms: Vec<i64> = {
+    let minted_at_ms: Vec<i64> = {
         let instances = state.instances.read().await;
         let Some(inst) = instances.iter().find(|i| i.id == id) else {
             return ContinuationOutcome::Stands;
@@ -129,7 +129,7 @@ pub(crate) async fn install_rate_limit_continuation(
             .filter_map(row_minted_at_ms)
             .collect()
     };
-    if !queued_at_ms.is_empty() {
+    if !minted_at_ms.is_empty() {
         // `None` covers a pruned limit row and a failed probe alike, and
         // neither proves a supersession, so the continuation stands.
         let limit_at_ms = query_store(
@@ -143,10 +143,10 @@ pub(crate) async fn install_rate_limit_continuation(
         )
         .await
         .flatten();
-        if queue_supersedes(&queued_at_ms, limit_at_ms) {
+        if queue_supersedes(&minted_at_ms, limit_at_ms) {
             // A continuation an earlier cadence installed is no longer next.
             // `/queue` never clears the slot the way `acp_prompt` does, so this
-            // is the only place the user's newer word can take it back.
+            // is the only place the user's newer word can clear it.
             state.session_service.clear_pending_initial_turn(id).await;
             return ContinuationOutcome::SupersededByQueue;
         }
@@ -635,10 +635,9 @@ mod tests {
             .count()
     }
 
-    /// Only a row minted after the limit replaced the turn. A row before it, a
-    /// limit that was never recorded, and a row whose mint time cannot be read
-    /// all leave the continuation standing: the interrupted request is the older
-    /// one and losing it is final.
+    /// Only a row minted after the limit replaced the turn. A row before it and
+    /// a limit that was never recorded both leave the continuation standing: the
+    /// interrupted request is the older one and losing it is final.
     #[test]
     fn only_a_row_minted_after_the_limit_supersedes() {
         let limit = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
@@ -686,11 +685,11 @@ mod tests {
         }
     }
 
-    /// #4092: a queued prompt owns the next turn only while the pending-turn
-    /// slot is free and at least one row was minted after the limit that
-    /// interrupted it. A row queued while the interrupted turn was still running
+    /// #4092: a queued prompt owns the next turn when at least one row was
+    /// minted after the limit that interrupted it. A row queued while the
+    /// interrupted turn was still running
     /// is a follow-up the user wants behind it, so the continuation is installed
-    /// and its redelivery charged. A row minted after the park retracts a
+    /// and its redelivery charged. A row minted after the park clears a
     /// continuation an earlier cadence installed, because `/queue` never clears
     /// the slot itself. The rows are seeded on the instance because the endpoint
     /// stamps the server's clock, which no test can place in the past.
