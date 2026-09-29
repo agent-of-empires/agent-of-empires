@@ -16,7 +16,7 @@
 
 #[cfg(debug_assertions)]
 mod cli_read_pack;
-#[cfg(debug_assertions)]
+#[cfg(all(target_os = "linux", debug_assertions))]
 mod cli_read_parity;
 #[cfg(debug_assertions)]
 mod cli_read_record;

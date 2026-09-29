@@ -952,11 +952,15 @@ fn is_c1_c0(value: char) -> bool {
     )
 }
 
-/// `YYYY-MM-DDTHH:MM:SS[.f{1,9}]Z`: UTC, `Z` zoned, and either a whole
-/// second or the fractional part RFC 3339 allows. The fixed separators are
-/// checked by position and the value must parse, so a permissive length is
-/// the only thing that is relaxed: a control character, a numeric offset or a
-/// lowercase `t`/`z` is still refused.
+/// `YYYY-MM-DDTHH:MM:SS[.f{3,6,9}]Z`: UTC, `Z` zoned, and either a whole
+/// second or the three fractional widths chrono's `AutoSi` writes. The fixed
+/// separators are checked by position and the value must parse, so a
+/// permissive length is the only thing that is relaxed: a control character, a
+/// numeric offset or a lowercase `t`/`z` is still refused.
+///
+/// Those widths are the producer's, not RFC 3339's: every instant on this
+/// wire is spelled with `SecondsFormat::AutoSi`, so any other count is a frame
+/// this half would echo as a spelling the local command never prints.
 fn valid_timestamp(value: &str) -> bool {
     let bytes = value.as_bytes();
     if bytes.len() < 20
@@ -969,7 +973,7 @@ fn valid_timestamp(value: &str) -> bool {
         return false;
     }
     // The head is 19 bytes: a whole second puts its `Z` at index 19, and a
-    // fractional part puts a `.` there with 1..=9 digits before the final `Z`.
+    // fractional part puts a `.` there before the final `Z`.
     let fraction: &[u8] = match bytes.len() {
         20 => &[],
         length if length > 21 => match bytes[19] {
@@ -978,7 +982,7 @@ fn valid_timestamp(value: &str) -> bool {
         },
         _ => return false,
     };
-    if fraction.len() > 9 || !fraction.iter().all(u8::is_ascii_digit) {
+    if !matches!(fraction.len(), 0 | 3 | 6 | 9) || !fraction.iter().all(u8::is_ascii_digit) {
         return false;
     }
     value.ends_with('Z') && parse_timestamp(value).is_some()
@@ -1194,12 +1198,15 @@ mod tests {
         ));
     }
 
-    /// The wire keeps the fractional part the local command serializes, so the
-    /// grammar accepts it and still refuses every other spelling.
+    /// The wire keeps only the fractional part the local command serializes, so
+    /// the grammar is `AutoSi`'s and still refuses every other spelling. A
+    /// `.25` is a legal RFC 3339 instant this producer has never emitted, and
+    /// admitting it would let a frame through that the local command could not
+    /// have printed.
     #[test]
-    fn a_timestamp_is_utc_z_or_a_utc_z_with_up_to_nine_fractional_digits() {
+    fn a_timestamp_is_utc_z_at_the_producer_s_fraction_widths() {
         assert!(valid_timestamp("2026-01-01T00:00:00Z"));
-        for fraction in ["1", "123", "123456", "123456789"] {
+        for fraction in ["250", "250000", "250000000"] {
             assert!(
                 valid_timestamp(&format!("2026-01-01T00:00:00.{fraction}Z")),
                 "{fraction}"
@@ -1211,7 +1218,10 @@ mod tests {
             "2026-01-01t00:00:00Z",            // a lowercase date/time separator
             "2026-01-01T00:00:00z",            // a lowercase zone
             "2026-01-01T00:00:00.Z",           // an empty fraction
-            "2026-01-01T00:00:00.1234567890Z", // ten fractional digits
+            "2026-01-01T00:00:00.25Z",         // one fractional digit
+            "2026-01-01T00:00:00.2500Z",       // four, a width AutoSi never writes
+            "2026-01-01T00:00:00.25000000Z",   // eight
+            "2026-01-01T00:00:00.1234567890Z", // ten
             "2026-01-01T00:00:00.12a456Z",     // a non-digit in the fraction
             "2026-01-01T00:00:0\u{1b}Z",       // a control character
         ] {

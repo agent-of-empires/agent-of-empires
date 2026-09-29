@@ -423,6 +423,7 @@ async fn the_held_lock_admits_a_client_and_refuses_a_publisher() {
 /// is unprovable rather than an absence, and the consumer consequence of that
 /// is asserted too, since reaping a marker is what would actually harm.
 #[test]
+#[serial_test::serial]
 fn process_identity_distinguishes_live_from_retained() {
     let pid = std::process::id();
     let live = MarkerProbe {
@@ -497,6 +498,7 @@ fn process_identity_distinguishes_live_from_retained() {
 /// unlink a possibly-live daemon's state, and publication would go ahead over
 /// its socket.
 #[test]
+#[serial_test::serial]
 fn a_marker_this_half_cannot_prove_dead_is_never_reaped() {
     let Some(namespace) = namespace_or_skip() else {
         return;

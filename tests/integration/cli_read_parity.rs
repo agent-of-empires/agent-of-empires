@@ -9,6 +9,11 @@
 //! a note in someone's release notes. A command that *refuses* is compared the
 //! same way, because the refusal's exit code and its sentence are exactly the
 //! things a served read gets wrong.
+//!
+//! Linux only, because a daemon that cannot publish the namespace refuses
+//! with `unsupported_platform` before it touches the filesystem, and the
+//! module gate is the honest report of that rather than a skip printed at
+//! runtime.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -32,9 +37,10 @@ const BROKEN: &str = "wrecked";
 /// The whole read surface, in the spelling a user types it. One assertion per
 /// command, all of them in the single test below. The command set carries the
 /// states that used to be invisible here: a human `session show` of a child
-/// whose parent was purged, and a `profile` listing over a profile named
-/// `default`.
-const COMMANDS: [&[&str]; 18] = [
+/// whose parent was purged, a human `session show` of an archived row whose
+/// `State:` line no other command prints, and a `profile` listing over a
+/// profile named `default`.
+const COMMANDS: [&[&str]; 19] = [
     &["list"],
     &["list", "--state", "all"],
     &["list", "--all"],
@@ -56,6 +62,7 @@ const COMMANDS: [&[&str]; 18] = [
     // they can answer differently.
     &["session", "show", "--json", "l-terminal"],
     &["session", "show", "l-terminal"],
+    &["session", "show", "a-archived"],
 ];
 
 /// The commands a *refusing* read has to agree on too. A command that exits
@@ -482,6 +489,10 @@ fn row(
     instance.created_at = "2026-01-02T03:04:05.123456789Z"
         .parse()
         .expect("created_at");
+    // `.25` and `.5` are deliberately short. They are the only observation
+    // this gate has that an instant is normalised to the spelling the local
+    // command prints, and a tidy-up to nine digits would remove the coverage
+    // silently.
     if archived {
         instance.archived_at = Some("2026-02-03T04:05:06.25Z".parse().expect("archived_at"));
     }
@@ -661,6 +672,11 @@ async fn a_profile_that_cannot_be_read_is_refused_by_both_transports() {
     .await;
 
     assert_eq!(
+        served.len(),
+        3,
+        "every command must have been compared, not skipped"
+    );
+    assert_eq!(
         served[0].exit, 0,
         "the picker reads no profile's data, so a broken one does not refuse it: {:?}",
         served[0].stderr
@@ -687,7 +703,12 @@ async fn a_profile_that_cannot_be_read_is_refused_by_both_transports() {
 async fn compare_both_transports(fixture: &Fixture) {
     let mut commands: Vec<&[&str]> = COMMANDS.to_vec();
     commands.extend_from_slice(&REFUSALS);
-    let _ = compare_transports(fixture, &commands, COMMANDS.len()).await;
+    let served = compare_transports(fixture, &commands, COMMANDS.len()).await;
+    assert_eq!(
+        served.len(),
+        commands.len(),
+        "every command must have been compared, not skipped"
+    );
 }
 
 /// `refusals_from` is the index at which the succeeding rows end; `usize::MAX`
@@ -712,21 +733,8 @@ async fn compare_transports(
 
     let mut served: Vec<(Vec<String>, Run)> = Vec::new();
     {
-        // The local admission walk is defined on Linux, so the producer
-        // refuses with `unsupported_platform` before it touches the
-        // filesystem. That is neither a broken fixture nor an untrusted base,
-        // so skip rather than panic on a message that would send a reader
-        // auditing the wrong subsystem.
-        let daemon = match RuntimeUdsTestServer::start_in(&xdg_base, state) {
-            Ok(daemon) => daemon,
-            Err(reason) if reason.contains("unsupported_platform") => {
-                eprintln!(
-                    "skipping: the local runtime read is not defined on this platform ({reason})"
-                );
-                return Vec::new();
-            }
-            Err(reason) => panic!("the fixture home is a trusted namespace: {reason}"),
-        };
+        let daemon = RuntimeUdsTestServer::start_in(&xdg_base, state)
+            .unwrap_or_else(|reason| panic!("the fixture home is a trusted namespace: {reason}"));
         for (index, args) in commands.iter().enumerate() {
             let args: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
             let result = run(home.clone(), args.clone()).await;

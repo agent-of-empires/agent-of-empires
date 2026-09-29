@@ -453,6 +453,17 @@ async fn run_all_profiles(json: bool, scope: SessionScope) -> Result<()> {
 mod tests {
     use super::*;
 
+    /// One spelling for every instant a command prints, and it is the spelling
+    /// the wire carries: milliseconds for a quarter second, nothing at all for
+    /// a whole second. A regression to bare `to_rfc3339()` appends `+00:00`
+    /// and the whole second loses its empty fraction.
+    #[test]
+    fn a_timestamp_prints_at_the_width_the_instant_has() {
+        let at = |value: &str| display_timestamp(value.parse().expect("an instant"));
+        assert_eq!(at("2026-02-03T04:05:06.25Z"), "2026-02-03T04:05:06.250Z");
+        assert_eq!(at("2026-02-03T04:05:06Z"), "2026-02-03T04:05:06Z");
+    }
+
     #[test]
     fn nest_children_lists_each_child_under_its_listed_parent() {
         let row = |title: &str, parent: Option<&str>| {

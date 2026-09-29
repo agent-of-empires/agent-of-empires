@@ -19,7 +19,7 @@ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use chrono::{DateTime, SecondsFormat, Utc};
+use chrono::{DateTime, Utc};
 use futures_util::{SinkExt, StreamExt};
 
 use serde::Serialize;
@@ -429,7 +429,7 @@ fn publish_freshness(runtime: &RuntimeState, observed_at: DateTime<Utc>) -> (Sta
     (
         StatusFreshness::Observed {
             revision: next,
-            observed_at: format_timestamp(observed_at),
+            observed_at: crate::cli::list::display_timestamp(observed_at),
         },
         cursor,
     )
@@ -1058,7 +1058,7 @@ impl SessionRead {
             profile: inst.source_profile.clone(),
             status: inst.status.wire_str(),
             state: wire_state(inst),
-            created_at: format_timestamp(inst.created_at),
+            created_at: crate::cli::list::display_timestamp(inst.created_at),
             last_accessed_at: timestamp(inst.last_accessed_at),
             idle_entered_at: timestamp(inst.idle_entered_at),
             last_error: inst.last_error.clone(),
@@ -1099,17 +1099,8 @@ fn wire_state(inst: &Instance) -> &'static str {
     }
 }
 
-/// One canonical timestamp spelling: RFC 3339 in UTC with the fractional part
-/// `AutoSi` keeps, spelled with `Z`. This is exactly how chrono's own
-/// `Serialize for DateTime<Utc>` writes a value: `to_rfc3339()` would instead
-/// spell the zone as `+00:00`, which is neither the wire grammar the client
-/// accepts nor the bytes the local command prints.
-fn format_timestamp(value: DateTime<Utc>) -> String {
-    value.to_rfc3339_opts(SecondsFormat::AutoSi, true)
-}
-
 fn timestamp(value: Option<DateTime<Utc>>) -> Option<String> {
-    value.map(format_timestamp)
+    value.map(crate::cli::list::display_timestamp)
 }
 
 #[cfg(test)]
