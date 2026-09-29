@@ -17,14 +17,14 @@ pub struct ReadRequestSource {
 
 /// The one definition of an *unset selection* in this module: a value that is
 /// absent, empty, or whitespace only. It covers both variables a read is
-/// aimed by — [`URL_ENV`] and [`PROFILE_ENV`] — because they are the same
+/// aimed by: [`URL_ENV`] and [`PROFILE_ENV`]: because they are the same
 /// decision, and a shell profile that exports either one empty has expressed
 /// the same thing. The local path is the oracle: `resolve_existing_profile`
 /// maps an empty profile name to the configured default, and an empty
 /// `AOE_DAEMON_URL` has always selected the local transport, so the served
 /// half may not invent a stricter rule than the local half has.
 ///
-/// The rule is applied where each value is *read as a selection* — the URL
+/// The rule is applied where each value is *read as a selection*: the URL
 /// when the endpoint is chosen, the profile by [`selected_profile_source`].
 /// It is not applied when a value is captured: a captured profile is also an
 /// input to decisions that are not reads, and dropping an empty one at
@@ -57,9 +57,9 @@ pub(crate) fn read_request_source(cli: &super::Cli) -> ReadRequestSource {
         token: std::env::var_os(TOKEN_ENV),
         explicit_profile: cli.profile.clone(),
         // Captured raw on purpose: this is the only record that the user named
-        // a profile at all, and `main` derives `profile_explicit` — the flag
+        // a profile at all, and `main` derives `profile_explicit`: the flag
         // that decides whether `aoe project add` writes to the profile or the
-        // global registry — from the value that ends up in `cli.profile`. An
+        // global registry: from the value that ends up in `cli.profile`. An
         // empty variable is "no selection" for a read
         // (`selected_profile_source`), which is not the same statement as "the
         // user asked for no profile in particular" on a write path.
@@ -126,7 +126,7 @@ pub(crate) fn select_endpoint(source: &ReadRequestSource) -> Result<SelectedEndp
 /// value: a `-p ''` the user typed is honoured as "no selection at all" and
 /// resolves to the default profile, exactly as the local command does
 /// (`resolve_existing_profile("")`). An explicit flag stops the search even
-/// when it is empty, because the local path reads it the same way — an
+/// when it is empty, because the local path reads it the same way: an
 /// explicit `-p` wins over the variable whatever its value.
 pub(crate) fn selected_profile_source(source: &ReadRequestSource) -> ProfileSource<'_> {
     if let Some(value) = source.explicit_profile.as_deref() {
@@ -443,7 +443,7 @@ mod tests {
     /// The same rule for the profile selection, in both halves: the local path
     /// maps an empty profile to the configured default
     /// (`resolve_existing_profile("")`), so the served half may not refuse it
-    /// with `profile_missing` — least of all when no daemon is published at
+    /// with `profile_missing`: least of all when no daemon is published at
     /// all, where the very same command succeeds.
     #[test]
     fn an_empty_profile_selection_is_the_default_in_both_halves() {
@@ -469,7 +469,7 @@ mod tests {
     }
 
     /// What "empty is unset" decides is which sessions a *read* shows, so it
-    /// is applied when the profile is selected — and the capture keeps the raw
+    /// is applied when the profile is selected: and the capture keeps the raw
     /// value, because `main` reads the same field to learn whether a profile
     /// was named at all. An exported-but-empty variable is a selection that
     /// resolves to the default, not the absence of one: dropping it here is

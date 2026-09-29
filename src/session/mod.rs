@@ -304,7 +304,7 @@ pub fn format_debug_namespace_warning(release: &Path, dev: &Path) -> String {
          is not visible to this build.\n\n\
          To migrate it, run:\n  \
          cp -r {} {}\n\n\
-         Otherwise, do nothing — this notice will not repeat once the dev dir exists.\n\
+         Otherwise, do nothing: this notice will not repeat once the dev dir exists.\n\
          See docs/development.md for details.",
         dev.display(),
         release.display(),
@@ -390,7 +390,7 @@ pub fn list_profiles_readonly() -> Result<Vec<String>> {
     // Absent is legitimately empty. Present but not a directory is a broken
     // app dir, and reporting it as "no profiles" would give every read that
     // depends on the inventory a clean answer about a state that is not
-    // clean — so it surfaces as an error and the caller degrades health.
+    // clean: so it surfaces as an error and the caller degrades health.
     match std::fs::metadata(&profiles_dir) {
         Ok(metadata) if !metadata.is_dir() => {
             anyhow::bail!(

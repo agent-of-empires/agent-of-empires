@@ -95,8 +95,8 @@ async fn main() -> Result<()> {
     // always has.
     //
     // A served read is still a CLI invocation, so its answer is carried into
-    // `run` rather than printed here: the preflight below — the namespace
-    // warning, telemetry, migrations, the unknown-config warnings — is what
+    // `run` rather than printed here: the preflight below: the namespace
+    // warning, telemetry, migrations, the unknown-config warnings: is what
     // every other command gets, and skipping it would make a daemon-served
     // `aoe list` the only command in the tool that reports neither.
     let answered = match cli::runtime_read::classify(cli.command.as_ref()) {
@@ -126,7 +126,7 @@ async fn main() -> Result<()> {
     }
 
     if let Some(url) = &cli.daemon_url {
-        // SAFETY: single-threaded at this point — we haven't entered
+        // SAFETY: single-threaded at this point: we haven't entered
         // the tokio runtime's worker pool yet (the runtime is owned by
         // the `#[tokio::main]` wrapper that called us, and clap's
         // parsing was synchronous).

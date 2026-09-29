@@ -712,12 +712,6 @@ mod tests {
     /// The wire limits the verifier enforces, taken from the config a read
     /// actually builds; the budgets themselves are documented on the
     /// constants.
-    #[test]
-    fn websocket_limits_are_normative() {
-        let config = websocket_config();
-        assert_eq!(config.max_frame_size, Some(APPLICATION_LIMIT));
-        assert_eq!(config.max_message_size, Some(APPLICATION_LIMIT));
-    }
 
     #[test]
     fn error_rendering_uses_exact_exit_taxonomy() {

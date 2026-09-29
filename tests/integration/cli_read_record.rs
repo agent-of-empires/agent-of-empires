@@ -7,7 +7,7 @@
 //! [`record_exchange`], which is the same assembly path and the same
 //! serialisers the daemon uses. The HTTP upgrade records and the close
 //! handshake around those frames are transport bytes rather than producer
-//! frames, so they are carried over unchanged — the drift this repairs is in
+//! frames, so they are carried over unchanged: the drift this repairs is in
 //! the JSON documents, not in the handshake.
 //!
 //! Run it deliberately:
@@ -72,7 +72,7 @@ impl Drop for TempAppDir {
 
 /// The store the recorded frames describe: one profile, a parent and a child
 /// group, a registered project, and a single live session that resolves through
-/// both. The registry project is the point — it is the only source of
+/// both. The registry project is the point: it is the only source of
 /// `registered: true`, and a row synthesized for a session's project path is
 /// the only source of `false`.
 fn seed() -> Vec<Instance> {
@@ -266,7 +266,7 @@ fn canonical(value: &serde_json::Value) -> String {
 }
 
 /// Bring `CASES.json` back into agreement with the bytes on disk, then re-hash
-/// the manifest — the same two steps `pack::verify` checks, in the same order,
+/// the manifest: the same two steps `pack::verify` checks, in the same order,
 /// so a re-seal can never paper over a case that still disagrees.
 fn restage(root: &Path) {
     let path = root.join(pack::CASES_NAME);
@@ -302,7 +302,7 @@ fn restage(root: &Path) {
 /// The one thing a producer will not emit: a snapshot whose `default_profile`
 /// names a profile the snapshot does not carry. The producer derives that
 /// field from the same enumeration it publishes, so it cannot contradict
-/// itself — which is exactly why the case has to plant the contradiction, and
+/// itself: which is exactly why the case has to plant the contradiction, and
 /// why it has to plant it *after* the real frames are recorded rather than
 /// typing the whole frame by hand.
 const INVALID_DEFAULT_PROFILE: (&str, &str) = (

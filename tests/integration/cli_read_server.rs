@@ -268,7 +268,7 @@ async fn the_route_rejects_a_valid_dashboard_cookie() {
 /// produces, because it is printed by the preflight and nothing else. Telemetry
 /// is not asserted here: `record_cli_usage_flush` clears the per-command counts
 /// once a send is confirmed, so a count is not a durable observation, and the
-/// namespace-drift warning cannot be witnessed from a subprocess at all — the
+/// namespace-drift warning cannot be witnessed from a subprocess at all: the
 /// debug app directory is created before `main` samples for drift, so its
 /// "absent" condition does not survive to the sample.
 #[tokio::test]
