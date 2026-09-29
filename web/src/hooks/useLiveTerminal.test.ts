@@ -226,6 +226,26 @@ describe("size owner", () => {
     expect(ws.bytes()).toEqual(["first"]);
   });
 
+  it("sends pastes as a JSON message, queued in order with keystrokes and refused to a non-owner", () => {
+    const { result, ws } = mount(false);
+    const accepted: boolean[] = [];
+    act(() => {
+      accepted.push(result.current.sendData("a"));
+      accepted.push(result.current.sendPaste("two\nlines", true));
+    });
+    ws.open();
+    ws.deliver({ type: "size_owner", is_owner: true });
+    const input = ws.sent.slice(-2).map((d) => (typeof d === "string" ? JSON.parse(d) : new TextDecoder().decode(d)));
+    expect(input).toEqual(["a", { type: "paste", text: "two\nlines", submit: true }]);
+
+    ws.deliver({ type: "size_owner", is_owner: false });
+    act(() => {
+      accepted.push(result.current.sendPaste("late", false));
+    });
+    expect(accepted).toEqual([true, true, false]);
+    expect(ws.json().filter((m) => m.type === "paste")).toHaveLength(1);
+  });
+
   it("claims on take-over and keeps reporting its grid while a non-owner", () => {
     const { result, ws } = mount();
     ws.deliver({ type: "size_owner", is_owner: false });

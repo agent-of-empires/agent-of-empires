@@ -1,15 +1,21 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { flushSync } from "react-dom";
 import { useIsCoarsePointer } from "../hooks/useIsCoarsePointer";
 import { useLiveTerminal } from "../hooks/useLiveTerminal";
 import { useMobileKeyboard } from "../hooks/useMobileKeyboard";
 import { MobileTerminalToolbar } from "./MobileTerminalToolbar";
+import { TerminalComposeSheet } from "./TerminalComposeSheet";
 import { MobileLiveTerminal } from "./MobileLiveTerminal";
 import { KeyboardFab } from "./KeyboardFab";
+import { ArrowJoystick } from "./ArrowJoystick";
+import { useWebSettings } from "../hooks/useWebSettings";
+import { invalidateRetainedImeContext } from "../lib/mobileKeyboardProxy";
 import { TerminalConnectionBanners } from "./TerminalConnectionBanners";
 import { ensureSession, ensureTerminal, isStartRefusal, pasteImage } from "../lib/api";
 import { armClipboardWrite, writeClipboard } from "../lib/clipboard";
 import type { ArmedClipboardWrite } from "../lib/clipboard";
 import type { SessionResponse } from "../lib/types";
+import { reportError } from "../lib/toastBus";
 import {
   FOCUS_TERMINAL_EVENT,
   consumePendingTerminalFocus,
@@ -82,10 +88,66 @@ export function LiveTerminalView({ session, active = true, surface = "agent", te
   useEffect(() => {
     ctrlActiveRef.current = ctrlActive;
   }, [ctrlActive]);
+  const [composeOpen, setComposeOpen] = useState(false);
+
+  const notOwner = live.state.ownerKnown && !live.state.isOwner;
+  const lastUndeliveredToastRef = useRef(0);
+  // Throttled, so a held repeat key does not stack toasts.
+  const reportUndelivered = useCallback(() => {
+    const now = Date.now();
+    if (now - lastUndeliveredToastRef.current < 2000) return;
+    lastUndeliveredToastRef.current = now;
+    reportError(
+      notOwner
+        ? "Not sent: this session is live on another device. Take over first."
+        : "Not sent: terminal not connected.",
+    );
+  }, [notOwner]);
+  const { sendData, sendPaste } = live;
+  // Explicit sends (toolbar, paste, compose) report a drop; typed keys stay quiet.
+  const sendDataOrReport = useCallback(
+    (data: string) => {
+      const ok = sendData(data);
+      if (!ok) reportUndelivered();
+      return ok;
+    },
+    [sendData, reportUndelivered],
+  );
+  const sendPasteOrReport = useCallback(
+    (text: string, submit: boolean) => {
+      const ok = sendPaste(text, submit);
+      if (!ok) reportUndelivered();
+      return ok;
+    },
+    [sendPaste, reportUndelivered],
+  );
+  // Out of band like the toolbar keys, so the retained IME syllable stops shadowing the line.
+  const sendArrow = useCallback(
+    (sequence: string) => {
+      invalidateRetainedImeContext(inputRef.current);
+      sendDataOrReport(sequence);
+    },
+    [sendDataOrReport],
+  );
+  const submitCompose = useCallback(
+    (text: string, submit: boolean) => {
+      invalidateRetainedImeContext(inputRef.current);
+      return sendPasteOrReport(text, submit);
+    },
+    [sendPasteOrReport],
+  );
+  const { settings: webSettings } = useWebSettings();
+  const openCompose = useCallback(() => flushSync(() => setComposeOpen(true)), []);
+  const closeCompose = useCallback((refocusTerminal: boolean) => {
+    // Focus first, inside the tap, so iOS keeps the keyboard up for the terminal.
+    if (refocusTerminal) inputRef.current?.focus();
+    setComposeOpen(false);
+  }, []);
 
   const [trackedSessionId, setTrackedSessionId] = useState(session.id);
   if (session.id !== trackedSessionId) {
     setTrackedSessionId(session.id);
+    setComposeOpen(false);
     setEnsureState("pending");
     setEnsureWarning(null);
     setEnsureError(null);
@@ -285,7 +347,7 @@ export function LiveTerminalView({ session, active = true, surface = "agent", te
           enterReading={live.enterReading}
           returnToLive={live.returnToLive}
           sendData={live.sendData}
-          typedWordRef={live.typedWordRef}
+          sendPaste={sendPasteOrReport}
           uploadPastedImage={uploadPastedImage}
           forwardWheel={live.forwardWheel}
           forwardButton={live.forwardButton}
@@ -297,15 +359,29 @@ export function LiveTerminalView({ session, active = true, surface = "agent", te
           keyboardOpen={keyboardOpen}
         />
         {coarse && live.state.connected && <KeyboardFab keyboardOpen={inputFocused} onToggle={toggleKeyboard} />}
+        {coarse && live.state.connected && webSettings.showArrowJoystick && <ArrowJoystick onArrow={sendArrow} />}
       </div>
 
       {coarse && live.state.connected && (
         <MobileTerminalToolbar
-          sendData={live.sendData}
+          keys={webSettings.mobileToolbarKeys}
+          sendData={sendDataOrReport}
+          sendPaste={sendPasteOrReport}
+          onCompose={openCompose}
           inputElRef={inputRef}
           keyboardOpen={inputFocused}
+          compact={!keyboardOpen && !inputFocused}
           ctrlActive={ctrlActive}
           onCtrlToggle={() => setCtrlActive((v) => !v)}
+        />
+      )}
+
+      {composeOpen && (
+        <TerminalComposeSheet
+          draftKey={`${session.id}:${surface}:${terminalIndex}`}
+          bottomInset={keyboardHeight}
+          onSubmit={submitCompose}
+          onClose={closeCompose}
         />
       )}
     </div>

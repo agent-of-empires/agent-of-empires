@@ -556,7 +556,7 @@ pub async fn trigger_approval_push(
         approval_title.to_string()
     };
     let tag = approval_tag(session_id);
-    send_acp_push(state, session_id, |url| AcpNotifyPayload {
+    send_acp_push(state, session_id, false, |url| AcpNotifyPayload {
         kind: "notify",
         title: title.clone(),
         body: body.clone(),
@@ -572,7 +572,7 @@ pub async fn trigger_approval_push(
 /// handled.
 pub async fn trigger_approval_clear_push(state: &AppState, session_id: &str, seq: u64) {
     let tag = approval_tag(session_id);
-    send_acp_push(state, session_id, |url| AcpClearPayload {
+    send_acp_push(state, session_id, true, |url| AcpClearPayload {
         kind: "clear",
         title: "Resolved",
         body: "Handled on another device",
@@ -601,7 +601,7 @@ pub async fn trigger_question_push(state: &AppState, session_id: &str, question:
     let title = format!("{} has a question", session_id);
     let body = push_body_snippet(question);
     let tag = question_tag(session_id);
-    send_acp_push(state, session_id, |url| AcpNotifyPayload {
+    send_acp_push(state, session_id, false, |url| AcpNotifyPayload {
         kind: "notify",
         title: title.clone(),
         body: body.clone(),
@@ -616,7 +616,7 @@ pub async fn trigger_question_push(state: &AppState, session_id: &str, question:
 /// Retract a previously shown question notification once the question is answered.
 pub async fn trigger_question_clear_push(state: &AppState, session_id: &str, seq: u64) {
     let tag = question_tag(session_id);
-    send_acp_push(state, session_id, |url| AcpClearPayload {
+    send_acp_push(state, session_id, true, |url| AcpClearPayload {
         kind: "clear",
         title: "Resolved",
         body: "Handled on another device",
@@ -666,8 +666,9 @@ fn push_body_snippet(s: &str) -> String {
 }
 
 /// Shared sender for the dedicated ACP "needs your attention" pushes (approval and
-/// question) and their matching clear pushes.
-async fn send_acp_push<T, F>(state: &AppState, session_id: &str, make_payload: F)
+/// question) and their matching clear pushes. A clear shows nothing, so it skips
+/// subscriptions whose browser revokes push after silent deliveries (#2491).
+async fn send_acp_push<T, F>(state: &AppState, session_id: &str, silent: bool, make_payload: F)
 where
     T: Serialize,
     F: Fn(String) -> T,
@@ -691,40 +692,13 @@ where
         }
     };
     for sub in subs {
+        if silent && !super::push::accepts_silent_push(&sub) {
+            continue;
+        }
         let Some(url) = super::push::build_push_url(&sub, &path) else {
             continue;
         };
-        let payload = make_payload(url);
-        let body_bytes = match serde_json::to_vec(&payload) {
-            Ok(b) => b,
-            Err(e) => {
-                warn!(target: "acp.push", "serialise payload: {e}");
-                continue;
-            }
-        };
-        let auth_header = match super::push_send::vapid_auth_header(push, &sub.endpoint) {
-            Ok(h) => h,
-            Err(e) => {
-                warn!(target: "acp.push", "vapid header: {e}");
-                continue;
-            }
-        };
-        let cipher = match super::push_send::encrypt_aes128gcm(&sub, &body_bytes) {
-            Ok(c) => c,
-            Err(e) => {
-                warn!(target: "acp.push", "encrypt: {e}");
-                continue;
-            }
-        };
-        let _ = client
-            .post(&sub.endpoint)
-            .header("Authorization", &auth_header)
-            .header("Content-Encoding", "aes128gcm")
-            .header("Content-Type", "application/octet-stream")
-            .header("TTL", "60")
-            .body(cipher)
-            .send()
-            .await;
+        super::push::deliver(push, &client, &sub, &make_payload(url), 60).await;
     }
 }
 

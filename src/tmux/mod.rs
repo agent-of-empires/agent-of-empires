@@ -18,6 +18,7 @@ pub(crate) mod utils;
 pub(crate) mod vt;
 
 pub use composite::PaneGeom;
+pub(crate) use session::{peel_trailing_semicolons, submit_text, SubmitText};
 pub use session::{PaneCursor, PaneEnvMutation, Session, SIZE_OWNER_HEARTBEAT, SIZE_OWNER_TTL};
 pub use status_bar::{get_session_info_for_current, get_status_for_current_session};
 pub use status_detection::{

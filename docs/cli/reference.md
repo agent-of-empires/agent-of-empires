@@ -193,7 +193,7 @@ Add a new session
 * `-g`, `--group <GROUP>` — Group path (defaults to parent folder)
 * `-c`, `--cmd <COMMAND>` — Command to run (e.g., 'claude' or any other supported agent)
 * `--tool <TOOL>` — Named built-in or configured custom agent to run
-* `-P`, `--parent <PARENT>` — Parent session (creates sub-session, inherits group)
+* `-P`, `--parent <PARENT>` — Parent session (creates sub-session, inherits group). The sub-session does not inherit the parent's worktree or path: without `--worktree` it opens at `<path>` (default: the current directory) on whatever branch is checked out there
 * `--fork-from <FORK_FROM>` — Fork an existing session: resume its conversation context in a new, independent session that then diverges. Give the source session's id or title. Terminal fork; available for agents that support forking (claude, codex, opencode)
 * `-l`, `--launch` — Launch the session immediately after creating
 * `-w`, `--worktree <WORKTREE_BRANCH>` — Create session in a git worktree for the specified branch

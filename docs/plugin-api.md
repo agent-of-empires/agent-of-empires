@@ -314,6 +314,8 @@ The payload is capped at 64 KiB. Everything but `blocks` is validated strictly; 
 
 `tone` is one of `neutral` / `info` / `success` / `warn` / `danger`. `color` is a validated `#rgb` / `#rrggbb` literal for a hue no tone names (a merged PR's purple); anything else is ignored.
 
+An `href` must be an `http(s)` URL or a same-origin path starting with a single `/`; a same-origin link navigates inside the dashboard, an external one opens a new tab, and any other value renders no link.
+
 **`row`** lays out at most two lines: `prefix` (mono, tone-tinted) and `label` lead the first with `value` pinned right; `sublabel` leads the second with `badges` (`{ text?, icon?, tone?, tooltip? }`) pinned right. `value_tone` colors the trailing token independently of the row, and `mono` monospaces the row's text. A `method` makes the row body a button firing that worker method, and an `href` alongside it becomes a separate trailing link-out; with `href` alone the whole row is the link. `selected` marks the row as the pane's current subject.
 
 **`section`** groups `children`, with a right-pinned `value` summary or `badges` in its header. `boxed` draws a bordered card, `scroll` caps the body height so a long list scrolls inside the section, and `collapsible` folds it via a native `<details>` (`collapsed` sets the initial state).

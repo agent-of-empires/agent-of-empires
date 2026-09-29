@@ -2333,7 +2333,7 @@ fn dispatch_via_fork(
             // the remaining head still rides the literal path. Embedded
             // and leading semicolons survive `-l` fine, so only the
             // trailing run needs the hex detour.
-            let (head, semis) = peel_trailing_semicolons(s);
+            let (head, semis) = crate::tmux::peel_trailing_semicolons(s);
             if semis > 0 {
                 if !head.is_empty() {
                     send_literal(&target, head)?;
@@ -2710,25 +2710,6 @@ pub(super) fn send_key_oneshot(tmux_name: &str, key: TmuxKey) {
             "could not spawn wheel-forward thread; notch dropped",
         );
     }
-}
-
-/// Upper bound on the number of bytes encoded into a single
-/// `tmux send-keys -H` fork. Each byte becomes one ~2-char hex argument
-/// plus its argv pointer (~11 bytes of kernel arg space), and macOS caps
-/// `execve` argv+envp at `ARG_MAX` = 256 KiB, so a per-byte encoding of
-/// a large paste overflows around 20 KB and fails wholesale with E2BIG.
-/// 4 KiB per fork keeps every argv under ~45 KiB, comfortably below the
-/// limit on every platform while keeping the fork count low.
-/// Split a literal payload into its leading content and the number of
-/// trailing `;` bytes. tmux's command parser drops a trailing `;` from a
-/// `send-keys -l` payload, reading it as a command separator even after the
-/// `--` end-of-options marker, so the trailing run never reaches the pane
-/// (#1942). The caller sends `head` on the literal path and the peeled
-/// semicolons as raw hex bytes. Embedded and leading semicolons survive
-/// `-l` untouched, so only the trailing run is peeled.
-fn peel_trailing_semicolons(s: &str) -> (&str, usize) {
-    let head = s.trim_end_matches(';');
-    (head, s.len() - head.len())
 }
 
 /// Send a literal string to the pane via one `tmux send-keys -l --` fork.
@@ -3381,23 +3362,6 @@ mod tests {
         // verifies the passthrough.
         assert_literal(translate(k(KeyCode::Char('q'))), "q");
         assert_literal(translate(k(KeyCode::Char('Q'))), "Q");
-    }
-
-    #[test]
-    fn peel_trailing_semicolons_splits_trailing_run_only() {
-        // tmux eats a trailing `;` from a `send-keys -l` payload, so the
-        // dispatcher peels the trailing run and sends it as raw hex (#1942).
-        // Lone, trailing, and multi-trailing semicolons get peeled.
-        assert_eq!(peel_trailing_semicolons(";"), ("", 1));
-        assert_eq!(peel_trailing_semicolons("ls;"), ("ls", 1));
-        assert_eq!(peel_trailing_semicolons(";;"), ("", 2));
-        assert_eq!(peel_trailing_semicolons("a;;"), ("a", 2));
-        // Embedded and leading semicolons survive `-l`, so they stay on the
-        // literal head and nothing is peeled.
-        assert_eq!(peel_trailing_semicolons("a;b"), ("a;b", 0));
-        assert_eq!(peel_trailing_semicolons(";a"), (";a", 0));
-        assert_eq!(peel_trailing_semicolons("hello"), ("hello", 0));
-        assert_eq!(peel_trailing_semicolons(""), ("", 0));
     }
 
     #[test]

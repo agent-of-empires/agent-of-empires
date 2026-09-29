@@ -1428,49 +1428,27 @@ impl Session {
 
         let target =
             self.live_pane_target_with_deadline(&crate::tmux::TmuxCommandDeadline::new())?;
-        let byte_len = text.len();
-        let line_count = text.lines().count();
-        let max_line = text.lines().map(str::len).max().unwrap_or(0);
-
-        // Non-trivial or multi-line messages go through the tmux paste-buffer
-        // path (load-buffer over stdin, then paste-buffer with bracketed-paste
-        // markers). The per-line `send-keys -l` + ESC+CR path encodes
-        // newlines as Shift+Enter, which is brittle compared to the
-        // bracketed-paste contract claude-code (and most agents in raw mode)
-        // are designed to ingest.
-        //
-        // The threshold is intentionally small: bracketed paste is also what
-        // prevents the receiving agent's input-burst detector from treating
-        // the trailing Enter as part of the keystroke stream and inserting a
-        // newline instead of submitting. Empirically, on Mosh sessions
-        // (bracketed-paste stripped end-to-end) a single-line ~365-byte
-        // VoiceInk dictation that took the `send-keys -l` path was followed
-        // by `tmux send-keys Enter` at 0ms and the agent rendered the text
-        // but never submitted, because the Enter arrived inside the burst
-        // window. Routing anything beyond a handful of characters through
-        // the bracketed-paste path frames it as a paste, after which the
-        // trailing Enter reliably submits. See gemini-cli#26114 for
-        // independent confirmation that claude-code handles paste correctly
-        // only when bracketed-paste markers are present.
-        const PASTE_BYTE_THRESHOLD: usize = 16;
-        let use_paste_buffer = byte_len >= PASTE_BYTE_THRESHOLD || text.contains('\n');
-
+        let delivery = submit_text(text);
         tracing::debug!(target: "tmux.command",
-            "send_keys_with_delay: bytes={} lines={} max_line={} use_paste_buffer={} target={}",
-            byte_len,
-            line_count,
-            max_line,
-            use_paste_buffer,
+            "send_keys_with_delay: bytes={} lines={} paste={} target={}",
+            text.len(),
+            text.lines().count(),
+            matches!(delivery, SubmitText::Paste(_)),
             target
         );
 
-        if use_paste_buffer {
-            Self::send_via_paste_buffer(&target, text)?;
-        } else {
-            let payload = pad_slash_command_for_autocomplete(text);
-            // `--` ends option parsing so lines beginning with `-` (markdown
-            // bullets, CLI flags in prompts) are not misread as tmux flags.
-            Self::tmux_send(&target, &["-l", "--", &payload])?;
+        match delivery {
+            SubmitText::Paste(text) => Self::send_via_paste_buffer(&target, text)?,
+            SubmitText::Literal(payload) => {
+                let (head, semis) = peel_trailing_semicolons(&payload);
+                if !head.is_empty() {
+                    // `--` so lines starting with `-` are not read as tmux flags.
+                    Self::tmux_send(&target, &["-l", "--", head])?;
+                }
+                if semis > 0 {
+                    self.send_raw_bytes(&vec![b';'; semis])?;
+                }
+            }
         }
 
         if enter_delay_ms > 0 {
@@ -2345,8 +2323,8 @@ impl Session {
     /// gemini, and most modern TUI agent CLIs do). For panes that do *not*
     /// enable bracketed paste (raw shells, simple REPLs), embedded newlines
     /// will arrive as literal CRs and submit per line. If a future agent
-    /// integration hits this, the fallback is to short-circuit the
-    /// `use_paste_buffer` branch above for that agent and keep the per-line
+    /// integration hits this, the fallback is to short-circuit
+    /// [`SubmitText::Paste`] for that agent and keep the per-line
     /// Shift+Enter path.
     fn send_via_paste_buffer(target: &str, text: &str) -> Result<()> {
         static SEND_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -2575,15 +2553,35 @@ impl Drop for EphemeralEnvFile {
     }
 }
 
-/// Whether `text` should get a trailing space appended before being typed
-/// via the literal (non-paste-buffer) keystroke path in
-/// [`Session::send_keys_with_delay`]. A message that opens with `/` triggers
-/// some agents' own slash-command autocomplete dropdown (e.g. opencode); the
-/// dropdown then consumes the terminating `Enter` sent after this payload as
-/// navigation instead of submit, leaving the command typed but never
-/// delivered. A trailing space closes the dropdown as it's typed, so the
-/// following `Enter` submits normally instead. Every other message keeps its
-/// exact bytes. Pure so the padding decision is unit-testable without tmux.
+/// How [`Session::send_keys_with_delay`] delivers `text` before its Enter.
+pub(crate) enum SubmitText<'a> {
+    /// Beyond a few characters, or multi-line: an Enter right after literal keystrokes
+    /// can land inside the agent's paste-burst window and insert a newline instead.
+    Paste(&'a str),
+    /// Typed literally, padded so a leading `/` cannot leave autocomplete open.
+    Literal(std::borrow::Cow<'a, str>),
+}
+
+pub(crate) fn submit_text(text: &str) -> SubmitText<'_> {
+    const PASTE_BYTE_THRESHOLD: usize = 16;
+    if text.len() >= PASTE_BYTE_THRESHOLD || text.contains('\n') {
+        SubmitText::Paste(text)
+    } else {
+        SubmitText::Literal(pad_slash_command_for_autocomplete(text))
+    }
+}
+
+/// Split a literal payload into its leading content and the count of trailing `;` bytes.
+/// tmux drops a trailing `;` from a `send-keys -l` payload, reading it as a command
+/// separator even after `--` (#1942), so callers send `head` literally and the
+/// semicolons as raw bytes. Embedded and leading semicolons survive untouched.
+pub(crate) fn peel_trailing_semicolons(s: &str) -> (&str, usize) {
+    let head = s.trim_end_matches(';');
+    (head, s.len() - head.len())
+}
+
+/// A leading `/` opens some agents' autocomplete, which would eat the Enter;
+/// a trailing space closes it.
 fn pad_slash_command_for_autocomplete(text: &str) -> std::borrow::Cow<'_, str> {
     if text.trim_start().starts_with('/') {
         std::borrow::Cow::Owned(format!("{text} "))
@@ -2873,6 +2871,22 @@ mod tests {
             "{what} for {} never painted {needle:?}; last seen: {last:?}",
             session.name
         );
+    }
+
+    #[test]
+    fn peel_trailing_semicolons_splits_trailing_run_only() {
+        // tmux eats a trailing `;` from a `send-keys -l` payload, so callers peel
+        // the trailing run and sends it as raw hex (#1942).
+        assert_eq!(peel_trailing_semicolons(";"), ("", 1));
+        assert_eq!(peel_trailing_semicolons("ls;"), ("ls", 1));
+        assert_eq!(peel_trailing_semicolons(";;"), ("", 2));
+        assert_eq!(peel_trailing_semicolons("a;;"), ("a", 2));
+        // Embedded and leading semicolons survive `-l`, so they stay on the
+        // literal head and nothing is peeled.
+        assert_eq!(peel_trailing_semicolons("a;b"), ("a;b", 0));
+        assert_eq!(peel_trailing_semicolons(";a"), (";a", 0));
+        assert_eq!(peel_trailing_semicolons("hello"), ("hello", 0));
+        assert_eq!(peel_trailing_semicolons(""), ("", 0));
     }
 
     #[test]

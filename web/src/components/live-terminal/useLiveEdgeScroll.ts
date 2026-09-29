@@ -33,14 +33,15 @@ export function useLiveEdgeScroll({
   useEffect(() => {
     cursorAnchorRef.current = null;
   }, [lineH]);
-  // The live-edge scroll target is the bottom, except while the keyboard has shrunk the container: then the
-  // cursor is anchored near the viewport bottom so the agent's prompt stays visible.
+  // The live-edge scroll target is the bottom. Only when the keyboard has shrunk the container so far that the
+  // bottom would hide the cursor is the cursor anchored near the viewport bottom, so the agent's prompt stays
+  // visible; otherwise what an agent draws below its prompt (a subagent list, a status line) stays in view.
   const liveScrollTarget = useCallback(
     (el: HTMLDivElement) => {
       const bottom = Math.max(0, el.scrollHeight - el.clientHeight);
       const shrunken = latchRef.current.maxHeight - el.clientHeight > lineH * 1.5;
       const anchor = cursorAnchorRef.current;
-      if (!shrunken || anchor == null) return bottom;
+      if (!shrunken || anchor == null || anchor >= bottom) return bottom;
       // One spare line keeps the input box border visible.
       return Math.min(bottom, Math.max(0, anchor + 2 * lineH - el.clientHeight));
     },

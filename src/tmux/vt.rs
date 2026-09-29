@@ -829,6 +829,31 @@ pub(crate) fn try_send_input(session: &str, bytes: &[u8]) -> bool {
         .unwrap_or(false)
 }
 
+/// Paste `text` through `session`'s input channel as `paste-buffer -p` would, so it
+/// keeps its order with keystrokes on the same socket. `false` when no input-capable
+/// channel is live.
+pub(crate) fn try_send_paste(session: &str, text: &str) -> bool {
+    let Some(channel) = lookup(session).filter(|c| c.input && c.is_alive()) else {
+        return false;
+    };
+    let bracketed = channel
+        .parser
+        .lock()
+        .is_ok_and(|p| p.screen().bracketed_paste());
+    channel.write_input(&paste_bytes(text, bracketed))
+}
+
+/// tmux's paste: LF becomes CR, wrapped in bracketed-paste markers only when the pane
+/// enabled DECSET 2004.
+fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
+    let body = text.replace('\n', "\r");
+    if bracketed {
+        format!("\x1b[200~{body}\x1b[201~").into_bytes()
+    } else {
+        body.into_bytes()
+    }
+}
+
 /// Single-quote a path for the `/bin/sh -c` line `tmux pipe-pane` runs.
 fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
@@ -3899,6 +3924,13 @@ pub(crate) fn unregister_for_test(name: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn paste_bytes_mirror_tmux_paste_buffer() {
+        assert_eq!(paste_bytes("a\nb", false), b"a\rb");
+        assert_eq!(paste_bytes("a\nb", true), b"\x1b[200~a\rb\x1b[201~");
+        assert_eq!(paste_bytes("", true), b"\x1b[200~\x1b[201~");
+    }
 
     #[test]
     fn pipe_owner_ids_are_unique_per_channel_generation() {
