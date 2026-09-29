@@ -90,7 +90,7 @@ export function ScratchOverridesModal({ profile, onClose }: Props) {
     <Dialog
       id="scratch-overrides-modal"
       title="Scratch session settings"
-      describeBody={false}
+      describedBy={false}
       onDismiss={close}
       footer={
         <>

@@ -2,6 +2,9 @@ import { useRef, useState } from "react";
 import { CancelButton, ConfirmButton, Dialog } from "./Dialog";
 import { useDialogFocus } from "./dialogHooks";
 
+const DIALOG_ID = "session-group-modal";
+const PROMPT_ID = `${DIALOG_ID}-prompt`;
+
 interface Props {
   sessionTitle: string;
   currentGroup: string;
@@ -31,9 +34,9 @@ export function SessionGroupModal({ sessionTitle, currentGroup, onSave, onClose 
 
   return (
     <Dialog
-      id="session-group-modal"
+      id={DIALOG_ID}
       title="Edit group"
-      describeBody={false}
+      describedBy={PROMPT_ID}
       bodyClassName="px-5 py-4 space-y-3"
       onDismiss={() => !saving && onClose()}
       footer={
@@ -50,7 +53,7 @@ export function SessionGroupModal({ sessionTitle, currentGroup, onSave, onClose 
         </>
       }
     >
-      <p className="text-[13px] text-text-secondary">
+      <p id={PROMPT_ID} className="text-[13px] text-text-secondary">
         Move <span className="text-text-primary">{sessionTitle}</span> to a group.
       </p>
       <input

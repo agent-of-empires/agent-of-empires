@@ -1845,7 +1845,7 @@
         "web/src/components/SessionGroupModal.tsx",
         "web/src/components/DeleteSessionDialog.tsx"
       ],
-      "notes": "The shared Dialog links its body as the accessible description; form and list bodies opt out."
+      "notes": "The shared Dialog links its body as the accessible description; bodies with controls point it at their prompt, and ScratchOverridesModal opts out."
     },
     {
       "id": "acp.tool-group-chunking",
