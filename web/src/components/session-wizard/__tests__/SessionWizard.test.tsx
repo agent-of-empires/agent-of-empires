@@ -205,6 +205,23 @@ describe("SessionWizard rows", () => {
     expect((screen.getByRole("switch", { name: "Create a worktree" }) as HTMLButtonElement).disabled).toBe(true);
   });
 
+  // A blocked switch left on shows on, matching the create payload, and can be turned off.
+  it.each([
+    [[agent("settl", { host_only: true })], "Run in a safe container", "settl runs on the host only"],
+    [undefined, "Run in a safe container", "Docker is not running"],
+    [[agent("settl", { host_only: true })], "Create a worktree", "settl runs on the host only"],
+  ])("a blocked switch left on shows on and turns off: %#", async (agents, name, reason) => {
+    if (agents) vi.mocked(fetchAgents).mockResolvedValueOnce(agents);
+    const tool = agents ? "settl" : "claude";
+    renderWizard({ path: "/tmp/proj", tool, sandboxEnabled: true, worktreeEnabled: true });
+    const toggle = () => screen.getByRole("switch", { name }) as HTMLButtonElement;
+    await waitFor(() => expect(toggle().closest("div")!.textContent).toContain(reason));
+    expect(toggle().getAttribute("aria-checked")).toBe("true");
+    fireEvent.click(toggle());
+    await waitFor(() => expect(toggle().disabled).toBe(true));
+    expect(toggle().getAttribute("aria-checked")).toBe("false");
+  });
+
   it("opens the project picker with no project, and returns to the form on a pick", async () => {
     renderWizard({});
     fireEvent.click((await screen.findByText("/tmp/proj")).closest("button")!);

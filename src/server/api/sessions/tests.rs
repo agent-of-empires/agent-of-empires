@@ -4331,3 +4331,120 @@ async fn permanent_delete_keeps_a_worktree_a_surviving_session_uses() {
             .all(|i| i.id != owner.id));
     }
 }
+
+async fn post_create(
+    state: &std::sync::Arc<AppState>,
+    body: serde_json::Value,
+) -> (axum::http::StatusCode, serde_json::Value) {
+    use axum::response::IntoResponse;
+    let response = create_session(
+        axum::extract::State(state.clone()),
+        axum::extract::Query(CreateSessionQuery { wait: None }),
+        Ok(axum::Json(serde_json::from_value(body).unwrap())),
+    )
+    .await
+    .into_response();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (status, serde_json::from_slice(&bytes).unwrap())
+}
+
+async fn wait_for(what: &str, mut ready: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !ready() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for {what}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+/// A client that drops mid-create (a backgrounded mobile tab) must not abandon
+/// it, and its same-key retry joins the running create instead of starting another.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_dropped_create_finishes_and_its_retry_returns_the_same_session() {
+    use crate::server::test_support as support;
+    let _home = crate::session::test_support::isolate_app_dir();
+    let gate = tempfile::tempdir().unwrap();
+    let (ready, release) = (gate.path().join("ready"), gate.path().join("release"));
+    let hook = format!(
+        ": > '{}'; while [ ! -e '{}' ]; do sleep 0.01; done; echo hook-done",
+        ready.display(),
+        release.display()
+    );
+    let project = project_with_on_create_hooks(&[hook.as_str()]);
+    support::seed_instances_on_disk_for_test("test", Vec::new());
+    let (launcher, _launches) = support::counting_failing_launcher();
+    let state = support::build_test_app_state_with_launcher(Vec::new(), launcher);
+    let body = serde_json::json!({
+        "title": "detached-create", "path": project.path(), "tool": "claude",
+        "view": "structured", "profile": "test", "trust_hooks": true,
+        "idempotency_key": "drop-me",
+    });
+
+    let first = tokio::spawn({
+        let (state, body) = (state.clone(), body.clone());
+        async move { post_create(&state, body).await }
+    });
+    wait_for("the on_create hook to start", || ready.exists()).await;
+    let progress = state
+        .create_progress
+        .snapshot("drop-me")
+        .expect("progress while running");
+    assert_eq!(progress.hook.as_deref(), Some(hook.as_str()));
+    first.abort();
+    assert!(first.await.unwrap_err().is_cancelled());
+
+    let retry = tokio::spawn({
+        let state = state.clone();
+        async move { post_create(&state, body).await }
+    });
+    std::fs::write(&release, "").unwrap();
+    let (status, session) = retry.await.unwrap();
+
+    assert_eq!(status, axum::http::StatusCode::OK, "{session}");
+    let rows = support::load_instances_from_disk_for_test("test");
+    let created: Vec<_> = rows
+        .iter()
+        .filter(|r| r.title == "detached-create")
+        .collect();
+    assert_eq!(
+        created.len(),
+        1,
+        "the retry must not create a second session"
+    );
+    assert_eq!(session["id"], created[0].id.as_str());
+    assert!(state.create_progress.snapshot("drop-me").is_none());
+}
+
+/// A retry whose first response was lost gets that failure back rather than
+/// running the create again; a fresh key runs it.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_failed_create_is_replayed_to_a_same_key_retry() {
+    use crate::server::test_support as support;
+    let _home = crate::session::test_support::isolate_app_dir();
+    support::seed_instances_on_disk_for_test("test", Vec::new());
+    let (launcher, _launches) = support::counting_failing_launcher();
+    let state = support::build_test_app_state_with_launcher(Vec::new(), launcher);
+    let parent = tempfile::tempdir().unwrap();
+    let path = parent.path().join("later");
+    let body = |key: &str| {
+        serde_json::json!({
+            "title": "replayed", "path": path, "tool": "claude",
+            "view": "structured", "profile": "test", "idempotency_key": key,
+        })
+    };
+
+    let (status, failed) = post_create(&state, body("k1")).await;
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{failed}");
+    // A re-run would now succeed, so a matching 400 proves the replay.
+    std::fs::create_dir_all(&path).unwrap();
+    assert_eq!(post_create(&state, body("k1")).await, (status, failed));
+    let (fresh, session) = post_create(&state, body("k2")).await;
+    assert_eq!(fresh, axum::http::StatusCode::CREATED, "{session}");
+}

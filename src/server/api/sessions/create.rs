@@ -960,6 +960,9 @@ pub async fn create_session(
         if let Some(resp) = existing {
             return (StatusCode::OK, Json(resp)).into_response();
         }
+        if let Some(failure) = state.create_progress.recent_failure(key) {
+            return api_error(failure.status, failure.code, failure.message);
+        }
         Some(guard)
     } else {
         None
@@ -998,7 +1001,7 @@ pub async fn create_session(
         trust_hooks: body.trust_hooks,
         custom_instruction: body.custom_instruction,
         callback_url: body.callback_url,
-        idempotency_key: body.idempotency_key,
+        idempotency_key: body.idempotency_key.clone(),
         profile,
         // Never decoded from the request body: only the plugin host path
         // stamps these, through create_structured_session (#2897).
@@ -1019,13 +1022,21 @@ pub async fn create_session(
     // mobile tab) cannot cancel it between persisting and publishing. The guard
     // and registration move with it, so a retry with the same key waits for
     // this create and then finds its session.
-    let service = Arc::clone(&state.session_service);
+    let task_state = Arc::clone(&state);
+    let key = body.idempotency_key;
     let created = tokio::spawn(async move {
         let _idempotency_guard = _idempotency_guard;
         let _progress = progress;
-        service
+        let result = task_state
+            .session_service
             .create_structured_session(spec, None, None, None)
-            .await
+            .await;
+        if let (Err(e), Some(key)) = (&result, &key) {
+            if let Some(failure) = create_failure(e) {
+                task_state.create_progress.record_failure(key, failure);
+            }
+        }
+        result
     })
     .await
     .unwrap_or_else(|e| {
@@ -1078,17 +1089,6 @@ pub async fn create_session(
             (StatusCode::CREATED, Json(resp)).into_response()
         }
         Err(e) => {
-            // A build-task panic keeps its 500; a plain build failure is a 400.
-            if let Some(panicked) =
-                e.downcast_ref::<crate::server::session_spawn::SessionBuildPanicked>()
-            {
-                tracing::error!(target: "http.api.sessions", "Session creation panicked: {}", panicked.0);
-                return api_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "internal",
-                    "Internal server error",
-                );
-            }
             // A repo whose hooks need approval gets a structured response so the
             // caller can surface the commands and resubmit (#2066).
             if let Some(needs_trust) = e.downcast_ref::<HooksNeedTrust>() {
@@ -1105,14 +1105,44 @@ pub async fn create_session(
                 )
                     .into_response();
             }
-            tracing::warn!(target: "http.api.sessions", "Session creation failed: {}", e);
-            api_error(
-                StatusCode::BAD_REQUEST,
-                "create_failed",
-                public_create_session_error(&e),
-            )
+            if let Some(panicked) =
+                e.downcast_ref::<crate::server::session_spawn::SessionBuildPanicked>()
+            {
+                tracing::error!(target: "http.api.sessions", "Session creation panicked: {}", panicked.0);
+            } else {
+                tracing::warn!(target: "http.api.sessions", "Session creation failed: {}", e);
+            }
+            let failure = create_failure(&e).expect("hooks_need_trust returned above");
+            api_error(failure.status, failure.code, failure.message)
         }
     }
+}
+
+/// The response for a failed create; `None` for a trust refusal, which the
+/// caller resubmits with the same key.
+fn create_failure(e: &anyhow::Error) -> Option<crate::server::create_progress::CreateFailure> {
+    use crate::server::create_progress::CreateFailure;
+    if e.downcast_ref::<HooksNeedTrust>().is_some() {
+        return None;
+    }
+    // A build-task panic keeps its 500; a plain build failure is a 400.
+    Some(
+        if e.downcast_ref::<crate::server::session_spawn::SessionBuildPanicked>()
+            .is_some()
+        {
+            CreateFailure {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                code: "internal",
+                message: "Internal server error".to_string(),
+            }
+        } else {
+            CreateFailure {
+                status: StatusCode::BAD_REQUEST,
+                code: "create_failed",
+                message: public_create_session_error(e),
+            }
+        },
+    )
 }
 
 /// `GET /api/sessions/create-progress/{key}`: stage and hook output of an

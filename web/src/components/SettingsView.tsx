@@ -561,7 +561,7 @@ export function SettingsView({
                 focusRequest={focusRequest}
                 values={session}
                 onSaveField={saveSubField}
-                advancedSubtitle="Idle auto-stop, attach modes, live-send, and other session tuning."
+                advancedSubtitle="Idle auto-stop, sleep inhibit, session-id polling, and other session tuning."
               />
             )}
           </div>

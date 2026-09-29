@@ -13,7 +13,7 @@ It speaks the [Agent Client Protocol](https://agentclientprotocol.com/) (ACP), a
 
 ## Supported agents
 
-aoe ships an ACP registry entry for each tool whose ACP server we have verified. For those the web wizard shows a per-session **Use structured view** toggle (on by default) under **More options**.
+aoe ships an ACP registry entry for each tool whose ACP server we have verified. For those the web wizard shows a per-session **Structured** switch (on by default).
 
 | Agent | ACP adapter | Install | Auth |
 |-------|-------------|---------|------|

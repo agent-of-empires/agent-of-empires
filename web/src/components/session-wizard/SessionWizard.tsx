@@ -380,12 +380,15 @@ export function SessionWizard({ onClose, onCreated, onCreatedInBackground, prefi
   const selectedAgent = state.agents.find((a) => a.name === d.tool);
   const acpCapable = isAcpEligible(d.tool, selectedAgent);
   const isHostOnly = selectedAgent?.host_only ?? false;
-  const worktreeBlocked = d.scratch ? "not for scratch sessions" : !d.pathIsGitRepo ? "not a git repository" : null;
-  const sandboxBlocked = isHostOnly
-    ? `${d.tool} runs on the host only`
-    : !state.dockerAvailable
-      ? "Docker is not running"
-      : null;
+  const hostOnlyReason = `${d.tool} runs on the host only`;
+  const worktreeBlocked = d.scratch
+    ? "not for scratch sessions"
+    : !d.pathIsGitRepo
+      ? "not a git repository"
+      : isHostOnly
+        ? hostOnlyReason
+        : null;
+  const sandboxBlocked = isHostOnly ? hostOnlyReason : !state.dockerAvailable ? "Docker is not running" : null;
   const agentCustomized = !!(d.extraArgs || d.commandOverride || d.customInstruction);
   const openPanel = (next: Panel) => () => setPanel(next);
 
@@ -523,9 +526,10 @@ export function SessionWizard({ onClose, onCreated, onCreatedInBackground, prefi
           label="Worktree"
           switchLabel="Create a worktree"
           testId="wizard-worktree-row"
-          checked={!worktreeBlocked && d.useWorktree}
+          // A blocked switch left on still shows on and can be turned off; it is what the create sends.
+          checked={d.useWorktree}
           onChange={(v) => handleChange("useWorktree", v)}
-          disabled={!!worktreeBlocked}
+          disabled={!!worktreeBlocked && !d.useWorktree}
           summary={worktreeBlocked ?? (d.useWorktree ? worktreeSummary(d) : "run in the repo folder")}
           onConfigure={!worktreeBlocked && d.useWorktree ? openPanel("worktree") : undefined}
         />
@@ -533,9 +537,9 @@ export function SessionWizard({ onClose, onCreated, onCreatedInBackground, prefi
           label="Sandbox"
           switchLabel="Run in a safe container"
           testId="wizard-sandbox-row"
-          checked={!sandboxBlocked && d.sandboxEnabled}
+          checked={d.sandboxEnabled}
           onChange={(v) => handleChange("sandboxEnabled", v)}
-          disabled={!!sandboxBlocked}
+          disabled={!!sandboxBlocked && !d.sandboxEnabled}
           summary={sandboxBlocked ?? (d.sandboxEnabled ? d.sandboxImage || "default image" : "run on the host")}
           onConfigure={!sandboxBlocked && d.sandboxEnabled ? openPanel("sandbox") : undefined}
         />

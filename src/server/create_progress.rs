@@ -3,6 +3,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
@@ -10,6 +11,8 @@ use crate::session::config::repo_config::HookProgress;
 
 const MAX_OUTPUT_LINES: usize = 200;
 const MAX_LINE_CHARS: usize = 400;
+/// How long a failed create's response is replayed to a retry with its key.
+const FAILURE_TTL: Duration = Duration::from_secs(600);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -78,8 +81,20 @@ impl CreateProgress {
     }
 }
 
+/// A failed create's response. A retry whose first response was lost gets it
+/// back instead of running the create, and its hooks, again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateFailure {
+    pub status: axum::http::StatusCode,
+    pub code: &'static str,
+    pub message: String,
+}
+
 #[derive(Default)]
-pub struct CreateProgressRegistry(Arc<Mutex<HashMap<String, Arc<CreateProgress>>>>);
+pub struct CreateProgressRegistry {
+    live: Arc<Mutex<HashMap<String, Arc<CreateProgress>>>>,
+    failures: Mutex<HashMap<String, (Instant, CreateFailure)>>,
+}
 
 /// Removes its key from the registry when the create finishes.
 pub struct CreateProgressRegistration {
@@ -104,23 +119,39 @@ impl Drop for CreateProgressRegistration {
 impl CreateProgressRegistry {
     pub fn register(&self, key: &str) -> CreateProgressRegistration {
         let progress = Arc::new(CreateProgress::new());
-        self.0
+        self.live
             .lock()
             .expect("create progress registry poisoned")
             .insert(key.to_string(), Arc::clone(&progress));
         CreateProgressRegistration {
-            map: Arc::clone(&self.0),
+            map: Arc::clone(&self.live),
             key: key.to_string(),
             progress,
         }
     }
 
     pub fn snapshot(&self, key: &str) -> Option<CreateProgressSnapshot> {
-        self.0
+        self.live
             .lock()
             .expect("create progress registry poisoned")
             .get(key)
             .map(|p| p.snapshot())
+    }
+
+    /// Record before the create releases its idempotency lock, so a waiting retry sees it.
+    pub fn record_failure(&self, key: &str, failure: CreateFailure) {
+        let mut failures = self.failures.lock().expect("create failures poisoned");
+        failures.retain(|_, (at, _)| at.elapsed() < FAILURE_TTL);
+        failures.insert(key.to_string(), (Instant::now(), failure));
+    }
+
+    pub fn recent_failure(&self, key: &str) -> Option<CreateFailure> {
+        self.failures
+            .lock()
+            .expect("create failures poisoned")
+            .get(key)
+            .filter(|(at, _)| at.elapsed() < FAILURE_TTL)
+            .map(|(_, failure)| failure.clone())
     }
 }
 

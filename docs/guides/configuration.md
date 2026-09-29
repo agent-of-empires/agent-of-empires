@@ -230,7 +230,7 @@ Set the same thing in the TUI under **Agents**, using `<agent>=<cmd>`, or per se
 
 A configured override also applies to plain `aoe add --cmd <agent>`, and the on-PATH check validates the resolved override binary, so a session works when only the wrapper is installed. Native conversation resume survives an override only when the command starts with the built-in's exact binary token, or is a single bare token, and contains no shell control syntax; see [session resume](session-resume.md).
 
-The web wizard previews the resolved command under **More options**, including the ACP registry args a structured view session adds (`opencode acp`). Extra args are ignored for structured view sessions, so change the command override instead.
+The web wizard previews the resolved command in its **Agent** panel, including the ACP registry args a structured view session adds (`opencode acp`). Extra args are ignored for structured view sessions, so change the command override instead.
 
 An override runs through your `$SHELL`, falling back to `bash` when `$SHELL` is unset or non-POSIX (`fish`, `nu`, `pwsh`). If your wrapper is a function or abbreviation in a non-POSIX shell, write it as a bash script or spell the command out here.
 

@@ -10,7 +10,7 @@ import {
   type ReactNode,
 } from "react";
 import { Puzzle } from "lucide-react";
-import { useMatch, useNavigate, useSearchParams } from "react-router-dom";
+import { useLocation, useMatch, useNavigate, useSearchParams } from "react-router-dom";
 import { IDLE_DECAY_WINDOW_MS } from "./lib/session";
 import { diffSelectionStale } from "./lib/diffSelection";
 import { useSessions } from "./hooks/useSessions";
@@ -343,6 +343,7 @@ function AppContent({
     void hydrateWebUiStateFromServer();
   }, []);
 
+  const location = useLocation();
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
   const { settings: webSettings } = useWebSettings();
@@ -1833,11 +1834,18 @@ function AppContent({
           onClose={handleCloseSettings}
           onSelectTab={(t) => {
             const p = searchParams.get("profile");
-            navigate(`/settings/${t}${p ? `?profile=${encodeURIComponent(p)}` : ""}`);
+            // Marks a tab opened from the mobile section list, so its Back pops to it.
+            navigate(`/settings/${t}${p ? `?profile=${encodeURIComponent(p)}` : ""}`, {
+              state: { fromSettingsList: settingsTab === null },
+            });
           }}
           onShowList={() => {
+            if ((location.state as { fromSettingsList?: boolean } | null)?.fromSettingsList) {
+              navigate(-1);
+              return;
+            }
             const p = searchParams.get("profile");
-            navigate(`/settings${p ? `?profile=${encodeURIComponent(p)}` : ""}`);
+            navigate(`/settings${p ? `?profile=${encodeURIComponent(p)}` : ""}`, { replace: true });
           }}
           onServerAboutRefresh={refreshServerAbout}
           profile={searchParams.get("profile")}

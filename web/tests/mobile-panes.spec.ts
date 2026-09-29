@@ -229,6 +229,14 @@ test.describe("Mobile settings", () => {
     await page.getByRole("button", { name: /All settings/ }).click();
     await expect(page).toHaveURL(/\/settings$/);
     await expect(list).toBeVisible();
+    // Returning to the list pops the tab rather than stacking another entry.
+    await page.goBack();
+    await expect(page).not.toHaveURL(/\/settings/);
+    await page.goto("/settings/sandbox");
+    await page.getByRole("button", { name: /All settings/ }).click();
+    await expect(list).toBeVisible();
+    await page.goBack();
+    await expect(page).not.toHaveURL(/\/settings\/sandbox$/);
 
     const header = page.getByTestId("settings-header");
     for (const width of [390, 320]) {
