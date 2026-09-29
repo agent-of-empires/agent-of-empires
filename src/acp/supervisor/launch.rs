@@ -104,7 +104,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             "spawning structured view worker"
         );
         // The hooks above may re-enter aoe, so the lifecycle lock is taken only for each check.
-        admit_durable_launch(&req).await?;
+        admit_durable_launch(session_id, req.source_profile.clone()).await?;
         // Clear a partial replay from a failed import before session/load re-emits it.
         if config.seed_history_replay {
             self.sink.clear_session_events(session_id);
@@ -134,7 +134,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         };
 
         // A peer that archived or trashed the row during the handshake wins: retire the runner.
-        if let Err(refused) = admit_durable_launch(&req).await {
+        if let Err(refused) = admit_durable_launch(session_id, req.source_profile.clone()).await {
             drop(client);
             self.reap_failed_launch(&lease).await;
             return Err(refused);
@@ -724,14 +724,17 @@ pub(super) fn publish_rejection(err: &AcpError, mut publish: impl FnMut(Event)) 
     true
 }
 
-/// Recheck the stored row under its lifecycle lock: the caller's check ran before
-/// `spawn_config` awaited the `before_session` hook. Refuses an archived or trashed row, or one
-/// purged since. A request without a source profile has no stored row to check.
-async fn admit_durable_launch(req: &SpawnRequest) -> Result<(), SupervisorError> {
-    let Some(profile) = req.source_profile.clone() else {
+/// Recheck the stored row under its lifecycle lock, after any awaited `before_session` hook.
+/// Refuses an archived or trashed row, or one purged since. A launch without a source profile
+/// has no stored row to check.
+pub(super) async fn admit_durable_launch(
+    session_id: &str,
+    source_profile: Option<String>,
+) -> Result<(), SupervisorError> {
+    let Some(profile) = source_profile else {
         return Ok(());
     };
-    let session_id = req.session_id.clone();
+    let session_id = session_id.to_string();
     let spawn_error = |e: anyhow::Error| {
         SupervisorError::Acp(AcpError::Spawn(format!("launch admission: {e:#}")))
     };

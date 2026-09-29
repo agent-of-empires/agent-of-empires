@@ -11,14 +11,14 @@ use tracing::{debug, info, warn};
 
 use super::agents::log_wrapper_substitution;
 use super::launch::{
-    apply_claude_store_pin, before_session_env, overlay_env, publish_rejection,
-    refresh_spawn_model_effort, resolve_mcp_servers,
+    admit_durable_launch, apply_claude_store_pin, before_session_env, overlay_env,
+    publish_rejection, refresh_spawn_model_effort, resolve_mcp_servers,
 };
 use super::teardown::{settle_lease, tear_down_replacement, tear_down_runner, wait_for_exit};
 use super::{
     lock_recover, next_seq, BroadcastSink, Launcher, PendingContextReset, ResumeReservation,
-    SeqMap, SharedSet, Supervisor, WorkerKind, Workers, MAX_RESPAWNS_IN_WINDOW, RESPAWN_BACKOFF,
-    RESTART_WINDOW,
+    SeqMap, SharedSet, Supervisor, SupervisorError, WorkerKind, Workers, MAX_RESPAWNS_IN_WINDOW,
+    RESPAWN_BACKOFF, RESTART_WINDOW,
 };
 use crate::acp::acp_client::{AcpError, SpawnConfig};
 use crate::acp::runner_lifecycle::{
@@ -391,6 +391,12 @@ impl<S: BroadcastSink> Drain<S> {
         }
 
         Self::refresh_launch_env(&self.session_id, &mut config).await;
+        // The hook above may re-enter aoe, so the lifecycle lock is taken only for each check.
+        let admission = admit_durable_launch(session_id, config.source_profile.clone()).await;
+        if let Err(refused) = admission {
+            self.refuse_respawn(&respawn_lease, None, refused).await;
+            return None;
+        }
         if let Some((wrapper, base)) = &config.wrapper_substitution {
             log_wrapper_substitution(session_id, &config.tool, wrapper, base);
         }
@@ -402,6 +408,17 @@ impl<S: BroadcastSink> Drain<S> {
                 return None;
             }
         };
+        // A peer that archived or trashed the row during the handshake wins: retire the runner.
+        let admission = admit_durable_launch(session_id, config.source_profile.clone()).await;
+        if let Err(refused) = admission {
+            let identity = client.runner_pid().map(|pid| RunnerIdentity {
+                pid,
+                generation: respawn_lease.epoch(),
+            });
+            let _ = client.shutdown().await;
+            self.refuse_respawn(&respawn_lease, identity, refused).await;
+            return None;
+        }
         let Some(inbound) = client.take_inbound() else {
             warn!(
                 target: "acp.supervisor",
@@ -605,6 +622,45 @@ impl<S: BroadcastSink> Drain<S> {
             .await;
             settle_lease(&self.lifecycle, &self.notify, respawn_lease, settlement);
         }
+    }
+
+    /// The stored row was archived, trashed or purged since the crash: retire any replacement
+    /// this respawn launched and leave the session stopped.
+    async fn refuse_respawn(
+        &self,
+        respawn_lease: &Lease,
+        launched: Option<RunnerIdentity>,
+        refused: SupervisorError,
+    ) {
+        let session_id = &self.session_id;
+        info!(
+            target: "acp.supervisor",
+            session = %session_id,
+            "respawn refused: {refused}"
+        );
+        self.workers.lock().await.remove(session_id);
+        let launched = launched.or_else(|| {
+            worker_registry::load(session_id)
+                .ok()
+                .flatten()
+                .filter(|r| r.generation == respawn_lease.epoch())
+                .map(|r| RunnerIdentity {
+                    pid: r.pid,
+                    generation: r.generation,
+                })
+        });
+        if launched.is_some() && lock_recover(&self.lifecycle).convert_to_stopping(respawn_lease) {
+            let settlement = tear_down_runner(&*self.process_control, session_id, launched).await;
+            settle_lease(&self.lifecycle, &self.notify, respawn_lease, settlement);
+        }
+        self.publish(match refused {
+            SupervisorError::Blocked(blocked) => Event::Stopped {
+                reason: blocked.code().into(),
+            },
+            other => Event::AgentStartupError {
+                message: format!("ACP agent respawn refused: {other}"),
+            },
+        });
     }
 
     /// Honor a stop that raced the respawn: retire the replacement and the runner it replaced.
@@ -1069,6 +1125,127 @@ mod tests {
             sup.take_respawned_in_place().is_empty(),
             "a retired replacement never reached the agent"
         );
+    }
+
+    /// #4206: a row archived or trashed while the crash respawn awaits its `before_session` hook
+    /// never reaches the launcher; one dismissed during the handshake retires the replacement.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn crash_respawn_refuses_a_row_shelved_during_hook_or_handshake() {
+        use crate::session::StartBlocked;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (_home, temp) = isolate_home();
+        let app_dir = crate::session::get_app_dir().unwrap();
+        std::fs::create_dir_all(&app_dir).unwrap();
+        let shelves: [(fn(&mut crate::session::Instance), StartBlocked); 2] = [
+            (crate::session::Instance::archive, StartBlocked::Archived),
+            (crate::session::Instance::trash, StartBlocked::Trashed),
+        ];
+        for (shelve, want) in shelves {
+            for during_hook in [true, false] {
+                let id = format!("s-{}-{}", want.code(), during_hook);
+                let ready = temp.path().join(format!("{id}-ready"));
+                let release = temp.path().join(format!("{id}-release"));
+                let hook = if during_hook {
+                    format!(
+                        "[host_hooks]\nbefore_session = \": > {}; while [ ! -e {} ]; do sleep 0.01; done\"\n",
+                        ready.display(),
+                        release.display(),
+                    )
+                } else {
+                    String::new()
+                };
+                std::fs::write(app_dir.join("config.toml"), hook).unwrap();
+
+                let control = Arc::new(
+                    crate::acp::runner_lifecycle::test_support::FakeProcessControl::default(),
+                );
+                control.alive(4242).alive(4343);
+                let gate = Gate::default();
+                let launches = Arc::new(AtomicUsize::new(0));
+                let launcher: Launcher = {
+                    let inner = gated_launcher(&gate, 4343);
+                    let launches = Arc::clone(&launches);
+                    Arc::new(move |config, session_id| {
+                        launches.fetch_add(1, Ordering::SeqCst);
+                        inner(config, session_id)
+                    })
+                };
+                let sink = VecSink::new();
+                let sup = Arc::new(
+                    Supervisor::new(sink.clone())
+                        .with_process_control(control.clone())
+                        .with_launcher(launcher),
+                );
+                let mut inst = crate::session::Instance::new(&id, "/tmp");
+                inst.id = id.clone();
+                let storage = crate::session::Storage::new_unwatched(&inst.source_profile).unwrap();
+                storage
+                    .update(|rows, _| {
+                        *rows = vec![inst.clone()];
+                        Ok(())
+                    })
+                    .unwrap();
+                save_record(&id, 4242, 0);
+                let mut config = runner_config(worker_registry::socket_path_for(&id).unwrap());
+                config.source_profile = Some(inst.source_profile.clone());
+                let lease = sup
+                    .test_install_runner(
+                        &id,
+                        config,
+                        Some(RunnerIdentity {
+                            pid: 4242,
+                            generation: 0,
+                        }),
+                    )
+                    .await;
+                let (inbound_tx, inbound_rx) = mpsc::channel::<Event>(4);
+                let drain = sup.start_drain_task(id.clone(), lease, inbound_rx, None);
+                drop(inbound_tx);
+
+                if during_hook {
+                    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+                    while !ready.exists() {
+                        assert!(tokio::time::Instant::now() < deadline, "{id}: hook not run");
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                } else {
+                    gate.entered.notified().await;
+                }
+                {
+                    let _lock = storage.acquire_instance_lifecycle_lock(&id).unwrap();
+                    storage
+                        .update(|rows, _| {
+                            shelve(&mut rows[0]);
+                            Ok(())
+                        })
+                        .unwrap();
+                }
+                std::fs::write(&release, b"release").unwrap();
+                gate.open.notify_one();
+
+                tokio::time::timeout(Duration::from_secs(10), drain)
+                    .await
+                    .unwrap_or_else(|_| panic!("{id}: drain task must finish"))
+                    .unwrap();
+                let expected_launches = usize::from(!during_hook);
+                assert_eq!(launches.load(Ordering::SeqCst), expected_launches, "{id}");
+                assert_eq!(
+                    control.signals().contains(&(4343, "TERM")),
+                    !during_hook,
+                    "{id}: the handshake's replacement is retired: {:?}",
+                    control.signals()
+                );
+                assert!(!sup.workers.lock().await.contains_key(&id), "{id}");
+                assert_eq!(sup.worker_state(&id).await, AcpWorkerState::Absent, "{id}");
+                assert!(sup.take_respawned_in_place().is_empty(), "{id}");
+                assert_eq!(stopped_reasons(&sink, &id), vec![want.code().to_string()]);
+                let stored = storage.load().unwrap().remove(0);
+                assert_eq!(stored.ensure_startable(), Err(want), "{id}");
+            }
+        }
+        let _ = std::fs::remove_file(app_dir.join("config.toml"));
     }
 
     /// The reconciler reads this flag to remind the agent its `Monitor` died.
