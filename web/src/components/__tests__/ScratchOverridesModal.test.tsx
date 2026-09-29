@@ -44,6 +44,8 @@ describe("ScratchOverridesModal", () => {
     await waitFor(() => expect(mockFetchGlobal).toHaveBeenCalled());
     await waitFor(() => expect(smartRenameSelect().value).toBe("off"));
     expect(mockFetchProfile).not.toHaveBeenCalled();
+    // A form body is not read out as the dialog's description.
+    expect(screen.getByRole("dialog").hasAttribute("aria-describedby")).toBe(false);
   });
 
   it("re-fetches the profile scope's override when the scope toggle is switched", async () => {
