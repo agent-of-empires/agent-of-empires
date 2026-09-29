@@ -1,5 +1,6 @@
 //! Shared session deletion logic used by CLI, TUI, and web server.
 
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -747,6 +748,25 @@ fn other_sessions_paths(instances: &[Instance], except_ids: &[&str]) -> Vec<Path
 /// anything, so it never conflicts. A *candidate* that does not exist yet is
 /// still compared lexically, which is what catches a fresh directory created
 /// underneath an existing peer parent.
+/// Canonical form of a path that need not exist yet, resolved through the
+/// deepest ancestor that does. A candidate about to be created has no canonical
+/// form of its own, but the directory it will land in has one, and on macOS a
+/// temporary path is itself an alias: `/var` resolves to `/private/var`.
+fn resolve_through_existing_ancestor(path: &Path) -> Option<PathBuf> {
+    let mut missing: Vec<&OsStr> = Vec::new();
+    let mut current = path;
+    loop {
+        if let Ok(resolved) = current.canonicalize() {
+            return Some(missing.iter().rev().fold(resolved, |mut acc, part| {
+                acc.push(part);
+                acc
+            }));
+        }
+        missing.push(current.file_name()?);
+        current = current.parent()?;
+    }
+}
+
 fn paths_overlap(left: &Path, right: &Path) -> bool {
     if left == right {
         return true;
@@ -764,9 +784,16 @@ fn paths_overlap(left: &Path, right: &Path) -> bool {
         // matters, a missing candidate under an existing peer parent. An
         // existing path with an unresolved alias is not proof of separation, so
         // the reverse direction counts too.
-        (Some(resolved), None) => [left, &resolved]
-            .iter()
-            .any(|peer| peer.starts_with(right) || right.starts_with(peer)),
+        (Some(peer), None) => {
+            let candidate = resolve_through_existing_ancestor(right);
+            let conflicts = |owner: &Path| {
+                [Some(right.to_path_buf()), candidate.clone()]
+                    .into_iter()
+                    .flatten()
+                    .any(|other| owner.starts_with(&other) || other.starts_with(owner))
+            };
+            conflicts(left) || conflicts(&peer)
+        }
     }
 }
 fn paths_overlap_destructive(left: &Path, right: &Path) -> bool {
@@ -1777,6 +1804,25 @@ mod tests {
         assert!(
             paths_overlap(&recorded, &candidate),
             "the recorded spelling and the candidate name different parents"
+        );
+    }
+
+    /// The macOS shape: the candidate's own parent is reached through an alias,
+    /// `/var` being `/private/var` there. Resolving only the peer cannot see it.
+    #[test]
+    fn missing_candidate_behind_its_own_alias_still_conflicts() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().join("private");
+        let peer = base.join("real/peer");
+        std::fs::create_dir_all(&peer).unwrap();
+        std::os::unix::fs::symlink(&base, temp.path().join("var")).unwrap();
+
+        let candidate = temp.path().join("var/real/peer/not-created-yet");
+        assert!(!candidate.exists());
+
+        assert!(
+            paths_overlap(&peer, &candidate),
+            "the candidate's parent is an alias of the peer's"
         );
     }
 
