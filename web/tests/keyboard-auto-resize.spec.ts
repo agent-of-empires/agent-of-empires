@@ -4,7 +4,7 @@ import { devices, type Page } from "@playwright/test";
 import { mockTerminalApis, type MockHandle } from "./helpers/terminal-mocks";
 
 // #1432: the soft keyboard shrinks the mobile terminal visually but never resizes tmux (that flashed and clipped
-// scrollback). Rows latch to the no-keyboard height and the cursor stays near the viewport bottom. iOS Safari
+// scrollback). Rows latch to the no-keyboard height and the prompt stays in view. iOS Safari
 // pads by the live occlusion; where 100dvh shrinks natively the live view adds no inset.
 
 test.use({ ...devices["iPhone 13"] });
@@ -133,6 +133,28 @@ test.describe("Keyboard auto-resize (#1432)", () => {
     await expect(page.getByRole("button", { name: "Back to live" })).toHaveCount(0);
   });
 
+  test("the keyboard keeps a subagent list drawn below the prompt in view when it fits", async ({ page }) => {
+    const handle = await mockTerminalApis(page);
+    await openSession(page, handle);
+    const rows = lastResize(handle)!.rows;
+    // Claude Code lists running subagents under its input box.
+    const lines = Array.from({ length: rows }, (_, i) => `transcript ${i}`);
+    lines[rows - 6] = "> prompt";
+    for (let i = 1; i <= 5; i++) lines[rows - 6 + i] = `agent ${i} working`;
+    await handle.pushLiveFrame({ content: lines.join("\n") + "\n", rows, history: 0, cursor: { x: 2, y: rows - 6 } });
+
+    await page.locator('textarea[aria-label="Live terminal input"]').focus();
+    await setKeyboard(page, { open: true, px: 320, pwa: false });
+    const lastAgentFits = () =>
+      page.evaluate(() => {
+        const el = document.querySelector<HTMLElement>("[data-live-terminal] > div")!;
+        const row = [...el.querySelectorAll("[data-live-content] > *")].find((r) => r.textContent?.includes("agent 5"));
+        return row != null && row.getBoundingClientRect().bottom <= el.getBoundingClientRect().bottom + 1;
+      });
+    await expect.poll(lastAgentFits).toBe(true);
+    await expect(page.locator("[data-live-content]")).toContainText("> prompt");
+  });
+
   test("PWA mode: dvh shrink owns the layout; no inset, no tmux resize", async ({ page }) => {
     const handle = await mockTerminalApis(page);
     await openSession(page, handle);
@@ -169,15 +191,17 @@ test.describe("Keyboard auto-resize (#1432)", () => {
     await openSession(page, handle);
 
     const layout = await page.evaluate(() => {
-      const root = document.querySelector<HTMLElement>("div.h-dvh.flex.flex-col");
+      const root = document.querySelector<HTMLElement>('div[class~="h-(--app-height)"].flex.flex-col');
       const panel = document.querySelector('[data-term="agent"]');
       const padded = panel?.closest<HTMLElement>("div.flex-1.flex.flex-col");
       return {
+        rootFound: root != null,
         rootInlineHeight: root?.style?.height ?? "",
         paddingBottom: padded ? getComputedStyle(padded).paddingBottom : "",
       };
     });
     // The live view wants the natural dvh shrink; only the single-pane paired shell pins the height.
+    expect(layout.rootFound).toBe(true);
     expect(layout.rootInlineHeight, "live sessions must keep the natural 100dvh root").toBe("");
     expect(["0px", "", "auto"]).toContain(layout.paddingBottom);
     expect(extractResizes(handle).length).toBeGreaterThan(0);

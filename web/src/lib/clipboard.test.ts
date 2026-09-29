@@ -87,6 +87,12 @@ describe("readClipboardText", () => {
       ["text/html", '<p><a href="https://x.example/pr/1">PR</a></p>', "https://x.example/pr/1"],
       ["text/html", '<a href="">click here</a>', "click here"],
       ["text/html", "<p> just text </p>", "just text"],
+      [
+        "text/html",
+        '<p>See <a href="https://a.example">A</a> and <a href="https://b.example">B</a>.</p><p>Next<br>line</p>',
+        "See A and B.\nNext\nline",
+      ],
+      ["text/html", '<p>Read <a href="https://a.example">this</a> first</p>', "Read this first"],
     ];
     for (const [type, raw, expected] of cases) {
       const item = { types: [type], getType: async () => new Blob([raw], { type }) };

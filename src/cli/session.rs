@@ -846,6 +846,7 @@ fn build_import_instance(
     s: &crate::session::claude_import::ClaudeSessionSummary,
     structured: bool,
     group: &str,
+    session_config: &crate::session::config::SessionConfig,
 ) -> Instance {
     let title = s.title.clone().unwrap_or_else(|| {
         let short = s.session_id.get(..8).unwrap_or(s.session_id.as_str());
@@ -853,6 +854,7 @@ fn build_import_instance(
     });
     let mut inst = Instance::new(&title, &s.cwd);
     inst.tool = "claude".to_string();
+    super::add::apply_agent_launch_config(&mut inst, session_config, None, None);
     if !group.is_empty() {
         inst.group_path = group.to_string();
     }
@@ -966,14 +968,24 @@ async fn import_sessions(profile: &str, args: ImportArgs) -> Result<()> {
     }
 
     let group = args.group.clone().unwrap_or_default();
+    let session_configs: Vec<_> = to_import
+        .iter()
+        .map(|s| {
+            crate::session::config::repo_config::resolve_config_with_repo_or_warn(
+                profile,
+                std::path::Path::new(&s.cwd),
+            )
+            .session
+        })
+        .collect();
     let storage = Storage::open_unwatched(profile)?;
     let created_ids = storage.update(|all_instances, groups| {
         let mut ids = Vec::new();
-        for s in &to_import {
+        for (s, session_config) in to_import.iter().zip(&session_configs) {
             if already_imported(all_instances, &s.session_id) {
                 continue;
             }
-            let inst = build_import_instance(s, structured, &group);
+            let inst = build_import_instance(s, structured, &group, session_config);
             ids.push(inst.id.clone());
             all_instances.push(inst.clone());
             if !inst.group_path.is_empty() {
@@ -3310,14 +3322,17 @@ mod import_tests {
 
     #[test]
     fn build_import_instance_pins_the_replay_target_for_each_view() {
+        let defaults = crate::session::config::SessionConfig::default();
         let terminal = build_import_instance(
             &summary("abc123-def456", "/home/me/proj", Some("Fix bug")),
             false,
             "",
+            &defaults,
         );
         assert_eq!(terminal.tool, "claude");
         assert_eq!(terminal.project_path, "/home/me/proj");
         assert_eq!(terminal.title, "Fix bug");
+        assert!(terminal.extra_args.is_empty() && terminal.command.is_empty());
         assert_eq!(
             terminal.resume_intent,
             ResumeIntent::Use("abc123-def456".to_string())
@@ -3327,16 +3342,39 @@ mod import_tests {
             &summary("abcdef12-3456-7890", "/home/me/proj", None),
             false,
             "team/imports",
+            &defaults,
         );
         assert_eq!(untitled.title, "Claude import abcdef12");
         assert_eq!(untitled.group_path, "team/imports");
 
-        let structured =
-            build_import_instance(&summary("sid-1", "/home/me/proj", Some("x")), true, "");
+        let structured = build_import_instance(
+            &summary("sid-1", "/home/me/proj", Some("x")),
+            true,
+            "",
+            &defaults,
+        );
         assert!(structured.is_structured());
         assert_eq!(structured.acp_session_id.as_deref(), Some("sid-1"));
         assert_eq!(structured.import_pending, Some(true));
         assert_eq!(structured.resume_intent, ResumeIntent::Default);
+
+        let mut configured = crate::session::config::SessionConfig::default();
+        configured
+            .agent_extra_args
+            .insert("claude".into(), "--remote-control".into());
+        configured
+            .agent_command_override
+            .insert("claude".into(), "claude-wrapper".into());
+        for view_structured in [false, true] {
+            let inst = build_import_instance(
+                &summary("sid-2", "/home/me/proj", None),
+                view_structured,
+                "",
+                &configured,
+            );
+            assert_eq!(inst.extra_args, "--remote-control", "{view_structured}");
+            assert_eq!(inst.command, "claude-wrapper", "{view_structured}");
+        }
     }
 
     #[test]

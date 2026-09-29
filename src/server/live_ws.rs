@@ -25,7 +25,9 @@
 //! size the window), `claim` / `claim_if_vacant` (take over from a non-owner), `window`
 //! (capture window in lines), `cadence` (fast at the live edge, idle otherwise),
 //! `resync` (lost patch continuity, send a full frame) and
-//! `{"type":"caps","deflate":bool,"patch":bool}`. With `deflate`, frame messages switch
+//! `{"type":"caps","deflate":bool,"patch":bool}`. `{"type":"paste","text":"..","submit":bool}`
+//! pastes through tmux's paste buffer, gated like binary input, and presses Enter after
+//! it when `submit` is set. With `deflate`, frame messages switch
 //! from text to binary: one connection-lifetime raw-deflate stream, sync-flushed per
 //! frame, carrying `u32-LE length || frame JSON` records, so consecutive near-identical
 //! frames compress against a shared dictionary. `size_owner` and close frames stay text.
@@ -153,6 +155,70 @@ enum LiveControlMessage {
     /// The client lost patch continuity and needs a full frame.
     #[serde(rename = "resync")]
     Resync,
+    /// Text for tmux's paste path, which has no size limit and adds bracketed-paste
+    /// markers only when the pane enabled them.
+    #[serde(rename = "paste")]
+    Paste {
+        text: String,
+        #[serde(default)]
+        submit: bool,
+    },
+}
+
+/// ESC is removed so pasted text cannot end the bracketed paste early. A submit
+/// drops trailing line breaks, since Enter follows.
+fn paste_payload(text: &str, submit: bool) -> String {
+    let text = if submit {
+        text.trim_end_matches(['\r', '\n'])
+    } else {
+        text
+    };
+    text.replace('\x1b', "")
+}
+
+/// Paste, then Enter after the agent's paste-burst delay when submitting. A live input
+/// channel (tmux 3.8) is the pane's single writer, so the paste and the Enter ride it to
+/// stay ordered with keystrokes; otherwise tmux's paste path takes them.
+fn deliver_paste(tmux_name: &str, text: &str, submit: bool, enter_delay_ms: u64) {
+    #[cfg(unix)]
+    if crate::tmux::vt::input_mode(tmux_name).is_some()
+        && deliver_paste_via_channel(tmux_name, text, submit, enter_delay_ms)
+    {
+        return;
+    }
+    let session = crate::tmux::Session::from_name(tmux_name);
+    let result = if submit {
+        session.send_keys_with_delay(text, enter_delay_ms)
+    } else {
+        session.paste_text(text)
+    };
+    if let Err(e) = result {
+        warn!(target: "terminal.ws", tmux = %tmux_name, kind = "live", "paste failed: {}", e);
+    }
+}
+
+/// `send_keys_with_delay` over the input channel; `false` when the channel is gone before
+/// anything was written.
+#[cfg(unix)]
+fn deliver_paste_via_channel(
+    tmux_name: &str,
+    text: &str,
+    submit: bool,
+    enter_delay_ms: u64,
+) -> bool {
+    use crate::tmux::vt::{try_send_input, try_send_paste};
+    use crate::tmux::SubmitText;
+    let sent = match (submit, crate::tmux::submit_text(text)) {
+        (true, SubmitText::Literal(payload)) => try_send_input(tmux_name, payload.as_bytes()),
+        _ => try_send_paste(tmux_name, text),
+    };
+    if sent && submit {
+        if enter_delay_ms > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(enter_delay_ms));
+        }
+        try_send_input(tmux_name, b"\r");
+    }
+    sent
 }
 
 /// Which transport renders a live surface.
@@ -440,20 +506,29 @@ pub async fn live_terminal_ws(
         return resp;
     }
     let instances = state.instances.read().await;
-    let tmux_name = instances
-        .iter()
-        .find(|i| i.id == id)
-        .map(|inst| crate::tmux::Session::resolve_name(&inst.id, &inst.title));
+    let target = instances.iter().find(|i| i.id == id).map(|inst| {
+        (
+            crate::tmux::Session::resolve_name(&inst.id, &inst.title),
+            crate::agents::send_keys_enter_delay(&inst.tool),
+        )
+    });
     drop(instances);
 
     let read_only = state.read_only;
     let shutdown = state.shutdown.clone();
 
-    match tmux_name {
-        Some(tmux_name) => ws
+    match target {
+        Some((tmux_name, enter_delay_ms)) => ws
             .protocols(["aoe-auth"])
             .on_upgrade(move |socket| {
-                handle_live_ws(socket, tmux_name, read_only, shutdown, LiveTransport::Grid)
+                handle_live_ws(
+                    socket,
+                    tmux_name,
+                    read_only,
+                    shutdown,
+                    LiveTransport::Grid,
+                    enter_delay_ms,
+                )
             })
             .into_response(),
         None => {
@@ -574,17 +649,20 @@ async fn live_shell_ws(
                 read_only,
                 shutdown,
                 LiveTransport::Snapshot,
+                0,
             )
         })
         .into_response()
 }
 
+/// `enter_delay_ms` is the agent's paste-burst guard before a submitting Enter; 0 for shells.
 async fn handle_live_ws(
     socket: WebSocket,
     tmux_name: String,
     read_only: bool,
     shutdown: tokio_util::sync::CancellationToken,
     transport: LiveTransport,
+    enter_delay_ms: u64,
 ) {
     handle_live_ws_inner(
         socket,
@@ -592,6 +670,7 @@ async fn handle_live_ws(
         read_only,
         shutdown,
         transport,
+        enter_delay_ms,
         #[cfg(test)]
         false,
     )
@@ -620,6 +699,7 @@ async fn handle_live_ws_inner(
     read_only: bool,
     shutdown: tokio_util::sync::CancellationToken,
     transport: LiveTransport,
+    enter_delay_ms: u64,
     #[cfg(test)] witness_cycles: bool,
 ) {
     match wait_for_tmux_ready(&tmux_name).await {
@@ -1411,6 +1491,22 @@ async fn handle_live_ws_inner(
                                     settings.patch.store(true, Ordering::Relaxed);
                                 }
                             }
+                            LiveControlMessage::Paste { text, submit } => {
+                                if read_only || !settings.is_owner.load(Ordering::Relaxed) {
+                                    continue;
+                                }
+                                let text = paste_payload(&text, submit);
+                                if text.is_empty() {
+                                    continue;
+                                }
+                                let name = tmux_name.clone();
+                                // Awaited like binary input, so it lands after earlier keystrokes.
+                                let _ = tokio::task::spawn_blocking(move || {
+                                    deliver_paste(&name, &text, submit, enter_delay_ms)
+                                })
+                                .await;
+                                nudge.notify_one();
+                            }
                             LiveControlMessage::Resync => {
                                 settings.force_full.store(true, Ordering::Relaxed);
                                 nudge.notify_one();
@@ -1624,6 +1720,42 @@ fn frame_json(content: &str, cursor: Option<&crate::tmux::PaneCursor>, seq: u64)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn paste_message_parses_and_sanitizes_its_payload() {
+        let cases: &[(&str, &str, bool, &str)] = &[
+            (r#"{"type":"paste","text":"a\nb"}"#, "a\nb", false, "a\nb"),
+            (
+                r#"{"type":"paste","text":"x\u001b[201~y\n","submit":true}"#,
+                "x\x1b[201~y\n",
+                true,
+                "x[201~y",
+            ),
+            (
+                r#"{"type":"paste","text":"line\r\n\n","submit":false}"#,
+                "line\r\n\n",
+                false,
+                "line\r\n\n",
+            ),
+            (
+                r#"{"type":"paste","text":"\n","submit":true}"#,
+                "\n",
+                true,
+                "",
+            ),
+        ];
+        for (json, want_text, want_submit, want_payload) in cases {
+            let Ok(LiveControlMessage::Paste { text, submit }) =
+                serde_json::from_str::<LiveControlMessage>(json)
+            else {
+                panic!("{json} did not parse as paste");
+            };
+            assert_eq!(&text, want_text, "{json}");
+            assert_eq!(submit, *want_submit, "{json}");
+            assert_eq!(paste_payload(&text, submit), *want_payload, "{json}");
+        }
+        assert!(serde_json::from_str::<LiveControlMessage>(r#"{"type":"paste"}"#).is_err());
+    }
 
     #[cfg(unix)]
     #[test]
@@ -2028,6 +2160,7 @@ mod tests {
                                 true,
                                 shutdown,
                                 LiveTransport::Grid,
+                                0,
                                 true,
                             )
                             .await;

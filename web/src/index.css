@@ -181,7 +181,8 @@
 }
 
 html {
-  height: 100dvh;
+  --app-height: 100dvh;
+  height: var(--app-height);
   overflow: hidden;
   overscroll-behavior: none;
   overscroll-behavior-x: none;
@@ -220,10 +221,17 @@ body {
   height: 100%;
 }
 
+/* iOS 26 installed apps report `100dvh` short by the top safe-area inset; lib/editingFocus.ts sets these attributes
+   only there, so `100lvh` spans the screen with no keyboard and `100dvh` keeps the keyboard shrink. */
+html[data-ios-standalone]:not([data-editing]) {
+  --app-height: 100lvh;
+}
+
 @media (pointer: coarse) {
   #root {
     position: fixed;
     inset: 0;
+    height: var(--app-height);
     width: 100%;
     overflow: hidden;
   }
@@ -642,13 +650,21 @@ select:focus-visible,
   outline-offset: 2px;
 }
 
+/* Terminal layers clear the home indicator, except around the mobile key row, which runs to the screen edge and
+   holds its own smaller clearance. */
+.home-indicator-clearance {
+  padding-bottom: env(safe-area-inset-bottom);
+}
+.home-indicator-clearance:has([data-terminal-toolbar]) {
+  padding-bottom: 0;
+}
+
 .safe-area-inset {
   /* Top/right/left only. The BOTTOM inset is intentionally NOT reserved here:
      the App root is `overflow-hidden`, so a bottom-anchored child (the ACP
      composer, the terminal toolbar) that tried to reach the physical edge got
      clipped at the padding edge on iOS. Instead each bottom-anchored surface
      owns its own `env(safe-area-inset-bottom)` clearance, and the composer
-     hugs the bottom with no reservation. iOS reports the bottom inset as 0
-     while the keyboard is open, so the keyboard-lift math is unaffected. */
+     hugs the bottom with no reservation. */
   padding: env(safe-area-inset-top) env(safe-area-inset-right) 0 env(safe-area-inset-left);
 }

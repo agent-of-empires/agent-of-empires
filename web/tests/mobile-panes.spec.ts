@@ -32,7 +32,10 @@ async function simulateKeyboardOpen(page: Page, keyboardPx: number) {
 /** The picked pane must reserve the home-indicator inset the App root no longer
  *  does (moved per-surface; see index.css .safe-area-inset). */
 async function expectSafeAreaInset(page: Page, testId: string) {
-  const inset = await page.getByTestId(testId).evaluate((el) => (el as HTMLElement).style.paddingBottom);
+  const layer = page.getByTestId(testId);
+  // Terminal layers clear it through a class the mobile key row can turn off.
+  if (await layer.evaluate((el) => el.classList.contains("home-indicator-clearance"))) return;
+  const inset = await layer.evaluate((el) => (el as HTMLElement).style.paddingBottom);
   expect(inset).toContain("safe-area-inset-bottom");
 }
 
@@ -103,8 +106,8 @@ test.describe("Desktop right panel split is unchanged (#1452)", () => {
     await expect(page.getByTestId("activity-bar")).toBeVisible();
     await expect(page.getByRole("button", { name: "Toggle panels" })).toHaveCount(0);
     await expect(picker(page)).toHaveCount(0);
-    await expect(page.getByRole("button", { name: "Arrow up" })).toHaveCount(0);
-    await expect(page.getByRole("button", { name: "Ctrl+C interrupt" })).toHaveCount(0);
+    await expect(page.getByRole("button", { name: "Compose", exact: true })).toHaveCount(0);
+    await expect(page.getByRole("group", { name: "Arrow keys joystick" })).toHaveCount(0);
   });
 });
 

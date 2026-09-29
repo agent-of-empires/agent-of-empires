@@ -8,6 +8,7 @@ import {
   normalizePersistentTerminalLimit,
 } from "../lib/persistentTerminals";
 import { FontSizeControl } from "./settings/FontSizeControl";
+import { MobileKeysSettings } from "./settings/MobileKeysSettings";
 
 export function TerminalSettings() {
   const { settings, update } = useWebSettings();
@@ -157,6 +158,8 @@ export function TerminalSettings() {
             )}
           </div>
         </div>
+
+        <MobileKeysSettings />
       </div>
     </div>
   );

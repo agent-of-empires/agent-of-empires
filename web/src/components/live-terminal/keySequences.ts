@@ -73,16 +73,6 @@ export function controlCode(key: string): string | null {
   return key.length === 1 && code >= 65 && code <= 90 ? String.fromCharCode(code - 64) : null;
 }
 
-/** The word under the caret: the non-whitespace run ending `run + typed`. Uncapped, so the IME's word always prefixes it. */
-export function plainRunAfter(run: string, typed: string): string {
-  return /\S*$/.exec(run + typed)?.[0] ?? "";
-}
-
-/** Drops one code point, so backspacing an emoji leaves no half surrogate in the run. */
-export function dropLastCodePoint(run: string): string {
-  return Array.from(run).slice(0, -1).join("");
-}
-
 /** Backslash-escapes whitespace and backslashes, as terminal drag-and-drop does. */
 export function escapePastePath(p: string): string {
   return p.replace(/[\\ \t]/g, (c) => `\\${c}`);

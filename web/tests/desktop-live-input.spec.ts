@@ -46,9 +46,7 @@ test.describe("Desktop live terminal input", () => {
     await expect(pane).not.toHaveAttribute("data-pane-focused", "true");
   });
 
-  test("Ctrl+Shift+C copies the selection without ^C, and Ctrl+V pastes as a bracketed paste without ^V", async ({
-    page,
-  }) => {
+  test("Ctrl+Shift+C copies the selection without ^C, and Ctrl+V pastes through tmux without ^V", async ({ page }) => {
     // #2384: Ctrl+Shift+C copies the DOM selection; the focused hidden input would copy nothing, and Ctrl+C stays SIGINT.
     const handle = await mockTerminalApis(page);
     await page.context().grantPermissions(["clipboard-read", "clipboard-write"]);
@@ -101,7 +99,7 @@ test.describe("Desktop live terminal input", () => {
     await page.keyboard.press("Control+v");
     await expect
       .poll(() => handle.liveMessages.slice(beforePaste).map((m) => m.toString("utf8")))
-      .toContainEqual("\x1b[200~pasted text\x1b[201~");
+      .toContainEqual(JSON.stringify({ type: "paste", text: "pasted text", submit: false }));
     expect(handle.liveMessages.slice(beforePaste).some((m) => m.toString("utf8") === "\x16")).toBe(false);
   });
 
