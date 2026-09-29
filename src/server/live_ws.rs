@@ -176,8 +176,16 @@ fn paste_payload(text: &str, submit: bool) -> String {
     text.replace('\x1b', "")
 }
 
-/// Paste, then Enter after the agent's paste-burst delay when submitting.
+/// Paste, then Enter after the agent's paste-burst delay when submitting. A live input
+/// channel (tmux 3.8) is the pane's single writer, so the paste and the Enter ride it to
+/// stay ordered with keystrokes; otherwise tmux's paste path takes them.
 fn deliver_paste(tmux_name: &str, text: &str, submit: bool, enter_delay_ms: u64) {
+    #[cfg(unix)]
+    if crate::tmux::vt::input_mode(tmux_name).is_some()
+        && deliver_paste_via_channel(tmux_name, text, submit, enter_delay_ms)
+    {
+        return;
+    }
     let session = crate::tmux::Session::from_name(tmux_name);
     let result = if submit {
         session.send_keys_with_delay(text, enter_delay_ms)
@@ -187,6 +195,30 @@ fn deliver_paste(tmux_name: &str, text: &str, submit: bool, enter_delay_ms: u64)
     if let Err(e) = result {
         warn!(target: "terminal.ws", tmux = %tmux_name, kind = "live", "paste failed: {}", e);
     }
+}
+
+/// `send_keys_with_delay` over the input channel; `false` when the channel is gone before
+/// anything was written.
+#[cfg(unix)]
+fn deliver_paste_via_channel(
+    tmux_name: &str,
+    text: &str,
+    submit: bool,
+    enter_delay_ms: u64,
+) -> bool {
+    use crate::tmux::vt::{try_send_input, try_send_paste};
+    use crate::tmux::SubmitText;
+    let sent = match (submit, crate::tmux::submit_text(text)) {
+        (true, SubmitText::Literal(payload)) => try_send_input(tmux_name, payload.as_bytes()),
+        _ => try_send_paste(tmux_name, text),
+    };
+    if sent && submit {
+        if enter_delay_ms > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(enter_delay_ms));
+        }
+        try_send_input(tmux_name, b"\r");
+    }
+    sent
 }
 
 /// Which transport renders a live surface.
