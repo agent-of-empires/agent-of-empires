@@ -15,6 +15,7 @@ export function Dialog({
   titleClassName = "text-text-primary",
   panelTestId,
   bodyClassName = "px-5 py-4",
+  describeBody = true,
   onDismiss,
   footer,
   children,
@@ -24,6 +25,8 @@ export function Dialog({
   titleClassName?: string;
   panelTestId?: string;
   bodyClassName?: string;
+  /** Link the body as the dialog's description; turn off for form bodies. */
+  describeBody?: boolean;
   onDismiss: () => void;
   footer: ReactNode;
   children: ReactNode;
@@ -33,6 +36,7 @@ export function Dialog({
       role="dialog"
       aria-modal="true"
       aria-labelledby={`${id}-title`}
+      aria-describedby={describeBody ? `${id}-desc` : undefined}
       data-testid={id}
       className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 animate-fade-in"
       onClick={onDismiss}
@@ -47,7 +51,9 @@ export function Dialog({
             {title}
           </h2>
         </div>
-        <div className={bodyClassName}>{children}</div>
+        <div id={`${id}-desc`} className={bodyClassName}>
+          {children}
+        </div>
         <div className="flex justify-end gap-3 px-5 py-3 border-t border-surface-700">{footer}</div>
       </div>
     </div>
