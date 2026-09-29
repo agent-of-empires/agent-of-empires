@@ -4,7 +4,7 @@ import { devices, type Page } from "@playwright/test";
 import { mockTerminalApis, type MockHandle } from "./helpers/terminal-mocks";
 
 // #1432: the soft keyboard shrinks the mobile terminal visually but never resizes tmux (that flashed and clipped
-// scrollback). Rows latch to the no-keyboard height and the cursor stays near the viewport bottom. iOS Safari
+// scrollback). Rows latch to the no-keyboard height and the prompt stays in view. iOS Safari
 // pads by the live occlusion; where 100dvh shrinks natively the live view adds no inset.
 
 test.use({ ...devices["iPhone 13"] });
@@ -131,6 +131,28 @@ test.describe("Keyboard auto-resize (#1432)", () => {
     expect(m!.cursorTop, "cursor is not above the viewport").toBeGreaterThanOrEqual(m!.scrollTop - 2);
     expect(m!.cursorTop, "cursor is not below the viewport").toBeLessThanOrEqual(m!.scrollTop + m!.clientHeight);
     await expect(page.getByRole("button", { name: "Back to live" })).toHaveCount(0);
+  });
+
+  test("the keyboard keeps a subagent list drawn below the prompt in view when it fits", async ({ page }) => {
+    const handle = await mockTerminalApis(page);
+    await openSession(page, handle);
+    const rows = lastResize(handle)!.rows;
+    // Claude Code lists running subagents under its input box.
+    const lines = Array.from({ length: rows }, (_, i) => `transcript ${i}`);
+    lines[rows - 6] = "> prompt";
+    for (let i = 1; i <= 5; i++) lines[rows - 6 + i] = `agent ${i} working`;
+    await handle.pushLiveFrame({ content: lines.join("\n") + "\n", rows, history: 0, cursor: { x: 2, y: rows - 6 } });
+
+    await page.locator('textarea[aria-label="Live terminal input"]').focus();
+    await setKeyboard(page, { open: true, px: 320, pwa: false });
+    const lastAgentFits = () =>
+      page.evaluate(() => {
+        const el = document.querySelector<HTMLElement>("[data-live-terminal] > div")!;
+        const row = [...el.querySelectorAll("[data-live-content] > *")].find((r) => r.textContent?.includes("agent 5"));
+        return row != null && row.getBoundingClientRect().bottom <= el.getBoundingClientRect().bottom + 1;
+      });
+    await expect.poll(lastAgentFits).toBe(true);
+    await expect(page.locator("[data-live-content]")).toContainText("> prompt");
   });
 
   test("PWA mode: dvh shrink owns the layout; no inset, no tmux resize", async ({ page }) => {
