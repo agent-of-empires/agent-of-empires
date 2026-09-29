@@ -117,6 +117,21 @@ impl Instance {
     }
 
     pub fn get_container_for_instance(&mut self) -> Result<containers::DockerContainer> {
+        self.get_container_until_cancelled(&tokio_util::sync::CancellationToken::new())
+    }
+
+    /// [`Self::get_container_for_instance`] that stops before each costly step, and
+    /// kills an image pull, once `cancel` fires.
+    pub fn get_container_until_cancelled(
+        &mut self,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<containers::DockerContainer> {
+        let checkpoint = || {
+            if cancel.is_cancelled() {
+                anyhow::bail!("sandbox start cancelled");
+            }
+            Ok(())
+        };
         let image = self
             .sandbox_info
             .as_ref()
@@ -253,8 +268,10 @@ impl Instance {
         }
 
         // Ensure image is available (always pulls to get latest)
+        checkpoint()?;
         let runtime = containers::get_container_runtime();
-        runtime.ensure_image(&image)?;
+        runtime.ensure_image(&image, cancel)?;
+        checkpoint()?;
 
         // Mint before building the container config so the docker-run env also
         // carries the values (leak-safe via the inherit path in run_create).
@@ -274,6 +291,7 @@ impl Instance {
         );
         container.remove_stranded_named_ignore_volumes(&self.id, &stranded);
         container_config::place_shadowed_credential_mountpoints(&config);
+        checkpoint()?;
         let container_id = container.create(&config)?;
         self.identity_publisher_launched = config.identity_publisher_installed
             && identity_publisher_dependencies_available(&container)

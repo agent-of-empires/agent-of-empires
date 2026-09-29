@@ -882,6 +882,46 @@ fn apply_creation_results_finalizes_persisted_stub() {
     );
 }
 
+/// A cancelled request must stay cancelled when another is queued behind it, and its
+/// result must not consume the newer request's stub.
+#[test]
+#[serial]
+fn cancelled_creation_is_not_revived_by_a_later_request() {
+    let CreationTestEnv {
+        mut view,
+        storage,
+        project_dir,
+        _guard,
+        _temp,
+    } = setup_creation_test_env();
+
+    let mut cancelled = creation_data(&project_dir, "Cancelled", "");
+    cancelled.worktree_enabled = true;
+    cancelled.create_new_branch = true;
+    cancelled.worktree_branch = Some("cancelled-branch".to_string());
+    view.request_creation(cancelled, None);
+    view.cancel_creation();
+    view.request_creation(creation_data(&project_dir, "Kept", ""), None);
+
+    let session_id = drain_creation_result(&mut view).expect("the later request should finish");
+    assert_eq!(view.get_instance(&session_id).unwrap().title, "Kept");
+    assert!(!view.is_creation_pending());
+    let persisted = storage.load().unwrap();
+    assert_eq!(
+        persisted
+            .iter()
+            .map(|row| row.title.as_str())
+            .collect::<Vec<_>>(),
+        ["Kept"]
+    );
+    let repo = git2::Repository::open(&project_dir).unwrap();
+    assert!(
+        repo.find_branch("cancelled-branch", git2::BranchType::Local)
+            .is_err(),
+        "the cancelled request's worktree branch must be rolled back"
+    );
+}
+
 /// A peer can commit the same title/path while the background builder waits for
 /// finalization. The duplicate rollback must preserve every resource the persisted winner
 /// references and its own pre-existing empty group, while discarding the losing stub's

@@ -382,7 +382,7 @@ impl HomeView {
             attach_project_poller: crate::tui::attach_project_poller::AttachProjectPoller::new(),
             attach_project_in_flight: std::collections::HashSet::new(),
             creation_poller: CreationPoller::new(),
-            creation_cancelled: false,
+            creation_cancel: None,
             on_launch_hooks_ran: HashSet::new(),
             creating_hook_progress: HashMap::new(),
             creating_stub_id: None,

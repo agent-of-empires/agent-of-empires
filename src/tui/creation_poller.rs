@@ -6,6 +6,8 @@
 use std::sync::mpsc;
 use std::thread;
 
+use tokio_util::sync::CancellationToken;
+
 use crate::session::builder::{self, CreatedWorktree, InstanceParams};
 use crate::session::config::repo_config::{self, HookProgress, ResolvedHooks};
 use crate::session::Instance;
@@ -16,6 +18,7 @@ pub struct CreationRequest {
     pub existing_instances: Vec<Instance>,
     /// Trusted hooks to execute after instance creation (already approved by user).
     pub hooks: Option<ResolvedHooks>,
+    pub cancel: CancellationToken,
 }
 
 #[derive(Debug)]
@@ -32,6 +35,14 @@ pub enum CreationResult {
         warnings: Vec<String>,
     },
     Error(String),
+    /// Cancelled before success; the worker already rolled back what it built.
+    Cancelled,
+}
+
+pub struct CreationOutcome {
+    pub result: CreationResult,
+    /// Cancelled after the worker's last check: a `Success` still needs rollback.
+    pub cancelled: bool,
 }
 
 /// Serializable worktree info for passing across thread boundary
@@ -64,11 +75,12 @@ impl From<&CreatedWorktreeInfo> for CreatedWorktree {
 
 pub struct CreationPoller {
     request_tx: mpsc::Sender<(CreationRequest, mpsc::Sender<HookProgress>)>,
-    result_rx: mpsc::Receiver<CreationResult>,
+    result_rx: mpsc::Receiver<(CreationResult, CancellationToken)>,
     progress_rx: mpsc::Receiver<HookProgress>,
     progress_tx: mpsc::Sender<HookProgress>,
     _handle: thread::JoinHandle<()>,
-    pending: bool,
+    /// Requests sent and not yet received, including cancelled ones still winding down.
+    in_flight: usize,
     /// Profile from the last creation request (for cross-profile saves)
     last_profile: Option<String>,
 }
@@ -86,13 +98,14 @@ impl CreationPoller {
     pub fn new() -> Self {
         let (request_tx, request_rx) =
             mpsc::channel::<(CreationRequest, mpsc::Sender<HookProgress>)>();
-        let (result_tx, result_rx) = mpsc::channel::<CreationResult>();
+        let (result_tx, result_rx) = mpsc::channel::<(CreationResult, CancellationToken)>();
         let (progress_tx, progress_rx) = mpsc::channel::<HookProgress>();
 
         let handle = thread::spawn(move || {
             while let Ok((request, prog_tx)) = request_rx.recv() {
+                let cancel = request.cancel.clone();
                 let result = Self::create_instance(request, &prog_tx);
-                if result_tx.send(result).is_err() {
+                if result_tx.send((result, cancel)).is_err() {
                     break;
                 }
             }
@@ -104,7 +117,7 @@ impl CreationPoller {
             progress_rx,
             progress_tx,
             _handle: handle,
-            pending: false,
+            in_flight: 0,
             last_profile: None,
         }
     }
@@ -115,6 +128,10 @@ impl CreationPoller {
     ) -> CreationResult {
         let data = request.data;
         let hooks = request.hooks;
+        let cancel = request.cancel;
+        if cancel.is_cancelled() {
+            return CreationResult::Cancelled;
+        }
         let profile = data.profile.clone();
         let sandbox = data.sandbox;
 
@@ -153,6 +170,29 @@ impl CreationPoller {
         let created_worktree = build_result.created_worktree;
         let created_workspace_worktrees = build_result.created_workspace_worktrees;
         let warnings = build_result.warnings;
+        let roll_back = |instance: &Instance| {
+            builder::cleanup_instance(
+                instance,
+                created_worktree.as_ref(),
+                &created_workspace_worktrees,
+                None,
+            )
+        };
+        let cancelled = |instance: &Instance| {
+            roll_back(instance);
+            CreationResult::Cancelled
+        };
+        // A step that fails because the user cancelled reports the cancel, not the error.
+        let failed = |instance: &Instance, message: String| {
+            if cancel.is_cancelled() {
+                return cancelled(instance);
+            }
+            roll_back(instance);
+            CreationResult::Error(message)
+        };
+        if cancel.is_cancelled() {
+            return cancelled(&instance);
+        }
 
         let has_on_create = hooks
             .as_ref()
@@ -170,14 +210,8 @@ impl CreationPoller {
                 // Ensure the container is running so we can exec hooks inside it.
                 // Don't create the tmux session yet -- that happens at attach time
                 // where the terminal size is available.
-                if let Err(e) = instance.get_container_for_instance() {
-                    builder::cleanup_instance(
-                        &instance,
-                        created_worktree.as_ref(),
-                        &created_workspace_worktrees,
-                        None,
-                    );
-                    return CreationResult::Error(format!("{:#}", e));
+                if let Err(e) = instance.get_container_until_cancelled(&cancel) {
+                    return failed(&instance, format!("{:#}", e));
                 }
                 container_started = true;
                 if let Some(ref sandbox) = instance.sandbox_info {
@@ -190,13 +224,7 @@ impl CreationPoller {
                         &hook_env,
                     ) {
                         tracing::warn!(target: "session.create", "on_create hook failed in container: {:#}", e);
-                        builder::cleanup_instance(
-                            &instance,
-                            created_worktree.as_ref(),
-                            &created_workspace_worktrees,
-                            None,
-                        );
-                        return CreationResult::Error(on_create_error(&e, hooks));
+                        return failed(&instance, on_create_error(&e, hooks));
                     }
                 }
             } else if let Err(e) = repo_config::execute_hooks_streamed(
@@ -205,13 +233,7 @@ impl CreationPoller {
                 progress_tx,
                 &hook_env,
             ) {
-                builder::cleanup_instance(
-                    &instance,
-                    created_worktree.as_ref(),
-                    &created_workspace_worktrees,
-                    None,
-                );
-                return CreationResult::Error(on_create_error(&e, hooks));
+                return failed(&instance, on_create_error(&e, hooks));
             }
         }
 
@@ -221,7 +243,10 @@ impl CreationPoller {
             let hooks = hooks.as_ref().unwrap();
             if sandbox {
                 if !container_started {
-                    if let Err(e) = instance.get_container_for_instance() {
+                    if let Err(e) = instance.get_container_until_cancelled(&cancel) {
+                        if cancel.is_cancelled() {
+                            return cancelled(&instance);
+                        }
                         let msg = format!("Container startup warning: {:#}", e);
                         tracing::warn!(target: "session.create", "{}", msg);
                         let _ = progress_tx.send(HookProgress::Output(msg));
@@ -257,15 +282,12 @@ impl CreationPoller {
             // Only ensure the container is running here if hooks didn't already
             // start it. Don't create the tmux session yet -- that happens at attach time
             // where the terminal size is available.
-            if let Err(e) = instance.get_container_for_instance() {
-                builder::cleanup_instance(
-                    &instance,
-                    created_worktree.as_ref(),
-                    &created_workspace_worktrees,
-                    None,
-                );
-                return CreationResult::Error(format!("{:#}", e));
+            if let Err(e) = instance.get_container_until_cancelled(&cancel) {
+                return failed(&instance, format!("{:#}", e));
             }
+        }
+        if cancel.is_cancelled() {
+            return cancelled(&instance);
         }
 
         let created_worktree_info = created_worktree.as_ref().map(CreatedWorktreeInfo::from);
@@ -285,7 +307,6 @@ impl CreationPoller {
     }
 
     pub fn request_creation(&mut self, request: CreationRequest) {
-        self.pending = true;
         self.last_profile = Some(request.data.profile.clone());
         if self
             .request_tx
@@ -293,7 +314,8 @@ impl CreationPoller {
             .is_err()
         {
             tracing::error!(target: "session.create", "Failed to send creation request: receiver thread died");
-            self.pending = false;
+        } else {
+            self.in_flight += 1;
         }
     }
 
@@ -301,25 +323,25 @@ impl CreationPoller {
         self.last_profile.clone()
     }
 
-    pub fn try_recv_result(&mut self) -> Option<CreationResult> {
-        match self.result_rx.try_recv() {
-            Ok(result) => {
-                self.pending = false;
-                Some(result)
-            }
-            Err(_) => None,
-        }
+    pub fn try_recv_result(&mut self) -> Option<CreationOutcome> {
+        self.received(self.result_rx.try_recv().ok())
     }
 
     /// Blocking receive with timeout, used during shutdown cleanup.
-    pub fn recv_result_timeout(&mut self, timeout: std::time::Duration) -> Option<CreationResult> {
-        match self.result_rx.recv_timeout(timeout) {
-            Ok(result) => {
-                self.pending = false;
-                Some(result)
-            }
-            Err(_) => None,
-        }
+    pub fn recv_result_timeout(&mut self, timeout: std::time::Duration) -> Option<CreationOutcome> {
+        self.received(self.result_rx.recv_timeout(timeout).ok())
+    }
+
+    fn received(
+        &mut self,
+        received: Option<(CreationResult, CancellationToken)>,
+    ) -> Option<CreationOutcome> {
+        let (result, cancel) = received?;
+        self.in_flight = self.in_flight.saturating_sub(1);
+        Some(CreationOutcome {
+            result,
+            cancelled: cancel.is_cancelled(),
+        })
     }
 
     pub fn try_recv_progress(&self) -> Option<HookProgress> {
@@ -327,7 +349,7 @@ impl CreationPoller {
     }
 
     pub fn is_pending(&self) -> bool {
-        self.pending
+        self.in_flight > 0
     }
 }
 
