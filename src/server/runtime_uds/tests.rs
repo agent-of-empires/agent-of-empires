@@ -368,7 +368,9 @@ async fn the_held_lock_admits_a_client_and_refuses_a_publisher() {
 }
 
 /// A marker written by this process is live; one recorded against another boot
-/// or another start time is retained state.
+/// or another start time is retained state. An identity this half cannot parse
+/// is unprovable rather than an absence, and the consumer consequence of that
+/// is asserted too, since reaping a marker is what would actually harm.
 #[test]
 fn process_identity_distinguishes_live_from_retained() {
     let pid = std::process::id();
@@ -379,7 +381,7 @@ fn process_identity_distinguishes_live_from_retained() {
             .expect("this process has a start identity"),
         prebind_instance_id: "11111111-2222-3333-4444-555555555555".to_string(),
     };
-    assert!(process_is_live(&live));
+    assert_eq!(process_liveness(&live), ProcessLiveness::Live);
     assert_eq!(
         live.process_start_identity,
         format!(
@@ -396,8 +398,9 @@ fn process_identity_distinguishes_live_from_retained() {
         process_start_identity: format!("linux:v1:{}:0", boot_id().expect("boot id")),
         ..clone_probe(&live)
     };
-    assert!(
-        !process_is_live(&recycled),
+    assert_eq!(
+        process_liveness(&recycled),
+        ProcessLiveness::Dead,
         "a different start time is dead"
     );
 
@@ -405,7 +408,77 @@ fn process_identity_distinguishes_live_from_retained() {
         process_start_identity: "linux:v1:00000000-0000-0000-0000-000000000000:1".to_string(),
         ..clone_probe(&live)
     };
-    assert!(!process_is_live(&rebooted), "another boot is dead");
+    assert_eq!(
+        process_liveness(&rebooted),
+        ProcessLiveness::Dead,
+        "another boot is dead"
+    );
+
+    let boot = boot_id().expect("boot id");
+    for identity in [
+        format!("darwin:v1:{boot}:1"),
+        format!("linux:v2:{boot}:1"),
+        format!("linux:v1:{boot}"),
+        String::new(),
+    ] {
+        let unprovable = MarkerProbe {
+            process_start_identity: identity.clone(),
+            ..clone_probe(&live)
+        };
+        assert_eq!(
+            process_liveness(&unprovable),
+            ProcessLiveness::Unprovable,
+            "{identity:?} is unprovable, not an absence"
+        );
+    }
+
+    fail_next_proc_read();
+    assert_eq!(
+        process_liveness(&live),
+        ProcessLiveness::Unprovable,
+        "a well-formed identity over an unreadable /proc is unprovable"
+    );
+}
+
+/// The consequence the unprovable rows exist to prevent: `reap_retained_state`
+/// unlinks a marker it proves dead and leaves every other one in place. A
+/// predicate that answered `Dead` for an identity it cannot parse would
+/// unlink a possibly-live daemon's state, and publication would go ahead over
+/// its socket.
+#[test]
+fn a_marker_this_half_cannot_prove_dead_is_never_reaped() {
+    let Some(namespace) = namespace_or_skip() else {
+        return;
+    };
+    let dir = app_dir(&namespace);
+    let boot = boot_id().expect("boot id");
+    for identity in [
+        format!("darwin:v1:{boot}:1"),
+        format!("linux:v2:{boot}:1"),
+        format!("linux:v1:{boot}"),
+        String::new(),
+    ] {
+        let path = dir.join(PREBIND_FILE);
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "schema": SCHEMA,
+                "pid": std::process::id(),
+                "process_start_identity": identity,
+                "prebind_instance_id": "11111111-2222-3333-4444-555555555555",
+            })
+            .to_string(),
+        )
+        .expect("write the retained marker");
+
+        let opened = open_trusted_app_dir(&dir).expect("open the namespace directory");
+        let refused = reap_retained_state(opened.as_raw_fd());
+        assert!(refused.is_err(), "{identity:?} must refuse publication");
+        assert!(
+            path.exists(),
+            "{identity:?} must be left in place, not reaped"
+        );
+    }
 }
 
 fn clone_probe(probe: &MarkerProbe) -> MarkerProbe {

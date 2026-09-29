@@ -1076,7 +1076,13 @@ fn socket_mode_allowed(stat: &libc::stat, euid: u32) -> bool {
     stat.st_uid == euid && stat.st_mode & 0o777 == 0o600
 }
 
-fn valid_process_identity(value: &str) -> bool {
+/// The one definition of a well-formed process identity: `linux:v1:` and a
+/// boot UUID and a start tick count, nothing else. An identity that fails this
+/// is unprovable, never an absence. The client turns that into
+/// `marker_identity` and refuses to read; the publisher turns it into its own
+/// `ProcessLiveness::Unprovable` and refuses to reap. Only a process proven
+/// gone is ever reaped.
+pub(crate) fn valid_process_identity(value: &str) -> bool {
     let Some((platform, version, boot, start)) = parse_process_identity(value) else {
         return false;
     };

@@ -116,6 +116,10 @@ pub struct AppState {
     pub summary_inflight: std::sync::Mutex<std::collections::HashSet<String>>,
     /// Global cap on concurrent conversation-summary one-shots.
     pub summary_semaphore: tokio::sync::Semaphore,
+    /// Global cap on concurrent runtime-read connections, so a burst of clients
+    /// cannot each hold a connection slot and a cloned row set while they wait
+    /// for the one sample in flight.
+    pub runtime_read_semaphore: tokio::sync::Semaphore,
     /// Suppression set for the startup-recovery cascade.
     pub recently_restarted: crate::session::recovery::RecentlyRestarted,
     /// Bumped under the `instances` write lock by any change an earlier disk snapshot

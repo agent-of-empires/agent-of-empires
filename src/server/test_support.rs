@@ -172,6 +172,9 @@ fn build_test_app_state_impl(
         summary_semaphore: tokio::sync::Semaphore::new(
             crate::session::conversation_summary::MAX_CONCURRENT,
         ),
+        runtime_read_semaphore: tokio::sync::Semaphore::new(
+            crate::server::runtime_ws::RUNTIME_READ_CONCURRENCY,
+        ),
         recently_restarted: crate::session::recovery::new_recently_restarted(),
         mutation_epoch: Arc::clone(&mutation_epoch),
         recovery_pending: crate::session::recovery::new_recovery_pending(),

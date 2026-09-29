@@ -36,6 +36,12 @@ const PROTOCOL_VERSION: u16 = 2;
 /// and it matches the client's single read budget, so a peer that
 /// authenticates and then says nothing is bounded identically either way.
 pub(crate) const CONNECTION_BUDGET: Duration = Duration::from_secs(15);
+/// The message ceiling both transports hand tungstenite. tungstenite 0.29.0
+/// defaults to 64 MiB for a message and 16 MiB for a frame, so the frame
+/// ceiling already matched `APPLICATION_LIMIT` on both routes while the WS
+/// route was accepting a message four times what the UDS route accepted. One
+/// constant, so the two routes cannot drift apart again.
+pub(crate) const MESSAGE_LIMIT: usize = crate::cli::runtime_read::APPLICATION_LIMIT;
 /// The trusted namespace this build publishes for itself, and the name the
 /// UDS marker files carry.
 pub(crate) const NAMESPACE: &str = if cfg!(debug_assertions) {
@@ -43,6 +49,12 @@ pub(crate) const NAMESPACE: &str = if cfg!(debug_assertions) {
 } else {
     "release:agent-of-empires"
 };
+
+/// How many runtime-read connections are admitted at once. The sample itself
+/// is single-flight, so this does not raise throughput; it bounds how many
+/// connections can be alive holding a slot and a cloned row set while they
+/// wait for that one sample.
+pub(crate) const RUNTIME_READ_CONCURRENCY: usize = 8;
 
 pub async fn runtime_ws(
     ws: WebSocketUpgrade,
@@ -63,15 +75,17 @@ pub async fn runtime_ws(
     // extractor, so the bound has to wrap the upgraded task itself: a peer
     // that authenticates, upgrades and then stops reading must not hold this
     // task, its connection slot and its sample for the life of the daemon.
-    ws.on_upgrade(move |socket| async move {
-        if tokio::time::timeout(CONNECTION_BUDGET, serve_runtime_read(socket, state))
-            .await
-            .is_err()
-        {
-            tracing::warn!(target: "runtime.ws", "runtime read exceeded its budget");
-        }
-    })
-    .into_response()
+    ws.max_message_size(MESSAGE_LIMIT)
+        .max_frame_size(crate::cli::runtime_read::APPLICATION_LIMIT)
+        .on_upgrade(move |socket| async move {
+            if tokio::time::timeout(CONNECTION_BUDGET, serve_runtime_read(socket, state))
+                .await
+                .is_err()
+            {
+                tracing::warn!(target: "runtime.ws", "runtime read exceeded its budget");
+            }
+        })
+        .into_response()
 }
 
 fn has_bearer_header(headers: &HeaderMap) -> bool {
@@ -175,18 +189,27 @@ async fn run_read(
     owner: Owner,
     close_after_frames: bool,
 ) {
+    let Ok(_admitted) = state.runtime_read_semaphore.acquire().await else {
+        return;
+    };
     let runtime = &RUNTIME;
-    // Single-flight: a second connection waits for the in-flight sample instead of
-    // publishing a second revision, so one sample is one revision and one cursor step.
-    let flight = runtime.flight.lock().await;
-
+    // The observation is the instant the row set left the watcher's cache.
+    // Everything after this is assembly, so stamping later would describe the
+    // assembly rather than what was observed.
+    let observed_at = runtime.pinned_now.unwrap_or_else(Utc::now);
     let instances: Vec<Instance> = state.instances.read().await.clone();
-    let sampled =
-        tokio::task::spawn_blocking(move || build_snapshot(runtime, &instances, owner)).await;
-
-    // The sample is the only work the flight serializes. A reader that stalls
-    // mid-write must not keep the next one from sampling.
-    drop(flight);
+    // The flight is taken by the sample, not by this future. A connection
+    // whose budget expires while the blocking task is still on the disk drops
+    // this future, and a guard owned by it would release the sample while its
+    // work still ran, so the next connection would rescan beside it.
+    let sampled = tokio::task::spawn_blocking(move || {
+        let _flight = runtime
+            .flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        build_snapshot(runtime, &instances, owner, observed_at)
+    })
+    .await;
 
     let snapshot = match sampled {
         Ok(snapshot) => snapshot,
@@ -296,10 +319,10 @@ pub fn record_exchange(
             runtime_instance_id: pins.runtime_instance_id.clone(),
         },
         sampler: Mutex::new(Sampler::default()),
-        flight: tokio::sync::Mutex::new(()),
+        flight: Mutex::new(()),
         pinned_now: Some(pins.observed_at),
     };
-    let sampled = build_snapshot(&runtime, instances, owner);
+    let sampled = build_snapshot(&runtime, instances, owner, pins.observed_at);
     let encode = |frame: Result<String, serde_json::Error>| {
         frame.expect("a recorded frame encodes").into_bytes()
     };
@@ -339,9 +362,12 @@ struct Sampler {
 struct RuntimeState {
     identity: RuntimeIdentity,
     sampler: Mutex<Sampler>,
-    flight: tokio::sync::Mutex<()>,
-    /// The clock `publish_freshness` reads. A seam and nothing more: `None` is
-    /// the wall clock, and a recording harness pins an instant so a transcript
+    /// The single sample in flight. A `std` mutex because the guard belongs to
+    /// the blocking sample rather than to the connection awaiting it, so a
+    /// cancelled read cannot release it while its work still runs.
+    flight: Mutex<()>,
+    /// The clock a read observes at. A seam and nothing more: `None` is the
+    /// wall clock, and a recording harness pins an instant so a transcript
     /// is reproducible. The daemon itself never pins one.
     pinned_now: Option<DateTime<Utc>>,
 }
@@ -356,7 +382,7 @@ impl RuntimeState {
                 runtime_instance_id: new_uuid(),
             },
             sampler: Mutex::new(Sampler::default()),
-            flight: tokio::sync::Mutex::new(()),
+            flight: Mutex::new(()),
             pinned_now: None,
         }
     }
@@ -373,27 +399,35 @@ pub(crate) fn identity() -> &'static RuntimeIdentity {
     &RUNTIME.identity
 }
 
-fn publish_freshness(runtime: &RuntimeState) -> (StatusFreshness, u64) {
+/// The cursor a latched sampler publishes. Both counters are saturated, so
+/// there is no next value and the cursor freezes at the last one it could
+/// name. It cannot freeze at zero, which is the value the client refuses,
+/// because that would turn a freshness the daemon cannot report into a
+/// snapshot the client rejects outright, and `freshness_unavailable` into
+/// `schema_invalid`.
+const LATCHED_CURSOR: u64 = u64::MAX;
+
+fn publish_freshness(runtime: &RuntimeState, observed_at: DateTime<Utc>) -> (StatusFreshness, u64) {
     let mut sampler = runtime
         .sampler
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     if sampler.latched {
-        return (unavailable(), 0);
+        return (unavailable(), LATCHED_CURSOR);
     }
     let Some(next) = sampler.successes.checked_add(1) else {
         sampler.latched = true;
-        return (unavailable(), 0);
+        return (unavailable(), LATCHED_CURSOR);
     };
     let Some(cursor) = next.checked_add(1) else {
         sampler.latched = true;
-        return (unavailable(), 0);
+        return (unavailable(), LATCHED_CURSOR);
     };
     sampler.successes = next;
     (
         StatusFreshness::Observed {
             revision: next,
-            observed_at: format_timestamp(runtime.pinned_now.unwrap_or_else(Utc::now)),
+            observed_at: format_timestamp(observed_at),
         },
         cursor,
     )
@@ -421,11 +455,16 @@ struct ProfileDisk {
     groups: Result<Vec<crate::session::Group>, ()>,
 }
 
-fn build_snapshot(runtime: &RuntimeState, instances: &[Instance], owner: Owner) -> Sampled {
+fn build_snapshot(
+    runtime: &RuntimeState,
+    instances: &[Instance],
+    owner: Owner,
+    observed_at: DateTime<Utc>,
+) -> Sampled {
     // `local_owner` mirrors the declared owner so the two can never disagree.
     let local_owner = owner.is_local();
     let identity = &runtime.identity;
-    let (freshness, cursor_revision) = publish_freshness(runtime);
+    let (freshness, cursor_revision) = publish_freshness(runtime, observed_at);
 
     // Rows are projected before the disk reads so the session projection itself
     // never runs behind a filesystem call.
@@ -1155,7 +1194,12 @@ mod tests {
         std::fs::create_dir_all(profiles.join("broken").join("projects.json"))
             .expect("a directory where the registry belongs: a read that cannot succeed");
         let instances = vec![instance("a", "main"), instance("b", "broken")];
-        let sampled = build_snapshot(&RuntimeState::new(), &instances, Owner::remote());
+        let sampled = build_snapshot(
+            &RuntimeState::new(),
+            &instances,
+            Owner::remote(),
+            Utc::now(),
+        );
 
         let hello = parse_hello(&hello_frame(&sampled)).expect("the client decodes the Hello");
         validate_hello(&hello).expect("a degraded profile is not a protocol violation");
@@ -1210,6 +1254,7 @@ mod tests {
             &RuntimeState::new(),
             &[instance("a", "zeta")],
             Owner::remote(),
+            Utc::now(),
         );
         assert_eq!(sampled.data.default_profile, None);
         assert_eq!(sampled.data.profiles.len(), 1);
@@ -1298,7 +1343,12 @@ mod tests {
     fn emitted_frames_satisfy_the_client_wire_contract() {
         let _home = TempHome::new();
         let instances = vec![instance("a", "main"), instance("b", "main")];
-        let sampled = build_snapshot(&RuntimeState::new(), &instances, Owner::remote());
+        let sampled = build_snapshot(
+            &RuntimeState::new(),
+            &instances,
+            Owner::remote(),
+            Utc::now(),
+        );
 
         let hello = parse_hello(&hello_frame(&sampled)).expect("client accepts the Hello");
         let snapshot =
@@ -1319,6 +1369,7 @@ mod tests {
             &RuntimeState::new(),
             &[instance("a", "main")],
             Owner::remote(),
+            Utc::now(),
         );
         let value: serde_json::Value = serde_json::to_value(&sampled.hello).expect("hello encodes");
 
@@ -1347,8 +1398,8 @@ mod tests {
     fn each_sample_advances_revision_and_cursor_together() {
         let _home = TempHome::new();
         let runtime = RuntimeState::new();
-        let first = build_snapshot(&runtime, &[], Owner::remote());
-        let second = build_snapshot(&runtime, &[], Owner::remote());
+        let first = build_snapshot(&runtime, &[], Owner::remote(), Utc::now());
+        let second = build_snapshot(&runtime, &[], Owner::remote(), Utc::now());
 
         assert_eq!(observed_revision(&first), 1);
         assert_eq!(observed_revision(&second), 2);
@@ -1358,19 +1409,44 @@ mod tests {
     }
 
     /// Once the counter would wrap, the projection latches to unavailable and no
-    /// counter moves again.
+    /// counter moves again. What matters is the consequence on the client: the
+    /// sample it produces has to survive the real decoder, or the read is
+    /// refused as `schema_invalid` and `freshness_unavailable`, which is in
+    /// the Contract Pack's code set and in `EMITTABLE_CODES`, can never be
+    /// emitted at all.
     #[test]
-    fn a_latched_sampler_stops_publishing() {
+    #[serial_test::serial]
+    fn a_latched_sampler_still_produces_a_snapshot_the_client_accepts() {
+        let _home = TempHome::new();
         let runtime = RuntimeState::new();
         runtime.sampler.lock().unwrap().successes = u64::MAX;
-        let (freshness, cursor) = publish_freshness(&runtime);
+        let sampled = build_snapshot(&runtime, &[], Owner::remote(), Utc::now());
 
-        assert!(matches!(freshness, StatusFreshness::Unavailable { .. }));
-        assert_eq!(cursor, 0);
+        assert!(matches!(
+            sampled.data.status_freshness,
+            StatusFreshness::Unavailable { .. }
+        ));
         assert!(runtime.sampler.lock().unwrap().latched);
-        let (again, cursor) = publish_freshness(&runtime);
+
+        let frame = serde_json::to_string(&SnapshotFrame {
+            kind: "snapshot",
+            data: &sampled.data,
+        })
+        .expect("the snapshot encodes");
+        let decoded = crate::cli::runtime_read::dto::parse_snapshot(frame.as_bytes())
+            .expect("the client accepts a latched sample");
+        assert!(
+            crate::cli::runtime_read::dto::validate_snapshot(&decoded).is_ok(),
+            "the latched cursor is one the client's validator accepts"
+        );
+        assert!(
+            !crate::cli::runtime_read::dto::freshness_observed(&decoded.status_freshness),
+            "and the renderer reads it as the freshness it cannot report"
+        );
+
+        let (again, cursor) = publish_freshness(&runtime, Utc::now());
         assert!(matches!(again, StatusFreshness::Unavailable { .. }));
-        assert_eq!(cursor, 0);
+        assert_eq!(cursor, LATCHED_CURSOR);
     }
 
     /// Referential integrity: a session whose project path is in no registry
@@ -1422,7 +1498,12 @@ mod tests {
         trailing.project_path = "/repo/".into();
         let instances = vec![named("a", "main"), orphan, trailing];
 
-        let sampled = build_snapshot(&RuntimeState::new(), &instances, Owner::remote());
+        let sampled = build_snapshot(
+            &RuntimeState::new(),
+            &instances,
+            Owner::remote(),
+            Utc::now(),
+        );
 
         let snapshot =
             parse_snapshot(&snapshot_frame(&sampled)).expect("client accepts the Snapshot");
@@ -1492,7 +1573,7 @@ mod tests {
         let mut inst = named("fractional", "main");
         inst.created_at = "2026-01-02T03:04:05.123456789Z".parse().expect("timestamp");
         inst.pinned_at = Some("2026-01-02T03:04:06.5Z".parse().expect("timestamp"));
-        let sampled = build_snapshot(&RuntimeState::new(), &[inst], Owner::remote());
+        let sampled = build_snapshot(&RuntimeState::new(), &[inst], Owner::remote(), Utc::now());
 
         let row = &sampled.data.sessions[0];
         assert_eq!(row.created_at, "2026-01-02T03:04:05.123456789Z");

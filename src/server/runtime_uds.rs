@@ -380,7 +380,7 @@ async fn connection(state: Arc<AppState>, stream: UnixStream) {
     // stalling in the handshake.
     let deadline = tokio::time::Instant::now() + CONNECTION_BUDGET;
     let config = WebSocketConfig::default()
-        .max_message_size(Some(FRAME_LIMIT))
+        .max_message_size(Some(runtime_ws::MESSAGE_LIMIT))
         .max_frame_size(Some(FRAME_LIMIT));
     let upgraded = tokio::time::timeout_at(
         deadline,
@@ -449,7 +449,8 @@ fn reap_retained_state(dir: RawFd) -> Result<(), PublishError> {
         unlink_entry(dir, name)?;
     }
     // A marker a live process wrote means that process is publishing right
-    // now, so nothing here is touched.
+    // now, and a marker this half cannot prove dead proves nothing at all, so
+    // both leave everything in place.
     for name in retained.iter().filter(|name| !is_temporary_name(name)) {
         // The socket carries no identity of its own: a live daemon always has a
         // postbind marker beside it, so an unmarked socket is retained state.
@@ -465,7 +466,7 @@ fn reap_retained_state(dir: RawFd) -> Result<(), PublishError> {
                 format!("{name} is not a schema {SCHEMA} marker"),
             ));
         }
-        if process_is_live(&probe) {
+        if process_liveness(&probe) != ProcessLiveness::Dead {
             return Err(PublishError::new(
                 "namespace_busy",
                 format!("{name} belongs to process {}", probe.pid),
@@ -527,7 +528,8 @@ fn temporary_is_live(dir: RawFd, name: &str) -> Result<bool, PublishError> {
             format!("{name} could not be read: {error}"),
         ));
     }
-    Ok(serde_json::from_slice::<MarkerProbe>(&bytes).is_ok_and(|probe| process_is_live(&probe)))
+    Ok(serde_json::from_slice::<MarkerProbe>(&bytes)
+        .is_ok_and(|probe| process_liveness(&probe) == ProcessLiveness::Live))
 }
 
 /// Every runtime artifact in the directory, temporary names included.
@@ -905,30 +907,52 @@ pub(super) fn fail_next_proc_read() {
     PROC_READ_UNPROVABLE.store(true, std::sync::atomic::Ordering::SeqCst);
 }
 
+/// A three-way answer about a retained marker's writer. `Live` and `Dead` are
+/// proven; `Unprovable` is everything else, and the only value that may be
+/// reaped is `Dead`. An identity string this platform cannot parse is
+/// unprovable rather than an absence. That rule is stated once, by
+/// [`crate::cli::runtime_read::uds::valid_process_identity`], which the client
+/// half turns into `marker_identity` and this half turns into this enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProcessLiveness {
+    Live,
+    Dead,
+    Unprovable,
+}
+
 /// Whether the process that wrote a retained marker is still running. A marker
 /// from a boot that has ended, or a pid that has been recycled, is dead.
-fn process_is_live(probe: &MarkerProbe) -> bool {
+fn process_liveness(probe: &MarkerProbe) -> ProcessLiveness {
+    if !crate::cli::runtime_read::uds::valid_process_identity(&probe.process_start_identity) {
+        return ProcessLiveness::Unprovable;
+    }
+    // The predicate has already established both of these, so a mismatch here
+    // is a predicate that stopped describing the marker, and unprovable is the
+    // answer that cannot reap a live daemon's state.
     let Some(rest) = probe.process_start_identity.strip_prefix("linux:v1:") else {
-        return false;
+        return ProcessLiveness::Unprovable;
     };
     let Some((recorded_boot, recorded_start)) = rest.split_once(':') else {
-        return false;
+        return ProcessLiveness::Unprovable;
     };
-    match boot_id() {
+    let Some(boot) = boot_id() else {
         // Without a boot id nothing can be proven dead, so fail closed.
-        None => true,
-        Some(boot) if boot != recorded_boot => false,
-        Some(_) => match process_start_ticks(probe.pid) {
-            ProcessStart::Ticks(start) => start == recorded_start,
-            // Only a proven-absent process is reaped.
-            ProcessStart::Absent => false,
-            // An unreadable `/proc` proves nothing, so the retained state of a
-            // possibly-running daemon is left alone and publication is
-            // refused. Reaping here would unlink a live daemon's markers and
-            // publish over its socket, and clients would fall back silently
-            // while that daemon kept serving the listener.
-            ProcessStart::Unprovable => true,
-        },
+        return ProcessLiveness::Unprovable;
+    };
+    if boot != recorded_boot {
+        return ProcessLiveness::Dead;
+    }
+    match process_start_ticks(probe.pid) {
+        ProcessStart::Ticks(start) if start == recorded_start => ProcessLiveness::Live,
+        ProcessStart::Ticks(_) => ProcessLiveness::Dead,
+        // Only a proven-absent process is reaped.
+        ProcessStart::Absent => ProcessLiveness::Dead,
+        // An unreadable `/proc` proves nothing, so the retained state of a
+        // possibly-running daemon is left alone and publication is refused.
+        // Reaping here would unlink a live daemon's markers and publish over
+        // its socket, and clients would fall back silently while that daemon
+        // kept serving the listener.
+        ProcessStart::Unprovable => ProcessLiveness::Unprovable,
     }
 }
 
