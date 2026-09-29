@@ -557,6 +557,39 @@ mod tests {
     }
 
     #[test]
+    fn only_the_launching_store_is_inventoried() {
+        for owner in ["own", "sibling"] {
+            let temporary = tempfile::tempdir().unwrap();
+            let host = temporary.path().join("host");
+            let stores = host.join(super::super::SANDBOX_PRIVATE_SUBDIR);
+            for store in ["own", "sibling"] {
+                fs::create_dir_all(stores.join(store).join("session-env/live")).unwrap();
+            }
+            let selected = fs::canonicalize(&host).unwrap().join("settings.json");
+            fs::write(&selected, b"AUTHORED_CONFIG").unwrap();
+            let foreign = stores.join("sibling/state.json");
+            fs::write(&foreign, b"OTHER_INSTANCE_STATE").unwrap();
+            symlink(&selected, stores.join(owner).join("alias")).unwrap();
+            let mut boundary = NativeStateBoundary::for_source(&host, &stores.join("own")).unwrap();
+            boundary.add_storage_root(&host).unwrap();
+            let mut guard = ReadGuard::new(&boundary, ReadAccess::default()).unwrap();
+            let foreign = fs::canonicalize(foreign).unwrap();
+            assert!(!guard
+                .record_file(&foreign, &File::open(&foreign).unwrap())
+                .unwrap());
+            let published = guard
+                .record_file(&selected, &File::open(&selected).unwrap())
+                .unwrap();
+            assert_eq!(published, owner == "sibling", "{owner}");
+            // A running sibling rewrites its own links and directories.
+            fs::remove_dir(stores.join("sibling/session-env/live")).unwrap();
+            fs::remove_file(stores.join("sibling/alias")).ok();
+            symlink("state.json", stores.join("sibling/alias")).unwrap();
+            guard.validate().unwrap();
+        }
+    }
+
+    #[test]
     fn validation_rechecks_new_state_subdirectories() {
         for (origin, conflict) in [
             (StateOrigin::Native, true),

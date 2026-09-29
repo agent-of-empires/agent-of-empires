@@ -42,6 +42,10 @@ pub(super) struct NativeStateBoundary {
     origin_root: PathBuf,
     private_stage: guard::PrivateStage,
     stopped_original: Option<PathBuf>,
+    /// The per-instance store this launch publishes into.
+    own_store: PathBuf,
+    /// Directories whose children are per-instance stores.
+    store_roots: Vec<PathBuf>,
     paths: Vec<(PathBuf, StateOrigin)>,
     patterns: Vec<(PathBuf, Arc<NativeRule>, StateOrigin)>,
     routes: Vec<(PathBuf, PathBuf)>,
@@ -56,6 +60,8 @@ impl NativeStateBoundary {
             origin_root: source.to_path_buf(),
             private_stage,
             stopped_original: None,
+            own_store: canonical_expected_path(destination)?,
+            store_roots: Vec::new(),
             paths: Vec::new(),
             patterns: Vec::new(),
             routes: Vec::new(),
@@ -230,7 +236,31 @@ impl NativeStateBoundary {
             self.add_classified_path(root.join(name), StateOrigin::Storage);
             self.add_classified_path(canonical.join(name), StateOrigin::Storage);
         }
+        let stores = canonical_expected_path(&canonical.join(SANDBOX_PRIVATE_SUBDIR))?;
+        if !self.store_roots.contains(&stores) {
+            self.store_roots.push(stores);
+        }
         Ok(())
+    }
+
+    /// Whether `physical` lies in another instance's store, which storage inventory
+    /// treats as opaque. Its container can link only within its own mount, so
+    /// it holds no alias of a source or of this launch's store, and path
+    /// refusal of the whole store root still fences it. Stores nested in a
+    /// tree this launch reads or writes are container-written and stay walked.
+    fn foreign_store(&self, physical: &Path) -> bool {
+        let ours = |path: &Path| {
+            path.starts_with(&self.own_store)
+                || self
+                    .stopped_original
+                    .as_ref()
+                    .is_some_and(|original| path.starts_with(original))
+        };
+        !ours(physical)
+            && physical
+                .ancestors()
+                .skip(1)
+                .any(|parent| self.store_roots.iter().any(|root| root == parent) && !ours(parent))
     }
 
     fn add_state_rule(
