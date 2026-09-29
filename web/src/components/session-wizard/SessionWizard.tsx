@@ -22,6 +22,12 @@ import { safeGetItem, safeSetItem } from "../../lib/safeStorage";
 import { toastBus } from "../../lib/toastBus";
 import { normalizeProjectPathKey } from "../../lib/registeredProjects";
 import { useMobileKeyboard } from "../../hooks/useMobileKeyboard";
+import {
+  claimPendingCreate,
+  peekPendingCreate,
+  trackPendingCreate,
+  type PendingCreate,
+} from "../../lib/pendingCreates";
 import { hasFinePointer } from "../../lib/platform";
 import { ProjectStep } from "./steps/ProjectStep";
 import { ExtraReposPicker } from "./steps/ExtraReposPicker";
@@ -106,8 +112,6 @@ const PROGRESS_DELAY_MS = 800;
 const PROGRESS_POLL_MS = 700;
 // Retries after a dropped connection; the idempotency key makes them join the running create.
 const NETWORK_RETRIES = 3;
-// A backgrounded create has no Launch button to retry from, so it keeps reconciling longer.
-const BACKGROUND_NETWORK_RETRIES = 20;
 const MAX_RETRY_DELAY_MS = 30_000;
 const UNKNOWN_OUTCOME_ERROR =
   "Lost connection while creating. The session may still be created; Launch retries the same request.";
@@ -173,7 +177,12 @@ export function SessionWizard({ onClose, onCreated, onCreatedInBackground, prefi
   const [progressKey, setProgressKey] = useState<string | null>(null);
   const [showProgress, setShowProgress] = useState(false);
   // A create whose response never arrived; Launch and reconnects retry it under its key.
-  const [unknownOutcome, setUnknownOutcome] = useState<{ body: CreateSessionRequest; tool: string } | null>(null);
+  // Seeded from a create an earlier wizard left unresolved, so Launch retries it under its key.
+  const [unknownOutcome, setUnknownOutcome] = useState<PendingCreate | null>(peekPendingCreate);
+  const unknownOutcomeRef = useRef(unknownOutcome);
+  useEffect(() => {
+    unknownOutcomeRef.current = unknownOutcome;
+  }, [unknownOutcome]);
   // Set once the user leaves a create running, so its outcome is reported, not navigated to.
   const backgroundRef = useRef(false);
   const { keyboardHeight } = useMobileKeyboard();
@@ -310,12 +319,11 @@ export function SessionWizard({ onClose, onCreated, onCreatedInBackground, prefi
     }
   };
 
-  const runCreate = async (body: CreateSessionRequest, tool: string) => {
+  const runCreate = async (body: CreateSessionRequest, tool: string, since = Date.now()) => {
     setUnknownOutcome(null);
     setProgressKey(body.idempotency_key ?? null);
     let result = await createSession(body);
-    const retries = () => (backgroundRef.current ? BACKGROUND_NETWORK_RETRIES : NETWORK_RETRIES);
-    for (let attempt = 0; result.network && body.idempotency_key && attempt < retries(); attempt++) {
+    for (let attempt = 0; result.network && body.idempotency_key && attempt < NETWORK_RETRIES; attempt++) {
       await waitUntilOnline();
       await waitUntilVisible();
       await new Promise((r) => setTimeout(r, Math.min(1000 * (attempt + 1), MAX_RETRY_DELAY_MS)));
@@ -326,10 +334,12 @@ export function SessionWizard({ onClose, onCreated, onCreatedInBackground, prefi
     // No answer is not a refusal: the detached server create may still finish, so
     // keep the key and reconcile under it rather than report a failure.
     if (result.network && body.idempotency_key) {
+      const pending = { body: { ...body, idempotency_key: body.idempotency_key }, tool, since };
       if (background) {
-        toastBus.handler?.error("Lost connection while creating a session; it may still appear in the sidebar.");
+        // The wizard is gone, so the app-level owner keeps retrying under this key.
+        trackPendingCreate(pending);
       } else {
-        setUnknownOutcome({ body, tool });
+        setUnknownOutcome(pending);
         dispatch({ type: "SUBMIT_ERROR", error: UNKNOWN_OUTCOME_ERROR });
       }
       return;
@@ -355,7 +365,7 @@ export function SessionWizard({ onClose, onCreated, onCreatedInBackground, prefi
   const handleSubmit = async () => {
     dispatch({ type: "SUBMIT_START" });
     if (unknownOutcome) {
-      await runCreate(unknownOutcome.body, unknownOutcome.tool);
+      await runCreate(unknownOutcome.body, unknownOutcome.tool, unknownOutcome.since);
       return;
     }
     const d = state.data;
@@ -380,12 +390,23 @@ export function SessionWizard({ onClose, onCreated, onCreatedInBackground, prefi
     await runCreate(body, d.tool);
   };
 
+  // Own the adopted create while open; on close, hand an unresolved create back to the
+  // app-level owner. A create still in flight at close reports through the background path.
+  useEffect(() => {
+    const adopted = unknownOutcomeRef.current;
+    if (adopted) claimPendingCreate(adopted.body.idempotency_key);
+    return () => {
+      backgroundRef.current = true;
+      if (unknownOutcomeRef.current) trackPendingCreate(unknownOutcomeRef.current);
+    };
+  }, []);
+
   // Reconnecting reconciles an unknown outcome without waiting for another Launch.
   useEffect(() => {
     if (!unknownOutcome || state.isSubmitting) return;
     const retry = () => {
       dispatch({ type: "SUBMIT_START" });
-      void runCreate(unknownOutcome.body, unknownOutcome.tool);
+      void runCreate(unknownOutcome.body, unknownOutcome.tool, unknownOutcome.since);
     };
     window.addEventListener("online", retry);
     return () => window.removeEventListener("online", retry);
@@ -649,7 +670,7 @@ export function SessionWizard({ onClose, onCreated, onCreatedInBackground, prefi
             <LaunchFooter
               data={d}
               isSubmitting={state.isSubmitting}
-              error={state.error}
+              error={state.error ?? (unknownOutcome ? UNKNOWN_OUTCOME_ERROR : null)}
               onSubmit={handleSubmit}
               nameOnly={nameOnly}
               defaultsReady={defaultsReady}

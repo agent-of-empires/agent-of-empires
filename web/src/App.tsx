@@ -101,6 +101,7 @@ import { parseSessionColorsEnabled, SessionColorsContext } from "./lib/sessionCo
 import { onSettingsChanged } from "./lib/settingsEvents";
 import { parseSystemHealthEnabled, SystemHealthEnabledContext } from "./lib/systemHealth";
 import { toastBus, reportError } from "./lib/toastBus";
+import { startPendingCreates } from "./lib/pendingCreates";
 import { isAbsolutePath, resolveToRepoRelative, type FileRef } from "./lib/fileRef";
 import { NAVIGATE_EVENT, OPEN_SESSION_EVENT } from "./lib/sessionRoute";
 import { dispatchFocusTerminal, requestSessionInputFocus, setPendingTerminalFocus } from "./lib/terminalFocus";
@@ -367,6 +368,17 @@ function AppContent({
     applySession,
   } = useSessions();
   const workspaces = useWorkspaces(sessions);
+  // Creates whose outcome the wizard never learned keep reconciling here, past its unmount.
+  useEffect(() => {
+    startPendingCreates({
+      onCreated: (session) => {
+        if (!session) return;
+        injectSession(session);
+        toastBus.handler?.info(`"${session.title}" is ready`);
+      },
+      onFailed: (message) => toastBus.handler?.error(`Session was not created: ${message}`),
+    });
+  }, [injectSession]);
   // Trash is a whole-workspace concern, so it is derived here from the
   // authoritative unsliced workspace list rather than reconstructed from the
   // sidebar's per-`group_path` slice views. A workspace is in Trash only when

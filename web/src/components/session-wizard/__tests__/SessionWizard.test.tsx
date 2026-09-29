@@ -7,6 +7,7 @@ import { SessionWizard, type WizardPrefill } from "../SessionWizard";
 import { fetchAgents, fetchCreateProgress, fetchIsGitRepo, fetchProfiles, fetchSettings } from "../../../lib/api";
 import { agent } from "./fixtures";
 import { toastBus } from "../../../lib/toastBus";
+import { startPendingCreates } from "../../../lib/pendingCreates";
 
 const createSession = vi.fn();
 
@@ -359,16 +360,50 @@ describe("SessionWizard unknown create outcome", () => {
     expect(payload(createSession.mock.calls.length - 1).idempotency_key).toBe(payload(0).idempotency_key);
   });
 
-  it("does not report a backgrounded create as failed when no response arrives", async () => {
+  // The wizard really unmounts on close, as in App, so only a longer-lived owner can keep the key.
+  const launchInBackgroundAndClose = async () => {
     createSession.mockResolvedValue(LOST);
-    const { onCreatedInBackground } = renderWizard();
+    const onCreatedInBackground = vi.fn();
+    const view = render(
+      <SessionWizard
+        onClose={() => view.unmount()}
+        onCreated={vi.fn()}
+        onCreatedInBackground={onCreatedInBackground}
+        prefill={{ path: "/tmp/proj", tool: "claude" }}
+      />,
+    );
     await launch();
     fireEvent.click(await screen.findByText("Continue in background", undefined, { timeout: 3000 }));
-    await vi.advanceTimersByTimeAsync(15 * 60_000);
-    await waitFor(() => expect(toastError).toHaveBeenCalled());
-    expect(toastError.mock.calls[0]![0]).toMatch(/may still appear/);
-    expect(toastError.mock.calls[0]![0]).not.toMatch(/not created/);
-    expect(onCreatedInBackground).not.toHaveBeenCalled();
-    expect(new Set(createSession.mock.calls.map(([body]) => body.idempotency_key)).size).toBe(1);
+    expect(screen.queryByTestId("session-wizard")).toBeNull();
+    await vi.advanceTimersByTimeAsync(5 * 60_000);
+    const key = payload(0).idempotency_key;
+    expect(new Set(createSession.mock.calls.map(([body]) => body.idempotency_key))).toEqual(new Set([key]));
+    expect(toastError).not.toHaveBeenCalled();
+    return { key, onCreatedInBackground };
+  };
+
+  it("a reopened wizard retries a closed wizard's unresolved create under its key", async () => {
+    const { key } = await launchInBackgroundAndClose();
+    const { onCreated } = renderWizard({ path: "/tmp/other", tool: "claude" });
+    await waitFor(() => expect(screen.getByText(/may still be created/)).toBeTruthy());
+
+    createSession.mockResolvedValue({ ok: true, session: { id: "s1" } });
+    await launch();
+    await waitFor(() => expect(onCreated).toHaveBeenCalledWith({ id: "s1" }));
+    expect(payload(createSession.mock.calls.length - 1).idempotency_key).toBe(key);
+  });
+
+  it("the app-level owner reconciles a closed wizard's create once the server answers", async () => {
+    const onCreatedByOwner = vi.fn();
+    startPendingCreates({ onCreated: onCreatedByOwner, onFailed: vi.fn() });
+    const { key } = await launchInBackgroundAndClose();
+
+    createSession.mockResolvedValue({ ok: true, session: { id: "s1" } });
+    await vi.advanceTimersByTimeAsync(60_000);
+    await waitFor(() => expect(onCreatedByOwner).toHaveBeenCalledWith({ id: "s1" }, expect.anything()));
+    expect(payload(createSession.mock.calls.length - 1).idempotency_key).toBe(key);
+    // Resolved, so a later wizard starts a fresh request.
+    renderWizard();
+    expect(screen.queryByText(/may still be created/)).toBeNull();
   });
 });

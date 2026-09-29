@@ -11,8 +11,9 @@ use crate::session::config::repo_config::HookProgress;
 
 const MAX_OUTPUT_LINES: usize = 200;
 const MAX_LINE_CHARS: usize = 400;
-/// How long a failed create's response is replayed to a retry with its key.
-const FAILURE_TTL: Duration = Duration::from_secs(600);
+/// How long a failed create's response is replayed to a retry with its key. The
+/// web client keeps retrying an unresolved create for as long (`pendingCreates.ts`).
+const FAILURE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
