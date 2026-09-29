@@ -4,6 +4,10 @@ export type ToolbarKeyId =
   | "shift-tab"
   | "ctrl"
   | "backspace"
+  | "up"
+  | "down"
+  | "left"
+  | "right"
   | "enter"
   | "ctrl-c"
   | "ctrl-o"
@@ -31,6 +35,11 @@ export const TOOLBAR_KEY_CATALOG: readonly ToolbarKeySpec[] = [
   { id: "shift-tab", label: "⇧Tab", name: "Shift+Tab", data: "\x1b[Z" },
   { id: "ctrl", label: "Ctrl", name: "Ctrl" },
   { id: "backspace", label: "⌫", name: "Backspace", data: "\x7f", repeat: true },
+  // Arrows also live in the joystick; these keep them reachable with it hidden.
+  { id: "up", label: "↑", name: "Arrow up", data: "\x1b[A", repeat: true },
+  { id: "down", label: "↓", name: "Arrow down", data: "\x1b[B", repeat: true },
+  { id: "left", label: "←", name: "Arrow left", data: "\x1b[D", repeat: true },
+  { id: "right", label: "→", name: "Arrow right", data: "\x1b[C", repeat: true },
   { id: "enter", label: "⏎", name: "Enter", data: "\r" },
   { id: "ctrl-c", label: "^C", name: "Ctrl+C interrupt", data: "\x03" },
   { id: "ctrl-o", label: "^O", name: "Ctrl+O", data: "\x0f" },

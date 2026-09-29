@@ -38,6 +38,8 @@ const LATCHED_KEY_CLASS = `${KEY_BASE} border-brand-500/80 bg-brand-600/30 text-
 // Compose is the primary action: a neutral cap with an accent glyph, so it never reads as latched.
 const COMPOSE_KEY_CLASS = `${KEY_BASE} border-surface-700/70 bg-surface-800 text-brand-400 active:bg-surface-700 active:border-surface-600`;
 
+const ARROW_ROTATION = { up: 0, right: 90, down: 180, left: 270 } as const;
+
 /** An icon where the mono font's glyph renders small or boxed, otherwise the label. */
 function KeyFace({ spec }: { spec: ToolbarKeySpec }) {
   switch (spec.id) {
@@ -54,6 +56,18 @@ function KeyFace({ spec }: { spec: ToolbarKeySpec }) {
         <StrokeIcon size={18} strokeWidth="1.75" hidden>
           <path d="M20 4v7a4 4 0 0 1-4 4H4" />
           <path d="m9 10-5 5 5 5" />
+        </StrokeIcon>
+      );
+    case "up":
+    case "down":
+    case "left":
+    case "right":
+      return (
+        <StrokeIcon size={18} strokeWidth="1.75" hidden>
+          <g transform={`rotate(${ARROW_ROTATION[spec.id]} 12 12)`}>
+            <path d="M12 19V5" />
+            <path d="m5 12 7-7 7 7" />
+          </g>
         </StrokeIcon>
       );
     default:

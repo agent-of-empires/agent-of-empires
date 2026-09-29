@@ -109,7 +109,7 @@ export function MobileKeysSettings() {
         <div>
           <div className="text-[13px] text-text-secondary">Arrow joystick on mobile</div>
           <p className="text-[11px] text-text-muted mt-1">
-            Drag the pad beside the keyboard button to send arrow keys; drag further to repeat faster.
+            Drag the pad above the keyboard button to send arrow keys; drag further to repeat faster.
           </p>
         </div>
         <input
