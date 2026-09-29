@@ -745,12 +745,7 @@ impl SettingsView {
             return Some(SettingsAction::Continue);
         }
 
-        if let Some((scope, _)) = self
-            .scope_tab_rects
-            .iter()
-            .find(|(_, rect)| rect.contains(pos))
-            .copied()
-        {
+        if let Some(scope) = hit(&self.scope_tab_rects, col, row) {
             if scope != self.scope {
                 if self.has_changes {
                     return Some(SettingsAction::UnsavedChangesWarning);
@@ -762,12 +757,7 @@ impl SettingsView {
             return Some(SettingsAction::Continue);
         }
 
-        if let Some((idx, _)) = self
-            .category_rects
-            .iter()
-            .find(|(_, rect)| rect.contains(pos))
-            .copied()
-        {
+        if let Some(idx) = hit(&self.category_rects, col, row) {
             self.focus = SettingsFocus::Categories;
             if self.selected_category != idx {
                 self.selected_category = idx;
@@ -778,12 +768,7 @@ impl SettingsView {
             return Some(SettingsAction::Continue);
         }
 
-        if let Some((idx, _)) = self
-            .field_rects
-            .iter()
-            .find(|(_, rect)| rect.contains(pos))
-            .copied()
-        {
+        if let Some(idx) = hit(&self.field_rects, col, row) {
             self.focus = SettingsFocus::Fields;
             self.selected_field = idx;
             // On the Plugins tab the click must also move sub-focus, or the

@@ -478,6 +478,8 @@ impl IntroDialog {
                 Span::styled(*url, Style::default().fg(theme.accent).underlined()),
             ])
         }));
+        // Link rows are only hit-testable while nothing above them wraps.
+        let unwrapped = lines.iter().all(|l| l.width() <= area.width as usize);
         lines.extend([
             Line::from(""),
             Line::from(Span::styled(
@@ -493,16 +495,12 @@ impl IntroDialog {
                 "→/Enter forward, ← back, Esc skip.",
                 Style::default().fg(theme.hint).italic(),
             )),
-            Line::from(Span::styled(
+        ]);
+        if unwrapped {
+            lines.push(Line::from(Span::styled(
                 "Click a link above to open it in your browser.",
                 Style::default().fg(theme.hint).italic(),
-            )),
-        ]);
-        // Link rows are only hit-testable while nothing above them wraps.
-        let unwrapped = lines[..links_row + WELCOME_LINKS.len()]
-            .iter()
-            .all(|l| l.width() <= area.width as usize);
-        if unwrapped {
+            )));
             for (i, (label, url)) in WELCOME_LINKS.iter().enumerate() {
                 let y = area.y + (links_row + i) as u16;
                 if y >= area.bottom() {
@@ -1163,6 +1161,29 @@ mod tests {
             let _ = dialog.handle_key(key(KeyCode::Enter));
         }
         assert_eq!(dialog.outcome().telemetry_opt_in, Some(true));
+    }
+
+    #[test]
+    fn welcome_links_click_only_while_they_render_unwrapped() {
+        use crate::tui::dialogs::test_render::{draw, find};
+        let url = WELCOME_LINKS[0].1;
+        let mut dialog = IntroDialog::new("zinc");
+        let buf = draw(100, 30, |f, theme| dialog.render(f, f.area(), theme));
+        find(&buf, "Click a link above");
+        let (x, y) = find(&buf, url);
+        assert!(dialog.handle_hover(x, y));
+        assert!(matches!(
+            dialog.handle_click(x, y),
+            Some(DialogResult::Continue)
+        ));
+        assert_eq!(dialog.take_pending_link(), Some(url));
+
+        // Too narrow: the links wrap, so they are neither targets nor advertised.
+        let mut dialog = IntroDialog::new("zinc");
+        let buf = draw(50, 40, |f, theme| dialog.render(f, f.area(), theme));
+        assert!(dialog.link_areas.is_empty());
+        let text: String = buf.content().iter().map(|c| c.symbol()).collect();
+        assert!(!text.contains("Click a link"));
     }
 
     #[test]

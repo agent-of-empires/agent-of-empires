@@ -317,7 +317,7 @@ pub struct HomeView {
     pub(super) shelf_inner_area: Rect,
     pub(super) collapse_button_area: Rect,
     pub(super) expand_strip_area: Rect,
-    pub(super) footer_buttons: Vec<(Rect, crossterm::event::KeyEvent)>,
+    pub(super) footer_buttons: Vec<(crossterm::event::KeyEvent, Rect)>,
     pub(super) footer_hover: Option<crossterm::event::KeyEvent>,
     pub(super) mouse_pos: Option<(u16, u16)>,
     pub(super) last_click: Option<(std::time::Instant, u16, u16)>,

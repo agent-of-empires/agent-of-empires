@@ -78,3 +78,17 @@ fn a_click_in_the_diff_file_list_selects_that_file() {
     assert!(env.view.handle_dialog_click(x, y));
     assert_eq!(env.view.diff_view.as_ref().unwrap().selected_file, 1);
 }
+
+#[test]
+#[serial]
+fn a_follow_up_dialog_over_new_session_takes_its_own_clicks() {
+    use crate::tui::dialogs::test_render::find;
+    let mut env = create_test_env_with_sessions(1);
+    env.view.open_new_session_dialog();
+    env.view.hooks_install_dialog = Some(crate::tui::dialogs::HooksInstallDialog::new("claude"));
+    let buf = render(&mut env);
+    let (x, y) = find(&buf, "[Cancel (Esc)]");
+    assert!(env.view.handle_dialog_click(x, y));
+    assert!(env.view.hooks_install_dialog.is_none());
+    assert!(env.view.new_dialog.is_some());
+}

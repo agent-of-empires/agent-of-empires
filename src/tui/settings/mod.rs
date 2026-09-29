@@ -395,31 +395,19 @@ impl SettingsView {
     /// selection.
     pub(super) fn hovered_scope(&self) -> Option<SettingsScope> {
         let (col, row) = self.mouse_pos?;
-        let pos = ratatui::layout::Position::from((col, row));
-        self.scope_tab_rects
-            .iter()
-            .find(|(_, rect)| rect.contains(pos))
-            .map(|(scope, _)| *scope)
+        crate::tui::dialogs::hit(&self.scope_tab_rects, col, row)
     }
 
     /// Category-row index under the mouse cursor, if any.
     pub(super) fn hovered_category(&self) -> Option<usize> {
         let (col, row) = self.mouse_pos?;
-        let pos = ratatui::layout::Position::from((col, row));
-        self.category_rects
-            .iter()
-            .find(|(_, rect)| rect.contains(pos))
-            .map(|(idx, _)| *idx)
+        crate::tui::dialogs::hit(&self.category_rects, col, row)
     }
 
     /// Field-row index under the mouse cursor, if any.
     pub(super) fn hovered_field(&self) -> Option<usize> {
         let (col, row) = self.mouse_pos?;
-        let pos = ratatui::layout::Position::from((col, row));
-        self.field_rects
-            .iter()
-            .find(|(_, rect)| rect.contains(pos))
-            .map(|(idx, _)| *idx)
+        crate::tui::dialogs::hit(&self.field_rects, col, row)
     }
 
     /// The category at `selected_category`, by invariant always a

@@ -551,8 +551,8 @@ fn render_active(
         ]))
     };
 
-    // Each row may carry a `(label, value)` whose value a click copies.
-    type Copy = Option<(&'static str, String)>;
+    // Each row may carry `(label, drawn value width, value a click copies)`.
+    type Copy = Option<(&'static str, u16, String)>;
     let mut rows: Vec<(u16, Paragraph, Copy)> = vec![(
         qr_lines.len() as u16,
         Paragraph::new(qr_lines).alignment(Alignment::Center),
@@ -579,33 +579,27 @@ fn render_active(
     let url_fits =
         "URL: ".len() + url.chars().count() <= content.width.saturating_sub(2).max(1) as usize;
     let (base_url, token) = split_url_and_token(url);
+    let width = |s: &str| s.chars().count() as u16;
     // The full URL is copied even when it wraps onto a token row.
-    if url_fits {
+    let shown_url = if url_fits { url.to_string() } else { base_url };
+    rows.push((
+        1,
+        labeled("URL: ", shown_url.clone(), accent),
+        Some(("URL: ", width(&shown_url), url.to_string())),
+    ));
+    if let Some(token) = token.filter(|_| !url_fits) {
         rows.push((
             1,
-            labeled("URL: ", url.to_string(), accent),
-            Some(("URL: ", url.to_string())),
+            labeled("Token: ", token.to_string(), accent),
+            Some(("Token: ", width(token), token.to_string())),
         ));
-    } else {
-        rows.push((
-            1,
-            labeled("URL: ", base_url.clone(), accent),
-            Some(("URL: ", base_url)),
-        ));
-        if let Some(token) = token {
-            rows.push((
-                1,
-                labeled("Token: ", token.to_string(), accent),
-                Some(("Token: ", token.to_string())),
-            ));
-        }
     }
     if is_tunnel {
         let (value, style, copy) = match passphrase {
             Some(pp) => (
                 pp.clone(),
                 accent.bold(),
-                Some(("Passphrase: ", pp.clone())),
+                Some(("Passphrase: ", width(pp), pp.clone())),
             ),
             None => (
                 "(set when the daemon started; check the shell that ran `aoe serve`)".to_string(),
@@ -626,9 +620,8 @@ fn render_active(
         .split(content);
     for ((_, row, copy), chunk) in rows.into_iter().zip(chunks.iter().skip(1)) {
         frame.render_widget(row, *chunk);
-        if let Some((label, value)) = copy {
+        if let Some((label, value_w, value)) = copy {
             let label_w = label.len() as u16;
-            let value_w = value.chars().count() as u16;
             let x = crate::tui::dialogs::centered_x(*chunk, label_w + value_w) + label_w;
             let width = value_w.min(chunk.right().saturating_sub(x));
             let what = label.trim_end_matches([':', ' ']);
@@ -938,6 +931,41 @@ mod tests {
         view.show_help = true;
         draw(&view);
         assert_eq!(view.handle_click(0, 0).map(|k| k.code), Some(KeyCode::Esc));
+    }
+
+    #[test]
+    fn a_wrapped_url_row_still_copies_the_whole_url() {
+        let url = "https://host.example.ts.net/?token=abcdefghijklmnopqrstuvwxyz0123456789";
+        let view = view(ServeViewState::Active {
+            mode: ServeMode::Local,
+            transport: None,
+            urls: vec![ServeUrl {
+                label: None,
+                url: url.to_string(),
+            }],
+            url_index: 0,
+            passphrase: None,
+            opened_at: Instant::now(),
+            log_offset: 0,
+        });
+        let mut term = Terminal::new(TestBackend::new(60, 40)).unwrap();
+        term.draw(|f| render(&view, f, f.area(), &Theme::default()))
+            .unwrap();
+        let copies: Vec<(&str, String)> = view
+            .mouse
+            .borrow()
+            .copies
+            .iter()
+            .map(|((label, value), _)| (*label, value.clone()))
+            .collect();
+        let (_, token) = split_url_and_token(url);
+        assert_eq!(
+            copies,
+            [
+                ("URL", url.to_string()),
+                ("Token", token.unwrap().to_string())
+            ]
+        );
     }
 
     #[test]

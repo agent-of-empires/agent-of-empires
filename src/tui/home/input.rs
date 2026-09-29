@@ -539,11 +539,7 @@ impl HomeView {
         if self.has_non_live_send_overlay() {
             return None;
         }
-        let pos = Position::from((col, row));
-        self.footer_buttons
-            .iter()
-            .find(|(rect, _)| rect.contains(pos))
-            .map(|(_, key)| *key)
+        crate::tui::dialogs::hit(&self.footer_buttons, col, row)
     }
 
     /// Handle a left-click on the sidebar collapse/expand affordances: the button on the
@@ -1220,6 +1216,102 @@ impl HomeView {
             // through to the list underneath.
             return true;
         }
+        // These follow-ups to a new-session submit float over the still-open
+        // dialog, so they route first, matching `handle_key`.
+        if let Some(dialog) = &self.hooks_install_dialog {
+            if let Some(result) = dialog.handle_click(col, row) {
+                match result {
+                    DialogResult::Continue => {}
+                    DialogResult::Cancel => {
+                        self.hooks_install_dialog = None;
+                        self.pending_hooks_install_data = None;
+                    }
+                    DialogResult::Submit(_) => {
+                        match crate::session::config::update_app_state(|state| {
+                            state.has_acknowledged_agent_hooks = true;
+                        }) {
+                            Ok(()) => {
+                                self.hooks_install_dialog = None;
+                                if let Some(data) = self.pending_hooks_install_data.take() {
+                                    self.pending_dialog_click_action =
+                                        self.maybe_confirm_volume_ignores_globs(data);
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(target: "tui.input", "Failed to save config: {e}")
+                            }
+                        }
+                    }
+                }
+            }
+            return true;
+        }
+        if let Some(dialog) = &mut self.volume_ignores_glob_dialog {
+            if let Some(result) = dialog.handle_click(col, row) {
+                let dont_ask_again = dialog.dont_ask_again();
+                match result {
+                    DialogResult::Continue => {}
+                    DialogResult::Cancel => {
+                        self.volume_ignores_glob_dialog = None;
+                        self.pending_volume_ignores_glob_data = None;
+                    }
+                    DialogResult::Submit(_) => {
+                        self.volume_ignores_glob_dialog = None;
+                        if dont_ask_again {
+                            self.persist_volume_ignores_globs_ack();
+                        }
+                        if let Some(data) = self.pending_volume_ignores_glob_data.take() {
+                            self.pending_dialog_click_action = self.continue_session_creation(data);
+                        }
+                    }
+                }
+            }
+            return true;
+        }
+        if let Some(dialog) = &self.repo_trust_dialog {
+            if let Some(result) = dialog.handle_click(col, row) {
+                match result {
+                    DialogResult::Continue => {}
+                    DialogResult::Cancel => {
+                        self.repo_trust_dialog = None;
+                        self.pending_repo_trust_data = None;
+                    }
+                    DialogResult::Submit(action) => {
+                        self.repo_trust_dialog = None;
+                        if let Some(data) = self.pending_repo_trust_data.take() {
+                            let emit = match action {
+                                RepoTrustAction::Trust {
+                                    hooks_hash,
+                                    mcp_hash,
+                                    project_path,
+                                    hooks,
+                                } => {
+                                    // Abort creation if trust cannot be persisted:
+                                    // launching anyway leaves hooks treated as approved
+                                    // while project MCP stays gated off the unwritten
+                                    // hashes.
+                                    if let Err(e) = repo_config::trust_repo(
+                                        std::path::Path::new(&project_path),
+                                        hooks_hash.as_deref(),
+                                        mcp_hash.as_deref(),
+                                    ) {
+                                        tracing::error!(target: "tui.input", "Failed to persist repo trust; aborting session creation: {}", e);
+                                        None
+                                    } else {
+                                        self.create_session_with_hooks(data, hooks)
+                                    }
+                                }
+                                RepoTrustAction::Skip { hooks } => {
+                                    self.create_session_with_hooks(data, hooks)
+                                }
+                            };
+                            self.pending_dialog_click_action = emit;
+                        }
+                    }
+                }
+            }
+            return true;
+        }
         if let Some(dialog) = &mut self.new_dialog {
             if let Some(result) = dialog.handle_click(col, row) {
                 self.pending_dialog_click_action = self.apply_new_dialog_result(result);
@@ -1492,100 +1584,6 @@ impl HomeView {
                     // through, and the palette commands that use it are
                     // keyboard-only, so the fallback is harmless.
                     self.pending_dialog_click_action = self.dispatch_palette_action(action, None);
-                }
-            }
-            return true;
-        }
-        if let Some(dialog) = &self.hooks_install_dialog {
-            if let Some(result) = dialog.handle_click(col, row) {
-                match result {
-                    DialogResult::Continue => {}
-                    DialogResult::Cancel => {
-                        self.hooks_install_dialog = None;
-                        self.pending_hooks_install_data = None;
-                    }
-                    DialogResult::Submit(_) => {
-                        match crate::session::config::update_app_state(|state| {
-                            state.has_acknowledged_agent_hooks = true;
-                        }) {
-                            Ok(()) => {
-                                self.hooks_install_dialog = None;
-                                if let Some(data) = self.pending_hooks_install_data.take() {
-                                    self.pending_dialog_click_action =
-                                        self.maybe_confirm_volume_ignores_globs(data);
-                                }
-                            }
-                            Err(e) => {
-                                tracing::warn!(target: "tui.input", "Failed to save config: {e}")
-                            }
-                        }
-                    }
-                }
-            }
-            return true;
-        }
-        if let Some(dialog) = &mut self.volume_ignores_glob_dialog {
-            if let Some(result) = dialog.handle_click(col, row) {
-                let dont_ask_again = dialog.dont_ask_again();
-                match result {
-                    DialogResult::Continue => {}
-                    DialogResult::Cancel => {
-                        self.volume_ignores_glob_dialog = None;
-                        self.pending_volume_ignores_glob_data = None;
-                    }
-                    DialogResult::Submit(_) => {
-                        self.volume_ignores_glob_dialog = None;
-                        if dont_ask_again {
-                            self.persist_volume_ignores_globs_ack();
-                        }
-                        if let Some(data) = self.pending_volume_ignores_glob_data.take() {
-                            self.pending_dialog_click_action = self.continue_session_creation(data);
-                        }
-                    }
-                }
-            }
-            return true;
-        }
-        if let Some(dialog) = &self.repo_trust_dialog {
-            if let Some(result) = dialog.handle_click(col, row) {
-                match result {
-                    DialogResult::Continue => {}
-                    DialogResult::Cancel => {
-                        self.repo_trust_dialog = None;
-                        self.pending_repo_trust_data = None;
-                    }
-                    DialogResult::Submit(action) => {
-                        self.repo_trust_dialog = None;
-                        if let Some(data) = self.pending_repo_trust_data.take() {
-                            let emit = match action {
-                                RepoTrustAction::Trust {
-                                    hooks_hash,
-                                    mcp_hash,
-                                    project_path,
-                                    hooks,
-                                } => {
-                                    // Abort creation if trust cannot be persisted:
-                                    // launching anyway leaves hooks treated as approved
-                                    // while project MCP stays gated off the unwritten
-                                    // hashes.
-                                    if let Err(e) = repo_config::trust_repo(
-                                        std::path::Path::new(&project_path),
-                                        hooks_hash.as_deref(),
-                                        mcp_hash.as_deref(),
-                                    ) {
-                                        tracing::error!(target: "tui.input", "Failed to persist repo trust; aborting session creation: {}", e);
-                                        None
-                                    } else {
-                                        self.create_session_with_hooks(data, hooks)
-                                    }
-                                }
-                                RepoTrustAction::Skip { hooks } => {
-                                    self.create_session_with_hooks(data, hooks)
-                                }
-                            };
-                            self.pending_dialog_click_action = emit;
-                        }
-                    }
                 }
             }
             return true;
@@ -5565,11 +5563,7 @@ impl HomeView {
         // highlight on the next render, recomputed against the current button rects so it
         // clears as the pointer leaves.
         let prev_footer_hover = self.footer_hover;
-        self.footer_hover = self
-            .footer_buttons
-            .iter()
-            .find(|(rect, _)| rect.contains(Position::from((col, row))))
-            .map(|(_, key)| *key);
+        self.footer_hover = crate::tui::dialogs::hit(&self.footer_buttons, col, row);
         let footer_changed = prev_footer_hover != self.footer_hover;
 
         let diagnostics_hovered = !self.has_non_live_send_overlay()
