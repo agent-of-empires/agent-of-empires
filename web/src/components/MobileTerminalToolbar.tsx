@@ -28,18 +28,42 @@ interface Props {
   inputElRef: RefObject<HTMLTextAreaElement | null>;
 }
 
-const KEY_CLASS =
-  "flex-1 min-w-0 flex items-center justify-center h-11 rounded-md transition-colors duration-75 text-text-secondary select-none touch-manipulation [-webkit-touch-callout:none] active:bg-surface-700/50";
+// Uniform key caps: a framed surface reads as a key, and one height, label size, and icon weight keep the row calm.
+const KEY_BASE =
+  "flex-1 min-w-0 h-10 flex items-center justify-center rounded-md border shadow-[inset_0_-1px_0_rgb(0_0_0/0.3)] transition-colors duration-75 select-none touch-manipulation [-webkit-touch-callout:none]";
+const KEY_CLASS = `${KEY_BASE} border-surface-700/70 bg-surface-800 text-text-primary active:bg-surface-700 active:border-surface-600`;
+const LATCHED_KEY_CLASS = `${KEY_BASE} border-brand-500/80 bg-brand-600/30 text-brand-400`;
+// Compose is the primary action: a neutral cap with an accent glyph, so it never reads as latched.
+const COMPOSE_KEY_CLASS = `${KEY_BASE} border-surface-700/70 bg-surface-800 text-brand-400 active:bg-surface-700 active:border-surface-600`;
 
-function KeyLabel({ label }: { label: string }) {
-  return <span className={`font-mono ${label.length > 2 ? "text-xs" : "text-sm"}`}>{label}</span>;
+/** An icon where the mono font's glyph renders small or boxed, otherwise the label. */
+function KeyFace({ spec }: { spec: ToolbarKeySpec }) {
+  switch (spec.id) {
+    case "backspace":
+      return (
+        <StrokeIcon size={18} strokeWidth="1.75" hidden>
+          <path d="M10 5a2 2 0 0 0-1.344.519l-6.328 5.74a1 1 0 0 0 0 1.481l6.328 5.741A2 2 0 0 0 10 19h10a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2z" />
+          <path d="m12 9 6 6" />
+          <path d="m18 9-6 6" />
+        </StrokeIcon>
+      );
+    case "enter":
+      return (
+        <StrokeIcon size={18} strokeWidth="1.75" hidden>
+          <path d="M20 4v7a4 4 0 0 1-4 4H4" />
+          <path d="m9 10-5 5 5 5" />
+        </StrokeIcon>
+      );
+    default:
+      return <span className="font-mono text-[12px] font-medium tracking-tight">{spec.label}</span>;
+  }
 }
 
 function RepeatKey({ spec, onSend }: { spec: ToolbarKeySpec; onSend: (data: string) => void }) {
   const handlers = useHoldRepeat(() => onSend(spec.data!));
   return (
     <button type="button" aria-label={spec.name} className={KEY_CLASS} {...handlers}>
-      <KeyLabel label={spec.label} />
+      <KeyFace spec={spec} />
     </button>
   );
 }
@@ -106,21 +130,19 @@ export function MobileTerminalToolbar({
             type="button"
             aria-label={spec.name}
             aria-pressed={ctrlActive}
-            className={
-              ctrlActive ? `${KEY_CLASS.replace("text-text-secondary", "text-brand-400")} bg-brand-600/20` : KEY_CLASS
-            }
+            className={ctrlActive ? LATCHED_KEY_CLASS : KEY_CLASS}
             onClick={() => {
               haptic();
               onCtrlToggle();
             }}
           >
-            <KeyLabel label={spec.label} />
+            <KeyFace spec={spec} />
           </button>
         );
       case "paste":
         return (
           <button key={spec.id} type="button" aria-label={spec.name} className={KEY_CLASS} onClick={paste}>
-            <StrokeIcon size={14} strokeWidth="2" hidden>
+            <StrokeIcon size={18} strokeWidth="1.75" hidden>
               <rect x="9" y="2" width="6" height="4" rx="1" />
               <path d="M8 4H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V6a2 2 0 0 0-2-2h-2" />
             </StrokeIcon>
@@ -132,13 +154,13 @@ export function MobileTerminalToolbar({
             key={spec.id}
             type="button"
             aria-label={spec.name}
-            className={`${KEY_CLASS} text-brand-400`}
+            className={COMPOSE_KEY_CLASS}
             onClick={() => {
               haptic();
               onCompose();
             }}
           >
-            <StrokeIcon size={16} strokeWidth="2" hidden>
+            <StrokeIcon size={18} strokeWidth="1.75" hidden>
               <path d="M12 20h9" />
               <path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z" />
             </StrokeIcon>
@@ -156,7 +178,7 @@ export function MobileTerminalToolbar({
               if (ctrlActive) onCtrlToggle();
             }}
           >
-            <KeyLabel label={spec.label} />
+            <KeyFace spec={spec} />
           </button>
         );
       default:
@@ -170,7 +192,7 @@ export function MobileTerminalToolbar({
             className={KEY_CLASS}
             onClick={() => send(spec.data!)}
           >
-            <KeyLabel label={spec.label} />
+            <KeyFace spec={spec} />
           </button>
         );
     }
@@ -179,7 +201,7 @@ export function MobileTerminalToolbar({
   if (keys.length === 0) return null;
   return (
     <div
-      className="shrink-0 flex items-center gap-0.5 px-1 py-1.5 bg-surface-850 border-t border-surface-700/20"
+      className="shrink-0 flex items-center gap-1.5 px-2 py-1.5 bg-surface-900 border-t border-surface-700/50"
       // Prevent toolbar taps from stealing focus away from the proxy input.
       onMouseDown={(e) => e.preventDefault()}
     >

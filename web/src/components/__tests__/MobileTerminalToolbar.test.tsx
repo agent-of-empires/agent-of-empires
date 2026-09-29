@@ -50,7 +50,8 @@ describe("MobileTerminalToolbar keys", () => {
       "Compose",
     ]);
     cleanup();
-    expect(renderToolbar({ keys: ["enter", "esc"] }).container.textContent).toBe("⏎Esc");
+    renderToolbar({ keys: ["enter", "esc"] });
+    expect(screen.getAllByRole("button").map((b) => b.getAttribute("aria-label"))).toEqual(["Enter", "Escape"]);
     cleanup();
     expect(renderToolbar({ keys: [] }).container.firstChild).toBeNull();
   });
