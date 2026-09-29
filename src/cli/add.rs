@@ -542,13 +542,12 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         instance.workspace_info = Some(workspace_info);
     }
 
-    instance.yolo_mode = args.yolo || config.session.yolo_mode_default;
-
-    apply_agent_launch_config(
+    crate::session::builder::apply_agent_launch_config(
         &mut instance,
         &config.session,
-        args.extra_args.as_deref(),
-        args.cmd_override.as_deref(),
+        args.extra_args.as_deref().unwrap_or_default(),
+        args.cmd_override.as_deref().unwrap_or_default(),
+        args.yolo.then_some(true),
     );
 
     let user_picked_agent = args.agent.is_some();
@@ -1240,32 +1239,6 @@ fn detect_tool(cmd: &str) -> Result<String> {
                 crate::agents::agent_names().join(", ")
             )
         })
-}
-
-/// Per-session values win; otherwise the config's `agent_extra_args` and
-/// resolved command for `instance.tool` apply.
-pub(crate) fn apply_agent_launch_config(
-    instance: &mut Instance,
-    session: &crate::session::config::SessionConfig,
-    extra_args: Option<&str>,
-    cmd_override: Option<&str>,
-) {
-    if let Some(extra) = extra_args {
-        instance.extra_args = extra.to_string();
-    } else if let Some(extra) = session.agent_extra_args.get(&instance.tool) {
-        if !extra.is_empty() {
-            instance.extra_args = extra.clone();
-        }
-    }
-
-    if let Some(cmd) = cmd_override {
-        instance.command = cmd.to_string();
-    } else {
-        let resolved = session.resolve_tool_command(&instance.tool);
-        if !resolved.is_empty() {
-            instance.command = resolved;
-        }
-    }
 }
 
 /// Declined trust keeps already-trusted repo hooks; unapproved ones fall back

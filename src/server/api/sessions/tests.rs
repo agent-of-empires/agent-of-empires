@@ -4800,11 +4800,11 @@ async fn diff_file_rejects_workspace_with_no_repos() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
-/// "Open file" in the diff list: the raw route serves the selected repo's
-/// current worktree bytes, typed so passive files render in the tab while
-/// scriptable or unrenderable ones download, and refuses whatever the confined
+/// "Open file" in the diff list and the Files pane: each raw route serves a
+/// file's current bytes, typed so passive files render in the tab while
+/// scriptable or unrenderable ones download, and refuses whatever its confined
 /// reader refuses.
-mod diff_file_raw {
+mod open_file {
     use super::*;
     use axum::body::to_bytes;
     use axum::extract::Query;
@@ -4824,6 +4824,39 @@ mod diff_file_raw {
         inst
     }
 
+    /// A workspace rooted at `dir` whose members each hold a `same.txt` naming
+    /// their repo.
+    fn workspace(dir: &std::path::Path, names: &[&str]) -> Instance {
+        let repos = names
+            .iter()
+            .map(|name| {
+                let worktree = dir.join(name);
+                std::fs::create_dir(&worktree).unwrap();
+                std::fs::write(worktree.join("same.txt"), name).unwrap();
+                crate::session::WorkspaceRepo {
+                    name: name.to_string(),
+                    source_path: format!("/src/{name}"),
+                    branch: "feature/x".to_string(),
+                    worktree_path: worktree.to_string_lossy().into_owned(),
+                    main_repo_path: format!("/src/{name}"),
+                    managed_by_aoe: true,
+                    branch_preexisting: false,
+                    base_branch: None,
+                    base_branch_override: None,
+                }
+            })
+            .collect();
+        let mut inst = single_repo(dir);
+        inst.workspace_info = Some(crate::session::WorkspaceInfo {
+            branch: "feature/x".to_string(),
+            workspace_dir: dir.to_string_lossy().into_owned(),
+            repos,
+            created_at: chrono::Utc::now(),
+            cleanup_on_delete: true,
+        });
+        inst
+    }
+
     async fn get(
         state: &Arc<crate::server::AppState>,
         id: &str,
@@ -4840,6 +4873,24 @@ mod diff_file_raw {
         )
         .await
         .into_response()
+    }
+
+    /// `raw` picks the Files pane's "Open file" route over its viewer's read.
+    async fn get_session_file(
+        state: &Arc<crate::server::AppState>,
+        id: &str,
+        path: &str,
+        raw: bool,
+    ) -> axum::response::Response {
+        let (state, id) = (State(state.clone()), Path(id.to_string()));
+        let query = Query(SessionFileQuery {
+            path: path.to_string(),
+        });
+        if raw {
+            session_file_raw(state, id, query).await.into_response()
+        } else {
+            session_file(state, id, query).await.into_response()
+        }
     }
 
     #[tokio::test]
@@ -4976,31 +5027,7 @@ mod diff_file_raw {
     #[tokio::test]
     async fn reads_from_the_named_workspace_repo() {
         let ws = tempfile::tempdir().unwrap();
-        let member = |name: &str| {
-            let worktree = ws.path().join(name);
-            std::fs::create_dir(&worktree).unwrap();
-            std::fs::write(worktree.join("same.txt"), name).unwrap();
-            crate::session::WorkspaceRepo {
-                name: name.to_string(),
-                source_path: format!("/src/{name}"),
-                branch: "feature/x".to_string(),
-                worktree_path: worktree.to_string_lossy().into_owned(),
-                main_repo_path: format!("/src/{name}"),
-                managed_by_aoe: true,
-                branch_preexisting: false,
-                base_branch: None,
-                base_branch_override: None,
-            }
-        };
-        let mut inst = single_repo(ws.path());
-        inst.workspace_info = Some(crate::session::WorkspaceInfo {
-            branch: "feature/x".to_string(),
-            workspace_dir: ws.path().to_string_lossy().into_owned(),
-            repos: vec![member("api"), member("web")],
-            created_at: chrono::Utc::now(),
-            cleanup_on_delete: true,
-        });
-        let state = state_for(inst, false);
+        let state = state_for(workspace(ws.path(), &["api", "web"]), false);
 
         for (repo, expected) in [(Some("web"), "web"), (Some("api"), "api"), (None, "api")] {
             let resp = get(&state, "raw", "same.txt", repo).await;
@@ -5008,6 +5035,104 @@ mod diff_file_raw {
             let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
             assert_eq!(&body[..], expected.as_bytes(), "repo={repo:?}");
         }
+    }
+
+    /// The Files pane lists paths relative to the session root, which in a
+    /// workspace holds the repos, so its reads must resolve there too.
+    #[tokio::test]
+    async fn files_pane_reads_resolve_against_the_session_root() {
+        let ws = tempfile::tempdir().unwrap();
+        std::fs::write(ws.path().join("NOTES.md"), "notes").unwrap();
+        let state = state_for(workspace(ws.path(), &["api", "web"]), false);
+
+        for raw in [false, true] {
+            for (path, expected) in [("NOTES.md", "notes"), ("web/same.txt", "web")] {
+                let resp = get_session_file(&state, "raw", path, raw).await;
+                assert_eq!(resp.status(), StatusCode::OK, "raw={raw} {path}");
+                let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+                let content = if raw {
+                    String::from_utf8(body.to_vec()).unwrap()
+                } else {
+                    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                    json["content"].as_str().unwrap().to_string()
+                };
+                assert_eq!(content, expected, "raw={raw} {path}");
+            }
+        }
+    }
+
+    /// Unlike the diff route, the Files pane's raw route takes what its viewer
+    /// takes: an absolute path under the root, or an outside file the agent
+    /// touched this session.
+    #[tokio::test]
+    async fn files_pane_raw_serves_what_the_viewer_may_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let (touched, secret) = (
+            outside.path().join("plan.md"),
+            outside.path().join("secret"),
+        );
+        std::fs::write(&touched, "plan").unwrap();
+        std::fs::write(&secret, "KEY").unwrap();
+        std::os::unix::fs::symlink(&secret, dir.path().join("link")).unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        let page = dir.path().join("sub/page.html");
+        std::fs::write(&page, "<script>alert(1)</script>").unwrap();
+        let state = state_for(single_repo(dir.path()), false);
+        let tool_call = crate::acp::state::ToolCall {
+            id: "t1".to_string(),
+            name: "Write".to_string(),
+            kind: "edit".to_string(),
+            args_preview: serde_json::json!({ "file_path": &touched }).to_string(),
+            started_at: chrono::Utc::now(),
+            parent_tool_call_id: None,
+            memory_recall: None,
+            diffs: Vec::new(),
+        };
+        state
+            .acp_event_store
+            .record(
+                "raw",
+                1,
+                &crate::acp::state::Event::ToolCallStarted { tool_call },
+            )
+            .unwrap();
+
+        // (path, status, Content-Disposition)
+        for (path, status, disposition) in [
+            ("sub/page.html", StatusCode::OK, Some("attachment")),
+            (page.to_str().unwrap(), StatusCode::OK, Some("attachment")),
+            (touched.to_str().unwrap(), StatusCode::OK, None),
+            (secret.to_str().unwrap(), StatusCode::FORBIDDEN, None),
+            ("link", StatusCode::FORBIDDEN, None),
+            ("../secret", StatusCode::BAD_REQUEST, None),
+            ("sub", StatusCode::BAD_REQUEST, None),
+            ("deleted.txt", StatusCode::NOT_FOUND, None),
+        ] {
+            let resp = get_session_file(&state, "raw", path, true).await;
+            assert_eq!(resp.status(), status, "{path}");
+            assert_eq!(
+                resp.headers()
+                    .get(header::CONTENT_DISPOSITION)
+                    .map(|v| v.to_str().unwrap()),
+                disposition,
+                "{path}"
+            );
+        }
+
+        assert_eq!(
+            get_session_file(&state, "missing", "sub/page.html", true)
+                .await
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        let cityhall = state_for(single_repo(dir.path()), true);
+        assert_eq!(
+            get_session_file(&cityhall, "raw", "sub/page.html", true)
+                .await
+                .status(),
+            StatusCode::FORBIDDEN
+        );
     }
 }
 

@@ -49,12 +49,12 @@ pub use sessions::{
     force_smart_rename, get_recent_projects, kill_terminal, list_sessions, paste_image,
     preview_volume_ignores_globs, read_output, rename_session, restart_session, restore_session,
     review_creation_trust, search_sessions, send_message, serve_session_artifact,
-    session_diff_file, session_diff_file_raw, session_diff_files, session_file, set_worktree_name,
-    start_session, stop_auxiliary, stop_session, summarize_session, touch_session_access,
-    trash_session, update_session_archive, update_session_color, update_session_diff_base,
-    update_session_favorite, update_session_group, update_session_notifications,
-    update_session_pin, update_session_snooze, update_session_unread, update_workspace_ordering,
-    OutputQuery, SendMessageRequest,
+    session_diff_file, session_diff_file_raw, session_diff_files, session_file, session_file_raw,
+    set_worktree_name, start_session, stop_auxiliary, stop_session, summarize_session,
+    touch_session_access, trash_session, update_session_archive, update_session_color,
+    update_session_diff_base, update_session_favorite, update_session_group,
+    update_session_notifications, update_session_pin, update_session_snooze, update_session_unread,
+    update_workspace_ordering, OutputQuery, SendMessageRequest,
 };
 pub(crate) use sessions::{
     lifecycle_rejection, persist_session_update, purge_expired_trash, reconcile_trashed_worktrees,

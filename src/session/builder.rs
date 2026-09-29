@@ -18,6 +18,39 @@ use crate::git::GitWorktree;
 
 use super::{civilizations, Instance, SandboxInfo, WorkspaceInfo, WorkspaceRepo, WorktreeInfo};
 
+/// Applies per-session launch values over the config defaults for
+/// `instance.tool`. Empty strings and `None` count as unset. Command priority:
+/// per-session > `agent_command_override` > `custom_agents` > the value already
+/// on `instance`.
+pub(crate) fn apply_agent_launch_config(
+    instance: &mut Instance,
+    session: &super::config::SessionConfig,
+    extra_args: &str,
+    command_override: &str,
+    yolo_mode: Option<bool>,
+) {
+    let extra = match extra_args {
+        "" => session
+            .agent_extra_args
+            .get(&instance.tool)
+            .map_or("", String::as_str),
+        set => set,
+    };
+    if !extra.is_empty() {
+        instance.extra_args = extra.to_string();
+    }
+
+    let command = match command_override {
+        "" => session.resolve_tool_command(&instance.tool),
+        set => set.to_string(),
+    };
+    if !command.is_empty() {
+        instance.command = command;
+    }
+
+    instance.yolo_mode = yolo_mode.unwrap_or(session.yolo_mode_default);
+}
+
 /// Parameters for creating a new session instance.
 #[derive(Debug, Clone)]
 pub struct InstanceParams {
@@ -881,30 +914,18 @@ pub(crate) fn plan_instance(
     }
     instance.worktree_info = worktree_info;
     instance.workspace_info = workspace_info;
-    instance.yolo_mode = params.yolo_mode;
-
-    // Apply command overrides and custom agent commands from resolved config.
-    // Priority: per-session params > agent_command_override > custom_agents > AgentDef default.
-    if !params.command_override.is_empty() {
-        instance.command = params.command_override;
-    } else {
-        let resolved = config.session.resolve_tool_command(&params.tool);
-        if !resolved.is_empty() {
-            instance.command = resolved;
-        }
-    }
+    apply_agent_launch_config(
+        &mut instance,
+        &config.session,
+        &params.extra_args,
+        &params.command_override,
+        Some(params.yolo_mode),
+    );
     if instance.command.trim().is_empty() && crate::agents::get_agent(&params.tool).is_none() {
         bail!(
             "No launch command resolved for custom agent '{}'. Config may have changed since validation.",
             params.tool
         );
-    }
-    if !params.extra_args.is_empty() {
-        instance.extra_args = params.extra_args;
-    } else if let Some(extra) = config.session.agent_extra_args.get(&params.tool) {
-        if !extra.is_empty() {
-            instance.extra_args = extra.clone();
-        }
     }
 
     if params.sandbox {
@@ -2262,6 +2283,61 @@ mod tests {
             repo_base_branches: Vec::new(),
             scratch: false,
             fork_seed: None,
+        }
+    }
+
+    #[test]
+    fn apply_agent_launch_config_prefers_set_session_values_over_config() {
+        // (session extra, config extra, session command, config override,
+        //  session yolo, config yolo) -> (extra, command, yolo)
+        let cases = [
+            (("", None, "", None, None, false), ("", "claude", false)),
+            (
+                ("", Some("--cfg"), "", Some("wrap"), None, true),
+                ("--cfg", "wrap", true),
+            ),
+            (
+                ("", Some(""), "", Some(""), None, false),
+                ("", "claude", false),
+            ),
+            (
+                (
+                    "--mine",
+                    Some("--cfg"),
+                    "mine",
+                    Some("wrap"),
+                    Some(false),
+                    true,
+                ),
+                ("--mine", "mine", false),
+            ),
+        ];
+        for ((extra, cfg_extra, cmd, cfg_cmd, yolo, cfg_yolo), expected) in cases {
+            let mut session = crate::session::config::SessionConfig {
+                yolo_mode_default: cfg_yolo,
+                ..Default::default()
+            };
+            if let Some(v) = cfg_extra {
+                session.agent_extra_args.insert("claude".into(), v.into());
+            }
+            if let Some(v) = cfg_cmd {
+                session
+                    .agent_command_override
+                    .insert("claude".into(), v.into());
+            }
+            let mut inst = Instance::new("t", "/p");
+            inst.tool = "claude".into();
+            inst.command = "claude".into();
+            apply_agent_launch_config(&mut inst, &session, extra, cmd, yolo);
+            assert_eq!(
+                (
+                    inst.extra_args.as_str(),
+                    inst.command.as_str(),
+                    inst.yolo_mode
+                ),
+                expected,
+                "extra={extra:?} cfg_extra={cfg_extra:?} cmd={cmd:?} cfg_cmd={cfg_cmd:?}"
+            );
         }
     }
     #[test]

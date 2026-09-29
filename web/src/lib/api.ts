@@ -244,6 +244,12 @@ export function getSessionFile(id: string, filePath: string): Promise<SessionFil
   return fetchJson<SessionFileResponse>(`/api/sessions/${id}/file?${params.toString()}`);
 }
 
+/** URL of a session file's raw bytes, confined like {@link getSessionFile}, for opening in a new tab. */
+export function sessionRawFileUrl(id: string, filePath: string): string {
+  const params = new URLSearchParams({ path: filePath });
+  return `/api/sessions/${id}/file/raw?${params.toString()}`;
+}
+
 // --- Settings ---
 
 export interface SettingsResponse {
