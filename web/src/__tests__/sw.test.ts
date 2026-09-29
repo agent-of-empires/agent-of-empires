@@ -101,6 +101,21 @@ describe("service worker push handler (#2491)", () => {
     expect(showNotification.mock.calls[0][1].tag).toBe(APPROVAL_TAG);
   });
 
+  it("on Apple shows a stale notify under its own tag and closes it, so the push is not silent", async () => {
+    const { handlers, showNotification, getNotifications, getSubscription } = loadSw();
+    getSubscription.mockResolvedValue({ endpoint: "https://web.push.apple.com/QGuQ" });
+    const close = vi.fn();
+    getNotifications.mockResolvedValue([{ close }]);
+    await dispatchPush(handlers, { kind: "notify", title: "new", tag: APPROVAL_TAG, seq: 11 });
+    showNotification.mockClear();
+
+    await dispatchPush(handlers, { kind: "notify", title: "stale", tag: APPROVAL_TAG, seq: 5 });
+    expect(showNotification).toHaveBeenCalledTimes(1);
+    expect(showNotification.mock.calls[0][1].tag).toBe(`${APPROVAL_TAG}:stale`);
+    expect(getNotifications).toHaveBeenLastCalledWith({ tag: `${APPROVAL_TAG}:stale` });
+    expect(close).toHaveBeenCalled();
+  });
+
   it("ignores a clear with no tag without throwing or showing", async () => {
     const { handlers, showNotification, getNotifications } = loadSw();
     await dispatchPush(handlers, { kind: "clear", seq: 1 });

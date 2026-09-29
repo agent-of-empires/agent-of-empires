@@ -108,7 +108,23 @@ self.addEventListener("push", (event) => {
   // Drop an out-of-order notify that is older than a clear (or newer notify)
   // already seen for this tag: the request it announces was already handled.
   const tag = payload.tag || "aoe";
-  if (isStaleSeq(tag, payload.seq)) return;
+  if (isStaleSeq(tag, payload.seq)) {
+    // Apple revokes after silent pushes, so there the stale notice is shown under its own tag, keeping the newer
+    // one, and closed at once.
+    event.waitUntil(
+      (async () => {
+        if (!(await mustShowNotification())) return;
+        const staleTag = `${tag}:stale`;
+        await self.registration.showNotification(payload.title || "Agent of Empires", { tag: staleTag, silent: true });
+        try {
+          for (const n of await self.registration.getNotifications({ tag: staleTag })) n.close();
+        } catch {
+          /* getNotifications may be unsupported; the notice then stays until dismissed */
+        }
+      })(),
+    );
+    return;
+  }
   recordSeq(tag, payload.seq);
 
   const title = payload.title || "Agent of Empires";

@@ -8,7 +8,7 @@ Three status events, each independently toggleable in Settings and overridable p
 
 Two more, **approval** and **question** ([AskUserQuestion](structured-view/controls.md#questions-askuserquestion)), fire immediately and bypass the suppression rules below: with the dashboard or TUI foregrounded you still get an in-app toast, plus the browser chime described in [Sound effects](sounds.md).
 
-Status notifications are suppressed while you are already looking at aoe: a focused dashboard tab shows an in-app toast instead of an OS notification (per device; Safari and iPhone always get the OS notification, because WebKit revokes a subscription whose pushes show nothing), and keyboard, paste, or mouse input in a TUI suppresses pushes for 30 seconds across every device. An unattended TUI does not silence your phone, and background polling does not count as foregrounded.
+Status notifications are suppressed while you are already looking at aoe: a focused dashboard tab shows an in-app toast instead of an OS notification (per device; Safari and iPhone always get the OS notification, because WebKit revokes a subscription whose pushes show nothing), and keyboard, paste, or mouse input in a TUI suppresses pushes for 30 seconds across every device. An unattended TUI does not silence your phone, and background polling does not count as foregrounded. An approval or question answered on another device stays in Notification Center on an iPhone or in Safari, since retracting it would be a push that shows nothing; other browsers retract it.
 
 ## A stable HTTPS origin first
 

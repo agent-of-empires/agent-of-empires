@@ -223,6 +223,15 @@ impl SubscriptionStore {
         map.get(endpoint).cloned()
     }
 
+    /// Drops the records of subscriptions removed on purpose. A dead subscription's
+    /// record outlives its GC: it is how the device learns why pushes stopped.
+    fn forget_deliveries<'a>(&self, endpoints: impl IntoIterator<Item = &'a String>) {
+        let mut map = self.delivery.lock().unwrap_or_else(|e| e.into_inner());
+        for endpoint in endpoints {
+            map.remove(endpoint);
+        }
+    }
+
     pub async fn snapshot(&self) -> Vec<Subscription> {
         self.subs.read().await.values().cloned().collect()
     }
@@ -261,6 +270,7 @@ impl SubscriptionStore {
             }
         };
         if removed {
+            self.forget_deliveries([&endpoint.to_string()]);
             self.persist().await?;
         }
         Ok(removed)
@@ -289,9 +299,16 @@ impl SubscriptionStore {
     pub async fn retain_owners(&self, valid: &[[u8; 32]]) -> anyhow::Result<usize> {
         let removed = {
             let mut guard = self.subs.write().await;
-            let before = guard.len();
-            guard.retain(|_, s| valid.iter().any(|v| v == &s.owner_token_hash));
-            before - guard.len()
+            let dropped: Vec<String> = guard
+                .values()
+                .filter(|s| !valid.iter().any(|v| v == &s.owner_token_hash))
+                .map(|s| s.endpoint.clone())
+                .collect();
+            for endpoint in &dropped {
+                guard.remove(endpoint);
+            }
+            self.forget_deliveries(&dropped);
+            dropped.len()
         };
         if removed > 0 {
             self.persist().await?;
@@ -1222,6 +1239,42 @@ mod tests {
         let removed = store.retain_owners(&[[2u8; 32]]).await.unwrap();
         assert_eq!(removed, 1);
         assert_eq!(store.snapshot().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn delivery_records_drop_with_removed_subscriptions_but_outlive_gc() {
+        use crate::server::push_send::SendOutcome;
+        let tmp = tempfile::tempdir().unwrap();
+        let store = SubscriptionStore::load_or_empty(tmp.path().join("push.subscriptions.json"));
+        let sub = |endpoint: &str, owner: u8| Subscription {
+            endpoint: endpoint.into(),
+            p256dh: "pk".into(),
+            auth: "auth".into(),
+            owner_token_hash: [owner; 32],
+            user_agent: "UA".into(),
+            created_at: Utc::now(),
+            generation: 0,
+            origin: "http://localhost:8080".into(),
+        };
+        for (endpoint, owner) in [
+            ("https://p/unsub", 1),
+            ("https://p/rotated", 2),
+            ("https://p/dead", 1),
+        ] {
+            store.upsert(sub(endpoint, owner)).await.unwrap();
+            store.record_delivery(endpoint, SendOutcome::Failed);
+        }
+
+        assert!(store
+            .remove_if_owner("https://p/unsub", &[1u8; 32])
+            .await
+            .unwrap());
+        assert_eq!(store.retain_owners(&[[1u8; 32]]).await.unwrap(), 1);
+        assert!(store.gc_stale("https://p/dead", 0).await.unwrap());
+
+        assert_eq!(store.delivery("https://p/unsub"), None);
+        assert_eq!(store.delivery("https://p/rotated"), None);
+        assert!(store.delivery("https://p/dead").is_some());
     }
 
     #[tokio::test]
