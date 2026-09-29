@@ -8,6 +8,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tokio::sync::RwLock;
 
+use super::push_send::PUSH_TTL_SECS;
+
 /// Emitted when an instance's status changes.
 #[derive(Clone, Debug)]
 pub struct StatusChange {
@@ -172,6 +174,17 @@ pub struct Subscription {
 pub struct SubscriptionStore {
     path: PathBuf,
     subs: RwLock<HashMap<String, Subscription>>,
+    /// Latest send result per endpoint. In memory only: it is diagnostic, and a restart
+    /// resets it to "unknown" rather than writing the store file on every push.
+    delivery: std::sync::Mutex<HashMap<String, DeliveryRecord>>,
+}
+
+/// Most recent delivery results for one endpoint, reported by `/api/push/status`.
+#[derive(Clone, Default, Serialize, Debug, PartialEq)]
+pub struct DeliveryRecord {
+    pub last_success_at: Option<DateTime<Utc>>,
+    pub last_failure_at: Option<DateTime<Utc>>,
+    pub last_failure: Option<&'static str>,
 }
 
 impl SubscriptionStore {
@@ -185,6 +198,37 @@ impl SubscriptionStore {
         Self {
             path,
             subs: RwLock::new(subs),
+            delivery: Default::default(),
+        }
+    }
+
+    pub async fn get(&self, endpoint: &str) -> Option<Subscription> {
+        self.subs.read().await.get(endpoint).cloned()
+    }
+
+    pub fn record_delivery(&self, endpoint: &str, outcome: super::push_send::SendOutcome) {
+        let mut map = self.delivery.lock().unwrap_or_else(|e| e.into_inner());
+        let rec = map.entry(endpoint.to_string()).or_default();
+        let now = Utc::now();
+        if outcome == super::push_send::SendOutcome::Delivered {
+            rec.last_success_at = Some(now);
+        } else {
+            rec.last_failure_at = Some(now);
+            rec.last_failure = Some(outcome.as_str());
+        }
+    }
+
+    pub fn delivery(&self, endpoint: &str) -> Option<DeliveryRecord> {
+        let map = self.delivery.lock().unwrap_or_else(|e| e.into_inner());
+        map.get(endpoint).cloned()
+    }
+
+    /// Drops the records of subscriptions removed on purpose. A dead subscription's
+    /// record outlives its GC: it is how the device learns why pushes stopped.
+    fn forget_deliveries<'a>(&self, endpoints: impl IntoIterator<Item = &'a String>) {
+        let mut map = self.delivery.lock().unwrap_or_else(|e| e.into_inner());
+        for endpoint in endpoints {
+            map.remove(endpoint);
         }
     }
 
@@ -226,6 +270,7 @@ impl SubscriptionStore {
             }
         };
         if removed {
+            self.forget_deliveries([&endpoint.to_string()]);
             self.persist().await?;
         }
         Ok(removed)
@@ -254,9 +299,16 @@ impl SubscriptionStore {
     pub async fn retain_owners(&self, valid: &[[u8; 32]]) -> anyhow::Result<usize> {
         let removed = {
             let mut guard = self.subs.write().await;
-            let before = guard.len();
-            guard.retain(|_, s| valid.iter().any(|v| v == &s.owner_token_hash));
-            before - guard.len()
+            let dropped: Vec<String> = guard
+                .values()
+                .filter(|s| !valid.iter().any(|v| v == &s.owner_token_hash))
+                .map(|s| s.endpoint.clone())
+                .collect();
+            for endpoint in &dropped {
+                guard.remove(endpoint);
+            }
+            self.forget_deliveries(&dropped);
+            dropped.len()
         };
         if removed > 0 {
             self.persist().await?;
@@ -632,13 +684,7 @@ async fn fire_due_pushes(
                 let Ok(_permit) = permit_sem.acquire_owned().await else {
                     return;
                 };
-                let outcome =
-                    super::push_send::send_one(&client, push.as_ref(), &sub, &payload_clone).await;
-                if outcome == super::push_send::SendOutcome::Gone {
-                    if let Err(e) = push.store.gc_stale(&sub.endpoint, sub.generation).await {
-                        tracing::warn!(target: "http.middleware", "Failed to GC stale push subscription: {e}");
-                    }
-                }
+                deliver(&push, &client, &sub, &payload_clone, PUSH_TTL_SECS).await;
             });
         }
     }
@@ -724,13 +770,7 @@ pub async fn fire_wake_fired_push(
             let Ok(_permit) = permit_sem.acquire_owned().await else {
                 return;
             };
-            let outcome =
-                super::push_send::send_one(&client, push.as_ref(), &sub, &payload_clone).await;
-            if outcome == super::push_send::SendOutcome::Gone {
-                if let Err(e) = push.store.gc_stale(&sub.endpoint, sub.generation).await {
-                    tracing::warn!(target: "http.middleware", "Failed to GC stale push subscription: {e}");
-                }
-            }
+            deliver(&push, &client, &sub, &payload_clone, PUSH_TTL_SECS).await;
         });
     }
 }
@@ -753,6 +793,43 @@ pub fn build_push_url(sub: &Subscription, path: &str) -> Option<String> {
         format!("/{}", path)
     };
     Some(format!("{origin}{path}"))
+}
+
+/// Apple's push service (Safari and iOS home screen apps). WebKit revokes a subscription
+/// after a few pushes that show no notification, so silent retract pushes must skip it.
+pub fn is_apple_endpoint(endpoint: &str) -> bool {
+    reqwest::Url::parse(endpoint)
+        .ok()
+        .and_then(|u| {
+            u.host_str()
+                .map(|h| h == "push.apple.com" || h.ends_with(".push.apple.com"))
+        })
+        .unwrap_or(false)
+}
+
+/// Whether a push that the service worker handles without showing anything may go to
+/// this subscription.
+pub fn accepts_silent_push(sub: &Subscription) -> bool {
+    !is_apple_endpoint(&sub.endpoint)
+}
+
+/// Send one push, record its outcome, and drop the subscription when the push service
+/// says it can never be delivered.
+pub async fn deliver<T: Serialize>(
+    push: &PushState,
+    client: &reqwest::Client,
+    sub: &Subscription,
+    payload: &T,
+    ttl_secs: u32,
+) -> super::push_send::SendOutcome {
+    let outcome = super::push_send::send_one(client, push, sub, payload, ttl_secs).await;
+    push.store.record_delivery(&sub.endpoint, outcome);
+    if outcome.is_dead() {
+        if let Err(e) = push.store.gc_stale(&sub.endpoint, sub.generation).await {
+            tracing::warn!(target: "http.middleware", "Failed to GC stale push subscription: {e}");
+        }
+    }
+    outcome
 }
 
 pub fn sha256_token(token: &str) -> [u8; 32] {
@@ -798,11 +875,49 @@ pub struct TestResult {
     pub delivered: u32,
     pub failed: u32,
     pub gone: u32,
+    /// The failure outcome, e.g. `key-mismatch`, when nothing was delivered.
+    pub reason: Option<&'static str>,
 }
 
-/// GET /api/push/status Tells the client whether the feature is enabled server-wide.
-pub async fn get_status(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
-    Json(serde_json::json!({ "enabled": state.push_enabled }))
+#[derive(Deserialize)]
+pub struct StatusQuery {
+    pub endpoint: Option<String>,
+}
+
+/// GET /api/push/status Tells the client whether the feature is enabled server-wide, the
+/// VAPID public key, and, given `?endpoint=`, what the server knows about that subscription.
+pub async fn get_status(
+    State(state): State<Arc<AppState>>,
+    auth: Option<Extension<AuthenticatedTokenHash>>,
+    axum::extract::Query(query): axum::extract::Query<StatusQuery>,
+) -> Json<serde_json::Value> {
+    let Some(push) = state.push.as_ref() else {
+        return Json(serde_json::json!({ "enabled": state.push_enabled }));
+    };
+    let mut body = serde_json::json!({
+        "enabled": state.push_enabled,
+        "public_key": push.vapid.public_b64url,
+    });
+    if let Some(endpoint) = query.endpoint.filter(|e| !e.is_empty()) {
+        body["subscription"] = subscription_status(push, &endpoint, auth.map(|a| a.0 .0)).await;
+    }
+    Json(body)
+}
+
+async fn subscription_status(
+    push: &PushState,
+    endpoint: &str,
+    owner: Option<[u8; 32]>,
+) -> serde_json::Value {
+    let sub = push.store.get(endpoint).await;
+    let delivery = push.store.delivery(endpoint).unwrap_or_default();
+    serde_json::json!({
+        "registered": sub.is_some(),
+        "owned": sub.is_some_and(|s| Some(s.owner_token_hash) == owner),
+        "last_success_at": delivery.last_success_at,
+        "last_failure_at": delivery.last_failure_at,
+        "last_failure": delivery.last_failure,
+    })
 }
 
 /// GET /api/push/vapid-public-key Returns the base64url-encoded raw public key for the
@@ -977,29 +1092,18 @@ pub async fn test(
 
     tokio::time::sleep(std::time::Duration::from_millis(TEST_DELAY_MS)).await;
 
-    let outcome = super::push_send::send_one(&client, push, &subscription, &payload).await;
-    let mut result = TestResult {
-        delivered: 0,
-        failed: 0,
-        gone: 0,
-    };
-    match outcome {
-        super::push_send::SendOutcome::Delivered => result.delivered = 1,
-        super::push_send::SendOutcome::Failed => result.failed = 1,
-        super::push_send::SendOutcome::Gone => {
-            result.gone = 1;
-            // Best-effort GC; the result still reports gone=1 even if GC races with a
-            // re-subscribe (that's what the generation counter in gc_stale prevents).
-            if let Err(e) = push
-                .store
-                .gc_stale(&body.endpoint, subscription.generation)
-                .await
-            {
-                tracing::warn!(target: "http.middleware", "Failed to GC stale push subscription: {e}");
-            }
-        }
-    }
-    Ok(Json(result))
+    let outcome = deliver(push, &client, &subscription, &payload, PUSH_TTL_SECS).await;
+    use super::push_send::SendOutcome;
+    let delivered = outcome == SendOutcome::Delivered;
+    Ok(Json(TestResult {
+        delivered: u32::from(delivered),
+        failed: u32::from(matches!(
+            outcome,
+            SendOutcome::Rejected | SendOutcome::Failed
+        )),
+        gone: u32::from(outcome.is_dead()),
+        reason: (!delivered).then(|| outcome.as_str()),
+    }))
 }
 
 #[cfg(test)]
@@ -1048,6 +1152,55 @@ mod tests {
         assert_eq!(store.snapshot().await.len(), 0);
     }
 
+    #[test]
+    fn silent_pushes_skip_apple_endpoints_only() {
+        let cases = [
+            ("https://web.push.apple.com/QGuQyavXutnMH8r", false),
+            ("https://api.push.apple.com/3/device/abc", false),
+            ("https://fcm.googleapis.com/fcm/send/abc", true),
+            ("https://updates.push.services.mozilla.com/wpush/v2/x", true),
+            ("https://wns2-bn3p.notify.windows.com/w/?token=x", true),
+            ("https://push.apple.com.evil.example/x", true),
+            ("https://notpush.apple.com/x", true),
+            ("not a url", true),
+        ];
+        for (endpoint, silent_ok) in cases {
+            let sub = Subscription {
+                endpoint: endpoint.into(),
+                p256dh: "pk".into(),
+                auth: "auth".into(),
+                owner_token_hash: [1u8; 32],
+                user_agent: "UA".into(),
+                created_at: Utc::now(),
+                generation: 0,
+                origin: String::new(),
+            };
+            assert_eq!(accepts_silent_push(&sub), silent_ok, "{endpoint}");
+        }
+    }
+
+    /// A later success does not erase the last failure, so the client can compare the
+    /// two timestamps; a failure keeps the most recent reason.
+    #[test]
+    fn delivery_record_tracks_latest_success_and_failure() {
+        use super::super::push_send::SendOutcome;
+        let tmp = tempfile::tempdir().unwrap();
+        let store = SubscriptionStore::load_or_empty(tmp.path().join("s.json"));
+        let ep = "https://push.example/abc";
+        assert_eq!(store.delivery(ep), None);
+
+        store.record_delivery(ep, SendOutcome::Failed);
+        store.record_delivery(ep, SendOutcome::KeyMismatch);
+        let rec = store.delivery(ep).unwrap();
+        assert_eq!(rec.last_failure, Some("key-mismatch"));
+        assert!(rec.last_success_at.is_none() && rec.last_failure_at.is_some());
+
+        store.record_delivery(ep, SendOutcome::Delivered);
+        let after = store.delivery(ep).unwrap();
+        assert!(after.last_success_at >= rec.last_failure_at);
+        assert_eq!(after.last_failure, Some("key-mismatch"));
+    }
+
     #[tokio::test]
     async fn retain_owners_keeps_grace_token_drops_rest() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1086,6 +1239,42 @@ mod tests {
         let removed = store.retain_owners(&[[2u8; 32]]).await.unwrap();
         assert_eq!(removed, 1);
         assert_eq!(store.snapshot().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn delivery_records_drop_with_removed_subscriptions_but_outlive_gc() {
+        use crate::server::push_send::SendOutcome;
+        let tmp = tempfile::tempdir().unwrap();
+        let store = SubscriptionStore::load_or_empty(tmp.path().join("push.subscriptions.json"));
+        let sub = |endpoint: &str, owner: u8| Subscription {
+            endpoint: endpoint.into(),
+            p256dh: "pk".into(),
+            auth: "auth".into(),
+            owner_token_hash: [owner; 32],
+            user_agent: "UA".into(),
+            created_at: Utc::now(),
+            generation: 0,
+            origin: "http://localhost:8080".into(),
+        };
+        for (endpoint, owner) in [
+            ("https://p/unsub", 1),
+            ("https://p/rotated", 2),
+            ("https://p/dead", 1),
+        ] {
+            store.upsert(sub(endpoint, owner)).await.unwrap();
+            store.record_delivery(endpoint, SendOutcome::Failed);
+        }
+
+        assert!(store
+            .remove_if_owner("https://p/unsub", &[1u8; 32])
+            .await
+            .unwrap());
+        assert_eq!(store.retain_owners(&[[1u8; 32]]).await.unwrap(), 1);
+        assert!(store.gc_stale("https://p/dead", 0).await.unwrap());
+
+        assert_eq!(store.delivery("https://p/unsub"), None);
+        assert_eq!(store.delivery("https://p/rotated"), None);
+        assert!(store.delivery("https://p/dead").is_some());
     }
 
     #[tokio::test]

@@ -17,6 +17,9 @@ vi.mock("../acp/useFilesIndex", () => ({
   fuzzyFilter: <T,>(items: T[]) => items,
 }));
 
+const openInNewTab = vi.hoisted(() => vi.fn());
+vi.mock("../../lib/openInNewTab", () => ({ openInNewTab }));
+
 vi.mock("../../hooks/useShikiTheme", () => ({
   useShikiTheme: () => ({ theme: "github-dark", appearance: "dark" }),
 }));
@@ -30,6 +33,7 @@ beforeEach(() => {
   filesMock.loading = false;
   filesMock.error = false;
   filesMock.reload = vi.fn();
+  openInNewTab.mockReset().mockResolvedValue({ ok: true });
 });
 afterEach(() => {
   vi.restoreAllMocks();
@@ -64,6 +68,15 @@ describe("FilesPane", () => {
     await waitFor(() => {
       expect(document.activeElement).toBe(screen.getByRole("button", { name: "docs/plan.md" }));
     });
+  });
+
+  it("opens a row's file in a new tab from its context menu without selecting it", () => {
+    render(<FilesPane sessionId="s1" />);
+    fireEvent.contextMenu(screen.getByRole("button", { name: "docs/plan.md" }));
+    expect(screen.getAllByRole("menuitem").map((b) => b.textContent)).toEqual(["Open file", "Copy relative path"]);
+    fireEvent.click(screen.getByRole("menuitem", { name: "Open file" }));
+    expect(openInNewTab).toHaveBeenCalledWith("/api/sessions/s1/file/raw?path=docs%2Fplan.md", "plan.md");
+    expect(screen.queryByRole("button", { name: "Back to files" })).toBeNull();
   });
 
   it("distinguishes a failed fetch from an empty session, and retries", () => {

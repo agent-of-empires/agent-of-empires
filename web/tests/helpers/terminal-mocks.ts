@@ -249,6 +249,8 @@ export async function seedSettings(
     desktopFontSize?: number;
     autoOpenKeyboard?: boolean;
     persistentTerminals?: boolean;
+    mobileToolbarKeys?: string[];
+    showArrowJoystick?: boolean;
   },
 ) {
   await page.evaluate((settings) => {

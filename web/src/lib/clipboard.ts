@@ -1,8 +1,3 @@
-/** Bracketed paste so newlines stay one paste. A pane without DECSET 2004 shows the markers as text. */
-export function bracketedPaste(text: string): string {
-  return `\x1b[200~${text}\x1b[201~`;
-}
-
 const CLIPBOARD_TEXT_TYPES = ["text/plain", "text/uri-list", "text/html"] as const;
 
 // Copy-link UIs often write only text/uri-list.
@@ -14,12 +9,26 @@ function normalizeClipboardData(type: string, raw: string): string {
       .filter((l) => l && !l.startsWith("#"))
       .join("\n");
   }
-  if (type === "text/html") {
-    const doc = new DOMParser().parseFromString(raw, "text/html");
-    const href = doc.querySelector("a[href]")?.getAttribute("href");
-    return href || (doc.body?.textContent?.trim() ?? "");
-  }
+  if (type === "text/html") return htmlClipboardText(raw);
   return raw;
+}
+
+const HTML_BLOCKS = "p,div,li,tr,pre,blockquote,h1,h2,h3,h4,h5,h6";
+
+/** The document's text, or the href when the html is a single copied link. */
+function htmlClipboardText(raw: string): string {
+  const body = new DOMParser().parseFromString(raw, "text/html").body;
+  if (!body) return "";
+  const links = body.querySelectorAll("a[href]");
+  const only = links.length === 1 ? links[0]! : null;
+  const href = only?.getAttribute("href");
+  if (only && href && body.textContent?.trim() === only.textContent?.trim()) return href;
+  for (const br of body.querySelectorAll("br")) br.replaceWith("\n");
+  for (const block of body.querySelectorAll(HTML_BLOCKS)) block.append("\n");
+  return (body.textContent ?? "")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
 }
 
 /** "" when refused or empty; the async Clipboard API needs a secure context. */

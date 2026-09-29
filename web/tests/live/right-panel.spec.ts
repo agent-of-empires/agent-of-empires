@@ -6,7 +6,7 @@ import { join } from "node:path";
 import type { Page } from "@playwright/test";
 import { test, expect, type ServeHandle } from "../helpers/liveTest";
 import { listSessions, seedSessionViaAoeAdd } from "../helpers/aoeServe";
-import { generateLargeFileContent, pngStubBytes, writeBinaryFile } from "../helpers/gitFixture";
+import { commitAll, generateLargeFileContent, pngStubBytes, writeBinaryFile } from "../helpers/gitFixture";
 import { enableStructuredViewAndWait } from "../helpers/acp";
 
 async function openSession(page: Page, serve: ServeHandle, title: string) {
@@ -132,6 +132,33 @@ test("right panel diff list: Open file shows the worktree copy, saves HTML, and 
   expect(download.suggestedFilename()).toBe("page.html");
 
   await expect(await openFileFor(/gone\.txt/)).toBeDisabled();
+});
+
+test("files pane: Open file shows an unchanged file in a new tab", async ({ page, spawnServe }) => {
+  const serve = await spawnServe({
+    seedFn: seedSessionViaAoeAdd({
+      title: "rp-files-open",
+      committed: { "docs/guide.md": "unchanged guide\n" },
+      prepare: (dir, env) => {
+        writeBinaryFile(dir, "logo.png", pngStubBytes());
+        commitAll(dir, "logo", env);
+      },
+    }),
+  });
+  await openSession(page, serve, "rp-files-open");
+  await page.getByRole("button", { name: "Toggle Files pane" }).first().click();
+
+  const openFileFor = async (name: string) => {
+    await page.getByRole("button", { name }).first().click({ button: "right" });
+    return page.getByRole("menuitem", { name: "Open file" });
+  };
+
+  const [textTab] = await Promise.all([page.waitForEvent("popup"), (await openFileFor("docs/guide.md")).click()]);
+  await expect(textTab.locator("body")).toContainText("unchanged guide", { timeout: 10_000 });
+  await textTab.close();
+
+  const [imageTab] = await Promise.all([page.waitForEvent("popup"), (await openFileFor("logo.png")).click()]);
+  await expect(imageTab.locator("img")).toHaveCount(1, { timeout: 10_000 });
 });
 
 test("right panel notifications: structured view comments banner appears on stage, clears on discard", async ({

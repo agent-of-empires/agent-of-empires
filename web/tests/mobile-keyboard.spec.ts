@@ -161,11 +161,12 @@ test.describe("Mobile proxy input keydown handling", () => {
     );
   }
 
-  test("Enter and Backspace send CR and DEL (0x7f) via proxy keydown", async ({ page }) => {
+  test("Enter and Backspace on the proxy send CR and DEL (0x7f)", async ({ page }) => {
     const handle = await setupProxySession(page);
     await sendProxyKey(page, "Enter", "Enter");
     await expect.poll(() => handle.liveInput.map((input) => input.toString())).toContain("\r");
-    await sendProxyKey(page, "Backspace", "Backspace");
+    // A plain Backspace edits the proxy natively and reaches the pane as its diff.
+    await page.keyboard.press("Backspace");
     await expect.poll(() => handle.liveInput.map((input) => input.toString())).toContain("\x7f");
   });
 
@@ -187,6 +188,8 @@ test.describe("Mobile proxy input keydown handling", () => {
         data: "reselected",
       });
       const delivered = proxy.dispatchEvent(event);
+      proxy.setRangeText("reselected", proxy.value.length, proxy.value.length, "end");
+      proxy.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: "reselected" }));
       return { data: event.data, delivered, inputType: event.inputType };
     });
     // An unprevented event also leaves the text in the proxy textarea as IME context.

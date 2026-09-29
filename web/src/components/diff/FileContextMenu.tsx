@@ -2,23 +2,19 @@ import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useClampedMenuPosition } from "../../lib/menuPosition";
 import { writeClipboard } from "../../lib/clipboard";
-import { sessionDiffRawFileUrl } from "../../lib/api";
 import { openInNewTab } from "../../lib/openInNewTab";
 import { toastBus } from "../../lib/toastBus";
-import type { RichDiffFile } from "../../lib/types";
 
 export interface PathMenuState {
   x: number;
   y: number;
   path: string;
-  /** The changed file under a file row; a directory row has none and only copies its path. */
-  file?: RichDiffFile;
+  /** Where Open file reads the file's current bytes; a directory row has none and only copies its path. */
+  open?: { url: string; disabled?: boolean };
 }
 
 interface Props {
   menu: PathMenuState | null;
-  /** Opening a file needs the session; without one the menu only copies. */
-  sessionId?: string | null;
   onClose: () => void;
 }
 
@@ -31,8 +27,8 @@ function openFailureMessage(path: string, status?: number): string {
   return `Couldn't open ${path}`;
 }
 
-/** Changed-file actions at the click position, clamped to the viewport. */
-export function DiffFileContextMenu({ menu, sessionId, onClose }: Props) {
+/** File-row actions at the click position, clamped to the viewport. */
+export function FileContextMenu({ menu, onClose }: Props) {
   const menuRef = useRef<HTMLDivElement | null>(null);
 
   // Local position so the clamp can nudge it on-screen before paint.
@@ -70,7 +66,7 @@ export function DiffFileContextMenu({ menu, sessionId, onClose }: Props) {
 
   if (!menu || !pos) return null;
 
-  const { path, file } = menu;
+  const { path, open } = menu;
   const copy = () => {
     void writeClipboard(path).then((ok) => {
       if (ok) toastBus.handler?.info(`Copied ${path}`);
@@ -78,10 +74,9 @@ export function DiffFileContextMenu({ menu, sessionId, onClose }: Props) {
     });
     onClose();
   };
-  const openFile = (id: string, target: RichDiffFile) => {
-    const name = target.path.slice(target.path.lastIndexOf("/") + 1);
-    void openInNewTab(sessionDiffRawFileUrl(id, target.path, target.repo_name), name).then((result) => {
-      if (!result.ok) toastBus.handler?.error(openFailureMessage(target.path, result.status));
+  const openFile = (url: string) => {
+    void openInNewTab(url, path.slice(path.lastIndexOf("/") + 1)).then((result) => {
+      if (!result.ok) toastBus.handler?.error(openFailureMessage(path, result.status));
     });
     onClose();
   };
@@ -94,12 +89,12 @@ export function DiffFileContextMenu({ menu, sessionId, onClose }: Props) {
       style={{ left: pos.x, top: pos.y }}
       onContextMenu={(e) => e.preventDefault()}
     >
-      {file && sessionId && (
+      {open && (
         <button
           type="button"
           role="menuitem"
-          disabled={file.status === "deleted"}
-          onClick={() => openFile(sessionId, file)}
+          disabled={open.disabled}
+          onClick={() => openFile(open.url)}
           className={ITEM}
         >
           Open file

@@ -170,10 +170,19 @@ describe("open file", () => {
     expect(openInNewTab).toHaveBeenCalledWith("s1:web:same.txt", "same.txt");
   });
 
-  it("offers only the copy on a directory row", () => {
-    renderList({ files: [file({ path: "src/app/foo.rs" })], sessionId: "s1" });
-    fireEvent.contextMenu(row("src"));
+  it.each([
+    ["a directory row", "src", "s1"],
+    ["a file row without a session", "foo.rs", null],
+  ])("offers only the copy on %s", (_, text, sessionId) => {
+    renderList({ files: [file({ path: "src/app/foo.rs" })], sessionId });
+    fireEvent.contextMenu(row(text));
     expect(menuItems()).toEqual(["Copy relative path"]);
+  });
+
+  it("disables Open file on a deleted file", () => {
+    renderList({ files: [file({ path: "old.pdf", status: "deleted" })], sessionId: "s1" });
+    fireEvent.contextMenu(row("old.pdf"));
+    expect(screen.getByRole("menuitem", { name: "Open file" })).toHaveProperty("disabled", true);
   });
 });
 

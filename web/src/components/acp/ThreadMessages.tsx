@@ -1,3 +1,5 @@
+import { useMemo } from "react";
+
 import { MessagePrimitive, useAuiState } from "@assistant-ui/react";
 
 import { isElicitationAnswersPayload, type ActivityRow, type ToolCall } from "../../lib/acpTypes";
@@ -156,27 +158,41 @@ interface GroupChild {
 
 const childItem = (c: GroupChild) => toToolItem({ ...c, args: parseJsonObject(c.argsText) ?? {} });
 
-/** The synthetic group parts AcpRuntime emits carry `{ children, parent?, async? }` in argsText. */
-function groupPayload(argsText?: string) {
-  const payload = argsText ? parseJsonObject(argsText) : null;
-  const children = Array.isArray(payload?.children) ? (payload.children as GroupChild[]) : null;
-  return { payload, children };
+/** The synthetic group parts AcpRuntime emits carry `{ children, parent?, async? }` in argsText.
+ *  Memoized per payload so a re-render does not re-parse every child. */
+function useGroupPayload(argsText?: string) {
+  return useMemo(() => {
+    const payload = argsText ? parseJsonObject(argsText) : null;
+    const children = Array.isArray(payload?.children) ? (payload.children as GroupChild[]).map(childItem) : null;
+    const parent = payload?.parent ? childItem(payload.parent as GroupChild) : null;
+    return { payload, children, parent };
+  }, [argsText]);
+}
+
+function AssistantToolGroup({ argsText }: ToolPart) {
+  return <ToolGroupCard items={useGroupPayload(argsText).children ?? []} />;
+}
+
+function AssistantTodoGroup({ argsText }: ToolPart) {
+  return <TodoGroupCard items={useGroupPayload(argsText).children ?? []} />;
+}
+
+function AssistantSubagent({ argsText }: ToolPart) {
+  const { payload, children, parent } = useGroupPayload(argsText);
+  if (!parent || !children) return null;
+  // An async launch has no inline children; it links to the Background agents panel.
+  if (payload?.async) return <AsyncSubagentCard tool={parent.tool} />;
+  return <SubagentCard tool={parent.tool} result={parent.result} children={children} />;
 }
 
 function AssistantToolCall(props: ToolPart) {
   switch (props.toolName) {
     case TOOL_GROUP_NAME:
-      return <ToolGroupCard items={(groupPayload(props.argsText).children ?? []).map(childItem)} />;
+      return <AssistantToolGroup {...props} />;
     case TODO_GROUP_NAME:
-      return <TodoGroupCard items={(groupPayload(props.argsText).children ?? []).map(childItem)} />;
-    case SUBAGENT_TASK_NAME: {
-      const { payload, children } = groupPayload(props.argsText);
-      if (!payload?.parent || !children) return null;
-      const parent = childItem(payload.parent as GroupChild);
-      // An async launch has no inline children; it links to the Background agents panel.
-      if (payload.async) return <AsyncSubagentCard tool={parent.tool} />;
-      return <SubagentCard tool={parent.tool} result={parent.result} children={children.map(childItem)} />;
-    }
+      return <AssistantTodoGroup {...props} />;
+    case SUBAGENT_TASK_NAME:
+      return <AssistantSubagent {...props} />;
     default: {
       const { tool, result } = toToolItem(props);
       return <ToolCard tool={tool} result={result} />;
