@@ -169,6 +169,8 @@ test.describe("mobile", () => {
   test("the wizard is a bottom sheet sized to its rows, with Launch right under them", async ({ page }) => {
     await mockWizardApis(page);
     await page.goto("/");
+    // The `n` shortcut is live once the dashboard has loaded its sessions.
+    await expect(page.getByTestId("sidebar-session-row").first()).toBeVisible();
     await openWizard(page);
     await selectProject(page, "/tmp/example");
     const w = wizard(page);
@@ -190,6 +192,7 @@ test.describe("mobile", () => {
       projects: Array.from({ length: 30 }, (_, i) => ({ name: `proj-${i}`, path: `/tmp/proj-${i}`, scope: "global" })),
     });
     await page.goto("/");
+    await expect(page.getByTestId("sidebar-session-row").first()).toBeVisible();
     await openWizard(page);
     const box = (await wizard(page).boundingBox())!;
     expect(box.y).toBeGreaterThanOrEqual(0);

@@ -1,3 +1,5 @@
+import { useId } from "react";
+
 const TEXT_INPUT =
   "w-full bg-surface-900 border border-surface-700 rounded-lg px-3 py-2.5 text-base md:text-sm font-mono text-text-primary placeholder:text-text-dim focus:border-brand-600 focus:outline-none";
 
@@ -15,10 +17,14 @@ export function LabeledInput({
   /** Hint rendered under the input. */
   children?: React.ReactNode;
 }) {
+  const id = useId();
   return (
     <div>
-      <label className="block text-sm text-text-dim mb-1.5">{label}</label>
+      <label htmlFor={id} className="block text-sm text-text-dim mb-1.5">
+        {label}
+      </label>
       <input
+        id={id}
         type="text"
         value={value}
         onChange={(e) => onChange(e.target.value)}

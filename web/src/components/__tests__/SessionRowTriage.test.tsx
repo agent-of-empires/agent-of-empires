@@ -121,12 +121,27 @@ describe("SessionRow unread", () => {
 });
 
 describe("SessionRow context menu", () => {
-  it("keeps the rarer actions folded under More until it is opened", () => {
+  it("keeps the rarer actions folded under a More disclosure until it is opened", () => {
     openRowMenu(ws({ view: "structured" }), { expandMore: false });
-    expect(testId("sidebar-context-menu-switch-agent")).toBeNull();
-    expect(testId("sidebar-context-menu-rename")).not.toBeNull();
+    const more = screen.getByTestId("sidebar-context-menu-more");
+    const group = document.getElementById(more.getAttribute("aria-controls")!)!;
+    expect(more.getAttribute("aria-expanded")).toBe("false");
+    expect(group.contains(testId("sidebar-context-menu-switch-agent"))).toBe(true);
+    expect(group.hidden).toBe(true);
     click("sidebar-context-menu-more");
-    expect(testId("sidebar-context-menu-switch-agent")).not.toBeNull();
+    expect(more.getAttribute("aria-expanded")).toBe("true");
+    expect(group.hidden).toBe(false);
+  });
+
+  it("is a named modal sheet that takes focus, closes on Escape, and returns focus to the row", () => {
+    const menu = openRowMenu(ws({ title: "Fix login" }), { expandMore: false });
+    expect(menu.getAttribute("role")).toBe("dialog");
+    expect(menu.getAttribute("aria-modal")).toBe("true");
+    expect(menu.getAttribute("aria-label")).toBe("Fix login actions");
+    expect(menu.contains(document.activeElement)).toBe(true);
+    fireEvent.keyDown(document.activeElement!, { key: "Escape" });
+    expect(testId("sidebar-context-menu")).toBeNull();
+    expect(document.activeElement).toBe(screen.getByTestId("sidebar-session-row"));
   });
 
   it.each([

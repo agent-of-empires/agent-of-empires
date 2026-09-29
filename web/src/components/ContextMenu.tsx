@@ -1,4 +1,4 @@
-import type { ReactNode, RefObject } from "react";
+import { useLayoutEffect, type ReactNode, type RefObject } from "react";
 import { createPortal } from "react-dom";
 
 export function ContextMenu({
@@ -7,6 +7,9 @@ export function ContextMenu({
   testId,
   minWidth = "min-w-[190px]",
   sheetOnMobile = false,
+  label,
+  onClose,
+  returnFocusTo,
   children,
 }: {
   menu: { x: number; y: number };
@@ -15,8 +18,29 @@ export function ContextMenu({
   minWidth?: string;
   /** Below `md`, dock to the bottom edge over a backdrop instead of floating at the pointer. */
   sheetOnMobile?: boolean;
+  /** Accessible name of the sheet dialog. */
+  label?: string;
+  /** Escape closes the sheet. */
+  onClose?: () => void;
+  /** Where focus returns on close, when nothing else took it. */
+  returnFocusTo?: RefObject<HTMLElement | null>;
   children: ReactNode;
 }) {
+  // The sheet is modal on a phone: focus enters on open and goes back to the trigger on
+  // close, unless the closing click already focused something else.
+  useLayoutEffect(() => {
+    if (!sheetOnMobile) return;
+    const el = menuRef.current;
+    const trigger = returnFocusTo?.current;
+    el?.querySelector<HTMLElement>("button:not([disabled])")?.focus({ preventScroll: true });
+    return () => {
+      const active = document.activeElement;
+      if (!active || active === document.body || el?.contains(active)) {
+        trigger?.focus({ preventScroll: true });
+      }
+    };
+  }, [sheetOnMobile, menuRef, returnFocusTo]);
+
   // `!` overrides the pointer position and height cap set inline.
   const sheet = sheetOnMobile
     ? " max-md:!left-0 max-md:!top-auto max-md:bottom-0 max-md:w-full max-md:!max-h-[85dvh] max-md:rounded-b-none max-md:border-x-0 max-md:border-b-0 max-md:pb-[max(0.5rem,env(safe-area-inset-bottom))]"
@@ -28,6 +52,15 @@ export function ContextMenu({
       <div
         ref={menuRef}
         data-testid={testId}
+        role={sheetOnMobile ? "dialog" : undefined}
+        aria-modal={sheetOnMobile || undefined}
+        aria-label={sheetOnMobile ? label : undefined}
+        onKeyDown={(e) => {
+          if (e.key === "Escape" && onClose) {
+            e.preventDefault();
+            onClose();
+          }
+        }}
         className={`fixed z-50 bg-surface-800 border border-surface-700 rounded-lg shadow-lg py-1 ${minWidth} overflow-y-auto${sheet}`}
         style={{ left: menu.x, top: menu.y, maxHeight: "calc(100dvh - 16px)" }}
       >
@@ -45,10 +78,15 @@ export function MenuItem({
   indent = false,
   flex = icon != null,
   className = "text-text-secondary hover:bg-surface-700/50",
+  ariaExpanded,
+  ariaControls,
   children,
 }: {
   onClick: () => void;
   testId?: string;
+  /** For an item that discloses a group, e.g. "More". */
+  ariaExpanded?: boolean;
+  ariaControls?: string;
   icon?: ReactNode;
   indent?: boolean;
   flex?: boolean;
@@ -57,8 +95,11 @@ export function MenuItem({
 }) {
   return (
     <button
+      type="button"
       onClick={onClick}
       data-testid={testId}
+      aria-expanded={ariaExpanded}
+      aria-controls={ariaControls}
       className={`w-full text-left ${indent ? "pl-6 pr-3" : "px-3"} py-2 md:py-2 max-md:py-3 text-sm ${className} cursor-pointer transition-colors${flex ? " flex items-center gap-2" : ""}`}
     >
       {icon}

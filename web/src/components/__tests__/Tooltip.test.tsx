@@ -66,4 +66,17 @@ describe("Tooltip", () => {
     fireEvent.mouseEnter(trigger);
     expect(document.querySelector("[role=tooltip]")).not.toBeNull();
   });
+
+  it("closes a tooltip a touch entry event opened before the tap's pointerdown", () => {
+    render(
+      <Tooltip text="New session">
+        <button type="button">+</button>
+      </Tooltip>,
+    );
+    const button = screen.getByRole("button");
+    fireEvent.mouseEnter(button.parentElement!);
+    expect(document.querySelector("[role=tooltip]")).not.toBeNull();
+    fireEvent.pointerDown(button, { pointerType: "touch" });
+    expect(document.querySelector("[role=tooltip]")).toBeNull();
+  });
 });

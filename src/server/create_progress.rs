@@ -14,6 +14,8 @@ const MAX_LINE_CHARS: usize = 400;
 /// How long a failed create's response is replayed to a retry with its key. The
 /// web client keeps retrying an unresolved create for as long (`pendingCreates.ts`).
 const FAILURE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+/// Failed creates remembered at once; beyond it the oldest is forgotten first.
+const MAX_FAILURES: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -94,7 +96,9 @@ pub struct CreateFailure {
 #[derive(Default)]
 pub struct CreateProgressRegistry {
     live: Arc<Mutex<HashMap<String, Arc<CreateProgress>>>>,
-    failures: Mutex<HashMap<String, (Instant, CreateFailure)>>,
+    /// Keyed failures with when they were recorded and an insertion sequence, which
+    /// orders entries recorded in the same instant.
+    failures: Mutex<(u64, HashMap<String, (Instant, u64, CreateFailure)>)>,
 }
 
 /// Removes its key from the registry when the create finishes.
@@ -141,24 +145,58 @@ impl CreateProgressRegistry {
 
     /// Record before the create releases its idempotency lock, so a waiting retry sees it.
     pub fn record_failure(&self, key: &str, failure: CreateFailure) {
-        let mut failures = self.failures.lock().expect("create failures poisoned");
-        failures.retain(|_, (at, _)| at.elapsed() < FAILURE_TTL);
-        failures.insert(key.to_string(), (Instant::now(), failure));
+        let mut guard = self.failures.lock().expect("create failures poisoned");
+        let (next_seq, failures) = &mut *guard;
+        // Bounded: only a full map is swept, and then the oldest entry makes room.
+        if failures.len() >= MAX_FAILURES && !failures.contains_key(key) {
+            failures.retain(|_, (at, _, _)| at.elapsed() < FAILURE_TTL);
+            if failures.len() >= MAX_FAILURES {
+                if let Some(oldest) = failures
+                    .iter()
+                    .min_by_key(|(_, (_, seq, _))| *seq)
+                    .map(|(k, _)| k.clone())
+                {
+                    failures.remove(&oldest);
+                }
+            }
+        }
+        *next_seq += 1;
+        failures.insert(key.to_string(), (Instant::now(), *next_seq, failure));
     }
 
     pub fn recent_failure(&self, key: &str) -> Option<CreateFailure> {
         self.failures
             .lock()
             .expect("create failures poisoned")
+            .1
             .get(key)
-            .filter(|(at, _)| at.elapsed() < FAILURE_TTL)
-            .map(|(_, failure)| failure.clone())
+            .filter(|(at, _, _)| at.elapsed() < FAILURE_TTL)
+            .map(|(_, _, failure)| failure.clone())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failure_replay_is_bounded_and_forgets_the_oldest_first() {
+        let registry = CreateProgressRegistry::default();
+        let failure = |n: usize| CreateFailure {
+            status: axum::http::StatusCode::BAD_REQUEST,
+            code: "create_failed",
+            message: format!("failure {n}"),
+        };
+        for n in 0..=MAX_FAILURES {
+            registry.record_failure(&format!("k{n}"), failure(n));
+        }
+        assert_eq!(registry.failures.lock().unwrap().1.len(), MAX_FAILURES);
+        assert!(registry.recent_failure("k0").is_none());
+        assert_eq!(
+            registry.recent_failure(&format!("k{MAX_FAILURES}")),
+            Some(failure(MAX_FAILURES))
+        );
+    }
 
     #[test]
     fn progress_tracks_hooks_caps_output_and_unregisters_on_drop() {

@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useId, useState } from "react";
 import {
   Archive,
   ArrowLeftRight,
@@ -161,6 +161,7 @@ export function SingleRowMenuItems({
   actions: SingleRowActions;
 }) {
   const [moreOpen, setMoreOpen] = useState(false);
+  const moreId = useId();
   const { firstSession: first, acpSession: acp } = model;
   const write = !readOnly;
   const canSwitchView = write && !!first && (first.view === "structured" || first.acp_capable);
@@ -213,57 +214,52 @@ export function SingleRowMenuItems({
           <MenuItem
             onClick={() => setMoreOpen((o) => !o)}
             testId="sidebar-context-menu-more"
+            ariaExpanded={moreOpen}
+            ariaControls={moreId}
             icon={icon(ChevronRight, `transition-transform ${moreOpen ? "rotate-90" : ""}`)}
           >
             More
           </MenuItem>
-          {moreOpen && (
-            <>
-              {more.switchAgent && (
-                <MenuItem
-                  onClick={a.switchAgent}
-                  testId="sidebar-context-menu-switch-agent"
-                  icon={icon(ArrowLeftRight)}
-                  indent
-                >
-                  Switch agent
-                </MenuItem>
-              )}
-              {more.autoName && (
-                <MenuItem onClick={a.autoName} testId="sidebar-context-menu-auto-name" icon={icon(Sparkles)} indent>
-                  Auto-name now
-                </MenuItem>
-              )}
-              {more.summarize && (
-                <MenuItem onClick={a.summarize} testId="sidebar-context-menu-summarize" icon={icon(ScrollText)} indent>
-                  Summarize conversation
-                </MenuItem>
-              )}
-              {more.editWorkdir && (
-                <MenuItem
-                  onClick={a.editWorkdir}
-                  testId="sidebar-context-menu-edit-workdir"
-                  icon={icon(FolderPen)}
-                  indent
-                >
-                  Edit workdir name
-                </MenuItem>
-              )}
-              {more.addProject && (
-                <MenuItem
-                  onClick={a.addProject}
-                  testId="sidebar-context-menu-add-project"
-                  icon={icon(FolderPlus)}
-                  indent
-                >
-                  Add project
-                </MenuItem>
-              )}
-              <MenuItem onClick={a.editGroup} testId="sidebar-context-menu-edit-group" icon={icon(Folders)} indent>
-                Edit group
+          <div id={moreId} hidden={!moreOpen}>
+            {more.switchAgent && (
+              <MenuItem
+                onClick={a.switchAgent}
+                testId="sidebar-context-menu-switch-agent"
+                icon={icon(ArrowLeftRight)}
+                indent
+              >
+                Switch agent
               </MenuItem>
-            </>
-          )}
+            )}
+            {more.autoName && (
+              <MenuItem onClick={a.autoName} testId="sidebar-context-menu-auto-name" icon={icon(Sparkles)} indent>
+                Auto-name now
+              </MenuItem>
+            )}
+            {more.summarize && (
+              <MenuItem onClick={a.summarize} testId="sidebar-context-menu-summarize" icon={icon(ScrollText)} indent>
+                Summarize conversation
+              </MenuItem>
+            )}
+            {more.editWorkdir && (
+              <MenuItem
+                onClick={a.editWorkdir}
+                testId="sidebar-context-menu-edit-workdir"
+                icon={icon(FolderPen)}
+                indent
+              >
+                Edit workdir name
+              </MenuItem>
+            )}
+            {more.addProject && (
+              <MenuItem onClick={a.addProject} testId="sidebar-context-menu-add-project" icon={icon(FolderPlus)} indent>
+                Add project
+              </MenuItem>
+            )}
+            <MenuItem onClick={a.editGroup} testId="sidebar-context-menu-edit-group" icon={icon(Folders)} indent>
+              Edit group
+            </MenuItem>
+          </div>
         </>
       )}
       <MenuSeparator />

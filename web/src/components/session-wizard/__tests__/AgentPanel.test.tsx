@@ -88,8 +88,9 @@ describe("AgentPanel launch fields", () => {
   it("edits the instructions, args and override", () => {
     const { onChange } = renderPanel();
     fireEvent.change(screen.getByLabelText("Agent instructions"), { target: { value: "be terse" } });
-    fireEvent.change(screen.getByPlaceholderText("e.g. --port 8080"), { target: { value: "--x" } });
-    fireEvent.change(screen.getByPlaceholderText("Override the agent launch command"), { target: { value: "cc" } });
+    // Found by their visible labels, which proves the label is tied to the input.
+    fireEvent.change(screen.getByLabelText("Additional arguments"), { target: { value: "--x" } });
+    fireEvent.change(screen.getByLabelText("Command override"), { target: { value: "cc" } });
     expect(onChange.mock.calls).toEqual([
       ["customInstruction", "be terse"],
       ["extraArgs", "--x"],

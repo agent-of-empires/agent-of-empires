@@ -24,19 +24,35 @@ const STORAGE_KEY = "aoe-pending-creates";
 export const PENDING_CREATE_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 const MAX_RETRY_DELAY_MS = 30_000;
 
+export const PENDING_CREATE_EXPIRED_MESSAGE =
+  "Gave up waiting for the server to confirm this session; check the session list before relaunching.";
+
 let handlers: PendingCreateHandlers | null = null;
+
+const isExpired = (p: PendingCreate) => Date.now() - p.since >= PENDING_CREATE_MAX_AGE_MS;
 const reconciling = new Set<string>();
 
-function load(): PendingCreate[] {
+/** Well-formed stored entries, expired or not; corrupt ones are dropped. */
+function loadValid(): PendingCreate[] {
   try {
     const parsed: unknown = JSON.parse(safeGetItem(STORAGE_KEY) ?? "[]");
     if (!Array.isArray(parsed)) return [];
     return (parsed as PendingCreate[]).filter(
-      (p) => typeof p?.body?.idempotency_key === "string" && Date.now() - p.since < PENDING_CREATE_MAX_AGE_MS,
+      (p) =>
+        typeof p?.body?.idempotency_key === "string" &&
+        typeof p.body.path === "string" &&
+        typeof p.body.tool === "string" &&
+        typeof p.tool === "string" &&
+        typeof p.since === "number" &&
+        Number.isFinite(p.since),
     );
   } catch {
     return [];
   }
+}
+
+function load(): PendingCreate[] {
+  return loadValid().filter((p) => !isExpired(p));
 }
 
 function save(list: PendingCreate[]): void {
@@ -45,8 +61,11 @@ function save(list: PendingCreate[]): void {
 
 const isPending = (key: string) => load().some((p) => p.body.idempotency_key === key);
 
+/** Whether `key` is still in storage, aged out or not. */
+const isStored = (key: string) => loadValid().some((p) => p.body.idempotency_key === key);
+
 function remove(key: string): void {
-  save(load().filter((p) => p.body.idempotency_key !== key));
+  save(loadValid().filter((p) => p.body.idempotency_key !== key));
 }
 
 function waitUntilReachable(): Promise<void> {
@@ -76,7 +95,13 @@ async function reconcile(pending: PendingCreate): Promise<void> {
         await waitUntilReachable();
         await new Promise((r) => setTimeout(r, Math.min(1000 * attempt, MAX_RETRY_DELAY_MS)));
       }
-      // Adopted by a reopened wizard, or aged out: whoever holds it now answers for it.
+      if (isExpired(pending)) {
+        const stillOurs = isStored(key);
+        remove(key);
+        if (stillOurs) handlers?.onFailed(PENDING_CREATE_EXPIRED_MESSAGE, pending);
+        return;
+      }
+      // Adopted by a reopened wizard: it answers for the outcome now.
       if (!isPending(key)) return;
       const result = await createSession(pending.body);
       if (result.network) continue;
@@ -110,5 +135,6 @@ export function claimPendingCreate(key: string): void {
 /** Register the app's outcome handlers and resume creates left unresolved by an earlier page. */
 export function startPendingCreates(next: PendingCreateHandlers): void {
   handlers = next;
-  for (const pending of load()) void reconcile(pending);
+  // `reconcile` reports one that aged out while no page was open.
+  for (const pending of loadValid()) void reconcile(pending);
 }

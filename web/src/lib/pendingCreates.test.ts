@@ -69,4 +69,47 @@ describe("pendingCreates", () => {
       vi.useRealTimers();
     }
   });
+
+  it("drops corrupt stored entries rather than sending them", async () => {
+    const good = pending("k-good");
+    localStorage.setItem(
+      "aoe-pending-creates",
+      JSON.stringify([
+        { ...pending("k-string-since"), since: String(Date.now()) },
+        { ...pending("k-no-path"), body: { tool: "claude", idempotency_key: "k-no-path" } },
+        { body: { idempotency_key: "k-bare" } },
+        good,
+      ]),
+    );
+    const { peekPendingCreate, claimPendingCreate } = await import("./pendingCreates");
+    expect(peekPendingCreate()?.body.idempotency_key).toBe("k-good");
+    claimPendingCreate("k-good");
+    expect(peekPendingCreate()).toBeNull();
+  });
+
+  it.each([
+    ["while its page stays open", true],
+    ["while no page was open", false],
+  ])("reports a create that ages out %s", async (_label, tracked) => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      createSession.mockResolvedValue({ ok: false, error: "offline", network: true });
+      const mod = await import("./pendingCreates");
+      const onFailed = vi.fn();
+      const nearlyExpired = pending("k-expire", Date.now() - mod.PENDING_CREATE_MAX_AGE_MS + 2_000);
+      if (tracked) {
+        mod.startPendingCreates({ onCreated: vi.fn(), onFailed });
+        mod.trackPendingCreate(nearlyExpired);
+      } else {
+        localStorage.setItem("aoe-pending-creates", JSON.stringify([nearlyExpired]));
+        await vi.advanceTimersByTimeAsync(5_000);
+        mod.startPendingCreates({ onCreated: vi.fn(), onFailed });
+      }
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(onFailed).toHaveBeenCalledWith(mod.PENDING_CREATE_EXPIRED_MESSAGE, expect.anything());
+      expect(localStorage.getItem("aoe-pending-creates")).toBe("[]");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
