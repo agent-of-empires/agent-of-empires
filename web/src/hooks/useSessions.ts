@@ -11,7 +11,6 @@ export function useSessions() {
   const [workspaceOrdering, setWorkspaceOrdering] = useState<string[]>([]);
   const [error, setError] = useState(false);
   const [loaded, setLoaded] = useState(false);
-  const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const lastLocalOrderingAtRef = useRef<number>(0);
 
   const injectSession = useCallback((session: SessionResponse) => {
@@ -43,10 +42,34 @@ export function useSessions() {
   }, []);
 
   useEffect(() => {
-    void fetchSessions().then(applyResult);
-    intervalRef.current = setInterval(() => void fetchSessions().then(applyResult), POLL_INTERVAL);
+    // Recursive setTimeout so polls never overlap: two /api/sessions
+    // responses can cross, and the slower one must not roll the canonical
+    // list back to an older snapshot.
+    let cancelled = false;
+    let inFlight = false;
+    let timer: number | undefined;
+
+    const scheduleNext = () => {
+      if (cancelled) return;
+      timer = setTimeout(() => void tick(), POLL_INTERVAL);
+    };
+
+    const tick = async () => {
+      if (inFlight) return;
+      inFlight = true;
+      try {
+        const data = await fetchSessions();
+        if (!cancelled) applyResult(data);
+      } finally {
+        inFlight = false;
+        scheduleNext();
+      }
+    };
+
+    void tick();
     return () => {
-      if (intervalRef.current) clearInterval(intervalRef.current);
+      cancelled = true;
+      clearTimeout(timer);
     };
   }, [applyResult]);
 
