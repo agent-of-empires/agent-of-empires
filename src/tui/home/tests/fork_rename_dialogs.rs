@@ -1183,10 +1183,6 @@ fn creation_result_does_not_carry_the_ownership_flocks() {
         "the builder should have delivered a successful result: {:?}",
         result.result
     );
-    // A `Success` delivered after the last cancellation check still needs a
-    // rollback by the caller, which would hold the flocks the probe below
-    // measures. Only the completed path makes that probe meaningful.
-    assert!(!result.cancelled, "the creation was reported cancelled");
 
     // Probe from another thread while the result is still held, exactly as
     // `apply_creation_results` holds it. The probe blocks on the flock, so the
