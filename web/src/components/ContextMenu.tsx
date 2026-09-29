@@ -1,5 +1,8 @@
-import { useLayoutEffect, type ReactNode, type RefObject } from "react";
+import { useLayoutEffect, useState, type ReactNode, type RefObject } from "react";
 import { createPortal } from "react-dom";
+
+// Below Tailwind's `md`, where `sheetOnMobile` docks the menu as a sheet.
+const MOBILE_QUERY = "(max-width: 767.98px)";
 
 export function ContextMenu({
   menu,
@@ -26,10 +29,14 @@ export function ContextMenu({
   returnFocusTo?: RefObject<HTMLElement | null>;
   children: ReactNode;
 }) {
-  // The sheet is modal on a phone: focus enters on open and goes back to the trigger on
-  // close, unless the closing click already focused something else.
+  // Only the phone layout is a modal sheet; the desktop menu stays a plain floating menu.
+  const [modal] = useState(
+    () => sheetOnMobile && typeof window !== "undefined" && !!window.matchMedia?.(MOBILE_QUERY).matches,
+  );
+  // Focus enters on open and goes back to the trigger on close, unless the closing click
+  // already focused something else.
   useLayoutEffect(() => {
-    if (!sheetOnMobile) return;
+    if (!modal) return;
     const el = menuRef.current;
     const trigger = returnFocusTo?.current;
     el?.querySelector<HTMLElement>("button:not([disabled])")?.focus({ preventScroll: true });
@@ -39,7 +46,7 @@ export function ContextMenu({
         trigger?.focus({ preventScroll: true });
       }
     };
-  }, [sheetOnMobile, menuRef, returnFocusTo]);
+  }, [modal, menuRef, returnFocusTo]);
 
   // `!` overrides the pointer position and height cap set inline.
   const sheet = sheetOnMobile
@@ -52,16 +59,16 @@ export function ContextMenu({
       <div
         ref={menuRef}
         data-testid={testId}
-        role={sheetOnMobile ? "dialog" : undefined}
-        aria-modal={sheetOnMobile || undefined}
-        aria-label={sheetOnMobile ? label : undefined}
+        role={modal ? "dialog" : undefined}
+        aria-modal={modal || undefined}
+        aria-label={modal ? label : undefined}
         onKeyDown={(e) => {
           if (e.key === "Escape" && onClose) {
             e.preventDefault();
             onClose();
           }
           // Modal sheet: Tab and Shift+Tab wrap instead of leaving for the page behind.
-          if (e.key === "Tab" && sheetOnMobile) {
+          if (e.key === "Tab" && modal) {
             const items = [...(menuRef.current?.querySelectorAll<HTMLElement>("button:not([disabled])") ?? [])].filter(
               (el) => !el.closest("[hidden]"),
             );

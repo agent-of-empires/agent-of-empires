@@ -133,7 +133,31 @@ describe("SessionRow context menu", () => {
     expect(group.hidden).toBe(false);
   });
 
+  // The row menu is a modal sheet only at phone width.
+  const atViewport = (phone: boolean) =>
+    vi.stubGlobal(
+      "matchMedia",
+      vi.fn((query: string) => ({ matches: phone && query.includes("max-width"), media: query })),
+    );
+
+  it("on a desktop viewport stays a plain menu: not modal, no focus takeover, Tab not trapped", () => {
+    atViewport(false);
+    const menu = openRowMenu(ws({ view: "structured" }), { expandMore: false });
+    expect(menu.getAttribute("role")).toBeNull();
+    expect(menu.getAttribute("aria-modal")).toBeNull();
+    expect(menu.contains(document.activeElement)).toBe(false);
+    const items = [...menu.querySelectorAll<HTMLElement>("button")].filter((el) => !el.closest("[hidden]"));
+    const last = items[items.length - 1]!;
+    last.focus();
+    fireEvent.keyDown(last, { key: "Tab" });
+    expect(document.activeElement).toBe(last);
+    // Escape still closes it.
+    fireEvent.keyDown(last, { key: "Escape" });
+    expect(testId("sidebar-context-menu")).toBeNull();
+  });
+
   it("keeps Tab and Shift+Tab inside the sheet, skipping folded actions", () => {
+    atViewport(true);
     const menu = openRowMenu(ws({ view: "structured" }), { expandMore: false });
     const items = [...menu.querySelectorAll<HTMLElement>("button")].filter((el) => !el.closest("[hidden]"));
     const [first, last] = [items[0]!, items[items.length - 1]!];
@@ -145,6 +169,7 @@ describe("SessionRow context menu", () => {
   });
 
   it("is a named modal sheet that takes focus, closes on Escape, and returns focus to the row", () => {
+    atViewport(true);
     const menu = openRowMenu(ws({ title: "Fix login" }), { expandMore: false });
     expect(menu.getAttribute("role")).toBe("dialog");
     expect(menu.getAttribute("aria-modal")).toBe("true");

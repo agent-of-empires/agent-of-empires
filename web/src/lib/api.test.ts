@@ -819,8 +819,22 @@ describe("createSession errors", () => {
       new Response(JSON.stringify({ error: "create_failed", message: "nope" }), { status: 400 }),
     );
     expect(await api.createSession(body)).toEqual({ ok: false, error: "nope" });
+    // A proxy's page is no verdict: the create may still be running behind it.
     fetchSpy.mockResolvedValueOnce(new Response("boom", { status: 500 }));
-    expect(await api.createSession(body)).toEqual({ ok: false, error: "Server error (500): boom" });
+    expect(await api.createSession(body)).toMatchObject({ ok: false, network: true });
+    fetchSpy.mockResolvedValueOnce(new Response("<html>504 Gateway Time-out</html>", { status: 504 }));
+    expect(await api.createSession(body)).toEqual({
+      ok: false,
+      error: "No answer from the server (504)",
+      network: true,
+    });
+    // AoE's own typed errors, and a proxy's refusal to forward, are verdicts.
+    fetchSpy.mockResolvedValueOnce(
+      new Response(JSON.stringify({ error: "create_failures_full", message: "try later" }), { status: 503 }),
+    );
+    expect(await api.createSession(body)).toEqual({ ok: false, error: "try later" });
+    fetchSpy.mockResolvedValueOnce(new Response("too large", { status: 413 }));
+    expect(await api.createSession(body)).toEqual({ ok: false, error: "Server error (413): too large" });
     offline();
     expect(await api.createSession(body)).toEqual({ ok: false, error: "Network error: offline", network: true });
   });

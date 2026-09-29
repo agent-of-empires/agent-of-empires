@@ -971,7 +971,8 @@
         "src/components/session-wizard/__tests__/SessionWizard.test.tsx",
         "src/lib/api.test.ts",
         "src/components/session-wizard/__tests__/CreateProgressView.test.tsx",
-        "src/lib/pendingCreates.test.ts"
+        "src/lib/pendingCreates.test.ts",
+        "src/lib/__tests__/createRecovery.test.ts"
       ],
       "components": [
         "web/src/components/session-wizard/CreateProgressView.tsx",

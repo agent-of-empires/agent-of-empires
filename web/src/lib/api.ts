@@ -1374,30 +1374,36 @@ export async function createSession(body: CreateSessionRequest): Promise<{
   error?: string;
   session?: SessionResponse;
   hooksNeedTrust?: HooksNeedTrust;
-  /** The request never got an answer, so the create may still be running. */
+  /** No definite answer (dropped request, or a proxy timeout page), so the create may still be running. */
   network?: boolean;
 }> {
   try {
     const res = await fetch("/api/sessions", jsonInit("POST", body));
     if (res.ok) return { ok: true, session: await res.json() };
     const text = await res.text();
+    let data: { error?: unknown; message?: string; [k: string]: unknown } | null = null;
     try {
-      const data = JSON.parse(text);
-      if (data.error !== "hooks_need_trust")
-        return { ok: false, error: data.message || `Server error (${res.status})` };
-      return {
-        ok: false,
-        error: data.message || "Repository hooks require trust",
-        hooksNeedTrust: {
-          onCreate: stringList(data.on_create),
-          onLaunch: stringList(data.on_launch),
-          onDestroy: stringList(data.on_destroy),
-          needsMcpTrust: data.needs_mcp_trust === true,
-        },
-      };
+      data = JSON.parse(text);
     } catch {
-      return { ok: false, error: `Server error (${res.status}): ${text.slice(0, 200)}` };
+      // Not AoE's JSON; classified below.
     }
+    // Only AoE's typed error body is a verdict. A reverse proxy's timeout or bad-gateway
+    // page says only that the upstream reply went missing, and the create may still finish.
+    if (typeof data?.error !== "string" && (res.status === 408 || res.status >= 500)) {
+      return { ok: false, error: `No answer from the server (${res.status})`, network: true };
+    }
+    if (!data) return { ok: false, error: `Server error (${res.status}): ${text.slice(0, 200)}` };
+    if (data.error !== "hooks_need_trust") return { ok: false, error: data.message || `Server error (${res.status})` };
+    return {
+      ok: false,
+      error: data.message || "Repository hooks require trust",
+      hooksNeedTrust: {
+        onCreate: stringList(data.on_create),
+        onLaunch: stringList(data.on_launch),
+        onDestroy: stringList(data.on_destroy),
+        needsMcpTrust: data.needs_mcp_trust === true,
+      },
+    };
   } catch (e) {
     return { ok: false, error: networkError(e), network: true };
   }

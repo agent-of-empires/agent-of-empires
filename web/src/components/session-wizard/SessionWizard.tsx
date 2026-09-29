@@ -25,6 +25,8 @@ import { normalizeProjectPathKey } from "../../lib/registeredProjects";
 import { useMobileKeyboard } from "../../hooks/useMobileKeyboard";
 import {
   claimPendingCreate,
+  isPendingCreateExpired,
+  PENDING_CREATE_EXPIRED_MESSAGE,
   peekPendingCreate,
   registerPendingCreate,
   releasePendingCreate,
@@ -326,13 +328,27 @@ export function SessionWizard({ onClose, onCreated, onCreatedInBackground, prefi
     setUnknownOutcome(null);
     setProgressKey(body.idempotency_key ?? null);
     const key = body.idempotency_key;
+    // Checked before every send, the first included, since a resumed request can be old
+    // and the waits below are unbounded: past the replay window, stop without sending.
+    const expired = () => !!key && isPendingCreateExpired(since);
+    const giveUp = () => {
+      if (key) resolvePendingCreate(key);
+      setProgressKey(null);
+      if (backgroundRef.current) {
+        toastBus.handler?.error(PENDING_CREATE_EXPIRED_MESSAGE);
+      } else {
+        dispatch({ type: "SUBMIT_ERROR", error: PENDING_CREATE_EXPIRED_MESSAGE });
+      }
+    };
+    if (expired()) return giveUp();
     // Recorded before the request goes out, so a reload mid-flight still has the key.
     if (key) registerPendingCreate({ body: { ...body, idempotency_key: key }, tool, since }, { claimed: true });
     let result = await createSession(body);
-    for (let attempt = 0; result.network && body.idempotency_key && attempt < NETWORK_RETRIES; attempt++) {
+    for (let attempt = 0; result.network && key && attempt < NETWORK_RETRIES; attempt++) {
       await waitUntilOnline();
       await waitUntilVisible();
       await new Promise((r) => setTimeout(r, Math.min(1000 * (attempt + 1), MAX_RETRY_DELAY_MS)));
+      if (expired()) return giveUp();
       result = await createSession(body);
     }
     setProgressKey(null);

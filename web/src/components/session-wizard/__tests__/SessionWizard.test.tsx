@@ -360,6 +360,51 @@ describe("SessionWizard unknown create outcome", () => {
     await vi.advanceTimersByTimeAsync(60_000);
   };
 
+  const DAY_MS = 24 * 60 * 60 * 1000;
+
+  it("stops without sending once the replay window passes while the browser is offline", async () => {
+    let online = true;
+    Object.defineProperty(window.navigator, "onLine", { configurable: true, get: () => online });
+    try {
+      renderWizard();
+      createSession.mockImplementation(async () => {
+        online = false;
+        return LOST;
+      });
+      await launch();
+      await waitFor(() => expect(createSession).toHaveBeenCalledTimes(1));
+
+      // A day offline, then the connection returns.
+      vi.setSystemTime(Date.now() + DAY_MS + 1_000);
+      online = true;
+      window.dispatchEvent(new Event("online"));
+      await vi.advanceTimersByTimeAsync(10_000);
+
+      await waitFor(() => expect(screen.getByText(/Gave up waiting/)).toBeTruthy());
+      expect(createSession).toHaveBeenCalledTimes(1);
+    } finally {
+      Object.defineProperty(window.navigator, "onLine", { configurable: true, get: () => true });
+    }
+  });
+
+  it("does not resend an unknown outcome from Launch once its replay window has passed", async () => {
+    renderWizard();
+    await loseEveryResponse();
+    await waitFor(() => expect(screen.getByText(/may still be created/)).toBeTruthy());
+    const sent = createSession.mock.calls.length;
+
+    vi.setSystemTime(Date.now() + DAY_MS);
+    createSession.mockResolvedValue({ ok: true, session: { id: "s1" } });
+    await launch();
+    await waitFor(() => expect(screen.getByText(/Gave up waiting/)).toBeTruthy());
+    expect(createSession).toHaveBeenCalledTimes(sent);
+
+    // The expired request is gone, so the next Launch is a fresh one.
+    await launch();
+    await waitFor(() => expect(createSession).toHaveBeenCalledTimes(sent + 1));
+    expect(payload(sent).idempotency_key).not.toBe(payload(0).idempotency_key);
+  });
+
   it("keeps the key and retries the same request from Launch", async () => {
     const { onCreated } = renderWizard();
     await loseEveryResponse();

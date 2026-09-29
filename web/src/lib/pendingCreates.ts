@@ -38,7 +38,9 @@ const claimed = new Set<string>();
 const reconciling = new Set<string>();
 const reportedUnsaved = new Set<string>();
 
-const isExpired = (p: PendingCreate) => Date.now() - p.since >= PENDING_CREATE_MAX_AGE_MS;
+/** Past the server's replay window, a retry could re-run a create that already failed. */
+export const isPendingCreateExpired = (since: number) => Date.now() - since >= PENDING_CREATE_MAX_AGE_MS;
+const isExpired = (p: PendingCreate) => isPendingCreateExpired(p.since);
 
 function isWellFormed(p: unknown): p is PendingCreate {
   const c = p as PendingCreate | null;
