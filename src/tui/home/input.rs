@@ -211,8 +211,8 @@ fn mouse_target(
 
 /// The input pane's slice within the preview, with no containment test: pane 0 on a
 /// composited preview, else the whole preview rect. Pane 0 is placed by
-/// [`super::render::live_pane_origin`], as the cursor is painted, then clipped to the
-/// preview. Split from [`mouse_target`] for mid-gesture events, which are not
+/// [`super::render::live_pane_origin`] from the painted slice, as the cursor is, then
+/// clipped to the preview. Split from [`mouse_target`] for mid-gesture events, which are not
 /// position-gated so a drag that began on pane 0 completes even after the pointer
 /// wanders off it.
 fn mouse_pane(cursor: &crate::tmux::PaneCursor, view: super::PreviewTextView) -> PaneSlice {
@@ -223,8 +223,7 @@ fn mouse_pane(cursor: &crate::tmux::PaneCursor, view: super::PreviewTextView) ->
             clipped_rows: 0,
         };
     };
-    let (x, y) =
-        super::render::live_pane_origin(pane, pane.height as usize, view.total_lines, cursor);
+    let (x, y) = super::render::live_pane_origin(view, cursor);
     let clip = |start: i32, len: u16, lo: u16, hi: u16| {
         let a = start.clamp(lo as i32, hi as i32);
         let b = (start + len as i32).clamp(lo as i32, hi as i32);
@@ -6579,13 +6578,26 @@ mod tests {
         }
     }
 
-    /// The live preview's text view over `pane`, showing `total_lines` captured rows.
-    fn view_of(pane: ratatui::layout::Rect, total_lines: usize) -> super::super::PreviewTextView {
+    /// The live preview's text view over `pane`, showing `total_lines` captured rows
+    /// scrolled `offset` rows back from the live tail.
+    fn scrolled_view(
+        pane: ratatui::layout::Rect,
+        total_lines: usize,
+        offset: u16,
+    ) -> super::super::PreviewTextView {
         super::super::PreviewTextView {
             pane,
-            first_line: total_lines.saturating_sub(pane.height as usize),
+            first_line: crate::tui::components::preview::compute_scroll(
+                total_lines,
+                pane.height as usize,
+                offset,
+            ) as usize,
             total_lines,
         }
+    }
+
+    fn view_of(pane: ratatui::layout::Rect, total_lines: usize) -> super::super::PreviewTextView {
+        scrolled_view(pane, total_lines, 0)
     }
 
     /// Forwarding needs a full-screen app: hover needs any-event tracking (1003) and is
@@ -6667,9 +6679,11 @@ mod tests {
         assert!(hover_forward_bytes(&split, view, 39, 5).is_some());
         assert_eq!(hover_forward_bytes(&split, view, 40, 5), None);
 
-        // Pane 0 is projected through the visible composite slice, so a click on the
-        // painted cursor reaches the cursor's 1-based app cell, and a cell beside pane 0
-        // is dropped. (name, window height, pane 0, cursor, a cell outside pane 0)
+        // Pane 0 is projected through the painted composite slice, so a click on the
+        // painted cursor reaches the cursor's 1-based app cell, the first painted row of
+        // pane 0 reports its clipped app row, and a cell beside pane 0 is dropped.
+        // (name, window height, scroll offset, pane 0, cursor, (first painted output row,
+        // its app row), a cell outside pane 0)
         let output = Rect::new(2, 3, 80, 24);
         let geom = |left, top, width, height| crate::tmux::PaneGeom {
             left,
@@ -6677,18 +6691,60 @@ mod tests {
             width,
             height,
         };
-        for (name, window_height, pane0, (x, y), outside) in [
+        for (name, window_height, offset, pane0, (x, y), (first_row, app_row), outside) in [
             // Side by side under `pane-border-status top`: bottom-follow clips the border
             // row, so `top == first_line` cancels and pane 0 starts at the output origin.
-            ("side by side", 25, geom(0, 1, 40, 24), (10, 4), (42, 5)),
+            (
+                "side by side",
+                25,
+                0,
+                geom(0, 1, 40, 24),
+                (10, 4),
+                (0, 1),
+                (42, 5),
+            ),
             // Stacked: the split reads as no chrome, so the border row stays visible and
             // pane 0 starts one row down.
-            ("stacked", 24, geom(0, 1, 80, 11), (5, 3), (10, 3)),
+            (
+                "stacked",
+                24,
+                0,
+                geom(0, 1, 80, 11),
+                (5, 3),
+                (1, 1),
+                (10, 3),
+            ),
             // Rotated or swapped: pane 0 sits right of another pane.
-            ("rotated", 24, geom(40, 0, 40, 24), (10, 4), (41, 5)),
+            (
+                "rotated",
+                24,
+                0,
+                geom(40, 0, 40, 24),
+                (10, 4),
+                (0, 1),
+                (41, 5),
+            ),
             // A window taller than the preview (another client pins its size):
             // bottom-follow clips six of pane 0's rows off the top.
-            ("clipped top", 30, geom(0, 0, 40, 30), (10, 10), (42, 5)),
+            (
+                "clipped top",
+                30,
+                0,
+                geom(0, 0, 40, 30),
+                (10, 10),
+                (0, 7),
+                (42, 5),
+            ),
+            // The same window scrolled locally to its top: pane 0 paints from row 1.
+            (
+                "scrolled to top",
+                30,
+                6,
+                geom(0, 0, 40, 30),
+                (10, 4),
+                (0, 1),
+                (42, 5),
+            ),
         ] {
             let mut cursor = cursor_for(true, true, true);
             cursor.mouse_all = true;
@@ -6696,15 +6752,17 @@ mod tests {
             cursor.y = y;
             cursor.pane_height = window_height;
             cursor.composite_pane0 = Some(pane0);
-            let lines = usize::from(window_height);
-            let painted = crate::tui::home::render::map_live_preview_cursor(
-                output,
-                usize::from(output.height),
-                lines,
-                cursor,
-            )
-            .expect("visible pane cursor");
-            let view = view_of(output, lines);
+            let view = scrolled_view(output, usize::from(window_height), offset);
+            let (col, row) = (output.x + pane0.left + 1, output.y + first_row);
+            let target = mouse_target(&cursor, view, col, row)
+                .unwrap_or_else(|| panic!("{name}: first painted row is inside pane 0"));
+            assert_eq!(
+                target.cell(col, row).1,
+                app_row,
+                "{name}: the first painted row of pane 0 reports its app row"
+            );
+            let painted = crate::tui::home::render::map_live_preview_cursor(view, cursor)
+                .expect("visible pane cursor");
             let target = mouse_target(&cursor, view, painted.x, painted.y)
                 .unwrap_or_else(|| panic!("{name}: painted cursor is inside pane 0"));
             assert_eq!(
