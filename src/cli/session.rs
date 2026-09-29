@@ -854,7 +854,7 @@ fn build_import_instance(
     });
     let mut inst = Instance::new(&title, &s.cwd);
     inst.tool = "claude".to_string();
-    super::add::apply_agent_launch_config(&mut inst, session_config, None, None);
+    crate::session::builder::apply_agent_launch_config(&mut inst, session_config, "", "", None);
     if !group.is_empty() {
         inst.group_path = group.to_string();
     }
@@ -3333,6 +3333,7 @@ mod import_tests {
         assert_eq!(terminal.project_path, "/home/me/proj");
         assert_eq!(terminal.title, "Fix bug");
         assert!(terminal.extra_args.is_empty() && terminal.command.is_empty());
+        assert!(!terminal.yolo_mode);
         assert_eq!(
             terminal.resume_intent,
             ResumeIntent::Use("abc123-def456".to_string())
@@ -3365,6 +3366,7 @@ mod import_tests {
         configured
             .agent_command_override
             .insert("claude".into(), "claude-wrapper".into());
+        configured.yolo_mode_default = true;
         for view_structured in [false, true] {
             let inst = build_import_instance(
                 &summary("sid-2", "/home/me/proj", None),
@@ -3374,6 +3376,7 @@ mod import_tests {
             );
             assert_eq!(inst.extra_args, "--remote-control", "{view_structured}");
             assert_eq!(inst.command, "claude-wrapper", "{view_structured}");
+            assert!(inst.yolo_mode, "{view_structured}");
         }
     }
 
