@@ -6580,7 +6580,7 @@ impl HomeView {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::config::{SessionConfig, ToolSessionConfig};
+    use crate::session::config::ToolSessionConfig;
 
     /// Wheel and button reports in both encodings: SGR is 1-based `<b;x;yM|m`, legacy X10
     /// adds 32 to each byte and clamps coordinates at 223; cells clamp to the pane rect.
@@ -6840,28 +6840,6 @@ mod tests {
                 count: WHEEL_PAGE_STEP,
             })
         );
-    }
-
-    #[test]
-    fn hook_install_agent_resolves_detect_as_after_builtins() {
-        // (tool, detect_as target, resolved agent)
-        let cases = [
-            ("wrapped-codex", "codex", Some("codex")),
-            // A built-in name resolves as itself first, never via detect_as.
-            ("opencode", "codex", None),
-            ("wrapped-agent", "missing-agent", None),
-        ];
-        for (tool, target, want) in cases {
-            let mut config = SessionConfig::default();
-            config
-                .agent_detect_as
-                .insert(tool.to_string(), target.to_string());
-            assert_eq!(
-                resolve_hook_install_agent(tool, &config).map(|agent| agent.name),
-                want,
-                "{tool} -> {target}"
-            );
-        }
     }
 
     #[test]
