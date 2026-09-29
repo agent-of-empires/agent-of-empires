@@ -578,7 +578,7 @@ mod tests {
         // Never call try_wait: that is what reaps. Poll the state instead, so
         // the pid stays a zombie for the assertions below.
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while !linux::is_terminated(pid) {
+        while !platform::is_terminated(pid) {
             assert!(
                 std::time::Instant::now() < deadline,
                 "child never became a zombie"

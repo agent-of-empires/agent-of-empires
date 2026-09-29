@@ -362,6 +362,34 @@ pub(super) fn boot_id() -> Option<String> {
     }
 }
 
+/// Whether `pid` has exited and is only waiting to be reaped rather than still
+/// running. Same rule as the Linux probe: a zombie holds nothing, so treating it
+/// as alive makes a torn-down runner unprovable forever.
+///
+/// macOS has no `/proc`, so the state comes from `waitid` with `WNOWAIT`, which
+/// reports an exited child without reaping it and leaves the supervisor's own
+/// wait intact. A pid that is not our child answers `ECHILD` and reads as alive,
+/// which is the behaviour the zombie rule never changed.
+pub(super) fn is_terminated(pid: u32) -> bool {
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    // SAFETY: `info` is a live, correctly sized `siginfo_t` and `WNOWAIT` leaves
+    // the zombie waitable, so nothing is reaped behind the supervisor's back.
+    let matched = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    if matched != 0 {
+        return false;
+    }
+    // SAFETY: the kernel filled `info`, and `waitid` returned success.
+    let reaped_pid = unsafe { info.si_pid() };
+    reaped_pid != 0
+}
+
 pub(super) fn parent_and_argv0(pid: u32) -> Option<(u32, String)> {
     let output = Command::new("ps")
         .args(["-o", "ppid=,args=", "-p", &pid.to_string()])

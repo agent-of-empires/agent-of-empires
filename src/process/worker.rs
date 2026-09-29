@@ -12,7 +12,7 @@ pub fn is_pid_alive(pid: u32) -> bool {
     use nix::sys::signal::kill;
     use nix::unistd::Pid;
     match kill(Pid::from_raw(pid as i32), None) {
-        Ok(()) => !crate::process::linux::is_terminated(pid),
+        Ok(()) => !crate::process::platform::is_terminated(pid),
         Err(Errno::ESRCH) => false,
         Err(_) => true,
     }
@@ -31,7 +31,7 @@ pub fn is_pid_alive_and_ours(pid: u32) -> bool {
     // Same rule as `is_pid_alive`, and this is the one the supervisor's
     // `ProcessControl` actually calls: a zombie answers to signal 0, holds
     // nothing, and must not make a torn-down runner unprovable forever.
-    kill(Pid::from_raw(pid as i32), None).is_ok() && !crate::process::linux::is_terminated(pid)
+    kill(Pid::from_raw(pid as i32), None).is_ok() && !crate::process::platform::is_terminated(pid)
 }
 
 #[cfg(not(unix))]

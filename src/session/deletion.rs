@@ -81,6 +81,10 @@ pub struct PurgeTransaction {
     workspace_claim_lock: Option<StorageFlock>,
     identity_lock: Option<StorageFlock>,
     active: bool,
+    /// The ownership verdict, taken once before any hook runs. Re-scanning after
+    /// the hooks would let a non-idempotent `on_destroy` play on a purge that is
+    /// then refused, and would replay on the next retry.
+    ownership_verdict: Option<Option<String>>,
 }
 
 /// A purge whose durable row has already been removed. The same lifecycle
@@ -99,6 +103,22 @@ enum CompletionGate {
     AlreadyGone,
     KeptRestored,
     Superseded,
+}
+
+impl DeletionRequest {
+    /// Whether this deletion can destroy a path another session owns. A session
+    /// with no managed worktree, no workspace and no scratch has nothing to
+    /// protect, so an inventory it cannot read must not refuse its deletion.
+    fn needs_path_inventory(&self) -> bool {
+        (self.delete_worktree
+            && (self
+                .instance
+                .worktree_info
+                .as_ref()
+                .is_some_and(|wt| wt.managed_by_aoe)
+                || self.instance.workspace_info.is_some()))
+            || self.instance.scratch
+    }
 }
 
 impl PurgeTransaction {
@@ -188,6 +208,7 @@ impl PurgeTransaction {
             lifecycle_lock: Some(lifecycle_lock),
             identity_lock,
             active: true,
+            ownership_verdict: None,
         }))
     }
     /// The authoritative instance snapshot captured by the reservation.
@@ -210,8 +231,14 @@ impl PurgeTransaction {
         )))
     }
 
-    fn ownership_error(&self) -> Option<String> {
-        with_paths_in_use_locked(
+    fn ownership_error(&mut self) -> Option<String> {
+        if !self.request.needs_path_inventory() {
+            return None;
+        }
+        if let Some(verdict) = &self.ownership_verdict {
+            return verdict.clone();
+        }
+        let verdict = with_paths_in_use_locked(
             &self.request.session_id,
             self.identity_lock.is_some(),
             |paths| match paths {
@@ -220,7 +247,9 @@ impl PurgeTransaction {
                 )),
                 PathsInUse::Known(_) => None,
             },
-        )
+        );
+        self.ownership_verdict = Some(verdict.clone());
+        verdict
     }
 
     /// Run best-effort hooks without a lifecycle or storage flock held.
@@ -729,11 +758,15 @@ fn paths_overlap(left: &Path, right: &Path) -> bool {
         // The recorded peer path is gone, so there is nothing it can contain.
         (None, _) => false,
         // The candidate is not on disk yet, so canonicalization proved nothing
-        // either way. Lexical containment still resolves the case that matters:
-        // a missing candidate under an existing peer parent. An existing path
-        // with an unresolved alias is not proof of separation, so the reverse
-        // direction counts too.
-        (Some(_), None) => left.starts_with(right) || right.starts_with(left),
+        // either way, and it is the peer whose alias can hide a conflict: the
+        // resolved form and the recorded spelling name the same directory, so
+        // both are tested. Lexical containment still resolves the case that
+        // matters, a missing candidate under an existing peer parent. An
+        // existing path with an unresolved alias is not proof of separation, so
+        // the reverse direction counts too.
+        (Some(resolved), None) => [left, &resolved]
+            .iter()
+            .any(|peer| peer.starts_with(right) || right.starts_with(peer)),
     }
 }
 fn paths_overlap_destructive(left: &Path, right: &Path) -> bool {
@@ -959,15 +992,7 @@ fn perform_deletion_core(
     } else {
         &[]
     };
-    let needs_path_inventory = (request.delete_worktree
-        && (request
-            .instance
-            .worktree_info
-            .as_ref()
-            .is_some_and(|wt| wt.managed_by_aoe)
-            || request.instance.workspace_info.is_some()))
-        || request.instance.scratch;
-    if lifecycle_locked && needs_path_inventory {
+    if lifecycle_locked && request.needs_path_inventory() {
         return with_paths_in_use_locked(&request.session_id, identity_lock_held, |paths| {
             perform_deletion_teardown_under_ownership_guard(request, repos, true, paths, teardown)
         });
@@ -1734,6 +1759,27 @@ mod tests {
         assert!(paths_overlap(&parent, &candidate));
     }
 
+    /// A peer recorded through a symlink names the same directory as its
+    /// resolved form. Testing only the recorded spelling let a candidate under
+    /// the real path through, which is the normal macOS layout.
+    #[test]
+    fn missing_candidate_under_a_symlinked_peer_parent_still_conflicts() {
+        let temp = tempfile::tempdir().unwrap();
+        let real = temp.path().join("real");
+        let peer = real.join("peer");
+        std::fs::create_dir_all(&peer).unwrap();
+        std::os::unix::fs::symlink(&real, temp.path().join("link")).unwrap();
+
+        let recorded = temp.path().join("link").join("peer");
+        let candidate = peer.join("not-created-yet");
+        assert!(!candidate.exists());
+
+        assert!(
+            paths_overlap(&recorded, &candidate),
+            "the recorded spelling and the candidate name different parents"
+        );
+    }
+
     /// Two profiles holding the same session id used to make the whole
     /// cross-profile inventory `Unknown`, so every path in every profile read
     /// as claimed. The id is not an ownership claim: only the recorded paths
@@ -1824,6 +1870,51 @@ mod tests {
         assert!(
             ensure_unclaimed_paths("caller", &[PathBuf::from("/tmp/unrelated")]).is_ok(),
             "an unresolvable alias must not make every path look claimed"
+        );
+    }
+
+    /// A session with no managed worktree, no workspace and no scratch destroys
+    /// no path another session can own, so an inventory it cannot read must not
+    /// refuse its deletion.
+    #[test]
+    #[serial_test::serial]
+    fn a_session_with_nothing_to_protect_is_not_refused_on_an_unknown_inventory() {
+        let temp = tempfile::tempdir().unwrap();
+        let _home = isolate_app_dir_at(&temp.path().join("home"));
+        let storage = Storage::new_unwatched("owner").unwrap();
+        let mut plain = Instance::new("Plain", temp.path().join("plain").to_str().unwrap());
+        plain.source_profile = "owner".to_string();
+        storage
+            .update(|instances, _groups| {
+                instances.push(plain.clone());
+                Ok(())
+            })
+            .unwrap();
+
+        // A neighbouring profile the inventory cannot read.
+        let other = Storage::new_unwatched("other").unwrap();
+        other.update(|_, _| Ok(())).unwrap();
+        std::fs::write(other.sessions_path(), "[{\"id\":1}]").unwrap();
+
+        let transaction = match PurgeTransaction::reserve(
+            storage,
+            DeletionRequest {
+                delete_worktree: true,
+                delete_branch: true,
+                ..request(plain)
+            },
+        )
+        .unwrap()
+        {
+            PurgeReservation::Reserved(transaction) => transaction,
+            PurgeReservation::Rejected(result) => panic!("reservation refused: {result:?}"),
+        };
+        let result = transaction.complete();
+
+        assert!(
+            result.success,
+            "nothing here can be owned, so an unreadable inventory must not refuse: {:?}",
+            result.errors
         );
     }
 
