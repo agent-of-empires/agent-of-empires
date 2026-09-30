@@ -610,7 +610,7 @@ async fn sessions_turn_send(
         };
         let dispatch = deps
             .session_service
-            .prompt_dispatch_under_submission(&req.session_id, woke_idle_dormant)
+            .prompt_dispatch_under_submission(&req.session_id, woke_idle_dormant, false)
             .await;
         if let crate::acp::dispatch::PromptDispatch::Queued { reason } = dispatch {
             if !matches!(reason, crate::acp::dispatch::QueueReason::WorkerDown) {

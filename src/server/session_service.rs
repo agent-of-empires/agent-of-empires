@@ -1337,8 +1337,14 @@ impl SessionService {
         &self,
         id: &str,
         idle_dormant: bool,
+        no_revive: bool,
     ) -> crate::acp::dispatch::PromptDispatch {
         let running = self.acp_supervisor.is_running(id).await;
+        if no_revive && !running {
+            return crate::acp::dispatch::PromptDispatch::Queued {
+                reason: crate::acp::dispatch::QueueReason::WorkerDown,
+            };
+        }
         // Settled here, under the guard, rather than probed by each handler before it
         // claims one.
         let rate_limit_parked = !running && !idle_dormant && self.is_rate_limit_parked(id).await;
