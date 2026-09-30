@@ -144,9 +144,11 @@ jobs:
           if [ "$result" -ne 0 ]; then
             python3 - <<'PYLOG'
           from pathlib import Path
-          log = Path('/tmp/aoe-counter-test.log').read_text()
-          message = log[-18000:].replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
-          print('::error title=Counter port test diagnostic::' + message)
+          import re
+          log = re.sub(r'\x1b\[[0-9;]*m', '', Path('/tmp/aoe-counter-test.log').read_text())[-14000:]
+          for offset in range(0, len(log), 2000):
+              message = log[offset:offset + 2000].replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
+              print(f'::error title=Counter diagnostic {offset}::' + message)
           PYLOG
           fi
           exit "$result"
