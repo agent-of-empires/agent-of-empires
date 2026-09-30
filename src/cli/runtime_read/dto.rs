@@ -498,7 +498,13 @@ pub(crate) fn validate_snapshot(snapshot: &SnapshotData) -> Result<(), &'static 
             .profiles
             .get(&profile.name)
             .ok_or("schema_invalid")?;
-        if serde_json::to_vec(health).ok() != serde_json::to_vec(&profile.health).ok() {
+        // A derived `PartialEq` is the whole check: the struct denies unknown
+        // fields and renames nothing, so a value that survives the decoder is
+        // compared field by field. The JSON round trip this replaced bought
+        // nothing and cost two `Vec<u8>` and two serde passes per profile row
+        // of every snapshot validation; nothing in the type can fail to
+        // serialise, so its `None == None` arm was unreachable.
+        if *health != profile.health {
             return Err("schema_invalid");
         }
         validate_profile_health(&profile.health)?;
@@ -1153,6 +1159,31 @@ mod tests {
             }
         }"#;
         assert!(serde_json::from_str::<SnapshotHealth>(duplicate).is_err());
+    }
+
+    /// The two places a profile's health is published have to agree, and the
+    /// other four tests that build a snapshot both put the same value in them,
+    /// so nothing held the comparison to it. A daemon that summarised the
+    /// profile one way and reported the components another is a snapshot whose
+    /// answer is not the answer either half describes.
+    #[test]
+    fn a_profile_health_the_summary_disagrees_with_is_refused() {
+        let mut value = snapshot();
+        value.health.profiles.insert(
+            "main".into(),
+            ProfileHealth {
+                metadata: ComponentHealth::Degraded {
+                    code: HealthCode::Metadata,
+                },
+                ..health()
+            },
+        );
+        value.profiles[0].health = health();
+        assert_eq!(
+            validate_snapshot(&value),
+            Err("schema_invalid"),
+            "a degraded component the profile row does not carry is a snapshot that describes two profiles"
+        );
     }
 
     /// A parent that names no row is persisted state: `rm --purge` of a parent
