@@ -148,6 +148,13 @@ fn render_list(
     let state = args.state;
     if args.all {
         require_list_all_health(snapshot)?;
+        // The empty check comes before the JSON branch, as `run_all_profiles`
+        // orders it: with no profiles the local command prints its sentence
+        // and returns, so a served `--json` prints the same sentence rather
+        // than `[]`. The inversion was the whole divergence.
+        if snapshot.profiles.is_empty() {
+            return Ok(Projection::text("No profiles found.\n".into()));
+        }
         if args.json {
             let mut rows = Vec::new();
             for profile in &snapshot.profiles {
@@ -158,9 +165,6 @@ fn render_list(
                 }
             }
             return json_lines(&rows).map(Projection::text);
-        }
-        if snapshot.profiles.is_empty() {
-            return Ok(Projection::text("No profiles found.\n".into()));
         }
         let show_state = state == StateFilter::All;
         let mut output = String::new();
@@ -1348,6 +1352,41 @@ mod tests {
         // spelling of it, and lets the profile row replace the survivor.
         assert_eq!(names, vec!["profile-plain"], "{output}");
         assert_eq!(rows[0]["scope"], "profile", "{output}");
+    }
+
+    /// `aoe list --all --json` over a store with no profiles prints the same
+    /// sentence the local command prints, not `[]`. The daemon comes up in
+    /// exactly this state on a fresh XDG directory, so the two byte streams
+    /// were reachable by anyone who had never run the command before.
+    ///
+    /// The snapshot carries no profiles and no health entries for them, and
+    /// neither default: `validate_snapshot` refuses a health map whose length
+    /// disagrees with the profile list, so a fixture that left one profile's
+    /// health behind would be a snapshot the client would never accept.
+    #[test]
+    fn the_all_listing_over_no_profiles_is_the_local_sentence_not_an_empty_array() {
+        let mut value = snapshot(vec![]);
+        value.profiles = vec![];
+        value.health.profiles = BTreeMap::new();
+        value.default_profile = None;
+        value.resolved_default_profile = None;
+        crate::cli::runtime_read::dto::validate_snapshot(&value)
+            .expect("a daemon publishes this snapshot on a fresh app dir");
+
+        for json in [true, false] {
+            let output = render_list(
+                &crate::cli::list::ListArgs {
+                    json,
+                    all: true,
+                    state: StateFilter::All,
+                },
+                &value,
+                &source(),
+            )
+            .expect("the listing renders")
+            .stdout;
+            assert_eq!(output, "No profiles found.\n", "json={json}");
+        }
     }
 
     /// The merge key is the producer's, so what the reader's own filesystem
