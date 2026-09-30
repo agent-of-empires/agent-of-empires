@@ -208,7 +208,12 @@ fn parse_endpoint(raw: &str) -> Result<(String, bool), ReadFailure> {
         return Err(invalid());
     }
     let (host, port): (&str, Option<u16>) = split_authority(authority).ok_or_else(invalid)?;
-    if !secure && host != "127.0.0.1" && host != "[::1]" {
+    // A bearer goes over plaintext only to a loopback peer, which is the rule
+    // the rest of the tool already applies (`acp`'s passphrase check, the
+    // daemon client's own) and the one `docs/structured-view.md` states. This
+    // is the grammar's spelling of it, so a host the tool calls loopback
+    // anywhere else is a host it calls loopback here.
+    if !secure && !crate::daemon::is_loopback_host(host) {
         return Err(invalid());
     }
     if secure && !valid_https_host(host) {
@@ -344,14 +349,15 @@ mod tests {
             "https://[fe80::1]",
             "HTTP://127.0.0.1:8080",
             "HtTpS://example.test",
+            "http://localhost:8080",
+            "http://LocalHost:8080",
+            "http://127.0.0.2",
             "https://example.test/base/",
         ] {
             assert!(parse_endpoint(raw).is_ok(), "{raw}");
         }
         for raw in [
             "",
-            "http://localhost:8080",
-            "http://127.0.0.2",
             "http://[::2]",
             "https://[fe80::1%25eth0]",
             "https://user@example.test",

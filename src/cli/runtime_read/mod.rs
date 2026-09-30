@@ -421,19 +421,15 @@ async fn execute_inner(
 
 /// This machine's home, when the endpoint names a loopback host. The rule is
 /// the host, not the transport: direct loopback to the local daemon is the
-/// same peer the socket reaches, and its rows are this machine's paths. An
-/// IPv6 host arrives bracketed, so the brackets come off before it is read.
+/// same peer the socket reaches, and its rows are this machine's paths. It is
+/// the tool's one loopback rule, so this and the endpoint grammar cannot
+/// disagree about what counts.
 fn loopback_home(
     request: &tokio_tungstenite::tungstenite::handshake::client::Request,
 ) -> Option<std::path::PathBuf> {
-    let host = endpoint::unbracketed(request.uri().host()?);
-    let is_loopback = match host {
-        "localhost" => true,
-        host => host
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(|address| address.is_loopback()),
-    };
-    is_loopback.then(dirs::home_dir).flatten()
+    crate::daemon::is_loopback_host(request.uri().host()?)
+        .then(dirs::home_dir)
+        .flatten()
 }
 
 fn websocket_config() -> WebSocketConfig {

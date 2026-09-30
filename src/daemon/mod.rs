@@ -214,9 +214,15 @@ impl DaemonClient {
 }
 
 pub(crate) fn is_loopback_url(url: &Url) -> bool {
-    let Some(host) = url.host_str() else {
-        return false;
-    };
+    url.host_str().is_some_and(is_loopback_host)
+}
+
+/// The host half of [`is_loopback_url`], for the callers that have read a host
+/// rather than a URL. A name equal to `localhost` whatever its case, or an
+/// address that parses as a loopback `IpAddr`, so the whole of `127.0.0.0/8`
+/// and `::1` is loopback and nothing else is. A bracketed IPv6 authority keeps
+/// its brackets in a URL, so they come off before the address is read.
+pub(crate) fn is_loopback_host(host: &str) -> bool {
     let ip_host = host
         .strip_prefix('[')
         .and_then(|host| host.strip_suffix(']'))
