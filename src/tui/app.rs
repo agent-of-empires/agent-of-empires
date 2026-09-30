@@ -527,6 +527,9 @@ impl App {
         crate::tmux::spawn_snapshot_poller();
 
         crate::tui::clear_terminal(terminal)?;
+        // This clear satisfies any pending redraw; honoring it on the first tick
+        // would blank the first frame until the next paint.
+        self.needs_redraw = false;
         self.draw(terminal)?;
         #[cfg(feature = "e2e-tests")]
         e2e_render_ack(true)?;
