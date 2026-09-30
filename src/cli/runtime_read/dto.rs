@@ -476,6 +476,9 @@ pub(crate) fn validate_hello(hello: &HelloData) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// How many rows one session's ancestry may span. Far above any chain a fork
+/// can produce and far below the point where the walk costs anything.
+const MAX_SESSION_DEPTH: usize = 64;
 pub(crate) fn validate_snapshot(snapshot: &SnapshotData) -> Result<(), &'static str> {
     if !valid_namespace(&snapshot.namespace)
         || !valid_uuid(&snapshot.cursor.epoch)
@@ -625,10 +628,12 @@ pub(crate) fn validate_snapshot(snapshot: &SnapshotData) -> Result<(), &'static 
             }
             let mut seen = HashSet::new();
             let mut cursor = Some(*id);
+            let mut depth = 0usize;
             while let Some(node) = cursor {
-                if !seen.insert(node) {
+                if !seen.insert(node) || depth >= MAX_SESSION_DEPTH {
                     return Err("schema_invalid");
                 }
+                depth += 1;
                 cursor = parents.get(node).and_then(|(_, parent)| *parent);
             }
         }
@@ -1223,6 +1228,74 @@ mod tests {
             validate_snapshot(&value),
             Err("schema_invalid"),
             "a parent in another profile is still refused"
+        );
+    }
+
+    /// One parent chain of `len` rows, built flat so that constructing the
+    /// input cannot itself recurse.
+    fn parent_chain_snapshot(len: usize) -> SnapshotData {
+        let mut value = snapshot();
+        value.health.profiles.insert("main".into(), health());
+        value.profiles[0].projects = vec![ProjectRead {
+            name: "repo".into(),
+            path: "/repo".into(),
+            merge_key: "/repo".into(),
+            scope: ProjectScope::Profile,
+            default_base_branch: None,
+            registered: true,
+        }];
+        let base = SessionRead {
+            id: "s0".into(),
+            title: "A".into(),
+            project_path: "/repo".into(),
+            group_path: String::new(),
+            tool: "tool".into(),
+            command: String::new(),
+            profile: "main".into(),
+            status: WireStatus::Idle,
+            state: WireState::Live,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            last_accessed_at: None,
+            idle_entered_at: None,
+            last_error: None,
+            archived_at: None,
+            trashed_at: None,
+            active_snoozed_until: None,
+            pinned_at: None,
+            agent_session_id: None,
+            parent_session_id: None,
+            has_worktree_info: false,
+            has_managed_worktree: false,
+            worktree: None,
+            workspace_repos: vec![],
+        };
+        value.sessions = (0..len)
+            .map(|index| {
+                let mut row = base.clone();
+                row.id = format!("s{index}");
+                row.parent_session_id = (index > 0).then(|| format!("s{}", index - 1));
+                row
+            })
+            .collect();
+        value
+    }
+
+    /// Each row's ancestry is walked from the row, so a long chain costs a
+    /// walk per row. No real chain is long: `parent_session_id` is written only
+    /// by an explicit fork. The validator is the one place that sees the whole
+    /// graph before a consumer walks it, so the bound belongs here rather than
+    /// in each consumer.
+    #[test]
+    fn a_parent_chain_deeper_than_the_bound_is_refused() {
+        assert_eq!(
+            validate_snapshot(&parent_chain_snapshot(MAX_SESSION_DEPTH + 1)),
+            Err("schema_invalid"),
+            "a chain one row past the bound is refused"
+        );
+        assert_eq!(
+            validate_snapshot(&parent_chain_snapshot(MAX_SESSION_DEPTH)),
+            Ok(()),
+            "a chain of exactly the bound is still accepted"
         );
     }
 
