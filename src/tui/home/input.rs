@@ -1294,36 +1294,21 @@ impl HomeView {
                     DialogResult::Cancel => {
                         self.repo_trust_dialog = None;
                         self.pending_repo_trust_data = None;
+                        self.pending_repo_trust_fingerprint = None;
                     }
                     DialogResult::Submit(action) => {
                         self.repo_trust_dialog = None;
+                        let fingerprint = self.pending_repo_trust_fingerprint.take();
                         if let Some(data) = self.pending_repo_trust_data.take() {
-                            let emit = match action {
-                                RepoTrustAction::Trust {
-                                    hooks_hash,
-                                    mcp_hash,
-                                    project_path,
-                                    hooks,
-                                } => {
-                                    // Abort creation if trust cannot be persisted:
-                                    // launching anyway leaves hooks treated as approved
-                                    // while project MCP stays gated off the unwritten
-                                    // hashes.
-                                    if let Err(e) = repo_config::trust_repo(
-                                        std::path::Path::new(&project_path),
-                                        hooks_hash.as_deref(),
-                                        mcp_hash.as_deref(),
-                                    ) {
-                                        tracing::error!(target: "tui.input", "Failed to persist repo trust; aborting session creation: {}", e);
-                                        None
-                                    } else {
-                                        self.create_session_with_hooks(data, hooks)
-                                    }
+                            let (hooks, decision) = match action {
+                                RepoTrustAction::Trust { hooks, .. } => {
+                                    (hooks, RepoTrustDecision::Approve(fingerprint))
                                 }
                                 RepoTrustAction::Skip { hooks } => {
-                                    self.create_session_with_hooks(data, hooks)
+                                    (hooks, RepoTrustDecision::Refuse)
                                 }
                             };
+                            let emit = self.create_session_with_hooks(data, hooks, decision);
                             self.pending_dialog_click_action = emit;
                         }
                     }
@@ -1807,11 +1792,10 @@ impl HomeView {
                     }),
                 );
                 if let Err(e) = submitted {
-                    tracing::warn!(
-                        target: "tui.home",
-                        "Failed to persist base_branch_override: {}",
-                        e
-                    );
+                    self.info_dialog = Some(InfoDialog::new(
+                        "Diff Base Not Saved",
+                        &format!("Failed to set the base branch: {e}"),
+                    ));
                 }
             }
             match action {
@@ -2094,33 +2078,19 @@ impl HomeView {
                 DialogResult::Cancel => {
                     self.repo_trust_dialog = None;
                     self.pending_repo_trust_data = None;
+                    self.pending_repo_trust_fingerprint = None;
                 }
                 DialogResult::Submit(action) => {
                     self.repo_trust_dialog = None;
+                    let fingerprint = self.pending_repo_trust_fingerprint.take();
                     if let Some(data) = self.pending_repo_trust_data.take() {
-                        match action {
-                            RepoTrustAction::Trust {
-                                hooks_hash,
-                                mcp_hash,
-                                project_path,
-                                hooks,
-                            } => {
-                                // Abort creation if trust cannot be persisted, to avoid
-                                // hooks approved while project MCP stays gated off.
-                                if let Err(e) = repo_config::trust_repo(
-                                    std::path::Path::new(&project_path),
-                                    hooks_hash.as_deref(),
-                                    mcp_hash.as_deref(),
-                                ) {
-                                    tracing::error!(target: "tui.input", "Failed to persist repo trust; aborting session creation: {}", e);
-                                    return None;
-                                }
-                                return self.create_session_with_hooks(data, hooks);
+                        let (hooks, decision) = match action {
+                            RepoTrustAction::Trust { hooks, .. } => {
+                                (hooks, RepoTrustDecision::Approve(fingerprint))
                             }
-                            RepoTrustAction::Skip { hooks } => {
-                                return self.create_session_with_hooks(data, hooks);
-                            }
-                        }
+                            RepoTrustAction::Skip { hooks } => (hooks, RepoTrustDecision::Refuse),
+                        };
+                        return self.create_session_with_hooks(data, hooks, decision);
                     }
                 }
             }
@@ -2844,17 +2814,18 @@ impl HomeView {
             }
             ActionId::ToggleFavorite => {
                 if let Err(e) = self.toggle_favorite_at_cursor() {
-                    tracing::error!("toggle_favorite_at_cursor failed: {}", e);
+                    self.info_dialog =
+                        Some(InfoDialog::new("Favorite not changed", &e.to_string()));
                 }
             }
             ActionId::ToggleSnooze => {
                 if let Err(e) = self.toggle_snooze_at_cursor() {
-                    tracing::error!("toggle_snooze_at_cursor failed: {}", e);
+                    self.info_dialog = Some(InfoDialog::new("Snooze not changed", &e.to_string()));
                 }
             }
             ActionId::ToggleUnread => {
                 if let Err(e) = self.toggle_unread_at_cursor() {
-                    tracing::error!("toggle_unread_at_cursor failed: {}", e);
+                    self.info_dialog = Some(InfoDialog::new("Unread not changed", &e.to_string()));
                 }
             }
             ActionId::ToggleContainer => self.toggle_container_for_selected(),
@@ -4734,13 +4705,13 @@ impl HomeView {
                 // Same cursor-on-the-clicked-row guarantee as ToggleArchive: snoozing an
                 // active row opens the duration picker, unsnoozing wakes it.
                 if let Err(e) = self.toggle_snooze_at_cursor() {
-                    tracing::error!("toggle_snooze_at_cursor (context menu) failed: {}", e);
+                    self.info_dialog = Some(InfoDialog::new("Snooze not changed", &e.to_string()));
                 }
             }
             ContextMenuAction::ToggleUnread => {
                 // Same cursor-on-the-clicked-row guarantee as ToggleArchive.
                 if let Err(e) = self.toggle_unread_at_cursor() {
-                    tracing::error!("toggle_unread_at_cursor (context menu) failed: {}", e);
+                    self.info_dialog = Some(InfoDialog::new("Unread not changed", &e.to_string()));
                 }
             }
             ContextMenuAction::NewSession => self.open_new_session_dialog(),
@@ -5883,16 +5854,16 @@ impl HomeView {
     /// and drops the worker (which closes its channel, exiting the
     /// thread cleanly on the next iteration).
     ///
-    /// Before dispatching we re-verify that the target session still
-    /// exists at the same tmux name as it had at entry time. If a peer
-    /// process deleted the session or a rename diverged the name from
-    /// what the worker is targeting, the user would otherwise type
-    /// into the void with only a `tracing::warn!` for company. Auto-
-    /// exit + info dialog instead.
+    /// Forwarding also stops when the daemon no longer grants native interaction: the
+    /// runtime that owns the pane is gone, so the keystroke has nowhere to go.
     fn handle_live_send_key(&mut self, key: KeyEvent) {
         let Some(state) = self.live_send.clone() else {
             return;
         };
+        if !self.session_feed.native_interaction_available() {
+            self.teardown_live_send();
+            return;
+        }
 
         // Leader menu: a prior keystroke matched the configured leader
         // (tmux-style prefix, default Ctrl+B), so this key picks a
@@ -6054,9 +6025,9 @@ impl HomeView {
     /// the instance row was deleted, the title was renamed and the tmux session with it
     /// (a retitle whose tmux rename did not land is not drift, since `resolve_name` still
     /// resolves onto the worker's pane), or the tmux session is gone while our row says
-    /// otherwise. The last check reads `session_exists_from_cache`, a hashmap probe per
-    /// keystroke; a `None` entry claims no drift, leaving the row and name checks as the
-    /// safety net.
+    /// otherwise. Presence is then probed on the target itself: an agent pane through
+    /// tmux, an auxiliary or tool pane through the snapshot's presence, so a target that
+    /// died without ever having opened a session is caught too.
     ///
     /// The caller shows the message verbatim, so phrase it as a user-facing sentence.
     fn live_send_drift_reason(&self, state: &live_send::LiveSendState) -> Option<&'static str> {
@@ -6082,7 +6053,30 @@ impl HomeView {
         if current_name != state.tmux_name {
             return Some("Session was renamed while live mode was active.");
         }
-        if crate::tmux::session_exists_from_cache(&state.tmux_name) == Some(false) {
+        use crate::session::{AuxiliaryTarget, PanePresence};
+        let gone = match &state.target {
+            live_send::LiveSendTarget::Agent => {
+                // The daemon may have created the pane after this process's last scan, so a
+                // cached miss is not evidence of death (the asymmetry documented on
+                // `session_exists`). Confirm with a live probe; Unknown stays put.
+                !crate::tmux::session_exists(&state.tmux_name)
+                    && crate::tmux::probe_session_existence(&state.tmux_name)
+                        == crate::tmux::SessionExistence::Absent
+            }
+            live_send::LiveSendTarget::Terminal => matches!(
+                inst.auxiliary_presence(&AuxiliaryTarget::Host { index: 0 }),
+                PanePresence::Absent | PanePresence::Dead
+            ),
+            live_send::LiveSendTarget::ContainerTerminal => matches!(
+                inst.auxiliary_presence(&AuxiliaryTarget::Container { index: 0 }),
+                PanePresence::Absent | PanePresence::Dead
+            ),
+            live_send::LiveSendTarget::Tool(name) => matches!(
+                inst.tool_presence(name),
+                PanePresence::Absent | PanePresence::Dead
+            ),
+        };
+        if gone {
             return Some("tmux pane went away while live mode was active.");
         }
         None
@@ -6531,7 +6525,20 @@ impl HomeView {
             Err(e) => {
                 tracing::warn!(target: "tui.input", "Failed to check repo trust: {}", e);
                 let fallback = repo_config::ResolvedHooks::global(&data.profile);
-                return self.create_session_with_hooks(data, fallback);
+                return self.create_session_with_hooks(data, fallback, RepoTrustDecision::Refuse);
+            }
+        };
+
+        // The daemon recomputes this before it approves anything, so it pins the exact
+        // state the user is answering for; a fingerprint we cannot build can only refuse.
+        let fingerprint = match crate::session::config::profile_config::resolve_config(
+            &data.profile,
+        ) {
+            Ok(config) => repo_config::creation_trust_fingerprint(&config.hooks, &trust),
+            Err(e) => {
+                tracing::warn!(target: "tui.input", "Failed to resolve trust review base: {}", e);
+                let fallback = repo_config::ResolvedHooks::global(&data.profile);
+                return self.create_session_with_hooks(data, fallback, RepoTrustDecision::Refuse);
             }
         };
 
@@ -6569,7 +6576,16 @@ impl HomeView {
         };
 
         if !trust.needs_prompt() {
-            return self.create_session_with_hooks(data, hooks_on_trust);
+            // Already-trusted repository hooks are approved explicitly so the daemon runs
+            // them; an absent repository surface approves nothing but still pins the
+            // fingerprint the daemon validated against.
+            let decision = match &trust.hooks {
+                TrustSurface::Trusted(_) => RepoTrustDecision::Approve(Some(fingerprint)),
+                TrustSurface::NeedsTrust { .. } | TrustSurface::Absent => {
+                    RepoTrustDecision::Unpinned(Some(fingerprint))
+                }
+            };
+            return self.create_session_with_hooks(data, hooks_on_trust, decision);
         }
 
         use crate::tui::dialogs::RepoTrustDialog;
@@ -6588,6 +6604,7 @@ impl HomeView {
             data.path.clone(),
         ));
         self.pending_repo_trust_data = Some(data);
+        self.pending_repo_trust_fingerprint = Some(fingerprint);
         None
     }
 
@@ -6598,6 +6615,7 @@ impl HomeView {
         &mut self,
         data: NewSessionData,
         hooks: Option<repo_config::ResolvedHooks>,
+        decision: RepoTrustDecision,
     ) -> Option<Action> {
         let has_hooks = hooks
             .as_ref()
@@ -6607,8 +6625,36 @@ impl HomeView {
         // The daemon owns creation, so this process does not open the session
         // itself: submit it and let the runtime report the id.
         let _ = (hooks, has_hooks, has_worktree);
-        self.request_creation(data, None, None);
+        let (trust_hooks, trust_review) = decision.into_request();
+        self.request_creation(data, trust_hooks, trust_review);
         None
+    }
+}
+
+/// The user's repository-trust answer, forwarded to the daemon that owns the approval.
+#[derive(Debug, Clone)]
+pub(super) enum RepoTrustDecision {
+    /// Approve the hooks the fingerprint pins; the daemon writes the hashes itself.
+    Approve(Option<crate::daemon::CreationTrustFingerprint>),
+    /// Approve nothing, so repo hooks stay gated and the global set runs.
+    Refuse,
+    /// No prompt was needed: no approval, but the reviewed fingerprint still travels.
+    Unpinned(Option<crate::daemon::CreationTrustFingerprint>),
+}
+
+impl RepoTrustDecision {
+    /// The `(trust_hooks, trust_review)` pair the daemon creation request carries.
+    fn into_request(
+        self,
+    ) -> (
+        Option<bool>,
+        Option<crate::daemon::CreationTrustFingerprint>,
+    ) {
+        match self {
+            Self::Approve(fingerprint) => (Some(true), fingerprint),
+            Self::Refuse => (Some(false), None),
+            Self::Unpinned(fingerprint) => (None, fingerprint),
+        }
     }
 }
 
