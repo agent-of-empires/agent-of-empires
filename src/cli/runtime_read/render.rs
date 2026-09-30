@@ -1406,13 +1406,14 @@ mod tests {
     fn a_served_project_list_does_not_resolve_a_path_on_the_readers_own_filesystem() {
         use crate::server::test_support::{record_exchange, RecordedOwner, RecordingPins};
 
-        let home = TempConfig::new();
+        let dir = tempfile::tempdir().expect("a temp app dir");
+        let _env = crate::server::test_support::RuntimeEnvGuard::set(dir.path());
         crate::session::create_profile("main").expect("the recorded profile");
         let app = crate::session::get_app_dir().expect("app dir");
         std::fs::write(app.join("config.toml"), "default_profile = \"main\"\n")
             .expect("seed the default");
-        let work = home.path().join("work/repo");
-        let dev = home.path().join("dev/repo");
+        let work = dir.path().join("work/repo");
+        let dev = dir.path().join("dev/repo");
         std::fs::create_dir_all(&work).expect("the first project directory");
         std::fs::create_dir_all(&dev).expect("the second project directory");
         std::fs::write(
@@ -1465,38 +1466,6 @@ mod tests {
             distinct,
             "the answer is the frame's, not the disk's"
         );
-    }
-
-    /// A temporary `XDG_CONFIG_HOME`, so the producer reads a store of this
-    /// test's own and restores the environment on drop.
-    struct TempConfig {
-        _dir: tempfile::TempDir,
-        previous: Option<OsString>,
-    }
-
-    impl TempConfig {
-        fn new() -> Self {
-            let dir = tempfile::tempdir().expect("a temp app dir");
-            let previous = std::env::var_os("XDG_CONFIG_HOME");
-            std::env::set_var("XDG_CONFIG_HOME", dir.path());
-            Self {
-                _dir: dir,
-                previous,
-            }
-        }
-
-        fn path(&self) -> &std::path::Path {
-            self._dir.path()
-        }
-    }
-
-    impl Drop for TempConfig {
-        fn drop(&mut self) {
-            match &self.previous {
-                Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
-                None => std::env::remove_var("XDG_CONFIG_HOME"),
-            }
-        }
     }
 
     /// A row as the producer builds it: the path as stored, and the key the
