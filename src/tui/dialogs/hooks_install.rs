@@ -152,7 +152,7 @@ impl HooksInstallDialog {
         if !self.hook_commands.is_empty() {
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
-                "Hook events added:",
+                "Hook events a launch would install:",
                 Style::default().bold(),
             )));
             for (event, effect) in &self.hook_commands {

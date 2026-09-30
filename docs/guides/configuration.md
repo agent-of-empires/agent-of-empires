@@ -36,7 +36,7 @@ On macOS nothing is moved for you: an existing `~/.agent-of-empires/` keeps bein
   logs/
 ```
 
-`state.toml` holds global-only bookkeeping (tour seen, last browse directory, sort order, dismissed tips and updates, and the agent hook approval described below). It is not a setting: it has no profile or repo layer. The TUI and the web dashboard both read some of these fields, the TUI writes several of them, and `aoe hooks approve` is the one CLI control; the flag is hand-editable. `GET /api/settings` still reports these under `app_state.*`, but `PATCH` rejects writes to them.
+`state.toml` holds global-only bookkeeping (tour seen, last browse directory, sort order, dismissed tips and updates, and the agent hook approval described below). It is not a setting: it has no profile or repo layer. The TUI and the web dashboard both read some of these fields, the TUI writes several of them, and the CLI writes a flag when asked; the agent hook approval below is set by `aoe hooks approve` and is hand-editable. `GET /api/settings` still reports these under `app_state.*`, but `PATCH` rejects writes to them.
 
 ## Environment variables
 

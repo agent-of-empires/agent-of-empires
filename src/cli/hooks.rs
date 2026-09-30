@@ -73,6 +73,10 @@ fn print_disclosure(profile: &str) {
     tool_names.sort_unstable();
     tool_names.dedup();
 
+    // A configured tool that resolves to no agent is dropped here, so it would
+    // vanish from the enumeration without a trace. Keep its name: the user
+    // cannot otherwise tell "no extra agent" from "an agent I could not name".
+    let mut unresolved: Vec<&str> = Vec::new();
     let disclosures: Vec<_> = tool_names
         .into_iter()
         .filter_map(|tool_name| {
@@ -80,7 +84,11 @@ fn print_disclosure(profile: &str) {
                 tool_name,
                 &config.session.launch_command_for(tool_name),
                 &config.session,
-            )?;
+            );
+            let Some(agent) = agent else {
+                unresolved.push(tool_name);
+                return None;
+            };
             if !crate::agents::hook_install_required(agent, status_hooks) {
                 return None;
             }
@@ -123,6 +131,19 @@ fn print_disclosure(profile: &str) {
         }
     }
 
+    if !unresolved.is_empty() {
+        println!();
+        println!("Configured but not named here:");
+        for tool_name in &unresolved {
+            println!("  {tool_name}");
+        }
+        println!("  A repository can set session.agent_detect_as, and this command has");
+        println!("  no project directory, so a launch inside one may resolve those to a");
+        println!("  different agent. Declaring agent_execution_as and agent_config_dir for");
+        println!("  them in this profile pins the file, because a repository cannot move");
+        println!("  either of those.");
+    }
+
     let events: Vec<_> = disclosures
         .iter()
         .filter(|(_, disclosure)| !disclosure.hook_commands.is_empty())
@@ -139,7 +160,7 @@ fn print_disclosure(profile: &str) {
 
     if !events.is_empty() {
         println!();
-        println!("Hook events added:");
+        println!("Hook events a launch would install:");
         for (tool_name, disclosure) in events {
             println!("  {tool_name}:");
             for (event, effect) in &disclosure.hook_commands {

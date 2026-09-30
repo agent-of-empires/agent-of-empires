@@ -204,6 +204,44 @@ fn hooks_disclosure_follows_the_effective_config() {
     }
 }
 
+/// #4159: the approval is install-wide while this command has no project
+/// directory, so a tool it cannot resolve must be named rather than dropped.
+/// Otherwise the user cannot tell "no extra agent" from "an agent I could not
+/// name", and approves a set they never saw.
+#[test]
+fn a_tool_this_command_cannot_name_is_still_reported() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let home = tmp.path().join("home");
+    let xdg = tmp.path().join("xdg");
+    let stub = tmp.path().join("stub");
+    for dir in [&home, &xdg, &stub] {
+        std::fs::create_dir_all(dir).expect("create dir");
+    }
+    let mut agent = std::fs::File::create(stub.join("acme-wrapper")).expect("create stub");
+    writeln!(agent, "#!/bin/sh\nsleep 300").unwrap();
+    drop(agent);
+    std::fs::set_permissions(
+        stub.join("acme-wrapper"),
+        std::os::unix::fs::PermissionsExt::from_mode(0o755),
+    )
+    .expect("chmod stub");
+    write_config(&xdg, "[session.custom_agents]\ncorp = \"acme-wrapper\"\n");
+
+    let socket = tmp.path().join("tmux.sock");
+    let status = run_aoe(&home, &xdg, &stub, &socket, &["hooks", "status"]);
+    assert_eq!(status.code, Some(0), "{}", status.all());
+    assert!(
+        status.stdout.contains("Configured but not named here:") && status.stdout.contains("corp"),
+        "a configured tool that resolves to nothing must be named: {}",
+        status.stdout
+    );
+    assert!(
+        status.stdout.contains("agent_execution_as") && status.stdout.contains("agent_config_dir"),
+        "the output must name the keys that pin the file: {}",
+        status.stdout
+    );
+}
+
 #[test]
 fn hooks_approve_clears_the_launch_gate_for_every_path() {
     if !tmux_available() {
