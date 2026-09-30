@@ -143,7 +143,9 @@ impl HooksInstallDialog {
             ));
             lines.push(Line::from("also changes launcher state:"));
             for (agent, note) in &self.post_install_notes {
+                // The note ends in a period, so the last segment already has one.
                 for line in note.split(". ") {
+                    let line = line.trim_end_matches('.');
                     lines.push(Line::from(format!("  {agent}: {line}.")));
                 }
             }
