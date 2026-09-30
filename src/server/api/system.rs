@@ -460,6 +460,11 @@ fn apply_profile_patch(
     name: &str,
     patch: &serde_json::Value,
 ) -> anyhow::Result<crate::session::ProfileConfig> {
+    // `get_profile_dir` creates a directory that is missing, so loading with a
+    // default would let a save to an unknown name mint a hollow profile: no
+    // storage transition, no disk watch, and it shows up in the picker. Saving
+    // to a profile that does not exist is a caller error, not a creation.
+    crate::session::require_known_profile(name)?;
     let config = crate::session::load_profile_config(name).unwrap_or_default();
     let mut current = serde_json::to_value(&config)?;
     if let Some(update_obj) = patch.as_object() {
