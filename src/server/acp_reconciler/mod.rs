@@ -318,9 +318,27 @@ pub async fn reconcile_acp_workers(
         return;
     }
 
-    let resume_limit = MAX_CONCURRENT_RESUMES
-        .min(state.acp_supervisor.max_concurrent_workers())
-        .max(1);
+    // The cap is read live, from the served profile's configuration, so an
+    // operator lowering `[acp] max_concurrent_workers` takes effect without
+    // restarting the daemon. Upstream read it this way too; the supervisor's
+    // snapshot is captured once at startup, so it cannot see the change.
+    let served = state
+        .canonical_metadata
+        .read()
+        .await
+        .default_profile
+        .clone();
+    let live_max_workers = tokio::task::spawn_blocking({
+        let served = served.clone();
+        move || {
+            crate::session::config::profile_config::resolve_config_or_warn(&served)
+                .acp
+                .max_concurrent_workers
+        }
+    })
+    .await
+    .unwrap_or_else(|_| state.acp_supervisor.max_concurrent_workers());
+    let resume_limit = MAX_CONCURRENT_RESUMES.min(live_max_workers).max(1);
     let semaphore = Arc::new(Semaphore::new(resume_limit as usize));
     let mut set: JoinSet<(String, ResumeOutcome)> = JoinSet::new();
     for target in tasks {
