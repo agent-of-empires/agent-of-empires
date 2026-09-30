@@ -120,7 +120,10 @@ pub enum StopDecision {
 /// Process signalling and liveness, so teardown can be driven against a
 /// fake in tests without spawning anything.
 pub trait ProcessControl: Send + Sync + 'static {
-    fn is_alive(&self, pid: u32) -> bool;
+    /// Whether the group led by `pid` still runs anything. This is the question
+    /// a teardown must answer before it authorises removing a checkout, and a
+    /// dead leader does not answer it: a descendant can outlive its runner.
+    fn is_group_alive(&self, pid: u32) -> bool;
     fn terminate_group(&self, pid: u32);
     fn kill_group(&self, pid: u32);
 }
@@ -129,8 +132,8 @@ pub struct SystemProcessControl;
 
 impl ProcessControl for SystemProcessControl {
     /// pid 0 addresses the caller's own group and is never a runner.
-    fn is_alive(&self, pid: u32) -> bool {
-        pid != 0 && crate::process::worker::is_pid_alive_and_ours(pid)
+    fn is_group_alive(&self, pid: u32) -> bool {
+        crate::process::worker::is_process_group_alive(pid)
     }
 
     fn terminate_group(&self, pid: u32) {
@@ -614,7 +617,7 @@ pub(crate) mod test_support {
     }
 
     impl ProcessControl for FakeProcessControl {
-        fn is_alive(&self, pid: u32) -> bool {
+        fn is_group_alive(&self, pid: u32) -> bool {
             self.alive.lock().unwrap().contains(&pid)
         }
 

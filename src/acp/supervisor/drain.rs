@@ -683,7 +683,7 @@ async fn kill_wedged_runner(control: &dyn ProcessControl, session_id: &str) {
         .flatten()
         .map(|r| r.pid);
     if let Some(pid) = old_pid {
-        if control.is_alive(pid) {
+        if control.is_group_alive(pid) {
             info!(
                 target: "acp.supervisor",
                 session = %session_id,
@@ -693,7 +693,7 @@ async fn kill_wedged_runner(control: &dyn ProcessControl, session_id: &str) {
             control.terminate_group(pid);
             wait_for_exit(control, pid, Duration::from_secs(3)).await;
         }
-        if control.is_alive(pid) {
+        if control.is_group_alive(pid) {
             warn!(
                 target: "acp.supervisor",
                 session = %session_id,

@@ -311,7 +311,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             };
             let pid = claim.identity.map(|i| i.pid);
             if claim.attempts > TEARDOWN_RETRY_CAP
-                && pid.is_none_or(|pid| !self.process_control.is_alive(pid))
+                && pid.is_none_or(|pid| !self.process_control.is_group_alive(pid))
             {
                 warn!(
                     target: "acp.supervisor",
@@ -598,7 +598,7 @@ async fn tear_down_runner_from(
         control.terminate_group(pid);
         wait_for_exit(control, pid, TEARDOWN_TERM_GRACE).await;
     }
-    if control.is_alive(pid) {
+    if control.is_group_alive(pid) {
         if !killed_before {
             warn!(
                 target: "acp.supervisor",
@@ -610,7 +610,7 @@ async fn tear_down_runner_from(
         control.kill_group(pid);
         wait_for_exit(control, pid, TEARDOWN_KILL_GRACE).await;
     }
-    if control.is_alive(pid) {
+    if control.is_group_alive(pid) {
         warn!(
             target: "acp.supervisor",
             session = %session_id,
@@ -653,7 +653,7 @@ pub(super) async fn tear_down_replacement(
 /// Polls on the tokio clock so paused-time tests advance through the grace.
 pub(super) async fn wait_for_exit(control: &dyn ProcessControl, pid: u32, grace: Duration) {
     let deadline = tokio::time::Instant::now() + grace;
-    while control.is_alive(pid) && tokio::time::Instant::now() < deadline {
+    while control.is_group_alive(pid) && tokio::time::Instant::now() < deadline {
         tokio::time::sleep(TEARDOWN_POLL).await;
     }
 }
@@ -1169,7 +1169,7 @@ mod tests {
             "the runner the late spawn built must be signalled: {:?}",
             control.signals()
         );
-        assert!(!control.is_alive(4242));
+        assert!(!control.is_group_alive(4242));
         assert_eq!(
             stopped_reasons(&sink, "s-late"),
             ["user_stopped"],

@@ -323,6 +323,37 @@ fn find_process_in_group(pgrp: u32) -> Option<u32> {
 /// on a checkout, and its process group is dead. Treating it as alive makes a
 /// torn-down runner unprovable forever. The repo's own descendant wait already
 /// uses this rule (`process::mod` test helper: "exited or a terminated zombie").
+/// Whether any process of `pgrp` is still running, ignoring zombies: a zombie
+/// holds nothing, so a group made only of zombies is dead.
+///
+/// `Err` when the enumeration itself failed, so a caller that cannot prove
+/// absence treats the group as alive rather than as gone.
+pub(super) fn process_group_has_live_members(pgrp: u32) -> std::io::Result<bool> {
+    for entry in fs::read_dir("/proc")? {
+        let entry = entry?;
+        if entry.file_name().to_string_lossy().parse::<u32>().is_err() {
+            continue;
+        }
+        let stat = match fs::read_to_string(entry.path().join("stat")) {
+            Ok(stat) => stat,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        let invalid = || std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid proc stat");
+        // `comm` may contain spaces and parentheses, so the fields past it start
+        // after the last one: state, ppid, pgrp, then the session id.
+        let (_, fields) = stat.rsplit_once(')').ok_or_else(invalid)?;
+        let mut fields = fields.split_whitespace();
+        let state = fields.next().ok_or_else(invalid)?;
+        let _parent = fields.next().ok_or_else(invalid)?;
+        let group = fields.next().ok_or_else(invalid)?;
+        if state != "Z" && group.parse::<u32>() == Ok(pgrp) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 pub(super) fn is_terminated(pid: u32) -> bool {
     let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
         return false;

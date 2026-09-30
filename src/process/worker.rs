@@ -39,6 +39,33 @@ pub fn is_pid_alive_and_ours(_pid: u32) -> bool {
     false
 }
 
+/// Whether a process group still runs anything. A group made only of zombies is
+/// dead, and a group whose members cannot be enumerated is alive: the caller
+/// uses this to authorise a teardown, so absence has to be proven, not assumed.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub fn is_process_group_alive(pgid: u32) -> bool {
+    if pgid == 0 {
+        return false;
+    }
+    if is_pid_alive_and_ours(pgid) {
+        return true;
+    }
+    use nix::errno::Errno;
+    use nix::sys::signal::killpg;
+    use nix::unistd::Pid;
+    match killpg(Pid::from_raw(pgid as i32), None) {
+        // No such group at all: nothing can be running in it.
+        Err(Errno::ESRCH) => false,
+        Ok(()) => crate::process::platform::process_group_has_live_members(pgid).unwrap_or(true),
+        Err(_) => true,
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub fn is_process_group_alive(pgid: u32) -> bool {
+    pgid != 0 && is_pid_alive_and_ours(pgid)
+}
+
 /// The pid listening on a Unix socket via peer credentials, used when the record is
 /// unreadable. Connect is capped at 100ms so a wedged runner cannot stall the caller.
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -264,6 +291,63 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    /// The teardown question is whether the group still runs anything, and a
+    /// dead leader does not answer it: the agent it started can outlive it. The
+    /// zombie rule that keeps a torn-down runner provable must not extend to the
+    /// group, or a live descendant is missed and its checkout removed.
+    #[test]
+    fn a_dead_leader_does_not_hide_a_live_member_of_its_group() {
+        // `setsid` makes the process lead a fresh group, so killing it leaves
+        // that group populated by the background child.
+        let mut leader = std::process::Command::new("setsid")
+            .args(["/bin/sh", "-c", "sleep 30 & echo $!; wait"])
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn a group leader with a background child");
+        let mut line = String::new();
+        {
+            use std::io::{BufRead, BufReader};
+            let stdout = leader.stdout.take().expect("piped stdout");
+            BufReader::new(stdout)
+                .read_line(&mut line)
+                .expect("read the background pid");
+        }
+        let child: u32 = line.trim().parse().expect("the shell prints its child pid");
+        let pid = leader.id();
+
+        // Kill the leader outright: the child keeps running in the group.
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(pid as i32),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while is_pid_alive_and_ours(pid) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        // The group still exists and its child is running, so the group probe
+        // must say alive even though the leader is gone. Probed before the
+        // child is killed, or it would answer about an empty group.
+        assert!(
+            !is_pid_alive_and_ours(pid),
+            "the leader has to be gone for this to test anything"
+        );
+        // Through the trait the supervisor actually calls: a probe that only
+        // asked about the leader would answer dead here.
+        assert!(
+            {
+                use crate::acp::runner_lifecycle::ProcessControl as _;
+                crate::acp::runner_lifecycle::SystemProcessControl.is_group_alive(pid)
+            },
+            "a live member of the group keeps it alive"
+        );
+
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(child as i32),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+        let _ = leader.wait();
+    }
     #[test]
     fn is_pid_alive_separates_this_process_from_an_unused_pid() {
         // On non-Unix `is_pid_alive` always returns false.
