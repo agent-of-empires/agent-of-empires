@@ -24,6 +24,28 @@ pub struct BranchSelectState {
     pub selected: usize,
 }
 
+/// The branch picker's click targets from the last frame.
+#[derive(Default)]
+pub(crate) struct BranchPickerMouse {
+    pub(crate) dialog: ratatui::layout::Rect,
+    /// `(branch index, rect)` per drawn branch row.
+    pub(crate) rows: Vec<(usize, ratatui::layout::Rect)>,
+    /// The `[N more above]` / `[N more below]` rows, zero-sized when absent.
+    pub(crate) more_above: ratatui::layout::Rect,
+    pub(crate) more_below: ratatui::layout::Rect,
+    /// Visual only: the list's scroll follows the selection, so moving it
+    /// on hover would slide rows out from under the pointer.
+    pub(crate) hover: crate::tui::components::hover::HoverState,
+}
+
+impl BranchPickerMouse {
+    pub(crate) fn rects(&self) -> Vec<ratatui::layout::Rect> {
+        let mut rects = crate::tui::dialogs::target_rects(&self.rows);
+        rects.extend([self.more_above, self.more_below]);
+        rects
+    }
+}
+
 pub struct DiffView {
     pub(crate) repo_path: PathBuf,
 
@@ -58,6 +80,8 @@ pub struct DiffView {
     pub(crate) total_lines: u16,
 
     pub(crate) branch_select: Option<BranchSelectState>,
+
+    pub(crate) branch_mouse: BranchPickerMouse,
 
     pub(crate) error_message: Option<String>,
 
@@ -161,6 +185,7 @@ impl DiffView {
             visible_lines: 20,
             total_lines: 0,
             branch_select: None,
+            branch_mouse: BranchPickerMouse::default(),
             error_message: None,
             success_message: None,
             context_lines,
@@ -489,6 +514,7 @@ impl DiffView {
             visible_lines: 20,
             total_lines: 0,
             branch_select: None,
+            branch_mouse: BranchPickerMouse::default(),
             error_message: None,
             success_message: None,
             context_lines: 3,

@@ -78,3 +78,21 @@ fn settings_takeover_owns_wheel_and_scrollbar_drag() {
         "a click off the bar must not begin a scrollbar drag"
     );
 }
+
+/// The help overlay covers the fields panel, so the scrollbar under it is not
+/// grabbable, and a click there closes help instead.
+#[test]
+#[serial]
+fn settings_help_overlay_takes_the_click_over_the_scrollbar() {
+    let mut env = create_test_env_empty();
+    open_overflowing_settings(&mut env);
+    let (col, row) = scrollbar_hit(&env).expect("fields must overflow so a scrollbar renders");
+    env.view.settings_view.as_mut().unwrap().show_help = true;
+
+    assert!(env.view.handle_dialog_click(col, row));
+    assert!(env.view.drag_state.is_none(), "no drag starts under help");
+    assert!(
+        !env.view.settings_view.as_ref().unwrap().show_help,
+        "the click closes help"
+    );
+}

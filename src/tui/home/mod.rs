@@ -6,6 +6,7 @@ mod creation;
 mod dialogs;
 #[cfg(test)]
 mod file_watch_tests;
+pub(crate) use icons::get_indent;
 mod icons;
 mod input;
 mod layout;
@@ -63,9 +64,9 @@ use super::settings::SettingsView;
 
 use self::creation::SessionMutationGuards;
 use self::icons::{
-    get_indent, ICON_ARCHIVED_SECTION, ICON_COLLAPSED, ICON_DELETING, ICON_DORMANT, ICON_ERROR,
-    ICON_EXPANDED, ICON_IDLE, ICON_PINNED, ICON_STOPPED, ICON_TRASH_SECTION, ICON_UNKNOWN,
-    ICON_UNREAD, UNREAD_DWELL,
+    ICON_ARCHIVED_SECTION, ICON_COLLAPSED, ICON_DELETING, ICON_DORMANT, ICON_ERROR, ICON_EXPANDED,
+    ICON_IDLE, ICON_PINNED, ICON_STOPPED, ICON_TRASH_SECTION, ICON_UNKNOWN, ICON_UNREAD,
+    UNREAD_DWELL,
 };
 use self::preview::{PreviewCache, PreviewSelection, PreviewTextView, PreviewTimings};
 use self::rows::project_group_key;
@@ -296,7 +297,6 @@ pub struct HomeView {
     pub(super) pending_repo_trust_data: Option<NewSessionData>,
     /// Canonical daemon-reviewed configuration fingerprint for the pending
     /// approval. Approval is never persisted locally before daemon validation.
-    pub(super) pending_repo_trust_fingerprint: Option<crate::daemon::CreationTrustFingerprint>,
     pub(super) hooks_install_dialog: Option<HooksInstallDialog>,
     /// Session data pending agent hooks acknowledgment
     pub(super) pending_hooks_install_data: Option<NewSessionData>,
@@ -538,6 +538,9 @@ pub struct HomeView {
     /// "press Enter" page, which otherwise flashes for the connect
     /// window on every selection.
     pub(in crate::tui) structured_preview_pending: bool,
+    /// The last frame painted the mounted structured transcript into the preview, so
+    /// `preview_text_view` maps transcript rows rather than the tmux capture.
+    pub(super) structured_transcript_painted: bool,
     /// Session to force-remove after the confirmation dialog is accepted
     pub(super) pending_force_remove_session: Option<String>,
     /// Session to trash after the `session.confirm_delete` dialog is accepted
@@ -722,7 +725,7 @@ pub struct HomeView {
     /// each paired with the `KeyEvent` a click synthesizes (so a click is
     /// dispatched through the exact same path as pressing the shortcut).
     /// Rebuilt every frame; empty in live mode and the takeover views.
-    pub(super) footer_buttons: Vec<(Rect, crossterm::event::KeyEvent)>,
+    pub(super) footer_buttons: Vec<(crossterm::event::KeyEvent, Rect)>,
     /// The `KeyEvent` of the footer button the pointer is currently over, used
     /// to draw a hover highlight. Recomputed on every `Moved` event. Keyed by
     /// the button's shortcut rather than its index into `footer_buttons` so the

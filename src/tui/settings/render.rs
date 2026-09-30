@@ -13,10 +13,13 @@ use ratatui::{
 use tui_input::Input;
 use unicode_width::UnicodeWidthStr;
 
+use crossterm::event::KeyCode;
+
 use super::{
-    CategoryRow, FieldValue, SettingsCategory, SettingsFocus, SettingsScope, SettingsView,
+    CategoryRow, FieldValue, ListEditHits, SettingsCategory, SettingsFocus, SettingsScope,
+    SettingsView,
 };
-use crate::tui::components::hover::paint_hover_bg;
+use crate::tui::components::hover::{paint_hover_bg, HoverState};
 use crate::tui::components::{set_input_cursor_position, truncate_to_width};
 use crate::tui::styles::Theme;
 
@@ -77,6 +80,10 @@ impl SettingsView {
         self.field_rects.clear();
         self.search_hit_rows.clear();
         self.search_popup_area = Rect::default();
+        self.list_edit_hits = ListEditHits::default();
+        if self.list_edit_state.is_none() {
+            self.list_hover = HoverState::default();
+        }
         // Repopulated below only when the panel overflows; a zero rect means
         // "no bar to grab".
         self.scrollbar_area = Rect::default();
@@ -101,7 +108,7 @@ impl SettingsView {
         self.render_content(frame, layout[2], theme);
         self.render_footer(frame, layout[3], theme);
 
-        if let Some(ref dialog) = self.custom_instruction_dialog {
+        if let Some(ref mut dialog) = self.custom_instruction_dialog {
             dialog.render(frame, area, theme);
         }
 
@@ -583,6 +590,7 @@ impl SettingsView {
         }
 
         let scroll_offset = self.fields_scroll_offset;
+        let mut list_hits = None;
 
         let mut y_pos = 0u16; // absolute position in content space
         for (i, field) in self.fields.iter().enumerate() {
@@ -608,12 +616,26 @@ impl SettingsView {
                 height: field_h.min(fields_viewport_height.saturating_sub(visible_y)),
             };
 
-            self.render_field(frame, field_area, field, i, is_selected, theme);
+            if let Some(mut hits) =
+                self.render_field(frame, field_area, field, i, is_selected, theme)
+            {
+                // The value area can overhang a field clipped by the viewport.
+                let bottom = field_area.bottom();
+                hits.rows.retain(|(_, r)| r.y < bottom);
+                hits.actions.retain(|(_, r)| r.y < bottom);
+                list_hits = Some(hits);
+            }
             // Dividers are non-interactive, as keyboard navigation reflects.
             if !matches!(field.value, FieldValue::SectionHeader) {
                 self.field_rects.push((i, field_area));
             }
             y_pos += field_h + 1; // +1 for spacing
+        }
+        if let Some(hits) = list_hits {
+            if let Some(rect) = self.list_hover.current_in(&hits.rects()) {
+                paint_hover_bg(frame, rect, theme.selection);
+            }
+            self.list_edit_hits = hits;
         }
 
         // Dim bg on the hovered field; selection wins. After the field loop,
@@ -683,7 +705,7 @@ impl SettingsView {
         index: usize,
         is_selected: bool,
         theme: &Theme,
-    ) {
+    ) -> Option<ListEditHits> {
         // A styled heading with a dimmed subtitle, never selected because
         // navigation skips it. `theme.text` matches the categories panel.
         if matches!(field.value, FieldValue::SectionHeader) {
@@ -717,7 +739,7 @@ impl SettingsView {
                     frame.render_widget(Paragraph::new(lines), subtitle_area);
                 }
             }
-            return;
+            return None;
         }
 
         let label_style = if is_selected {
@@ -771,7 +793,7 @@ impl SettingsView {
         // description height. The value sits at row `desc_height + 1`, so it is
         // skipped when the clipped slice leaves no room for it.
         if desc_height.saturating_add(1) >= area.height {
-            return;
+            return None;
         }
         let value_area = Rect {
             y: area.y + desc_height,
@@ -811,12 +833,13 @@ impl SettingsView {
                 self.render_select_field(frame, value_area, *selected, options, is_selected, theme);
             }
             FieldValue::List(items) => {
-                self.render_list_field(frame, value_area, items, index, is_selected, theme);
+                return self.render_list_field(frame, value_area, items, index, is_selected, theme);
             }
             FieldValue::SectionHeader => {
                 // Handled by the early return at the top of `render_field`.
             }
         }
+        None
     }
 
     fn render_bool_field(
@@ -1011,6 +1034,7 @@ impl SettingsView {
         );
     }
 
+    /// Returns the editor's hit rects while this list is expanded.
     fn render_list_field(
         &self,
         frame: &mut Frame,
@@ -1019,7 +1043,7 @@ impl SettingsView {
         index: usize,
         is_selected: bool,
         theme: &Theme,
-    ) {
+    ) -> Option<ListEditHits> {
         let is_expanded = self.list_edit_state.is_some() && index == self.selected_field;
 
         if !is_expanded {
@@ -1043,9 +1067,11 @@ impl SettingsView {
             };
 
             frame.render_widget(Paragraph::new(text).style(style), value_area);
+            None
         } else {
             // Expanded view - show all items
             let list_state = self.list_edit_state.as_ref().unwrap();
+            let mut hits = ListEditHits::default();
 
             let header_area = Rect {
                 x: area.x,
@@ -1054,15 +1080,31 @@ impl SettingsView {
                 height: 1,
             };
 
-            let header = Line::from(vec![
-                Span::styled("Items: ", Style::default().fg(theme.dimmed)),
-                Span::styled(
-                    "(a)dd (d)elete (Enter)edit (Esc)close",
-                    Style::default().fg(theme.dimmed),
-                ),
-            ]);
-            frame.render_widget(Paragraph::new(header), header_area);
-
+            const PREFIX: &str = "Items: ";
+            const ACTIONS: [(KeyCode, &str); 4] = [
+                (KeyCode::Char('a'), "(a)dd"),
+                (KeyCode::Char('d'), "(d)elete"),
+                (KeyCode::Enter, "(Enter)edit"),
+                (KeyCode::Esc, "(Esc)close"),
+            ];
+            let dimmed = Style::default().fg(theme.dimmed);
+            let mut spans = vec![Span::styled(PREFIX, dimmed)];
+            // ASCII labels, so a byte count is the cell count.
+            let mut x = header_area.x + PREFIX.len() as u16;
+            for (i, (code, label)) in ACTIONS.into_iter().enumerate() {
+                if i > 0 {
+                    spans.push(Span::raw(" "));
+                    x += 1;
+                }
+                spans.push(Span::styled(label, dimmed));
+                let width = label.len() as u16;
+                if x + width <= header_area.right() && header_area.height > 0 {
+                    hits.actions
+                        .push((code, Rect::new(x, header_area.y, width, 1)));
+                }
+                x += width;
+            }
+            frame.render_widget(Paragraph::new(Line::from(spans)), header_area);
             // An empty expanded list used to render nothing under the
             // header, leaving the user staring at blank rows with no cue
             // that `a` starts an entry (issue #2932).
@@ -1096,6 +1138,7 @@ impl SettingsView {
                     width: area.width.saturating_sub(2),
                     height: 1,
                 };
+                hits.rows.push((i, item_area));
 
                 // While the add prompt is open the cursor belongs to the new
                 // row at the bottom; suppress the marker on the previously
@@ -1140,6 +1183,7 @@ impl SettingsView {
                     }
                 }
             }
+            Some(hits)
         }
     }
 

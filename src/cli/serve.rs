@@ -3,6 +3,7 @@
 use anyhow::{bail, Context, Result};
 use clap::{Args, ValueEnum};
 use std::path::PathBuf;
+use std::sync::Mutex;
 
 /// How the dashboard authenticates HTTP/WS requests.
 ///
@@ -2412,5 +2413,24 @@ mod tests {
                 "a known profile must reach the next validation, got: {msg}"
             );
         }
+    }
+}
+
+/// Cached label of the running daemon's serve mode, refreshed by pid.
+pub fn cached_serve_mode_label() -> Option<&'static str> {
+    static CACHE: Mutex<Option<(u32, Option<&'static str>)>> = Mutex::new(None);
+
+    let pid = daemon_pid()?;
+    if let Ok(mut guard) = CACHE.lock() {
+        if let Some((cached_pid, cached_label)) = *guard {
+            if cached_pid == pid {
+                return cached_label;
+            }
+        }
+        let label = read_serve_mode_label();
+        *guard = Some((pid, label));
+        label
+    } else {
+        read_serve_mode_label()
     }
 }

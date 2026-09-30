@@ -296,4 +296,12 @@ impl HomeView {
         };
         self.terminal_modes.insert(session_id.to_string(), new_mode);
     }
+    /// The terminal a session's Terminal view shows: its chosen mode when
+    /// sandboxed, otherwise always the host terminal.
+    pub(super) fn effective_terminal_mode(&self, session_id: &str) -> TerminalMode {
+        match self.get_instance(session_id) {
+            Some(inst) if inst.is_sandboxed() => self.get_terminal_mode(session_id),
+            _ => TerminalMode::Host,
+        }
+    }
 }

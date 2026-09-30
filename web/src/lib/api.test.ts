@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import * as api from "./api";
 import type { ServerAbout } from "./api";
+import { onSettingsChanged } from "./settingsEvents";
 import type { CreateSessionRequest, SettingsFieldDescriptor } from "./types";
 
 const fetchSpy = vi.fn<typeof fetch>();
@@ -75,7 +76,10 @@ const requestCases: RequestCase[] = [
   ["GET /api/sessions/s1/file?path=a+b.ts", () => api.getSessionFile("s1", "a b.ts")],
   ["GET /api/settings", () => api.fetchSettings()],
   ["GET /api/settings?profile=my%20profile", () => api.fetchSettings("my profile")],
+  ["GET /api/settings?layer=machine", () => api.fetchMachineSettings()],
   ["PATCH /api/settings", () => api.updateSettings({ a: 1 }), { body: { a: 1 }, result: true }],
+  ["PATCH /api/settings?profile=my%20p", () => api.updateSettings({ a: 1 }, "my p"), { body: { a: 1 }, result: true }],
+  ["PATCH /api/settings?layer=machine", () => api.updateMachineSettings({ a: 1 }), { body: { a: 1 }, result: true }],
   ["PATCH /api/theme", () => api.updateTheme({ name: "dracula" }), { body: { name: "dracula" }, result: true }],
   ["GET /api/app-state/web-ui-state", () => api.getWebUiState(), { respond: json({ k: "v" }), result: { k: "v" } }],
   [
@@ -581,6 +585,29 @@ describe("request shapes", () => {
     if (body === undefined) expect(last.init?.body).toBeUndefined();
     else expect(bodyOf(last.init)).toEqual(body);
     if (result !== undefined) expect(out).toEqual(result);
+  });
+});
+
+describe("settings saves", () => {
+  it.each([
+    ["updateSettings", () => api.updateSettings({ a: 1 }, "p")],
+    ["updateMachineSettings", () => api.updateMachineSettings({ a: 1 })],
+    ["updateProfileSettings", () => api.updateProfileSettings("p", { a: 1 })],
+    ["setDefaultProfile", () => api.setDefaultProfile("p")],
+  ])("%s announces a landed save and stays quiet on a rejected one", async (_name, save) => {
+    const listener = vi.fn();
+    const off = onSettingsChanged(listener);
+    try {
+      fetchSpy.mockImplementation(async () => empty(500));
+      expect(await save()).toBe(false);
+      expect(listener).not.toHaveBeenCalled();
+
+      fetchSpy.mockImplementation(async () => empty());
+      expect(await save()).toBe(true);
+      expect(listener).toHaveBeenCalledTimes(1);
+    } finally {
+      off();
+    }
   });
 });
 

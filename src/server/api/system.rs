@@ -2014,7 +2014,7 @@ pub async fn update_profile_settings(
                 .into_response();
         }
     }
-    let elevated = handler_elevated(&state, session.as_deref(), loopback.as_deref()).await;
+    let elevated = handler_elevated(&state, session.as_deref(), loopback.is_some()).await;
 
     // Validate every leaf against the schema. Global-only fields are invalid here.
     // Elevation failures retain the payload consumed by the web prompt.

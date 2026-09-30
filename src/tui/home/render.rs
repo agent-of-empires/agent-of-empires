@@ -3447,10 +3447,6 @@ impl HomeView {
         if !cursor.position_reliable {
             return None;
         }
-        // `total_lines` is the parsed line count of the capture painted this
-        // frame (set by `set_preview_text_view` right before this), matching
-        // what the renderer fed to `compute_scroll`, so the cursor anchors the
-        // same way the text did.
         map_live_preview_cursor(
             self.preview_pane_area,
             self.preview_visible_rows,
@@ -4392,13 +4388,13 @@ impl HomeView {
             match key {
                 Some(key) => {
                     self.footer_buttons.push((
+                        key,
                         Rect {
                             x: col,
                             y: area.y,
                             width,
                             height: area.height,
                         },
-                        key,
                     ));
                     if self.footer_hover == Some(key) {
                         for s in group {
@@ -4474,6 +4470,20 @@ impl HomeView {
             .style(Style::default().bg(theme.selection));
         frame.render_widget(bar, area);
     }
+}
+
+pub(super) fn live_pane_origin(
+    view: super::PreviewTextView,
+    cursor: &crate::tmux::PaneCursor,
+) -> (i32, i32) {
+    let pane_top = view.total_lines as i32 - cursor.pane_height as i32 - view.first_line as i32;
+    let (left, top) = cursor
+        .composite_pane0
+        .map_or((0, 0), |rect| (rect.left as i32, rect.top as i32));
+    (
+        view.pane.x as i32 + left,
+        view.pane.y as i32 + pane_top + top,
+    )
 }
 
 #[cfg(test)]

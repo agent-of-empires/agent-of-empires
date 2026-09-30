@@ -21,8 +21,8 @@ fn button_key(env: &TestEnv, code: KeyCode) -> Option<KeyEvent> {
     env.view
         .footer_buttons
         .iter()
-        .find(|(_, k)| k.code == code)
-        .map(|(_, k)| *k)
+        .find(|(k, _)| k.code == code)
+        .map(|(k, _)| *k)
 }
 
 /// Each rendered shortcut produces a hit rect carrying the equivalent key: a click inside
@@ -44,11 +44,11 @@ fn buttons_map_clicks_hover_and_yield_to_overlays() {
     let cmds = button_key(&env, KeyCode::Char('k')).expect("Cmds button present");
     assert_eq!(cmds.modifiers, KeyModifiers::CONTROL, "Cmds maps to Ctrl+K");
 
-    let (new_rect, new_key) = env
+    let (new_key, new_rect) = env
         .view
         .footer_buttons
         .iter()
-        .find(|(_, k)| k.code == KeyCode::Char('n'))
+        .find(|(k, _)| k.code == KeyCode::Char('n'))
         .cloned()
         .expect("New button rect");
     assert_eq!(
@@ -64,7 +64,7 @@ fn buttons_map_clicks_hover_and_yield_to_overlays() {
         "a click off the footer row hits no button"
     );
 
-    let (rect, hover_key) = env.view.footer_buttons[1];
+    let (hover_key, rect) = env.view.footer_buttons[1];
     assert!(env.view.footer_hover.is_none());
     assert!(
         env.view.handle_hover(rect.x + 1, rect.y),

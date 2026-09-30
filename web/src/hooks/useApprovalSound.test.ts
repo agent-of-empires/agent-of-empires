@@ -14,6 +14,7 @@ vi.mock("../lib/api", () => ({
 }));
 
 import { useApprovalSound, clearApprovalSoundCache } from "./useApprovalSound";
+import { notifySettingsChanged } from "../lib/settingsEvents";
 
 const REPLAY_QUIET_MS = 1500;
 
@@ -150,5 +151,33 @@ describe("useApprovalSound", () => {
     }
     expect(fetchSettings).toHaveBeenCalledTimes(2);
     expect(fetchSoundBlob).toHaveBeenCalledTimes(2);
+  });
+
+  it("plays a newly saved sound on the next edge after a settings save", async () => {
+    const { rerender } = await walk(1);
+    fetchSettings.mockResolvedValue({ sound: { enabled: true, on_approval: "chime" } });
+    act(() => notifySettingsChanged());
+    for (const count of [0, 1]) {
+      rerender(count);
+      await flushPlayback();
+    }
+    expect(fetchSettings).toHaveBeenCalledTimes(2);
+    expect(fetchSoundBlob).toHaveBeenLastCalledWith("chime");
+  });
+
+  it("does not re-cache a read that started before a settings save", async () => {
+    let finishStaleRead: (value: unknown) => void = () => {};
+    fetchSettings.mockReturnValueOnce(new Promise((resolve) => (finishStaleRead = resolve)));
+    const { rerender } = await walk(1);
+    act(() => notifySettingsChanged());
+    finishStaleRead({ sound: { enabled: true, on_approval: "ding" } });
+    await flushPlayback();
+    fetchSettings.mockResolvedValue({ sound: { enabled: true, on_approval: "chime" } });
+    for (const count of [0, 1]) {
+      rerender(count);
+      await flushPlayback();
+    }
+    expect(fetchSettings).toHaveBeenCalledTimes(2);
+    expect(fetchSoundBlob).toHaveBeenLastCalledWith("chime");
   });
 });

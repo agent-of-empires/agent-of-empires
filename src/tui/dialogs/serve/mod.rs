@@ -4,12 +4,15 @@ mod daemon;
 mod render;
 mod words;
 
+use std::cell::RefCell;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::prelude::*;
 
 use crate::cli::serve::{read_serve_urls, ServeUrl};
+use crate::tui::components::hover::HoverState;
+use crate::tui::dialogs::{contains, hit, target_rects};
 use crate::tui::styles::Theme;
 pub(crate) use daemon::start_local_daemon_and_wait;
 use daemon::*;
@@ -155,6 +158,25 @@ impl ServeViewState {
     }
 }
 
+/// What the last frame drew under the mouse, recorded through a `RefCell`
+/// since rendering borrows the view immutably.
+#[derive(Default)]
+struct ServeMouse {
+    /// Hints and cards, each standing for a key.
+    keys: Vec<(KeyEvent, Rect)>,
+    /// Values a click copies, keyed by `(label, value)`.
+    copies: Vec<((&'static str, String), Rect)>,
+    hover: HoverState,
+}
+
+impl ServeMouse {
+    fn rects(&self) -> Vec<Rect> {
+        let mut rects = target_rects(&self.keys);
+        rects.extend(target_rects(&self.copies));
+        rects
+    }
+}
+
 /// A destructive action awaiting a second press of its key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PendingConfirm {
@@ -168,6 +190,9 @@ pub struct ServeView {
     pending_passphrase: String,
     pending_confirm: Option<(PendingConfirm, Instant)>,
     show_help: bool,
+    mouse: RefCell<ServeMouse>,
+    /// The label of the value a click last copied, shown for `FLASH_TTL`.
+    copied: Option<(&'static str, Instant)>,
 }
 
 impl Default for ServeView {
@@ -195,7 +220,35 @@ impl ServeView {
             pending_passphrase,
             pending_confirm: None,
             show_help: false,
+            mouse: RefCell::default(),
+            copied: None,
         }
+    }
+
+    /// Hints and cards return their key; the URL, token and passphrase copy
+    /// on click. Any click closes help, like any key.
+    pub fn handle_click(&mut self, col: u16, row: u16) -> Option<KeyEvent> {
+        if self.show_help {
+            return Some(KeyEvent::from(KeyCode::Esc));
+        }
+        let mouse = self.mouse.get_mut();
+        let copy = mouse
+            .copies
+            .iter()
+            .find(|(_, rect)| contains(*rect, col, row))
+            .map(|(copy, _)| copy.clone());
+        if let Some((label, value)) = copy {
+            crate::tui::clipboard::copy_to_clipboard(&value);
+            self.copied = Some((label, Instant::now()));
+            return None;
+        }
+        hit(&mouse.keys, col, row)
+    }
+
+    pub fn handle_hover(&mut self, col: u16, row: u16) -> bool {
+        let mouse = self.mouse.get_mut();
+        let rects = mouse.rects();
+        mouse.hover.update(col, row, &rects)
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> ServeAction {

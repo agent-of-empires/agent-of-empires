@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph};
 use ratatui::Frame;
@@ -14,15 +14,16 @@ use aoe_plugin_api::UiSlot;
 
 use ansi_to_tui::IntoText;
 
-use super::input::Focus;
+use super::input::{Focus, Intent};
 use super::reducer::{
     AcpTranscript, NoteKind, PendingApproval, ToolCallRow, ToolCompletion, ToolOutcome,
 };
-use super::state::{FileIndex, StructuredViewState, ViewLayout};
+use super::state::{FileIndex, PickerKind, PickerTarget, StructuredViewState, ViewLayout};
 use crate::acp::approvals::{tool_target, ToolTarget, CMD_KEYS, PATH_KEYS};
 use crate::acp::session_paths::{relative_display_path, SessionPathRoots};
 use crate::acp::state::{SessionUsage, ToolOutputBlock};
 use crate::acp::transcript::{TranscriptRow, TranscriptRowKind};
+use crate::tui::components::hover::paint_hover_bg;
 use crate::tui::plugin_ui;
 use crate::tui::styles::Theme;
 
@@ -36,6 +37,8 @@ pub fn render(
     active: bool,
 ) -> TranscriptGeometry {
     let layout = compute_layout(area, state);
+    // Keep the previous window start so hover cannot scroll rows away.
+    let prev_picker = state.mouse_targets.take().picker;
 
     let geometry = render_transcript(frame, layout.transcript, theme, state, active);
     render_status(frame, layout.status, theme, state, active);
@@ -48,12 +51,20 @@ pub fn render(
     render_composer(frame, layout.composer, theme, state, active);
     // Pickers float above the bottom-anchored composer. The choice picker owns
     // the navigation keys while open, so it wins the pixels too.
-    if let Some(picker) = &state.choice {
-        render_choice_picker(frame, layout.composer, theme, picker);
+    let prev_first = |kind| {
+        prev_picker
+            .filter(|p: &PickerTarget| p.kind == kind)
+            .map_or(0, |p| p.first)
+    };
+    if state.choice.is_some() {
+        let first = prev_first(PickerKind::Choice);
+        render_choice_picker(frame, layout.composer, theme, state, first);
     } else if matches!(state.focus, Focus::Composer) && state.slash_picker_open() {
-        render_slash_picker(frame, layout.composer, theme, state);
+        let first = prev_first(PickerKind::Slash);
+        render_slash_picker(frame, layout.composer, theme, state, first);
     } else if matches!(state.focus, Focus::Composer) && state.mention.is_some() {
-        render_mention_picker(frame, layout.composer, theme, state);
+        let first = prev_first(PickerKind::Mention);
+        render_mention_picker(frame, layout.composer, theme, state, first);
     }
     // The plugin pane is a modal overlay; an open choice picker still owns the
     // navigation keys, so it must stay visible on top.
@@ -63,41 +74,71 @@ pub fn render(
     geometry
 }
 
-/// Permission mode / elicitation answer picker.
+/// Permission mode / elicitation answer / plugin-link picker.
 fn render_choice_picker(
     frame: &mut Frame,
     composer_area: Rect,
     theme: &Theme,
-    picker: &super::state::ChoicePicker,
+    state: &StructuredViewState,
+    prev_first: usize,
 ) {
-    let lines = window_rows(
+    let Some(picker) = &state.choice else {
+        return;
+    };
+    let (first, lines) = window_rows(
         composer_area,
         8,
         picker.selected,
+        prev_first,
         &picker.options,
         |(_, label)| vec![label.clone()],
     );
-    render_popup_above(frame, composer_area, theme, picker.title.clone(), lines);
+    let rows = lines.len();
+    let drawn = render_popup_above(frame, composer_area, theme, picker.title.clone(), lines);
+    record_picker(state, PickerKind::Choice, drawn, first, rows);
+}
+
+/// Store a drawn picker as the frame's click / hover target. `rows` counts the
+/// item rows at the top of the popup body, excluding any trailing note.
+fn record_picker(
+    state: &StructuredViewState,
+    kind: PickerKind,
+    drawn: Option<(Rect, Rect)>,
+    first: usize,
+    rows: usize,
+) {
+    let Some((area, inner)) = drawn else {
+        return;
+    };
+    let height = u16::try_from(rows).unwrap_or(u16::MAX).min(inner.height);
+    state.mouse_targets.borrow_mut().picker = Some(PickerTarget {
+        kind,
+        area,
+        rows: Rect { height, ..inner },
+        first,
+    });
 }
 
 /// Up to `max_rows` picker rows (fewer on a short terminal), windowed so
-/// `selected` stays visible and marked.
+/// `selected` stays visible and marked. Returns the first shown item's index
+/// with the rows.
 fn window_rows<T, S: Into<Span<'static>>>(
     composer_area: Rect,
     max_rows: usize,
     selected: usize,
+    prev_start: usize,
     items: &[T],
     spans: impl Fn(&T) -> Vec<S>,
-) -> Vec<Line<'static>> {
+) -> (usize, Vec<Line<'static>>) {
     // Minus the two border rows, so the selection can't paint off-screen.
     let max_rows = (composer_area.y as usize).saturating_sub(2).min(max_rows);
     if max_rows == 0 || items.is_empty() {
-        return Vec::new();
+        return (0, Vec::new());
     }
     let total = items.len();
     let cap = max_rows.min(total);
-    let start = window_start(selected, cap, total);
-    items[start..(start + cap).min(total)]
+    let start = window_start(selected, cap, total, prev_start);
+    let lines = items[start..(start + cap).min(total)]
         .iter()
         .enumerate()
         .map(|(offset, item)| {
@@ -112,28 +153,34 @@ fn window_rows<T, S: Into<Span<'static>>>(
             }
             Line::from(row)
         })
-        .collect()
+        .collect();
+    (start, lines)
 }
 
-/// First visible index of a `cap`-row window that keeps `selected` inside it.
-fn window_start(selected: usize, cap: usize, total: usize) -> usize {
-    if selected >= cap {
-        (selected - cap + 1).min(total.saturating_sub(cap))
+/// First visible index of a `cap`-row window that keeps `selected` inside it,
+/// scrolling from `prev_start` only as far as needed.
+fn window_start(selected: usize, cap: usize, total: usize, prev_start: usize) -> usize {
+    let start = prev_start.min(total.saturating_sub(cap));
+    if selected < start {
+        selected
+    } else if selected >= start + cap {
+        selected + 1 - cap
     } else {
-        0
+        start
     }
 }
 
-/// Bordered popup whose bottom edge sits on the composer's top edge.
+/// Bordered popup whose bottom edge sits on the composer's top edge. Returns
+/// the popup and its body rects, or `None` when nothing was drawn.
 fn render_popup_above(
     frame: &mut Frame,
     composer_area: Rect,
     theme: &Theme,
     title: String,
     lines: Vec<Line<'_>>,
-) {
+) -> Option<(Rect, Rect)> {
     if lines.is_empty() {
-        return;
+        return None;
     }
     let y = composer_area.y.saturating_sub(lines.len() as u16 + 2);
     let area = Rect {
@@ -142,7 +189,7 @@ fn render_popup_above(
         ..composer_area
     };
     if area.height < 3 {
-        return;
+        return None;
     }
     let block = Block::default()
         .borders(Borders::ALL)
@@ -154,6 +201,7 @@ fn render_popup_above(
     frame.render_widget(Clear, area);
     frame.render_widget(block, area);
     frame.render_widget(Paragraph::new(lines), inner);
+    Some((area, inner))
 }
 
 /// Pure so the redraw path can stash it on `state.layout` for hit-testing.
@@ -198,12 +246,27 @@ fn render_pane_panel(frame: &mut Frame, area: Rect, theme: &Theme, state: &Struc
         .border_type(BorderType::Rounded)
         .padding(Padding::horizontal(1))
         .title(" Plugin pane ")
-        // The status hint is covered by this overlay, so paint the way out here.
-        .title_bottom(" Esc to close ")
         .border_style(Style::default().fg(theme.title));
     let inner = block.inner(panel);
     frame.render_widget(Clear, panel);
     frame.render_widget(block, panel);
+    // The status hint is covered by this overlay, so paint the way out on the
+    // bottom border as a button. The modal covers every other target.
+    let close = if panel.width > 2 && panel.height > 1 {
+        let label = " Esc to close ";
+        let rect = Rect {
+            x: panel.x + 1,
+            y: panel.bottom() - 1,
+            width: (label.len() as u16).min(panel.width - 2),
+            height: 1,
+        };
+        frame.render_widget(Paragraph::new(label), rect);
+        vec![(rect, Intent::SetFocus(Focus::Transcript))]
+    } else {
+        Vec::new()
+    };
+    paint_hovered_button(frame, theme, state, &close);
+    state.mouse_targets.borrow_mut().buttons = close;
     if inner.width == 0 || inner.height == 0 {
         return;
     }
@@ -306,59 +369,93 @@ fn render_approval_shelf(
         .border_style(Style::default().fg(accent));
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let actions = approval_actions_line(theme, active, row.choice && !row.options.is_empty());
+    let (actions, spans) =
+        approval_actions_line(theme, active, row.choice && !row.options.is_empty());
     frame.render_widget(Paragraph::new(actions), inner);
+    // An open choice picker owns the keyboard, so the decision buttons go
+    // inert with their keys.
+    if state.choice.is_some() {
+        return;
+    }
+    let buttons: Vec<(Rect, Intent)> = spans
+        .into_iter()
+        .filter(|(offset, _, _)| *offset < inner.width)
+        .map(|(offset, width, intent)| {
+            let rect = Rect {
+                x: inner.x + offset,
+                y: inner.y,
+                width: width.min(inner.width - offset),
+                height: 1,
+            };
+            (rect, intent)
+        })
+        .collect();
+    paint_hovered_button(frame, theme, state, &buttons);
+    state.mouse_targets.borrow_mut().buttons = buttons;
 }
 
-/// Choice approvals ask a question, so `a` answers and "always" doesn't apply.
-fn approval_actions_line(theme: &Theme, active: bool, choice: bool) -> Line<'static> {
+/// Highlight whichever of this frame's `buttons` the pointer is over.
+fn paint_hovered_button(
+    frame: &mut Frame,
+    theme: &Theme,
+    state: &StructuredViewState,
+    buttons: &[(Rect, Intent)],
+) {
+    let rects: Vec<Rect> = buttons.iter().map(|(rect, _)| *rect).collect();
+    if let Some(rect) = state.hover.current_in(&rects) {
+        paint_hover_bg(frame, rect, theme.selection);
+    }
+}
+
+/// The action hints, plus each clickable action as `(column offset, width,
+/// intent)` with the intent its key sends. Choice approvals ask a question, so
+/// `a` answers and "always" doesn't apply.
+fn approval_actions_line(
+    theme: &Theme,
+    active: bool,
+    choice: bool,
+) -> (Line<'static>, Vec<(u16, u16, Intent)>) {
+    use crate::acp::protocol::ApprovalDecisionWire as Decision;
+
     if !active {
-        return Line::from(Span::styled(
-            "Enter to respond",
-            Style::default().fg(theme.hint),
+        let hint = Span::styled("Enter to respond", Style::default().fg(theme.hint));
+        return (Line::from(hint), Vec::new());
+    }
+    let resolve = Intent::ResolveApproval;
+    let mut actions: Vec<(&'static str, Color, &'static str, Intent)> = vec![(
+        "a",
+        theme.running,
+        if choice { " answer" } else { " allow once" },
+        resolve(Decision::Allow),
+    )];
+    if !choice {
+        actions.push((
+            "A",
+            theme.running,
+            " always",
+            resolve(Decision::AllowAlways),
         ));
     }
-    let mut spans = vec![
-        Span::styled(
-            "a",
-            Style::default()
-                .fg(theme.running)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            if choice { " answer" } else { " allow once" },
-            Style::default().fg(theme.hint),
-        ),
-        Span::styled("  ·  ", Style::default().fg(theme.border)),
-    ];
-    if !choice {
-        spans.extend([
-            Span::styled(
-                "A",
-                Style::default()
-                    .fg(theme.running)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(" always", Style::default().fg(theme.hint)),
-            Span::styled("  ·  ", Style::default().fg(theme.border)),
-        ]);
+    actions.push(("d", theme.error, " deny", resolve(Decision::Deny)));
+    actions.push(("Esc", theme.hint, " stop", Intent::CancelInFlight));
+
+    let mut spans = Vec::new();
+    let mut buttons = Vec::new();
+    let mut offset = 0u16;
+    for (i, (key, color, label, intent)) in actions.into_iter().enumerate() {
+        if i > 0 {
+            let sep = Span::styled("  ·  ", Style::default().fg(theme.border));
+            offset += sep.width() as u16;
+            spans.push(sep);
+        }
+        let key = Span::styled(key, Style::default().fg(color).add_modifier(Modifier::BOLD));
+        let label = Span::styled(label, Style::default().fg(theme.hint));
+        let width = (key.width() + label.width()) as u16;
+        buttons.push((offset, width, intent));
+        offset += width;
+        spans.extend([key, label]);
     }
-    spans.extend([
-        Span::styled(
-            "d",
-            Style::default()
-                .fg(theme.error)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(" deny", Style::default().fg(theme.hint)),
-        Span::styled("  ·  ", Style::default().fg(theme.border)),
-        Span::styled(
-            "Esc",
-            Style::default().fg(theme.hint).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(" stop", Style::default().fg(theme.hint)),
-    ]);
-    Line::from(spans)
+    (Line::from(spans), buttons)
 }
 
 fn approval_target(row: &PendingApproval, path_roots: Option<&SessionPathRoots>) -> String {
@@ -382,25 +479,35 @@ fn render_slash_picker(
     composer_area: Rect,
     theme: &Theme,
     state: &StructuredViewState,
+    prev_first: usize,
 ) {
     let matches = state.slash_matches();
-    let lines = window_rows(composer_area, 8, state.slash_selected, &matches, |cmd| {
-        let mut spans = vec![Span::raw(format!("/{}", cmd.name))];
-        if !cmd.description.is_empty() {
-            spans.push(Span::styled(
-                format!("  {}", cmd.description),
-                Style::default().add_modifier(Modifier::DIM),
-            ));
-        }
-        spans
-    });
-    render_popup_above(
+    let (first, lines) = window_rows(
+        composer_area,
+        8,
+        state.slash_selected,
+        prev_first,
+        &matches,
+        |cmd| {
+            let mut spans = vec![Span::raw(format!("/{}", cmd.name))];
+            if !cmd.description.is_empty() {
+                spans.push(Span::styled(
+                    format!("  {}", cmd.description),
+                    Style::default().add_modifier(Modifier::DIM),
+                ));
+            }
+            spans
+        },
+    );
+    let rows = lines.len();
+    let drawn = render_popup_above(
         frame,
         composer_area,
         theme,
         " Commands (↑/↓ or Ctrl+n/p · Enter/Tab select · Esc dismiss) ".into(),
         lines,
     );
+    record_picker(state, PickerKind::Slash, drawn, first, rows);
 }
 
 /// `@` mention picker, with placeholders while the file index loads or fails.
@@ -409,10 +516,14 @@ fn render_mention_picker(
     composer_area: Rect,
     theme: &Theme,
     state: &StructuredViewState,
+    prev_first: usize,
 ) {
     let dim = Style::default().add_modifier(Modifier::DIM);
     let placeholder = |text: String, style: Style| vec![Line::from(Span::styled(text, style))];
     let selected = state.mention.as_ref().map(|s| s.selected).unwrap_or(0);
+    // Placeholders are not rows: the popup swallows clicks but picks nothing.
+    let mut first = 0;
+    let mut rows = 0;
     let lines = match &state.file_index {
         FileIndex::Unloaded | FileIndex::Loading => placeholder("  loading files…".into(), dim),
         FileIndex::Failed(err) => placeholder(
@@ -424,12 +535,15 @@ fn render_mention_picker(
             if files.is_empty() {
                 placeholder("  no matching files".into(), dim)
             } else {
-                let mut lines = window_rows(composer_area, 8, selected, &files, |path| {
-                    vec![path.to_string()]
-                });
+                let (start, mut lines) =
+                    window_rows(composer_area, 8, selected, prev_first, &files, |path| {
+                        vec![path.to_string()]
+                    });
                 if lines.is_empty() {
                     return;
                 }
+                first = start;
+                rows = lines.len();
                 if *truncated {
                     lines.push(Line::from(Span::styled(
                         "  (workspace over 5000 files; list capped)",
@@ -440,13 +554,14 @@ fn render_mention_picker(
             }
         }
     };
-    render_popup_above(
+    let drawn = render_popup_above(
         frame,
         composer_area,
         theme,
         " Files (↑/↓ or Ctrl+n/p · Enter/Tab insert · Esc close) ".into(),
         lines,
     );
+    record_picker(state, PickerKind::Mention, drawn, first, rows);
 }
 
 /// One separator row above the terminal-native prompt rail.
@@ -1758,22 +1873,55 @@ mod tests {
 
     #[test]
     fn approval_actions_and_hints() {
-        let text = line_text(&approval_actions_line(&Theme::default(), true, false));
-        for want in ["a allow once", "A always", "d deny"] {
-            assert!(text.contains(want), "{text:?}");
-        }
-        assert!(
-            !text.contains('[') && !text.contains(']'),
-            "button chrome: {text:?}"
-        );
+        use crate::acp::protocol::ApprovalDecisionWire as Decision;
 
-        // A question offers answering instead of the permission vocabulary (#3741).
-        let text = line_text(&approval_actions_line(&Theme::default(), true, true));
-        assert!(
-            text.contains("a answer") && text.contains("d deny"),
-            "{text:?}"
-        );
-        assert!(!text.contains("always"), "{text:?}");
+        // Each clickable span must cover exactly its hint and fire its key's
+        // intent; a (choice, want) row per shelf variant.
+        for (choice, want) in [
+            (
+                false,
+                vec![
+                    ("a allow once", Intent::ResolveApproval(Decision::Allow)),
+                    ("A always", Intent::ResolveApproval(Decision::AllowAlways)),
+                    ("d deny", Intent::ResolveApproval(Decision::Deny)),
+                    ("Esc stop", Intent::CancelInFlight),
+                ],
+            ),
+            // A question offers answering instead of the permission vocabulary (#3741).
+            (
+                true,
+                vec![
+                    ("a answer", Intent::ResolveApproval(Decision::Allow)),
+                    ("d deny", Intent::ResolveApproval(Decision::Deny)),
+                    ("Esc stop", Intent::CancelInFlight),
+                ],
+            ),
+        ] {
+            let (line, buttons) = approval_actions_line(&Theme::default(), true, choice);
+            let text = line_text(&line);
+            assert!(
+                !text.contains('[') && !text.contains(']'),
+                "button chrome: {text:?}"
+            );
+            let got: Vec<(String, Intent)> = buttons
+                .into_iter()
+                .map(|(offset, width, intent)| {
+                    let label = text
+                        .chars()
+                        .skip(offset as usize)
+                        .take(width as usize)
+                        .collect();
+                    (label, intent)
+                })
+                .collect();
+            let want: Vec<(String, Intent)> =
+                want.into_iter().map(|(l, i)| (l.to_string(), i)).collect();
+            assert_eq!(got, want, "choice={choice}");
+        }
+        // The preview shelf has no keyboard, so nothing is clickable.
+        assert!(approval_actions_line(&Theme::default(), false, false)
+            .1
+            .is_empty());
         assert!(help_hint(Focus::Approval, true).contains("a answer"));
         assert!(!help_hint(Focus::Approval, true).contains("always"));
         assert!(help_hint(Focus::Approval, false).contains("A always"));
@@ -1894,11 +2042,18 @@ mod tests {
 
     #[test]
     fn window_follows_selection_past_cap() {
-        assert_eq!(window_start(0, 3, 10), 0);
-        assert_eq!(window_start(9, 3, 10), 7);
+        // (selected, previous start) -> start: scroll only as far as needed.
+        for (selected, prev, want) in [(0, 0, 0), (9, 0, 7), (5, 4, 4), (3, 4, 3), (7, 9, 7)] {
+            assert_eq!(
+                window_start(selected, 3, 10, prev),
+                want,
+                "{selected} from {prev}"
+            );
+        }
         let cmds: Vec<AvailableCommand> = (0..10).map(|i| cmd(&format!("c{i}"), "")).collect();
         let area = Rect::new(0, 5, 20, 2);
-        let lines = window_rows(area, 8, 9, &cmds, |c| vec![format!("/{}", c.name)]);
+        let (first, lines) = window_rows(area, 8, 9, 0, &cmds, |c| vec![format!("/{}", c.name)]);
+        assert_eq!(first, 7);
         assert_eq!(lines.len(), 3, "capped by the rows above the composer");
         assert_eq!(line_text(&lines[2]), "▶ /c9");
     }

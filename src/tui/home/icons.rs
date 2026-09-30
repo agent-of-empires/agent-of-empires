@@ -1,22 +1,5 @@
 //! The glyphs the list view draws with.
 
-pub(in crate::tui) const INDENTS: [&str; 10] = [
-    "",
-    " ",
-    "  ",
-    "   ",
-    "    ",
-    "     ",
-    "      ",
-    "       ",
-    "        ",
-    "         ",
-];
-
-pub(in crate::tui) fn get_indent(depth: usize) -> &'static str {
-    INDENTS.get(depth).copied().unwrap_or(INDENTS[9])
-}
-
 pub(in crate::tui) const ICON_IDLE: &str = "⠒";
 /// Solid dot so unread reads at a glance; matches the web sidebar.
 pub(in crate::tui) const ICON_UNREAD: &str = "●";
@@ -34,3 +17,20 @@ pub(in crate::tui) const ICON_PINNED: &str = "◆";
 // Shelf glyphs stay single-width: wide glyphs break column alignment and hit-testing.
 pub(in crate::tui) const ICON_TRASH_SECTION: &str = "⊘";
 pub(in crate::tui) const ICON_ARCHIVED_SECTION: &str = "▤";
+
+const INDENTS: [&str; 10] = [
+    "",
+    " ",
+    "  ",
+    "   ",
+    "    ",
+    "     ",
+    "      ",
+    "       ",
+    "        ",
+    "         ",
+];
+
+pub(crate) fn get_indent(depth: usize) -> &'static str {
+    INDENTS.get(depth).copied().unwrap_or(INDENTS[9])
+}

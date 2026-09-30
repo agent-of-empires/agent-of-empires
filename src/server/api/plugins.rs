@@ -40,7 +40,7 @@ async fn mutation_gate(
     if let Some(resp) = super::cityhall_block(state) {
         return Err(resp);
     }
-    if !handler_elevated(state, session, local).await {
+    if !handler_elevated(state, session, local.is_some()).await {
         return Err(error_response(
             StatusCode::FORBIDDEN,
             "elevation_required",

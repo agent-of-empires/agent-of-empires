@@ -255,4 +255,15 @@ impl HomeView {
             || self.new_dialog.is_some()
             || self.settings_view.is_some()
     }
+
+    pub(in crate::tui) fn open_link(&mut self, url: &str) {
+        let status = match crate::tui::open_url::open_url(url) {
+            Ok(()) => format!("opened {url}"),
+            Err(e) => {
+                crate::tui::clipboard::copy_to_clipboard(url);
+                format!("{e}; copied {url}")
+            }
+        };
+        self.flash_status(status);
+    }
 }

@@ -517,23 +517,7 @@ impl App {
         })
     }
 
-    /// Turn xterm mouse tracking on or off to match the current view state.
-    ///
-    /// **Contract**: must be called after any handler that may open or close
-    /// a surface counted by `HomeView::wants_text_selection`. Currently the
-    /// event-loop `Event::Key` arm and the tail of `with_raw_mode_disabled`
-    /// cover this; new event sources that mutate dialog state need to call
-    /// this too or mouse capture will lag a frame behind reality.
     fn sync_mouse_capture(&mut self, terminal: &mut Terminal<TuiBackend>) -> Result<()> {
-        // Mouse capture is on by default; the Mouse Capture setting (or the
-        // AOE_MOUSE_CAPTURE=0 backstop) opts out so iOS Mosh + Termius/Blink
-        // use the terminal app's native scrollback for touch-scroll (Mosh
-        // doesn't reliably forward mouse-tracking escapes to mobile clients).
-        // Folding `mouse_capture_allowed` into `desired` (rather than an early
-        // return) means flipping the setting off mid-session disables tracking
-        // on the next sync instead of leaving it stuck on. `mosh_active` is
-        // folded in too so a mid-session enable never emits the escape under
-        // Mosh, matching the startup gate in `tui::run`.
         let desired =
             self.mouse_capture_allowed && !self.mosh_active && !self.home.wants_text_selection();
         if desired == self.mouse_captured {
@@ -1109,7 +1093,7 @@ impl App {
                                                 let hit_scroll_target = hit_diff
                                                     || hit_list
                                                     || hit_preview
-                                                    || self.home.is_settings_open();
+                                                    || self.home.owns_wheel();
                                                 match mouse.kind {
                                                     MouseEventKind::ScrollUp if hit_scroll_target => { self.home.handle_scroll_up(mouse.column, mouse.row); }
                                                     MouseEventKind::ScrollDown if hit_scroll_target => { self.home.handle_scroll_down(mouse.column, mouse.row); }
@@ -1157,12 +1141,7 @@ impl App {
                                         }
                                     }
                                 }
-                                // Mouse-capture state may have changed if the
-                                // burst opened or closed a copy-friendly surface
-                                // (info/changelog/serve dialog). Keep it in sync
-                                // before the next render, matching the
-                                // non-burst Event::Key arm below.
-                                self.sync_mouse_capture(terminal)?;
+
                                 if !self.needs_redraw {
                                     self.draw(terminal)?;
                                 }
@@ -1173,7 +1152,6 @@ impl App {
                             }
 
                             self.handle_key(key, terminal).await?;
-                            self.sync_mouse_capture(terminal)?;
 
                             // Arm the post-key wake when the key was
                             // routed into live-send. We don't have an
@@ -1303,7 +1281,6 @@ impl App {
                                 {
                                     let _ = self.home.clear_preview_selection();
                                     self.handle_key(key, terminal).await?;
-                                    self.sync_mouse_capture(terminal)?;
                                     if !self.needs_redraw {
                                         self.draw(terminal)?;
                                     }
@@ -1335,7 +1312,6 @@ impl App {
                                 {
                                     self.open_structured_view(&session_id).await?;
                                 }
-                                self.sync_mouse_capture(terminal)?;
                                 if self.should_quit {
                                     break;
                                 }
@@ -1358,24 +1334,19 @@ impl App {
                                 if let Some(url) =
                                     self.home.preview_link_at(mouse.column, mouse.row)
                                 {
-                                    // The browser can open behind the terminal,
-                                    // so say what happened either way, and never
-                                    // claim an open that did not happen. When no
-                                    // browser the user could see is reachable
-                                    // (the normal case over SSH), the clipboard
-                                    // does reach their machine over OSC 52, so
-                                    // hand them the URL instead of a dead end.
-                                    let status = match crate::tui::open_url::open_url(&url) {
-                                        Ok(()) => format!("opened {url}"),
-                                        Err(e) => {
-                                            crate::tui::clipboard::copy_to_clipboard(&url);
-                                            format!("{e}; copied {url}")
-                                        }
-                                    };
+                                    // Say what happened either way, and never claim
+                                    // an open that did not happen: when no browser
+                                    // the user could see is reachable, the
+                                    // clipboard still reaches their machine.
+                                    let status =
+                                        match crate::tui::open_url::open_url(&url) {
+                                            Ok(()) => format!("opened {url}"),
+                                            Err(e) => {
+                                                crate::tui::clipboard::copy_to_clipboard(&url);
+                                                format!("{e}; copied {url}")
+                                            }
+                                        };
                                     self.home.flash_status(status);
-                                    // The press is consumed here, so it never
-                                    // reaches the drag-select path that would
-                                    // otherwise clear a finalized highlight.
                                     let _ = self.home.clear_preview_selection();
                                     // This press is spent; without forgetting
                                     // it, clicking the link again pairs into a
@@ -1406,32 +1377,14 @@ impl App {
                             let hit_preview = self.home.hit_preview(mouse.column, mouse.row);
                             let hit_diff = self.home.is_diff_open()
                                 && self.home.hit_diff(mouse.column, mouse.row);
-                            // Settings is a full-screen takeover: the whole
-                            // screen is a scroll target because its fields
-                            // panel is the only scrollable surface and the
-                            // list/preview rects it covers are stale.
+                            // Full-screen overlays cover the stale list/preview rects.
                             let hit_scroll_target = hit_diff
                                 || hit_list
                                 || hit_preview
-                                || self.home.is_settings_open();
-                            // Left-click is handled outside the unified
-                            // match because it returns an `Option<Action>`
-                            // (a double-click activates the session and
-                            // needs to flow through `execute_action`), not
-                            // a bool. The single-click selection always
-                            // mutates `cursor` so we redraw unconditionally
-                            // before dispatching the action.
-                            //
-                            // Priority order for `Down(Left)`:
-                            //   1. context menu outside-click (close it)
-                            //   2. modal dialog click (e.g. delete Yes/No)
-                            //   3. drag-start (divider, or preview text
-                            //      selection)
-                            //   4. list row click (existing select/activate)
-                            // A bare press on the preview seeds a 1x1
-                            // PreviewSelect; `handle_drag_end` collapses it
-                            // back to no selection on release if the cursor
-                            // never moved.
+                                || self.home.owns_wheel();
+                            // Left-click priority: context menu, dialog (the diff
+                            // view included), sidebar toggle, diagnostics, tips
+                            // badge, drag start, list row.
                             let click_action = if matches!(
                                 mouse.kind,
                                 MouseEventKind::Down(MouseButton::Left)
@@ -1459,7 +1412,6 @@ impl App {
                                     if let Some(name) = self.home.take_pending_intro_theme() {
                                         self.set_theme(&name);
                                     }
-                                    self.sync_mouse_capture(terminal)?;
                                     self.draw(terminal)?;
                                     None
                                 } else if self
@@ -1516,15 +1468,7 @@ impl App {
                                     }
                                     self.draw(terminal)?;
                                     action
-                                } else if hit_diff {
-                                    // The diff view file-list panel
-                                    // accepts clicks to select files,
-                                    // matching j/k navigation. Other
-                                    // diff regions are no-op.
-                                    let _ = self.home.clear_preview_selection();
-                                    self.home.handle_diff_click(mouse.column, mouse.row);
-                                    self.draw(terminal)?;
-                                    None
+
                                 } else if self.home.clear_preview_selection() {
                                     // A click on no surface at all still
                                     // dismisses a finalized highlight, and
@@ -1603,6 +1547,9 @@ impl App {
                                         changed |= self
                                             .home
                                             .handle_diff_hover(mouse.column, mouse.row);
+                                    }
+                                    if let Some(view) = self.home.structured_preview.as_mut() {
+                                        changed |= view.handle_hover(mouse.column, mouse.row);
                                     }
                                     changed
                                 }

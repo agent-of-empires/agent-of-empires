@@ -770,3 +770,43 @@ fn sidebar_collapse_button_and_strip_toggle() {
     assert!(env.view.footer_buttons.is_empty());
     assert!(!env.view.handle_sidebar_collapse_click(0, 0));
 }
+
+/// A diff modal owns the whole screen: a click over the stale list rect reaches it
+/// through `handle_dialog_click`, and the wheel must not scroll the diff underneath.
+#[test]
+#[serial]
+fn diff_modal_owns_clicks_and_wheel() {
+    let mut env = create_test_env_with_sessions(1);
+    setup_panes(&mut env);
+    let mut diff = crate::tui::diff::DiffView::test_default();
+    diff.total_lines = 100;
+    diff.visible_lines = 10;
+    diff.show_help = true;
+    env.view.diff_view = Some(diff);
+
+    assert!(
+        env.view.hit_diff(5, 5),
+        "the modal covers the list rect too"
+    );
+    assert!(!env.view.handle_scroll_down(5, 5));
+    assert_eq!(env.view.diff_view.as_ref().unwrap().scroll_offset, 0);
+    assert!(
+        env.view.handle_dialog_click(5, 5),
+        "the modal consumes the click"
+    );
+
+    let diff = env.view.diff_view.as_ref().unwrap();
+    assert!(!diff.has_modal(), "the click closes help");
+    assert!(
+        !env.view.hit_diff(5, 5),
+        "without a modal only the diff pane hits"
+    );
+    assert!(
+        env.view.handle_dialog_click(5, 5),
+        "the full-screen diff still owns clicks over the stale list rect"
+    );
+    assert!(
+        env.view.handle_scroll_down(5, 5),
+        "the wheel scrolls the diff again"
+    );
+}

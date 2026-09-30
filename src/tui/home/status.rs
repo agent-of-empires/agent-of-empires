@@ -320,16 +320,6 @@ impl HomeView {
         true
     }
 
-    /// Promote the next queued unknown-outcome id to a dialog, if any is
-    /// waiting. Called after one is resolved so a batch of them all get their
-    /// unlock prompt.
-    pub(super) fn promote_next_indeterminate(&mut self) {
-        let Some((id, message)) = self.pending_indeterminate_queue.first().cloned() else {
-            return;
-        };
-        self.open_indeterminate_dialog(&id, &message);
-    }
-
     fn open_indeterminate_dialog(&mut self, id: &str, message: &str) {
         self.pending_indeterminate_resolution = Some(id.to_string());
         self.confirm_dialog = Some(
@@ -503,27 +493,6 @@ impl HomeView {
         updated || command_error
     }
 
-    pub(super) fn auxiliary_presence_for_view(
-        &self,
-        instance: &Instance,
-    ) -> crate::session::PanePresence {
-        use crate::session::{AuxiliaryTarget, PanePresence};
-        match &self.view_mode {
-            ViewMode::Terminal => {
-                let target = if instance.is_sandboxed()
-                    && self.get_terminal_mode(&instance.id) == TerminalMode::Container
-                {
-                    AuxiliaryTarget::Container { index: 0 }
-                } else {
-                    AuxiliaryTarget::Host { index: 0 }
-                };
-                instance.auxiliary_presence(&target)
-            }
-            ViewMode::Tool(name) => instance.tool_presence(name),
-            ViewMode::Structured => PanePresence::Unknown,
-        }
-    }
-
     pub(in crate::tui) fn apply_daemon_status_update(
         &mut self,
         row: &crate::daemon::SessionResponse,
@@ -665,5 +634,36 @@ impl HomeView {
                 }
             }
         }
+    }
+
+    pub(super) fn auxiliary_presence_for_view(
+        &self,
+        instance: &Instance,
+    ) -> crate::session::PanePresence {
+        use crate::session::{AuxiliaryTarget, PanePresence};
+        match &self.view_mode {
+            ViewMode::Terminal => {
+                let target = if instance.is_sandboxed()
+                    && self.get_terminal_mode(&instance.id) == TerminalMode::Container
+                {
+                    AuxiliaryTarget::Container { index: 0 }
+                } else {
+                    AuxiliaryTarget::Host { index: 0 }
+                };
+                instance.auxiliary_presence(&target)
+            }
+            ViewMode::Tool(name) => instance.tool_presence(name),
+            ViewMode::Structured => PanePresence::Unknown,
+        }
+    }
+
+    /// Promote the next queued unknown-outcome id to a dialog, if any is
+    /// waiting. Called after one is resolved so a batch of them all get their
+    /// unlock prompt.
+    pub(super) fn promote_next_indeterminate(&mut self) {
+        let Some((id, message)) = self.pending_indeterminate_queue.first().cloned() else {
+            return;
+        };
+        self.open_indeterminate_dialog(&id, &message);
     }
 }

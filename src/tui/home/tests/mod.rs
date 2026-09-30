@@ -50,6 +50,7 @@ mod click_to_select;
 mod command_errors;
 mod creation_fence;
 mod default_attach_mode;
+mod dialog_mouse;
 mod divider_drag;
 mod footer_toolbar;
 mod fork_rename_dialogs;

@@ -37,6 +37,8 @@ describe("SessionGroupModal", () => {
     expect(container.textContent).toContain("alpha");
     expect(input.value).toBe("work/projects");
     expect(document.activeElement).toBe(input);
+    // The prompt, not the input or hint, describes the dialog.
+    screen.getByRole("dialog", { description: "Move alpha to a group." });
   });
 
   it.each([
