@@ -118,8 +118,10 @@ pub struct AppState {
     pub summary_semaphore: tokio::sync::Semaphore,
     /// Global cap on concurrent runtime-read connections, so a burst of clients
     /// cannot each hold a connection slot and a cloned row set while they wait
-    /// for the one sample in flight.
-    pub runtime_read_semaphore: tokio::sync::Semaphore,
+    /// for the one sample in flight. Shared rather than owned because the permit
+    /// is handed to the blocking sample itself, which outlives the connection
+    /// that was admitted against it.
+    pub runtime_read_semaphore: Arc<tokio::sync::Semaphore>,
     /// Suppression set for the startup-recovery cascade.
     pub recently_restarted: crate::session::recovery::RecentlyRestarted,
     /// Bumped under the `instances` write lock by any change an earlier disk snapshot

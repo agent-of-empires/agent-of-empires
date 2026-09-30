@@ -193,7 +193,7 @@ async fn run_read(
     owner: Owner,
     close_after_frames: bool,
 ) {
-    let Ok(_admitted) = state.runtime_read_semaphore.acquire().await else {
+    let Ok(admitted) = state.runtime_read_semaphore.clone().acquire_owned().await else {
         return;
     };
     let runtime = &RUNTIME;
@@ -202,15 +202,18 @@ async fn run_read(
     // assembly rather than what was observed.
     let observed_at = runtime.pinned_now.unwrap_or_else(Utc::now);
     let instances: Vec<Instance> = state.instances.read().await.clone();
-    // The flight is taken by the sample, not by this future. A connection
-    // whose budget expires while the blocking task is still on the disk drops
-    // this future, and a guard owned by it would release the sample while its
-    // work still ran, so the next connection would rescan beside it.
+    // Both guards belong to the sample, not to this future. A connection whose
+    // budget expires drops this future while the blocking task is still on the
+    // disk, and dropping a `JoinHandle` does not cancel it: the row set and the
+    // slot it was admitted against would otherwise outlive the thing that
+    // released them, and the next connection would rescan beside a sample this
+    // semaphore no longer counts.
     let sampled = tokio::task::spawn_blocking(move || {
         let _flight = runtime
             .flight
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _admitted = admitted;
         build_snapshot(runtime, &instances, owner, observed_at)
     })
     .await;
