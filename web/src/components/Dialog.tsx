@@ -15,7 +15,7 @@ export function Dialog({
   titleClassName = "text-text-primary",
   panelTestId,
   bodyClassName = "px-5 py-4",
-  describeBody = true,
+  describedBy = `${id}-desc`,
   onDismiss,
   footer,
   children,
@@ -25,8 +25,8 @@ export function Dialog({
   titleClassName?: string;
   panelTestId?: string;
   bodyClassName?: string;
-  /** Link the body as the dialog's description; turn off for form bodies. */
-  describeBody?: boolean;
+  /** Element id for aria-describedby: the body by default, a prompt id when the body has controls, or false. */
+  describedBy?: string | false;
   onDismiss: () => void;
   footer: ReactNode;
   children: ReactNode;
@@ -36,7 +36,7 @@ export function Dialog({
       role="dialog"
       aria-modal="true"
       aria-labelledby={`${id}-title`}
-      aria-describedby={describeBody ? `${id}-desc` : undefined}
+      aria-describedby={describedBy || undefined}
       data-testid={id}
       className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 animate-fade-in"
       onClick={onDismiss}

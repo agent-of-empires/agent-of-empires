@@ -129,29 +129,41 @@ fn live_resize_retry_due(
 /// Matches tmux's default `history-limit` and the VT grid's `SCROLLBACK_LINES`.
 const READING_CAPTURE_LINES: u16 = 2000;
 
-/// Map a tmux pane cursor onto the preview's output rect for live-send.
-///
-/// `cursor.x`/`y` are pane relative; on a composite, add the pane origin from
-/// [`crate::tmux::PaneCursor::composite_pane0`]. The renderer bottom-anchors captures that
-/// overflow `output`, so the row is `output.y + min(line_count, visible_rows) -
-/// pane_height + top + cursor.y`, while a short capture anchors at the top. That keeps the
-/// cursor on the same text row for the status-row offset (#3515) and the shorter-pane case
-/// (#2742). A hidden or out-of-bounds cursor yields `None`.
+/// Screen cell showing the input pane's `(0, 0)`, unclipped and possibly outside
+/// `view.pane`. On a composite this is pane 0's origin from
+/// [`crate::tmux::PaneCursor::composite_pane0`]. The pane is the capture's last
+/// `pane_height` lines and row `k` paints line `first_line + k`, so this holds at the live
+/// tail and scrolled back alike. Shared by the cursor painter and pointer mapping so a
+/// click on a painted cell reaches the same pane cell.
+pub(super) fn live_pane_origin(
+    view: super::PreviewTextView,
+    cursor: &crate::tmux::PaneCursor,
+) -> (i32, i32) {
+    let pane_top = view.total_lines as i32 - cursor.pane_height as i32 - view.first_line as i32;
+    let (left, top) = cursor
+        .composite_pane0
+        .map_or((0, 0), |rect| (rect.left as i32, rect.top as i32));
+    (
+        view.pane.x as i32 + left,
+        view.pane.y as i32 + pane_top + top,
+    )
+}
+
+/// Map a tmux pane cursor onto the painted preview for live-send, from
+/// [`live_pane_origin`]. That keeps the cursor on the same text row for the status-row
+/// offset (#3515) and the shorter-pane case (#2742). A hidden or out-of-bounds cursor
+/// yields `None`.
 pub(super) fn map_live_preview_cursor(
-    output: Rect,
-    visible_rows: usize,
-    line_count: usize,
+    view: super::PreviewTextView,
     cursor: crate::tmux::PaneCursor,
 ) -> Option<Position> {
     if !cursor.visible {
         return None;
     }
-    let anchor = line_count.min(visible_rows) as i32;
-    let (left, top) = cursor
-        .composite_pane0
-        .map_or((0, 0), |rect| (rect.left as i32, rect.top as i32));
-    let row = output.y as i32 + (anchor - cursor.pane_height as i32) + top + cursor.y as i32;
-    let col = output.x as i32 + left + cursor.x as i32;
+    let output = view.pane;
+    let (x, y) = live_pane_origin(view, &cursor);
+    let row = y + cursor.y as i32;
+    let col = x + cursor.x as i32;
     if row < output.y as i32
         || row >= output.y as i32 + output.height as i32
         || col < output.x as i32
@@ -2536,6 +2548,7 @@ impl HomeView {
 
     /// Paint the preview and refresh geometry used by selection and live-send.
     fn render_preview(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
+        self.structured_transcript_painted = false;
         if self.system_health_open {
             self.preview_outer_area = area;
             self.preview_area = area;
@@ -2824,6 +2837,7 @@ impl HomeView {
                     .as_mut()
                     .and_then(|v| v.render(frame, layout.output, theme));
                 self.structured_preview = view;
+                self.structured_transcript_painted = true;
                 self.preview_pane_area = layout.output;
                 if let Some(g) = geometry {
                     self.preview_visible_rows = g.text_area.height as usize;
@@ -3125,10 +3139,11 @@ impl HomeView {
     /// underline a link whose text is not itself a URL is indistinguishable from the
     /// output around it. It is the affordance for `preview_link_at`.
     pub(super) fn paint_preview_links(&self, buf: &mut Buffer) {
-        // Same guard as `preview_link_at`: an overlay swallows the click, so underlining
-        // behind it would advertise nothing, and the dialog paints over these cells,
-        // leaving the backend to wrap its own text in OSC 8.
-        if self.has_non_live_send_overlay() {
+        // Same guards as `preview_link_at`, so an underline always marks a clickable
+        // link: an overlay swallows the click (and paints over these cells, leaving the
+        // backend to wrap its own text in OSC 8), and transcript rows are not the
+        // capture's links.
+        if self.has_non_live_send_overlay() || self.structured_transcript_painted {
             return;
         }
         let view = self.preview_text_view;
@@ -3187,14 +3202,9 @@ impl HomeView {
         if !cursor.position_reliable {
             return None;
         }
-        // `total_lines` is the parsed line count of the capture painted this frame (set
-        // by `set_preview_text_view` just above), so the cursor anchors as the text did.
-        map_live_preview_cursor(
-            self.preview_pane_area,
-            self.preview_visible_rows,
-            self.preview_text_view.total_lines,
-            cursor,
-        )
+        // Set by `set_preview_text_view` for the capture painted this frame, so the
+        // cursor anchors as the text did.
+        map_live_preview_cursor(self.preview_text_view, cursor)
     }
 
     /// Apply the drag-select highlight to cells inside the preview pane, reversing
@@ -4158,6 +4168,15 @@ mod tests {
             (true, Some((7, t0)))
         );
     }
+    /// `output` painting the last rows of a `lines`-line capture.
+    fn tail_view(output: Rect, lines: usize) -> crate::tui::home::PreviewTextView {
+        crate::tui::home::PreviewTextView {
+            pane: output,
+            first_line: preview::compute_scroll(lines, output.height as usize, 0) as usize,
+            total_lines: lines,
+        }
+    }
+
     fn pane_cursor(x: u16, y: u16, visible: bool, pane_height: u16) -> crate::tmux::PaneCursor {
         crate::tmux::PaneCursor {
             x,
@@ -4274,7 +4293,7 @@ mod tests {
         let output = Rect::new(40, 5, 80, 24);
 
         // Steady-state single pane: the origin and anchoring delta are zero.
-        let single = map_live_preview_cursor(output, 24, 200, pane_cursor(3, 2, true, 24));
+        let single = map_live_preview_cursor(tail_view(output, 200), pane_cursor(3, 2, true, 24));
         assert_eq!(single, Some(Position::new(43, 7)));
 
         // A top border row makes the composite one row taller than the visible output and
@@ -4287,7 +4306,7 @@ mod tests {
             width: 79,
             height: 24,
         });
-        let composited = map_live_preview_cursor(output, 24, 200, split);
+        let composited = map_live_preview_cursor(tail_view(output, 200), split);
         assert_eq!(composited, Some(Position::new(44, 7)));
     }
 
@@ -4298,11 +4317,11 @@ mod tests {
         // row, and one in the clipped top maps out and drops.
         let output = Rect::new(0, 0, 80, 10);
         assert_eq!(
-            map_live_preview_cursor(output, 10, 100, pane_cursor(0, 23, true, 24)),
+            map_live_preview_cursor(tail_view(output, 100), pane_cursor(0, 23, true, 24)),
             Some(Position::new(0, 9)),
         );
         assert_eq!(
-            map_live_preview_cursor(output, 10, 100, pane_cursor(0, 5, true, 24)),
+            map_live_preview_cursor(tail_view(output, 100), pane_cursor(0, 5, true, 24)),
             None,
         );
     }
@@ -4317,19 +4336,19 @@ mod tests {
         // to overflow the 24-row output). Cursor on the pane's last row (y=22).
         let short = pane_cursor(5, 22, true, 23);
         assert_eq!(
-            map_live_preview_cursor(output, 24, 23, short),
+            map_live_preview_cursor(tail_view(output, 23), short),
             Some(Position::new(5, 22)),
             "top-anchored capture must not drift the cursor down a row",
         );
         // The buggy formula (`visible_rows - pane_height`) would place it at
         // row 23; assert the fix does not.
         assert_ne!(
-            map_live_preview_cursor(output, 24, 23, short),
+            map_live_preview_cursor(tail_view(output, 23), short),
             Some(Position::new(5, 23)),
         );
         // Cursor on the pane's top row lands on the output's top row.
         assert_eq!(
-            map_live_preview_cursor(output, 24, 23, pane_cursor(0, 0, true, 23)),
+            map_live_preview_cursor(tail_view(output, 23), pane_cursor(0, 0, true, 23)),
             Some(Position::new(0, 0)),
         );
     }
@@ -4339,12 +4358,12 @@ mod tests {
         let output = Rect::new(0, 0, 80, 24);
         // DECTCEM-hidden cursor: nothing to paint.
         assert_eq!(
-            map_live_preview_cursor(output, 24, 200, pane_cursor(3, 2, false, 24)),
+            map_live_preview_cursor(tail_view(output, 200), pane_cursor(3, 2, false, 24)),
             None,
         );
         // Column past the output width is dropped rather than clamped.
         assert_eq!(
-            map_live_preview_cursor(output, 24, 200, pane_cursor(80, 2, true, 24)),
+            map_live_preview_cursor(tail_view(output, 200), pane_cursor(80, 2, true, 24)),
             None,
         );
     }

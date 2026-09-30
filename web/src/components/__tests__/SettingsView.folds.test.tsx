@@ -66,7 +66,7 @@ vi.mock("../../lib/api", () => ({
   fetchPlugins: vi.fn(() => Promise.resolve(null)),
   fetchSettings: vi.fn(() => Promise.resolve({ acp: {}, sandbox: {}, worktree: {} })),
   getSettingsSchema: vi.fn(() => Promise.resolve(MOCK_SCHEMA)),
-  updateProfileSettings: vi.fn(() => Promise.resolve(true)),
+  updateSettings: vi.fn(() => Promise.resolve(true)),
   setDefaultProfile: vi.fn(() => Promise.resolve(true)),
   createProfile: vi.fn(() => Promise.resolve(true)),
   renameProfile: vi.fn(() => Promise.resolve(true)),
@@ -191,29 +191,44 @@ describe("Settings Advanced fold", () => {
     commit(fieldInputByLabel(container, "Auto-stop idle workers (s)", "number"), "28800");
 
     await waitFor(() =>
-      expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith("main", {
-        acp: { max_concurrent_workers: 50 },
-      }),
+      expect(vi.mocked(api.updateSettings)).toHaveBeenCalledWith(
+        {
+          acp: { max_concurrent_workers: 50 },
+        },
+        "main",
+      ),
     );
-    expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith("main", {
-      acp: { silent_orphan_grace_secs: 240 },
-    });
-    expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith("main", {
-      acp: { auto_stop_idle_secs: 28800 },
-    });
+    expect(vi.mocked(api.updateSettings)).toHaveBeenCalledWith(
+      {
+        acp: { silent_orphan_grace_secs: 240 },
+      },
+      "main",
+    );
+    expect(vi.mocked(api.updateSettings)).toHaveBeenCalledWith(
+      {
+        acp: { auto_stop_idle_secs: 28800 },
+      },
+      "main",
+    );
 
     // High-level controls outside the fold save the same way.
     commit(fieldInputByLabel(container, "History cap (events)", "number"), "500");
     clickToggle(container, "Auto-resume after rate limit");
 
     await waitFor(() =>
-      expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith("main", {
-        acp: { replay_events: 500 },
-      }),
+      expect(vi.mocked(api.updateSettings)).toHaveBeenCalledWith(
+        {
+          acp: { replay_events: 500 },
+        },
+        "main",
+      ),
     );
-    expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith("main", {
-      acp: { rate_limit_auto_resume: true },
-    });
+    expect(vi.mocked(api.updateSettings)).toHaveBeenCalledWith(
+      {
+        acp: { rate_limit_auto_resume: true },
+      },
+      "main",
+    );
   });
 
   it("expands the worktree fold and saves every advanced field", async () => {
@@ -230,13 +245,19 @@ describe("Settings Advanced fold", () => {
     clickToggle(container, "Init Submodules");
 
     await waitFor(() =>
-      expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith("main", {
-        worktree: { workspace_path_template: "../wt-{branch}" },
-      }),
+      expect(vi.mocked(api.updateSettings)).toHaveBeenCalledWith(
+        {
+          worktree: { workspace_path_template: "../wt-{branch}" },
+        },
+        "main",
+      ),
     );
-    expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith("main", {
-      worktree: { delete_branch_on_cleanup: true },
-    });
+    expect(vi.mocked(api.updateSettings)).toHaveBeenCalledWith(
+      {
+        worktree: { delete_branch_on_cleanup: true },
+      },
+      "main",
+    );
   });
 
   it("saves sandbox advanced fields, including the derived list validators", async () => {
@@ -259,16 +280,25 @@ describe("Settings Advanced fold", () => {
     addListItem(container, "Volume ignores", "node_modules");
 
     await waitFor(() =>
-      expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith("main", {
-        sandbox: { cpu_limit: "4" },
-      }),
+      expect(vi.mocked(api.updateSettings)).toHaveBeenCalledWith(
+        {
+          sandbox: { cpu_limit: "4" },
+        },
+        "main",
+      ),
     );
-    expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith("main", {
-      sandbox: { environment: ["FOO=bar"] },
-    });
-    expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith("main", {
-      sandbox: { port_mappings: ["3000:3000"] },
-    });
+    expect(vi.mocked(api.updateSettings)).toHaveBeenCalledWith(
+      {
+        sandbox: { environment: ["FOO=bar"] },
+      },
+      "main",
+    );
+    expect(vi.mocked(api.updateSettings)).toHaveBeenCalledWith(
+      {
+        sandbox: { port_mappings: ["3000:3000"] },
+      },
+      "main",
+    );
   });
 
   // Regression: the mount-time fetchProfiles resolution flips selectedProfile from its "" seed to the default.
