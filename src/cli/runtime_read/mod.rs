@@ -117,11 +117,12 @@ pub fn classify(command: Option<&Commands>) -> Option<ScopedCommand<'_>> {
 /// Every code a scoped read can report, and the only vocabulary the Contract
 /// Pack's phase/code/exit table may use.
 ///
-/// The two lists are held together from both ends. Each constructor below
-/// asserts that the code it was handed is in this set, so a new emitter cannot
-/// introduce a code the table does not describe; the pack verifier requires
-/// every code in its table to be in this set, so the table cannot describe a
-/// code this half cannot emit.
+/// The two lists are held together from both ends, and in a debug build only:
+/// every constructor below asserts in a `debug_assert!` that the code it was
+/// handed is in this set, so a new emitter cannot introduce a code the table
+/// does not describe, and the pack verifier is behind the pack's own
+/// `#[cfg(debug_assertions)]`, so the table cannot describe a code this half
+/// cannot emit. A release build checks neither.
 pub(crate) const EMITTABLE_CODES: &[&str] = &[
     // `parser_error` is clap's, raised before any read begins.
     "parser_error",
@@ -153,7 +154,16 @@ pub(crate) const EMITTABLE_CODES: &[&str] = &[
 
 /// The code a caller-chosen-exit refusal carries: the renderer refused on the
 /// user's own state, not on the wire.
-pub(crate) const RENDERER_INTERNAL: &str = "renderer_internal";
+pub const RENDERER_INTERNAL: &str = "renderer_internal";
+
+/// The sentence a wire code is reported under, in the one place it is spelled.
+/// Three callers report `renderer_internal` (this module's own refusal, the
+/// renderer's failed serialisation, and a failed write of the answer to stdout)
+/// and the first of them reports a code the caller chose, so a literal in any
+/// of them is a second spelling waiting to drift.
+pub fn read_sentence(code: &str) -> String {
+    format!("daemon read: {code}\n")
+}
 
 #[derive(Debug)]
 pub(crate) struct ReadFailure {
@@ -228,13 +238,6 @@ impl ReadFailure {
         failure
     }
 
-    /// The same refusal from a constant, for the callers whose sentence is
-    /// fixed at compile time. One spelling, so there is a single construction
-    /// path and the owned field has exactly one writer.
-    pub(crate) fn exit_const(exit: i32, message: &'static str) -> Self {
-        Self::exit_with(exit, message.to_string())
-    }
-
     fn exit_with(exit: i32, message: String) -> Self {
         Self::refuse(RENDERER_INTERNAL, exit, message)
     }
@@ -255,7 +258,7 @@ impl From<ReadFailure> for ReadOutcome {
     fn from(error: ReadFailure) -> Self {
         let message = match error.exact {
             Some(exact) => exact,
-            None => format!("daemon read: {}\n", error.code),
+            None => read_sentence(error.code),
         };
         Self {
             stdout: None,

@@ -295,7 +295,10 @@ fn emit_read_outcome(outcome: cli::runtime_read::ReadOutcome) -> i32 {
             .and_then(|()| std::io::stdout().lock().flush())
             .is_err()
         {
-            eprintln!("daemon read: renderer_internal");
+            eprint!(
+                "{}",
+                cli::runtime_read::read_sentence(cli::runtime_read::RENDERER_INTERNAL)
+            );
             return 1;
         }
     }

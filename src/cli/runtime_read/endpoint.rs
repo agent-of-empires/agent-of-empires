@@ -63,8 +63,9 @@ pub(crate) fn read_request_source(cli: &super::Cli) -> ReadRequestSource {
 pub(crate) enum SelectedEndpoint {
     Local,
     Http {
-        /// Boxed: the local branch carries no data, and a bare 224-byte request
-        /// would make every `SelectedEndpoint` that wide.
+        /// Boxed: the local branch carries no data, so the enum is as wide as
+        /// the request it has to hold or it is wider than every other value
+        /// this function returns.
         request: Box<tokio_tungstenite::tungstenite::handshake::client::Request>,
     },
 }

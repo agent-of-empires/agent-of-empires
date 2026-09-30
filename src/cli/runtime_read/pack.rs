@@ -272,9 +272,12 @@ const TABLE: &[(&str, &[&str], &[u8])] = &[
         &[1, 4],
     ),
     ("close", &["close_timeout"], &[4]),
-    // The renderer chooses the exit itself: an internal fault leaves 1, and a
-    // refusal on the user's own state, no tmux session to read or a pane that
-    // is not an Agent of Empires session, leaves 2.
+    // The renderer chooses the exit itself, and 1 is what every refusal on the
+    // user's own state leaves: an internal JSON fault, an empty profile name,
+    // and the two tmux refusals, no session to read and a pane that is not an
+    // Agent of Empires session. The row admits 2 as well for the one case that
+    // leaves it, a profile variable that is not UTF-8, which clap refuses with
+    // its own exit and this half mirrors.
     ("renderer", &["renderer_internal"], &[1, 2]),
 ];
 
