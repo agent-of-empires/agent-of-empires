@@ -627,6 +627,61 @@ pub async fn create_session(
         Err(rej) => return rej.into_response(),
     };
 
+    if let Some(key) = body.idempotency_key.as_deref() {
+        if key.is_empty() || key.len() > IDEMPOTENCY_KEY_MAX_LEN {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "validation_failed",
+                format!("idempotency_key must be 1-{IDEMPOTENCY_KEY_MAX_LEN} characters"),
+            );
+        }
+    }
+
+    // Idempotency first: a known key is answered from its result, replayed failure or
+    // restart fence before any validation that reads mutable state (profiles, agents,
+    // projects), which could otherwise turn a retry of an unknown outcome into a verdict.
+    // The per-key lock is held across the check-and-create so two concurrent requests
+    // sharing a new key cannot both scan-miss and create.
+    let _idempotency_guard = if let Some(key) = body.idempotency_key.as_deref() {
+        let lock = state.idempotency_lock(key).await;
+        let guard = lock.lock_owned().await;
+        let existing = {
+            let instances = state.instances.read().await;
+            find_by_idempotency_key(&instances, key).map(|inst| {
+                SessionResponse::from_instance(inst, crate::claude_settings::read_tui_fullscreen())
+            })
+        };
+        if let Some(resp) = existing {
+            return (StatusCode::OK, Json(resp)).into_response();
+        }
+        if let Some(failure) = state.create_progress.recent_failure(key) {
+            return api_error(failure.status, failure.code, failure.message);
+        }
+        if body
+            .retry_origin
+            .as_deref()
+            .is_some_and(|origin| origin != state.create_progress.boot_id())
+        {
+            return api_error(
+                StatusCode::CONFLICT,
+                "create_outcome_unknown",
+                "The server restarted before confirming this session, so whether it was created is unknown. Check the session list before launching it again.",
+            );
+        }
+        // Forgetting a live failure would let its retry run the create again, so a full
+        // replay map refuses new keyed creates instead.
+        if !state.create_progress.has_failure_capacity() {
+            return api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "create_failures_full",
+                "Too many recent failed session creates; try again later.",
+            );
+        }
+        Some(guard)
+    } else {
+        None
+    };
+
     if state.cityhall_mode {
         // CityHall sessions are server-derived and locked down. Every
         // client-supplied field that could escape the mode is neutralized (#7).
@@ -939,59 +994,6 @@ pub async fn create_session(
             return api_error(StatusCode::BAD_REQUEST, "validation_failed", msg);
         }
     }
-
-    if let Some(key) = body.idempotency_key.as_deref() {
-        if key.is_empty() || key.len() > IDEMPOTENCY_KEY_MAX_LEN {
-            return api_error(
-                StatusCode::BAD_REQUEST,
-                "validation_failed",
-                format!("idempotency_key must be 1-{IDEMPOTENCY_KEY_MAX_LEN} characters"),
-            );
-        }
-    }
-
-    // Idempotency: hold a per-key lock across the check-and-create so two
-    // concurrent requests sharing a new key cannot both scan-miss and create.
-    // Only requests sharing this exact key serialize.
-    let _idempotency_guard = if let Some(key) = body.idempotency_key.as_deref() {
-        let lock = state.idempotency_lock(key).await;
-        let guard = lock.lock_owned().await;
-        let existing = {
-            let instances = state.instances.read().await;
-            find_by_idempotency_key(&instances, key).map(|inst| {
-                SessionResponse::from_instance(inst, crate::claude_settings::read_tui_fullscreen())
-            })
-        };
-        if let Some(resp) = existing {
-            return (StatusCode::OK, Json(resp)).into_response();
-        }
-        if let Some(failure) = state.create_progress.recent_failure(key) {
-            return api_error(failure.status, failure.code, failure.message);
-        }
-        if body
-            .retry_origin
-            .as_deref()
-            .is_some_and(|origin| origin != state.create_progress.boot_id())
-        {
-            return api_error(
-                StatusCode::CONFLICT,
-                "create_outcome_unknown",
-                "The server restarted before confirming this session, so whether it was created is unknown. Check the session list before launching it again.",
-            );
-        }
-        // Forgetting a live failure would let its retry run the create again, so a full
-        // replay map refuses new keyed creates instead.
-        if !state.create_progress.has_failure_capacity() {
-            return api_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "create_failures_full",
-                "Too many recent failed session creates; try again later.",
-            );
-        }
-        Some(guard)
-    } else {
-        None
-    };
 
     let profile = body.profile.unwrap_or_else(|| state.profile.clone());
     // Registered after the idempotency lock, so a retry waiting on it cannot
