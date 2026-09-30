@@ -123,6 +123,7 @@ pub(crate) struct WorktreeJson {
     pub(crate) branch: String,
     pub(crate) main_repo_path: String,
     pub(crate) managed_by_aoe: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) base_branch: Option<String>,
 }
 
@@ -462,6 +463,31 @@ mod tests {
         let at = |value: &str| display_timestamp(value.parse().expect("an instant"));
         assert_eq!(at("2026-02-03T04:05:06.25Z"), "2026-02-03T04:05:06.250Z");
         assert_eq!(at("2026-02-03T04:05:06Z"), "2026-02-03T04:05:06Z");
+    }
+
+    /// An optional field the row has no value for is left out, as every other
+    /// optional field in the struct is. A `null` here would make a consumer
+    /// carry a branch that does not exist.
+    #[test]
+    fn a_worktree_without_a_base_branch_emits_no_key() {
+        let row = |base_branch| WorktreeJson {
+            branch: "feature".into(),
+            main_repo_path: "/repo".into(),
+            managed_by_aoe: true,
+            base_branch,
+        };
+        let keys = |value: Option<String>| {
+            let text = serde_json::to_string(&row(value)).expect("encodes");
+            serde_json::from_str::<serde_json::Value>(&text).expect("is JSON")
+        };
+        assert!(
+            keys(None).get("base_branch").is_none(),
+            "an absent base branch is omitted, not null"
+        );
+        assert_eq!(
+            keys(Some("main".into()))["base_branch"],
+            serde_json::json!("main")
+        );
     }
 
     #[test]
