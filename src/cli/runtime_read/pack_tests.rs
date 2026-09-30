@@ -96,10 +96,16 @@ fn every_nominal_transcript_decodes_and_validates() {
             .unwrap_or_else(|code| panic!("case {} Hello is {code}", case.case_id));
         validate_snapshot(&snapshot)
             .unwrap_or_else(|code| panic!("case {} Snapshot is {code}", case.case_id));
-        if case.transport != "uds" {
-            validate_cross_message(&hello, &snapshot, None)
-                .unwrap_or_else(|code| panic!("case {} cross-message is {code}", case.case_id));
-        }
+        // The uds transcript is the one that declares a local owner, so it is
+        // the one the local arm of the cross-message check applies to. It used
+        // to be skipped for that reason, which left the arm cold; the uid is
+        // the one the recorded Hello carries, read from that Hello rather than
+        // written down here, so the case cannot disagree with itself.
+        let local_uid = (case.transport == "uds")
+            .then_some(hello.owner.uid)
+            .flatten();
+        validate_cross_message(&hello, &snapshot, local_uid)
+            .unwrap_or_else(|code| panic!("case {} cross-message is {code}", case.case_id));
         checked += 1;
     }
     assert!(
