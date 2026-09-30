@@ -3331,7 +3331,7 @@ impl HomeView {
         self.confirm_dialog = Some(ConfirmDialog::new(
             "Kill Terminal",
             &message,
-            "stop_terminal",
+            "stop_auxiliary",
         ));
     }
 

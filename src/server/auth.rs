@@ -4,7 +4,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use axum::{
-    extract::{Request, State},
+    extract::{ConnectInfo, Request, State},
     http::{header, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
@@ -480,25 +480,32 @@ async fn run_passphrase_wall(
 
 pub async fn auth_middleware(
     State(state): State<Arc<AppState>>,
-    peer: Option<axum::Extension<super::peer::ConnectionPeer>>,
-
     mut request: Request,
     next: Next,
 ) -> Response {
-    // The acceptor stamps the peer identity on the Unix listener from
-    // SO_PEERCRED. Upstream's token, elevation and passphrase logic still runs
-    // for such a caller; this only records who it was, so handlers that gate a
-    // secret-bearing capability can tell the socket's owner from any other
-    // loopback process.
-    let peer_uid = match peer {
-        Some(axum::Extension(super::peer::ConnectionPeer::UnixOwner { uid })) => Some(uid),
-        _ => None,
-    };
-    // A Unix-socket peer carries no address, only a kernel-attested uid; a
-    // request with neither is a non-local caller, not a failed request.
-    let addr = match peer {
-        Some(axum::Extension(super::peer::ConnectionPeer::Tcp(addr))) => addr,
-        _ => SocketAddr::from(([0, 0, 0, 0], 0)),
+    // The listeners stamp the connection's identity as a `ConnectInfo`: the
+    // Unix one from SO_PEERCRED, the TCP one from the accepted address. It is
+    // read off the request rather than taken as an extractor, because the two
+    // listeners stamp different payloads and a required extractor would fail
+    // on the one that stamps the other.
+    let (peer_uid, addr) = match request
+        .extensions()
+        .get::<ConnectInfo<super::peer::ConnectionPeer>>()
+    {
+        Some(ConnectInfo(super::peer::ConnectionPeer::UnixOwner { uid })) => {
+            (Some(*uid), SocketAddr::from(([0, 0, 0, 0], 0)))
+        }
+        Some(ConnectInfo(super::peer::ConnectionPeer::Tcp(addr))) => (None, *addr),
+        // A request with no stamped identity is a non-local caller, not a
+        // failed request.
+        None => (
+            None,
+            request
+                .extensions()
+                .get::<ConnectInfo<SocketAddr>>()
+                .map(|ConnectInfo(addr)| *addr)
+                .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0))),
+        ),
     };
     let client_ip = resolve_client_ip(addr, request.headers(), state.behind_tunnel);
 
