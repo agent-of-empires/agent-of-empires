@@ -300,8 +300,13 @@ mod tests {
     fn a_dead_leader_does_not_hide_a_live_member_of_its_group() {
         // `setsid` makes the process lead a fresh group, so killing it leaves
         // that group populated by the background child.
-        let mut leader = std::process::Command::new("setsid")
-            .args(["/bin/sh", "-c", "sleep 30 & echo $!; wait"])
+        let mut command = std::process::Command::new("/bin/sh");
+        command.args(["-c", "sleep 30 & echo $!; wait"]);
+        // The shell leads its own group, so killing it leaves that group
+        // populated by the background child. The crate's own helper does this
+        // on both supported targets; `setsid` would only exist on Linux.
+        crate::process::configure_process_group_of(&mut command);
+        let mut leader = command
             .stdout(std::process::Stdio::piped())
             .spawn()
             .expect("spawn a group leader with a background child");
