@@ -455,7 +455,6 @@ impl HomeView {
                             .retain(|id, _| ids.contains(id.as_str()));
                         metadata_changed |= count != self.structured_pending_approvals.len();
                     }
-                    metadata_changed |= self.apply_pending_archive_cursor();
                     if !reload_failed {
                         metadata_changed |= self.session_feed.mark_snapshot_applied(snapshot);
                     }
@@ -464,6 +463,10 @@ impl HomeView {
                         self.teardown_live_send();
                         self.pending_paste = None;
                     }
+                    // Last: the native teardown reseats the cursor even when no
+                    // live send was active, so the archive's placement has to be
+                    // the final word or it selects the row that just sank.
+                    metadata_changed |= self.apply_pending_archive_cursor();
                     snapshot_applied = true;
                     metadata_changed
                 }
