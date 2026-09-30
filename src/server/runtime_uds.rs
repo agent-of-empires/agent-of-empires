@@ -989,5 +989,9 @@ fn process_liveness(probe: &MarkerProbe) -> ProcessLiveness {
     }
 }
 
-#[cfg(test)]
+// `publish` returns `unsupported_platform` before it touches the filesystem,
+// so nothing in this module can pass off Linux. The macOS job compiles and
+// runs the lib target, and a `None` namespace that returns early would report
+// those tests as passed.
+#[cfg(all(test, target_os = "linux"))]
 mod tests;

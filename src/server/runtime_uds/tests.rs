@@ -35,21 +35,11 @@ fn client_admits(path: &Path) -> bool {
 }
 
 /// The first base whose whole ancestor chain is private enough for the client's
-/// walk. `None` means this host has no such directory, which is reported rather
-/// than silently passed.
+/// walk. `None` means this host has no such directory, which every caller
+/// treats as a failure.
 fn namespace() -> Option<Namespace> {
     let (base, _guard) = crate::server::test_support::trusted_namespace()?;
     Some(Namespace { base, _guard })
-}
-
-fn namespace_or_skip() -> Option<Namespace> {
-    match namespace() {
-        Some(namespace) => Some(namespace),
-        None => {
-            eprintln!("skipping: no private ancestor chain exists for the trusted app dir walk");
-            None
-        }
-    }
 }
 
 fn app_dir(namespace: &Namespace) -> PathBuf {
@@ -87,9 +77,7 @@ fn retained_marker(dir: &Path, name: &str) {
 #[tokio::test]
 #[serial_test::serial]
 async fn publication_writes_the_pair_the_client_parses() {
-    let Some(namespace) = namespace_or_skip() else {
-        return;
-    };
+    let namespace = namespace().expect("a private ancestor chain exists on this host");
     let dir = app_dir(&namespace);
     let published = publish().expect("the namespace is free");
 
@@ -140,9 +128,7 @@ async fn publication_writes_the_pair_the_client_parses() {
 #[tokio::test]
 #[serial_test::serial]
 async fn a_live_publication_is_never_replaced() {
-    let Some(namespace) = namespace_or_skip() else {
-        return;
-    };
+    let namespace = namespace().expect("a private ancestor chain exists on this host");
     let dir = app_dir(&namespace);
     let first = publish().expect("the namespace is free");
     let before = std::fs::read(dir.join(POSTBIND_FILE)).expect("postbind");
@@ -168,9 +154,7 @@ async fn a_live_publication_is_never_replaced() {
 #[tokio::test]
 #[serial_test::serial]
 async fn retained_dead_artifacts_are_reaped_before_publishing() {
-    let Some(namespace) = namespace_or_skip() else {
-        return;
-    };
+    let namespace = namespace().expect("a private ancestor chain exists on this host");
     let dir = app_dir(&namespace);
     retained_marker(&dir, PREBIND_FILE);
     retained_marker(&dir, POSTBIND_FILE);
@@ -204,9 +188,7 @@ async fn retained_dead_artifacts_are_reaped_before_publishing() {
 #[tokio::test]
 #[serial_test::serial]
 async fn a_live_temporary_marker_stops_publication() {
-    let Some(namespace) = namespace_or_skip() else {
-        return;
-    };
+    let namespace = namespace().expect("a private ancestor chain exists on this host");
     let dir = app_dir(&namespace);
     let identity = runtime_ws::identity();
     let temporary = format!("{POSTBIND_FILE}.tmp.{}", identity.prebind_instance_id);
@@ -246,9 +228,7 @@ async fn a_live_temporary_marker_stops_publication() {
 #[tokio::test]
 #[serial_test::serial]
 async fn an_unreadable_proc_entry_refuses_publication_and_keeps_the_artifacts() {
-    let Some(namespace) = namespace_or_skip() else {
-        return;
-    };
+    let namespace = namespace().expect("a private ancestor chain exists on this host");
     let dir = app_dir(&namespace);
     let identity = runtime_ws::identity();
     let marker = serde_json::json!({
@@ -289,9 +269,7 @@ async fn an_unreadable_proc_entry_refuses_publication_and_keeps_the_artifacts() 
 #[test]
 #[serial_test::serial]
 fn a_foreign_schema_marker_is_reaped_only_from_a_writer_proven_dead() {
-    let Some(namespace) = namespace_or_skip() else {
-        return;
-    };
+    let namespace = namespace().expect("a private ancestor chain exists on this host");
     let dir = app_dir(&namespace);
     let pid = std::process::id();
     let live = process_start_identity(pid).expect("this process has a start identity");
@@ -357,9 +335,7 @@ fn a_foreign_schema_marker_is_reaped_only_from_a_writer_proven_dead() {
 #[tokio::test]
 #[serial_test::serial]
 async fn shutdown_retracts_only_its_own_publication() {
-    let Some(namespace) = namespace_or_skip() else {
-        return;
-    };
+    let namespace = namespace().expect("a private ancestor chain exists on this host");
     let dir = app_dir(&namespace);
     drop(publish().expect("the namespace is free"));
     for name in [PREBIND_FILE, POSTBIND_FILE, SOCKET_FILE] {
@@ -376,9 +352,7 @@ async fn shutdown_retracts_only_its_own_publication() {
 #[tokio::test]
 #[serial_test::serial]
 async fn shutdown_leaves_a_foreign_publication_in_place() {
-    let Some(namespace) = namespace_or_skip() else {
-        return;
-    };
+    let namespace = namespace().expect("a private ancestor chain exists on this host");
     let dir = app_dir(&namespace);
     let mut published = publish().expect("the namespace is free");
     let foreign = serde_json::json!({
@@ -407,9 +381,7 @@ async fn shutdown_leaves_a_foreign_publication_in_place() {
 #[tokio::test]
 #[serial_test::serial]
 async fn the_held_lock_admits_a_client_and_refuses_a_publisher() {
-    let Some(namespace) = namespace_or_skip() else {
-        return;
-    };
+    let namespace = namespace().expect("a private ancestor chain exists on this host");
     let dir = app_dir(&namespace);
     let _published = publish().expect("the namespace is free");
     let client = open_client_lock(&dir);
@@ -500,9 +472,7 @@ fn process_identity_distinguishes_live_from_retained() {
 #[test]
 #[serial_test::serial]
 fn a_marker_this_half_cannot_prove_dead_is_never_reaped() {
-    let Some(namespace) = namespace_or_skip() else {
-        return;
-    };
+    let namespace = namespace().expect("a private ancestor chain exists on this host");
     let dir = app_dir(&namespace);
     let boot = boot_id().expect("boot id");
     for identity in [
@@ -547,9 +517,7 @@ fn clone_probe(probe: &MarkerProbe) -> MarkerProbe {
 #[test]
 #[serial_test::serial]
 fn the_publisher_only_publishes_into_a_trusted_chain() {
-    let Some(namespace) = namespace_or_skip() else {
-        return;
-    };
+    let namespace = namespace().expect("a private ancestor chain exists on this host");
     assert!(client_admits(&app_dir(&namespace)));
 
     let widened = namespace.base.path().join("widened");
@@ -575,9 +543,7 @@ fn the_publisher_only_publishes_into_a_trusted_chain() {
 #[test]
 #[serial_test::serial]
 fn a_symlinked_prefix_resolves_to_the_directory_it_verified() {
-    let Some(namespace) = namespace_or_skip() else {
-        return;
-    };
+    let namespace = namespace().expect("a private ancestor chain exists on this host");
     let real = namespace.base.path().join("real");
     let app = real.join(crate::session::APP_DIR_NAME_XDG);
     std::fs::create_dir_all(&app).expect("app dir under the real prefix");
@@ -899,9 +865,7 @@ fn the_hosts_posix_acl_capability_is_reported() {
 #[test]
 #[serial_test::serial]
 fn a_symlinked_final_component_is_still_refused() {
-    let Some(namespace) = namespace_or_skip() else {
-        return;
-    };
+    let namespace = namespace().expect("a private ancestor chain exists on this host");
     let real = namespace.base.path().join("real");
     std::fs::create_dir_all(&real).expect("real dir");
     let link = namespace.base.path().join(crate::session::APP_DIR_NAME_XDG);
@@ -919,9 +883,7 @@ fn a_symlinked_final_component_is_still_refused() {
 #[test]
 #[serial_test::serial]
 fn a_symlinked_prefix_to_a_world_writable_directory_is_refused() {
-    let Some(namespace) = namespace_or_skip() else {
-        return;
-    };
+    let namespace = namespace().expect("a private ancestor chain exists on this host");
     let open_dir = namespace.base.path().join("open");
     std::fs::create_dir_all(&open_dir).expect("open dir");
     use std::os::unix::fs::PermissionsExt;
@@ -944,9 +906,7 @@ fn a_symlinked_prefix_to_a_world_writable_directory_is_refused() {
 #[tokio::test]
 #[serial_test::serial]
 async fn retraction_succeeds_while_a_client_holds_the_namespace() {
-    let Some(namespace) = namespace_or_skip() else {
-        return;
-    };
+    let namespace = namespace().expect("a private ancestor chain exists on this host");
     let dir = app_dir(&namespace);
     let mut published = publish().expect("the namespace is free");
     let client = open_client_lock(&dir);

@@ -1108,15 +1108,17 @@ mod tests {
     /// The mode exists to leave as little as possible on disk, and the local
     /// read is a lock, two markers and a 0600 socket it refuses to serve, so
     /// nothing may be published and nothing left behind to retract.
+    // `publish_runtime_uds` returns `unsupported_platform` off Linux, so there
+    // is nothing here to assert, and a body that returns early would report a
+    // pass.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     #[serial_test::serial]
     async fn cityhall_mode_publishes_no_local_runtime_read() {
         use crate::server::runtime_uds::{LOCK_FILE, POSTBIND_FILE, PREBIND_FILE, SOCKET_FILE};
 
-        let Some((base, _env)) = crate::server::test_support::trusted_namespace() else {
-            eprintln!("skipping: no private ancestor chain exists for the trusted app dir walk");
-            return;
-        };
+        let (base, _env) = crate::server::test_support::trusted_namespace()
+            .expect("a private ancestor chain exists on this host");
         let app_dir = base.path().join(crate::session::APP_DIR_NAME_XDG);
         std::fs::create_dir_all(&app_dir).expect("app dir");
         let state = crate::server::test_support::build_test_app_state_cityhall(Vec::new());

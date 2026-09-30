@@ -319,7 +319,7 @@ pub async fn reload_tmux_applied_for_test(
 /// A temporary XDG base whose whole ancestor chain satisfies the client's
 /// trusted walk, with the environment bound to it, so a test that publishes or
 /// reads never touches the developer's real app directory. `None` means this
-/// host has no such chain, which a caller reports rather than passes over.
+/// host has no such chain, which every caller treats as a failure.
 #[cfg(test)]
 pub(crate) fn trusted_namespace() -> Option<(tempfile::TempDir, RuntimeEnvGuard)> {
     let euid = unsafe { libc::geteuid() };
