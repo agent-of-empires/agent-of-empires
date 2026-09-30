@@ -201,8 +201,7 @@ pub(crate) fn host_hook_disclosure(
 
     // Resolved through the installer's own resolver, so status_map overrides
     // apply and the status events drop out with the setting. An event can
-    // install both an identity extractor and a status writer, so both effects
-    // are disclosed; an event with neither installs nothing and is not listed.
+    // carry identity, usage, and status commands, which are all disclosed.
     let mut status_events = 0;
     // A Codex that turned its hooks off installs none, so none is listed; the
     // target stays because the installer still opens the file.
@@ -220,7 +219,7 @@ pub(crate) fn host_hook_disclosure(
             }
             if event.usage {
                 effects.push(format!(
-                    "__usage-event{}",
+                    "runs aoe __usage-event{}",
                     crate::hooks::identity_publisher_arg(event.publisher)
                 ));
             }
@@ -1371,17 +1370,24 @@ mod tests {
                 .flat_map(|(_, effect)| effect.split(", and ").map(str::to_string))
                 .collect::<Vec<_>>();
 
-            // Every disclosed effect names one command, an identity effect and a
-            // status effect per written entry.
+            // Every disclosed effect names one installed command.
             let identity_written = written
                 .iter()
                 .filter(|c| c.contains("__extract-session-id"))
                 .count();
-            let status_written = written.len() - identity_written;
+            let usage_written = written
+                .iter()
+                .filter(|c| c.contains("__usage-event"))
+                .count();
+            let status_written = written.len() - identity_written - usage_written;
             let identity_disclosed = disclosure
                 .hook_commands
                 .iter()
                 .filter(|(_, effect)| effect.contains("__extract-session-id"))
+                .count();
+            let usage_disclosed = disclosed
+                .iter()
+                .filter(|effect| effect.contains("__usage-event"))
                 .count();
             let status_disclosed = disclosure
                 .hook_commands
@@ -1389,8 +1395,8 @@ mod tests {
                 .filter(|(_, effect)| effect.contains("writes \""))
                 .count();
             assert_eq!(
-                (identity_disclosed, status_disclosed),
-                (identity_written, status_written),
+                (identity_disclosed, usage_disclosed, status_disclosed),
+                (identity_written, usage_written, status_written),
                 "{tool}: the disclosure must account for every installed command"
             );
             assert_eq!(
