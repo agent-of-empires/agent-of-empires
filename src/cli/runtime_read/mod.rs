@@ -277,13 +277,32 @@ pub async fn attempt(command: ScopedCommand<'_>, source: &ReadRequestSource) -> 
     }
 }
 
-/// Whether this failure means no daemon is publishing here, which is the one
-/// pre-admission refusal the local command path may take over. A named
-/// endpoint, and every refusal that says the artifacts are present but not
-/// trustworthy, are the daemon's answer to keep: falling back on those would
-/// quietly serve data the admission was built to withhold.
+/// Whether this failure means the local command path may answer for itself.
+///
+/// An explicit `--daemon-url` is a request for a served answer: whatever the
+/// endpoint says, including that it cannot be reached, is what the user asked
+/// for by name, so nothing here applies to it.
 fn absent_local_publication(error: &ReadFailure, source: &ReadRequestSource) -> bool {
-    error.code() == "marker_missing" && source.explicit_url.is_none() && !source.env_url_is_set()
+    if source.explicit_url.is_some() {
+        return false;
+    }
+    match error.code() {
+        // No local publication at all: the pre-existing take-over, unchanged.
+        "marker_missing" => !source.env_url_is_set(),
+        // The environment named an endpoint that cannot answer right now: a
+        // malformed or non-UTF-8 URL, no usable bearer token, an unreachable
+        // daemon, or one that did not finish the handshake inside the budget.
+        // Before the take-over existed none of these reached the read commands
+        // at all, so the local store is what the user was getting, and it stays
+        // what they get.
+        "invalid_endpoint" | "invalid_token" | "unavailable" | "establishment_timeout" => {
+            source.env_url_is_set()
+        }
+        // Everything else is a refusal about what a publisher said, not about
+        // whether one is there: the admission codes, the wire codes, and the
+        // renderer's own state refusals. Those stay the daemon's answer.
+        _ => false,
+    }
 }
 
 async fn execute_inner(
@@ -665,6 +684,52 @@ mod tests {
             "only an absent publication is a take-over"
         );
     }
+    /// The property worth pinning is not that these five codes take over, but
+    /// that **nothing else does**. A new code added to the emit table is the
+    /// edit that would silently widen this, so the table enumerates the whole
+    /// vocabulary and asserts `false` for everything outside the five, under
+    /// every combination of endpoint inputs.
+    #[test]
+    fn only_the_five_endpoint_codes_take_over_and_nothing_else_does() {
+        const TAKES_OVER: [&str; 5] = [
+            "marker_missing",
+            "invalid_endpoint",
+            "invalid_token",
+            "unavailable",
+            "establishment_timeout",
+        ];
+        for code in EMITTABLE_CODES {
+            let error = ReadFailure::pre(code);
+            for (label, explicit_url, env_url) in [
+                ("nothing named", None, None),
+                ("a flag", Some("https://flag.test".to_string()), None),
+                ("a variable", None, Some(OsString::from("https://env.test"))),
+            ] {
+                let source = ReadRequestSource {
+                    explicit_url,
+                    env_url,
+                    token: None,
+                    explicit_profile: None,
+                    env_profile: None,
+                };
+                // `marker_missing` takes over only with no endpoint named, and
+                // the four transport codes only with a variable naming one; an
+                // explicit flag is a request for a served answer either way.
+                let expected = match (*code, label) {
+                    ("marker_missing", "nothing named") => true,
+                    ("marker_missing", _) => false,
+                    (_, "a variable") => TAKES_OVER.contains(code),
+                    _ => false,
+                };
+                assert_eq!(
+                    absent_local_publication(&error, &source),
+                    expected,
+                    "{code} with {label}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn classifier_matches_only_exact_scoped_paths() {
         let cases = [
