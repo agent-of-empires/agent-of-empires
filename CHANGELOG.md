@@ -4,7 +4,7 @@ All notable changes to Agent of Empires will be documented in this file.
 
 The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 
-## [1.17.3](https://github.com/agent-of-empires/agent-of-empires/releases/tag/v1.17.3) - 2026-09-30
+## [1.18.0](https://github.com/agent-of-empires/agent-of-empires/releases/tag/v1.18.0) - 2026-09-30
 
 
 
@@ -59,7 +59,7 @@ The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 
 - [@SanderVocke](https://github.com/SanderVocke) made their first contribution in [#4199](https://github.com/agent-of-empires/agent-of-empires/pull/4199)
 
-**Full Changelog**: https://github.com/agent-of-empires/agent-of-empires/compare/v1.17.2...v1.17.3
+**Full Changelog**: https://github.com/agent-of-empires/agent-of-empires/compare/v1.17.2...v1.18.0
 ## [1.17.2](https://github.com/agent-of-empires/agent-of-empires/releases/tag/v1.17.2) - 2026-09-25
 
 
