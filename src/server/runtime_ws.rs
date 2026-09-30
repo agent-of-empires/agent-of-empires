@@ -508,8 +508,7 @@ fn build_snapshot(
                         })
                         .map_err(|_| ()),
                     groups: Storage::open_unwatched(name)
-                        .and_then(|storage| storage.load_with_groups())
-                        .map(|(_, groups)| groups)
+                        .and_then(|storage| storage.load_groups_readonly())
                         .map_err(|_| ()),
                 },
             )
@@ -1135,13 +1134,11 @@ fn timestamp(value: Option<DateTime<Utc>>) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::OsString;
-
     use super::*;
     use crate::cli::runtime_read::dto::{
         parse_hello, parse_snapshot, validate_cross_message, validate_hello, validate_snapshot,
     };
-    use crate::session::{WorkspaceInfo, WorkspaceRepo as StoredRepo};
+    use crate::session::{Group, WorkspaceInfo, WorkspaceRepo as StoredRepo};
 
     /// The published schema's `required` list for one `$defs` entry, from the
     /// document committed beside the fixtures rather than from anything this
@@ -1322,6 +1319,64 @@ mod tests {
         );
     }
 
+    /// A read must not write. The projection path may read a registry with a
+    /// row that cannot deserialise, but it must not materialise a quarantine
+    /// sidecar beside a store it only reads.
+    #[test]
+    #[serial_test::serial]
+    fn a_served_read_leaves_the_profile_directory_untouched() {
+        let home = TempHome::new();
+        let profile_dir = home.app_dir().join("profiles").join("main");
+        std::fs::create_dir_all(&profile_dir).expect("main profile");
+        std::fs::write(profile_dir.join("sessions.json"), "[]").expect("an empty session list");
+        let groups = serde_json::json!([
+            Group::new("alpha", "work/alpha"),
+            { "name": "corrupt-no-path" },
+            Group::new("beta", "work/beta"),
+        ]);
+        std::fs::write(
+            profile_dir.join("groups.json"),
+            serde_json::to_vec(&groups).expect("groups encode"),
+        )
+        .expect("a registry with one row that cannot deserialise");
+        let before = directory_contents(&profile_dir);
+
+        let sampled = build_snapshot(&RuntimeState::new(), &[], Owner::remote(), Utc::now());
+
+        let published: Vec<&str> = sampled.data.profiles[0]
+            .groups
+            .iter()
+            .map(|group| group.path.as_str())
+            .collect();
+        assert_eq!(
+            published,
+            ["work/alpha", "work/beta"],
+            "the readable rows still reach the snapshot, so this is not fixed by not reading"
+        );
+        assert_eq!(
+            before,
+            directory_contents(&profile_dir),
+            "the served read must not write beside the store it reads"
+        );
+    }
+
+    /// Every regular file under `dir` as a sorted `(name, bytes)` list, so a
+    /// created file and a rewritten one both show up as a difference.
+    fn directory_contents(dir: &std::path::Path) -> Vec<(String, Vec<u8>)> {
+        let mut contents: Vec<(String, Vec<u8>)> = std::fs::read_dir(dir)
+            .expect("the profile directory")
+            .map(|entry| {
+                let entry = entry.expect("a directory entry");
+                (
+                    entry.file_name().to_string_lossy().into_owned(),
+                    std::fs::read(entry.path()).expect("a readable file"),
+                )
+            })
+            .collect();
+        contents.sort();
+        contents
+    }
+
     /// Deleting the configured default leaves the config naming a profile that
     /// is gone. The local path refuses (`resolve_existing_profile`), so the
     /// served path publishes no default at all rather than marking some other
@@ -1356,35 +1411,26 @@ mod tests {
 
     /// Points the app dir at an empty temporary XDG base for the duration of one
     /// test, so a snapshot is assembled from fixtures rather than the developer's
-    /// real profiles and project registries.
+    /// real profiles and project registries. The environment guard holds the
+    /// process-wide lock, and drops before the directory it points at.
     struct TempHome {
+        _env: crate::server::test_support::RuntimeEnvGuard,
         _dir: tempfile::TempDir,
-        previous: Option<OsString>,
     }
 
     impl TempHome {
         fn new() -> Self {
             let dir = tempfile::tempdir().expect("temp home");
-            let previous = std::env::var_os("XDG_CONFIG_HOME");
-            std::env::set_var("XDG_CONFIG_HOME", dir.path());
+            let env = crate::server::test_support::RuntimeEnvGuard::set(dir.path());
             Self {
+                _env: env,
                 _dir: dir,
-                previous,
             }
         }
 
         /// The app dir the seeded profiles and config live in.
         fn app_dir(&self) -> std::path::PathBuf {
             self._dir.path().join(crate::session::APP_DIR_NAME_XDG)
-        }
-    }
-
-    impl Drop for TempHome {
-        fn drop(&mut self) {
-            match &self.previous {
-                Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
-                None => std::env::remove_var("XDG_CONFIG_HOME"),
-            }
         }
     }
 
