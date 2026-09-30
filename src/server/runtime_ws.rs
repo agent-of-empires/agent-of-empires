@@ -1143,6 +1143,7 @@ mod tests {
     /// The published schema's `required` list for one `$defs` entry, from the
     /// document committed beside the fixtures rather than from anything this
     /// module knows.
+    #[cfg(debug_assertions)]
     fn schema_required(definition: &str) -> BTreeSet<String> {
         let text = std::fs::read_to_string(
             crate::cli::runtime_read::pack::pack_root()
@@ -1168,6 +1169,10 @@ mod tests {
     /// the one no version number would catch.
     #[test]
     #[serial_test::serial]
+    // The published schemas it reads live behind the pack module's debug gate,
+    // so this gate is where a release test build would otherwise name a module
+    // that is not compiled.
+    #[cfg(debug_assertions)]
     fn every_field_the_producer_emits_is_required_by_the_published_schema() {
         let _home = TempHome::new();
         let mut session = named("a", "main");
