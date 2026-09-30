@@ -449,6 +449,10 @@ impl PurgeTransaction {
                 match commit {
                     Some((CompletionGate::Proceed, _)) => {
                         result.disposition = DeletionDisposition::Removed;
+                        crate::usage::record_lifecycle(
+                            &self.request.instance,
+                            crate::usage::UsageKind::InstanceDeleted,
+                        );
                         result
                     }
                     Some((gate, retained)) => {
@@ -486,6 +490,10 @@ impl CommittedPurge {
     pub fn finish(self) -> DeletionResult {
         let mut result = perform_deletion_teardown_lifecycle_locked(&self.request);
         result.disposition = DeletionDisposition::Removed;
+        crate::usage::record_lifecycle(
+            &self.request.instance,
+            crate::usage::UsageKind::InstanceDeleted,
+        );
         result
     }
 }

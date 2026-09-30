@@ -189,6 +189,8 @@ pub struct HookEvent {
     pub identity_field: Option<HookIdentityField>,
     /// Tools that block on the user for their whole run; the hook writes `waiting` for them.
     pub waiting_tools: &'static [&'static str],
+    /// Also record the event in the usage log (`crate::usage`).
+    pub usage: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -201,6 +203,7 @@ pub struct ResolvedHookEvent {
     /// Binary of the agent whose config declares this event. The identity publisher carries it
     /// so a nested agent of another kind cannot publish into the pane's sidecar.
     pub publisher: Option<&'static str>,
+    pub usage: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -318,6 +321,7 @@ const fn hook(name: &'static str, status: HookStatus) -> HookEvent {
         status: Some(status),
         identity_field: None,
         waiting_tools: &[],
+        usage: false,
     }
 }
 
@@ -325,6 +329,15 @@ const fn matched_hook(name: &'static str, matcher: &'static str, status: HookSta
     HookEvent {
         matcher: Some(matcher),
         ..hook(name, status)
+    }
+}
+
+/// An event recorded in the usage log, with or without a status.
+const fn usage_hook(name: &'static str, status: Option<HookStatus>) -> HookEvent {
+    HookEvent {
+        status,
+        usage: true,
+        ..hook(name, HookStatus::Idle)
     }
 }
 
@@ -342,6 +355,7 @@ const CLAUDE_HOOK_EVENTS: &[HookEvent] = &[
     HookEvent {
         status: None,
         identity_field: Some(HookIdentityField::SessionId),
+        usage: true,
         ..hook("SessionStart", HookStatus::Idle)
     },
     HookEvent {
@@ -351,10 +365,11 @@ const CLAUDE_HOOK_EVENTS: &[HookEvent] = &[
     matched_hook("PostToolUse", "AskUserQuestion", HookStatus::Running),
     HookEvent {
         identity_field: Some(HookIdentityField::SessionId),
+        usage: true,
         ..hook("UserPromptSubmit", HookStatus::Running)
     },
-    hook("Stop", HookStatus::Idle),
-    hook("StopFailure", HookStatus::Idle),
+    usage_hook("Stop", Some(HookStatus::Idle)),
+    usage_hook("StopFailure", Some(HookStatus::Idle)),
     matched_hook(
         "Notification",
         "permission_prompt|elicitation_dialog|agent_needs_input",
@@ -366,6 +381,8 @@ const CLAUDE_HOOK_EVENTS: &[HookEvent] = &[
         HookStatus::Idle,
     ),
     hook("ElicitationResult", HookStatus::Running),
+    usage_hook("PostCompact", None),
+    usage_hook("SessionEnd", None),
 ];
 
 /// generation_id is turn-scoped and must never be used as resume identity.
@@ -399,13 +416,14 @@ const CODEX_HOOK_EVENTS: &[HookEvent] = &[
     // on this event is kept alongside the publisher.
     HookEvent {
         identity_field: Some(HookIdentityField::SessionId),
-        ..hook("SessionStart", HookStatus::Idle)
+        ..usage_hook("SessionStart", Some(HookStatus::Idle))
     },
-    hook("UserPromptSubmit", HookStatus::Running),
+    usage_hook("UserPromptSubmit", Some(HookStatus::Running)),
     hook("PreToolUse", HookStatus::Running),
     hook("PermissionRequest", HookStatus::Waiting),
     hook("PostToolUse", HookStatus::Running),
-    hook("Stop", HookStatus::Idle),
+    usage_hook("Stop", Some(HookStatus::Idle)),
+    usage_hook("PostCompact", None),
 ];
 
 const GEMINI_HOOK_EVENTS: &[HookEvent] = &[
@@ -1098,6 +1116,7 @@ fn append_configured_status_events(
                 identity_field: None,
                 waiting_tools: Vec::new(),
                 publisher: None,
+                usage: false,
             });
         }
     }
@@ -1139,6 +1158,7 @@ pub fn resolved_hook_events(
             identity_field: event.identity_field,
             waiting_tools: event.waiting_tools.iter().map(|t| t.to_string()).collect(),
             publisher: Some(agent.binary),
+            usage: event.usage && config.session.usage_tracking,
         })
         .collect();
     append_configured_status_events(&mut events, overrides);
@@ -1167,6 +1187,7 @@ pub fn resolved_sidecar_hook_events(
             identity_field: event.identity_field,
             waiting_tools: Vec::new(),
             publisher: Some(agent.binary),
+            usage: false,
         })
         .collect();
     append_configured_status_events(&mut events, overrides);

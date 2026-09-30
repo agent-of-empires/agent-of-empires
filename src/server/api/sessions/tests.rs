@@ -4599,3 +4599,61 @@ async fn a_retry_across_a_restart_is_fenced_before_profile_validation() {
     assert_eq!(refused["error"], "create_outcome_unknown");
     assert_eq!(effects(), 1);
 }
+
+// GET /api/sessions/{id}/usage surfaces the same store the TUI overlay
+// reads (#session-usage-counter): a single clear-context row rolls up into
+// both the per-kind count and the headline reset count. An unknown id must
+// not leak whether an instance ever existed, matching the other session GETs.
+#[tokio::test]
+#[serial_test::serial]
+async fn session_usage_reports_summary_and_404_for_unknown_session() {
+    use crate::usage::{UsageEvent, UsageKind, UsageStore};
+    use axum::body::to_bytes;
+    use chrono::Utc;
+
+    let _home = crate::session::test_support::isolate_app_dir();
+
+    let inst = Instance::new("usage-overlay", "/tmp/usage-overlay");
+    let id = inst.id.clone();
+    let state = crate::server::test_support::build_test_app_state(vec![inst]);
+
+    let store = UsageStore::open_default().expect("open isolated usage store");
+    store
+        .insert(&UsageEvent {
+            id: 0,
+            occurred_at: Utc::now(),
+            instance_id: id.clone(),
+            profile: None,
+            agent: Some("claude".to_string()),
+            kind: UsageKind::ContextStart,
+            detail: Some("clear".to_string()),
+            agent_session_id: None,
+        })
+        .expect("insert usage event");
+
+    let resp = session_usage(State(state.clone()), Path(id.clone()))
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["clears"], 1, "{body}");
+    assert_eq!(body["resets"], 1, "{body}");
+
+    let resp = session_usage(State(state), Path("does-not-exist".to_string()))
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+// CityHall hides the terminal view the usage overlay sits on, so the read
+// underneath it must be closed too, matching /output's cityhall_block gate.
+#[tokio::test]
+async fn session_usage_is_blocked_in_cityhall_mode() {
+    let inst = Instance::new("usage-overlay-cityhall", "/tmp/usage-overlay-cityhall");
+    let id = inst.id.clone();
+    let state = crate::server::test_support::build_test_app_state_cityhall(vec![inst]);
+
+    let resp = session_usage(State(state), Path(id)).await.into_response();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}

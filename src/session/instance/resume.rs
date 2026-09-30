@@ -191,6 +191,11 @@ impl Instance {
             let outcome =
                 self.finish_resume_launch(launch_outcome, skipped_failed_resume_sid, &profile)?;
             self.commit_lifecycle_launch(&storage, restart)?;
+            // The shared convergence point for every restart path (web, CLI, `restart --all`,
+            // dead-pane relaunch): record once here, never at the individual call sites.
+            if restart && crate::session::restart::launched_agent(&Ok(outcome.clone())) {
+                crate::usage::record_lifecycle(self, crate::usage::UsageKind::InstanceRestarted);
+            }
             Ok(outcome)
         })();
         if let Err(error) = result {
@@ -747,6 +752,72 @@ mod tests {
                 .stores,
             vec![destination.canonicalize().unwrap()]
         );
+    }
+
+    /// The convergence point records `instance_restarted` once a restart's
+    /// agent actually launched, and never on a first start.
+    #[test]
+    #[serial]
+    fn restart_records_one_row_and_a_fresh_start_records_none() {
+        let temp = tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let _env = isolate_resume_environment(temp.path());
+        let profile = crate::session::config::effective_profile("");
+        let _registry = crate::tmux::status_rules::ProfileRegistryGuard::take(&profile);
+        crate::session::config::profile_config::resolve_config_or_warn(&profile);
+
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let _claude = install_fake_claude(temp.path(), "#!/bin/sh\nexec sleep 60\n");
+
+        let mut instance = Instance::new("usage-restart", project.to_str().unwrap());
+        instance.source_profile = profile.clone();
+        instance.tool = "claude".into();
+        instance.command = "claude".into();
+        instance.detect_as = "claude".into();
+        let storage = crate::session::storage::Storage::new_unwatched(&profile).unwrap();
+        storage
+            .update(|rows, _| {
+                rows.push(instance.clone());
+                Ok(())
+            })
+            .unwrap();
+        let name = crate::tmux::Session::generate_name(&instance.id, &instance.title);
+        let _pane = crate::tmux::test_helpers::TmuxTestSession::from_name(name);
+
+        let started = instance
+            .start_with_resume_fallback(None, true, ResumeAttemptPolicy::Allow)
+            .unwrap();
+        assert_eq!(started, StartOutcome::Fresh);
+
+        let db = crate::usage::db_path().unwrap();
+        let store = crate::usage::UsageStore::open(&db).unwrap();
+        let after_start = store.events_for_instance(&instance.id).unwrap();
+        assert!(
+            after_start
+                .iter()
+                .all(|e| e.kind != crate::usage::UsageKind::InstanceRestarted),
+            "a first start must not record a restart: {after_start:?}"
+        );
+
+        let restarted = instance.restart_with_size(None).unwrap();
+        instance.kill_clean().unwrap();
+        assert!(
+            matches!(
+                restarted,
+                StartOutcome::Fresh
+                    | StartOutcome::Resumed
+                    | StartOutcome::FreshAfterFailedResume { .. }
+            ),
+            "{restarted:?}"
+        );
+
+        let after_restart = store.events_for_instance(&instance.id).unwrap();
+        let restarts = after_restart
+            .iter()
+            .filter(|e| e.kind == crate::usage::UsageKind::InstanceRestarted)
+            .count();
+        assert_eq!(restarts, 1, "{after_restart:?}");
     }
 
     #[test]

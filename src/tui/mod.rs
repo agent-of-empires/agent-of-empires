@@ -31,6 +31,7 @@ mod store_move_poller;
 pub(crate) mod structured_view;
 pub(crate) mod styles;
 mod trash_poller;
+mod usage_poller;
 mod worker;
 
 pub use app::*;

@@ -993,6 +993,21 @@ pub struct SessionConfig {
     #[setting(label = "Show system health strip", widget = "toggle")]
     pub show_diagnostics_pane: bool,
 
+    /// Record agent context resets, prompts, and turns per session in a local
+    /// usage log (`usage.db` in the app directory). Claude and Pi always
+    /// record when this is on; Codex records only when agent status hooks
+    /// are also on, since Codex has no identity hooks to tether the usage
+    /// hooks to. Off adds nothing. Nothing leaves this machine.
+    #[serde(default = "default_true")]
+    #[setting(label = "Record session usage", widget = "toggle")]
+    pub usage_tracking: bool,
+
+    /// Show the session's context-reset count and usage breakdown in a corner
+    /// of the preview pane and the web session view.
+    #[serde(default = "default_true")]
+    #[setting(label = "Show usage overlay", widget = "toggle")]
+    pub show_usage_overlay: bool,
+
     /// Side of the TUI session list. Narrow terminals keep the list above the preview.
     #[serde(default)]
     #[setting(
@@ -1055,9 +1070,11 @@ pub struct SessionConfig {
     pub agent_command_override: HashMap<String, String>,
 
     /// Install status-detection hooks into the agent's config file (e.g.
-    /// ~/.claude/settings.json). When disabled, AoE will not modify the
-    /// agent's settings file; status detection falls back to tmux pane
-    /// content parsing, which is less reliable.
+    /// ~/.claude/settings.json). When disabled, AoE installs no status hooks;
+    /// status detection falls back to tmux pane content parsing, which is
+    /// less reliable. Agents whose resume depends on it (Claude) still get
+    /// the session-identity hooks, and, when usage recording is on, the
+    /// usage hooks too.
     #[serde(default = "default_true")]
     #[setting(label = "Agent Status Hooks", widget = "toggle", category = "Agents")]
     pub agent_status_hooks: bool,
@@ -1848,6 +1865,8 @@ impl Default for SessionConfig {
             yolo_mode_default: false,
             pre_trust_agent_folders: false,
             show_diagnostics_pane: false,
+            usage_tracking: true,
+            show_usage_overlay: true,
             sidebar_position: SidebarPosition::default(),
             daemon_sidebar: true,
             inherit_host_environment: false,

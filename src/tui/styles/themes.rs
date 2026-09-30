@@ -258,7 +258,7 @@ impl Theme {
 /// Linear RGB blend of `a` and `b` at `t` (0.0 = all `a`). Falls back to `a` for
 /// a non-RGB terminal color, which theme colors never are. Mirrors the private
 /// `mix` in `resolved.rs`, kept local to avoid a backwards dependency.
-fn blend(a: Color, b: Color, t: f32) -> Color {
+pub(crate) fn blend(a: Color, b: Color, t: f32) -> Color {
     let rgb = |c: Color| match c {
         Color::Rgb(r, g, bl) => Some((r, g, bl)),
         _ => None,

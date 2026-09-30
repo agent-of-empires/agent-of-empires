@@ -64,6 +64,24 @@ impl Drop for FailNextPiPathWriteGuard {
     }
 }
 
+/// The Pi extension's environment: its identity sidecar, plus the usage
+/// reporter when usage tracking is on (`bin`, instance id, profile).
+fn pi_extension_env(sidecar: &Path, usage: Option<(&Path, &str, &str)>) -> String {
+    let mut env = format!(
+        "AOE_SESSION_ID_FILE={} ",
+        shell_escape(&sidecar.to_string_lossy())
+    );
+    if let Some((bin, instance_id, profile)) = usage {
+        env.push_str(&format!(
+            "AOE_USAGE_BIN={} AOE_INSTANCE_ID={} AOE_PROFILE={} ",
+            shell_escape(&bin.to_string_lossy()),
+            shell_escape(instance_id),
+            shell_escape(profile),
+        ));
+    }
+    env
+}
+
 impl Instance {
     #[cfg(test)]
     pub(crate) fn mark_pi_extension_launched_for_test(&mut self) {
@@ -89,11 +107,20 @@ impl Instance {
             let sidecar = crate::hooks::ensure_instance_dir_path(&self.id)
                 .ok()?
                 .join("session_id");
+            let profile = self.effective_profile();
+            let usage_bin =
+                crate::session::config::profile_config::resolve_config_or_warn(&profile)
+                    .session
+                    .usage_tracking
+                    .then(std::env::current_exe)
+                    .and_then(Result::ok);
             return Some((
                 format!(" -e {}", shell_escape(&extension.to_string_lossy())),
-                format!(
-                    "AOE_SESSION_ID_FILE={} ",
-                    shell_escape(&sidecar.to_string_lossy())
+                pi_extension_env(
+                    &sidecar,
+                    usage_bin
+                        .as_deref()
+                        .map(|bin| (bin, self.id.as_str(), profile.as_str())),
                 ),
             ));
         }
@@ -1036,5 +1063,22 @@ pi = "~/.pi-personal"
         let claude = tool_instance("claude", "/tmp/pi-pinned");
         assert!(claude.resume_flag_arm_is_existing(None, true, true, minted, false));
         assert!(!claude.pi_session_id_pinnable());
+    }
+
+    #[test]
+    fn pi_extension_env_adds_usage_vars_only_when_enabled() {
+        let sidecar = std::path::Path::new("/tmp/aoe-hooks-1/abc/session_id");
+        let bin = std::path::Path::new("/opt/aoe");
+        let without = pi_extension_env(sidecar, None);
+        assert!(without.starts_with("AOE_SESSION_ID_FILE="));
+        assert!(!without.contains("AOE_USAGE_BIN"));
+        let with = pi_extension_env(sidecar, Some((bin, "abc", "work")));
+        for needle in [
+            "AOE_USAGE_BIN='/opt/aoe'",
+            "AOE_INSTANCE_ID='abc'",
+            "AOE_PROFILE='work'",
+        ] {
+            assert!(with.contains(needle), "{with}");
+        }
     }
 }

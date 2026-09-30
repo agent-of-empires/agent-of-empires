@@ -14,6 +14,7 @@ pub(crate) mod scroll;
 pub(crate) mod text;
 mod text_input;
 mod tool_config;
+pub(crate) mod usage_overlay;
 
 pub use cycler::{profile_cycler_spans, tool_cycler_spans};
 pub use dir_picker::{DirPicker, DirPickerResult};

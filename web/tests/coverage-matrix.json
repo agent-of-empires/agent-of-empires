@@ -1395,6 +1395,18 @@
       ]
     },
     {
+      "id": "sessions.usage-overlay",
+      "kind": "vitest",
+      "risk": "low",
+      "specs": ["src/lib/usage.test.ts", "src/components/__tests__/UsageOverlay.test.tsx"],
+      "components": [
+        "web/src/lib/usage.ts",
+        "web/src/lib/sessionFlagGate.ts",
+        "web/src/components/UsageOverlay.tsx",
+        "web/src/components/TerminalSessionStack.tsx"
+      ]
+    },
+    {
       "id": "sidebar.session-color-toggle",
       "kind": "vitest",
       "risk": "low",

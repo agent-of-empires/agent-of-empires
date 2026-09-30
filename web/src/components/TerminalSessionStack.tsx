@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import type { SessionResponse } from "../lib/types";
 import { DEFAULT_PERSISTENT_TERMINALS, normalizePersistentTerminalLimit } from "../lib/persistentTerminals";
 import { TerminalView } from "./TerminalView";
+import { UsageOverlay } from "./UsageOverlay";
 
 interface Props {
   active?: boolean;
@@ -69,6 +70,7 @@ export function TerminalSessionStack({
             }
           >
             <TerminalView session={session} active={active && selected} />
+            {selected && <UsageOverlay session={session} />}
           </div>
         );
       })}

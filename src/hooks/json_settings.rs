@@ -15,15 +15,17 @@ use super::config_io::{
 use super::HookInstallTarget;
 
 /// Commands for one event: the identity extractor first (it must see stdin
-/// first), then the status writer.
+/// first), then the usage recorder, then the status writer.
 fn event_commands(event: &ResolvedHookEvent, target: HookInstallTarget) -> Vec<String> {
     let identity = event
         .identity_field
         .map(|field| hook_command_session_id(target, field, event.publisher));
+    let usage = (event.usage && target == HookInstallTarget::Host)
+        .then(|| super::command::hook_command_usage_event(event.publisher));
     let status = event
         .status
         .map(|status| status_command_for_event(status, &event.waiting_tools, target));
-    identity.into_iter().chain(status).collect()
+    identity.into_iter().chain(usage).chain(status).collect()
 }
 
 /// One matcher group per event, appended under the event name so events that
@@ -479,6 +481,7 @@ mod tests {
             identity_field: Some(HookIdentityField::ConversationIdOrSessionId),
             waiting_tools: Vec::new(),
             publisher: Some("agent"),
+            usage: false,
         }];
 
         install_cursor_hooks_with_events(&path, HookInstallTarget::Host, &events).unwrap();
@@ -501,5 +504,51 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn usage_command_is_installed_on_host_for_usage_events_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let events = agent_events("claude", &[]);
+        assert!(
+            events.iter().any(|e| e.usage),
+            "claude declares usage events"
+        );
+
+        install_hooks(&path, &events, HookInstallTarget::Host).unwrap();
+        let hooks = read_json(&path)["hooks"].clone();
+        let commands = |event: &str| -> Vec<String> {
+            hooks[event]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .flat_map(|g| g["hooks"].as_array().cloned().unwrap_or_default())
+                .filter_map(|h| h["command"].as_str().map(str::to_string))
+                .collect()
+        };
+        for event in [
+            "SessionStart",
+            "UserPromptSubmit",
+            "Stop",
+            "StopFailure",
+            "PostCompact",
+            "SessionEnd",
+        ] {
+            assert!(
+                commands(event).iter().any(|c| c.contains("__usage-event")),
+                "{event} records usage"
+            );
+        }
+        assert!(!commands("PreToolUse")
+            .iter()
+            .any(|c| c.contains("__usage-event")));
+        assert!(uninstall_hooks(&path).unwrap());
+        assert!(read_json(&path)["hooks"].get("PostCompact").is_none());
+
+        install_hooks(&path, &events, HookInstallTarget::Sandbox).unwrap();
+        assert!(!std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("__usage-event"));
     }
 }

@@ -113,6 +113,9 @@ fn start_with_size_opts_relaunches_a_dead_pane() {
     }
     let temp = setup_temp_home();
     acknowledge_agent_hooks();
+    // Not part of `setup_temp_home`'s set; restored on drop so it cannot leak
+    // and point a later test at a deleted tempdir.
+    let _claude_home = EnvRestore::set("CLAUDE_CONFIG_DIR", temp.path().join(".claude"));
     let workdir = temp.path().join("workdir");
     std::fs::create_dir_all(&workdir).expect("create workdir");
 

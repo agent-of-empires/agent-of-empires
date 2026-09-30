@@ -115,6 +115,56 @@ impl HomeView {
         }
     }
 
+    /// Request the selected session's usage summary while the overlay is on.
+    pub fn request_usage_refresh(&mut self) {
+        if !self.show_usage_overlay || self.pending_usage_refresh {
+            return;
+        }
+        if let Some(id) = self.selected_session.clone() {
+            self.usage_poller.request_refresh(id);
+            self.pending_usage_refresh = true;
+        }
+    }
+
+    /// Apply a loaded usage summary; true when the overlay needs a repaint.
+    pub fn apply_usage_updates(&mut self) -> bool {
+        use std::sync::mpsc::TryRecvError;
+
+        match self.usage_poller.try_recv_updates() {
+            Ok((id, summary)) => {
+                self.pending_usage_refresh = false;
+                self.apply_one_usage_update(id, summary)
+            }
+            Err(TryRecvError::Empty) => false,
+            Err(TryRecvError::Disconnected) => {
+                tracing::error!(target: "tui.home", "usage poller worker gone; respawning");
+                self.usage_poller = crate::tui::usage_poller::UsagePoller::new();
+                self.pending_usage_refresh = false;
+                false
+            }
+        }
+    }
+
+    /// Store a fetched summary; true when the overlay needs a repaint.
+    /// Split out from `apply_usage_updates` so tests can drive it without a
+    /// background thread.
+    pub(in crate::tui) fn apply_one_usage_update(
+        &mut self,
+        id: String,
+        summary: Option<crate::usage::UsageSummary>,
+    ) -> bool {
+        // Selection moved on while this fetch was in flight: the refresh for
+        // the new selection was skipped (pending was still true), so kick it
+        // off now instead of waiting for the next tick.
+        if self.selected_session.as_deref() != Some(id.as_str()) {
+            self.request_usage_refresh();
+        }
+        let next = summary.map(|summary| (id, summary));
+        let changed = next != self.usage_summary;
+        self.usage_summary = next;
+        changed
+    }
+
     /// Toggle the diagnostics strip and persist the new state to
     /// `session.show_diagnostics_pane` so it survives restarts.
     pub fn toggle_diagnostics(&mut self) {

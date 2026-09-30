@@ -40,6 +40,7 @@ mod rename;
 mod search;
 mod send;
 mod update;
+mod usage;
 
 pub use artifacts::*;
 pub use create::*;
@@ -53,6 +54,7 @@ pub use rename::*;
 pub use search::*;
 pub use send::*;
 pub use update::*;
+pub use usage::*;
 
 #[cfg(test)]
 mod tests;

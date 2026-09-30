@@ -173,6 +173,7 @@ impl HomeView {
         // real create is never `Creating`. Mirrors the serve side's single increment.
         if instance.status != crate::session::Status::Creating {
             crate::tui::app::record_session_create();
+            crate::usage::record_lifecycle(&instance, crate::usage::UsageKind::InstanceCreated);
         }
         self.pending_added
             .entry(instance.source_profile.clone())

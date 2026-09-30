@@ -191,6 +191,19 @@ fn hook_command_session_id_host(field: HookIdentityField, publisher: Option<&str
     )
 }
 
+/// Records the hook in the usage log. Host only: the sandbox has no `aoe`.
+/// Output is discarded because Claude reads `SessionStart` stdout as context.
+pub(crate) fn hook_command_usage_event(publisher: Option<&str>) -> String {
+    let agent = identity_publisher_arg(publisher);
+    format!(
+        "sh -c '[ \"$AOE_USAGE\" = 1 ] || exit 0; \
+         [ -n \"$AOE_INSTANCE_ID\" ] || exit 0; \
+         [ -n \"$AOE_HOOK_BIN\" ] || exit 0; \
+         [ -x \"$AOE_HOOK_BIN\" ] || exit 0; \
+         \"$AOE_HOOK_BIN\" __usage-event{agent} >/dev/null 2>&1; exit 0 # {AOE_HOOK_MARKER}'"
+    )
+}
+
 /// A second `AOE_AGENT_BIN` ancestor marks a nested agent, whose id must not
 /// replace the pane's; with no launch pid in the container the walk runs to root.
 fn hook_command_session_id_sandbox(
@@ -416,6 +429,25 @@ mod tests {
             assert!(cmd.contains(&format!("B=/tmp/aoe-hooks-{euid};")), "{cmd}");
             assert!(cmd.contains("ME=$(id -u 2>/dev/null)"), "{cmd}");
         }
+    }
+
+    #[test]
+    fn usage_command_is_recognized_as_aoe() {
+        assert!(is_aoe_hook_command(&hook_command_usage_event(Some(
+            "claude"
+        ))));
+    }
+
+    /// A profile with usage off spawns no process at all, not just a
+    /// recorded-but-dropped event: the guard runs before `AOE_HOOK_BIN` is
+    /// even checked, let alone invoked.
+    #[test]
+    fn usage_command_exits_before_invoking_the_binary_when_disabled() {
+        let cmd = hook_command_usage_event(Some("claude"));
+        assert!(cmd.contains(r#"[ "$AOE_USAGE" = 1 ] || exit 0;"#), "{cmd}");
+        let guard_pos = cmd.find(r#"[ "$AOE_USAGE" = 1 ]"#).unwrap();
+        let invoke_pos = cmd.find("__usage-event").unwrap();
+        assert!(guard_pos < invoke_pos, "{cmd}");
     }
 
     #[test]

@@ -15,6 +15,9 @@ This document contains the help content for the `aoe` command-line program.
 * [`aoe remove`↴](#aoe-remove)
 * [`aoe send`↴](#aoe-send)
 * [`aoe status`↴](#aoe-status)
+* [`aoe usage`↴](#aoe-usage)
+* [`aoe usage show`↴](#aoe-usage-show)
+* [`aoe usage export`↴](#aoe-usage-export)
 * [`aoe killall`↴](#aoe-killall)
 * [`aoe session`↴](#aoe-session)
 * [`aoe session start`↴](#aoe-session-start)
@@ -148,6 +151,7 @@ Run without arguments to launch the TUI dashboard.
 * `remove` — Remove a session
 * `send` — Send a message to a running agent session
 * `status` — Show session status summary
+* `usage` — Session usage: context resets, prompts, and turns from the local usage log
 * `killall` — Force-stop everything aoe is running: the serve daemon, all agent workers, and all aoe tmux sessions. Destructive and unprompted
 * `session` — Manage session lifecycle (start, stop, attach, etc.)
 * `group` — Manage groups for organizing sessions
@@ -365,6 +369,60 @@ Show session status summary
 * `-v`, `--verbose` — Show detailed session list
 * `-q`, `--quiet` — Only output waiting count (for scripts)
 * `--json` — Output as JSON
+
+
+
+## `aoe usage`
+
+Session usage: context resets, prompts, and turns from the local usage log
+
+**Usage:** `aoe usage [OPTIONS]
+       usage <COMMAND>`
+
+###### **Subcommands:**
+
+* `show` — One session's usage summary and its latest events
+* `export` — Raw usage events as JSON lines, oldest first (the Ledger feed)
+
+###### **Options:**
+
+* `--since <SINCE>` — Window to summarize, like `30d`, `12h`, or `90m`. Resumes are counted within the window
+
+  Default value: `30d`
+* `--json`
+
+
+
+## `aoe usage show`
+
+One session's usage summary and its latest events
+
+**Usage:** `aoe usage show [OPTIONS] <SESSION>`
+
+###### **Arguments:**
+
+* `<SESSION>` — Session id, id prefix, or title
+
+###### **Options:**
+
+* `--json`
+
+
+
+## `aoe usage export`
+
+Raw usage events as JSON lines, oldest first (the Ledger feed)
+
+**Usage:** `aoe usage export [OPTIONS]`
+
+###### **Options:**
+
+* `--after-id <AFTER_ID>` — Only events with a larger id
+
+  Default value: `0`
+* `--limit <LIMIT>`
+
+  Default value: `10000`
 
 
 

@@ -1853,3 +1853,34 @@ fn confirm_delete_dialog_cancel_leaves_session() {
         "cancelling must clear the pending trash target"
     );
 }
+
+/// A usage fetch that lands after the selection moved on must not leave the
+/// new selection's overlay waiting for the next tick.
+#[test]
+#[serial]
+fn apply_one_usage_update_requests_a_refresh_when_the_selection_has_moved_on() {
+    let mut env = create_test_env_with_sessions(2);
+    let first = session_id_at(&env.view, 0).unwrap();
+    let second = session_id_at(&env.view, 1).unwrap();
+
+    env.view.selected_session = Some(first.clone());
+    env.view.request_usage_refresh();
+    assert!(env.view.pending_usage_refresh, "first's fetch is in flight");
+
+    // Selection moves to `second` while `first`'s fetch is still in flight;
+    // the pending flag is still set, so this request is a no-op.
+    env.view.selected_session = Some(second.clone());
+    env.view.request_usage_refresh();
+
+    // `first`'s stale result now arrives; `apply_usage_updates` would have
+    // just cleared the pending flag before handing off to this helper.
+    env.view.pending_usage_refresh = false;
+    env.view
+        .apply_one_usage_update(first, Some(crate::usage::UsageSummary::default()));
+
+    assert!(
+        env.view.pending_usage_refresh,
+        "a fresh refresh for the current selection must fire immediately, \
+         not wait for the next tick"
+    );
+}

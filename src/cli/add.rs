@@ -920,7 +920,9 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         Ok(true)
     });
     match persist_result {
-        Ok(true) => {}
+        Ok(true) => {
+            crate::usage::record_lifecycle(&instance, crate::usage::UsageKind::InstanceCreated);
+        }
         Ok(false) => {
             cleanup_partial_session(
                 &path,

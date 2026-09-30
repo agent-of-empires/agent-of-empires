@@ -206,6 +206,10 @@ mod tests {
                                 crate::agents::get_agent("claude").map(|agent| agent.binary),
                             ));
                         }
+                        if event_def.usage {
+                            canonical_set
+                                .push(crate::hooks::hook_command_usage_event(Some("claude")));
+                        }
                         if let Some(status) = event_def.status {
                             let waiting_tools: Vec<String> = event_def
                                 .waiting_tools

@@ -85,6 +85,7 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
             post(api::paste_image).layer(axum::extract::DefaultBodyLimit::max(8 * 1024 * 1024)),
         )
         .route("/api/sessions/{id}/output", get(api::read_output))
+        .route("/api/sessions/{id}/usage", get(api::session_usage))
         .route(
             "/api/sessions/{id}/notifications",
             patch(api::update_session_notifications),

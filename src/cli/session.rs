@@ -862,6 +862,21 @@ fn build_import_instance(
     inst
 }
 
+/// Attributes an imported instance to the profile it's being imported into, so
+/// its usage lifecycle event is recorded (and gated) under that profile
+/// rather than the process-wide default.
+fn prepare_import_instance(
+    s: &crate::session::claude_import::ClaudeSessionSummary,
+    structured: bool,
+    group: &str,
+    profile: &str,
+    session_config: &crate::session::config::SessionConfig,
+) -> Instance {
+    let mut inst = build_import_instance(s, structured, group, session_config);
+    inst.source_profile = profile.to_string();
+    inst
+}
+
 fn apply_import_mode(
     inst: &mut Instance,
     s: &crate::session::claude_import::ClaudeSessionSummary,
@@ -979,23 +994,27 @@ async fn import_sessions(profile: &str, args: ImportArgs) -> Result<()> {
         })
         .collect();
     let storage = Storage::open_unwatched(profile)?;
-    let created_ids = storage.update(|all_instances, groups| {
-        let mut ids = Vec::new();
+    let created = storage.update(|all_instances, groups| {
+        let mut created = Vec::new();
         for (s, session_config) in to_import.iter().zip(&session_configs) {
             if already_imported(all_instances, &s.session_id) {
                 continue;
             }
-            let inst = build_import_instance(s, structured, &group, session_config);
-            ids.push(inst.id.clone());
+            let inst = prepare_import_instance(s, structured, &group, profile, session_config);
             all_instances.push(inst.clone());
             if !inst.group_path.is_empty() {
                 let mut tree = GroupTree::new_with_groups(all_instances, groups);
                 tree.create_group(&inst.group_path);
                 *groups = tree.get_all_groups();
             }
+            created.push(inst);
         }
-        Ok(ids)
+        Ok(created)
     })?;
+    for inst in &created {
+        crate::usage::record_lifecycle(inst, crate::usage::UsageKind::InstanceCreated);
+    }
+    let created_ids: Vec<String> = created.into_iter().map(|inst| inst.id).collect();
 
     println!("✓ Imported {} session(s).", created_ids.len());
 
@@ -3378,6 +3397,18 @@ mod import_tests {
             assert_eq!(inst.command, "claude-wrapper", "{view_structured}");
             assert!(inst.yolo_mode, "{view_structured}");
         }
+    }
+
+    #[test]
+    fn prepare_import_instance_attributes_the_target_profile() {
+        let inst = prepare_import_instance(
+            &summary("abc123-def456", "/home/me/proj", Some("Fix bug")),
+            false,
+            "",
+            "work",
+            &crate::session::config::SessionConfig::default(),
+        );
+        assert_eq!(inst.source_profile, "work");
     }
 
     #[test]

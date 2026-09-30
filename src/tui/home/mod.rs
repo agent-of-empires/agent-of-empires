@@ -256,6 +256,11 @@ pub struct HomeView {
     pub(super) metrics_poller: super::metrics_poller::MetricsPoller,
     pub(super) pending_metrics_refresh: bool,
     pub(super) metrics: crate::process::metrics::MetricsSnapshot,
+    pub(super) usage_poller: super::usage_poller::UsagePoller,
+    pub(super) pending_usage_refresh: bool,
+    /// Summary for one instance id; drawn only while that id is selected.
+    pub(super) usage_summary: Option<(String, crate::usage::UsageSummary)>,
+    pub(super) show_usage_overlay: bool,
     pub(super) system_health_open: bool,
     pub(super) system_health_scroll: usize,
     pub(super) diagnostics_area: Rect,
