@@ -1138,20 +1138,20 @@ mod tests {
     use crate::cli::runtime_read::dto::{
         parse_hello, parse_snapshot, validate_cross_message, validate_hello, validate_snapshot,
     };
-    use crate::session::{Group, WorkspaceInfo, WorkspaceRepo as StoredRepo};
+    use crate::session::{Group, WorkspaceInfo, WorkspaceRepo as StoredRepo, WorktreeInfo};
 
-    /// The published schema's `required` list for one `$defs` entry, from the
-    /// document committed beside the fixtures rather than from anything this
-    /// module knows.
+    /// One row's `required` list from the published document beside the
+    /// fixtures rather than from anything this module knows. `definition` of
+    /// `None` is the frame's own list, which is the one the top-level row
+    /// answers to.
     #[cfg(debug_assertions)]
-    fn schema_required(definition: &str) -> BTreeSet<String> {
-        let text = std::fs::read_to_string(
-            crate::cli::runtime_read::pack::pack_root()
-                .join(crate::cli::runtime_read::pack::SNAPSHOT_SCHEMA),
-        )
-        .expect("the published snapshot schema");
-        let document: serde_json::Value = serde_json::from_str(&text).expect("it is JSON");
-        document["$defs"][definition]["required"]
+    fn schema_required(document: &str, definition: Option<&str>) -> BTreeSet<String> {
+        let parsed = published_schema(document);
+        let node = match definition {
+            Some(definition) => &parsed["$defs"][definition],
+            None => &parsed,
+        };
+        node["required"]
             .as_array()
             .expect("every wire row requires its fields")
             .iter()
@@ -1159,14 +1159,60 @@ mod tests {
             .collect()
     }
 
+    /// Every `$defs` entry that names a row the producer emits an instance of.
+    /// A row on the wire is named after the type that made it, so `GroupRead`
+    /// is `group_read`; the Hello's two rows do not follow the type name, and
+    /// are named here. Everything else in `$defs` is a scalar, an enum, or a
+    /// shape only reached through one of these.
+    #[cfg(debug_assertions)]
+    fn row_definitions(document: &str) -> BTreeSet<String> {
+        use crate::cli::runtime_read::pack::{HELLO_SCHEMA, SNAPSHOT_SCHEMA};
+        let defs = published_schema(document)["$defs"]
+            .as_object()
+            .expect("$defs is an object")
+            .clone();
+        let mut rows: BTreeSet<String> = defs
+            .keys()
+            .filter(|name| name.ends_with("_read") || name.ends_with("_repo"))
+            .cloned()
+            .collect();
+        if document == HELLO_SCHEMA {
+            for row in ["owner", "profile_hello"] {
+                assert!(defs.contains_key(row), "hello.schema.json defines {row}");
+                rows.insert(row.to_string());
+            }
+        }
+        assert_eq!(
+            document == SNAPSHOT_SCHEMA,
+            rows.contains("session_read"),
+            "the documents are not the ones this gate reads"
+        );
+        rows
+    }
+
+    #[cfg(debug_assertions)]
+    fn published_schema(document: &str) -> serde_json::Value {
+        let text =
+            std::fs::read_to_string(crate::cli::runtime_read::pack::pack_root().join(document))
+                .expect("the published schema");
+        serde_json::from_str(&text).expect("it is JSON")
+    }
+
     /// Every field the producer serialises is one the published schema
-    /// requires.
+    /// requires, in both frames and in every row either one names.
     ///
-    /// The pack holds a recorded transcript to the schema, which proves the
+    /// The pack holds recorded transcripts to the schemas, which proves the
     /// two agree with each other and says nothing about either against the
     /// producer. A field the producer grew and the schema and every recorded
     /// frame left out is the shape that passes: the one this gate is for, and
-    /// the one no version number would catch.
+    /// the one no version number would catch. Checking three of the rows left
+    /// the rest unchecked, and a field added inside a worktree or a workspace
+    /// repo passed while the same field added to a session row did not.
+    ///
+    /// The last assertion is what makes this a gate rather than a list: a
+    /// definition the schemas gain and this table does not account for is a
+    /// row nothing holds the producer to, so adding one fails here until the
+    /// sample grows a row of that shape.
     #[test]
     #[serial_test::serial]
     // The published schemas it reads live behind the pack module's debug gate,
@@ -1174,35 +1220,87 @@ mod tests {
     // that is not compiled.
     #[cfg(debug_assertions)]
     fn every_field_the_producer_emits_is_required_by_the_published_schema() {
+        use crate::cli::runtime_read::pack::{HELLO_SCHEMA, SNAPSHOT_SCHEMA};
         let _home = TempHome::new();
         let mut session = named("a", "main");
         session.group_path = "team/sub".into();
+        // A row the gate cannot see is a row nothing holds the producer to,
+        // so the sample carries one of every shape the two schemas name.
+        session.worktree_info = Some(WorktreeInfo {
+            branch: "feature".into(),
+            main_repo_path: "/repo".into(),
+            managed_by_aoe: true,
+            created_at: Utc::now(),
+            base_branch: Some("main".into()),
+        });
+        session.workspace_info = Some(WorkspaceInfo {
+            branch: "feature".into(),
+            workspace_dir: "/repo/.aoe/workspace".into(),
+            created_at: Utc::now(),
+            cleanup_on_delete: true,
+            repos: vec![repo("beta", "/srv/beta")],
+        });
         let sampled = build_snapshot(
             &RuntimeState::new(),
             &[session],
             Owner::remote(),
             Utc::now(),
         );
-        let frame: serde_json::Value =
-            serde_json::from_slice(&snapshot_frame(&sampled)).expect("the frame is JSON");
-        let profile = &frame["data"]["profiles"][0];
-        let emitted: [(&str, &serde_json::Value); 3] = [
-            ("session_read", &frame["data"]["sessions"][0]),
-            ("project_read", &profile["projects"][0]),
-            ("group_read", &profile["groups"][0]),
+        let hello: serde_json::Value =
+            serde_json::from_slice(&hello_frame(&sampled)).expect("the Hello is JSON");
+        let snapshot: serde_json::Value =
+            serde_json::from_slice(&snapshot_frame(&sampled)).expect("the Snapshot is JSON");
+        let hello = &hello["data"];
+        let snapshot = &snapshot["data"];
+        let profile = &snapshot["profiles"][0];
+        let row = &snapshot["sessions"][0];
+        let emitted: [(&str, Option<&str>, &serde_json::Value); 10] = [
+            (HELLO_SCHEMA, None, hello),
+            (HELLO_SCHEMA, Some("owner"), &hello["owner"]),
+            (HELLO_SCHEMA, Some("profile_hello"), &hello["profiles"][0]),
+            (SNAPSHOT_SCHEMA, None, snapshot),
+            (SNAPSHOT_SCHEMA, Some("session_read"), row),
+            (SNAPSHOT_SCHEMA, Some("profile_read"), profile),
+            (
+                SNAPSHOT_SCHEMA,
+                Some("project_read"),
+                &profile["projects"][0],
+            ),
+            (SNAPSHOT_SCHEMA, Some("group_read"), &profile["groups"][0]),
+            (SNAPSHOT_SCHEMA, Some("worktree_read"), &row["worktree"]),
+            (
+                SNAPSHOT_SCHEMA,
+                Some("workspace_repo"),
+                &row["workspace_repos"][0],
+            ),
         ];
-        for (definition, row) in emitted {
-            let object = row
+        let mut checked: BTreeMap<&str, BTreeSet<String>> = BTreeMap::new();
+        for (document, definition, value) in emitted {
+            let label = definition.unwrap_or("the frame itself");
+            let object = value
                 .as_object()
-                .unwrap_or_else(|| panic!("{definition} is an object"));
-            let required = schema_required(definition);
-            let missing: Vec<&String> = object
+                .unwrap_or_else(|| panic!("{label} is an object"));
+            let required = schema_required(document, definition);
+            let unrequired: Vec<&String> = object
                 .keys()
                 .filter(|key| !required.contains(*key))
                 .collect();
             assert!(
-                missing.is_empty(),
-                "{definition} emits fields the published schema does not require: {missing:?}"
+                unrequired.is_empty(),
+                "{label} emits fields the published schema does not require: {unrequired:?}"
+            );
+            if let Some(definition) = definition {
+                checked
+                    .entry(document)
+                    .or_default()
+                    .insert(definition.to_string());
+            }
+        }
+        for document in [HELLO_SCHEMA, SNAPSHOT_SCHEMA] {
+            assert_eq!(
+                row_definitions(document),
+                checked.get(document).cloned().unwrap_or_default(),
+                "{document} names a row this gate does not check"
             );
         }
     }
