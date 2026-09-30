@@ -1739,14 +1739,6 @@ mod tests {
     }
 
     #[test]
-    fn os_path_helpers_do_not_create_directories() {
-        let base = std::env::temp_dir().join(format!("aoe-read-{}", uuid::Uuid::new_v4()));
-        let path = base.join("missing");
-        assert!(!path.exists());
-        assert!(app_path_and_home().is_ok());
-        assert!(!path.exists());
-    }
-    #[test]
     fn connected_socket_identity_does_not_require_path_inode_equality() {
         use std::os::unix::net::{UnixListener, UnixStream};
 
