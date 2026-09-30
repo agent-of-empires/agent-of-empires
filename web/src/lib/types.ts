@@ -388,6 +388,8 @@ export interface CreateSessionRequest {
   /** A retry with the same key returns the session the first attempt created;
    *  also keys `fetchCreateProgress`. */
   idempotency_key?: string;
+  /** On a retry only: the daemon run the first attempt went to (`create_boot_id`). */
+  retry_origin?: string;
 }
 
 export interface CreateProgress {

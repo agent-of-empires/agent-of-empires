@@ -95,8 +95,10 @@ pub struct CreateFailure {
     pub message: String,
 }
 
-#[derive(Default)]
 pub struct CreateProgressRegistry {
+    /// Random per daemon run: a retry naming another run's id is refused when its key
+    /// is unknown here, since that run's in-memory replay record is gone.
+    boot_id: String,
     live: Arc<Mutex<HashMap<String, Arc<CreateProgress>>>>,
     failures: Mutex<HashMap<String, (Instant, CreateFailure)>>,
 }
@@ -121,7 +123,21 @@ impl Drop for CreateProgressRegistration {
     }
 }
 
+impl Default for CreateProgressRegistry {
+    fn default() -> Self {
+        Self {
+            boot_id: uuid::Uuid::new_v4().to_string(),
+            live: Default::default(),
+            failures: Default::default(),
+        }
+    }
+}
+
 impl CreateProgressRegistry {
+    pub fn boot_id(&self) -> &str {
+        &self.boot_id
+    }
+
     pub fn register(&self, key: &str) -> CreateProgressRegistration {
         let progress = Arc::new(CreateProgress::new());
         self.live

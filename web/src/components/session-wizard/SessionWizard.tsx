@@ -9,6 +9,7 @@ import {
   fetchProjects,
   fetchSettings,
   createSession,
+  fetchCreateBootId,
   fetchCreateProgress,
   fetchVolumeIgnoresPreview,
   fetchIsGitRepo,
@@ -31,6 +32,7 @@ import {
   registerPendingCreate,
   releasePendingCreate,
   resolvePendingCreate,
+  retryBody,
   type PendingCreate,
 } from "../../lib/pendingCreates";
 import { hasFinePointer } from "../../lib/platform";
@@ -324,10 +326,13 @@ export function SessionWizard({ onClose, onCreated, onCreatedInBackground, prefi
     }
   };
 
-  const runCreate = async (body: CreateSessionRequest, tool: string, since = Date.now()) => {
+  // `resume` continues a create whose first send already went out: every send is then
+  // a retry naming the daemon run that took the first one.
+  const runCreate = async (body: CreateSessionRequest, tool: string, resume?: PendingCreate) => {
     setUnknownOutcome(null);
     setProgressKey(body.idempotency_key ?? null);
     const key = body.idempotency_key;
+    const since = resume?.since ?? Date.now();
     // Checked before every send, the first included, since a resumed request can be old
     // and the waits below are unbounded: past the replay window, stop without sending.
     const expired = () => !!key && isPendingCreateExpired(since);
@@ -341,31 +346,41 @@ export function SessionWizard({ onClose, onCreated, onCreatedInBackground, prefi
       }
     };
     if (expired()) return giveUp();
+    const origin = resume ? resume.origin : key ? await fetchCreateBootId() : null;
+    const pending: PendingCreate | null = key ? { body: { ...body, idempotency_key: key }, tool, since, origin } : null;
     // Recorded before the request goes out, so a reload mid-flight still has the key.
-    if (key) registerPendingCreate({ body: { ...body, idempotency_key: key }, tool, since }, { claimed: true });
-    let result = await createSession(body);
-    for (let attempt = 0; result.network && key && attempt < NETWORK_RETRIES; attempt++) {
+    if (pending) registerPendingCreate(pending, { claimed: true });
+    const send = (retry: boolean) => createSession(pending && retry ? retryBody(pending) : body);
+    let result = await send(!!resume);
+    for (let attempt = 0; result.network && pending && attempt < NETWORK_RETRIES; attempt++) {
       await waitUntilOnline();
       await waitUntilVisible();
       await new Promise((r) => setTimeout(r, Math.min(1000 * (attempt + 1), MAX_RETRY_DELAY_MS)));
       if (expired()) return giveUp();
-      result = await createSession(body);
+      result = await send(true);
     }
     setProgressKey(null);
     const background = backgroundRef.current;
     // No answer is not a refusal: the detached server create may still finish, so
     // keep the key and reconcile under it rather than report a failure.
-    if (result.network && key) {
+    if (result.network && pending) {
       if (background) {
         // The wizard is gone, so the app-level owner keeps retrying under this key.
-        releasePendingCreate(key);
+        releasePendingCreate(pending.body.idempotency_key);
       } else {
-        setUnknownOutcome({ body: { ...body, idempotency_key: key }, tool, since });
+        setUnknownOutcome(pending);
         dispatch({ type: "SUBMIT_ERROR", error: UNKNOWN_OUTCOME_ERROR });
       }
       return;
     }
     if (key) resolvePendingCreate(key);
+    if (result.outcomeUnknown) {
+      // The server restarted and cannot say whether the first attempt ran; retrying could
+      // run it twice, so this is where it stops.
+      if (background) toastBus.handler?.error(result.error ?? "Unknown outcome");
+      else dispatch({ type: "SUBMIT_ERROR", error: result.error ?? "Unknown outcome" });
+      return;
+    }
     if (result.ok) {
       dispatch({ type: "SUBMIT_SUCCESS" });
       if (ACP_CAPABLE_TOOLS.has(tool)) safeSetItem(LAST_USED_TOOL_KEY, tool);
@@ -387,7 +402,7 @@ export function SessionWizard({ onClose, onCreated, onCreatedInBackground, prefi
   const handleSubmit = async () => {
     dispatch({ type: "SUBMIT_START" });
     if (unknownOutcome) {
-      await runCreate(unknownOutcome.body, unknownOutcome.tool, unknownOutcome.since);
+      await runCreate(unknownOutcome.body, unknownOutcome.tool, unknownOutcome);
       return;
     }
     const d = state.data;
@@ -431,7 +446,7 @@ export function SessionWizard({ onClose, onCreated, onCreatedInBackground, prefi
     if (!unknownOutcome || state.isSubmitting) return;
     const retry = () => {
       dispatch({ type: "SUBMIT_START" });
-      void runCreate(unknownOutcome.body, unknownOutcome.tool, unknownOutcome.since);
+      void runCreate(unknownOutcome.body, unknownOutcome.tool, unknownOutcome);
     };
     window.addEventListener("online", retry);
     return () => window.removeEventListener("online", retry);

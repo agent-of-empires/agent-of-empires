@@ -931,10 +931,17 @@ export interface ServerAbout {
     /** Optimistic: true means no failure has latched yet. */
     backend_available: boolean;
   };
+  /** This daemon run's id; a create's retries send it back as `retry_origin`. */
+  create_boot_id?: string;
 }
 
 export function fetchAbout(): Promise<ServerAbout | null> {
   return fetchJson<ServerAbout>("/api/about");
+}
+
+/** The current daemon run's id, read fresh right before a create's first send. */
+export async function fetchCreateBootId(): Promise<string | null> {
+  return (await fetchAbout())?.create_boot_id ?? null;
 }
 
 export interface TelemetryStatus {
@@ -1376,6 +1383,8 @@ export async function createSession(body: CreateSessionRequest): Promise<{
   hooksNeedTrust?: HooksNeedTrust;
   /** No definite answer (dropped request, or a proxy timeout page), so the create may still be running. */
   network?: boolean;
+  /** A restarted daemon cannot tell whether the first attempt ran; retrying stops here. */
+  outcomeUnknown?: boolean;
 }> {
   try {
     const res = await fetch("/api/sessions", jsonInit("POST", body));
@@ -1393,6 +1402,9 @@ export async function createSession(body: CreateSessionRequest): Promise<{
       return { ok: false, error: `No answer from the server (${res.status})`, network: true };
     }
     if (!data) return { ok: false, error: `Server error (${res.status}): ${text.slice(0, 200)}` };
+    if (data.error === "create_outcome_unknown") {
+      return { ok: false, error: data.message || "Whether the session was created is unknown.", outcomeUnknown: true };
+    }
     if (data.error !== "hooks_need_trust") return { ok: false, error: data.message || `Server error (${res.status})` };
     return {
       ok: false,

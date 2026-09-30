@@ -835,6 +835,11 @@ describe("createSession errors", () => {
     expect(await api.createSession(body)).toEqual({ ok: false, error: "try later" });
     fetchSpy.mockResolvedValueOnce(new Response("too large", { status: 413 }));
     expect(await api.createSession(body)).toEqual({ ok: false, error: "Server error (413): too large" });
+    // A restarted daemon that cannot see the first attempt: settled, and not a failure.
+    fetchSpy.mockResolvedValueOnce(
+      new Response(JSON.stringify({ error: "create_outcome_unknown", message: "restarted" }), { status: 409 }),
+    );
+    expect(await api.createSession(body)).toEqual({ ok: false, error: "restarted", outcomeUnknown: true });
     offline();
     expect(await api.createSession(body)).toEqual({ ok: false, error: "Network error: offline", network: true });
   });

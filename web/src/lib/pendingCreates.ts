@@ -12,11 +12,25 @@ export interface PendingCreate {
   body: CreateSessionRequest & { idempotency_key: string };
   tool: string;
   since: number;
+  /** `create_boot_id` of the daemon run the first attempt went to; null when unknown. */
+  origin: string | null;
 }
+
+// Never a real boot id, so a retry whose origin was not captured is fenced on any
+// daemon that does not know its key.
+const UNKNOWN_ORIGIN = "unknown";
+
+/** The body of any send after the first: a restarted daemon refuses rather than re-run it. */
+export const retryBody = (p: PendingCreate): CreateSessionRequest => ({
+  ...p.body,
+  retry_origin: p.origin ?? UNKNOWN_ORIGIN,
+});
 
 export interface PendingCreateHandlers {
   onCreated: (session: SessionResponse | undefined, pending: PendingCreate) => void;
   onFailed: (message: string, pending: PendingCreate) => void;
+  /** The server restarted and cannot tell whether the create ran. */
+  onUnknown: (message: string, pending: PendingCreate) => void;
   /** Storage refused the record: it is still retried, but a reload would lose it. */
   onUnsaved?: (pending: PendingCreate) => void;
 }
@@ -50,7 +64,8 @@ function isWellFormed(p: unknown): p is PendingCreate {
     typeof c.body.tool === "string" &&
     typeof c.tool === "string" &&
     typeof c.since === "number" &&
-    Number.isFinite(c.since)
+    Number.isFinite(c.since) &&
+    (c.origin === null || c.origin === undefined || typeof c.origin === "string")
   );
 }
 
@@ -114,11 +129,13 @@ async function reconcile(pending: PendingCreate): Promise<void> {
         handlers?.onFailed(PENDING_CREATE_EXPIRED_MESSAGE, pending);
         return;
       }
-      const result = await createSession(pending.body);
+      // Every send here follows a first one, so each names the run that took it.
+      const result = await createSession(retryBody(pending));
       if (result.network) continue;
       if (!isOwned(key)) return;
       resolvePendingCreate(key);
       if (result.ok) handlers?.onCreated(result.session, pending);
+      else if (result.outcomeUnknown) handlers?.onUnknown(result.error || "Unknown outcome", pending);
       else handlers?.onFailed(result.error || "Unknown error", pending);
       return;
     }

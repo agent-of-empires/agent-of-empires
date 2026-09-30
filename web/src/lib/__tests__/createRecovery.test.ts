@@ -26,11 +26,12 @@ describe("create recovery through a reverse proxy", () => {
     );
     const onCreated = vi.fn();
     const onFailed = vi.fn();
-    startPendingCreates({ onCreated, onFailed });
+    startPendingCreates({ onCreated, onFailed, onUnknown: vi.fn() });
     registerPendingCreate({
       body: { path: "/tmp/p", tool: "claude", idempotency_key: "k-504" },
       tool: "claude",
       since: Date.now(),
+      origin: "boot-a",
     });
 
     await vi.waitFor(() => expect(onCreated).toHaveBeenCalled(), { timeout: 5000 });

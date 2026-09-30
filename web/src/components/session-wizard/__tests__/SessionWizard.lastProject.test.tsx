@@ -24,6 +24,7 @@ const fetchRecentProjects = vi.fn();
 
 vi.mock("../../../lib/api", () => ({
   fetchCreateProgress: vi.fn().mockResolvedValue(null),
+  fetchCreateBootId: vi.fn().mockResolvedValue("boot-1"),
   fetchSettings: (...args: unknown[]) => fetchSettings(...args),
   fetchAgents: vi.fn().mockResolvedValue([]),
   fetchIsGitRepo: (...args: unknown[]) => fetchIsGitRepo(...args),

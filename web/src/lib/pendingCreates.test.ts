@@ -19,6 +19,7 @@ const pending = (key: string, since = Date.now()) => ({
   body: { path: "/tmp/p", tool: "claude", idempotency_key: key },
   tool: "claude",
   since,
+  origin: null as string | null,
 });
 
 beforeEach(() => {
@@ -41,7 +42,7 @@ describe("pendingCreates", () => {
     createSession.mockResolvedValue({ ok: true, session: { id: "s1" } });
     const onCreated = vi.fn();
     const second = await import("./pendingCreates");
-    second.startPendingCreates({ onCreated, onFailed: vi.fn() });
+    second.startPendingCreates({ onCreated, onFailed: vi.fn(), onUnknown: vi.fn() });
     await vi.waitFor(() => expect(onCreated).toHaveBeenCalledWith({ id: "s1" }, expect.anything()));
     expect(createSession.mock.calls.every(([body]) => body.idempotency_key === "k-reload")).toBe(true);
     expect(second.peekPendingCreate()).toBeNull();
@@ -51,7 +52,7 @@ describe("pendingCreates", () => {
     const { startPendingCreates, registerPendingCreate, peekPendingCreate, PENDING_CREATE_MAX_AGE_MS } =
       await import("./pendingCreates");
     const onFailed = vi.fn();
-    startPendingCreates({ onCreated: vi.fn(), onFailed });
+    startPendingCreates({ onCreated: vi.fn(), onFailed, onUnknown: vi.fn() });
     createSession.mockResolvedValue({ ok: false, error: "hook failed" });
     registerPendingCreate(pending("k-fail"));
     await vi.waitFor(() => expect(onFailed).toHaveBeenCalledWith("hook failed", expect.anything()));
@@ -109,12 +110,12 @@ describe("pendingCreates", () => {
       const onFailed = vi.fn();
       const nearlyExpired = pending("k-expire", Date.now() - mod.PENDING_CREATE_MAX_AGE_MS + 2_000);
       if (tracked) {
-        mod.startPendingCreates({ onCreated: vi.fn(), onFailed });
+        mod.startPendingCreates({ onCreated: vi.fn(), onFailed, onUnknown: vi.fn() });
         mod.registerPendingCreate(nearlyExpired);
       } else {
         localStorage.setItem("aoe-pending-creates", JSON.stringify([nearlyExpired]));
         await vi.advanceTimersByTimeAsync(5_000);
-        mod.startPendingCreates({ onCreated: vi.fn(), onFailed });
+        mod.startPendingCreates({ onCreated: vi.fn(), onFailed, onUnknown: vi.fn() });
       }
       await vi.advanceTimersByTimeAsync(10_000);
       expect(onFailed).toHaveBeenCalledWith(mod.PENDING_CREATE_EXPIRED_MESSAGE, expect.anything());
@@ -143,7 +144,7 @@ describe("pendingCreates", () => {
     createSession.mockResolvedValue({ ok: true, session: { id: "s1" } });
     const onCreated = vi.fn();
     const second = await import("./pendingCreates");
-    second.startPendingCreates({ onCreated, onFailed: vi.fn() });
+    second.startPendingCreates({ onCreated, onFailed: vi.fn(), onUnknown: vi.fn() });
     await vi.waitFor(() => expect(onCreated).toHaveBeenCalledWith({ id: "s1" }, expect.anything()));
     expect(createSession.mock.calls.map(([body]) => body.idempotency_key)).toEqual(["k-kept"]);
   });
@@ -154,7 +155,7 @@ describe("pendingCreates", () => {
     const mod = await import("./pendingCreates");
     const onUnsaved = vi.fn();
     const onCreated = vi.fn();
-    mod.startPendingCreates({ onCreated, onFailed: vi.fn(), onUnsaved });
+    mod.startPendingCreates({ onCreated, onFailed: vi.fn(), onUnsaved, onUnknown: vi.fn() });
     mod.registerPendingCreate(pending("k-unsaved"));
     expect(onUnsaved).toHaveBeenCalledTimes(1);
     expect(mod.peekPendingCreate()?.body.idempotency_key).toBe("k-unsaved");
@@ -165,5 +166,31 @@ describe("pendingCreates", () => {
     });
     // Retried under its own key (loops left by earlier tests' module copies share the mock).
     expect(createSession.mock.calls.filter(([body]) => body.idempotency_key === "k-unsaved").length).toBeGreaterThan(1);
+  });
+
+  it("names the first attempt's daemon run on every send, and reports a restart's unknown outcome", async () => {
+    createSession
+      .mockResolvedValueOnce({ ok: false, error: "offline", network: true })
+      .mockResolvedValueOnce({ ok: false, error: "restarted", outcomeUnknown: true });
+    const mod = await import("./pendingCreates");
+    const onUnknown = vi.fn();
+    const onFailed = vi.fn();
+    mod.startPendingCreates({ onCreated: vi.fn(), onFailed, onUnknown });
+    mod.registerPendingCreate({ ...pending("k-origin"), origin: "boot-a" });
+    await vi.waitFor(() => expect(onUnknown).toHaveBeenCalledWith("restarted", expect.anything()), { timeout: 5000 });
+    expect(onFailed).not.toHaveBeenCalled();
+    expect(createSession.mock.calls.map(([body]) => body.retry_origin)).toEqual(["boot-a", "boot-a"]);
+    expect(mod.peekPendingCreate()).toBeNull();
+  });
+
+  it("fences a saved create whose first run was never recorded", async () => {
+    createSession.mockResolvedValue({ ok: true, session: { id: "s1" } });
+    // Saved before origins were recorded.
+    const { origin: _dropped, ...legacy } = pending("k-legacy");
+    localStorage.setItem("aoe-pending-creates", JSON.stringify([legacy]));
+    const mod = await import("./pendingCreates");
+    mod.startPendingCreates({ onCreated: vi.fn(), onFailed: vi.fn(), onUnknown: vi.fn() });
+    await vi.waitFor(() => expect(createSession).toHaveBeenCalled());
+    expect(createSession.mock.calls[0]![0].retry_origin).toBe("unknown");
   });
 });

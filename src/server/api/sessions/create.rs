@@ -95,6 +95,11 @@ pub struct CreateSessionBody {
     /// survives a daemon restart (#3156).
     #[serde(default)]
     pub idempotency_key: Option<String>,
+    /// Set on a retry: the `create_boot_id` of the daemon the first attempt went to. A
+    /// daemon that does not know the key and did not take that attempt cannot tell
+    /// whether it ran, so it refuses rather than run it, and its hooks, again.
+    #[serde(default)]
+    pub retry_origin: Option<String>,
 }
 
 /// Hard cap on one `idempotency_key`'s length, so a request cannot persist an
@@ -962,6 +967,17 @@ pub async fn create_session(
         }
         if let Some(failure) = state.create_progress.recent_failure(key) {
             return api_error(failure.status, failure.code, failure.message);
+        }
+        if body
+            .retry_origin
+            .as_deref()
+            .is_some_and(|origin| origin != state.create_progress.boot_id())
+        {
+            return api_error(
+                StatusCode::CONFLICT,
+                "create_outcome_unknown",
+                "The server restarted before confirming this session, so whether it was created is unknown. Check the session list before launching it again.",
+            );
         }
         // Forgetting a live failure would let its retry run the create again, so a full
         // replay map refuses new keyed creates instead.

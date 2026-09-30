@@ -377,6 +377,7 @@ function AppContent({
         toastBus.handler?.info(`"${session.title}" is ready`);
       },
       onFailed: (message) => toastBus.handler?.error(`Session was not created: ${message}`),
+      onUnknown: (message) => toastBus.handler?.error(message),
       onUnsaved: () =>
         toastBus.handler?.error(
           "This browser could not save a session that is still being created; keep this tab open until it finishes.",

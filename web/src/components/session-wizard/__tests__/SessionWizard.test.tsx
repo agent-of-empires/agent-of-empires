@@ -14,6 +14,7 @@ const createSession = vi.fn();
 
 vi.mock("../../../lib/api", () => ({
   fetchCreateProgress: vi.fn().mockResolvedValue(null),
+  fetchCreateBootId: vi.fn().mockResolvedValue("boot-1"),
   fetchSettings: vi.fn().mockResolvedValue({}),
   fetchAgents: vi.fn().mockResolvedValue([]),
   fetchIsGitRepo: vi.fn().mockResolvedValue(true),
@@ -405,6 +406,39 @@ describe("SessionWizard unknown create outcome", () => {
     expect(payload(sent).idempotency_key).not.toBe(payload(0).idempotency_key);
   });
 
+  it("sends the first attempt plain and names its daemon run on every retry", async () => {
+    renderWizard();
+    await loseEveryResponse();
+    await waitFor(() => expect(screen.getByText(/may still be created/)).toBeTruthy());
+    expect(payload(0).retry_origin).toBeUndefined();
+    const retries = createSession.mock.calls.slice(1).map(([body]) => body.retry_origin);
+    expect(retries.length).toBeGreaterThan(0);
+    expect(new Set(retries)).toEqual(new Set(["boot-1"]));
+
+    // Launch resumes the same attempt, so it is a retry too.
+    createSession.mockResolvedValue({ ok: true, session: { id: "s1" } });
+    await launch();
+    await waitFor(() => expect(payload(createSession.mock.calls.length - 1).retry_origin).toBe("boot-1"));
+  });
+
+  it("stops at a restarted server's unknown outcome instead of calling it a failure", async () => {
+    renderWizard();
+    await loseEveryResponse();
+    await waitFor(() => expect(screen.getByText(/may still be created/)).toBeTruthy());
+    const message = "The server restarted before confirming this session.";
+    createSession.mockResolvedValue({ ok: false, error: message, outcomeUnknown: true });
+    await launch();
+    await waitFor(() => expect(screen.getByText(message)).toBeTruthy());
+    const sent = createSession.mock.calls.length;
+
+    // Settled: the next Launch is a fresh request under a new key.
+    createSession.mockResolvedValue({ ok: true, session: { id: "s1" } });
+    await launch();
+    await waitFor(() => expect(createSession).toHaveBeenCalledTimes(sent + 1));
+    expect(payload(sent).idempotency_key).not.toBe(payload(0).idempotency_key);
+    expect(payload(sent).retry_origin).toBeUndefined();
+  });
+
   it("keeps the key and retries the same request from Launch", async () => {
     const { onCreated } = renderWizard();
     await loseEveryResponse();
@@ -463,7 +497,7 @@ describe("SessionWizard unknown create outcome", () => {
 
   it("the app-level owner reconciles a closed wizard's create once the server answers", async () => {
     const onCreatedByOwner = vi.fn();
-    startPendingCreates({ onCreated: onCreatedByOwner, onFailed: vi.fn() });
+    startPendingCreates({ onCreated: onCreatedByOwner, onFailed: vi.fn(), onUnknown: vi.fn() });
     const { key } = await launchInBackgroundAndClose();
 
     createSession.mockResolvedValue({ ok: true, session: { id: "s1" } });

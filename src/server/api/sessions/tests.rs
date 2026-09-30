@@ -4502,3 +4502,53 @@ async fn a_full_failure_map_replays_its_oldest_key_and_refuses_new_ones() {
     );
     assert_eq!(hook_runs(), 1, "neither retry may run the create again");
 }
+
+/// A daemon restart empties the in-memory replay record. A same-key retry that names the
+/// earlier run must then be refused as unknown, not run again with its hooks.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_retry_across_a_daemon_restart_never_reruns_a_failed_create() {
+    use crate::server::test_support as support;
+    let _home = crate::session::test_support::isolate_app_dir();
+    let marker = tempfile::tempdir().unwrap();
+    let side_effects = marker.path().join("side-effects");
+    // The first hook leaves an external side effect, the second fails.
+    let effect = format!("echo effect >> '{}'", side_effects.display());
+    let project = project_with_on_create_hooks(&[effect.as_str(), "exit 1"]);
+    support::seed_instances_on_disk_for_test("test", Vec::new());
+    let effects = || {
+        std::fs::read_to_string(&side_effects)
+            .unwrap_or_default()
+            .lines()
+            .count()
+    };
+    let body = |origin: Option<&str>| {
+        serde_json::json!({
+            "title": "restart", "path": project.path(), "tool": "claude",
+            "view": "structured", "profile": "test", "trust_hooks": true,
+            "idempotency_key": "across-restart", "retry_origin": origin,
+        })
+    };
+
+    let (launcher, _) = support::counting_failing_launcher();
+    let before = support::build_test_app_state_with_launcher(Vec::new(), launcher);
+    let first_run = before.create_progress.boot_id().to_string();
+    let (status, _) = post_create(&before, body(None)).await;
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+    assert_eq!(effects(), 1);
+
+    // The response was lost and the daemon restarted.
+    let (launcher, _) = support::counting_failing_launcher();
+    let after = support::build_test_app_state_with_launcher(Vec::new(), launcher);
+    assert_ne!(after.create_progress.boot_id(), first_run);
+    let (status, refused) = post_create(&after, body(Some(&first_run))).await;
+    assert_eq!(status, axum::http::StatusCode::CONFLICT, "{refused}");
+    assert_eq!(refused["error"], "create_outcome_unknown");
+    assert_eq!(effects(), 1, "the retry must not run the hooks again");
+
+    // A retry that names this run is not fenced: this run would know the key if it ran.
+    let own = after.create_progress.boot_id().to_string();
+    let (status, _) = post_create(&after, body(Some(&own))).await;
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+    assert_eq!(effects(), 2);
+}

@@ -1,4 +1,4 @@
-import { useLayoutEffect, useState, type ReactNode, type RefObject } from "react";
+import { useEffect, useLayoutEffect, useState, type ReactNode, type RefObject } from "react";
 import { createPortal } from "react-dom";
 
 // Below Tailwind's `md`, where `sheetOnMobile` docks the menu as a sheet.
@@ -33,6 +33,14 @@ export function ContextMenu({
   const [modal] = useState(
     () => sheetOnMobile && typeof window !== "undefined" && !!window.matchMedia?.(MOBILE_QUERY).matches,
   );
+  // The mode is fixed at open, so crossing the breakpoint closes the menu rather than
+  // leaving a desktop menu modal or a phone sheet without containment.
+  useEffect(() => {
+    if (!sheetOnMobile || !onClose || typeof window === "undefined") return;
+    const query = window.matchMedia?.(MOBILE_QUERY);
+    query?.addEventListener?.("change", onClose);
+    return () => query?.removeEventListener?.("change", onClose);
+  }, [sheetOnMobile, onClose]);
   // Focus enters on open and goes back to the trigger on close, unless the closing click
   // already focused something else.
   useLayoutEffect(() => {

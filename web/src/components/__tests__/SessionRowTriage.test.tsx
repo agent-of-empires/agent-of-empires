@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, screen } from "@testing-library/react";
 
 import type { SessionResponse } from "../../lib/types";
 import { OPEN_SESSION_EVENT } from "../../lib/sessionRoute";
@@ -153,6 +153,23 @@ describe("SessionRow context menu", () => {
     expect(document.activeElement).toBe(last);
     // Escape still closes it.
     fireEvent.keyDown(last, { key: "Escape" });
+    expect(testId("sidebar-context-menu")).toBeNull();
+  });
+
+  it("closes when the viewport crosses the phone breakpoint while open", () => {
+    const listeners: (() => void)[] = [];
+    vi.stubGlobal(
+      "matchMedia",
+      vi.fn((query: string) => ({
+        matches: false,
+        media: query,
+        addEventListener: (_: string, fn: () => void) => listeners.push(fn),
+        removeEventListener: vi.fn(),
+      })),
+    );
+    openRowMenu(ws(), { expandMore: false });
+    expect(listeners.length).toBeGreaterThan(0);
+    act(() => listeners.forEach((fn) => fn()));
     expect(testId("sidebar-context-menu")).toBeNull();
   });
 
