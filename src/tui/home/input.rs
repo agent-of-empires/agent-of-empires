@@ -4174,6 +4174,14 @@ impl HomeView {
             }
         }
         self.rebuild_flat_items();
+        // The runtime owns the session rows, so `save()` is now a no-op for a
+        // collapse: the toggle would look like it worked and never persist.
+        // Say so rather than dropping the user's click, until the collapse is
+        // submitted as `SessionMutation::Group` like the other group writes.
+        if let Some(reason) = self.local_write_block() {
+            self.refuse_local_write(reason);
+            return;
+        }
         if let Err(e) = self.save() {
             tracing::error!(target: "tui.input", "Failed to save group state: {}", e);
         }
