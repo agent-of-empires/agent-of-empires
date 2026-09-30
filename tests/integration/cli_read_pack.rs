@@ -637,7 +637,7 @@ fn a_frame_that_breaks_the_published_schema_is_still_refused() {
 
 /// A timestamp outside the grammar both the producer and the client admit is
 /// refused for what it is: a bad timestamp, named as one. The `+00:00` zone is
-/// the offset form `valid_timestamp` refuses and `format_timestamp` never
+/// the offset form `valid_timestamp` refuses and `display_timestamp` never
 /// writes.
 #[test]
 #[parallel]
@@ -978,7 +978,7 @@ fn a_boolean_items_in_a_published_document_is_refused() {
 
 /// `enum` is the same identity test as `const`, and the two must agree on the
 /// spelling of a number: the draft defines both over the *value*, so
-/// `{"enum": [2.0]}` names the value every recorded `protocol_version` carries.
+/// `{"enum": [3.0]}` names the value every recorded `protocol_version` carries.
 /// `enum` once compared `Number` spellings structurally, which made this edit
 /// refuse every frame in the pack over a difference no document had written
 /// down.
@@ -988,14 +988,14 @@ fn an_enumerated_number_names_the_value_and_not_its_spelling() {
     let (_dir, root) = staged_pack();
     let path = root.join("hello.schema.json");
     let text = fs::read_to_string(&path).expect("read the published document");
-    let from = r#""protocol_version": { "const": 2 }"#;
+    let from = r#""protocol_version": { "const": 3 }"#;
     assert!(
         text.contains(from),
         "the document carries the edited keyword"
     );
     fs::write(
         &path,
-        text.replacen(from, r#""protocol_version": { "enum": [2.0] }"#, 1),
+        text.replacen(from, r#""protocol_version": { "enum": [3.0] }"#, 1),
     )
     .expect("rewrite the document");
     restage(&root);

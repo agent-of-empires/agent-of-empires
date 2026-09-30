@@ -19,6 +19,7 @@ use super::render;
 use super::{map_upgrade_error, Cli, ReadOutcome, ScopedCommand, WsError};
 use crate::cli::list::{ListArgs, StateFilter};
 use crate::cli::status::StatusArgs;
+use crate::server::runtime_ws::PROTOCOL_VERSION;
 
 fn pack() -> pack::VerifiedPack {
     pack::verify(&pack::pack_root()).expect("the committed Contract Pack verifies")
@@ -140,7 +141,11 @@ fn a_hello_from_another_protocol_version_is_a_transport_mismatch() {
         .expect("the pack ships a UDS case");
     let frames = application_frames(case);
     let hello = text_payload(&frames[0]);
-    let downgraded = hello.replacen("\"protocol_version\":2", "\"protocol_version\":1", 1);
+    let emitted = PROTOCOL_VERSION;
+    let downgraded = hello.replace(
+        &format!("\"protocol_version\":{emitted}"),
+        &format!("\"protocol_version\":{}", emitted - 1),
+    );
     assert_ne!(hello, downgraded, "the Hello states its version");
     assert!(matches!(
         parse_hello(downgraded.as_bytes()),

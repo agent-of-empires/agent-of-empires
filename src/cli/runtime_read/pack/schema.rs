@@ -118,6 +118,10 @@ impl Schema {
         if let Some(reason) = self.check_keyword(object, instance, pointer, schema_at, "minimum") {
             return Some(reason);
         }
+        if let Some(reason) = self.check_keyword(object, instance, pointer, schema_at, "minLength")
+        {
+            return Some(reason);
+        }
         if let Some(reason) = self.check_keyword(object, instance, pointer, schema_at, "required") {
             return Some(reason);
         }
@@ -255,6 +259,14 @@ impl Schema {
                 let bound = expected.as_f64()?;
                 let value = instance.as_f64()?;
                 (value < bound).then_some(format!("{at}: {value} is below the minimum {bound}"))
+            }
+            "minLength" => {
+                // Length in characters, as JSON Schema counts it, so a
+                // multi-byte value is not held to its byte count.
+                let bound = expected.as_u64()?;
+                let text = instance.as_str()?;
+                (text.chars().count() < bound as usize)
+                    .then_some(format!("{at}: {text:?} is shorter than {bound} characters"))
             }
             "required" => {
                 let members = instance.as_object()?;
@@ -477,6 +489,7 @@ const SUPPORTED: &[&str] = &[
     "enum",
     "examples",
     "items",
+    "minLength",
     "minimum",
     "not",
     "oneOf",

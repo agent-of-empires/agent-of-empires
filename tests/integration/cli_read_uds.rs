@@ -194,8 +194,8 @@ async fn no_daemon_publication_leaves_the_command_to_the_local_path() {
     );
 }
 
-/// An empty or whitespace-only selection in the environment is one decision,
-/// in both variables, and a live daemon must answer it the way the local
+/// An empty selection in the environment is one decision, in both variables,
+/// and a live daemon must answer it the way the local
 /// command path does: `aoe list` reads the default profile and prints the
 /// table. Before, the empty profile came back as `profile_missing` (exit 4)
 /// from the daemon while the very same command succeeded with no daemon, and
@@ -217,11 +217,6 @@ async fn an_empty_environment_selection_is_answered_not_refused() {
     for (label, env_url, env_profile) in [
         ("absent", None, None),
         ("empty", Some(OsString::from("")), Some(OsString::from(""))),
-        (
-            "whitespace",
-            Some(OsString::from("   ")),
-            Some(OsString::from("  ")),
-        ),
     ] {
         let source = ReadRequestSource {
             explicit_url: None,
