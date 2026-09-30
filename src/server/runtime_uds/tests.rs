@@ -788,6 +788,86 @@ fn client_refusal(path: &Path) -> String {
     format!("{walked:?}")
 }
 
+/// A marker is created with `0o600` as a *mode argument*, so a umask that
+/// masks an owner bit lands it at less than the client admits, and a marker the
+/// publisher then cannot read back wedges the namespace for good. The two
+/// neighbouring artifacts pin their own mode; the marker did not.
+///
+/// The umask is process-global rather than a key in the environment map, so
+/// neither `test_env_lock` nor `RuntimeEnvGuard` covers it, and
+/// `#[serial_test::serial]` excludes only other `serial` tests, not the lib's
+/// unannotated ones. What bounds the exposure is the window, not the
+/// attribute: it opens immediately before `publish()` and stays open across the
+/// publication's `Drop`, because retraction has to run under the same mask or
+/// the wedge is invisible. The app directory is created outside the window
+/// because `get_app_dir` creates it with a bare `create_dir_all`, and a
+/// reduced umask would break the directory rather than the marker; its mode is
+/// left at whatever the ambient umask gives it, since the walk refuses only
+/// group and other writes.
+///
+/// The assertions are behaviour, not codes. A `namespace_busy` or a
+/// `marker_foreign` expectation would pin a label that has already changed
+/// once, and a mode assertion alone would pass just as happily against a
+/// "fix" that hardens the mode by refusing to publish at all.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_marker_keeps_its_mode_under_a_umask_that_would_clear_it() {
+    let namespace = namespace().expect("a private ancestor chain exists on this host");
+    let dir = app_dir(&namespace);
+    {
+        let _umask = Umask::set(0o777);
+        let published = publish().expect("the namespace is free under the mask");
+        assert_eq!(
+            mode_of(&dir.join(PREBIND_FILE)),
+            0o600,
+            "the prebind marker is owner read and write whatever the umask says"
+        );
+        assert_eq!(
+            mode_of(&dir.join(POSTBIND_FILE)),
+            0o600,
+            "the postbind marker is owner read and write whatever the umask says"
+        );
+        // Retraction proves it owns what it wrote by reading the postbind
+        // marker back. A marker it cannot read fails that check before any
+        // unlink, so the artifacts survive the process that created them.
+        drop(published);
+        // The lock is the one artifact retraction keeps, by design: a
+        // publisher must find it to take the lock again.
+        for name in [PREBIND_FILE, POSTBIND_FILE, SOCKET_FILE] {
+            assert!(
+                !dir.join(name).exists(),
+                "{name} must be gone after retraction, or the namespace is wedged"
+            );
+        }
+        // And a namespace nothing was stranded in is publishable again.
+        let republished = publish().expect("a retracted namespace is publishable");
+        drop(republished);
+    }
+    // With the mask gone, a client read answers from what is published.
+    assert!(
+        client_admits(&dir),
+        "the client admits the published directory: {}",
+        client_refusal(&dir)
+    );
+}
+
+/// A process-global umask held for one scope. It is a global rather than a key
+/// in the environment map, so the environment locks this crate has do not
+/// cover it and the enclosing test must be `#[serial_test::serial]`.
+struct Umask(libc::mode_t);
+
+impl Umask {
+    fn set(mask: libc::mode_t) -> Self {
+        Self(unsafe { libc::umask(mask) })
+    }
+}
+
+impl Drop for Umask {
+    fn drop(&mut self) {
+        unsafe { libc::umask(self.0) };
+    }
+}
+
 /// Whether this host's filesystem takes an access ACL at all, printed. It
 /// exists so a failing lane can be read against the platform's answer rather
 /// than guessed at, and it neither returns nor skips: the lanes that depend on

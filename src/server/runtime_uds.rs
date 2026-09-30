@@ -732,6 +732,19 @@ fn write_marker(dir: RawFd, name: &str, suffix: &str, bytes: &[u8]) -> Result<()
         ));
     }
     let mut file = unsafe { File::from_raw_fd(fd) };
+    // Unconditional, and on this descriptor rather than by name: `0o600` is a
+    // creation mode, so a umask that masks an owner bit lands the marker at
+    // less than the client admits, and the client's `validate_regular_file`
+    // requires exactly `0o600`. The conditional form `open_lock` uses is
+    // available there because it re-stats the inode; this path has no such
+    // re-stat, and a name-based chmod could be raced between the chmod and
+    // the rename below.
+    if unsafe { libc::fchmod(file.as_raw_fd(), 0o600) } != 0 {
+        let error = PublishError::new("marker_write", std::io::Error::last_os_error().to_string());
+        drop(file);
+        let _ = unlink_entry(dir, &temporary);
+        return Err(error);
+    }
     let written = file
         .write_all(bytes)
         .and_then(|()| file.sync_all())
