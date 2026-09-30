@@ -149,6 +149,16 @@ pub(crate) struct GroupRead {
 pub(crate) struct ProjectRead {
     pub name: String,
     pub path: String,
+    /// Opaque equality metadata the producer computed on its own filesystem.
+    /// Two rows naming one directory share it, which is what the merge needs;
+    /// it is not a path, is not rendered, and is never resolved here, because
+    /// resolving it would resolve it against the reader's machine.
+    ///
+    /// Required, and validated for type and non-emptiness only: a stored alias
+    /// may resolve to a target whose characters a rendered path may not carry,
+    /// and a key is not rendered. A frame without one is refused rather than
+    /// merged on a path, because that fallback is the defect it replaces.
+    pub merge_key: String,
     pub scope: ProjectScope,
     pub default_base_branch: Option<String>,
     /// Whether the row came from a project registry rather than being
@@ -813,7 +823,8 @@ fn validate_projects(projects: &[ProjectRead], scope: ProjectScope) -> Result<()
             // synthesized row.
             || (matches!(scope, ProjectScope::Global) && !project.registered)
             || !valid_text(&project.name)
-            || !valid_absolute_path(&project.path)
+            || !valid_stored_project_path(&project.path)
+            || project.merge_key.is_empty()
             || project
                 .default_base_branch
                 .as_deref()
@@ -857,7 +868,7 @@ fn validate_session(session: &SessionRead) -> Result<(), &'static str> {
     {
         return Err("schema_invalid");
     }
-    if !valid_absolute_path(&session.project_path)
+    if !valid_stored_project_path(&session.project_path)
         || (!session.group_path.is_empty() && !valid_group_path(&session.group_path))
     {
         return Err("schema_invalid");
@@ -1056,6 +1067,21 @@ pub(crate) fn valid_absolute_path(value: &str) -> bool {
             }))
 }
 
+/// The grammar of a path a registry stored, which the store itself compares
+/// with trailing separators aside: `/repo` and `/repo/` are one project there,
+/// so both are admissible here. The value is validated, never rewritten, so
+/// what a session row was stored with stays what the wire carries and stays
+/// usable as the identifier a `session show` is given.
+///
+/// The worktree and workspace paths keep [`valid_absolute_path`]: they name
+/// things the client does not own, so their grammar stays strict.
+pub(crate) fn valid_stored_project_path(value: &str) -> bool {
+    let trimmed = value.trim_end_matches('/');
+    // A root spelled with nothing but separators trims away entirely, and it
+    // is still the root.
+    (trimmed.is_empty() && value.starts_with('/')) || valid_absolute_path(trimmed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1133,6 +1159,7 @@ mod tests {
         value.profiles[0].projects = vec![ProjectRead {
             name: "repo".into(),
             path: "/repo".into(),
+            merge_key: "/repo".into(),
             scope: ProjectScope::Profile,
             default_base_branch: None,
             registered: true,
@@ -1279,6 +1306,7 @@ mod tests {
         value.profiles[0].projects = vec![ProjectRead {
             name: "repo".into(),
             path: "/repo".into(),
+            merge_key: "/repo".into(),
             scope: ProjectScope::Profile,
             default_base_branch: None,
             registered: true,
@@ -1317,6 +1345,32 @@ mod tests {
         assert_eq!(validate_snapshot(&value), Err("schema_invalid"));
     }
 
+    /// A stored project path is the spelling the registry holds, so a trailing
+    /// separator is admissible and left alone: it is the identifier a
+    /// `session show` is given. Everything the strict path grammar refuses is
+    /// still refused here, because a registry holding one is holding a path
+    /// that names nothing.
+    #[test]
+    fn a_stored_project_path_tolerates_a_trailing_separator_and_nothing_else() {
+        for admitted in ["/repo", "/repo/", "/repo///", "/"] {
+            assert!(
+                valid_stored_project_path(admitted),
+                "{admitted} is a directory the store can hold"
+            );
+        }
+        for refused in ["repo", "", "/repo/../etc", "/repo//one", "/repo/\u{202e}"] {
+            assert!(
+                !valid_stored_project_path(refused),
+                "{refused} names nothing the client can match on"
+            );
+        }
+        // The worktree and workspace paths keep the strict grammar: they name
+        // things the client does not own, so a trailing separator there is a
+        // spelling no read can rely on.
+        assert!(valid_absolute_path("/repo"));
+        assert!(!valid_absolute_path("/repo/"));
+    }
+
     #[test]
     fn status_wire_values_are_pascal_case() {
         assert_eq!(WireStatus::Waiting.as_str(), "Waiting");
@@ -1330,12 +1384,19 @@ mod tests {
     /// permissive than the contract it publishes.
     #[test]
     fn an_absent_registered_flag_is_refused_rather_than_guessed() {
-        let absent = json!({
+        let named = json!({
             "name": "alpha",
             "path": "/srv/alpha",
+            "merge_key": "/srv/alpha",
             "scope": {"kind": "profile"},
             "default_base_branch": null,
+            "registered": true,
         });
+        let mut absent = named.clone();
+        absent
+            .as_object_mut()
+            .expect("an object")
+            .remove("registered");
         assert!(
             serde_json::from_value::<ProjectRead>(absent.clone()).is_err(),
             "the decoder must not supply a value the schema requires"

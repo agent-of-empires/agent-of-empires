@@ -40,7 +40,7 @@ const BROKEN: &str = "wrecked";
 /// whose parent was purged, a human `session show` of an archived row whose
 /// `State:` line no other command prints, and a `profile` listing over a
 /// profile named `default`.
-const COMMANDS: [&[&str]; 19] = [
+const COMMANDS: [&[&str]; 20] = [
     &["list"],
     &["list", "--state", "all"],
     &["list", "--all"],
@@ -63,6 +63,9 @@ const COMMANDS: [&[&str]; 19] = [
     &["session", "show", "--json", "l-terminal"],
     &["session", "show", "l-terminal"],
     &["session", "show", "a-archived"],
+    // The stored spelling of a project path is the identifier a show is given,
+    // so a stored trailing separator has to reach the row that holds it.
+    &["session", "show", "--json", "/srv/registered/"],
 ];
 
 /// The commands a *refusing* read has to agree on too. A command that exits
@@ -75,10 +78,13 @@ const COMMANDS: [&[&str]; 19] = [
 /// A one-character typo in a session id is the case this exists for: the local
 /// command exits 1 in the operator's own words, the served one exits 4 in
 /// `daemon read: <code>`, and nothing in the branch could see that they differ.
-const REFUSALS: [&[&str]; 3] = [
+const REFUSALS: [&[&str]; 4] = [
     &["session", "show", "no-such-session"],
     &["list", "-p", "ghost-profile"],
     &["session", "show", "k-amb"],
+    // A whitespace-only `-p` is a profile *name*, so both halves must fail it
+    // rather than one of them quietly reading the default profile.
+    &["list", "-p", "   ", "--json"],
 ];
 
 /// One `aoe` invocation as the user sees it: the exit code and both streams.
@@ -436,6 +442,20 @@ fn fixture_sessions(home: &Path) -> Vec<serde_json::Value> {
             value["agent_session_id"] = serde_json::Value::Null;
             value
         },
+        // A stored project path with a trailing separator. The store treats
+        // `/srv/registered` and `/srv/registered/` as one project, so the
+        // path is admissible, and it has to stay the spelling the row is
+        // identified by: the producer used to normalise it away, after which
+        // `aoe session show /srv/registered/` could not find the row it named.
+        row(
+            "m-trailing",
+            stopped,
+            "/srv/registered/",
+            "",
+            "Trailing separator",
+            false,
+            false,
+        ),
     ];
     let mut rows: Vec<serde_json::Value> = rows;
     // A parent/child relation, spelled the way the store spells it.
@@ -744,6 +764,101 @@ async fn a_broken_global_registry_does_not_refuse_the_reads_that_ignore_it() {
             run.stderr
         );
     }
+}
+
+/// A stored project path is the identifier a `session show` is given, trailing
+/// separator and all. The producer normalised it away, so a served show by the
+/// stored spelling answered "not found" while the local one found the row, and
+/// the listing showed a path no row could be found by.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_stored_trailing_separator_still_names_its_session() {
+    let fixture = Fixture::new();
+    let served = compare_transports(
+        &fixture,
+        &[
+            &["session", "show", "/srv/registered/", "--json"],
+            &["list", "--json"],
+        ],
+        usize::MAX,
+    )
+    .await;
+    assert!(
+        served[0].stdout.contains("m-trailing"),
+        "the show found the row the stored path names: {:?}",
+        served[0]
+    );
+    assert!(
+        served[0].stdout.contains("/srv/registered/"),
+        "the row keeps the spelling it was stored with: {:?}",
+        served[0].stdout
+    );
+    assert!(
+        served[1].stdout.contains("/srv/registered/"),
+        "the listing reports the stored spelling too: {:?}",
+        served[1].stdout
+    );
+}
+
+/// Only the empty profile is "no profile". A whitespace-only `-p` names a
+/// profile that does not exist, and the local command says so at exit 1; the
+/// served half used to read the default profile instead and answer `[]` at
+/// exit 0. The variable keeps its own local rule, which is the oracle for
+/// this comparison rather than something asserted here.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_whitespace_profile_is_a_profile_name_on_both_transports() {
+    let fixture = Fixture::new();
+    let served = compare_transports(&fixture, &[&["list", "-p", "   ", "--json"]], 0).await;
+    assert_eq!(
+        served[0].exit, 1,
+        "a profile that does not exist is the operator's own state: {:?}",
+        served[0].stderr
+    );
+    assert!(
+        served[0].stdout.is_empty(),
+        "a refusal prints no rows: {:?}",
+        served[0].stdout
+    );
+    assert!(
+        served[0].stderr.contains("Profile '   ' does not exist"),
+        "the refusal names the profile the user typed: {:?}",
+        served[0].stderr
+    );
+
+    // An explicitly empty `-p` is the one value that means "no selection", and a
+    // named profile still beats a variable that is not empty.
+    let home = fixture.path().to_path_buf();
+    let explicit_empty = run(
+        home.clone(),
+        vec![
+            "list".to_string(),
+            "-p".to_string(),
+            String::new(),
+            "--json".to_string(),
+        ],
+    )
+    .await;
+    assert_eq!(
+        explicit_empty.exit, 0,
+        "an empty flag is the default profile: {:?}",
+        explicit_empty.stderr
+    );
+    let named = run(
+        home,
+        vec![
+            "list".to_string(),
+            "-p".to_string(),
+            PROFILE.to_string(),
+            "--json".to_string(),
+        ],
+    )
+    .await;
+    assert_eq!(
+        named.exit, 0,
+        "a named profile beats a blank variable: {:?}",
+        named.stderr
+    );
 }
 
 async fn compare_both_transports(fixture: &Fixture) {

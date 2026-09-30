@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::Path;
 
 use serde::Serialize;
@@ -720,19 +721,20 @@ fn render_projects(
             }
             require_profile_components(profile, true, true)?;
             // The merged registry in the local order: the global rows, then the
-            // profile rows that shadow them by path. A synthesized row is not a
-            // registry entry, so it can neither shadow a global row nor add a
-            // row of its own.
+            // profile rows that shadow them by identity. A synthesized row is
+            // not a registry entry, so it can neither shadow a global row nor
+            // add a row of its own.
             //
-            // Two rows are the same project when their paths name the same
-            // directory, which is `projects::canonical_key`'s rule and the one
-            // the local `load_merged` merges by. Keying on the wire string
-            // instead lets one directory spelled two ways in a registry file
-            // (`/repo`, `/repo/.`, `/repo/`) answer as two projects here and as
-            // one locally. The key decides identity only; the surviving row
-            // keeps the spelling it was stored with, so what either path
-            // prints for a registered project does not change.
+            // Identity is the producer's `merge_key`, which it computed with
+            // the store's own rule on the daemon's filesystem. Resolving a
+            // path here would answer with a directory on the reader's
+            // machine, which is how a remote daemon's two distinct
+            // directories became one project on a workstation that reached
+            // both through one of them. The key decides identity only; the
+            // surviving row keeps the spelling it was stored with, so what
+            // either path prints for a registered project does not change.
             let mut merged: Vec<ProjectRead> = Vec::new();
+            let mut index_of: HashMap<String, usize> = HashMap::new();
             for project in snapshot
                 .global_projects
                 .iter()
@@ -741,20 +743,21 @@ fn render_projects(
                 if !project.registered {
                     continue;
                 }
-                let key = crate::session::projects::canonical_key(&project.path);
-                match merged
-                    .iter()
-                    .position(|row| crate::session::projects::canonical_key(&row.path) == key)
-                {
-                    // Profile shadows global on a path collision, and only a
-                    // profile row shadows: a second global row for a path the
-                    // global registry already names is a duplicate the local
-                    // merge drops, not one that replaces the first.
-                    Some(index) if matches!(project.scope, ProjectScope::Profile) => {
+                match index_of.get(&project.merge_key) {
+                    // Profile shadows global on a collision, and only a profile
+                    // row shadows: a second global row for a path the global
+                    // registry already names is a duplicate the local merge
+                    // drops, not one that replaces the first. Either way the
+                    // key is the one the index already holds, so it still
+                    // points at the surviving row.
+                    Some(&index) if matches!(project.scope, ProjectScope::Profile) => {
                         merged[index] = project.clone();
                     }
                     Some(_) => {}
-                    None => merged.push(project.clone()),
+                    None => {
+                        index_of.insert(project.merge_key.clone(), merged.len());
+                        merged.push(project.clone());
+                    }
                 }
             }
             merged
@@ -1149,6 +1152,7 @@ mod tests {
         value.global_projects = vec![ProjectRead {
             name: "shared".into(),
             path: "/srv/shared".into(),
+            merge_key: "/srv/shared".into(),
             scope: ProjectScope::Global,
             default_base_branch: None,
             registered: true,
@@ -1346,10 +1350,123 @@ mod tests {
         assert_eq!(rows[0]["scope"], "profile", "{output}");
     }
 
+    /// The merge key is the producer's, so what the reader's own filesystem
+    /// makes of a path cannot change the answer. A remote daemon holding
+    /// `/work/repo` and `/dev/repo` as two distinct directories used to become
+    /// one project on a workstation that reached one of them through the
+    /// other.
+    ///
+    /// The frame is captured while the producer still sees two distinct
+    /// directories, and only the reader's filesystem changes afterwards, so
+    /// the renders differ only if the renderer resolved a path. The producer
+    /// is never asked again: asking it again would rebuild the frame from the
+    /// changed filesystem and prove nothing about the renderer.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[serial_test::serial]
+    fn a_served_project_list_does_not_resolve_a_path_on_the_readers_own_filesystem() {
+        use crate::server::test_support::{record_exchange, RecordedOwner, RecordingPins};
+
+        let home = TempConfig::new();
+        crate::session::create_profile("main").expect("the recorded profile");
+        let app = crate::session::get_app_dir().expect("app dir");
+        std::fs::write(app.join("config.toml"), "default_profile = \"main\"\n")
+            .expect("seed the default");
+        let work = home.path().join("work/repo");
+        let dev = home.path().join("dev/repo");
+        std::fs::create_dir_all(&work).expect("the first project directory");
+        std::fs::create_dir_all(&dev).expect("the second project directory");
+        std::fs::write(
+            app.join("projects.json"),
+            serde_json::to_vec_pretty(&serde_json::json!([
+                {"name": "work-repo", "path": work.to_string_lossy(), "scope": "global"},
+                {"name": "dev-repo", "path": dev.to_string_lossy(), "scope": "global"},
+            ]))
+            .expect("global registry"),
+        )
+        .expect("seed the global registry");
+
+        let pins = RecordingPins {
+            runtime_epoch: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".into(),
+            prebind_instance_id: "11111111-2222-3333-4444-555555555555".into(),
+            runtime_instance_id: "66666666-7777-8888-9999-aaaaaaaaaaaa".into(),
+            observed_at: "2026-01-01T00:00:00Z".parse().expect("a pinned instant"),
+        };
+        let exchange = record_exchange(&[], RecordedOwner::Remote, &pins);
+        let args = ProjectListArgs {
+            json: true,
+            scope: ScopeFilter::All,
+        };
+        let render = || {
+            let snapshot = crate::cli::runtime_read::dto::parse_snapshot(&exchange.snapshot)
+                .expect("the recorded frame decodes");
+            crate::cli::runtime_read::dto::validate_snapshot(&snapshot)
+                .expect("the recorded frame is projectable");
+            render_projects(&args, &snapshot, &source()).expect("the merged listing renders")
+        };
+
+        let distinct = render();
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&distinct).expect("json rows");
+        assert_eq!(rows.len(), 2, "{distinct}");
+
+        // The reader's own filesystem now makes the two paths one directory.
+        std::fs::remove_dir_all(&dev).expect("drop the second directory");
+        std::os::unix::fs::symlink(&work, &dev).expect("one path reaches the other");
+        assert_eq!(
+            render(),
+            distinct,
+            "a symlinked path is the reader's own business"
+        );
+
+        // And with neither directory present, a renderer that resolved a path
+        // would have nothing left to resolve.
+        std::fs::remove_dir_all(&work).expect("drop the first directory");
+        assert_eq!(
+            render(),
+            distinct,
+            "the answer is the frame's, not the disk's"
+        );
+    }
+
+    /// A temporary `XDG_CONFIG_HOME`, so the producer reads a store of this
+    /// test's own and restores the environment on drop.
+    struct TempConfig {
+        _dir: tempfile::TempDir,
+        previous: Option<OsString>,
+    }
+
+    impl TempConfig {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().expect("a temp app dir");
+            let previous = std::env::var_os("XDG_CONFIG_HOME");
+            std::env::set_var("XDG_CONFIG_HOME", dir.path());
+            Self {
+                _dir: dir,
+                previous,
+            }
+        }
+
+        fn path(&self) -> &std::path::Path {
+            self._dir.path()
+        }
+    }
+
+    impl Drop for TempConfig {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+        }
+    }
+
+    /// A row as the producer builds it: the path as stored, and the key the
+    /// store's own rule computes for it on the producer's filesystem.
     fn project(name: &str, path: &Path, scope: ProjectScope) -> ProjectRead {
         ProjectRead {
             name: name.into(),
             path: path.to_string_lossy().to_string(),
+            merge_key: crate::session::projects::canonical_key(&path.to_string_lossy()),
             scope,
             default_base_branch: None,
             registered: true,

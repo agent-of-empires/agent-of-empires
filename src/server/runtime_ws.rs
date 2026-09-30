@@ -30,8 +30,9 @@ use crate::session::{GroupTree, Instance, Storage};
 
 /// Wire protocol version. The client refuses anything else and imports this
 /// constant, because a version the two halves spell differently is a handshake
-/// that fails closed for no reason anyone can see.
-pub(crate) const PROTOCOL_VERSION: u16 = 2;
+/// that fails closed for no reason anyone can see. Version 3 adds a project
+/// row's `merge_key`, so a client that cannot read it cannot merge projects.
+pub(crate) const PROTOCOL_VERSION: u16 = 3;
 /// A stalled reader must not hold a connection slot, or a full disk rescan's
 /// worth of work, open indefinitely. Both transports spend this one budget,
 /// each for the whole connection from accept to close rather than per stage,
@@ -505,6 +506,9 @@ fn build_snapshot(
                             projects
                                 .into_iter()
                                 .map(|project| ProjectRead {
+                                    merge_key: crate::session::projects::canonical_key(
+                                        &project.path,
+                                    ),
                                     name: project.name,
                                     path: project.path,
                                     scope: ProjectScope::Profile,
@@ -528,6 +532,7 @@ fn build_snapshot(
             projects
                 .into_iter()
                 .map(|project| ProjectRead {
+                    merge_key: crate::session::projects::canonical_key(&project.path),
                     name: project.name,
                     path: project.path,
                     scope: ProjectScope::Global,
@@ -666,12 +671,10 @@ fn build_snapshot(
 /// the one way a row gets one, and refusing a whole snapshot over a single row
 /// would fail every read command on every profile: so the row goes, in the
 /// same spirit as [`reconcile_legacy_rows`], and the client's own
-/// `valid_absolute_path` stays fail-closed.
+/// `valid_stored_project_path` stays fail-closed.
 fn drop_unusable_projects(projects: &mut Vec<ProjectRead>) {
-    // The client's own grammar, not a weaker local one: `is_absolute` admits
-    // `/a//b`, `/a/./b` and `/a/../x`, all of which the client then refuses,
-    // and one refused row fails the whole snapshot.
-    projects.retain(|project| crate::cli::runtime_read::dto::valid_absolute_path(&project.path));
+    projects
+        .retain(|project| crate::cli::runtime_read::dto::valid_stored_project_path(&project.path));
 }
 
 /// Reconcile the stored rows against the rules a read projects under, field by
@@ -684,9 +687,6 @@ fn drop_unusable_projects(projects: &mut Vec<ProjectRead>) {
 /// separators aside. Every other field is projected as stored, so the client's
 /// validation stays fail-closed rather than learning to tolerate more.
 fn reconcile_legacy_rows(sessions: &mut [SessionRead]) {
-    for row in sessions.iter_mut() {
-        row.project_path = comparable_project_path(&row.project_path);
-    }
     let index: HashMap<&str, usize> = sessions
         .iter()
         .enumerate()
@@ -722,17 +722,6 @@ fn reconcile_legacy_rows(sessions: &mut [SessionRead]) {
         if !resolved {
             row.parent_session_id = None;
         }
-    }
-}
-
-/// The trailing-separator-free spelling the store compares project paths by
-/// (`Storage` treats `/repo` and `/repo/` as one project).
-fn comparable_project_path(path: &str) -> String {
-    let trimmed = path.trim_end_matches('/');
-    if trimmed.is_empty() {
-        "/".to_string()
-    } else {
-        trimmed.to_string()
     }
 }
 
@@ -824,10 +813,16 @@ fn add_session_projects(
     let mut seen: BTreeSet<String> = BTreeSet::new();
     for session in sessions {
         let path = session.project_path.clone();
-        if !canonical_absolute_path(&path) || known.contains(&path) || !seen.insert(path.clone()) {
+        if !crate::cli::runtime_read::dto::valid_stored_project_path(&path)
+            || known.contains(&path)
+            || !seen.insert(path.clone())
+        {
             continue;
         }
         projects.push(ProjectRead {
+            // A synthesized row is never merged, so it needs no canonical_key
+            // call; the path is as good a key as any for a row nothing keys on.
+            merge_key: path.clone(),
             name: path.rsplit('/').next().unwrap_or_default().to_string(),
             path,
             scope: ProjectScope::Profile,
@@ -835,27 +830,6 @@ fn add_session_projects(
             registered: false,
         });
     }
-}
-
-/// The one canonical absolute-path grammar the wire contract requires.
-fn canonical_absolute_path(value: &str) -> bool {
-    value == "/"
-        || (value.starts_with('/')
-            && value.split('/').skip(1).all(|component| {
-                !component.is_empty()
-                    && component != "."
-                    && component != ".."
-                    && valid_text(component)
-            }))
-}
-
-/// Rejected everywhere a value can reach a rendered template: C0/C1 controls,
-/// DEL, the Unicode line/paragraph separators and the bidi controls.
-fn valid_text(value: &str) -> bool {
-    !value.chars().any(|scalar| {
-        matches!(scalar as u32,
-            0x00..=0x1f | 0x7f..=0x9f | 0x2028 | 0x2029 | 0x202a..=0x202e | 0x2066..=0x2069)
-    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1014,6 +988,10 @@ struct GroupRead {
 struct ProjectRead {
     name: String,
     path: String,
+    /// Opaque equality metadata: the project's identity as the *daemon's*
+    /// filesystem resolves it. The client merges on this and never on a path,
+    /// because a path it resolved would be a path on the wrong machine.
+    merge_key: String,
     scope: ProjectScope,
     default_base_branch: Option<String>,
     /// True for a row the registry holds, false for one synthesized so a
@@ -1518,11 +1496,12 @@ mod tests {
         row
     }
 
-    /// A stored row the read cannot fix is kept as it stands: a legacy
-    /// trailing separator is spelled the way the store compares paths, and an
-    /// orphan parent is left pointing at a row that is not there: the state
-    /// `rm --purge` leaves behind, and the one the local path prints. The
-    /// client then accepts the snapshot unchanged.
+    /// A stored row the read cannot fix is kept as it stands: a trailing
+    /// separator is the spelling the store holds and stays it, so the row is
+    /// still the identifier a `session show` can be given, and an orphan parent
+    /// is left pointing at a row that is not there: the state `rm --purge`
+    /// leaves behind, and the one the local path prints. The client then
+    /// accepts the snapshot unchanged.
     #[test]
     #[serial_test::serial]
     fn a_legacy_row_is_reconciled_and_the_client_still_accepts_the_snapshot() {
@@ -1559,7 +1538,7 @@ mod tests {
             vec![
                 ("a", None, "/repo"),
                 ("orphan", Some("deleted"), "/repo"),
-                ("trailing", None, "/repo"),
+                ("trailing", None, "/repo/"),
             ]
         );
     }
@@ -1623,14 +1602,6 @@ mod tests {
         validate_snapshot(&snapshot).expect("the snapshot is projectable");
     }
 
-    #[test]
-    fn canonical_paths_reject_traversal_and_control_bytes() {
-        assert!(canonical_absolute_path("/repo/one"));
-        assert!(!canonical_absolute_path("repo"));
-        assert!(!canonical_absolute_path("/repo/../etc"));
-        assert!(!canonical_absolute_path("/repo//one"));
-        assert!(!canonical_absolute_path("/repo/\u{202e}"));
-    }
     #[test]
     fn runtime_ws_requires_one_bearer_header() {
         let mut headers = HeaderMap::new();
