@@ -9,7 +9,7 @@ mod requests;
 mod sink;
 mod teardown;
 
-pub use teardown::WorktreeIntent;
+pub use teardown::{settle_runner_from_registry, WorktreeIntent};
 #[cfg(test)]
 mod test_support;
 

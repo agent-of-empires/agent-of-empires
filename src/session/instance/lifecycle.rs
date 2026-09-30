@@ -105,6 +105,19 @@ impl Instance {
         )
     }
 
+    /// Whether a purge currently owns this row. The reconciler has to honour
+    /// it: settling a runner from the registry leaves no in-memory lease, so
+    /// without this the next tick would respawn the runner the purge killed.
+    pub fn is_purge_reserved(&self, now: DateTime<Utc>) -> bool {
+        matches!(
+            &self.lifecycle_reservation,
+            Some(reservation)
+                if reservation.generation == self.lifecycle_generation
+                    && (now - reservation.at) < Self::LIFECYCLE_RESERVATION_TTL
+                    && reservation.op == LifecycleOperation::Purge
+        )
+    }
+
     pub fn release_lifecycle_reservation_if_owned(
         &mut self,
         operation: LifecycleOperation,

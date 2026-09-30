@@ -228,6 +228,20 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
             anyhow::bail!("{detail}: {removed_title}");
         }
     };
+    // Same barrier as the daemon and the TUI: a structured session's runner has
+    // to be proven dead before the hooks play, since `on_destroy` scripts are
+    // the user's and are not idempotent.
+    let transaction = match crate::session::deletion::settle_runner_of(transaction).await {
+        Ok(transaction) => transaction,
+        Err(result) => {
+            let detail = result
+                .errors
+                .first()
+                .map(String::as_str)
+                .unwrap_or("The session's agent could not be proven dead");
+            anyhow::bail!("{detail}: {removed_title}");
+        }
+    };
     let result = transaction.run_hooks().complete_with(|instance| {
         super::purge_acp_transcript(instance).map_err(|error| {
             format!(

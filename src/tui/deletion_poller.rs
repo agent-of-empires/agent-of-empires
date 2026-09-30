@@ -12,8 +12,28 @@ pub struct DeletionPoller {
 
 impl DeletionPoller {
     pub fn new() -> Self {
+        // Settling a structured session's runner awaits, so the worker needs a
+        // runtime. Same shape as `StructuredApprovalPoller`, which owns one for
+        // the same reason.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build();
+        if let Err(error) = &runtime {
+            tracing::warn!(
+                target: "tui.deletion",
+                "runtime build failed; a structured deletion cannot prove its runner dead: {error}"
+            );
+        }
         Self {
-            worker: Worker::spawn("aoe-deletion-poller", execute_deletion),
+            worker: Worker::spawn("aoe-deletion-poller", move |request| {
+                match runtime.as_ref() {
+                    Ok(runtime) => runtime.block_on(execute_deletion(request)),
+                    Err(error) => crate::session::deletion::runner_undiscoverable_result(
+                        request.session_id,
+                        format!("no runtime to settle the runner: {error}"),
+                    ),
+                }
+            }),
         }
     }
 

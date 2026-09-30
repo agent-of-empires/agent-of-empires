@@ -120,7 +120,10 @@ fn is_untriaged_structured(i: &Instance) -> bool {
 
 /// Eligible for a reconciler-driven worker.
 fn is_resumable(i: &Instance) -> bool {
-    is_untriaged_structured(i) && !i.is_idle_dormant()
+    // A purge that settled its runner from the registry left no in-memory lease
+    // to skip on, so the durable reservation is what keeps the next tick from
+    // respawning what the purge just killed.
+    is_untriaged_structured(i) && !i.is_idle_dormant() && !i.is_purge_reserved(chrono::Utc::now())
 }
 
 /// Runs a blocking event-store query for `id` off the runtime; `None` (logged) if the task panicked.

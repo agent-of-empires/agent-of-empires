@@ -687,18 +687,78 @@ impl Drop for PurgeTransaction {
     }
 }
 
-pub fn execute_deletion(request: DeletionRequest) -> DeletionResult {
+/// A refusal for a caller that could not reach the runner settlement at all,
+/// phrased once so the surfaces do not each build the message.
+pub fn runner_undiscoverable_result(session_id: String, detail: String) -> DeletionResult {
+    DeletionResult::rejected(
+        session_id,
+        DeletionDisposition::Failed,
+        format!(
+            "The agent for this session could not be checked, so nothing was removed: {detail}. \
+             Retry once it exits."
+        ),
+        None,
+    )
+}
+
+/// Prove a structured session's runner is dead before anything destroys the
+/// directory it runs in, settled from the on-disk registry alone so the TUI and
+/// the CLI, which hold no supervisor of their own, get the guarantee the daemon
+/// path has. A refusal keeps the row and the checkout, so the caller retries.
+///
+/// Settling this way leaves no in-memory lease, which is why
+/// `acp_reconciler::is_resumable` also honours the durable purge reservation:
+/// without it the next tick would respawn the runner just killed.
+pub async fn settle_runner_of(
+    transaction: PurgeTransaction,
+) -> Result<PurgeTransaction, Box<DeletionResult>> {
+    if !transaction.request.instance.is_structured() {
+        return Ok(transaction);
+    }
+    let mut released = transaction.release_locks_for_teardown();
+    let outcome = crate::acp::supervisor::settle_runner_from_registry(
+        &crate::acp::runner_lifecycle::SystemProcessControl,
+        &released.request.session_id,
+    )
+    .await;
+    match outcome {
+        Ok(()) => Ok(released),
+        Err(error) => {
+            let retained = released.release_reservation().ok().flatten();
+            released.active = false;
+            Err(Box::new(DeletionResult::rejected(
+                released.request.session_id.clone(),
+                DeletionDisposition::Failed,
+                format!(
+                    "The agent for this session is not proven dead, so nothing was removed: \\
+                     {error}. Retry once it exits."
+                ),
+                retained,
+            )))
+        }
+    }
+}
+
+pub async fn execute_deletion(request: DeletionRequest) -> DeletionResult {
     let id = request.session_id.clone();
     let recent_entry = crate::session::recent_project_entry_for(&request.instance);
-    let result = match PurgeTransaction::reserve_unwatched(request) {
-        Ok(PurgeReservation::Reserved(transaction)) => transaction.run_hooks().complete(),
-        Ok(PurgeReservation::Rejected(result)) => result,
-        Err(error) => DeletionResult::rejected(
-            id,
+    // A structured session's runner has to be proven dead before the hooks run
+    // and before anything removes its checkout, on this surface as on the daemon
+    // one. `on_destroy` scripts are the user's and are not idempotent, so the
+    // refusal has to arrive before they play.
+    let settled = match PurgeTransaction::reserve_unwatched(request) {
+        Ok(PurgeReservation::Reserved(transaction)) => settle_runner_of(transaction).await,
+        Ok(PurgeReservation::Rejected(result)) => Err(Box::new(result)),
+        Err(error) => Err(Box::new(DeletionResult::rejected(
+            id.clone(),
             DeletionDisposition::Failed,
             format!("Could not reserve session deletion: {error}"),
             None,
-        ),
+        ))),
+    };
+    let result = match settled {
+        Ok(transaction) => transaction.run_hooks().complete(),
+        Err(result) => *result,
     };
     if result.disposition == DeletionDisposition::Removed {
         if let Some(entry) = recent_entry {
@@ -3068,5 +3128,46 @@ mod tests {
                 );
             }
         }
+    }
+    /// The barrier the TUI and the CLI now share with the daemon: a structured
+    /// session's runner has to be settled before anything runs a hook or removes
+    /// its checkout. A non-structured session has no agent to stop, so it must
+    /// not be refused for a runner that never existed.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_structured_purge_settles_its_runner_before_the_hooks() {
+        let temp = tempfile::tempdir().unwrap();
+        let _home = isolate_app_dir_at(&temp.path().join("home"));
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+
+        let mut structured = Instance::new("Structured", project.to_str().unwrap());
+        structured.id = "structured-purge".to_string();
+        structured.view = crate::session::View::Structured;
+        let storage = Storage::new_unwatched("owner").unwrap();
+        structured.source_profile = "owner".to_string();
+        storage
+            .update(|instances, _groups| {
+                instances.push(structured.clone());
+                Ok(())
+            })
+            .unwrap();
+
+        // No registry record names a runner, so nothing can be proven dead.
+        let transaction = match PurgeTransaction::reserve_unwatched(DeletionRequest {
+            delete_worktree: true,
+            ..request(structured)
+        })
+        .unwrap()
+        {
+            PurgeReservation::Reserved(transaction) => transaction,
+            PurgeReservation::Rejected(result) => panic!("refused too early: {result:?}"),
+        };
+        let refused = settle_runner_of(transaction).await;
+
+        assert!(
+            refused.is_err(),
+            "a structured purge with no discoverable runner must not proceed"
+        );
     }
 }

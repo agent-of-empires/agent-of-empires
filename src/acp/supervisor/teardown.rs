@@ -596,6 +596,43 @@ pub(super) async fn tear_down_runner(
     tear_down_runner_from(control, session_id, identity, false).await
 }
 
+/// Settle a runner from the on-disk registry alone, for a process that holds no
+/// supervisor of its own: the TUI and the CLI run the same purge the daemon
+/// does, and a structured runner deliberately outlives its daemon, so the case
+/// where there is nothing in memory is the one that most needs the proof.
+///
+/// `Err(TeardownPending)` when the runner cannot be proven dead, which is the
+/// caller's signal to keep the row and retry.
+pub async fn settle_runner_from_registry(
+    control: &dyn ProcessControl,
+    session_id: &str,
+) -> Result<(), SupervisorError> {
+    // An unreadable record is not an absent one, so it refuses like an unproven
+    // runner rather than surfacing as a read failure the caller would treat as
+    // fatal.
+    let record = match worker_registry::load_strict(session_id) {
+        Ok(Some(record)) => record,
+        Ok(None) => return Err(SupervisorError::UnknownSession(session_id.into())),
+        Err(error) => {
+            warn!(
+                target: "acp.supervisor",
+                session = %session_id,
+                "runner record unreadable; refusing to release agent-side state: {error:#}"
+            );
+            return Err(SupervisorError::TeardownPending(session_id.into()));
+        }
+    };
+    worker_registry::clear_restart_marker(session_id);
+    let identity = RunnerIdentity {
+        pid: record.pid,
+        generation: record.generation,
+    };
+    match tear_down_runner(control, session_id, Some(identity)).await {
+        Settlement::Proven => Ok(()),
+        Settlement::Unproven(_) => Err(SupervisorError::TeardownPending(session_id.into())),
+    }
+}
+
 /// `killed_before` skips straight to SIGKILL for a process that already ignored a full escalation.
 async fn tear_down_runner_from(
     control: &dyn ProcessControl,
