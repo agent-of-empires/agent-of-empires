@@ -13,7 +13,7 @@ use crate::file_watch::FileWatchService;
 
 use super::{
     get_app_dir, get_profile_dir, get_profile_dir_locked, get_profile_dir_path,
-    resolve_existing_profile, resolve_profile_name, Group, Instance,
+    resolve_existing_profile, resolve_profile_name_locked, Group, Instance,
 };
 
 /// Sidecar lock file name for per-profile storage.
@@ -975,8 +975,12 @@ impl Storage {
     /// profile delete and rename also takes, so the creation cannot land outside
     /// that window. A teardown or a read must use [`Storage::open`], which
     /// refuses a profile that is not there rather than bringing one back.
+    /// Creating constructor: the caller holds the session identity flock, so the
+    /// name is resolved with the locked variant. The unlocked one can reach the
+    /// first-profile bootstrap, which takes that flock again on a fresh
+    /// descriptor and would wait on the caller's own lock.
     pub(crate) fn open_or_create(profile: &str, file_watch: Arc<FileWatchService>) -> Result<Self> {
-        let profile_name = resolve_profile_name(profile)?;
+        let profile_name = resolve_profile_name_locked(profile)?;
         let profile_dir = get_profile_dir_locked(&profile_name)?;
         let sessions_path = profile_dir.join("sessions.json");
         let save_lock = save_lock_for(&profile_name);
@@ -5325,5 +5329,28 @@ mod tests {
             .next()
             .map(|(path, _)| path)
             .expect("journal entry on disk")
+    }
+    /// The creating constructor is called with the session identity flock held.
+    /// Resolving an empty profile the unlocked way can reach the first-profile
+    /// bootstrap, which takes that same flock on a fresh descriptor and waits on
+    /// the caller's own lock, so the call has to come back rather than hang.
+    #[test]
+    fn open_or_create_under_the_identity_lock_resolves_an_empty_profile() {
+        let temp = tempfile::tempdir().unwrap();
+        let _home = isolate_app_dir_at(temp.path());
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let watcher = FileWatchService::noop();
+        std::thread::spawn(move || {
+            let _identity_lock =
+                crate::session::acquire_session_identity_lock().expect("identity lock");
+            let _ = done_tx.send(Storage::open_or_create("", watcher).map(|s| s.profile));
+        });
+
+        let profile = done_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("open_or_create blocked on the identity lock it already holds")
+            .expect("the first profile is created, not an error");
+        assert_eq!(profile, "main");
     }
 }
