@@ -2,13 +2,11 @@
 /// decoders; the two halves then cannot drift on a field name or member order.
 pub(crate) mod dto;
 mod endpoint;
-/// The Contract Pack verifier and its frozen fixtures. Test-only surface, in
-/// the same shape as the other `test_support` modules, so the integration
-/// tests that verify the pack can reach it.
-#[cfg(any(test, debug_assertions))]
+/// Debug-only Contract Pack support for unit and integration tests.
+#[cfg(debug_assertions)]
 #[doc(hidden)]
 pub mod pack;
-#[cfg(test)]
+#[cfg(all(test, debug_assertions))]
 mod pack_tests;
 mod render;
 /// The local admission walk and its peer-credential check, which read process

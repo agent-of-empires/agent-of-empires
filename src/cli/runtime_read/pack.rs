@@ -11,10 +11,8 @@
 //! contract; the closed structs below enforce the same closure at run time, so
 //! no JSON Schema engine is needed to gate a run.
 //!
-//! This module is deliberately debug-resident: the `dev-release` profile turns
-//! `debug-assertions` off, so the gate is absent there, and the runtime
-//! `cfg!(debug_assertions)` guard is what makes `verify` refuse under
-//! `cargo test --release --lib` rather than let an unverified fixture replay.
+//! The verifier and its tests require debug assertions; release and
+//! dev-release builds omit them.
 //!
 //! `root-home` is a replay scratch path, never manifest-listed: a harness that
 //! materializes it must remove the subtree before calling `verify`.
@@ -955,9 +953,6 @@ fn verify_application_frames(
 /// Verify a whole pack: safe root, manifest universe and digests, canonical
 /// `CASES.json`, per-case layout, and the expected/error closure.
 pub fn verify(root: &Path) -> Result<VerifiedPack> {
-    if !cfg!(debug_assertions) {
-        return fail("expected_debug_profile");
-    }
     let metadata = fs::symlink_metadata(root)
         .map_err(|error| PackError(format!("cannot stat the pack root: {error}")))?;
     if !metadata.is_dir() {
