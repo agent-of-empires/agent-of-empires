@@ -422,15 +422,20 @@ async fn execute_inner(
     }
 }
 
-/// This machine's home, when the endpoint names a loopback host. The rule is
-/// the host, not the transport: direct loopback to the local daemon is the
-/// same peer the socket reaches, and its rows are this machine's paths. It is
-/// the tool's one loopback rule, so this and the endpoint grammar cannot
-/// disagree about what counts.
+/// This machine's home, when the endpoint names a loopback address, and
+/// nothing else.
+///
+/// The question is whether the peer is the machine these paths belong to, and
+/// only an address answers it. A name does not: nothing here resolves one, so
+/// an endpoint called `localhost` that resolves to another machine would have
+/// this machine's home collapsed into that machine's paths. That is wrong in
+/// the direction that leaks, so a name is refused rather than trusted. The
+/// cost is that a local daemon reached over TLS by name prints its rows
+/// unabbreviated.
 fn loopback_home(
     request: &tokio_tungstenite::tungstenite::handshake::client::Request,
 ) -> Option<std::path::PathBuf> {
-    crate::daemon::is_loopback_host(request.uri().host()?)
+    crate::daemon::is_loopback_address(request.uri().host()?)
         .then(dirs::home_dir)
         .flatten()
 }
@@ -682,7 +687,7 @@ mod tests {
             ("http://127.0.0.1:8080/api/runtime/ws", true),
             ("http://[::1]:8080/api/runtime/ws", true),
             ("https://[::1]/api/runtime/ws", true),
-            ("https://localhost:8080/api/runtime/ws", true),
+            ("https://localhost:8080/api/runtime/ws", false),
             ("https://example.test/api/runtime/ws", false),
             ("wss://[fe80::1]/api/runtime/ws", false),
             ("wss://[2001:db8::1]/api/runtime/ws", false),

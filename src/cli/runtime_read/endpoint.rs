@@ -209,12 +209,25 @@ fn parse_endpoint(raw: &str) -> Result<(String, bool), ReadFailure> {
         return Err(invalid());
     }
     let (host, port): (&str, Option<u16>) = split_authority(authority).ok_or_else(invalid)?;
-    // A bearer goes over plaintext only to a loopback peer, which is the rule
-    // the rest of the tool already applies (`acp`'s passphrase check, the
-    // daemon client's own) and the one `docs/structured-view.md` states. This
-    // is the grammar's spelling of it, so a host the tool calls loopback
-    // anywhere else is a host it calls loopback here.
-    if !secure && !crate::daemon::is_loopback_host(host) {
+    // A bearer goes over plaintext only to a loopback address, and a name is
+    // not an address: nothing here resolves one, so `localhost` would send the
+    // token to whatever the name was redirected to. HTTPS is unaffected, so a
+    // remote named `localhost` over TLS still works and the token is
+    // encrypted.
+    //
+    // The obvious repair is to resolve the name and re-check the address, and
+    // it is wrong here: `parse_endpoint` is synchronous and `execute_inner`
+    // calls it on a tokio worker, so a blocking resolve there blocks the
+    // runtime.
+    //
+    // This is narrower than the rest of the tool on purpose. `aoe acp attach`
+    // and `DaemonClient::new` still take `http://localhost`, because they are
+    // this PR's merge-base callers and narrowing them reaches the TUI
+    // dashboard. So `aoe ps --daemon-url http://localhost:8080` is refused
+    // where `aoe acp attach` accepts the identical host. The cost is paid
+    // here rather than widening this PR's blast radius; closing it everywhere
+    // is its own change.
+    if !secure && !crate::daemon::is_loopback_address(host) {
         return Err(invalid());
     }
     if secure && !valid_https_host(host) {
@@ -350,8 +363,6 @@ mod tests {
             "https://[fe80::1]",
             "HTTP://127.0.0.1:8080",
             "HtTpS://example.test",
-            "http://localhost:8080",
-            "http://LocalHost:8080",
             "http://127.0.0.2",
             "https://example.test/base/",
         ] {
@@ -359,6 +370,8 @@ mod tests {
         }
         for raw in [
             "",
+            "http://localhost:8080",
+            "http://LocalHost:8080",
             "http://[::2]",
             "https://[fe80::1%25eth0]",
             "https://user@example.test",

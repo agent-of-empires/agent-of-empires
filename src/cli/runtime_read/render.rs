@@ -347,14 +347,14 @@ fn render_status(
             // Borrowed rather than cloned: `sessions` are rows of the snapshot,
             // which outlives this projection, and the local path it replaced
             // borrowed the same way.
-            let rows: Vec<(String, &str, &str)> = sessions
+            let rows: Vec<(&str, &str, String)> = sessions
                 .iter()
                 .filter(|session| session.status.session_status() == status)
                 .map(|session| {
                     (
-                        collapse_home(&session.project_path, local_home),
                         session.title.as_str(),
                         session.tool.as_str(),
+                        collapse_home(&session.project_path, local_home),
                     )
                 })
                 .collect();

@@ -56,11 +56,12 @@ pub(crate) const VERBOSE_GROUPS: [(&str, &str, Status); 5] = [
 /// One verbose group: the heading, one padded row per session, and the blank
 /// line after it. Empty when the group has no members, exactly as the local
 /// command prints nothing at all for an empty group.
-/// `title` and `path` are borrowed because both callers hold the sessions for
-/// the length of the call, so a row cost two clones it does not need. Only the
-/// path is owned: collapsing it under a home is the one step that builds a new
-/// string.
-pub(crate) fn verbose_group(label: &str, symbol: &str, rows: &[(String, &str, &str)]) -> String {
+/// A row is title, tool, path, in the order it is printed. `title` and `tool`
+/// are borrowed because both callers hold the sessions for the length of the
+/// call, so a row cost two clones it does not need. Only the path is owned:
+/// collapsing it under a home is the one step that builds a new string, and
+/// putting it last keeps the owned field from reading as the first column.
+pub(crate) fn verbose_group(label: &str, symbol: &str, rows: &[(&str, &str, String)]) -> String {
     use std::fmt::Write;
     if rows.is_empty() {
         return String::new();
@@ -158,14 +159,14 @@ pub async fn run(profile: &str, args: StatusArgs) -> Result<()> {
         println!("{}", counts.waiting);
     } else if args.verbose {
         for (label, symbol, status) in VERBOSE_GROUPS {
-            let rows: Vec<(String, &str, &str)> = instances
+            let rows: Vec<(&str, &str, String)> = instances
                 .iter()
                 .filter(|inst| inst.status == status)
                 .map(|inst| {
                     (
-                        crate::util::collapse_tilde(&inst.project_path),
                         inst.title.as_str(),
                         inst.tool.as_str(),
+                        crate::util::collapse_tilde(&inst.project_path),
                     )
                 })
                 .collect();
@@ -193,4 +194,23 @@ pub async fn run(profile: &str, args: StatusArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::verbose_group;
+
+    /// A row is read positionally and printed in the order it is read, so a
+    /// transposition is invisible to the parity suite: both transports build
+    /// the row and call this one function, so both print the same wrong order
+    /// and the comparison of the two passes. This is the only place that can
+    /// see it.
+    #[test]
+    fn a_verbose_row_prints_title_then_tool_then_path() {
+        let rows = vec![("fix the thing", "claude", "~/work/repo".to_string())];
+        assert_eq!(
+            verbose_group("RUNNING", "⠋", &rows),
+            "RUNNING (1):\n  ⠋ fix the thing    claude     ~/work/repo\n\n"
+        );
+    }
 }
