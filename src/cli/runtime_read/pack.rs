@@ -241,6 +241,7 @@ const TABLE: &[(&str, &[&str], &[u8])] = &[
         &[
             "unauthorized",
             "unavailable",
+            "publisher_absent",
             "socket_identity",
             "peer_identity",
             "protocol_mismatch",

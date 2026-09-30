@@ -159,8 +159,8 @@ impl UdsConnection {
             tokio_tungstenite::client_async_with_config(request, self.stream, Some(config)),
         )
         .await
-        .map_err(|_| ReadFailure::post("connection_closed"))?
-        .map_err(|_| ReadFailure::post("unavailable"))?;
+        .map_err(|_| ReadFailure::post("publisher_absent"))?
+        .map_err(|_| ReadFailure::post("publisher_absent"))?;
         Ok(UdsExchange {
             stream,
             identity: self.identity,
@@ -688,7 +688,7 @@ async fn connect_admission(
     let path = admission._namespace.anchored_socket_path()?;
     let stream = UnixStream::connect(&path)
         .await
-        .map_err(|_| ReadFailure::post("unavailable"))?;
+        .map_err(|_| ReadFailure::post("publisher_absent"))?;
     validate_connected_socket(stream.as_raw_fd(), dir, &postbind, euid)?;
     Ok(UdsConnection {
         stream,
@@ -1576,6 +1576,107 @@ mod tests {
             "marker_missing",
             "a provably dead publisher is an absence, not a retryable identity fault"
         );
+    }
+
+    /// Past admission the markers have proved a live publisher and
+    /// `validate_connected_socket` has proved this socket is that publisher's.
+    /// A publisher that then takes the connection and never completes the
+    /// exchange, whether the client's budget runs out or the peer drops, has
+    /// said something about the environment and nothing about this client, so
+    /// it has to say so with the code the take-over set already understands.
+    #[tokio::test]
+    async fn an_admitted_publisher_that_never_completes_the_exchange_is_an_absence() {
+        use std::os::unix::net::UnixListener;
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+        let dir = tempfile::tempdir().expect("namespace");
+        let socket_path = dir.path().join(SOCKET_FILE);
+        let listener = UnixListener::bind(&socket_path).expect("bind socket");
+        listener.set_nonblocking(true).expect("nonblocking accept");
+        let lock = dir.path().join(LOCK_FILE);
+        std::fs::write(&lock, b"").expect("lock");
+        let request = || {
+            "ws://localhost/api/runtime/ws"
+                .into_client_request()
+                .expect("the local request")
+        };
+
+        // The budget already spent: the client-budget scenario, where the
+        // publisher answered the connect and then said nothing.
+        let Err(error) = admitted_connection(dir.path(), &socket_path, &lock, Instant::now())
+            .await
+            .upgrade(request())
+            .await
+        else {
+            panic!("a publisher that never answers admits no exchange");
+        };
+        assert_eq!(
+            error.code(),
+            "publisher_absent",
+            "a spent budget against a silent publisher is a statement about the environment"
+        );
+
+        // The other half of the same statement: the peer drops the admitted
+        // connection instead of finishing the handshake. The connection is in
+        // the backlog the moment `connect` returns, so the accept below only
+        // has to collect it.
+        let connection = admitted_connection(
+            dir.path(),
+            &socket_path,
+            &lock,
+            Instant::now() + crate::server::runtime_ws::CONNECTION_BUDGET,
+        )
+        .await;
+        let publisher = loop {
+            match listener.accept() {
+                Ok((publisher, _)) => break publisher,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => continue,
+                Err(error) => panic!("accept socket: {error}"),
+            }
+        };
+        drop(publisher);
+        let Err(error) = connection.upgrade(request()).await else {
+            panic!("a publisher that drops the exchange admits none");
+        };
+        assert_eq!(
+            error.code(),
+            "publisher_absent",
+            "an admitted connection dropped mid-handshake is the same absence"
+        );
+    }
+
+    /// A connection admitted to `socket_path`, built by hand because
+    /// `upgrade` is otherwise only reachable behind a publisher that completes
+    /// an exchange, which is exactly what these cases are about.
+    async fn admitted_connection(
+        dir: &std::path::Path,
+        socket_path: &std::path::Path,
+        lock: &std::path::Path,
+        exchange_deadline: Instant,
+    ) -> UdsConnection {
+        let opened = File::open(dir).expect("open namespace");
+        UdsConnection {
+            stream: UnixStream::connect(socket_path)
+                .await
+                .expect("connect socket"),
+            identity: UdsIdentity {
+                namespace: "debug:agent-of-empires-dev".into(),
+                prebind_instance_id: String::new(),
+                runtime_instance_id: String::new(),
+                runtime_epoch: String::new(),
+                owner_uid: unsafe { libc::geteuid() },
+            },
+            home: dir.to_path_buf(),
+            admission: Admission {
+                _namespace: OwnedNamespace {
+                    name: "debug:agent-of-empires-dev".into(),
+                    home: dir.to_path_buf(),
+                    dir: OwnedFd::from(opened),
+                },
+                _lock: File::open(lock).expect("lock file"),
+            },
+            exchange_deadline,
+        }
     }
 
     /// A daemon killed between the prebind write and the postbind write leaves

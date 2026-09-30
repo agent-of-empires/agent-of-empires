@@ -119,6 +119,7 @@ pub(crate) const EMITTABLE_CODES: &[&str] = &[
     "peer_identity",
     "profile_missing",
     "protocol_mismatch",
+    "publisher_absent",
     "renderer_internal",
     "schema_invalid",
     "session_ambiguous",
@@ -287,20 +288,26 @@ fn absent_local_publication(error: &ReadFailure, source: &ReadRequestSource) -> 
         return false;
     }
     match error.code() {
-        // No local publication at all: the pre-existing take-over, unchanged.
+        // A take-over may carry a statement about the environment, never one
+        // about this client. The walk, the marker read and the join of the
+        // blocking task are this client's, so they stay refusals, and so does
+        // `marker_invalid`, because the artifact is there and untrustworthy.
+        // `marker_missing` is the exception: it is defined as an absence.
+        //
+        // Past admission the markers have proved a live publisher and the
+        // connected socket has been proved to be that publisher's, so failing
+        // to get an answer out of it is a fact about the environment.
         "marker_missing" => !source.env_url_is_set(),
-        // The environment named an endpoint that cannot answer right now: a
-        // malformed or non-UTF-8 URL, no usable bearer token, an unreachable
-        // daemon, or one that did not finish the handshake inside the budget.
-        // Before the take-over existed none of these reached the read commands
-        // at all, so the local store is what the user was getting, and it stays
-        // what they get.
-        "invalid_endpoint" | "invalid_token" | "unavailable" | "establishment_timeout" => {
-            source.env_url_is_set()
-        }
-        // Everything else is a refusal about what a publisher said, not about
-        // whether one is there: the admission codes, the wire codes, and the
-        // renderer's own state refusals. Those stay the daemon's answer.
+        "invalid_endpoint"
+        | "invalid_token"
+        | "unavailable"
+        | "establishment_timeout"
+        | "publisher_absent" => source.env_url_is_set(),
+        // What stays a refusal, and why: a peer was reached and found not to
+        // be the publisher, and a connection dropped after the publisher had
+        // spoken is a read failure the user has to see rather than a missing
+        // daemon. The constant local request that cannot be built is this
+        // client's own fault, even though nothing reaches it.
         _ => false,
     }
 }
@@ -713,19 +720,20 @@ mod tests {
             "only an absent publication is a take-over"
         );
     }
-    /// The property worth pinning is not that these five codes take over, but
-    /// that **nothing else does**. A new code added to the emit table is the
-    /// edit that would silently widen this, so the table enumerates the whole
-    /// vocabulary and asserts `false` for everything outside the five, under
+    /// The property worth pinning is not that these codes take over, but that
+    /// **nothing else does**. A new code added to the emit table is the edit
+    /// that would silently widen this, so the table enumerates the whole
+    /// vocabulary and asserts `false` for everything outside the set, under
     /// every combination of endpoint inputs.
     #[test]
-    fn only_the_five_endpoint_codes_take_over_and_nothing_else_does() {
-        const TAKES_OVER: [&str; 5] = [
+    fn only_the_endpoint_codes_take_over_and_nothing_else_does() {
+        const TAKES_OVER: [&str; 6] = [
             "marker_missing",
             "invalid_endpoint",
             "invalid_token",
             "unavailable",
             "establishment_timeout",
+            "publisher_absent",
         ];
         for code in EMITTABLE_CODES {
             let error = ReadFailure::pre(code);
@@ -742,7 +750,7 @@ mod tests {
                     env_profile: None,
                 };
                 // `marker_missing` takes over only with no endpoint named, and
-                // the four transport codes only with a variable naming one; an
+                // the transport codes only with a variable naming one; an
                 // explicit flag is a request for a served answer either way.
                 let expected = match (*code, label) {
                     ("marker_missing", "nothing named") => true,

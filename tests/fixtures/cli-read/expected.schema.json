@@ -56,6 +56,7 @@
         "anchored_alias_unavailable",
         "unauthorized",
         "unavailable",
+        "publisher_absent",
         "socket_identity",
         "peer_identity",
         "protocol_mismatch",
