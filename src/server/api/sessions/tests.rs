@@ -3907,6 +3907,34 @@ fn resolve_hook_plan_refuses_untrusted_repo_hooks_until_trusted() {
     }
 }
 
+#[test]
+#[serial_test::serial]
+fn run_create_hooks_forwards_the_running_hook_and_its_output_to_progress() {
+    let temp_home = tempfile::tempdir().unwrap();
+    let _home = crate::session::test_support::isolate_app_dir_at(temp_home.path());
+    let project = project_with_on_create_hooks(&["echo from-the-hook"]);
+    let plan = resolve_create_hook_plan("default", project.path(), false, true).unwrap();
+    let registry = crate::server::create_progress::CreateProgressRegistry::default();
+    let registration = registry.register("key");
+    let mut instance = Instance::new("hooked", project.path().to_str().unwrap());
+
+    run_create_hooks(
+        &mut instance,
+        &plan,
+        project.path(),
+        Some(&registration.progress),
+    )
+    .unwrap();
+
+    let snapshot = registry.snapshot("key").unwrap();
+    assert_eq!(snapshot.hook.as_deref(), Some("echo from-the-hook"));
+    assert!(
+        snapshot.output.iter().any(|l| l.contains("from-the-hook")),
+        "{:?}",
+        snapshot.output
+    );
+}
+
 /// None of these refuse a create. A scratch session has no repo config anchor,
 /// so it skips the repo trust check entirely (matching the CLI scratch branch),
 /// and an untrusted `.mcp.json` is gated by the supervisor at spawn rather than
@@ -4302,4 +4330,272 @@ async fn permanent_delete_keeps_a_worktree_a_surviving_session_uses() {
             .iter()
             .all(|i| i.id != owner.id));
     }
+}
+
+async fn post_create(
+    state: &std::sync::Arc<AppState>,
+    body: serde_json::Value,
+) -> (axum::http::StatusCode, serde_json::Value) {
+    use axum::response::IntoResponse;
+    let response = create_session(
+        axum::extract::State(state.clone()),
+        axum::extract::Query(CreateSessionQuery { wait: None }),
+        Ok(axum::Json(serde_json::from_value(body).unwrap())),
+    )
+    .await
+    .into_response();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (status, serde_json::from_slice(&bytes).unwrap())
+}
+
+async fn wait_for(what: &str, mut ready: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !ready() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for {what}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+/// A client that drops mid-create (a backgrounded mobile tab) must not abandon
+/// it, and its same-key retry joins the running create instead of starting another.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_dropped_create_finishes_and_its_retry_returns_the_same_session() {
+    use crate::server::test_support as support;
+    let _home = crate::session::test_support::isolate_app_dir();
+    let gate = tempfile::tempdir().unwrap();
+    let (ready, release) = (gate.path().join("ready"), gate.path().join("release"));
+    let hook = format!(
+        ": > '{}'; while [ ! -e '{}' ]; do sleep 0.01; done; echo hook-done",
+        ready.display(),
+        release.display()
+    );
+    let project = project_with_on_create_hooks(&[hook.as_str()]);
+    support::seed_instances_on_disk_for_test("test", Vec::new());
+    let (launcher, _launches) = support::counting_failing_launcher();
+    let state = support::build_test_app_state_with_launcher(Vec::new(), launcher);
+    let body = serde_json::json!({
+        "title": "detached-create", "path": project.path(), "tool": "claude",
+        "view": "structured", "profile": "test", "trust_hooks": true,
+        "idempotency_key": "drop-me",
+    });
+
+    let first = tokio::spawn({
+        let (state, body) = (state.clone(), body.clone());
+        async move { post_create(&state, body).await }
+    });
+    wait_for("the on_create hook to start", || ready.exists()).await;
+    let progress = state
+        .create_progress
+        .snapshot("drop-me")
+        .expect("progress while running");
+    assert_eq!(progress.hook.as_deref(), Some(hook.as_str()));
+    first.abort();
+    assert!(first.await.unwrap_err().is_cancelled());
+
+    let retry = tokio::spawn({
+        let state = state.clone();
+        async move { post_create(&state, body).await }
+    });
+    std::fs::write(&release, "").unwrap();
+    let (status, session) = retry.await.unwrap();
+
+    assert_eq!(status, axum::http::StatusCode::OK, "{session}");
+    let rows = support::load_instances_from_disk_for_test("test");
+    let created: Vec<_> = rows
+        .iter()
+        .filter(|r| r.title == "detached-create")
+        .collect();
+    assert_eq!(
+        created.len(),
+        1,
+        "the retry must not create a second session"
+    );
+    assert_eq!(session["id"], created[0].id.as_str());
+    assert!(state.create_progress.snapshot("drop-me").is_none());
+}
+
+/// A retry whose first response was lost gets that failure back rather than
+/// running the create again; a fresh key runs it.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_failed_create_is_replayed_to_a_same_key_retry() {
+    use crate::server::test_support as support;
+    let _home = crate::session::test_support::isolate_app_dir();
+    support::seed_instances_on_disk_for_test("test", Vec::new());
+    let (launcher, _launches) = support::counting_failing_launcher();
+    let state = support::build_test_app_state_with_launcher(Vec::new(), launcher);
+    let parent = tempfile::tempdir().unwrap();
+    let path = parent.path().join("later");
+    let body = |key: &str| {
+        serde_json::json!({
+            "title": "replayed", "path": path, "tool": "claude",
+            "view": "structured", "profile": "test", "idempotency_key": key,
+        })
+    };
+
+    let (status, failed) = post_create(&state, body("k1")).await;
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{failed}");
+    // A re-run would now succeed, so a matching 400 proves the replay.
+    std::fs::create_dir_all(&path).unwrap();
+    assert_eq!(post_create(&state, body("k1")).await, (status, failed));
+    let (fresh, session) = post_create(&state, body("k2")).await;
+    assert_eq!(fresh, axum::http::StatusCode::CREATED, "{session}");
+}
+
+/// A full replay map must not forget a live failure: its retry would run the create,
+/// and its hooks, a second time. New keyed creates are refused instead.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_full_failure_map_replays_its_oldest_key_and_refuses_new_ones() {
+    use crate::server::test_support as support;
+    let _home = crate::session::test_support::isolate_app_dir();
+    let marker = tempfile::tempdir().unwrap();
+    let runs = marker.path().join("runs");
+    let hook = format!("echo run >> '{}'; exit 1", runs.display());
+    let project = project_with_on_create_hooks(&[hook.as_str()]);
+    support::seed_instances_on_disk_for_test("test", Vec::new());
+    let (launcher, _launches) = support::counting_failing_launcher();
+    let state = support::build_test_app_state_with_launcher(Vec::new(), launcher);
+    let body = |key: &str| {
+        serde_json::json!({
+            "title": "hook-fails", "path": project.path(), "tool": "claude",
+            "view": "structured", "profile": "test", "trust_hooks": true,
+            "idempotency_key": key,
+        })
+    };
+    let hook_runs = || {
+        std::fs::read_to_string(&runs)
+            .unwrap_or_default()
+            .lines()
+            .count()
+    };
+
+    let (status, failed) = post_create(&state, body("oldest")).await;
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{failed}");
+    assert_eq!(hook_runs(), 1);
+
+    // More live failures than the map holds.
+    for n in 0..5000 {
+        state.create_progress.record_failure(
+            &format!("filler-{n}"),
+            crate::server::create_progress::CreateFailure {
+                status: axum::http::StatusCode::BAD_REQUEST,
+                code: "create_failed",
+                message: "filler".to_string(),
+            },
+        );
+    }
+
+    assert_eq!(post_create(&state, body("oldest")).await, (status, failed));
+    let (full, refused) = post_create(&state, body("fresh")).await;
+    assert_eq!(
+        full,
+        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        "{refused}"
+    );
+    assert_eq!(hook_runs(), 1, "neither retry may run the create again");
+}
+
+/// A daemon restart empties the in-memory replay record. A same-key retry that names the
+/// earlier run must then be refused as unknown, not run again with its hooks.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_retry_across_a_daemon_restart_never_reruns_a_failed_create() {
+    use crate::server::test_support as support;
+    let _home = crate::session::test_support::isolate_app_dir();
+    let marker = tempfile::tempdir().unwrap();
+    let side_effects = marker.path().join("side-effects");
+    // The first hook leaves an external side effect, the second fails.
+    let effect = format!("echo effect >> '{}'", side_effects.display());
+    let project = project_with_on_create_hooks(&[effect.as_str(), "exit 1"]);
+    support::seed_instances_on_disk_for_test("test", Vec::new());
+    let effects = || {
+        std::fs::read_to_string(&side_effects)
+            .unwrap_or_default()
+            .lines()
+            .count()
+    };
+    let body = |origin: Option<&str>| {
+        serde_json::json!({
+            "title": "restart", "path": project.path(), "tool": "claude",
+            "view": "structured", "profile": "test", "trust_hooks": true,
+            "idempotency_key": "across-restart", "retry_origin": origin,
+        })
+    };
+
+    let (launcher, _) = support::counting_failing_launcher();
+    let before = support::build_test_app_state_with_launcher(Vec::new(), launcher);
+    let first_run = before.create_progress.boot_id().to_string();
+    let (status, _) = post_create(&before, body(None)).await;
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+    assert_eq!(effects(), 1);
+
+    // The response was lost and the daemon restarted.
+    let (launcher, _) = support::counting_failing_launcher();
+    let after = support::build_test_app_state_with_launcher(Vec::new(), launcher);
+    assert_ne!(after.create_progress.boot_id(), first_run);
+    let (status, refused) = post_create(&after, body(Some(&first_run))).await;
+    assert_eq!(status, axum::http::StatusCode::CONFLICT, "{refused}");
+    assert_eq!(refused["error"], "create_outcome_unknown");
+    assert_eq!(effects(), 1, "the retry must not run the hooks again");
+
+    // A retry that names this run is not fenced: this run would know the key if it ran.
+    let own = after.create_progress.boot_id().to_string();
+    let (status, _) = post_create(&after, body(Some(&own))).await;
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+    assert_eq!(effects(), 2);
+}
+
+/// Validation that reads mutable state must not answer a retry the restart fence owns:
+/// with the first attempt's profile deleted after the restart, the retry is still an
+/// unknown outcome, not a definitive `profile_not_found`, and no hook runs again.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_retry_across_a_restart_is_fenced_before_profile_validation() {
+    use crate::server::test_support as support;
+    let _home = crate::session::test_support::isolate_app_dir();
+    let marker = tempfile::tempdir().unwrap();
+    let side_effects = marker.path().join("side-effects");
+    let effect = format!("echo effect >> '{}'", side_effects.display());
+    let project = project_with_on_create_hooks(&[effect.as_str(), "exit 1"]);
+    // A second profile, since the last one cannot be deleted.
+    crate::session::create_profile("keep").unwrap();
+    crate::session::create_profile("work").unwrap();
+    support::seed_instances_on_disk_for_test("work", Vec::new());
+    let effects = || {
+        std::fs::read_to_string(&side_effects)
+            .unwrap_or_default()
+            .lines()
+            .count()
+    };
+    let body = |origin: Option<&str>| {
+        serde_json::json!({
+            "title": "gone-profile", "path": project.path(), "tool": "claude",
+            "view": "structured", "profile": "work", "trust_hooks": true,
+            "idempotency_key": "profile-then-restart", "retry_origin": origin,
+        })
+    };
+
+    let (launcher, _) = support::counting_failing_launcher();
+    let before = support::build_test_app_state_with_launcher(Vec::new(), launcher);
+    let first_run = before.create_progress.boot_id().to_string();
+    let (status, _) = post_create(&before, body(None)).await;
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+    assert_eq!(effects(), 1);
+
+    // The response was lost, the daemon restarted, and the profile was deleted.
+    crate::session::delete_profile("work").unwrap();
+    let (launcher, _) = support::counting_failing_launcher();
+    let after = support::build_test_app_state_with_launcher(Vec::new(), launcher);
+    let (status, refused) = post_create(&after, body(Some(&first_run))).await;
+    assert_eq!(status, axum::http::StatusCode::CONFLICT, "{refused}");
+    assert_eq!(refused["error"], "create_outcome_unknown");
+    assert_eq!(effects(), 1);
 }

@@ -57,6 +57,7 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
         let validation = build_validation(field, &attrs)?;
         let overridable = !attrs.global_only;
         let advanced = attrs.advanced;
+        let tui_only = attrs.tui_only;
         let label = attrs.label.unwrap_or_else(|| humanize(&field_name));
         let description = attrs
             .desc
@@ -77,6 +78,7 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
                 profile_overridable: #overridable,
                 validation: #validation,
                 advanced: #advanced,
+                tui_only: #tui_only,
                 default: ::core::option::Option::None,
             }
         });
@@ -146,6 +148,7 @@ struct FieldAttrs {
     skip: bool,
     global_only: bool,
     advanced: bool,
+    tui_only: bool,
     label: Option<String>,
     desc: Option<String>,
     category: Option<String>,
@@ -179,6 +182,7 @@ fn parse_field_attrs(field: &syn::Field, field_name: &str) -> syn::Result<FieldA
                 "skip" => out.skip = true,
                 "global_only" => out.global_only = true,
                 "advanced" => out.advanced = true,
+                "tui_only" => out.tui_only = true,
                 "multiline" => out.multiline = true,
                 "mono" => out.mono = true,
                 "label" => out.label = Some(meta.value()?.parse::<LitStr>()?.value()),

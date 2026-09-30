@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import { describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { SchemaSection } from "../SchemaSection";
 import type { SettingsFieldDescriptor } from "../../../lib/types";
 
@@ -69,6 +69,31 @@ describe("SchemaSection", () => {
     expect(screen.queryByText("Extra volumes")).toBeNull();
     fireEvent.click(screen.getByText("Advanced"));
     expect(screen.getByText("Extra volumes")).toBeTruthy();
+  });
+
+  it("folds tui_only fields under Terminal UI, opening it when search targets one", () => {
+    const schema = [
+      ...SCHEMA,
+      descriptor({ field: "mouse_capture", label: "Mouse capture", widget: { kind: "toggle" }, tui_only: true }),
+      descriptor({
+        field: "attach_mode",
+        label: "Attach mode",
+        widget: { kind: "toggle" },
+        advanced: true,
+        tui_only: true,
+      }),
+    ];
+    mount(schema);
+    expect(screen.queryByText("Mouse capture")).toBeNull();
+    fireEvent.click(screen.getByText("Advanced"));
+    expect(screen.queryByText("Attach mode")).toBeNull();
+    fireEvent.click(screen.getByText("Terminal UI"));
+    expect(screen.getByText("Mouse capture")).toBeTruthy();
+    expect(screen.getByText("Attach mode")).toBeTruthy();
+
+    cleanup();
+    mount(schema, {}, { focusRequest: { section: "sandbox", field: "mouse_capture", nonce: 1 } });
+    expect(screen.getByText("Mouse capture")).toBeTruthy();
   });
 
   it("renders a registered custom widget and a visible fallback for an unknown one", () => {

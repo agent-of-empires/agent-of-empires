@@ -8,6 +8,7 @@ use super::add::AddArgs;
 use super::cityhall::CityHallCommands;
 use super::extract_session_id::ExtractSessionIdArgs;
 use super::group::GroupCommands;
+use super::hooks::HooksCommands;
 use super::init::InitArgs;
 use super::killall::KillallArgs;
 use super::list::ListArgs;
@@ -212,6 +213,13 @@ pub enum Commands {
         command: SkillCommands,
     },
 
+    /// Let AoE write agent hooks into each agent's own config, for every
+    /// agent and every profile
+    Hooks {
+        #[command(subcommand)]
+        command: HooksCommands,
+    },
+
     /// Start the aoe daemon: REST/WebSocket API, plus the web dashboard in
     /// builds that embed it
     Serve(ServeArgs),
@@ -285,6 +293,7 @@ pub const CLI_COMMAND_NAMES: &[&str] = &[
     "telemetry",
     "mcp",
     "skill",
+    "hooks",
     "serve",
     "url",
     "acp",
@@ -323,6 +332,7 @@ pub fn command_name(command: &Commands) -> Option<&'static str> {
         Commands::Telemetry { .. } => "telemetry",
         Commands::Mcp { .. } => "mcp",
         Commands::Skill { .. } => "skill",
+        Commands::Hooks { .. } => "hooks",
         Commands::Serve(_) => "serve",
         Commands::Url(_) => "url",
         Commands::Acp { .. } => "acp",

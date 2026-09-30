@@ -98,6 +98,8 @@ pub struct AppState {
     /// existing-instance check and both create a session.
     pub idempotency_locks:
         Arc<RwLock<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    /// Hook progress of in-flight web creates, keyed by `idempotency_key`.
+    pub create_progress: super::create_progress::CreateProgressRegistry,
     /// Disk config resolutions performed by `list_sessions`, one per unique `(profile,
     /// project_path)` per request, accumulated monotonically.
     pub list_sessions_resolver_misses: std::sync::atomic::AtomicUsize,

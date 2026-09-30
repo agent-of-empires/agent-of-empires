@@ -3,13 +3,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 
-vi.mock("../../../lib/api", () => ({
-  fetchProfiles: vi.fn().mockResolvedValue([{ name: "default", is_default: true }]),
-  createProfile: vi.fn(),
-  renameProfile: vi.fn(),
-  deleteProfile: vi.fn(),
-}));
-
 import { SettingsHeader } from "../SettingsHeader";
 
 afterEach(() => {
@@ -21,8 +14,6 @@ describe("SettingsHeader", () => {
     onClose: () => {},
     saving: false,
     saveError: null as string | null,
-    selectedProfile: "default",
-    onSelectProfile: () => {},
     schema: [],
     schemaLoading: false,
     onSearchJump: () => {},
@@ -33,6 +24,15 @@ describe("SettingsHeader", () => {
     render(<SettingsHeader {...baseProps} onClose={onClose} />);
     fireEvent.click(screen.getByRole("button", { name: /Back/ }));
     expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
+  it("on a tab page, the mobile Back returns to the section list", () => {
+    const onClose = vi.fn();
+    const onBackToList = vi.fn();
+    render(<SettingsHeader {...baseProps} onClose={onClose} onBackToList={onBackToList} />);
+    fireEvent.click(screen.getByRole("button", { name: /All settings/ }));
+    expect(onBackToList).toHaveBeenCalledTimes(1);
+    expect(onClose).not.toHaveBeenCalled();
   });
 
   it.each([

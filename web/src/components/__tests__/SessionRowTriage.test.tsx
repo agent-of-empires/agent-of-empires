@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, screen } from "@testing-library/react";
 
 import type { SessionResponse } from "../../lib/types";
 import { OPEN_SESSION_EVENT } from "../../lib/sessionRoute";
@@ -103,8 +103,8 @@ describe("SessionRow unread", () => {
   });
 
   it.each([
-    [false, "Mark as unread", true],
-    [true, "Mark as read", false],
+    [false, "Unread", true],
+    [true, "Read", false],
   ])("unread=%s offers %j and PATCHes { unread: %s }", async (unread, text, next) => {
     openRowMenu(ws({ id: "sess-u", unread }));
     expect(testId("sidebar-context-menu-unread")!.textContent).toContain(text);
@@ -121,12 +121,88 @@ describe("SessionRow unread", () => {
 });
 
 describe("SessionRow context menu", () => {
+  it("keeps the rarer actions folded under a More disclosure until it is opened", () => {
+    openRowMenu(ws({ view: "structured" }), { expandMore: false });
+    const more = screen.getByTestId("sidebar-context-menu-more");
+    const group = document.getElementById(more.getAttribute("aria-controls")!)!;
+    expect(more.getAttribute("aria-expanded")).toBe("false");
+    expect(group.contains(testId("sidebar-context-menu-switch-agent"))).toBe(true);
+    expect(group.hidden).toBe(true);
+    click("sidebar-context-menu-more");
+    expect(more.getAttribute("aria-expanded")).toBe("true");
+    expect(group.hidden).toBe(false);
+  });
+
+  // The row menu is a modal sheet only at phone width.
+  const atViewport = (phone: boolean) =>
+    vi.stubGlobal(
+      "matchMedia",
+      vi.fn((query: string) => ({ matches: phone && query.includes("max-width"), media: query })),
+    );
+
+  it("on a desktop viewport stays a plain menu: not modal, no focus takeover, Tab not trapped", () => {
+    atViewport(false);
+    const menu = openRowMenu(ws({ view: "structured" }), { expandMore: false });
+    expect(menu.getAttribute("role")).toBeNull();
+    expect(menu.getAttribute("aria-modal")).toBeNull();
+    expect(menu.contains(document.activeElement)).toBe(false);
+    const items = [...menu.querySelectorAll<HTMLElement>("button")].filter((el) => !el.closest("[hidden]"));
+    const last = items[items.length - 1]!;
+    last.focus();
+    fireEvent.keyDown(last, { key: "Tab" });
+    expect(document.activeElement).toBe(last);
+    // Escape still closes it.
+    fireEvent.keyDown(last, { key: "Escape" });
+    expect(testId("sidebar-context-menu")).toBeNull();
+  });
+
+  it("closes when the viewport crosses the phone breakpoint while open", () => {
+    const listeners: (() => void)[] = [];
+    vi.stubGlobal(
+      "matchMedia",
+      vi.fn((query: string) => ({
+        matches: false,
+        media: query,
+        addEventListener: (_: string, fn: () => void) => listeners.push(fn),
+        removeEventListener: vi.fn(),
+      })),
+    );
+    openRowMenu(ws(), { expandMore: false });
+    expect(listeners.length).toBeGreaterThan(0);
+    act(() => listeners.forEach((fn) => fn()));
+    expect(testId("sidebar-context-menu")).toBeNull();
+  });
+
+  it("keeps Tab and Shift+Tab inside the sheet, skipping folded actions", () => {
+    atViewport(true);
+    const menu = openRowMenu(ws({ view: "structured" }), { expandMore: false });
+    const items = [...menu.querySelectorAll<HTMLElement>("button")].filter((el) => !el.closest("[hidden]"));
+    const [first, last] = [items[0]!, items[items.length - 1]!];
+    last.focus();
+    fireEvent.keyDown(last, { key: "Tab" });
+    expect(document.activeElement).toBe(first);
+    fireEvent.keyDown(first, { key: "Tab", shiftKey: true });
+    expect(document.activeElement).toBe(last);
+  });
+
+  it("is a named modal sheet that takes focus, closes on Escape, and returns focus to the row", () => {
+    atViewport(true);
+    const menu = openRowMenu(ws({ title: "Fix login" }), { expandMore: false });
+    expect(menu.getAttribute("role")).toBe("dialog");
+    expect(menu.getAttribute("aria-modal")).toBe("true");
+    expect(menu.getAttribute("aria-label")).toBe("Fix login actions");
+    expect(menu.contains(document.activeElement)).toBe(true);
+    fireEvent.keyDown(document.activeElement!, { key: "Escape" });
+    expect(testId("sidebar-context-menu")).toBeNull();
+    expect(document.activeElement).toBe(screen.getByTestId("sidebar-session-row"));
+  });
+
   it.each([
     // Archiving or snoozing a pinned session clears the pin server-side, as in the TUI.
     ["pinned", { pinned_at: PAST }, ["Unpin", "Archive", "Snooze"], []],
     ["archived", { archived_at: PAST }, ["Unarchive"], ["Pin", "Snooze"]],
     ["snoozed", { snoozed_until: inMinutes(60) }, ["Unsnooze"], ["Pin", "Archive"]],
-    ["live", {}, ["Pin", "Archive", "Snooze…"], []],
+    ["live", {}, ["Pin", "Archive", "Snooze"], []],
   ] as [string, Partial<SessionResponse>, string[], string[]][])("%s row triage items", (_n, over, has, lacks) => {
     const text = openRowMenu(ws(over)).textContent;
     for (const t of has) expect(text).toContain(t);

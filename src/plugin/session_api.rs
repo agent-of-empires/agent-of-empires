@@ -454,6 +454,7 @@ async fn admit_and_create(
         agent_effort: None,
         import_acp_session_id: None,
         fork_seed: None,
+        progress: None,
     };
 
     if let Some(key) = req.idempotency_key.as_deref() {

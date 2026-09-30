@@ -71,8 +71,11 @@ export function ProfileSelector({ selectedProfile, onSelect }: Props) {
   return (
     <div className="relative" ref={panelRef}>
       <div className="flex items-center gap-2 flex-nowrap">
-        <label className="text-sm font-medium text-text-secondary shrink-0">Profile</label>
+        <label htmlFor="settings-profile-select" className="text-sm font-medium text-text-secondary shrink-0">
+          Editing profile
+        </label>
         <select
+          id="settings-profile-select"
           value={selectedProfile}
           onChange={(e) => onSelect(e.target.value)}
           className="bg-surface-900 border border-surface-700 rounded-md px-2 py-1 text-sm text-text-primary focus:border-brand-600 focus:outline-none w-32 sm:w-40 shrink"

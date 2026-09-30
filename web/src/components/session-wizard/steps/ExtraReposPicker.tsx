@@ -119,15 +119,12 @@ export function ExtraReposPicker({
 
   return (
     <div data-testid="extra-repos-picker">
-      <div className="flex items-center justify-between mb-2">
-        <h3 className="text-sm font-medium text-text-primary">Extra repos (optional)</h3>
-        <span className="text-[11px] text-text-dim">
-          {selectedPaths.length > 0 ? `${selectedPaths.length} selected` : "none"}
-        </span>
-      </div>
       <p className="text-[11px] text-text-dim mb-3">
         Include additional repositories in the same workspace. Each gets its own worktree on the same branch, forked
-        from the session's base branch unless you give it one of its own.
+        from the session's base branch unless you give it one of its own.{" "}
+        <span className="text-text-secondary">
+          {selectedPaths.length > 0 ? `${selectedPaths.length} selected` : "none"}
+        </span>
       </p>
 
       {selectedPaths.length > 0 && (

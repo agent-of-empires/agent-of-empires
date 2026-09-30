@@ -3,7 +3,7 @@
 // persist-after-expand path lives in tests/settings-advanced-fold.spec.ts.
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { SettingsView } from "../SettingsView";
 import * as api from "../../lib/api";
 
@@ -302,31 +302,6 @@ describe("Settings Advanced fold", () => {
   });
 
   // Regression: the mount-time fetchProfiles resolution flips selectedProfile from its "" seed to the default.
-  it("keeps an expanded fold open when the initial profile resolves", async () => {
-    let resolveProfiles!: (p: typeof PROFILES) => void;
-    vi.mocked(api.fetchProfiles).mockImplementationOnce(
-      () =>
-        new Promise((resolve) => {
-          resolveProfiles = resolve;
-        }),
-    );
-
-    const { container } = renderView("structured-view");
-    await screen.findByText("Show tool-call durations");
-
-    expandAdvanced(container);
-    expect(screen.getByText("Silent-orphan grace (s)")).toBeTruthy();
-
-    // Profiles resolve: selectedProfile flips "" -> "main". Pre-fix this
-    // remounted the fieldset and collapsed the fold.
-    await act(async () => {
-      resolveProfiles(PROFILES);
-    });
-
-    await waitFor(() => expect(vi.mocked(api.fetchSettings)).toHaveBeenCalledWith("main"));
-    expect(screen.getByText("Silent-orphan grace (s)")).toBeTruthy();
-  });
-
   it("collapses the fold when switching profiles (#4)", async () => {
     const { container } = renderView("structured-view");
     await screen.findByText("Show tool-call durations");

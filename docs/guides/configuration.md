@@ -36,7 +36,7 @@ On macOS nothing is moved for you: an existing `~/.agent-of-empires/` keeps bein
   logs/
 ```
 
-`state.toml` holds global-only UI bookkeeping (tour seen, last browse directory, sort order, dismissed tips and updates). It is not a setting: it has no profile or repo layer and no TUI or web control. `GET /api/settings` still reports these under `app_state.*`, but `PATCH` rejects writes to them.
+`state.toml` holds global-only bookkeeping (tour seen, last browse directory, sort order, dismissed tips and updates, and the agent hook approval described below). It is not a setting: it has no profile or repo layer. The TUI and the web dashboard both read some of these fields, the TUI writes several of them, and the CLI writes a flag when asked; the agent hook approval below is set by `aoe hooks approve` and is hand-editable. `GET /api/settings` still reports these under `app_state.*`, but `PATCH` rejects writes to them.
 
 ## Environment variables
 
@@ -92,7 +92,7 @@ sidebar_position = "left" # left | right; TUI session list
 | `sidebar_position` | `"left"` | TUI session sidebar position: `left` or `right`. Global only. Narrow terminals keep the stacked layout. |
 | `tie_workdir_to_name` | `true` | Keep a managed worktree session's directory named after its title. See [Worktrees](worktrees.md#naming). |
 | `pre_trust_agent_folders` | `false` | Pre-trust each host session's worktree in the agent's own config (Claude Code, Codex, Gemini) so it does not open on a folder-trust prompt. Config-dir overrides are honored, and an `agent_config_dir` entry wins over them. Trust also activates the repo's `.claude/settings.json`, hooks included, so enable it only for directories you would have trusted by hand. Sandboxed sessions always pre-trust their own staged config. |
-| `agent_status_hooks` | `true` | Install status-detection hooks into the agent's config; see [Adding a New Agent](../development/adding-agents.md#hook-format-reference). Disabling it leaves status to pane reading but keeps identity hooks used for native resume. |
+| `agent_status_hooks` | `true` | Install status-detection hooks into the agent's config; see [Agent hook approval](#agent-hook-approval) for the approval that gates it and [Adding a New Agent](../development/adding-agents.md#hook-format-reference) for the formats. Disabling it leaves status to pane reading but keeps identity hooks used for native resume. |
 | `opencode_preassign_session_id` | `false` | Pre-assign OpenCode's native session id before a host launch (about two seconds per session) so resume captures it. Unsupported for sandboxed OpenCode. |
 | `smart_rename` | `true` | Auto-rename a still-default-named structured session from its first turn, using the session's agent in one-shot mode. Title only; a session you named is never touched. Skipped for agents with no one-shot mode and command-overridden agents. Overridable per project. |
 | `smart_rename_agent` | `""` | Agent used for one-shot utility calls (the rename title and the conversation summary). Empty means the session's own agent. A sandboxed session only mounts its own agent's credentials, so a different value makes it ineligible instead of falling back. |
@@ -139,6 +139,14 @@ on_error = "notify-send -u critical -a aoe 'AoE: Error' \"$AOE_SESSION_TITLE err
 `on_starting`, `on_running`, `on_waiting`, `on_idle`, and `on_error` fire on that transition; `on_change` fires on every transition, after the status-specific command. A status must hold for a 100 ms debounce before a hook runs. Commands run in the session's project directory, are best-effort, and never block status updates or sounds.
 
 Each command receives `AOE_SESSION_ID`, `AOE_SESSION_TITLE`, `AOE_PROJECT_PATH`, `AOE_PROFILE`, `AOE_TOOL`, `AOE_GROUP_PATH`, `AOE_OLD_STATUS`, `AOE_NEW_STATUS`, and `AOE_STATUS_CHANGED_AT`.
+
+## Agent hook approval
+
+`agent_status_hooks` (above) makes AoE write hook entries into the agent's own config, which lives under your home directory unless `agent_config_dir`, the profile `environment`, or a config-dir variable exported in the launching shell moves it, so status comes from the agent reporting it rather than from reading its pane. That writes into files you own and runs a command whenever the agent fires a hook, so it is gated behind a one-time approval. The TUI offers it as a dialog when you create a session that writes to the host; `aoe hooks approve` is the same approval for a launch with no TUI, and `aoe hooks status` reports the current answer alongside the files and hook events the effective profile resolves. That list is a disclosure, not a manifest: a launch that routes through a native store, merges into a selected agent, or targets a selected or recorded Claude conversation store resolves its own target at launch time.
+
+The approval is per installation and is not bound to a profile, so every profile and every agent resolves its own paths under it. One agent's hooks also change launcher state: installing Kiro hooks may run `kiro-cli agent set-default aoe-hooks`, which Kiro keeps as its persistent default, so it affects later Kiro sessions including ones outside AoE. `aoe hooks status` prints that next to the files. There is no revoke command: set `has_acknowledged_agent_hooks = false` in `<app_dir>/state.toml` to take it back. A sandboxed session stages its hooks inside its own container config and is never gated. It is not the repo trust gate: `aoe add --trust-hooks` covers the hooks a repository declares in `.agent-of-empires/config.toml` and its project-local MCP servers, which are a separate decision. See [Hook trust](repo-config.md#hook-trust).
+
+Turning `agent_status_hooks` off stops AoE installing status hooks, but it does not end the gate: identity hooks, which native resume depends on, stay installed. How many agents remain gated then depends on which ones declare an identity event, so check `aoe hooks status` for the list under a given profile. A session launched with its own command resolves the file that command names, which the TUI creation dialog describes exactly. `aoe hooks status` has neither a session nor a project directory: it resolves each tool from the profile config, so for a repository that sets `session.agent_detect_as` it can name a different agent than the same session launched inside that repository.
 
 ## Custom agents
 
@@ -230,7 +238,7 @@ Set the same thing in the TUI under **Agents**, using `<agent>=<cmd>`, or per se
 
 A configured override also applies to plain `aoe add --cmd <agent>`, and the on-PATH check validates the resolved override binary, so a session works when only the wrapper is installed. Native conversation resume survives an override only when the command starts with the built-in's exact binary token, or is a single bare token, and contains no shell control syntax; see [session resume](session-resume.md).
 
-The web wizard previews the resolved command under **More options**, including the ACP registry args a structured view session adds (`opencode acp`). Extra args are ignored for structured view sessions, so change the command override instead.
+The web wizard previews the resolved command in its **Agent** panel, including the ACP registry args a structured view session adds (`opencode acp`). Extra args are ignored for structured view sessions, so change the command override instead.
 
 An override runs through your `$SHELL`, falling back to `bash` when `$SHELL` is unset or non-POSIX (`fish`, `nu`, `pwsh`). If your wrapper is a function or abbreviation in a non-POSIX shell, write it as a bash script or spell the command out here.
 

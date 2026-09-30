@@ -24,7 +24,24 @@ async function installProfileMocks(page: Page, initial: string[] = ["main"]): Pr
     defaultPatches: [],
   };
 
-  await mockSettingsApis(page, { settings: () => ({ session: {} }) });
+  // One profile-overridable session field puts the profile picker on the Session tab.
+  await mockSettingsApis(page, {
+    settings: () => ({ session: {} }),
+    schema: [
+      {
+        section: "session",
+        field: "yolo_mode_default",
+        category: "Session",
+        label: "YOLO Mode Default",
+        description: "",
+        widget: { kind: "toggle" },
+        web_write: { policy: "allow" },
+        profile_overridable: true,
+        validation: { rule: "none" },
+        advanced: false,
+      },
+    ],
+  });
 
   await page.route(
     (url) => url.pathname === "/api/profiles",
@@ -52,15 +69,12 @@ async function installProfileMocks(page: Page, initial: string[] = ["main"]): Pr
 }
 
 function profileSelect(page: Page) {
-  return page
-    .locator("label", { hasText: /^Profile$/ })
-    .locator("..")
-    .locator("select");
+  return page.getByTestId("settings-profile-picker").locator("select");
 }
 
 async function openSessionSettings(page: Page) {
   await page.goto("/settings/session");
-  await expect(page.getByTestId("settings-header").getByText("Profile", { exact: true })).toBeVisible();
+  await expect(page.getByTestId("settings-profile-picker")).toBeVisible();
 }
 
 test("create profile via + New POSTs /api/profiles and the dropdown gains it", async ({ page }) => {

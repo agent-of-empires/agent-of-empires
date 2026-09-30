@@ -53,6 +53,8 @@ pub(crate) struct StructuredSessionSpec {
     pub agent_effort: Option<String>,
     pub import_acp_session_id: Option<String>,
     pub fork_seed: Option<crate::session::ForkSeed>,
+    /// Where the web wizard polls this create's stage and hook output.
+    pub progress: Option<Arc<crate::server::create_progress::CreateProgress>>,
 }
 
 /// What the create core returns to its caller once the session exists in state.
@@ -129,6 +131,7 @@ pub(crate) async fn spawn_structured_session(
             agent_effort,
             import_acp_session_id,
             fork_seed,
+            progress,
         } = spec;
 
         let config = Config::load_or_warn();
@@ -320,6 +323,7 @@ pub(crate) async fn spawn_structured_session(
             &mut instance,
             &hook_plan,
             std::path::Path::new(&original_path),
+            progress.as_deref(),
         ) {
             builder::cleanup_instance(
                 &instance,
@@ -334,6 +338,10 @@ pub(crate) async fn spawn_structured_session(
                 .map(|hint| format!("\n{hint}"))
                 .unwrap_or_default();
             return Err(anyhow::anyhow!("on_create hook failed: {e:#}{hint}"));
+        }
+
+        if let Some(progress) = &progress {
+            progress.set_stage(crate::server::create_progress::CreateStage::Starting);
         }
 
         // Anything that fails between here and the final `Ok(..)` would otherwise orphan

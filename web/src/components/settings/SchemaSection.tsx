@@ -170,7 +170,7 @@ function renderField(
   }
 }
 
-/** Schema-driven form for one settings section; `local_only` fields are skipped and `advanced` ones folded. */
+/** Schema-driven form for one settings section; `local_only` fields are skipped, `advanced` and `tui_only` ones folded. */
 export function SchemaSection({
   section,
   schema,
@@ -190,11 +190,13 @@ export function SchemaSection({
       (!onlyFields || onlyFields.includes(d.field)) &&
       !hideFields?.includes(d.field),
   );
-  const primary = fields.filter((d) => !d.advanced);
-  const advanced = fields.filter((d) => d.advanced);
+  const primary = fields.filter((d) => !d.advanced && !d.tui_only);
+  const advanced = fields.filter((d) => d.advanced && !d.tui_only);
+  const tuiOnly = fields.filter((d) => d.tui_only);
 
   const targetField = focusRequest && focusRequest.section === section ? focusRequest.field : null;
   const targetAdvanced = !!targetField && advanced.some((d) => d.field === targetField);
+  const targetTuiOnly = !!targetField && tuiOnly.some((d) => d.field === targetField);
   const targetRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
@@ -245,6 +247,15 @@ export function SchemaSection({
       {advanced.length > 0 && (
         <CollapsibleSection title="Advanced" subtitle={advancedSubtitle} defaultOpen={targetAdvanced}>
           {advanced.map((d) => wrap(d, renderField(d, values, makeSave(d))))}
+        </CollapsibleSection>
+      )}
+      {tuiOnly.length > 0 && (
+        <CollapsibleSection
+          title="Terminal UI"
+          subtitle="Only the aoe terminal app reads these; they do not change this dashboard."
+          defaultOpen={targetTuiOnly}
+        >
+          {tuiOnly.map((d) => wrap(d, renderField(d, values, makeSave(d))))}
         </CollapsibleSection>
       )}
     </div>

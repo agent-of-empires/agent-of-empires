@@ -352,6 +352,10 @@ async fn run(
         Some(Commands::Serve(args)) => cli::serve::run(&profile, args).await,
         Some(Commands::Url(args)) => cli::url::run(args),
         Some(Commands::Sandbox { command }) => cli::sandbox::run(command),
+        // Runs after migrations, which run for every command: `approve` writes
+        // state.toml, and on a pre-v021 install v021 strips [app_state] from
+        // config.toml without copying it, dropping every other key.
+        Some(Commands::Hooks { command }) => cli::hooks::run(&profile, command),
         Some(Commands::Acp { command }) => cli::acp::run(command).await,
         Some(Commands::AcpRunner(args)) => agent_of_empires::process::runner::run(*args).await,
         None => {
