@@ -506,13 +506,15 @@ fn is_temporary_name(name: &str) -> bool {
     is_temporary_of(name, PREBIND_FILE) || is_temporary_of(name, POSTBIND_FILE)
 }
 
-/// Whether a retained temporary marker still has a live writer. A body that
-/// does not parse is not in flight: a writer that is still running has not
-/// finished its write, and only a finished write can be refused. A body that
-/// cannot even be *read* proves nothing about a writer, so it is not reaped
-/// on a guess: publication is refused and the name is left in place, exactly
-/// as the client half refuses to leave `marker_identity` on an unreadable
-/// `/proc`.
+/// Whether a retained temporary marker still owns the namespace, which is the
+/// same question the final-name loop asks and the same answer it accepts: busy
+/// unless a writer is *proven* gone. A body that parses but whose process this
+/// half cannot place proves nothing about a writer, so it is refused and the
+/// name is left in place, exactly as the client half refuses to leave
+/// `marker_identity` on an unreadable `/proc`. A body that does not parse is
+/// the one exception, and it is deliberate: that is the torn write a crash
+/// between the exclusive create and the rename leaves behind, no writer is left
+/// to honour, and keeping it would refuse publication forever.
 fn temporary_is_live(dir: RawFd, name: &str) -> Result<bool, PublishError> {
     let Some(stat) = entry_stat(dir, name)? else {
         return Ok(false);
@@ -550,7 +552,7 @@ fn temporary_is_live(dir: RawFd, name: &str) -> Result<bool, PublishError> {
         ));
     }
     Ok(serde_json::from_slice::<MarkerProbe>(&bytes)
-        .is_ok_and(|probe| process_liveness(&probe) == ProcessLiveness::Live))
+        .is_ok_and(|probe| !matches!(process_liveness(&probe), ProcessLiveness::Dead)))
 }
 
 /// Every runtime artifact in the directory, temporary names included.

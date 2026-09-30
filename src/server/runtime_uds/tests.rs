@@ -961,3 +961,65 @@ fn open_client_lock(dir: &Path) -> File {
     assert!(fd >= 0, "the client opens the lock file directly");
     unsafe { File::from_raw_fd(fd) }
 }
+/// The twin of the test above, on the temporary name. The two halves of the
+/// retained-state scan answer the same question and used to answer it
+/// differently: the final name was reaped only on a writer proven gone, while a
+/// temporary was reaped on anything that was not provably alive, so an
+/// unplaceable process lost its artifact instead of owning the namespace. A
+/// shared regression cannot be caught by comparing the two paths against each
+/// other, because both would agree; only writing the temporary name says it.
+#[tokio::test]
+#[serial_test::serial]
+async fn an_unreadable_proc_entry_keeps_a_retained_temporary_marker_too() {
+    let namespace = namespace().expect("a private ancestor chain exists on this host");
+    let dir = app_dir(&namespace);
+    let marker = serde_json::json!({
+        "schema": SCHEMA,
+        "pid": std::process::id(),
+        "process_start_identity": process_start_identity(std::process::id()).expect("start"),
+        "prebind_instance_id": runtime_ws::identity().prebind_instance_id,
+        "runtime_instance_id": runtime_ws::identity().runtime_instance_id,
+        "runtime_epoch": runtime_ws::identity().runtime_epoch,
+        "namespace": runtime_ws::NAMESPACE,
+        "socket_path": SOCKET_FILE,
+        "owner_uid": unsafe { libc::geteuid() },
+        "socket_device": 0,
+        "socket_inode": 0,
+        "socket_creator_pid": std::process::id(),
+    });
+    let before = marker.to_string();
+    let name = format!("{POSTBIND_FILE}.tmp.44444444-3333-2222-1111-000000000000");
+    let temporary = dir.join(&name);
+    std::fs::write(&temporary, &before).expect("retained temporary");
+
+    fail_next_proc_read();
+    let error = match publish() {
+        Err(error) => error,
+        Ok(_) => panic!("an unprovable process must not have its temporary reaped"),
+    };
+    assert_eq!(error.code(), "namespace_busy");
+    assert_eq!(
+        std::fs::read(&temporary).expect("temporary"),
+        before.as_bytes(),
+        "the retained temporary must survive a refused publication"
+    );
+    assert!(!dir.join(PREBIND_FILE).exists(), "nothing was published");
+}
+
+/// A temporary whose body never landed is the torn write a crash leaves between
+/// the exclusive create and the rename. No writer is left to honour, so keeping
+/// it would refuse publication forever, and it is reaped. This is the one
+/// exception to the rule its twin pins, and it is why the exception exists.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_torn_temporary_is_reaped_because_no_writer_is_left_to_honour() {
+    let namespace = namespace().expect("a private ancestor chain exists on this host");
+    let dir = app_dir(&namespace);
+    let name = format!("{POSTBIND_FILE}.tmp.55555555-4444-3333-2222-111111111111");
+    let temporary = dir.join(&name);
+    std::fs::write(&temporary, b"{\"schema\":1,\"pid\":").expect("retained temporary");
+
+    publish().expect("a torn temporary must not refuse publication forever");
+    assert!(!temporary.exists(), "the torn temporary is reaped");
+}
+
