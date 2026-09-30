@@ -82,8 +82,9 @@ pub(crate) enum ContinuationOutcome {
     Stands,
     /// A queued prompt owns the next turn, and any continuation an earlier
     /// cadence installed is cleared. That prompt has no other route to a
-    /// worker, so the caller still frees the respawn, but no automatic
-    /// breadcrumb.
+    /// worker, so the caller still frees the respawn, and publishes the
+    /// manual marker to retire an arming an earlier automatic resume left
+    /// behind: no continuation goes out, so nothing may stay armed.
     SupersededByQueue,
 }
 
@@ -333,11 +334,12 @@ pub(super) async fn reap_rate_limit_resumes(
             }
             ContinuationOutcome::SupersededByQueue => {
                 // A queued prompt takes the session, so no continuation goes
-                // out. The manual marker is the budget's disarm step rather
-                // than a record of a delivery, so an arming an earlier
-                // automatic resume left behind has to be retired here too, or
-                // it outlives the daemon and charges a redelivery that never
-                // happened.
+                // out. The `manual` flag is the budget's disarm step rather
+                // than a claim about who resumed: here it says the opposite
+                // of what it says on the automatic branch, that nothing was
+                // delivered. Without it an arming an earlier automatic resume
+                // left behind outlives the daemon and charges a redelivery
+                // that never happened.
                 state
                     .acp_supervisor
                     .publish_rate_limit_auto_resumed(&id, resume_at, true);
