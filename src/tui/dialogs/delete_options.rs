@@ -135,11 +135,7 @@ impl UnifiedDeleteDialog {
     }
 
     fn hit_focusable(&self, col: u16, row: u16) -> Option<FocusElement> {
-        let pos = ratatui::layout::Position::from((col, row));
-        self.focusable_rects
-            .iter()
-            .find(|(_, rect)| rect.contains(pos))
-            .map(|(element, _)| *element)
+        super::hit(&self.focusable_rects, col, row)
     }
 
     /// Toggle whichever checkbox the focus is currently on. No-op for

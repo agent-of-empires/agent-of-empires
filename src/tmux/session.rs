@@ -989,31 +989,27 @@ impl Session {
         }
 
         let target = format!("{}:^.0", self.name);
-        let byte_len = text.len();
-        let line_count = text.lines().count();
-        let max_line = text.lines().map(str::len).max().unwrap_or(0);
-
-        // Anything beyond a few characters goes via bracketed paste: an Enter right
-        // after literal keystrokes can land inside the agent's burst window and insert
-        // a newline instead of submitting.
-        const PASTE_BYTE_THRESHOLD: usize = 16;
-        let use_paste_buffer = byte_len >= PASTE_BYTE_THRESHOLD || text.contains('\n');
-
+        let delivery = submit_text(text);
         tracing::debug!(target: "tmux.command",
-            "send_keys_with_delay: bytes={} lines={} max_line={} use_paste_buffer={} target={}",
-            byte_len,
-            line_count,
-            max_line,
-            use_paste_buffer,
+            "send_keys_with_delay: bytes={} lines={} paste={} target={}",
+            text.len(),
+            text.lines().count(),
+            matches!(delivery, SubmitText::Paste(_)),
             target
         );
 
-        if use_paste_buffer {
-            Self::send_via_paste_buffer(&target, text)?;
-        } else {
-            let payload = pad_slash_command_for_autocomplete(text);
-            // `--` so lines starting with `-` are not read as tmux flags.
-            Self::tmux_send(&target, &["-l", "--", &payload])?;
+        match delivery {
+            SubmitText::Paste(text) => Self::send_via_paste_buffer(&target, text)?,
+            SubmitText::Literal(payload) => {
+                let (head, semis) = peel_trailing_semicolons(&payload);
+                if !head.is_empty() {
+                    // `--` so lines starting with `-` are not read as tmux flags.
+                    Self::tmux_send(&target, &["-l", "--", head])?;
+                }
+                if semis > 0 {
+                    self.send_raw_bytes(&vec![b';'; semis])?;
+                }
+            }
         }
 
         if enter_delay_ms > 0 {
@@ -1949,6 +1945,33 @@ impl Drop for EphemeralEnvFile {
     }
 }
 
+/// How [`Session::send_keys_with_delay`] delivers `text` before its Enter.
+pub(crate) enum SubmitText<'a> {
+    /// Beyond a few characters, or multi-line: an Enter right after literal keystrokes
+    /// can land inside the agent's paste-burst window and insert a newline instead.
+    Paste(&'a str),
+    /// Typed literally, padded so a leading `/` cannot leave autocomplete open.
+    Literal(std::borrow::Cow<'a, str>),
+}
+
+pub(crate) fn submit_text(text: &str) -> SubmitText<'_> {
+    const PASTE_BYTE_THRESHOLD: usize = 16;
+    if text.len() >= PASTE_BYTE_THRESHOLD || text.contains('\n') {
+        SubmitText::Paste(text)
+    } else {
+        SubmitText::Literal(pad_slash_command_for_autocomplete(text))
+    }
+}
+
+/// Split a literal payload into its leading content and the count of trailing `;` bytes.
+/// tmux drops a trailing `;` from a `send-keys -l` payload, reading it as a command
+/// separator even after `--` (#1942), so callers send `head` literally and the
+/// semicolons as raw bytes. Embedded and leading semicolons survive untouched.
+pub(crate) fn peel_trailing_semicolons(s: &str) -> (&str, usize) {
+    let head = s.trim_end_matches(';');
+    (head, s.len() - head.len())
+}
+
 /// A leading `/` opens some agents' autocomplete, which would eat the Enter;
 /// a trailing space closes it.
 fn pad_slash_command_for_autocomplete(text: &str) -> std::borrow::Cow<'_, str> {
@@ -2195,6 +2218,22 @@ mod tests {
             "{what} for {} never painted {needle:?}; last seen: {last:?}",
             session.name
         );
+    }
+
+    #[test]
+    fn peel_trailing_semicolons_splits_trailing_run_only() {
+        // tmux eats a trailing `;` from a `send-keys -l` payload, so callers peel
+        // the trailing run and sends it as raw hex (#1942).
+        assert_eq!(peel_trailing_semicolons(";"), ("", 1));
+        assert_eq!(peel_trailing_semicolons("ls;"), ("ls", 1));
+        assert_eq!(peel_trailing_semicolons(";;"), ("", 2));
+        assert_eq!(peel_trailing_semicolons("a;;"), ("a", 2));
+        // Embedded and leading semicolons survive `-l`, so they stay on the
+        // literal head and nothing is peeled.
+        assert_eq!(peel_trailing_semicolons("a;b"), ("a;b", 0));
+        assert_eq!(peel_trailing_semicolons(";a"), (";a", 0));
+        assert_eq!(peel_trailing_semicolons("hello"), ("hello", 0));
+        assert_eq!(peel_trailing_semicolons(""), ("", 0));
     }
 
     #[test]

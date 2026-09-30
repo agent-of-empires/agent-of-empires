@@ -152,6 +152,12 @@ pub struct SessionService {
     /// reaches `prompt_locks`. See [`SessionService::watch_submission_claims`].
     #[cfg(test)]
     submission_claims: std::sync::OnceLock<tokio::sync::mpsc::UnboundedSender<String>>,
+    /// Holds a continuation install between its store read and its write, so a
+    /// test can admit a prompt in that window.
+    #[cfg(test)]
+    install_barrier: std::sync::Mutex<
+        Option<tokio::sync::mpsc::UnboundedSender<(String, tokio::sync::oneshot::Sender<()>)>>,
+    >,
     #[cfg(test)]
     pub(super) created_instance_gate: std::sync::Mutex<
         Option<(
@@ -212,22 +218,26 @@ pub(crate) enum SendTurnError {
 
 /// Outcome of [`SessionService::touch_and_wake_on_prompt`].
 pub(crate) enum PromptTouch {
-    /// Touched (and woken, if archived/snoozed/idle-dormant); carries
+    /// Touched (and woken, if snoozed/idle-dormant); carries
     /// whether this specifically was the idle-dormant wake, the flag
     /// `prompt_dispatch_under_submission` and `send_turn` need.
     Touched { idle_dormant: bool },
-    /// `no_revive` was set and the session needed archived/snoozed/
-    /// idle-dormant revival to accept this prompt; refused before any
-    /// mutation.
+    /// `no_revive` was set and the session needed snoozed/idle-dormant
+    /// revival to accept this prompt; refused before any mutation.
     RevivalRefused,
+    /// The session is archived or trashed; refused before any mutation.
+    Blocked(crate::session::StartBlocked),
 }
 
 impl PromptTouch {
-    /// The idle-dormant flag for a `Touched` outcome. Only meaningful when
-    /// the caller passed `no_revive: false`, which never produces
-    /// `RevivalRefused`.
-    pub(crate) fn idle_dormant(&self) -> bool {
-        matches!(self, PromptTouch::Touched { idle_dormant: true })
+    /// The idle-dormant flag for a caller that never sets `no_revive`, so
+    /// never sees `RevivalRefused`.
+    pub(crate) fn idle_dormant(self) -> Result<bool, crate::session::StartBlocked> {
+        match self {
+            PromptTouch::Touched { idle_dormant } => Ok(idle_dormant),
+            PromptTouch::RevivalRefused => Ok(false),
+            PromptTouch::Blocked(blocked) => Err(blocked),
+        }
     }
 }
 
@@ -299,6 +309,8 @@ impl SessionService {
             prompt_locks: RwLock::new(HashMap::new()),
             #[cfg(test)]
             submission_claims: std::sync::OnceLock::new(),
+            #[cfg(test)]
+            install_barrier: std::sync::Mutex::new(None),
             #[cfg(test)]
             created_instance_gate: std::sync::Mutex::new(None),
         }
@@ -431,11 +443,11 @@ impl SessionService {
         }
     }
 
-    /// Record that a prompt is arriving. `no_revive` refuses atomically,
-    /// under the same per-session lock, rather than waking an
-    /// archived/snoozed/idle-dormant session (#4081 review: a client-side
-    /// liveness check before this call would race a concurrent archive,
-    /// snooze, or wake).
+    /// Record that a prompt is arriving. An archived or trashed session is
+    /// refused, never woken. `no_revive` refuses atomically, under the same
+    /// per-session lock, rather than waking a snoozed/idle-dormant session
+    /// (#4081 review: a client-side liveness check before this call would
+    /// race a concurrent archive, snooze, or wake).
     pub(crate) async fn touch_and_wake_on_prompt(&self, id: &str, no_revive: bool) -> PromptTouch {
         let inst_lock = self.instance_lock(id).await;
         let _guard = inst_lock.lock().await;
@@ -446,8 +458,11 @@ impl SessionService {
                     idle_dormant: false,
                 };
             };
+            if let Err(blocked) = inst.ensure_startable() {
+                return PromptTouch::Blocked(blocked);
+            }
             let was_idle_dormant = inst.is_idle_dormant();
-            let wake = inst.is_archived() || inst.is_snoozed() || was_idle_dormant;
+            let wake = inst.is_snoozed() || was_idle_dormant;
             if no_revive && wake {
                 return PromptTouch::RevivalRefused;
             }
@@ -466,15 +481,22 @@ impl SessionService {
             let id_clone = id.to_string();
             let outcome = tokio::task::spawn_blocking(move || {
                 storage.update(|instances, _groups| {
-                    if let Some(inst) = instances.iter_mut().find(|i| i.id == id_clone) {
-                        apply_prompt_persist_to_disk(inst, wake);
+                    let Some(inst) = instances.iter_mut().find(|i| i.id == id_clone) else {
+                        return Ok(None);
+                    };
+                    // A peer (e.g. the CLI) may have archived or trashed the row since the
+                    // memory check; waking it here would clear that.
+                    if let Err(blocked) = inst.ensure_startable() {
+                        return Ok(Some(blocked));
                     }
-                    Ok(())
+                    apply_prompt_persist_to_disk(inst, wake);
+                    Ok(None)
                 })
             })
             .await;
             match outcome {
-                Ok(Ok(())) => {}
+                Ok(Ok(None)) => {}
+                Ok(Ok(Some(blocked))) => return PromptTouch::Blocked(blocked),
                 Ok(Err(e)) => tracing::warn!(
                     target: "server.session_service",
                     session = %id,
@@ -882,7 +904,6 @@ impl SessionService {
         text: String,
         attachments: Vec<crate::daemon::PromptAttachmentRef>,
         origin_device: Option<String>,
-        created_at: String,
     ) -> Option<crate::daemon::QueuedPromptEntry> {
         self.mutate_instance_persisted(id, move |inst| {
             inst.last_accessed_at = inst.last_accessed_at.max(Some(chrono::Utc::now()));
@@ -898,7 +919,10 @@ impl SessionService {
                 seq,
                 text: text.clone(),
                 attachments: attachments.clone(),
-                created_at: created_at.clone(),
+                // The server's clock, drawn in the same critical section that
+                // assigns `seq`, so row order and stamp order agree and the
+                // resume admission can order rows against the park (#4092).
+                created_at: chrono::Utc::now().to_rfc3339(),
                 origin_device: origin_device.clone(),
             };
             inst.queued_prompts.push(entry.clone());
@@ -1213,11 +1237,35 @@ impl SessionService {
         if let Some(tap) = self.submission_claims.get() {
             let _ = tap.send(id.to_string());
         }
+        self.prompt_gate(id).await.lock_owned().await
+    }
+
+    /// [`Self::prompt_submission`] for a pass that treats contention as a
+    /// refusal rather than a queue, so it never stalls behind a long-running
+    /// submission (#4092). Not a claim: it does not report to
+    /// [`Self::watch_submission_claims`].
+    pub(crate) async fn try_prompt_submission(
+        &self,
+        id: &str,
+    ) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        let guard = self.prompt_gate(id).await.try_lock_owned().ok()?;
+        // A vanished session, as in `admit_prompt_submission`: forgetting
+        // keeps `prompt_locks` from leaking an entry nothing else prunes.
+        if self.admits_turn(&SessionCaller::User, id).await.is_err() {
+            drop(guard);
+            self.forget_prompt_lock(id).await;
+            return None;
+        }
+        Some(guard)
+    }
+
+    /// The per-session submission gate, vivified on first use.
+    async fn prompt_gate(&self, id: &str) -> Arc<tokio::sync::Mutex<()>> {
         let lock = {
             let guard = self.prompt_locks.read().await;
             guard.get(id).cloned()
         };
-        let lock = match lock {
+        match lock {
             Some(lock) => lock,
             None => self
                 .prompt_locks
@@ -1226,8 +1274,7 @@ impl SessionService {
                 .entry(id.to_string())
                 .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
                 .clone(),
-        };
-        lock.lock_owned().await
+        }
     }
 
     /// [`Self::prompt_submission`] for a caller that has not yet proved it may act on the
@@ -1290,8 +1337,14 @@ impl SessionService {
         &self,
         id: &str,
         idle_dormant: bool,
+        no_revive: bool,
     ) -> crate::acp::dispatch::PromptDispatch {
         let running = self.acp_supervisor.is_running(id).await;
+        if no_revive && !running {
+            return crate::acp::dispatch::PromptDispatch::Queued {
+                reason: crate::acp::dispatch::QueueReason::WorkerDown,
+            };
+        }
         // Settled here, under the guard, rather than probed by each handler before it
         // claims one.
         let rate_limit_parked = !running && !idle_dormant && self.is_rate_limit_parked(id).await;
@@ -1322,6 +1375,36 @@ impl SessionService {
     #[cfg(test)]
     pub(crate) async fn prompt_locks_len(&self) -> usize {
         self.prompt_locks.read().await.len()
+    }
+
+    /// Arm the install barrier for one test. Each producer read reports its
+    /// session id to the receiver and waits for the returned ack before it
+    /// installs; dropping the receiver disarms the gate with the service.
+    #[cfg(test)]
+    pub(crate) fn arm_install_barrier(
+        &self,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<(String, tokio::sync::oneshot::Sender<()>)> {
+        let (tx, reads) = tokio::sync::mpsc::unbounded_channel();
+        *self
+            .install_barrier
+            .lock()
+            .expect("install_barrier mutex poisoned") = Some(tx);
+        reads
+    }
+
+    /// Block an armed install until the test releases it.
+    #[cfg(test)]
+    pub(super) async fn await_install_barrier(&self, id: &str) {
+        let sender = self
+            .install_barrier
+            .lock()
+            .expect("install_barrier mutex poisoned")
+            .clone();
+        let Some(tx) = sender else { return };
+        let (ack, released) = tokio::sync::oneshot::channel();
+        if tx.send((id.to_string(), ack)).is_ok() {
+            let _ = released.await;
+        }
     }
 
     /// Report every [`Self::prompt_submission`] claim at the one moment a deletion-race
@@ -1851,7 +1934,6 @@ mod tests {
                         size: 9,
                     }],
                     None,
-                    "t0".into(),
                 )
                 .await
                 .expect("session exists");
@@ -1889,14 +1971,7 @@ mod tests {
         // Deliverable text, so the drain reaches `send_turn` rather than
         // retiring an undeliverable husk on the way.
         service
-            .enqueue_prompt(
-                "sess-3621",
-                "q1".into(),
-                "follow-up".into(),
-                vec![],
-                None,
-                "t0".into(),
-            )
+            .enqueue_prompt("sess-3621", "q1".into(), "follow-up".into(), vec![], None)
             .await
             .expect("session exists");
 
@@ -1961,14 +2036,7 @@ mod tests {
         inst.status = crate::session::Status::Idle;
         let service = service_for(vec![inst]);
         service
-            .enqueue_prompt(
-                "sess-mut",
-                "q1".into(),
-                "original".into(),
-                vec![],
-                None,
-                "t0".into(),
-            )
+            .enqueue_prompt("sess-mut", "q1".into(), "original".into(), vec![], None)
             .await
             .expect("session exists");
 
@@ -2146,7 +2214,6 @@ mod tests {
                 "follow-up behind a live turn".into(),
                 vec![],
                 None,
-                "t0".into(),
             )
             .await
             .expect("session exists");
@@ -2209,7 +2276,6 @@ mod tests {
                     format!("prompt {i}"),
                     vec![],
                     None,
-                    "t".into(),
                 )
                 .await
             }));
@@ -2263,7 +2329,7 @@ mod tests {
                 false,
                 |s| {
                     Box::pin(async move {
-                        s.enqueue_prompt("s", "p".into(), "t".into(), vec![], None, "t0".into())
+                        s.enqueue_prompt("s", "p".into(), "t".into(), vec![], None)
                             .await;
                     })
                 },
@@ -2334,25 +2400,11 @@ mod tests {
 
         // Enqueue two.
         let a = service
-            .enqueue_prompt(
-                "sess-q",
-                "a".into(),
-                "first".into(),
-                vec![],
-                None,
-                "t0".into(),
-            )
+            .enqueue_prompt("sess-q", "a".into(), "first".into(), vec![], None)
             .await
             .expect("session exists");
         let b = service
-            .enqueue_prompt(
-                "sess-q",
-                "b".into(),
-                "second".into(),
-                vec![],
-                None,
-                "t1".into(),
-            )
+            .enqueue_prompt("sess-q", "b".into(), "second".into(), vec![], None)
             .await
             .expect("session exists");
         assert_eq!((a.seq, b.seq), (0, 1));
@@ -2364,14 +2416,7 @@ mod tests {
 
         // Re-enqueue by the same id is an idempotent update, not a duplicate.
         let a2 = service
-            .enqueue_prompt(
-                "sess-q",
-                "a".into(),
-                "first edited".into(),
-                vec![],
-                None,
-                "t2".into(),
-            )
+            .enqueue_prompt("sess-q", "a".into(), "first edited".into(), vec![], None)
             .await
             .expect("session exists");
         assert_eq!(a2.seq, 0, "re-enqueue keeps the original seq");
@@ -2420,14 +2465,7 @@ mod tests {
 
         // A gone session is a None/no-op, never a panic.
         assert!(service
-            .enqueue_prompt(
-                "sess-gone",
-                "z".into(),
-                "x".into(),
-                vec![],
-                None,
-                "t".into()
-            )
+            .enqueue_prompt("sess-gone", "z".into(), "x".into(), vec![], None)
             .await
             .is_none());
     }

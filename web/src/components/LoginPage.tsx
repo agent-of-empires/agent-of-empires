@@ -36,7 +36,7 @@ export function LoginPage({ onSuccess }: Props) {
   };
 
   return (
-    <div className="h-dvh flex items-center justify-center bg-surface-900 p-4 safe-area-inset">
+    <div className="h-(--app-height) flex items-center justify-center bg-surface-900 p-4 safe-area-inset">
       <div className="w-full max-w-sm animate-slide-up">
         <form onSubmit={handleSubmit} className="bg-surface-800 border border-surface-700/40 rounded-xl p-8">
           {/* Logo */}

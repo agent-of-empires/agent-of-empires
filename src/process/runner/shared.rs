@@ -5,7 +5,7 @@ use super::jsonrpc::{
     parse_agent_call_outcome, parse_notification, parse_request_value_id, parse_response,
     parse_response_id,
 };
-use crate::acp::control_protocol::{self, ControlBody, SessionReplayed};
+use crate::acp::control_protocol::{self, ControlBody, PromptCompletedMarker, SessionReplayed};
 use crate::process::worker_registry;
 use agent_client_protocol::JsonRpcMessage;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -329,7 +329,9 @@ impl RunnerShared {
         }
 
         if let Some((method, params)) = parse_notification(line) {
-            if SessionReplayed::matches_method(&method) {
+            if SessionReplayed::matches_method(&method)
+                || PromptCompletedMarker::matches_method(&method)
+            {
                 return;
             }
             self.enqueue(
@@ -1228,7 +1230,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prompt_completion_follows_the_notifications_before_it() {
+    async fn prompt_completion_follows_usage_update_and_rejects_agent_marker() {
         let (shared, stdin, _child) = shared_with_stdin().await;
         let attachment_id = shared.begin_attachment().await;
         let id = shared
@@ -1237,28 +1239,49 @@ mod tests {
             .expect("prompt written");
         assert!(shared.prompt_requests.lock().await.contains(&id));
 
-        for text in ["first", "second"] {
-            let line = format!(
-                "{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"text\":\"{text}\"}}}}\n"
-            );
-            shared.deliver_line(line.as_bytes(), &stdin).await;
-        }
+        shared
+            .deliver_line(
+                br#"{"jsonrpc":"2.0","method":"_aoe/prompt_completed","params":{}}"#,
+                &stdin,
+            )
+            .await;
+        let usage_update = serde_json::json!({
+            "sessionId": "s",
+            "update": {
+                "sessionUpdate": "usage_update",
+                "used": 100,
+                "size": 200,
+                "_meta": {
+                    "_claude/rateLimit": {
+                        "status": "rejected",
+                        "rateLimitType": "five_hour",
+                        "resetsAt": 4_102_444_800_i64
+                    }
+                }
+            }
+        });
+        let line = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": usage_update.clone()
+        })
+        .to_string();
+        shared.deliver_line(line.as_bytes(), &stdin).await;
         let resp = format!(
             "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"stopReason\":\"end_turn\"}}}}\n"
         );
         shared.deliver_line(resp.as_bytes(), &stdin).await;
 
         assert!(shared.prompt_requests.lock().await.is_empty());
-        let notify = |text: &str| ControlBody::Notify {
+        let usage = ControlBody::Notify {
             method: "session/update".into(),
-            params: serde_json::json!({ "text": text }),
+            params: usage_update,
         };
         assert_eq!(
             queued(&shared).await,
             vec![
                 ControlBody::PromptStarted { prompt_req_id: id },
-                notify("first"),
-                notify("second"),
+                usage,
                 ControlBody::PromptCompleted {
                     prompt_req_id: id,
                     outcome: PromptOutcome::Completed {

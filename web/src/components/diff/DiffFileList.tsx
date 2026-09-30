@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { RepoBase, RichDiffFile } from "../../lib/types";
+import { sessionDiffRawFileUrl } from "../../lib/api";
 import { buildDiffTree } from "../../lib/diffTree";
 import { useWebSettings } from "../../hooks/useWebSettings";
 import { BasePicker } from "./BasePicker";
-import { DiffFileContextMenu, type PathMenuState } from "./DiffFileContextMenu";
+import { FileContextMenu, type PathMenuState } from "./FileContextMenu";
 import { Chevron, FlatList, LineCounts, TreeView } from "./DiffFileRows";
 
 interface Props {
@@ -116,9 +117,13 @@ export function DiffFileList({
       // Only file rows carry a repo, since workspace repos can share a path.
       const repo = row.getAttribute("data-repo");
       const file = repo === null ? undefined : files.find((f) => f.path === path && (f.repo_name ?? "") === repo);
-      setPathMenu({ x: e.clientX, y: e.clientY, path, file });
+      const open =
+        file && sessionId
+          ? { url: sessionDiffRawFileUrl(sessionId, file.path, file.repo_name), disabled: file.status === "deleted" }
+          : undefined;
+      setPathMenu({ x: e.clientX, y: e.clientY, path, open });
     },
-    [files],
+    [files, sessionId],
   );
   const closePathMenu = useCallback(() => setPathMenu(null), []);
 
@@ -170,7 +175,7 @@ export function DiffFileList({
 
   return (
     <div className="flex flex-col h-full bg-surface-900 overflow-hidden" onContextMenu={handleContextMenu}>
-      <DiffFileContextMenu menu={pathMenu} sessionId={sessionId} onClose={closePathMenu} />
+      <FileContextMenu menu={pathMenu} onClose={closePathMenu} />
       <div className="px-3 py-2 border-b border-surface-700/20 shrink-0">
         <div className="flex items-center gap-2 flex-wrap">
           <span className="font-mono text-[11px] uppercase tracking-wider text-text-dim">Changes</span>

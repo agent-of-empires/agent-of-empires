@@ -2,6 +2,10 @@
   "description": "Component files intentionally not assigned to a coverage-matrix surface, with a one-line reason per entry. The matrix validator allows these to skip the 'every component must appear somewhere' check. Use sparingly; the default expectation is that every UI surface lives in the matrix.",
   "exempt": [
     {
+      "path": "web/src/components/live-terminal/InputTraceOverlay.tsx",
+      "reason": "Diagnostic overlay shown only with ?livedebug=1; not a user flow"
+    },
+    {
       "path": "web/src/components/BackToLiveButton.tsx",
       "reason": "Tiny presentational button covered indirectly by terminal-focus-shortcut.spec.ts"
     },

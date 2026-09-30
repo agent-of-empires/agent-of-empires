@@ -48,10 +48,11 @@ pub use sessions::{
     get_recent_projects, kill_terminal, list_sessions, paste_image, preview_volume_ignores_globs,
     read_output, rename_session, restore_session, search_sessions, send_message,
     serve_session_artifact, session_diff_file, session_diff_file_raw, session_diff_files,
-    session_file, set_worktree_name, start_session, stop_session, summarize_session, trash_session,
-    update_session_archive, update_session_color, update_session_diff_base, update_session_group,
-    update_session_notifications, update_session_pin, update_session_snooze, update_session_unread,
-    update_workspace_ordering, OutputQuery, SendMessageRequest,
+    session_file, session_file_raw, set_worktree_name, start_session, stop_session,
+    summarize_session, trash_session, update_session_archive, update_session_color,
+    update_session_diff_base, update_session_group, update_session_notifications,
+    update_session_pin, update_session_snooze, update_session_unread, update_workspace_ordering,
+    OutputQuery, SendMessageRequest,
 };
 pub use skills::{
     adopt_skill, create_skill, delete_skill, edit_skill, list_skills, read_skill, sync_skills,
@@ -59,7 +60,7 @@ pub use skills::{
 // Not route handlers: used by the daemon's background loops.
 pub(crate) use sessions::{
     persist_session_update, purge_expired_trash, reconcile_trashed_worktrees,
-    reconcile_worktree_paths,
+    reconcile_worktree_paths, trash_sweep_interval,
 };
 pub use system::{
     browse_filesystem, create_profile, default_profile, delete_profile, dismiss_update,
@@ -87,6 +88,44 @@ pub(crate) fn api_error(status: StatusCode, code: &str, message: impl Into<Strin
         axum::Json(serde_json::json!({ "error": code, "message": message })),
     )
         .into_response()
+}
+
+/// The stored row, which can differ from the daemon's cache when a peer such as the CLI
+/// archived, trashed, or purged it.
+pub(crate) async fn load_persisted_instance(
+    state: &AppState,
+    profile: &str,
+    id: &str,
+) -> Result<Option<crate::session::Instance>, Response> {
+    let id_for_load = id.to_string();
+    let profile_for_load = profile.to_string();
+    let file_watch = state.file_watch.clone();
+    let persisted = tokio::task::spawn_blocking(
+        move || -> anyhow::Result<Option<crate::session::Instance>> {
+            let storage = crate::session::Storage::new(&profile_for_load, file_watch)?;
+            Ok(storage
+                .load()?
+                .into_iter()
+                .find(|candidate| candidate.id == id_for_load))
+        },
+    )
+    .await;
+    let error = match persisted {
+        Ok(Ok(found)) => return Ok(found),
+        Ok(Err(error)) => format!("{error:#}"),
+        Err(join_error) => join_error.to_string(),
+    };
+    tracing::error!(target: "http.api", session = %id, "load persisted session: {error}");
+    Err(api_error(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "internal",
+        "failed to read session state",
+    ))
+}
+
+/// 409 for a start or resume refused because the session is archived or trashed.
+pub(crate) fn start_blocked_response(blocked: crate::session::StartBlocked) -> Response {
+    api_error(StatusCode::CONFLICT, blocked.code(), blocked.to_string())
 }
 
 pub(super) fn session_not_found() -> Response {

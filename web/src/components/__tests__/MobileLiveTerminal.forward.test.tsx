@@ -3,7 +3,7 @@
 // lib/__tests__/liveMouse.test.ts.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent } from "@testing-library/react";
+import { act, fireEvent } from "@testing-library/react";
 import type { LiveFrame } from "../../hooks/useLiveTerminal";
 import { deliverMobileKeyboardProxyInput } from "../../lib/mobileKeyboardProxy";
 import { alt, installResizeObserver, liveFrame, renderLiveTerminal } from "./liveTerminalHarness";
@@ -28,6 +28,11 @@ const mouse = (over: Record<string, unknown> = {}) => ({
   clientY: 10,
   ...over,
 });
+/** A finger down and up at (x, y); returns whether touchend was left uncancelled. */
+function tap(target: HTMLElement, y = 40, x = 100) {
+  fireEvent.touchStart(target, { touches: [touch(y, x)] });
+  return fireEvent.touchEnd(target, { touches: [], changedTouches: [touch(y, x)] });
+}
 function drag(scroller: HTMLElement, from: number, to: number) {
   fireEvent.touchStart(scroller, { touches: [touch(from)] });
   fireEvent.touchMove(scroller, { touches: [touch(to)] });
@@ -116,7 +121,7 @@ describe("MobileLiveTerminal wheel forwarding", () => {
     document.body.append(proxy);
     try {
       const { props } = term();
-      deliverMobileKeyboardProxyInput({ inputType: "insertText", data: "hello", isComposing: false });
+      deliverMobileKeyboardProxyInput({ inputType: "edit", deleted: 0, data: "hello" });
       expect(props.sendData).toHaveBeenCalledWith("hello");
     } finally {
       proxy.remove();
@@ -246,5 +251,77 @@ describe("MobileLiveTerminal link clicks in forward mode", () => {
     button.mockClear();
     fireEvent.pointerDown(anchor, mouse({ button: 2 }));
     expect(button.mock.calls[0]![0]).toBe(2);
+  });
+});
+
+describe("MobileLiveTerminal forward-mode taps", () => {
+  const pane0 = { cols: 80, rows: 3 };
+
+  it.each([
+    ["SGR", true],
+    ["X10", false],
+  ])("forwards a tap as a %s left press and release at the tapped cell, keeping the keyboard down", (_n, sgr) => {
+    const armAgentClipboard = vi.fn();
+    const view = renderLiveTerminal({ frame: frame({ ...alt, mouseSgr: sgr, pane0 }), armAgentClipboard });
+    const button = view.props.forwardButton as Mock;
+    // jsdom rects sit at the origin: column floor(100 / 8.4) + 1, row floor(40 / 16.8) + 1.
+    expect(tap(view.scroller)).toBe(false);
+    expect(button.mock.calls).toEqual([
+      [0, false, false, sgr, 12, 3],
+      [0, true, false, sgr, 12, 3],
+    ]);
+    expect(armAgentClipboard).toHaveBeenCalledOnce();
+    fireEvent.click(view.scroller);
+    expect(document.activeElement).not.toBe(view.input());
+  });
+
+  it("does not click for a swipe or a long press", () => {
+    const swipe = term();
+    drag(swipe.scroller, 300, 220);
+    fireEvent.touchEnd(swipe.scroller, { touches: [], changedTouches: [touch(220)] });
+    expect(swipe.button).not.toHaveBeenCalled();
+    swipe.unmount();
+
+    const now = vi.spyOn(performance, "now").mockReturnValue(1_000);
+    try {
+      const press = term();
+      fireEvent.touchStart(press.scroller, { touches: [touch(40)] });
+      now.mockReturnValue(1_500);
+      fireEvent.touchEnd(press.scroller, { touches: [], changedTouches: [touch(40)] });
+      expect(press.button).not.toHaveBeenCalled();
+    } finally {
+      now.mockRestore();
+    }
+  });
+
+  it("raises the keyboard instead outside forward mode", () => {
+    const { scroller, input, button } = term({});
+    expect(tap(scroller)).toBe(true);
+    fireEvent.click(scroller);
+    expect(button).not.toHaveBeenCalled();
+    expect(document.activeElement).toBe(input());
+  });
+
+  it("leaves a held selection alone", () => {
+    const view = term();
+    const range = document.createRange();
+    range.selectNodeContents(view.content());
+    document.getSelection()!.removeAllRanges();
+    document.getSelection()!.addRange(range);
+    try {
+      act(() => void document.dispatchEvent(new Event("selectionchange")));
+      view.rerenderWith({ frame: frame(alt) });
+      expect(tap(view.scroller)).toBe(true);
+      expect(view.button).not.toHaveBeenCalled();
+    } finally {
+      document.getSelection()!.removeAllRanges();
+    }
+  });
+
+  it("lets a tap on a link open it", () => {
+    const view = term({ ...alt, content: "see https://example.com/x\n" } as Partial<LiveFrame>);
+    const anchor = view.container.querySelector("a[href='https://example.com/x']") as HTMLElement;
+    expect(tap(anchor.querySelector("span") ?? anchor)).toBe(true);
+    expect(view.button).not.toHaveBeenCalled();
   });
 });

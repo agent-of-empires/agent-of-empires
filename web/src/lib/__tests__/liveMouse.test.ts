@@ -1,5 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { cursorLineIndex, pointerPaneCell, buttonMouseBytes, wheelMouseBytes, wheelNotches } from "../liveMouse";
+import {
+  cursorLineIndex,
+  pointerPaneCell,
+  buttonMouseBytes,
+  unwrapPointer,
+  wheelMouseBytes,
+  wheelNotches,
+} from "../liveMouse";
 
 const bytes = (...n: number[]) => new Uint8Array(n);
 const ascii = (s: string) => new Uint8Array([...s].map((c) => c.charCodeAt(0)));
@@ -125,5 +132,35 @@ describe("pointerPaneCell", () => {
 
   it("treats a missing rectangle as a 1x1 pane", () => {
     expect(pointerPaneCell(7, 9, null)).toEqual({ col: 1, row: 1 });
+  });
+});
+
+describe("unwrapPointer", () => {
+  // Line 0 is one row, line 1 wraps into three (the middle row one cell short for a deferred wide glyph), line 2 is one row.
+  const source = [
+    { line: 0, wrap: 0 },
+    { line: 1, wrap: 0 },
+    { line: 1, wrap: 1 },
+    { line: 1, wrap: 2 },
+    { line: 2, wrap: 0 },
+  ];
+  const widths = [5, 40, 39, 10, 3];
+  const rowWidth = (i: number) => widths[i]!;
+
+  it.each([
+    ["an unwrapped row", 0, 7, 0, { compositeRow: 0, compositeCol: 7 }],
+    ["a wrapped line's first row", 1, 7, 0, { compositeRow: 1, compositeCol: 7 }],
+    ["a continuation row", 2, 7, 0, { compositeRow: 1, compositeCol: 47 }],
+    ["a later continuation after a short row", 3, 7, 0, { compositeRow: 1, compositeCol: 86 }],
+    ["the line after a wrap", 4, 2, 0, { compositeRow: 2, compositeCol: 2 }],
+    ["a screen starting below history", 4, 2, 1, { compositeRow: 1, compositeCol: 2 }],
+    ["a row above the content", -2, 3, 0, { compositeRow: -2, compositeCol: 3 }],
+    ["a row below the content", 6, 3, 0, { compositeRow: 4, compositeCol: 3 }],
+  ])("maps %s", (_n, row, col, screenTop, want) => {
+    expect(unwrapPointer(row, col, source, rowWidth, screenTop)).toEqual(want);
+  });
+
+  it("passes coordinates through with no rendered rows", () => {
+    expect(unwrapPointer(3, 4, [], rowWidth, 0)).toEqual({ compositeRow: 3, compositeCol: 4 });
   });
 });

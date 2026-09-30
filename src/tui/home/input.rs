@@ -169,56 +169,76 @@ fn split_bracketed_paste(text: &str) -> Vec<live_send::TmuxKey> {
     vec![live_send::TmuxKey::Paste(out)]
 }
 
-/// The rectangle mouse coordinates map into, or `None` when the pointer is not over the
-/// pane that receives input.
-///
-/// Normally the previewed pane is sized to the preview output rect, so the rect is the
-/// pane. On a composited preview the rect is the whole window while input still goes to
-/// pane 0 alone (#435, #488), so pane 0's sub-rectangle is the target: mapping against
-/// the full rect would report a column past its right edge as though the pane were
-/// window-wide. A pointer outside pane 0 is dropped rather than clamped, which would
-/// synthesise a click on its border.
-///
-/// Pane 0 may have a non-zero origin in the composite. The TUI bottom-follows a composite
-/// taller than its output, clipping reserved rows above pane 0, so its first visible cell
-/// still starts at `pane.x`/`pane.y`; adding `rect.top` here would shift input below the
-/// displayed pane.
-fn mouse_target_rect(
-    cursor: &crate::tmux::PaneCursor,
-    pane: ratatui::layout::Rect,
-    col: u16,
-    row: u16,
-) -> Option<ratatui::layout::Rect> {
-    // Unsplit: the rect is the pane, and containment stays the caller's business
-    // (`hit_preview` gates the press) with `map_pane_cell` clamping, so this must not
-    // start rejecting cells that used to clamp.
-    if cursor.composite_pane0.is_none() {
-        return Some(pane);
-    }
-    let pane0 = mouse_pane_rect(cursor, pane);
-    let inside = col >= pane0.x
-        && col < pane0.x.saturating_add(pane0.width)
-        && row >= pane0.y
-        && row < pane0.y.saturating_add(pane0.height);
-    inside.then_some(pane0)
+/// The visible part of the pane that receives input, and how many of its rows are
+/// clipped above the preview, so a cell maps to the pane row actually painted there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PaneSlice {
+    visible: ratatui::layout::Rect,
+    clipped_rows: u16,
 }
 
-/// The input pane's rectangle within the preview, with no containment test: pane 0's
-/// sub-rectangle on a composited preview, else the whole preview rect. Split from
-/// [`mouse_target_rect`] for mid-gesture events, which are not position-gated so a drag
-/// that began on pane 0 completes even after the pointer wanders off it.
-fn mouse_pane_rect(
+impl PaneSlice {
+    /// The forwarded app's 1-based cell under screen `(col, row)`, clamped into the
+    /// visible slice.
+    fn cell(self, col: u16, row: u16) -> (u16, u16) {
+        let (cx, cy) = map_pane_cell(self.visible, col, row);
+        (cx, cy.saturating_add(self.clipped_rows))
+    }
+}
+
+/// The slice mouse coordinates map into, or `None` when the pointer is not over the
+/// pane that receives input.
+///
+/// Normally the previewed pane is sized to the preview output rect, so the slice is the
+/// pane. On a composited preview the rect is the whole window while input still goes to
+/// pane 0 alone (#435, #488), so pane 0's slice is the target: mapping against the full
+/// rect would report a column past its right edge as though the pane were window-wide.
+/// A pointer outside pane 0 is dropped rather than clamped, which would synthesise a
+/// click on its border.
+fn mouse_target(
     cursor: &crate::tmux::PaneCursor,
-    pane: ratatui::layout::Rect,
-) -> ratatui::layout::Rect {
-    match cursor.composite_pane0 {
-        Some(rect) => ratatui::layout::Rect {
-            x: pane.x,
-            y: pane.y,
-            width: rect.width.min(pane.width),
-            height: rect.height.min(pane.height),
+    view: super::PreviewTextView,
+    col: u16,
+    row: u16,
+) -> Option<PaneSlice> {
+    let slice = mouse_pane(cursor, view);
+    // Unsplit: containment stays the caller's business (`hit_preview` gates the press)
+    // with `map_pane_cell` clamping, so this must not start rejecting cells that used to
+    // clamp.
+    (cursor.composite_pane0.is_none() || slice.visible.contains(Position::new(col, row)))
+        .then_some(slice)
+}
+
+/// The input pane's slice within the preview, with no containment test: pane 0 on a
+/// composited preview, else the whole preview rect. Pane 0 is placed by
+/// [`super::render::live_pane_origin`] from the painted slice, as the cursor is, then
+/// clipped to the preview. Split from [`mouse_target`] for mid-gesture events, which are not
+/// position-gated so a drag that began on pane 0 completes even after the pointer
+/// wanders off it.
+fn mouse_pane(cursor: &crate::tmux::PaneCursor, view: super::PreviewTextView) -> PaneSlice {
+    let pane = view.pane;
+    let Some(rect) = cursor.composite_pane0 else {
+        return PaneSlice {
+            visible: pane,
+            clipped_rows: 0,
+        };
+    };
+    let (x, y) = super::render::live_pane_origin(view, cursor);
+    let clip = |start: i32, len: u16, lo: u16, hi: u16| {
+        let a = start.clamp(lo as i32, hi as i32);
+        let b = (start + len as i32).clamp(lo as i32, hi as i32);
+        (a as u16, (b - a) as u16)
+    };
+    let (vx, width) = clip(x, rect.width, pane.x, pane.right());
+    let (vy, height) = clip(y, rect.height, pane.y, pane.bottom());
+    PaneSlice {
+        visible: ratatui::layout::Rect {
+            x: vx,
+            y: vy,
+            width,
+            height,
         },
-        None => pane,
+        clipped_rows: (vy as i32 - y).clamp(0, u16::MAX as i32) as u16,
     }
 }
 
@@ -238,14 +258,7 @@ fn map_pane_cell(pane: ratatui::layout::Rect, col: u16, row: u16) -> (u16, u16) 
 /// Build the mouse-wheel bytes to forward to a full-screen app under the live preview.
 /// `up` selects wheel-up (button 64) over wheel-down (65); `sgr` selects the SGR (1006)
 /// encoding over legacy X10, matching whatever the app enabled.
-fn wheel_mouse_bytes(
-    up: bool,
-    sgr: bool,
-    pane: ratatui::layout::Rect,
-    col: u16,
-    row: u16,
-) -> Vec<u8> {
-    let (cx, cy) = map_pane_cell(pane, col, row);
+fn wheel_mouse_bytes(up: bool, sgr: bool, (cx, cy): (u16, u16)) -> Vec<u8> {
     let button: u16 = if up { 64 } else { 65 };
     if sgr {
         // SGR (1006): textual, press marker `M`. No coordinate limit.
@@ -258,20 +271,16 @@ fn wheel_mouse_bytes(
     }
 }
 
-/// Build the bytes for one forwarded mouse button event at screen cell `(col, row)`,
-/// mapped into the app's pane. `base_button` is the SGR low-bits code (left=0, middle=1,
-/// right=2), `release` a button-up, `motion` a drag. Mirrors `wheel_mouse_bytes`, which
-/// covers the wheel buttons.
+/// Build the bytes for one forwarded mouse button event at the app's 1-based cell.
+/// `base_button` is the SGR low-bits code (left=0, middle=1, right=2), `release` a
+/// button-up, `motion` a drag. Mirrors `wheel_mouse_bytes`, which covers the wheel buttons.
 fn mouse_event_bytes(
     base_button: u16,
     release: bool,
     motion: bool,
     sgr: bool,
-    pane: ratatui::layout::Rect,
-    col: u16,
-    row: u16,
+    (cx, cy): (u16, u16),
 ) -> Vec<u8> {
-    let (cx, cy) = map_pane_cell(pane, col, row);
     // The motion bit (32) rides on press/drag reports in both encodings.
     let cb = base_button + if motion { 32 } else { 0 };
     if sgr {
@@ -295,13 +304,13 @@ fn mouse_event_bytes(
 /// highlights content under the pointer reacts as it would over a direct attach.
 fn hover_forward_bytes(
     cursor: &crate::tmux::PaneCursor,
-    pane: ratatui::layout::Rect,
+    view: super::PreviewTextView,
     col: u16,
     row: u16,
 ) -> Option<Vec<u8>> {
-    let target = mouse_target_rect(cursor, pane, col, row)?;
+    let target = mouse_target(cursor, view, col, row)?;
     (cursor.alternate_on && cursor.mouse_all)
-        .then(|| mouse_event_bytes(3, false, true, cursor.mouse_sgr, target, col, row))
+        .then(|| mouse_event_bytes(3, false, true, cursor.mouse_sgr, target.cell(col, row)))
 }
 
 /// Page presses per wheel notch for a no-mouse full-screen app: such apps scroll on
@@ -315,7 +324,7 @@ const WHEEL_PAGE_STEP: usize = 1;
 fn wheel_forward_key(
     cursor: &crate::tmux::PaneCursor,
     up: bool,
-    pane: ratatui::layout::Rect,
+    view: super::PreviewTextView,
     col: u16,
     row: u16,
 ) -> Option<live_send::TmuxKey> {
@@ -324,14 +333,12 @@ fn wheel_forward_key(
     }
     // Outside pane 0 on a composited preview there is nothing to drive, and paging pane 0
     // because the wheel turned elsewhere would be a scroll the user did not aim.
-    let target = mouse_target_rect(cursor, pane, col, row)?;
+    let target = mouse_target(cursor, view, col, row)?;
     if cursor.mouse_tracking {
         Some(live_send::TmuxKey::HexBytes(wheel_mouse_bytes(
             up,
             cursor.mouse_sgr,
-            target,
-            col,
-            row,
+            target.cell(col, row),
         )))
     } else {
         // No mouse tracking: send `PageUp`/`PageDown`, not arrows, which a full-screen
@@ -427,8 +434,10 @@ impl HomeView {
     /// Whether the full-screen Settings takeover is showing. The wheel scroll gate in
     /// `app.rs` uses this so the whole screen counts as a scroll target, since the
     /// list/preview hit rects it replaced are stale.
-    pub fn is_settings_open(&self) -> bool {
-        self.settings_view.is_some()
+    /// Full-screen surfaces that own the wheel wherever the pointer is, over
+    /// list and preview rects that are stale beneath them.
+    pub fn owns_wheel(&self) -> bool {
+        self.settings_view.is_some() || self.show_help
     }
 
     pub fn hit_preview(&self, col: u16, row: u16) -> bool {
@@ -442,16 +451,10 @@ impl HomeView {
         self.pending_intro_theme.take()
     }
 
+    /// The diff pane, or the whole screen while a diff modal is open.
     pub fn hit_diff(&self, col: u16, row: u16) -> bool {
-        self.diff_area.contains(Position::from((col, row)))
-    }
-
-    /// Forward a left-click to the diff view's file-list panel. No-op
-    /// when no diff view is open.
-    pub fn handle_diff_click(&mut self, col: u16, row: u16) {
-        if let Some(view) = &mut self.diff_view {
-            view.handle_click(col, row);
-        }
+        self.diff_view.as_ref().is_some_and(DiffView::has_modal)
+            || self.diff_area.contains(Position::from((col, row)))
     }
 
     /// Forward a hover event to the diff view's file-list panel.
@@ -543,11 +546,7 @@ impl HomeView {
         if self.has_non_live_send_overlay() {
             return None;
         }
-        let pos = Position::from((col, row));
-        self.footer_buttons
-            .iter()
-            .find(|(rect, _)| rect.contains(pos))
-            .map(|(_, key)| *key)
+        crate::tui::dialogs::hit(&self.footer_buttons, col, row)
     }
 
     /// Handle a left-click on the sidebar collapse/expand affordances: the button on the
@@ -932,11 +931,7 @@ impl HomeView {
         let structured_lines = self
             .structured_preview
             .as_ref()
-            .filter(|v| {
-                self.selected_session
-                    .as_deref()
-                    .is_some_and(|id| id == v.session_id())
-            })
+            .filter(|_| self.structured_transcript_painted)
             .map(|v| v.selection_text(width));
         let lines = match structured_lines.as_ref() {
             Some(text) => text,
@@ -1160,6 +1155,9 @@ impl HomeView {
         if let Some(dialog) = &mut self.intro_dialog {
             let click = dialog.handle_click(col, row);
             let preview = dialog.take_pending_preview();
+            if let Some(url) = dialog.take_pending_link() {
+                self.open_link(url);
+            }
             if let Some(result) = click {
                 match result {
                     DialogResult::Continue => {}
@@ -1221,27 +1219,119 @@ impl HomeView {
             // through to the list underneath.
             return true;
         }
-        if let Some(dialog) = &mut self.new_dialog {
+        // These follow-ups to a new-session submit float over the still-open
+        // dialog, so they route first, matching `handle_key`.
+        if let Some(dialog) = &self.hooks_install_dialog {
             if let Some(result) = dialog.handle_click(col, row) {
                 match result {
                     DialogResult::Continue => {}
                     DialogResult::Cancel => {
-                        self.new_dialog = None;
+                        self.hooks_install_dialog = None;
+                        self.pending_hooks_install_data = None;
                     }
-                    DialogResult::Submit(_data) => {
-                        // Defensive: the new-session dialog submits only from the
-                        // Enter path, while clicks return Continue.
+                    DialogResult::Submit(_) => {
+                        match crate::session::config::update_app_state(|state| {
+                            state.has_acknowledged_agent_hooks = true;
+                        }) {
+                            Ok(()) => {
+                                self.hooks_install_dialog = None;
+                                if let Some(data) = self.pending_hooks_install_data.take() {
+                                    self.pending_dialog_click_action =
+                                        self.maybe_confirm_volume_ignores_globs(data);
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(target: "tui.input", "Failed to save config: {e}")
+                            }
+                        }
                     }
                 }
             }
-            // Always swallow clicks while the new-session dialog is
-            // open so the underlying list / preview don't react.
+            return true;
+        }
+        if let Some(dialog) = &mut self.volume_ignores_glob_dialog {
+            if let Some(result) = dialog.handle_click(col, row) {
+                let dont_ask_again = dialog.dont_ask_again();
+                match result {
+                    DialogResult::Continue => {}
+                    DialogResult::Cancel => {
+                        self.volume_ignores_glob_dialog = None;
+                        self.pending_volume_ignores_glob_data = None;
+                    }
+                    DialogResult::Submit(_) => {
+                        self.volume_ignores_glob_dialog = None;
+                        if dont_ask_again {
+                            self.persist_volume_ignores_globs_ack();
+                        }
+                        if let Some(data) = self.pending_volume_ignores_glob_data.take() {
+                            self.pending_dialog_click_action = self.continue_session_creation(data);
+                        }
+                    }
+                }
+            }
+            return true;
+        }
+        if let Some(dialog) = &self.repo_trust_dialog {
+            if let Some(result) = dialog.handle_click(col, row) {
+                match result {
+                    DialogResult::Continue => {}
+                    DialogResult::Cancel => {
+                        self.repo_trust_dialog = None;
+                        self.pending_repo_trust_data = None;
+                    }
+                    DialogResult::Submit(action) => {
+                        self.repo_trust_dialog = None;
+                        if let Some(data) = self.pending_repo_trust_data.take() {
+                            let emit = match action {
+                                RepoTrustAction::Trust {
+                                    hooks_hash,
+                                    mcp_hash,
+                                    project_path,
+                                    hooks,
+                                } => {
+                                    // Abort creation if trust cannot be persisted:
+                                    // launching anyway leaves hooks treated as approved
+                                    // while project MCP stays gated off the unwritten
+                                    // hashes.
+                                    if let Err(e) = repo_config::trust_repo(
+                                        std::path::Path::new(&project_path),
+                                        hooks_hash.as_deref(),
+                                        mcp_hash.as_deref(),
+                                    ) {
+                                        tracing::error!(target: "tui.input", "Failed to persist repo trust; aborting session creation: {}", e);
+                                        None
+                                    } else {
+                                        self.create_session_with_hooks(data, hooks)
+                                    }
+                                }
+                                RepoTrustAction::Skip { hooks } => {
+                                    self.create_session_with_hooks(data, hooks)
+                                }
+                            };
+                            self.pending_dialog_click_action = emit;
+                        }
+                    }
+                }
+            }
+            return true;
+        }
+        if let Some(dialog) = &mut self.new_dialog {
+            if let Some(result) = dialog.handle_click(col, row) {
+                self.pending_dialog_click_action = self.apply_new_dialog_result(result);
+            }
+            // Swallow every click while the dialog is open so the list and
+            // preview underneath don't react.
+            return true;
+        }
+        if let Some(serve) = &mut self.serve_view {
+            let key = serve.handle_click(col, row);
+            self.press_dialog_key(key);
             return true;
         }
         // The confirm dialog floats over settings, so it wins click routing the same way
         // the keyboard path checks `settings_close_confirm` before `settings_view`;
         // otherwise a click on Yes / No goes into settings and never reaches the modal.
-        if let Some(dialog) = &self.confirm_dialog {
+        if let Some(dialog) = &mut self.confirm_dialog {
             if let Some(result) = dialog.handle_click(col, row) {
                 let action = dialog.action().to_string();
                 match result {
@@ -1295,6 +1385,12 @@ impl HomeView {
             // it, hit or miss; `handle_click` mutates focus on hits and returns None
             // otherwise, and the click is swallowed either way.
             let _ = view.handle_click(col, row);
+            return true;
+        }
+        // The diff view is a full-screen takeover: it owns every click, since the
+        // stale list rect underneath would otherwise outrank `hit_diff` in `app.rs`.
+        if let Some(view) = &mut self.diff_view {
+            view.handle_click(col, row);
             return true;
         }
         if let Some(dialog) = &self.info_dialog {
@@ -1407,14 +1503,13 @@ impl HomeView {
             return true;
         }
         if let Some(dialog) = &mut self.rename_dialog {
-            // The rename dialog's click handler only returns Continue (submitting needs
-            // Enter on a valid input), so always swallow the click.
-            let _ = dialog.handle_click(col, row);
+            let key = dialog.handle_click(col, row);
+            self.press_dialog_key(key);
             return true;
         }
-        if self.worktree_name_dialog.is_some() {
-            // Keyboard-driven dialog; swallow clicks so the list underneath
-            // doesn't react while it's open.
+        if let Some(dialog) = &mut self.worktree_name_dialog {
+            let key = dialog.handle_click(col, row);
+            self.press_dialog_key(key);
             return true;
         }
         if let Some(dialog) = &mut self.restart_dialog {
@@ -1496,103 +1591,111 @@ impl HomeView {
             }
             return true;
         }
-        if let Some(dialog) = &self.hooks_install_dialog {
-            if let Some(result) = dialog.handle_click(col, row) {
-                match result {
-                    DialogResult::Continue => {}
-                    DialogResult::Cancel => {
-                        self.hooks_install_dialog = None;
-                        self.pending_hooks_install_data = None;
-                    }
-                    DialogResult::Submit(_) => {
-                        match crate::session::config::update_app_state(|state| {
-                            state.has_acknowledged_agent_hooks = true;
-                        }) {
-                            Ok(()) => {
-                                self.hooks_install_dialog = None;
-                                if let Some(data) = self.pending_hooks_install_data.take() {
-                                    self.pending_dialog_click_action =
-                                        self.maybe_confirm_volume_ignores_globs(data);
-                                }
-                            }
-                            Err(e) => {
-                                tracing::warn!(target: "tui.input", "Failed to save config: {e}")
-                            }
-                        }
-                    }
-                }
-            }
+        if let Some(dialog) = &mut self.skills_manager_dialog {
+            let key = dialog.handle_click(col, row);
+            self.press_dialog_key(key);
             return true;
         }
-        if let Some(dialog) = &self.volume_ignores_glob_dialog {
-            if let Some(result) = dialog.handle_click(col, row) {
-                let dont_ask_again = dialog.dont_ask_again();
-                match result {
-                    DialogResult::Continue => {}
-                    DialogResult::Cancel => {
-                        self.volume_ignores_glob_dialog = None;
-                        self.pending_volume_ignores_glob_data = None;
-                    }
-                    DialogResult::Submit(_) => {
-                        self.volume_ignores_glob_dialog = None;
-                        if dont_ask_again {
-                            self.persist_volume_ignores_globs_ack();
-                        }
-                        if let Some(data) = self.pending_volume_ignores_glob_data.take() {
-                            self.pending_dialog_click_action = self.continue_session_creation(data);
-                        }
-                    }
-                }
-            }
+        if let Some(dialog) = &mut self.plugin_manager_dialog {
+            let key = dialog.handle_click(col, row);
+            self.press_dialog_key(key);
             return true;
         }
-        if let Some(dialog) = &self.repo_trust_dialog {
-            if let Some(result) = dialog.handle_click(col, row) {
-                match result {
-                    DialogResult::Continue => {}
-                    DialogResult::Cancel => {
-                        self.repo_trust_dialog = None;
-                        self.pending_repo_trust_data = None;
-                    }
-                    DialogResult::Submit(action) => {
-                        self.repo_trust_dialog = None;
-                        if let Some(data) = self.pending_repo_trust_data.take() {
-                            let emit = match action {
-                                RepoTrustAction::Trust {
-                                    hooks_hash,
-                                    mcp_hash,
-                                    project_path,
-                                    hooks,
-                                } => {
-                                    // Abort creation if trust cannot be persisted:
-                                    // launching anyway leaves hooks treated as approved
-                                    // while project MCP stays gated off the unwritten
-                                    // hashes.
-                                    if let Err(e) = repo_config::trust_repo(
-                                        std::path::Path::new(&project_path),
-                                        hooks_hash.as_deref(),
-                                        mcp_hash.as_deref(),
-                                    ) {
-                                        tracing::error!(target: "tui.input", "Failed to persist repo trust; aborting session creation: {}", e);
-                                        None
-                                    } else {
-                                        self.create_session_with_hooks(data, hooks)
-                                    }
-                                }
-                                RepoTrustAction::Skip { hooks } => {
-                                    self.create_session_with_hooks(data, hooks)
-                                }
-                            };
-                            self.pending_dialog_click_action = emit;
-                        }
-                    }
-                }
-            }
+        if let Some(dialog) = &mut self.projects_dialog {
+            let key = dialog.handle_click(col, row);
+            self.press_dialog_key(key);
+            return true;
+        }
+        if let Some(dialog) = &mut self.profile_picker_dialog {
+            let key = dialog.handle_click(col, row);
+            self.press_dialog_key(key);
+            return true;
+        }
+        if let Some(dialog) = &self.send_message_dialog {
+            let key = dialog.handle_click(col, row);
+            self.press_dialog_key(key);
+            return true;
+        }
+        if let Some(dialog) = &self.permission_response_dialog {
+            let key = dialog.handle_click(col, row);
+            self.press_dialog_key(key);
+            return true;
+        }
+        if self.show_help {
+            // The overlay has no targets; a click closes it like Esc.
+            self.press_dialog_key(Some(KeyEvent::from(KeyCode::Esc)));
             return true;
         }
         // Other dialogs swallow clicks through the `has_dialog()` gates in the list,
         // preview and divider handlers.
         false
+    }
+
+    /// Act on a new-session dialog result, from a key or a click.
+    fn apply_new_dialog_result(&mut self, result: DialogResult<NewSessionData>) -> Option<Action> {
+        match result {
+            DialogResult::Continue => None,
+            DialogResult::Cancel => {
+                // If creation is pending, mark it as cancelled
+                if self.is_creation_pending() {
+                    self.cancel_creation();
+                } else {
+                    self.new_dialog = None;
+                    // Backing out of `n` with a selection is the most contextual
+                    // moment for the new-from-selection tip; queue it (a no-op until
+                    // earned). Submit skips the pop so creation isn't interrupted and
+                    // the badge still carries it. See #2262.
+                    self.queue_earned_tip_pop();
+                }
+                None
+            }
+            DialogResult::Submit(data) => {
+                // Check if the tool uses hooks and user hasn't acknowledged yet
+                let tool_name = if data.tool.is_empty() {
+                    "claude".to_string()
+                } else {
+                    data.tool.clone()
+                };
+
+                let resolved_config = crate::session::resolve_config_with_repo_or_warn(
+                    &data.profile,
+                    std::path::Path::new(&data.path),
+                );
+                if let Some(hook_agent) =
+                    resolve_hook_install_agent(&tool_name, &resolved_config.session)
+                {
+                    let config = crate::session::config::load_config().ok().flatten();
+                    let hooks_enabled = resolved_config.session.agent_status_hooks;
+                    let acknowledged = config
+                        .as_ref()
+                        .map(|c| c.app_state.has_acknowledged_agent_hooks)
+                        .unwrap_or(false);
+
+                    if crate::agents::hook_install_required(hook_agent, hooks_enabled)
+                        && !acknowledged
+                    {
+                        self.hooks_install_dialog =
+                            Some(HooksInstallDialog::new_for_profile_resolved(
+                                &tool_name,
+                                hook_agent.name,
+                                Some(&data.profile),
+                            ));
+                        self.pending_hooks_install_data = Some(data);
+                        return None;
+                    }
+                }
+
+                self.maybe_confirm_volume_ignores_globs(data)
+            }
+        }
+    }
+
+    /// Replay a click that a keyboard-driven dialog mapped to a key through
+    /// `handle_key`, so mouse and keyboard share one result handler.
+    fn press_dialog_key(&mut self, key: Option<KeyEvent>) {
+        if let Some(key) = key {
+            self.pending_dialog_click_action = self.handle_key(key, None);
+        }
     }
 
     pub fn handle_key(
@@ -1994,67 +2097,12 @@ impl HomeView {
             return None;
         }
 
-        let dialog_result = self
+        if let Some(result) = self
             .new_dialog
             .as_mut()
-            .map(|dialog| dialog.handle_key(key));
-
-        if let Some(result) = dialog_result {
-            match result {
-                DialogResult::Continue => {}
-                DialogResult::Cancel => {
-                    // If creation is pending, mark it as cancelled
-                    if self.is_creation_pending() {
-                        self.cancel_creation();
-                    } else {
-                        self.new_dialog = None;
-                        // Backing out of `n` with a selection is the most contextual
-                        // moment for the new-from-selection tip; queue it (a no-op until
-                        // earned). Submit skips the pop so creation isn't interrupted and
-                        // the badge still carries it. See #2262.
-                        self.queue_earned_tip_pop();
-                    }
-                }
-                DialogResult::Submit(data) => {
-                    // Check if the tool uses hooks and user hasn't acknowledged yet
-                    let tool_name = if data.tool.is_empty() {
-                        "claude".to_string()
-                    } else {
-                        data.tool.clone()
-                    };
-
-                    let resolved_config = crate::session::resolve_config_with_repo_or_warn(
-                        &data.profile,
-                        std::path::Path::new(&data.path),
-                    );
-                    if let Some(hook_agent) =
-                        resolve_hook_install_agent(&tool_name, &resolved_config.session)
-                    {
-                        let config = crate::session::config::load_config().ok().flatten();
-                        let hooks_enabled = resolved_config.session.agent_status_hooks;
-                        let acknowledged = config
-                            .as_ref()
-                            .map(|c| c.app_state.has_acknowledged_agent_hooks)
-                            .unwrap_or(false);
-
-                        if crate::agents::hook_install_required(hook_agent, hooks_enabled)
-                            && !acknowledged
-                        {
-                            self.hooks_install_dialog =
-                                Some(HooksInstallDialog::new_for_profile_resolved(
-                                    &tool_name,
-                                    hook_agent.name,
-                                    Some(&data.profile),
-                                ));
-                            self.pending_hooks_install_data = Some(data);
-                            return None;
-                        }
-                    }
-
-                    return self.maybe_confirm_volume_ignores_globs(data);
-                }
-            }
-            return None;
+            .map(|dialog| dialog.handle_key(key))
+        {
+            return self.apply_new_dialog_result(result);
         }
 
         if let Some(dialog) = &mut self.confirm_dialog {
@@ -2553,8 +2601,15 @@ impl HomeView {
                 self.mouse_pos = None;
                 self.update_selected();
             }
-            KeyCode::Char('<') => self.shrink_list(),
-            KeyCode::Char('>') => self.grow_list(),
+            // `<` and `>` move the divider in their on-screen direction.
+            KeyCode::Char('<') => match self.sidebar_position {
+                SidebarPosition::Left => self.shrink_list(),
+                SidebarPosition::Right => self.grow_list(),
+            },
+            KeyCode::Char('>') => match self.sidebar_position {
+                SidebarPosition::Left => self.grow_list(),
+                SidebarPosition::Right => self.shrink_list(),
+            },
             KeyCode::Enter => {
                 if self.selected_session.is_some() {
                     return self.activate_selected_session();
@@ -4139,8 +4194,7 @@ impl HomeView {
     fn forward_wheel_to_preview(&self, up: bool, col: u16, row: u16) -> bool {
         let cursor = self.active_preview_cursor();
         let Some(cursor) = cursor else { return false };
-        let Some(key) = wheel_forward_key(&cursor, up, self.preview_text_view.pane, col, row)
-        else {
+        let Some(key) = wheel_forward_key(&cursor, up, self.preview_text_view, col, row) else {
             return false;
         };
         self.send_to_preview_pane(key)
@@ -4156,8 +4210,7 @@ impl HomeView {
         let Some(cursor) = self.active_preview_cursor() else {
             return false;
         };
-        let Some(key) = wheel_forward_key(&cursor, up, self.preview_text_view.pane, col, row)
-        else {
+        let Some(key) = wheel_forward_key(&cursor, up, self.preview_text_view, col, row) else {
             return false;
         };
         self.send_to_preview_pane(key)
@@ -4247,7 +4300,7 @@ impl HomeView {
         // open a gesture: forwarding would report the click at a clamped cell pane 0 never
         // saw. Drags and releases stay ungated so a gesture begun on pane 0 completes.
         let press = !release && !motion;
-        if press && mouse_target_rect(&cursor, self.preview_text_view.pane, col, row).is_none() {
+        if press && mouse_target(&cursor, self.preview_text_view, col, row).is_none() {
             self.mouse_forward_btn = None;
             return false;
         }
@@ -4257,9 +4310,7 @@ impl HomeView {
             release,
             motion,
             cursor.mouse_sgr,
-            mouse_pane_rect(&cursor, self.preview_text_view.pane),
-            col,
-            row,
+            mouse_pane(&cursor, self.preview_text_view).cell(col, row),
         );
         self.send_to_preview_pane(live_send::TmuxKey::HexBytes(bytes))
     }
@@ -4280,11 +4331,11 @@ impl HomeView {
         let Some(cursor) = self.active_preview_cursor() else {
             return false;
         };
-        let pane = self.preview_text_view.pane;
-        let Some(bytes) = hover_forward_bytes(&cursor, pane, col, row) else {
+        let view = self.preview_text_view;
+        let Some(bytes) = hover_forward_bytes(&cursor, view, col, row) else {
             return false;
         };
-        let cell = map_pane_cell(pane, col, row);
+        let cell = map_pane_cell(view.pane, col, row);
         if self.hover_forward_cell == Some(cell) {
             return false;
         }
@@ -4300,6 +4351,10 @@ impl HomeView {
         if let Some(view) = &mut self.settings_view {
             return view.handle_wheel_scroll(true);
         }
+        if self.show_help {
+            self.help_scroll = self.help_scroll.saturating_sub(STEP);
+            return true;
+        }
         if self.system_health_open && self.hit_preview(col, row) {
             self.system_health_scroll = self.system_health_scroll.saturating_sub(3);
             return true;
@@ -4307,6 +4362,9 @@ impl HomeView {
         // A preview selection is anchored to absolute scrollback lines, not screen cells,
         // so scrolling does not invalidate it and it is deliberately not cleared here.
         if let Some(ref mut diff) = self.diff_view {
+            if diff.has_modal() {
+                return false;
+            }
             diff.scroll_up(STEP);
             return true;
         }
@@ -4503,6 +4561,12 @@ impl HomeView {
                     return true;
                 }
             }
+            if let super::Item::Session { id, .. } = &self.flat_items[idx] {
+                if self.get_instance(id).is_some_and(|inst| inst.is_trashed()) {
+                    self.context_menu = Some(ContextMenuDialog::for_trashed_session(anchor));
+                    return true;
+                }
+            }
             let is_group = matches!(self.flat_items[idx], super::Item::Group { .. });
             // A real project header in project view gets the pin menu; the cursor was
             // just moved onto this row, so `project_group_at_cursor` reflects it.
@@ -4656,6 +4720,7 @@ impl HomeView {
                 Some(SidebarSection::Archived) => self.unarchive_all(),
                 None => {}
             },
+            ContextMenuAction::Restore => self.restore_selected_from_trash(),
             ContextMenuAction::ToggleSectionCollapse => match self.section_at_cursor() {
                 Some(SidebarSection::Trash) => self.toggle_trashed_section(),
                 Some(SidebarSection::Archived) => self.toggle_archived_section(),
@@ -5321,17 +5386,10 @@ impl HomeView {
         if self.has_non_live_send_overlay() {
             return None;
         }
-        // A mounted structured transcript owns the pane and supplies its own rows, but
-        // `active_preview_cache` still returns the tmux capture and `preview_text_view`
-        // came from the transcript's geometry. Resolving one against the other opens a URL
-        // from another session's output, with no underline to warn the user. Same
-        // line-source branch `extract_preview_selection_text` makes.
-        let structured_owns_pane = self
-            .structured_preview
-            .as_ref()
-            .zip(self.selected_session.as_deref())
-            .is_some_and(|(view, id)| view.session_id() == id);
-        if structured_owns_pane {
+        // `active_preview_cache` is the tmux capture while `preview_text_view` may come from
+        // the transcript's geometry; resolving one against the other opens a URL from
+        // another session's output. `paint_preview_links` skips the same case.
+        if self.structured_transcript_painted {
             return None;
         }
         let view = self.preview_text_view;
@@ -5415,6 +5473,12 @@ impl HomeView {
         if let Some(dialog) = &mut self.confirm_dialog {
             overlay_changed |= dialog.handle_hover(col, row);
         }
+        if let Some(dialog) = &mut self.volume_ignores_glob_dialog {
+            overlay_changed |= dialog.handle_hover(col, row);
+        }
+        if let Some(dialog) = &mut self.tips_dialog {
+            overlay_changed |= dialog.handle_hover(col, row);
+        }
         if let Some(dialog) = &mut self.update_confirm_dialog {
             overlay_changed |= dialog.handle_hover(col, row);
         }
@@ -5440,6 +5504,30 @@ impl HomeView {
             overlay_changed |= dialog.handle_hover(col, row);
         }
         if let Some(dialog) = &mut self.restart_dialog {
+            overlay_changed |= dialog.handle_hover(col, row);
+        }
+        if let Some(dialog) = &mut self.worktree_name_dialog {
+            overlay_changed |= dialog.handle_hover(col, row);
+        }
+        if let Some(dialog) = &mut self.send_message_dialog {
+            overlay_changed |= dialog.handle_hover(col, row);
+        }
+        if let Some(dialog) = &mut self.profile_picker_dialog {
+            overlay_changed |= dialog.handle_hover(col, row);
+        }
+        if let Some(dialog) = &mut self.projects_dialog {
+            overlay_changed |= dialog.handle_hover(col, row);
+        }
+        if let Some(dialog) = &mut self.plugin_manager_dialog {
+            overlay_changed |= dialog.handle_hover(col, row);
+        }
+        if let Some(dialog) = &mut self.skills_manager_dialog {
+            overlay_changed |= dialog.handle_hover(col, row);
+        }
+        if let Some(serve) = &mut self.serve_view {
+            overlay_changed |= serve.handle_hover(col, row);
+        }
+        if let Some(dialog) = &mut self.permission_response_dialog {
             overlay_changed |= dialog.handle_hover(col, row);
         }
         if let Some(dialog) = &mut self.hooks_install_dialog {
@@ -5474,11 +5562,7 @@ impl HomeView {
         // highlight on the next render, recomputed against the current button rects so it
         // clears as the pointer leaves.
         let prev_footer_hover = self.footer_hover;
-        self.footer_hover = self
-            .footer_buttons
-            .iter()
-            .find(|(rect, _)| rect.contains(Position::from((col, row))))
-            .map(|(_, key)| *key);
+        self.footer_hover = crate::tui::dialogs::hit(&self.footer_buttons, col, row);
         let footer_changed = prev_footer_hover != self.footer_hover;
 
         let diagnostics_hovered = !self.has_non_live_send_overlay()
@@ -5518,6 +5602,11 @@ impl HomeView {
         if let Some(view) = &mut self.settings_view {
             return view.handle_wheel_scroll(false);
         }
+        if self.show_help {
+            // HelpOverlay::render clamps this to the real max scroll.
+            self.help_scroll = self.help_scroll.saturating_add(STEP);
+            return true;
+        }
         if self.system_health_open && self.hit_preview(col, row) {
             let visible_rows = crate::tui::components::diagnostics::agent_table_visible_rows(
                 self.preview_area.height,
@@ -5529,6 +5618,9 @@ impl HomeView {
         // Mirror handle_scroll_up: the selection is anchored to scrollback
         // lines, so it survives the scroll and is left in place.
         if let Some(ref mut diff) = self.diff_view {
+            if diff.has_modal() {
+                return false;
+            }
             diff.scroll_down(STEP);
             return true;
         }
@@ -6524,7 +6616,7 @@ mod tests {
         ];
         for (up, sgr, rect, x, y, want) in wheel_cases {
             assert_eq!(
-                wheel_mouse_bytes(up, sgr, rect, x, y),
+                wheel_mouse_bytes(up, sgr, map_pane_cell(rect, x, y)),
                 want,
                 "wheel up={up} sgr={sgr} ({x},{y})"
             );
@@ -6544,7 +6636,7 @@ mod tests {
         ];
         for (button, release, drag, sgr, want) in event_cases {
             assert_eq!(
-                mouse_event_bytes(button, release, drag, sgr, pane, 10, 5),
+                mouse_event_bytes(button, release, drag, sgr, map_pane_cell(pane, 10, 5)),
                 want,
                 "button={button} release={release} drag={drag} sgr={sgr}"
             );
@@ -6572,6 +6664,28 @@ mod tests {
         }
     }
 
+    /// The live preview's text view over `pane`, showing `total_lines` captured rows
+    /// scrolled `offset` rows back from the live tail.
+    fn scrolled_view(
+        pane: ratatui::layout::Rect,
+        total_lines: usize,
+        offset: u16,
+    ) -> super::super::PreviewTextView {
+        super::super::PreviewTextView {
+            pane,
+            first_line: crate::tui::components::preview::compute_scroll(
+                total_lines,
+                pane.height as usize,
+                offset,
+            ) as usize,
+            total_lines,
+        }
+    }
+
+    fn view_of(pane: ratatui::layout::Rect, total_lines: usize) -> super::super::PreviewTextView {
+        scrolled_view(pane, total_lines, 0)
+    }
+
     /// Forwarding needs a full-screen app: hover needs any-event tracking (1003) and is
     /// encoded like the app's reports; a tracking app gets wheel bytes; a normal-screen
     /// pane gets nothing, so the caller keeps its capture-window scroll.
@@ -6579,32 +6693,33 @@ mod tests {
     fn mouse_forwarding_requires_full_screen_tracking() {
         use ratatui::layout::Rect;
         let pane = Rect::new(0, 0, 80, 24);
+        let view = view_of(pane, 24);
         let mut all = cursor_for(true, true, true);
         all.mouse_all = true;
         // No-button motion is 3 + 32.
         assert_eq!(
-            hover_forward_bytes(&all, pane, 10, 5).as_deref(),
+            hover_forward_bytes(&all, view, 10, 5).as_deref(),
             Some(b"\x1b[<35;11;6M".as_slice())
         );
         all.mouse_sgr = false;
         assert_eq!(
-            hover_forward_bytes(&all, pane, 10, 5),
+            hover_forward_bytes(&all, view, 10, 5),
             Some(vec![0x1b, b'[', b'M', 35 + 32, 11 + 32, 6 + 32])
         );
         assert_eq!(
-            hover_forward_bytes(&cursor_for(true, true, true), pane, 10, 5),
+            hover_forward_bytes(&cursor_for(true, true, true), view, 10, 5),
             None,
             "button-only tracking gets no bare motion"
         );
         let mut normal = cursor_for(false, true, true);
         normal.mouse_all = true;
-        assert_eq!(hover_forward_bytes(&normal, pane, 10, 5), None);
+        assert_eq!(hover_forward_bytes(&normal, view, 10, 5), None);
 
-        match wheel_forward_key(&cursor_for(true, true, true), true, pane, 10, 10) {
+        match wheel_forward_key(&cursor_for(true, true, true), true, view, 10, 10) {
             Some(live_send::TmuxKey::HexBytes(b)) => assert_eq!(b[0], 0x1b),
             other => panic!("expected SGR HexBytes, got {other:?}"),
         }
-        match wheel_forward_key(&cursor_for(true, true, false), true, pane, 10, 10) {
+        match wheel_forward_key(&cursor_for(true, true, false), true, view, 10, 10) {
             Some(live_send::TmuxKey::HexBytes(b)) => {
                 assert_eq!(&b[..3], &[0x1b, b'[', b'M'])
             }
@@ -6614,7 +6729,7 @@ mod tests {
             cursor_for(false, false, false),
             cursor_for(false, true, true),
         ] {
-            assert_eq!(wheel_forward_key(&normal_screen, true, pane, 10, 10), None);
+            assert_eq!(wheel_forward_key(&normal_screen, true, view, 10, 10), None);
         }
     }
 
@@ -6627,6 +6742,7 @@ mod tests {
         use ratatui::layout::Rect;
         // An 80x24 preview showing a window split at column 40.
         let pane = Rect::new(0, 0, 80, 24);
+        let view = view_of(pane, 24);
         let mut split = cursor_for(true, true, true);
         split.mouse_all = true;
         split.composite_pane0 = Some(crate::tmux::PaneGeom {
@@ -6638,43 +6754,114 @@ mod tests {
 
         // Inside pane 0: maps as before, 1-based.
         assert_eq!(
-            hover_forward_bytes(&split, pane, 10, 5).as_deref(),
+            hover_forward_bytes(&split, view, 10, 5).as_deref(),
             Some(b"\x1b[<35;11;6M".as_slice())
         );
         // Over the neighbour: dropped, not clamped to pane 0's border, which
         // would synthesise a hover on a cell the pointer never touched.
-        assert_eq!(hover_forward_bytes(&split, pane, 60, 5), None);
-        assert_eq!(wheel_forward_key(&split, true, pane, 60, 5), None);
+        assert_eq!(hover_forward_bytes(&split, view, 60, 5), None);
+        assert_eq!(wheel_forward_key(&split, true, view, 60, 5), None);
         // The last column of pane 0 is still inside it; the first past it is not.
-        assert!(hover_forward_bytes(&split, pane, 39, 5).is_some());
-        assert_eq!(hover_forward_bytes(&split, pane, 40, 5), None);
+        assert!(hover_forward_bytes(&split, view, 39, 5).is_some());
+        assert_eq!(hover_forward_bytes(&split, view, 40, 5), None);
 
-        // In the bottom-follow layout the composite's top border row is clipped before
-        // painting, so `first_line == pane0.top == 1`. The cursor mapper adds `top` after
-        // its anchor delta while the mouse rect stays at the visible output origin, so a
-        // click on the painted cursor must round-trip to that cursor's 1-based app cell.
-        let mut bottom_follow = cursor_for(true, true, true);
-        bottom_follow.x = 10;
-        bottom_follow.y = 4;
-        bottom_follow.pane_height = 25;
-        bottom_follow.composite_pane0 = Some(crate::tmux::PaneGeom {
-            left: 0,
-            top: 1,
-            width: 40,
-            height: 24,
-        });
-        let painted = crate::tui::home::render::map_live_preview_cursor(
-            pane,
-            usize::from(pane.height),
-            25,
-            bottom_follow,
-        )
-        .expect("visible pane cursor");
-        assert_eq!(
-            map_pane_cell(mouse_pane_rect(&bottom_follow, pane), painted.x, painted.y,),
-            (bottom_follow.x + 1, bottom_follow.y + 1),
-            "clicking the painted cursor must report the same app cell"
-        );
+        // Pane 0 is projected through the painted composite slice, so a click on the
+        // painted cursor reaches the cursor's 1-based app cell, the first painted row of
+        // pane 0 reports its clipped app row, and a cell beside pane 0 is dropped.
+        // (name, window height, scroll offset, pane 0, cursor, (first painted output row,
+        // its app row), a cell outside pane 0)
+        let output = Rect::new(2, 3, 80, 24);
+        let geom = |left, top, width, height| crate::tmux::PaneGeom {
+            left,
+            top,
+            width,
+            height,
+        };
+        for (name, window_height, offset, pane0, (x, y), (first_row, app_row), outside) in [
+            // Side by side under `pane-border-status top`: bottom-follow clips the border
+            // row, so `top == first_line` cancels and pane 0 starts at the output origin.
+            (
+                "side by side",
+                25,
+                0,
+                geom(0, 1, 40, 24),
+                (10, 4),
+                (0, 1),
+                (42, 5),
+            ),
+            // Stacked: the split reads as no chrome, so the border row stays visible and
+            // pane 0 starts one row down.
+            (
+                "stacked",
+                24,
+                0,
+                geom(0, 1, 80, 11),
+                (5, 3),
+                (1, 1),
+                (10, 3),
+            ),
+            // Rotated or swapped: pane 0 sits right of another pane.
+            (
+                "rotated",
+                24,
+                0,
+                geom(40, 0, 40, 24),
+                (10, 4),
+                (0, 1),
+                (41, 5),
+            ),
+            // A window taller than the preview (another client pins its size):
+            // bottom-follow clips six of pane 0's rows off the top.
+            (
+                "clipped top",
+                30,
+                0,
+                geom(0, 0, 40, 30),
+                (10, 10),
+                (0, 7),
+                (42, 5),
+            ),
+            // The same window scrolled locally to its top: pane 0 paints from row 1.
+            (
+                "scrolled to top",
+                30,
+                6,
+                geom(0, 0, 40, 30),
+                (10, 4),
+                (0, 1),
+                (42, 5),
+            ),
+        ] {
+            let mut cursor = cursor_for(true, true, true);
+            cursor.mouse_all = true;
+            cursor.x = x;
+            cursor.y = y;
+            cursor.pane_height = window_height;
+            cursor.composite_pane0 = Some(pane0);
+            let view = scrolled_view(output, usize::from(window_height), offset);
+            let (col, row) = (output.x + pane0.left + 1, output.y + first_row);
+            let target = mouse_target(&cursor, view, col, row)
+                .unwrap_or_else(|| panic!("{name}: first painted row is inside pane 0"));
+            assert_eq!(
+                target.cell(col, row).1,
+                app_row,
+                "{name}: the first painted row of pane 0 reports its app row"
+            );
+            let painted = crate::tui::home::render::map_live_preview_cursor(view, cursor)
+                .expect("visible pane cursor");
+            let target = mouse_target(&cursor, view, painted.x, painted.y)
+                .unwrap_or_else(|| panic!("{name}: painted cursor is inside pane 0"));
+            assert_eq!(
+                target.cell(painted.x, painted.y),
+                (x + 1, y + 1),
+                "{name}: clicking the painted cursor must report the same app cell"
+            );
+            assert_eq!(
+                mouse_target(&cursor, view, outside.0, outside.1),
+                None,
+                "{name}: a cell outside pane 0 is dropped"
+            );
+        }
 
         // A no-mouse full-screen agent gets no page key from a wheel aimed at
         // the neighbour either, but keeps it over pane 0.
@@ -6685,8 +6872,8 @@ mod tests {
             width: 40,
             height: 24,
         });
-        assert_eq!(wheel_forward_key(&no_mouse, true, pane, 60, 5), None);
-        assert!(wheel_forward_key(&no_mouse, true, pane, 10, 5).is_some());
+        assert_eq!(wheel_forward_key(&no_mouse, true, view, 60, 5), None);
+        assert!(wheel_forward_key(&no_mouse, true, view, 10, 5).is_some());
 
         // Unsplit is unchanged: no composite extent, so the whole rect maps.
         let unsplit = {
@@ -6695,14 +6882,14 @@ mod tests {
             c
         };
         assert_eq!(
-            hover_forward_bytes(&unsplit, pane, 60, 5).as_deref(),
+            hover_forward_bytes(&unsplit, view, 60, 5).as_deref(),
             Some(b"\x1b[<35;61;6M".as_slice())
         );
         // An unsplit cell outside the rect must still clamp, not drop: the press is gated
         // by `hit_preview` and these helpers have always relied on `map_pane_cell`, so the
         // pane-0 containment test must not leak into the single-pane path.
         assert_eq!(
-            hover_forward_bytes(&unsplit, pane, 999, 999).as_deref(),
+            hover_forward_bytes(&unsplit, view, 999, 999).as_deref(),
             Some(b"\x1b[<35;80;24M".as_slice()),
             "unsplit coordinates clamp to the rect, they do not get dropped"
         );
@@ -6714,6 +6901,7 @@ mod tests {
     fn composite_pane_rect_clamps_to_the_preview() {
         use ratatui::layout::Rect;
         let pane = Rect::new(2, 3, 20, 10);
+        let view = view_of(pane, 24);
         let mut cursor = cursor_for(true, true, true);
         cursor.composite_pane0 = Some(crate::tmux::PaneGeom {
             left: 0,
@@ -6721,10 +6909,10 @@ mod tests {
             width: 999,
             height: 999,
         });
-        assert_eq!(mouse_pane_rect(&cursor, pane), pane);
+        assert_eq!(mouse_pane(&cursor, view).visible, pane);
         // And the origin is honored: a cell above/left of the rect is outside.
-        assert_eq!(mouse_target_rect(&cursor, pane, 1, 3), None);
-        assert!(mouse_target_rect(&cursor, pane, 2, 3).is_some());
+        assert_eq!(mouse_target(&cursor, view, 1, 3), None);
+        assert!(mouse_target(&cursor, view, 2, 3).is_some());
     }
 
     /// The fix for #2407: a full-screen pane with no mouse tracking must forward
@@ -6735,16 +6923,17 @@ mod tests {
     fn wheel_forward_key_no_mouse_alt_screen_is_page_key() {
         use ratatui::layout::Rect;
         let pane = Rect::new(0, 0, 80, 24);
+        let view = view_of(pane, 24);
         let cursor = cursor_for(true, false, false);
         assert_eq!(
-            wheel_forward_key(&cursor, true, pane, 10, 10),
+            wheel_forward_key(&cursor, true, view, 10, 10),
             Some(live_send::TmuxKey::NamedRepeat {
                 name: "PageUp".into(),
                 count: WHEEL_PAGE_STEP,
             })
         );
         assert_eq!(
-            wheel_forward_key(&cursor, false, pane, 10, 10),
+            wheel_forward_key(&cursor, false, view, 10, 10),
             Some(live_send::TmuxKey::NamedRepeat {
                 name: "PageDown".into(),
                 count: WHEEL_PAGE_STEP,

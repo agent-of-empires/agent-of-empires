@@ -25,7 +25,7 @@ interface Props {
   sessionId: string;
   /** Parks the queue drain while the reconciler resumes the worker. */
   acpWorkerState?: "absent" | "resuming" | "running" | "stopping";
-  /** Archived and snoozed sessions auto-wake on send. */
+  /** Snoozed sessions auto-wake on send; archived ones refuse it. */
   archivedAt?: string | null;
   snoozedUntil?: string | null;
   /** Render rows before the latest `/clear` instead of folding them. */

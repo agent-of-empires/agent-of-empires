@@ -100,6 +100,7 @@ async fn sensitive_routes_are_blocked() {
         // code-inspection surface as the gated diff reads.
         (Method::GET, "/api/sessions/does-not-exist/output", ""),
         (Method::GET, "/api/sessions/x/file?path=Cargo.toml", ""),
+        (Method::GET, "/api/sessions/x/file/raw?path=Cargo.toml", ""),
         (Method::GET, "/api/sessions/x/acp/files", ""),
         // Host + per-agent health. The per-agent rows are the plain/terminal
         // sessions this mode must not enumerate (the sampler selects the

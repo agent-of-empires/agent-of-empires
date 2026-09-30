@@ -169,6 +169,19 @@ export function useForwardInput({
     },
     [pointerCell, forwardButton, armAgentClipboard, mouseSgrRef],
   );
+  // A finger tap is a left click at the tapped cell; it leaves the soft keyboard alone.
+  const forwardTap = useCallback(
+    (clientX: number, clientY: number) => {
+      stopMomentum();
+      notchPacer.cancel();
+      wheelAccumRef.current = 0;
+      const { col, row } = pointerCell(clientX, clientY);
+      forwardButton(0, false, false, mouseSgrRef.current, col, row);
+      armAgentClipboard?.();
+      forwardButton(0, true, false, mouseSgrRef.current, col, row);
+    },
+    [stopMomentum, notchPacer, pointerCell, forwardButton, armAgentClipboard, mouseSgrRef],
+  );
 
   return {
     wheelAccumRef,
@@ -180,5 +193,6 @@ export function useForwardInput({
     onPointerDown,
     onPointerMove,
     endPointerForward,
+    forwardTap,
   };
 }

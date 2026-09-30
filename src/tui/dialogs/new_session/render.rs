@@ -32,12 +32,34 @@ struct ListField<'a> {
     focused: bool,
 }
 
+/// The first row of a field's rect: fields reserve a spacer row below their
+/// content, which the hover tint leaves alone.
+fn label_row(rect: Rect) -> Rect {
+    Rect {
+        height: rect.height.min(1),
+        ..rect
+    }
+}
+
+/// Hoverable rows of a config overlay: list entries first, since the list
+/// field's own rect spans them, then each field's label row.
+fn overlay_hover_rects(entries: &[(usize, Rect)], fields: &[(usize, Rect)]) -> Vec<Rect> {
+    entries
+        .iter()
+        .map(|(_, r)| *r)
+        .chain(fields.iter().map(|(_, r)| label_row(*r)))
+        .collect()
+}
+
 impl NewSessionDialog {
     pub fn render(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
         // Rebuilt every frame: a layout change moves every later field, so a
         // stale rect points at the wrong row. Clearing here also empties them
         // while an overlay replaces the main form.
         self.focusable_rects.clear();
+        self.list_entry_rects.clear();
+        self.confirm_create_rects.clear();
+        self.hover_rects.clear();
 
         if self.loading {
             self.render_loading(frame, area, theme);
@@ -411,16 +433,22 @@ impl NewSessionDialog {
             } else {
                 Style::default().fg(theme.dimmed)
             };
-            let line = Line::from(vec![
-                Span::styled(
-                    "⚠ Path does not exist. Create? ",
-                    Style::default().fg(theme.error),
-                ),
-                Span::styled("[y]es", yes_style),
-                Span::raw(" "),
-                Span::styled("[N]o", no_style),
-            ]);
-            frame.render_widget(Paragraph::new(line), chunks[hint_chunk]);
+            let prompt = Span::styled(
+                "⚠ Path does not exist. Create? ",
+                Style::default().fg(theme.error),
+            );
+            let yes = Span::styled("[y]es", yes_style);
+            let no = Span::styled("[N]o", no_style);
+            let row = chunks[hint_chunk];
+            let yes_x = row.x + prompt.width() as u16;
+            let no_x = yes_x + yes.width() as u16 + 1;
+            for (choice, x, width) in [(true, yes_x, yes.width()), (false, no_x, no.width())] {
+                let width = (width as u16).min(row.right().saturating_sub(x));
+                self.confirm_create_rects
+                    .push((choice, Rect::new(x, row.y, width, 1)));
+            }
+            let line = Line::from(vec![prompt, yes, Span::raw(" "), no]);
+            frame.render_widget(Paragraph::new(line), row);
         } else if let Some(error) = &self.error_message {
             let error_text = format!("✗ Error: {}", error);
             let error_paragraph = Paragraph::new(error_text)
@@ -494,6 +522,14 @@ impl NewSessionDialog {
                 chunks[hint_chunk],
             );
         }
+
+        let rects = self
+            .focusable_rects
+            .iter()
+            .map(|(_, r)| label_row(*r))
+            .chain(self.confirm_create_rects.iter().map(|(_, r)| *r))
+            .collect();
+        self.paint_hover(frame, rects, theme);
 
         if self.show_help {
             self.render_help_overlay(frame, full_area, theme);
@@ -707,7 +743,7 @@ impl NewSessionDialog {
         ci += 1;
 
         // Environment
-        self.render_list_field(
+        self.list_entry_rects = self.render_list_field(
             frame,
             chunks[ci],
             theme,
@@ -743,6 +779,13 @@ impl NewSessionDialog {
         ];
         frame.render_widget(Paragraph::new(Line::from(hint_spans)), chunks[ci]);
 
+        let rects = if self.env_editing_input.is_some() {
+            Vec::new()
+        } else {
+            overlay_hover_rects(&self.list_entry_rects, &self.sandbox_config_rects)
+        };
+        self.paint_hover(frame, rects, theme);
+
         if self.show_help {
             self.render_help_overlay(frame, area, theme);
         }
@@ -764,6 +807,8 @@ impl NewSessionDialog {
             self.tool_config_focused_field,
             theme,
         );
+        let rects = overlay_hover_rects(&[], &self.tool_config_rects);
+        self.paint_hover(frame, rects, theme);
 
         if self.show_help {
             self.render_help_overlay(frame, area, theme);
@@ -892,7 +937,7 @@ impl NewSessionDialog {
         }
 
         // Extra Repos
-        self.render_list_field(
+        self.list_entry_rects = self.render_list_field(
             frame,
             chunks[3],
             theme,
@@ -950,6 +995,13 @@ impl NewSessionDialog {
             frame.render_widget(Paragraph::new(Line::from(hint_spans)), chunks[4]);
         }
 
+        let rects = if self.workspace_repo_editing_input.is_some() {
+            Vec::new()
+        } else {
+            overlay_hover_rects(&self.list_entry_rects, &self.worktree_config_rects)
+        };
+        self.paint_hover(frame, rects, theme);
+
         if self.show_help {
             self.render_help_overlay(frame, area, theme);
         }
@@ -970,7 +1022,15 @@ impl NewSessionDialog {
     /// One editable list field: `Environment` and `Extra Repos` differ only in
     /// their labels, their summary unit, and whether the add/edit input offers
     /// a path ghost completion.
-    fn render_list_field(&self, frame: &mut Frame, area: Rect, theme: &Theme, spec: ListField<'_>) {
+    /// Returns the rect of each entry row while the list is expanded and no
+    /// entry is being typed, keyed by entry index.
+    fn render_list_field(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        theme: &Theme,
+        spec: ListField<'_>,
+    ) -> Vec<(usize, Rect)> {
         let label_style = if spec.focused {
             Style::default().fg(theme.accent).underlined()
         } else {
@@ -993,7 +1053,7 @@ impl NewSessionDialog {
             };
             let line = Line::from(vec![label, Span::raw(" "), Span::styled(summary, style)]);
             frame.render_widget(Paragraph::new(line), area);
-            return;
+            return Vec::new();
         }
 
         let mut lines = vec![Line::from(vec![
@@ -1070,6 +1130,23 @@ impl NewSessionDialog {
         frame.render_widget(Paragraph::new(lines), area);
         if let Some((row, prefix, input)) = cursor_row {
             Self::set_input_cursor_on_row(frame, area, row, prefix, input);
+            return Vec::new();
+        }
+        // Row 0 is the label; entries follow until the area clips them.
+        (0..spec.entries.len())
+            .map_while(|i| {
+                let y = area.y + 1 + i as u16;
+                (y < area.bottom()).then(|| (i, Rect::new(area.x, y, area.width, 1)))
+            })
+            .collect()
+    }
+
+    /// Record the panel's hoverable rows and tint the one under the pointer.
+    /// Nothing is hoverable under the help overlay.
+    fn paint_hover(&mut self, frame: &mut Frame, rects: Vec<Rect>, theme: &Theme) {
+        self.hover_rects = if self.show_help { Vec::new() } else { rects };
+        if let Some(rect) = self.hover.current_in(&self.hover_rects) {
+            crate::tui::components::hover::paint_hover_bg(frame, rect, theme.selection);
         }
     }
 

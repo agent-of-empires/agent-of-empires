@@ -13,7 +13,7 @@ use ratatui::{
 use similar::ChangeTag;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use super::DiffView;
+use super::{BranchPickerMouse, DiffView};
 use crate::git::diff::FileStatus;
 use crate::tui::styles::Theme;
 
@@ -547,6 +547,11 @@ impl DiffView {
         };
 
         frame.render_widget(Clear, dialog_area);
+        let mut mouse = BranchPickerMouse {
+            dialog: dialog_area,
+            hover: std::mem::take(&mut self.branch_mouse.hover),
+            ..Default::default()
+        };
 
         let block = Block::default()
             .title(" Select Branch ")
@@ -566,7 +571,9 @@ impl DiffView {
 
         let mut lines: Vec<Line> = Vec::new();
 
+        let row_at = |line: usize| Rect::new(inner.x, inner.y + line as u16, inner.width, 1);
         if scroll.has_more_above {
+            mouse.more_above = row_at(lines.len());
             lines.push(Line::from(Span::styled(
                 format!("  [{} more above]", scroll.scroll_offset),
                 Style::default().fg(theme.dimmed),
@@ -594,6 +601,7 @@ impl DiffView {
             let prefix = if is_selected { "> " } else { "  " };
             let suffix = if is_current { " (current)" } else { "" };
 
+            mouse.rows.push((i, row_at(lines.len())));
             lines.push(Line::from(vec![
                 Span::styled(prefix, style),
                 Span::styled(branch.as_str(), style),
@@ -606,6 +614,7 @@ impl DiffView {
                 .branches
                 .len()
                 .saturating_sub(scroll.scroll_offset + scroll.list_visible);
+            mouse.more_below = row_at(lines.len());
             lines.push(Line::from(Span::styled(
                 format!("  [{} more below]", remaining),
                 Style::default().fg(theme.dimmed),
@@ -613,6 +622,10 @@ impl DiffView {
         }
 
         frame.render_widget(Paragraph::new(lines), inner);
+        if let Some(rect) = mouse.hover.current_in(&mouse.rects()) {
+            crate::tui::components::hover::paint_hover_bg(frame, rect, theme.selection);
+        }
+        self.branch_mouse = mouse;
 
         // Render scrollbar when branches overflow, matching the diff content pane style
         if state.branches.len() > inner.height as usize {
@@ -845,6 +858,41 @@ mod tests {
             out.contains("branch-39"),
             "selection must stay visible:\n{out}"
         );
+    }
+
+    #[test]
+    fn branch_picker_rows_indicators_and_outside_take_clicks() {
+        use crate::tui::dialogs::test_render::{draw, find};
+        let open = || {
+            let mut view = DiffView::test_default();
+            view.branch_select = Some(BranchSelectState {
+                branches: (0..40).map(|i| format!("branch-{i:02}")).collect(),
+                selected: 0,
+            });
+            view
+        };
+
+        let mut view = open();
+        let buf = draw(80, 24, |f, theme| view.render(f, f.area(), theme));
+        let (x, y) = find(&buf, "branch-02");
+        assert!(view.handle_hover(x, y));
+        assert_eq!(
+            view.branch_select.as_ref().unwrap().selected,
+            0,
+            "hover only tints"
+        );
+        view.handle_click(x, y);
+        assert!(view.branch_select.is_none());
+        assert_eq!(view.base_branch, "branch-02", "a row applies like Enter");
+
+        let mut view = open();
+        let buf = draw(80, 24, |f, theme| view.render(f, f.area(), theme));
+        let (x, y) = find(&buf, "more below");
+        view.handle_click(x, y);
+        assert_eq!(view.branch_select.as_ref().unwrap().selected, 1);
+        view.handle_click(0, 0);
+        assert!(view.branch_select.is_none(), "outside closes like Esc");
+        assert_eq!(view.base_branch, "main");
     }
 
     /// Markdown files render as prose by default, with the source markers gone,

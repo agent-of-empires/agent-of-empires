@@ -543,8 +543,7 @@ pub async fn session_diff_file_raw(
         Err(resp) => return resp,
     };
 
-    let result = tokio::task::spawn_blocking(move || {
-        let requested = std::path::Path::new(&query.path);
+    open_file(query.path, move |requested| {
         // Diff paths are repo-relative, and refusing the rest keeps this from
         // probing host paths outside the worktree.
         if requested.is_absolute() {
@@ -553,16 +552,34 @@ pub async fn session_diff_file_raw(
         let root = std::path::Path::new(&repo.path)
             .canonicalize()
             .map_err(|_| (StatusCode::NOT_FOUND, "file not found"))?;
-        let confined = crate::server::api::file_provenance::confine_path(
+        crate::server::api::file_provenance::confine_path(
             std::slice::from_ref(&root),
             std::collections::HashSet::new,
             requested,
-        )?;
+        )
+    })
+    .await
+}
+
+/// Serve "Open file" off the async runtime: the path `confine` admits, typed by
+/// the name it was requested under.
+async fn open_file(
+    requested: String,
+    confine: impl FnOnce(
+            &std::path::Path,
+        )
+            -> Result<crate::server::api::file_provenance::Confined, (StatusCode, &'static str)>
+        + Send
+        + 'static,
+) -> axum::response::Response {
+    let result = tokio::task::spawn_blocking(move || {
+        let requested = std::path::Path::new(&requested);
+        let confined = confine(requested)?;
         let bytes = crate::server::api::file_provenance::read_confined_bytes(
             &confined,
             super::artifacts::MAX_RAW_FILE_BYTES,
         )?;
-        Ok((open_file_mime(requested, &bytes), bytes))
+        Ok::<_, (StatusCode, &'static str)>((open_file_mime(requested, &bytes), bytes))
     })
     .await;
 
@@ -631,39 +648,44 @@ pub struct SessionFileResponse {
     pub truncated: bool,
 }
 
-/// Read a session file for the dashboard file viewer (#3088).
-///
-/// Git-agnostic, so it works on non-git scratch sessions. A read is allowed when
-/// the canonical target is under a session project root or is a path the agent
-/// touched this session. Confinement and bounded reading live in
-/// `file_provenance`.
-pub async fn session_file(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<String>,
-    axum::extract::Query(query): axum::extract::Query<SessionFileQuery>,
-) -> impl IntoResponse {
-    // Reads workspace file contents, the same inspection surface as the diff
-    // reads, and the Files pane is hidden in CityHall.
-    if let Some(resp) = crate::server::api::cityhall_block(&state) {
-        return resp;
-    }
-    let ctx = match resolve_diff_repos(&state, &id).await {
-        Ok(c) => c,
-        Err(resp) => return resp,
-    };
-    let project_paths: Vec<std::path::PathBuf> = ctx
-        .repos
-        .iter()
-        .map(|r| std::path::PathBuf::from(&r.path))
-        .collect();
-    let store = state.acp_event_store.clone();
-    let session_id = id.clone();
-    let requested = query.path.clone();
+/// What a session file read may reach, gathered before the blocking read. It is
+/// git-agnostic, so it works on non-git scratch sessions (#3088).
+struct SessionFileScope {
+    roots: Vec<std::path::PathBuf>,
+    store: Arc<crate::acp::event_store::EventStore>,
+    session_id: String,
+}
 
-    let result = tokio::task::spawn_blocking(move || {
-        // Canonicalize project roots up front; a root that no longer resolves
-        // is dropped, so a stale worktree cannot break or widen confinement.
-        let roots: Vec<std::path::PathBuf> = project_paths
+impl SessionFileScope {
+    async fn of(state: &AppState, id: &str) -> Result<Self, axum::response::Response> {
+        let instances = state.instances.read().await;
+        let inst = instances
+            .iter()
+            .find(|i| i.id == id)
+            .ok_or_else(crate::server::api::session_not_found)?;
+        // The session root comes first because relative paths resolve against
+        // it: the Files pane lists them from there, and in a workspace it holds
+        // every repo.
+        let roots = std::iter::once(inst.project_path.as_str())
+            .chain(inst.all_repos().iter().map(|r| r.worktree_path.as_str()))
+            .map(std::path::PathBuf::from)
+            .collect();
+        Ok(Self {
+            roots,
+            store: state.acp_event_store.clone(),
+            session_id: id.to_string(),
+        })
+    }
+
+    /// Admit a path under a root or one the agent touched this session. Blocks.
+    fn confine(
+        &self,
+        requested: &std::path::Path,
+    ) -> Result<crate::server::api::file_provenance::Confined, (StatusCode, &'static str)> {
+        // A root that no longer resolves is dropped, so a stale worktree cannot
+        // break or widen confinement.
+        let roots: Vec<std::path::PathBuf> = self
+            .roots
             .iter()
             .filter_map(|p| p.canonicalize().ok())
             .collect();
@@ -676,7 +698,7 @@ pub async fn session_file(
             let mut events = Vec::new();
             let mut since = 0u64;
             loop {
-                let page = store.replay_page(&session_id, since, Some(1000));
+                let page = self.store.replay_page(&self.session_id, since, Some(1000));
                 let advance = page.last_scanned_seq;
                 events.extend(page.events);
                 match (page.has_more, advance) {
@@ -687,11 +709,28 @@ pub async fn session_file(
             crate::server::api::file_provenance::collect_touched_paths(&events)
         };
 
-        let confined = crate::server::api::file_provenance::confine_path(
-            &roots,
-            touched,
-            std::path::Path::new(&requested),
-        )?;
+        crate::server::api::file_provenance::confine_path(&roots, touched, requested)
+    }
+}
+
+/// Read a session file for the dashboard file viewer.
+pub async fn session_file(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    axum::extract::Query(query): axum::extract::Query<SessionFileQuery>,
+) -> impl IntoResponse {
+    // Reads workspace file contents, the same inspection surface as the diff
+    // reads, and the Files pane is hidden in CityHall.
+    if let Some(resp) = crate::server::api::cityhall_block(&state) {
+        return resp;
+    }
+    let scope = match SessionFileScope::of(&state, &id).await {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+
+    let result = tokio::task::spawn_blocking(move || {
+        let confined = scope.confine(std::path::Path::new(&query.path))?;
         let (content, is_binary, truncated) =
             crate::server::api::file_provenance::read_confined(&confined, MAX_CONTENTS_BYTES)?;
         Ok::<_, (StatusCode, &'static str)>(SessionFileResponse {
@@ -718,6 +757,23 @@ pub async fn session_file(
             )
         }
     }
+}
+
+/// Serve a session file's raw bytes for the Files pane's "Open file", confined
+/// like [`session_file`] and typed like [`session_diff_file_raw`].
+pub async fn session_file_raw(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    axum::extract::Query(query): axum::extract::Query<SessionFileQuery>,
+) -> impl IntoResponse {
+    if let Some(resp) = crate::server::api::cityhall_block(&state) {
+        return resp;
+    }
+    let scope = match SessionFileScope::of(&state, &id).await {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    open_file(query.path, move |requested| scope.confine(requested)).await
 }
 
 #[derive(Deserialize)]

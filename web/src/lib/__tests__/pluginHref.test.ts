@@ -53,6 +53,12 @@ describe("isInternalHref / toInternalPath", () => {
     expect(isInternalHref("//evil.com")).toBe(false);
   });
 
+  it("does not treat a path that normalizes to a scheme-relative URL as internal", () => {
+    for (const href of ["/..//evil.com", "/a/../..//evil.com", `${origin}/..//evil.com`]) {
+      expect(isInternalHref(href)).toBe(false);
+    }
+  });
+
   it("does not treat a backslash- or control-character-smuggled scheme-relative URL as internal", () => {
     // Browsers normalize `\` to `/` for special schemes and strip tab/CR/LF anywhere in the
     // string, so these resolve to a different origin despite starting with a single `/`.

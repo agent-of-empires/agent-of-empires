@@ -1,9 +1,8 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { act, fireEvent, render, screen } from "@testing-library/react";
-import { DiffFileContextMenu, type PathMenuState } from "../DiffFileContextMenu";
+import { FileContextMenu, type PathMenuState } from "../FileContextMenu";
 import { toastBus } from "../../../lib/toastBus";
-import type { RichDiffFile } from "../../../lib/types";
 
 function stubClipboard(secure: boolean, execResult = true) {
   Object.defineProperty(window, "isSecureContext", { value: secure, configurable: true });
@@ -27,24 +26,9 @@ function stubToast() {
   return toast;
 }
 
-const file = (over: Partial<RichDiffFile> = {}): RichDiffFile => ({
-  path: "assets/logo.png",
-  old_path: null,
-  status: "modified",
-  additions: 0,
-  deletions: 0,
-  ...over,
-});
-
-function openMenu(menu: Partial<PathMenuState> = {}, sessionId: string | null = "s1") {
+function openMenu(menu: Partial<PathMenuState> = {}) {
   const onClose = vi.fn();
-  render(
-    <DiffFileContextMenu
-      menu={{ x: 12, y: 34, path: "src/app/foo.rs", ...menu }}
-      sessionId={sessionId}
-      onClose={onClose}
-    />,
-  );
+  render(<FileContextMenu menu={{ x: 12, y: 34, path: "src/app/foo.rs", ...menu }} onClose={onClose} />);
   return onClose;
 }
 
@@ -71,9 +55,9 @@ afterEach(() => {
   toastBus.handler = null;
 });
 
-describe("DiffFileContextMenu", () => {
+describe("FileContextMenu", () => {
   it("renders nothing without a menu", () => {
-    render(<DiffFileContextMenu menu={null} onClose={() => {}} />);
+    render(<FileContextMenu menu={null} onClose={() => {}} />);
     expect(screen.queryByText("Copy relative path")).toBeNull();
   });
 
@@ -111,14 +95,13 @@ describe("DiffFileContextMenu", () => {
     expect(onClose).toHaveBeenCalled();
   });
 
-  it("opens the file's worktree copy from its own repo in a new tab", async () => {
+  it("opens the file's URL in a new tab", async () => {
     const tab = stubTab();
     const png = new Response("png", { headers: { "Content-Type": "image/png" } });
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(png));
     vi.stubGlobal("URL", { createObjectURL: vi.fn(() => "blob:logo"), revokeObjectURL: vi.fn() });
     const toast = stubToast();
-    const target = file({ path: "assets/logo.png", repo_name: "web" });
-    const onClose = openMenu({ path: target.path, file: target });
+    const onClose = openMenu({ path: "assets/logo.png", open: { url: "/raw/logo.png" } });
 
     const items = screen.getAllByRole("menuitem").map((b) => b.textContent);
     expect(items).toEqual(["Open file", "Copy relative path"]);
@@ -127,7 +110,7 @@ describe("DiffFileContextMenu", () => {
     expect(window.open).toHaveBeenCalledWith("about:blank", "_blank");
     expect(onClose).toHaveBeenCalledTimes(1);
     await settle();
-    expect(fetch).toHaveBeenCalledWith("/api/sessions/s1/diff/file/raw?path=assets%2Flogo.png&repo=web");
+    expect(fetch).toHaveBeenCalledWith("/raw/logo.png");
     await vi.waitFor(() => expect(tab.location.href).toBe("blob:logo"));
     expect(toast.error).not.toHaveBeenCalled();
   });
@@ -140,17 +123,16 @@ describe("DiffFileContextMenu", () => {
     const tab = stubTab();
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(null, { status })));
     const toast = stubToast();
-    openMenu({ path: "gone.bin", file: file({ path: "gone.bin" }) });
+    openMenu({ path: "gone.bin", open: { url: "/raw/gone.bin" } });
     fireEvent.click(screen.getByText("Open file"));
     await vi.waitFor(() => expect(toast.error).toHaveBeenCalledWith(message));
-    expect(fetch).toHaveBeenCalledWith("/api/sessions/s1/diff/file/raw?path=gone.bin");
     expect(tab.close).toHaveBeenCalled();
   });
 
-  it("keeps Open file visible but disabled for a deleted file, and still copies", async () => {
+  it("keeps a disabled Open file visible, and still copies", async () => {
     vi.stubGlobal("open", vi.fn());
     const { writeText } = stubClipboard(true);
-    openMenu({ path: "old.pdf", file: file({ path: "old.pdf", status: "deleted" }) });
+    openMenu({ path: "old.pdf", open: { url: "/raw/old.pdf", disabled: true } });
     const openItem = screen.getByRole("menuitem", { name: "Open file" });
     expect(openItem).toHaveProperty("disabled", true);
     fireEvent.click(openItem);
@@ -159,11 +141,8 @@ describe("DiffFileContextMenu", () => {
     expect(writeText).toHaveBeenCalledWith("old.pdf");
   });
 
-  it.each<[string, Partial<PathMenuState>, string | null]>([
-    ["a directory row", { path: "src/app" }, "s1"],
-    ["a menu without a session", { file: file() }, null],
-  ])("only copies for %s", (_, menu, sessionId) => {
-    openMenu(menu, sessionId);
+  it("only copies for a directory row", () => {
+    openMenu({ path: "src/app" });
     expect(screen.getAllByRole("menuitem").map((b) => b.textContent)).toEqual(["Copy relative path"]);
   });
 });

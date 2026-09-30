@@ -42,7 +42,7 @@ fn worker_not_ready() -> Response {
     (StatusCode::SERVICE_UNAVAILABLE, "worker_not_ready").into_response()
 }
 
-/// `no_revive` refused: reviving (archived/snoozed/idle-dormant wake, or a
+/// `no_revive` refused: reviving (snoozed/idle-dormant wake, or a
 /// stopped worker) was required to accept this prompt and the caller asked
 /// not to. Distinct from `worker_not_ready`, which is transient and worth
 /// retrying; this is a standing precondition until something else revives
@@ -81,6 +81,9 @@ pub async fn acp_prompt(
     {
         PromptTouch::Touched { idle_dormant } => idle_dormant,
         PromptTouch::RevivalRefused => return no_revive_refused(),
+        PromptTouch::Blocked(blocked) => {
+            return crate::server::api::start_blocked_response(blocked)
+        }
     };
     // Validated before publishing or resuming, so a rejected prompt leaves no
     // trace in the transcript and spawns no worker.
@@ -92,7 +95,7 @@ pub async fn acp_prompt(
     // (#3621). The wake already cleared the dormant marker, hence the flag.
     let dispatch = state
         .session_service
-        .prompt_dispatch_under_submission(&id, woke_idle_dormant)
+        .prompt_dispatch_under_submission(&id, woke_idle_dormant, req.no_revive)
         .await;
     // Refused before touching the pending-turn/queue state below, so a
     // rejected prompt leaves both untouched (#4081 review).
@@ -122,7 +125,6 @@ pub async fn acp_prompt(
             req.text.clone(),
             &attachments,
             None,
-            chrono::Utc::now().to_rfc3339(),
         )
         .await
         {
@@ -230,14 +232,18 @@ pub async fn acp_prompt_diff_comments(
     else {
         return session_not_found();
     };
-    let woke_idle_dormant = state
+    let woke_idle_dormant = match state
         .session_service
         .touch_and_wake_on_prompt(&id, false)
         .await
-        .idle_dormant();
+        .idle_dormant()
+    {
+        Ok(woke) => woke,
+        Err(blocked) => return crate::server::api::start_blocked_response(blocked),
+    };
     let dispatch = state
         .session_service
-        .prompt_dispatch_under_submission(&id, woke_idle_dormant)
+        .prompt_dispatch_under_submission(&id, woke_idle_dormant, false)
         .await;
     // There is no queue row for a typed review, so refuse rather than publish
     // a card the agent would then reject as busy.

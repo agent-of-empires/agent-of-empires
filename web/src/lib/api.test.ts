@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import * as api from "./api";
 import type { ServerAbout } from "./api";
+import { onSettingsChanged } from "./settingsEvents";
 import type { CreateSessionRequest, SettingsFieldDescriptor } from "./types";
 
 const fetchSpy = vi.fn<typeof fetch>();
@@ -61,7 +62,7 @@ const requestCases: RequestCase[] = [
     () => api.updateWorkspaceOrdering(["a", "b"]),
     { body: { order: ["a", "b"] }, result: true },
   ],
-  ["POST /api/sessions/s1/terminal?index=0", () => api.ensureTerminal("s1"), { result: true }],
+  ["POST /api/sessions/s1/terminal?index=0", () => api.ensureTerminal("s1"), { result: { ok: true } }],
   ["POST /api/sessions/s1/container-terminal?index=2", () => api.ensureTerminal("s1", 2, true)],
   ["DELETE /api/sessions/s1/terminal?index=2", () => api.killTerminal("s1", 2), { result: true }],
   [
@@ -74,7 +75,10 @@ const requestCases: RequestCase[] = [
   ["GET /api/sessions/s1/file?path=a+b.ts", () => api.getSessionFile("s1", "a b.ts")],
   ["GET /api/settings", () => api.fetchSettings()],
   ["GET /api/settings?profile=my%20profile", () => api.fetchSettings("my profile")],
+  ["GET /api/settings?layer=machine", () => api.fetchMachineSettings()],
   ["PATCH /api/settings", () => api.updateSettings({ a: 1 }), { body: { a: 1 }, result: true }],
+  ["PATCH /api/settings?profile=my%20p", () => api.updateSettings({ a: 1 }, "my p"), { body: { a: 1 }, result: true }],
+  ["PATCH /api/settings?layer=machine", () => api.updateMachineSettings({ a: 1 }), { body: { a: 1 }, result: true }],
   ["PATCH /api/theme", () => api.updateTheme({ name: "dracula" }), { body: { name: "dracula" }, result: true }],
   ["GET /api/app-state/web-ui-state", () => api.getWebUiState(), { respond: json({ k: "v" }), result: { k: "v" } }],
   [
@@ -197,14 +201,12 @@ const requestCases: RequestCase[] = [
       api.enqueueServerPrompt("s1", {
         id: "q1",
         text: "hi",
-        createdAt: "t0",
         attachments: [{ kind: "image", mimeType: "image/png", name: "a.png", dataB64: "AA" }],
       }),
     {
       body: {
         id: "q1",
         text: "hi",
-        created_at: "t0",
         attachments: [{ kind: "image", mime_type: "image/png", data: "AA", name: "a.png" }],
       },
       respond: json({ id: "q1", seq: 3 }),
@@ -346,7 +348,11 @@ const requestCases: RequestCase[] = [
   ],
   ["POST /api/sessions/s1/restore", () => api.restoreSession("s1"), { respond: json(session), result: session }],
   ["POST /api/sessions/s1/stop", () => api.stopSession("s1"), { respond: json(session), result: session }],
-  ["POST /api/sessions/s1/start", () => api.startSession("s1"), { respond: json(session), result: session }],
+  [
+    "POST /api/sessions/s1/start",
+    () => api.startSession("s1"),
+    { respond: json(session), result: { ok: true, session } },
+  ],
   ["PATCH /api/sessions/s1/snooze", () => api.setSessionSnooze("s1", 60), { body: { minutes: 60 } }],
   ["PATCH /api/sessions/s1/unread", () => api.setSessionUnread("s1", true), { body: { unread: true } }],
   [
@@ -547,11 +553,33 @@ describe("request shapes", () => {
   });
 });
 
+describe("settings saves", () => {
+  it.each([
+    ["updateSettings", () => api.updateSettings({ a: 1 }, "p")],
+    ["updateMachineSettings", () => api.updateMachineSettings({ a: 1 })],
+    ["updateProfileSettings", () => api.updateProfileSettings("p", { a: 1 })],
+    ["setDefaultProfile", () => api.setDefaultProfile("p")],
+  ])("%s announces a landed save and stays quiet on a rejected one", async (_name, save) => {
+    const listener = vi.fn();
+    const off = onSettingsChanged(listener);
+    try {
+      fetchSpy.mockImplementation(async () => empty(500));
+      expect(await save()).toBe(false);
+      expect(listener).not.toHaveBeenCalled();
+
+      fetchSpy.mockImplementation(async () => empty());
+      expect(await save()).toBe(true);
+      expect(listener).toHaveBeenCalledTimes(1);
+    } finally {
+      off();
+    }
+  });
+});
+
 const failureCases: [string, () => Promise<unknown>, unknown][] = [
   ["fetchSessions", () => api.fetchSessions(), null],
   ["searchConversations", () => api.searchConversations("q"), []],
   ["updateWorkspaceOrdering", () => api.updateWorkspaceOrdering([]), false],
-  ["ensureTerminal", () => api.ensureTerminal("s1"), false],
   ["getSessionFileContents", () => api.getSessionFileContents("s1", "a"), null],
   ["fetchThemes", () => api.fetchThemes(), []],
   ["fetchAcpAgents", () => api.fetchAcpAgents(), []],
@@ -611,6 +639,46 @@ describe("ensureSession", () => {
     expect(await api.ensureSession("s1")).toEqual({ ok: false, error: "aborted" });
     offline();
     expect(await api.ensureSession("s1")).toEqual({ ok: false, message: "offline" });
+  });
+});
+describe("ensureTerminal", () => {
+  it.each([
+    [
+      "container refusal",
+      json({ error: "session_archived", message: "session is archived; unarchive it first" }, 409),
+      { ok: false, error: "session_archived", message: "session is archived; unarchive it first" },
+    ],
+    ["empty error body", empty(500), { ok: false, message: "Server error (500)" }],
+  ])("%s", async (_name, response, expected) => {
+    fetchSpy.mockResolvedValueOnce(response);
+    expect(await api.ensureTerminal("s1", 0, true)).toEqual(expected);
+  });
+
+  it("reports a network failure", async () => {
+    offline();
+    expect(await api.ensureTerminal("s1")).toEqual({ ok: false, message: "offline" });
+  });
+});
+describe("startSession", () => {
+  it.each([
+    [
+      "archived refusal",
+      json({ error: "session_archived", message: "session is archived; unarchive it first" }, 409),
+      { ok: false, refused: true, message: "session is archived; unarchive it first" },
+    ],
+    [
+      "trashed refusal",
+      json({ error: "session_trashed", message: "session is in trash; restore it first" }, 409),
+      { ok: false, refused: true, message: "session is in trash; restore it first" },
+    ],
+    [
+      "restart failure",
+      json({ error: "restart_failed", message: "boom" }, 500),
+      { ok: false, refused: false, message: "boom" },
+    ],
+  ])("%s", async (_name, response, expected) => {
+    fetchSpy.mockResolvedValueOnce(response);
+    expect(await api.startSession("s1")).toEqual(expected);
   });
 });
 describe("acpDisable", () => {

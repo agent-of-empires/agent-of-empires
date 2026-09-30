@@ -555,14 +555,14 @@ async fn sessions_turn_send(
         // caught up. Cleared by the next real status transition this session gets (see
         // `apply_status_intent` in `server::acp_events`), not by this RPC call returning:
         // `send_turn` only queues the prompt, and `Instance.status` itself updates later,
-        // asynchronously, off the ACP event listener. A trashed target is the one exemption,
-        // since it can never resume.
+        // asynchronously, off the ACP event listener. Archived and trashed targets are exempt,
+        // since a prompt never revives them.
         let marked_pending = {
             let mut instances = deps.session_service.instances.write().await;
             let needs_reservation = instances
                 .iter()
                 .find(|i| i.id == req.session_id)
-                .is_some_and(|i| !i.is_trashed() && !i.counts_toward_plugin_session_cap());
+                .is_some_and(|i| i.ensure_startable().is_ok() && !i.counts_toward_plugin_session_cap());
             if needs_reservation {
                 let active_sessions = instances
                     .iter()
@@ -590,14 +590,27 @@ async fn sessions_turn_send(
             }
         };
 
-        let woke_idle_dormant = deps
+        let woke_idle_dormant = match deps
             .session_service
             .touch_and_wake_on_prompt(&req.session_id, false)
             .await
-            .idle_dormant();
+            .idle_dormant()
+        {
+            Ok(woke) => woke,
+            Err(blocked) => {
+                if marked_pending {
+                    clear_revival_pending(&deps.session_service, &req.session_id).await;
+                }
+                return Err(DispatchError::with_kind(
+                    codes::FAILED_PRECONDITION,
+                    blocked.code(),
+                    blocked.to_string(),
+                ));
+            }
+        };
         let dispatch = deps
             .session_service
-            .prompt_dispatch_under_submission(&req.session_id, woke_idle_dormant)
+            .prompt_dispatch_under_submission(&req.session_id, woke_idle_dormant, false)
             .await;
         if let crate::acp::dispatch::PromptDispatch::Queued { reason } = dispatch {
             if !matches!(reason, crate::acp::dispatch::QueueReason::WorkerDown) {
@@ -1137,7 +1150,6 @@ mod tests {
         type Park = (&'static str, fn(&mut Instance));
         let parks: Vec<Park> = vec![
             ("idle-dormant", |i| i.mark_idle_dormant()),
-            ("archived", |i| i.archived_at = Some(chrono::Utc::now())),
             ("snoozed", |i| {
                 i.snoozed_until = Some(chrono::Utc::now() + chrono::Duration::hours(1))
             }),
@@ -1182,13 +1194,11 @@ mod tests {
         use crate::plugin::automation_policy::MAX_ACTIVE_PLUGIN_SESSIONS;
         let _home = crate::session::test_support::isolate_app_dir();
 
-        // `touch_and_wake_on_prompt` unconditionally clears archived/snoozed/idle-dormant on
-        // any successful wake, so none of the park kinds below can be treated as exempt: by
-        // the time the later resumability check would see the flag, it is already gone. Idle
+        // A successful wake clears snoozed/idle-dormant, so neither park kind can be treated as
+        // exempt: by the time a later resumability check would see the flag, it is gone. Idle
         // and Stopped have no such flag to clear, but are just as capable of a dead worker.
         type Park = (&'static str, fn(&mut Instance));
         let parks: Vec<Park> = vec![
-            ("archived", |i| i.archived_at = Some(chrono::Utc::now())),
             ("snoozed", |i| {
                 i.snoozed_until = Some(chrono::Utc::now() + chrono::Duration::hours(1))
             }),
@@ -1235,7 +1245,6 @@ mod tests {
             let instances = state.instances.read().await;
             let inst = instances.iter().find(|i| i.id == "sess-resting").unwrap();
             let still_parked = match label {
-                "archived" => inst.is_archived(),
                 "snoozed" => inst.is_snoozed(),
                 "idle-dormant" => inst.is_idle_dormant(),
                 "idle" => inst.status == Status::Idle,
@@ -1249,46 +1258,89 @@ mod tests {
         }
     }
 
+    /// #4116: a prompt never wakes an archived or trashed target. It neither consumes nor is
+    /// denied by the cap, leaves no pending mark, and leaves the row untouched.
     #[tokio::test]
-    async fn turn_send_ignores_the_cap_for_a_trashed_target() {
+    async fn turn_send_refuses_a_shelved_target_without_touching_the_cap() {
         use crate::plugin::automation_policy::MAX_ACTIVE_PLUGIN_SESSIONS;
         let _home = crate::session::test_support::isolate_app_dir();
 
-        let mut prior: Vec<Instance> = (0..MAX_ACTIVE_PLUGIN_SESSIONS)
-            .map(|n| {
-                let mut i = Instance::new("scheduled", "/tmp/aoe-4120-plugin");
-                i.id = format!("sess-running-{n}");
-                i.created_by_plugin = Some("cron".to_string());
-                i.status = Status::Running;
-                i
-            })
-            .collect();
+        let shelves: [(fn(&mut Instance), &str); 2] = [
+            (Instance::archive, "session_archived"),
+            (Instance::trash, "session_trashed"),
+        ];
+        for (shelve, want) in shelves {
+            let mut prior: Vec<Instance> = (0..MAX_ACTIVE_PLUGIN_SESSIONS)
+                .map(|n| {
+                    let mut i = Instance::new("scheduled", "/tmp/aoe-4120-plugin");
+                    i.id = format!("sess-running-{n}");
+                    i.created_by_plugin = Some("cron".to_string());
+                    i.status = Status::Running;
+                    i
+                })
+                .collect();
 
-        let mut trashed = Instance::new("parked-owned", "/tmp/aoe-4120-plugin");
-        trashed.id = "sess-trashed".to_string();
-        trashed.view = crate::session::View::Structured;
-        trashed.agent_name = Some("aoe-no-such-agent-4120".to_string());
-        trashed.created_by_plugin = Some("cron".to_string());
-        trashed.trash();
-        prior.push(trashed);
+            let mut shelved = Instance::new("parked-owned", "/tmp/aoe-4120-plugin");
+            shelved.id = "sess-shelved".to_string();
+            shelved.view = crate::session::View::Structured;
+            shelved.agent_name = Some("aoe-no-such-agent-4120".to_string());
+            shelved.created_by_plugin = Some("cron".to_string());
+            shelve(&mut shelved);
+            prior.push(shelved.clone());
 
-        let (deps, _state, _dir) = test_deps_with_state(prior);
-        let ctx = ctx_with(&["session.prompt"]);
-
-        let result = dispatch(
-            &deps,
-            &ctx,
-            "sessions.turn.send",
-            &serde_json::json!({ "session_id": "sess-trashed", "text": "wake up" }),
-        )
-        .await;
-        if let Err(err) = &result {
-            assert_ne!(
-                kind(err),
-                "concurrency_limited",
-                "a trashed session can never resume, so it must not consume the cap: {err:?}"
-            );
+            let (deps, state, _dir) = test_deps_with_state(prior);
+            let err = dispatch(
+                &deps,
+                &ctx_with(&["session.prompt"]),
+                "sessions.turn.send",
+                &serde_json::json!({ "session_id": "sess-shelved", "text": "wake up" }),
+            )
+            .await
+            .expect_err("a shelved session must not be woken");
+            assert_eq!(kind(&err), want);
+            let instances = state.instances.read().await;
+            let inst = instances.iter().find(|i| i.id == "sess-shelved").unwrap();
+            assert!(!inst.plugin_revival_pending, "{want}");
+            assert_eq!(inst.archived_at, shelved.archived_at, "{want}");
+            assert_eq!(inst.trashed_at, shelved.trashed_at, "{want}");
+            assert_eq!(inst.last_accessed_at, shelved.last_accessed_at, "{want}");
+            assert!(!state.acp_supervisor.is_running("sess-shelved").await);
         }
+    }
+
+    /// #4116: a peer that archived the stored row after the cap reservation still releases the
+    /// pending mark, so the refused revival does not hold a slot.
+    #[tokio::test]
+    async fn turn_send_releases_the_pending_mark_when_the_stored_row_was_archived() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let mut resting = Instance::new("parked-owned", "/tmp/aoe-4116-plugin");
+        resting.id = "sess-resting".to_string();
+        resting.source_profile = "default".to_string();
+        resting.view = crate::session::View::Structured;
+        resting.created_by_plugin = Some("cron".to_string());
+        resting.status = Status::Idle;
+        let mut peer = resting.clone();
+        peer.archive();
+        crate::session::Storage::new_unwatched("default")
+            .unwrap()
+            .update(|rows, _| {
+                *rows = vec![peer];
+                Ok(())
+            })
+            .unwrap();
+        let (deps, state, _dir) = test_deps_with_state(vec![resting]);
+
+        let err = dispatch(
+            &deps,
+            &ctx_with(&["session.prompt"]),
+            "sessions.turn.send",
+            &serde_json::json!({ "session_id": "sess-resting", "text": "wake up" }),
+        )
+        .await
+        .expect_err("a row archived on disk must not be woken");
+        assert_eq!(kind(&err), "session_archived");
+        let instances = state.instances.read().await;
+        assert!(!instances[0].plugin_revival_pending);
     }
 
     /// The atomic property the pending mark exists for: a sibling revival already admitted

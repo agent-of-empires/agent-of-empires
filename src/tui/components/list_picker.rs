@@ -6,6 +6,7 @@ use ratatui::widgets::*;
 use tui_input::backend::crossterm::EventHandler;
 use tui_input::Input;
 
+use super::hint_buttons::HintButtons;
 use super::text_input::set_prefixed_input_cursor_position;
 use crate::tui::styles::Theme;
 
@@ -32,6 +33,7 @@ pub struct ListPicker {
     /// index without re-deriving the scroll math.
     list_area: Rect,
     list_scroll_offset: usize,
+    footer: HintButtons,
 }
 
 impl ListPicker {
@@ -45,6 +47,7 @@ impl ListPicker {
             dialog_area: Rect::default(),
             list_area: Rect::default(),
             list_scroll_offset: 0,
+            footer: HintButtons::default(),
         }
     }
 
@@ -80,6 +83,9 @@ impl ListPicker {
             self.active = false;
             return ListPickerResult::Cancelled;
         }
+        if let Some(key) = self.footer.key_at(col, row) {
+            return self.handle_key(key);
+        }
         if let Some(idx) = self.row_to_filtered_idx(col, row) {
             let value = self.filtered_items()[idx].clone();
             self.active = false;
@@ -88,17 +94,12 @@ impl ListPicker {
         ListPickerResult::Continue
     }
 
-    /// Move the highlight to whatever row the mouse is hovering.
-    /// Returns true when the selection actually changed.
+    /// Move the highlight to whatever row the mouse is hovering and tint a
+    /// hovered hint. Returns true when either changed.
     pub fn handle_hover(&mut self, col: u16, row: u16) -> bool {
-        let Some(idx) = self.row_to_filtered_idx(col, row) else {
-            return false;
-        };
-        if self.selected == idx {
-            return false;
-        }
-        self.selected = idx;
-        true
+        let hovered = self.row_to_filtered_idx(col, row);
+        self.footer.handle_hover(col, row)
+            | crate::tui::dialogs::hover_select(&mut self.selected, hovered)
     }
 
     pub fn is_active(&self) -> bool {
@@ -258,16 +259,17 @@ impl ListPicker {
         }
         frame.render_widget(Paragraph::new(lines), chunks[2]);
 
-        // Hint line
-        let hint_line = Line::from(vec![
-            Span::styled("Type", Style::default().fg(theme.hint)),
-            Span::raw(" filter  "),
-            Span::styled("Enter", Style::default().fg(theme.hint)),
-            Span::raw(" select  "),
-            Span::styled("Esc", Style::default().fg(theme.hint)),
-            Span::raw(" cancel"),
-        ]);
-        frame.render_widget(Paragraph::new(hint_line), chunks[3]);
+        self.footer.render(
+            frame,
+            chunks[3],
+            theme,
+            &[
+                ("Type", "filter", KeyCode::Null),
+                ("Enter", "select", KeyCode::Null),
+                ("Esc", "cancel", KeyCode::Esc),
+            ],
+            Alignment::Left,
+        );
     }
 }
 

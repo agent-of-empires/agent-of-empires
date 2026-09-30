@@ -125,7 +125,8 @@ fn create_pane(name: &str, typed: &str) {
         let output = Command::new("tmux")
             .arg("-S")
             .arg(tmux_socket())
-            .args(["capture-pane", "-t", name, "-p"])
+            // `-J` joins soft-wrapped rows so a prompt longer than the pane width still matches.
+            .args(["capture-pane", "-t", name, "-p", "-J"])
             .output()
             .expect("tmux capture-pane");
         pane = String::from_utf8_lossy(&output.stdout).into_owned();

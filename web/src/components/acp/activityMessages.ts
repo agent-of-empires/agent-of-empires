@@ -19,6 +19,7 @@ export const TODO_GROUP_NAME = "_aoe_todo_group";
 
 /** Two in a row stay inline; three or more fold. */
 const TOOL_GROUP_MIN_RUN = 3;
+const TOOL_GROUP_MAX_RUN = 10;
 
 /** React key for the fold point: the last `/clear` id, "none" before one, "all" when unfolded. */
 export function clearFoldGeneration(rows: readonly ActivityRow[], showClearedTurns: boolean): string {
@@ -273,28 +274,33 @@ function collapseSubagents(parts: DraftPart[], profile: AgentProfile): DraftPart
   return out;
 }
 
-/** Fold runs of 3+ consecutive tool calls between text into one group. Group ids
- *  anchor on the first child so a growing run keeps its card and expand state. */
+/** Fold runs of 3+ consecutive tool calls between text into groups, splitting
+ *  generic runs into chunks of at most TOOL_GROUP_MAX_RUN. Group ids anchor on
+ *  each chunk's first child so a growing run keeps its cards and expand state. */
 function collapseToolRuns(parts: DraftPart[], todosEnabled: boolean): DraftPart[] {
   const out: DraftPart[] = [];
   let run: ToolPart[] = [];
-  const group = (toolName: string, prefix: string) =>
+  const group = (toolName: string, prefix: string, children: ToolPart[]) =>
     out.push({
       type: "tool-call",
-      toolCallId: `${prefix}-${run[0]!.toolCallId}`,
+      toolCallId: `${prefix}-${children[0]!.toolCallId}`,
       toolName,
-      argsText: JSON.stringify({ children: run.map(childPayload) }),
+      argsText: JSON.stringify({ children: children.map(childPayload) }),
     });
   const flushRun = () => {
     const isTodo = (p: ToolPart) => isTodoWriteArgsText(p.argsText, todosEnabled);
     if (run.length >= TOOL_GROUP_MIN_RUN && run.every(isTodo)) {
-      group(TODO_GROUP_NAME, "todogroup");
+      group(TODO_GROUP_NAME, "todogroup", run);
     } else if (
       run.length >= TOOL_GROUP_MIN_RUN &&
       // A todo update among real work, or a subagent card, stays inline.
       !run.some((p) => isTodo(p) || p.toolName === SUBAGENT_TASK_NAME)
     ) {
-      group(TOOL_GROUP_NAME, "group");
+      for (let i = 0; i < run.length; i += TOOL_GROUP_MAX_RUN) {
+        const chunk = run.slice(i, i + TOOL_GROUP_MAX_RUN);
+        if (chunk.length >= TOOL_GROUP_MIN_RUN) group(TOOL_GROUP_NAME, "group", chunk);
+        else out.push(...chunk);
+      }
     } else {
       out.push(...run);
     }

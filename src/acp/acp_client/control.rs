@@ -1,7 +1,7 @@
 //! The v3 runner control socket: connecting, establishing a session, and
 //! routing ACP frames over it.
 
-use crate::acp::control_protocol::{self, ControlBody, SessionReplayed};
+use crate::acp::control_protocol::{self, ControlBody, PromptCompletedMarker, SessionReplayed};
 use crate::acp::state::Event;
 use agent_client_protocol::schema::v1::PromptResponse;
 use agent_client_protocol::JsonRpcMessage as _;
@@ -41,7 +41,7 @@ pub(super) struct DaemonControlClient {
     sessions_replayed: watch::Sender<u64>,
     completion: Arc<std::sync::Mutex<PromptCompletion>>,
     /// A matched local outcome held until the crate reaches its
-    /// [`PromptCompletedMarker`].
+    /// [`PromptCompletedMarker`], or until one of the reader's relays fails.
     settled: Arc<std::sync::Mutex<Option<LocalOutcome>>>,
     raw_fd: RawFd,
 }
@@ -50,21 +50,6 @@ type LocalOutcome = (
     oneshot::Sender<control_protocol::PromptOutcome>,
     control_protocol::PromptOutcome,
 );
-
-/// Daemon-minted notification written to the crate after a local prompt's
-/// `PromptCompleted`. The crate handles notifications in order, so the waiter
-/// resolves only after the updates the agent sent before its reply, such as a
-/// rate-limit reset, have been applied.
-#[derive(
-    Debug,
-    Clone,
-    Default,
-    serde::Serialize,
-    serde::Deserialize,
-    agent_client_protocol::JsonRpcNotification,
-)]
-#[notification(method = "_aoe/prompt_completed")]
-pub(super) struct PromptCompletedMarker {}
 
 enum PromptCompletion {
     Adopted,
@@ -105,7 +90,8 @@ impl ShimCorrelation {
     }
 }
 
-/// False once the crate side has hung up.
+/// `true` once the line sits in the pipe for the crate; `false` once this
+/// write half is closed, by the crate hanging up or by the reader's teardown.
 async fn shim_write_line(
     duplex: &Mutex<tokio::io::WriteHalf<tokio::io::DuplexStream>>,
     value: &serde_json::Value,
@@ -117,6 +103,28 @@ async fn shim_write_line(
     bytes.push(b'\n');
     let mut w = duplex.lock().await;
     w.write_all(&bytes).await.is_ok() && w.flush().await.is_ok()
+}
+
+/// Drop the settled outcome, so its waiter aborts instead of waiting on a
+/// marker that can no longer reach the crate.
+fn release_settled(settled: &std::sync::Mutex<Option<LocalOutcome>>) {
+    settled.lock().expect("settled mutex poisoned").take();
+}
+
+/// Every relay the reader makes to the crate, so a failed one releases the
+/// settled sender: the crate is gone, and no marker will reach it. Only a
+/// write failure returns `false` here, since a `serde_json::Value` always
+/// encodes.
+async fn shim_write_line_releasing(
+    duplex: &Mutex<tokio::io::WriteHalf<tokio::io::DuplexStream>>,
+    value: &serde_json::Value,
+    settled: &std::sync::Mutex<Option<LocalOutcome>>,
+) -> bool {
+    if shim_write_line(duplex, value).await {
+        return true;
+    }
+    release_settled(settled);
+    false
 }
 
 impl DaemonControlClient {
@@ -416,7 +424,7 @@ pub(super) async fn connect_runner_control_v3(
                             "method": PromptCompletedMarker::default().method(),
                             "params": {},
                         });
-                        if !shim_write_line(&reader_shim_write, &marker).await {
+                        if !shim_write_line_releasing(&reader_shim_write, &marker, &reader_settled).await {
                             return;
                         }
                     } else {
@@ -459,7 +467,7 @@ pub(super) async fn connect_runner_control_v3(
                         "method": method,
                         "params": params,
                     });
-                    if !shim_write_line(&reader_shim_write, &line).await {
+                    if !shim_write_line_releasing(&reader_shim_write, &line, &reader_settled).await {
                         return;
                     }
                 }
@@ -478,7 +486,7 @@ pub(super) async fn connect_runner_control_v3(
                     let mut line = serde_json::json!({"jsonrpc": "2.0"});
                     line["method"] = method.into();
                     line["params"] = params;
-                    if !shim_write_line(&reader_shim_write, &line).await {
+                    if !shim_write_line_releasing(&reader_shim_write, &line, &reader_settled).await {
                         return;
                     }
                 }
@@ -489,7 +497,7 @@ pub(super) async fn connect_runner_control_v3(
                         let line = serde_json::json!({
                             "jsonrpc": "2.0", "id": id, "result": result,
                         });
-                        if !shim_write_line(&reader_shim_write, &line).await {
+                        if !shim_write_line_releasing(&reader_shim_write, &line, &reader_settled).await {
                             return;
                         }
                     }
@@ -500,7 +508,7 @@ pub(super) async fn connect_runner_control_v3(
                         let line = serde_json::json!({
                             "jsonrpc": "2.0", "id": id, "error": error,
                         });
-                        if !shim_write_line(&reader_shim_write, &line).await {
+                        if !shim_write_line_releasing(&reader_shim_write, &line, &reader_settled).await {
                             return;
                         }
                     }
@@ -605,6 +613,8 @@ pub(super) async fn connect_runner_control_v3(
                                 "message": format!("request exceeds control transport capacity: {error}"),
                             },
                         });
+                        // The reader's teardown closes this half too, so a
+                        // failure here does not mean the crate is gone.
                         if !shim_write_line(&pump_shim_write, &response).await {
                             return;
                         }
@@ -883,6 +893,37 @@ mod tests {
             }
         }
 
+        /// Drop the crate side so a reader relay fails as it would for a dead
+        /// transport. The replacement only keeps the field typed.
+        fn close_crate_side(&mut self) {
+            let (dead, peer) = tokio::io::duplex(64);
+            drop(peer);
+            self.transport = BufReader::new(dead);
+        }
+
+        /// Wait until the reader has settled the matched outcome, which a
+        /// relayed marker alone never resolves.
+        async fn await_settled_outcome(&self, completion: &mut oneshot::Receiver<PromptOutcome>) {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while self
+                    .client
+                    .settled
+                    .lock()
+                    .expect("settled mutex poisoned")
+                    .is_none()
+                {
+                    assert_eq!(
+                        completion.try_recv(),
+                        Err(oneshot::error::TryRecvError::Empty),
+                        "the waiter must stay open and unresolved until the reader settles the outcome"
+                    );
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the reader must settle the matched outcome");
+        }
+
         fn assert_local_terminal_ownership(&mut self) {
             assert!(self.in_flight.load(AtomicOrdering::Relaxed));
             assert!(!self.terminal.claimed());
@@ -971,6 +1012,106 @@ mod tests {
         peer.drain().await;
         assert_eq!(completion.await.unwrap(), end("cancelled"));
         peer.assert_local_terminal_ownership();
+    }
+
+    /// The sender is settled before the marker is relayed, so a failed relay
+    /// drops it and aborts the waiter while the client still commands the runner.
+    #[tokio::test]
+    async fn failed_marker_relay_aborts_the_waiter_without_dropping_the_client() {
+        let mut peer = PromptControlPeer::new().await;
+        let completion = peer.prompt().await;
+        peer.send(ControlBody::PromptStarted { prompt_req_id: 9 })
+            .await;
+        peer.close_crate_side();
+        peer.completed(9, "end_turn").await;
+        assert!(tokio::time::timeout(Duration::from_secs(2), completion)
+            .await
+            .expect("a completion the crate never receives must abort the waiter")
+            .is_err());
+        // The waiter aborted, not the handle: the client still commands the
+        // runner.
+        peer.client.cancel().await;
+        assert!(matches!(
+            control_protocol::read_frame(&mut peer.peer).await.unwrap(),
+            Some(ControlBody::Cancel)
+        ));
+    }
+
+    /// A marker already buffered for the crate stays deliverable, so the
+    /// reader's teardown must not release the sender: the turn would end as
+    /// aborted, losing its real stop reason and any rate-limit parking.
+    #[tokio::test]
+    async fn runner_hangup_still_delivers_a_relayed_outcome() {
+        let mut peer = PromptControlPeer::new().await;
+        let mut completion = peer.prompt().await;
+        peer.send(ControlBody::PromptStarted { prompt_req_id: 9 })
+            .await;
+        // No crate reads this peer's transport, so the relayed marker stays
+        // undispatched.
+        peer.completed(9, "end_turn").await;
+        peer.await_settled_outcome(&mut completion).await;
+        // Hang the runner up so the reader's teardown runs, crate side up.
+        peer.peer.shutdown().await.unwrap();
+        // Reading to EOF drains the buffer ahead of the shutdown, and only the
+        // reader's teardown produces that EOF, so this waits out the teardown
+        // rather than racing it.
+        let mut relayed = String::new();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            peer.transport.read_to_string(&mut relayed),
+        )
+        .await
+        .expect("a relayed marker must reach the crate")
+        .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(relayed.trim())
+                .unwrap()
+                .get("method")
+                .unwrap(),
+            &serde_json::json!(PromptCompletedMarker::default().method())
+        );
+        peer.client
+            .deliver_prompt_completion(PromptCompletedMarker::default());
+        assert_eq!(completion.await.unwrap(), end("end_turn"));
+    }
+
+    /// The settled sender loses its route when any later relay fails, so that
+    /// waiter aborts too rather than waiting for the handle to drop.
+    #[tokio::test]
+    async fn failed_relay_after_a_relayed_marker_aborts_the_waiter() {
+        let mut peer = PromptControlPeer::new().await;
+        let mut completion = peer.prompt().await;
+        peer.send(ControlBody::PromptStarted { prompt_req_id: 9 })
+            .await;
+        peer.completed(9, "end_turn").await;
+        peer.await_settled_outcome(&mut completion).await;
+        // Reading the marker proves the relay that wrote it returned, so the
+        // notification below is the relay that fails.
+        let mut relayed = String::new();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            peer.transport.read_line(&mut relayed),
+        )
+        .await
+        .expect("the relayed marker must reach the crate")
+        .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(relayed.trim())
+                .unwrap()
+                .get("method")
+                .unwrap(),
+            &serde_json::json!(PromptCompletedMarker::default().method())
+        );
+        peer.close_crate_side();
+        peer.send(ControlBody::Notify {
+            method: "test/after".into(),
+            params: serde_json::json!({}),
+        })
+        .await;
+        assert!(tokio::time::timeout(Duration::from_secs(2), completion)
+            .await
+            .expect("an unreachable crate must abort the waiter")
+            .is_err());
     }
 
     /// An oversized reverse response becomes a bounded error and the
@@ -1607,7 +1748,21 @@ mod tests {
                             ControlBody::PromptStarted { prompt_req_id: 1 },
                             ControlBody::Notify {
                                 method: "session/update".into(),
-                                params: serde_json::json!({"sessionId":"s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"live"}}}),
+                                params: serde_json::json!({
+                                    "sessionId": "s",
+                                    "update": {
+                                        "sessionUpdate": "usage_update",
+                                        "used": 100,
+                                        "size": 200,
+                                        "_meta": {
+                                            "_claude/rateLimit": {
+                                                "status": "rejected",
+                                                "rateLimitType": "five_hour",
+                                                "resetsAt": 4_102_444_800_i64
+                                            }
+                                        }
+                                    }
+                                }),
                             },
                             ControlBody::PromptCompleted {
                                 prompt_req_id: 1,

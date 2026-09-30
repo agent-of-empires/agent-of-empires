@@ -195,6 +195,12 @@ impl EmbeddedView {
         handle_terminal_event(&mut self.state, evt, &mut self.toast_deadline).await
     }
 
+    /// Route pointer motion to the view's popups. Only an active view takes the
+    /// mouse, as with clicks. True when a redraw is needed.
+    pub fn handle_hover(&mut self, col: u16, row: u16) -> bool {
+        self.active && super::handle_hover(&mut self.state, col, row)
+    }
+
     /// Periodic housekeeping driven by the App's refresh ticker:
     /// expire the toast and surface the next queued plugin
     /// notification. Returns `true` when something visible changed.

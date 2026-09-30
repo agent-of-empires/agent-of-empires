@@ -44,10 +44,10 @@ describe("StopSessionDialog", () => {
     expect(second.onCancel).toHaveBeenCalledTimes(1);
   });
 
-  it("is a modal dialog named by its title and restores focus on unmount", () => {
+  it("is a modal dialog named by its title, described by its body, and restores focus on unmount", () => {
     expect(
       setup()
-        .getByRole("dialog", { name: /Stop Session/ })
+        .getByRole("dialog", { name: /Stop Session/, description: /Are you sure you want to stop my-session\?/ })
         .getAttribute("aria-modal"),
     ).toBe("true");
     cleanup();

@@ -128,10 +128,17 @@ fn failing_start_state(
             })
         })
     });
-    let state = crate::server::test_support::build_test_app_state_with_launcher(
-        vec![structured_instance(id, false)],
-        launcher,
-    );
+    let inst = structured_instance(id, false);
+    // The launch admission rereads the stored row, as it exists in production.
+    crate::session::Storage::new_unwatched(&inst.source_profile)
+        .unwrap()
+        .update(|rows, _| {
+            rows.push(inst.clone());
+            Ok(())
+        })
+        .unwrap();
+    let state =
+        crate::server::test_support::build_test_app_state_with_launcher(vec![inst], launcher);
     (state, launches)
 }
 
@@ -292,7 +299,7 @@ async fn rate_limit_park_is_sendable_at_the_shared_decision_point() {
                 .await
                 .expect("session exists");
             service
-                .prompt_dispatch_under_submission(id_ref, false)
+                .prompt_dispatch_under_submission(id_ref, false, false)
                 .await
         };
         assert_eq!(
@@ -508,6 +515,66 @@ async fn no_revive_refuses_a_prompt_on_a_rate_limit_park() {
     }
 }
 
+/// #4109: a rate-limit park can retain a stale active-turn latch until the
+/// worker's `Stopped` event is persisted. `no_revive` still refuses while the
+/// worker is absent, regardless of the dispatch queue reason.
+#[tokio::test]
+async fn no_revive_refuses_a_workerless_rate_limit_park_with_a_stale_turn() {
+    let _app_dir = crate::session::test_support::isolate_app_dir();
+    let id = "sess-no-revive-stale-rate-limit".to_string();
+    let (state, launches) = failing_start_state(&id, true);
+    seed_elapsed_rate_limit_park(&state, &id, true);
+    state.instances.write().await[0].pending_initial_turn =
+        Some(crate::session::PendingInitialTurn {
+            text: "queued before the park".to_string(),
+            attachments: Vec::new(),
+            synthesized: true,
+        });
+
+    assert!(!state.acp_supervisor.is_running(&id).await);
+    assert!(
+        state
+            .session_service
+            .fold_control_state(&id)
+            .await
+            .turn_active,
+        "the fixture must retain a stale active-turn latch"
+    );
+
+    let response = acp_prompt(
+        State(Arc::clone(&state)),
+        Path(id.clone()),
+        no_revive_prompt_req("hello"),
+    )
+    .await
+    .into_response();
+
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        launches.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "no_revive must not start a worker"
+    );
+    assert!(
+        state
+            .session_service
+            .queued_prompts_snapshot(&id)
+            .await
+            .is_empty(),
+        "a refusal must not enqueue the prompt"
+    );
+    assert!(
+        state.acp_event_store.rate_limit_park(&id).is_some(),
+        "the rate-limit park must remain intact"
+    );
+    assert!(
+        state.instances.read().await[0]
+            .pending_initial_turn
+            .is_some(),
+        "the refusal must preserve the pending initial turn"
+    );
+}
+
 /// #3621: a direct prompt parks while a drain owns the session, and the drain
 /// that follows leaves its row queued behind the turn the prompt started.
 #[tokio::test]
@@ -521,14 +588,7 @@ async fn a_direct_prompt_and_the_queue_drain_cannot_both_own_the_same_turn() {
         .await;
     state
         .session_service
-        .enqueue_prompt(
-            &id,
-            "q1".into(),
-            "queued follow-up".into(),
-            vec![],
-            None,
-            "t0".into(),
-        )
+        .enqueue_prompt(&id, "q1".into(), "queued follow-up".into(), vec![], None)
         .await
         .expect("session exists");
 
@@ -609,6 +669,200 @@ async fn diff_comments_refuse_to_open_a_turn_another_submission_started() {
         e,
         Event::UserDiffCommentsPrompt { .. }
     )));
+}
+
+/// Seed the rate-limit state a resume acts on: prompt A interrupted by a limit
+/// whose park window has already elapsed, the state the install reads.
+/// Backdated an hour, under the redelivery cap. `busy` adds a running turn,
+/// which is what makes B queue rather than dispatch.
+fn seed_elapsed_rate_limit_park(state: &AppState, id: &str, busy: bool) {
+    let store = &state.acp_event_store;
+    let long_ago = chrono::Utc::now() - chrono::Duration::hours(1);
+    let at = long_ago.timestamp_millis();
+    let mut events = vec![
+        Event::UserPromptSent {
+            text: "interrupted prompt A".into(),
+            attachments: Vec::new(),
+            prompt_id: None,
+            synthesized: false,
+        },
+        Event::RateLimit {
+            info: crate::acp::state::RateLimitInfo {
+                status: "limited".into(),
+                resets_at: Some(long_ago),
+                kind: "usage".into(),
+            },
+        },
+        Event::Stopped {
+            reason: "rate_limited".into(),
+        },
+    ];
+    if busy {
+        events.push(Event::ThinkingStarted);
+    }
+    for (seq, event) in events.iter().enumerate() {
+        store
+            .record_at(id, seq as u64 + 1, event, at)
+            .expect("seed the rate-limit park");
+    }
+    state
+        .acp_supervisor
+        .hydrate_seqs([(id.to_string(), store.highest_seq(id))]);
+    let park = store.rate_limit_park(id).expect("an armed park");
+    assert!(!park.cap_reached, "the fixture must stay under the cap");
+    assert!(
+        store.rate_limited_turn_prompt(id).is_some(),
+        "the fixture must leave a continuation to install"
+    );
+}
+
+/// The pending continuation as it stands on disk, which the in-memory slot can
+/// disagree with. Reads the profile the writer resolved, and fails rather than
+/// returning `None` when the row is missing.
+async fn persisted_pending_turn(
+    state: &AppState,
+    id: &str,
+) -> Option<crate::session::PendingInitialTurn> {
+    let profile = state
+        .instances
+        .read()
+        .await
+        .iter()
+        .find(|i| i.id == id)
+        .expect("seeded session")
+        .source_profile
+        .clone();
+    crate::server::test_support::load_instances_from_disk_for_test(&profile)
+        .into_iter()
+        .find(|i| i.id == id)
+        .expect("the session row must be on disk, or this assertion is vacuous")
+        .pending_initial_turn
+}
+
+/// #4092: a manual prompt may not slip between a rate-limit continuation's
+/// store read and its installation. The producer holds the session's
+/// submission authority across that window, so B is provably serialized
+/// behind it rather than overtaking it and being overwritten.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_manual_prompt_cannot_overtake_a_continuation_install() {
+    // `queued` is the #4079 shape: a live worker with a turn in flight parks B
+    // on the server queue. `direct` has no turn, so B starts one.
+    for queued in [false, true] {
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let label = if queued { "queued" } else { "direct" };
+        let id = format!("sess-4092-{label}");
+        let inst = structured_instance(&id, false);
+        // An empty profile resolves the same way for the seeder, the writer and
+        // the reader, so all three land on one sessions.json.
+        crate::server::test_support::seed_instances_on_disk_for_test(
+            &inst.source_profile,
+            vec![inst.clone()],
+        );
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+        state
+            .acp_supervisor
+            .test_insert_worker_cmd_recording(&id)
+            .await;
+        seed_elapsed_rate_limit_park(&state, &id, queued);
+        // Causal precondition: the durable read this test ends on is live.
+        state
+            .session_service
+            .set_pending_initial_turn(&id, "probe".into(), Vec::new())
+            .await;
+        assert_eq!(
+            persisted_pending_turn(&state, &id).await.map(|t| t.text),
+            Some("probe".to_string()),
+            "{label}: a probe turn must reach disk before absence means anything"
+        );
+        state.session_service.clear_pending_initial_turn(&id).await;
+        assert!(persisted_pending_turn(&state, &id).await.is_none());
+
+        let mut barrier = state.session_service.arm_install_barrier();
+        let mut claims = state.session_service.watch_submission_claims();
+        let producer = tokio::spawn({
+            let state = Arc::clone(&state);
+            let id = id.clone();
+            async move {
+                let Some(submission) = state.session_service.try_prompt_submission(&id).await
+                else {
+                    return;
+                };
+                // B is blocked on the guard, so the queue is still empty here
+                // and the producer must decide the continuation stands.
+                let outcome = crate::server::acp_reconciler::install_rate_limit_continuation(
+                    &state, &id, submission,
+                )
+                .await;
+                assert!(matches!(
+                    outcome,
+                    crate::server::acp_reconciler::ContinuationOutcome::Stands
+                ));
+            }
+        });
+        // Causal barrier: A has been read from the store and is not installed.
+        let (read_id, release) = tokio::time::timeout(Duration::from_secs(10), barrier.recv())
+            .await
+            .expect("the producer must reach the barrier")
+            .expect("the barrier tap outlives the producer");
+        assert_eq!(read_id, id, "{label}");
+        assert!(
+            state.instances.read().await[0]
+                .pending_initial_turn
+                .is_none(),
+            "{label}: the barrier must sit before the installation"
+        );
+
+        let prompt = {
+            let state = Arc::clone(&state);
+            let id = id.clone();
+            async move {
+                acp_prompt(State(state), Path(id), prompt_req("manual prompt B"))
+                    .await
+                    .into_response()
+            }
+        };
+        tokio::pin!(prompt);
+        // B reached its submission claim, so it is contending for the session
+        // the producer is holding. Its accepted decision must not land while
+        // that install is in progress; the deadline bounds the wait, the claim
+        // above is what establishes the contention.
+        assert!(futures_util::poll!(&mut prompt).is_pending());
+        assert_eq!(
+            claims.try_recv().expect("the prompt must reach its claim"),
+            id,
+            "{label}"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), &mut prompt)
+                .await
+                .is_err(),
+            "{label}: a submission must not land while the continuation install holds the session"
+        );
+
+        let _ = release.send(());
+        tokio::time::timeout(Duration::from_secs(10), producer)
+            .await
+            .expect("the producer must finish once released")
+            .expect("the producer must not panic");
+        let response = tokio::time::timeout(Duration::from_secs(30), prompt)
+            .await
+            .expect("the prompt must finish once the producer releases the session");
+        assert_eq!(response.status(), StatusCode::ACCEPTED, "{label}");
+
+        assert_eq!(
+            state.instances.read().await[0]
+                .pending_initial_turn
+                .as_ref()
+                .map(|t| t.text.as_str()),
+            None,
+            "{label}: B superseded A, so no continuation may survive it"
+        );
+        assert!(
+            persisted_pending_turn(&state, &id).await.is_none(),
+            "{label}: the superseded continuation must not reach disk"
+        );
+    }
 }
 
 #[test]

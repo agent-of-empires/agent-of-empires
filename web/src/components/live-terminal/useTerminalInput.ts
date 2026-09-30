@@ -1,17 +1,16 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, type RefObject } from "react";
 import {
-  forwardTerminalBeforeInput,
+  bindHiddenInput,
   invalidateRetainedImeContext,
   registerMobileKeyboardProxyReceiver,
+  resetHiddenInput,
   type MobileKeyboardProxyInput,
 } from "../../lib/mobileKeyboardProxy";
-import { bracketedPaste, writeClipboard } from "../../lib/clipboard";
+import { writeClipboard } from "../../lib/clipboard";
 import {
   altPrintableMetaKey,
   controlCode,
-  dropLastCodePoint,
   escapePastePath,
-  plainRunAfter,
   specialKeySequence,
   type KeyboardLayoutReader,
 } from "./keySequences";
@@ -22,23 +21,22 @@ const textareaOf = (e: Event) => (e.target instanceof HTMLTextAreaElement ? e.ta
 export function useTerminalInput({
   active,
   inputRef,
-  typedWordRef,
   ctrlActiveRef,
   clearCtrl,
   sendData,
+  sendPaste,
   uploadPastedImage,
 }: {
   active: boolean;
   inputRef: RefObject<HTMLTextAreaElement | null>;
-  typedWordRef: RefObject<string>;
   ctrlActiveRef: RefObject<boolean>;
   clearCtrl: () => void;
   sendData: (data: string) => boolean;
+  /** Pastes through tmux, which adds bracketed-paste markers only when the pane enabled them. */
+  sendPaste: (text: string, submit: boolean) => boolean;
   uploadPastedImage: (file: File) => Promise<string | null>;
 }) {
   const composingRef = useRef(false);
-  // Whether the composition in flight took over already-typed text; null until its first update.
-  const retroactiveRef = useRef<boolean | null>(null);
   const activeRef = useRef(active);
   useLayoutEffect(() => {
     activeRef.current = active;
@@ -73,50 +71,36 @@ export function useTerminalInput({
     [sendData, ctrlActiveRef, clearCtrl],
   );
 
-  // Native beforeinput: React's synthetic one carries no inputType in Chromium.
-  // The return value tells the shadow textarea whether it may keep the edit.
+  // The return value tells the hidden textarea whether it may keep the edit.
   const handleProxyInput = useCallback(
     (input: MobileKeyboardProxyInput): boolean => {
-      if (composingRef.current || input.isComposing) return true;
-      const run = typedWordRef.current;
-      typedWordRef.current = "";
       switch (input.inputType) {
-        case "insertText": {
-          const data = input.data ?? "";
-          if (data && !sendKeys(data)) return false;
-          typedWordRef.current = plainRunAfter(run, data);
-          return true;
-        }
+        case "edit":
+          return sendKeys("\x7f".repeat(input.deleted) + input.data);
         case "insertLineBreak":
         case "insertParagraph":
           return sendKeys("\r");
-        case "deleteContentBackward":
-          if (!sendKeys("\x7f")) return false;
-          typedWordRef.current = dropLastCodePoint(run);
-          return true;
         case "insertFromPaste":
           // The paste bypasses the textarea, so the retained IME syllable no longer mirrors the line.
           invalidateRetainedImeContext(inputRef.current);
-          if (input.data) sendData(bracketedPaste(input.data));
-          return true;
-        default:
+          if (input.data) sendPaste(input.data, false);
           return true;
       }
     },
-    [sendKeys, sendData, typedWordRef, inputRef],
+    [sendKeys, sendPaste, inputRef],
   );
 
   useEffect(() => {
     const ta = inputRef.current;
     if (!ta) return;
-    const onBeforeInput = (ev: InputEvent) => forwardTerminalBeforeInput(ev, handleProxyInput);
-    ta.addEventListener("beforeinput", onBeforeInput);
-    return () => ta.removeEventListener("beforeinput", onBeforeInput);
+    return bindHiddenInput(ta, handleProxyInput, "live");
   }, [handleProxyInput, inputRef]);
 
   const onKeyDown = useCallback(
     (e: KeyboardEvent) => {
       if (composingRef.current || e.isComposing) return;
+      // A plain Backspace edits the textarea natively, so autorepeat and word deletes reach the pane as a diff.
+      if (e.key === "Backspace" && !e.altKey && !e.ctrlKey && !e.metaKey) return;
       const seq = specialKeySequence(e);
       if (seq) {
         e.preventDefault();
@@ -168,7 +152,7 @@ export function useTerminalInput({
       e.preventDefault();
       invalidateRetainedImeContext(textareaOf(e));
       if (imageFiles.length === 0) {
-        if (text) sendData(bracketedPaste(text));
+        if (text) sendPaste(text, false);
         return;
       }
       // Images cannot be typed into the pane: upload them and paste the paths the agent can read.
@@ -181,42 +165,20 @@ export function useTerminalInput({
         if (parts.length === 0 || !target) return;
         // A background session may finish its paste but must not invalidate the foreground proxy.
         if (activeRef.current) invalidateRetainedImeContext(target);
-        else target.value = "";
-        sendData(bracketedPaste(` ${parts.join(" ")} `));
+        else resetHiddenInput(target);
+        sendPaste(` ${parts.join(" ")} `, false);
       })();
     },
-    [inputRef, sendData, uploadPastedImage],
+    [inputRef, sendPaste, uploadPastedImage],
   );
 
+  // Composition text is sent by the hidden input's diff at compositionend; this only gates key handling.
   const onCompositionStart = useCallback(() => {
     composingRef.current = true;
-    retroactiveRef.current = null;
   }, []);
-  // A retroactive composition (SwiftKey adopting the typed word) carries the whole run in its first update.
-  const onCompositionUpdate = useCallback(
-    (e: CompositionEvent) => {
-      if (retroactiveRef.current !== null) return;
-      const run = typedWordRef.current;
-      retroactiveRef.current = run !== "" && (e.data ?? "").startsWith(run);
-    },
-    [typedWordRef],
-  );
-  const onCompositionEnd = useCallback(
-    (e: CompositionEvent) => {
-      composingRef.current = false;
-      const retroactive = retroactiveRef.current === true;
-      retroactiveRef.current = null;
-      const run = typedWordRef.current;
-      typedWordRef.current = "";
-      const data = e.data ?? "";
-      // Only a composition that adopted the typed word may drop that prefix.
-      const rest = retroactive && data.startsWith(run) ? data.slice(run.length) : data;
-      if (!rest) typedWordRef.current = run;
-      else if (!sendKeys(rest)) invalidateRetainedImeContext(textareaOf(e));
-      else if (retroactive) typedWordRef.current = plainRunAfter(run, rest);
-    },
-    [sendKeys, typedWordRef],
-  );
+  const onCompositionEnd = useCallback(() => {
+    composingRef.current = false;
+  }, []);
 
   // App's persistent keyboard proxy keeps focus after a session tap on iOS, so its native events are handled directly.
   useEffect(() => {
@@ -229,24 +191,14 @@ export function useTerminalInput({
       ["keydown", onKeyDown as EventListener],
       ["paste", onPaste as EventListener],
       ["compositionstart", onCompositionStart],
-      ["compositionupdate", onCompositionUpdate as EventListener],
-      ["compositionend", onCompositionEnd as EventListener],
+      ["compositionend", onCompositionEnd],
     ];
     for (const [type, fn, capture] of listeners) proxy.addEventListener(type, fn, capture);
     return () => {
       unregister();
       for (const [type, fn, capture] of listeners) proxy.removeEventListener(type, fn, capture);
     };
-  }, [
-    active,
-    onKeyDownCapture,
-    onKeyDown,
-    handleProxyInput,
-    onPaste,
-    onCompositionStart,
-    onCompositionUpdate,
-    onCompositionEnd,
-  ]);
+  }, [active, onKeyDownCapture, onKeyDown, handleProxyInput, onPaste, onCompositionStart, onCompositionEnd]);
 
-  return { onKeyDown, onKeyDownCapture, onPaste, onCompositionStart, onCompositionUpdate, onCompositionEnd };
+  return { onKeyDown, onKeyDownCapture, onPaste, onCompositionStart, onCompositionEnd };
 }

@@ -7,7 +7,7 @@ use ratatui::widgets::*;
 use super::DialogResult;
 use crate::tui::components::buttons::render_buttons;
 use crate::tui::components::checkbox::{checkbox_line, CheckboxStyle};
-use crate::tui::components::hover::HoverState;
+use crate::tui::components::hover::{paint_hover_bg, HoverState};
 use crate::tui::styles::Theme;
 
 /// The dialog's emphasis color: destructive prompts alarm in red, routine
@@ -35,7 +35,8 @@ pub struct ConfirmDialog {
     buttons: (String, String),
     yes_button_area: Rect,
     no_button_area: Rect,
-    /// The hovered button. Visual only; never changes `selected`.
+    checkbox_area: Rect,
+    /// The hovered target. Visual only; never changes `selected`.
     hover: HoverState,
 }
 
@@ -52,6 +53,7 @@ impl ConfirmDialog {
             buttons: ("Yes".to_string(), "No".to_string()),
             yes_button_area: Rect::default(),
             no_button_area: Rect::default(),
+            checkbox_area: Rect::default(),
             hover: HoverState::default(),
         }
     }
@@ -85,10 +87,16 @@ impl ConfirmDialog {
         self.dont_ask_again.unwrap_or(false)
     }
 
-    /// Route a left-click: `Submit` on `[Yes]`, `Cancel` on `[No]`, `None`
-    /// anywhere else inside the dialog.
-    pub fn handle_click(&self, col: u16, row: u16) -> Option<DialogResult<()>> {
+    /// Route a left-click: `Submit` on `[Yes]`, `Cancel` on `[No]`, a toggle
+    /// on the "don't warn me again" checkbox, `None` anywhere else.
+    pub fn handle_click(&mut self, col: u16, row: u16) -> Option<DialogResult<()>> {
         let pos = ratatui::layout::Position::from((col, row));
+        if let Some(checked) = self.dont_ask_again.as_mut() {
+            if self.checkbox_area.contains(pos) {
+                *checked = !*checked;
+                return Some(DialogResult::Continue);
+            }
+        }
         if self.yes_button_area.contains(pos) {
             return Some(DialogResult::Submit(()));
         }
@@ -102,8 +110,15 @@ impl ConfirmDialog {
     /// a drift between reading the prompt and pressing Enter must not flip
     /// which action fires. True when the highlight changed.
     pub fn handle_hover(&mut self, col: u16, row: u16) -> bool {
-        self.hover
-            .update(col, row, &[self.yes_button_area, self.no_button_area])
+        self.hover.update(
+            col,
+            row,
+            &[
+                self.yes_button_area,
+                self.no_button_area,
+                self.checkbox_area,
+            ],
+        )
     }
 
     pub fn action(&self) -> &str {
@@ -208,7 +223,14 @@ impl ConfirmDialog {
                 false,
                 CheckboxStyle::confirm(theme),
             );
+            self.checkbox_area = Rect {
+                width: (line.width() as u16).min(chunks[2].width),
+                ..chunks[2]
+            };
             frame.render_widget(Paragraph::new(line), chunks[2]);
+            if let Some(rect) = self.hover.current_in(&[self.checkbox_area]) {
+                paint_hover_bg(frame, rect, theme.selection);
+            }
             let (yes, no) = render_buttons(
                 frame,
                 chunks[4],
@@ -220,6 +242,7 @@ impl ConfirmDialog {
             self.yes_button_area = yes;
             self.no_button_area = no;
         } else {
+            self.checkbox_area = Rect::default();
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .margin(1)
@@ -428,6 +451,32 @@ mod tests {
             DialogResult::Submit(())
         ));
         assert!(d.dont_ask_again());
+    }
+
+    #[test]
+    fn clicking_the_rendered_checkbox_toggles_it_and_hover_lights_it() {
+        let mut d = ConfirmDialog::new("Quit", "Quit?", "quit").offering_dont_ask_again();
+        let (screen, _buf, _theme) = render_to(&mut d, 70, 14);
+        let (y, line) = screen
+            .lines()
+            .enumerate()
+            .find(|(_, l)| l.contains("Don't warn"))
+            .expect("checkbox row");
+        let x = line[..line.find("[ ]").unwrap()].chars().count() as u16;
+        let y = y as u16;
+
+        assert!(d.handle_hover(x, y));
+        assert_eq!(d.hover.current(), Some(d.checkbox_area));
+        for want in [true, false] {
+            assert!(matches!(d.handle_click(x, y), Some(DialogResult::Continue)));
+            assert_eq!(d.dont_ask_again(), want);
+        }
+
+        // Without the checkbox its row is inert.
+        let mut plain = dialog();
+        render_to(&mut plain, 70, 14);
+        assert!(plain.handle_click(x, y).is_none());
+        assert!(!plain.dont_ask_again());
     }
 
     #[test]

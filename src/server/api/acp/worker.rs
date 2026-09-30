@@ -4,7 +4,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::acp::protocol::{SwitchAgentRequest, SwitchAgentResponse};
-use crate::server::api::{find_instance, instance_exists};
+use crate::server::acp_reconciler::install_rate_limit_continuation;
+use crate::server::api::find_instance;
 
 use super::*;
 
@@ -74,6 +75,26 @@ async fn rate_limit_resume_probe(state: &AppState, id: &str) -> Option<DateTime<
     })
 }
 
+/// The memory check runs before the handler's awaits, during which a peer such as
+/// `aoe session archive` or `aoe rm --purge` can shelve or remove the stored row, so
+/// recheck it right before spawning.
+async fn refuse_if_stored_row_shelved(
+    state: &AppState,
+    instance: &crate::session::Instance,
+) -> Option<Response> {
+    match crate::server::api::load_persisted_instance(state, &instance.source_profile, &instance.id)
+        .await
+    {
+        // A purge removes the row while the cache may still hold it.
+        Ok(None) => Some(session_not_found()),
+        Ok(Some(stored)) => stored
+            .ensure_startable()
+            .err()
+            .map(crate::server::api::start_blocked_response),
+        Err(resp) => Some(resp),
+    }
+}
+
 pub async fn spawn_acp(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -89,10 +110,15 @@ pub async fn spawn_acp(
         Ok(j) => j,
         Err(rej) => return rej.into_response(),
     };
-    // Checked first so a missing session does not create an instance lock.
-    if !instance_exists(&state, &id).await {
+    // Submission authority before `instance_lock`, as the permanent DELETE
+    // path takes them (#4092); the claim also proves the session exists.
+    let Some(_submission) = state
+        .session_service
+        .prompt_submission_for_session(&id)
+        .await
+    else {
         return session_not_found();
-    }
+    };
     let inst_lock = state.instance_lock(&id).await;
     let _guard = inst_lock.lock().await;
     let Some(instance) = find_instance(&state, &id).await else {
@@ -100,6 +126,9 @@ pub async fn spawn_acp(
     };
     if !instance.is_structured() {
         return not_structured_response();
+    }
+    if let Err(blocked) = instance.ensure_startable() {
+        return crate::server::api::start_blocked_response(blocked);
     }
 
     let explicit = req.agent.clone().or_else(|| instance.agent_name.clone());
@@ -135,6 +164,9 @@ pub async fn spawn_acp(
         model: req.model.or_else(|| instance.agent_model.clone()),
         ..spawn_request_for(&instance, agent.clone(), sandbox_info)
     };
+    if let Some(resp) = refuse_if_stored_row_shelved(&state, &instance).await {
+        return resp;
+    }
     match state.acp_supervisor.spawn(request).await {
         Ok(()) => {}
         Err(SupervisorError::AlreadyRunning(_)) if rate_limit_resume_resets_at.is_some() => {}
@@ -142,7 +174,9 @@ pub async fn spawn_acp(
     }
     if let Some(resets_at) = rate_limit_resume_resets_at {
         // Continue the rate-limit-interrupted turn once the worker is live.
-        crate::server::acp_reconciler::enqueue_rate_limit_continuation(&state, &id).await;
+        let _ = install_rate_limit_continuation(&state, &id, _submission).await;
+        // The manual breadcrumb is the budget's disarm step, so it fires
+        // whether or not a queued prompt superseded the continuation.
         state
             .acp_supervisor
             .publish_rate_limit_auto_resumed(&id, resets_at, true);
@@ -339,6 +373,9 @@ pub async fn switch_acp_agent(
     let Some(instance) = find_instance(&state, &id).await else {
         return session_not_found();
     };
+    if let Err(blocked) = instance.ensure_startable() {
+        return crate::server::api::start_blocked_response(blocked);
+    }
     let from_agent = match check_switch_target(&state, &instance, &target).await {
         Ok(agent) => agent,
         Err(resp) => return resp,
@@ -397,6 +434,9 @@ pub async fn switch_acp_agent(
         claude_store_pin: None,
         ..spawn_request_for(&instance, target.clone(), sandbox_info)
     };
+    if let Some(resp) = refuse_if_stored_row_shelved(&state, &instance).await {
+        return resp;
+    }
     if let Err(e) = state.acp_supervisor.spawn(request).await {
         return supervisor_error_response("spawn failed", &e);
     }
@@ -568,5 +608,58 @@ mod tests {
                 "{label}"
             );
         }
+    }
+
+    /// #4092: the manual resume installs a continuation under the session's
+    /// submission authority, so `/acp/spawn` must claim it ahead of the
+    /// instance lock. The reverse order would close a cycle with every path
+    /// that takes the submission guard before the instance lock.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn spawn_claims_the_submission_guard_before_the_instance_lock() {
+        use crate::session::test_support::isolate_app_dir;
+        let _app_dir = isolate_app_dir();
+        let mut inst = crate::session::Instance::new("sess-4092-spawn", "/tmp/aoe-4092-spawn");
+        inst.id = "sess-4092-spawn".to_string();
+        inst.view = crate::session::View::Structured;
+        let id = inst.id.clone();
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+
+        let _held = state
+            .session_service
+            .prompt_submission_for_session(&id)
+            .await
+            .expect("seeded session must admit a submission");
+        let mut claims = state.session_service.watch_submission_claims();
+        let spawn = {
+            let state = Arc::clone(&state);
+            let id = id.clone();
+            async move {
+                spawn_acp(
+                    State(state),
+                    Path(id),
+                    Ok(Json(SpawnAcpRequest {
+                        agent: None,
+                        model: None,
+                        additional_dirs: Vec::new(),
+                        provider_env: Vec::new(),
+                    })),
+                )
+                .await
+                .into_response()
+            }
+        };
+        tokio::pin!(spawn);
+        assert!(futures_util::poll!(&mut spawn).is_pending());
+        assert_eq!(
+            claims
+                .try_recv()
+                .expect("spawn reaches its submission claim"),
+            id
+        );
+        let instance_lock = state.instance_lock(&id).await;
+        let _instance_lock = instance_lock
+            .try_lock()
+            .expect("submission must precede the instance lock");
     }
 }

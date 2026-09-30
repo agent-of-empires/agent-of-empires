@@ -1,102 +1,137 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { HIDDEN_INPUT_SENTINEL as S } from "./hiddenInputDiff";
 import {
+  bindHiddenInput,
   clearMobileKeyboardProxyInput,
   deliverMobileKeyboardProxyInput,
-  forwardTerminalBeforeInput,
   invalidateRetainedImeContext,
   registerMobileKeyboardProxyReceiver,
+  type MobileKeyboardProxyInput,
 } from "./mobileKeyboardProxy";
 
-afterEach(clearMobileKeyboardProxyInput);
+afterEach(() => {
+  clearMobileKeyboardProxyInput();
+  document.body.innerHTML = "";
+});
 
-function beforeInput(target: HTMLTextAreaElement, init: InputEventInit, delivered = true) {
-  const ev = new InputEvent("beforeinput", { bubbles: true, cancelable: true, ...init });
-  const deliver = vi.fn(() => delivered);
-  target.addEventListener("beforeinput", (e) => forwardTerminalBeforeInput(e as InputEvent, deliver), { once: true });
-  target.dispatchEvent(ev);
-  return { ev, deliver };
+const edit = (data: string, deleted = 0): MobileKeyboardProxyInput => ({ inputType: "edit", deleted, data });
+
+function bound(accepted = true) {
+  const ta = document.createElement("textarea");
+  document.body.append(ta);
+  const deliver = vi.fn<(input: MobileKeyboardProxyInput) => boolean>(() => accepted);
+  bindHiddenInput(ta, deliver, "test");
+  /** Applies a native edit the way the browser does: the value changes, then `input` fires. */
+  const apply = (value: string, init: InputEventInit = {}) => {
+    ta.value = value;
+    ta.dispatchEvent(new InputEvent("input", { bubbles: true, ...init }));
+  };
+  const beforeInput = (init: InputEventInit) => {
+    const ev = new InputEvent("beforeinput", { bubbles: true, cancelable: true, ...init });
+    ta.dispatchEvent(ev);
+    return ev;
+  };
+  return { ta, deliver, apply, beforeInput };
 }
 
-describe("forwardTerminalBeforeInput", () => {
-  it.each<[string, InputEventInit, string, boolean, boolean, string]>([
-    ["forwards an accepted insert into the textarea", { inputType: "insertText", data: "ㅎ" }, "", true, false, ""],
-    ["forwards an accepted delete", { inputType: "deleteContentBackward" }, "ㅎ", true, false, "ㅎ"],
-    ["swallows a line break and drops the IME context", { inputType: "insertLineBreak" }, "한국어", true, true, ""],
-    ["swallows a paste", { inputType: "insertFromPaste", data: "a\nb" }, "", true, true, ""],
-    ["cancels a refused delete and drops the text", { inputType: "deleteContentBackward" }, "그", false, true, ""],
-  ])("%s", (_name, init, before, accepted, prevented, after) => {
-    const ta = document.createElement("textarea");
-    ta.value = before;
-    const { ev, deliver } = beforeInput(ta, init, accepted);
-    expect(deliver).toHaveBeenCalledWith({ inputType: init.inputType, data: init.data ?? null, isComposing: false });
-    expect(ev.defaultPrevented).toBe(prevented);
-    expect(ta.value).toBe(after);
+describe("bindHiddenInput", () => {
+  it("starts with the sentinel and sends each edit as a diff", () => {
+    const { ta, deliver, apply } = bound();
+    expect(ta.value).toBe(S);
+    apply(S + "thi", { inputType: "insertText" });
+    apply(S + "this is", { inputType: "insertReplacementText" });
+    apply(S + "This is", { inputType: "insertReplacementText" });
+    expect(deliver.mock.calls.map(([i]) => i)).toEqual([edit("thi"), edit("s is"), edit("This is", 7)]);
   });
 
-  it("ignores other input types", () => {
-    const { ev, deliver } = beforeInput(document.createElement("textarea"), {
-      inputType: "insertReplacementText",
-      data: "x",
-    });
+  it("refills the sentinel a delete reached and keeps the caret at the end", () => {
+    const { ta, deliver, apply } = bound();
+    apply(S.slice(1), { inputType: "deleteContentBackward" });
+    expect(deliver).toHaveBeenCalledWith(edit("", 1));
+    expect([ta.value, ta.selectionStart]).toEqual([S, S.length]);
+  });
+
+  it("waits for compositionend to send a composition", () => {
+    const { ta, deliver, apply } = bound();
+    ta.dispatchEvent(new CompositionEvent("compositionstart"));
+    apply(S + "n", { isComposing: true });
+    apply(S + "android", { isComposing: true });
     expect(deliver).not.toHaveBeenCalled();
-    expect(ev.defaultPrevented).toBe(false);
+    ta.dispatchEvent(new CompositionEvent("compositionend", { data: "android" }));
+    expect(deliver.mock.calls).toEqual([[edit("android")]]);
   });
 
-  it.each<[InputEventInit, boolean]>([
-    [{ inputType: "insertLineBreak" }, true],
-    [{ inputType: "insertText", data: "c" }, false],
-  ])("tolerates a non-textarea target (%o)", (init, accepted) => {
-    const ev = new InputEvent("beforeinput", { bubbles: true, cancelable: true, ...init });
-    Object.defineProperty(ev, "target", { value: document.createElement("div") });
-    expect(() => forwardTerminalBeforeInput(ev, () => accepted)).not.toThrow();
+  it("resets a refused edit so the textarea never shadows unsent text", () => {
+    const { ta, deliver, apply } = bound(false);
+    apply(S + "c", { inputType: "insertText" });
+    expect(deliver).toHaveBeenCalledWith(edit("c"));
+    expect(ta.value).toBe(S);
+    apply(S + "ㅎ", { inputType: "insertText" });
+    expect(deliver).toHaveBeenLastCalledWith(edit("ㅎ"));
+  });
+
+  it("cancels a line break, flushes pending text first, and resets", () => {
+    const { ta, deliver, beforeInput } = bound();
+    ta.value = S + "ls";
+    const ev = beforeInput({ inputType: "insertParagraph" });
     expect(ev.defaultPrevented).toBe(true);
+    expect(deliver.mock.calls).toEqual([[edit("ls")], [{ inputType: "insertParagraph" }]]);
+    expect(ta.value).toBe(S);
+  });
+
+  it("cancels a paste and reports it", () => {
+    const { deliver, beforeInput } = bound();
+    const ev = beforeInput({ inputType: "insertFromPaste", data: "a\nb" });
+    expect(ev.defaultPrevented).toBe(true);
+    expect(deliver).toHaveBeenCalledWith({ inputType: "insertFromPaste", data: "a\nb" });
+  });
+
+  it("returns a moved caret to the end before a key edits", () => {
+    const { ta } = bound();
+    ta.value = S + "hello";
+    ta.setSelectionRange(S.length + 2, S.length + 2);
+    ta.dispatchEvent(new KeyboardEvent("keydown", { key: "x" }));
+    expect(ta.selectionStart).toBe(ta.value.length);
   });
 });
 
 describe("mobile keyboard proxy", () => {
+  function proxy(value: string) {
+    document.body.innerHTML = "<textarea data-keyboard-proxy></textarea>";
+    const ta = document.querySelector<HTMLTextAreaElement>("[data-keyboard-proxy]")!;
+    ta.value = value;
+    return ta;
+  }
+
   it("rejects input past the queue bound", () => {
-    for (let i = 0; i < 128; i++) {
-      const ok = deliverMobileKeyboardProxyInput({ inputType: "insertText", data: `x${i}`, isComposing: false });
-      expect(ok).toBe(true);
-    }
-    expect(deliverMobileKeyboardProxyInput({ inputType: "insertText", data: "over", isComposing: false })).toBe(false);
+    for (let i = 0; i < 128; i++) expect(deliverMobileKeyboardProxyInput(edit(`x${i}`))).toBe(true);
+    expect(deliverMobileKeyboardProxyInput(edit("over"))).toBe(false);
   });
 
-  it("drops queued input at a session boundary", () => {
-    deliverMobileKeyboardProxyInput({ inputType: "insertText", data: "old", isComposing: false });
+  it("drops queued input and the proxy text at a session boundary", () => {
+    const ta = proxy(S + "old");
+    deliverMobileKeyboardProxyInput(edit("old"));
     clearMobileKeyboardProxyInput();
-    const receive = vi.fn();
+    const receive = vi.fn(() => true);
     registerMobileKeyboardProxyReceiver(receive);
     expect(receive).not.toHaveBeenCalled();
+    expect(ta.value).toBe(S);
   });
 
-  it("clears the proxy when a drained queued edit is refused", () => {
-    document.body.innerHTML = "<textarea data-keyboard-proxy></textarea>";
-    const proxy = document.querySelector<HTMLTextAreaElement>("[data-keyboard-proxy]")!;
-    proxy.value = "ㅎ";
-    expect(proxy.value).toBe("ㅎ");
-    deliverMobileKeyboardProxyInput({ inputType: "insertText", data: "가", isComposing: false });
-
-    const receive = vi.fn(() => false);
+  it.each([
+    ["keeps the proxy text when every replayed edit is accepted", [true, true], S + "cㅎ"],
+    ["resets the proxy when a replayed edit is refused", [false, true], S],
+  ])("%s", (_name, results, value) => {
+    const ta = proxy(S + "cㅎ");
+    deliverMobileKeyboardProxyInput(edit("c"));
+    deliverMobileKeyboardProxyInput(edit("ㅎ"));
+    const receive = vi.fn();
+    for (const r of results) receive.mockReturnValueOnce(r);
     const unregister = registerMobileKeyboardProxyReceiver(receive);
-    expect(receive).toHaveBeenCalledWith({ inputType: "insertText", data: "가", isComposing: false });
-    expect(proxy.value).toBe("");
+    expect(receive.mock.calls).toEqual([[edit("c")], [edit("ㅎ")]]);
+    expect(ta.value).toBe(value);
     unregister();
-    document.body.innerHTML = "";
-  });
-
-  it("keeps the proxy content when drained edits are accepted", () => {
-    document.body.innerHTML = "<textarea data-keyboard-proxy></textarea>";
-    const proxy = document.querySelector<HTMLTextAreaElement>("[data-keyboard-proxy]")!;
-    proxy.value = "ㅎ";
-    deliverMobileKeyboardProxyInput({ inputType: "insertText", data: "가", isComposing: false });
-    const receive = vi.fn(() => true);
-    const unregister = registerMobileKeyboardProxyReceiver(receive);
-    expect(receive).toHaveBeenCalled();
-    expect(proxy.value).toBe("ㅎ");
-    unregister();
-    document.body.innerHTML = "";
   });
 
   it("keeps the current receiver when an older cleanup runs", () => {
@@ -105,26 +140,34 @@ describe("mobile keyboard proxy", () => {
     const second = vi.fn(() => true);
     const stop2 = registerMobileKeyboardProxyReceiver(second);
     stop1();
-    deliverMobileKeyboardProxyInput({ inputType: "insertText", data: "x", isComposing: false });
-    expect(second).toHaveBeenCalledWith({ inputType: "insertText", data: "x", isComposing: false });
-    expect(first).not.toHaveBeenCalledWith({ inputType: "insertText", data: "x", isComposing: false });
+    deliverMobileKeyboardProxyInput(edit("x"));
+    expect(second).toHaveBeenCalledWith(edit("x"));
+    expect(first).not.toHaveBeenCalled();
     stop2();
   });
 });
 
 describe("invalidateRetainedImeContext", () => {
-  afterEach(() => {
-    document.body.innerHTML = "";
+  it.each([true, false])("resets the proxy, and the given input when passed=%s", (passLocal) => {
+    document.body.innerHTML = "<textarea data-keyboard-proxy></textarea>";
+    const proxy = document.querySelector<HTMLTextAreaElement>("[data-keyboard-proxy]")!;
+    proxy.value = S + "ㅎ";
+    const local = document.createElement("textarea");
+    local.value = S + "ㅎ";
+    invalidateRetainedImeContext(passLocal ? local : undefined);
+    expect([local.value, proxy.value]).toEqual([passLocal ? S : S + "ㅎ", S]);
   });
 
-  it.each([true, false])("clears the proxy, and the given input when passed=%s", (passLocal) => {
-    document.body.innerHTML = "<textarea data-keyboard-proxy>ㅎ</textarea>";
-    const proxy = document.querySelector<HTMLTextAreaElement>("[data-keyboard-proxy]")!;
-    proxy.value = "ㅎ";
-    const local = document.createElement("textarea");
-    local.value = "ㅎ";
-    invalidateRetainedImeContext(passLocal ? local : undefined);
-    expect([local.value, proxy.value]).toEqual([passLocal ? "" : "ㅎ", ""]);
+  it("makes the next edit diff against the reset value", () => {
+    const deliver = vi.fn(() => true);
+    const ta = document.createElement("textarea");
+    bindHiddenInput(ta, deliver, "test");
+    ta.value = S + "ㅎ";
+    ta.dispatchEvent(new InputEvent("input"));
+    invalidateRetainedImeContext(ta);
+    ta.value = S + "a";
+    ta.dispatchEvent(new InputEvent("input"));
+    expect(deliver).toHaveBeenLastCalledWith(edit("a"));
   });
 
   it("tolerates a missing proxy", () => {

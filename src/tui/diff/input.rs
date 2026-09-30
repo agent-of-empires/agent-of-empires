@@ -49,11 +49,47 @@ impl DiffView {
         self.handle_normal_key(key)
     }
 
-    /// Route a left-click. Currently only the file-list panel accepts
-    /// click input (select the clicked file). Clicks elsewhere are
-    /// swallowed by the modal but no-op.
+    /// Whether the warning dialog or help overlay covers the diff. It then
+    /// owns every click, hover and wheel event on the screen.
+    pub fn has_modal(&self) -> bool {
+        self.warning_dialog.is_some() || self.show_help || self.branch_select.is_some()
+    }
+
+    /// An open modal takes every click; otherwise a file-list row selects.
     pub fn handle_click(&mut self, col: u16, row: u16) {
+        if let Some(dialog) = &self.warning_dialog {
+            if dialog.handle_click(col, row).is_some() {
+                self.warning_dialog = None;
+            }
+            return;
+        }
+        if self.show_help {
+            self.show_help = false;
+            return;
+        }
         let pos = ratatui::layout::Position::from((col, row));
+        if let Some(state) = &mut self.branch_select {
+            use crate::tui::dialogs::hit;
+            let mouse = &self.branch_mouse;
+            // A row applies its branch like Enter; the scroll indicators step
+            // like the arrows; a click outside closes like Esc.
+            let indicators = [
+                (KeyCode::Up, mouse.more_above),
+                (KeyCode::Down, mouse.more_below),
+            ];
+            let key = if !mouse.dialog.contains(pos) {
+                KeyCode::Esc
+            } else if let Some(idx) = hit(&mouse.rows, col, row) {
+                state.selected = idx;
+                KeyCode::Enter
+            } else if let Some(key) = hit(&indicators, col, row) {
+                key
+            } else {
+                return;
+            };
+            self.handle_branch_select_key(KeyEvent::from(key));
+            return;
+        }
         if self.file_list_inner.contains(pos) {
             let row_in_list = (row - self.file_list_inner.y) as usize;
             let file_index = self.file_list_scroll_offset + row_in_list;
@@ -64,12 +100,15 @@ impl DiffView {
         }
     }
 
-    /// Hover does not move the file-list selection. Otherwise pressing
-    /// j/k after a stray mouse drift would jump to whichever file the
-    /// cursor last crossed instead of advancing from the actually
-    /// selected one. Click still selects.
-    pub fn handle_hover(&mut self, _col: u16, _row: u16) -> bool {
-        false
+    /// Hover never moves the file-list selection, which j/k advance from.
+    pub fn handle_hover(&mut self, col: u16, row: u16) -> bool {
+        if self.branch_select.is_some() {
+            let rects = self.branch_mouse.rects();
+            return self.branch_mouse.hover.update(col, row, &rects);
+        }
+        self.warning_dialog
+            .as_mut()
+            .is_some_and(|dialog| dialog.handle_hover(col, row))
     }
 
     fn handle_normal_key(&mut self, key: KeyEvent) -> DiffAction {
@@ -238,6 +277,46 @@ mod tests {
             view.handle_key(key(KeyCode::Char('q'))),
             DiffAction::Close
         ));
+    }
+
+    /// A rendered view, so its modals capture their real hit rects.
+    fn rendered(warning: bool, help: bool) -> DiffView {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut view = DiffView::test_default();
+        if warning {
+            view.warning_dialog = Some(InfoDialog::new("Warning", "Test warning"));
+        }
+        view.show_help = help;
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        let theme = crate::tui::styles::Theme::default();
+        terminal
+            .draw(|frame| view.render(frame, frame.area(), &theme))
+            .unwrap();
+        view
+    }
+
+    #[test]
+    fn modals_own_clicks_and_hover_until_dismissed() {
+        // The 50x9 warning centers on 120x40 with [OK] at columns 58..62, row 20.
+        // (warning, help, click, modal still open)
+        let cases = [
+            (true, false, (60, 18), false),
+            (true, false, (1, 1), true),
+            (false, true, (1, 1), false),
+            (false, false, (1, 1), false),
+        ];
+        for (warning, help, (col, row), open) in cases {
+            let mut view = rendered(warning, help);
+            view.handle_click(col, row);
+            assert_eq!(view.has_modal(), open, "{warning} {help} at {col},{row}");
+        }
+
+        let mut view = rendered(true, false);
+        assert!(view.handle_hover(59, 20), "hovering [OK] highlights it");
+        assert!(!view.handle_hover(60, 20));
+        assert!(view.handle_hover(1, 1), "leaving [OK] clears it");
+        let mut view = rendered(false, false);
+        assert!(!view.handle_hover(59, 20), "no modal, nothing to highlight");
     }
 
     fn diff_file(path: &str) -> crate::git::diff::DiffFile {

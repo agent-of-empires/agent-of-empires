@@ -43,9 +43,6 @@ pub struct EnqueueRequest {
     /// server row and a retry does not double-queue.
     pub id: String,
     pub text: String,
-    /// RFC3339 enqueue time; the server stamps one if omitted.
-    #[serde(default)]
-    pub created_at: Option<String>,
     /// Optional provenance: which device queued it.
     #[serde(default)]
     pub origin_device: Option<String>,
@@ -122,20 +119,7 @@ pub async fn queue_enqueue(
         Ok(b) => b,
         Err((status, msg)) => return (status, msg).into_response(),
     };
-    let created_at = req
-        .created_at
-        .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
-    match buffer_and_enqueue(
-        &state,
-        &id,
-        &req.id,
-        req.text,
-        &blobs,
-        req.origin_device,
-        created_at,
-    )
-    .await
-    {
+    match buffer_and_enqueue(&state, &id, &req.id, req.text, &blobs, req.origin_device).await {
         Ok(entry) => (StatusCode::OK, Json(entry)).into_response(),
         Err((status, msg)) => (status, msg).into_response(),
     }
@@ -147,7 +131,6 @@ pub async fn queue_enqueue(
 /// Shared by `queue_enqueue` and the prompt endpoint's `Queued` disposition, so
 /// a prompt the daemon parks is byte-for-byte the queue row a client would have
 /// created itself.
-#[allow(clippy::too_many_arguments)]
 pub(super) async fn buffer_and_enqueue(
     state: &Arc<AppState>,
     id: &str,
@@ -155,7 +138,6 @@ pub(super) async fn buffer_and_enqueue(
     text: String,
     blobs: &[crate::acp::event_store::AttachmentBlob],
     origin_device: Option<String>,
-    created_at: String,
 ) -> Result<crate::daemon::QueuedPromptEntry, (StatusCode, String)> {
     // Per-session buffer cap, so an undrained queue cannot grow without bound.
     // Re-enqueuing the same id replaces its blobs, so subtract what this prompt
@@ -209,14 +191,7 @@ pub(super) async fn buffer_and_enqueue(
 
     match state
         .session_service
-        .enqueue_prompt(
-            id,
-            prompt_id.to_string(),
-            text,
-            refs,
-            origin_device,
-            created_at,
-        )
+        .enqueue_prompt(id, prompt_id.to_string(), text, refs, origin_device)
         .await
     {
         Some(entry) => Ok(entry),
@@ -344,7 +319,6 @@ mod tests {
                     Ok(Json(EnqueueRequest {
                         id: "q1".to_string(),
                         text: "rewritten".to_string(),
-                        created_at: None,
                         origin_device: None,
                         attachments: Vec::new(),
                     })),
@@ -369,5 +343,54 @@ mod tests {
             .await
             .expect("the enqueue lands once the delivery releases the session");
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// #4092: the resume admission orders queue rows against the rate-limit
+    /// park, so the enqueue time is the server's. A client clock, however far
+    /// ahead, must not reach the row.
+    #[tokio::test]
+    async fn a_client_clock_never_dates_a_queued_row() {
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let mut inst = Instance::new("queue-stamp", "/tmp/aoe-4092-stamp");
+        inst.id = "sess-4092-stamp".to_string();
+        inst.view = crate::session::View::Structured;
+        let id = inst.id.clone();
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+
+        let response = queue_enqueue(
+            State(Arc::clone(&state)),
+            Path(id.clone()),
+            Ok(Json(
+                serde_json::from_value(serde_json::json!({
+                    "id": "q1",
+                    "text": "queued by a client with a fast clock",
+                    "created_at": "2999-01-01T00:00:00Z",
+                }))
+                .expect("the hostile body deserialises"),
+            )),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "an unknown key must not reject an older client's body"
+        );
+        let row = state
+            .session_service
+            .queued_prompts_snapshot(&id)
+            .await
+            .into_iter()
+            .next()
+            .expect("the row must land");
+        let stamped = chrono::DateTime::parse_from_rfc3339(&row.created_at)
+            .expect("the server stamps a readable instant")
+            .with_timezone(&chrono::Utc);
+        let skew = (stamped - chrono::Utc::now()).num_seconds().abs();
+        assert!(
+            skew < 60,
+            "the row carries the client's 2999 clock, {skew}s from now"
+        );
     }
 }

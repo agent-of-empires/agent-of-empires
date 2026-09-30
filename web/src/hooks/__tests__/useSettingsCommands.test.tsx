@@ -9,7 +9,6 @@ vi.mock("../../lib/api", () => ({
   getSettingsSchema: vi.fn(),
   fetchProfiles: vi.fn(),
   fetchSettings: vi.fn(),
-  updateProfileSettings: vi.fn(),
   updateSettings: vi.fn(),
 }));
 vi.mock("../../lib/toastBus", () => ({
@@ -17,7 +16,7 @@ vi.mock("../../lib/toastBus", () => ({
   reportError: vi.fn(),
 }));
 
-import { fetchProfiles, fetchSettings, getSettingsSchema, updateProfileSettings, updateSettings } from "../../lib/api";
+import { fetchProfiles, fetchSettings, getSettingsSchema, updateSettings } from "../../lib/api";
 
 function field(
   section: string,
@@ -57,7 +56,6 @@ beforeEach(() => {
     session: { live_send: false },
     worktree: { auto_cleanup: true },
   } as never);
-  vi.mocked(updateProfileSettings).mockResolvedValue(true);
   vi.mocked(updateSettings).mockResolvedValue(true);
 });
 
@@ -92,13 +90,11 @@ describe("useSettingsCommands", () => {
     toggle()?.perform();
     expect(onOpenSettingsTab).toHaveBeenCalledWith("worktree");
     expect(updateSettings).not.toHaveBeenCalled();
-    expect(updateProfileSettings).not.toHaveBeenCalled();
 
     await act(async () => resolveSettings({ worktree: { auto_cleanup: true } } as never));
     await waitFor(() => expect(toggle()?.subtitle).toBe("On · Global"));
     toggle()?.perform();
     await waitFor(() => expect(updateSettings).toHaveBeenCalledWith({ worktree: { auto_cleanup: false } }));
-    expect(updateProfileSettings).not.toHaveBeenCalled();
   });
 
   it("generates one Settings entry per writable field, omitting local_only", async () => {
@@ -130,20 +126,20 @@ describe("useSettingsCommands", () => {
         action("setting:worktree.auto_cleanup")?.perform();
       }
       await waitFor(() => expect(fetchSettings).toHaveBeenCalledTimes(fetchCount + 1));
-      expect(fetchSettings).toHaveBeenLastCalledWith("alternate");
+      expect(fetchSettings).toHaveBeenLastCalledWith();
       expect(action("setting:session.live_send")?.subtitle).toBe("Opens settings · session");
-      const saveCount = vi.mocked(updateProfileSettings).mock.calls.length;
+      const saveCount = vi.mocked(updateSettings).mock.calls.length;
       action("setting:session.live_send")?.perform();
       expect(onOpenSettingsTab).toHaveBeenCalledWith("session");
-      expect(updateProfileSettings).toHaveBeenCalledTimes(saveCount);
+      expect(updateSettings).toHaveBeenCalledTimes(saveCount);
 
       await act(async () =>
         resolveSettings({ session: { live_send: true }, worktree: { auto_cleanup: false } } as never),
       );
       await waitFor(() => expect(action("setting:session.live_send")?.subtitle).toBe("On · alternate"));
       action("setting:session.live_send")?.perform();
-      await waitFor(() => expect(updateProfileSettings).toHaveBeenCalledTimes(saveCount + 1));
-      expect(updateProfileSettings).toHaveBeenLastCalledWith("alternate", { session: { live_send: false } });
+      await waitFor(() => expect(updateSettings).toHaveBeenCalledTimes(saveCount + 1));
+      expect(updateSettings).toHaveBeenLastCalledWith({ session: { live_send: false } });
       unmount();
     }
   });
@@ -156,7 +152,6 @@ describe("useSettingsCommands", () => {
     expect(onOpenSettingsTab).toHaveBeenCalledWith("security");
     action("setting:telemetry.enabled")?.perform();
     expect(onOpenSettingsTab).toHaveBeenCalledWith("telemetry");
-    expect(updateProfileSettings).not.toHaveBeenCalled();
     expect(updateSettings).not.toHaveBeenCalled();
   });
 
@@ -164,6 +159,6 @@ describe("useSettingsCommands", () => {
     const { onOpenSettingsTab, action } = await render({ readOnly: true });
     action("setting:session.live_send")?.perform();
     expect(onOpenSettingsTab).toHaveBeenCalledWith("session");
-    expect(updateProfileSettings).not.toHaveBeenCalled();
+    expect(updateSettings).not.toHaveBeenCalled();
   });
 });

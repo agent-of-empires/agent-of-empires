@@ -51,7 +51,10 @@ pub struct AddArgs {
     #[arg(long = "tool", conflicts_with = "command")]
     tool: Option<String>,
 
-    /// Parent session (creates sub-session, inherits group)
+    /// Parent session (creates sub-session, inherits group). The sub-session
+    /// does not inherit the parent's worktree or path: without `--worktree`
+    /// it opens at `<path>` (default: the current directory) on whatever
+    /// branch is checked out there.
     #[arg(short = 'P', long)]
     parent: Option<String>,
 
@@ -539,24 +542,13 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         instance.workspace_info = Some(workspace_info);
     }
 
-    instance.yolo_mode = args.yolo || config.session.yolo_mode_default;
-
-    if let Some(ref extra) = args.extra_args {
-        instance.extra_args = extra.clone();
-    } else if let Some(extra) = config.session.agent_extra_args.get(&instance.tool) {
-        if !extra.is_empty() {
-            instance.extra_args = extra.clone();
-        }
-    }
-
-    if let Some(ref cmd) = args.cmd_override {
-        instance.command = cmd.clone();
-    } else {
-        let resolved = config.session.resolve_tool_command(&instance.tool);
-        if !resolved.is_empty() {
-            instance.command = resolved;
-        }
-    }
+    crate::session::builder::apply_agent_launch_config(
+        &mut instance,
+        &config.session,
+        args.extra_args.as_deref().unwrap_or_default(),
+        args.cmd_override.as_deref().unwrap_or_default(),
+        args.yolo.then_some(true),
+    );
 
     let user_picked_agent = args.agent.is_some();
     let user_wants_structured = args.structured_view || user_picked_agent;
@@ -832,13 +824,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                         println!(
                             "Skipped (session created without trusting repo hooks or project MCP)"
                         );
-                        match &trust.hooks {
-                            TrustSurface::Trusted(h) => {
-                                repo_config::ResolvedHooks::with_repo(profile, repo_root, h.clone())
-                            }
-                            TrustSurface::NeedsTrust { .. } => None,
-                            TrustSurface::Absent => repo_config::ResolvedHooks::global(profile),
-                        }
+                        hooks_when_trust_declined(profile, repo_root, &trust.hooks)
                     }
                 }
                 Err(e) => {
@@ -1255,6 +1241,23 @@ fn detect_tool(cmd: &str) -> Result<String> {
         })
 }
 
+/// Declined trust keeps already-trusted repo hooks; unapproved ones fall back
+/// to the personal global and profile hooks.
+fn hooks_when_trust_declined(
+    profile: &str,
+    repo_root: &std::path::Path,
+    hooks: &repo_config::TrustSurface<crate::session::HooksConfig>,
+) -> Option<repo_config::ResolvedHooks> {
+    match hooks {
+        repo_config::TrustSurface::Trusted(h) => {
+            repo_config::ResolvedHooks::with_repo(profile, repo_root, h.clone())
+        }
+        repo_config::TrustSurface::NeedsTrust { .. } | repo_config::TrustSurface::Absent => {
+            repo_config::ResolvedHooks::global(profile)
+        }
+    }
+}
+
 fn override_launch_binary(
     tool: &str,
     session: &crate::session::config::SessionConfig,
@@ -1361,8 +1364,58 @@ fn resolve_sandbox_image(
 
 #[cfg(test)]
 mod tests {
-    use super::{override_launch_binary, parse_repo_base, resolve_sandbox_image};
+    use super::{
+        hooks_when_trust_declined, override_launch_binary, parse_repo_base, resolve_sandbox_image,
+    };
+    use crate::session::config::repo_config::TrustSurface;
     use crate::session::config::SessionConfig;
+    use crate::session::HooksConfig;
+
+    #[test]
+    fn declined_trust_keeps_personal_on_create_hooks_only() {
+        let _app = crate::session::test_support::isolate_app_dir();
+        let write = |path: std::path::PathBuf, body: &str| {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
+        };
+        write(
+            crate::session::get_app_dir().unwrap().join("config.toml"),
+            "[hooks]\non_create = [\"global-create\"]\n",
+        );
+        write(
+            crate::session::get_profile_dir_path("work")
+                .unwrap()
+                .join("config.toml"),
+            "[hooks]\non_create = [\"profile-create\"]\n",
+        );
+        let repo = HooksConfig {
+            on_create: vec!["repo-create".into()],
+            on_launch: vec!["repo-launch".into()],
+            ..Default::default()
+        };
+        let root = std::path::Path::new("/repo");
+
+        for (profile, expected) in [("default", "global-create"), ("work", "profile-create")] {
+            let unapproved = TrustSurface::NeedsTrust {
+                config: repo.clone(),
+                hash: "h".into(),
+            };
+            for surface in [unapproved, TrustSurface::Absent] {
+                let hooks = hooks_when_trust_declined(profile, root, &surface)
+                    .expect("personal on_create hooks must survive a declined prompt");
+                assert_eq!(
+                    hooks.hooks().on_create,
+                    vec![expected.to_string()],
+                    "{profile}"
+                );
+                assert!(hooks.hooks().on_launch.is_empty(), "{profile}");
+            }
+            let trusted =
+                hooks_when_trust_declined(profile, root, &TrustSurface::Trusted(repo.clone()))
+                    .unwrap();
+            assert_eq!(trusted.hooks().on_create, vec!["repo-create".to_string()]);
+        }
+    }
 
     #[test]
     fn parse_repo_base_splits_on_the_first_equals() {

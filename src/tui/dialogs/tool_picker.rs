@@ -6,6 +6,7 @@ use ratatui::widgets::*;
 
 use super::DialogResult;
 use crate::session::config::ToolSessionConfig;
+use crate::tui::components::hint_buttons::HintButtons;
 use crate::tui::styles::Theme;
 
 pub struct ToolPickerDialog {
@@ -13,6 +14,7 @@ pub struct ToolPickerDialog {
     cursor: usize,
     dialog_area: Rect,
     list_area: Rect,
+    footer: HintButtons,
 }
 
 struct ToolPickerEntry {
@@ -39,12 +41,16 @@ impl ToolPickerDialog {
             cursor: 0,
             dialog_area: Rect::default(),
             list_area: Rect::default(),
+            footer: HintButtons::default(),
         }
     }
 
     pub fn handle_click(&mut self, col: u16, row: u16) -> DialogResult<String> {
         if !super::contains(self.dialog_area, col, row) {
             return DialogResult::Cancel;
+        }
+        if let Some(key) = self.footer.key_at(col, row) {
+            return self.handle_key(key);
         }
         let Some(idx) = super::row_index(self.list_area, col, row, self.items.len()) else {
             return DialogResult::Continue;
@@ -55,7 +61,7 @@ impl ToolPickerDialog {
 
     pub fn handle_hover(&mut self, col: u16, row: u16) -> bool {
         let hovered = super::row_index(self.list_area, col, row, self.items.len());
-        super::hover_select(&mut self.cursor, hovered)
+        self.footer.handle_hover(col, row) | super::hover_select(&mut self.cursor, hovered)
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> DialogResult<String> {
@@ -136,10 +142,16 @@ impl ToolPickerDialog {
         state.select(Some(self.cursor));
         frame.render_stateful_widget(list, list_area, &mut state);
 
-        let footer = super::hint_line(
+        self.footer.render(
+            frame,
+            footer_area,
             theme,
-            &[("↑↓", "navigate"), ("Enter", "open"), ("Esc", "close")],
+            &[
+                ("↑↓", "navigate", KeyCode::Null),
+                ("Enter", "open", KeyCode::Null),
+                ("Esc", "close", KeyCode::Esc),
+            ],
+            Alignment::Left,
         );
-        frame.render_widget(Paragraph::new(footer), footer_area);
     }
 }

@@ -1,7 +1,9 @@
-import { useMemo, useRef, useState } from "react";
+import { useCallback, useMemo, useRef, useState } from "react";
 import { flushSync } from "react-dom";
+import { sessionRawFileUrl } from "../lib/api";
 import { useFilesIndex } from "./acp/useFilesIndex";
 import { FileContentViewer } from "./diff/FileContentViewer";
+import { FileContextMenu, type PathMenuState } from "./diff/FileContextMenu";
 
 interface Props {
   sessionId: string | null;
@@ -15,6 +17,8 @@ export function FilesPane({ sessionId }: Props) {
   // Row nodes by path, so closing the viewer can return focus to the row the
   // user opened instead of dumping them at the top of the pane.
   const rowRefs = useRef(new Map<string, HTMLButtonElement>());
+  const [menu, setMenu] = useState<PathMenuState | null>(null);
+  const closeMenu = useCallback(() => setMenu(null), []);
 
   const shown = useMemo(() => {
     const q = filter.trim().toLowerCase();
@@ -43,6 +47,7 @@ export function FilesPane({ sessionId }: Props) {
 
   return (
     <div className="flex-1 flex flex-col bg-surface-900 overflow-hidden">
+      <FileContextMenu menu={menu} onClose={closeMenu} />
       <div className="px-3 py-2 border-b border-surface-700/20 shrink-0">
         <input
           type="text"
@@ -82,6 +87,10 @@ export function FilesPane({ sessionId }: Props) {
                 else rowRefs.current.delete(f);
               }}
               onClick={() => setSelected(f)}
+              onContextMenu={(e) => {
+                e.preventDefault();
+                setMenu({ x: e.clientX, y: e.clientY, path: f, open: { url: sessionRawFileUrl(sessionId, f) } });
+              }}
               className="w-full text-left px-3 py-1 font-mono text-[12px] text-text-secondary hover:bg-surface-800 hover:text-text-primary truncate cursor-pointer"
               title={f}
             >
