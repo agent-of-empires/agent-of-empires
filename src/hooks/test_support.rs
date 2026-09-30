@@ -7,17 +7,26 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
-/// Installs a hook-base override, cleared on drop.
-pub(crate) struct BaseGuard;
+/// Installs a hook-base override, cleared on drop. It also holds
+/// `test_env_lock`: a test that creates the base and then reads its mode is
+/// reading a mode, and `mkdirat` is masked by the process umask, so any test
+/// holding one for its own reasons has to exclude these.
+pub(crate) struct BaseGuard(Option<std::sync::MutexGuard<'static, ()>>);
 
 impl BaseGuard {
+    fn lock() -> Option<std::sync::MutexGuard<'static, ()>> {
+        crate::test_env_lock::acquire_env_lock(|| {
+            eprintln!("waiting for the environment lock: another test holds a process-wide state")
+        })
+    }
+
     /// Base under a fresh tempdir, not yet created on disk.
     pub(crate) fn fresh() -> (Self, PathBuf, TempDir) {
         let tmp = TempDir::new().unwrap();
         let base = tmp.path().join("aoe-hooks");
         super::dir_guard::override_base_for_test(base.clone());
         super::dir_guard::reset_for_test();
-        (Self, base, tmp)
+        (Self(Self::lock()), base, tmp)
     }
 
     /// As [`Self::fresh`], with the base created at 0o700.
@@ -31,7 +40,7 @@ impl BaseGuard {
     pub(crate) fn with_base(base: PathBuf) -> Self {
         super::dir_guard::override_base_for_test(base);
         super::dir_guard::reset_for_test();
-        Self
+        Self(Self::lock())
     }
 }
 
@@ -39,6 +48,7 @@ impl Drop for BaseGuard {
     fn drop(&mut self) {
         super::dir_guard::clear_base_override_for_test();
         super::dir_guard::reset_for_test();
+        crate::test_env_lock::release_env_lock(self.0.is_some());
     }
 }
 
