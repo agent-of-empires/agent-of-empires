@@ -109,13 +109,11 @@ impl Instance {
     /// it: settling a runner from the registry leaves no in-memory lease, so
     /// without this the next tick would respawn the runner the purge killed.
     pub fn is_purge_reserved(&self, now: DateTime<Utc>) -> bool {
-        matches!(
-            &self.lifecycle_reservation,
-            Some(reservation)
-                if reservation.generation == self.lifecycle_generation
-                    && (now - reservation.at) < Self::LIFECYCLE_RESERVATION_TTL
-                    && reservation.op == LifecycleOperation::Purge
-        )
+        self.has_fresh_lifecycle_reservation(now)
+            && self
+                .lifecycle_reservation
+                .as_ref()
+                .is_some_and(|reservation| reservation.op == LifecycleOperation::Purge)
     }
 
     pub fn release_lifecycle_reservation_if_owned(

@@ -145,9 +145,9 @@ pub fn run_until_cancelled(
     run_with_timeout_inner(cmd, timeout, false, Some(cancel))
 }
 
-/// Put a command in a fresh process group. Every supervised child needs it,
-/// and so does a test that has to observe a group outliving its own leader.
-pub fn configure_process_group_of(cmd: &mut Command) {
+/// Put a command in a fresh process group, so a signal to the group reaches it
+/// and only it.
+pub(crate) fn configure_process_group(cmd: &mut Command) {
     platform::configure_process_group(cmd);
 }
 
@@ -155,7 +155,7 @@ pub fn run_with_timeout_process_group(
     cmd: &mut Command,
     timeout: Duration,
 ) -> std::io::Result<Option<Output>> {
-    platform::configure_process_group(cmd);
+    configure_process_group(cmd);
     run_with_timeout_inner(
         cmd,
         timeout,

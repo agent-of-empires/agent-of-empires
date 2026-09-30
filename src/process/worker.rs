@@ -305,7 +305,7 @@ mod tests {
         // The shell leads its own group, so killing it leaves that group
         // populated by the background child. The crate's own helper does this
         // on both supported targets; `setsid` would only exist on Linux.
-        crate::process::configure_process_group_of(&mut command);
+        crate::process::configure_process_group(&mut command);
         let mut leader = command
             .stdout(std::process::Stdio::piped())
             .spawn()

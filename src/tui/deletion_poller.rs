@@ -28,9 +28,14 @@ impl DeletionPoller {
             worker: Worker::spawn("aoe-deletion-poller", move |request| {
                 match runtime.as_ref() {
                     Ok(runtime) => runtime.block_on(execute_deletion(request)),
-                    Err(error) => crate::session::deletion::runner_undiscoverable_result(
+                    Err(error) => DeletionResult::rejected(
                         request.session_id,
-                        format!("no runtime to settle the runner: {error}"),
+                        crate::session::deletion::DeletionDisposition::Failed,
+                        format!(
+                            "No runtime to settle this session's agent, so nothing was removed: \
+                             {error}"
+                        ),
+                        None,
                     ),
                 }
             }),

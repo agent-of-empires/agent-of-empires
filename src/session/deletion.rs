@@ -49,7 +49,7 @@ pub struct DeletionResult {
 }
 
 impl DeletionResult {
-    fn rejected(
+    pub(crate) fn rejected(
         session_id: String,
         disposition: DeletionDisposition,
         message: impl Into<String>,
@@ -685,20 +685,6 @@ impl Drop for PurgeTransaction {
                 });
             });
     }
-}
-
-/// A refusal for a caller that could not reach the runner settlement at all,
-/// phrased once so the surfaces do not each build the message.
-pub fn runner_undiscoverable_result(session_id: String, detail: String) -> DeletionResult {
-    DeletionResult::rejected(
-        session_id,
-        DeletionDisposition::Failed,
-        format!(
-            "The agent for this session could not be checked, so nothing was removed: {detail}. \
-             Retry once it exits."
-        ),
-        None,
-    )
 }
 
 /// Prove a structured session's runner is dead before anything destroys the
