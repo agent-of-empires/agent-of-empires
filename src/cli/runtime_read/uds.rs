@@ -602,10 +602,10 @@ async fn connect_admission(
     let euid = unsafe { libc::geteuid() };
     // Structural and process-start validation precedes the lock and the
     // marker_missing shortcut, so retained crash state is never hidden.
-    inspect_temporary_markers(dir)?;
+    let placed_temporary = inspect_temporary_markers(dir)?;
     let (lock, lock_identity) = match open_entry(dir, LOCK_FILE) {
         Ok(value) => value,
-        Err(EntryError::Missing) if runtime_entry_present(dir) => {
+        Err(EntryError::Missing) if runtime_entry_present(dir, placed_temporary) => {
             return Err(ReadFailure::pre("marker_identity"));
         }
         Err(EntryError::Missing) => return Err(ReadFailure::pre("marker_missing")),
@@ -659,7 +659,7 @@ async fn connect_admission(
             }
             return Err(ReadFailure::pre("marker_identity"));
         }
-        if runtime_entry_present(dir) {
+        if runtime_entry_present(dir, placed_temporary) {
             return Err(ReadFailure::pre("marker_identity"));
         }
         return Err(ReadFailure::pre("marker_missing"));
@@ -707,42 +707,11 @@ async fn connect_admission(
     })
 }
 
-fn runtime_entry_present(dir: RawFd) -> bool {
-    if [PREBIND_FILE, POSTBIND_FILE, SOCKET_FILE]
+fn runtime_entry_present(dir: RawFd, placed_temporary: bool) -> bool {
+    [PREBIND_FILE, POSTBIND_FILE, SOCKET_FILE]
         .iter()
         .any(|name| fstatat(dir, name).is_ok())
-    {
-        return true;
-    }
-    directory_contains_temp_marker(dir)
-}
-
-fn directory_contains_temp_marker(dir: RawFd) -> bool {
-    let duplicate = unsafe { libc::dup(dir) };
-    let Ok(scan) = fd_to_owned(duplicate) else {
-        return true;
-    };
-    let raw = scan.into_raw_fd();
-    let entries = unsafe { libc::fdopendir(raw) };
-    if entries.is_null() {
-        unsafe { libc::close(raw) };
-        return true;
-    }
-    let mut found = false;
-    loop {
-        errno_reset();
-        let entry = unsafe { libc::readdir(entries) };
-        if entry.is_null() {
-            break;
-        }
-        let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) }.to_string_lossy();
-        if temporary_kind(&name).is_some() {
-            found = true;
-            break;
-        }
-    }
-    unsafe { libc::closedir(entries) };
-    found
+        || placed_temporary
 }
 
 /// A marker the producer spells with a schema this client does not speak is
@@ -806,7 +775,11 @@ fn read_marker<T: for<'de> Deserialize<'de>>(dir: RawFd, name: &str) -> Result<T
     serde_json::from_slice(&bytes).map_err(|_| ReadFailure::pre("marker_invalid"))
 }
 
-fn inspect_temporary_markers(dir: RawFd) -> Result<(), ReadFailure> {
+/// Whether a temporary this client can place is present. A body that does not
+/// parse places none and is skipped rather than refused, because nothing is
+/// writing it: a publisher mid-write holds the lock, which this client fails
+/// to take before it ever reads a marker.
+fn inspect_temporary_markers(dir: RawFd) -> Result<bool, ReadFailure> {
     let duplicate = unsafe { libc::dup(dir) };
     let scan = fd_to_owned(duplicate).map_err(|_| ReadFailure::pre("marker_identity"))?;
     let raw = scan.into_raw_fd();
@@ -820,13 +793,14 @@ fn inspect_temporary_markers(dir: RawFd) -> Result<(), ReadFailure> {
     result
 }
 
-fn scan_temporary_markers(entries: *mut libc::DIR) -> Result<(), ReadFailure> {
+fn scan_temporary_markers(entries: *mut libc::DIR) -> Result<bool, ReadFailure> {
+    let mut placed = false;
     loop {
         errno_reset();
         let entry = unsafe { libc::readdir(entries) };
         if entry.is_null() {
             return if errno() == 0 {
-                Ok(())
+                Ok(placed)
             } else {
                 Err(ReadFailure::pre("marker_identity"))
             };
@@ -868,7 +842,10 @@ fn scan_temporary_markers(entries: *mut libc::DIR) -> Result<(), ReadFailure> {
                     )
                 }
                 Ok(_) => return Err(ReadFailure::pre("marker_invalid")),
-                Err(_) => return Err(ReadFailure::pre("marker_identity")),
+                // A body that does not parse is what a publisher killed
+                // between its exclusive create and its rename leaves. Nothing
+                // is writing it, so it places no publisher here.
+                Err(_) => continue,
             },
             TempKind::Postbind => match serde_json::from_slice::<PostbindMarker>(&bytes) {
                 Ok(value)
@@ -883,7 +860,7 @@ fn scan_temporary_markers(entries: *mut libc::DIR) -> Result<(), ReadFailure> {
                     )
                 }
                 Ok(_) => return Err(ReadFailure::pre("marker_invalid")),
-                Err(_) => return Err(ReadFailure::pre("marker_identity")),
+                Err(_) => continue,
             },
         };
         if content_uuid != suffix {
@@ -896,6 +873,7 @@ fn scan_temporary_markers(entries: *mut libc::DIR) -> Result<(), ReadFailure> {
         {
             return Err(ReadFailure::pre("marker_identity"));
         }
+        placed = true;
     }
 }
 
@@ -1463,26 +1441,64 @@ mod tests {
         assert!(!valid_uuid("AAAAAAAA-bbbb-cccc-dddd-eeeeeeeeeeee"));
     }
 
-    /// A crash between the publisher's exclusive create and its rename leaves a
-    /// temporary marker whose body does not parse. The client refuses that file
-    /// until the publisher reaps it, and accepts the directory the reap leaves
-    /// behind: the two halves agree on which directory is trustworthy.
-    #[test]
-    fn a_directory_whose_temporary_was_reaped_is_admitted() {
+    /// A publisher killed between its exclusive create and its rename leaves a
+    /// temporary whose body does not parse. Nothing is writing it, so it is no
+    /// evidence that a publisher exists: the read has to answer as an absence
+    /// and hand back to the local store, instead of spending the whole
+    /// establishment budget retrying a daemon that was never there.
+    #[tokio::test]
+    async fn a_torn_temporary_is_not_a_publisher() {
+        use std::os::unix::fs::PermissionsExt;
+
         let dir = tempfile::tempdir().expect("namespace");
         let torn = dir
             .path()
             .join("runtime.prebind.json.tmp.aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
         std::fs::write(&torn, b"").expect("torn temporary");
-        let namespace = File::open(dir.path()).expect("open namespace");
+        // The publisher creates its temporary 0600, and another mode is
+        // refused as untrustworthy before the body is ever read.
+        std::fs::set_permissions(&torn, std::fs::Permissions::from_mode(0o600)).expect("mode");
 
-        assert!(
-            inspect_temporary_markers(namespace.as_raw_fd()).is_err(),
-            "an unparsable temporary is not admitted"
+        let opened = File::open(dir.path()).expect("open namespace");
+        let namespace = OwnedNamespace {
+            name: "debug:agent-of-empires-dev".into(),
+            home: dir.path().to_path_buf(),
+            dir: OwnedFd::from(opened),
+        };
+        let Err(error) = connect_admission(
+            namespace,
+            Instant::now() + crate::server::runtime_ws::CONNECTION_BUDGET,
+        )
+        .await
+        else {
+            panic!("a namespace publishing nothing admits nothing");
+        };
+        assert_ne!(
+            error.code(),
+            "marker_identity",
+            "a torn temporary is not a publisher about to appear"
         );
 
         std::fs::remove_file(&torn).expect("the publisher reaps it");
-        inspect_temporary_markers(namespace.as_raw_fd()).expect("the reaped directory is admitted");
+        let opened = File::open(dir.path()).expect("open namespace");
+        let namespace = OwnedNamespace {
+            name: "debug:agent-of-empires-dev".into(),
+            home: dir.path().to_path_buf(),
+            dir: OwnedFd::from(opened),
+        };
+        let Err(error) = connect_admission(
+            namespace,
+            Instant::now() + crate::server::runtime_ws::CONNECTION_BUDGET,
+        )
+        .await
+        else {
+            panic!("the reaped directory admits nothing");
+        };
+        assert_eq!(
+            error.code(),
+            "marker_missing",
+            "both halves answer the same way: no publisher here"
+        );
     }
 
     /// A namespace whose markers are all present, all consistent and all

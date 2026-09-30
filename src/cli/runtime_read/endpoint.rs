@@ -224,9 +224,10 @@ fn parse_endpoint(raw: &str) -> Result<(String, bool), ReadFailure> {
     ))
 }
 
-/// An IPv6 authority without its brackets, which is how `http` spells it and
-/// therefore what every rule downstream of this module reads. A host that is
-/// not bracketed comes back as it stands.
+/// The address inside an authority's brackets. A URI authority must keep
+/// them and `http` hands them back that way, so a rule that parses the
+/// address strips them first. A host that is not bracketed comes back as it
+/// stands.
 pub(super) fn unbracketed(host: &str) -> &str {
     host.strip_prefix('[')
         .and_then(|inner| inner.strip_suffix(']'))

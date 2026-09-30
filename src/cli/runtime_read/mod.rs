@@ -639,6 +639,10 @@ mod tests {
     /// not collapse.
     #[test]
     fn only_a_loopback_host_answers_with_this_machines_home() {
+        assert!(
+            dirs::home_dir().is_some(),
+            "this machine has a home to collapse to"
+        );
         let cases: [(&str, bool); 8] = [
             ("http://127.0.0.1:8080/api/runtime/ws", true),
             ("http://[::1]:8080/api/runtime/ws", true),
