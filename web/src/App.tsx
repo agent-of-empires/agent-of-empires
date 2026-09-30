@@ -10,7 +10,7 @@ import {
   type ReactNode,
 } from "react";
 import { Puzzle } from "lucide-react";
-import { useMatch, useNavigate, useSearchParams } from "react-router-dom";
+import { useLocation, useMatch, useNavigate, useSearchParams } from "react-router-dom";
 import { IDLE_DECAY_WINDOW_MS } from "./lib/session";
 import { diffSelectionStale } from "./lib/diffSelection";
 import { useSessions } from "./hooks/useSessions";
@@ -102,6 +102,7 @@ import { parseSessionColorsEnabled, SessionColorsContext } from "./lib/sessionCo
 import { onSettingsChanged } from "./lib/settingsEvents";
 import { parseSystemHealthEnabled, SystemHealthEnabledContext } from "./lib/systemHealth";
 import { toastBus, reportError } from "./lib/toastBus";
+import { startPendingCreates } from "./lib/pendingCreates";
 import { isAbsolutePath, resolveToRepoRelative, type FileRef } from "./lib/fileRef";
 import { NAVIGATE_EVENT, OPEN_SESSION_EVENT } from "./lib/sessionRoute";
 import { dispatchFocusTerminal, requestSessionInputFocus, setPendingTerminalFocus } from "./lib/terminalFocus";
@@ -344,6 +345,7 @@ function AppContent({
     void hydrateWebUiStateFromServer();
   }, []);
 
+  const location = useLocation();
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
   const { settings: webSettings } = useWebSettings();
@@ -367,6 +369,22 @@ function AppContent({
     applySession,
   } = useSessions();
   const workspaces = useWorkspaces(sessions);
+  // Creates whose outcome the wizard never learned keep reconciling here, past its unmount.
+  useEffect(() => {
+    startPendingCreates({
+      onCreated: (session) => {
+        if (!session) return;
+        injectSession(session);
+        toastBus.handler?.info(`"${session.title}" is ready`);
+      },
+      onFailed: (message) => toastBus.handler?.error(`Session was not created: ${message}`),
+      onUnknown: (message) => toastBus.handler?.error(message),
+      onUnsaved: () =>
+        toastBus.handler?.error(
+          "This browser could not save a session that is still being created; keep this tab open until it finishes.",
+        ),
+    });
+  }, [injectSession]);
   // Trash is a whole-workspace concern, so it is derived here from the
   // authoritative unsliced workspace list rather than reconstructed from the
   // sidebar's per-`group_path` slice views. A workspace is in Trash only when
@@ -1852,7 +1870,18 @@ function AppContent({
           onClose={handleCloseSettings}
           onSelectTab={(t) => {
             const p = searchParams.get("profile");
-            navigate(`/settings/${t}${p ? `?profile=${encodeURIComponent(p)}` : ""}`);
+            // Marks a tab opened from the mobile section list, so its Back pops to it.
+            navigate(`/settings/${t}${p ? `?profile=${encodeURIComponent(p)}` : ""}`, {
+              state: { fromSettingsList: settingsTab === null },
+            });
+          }}
+          onShowList={() => {
+            if ((location.state as { fromSettingsList?: boolean } | null)?.fromSettingsList) {
+              navigate(-1);
+              return;
+            }
+            const p = searchParams.get("profile");
+            navigate(`/settings${p ? `?profile=${encodeURIComponent(p)}` : ""}`, { replace: true });
           }}
           onServerAboutRefresh={refreshServerAbout}
           profile={searchParams.get("profile")}
@@ -2406,6 +2435,11 @@ function AppContent({
               }
               setShowSessionWizard(false);
               setWizardPrefill(undefined);
+            }}
+            onCreatedInBackground={(session?: SessionResponse) => {
+              if (!session) return;
+              injectSession(session);
+              toastBus.handler?.info(`"${session.title}" is ready`);
             }}
             prefill={wizardPrefill}
             nameOnly={caps.nameOnlyWizard}

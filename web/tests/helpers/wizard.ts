@@ -1,5 +1,5 @@
-// Single-screen new-session wizard DSL (#2210), shared by mocked and live specs. Queries scope to the
-// modal because the app shell behind it owns colliding labels ("More options", "New session").
+// New-session wizard DSL, shared by mocked and live specs: one-line rows whose details open in
+// sub-panels. Queries scope to the modal because the app shell behind it owns colliding labels.
 
 import { expect, type Locator, type Page, type Route } from "@playwright/test";
 import { sessionResponse } from "./sessions";
@@ -18,22 +18,40 @@ export async function openWizard(page: Page) {
   await expect(page.getByTestId("session-wizard")).toBeVisible();
 }
 
-/** Pick a recent or saved project by a substring of its path or name. */
+/** Pick a recent or saved project by a substring of its path or name; opens the picker if needed. */
 export async function selectProject(page: Page, pathText: string) {
-  const recent = wizard(page).getByRole("button").filter({ hasText: pathText }).first();
+  const w = wizard(page);
+  if (!(await w.getByRole("button", { name: "Done" }).isVisible())) await w.getByTestId("wizard-project-row").click();
+  const recent = w.getByRole("button").filter({ hasText: pathText }).first();
   await recent.waitFor({ state: "visible", timeout: 5000 });
   await recent.click();
 }
 
-export async function selectAgent(page: Page, name: string | RegExp) {
-  await wizard(page).getByRole("button", { name }).click();
+export type WizardPanel = "Profile" | "Project" | "Extra repos" | "Agent" | "Worktree" | "Sandbox";
+
+/** Open a row's sub-panel; Worktree and Sandbox open from their switch row's summary. */
+export async function openPanel(page: Page, panel: WizardPanel) {
+  const w = wizard(page);
+  if (panel === "Worktree" || panel === "Sandbox") {
+    await w.getByRole("button", { name: `Configure ${panel.toLowerCase()}` }).click();
+  } else {
+    await w
+      .getByRole("button")
+      .filter({ hasText: new RegExp(`^${panel}`) })
+      .first()
+      .click();
+  }
+  await expect(w.getByRole("heading", { name: panel })).toBeVisible();
 }
 
-/** Expand the "More options" fold if it is not already open. */
-export async function expandMoreOptions(page: Page) {
-  const button = wizard(page).getByRole("button", { name: "More options" });
-  await button.waitFor({ state: "visible" });
-  if ((await button.getAttribute("aria-expanded")) !== "true") await button.click();
+export async function closePanel(page: Page) {
+  await wizard(page).getByRole("button", { name: "Done" }).click();
+}
+
+export async function selectAgent(page: Page, name: string | RegExp) {
+  await openPanel(page, "Agent");
+  await wizard(page).getByRole("button", { name }).click();
+  await closePanel(page);
 }
 
 export async function setTitle(page: Page, title: string) {

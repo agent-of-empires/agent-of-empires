@@ -395,6 +395,18 @@ export interface CreateSessionRequest {
   import_acp_session_id?: string;
   /** Agent or ACP session id to fork from. */
   fork_from?: string;
+  /** A retry with the same key returns the session the first attempt created;
+   *  also keys `fetchCreateProgress`. */
+  idempotency_key?: string;
+  /** On a retry only: the daemon run the first attempt went to (`create_boot_id`). */
+  retry_origin?: string;
+}
+
+export interface CreateProgress {
+  stage: "preparing" | "starting_container" | "running_hooks" | "starting";
+  /** The `on_create` command currently running. */
+  hook: string | null;
+  output: string[];
 }
 
 export interface ClaudeSessionSummary {
@@ -501,6 +513,8 @@ export interface SettingsFieldDescriptor {
   profile_overridable: boolean;
   validation: SettingsValidation;
   advanced: boolean;
+  /** Read only by the TUI; folded apart from the dashboard's own settings. */
+  tui_only?: boolean;
   /** Present only on plugin fields, which have no stored value until saved. */
   default?: unknown;
 }

@@ -109,6 +109,11 @@ pub struct CreateSessionBody {
     /// Persisted replay key, retained until the created row is hard-deleted.
     #[serde(default)]
     pub idempotency_key: Option<String>,
+    /// Set on a retry: the `create_boot_id` of the daemon the first attempt went to. A
+    /// daemon that does not know the key and did not take that attempt cannot tell
+    /// whether it ran, so it refuses rather than run it, and its hooks, again.
+    #[serde(default)]
+    pub retry_origin: Option<String>,
 }
 
 /// Persisted group identity; empty paths and synthetic sidebar sections are invalid.

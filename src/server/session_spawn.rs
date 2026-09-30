@@ -59,6 +59,8 @@ pub(crate) struct StructuredSessionSpec {
     pub agent_effort: Option<String>,
     pub import_acp_session_id: Option<String>,
     pub fork_seed: Option<crate::session::ForkSeed>,
+    /// Where the web wizard polls this create's stage and hook output.
+    pub progress: Option<Arc<crate::server::create_progress::CreateProgress>>,
 }
 
 /// Created session and transient warnings; HTTP row authority is the runtime snapshot.
@@ -141,6 +143,7 @@ pub(crate) async fn spawn_structured_session(
             agent_effort,
             import_acp_session_id,
             fork_seed,
+            progress,
         } = spec;
 
         let sandbox_image = sandbox_image.unwrap_or_else(|| {
@@ -260,7 +263,15 @@ pub(crate) async fn spawn_structured_session(
             &instance.source_profile,
             instance.idempotency_key.as_deref(),
         )?;
-        let creation_progress = |event| creation_guard.hook_event(event);
+        // One hook event feeds both progress channels: the live registry the
+        // web wizard polls by `idempotency_key`, and the session service's
+        // published creation progress.
+        let creation_progress = |event: crate::session::config::repo_config::HookProgress| {
+            if let Some(progress) = progress.as_deref() {
+                progress.record(event.clone());
+            }
+            creation_guard.hook_event(event)
+        };
         let generation = {
             let _submission = runtime.block_on(worker_state.session_service.prompt_submission(&instance.id));
             let _guard = lock.blocking_lock();
@@ -499,6 +510,13 @@ pub(crate) async fn spawn_structured_session(
                 .map_err(anyhow::Error::from)
                 .and_then(|()| {
                     creation_guard.phase(CreationPhase::CreateHooks);
+                    if instance.sandbox_info.is_some() {
+                        if let Some(progress) = progress.as_deref() {
+                            progress.set_stage(
+                                crate::server::create_progress::CreateStage::StartingContainer,
+                            );
+                        }
+                    }
                     crate::server::api::sessions::run_create_hooks(
                         &mut instance,
                         &hook_plan,
@@ -523,6 +541,10 @@ pub(crate) async fn spawn_structured_session(
         if let Err(error) = creation {
             rollback(native, instance, provisioning_failed);
             return Err(error);
+        }
+
+        if let Some(progress) = progress.as_deref() {
+            progress.set_stage(crate::server::create_progress::CreateStage::Starting);
         }
 
         let launch_reservation = {
@@ -914,8 +936,8 @@ mod tests {
             agent_effort: None,
             import_acp_session_id: None,
             fork_seed: None,
+            progress: None,
         };
-
         let result = spawn_structured_session(&state.session_service, spec).await;
         assert!(
             result.is_err(),

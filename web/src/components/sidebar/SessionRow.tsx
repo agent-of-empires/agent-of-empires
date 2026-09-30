@@ -76,6 +76,7 @@ export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
   const [renaming, setRenaming] = useState(false);
   const [renameValue, setRenameValue] = useState(label);
   const renameRef = useRef<HTMLInputElement>(null);
+  const rowRef = useRef<HTMLAnchorElement>(null);
 
   const openedAtRef = useRef(0);
   const { menu, menuRef, openMenu, closeMenu } = useContextMenu<{ x: number; y: number; scope: RowContextScope }>(
@@ -154,6 +155,7 @@ export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
   return (
     <>
       <a
+        ref={rowRef}
         href={navigationSessionId ? `/session/${encodeURIComponent(navigationSessionId)}` : "/"}
         tabIndex={isDeleting ? -1 : undefined}
         aria-disabled={isDeleting || undefined}
@@ -233,7 +235,16 @@ export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
         </div>
       </a>
       {menu && (
-        <ContextMenu menu={menu} menuRef={menuRef} testId="sidebar-context-menu" minWidth="min-w-[180px]">
+        <ContextMenu
+          menu={menu}
+          menuRef={menuRef}
+          testId="sidebar-context-menu"
+          minWidth="min-w-[240px]"
+          sheetOnMobile
+          label={menu.scope.kind === "bulk" ? `${menu.scope.count} selected sessions` : `${label} actions`}
+          onClose={closeMenu}
+          returnFocusTo={rowRef}
+        >
           {menu.scope.kind === "bulk" ? (
             <BulkTriageMenuItems
               count={menu.scope.count}

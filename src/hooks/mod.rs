@@ -22,12 +22,13 @@ use std::path::{Path, PathBuf};
 
 pub use codex::uninstall_codex_hooks;
 pub(crate) use codex::{
-    install_codex_hooks_with_preserved_state, install_codex_json_hooks, restore_codex_hooks_state,
-    snapshot_codex_hooks_state,
+    codex_hooks_disabled_at, install_codex_hooks_with_preserved_state, install_codex_json_hooks,
+    restore_codex_hooks_state, snapshot_codex_hooks_state,
 };
 pub(crate) use command::HOOK_STATUS_BASE_IN_CONTAINER;
 #[cfg(test)]
 pub(crate) use command::{hook_command, hook_command_session_id, status_command_for_event};
+pub(crate) use command::{identity_field_name, identity_publisher_arg};
 pub(crate) use config_io::with_config_lock_policy;
 pub use config_io::SymlinkPolicy;
 pub(crate) use dir_guard::{
@@ -38,11 +39,12 @@ pub(crate) use status_file::{
     read_hook_session_id_within, read_hook_sidecar_at, SESSION_ID_SIDECAR_MAX_AGE,
 };
 pub(crate) const SESSION_SOURCE_ENV: &str = "AOE_SESSION_SOURCE";
-pub use hermes::{install_hermes_hooks_with_events, uninstall_hermes_hooks};
+pub use hermes::{install_hermes_hooks_with_events, uninstall_hermes_hooks, HERMES_ALLOWLIST_FILE};
 pub use json_settings::{
     install_cursor_hooks_with_events, install_hooks, uninstall_cursor_hooks, uninstall_hooks,
 };
 pub use kimi::{install_kimi_hooks_with_events, uninstall_kimi_hooks};
+pub use kiro::KIRO_DEFAULT_AGENT_NOTE;
 pub use kiro::{
     install_kiro_hooks_with_events, resolve_kiro_agent_file, set_kiro_default_agent_if_builtin,
     uninstall_kiro_hooks, KIRO_HOOKS_AGENT_FILE,

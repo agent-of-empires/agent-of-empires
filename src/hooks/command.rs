@@ -164,12 +164,25 @@ pub(crate) fn hook_command_session_id(
     }
 }
 
-fn hook_command_session_id_host(field: HookIdentityField, publisher: Option<&str>) -> String {
-    let field = match field {
+/// The `--field` value an identity hook extracts. Named here so the command
+/// and the disclosure cannot drift apart.
+pub(crate) fn identity_field_name(field: HookIdentityField) -> &'static str {
+    match field {
         HookIdentityField::SessionId => "session-id",
         HookIdentityField::ConversationIdOrSessionId => "conversation-id-or-session-id",
-    };
-    let agent = publisher.map_or_else(String::new, |name| format!(" --agent {name}"));
+    }
+}
+
+/// The `--agent NAME` qualifier an identity command carries, empty when the
+/// event declares no publisher. Named here so the command and the
+/// disclosure cannot drift.
+pub(crate) fn identity_publisher_arg(publisher: Option<&str>) -> String {
+    publisher.map_or_else(String::new, |name| format!(" --agent {name}"))
+}
+
+fn hook_command_session_id_host(field: HookIdentityField, publisher: Option<&str>) -> String {
+    let field = identity_field_name(field);
+    let agent = identity_publisher_arg(publisher);
     format!(
         "sh -c '[ -n \"$AOE_INSTANCE_ID\" ] || exit 0; \
          [ -n \"$AOE_HOOK_BIN\" ] || exit 0; \

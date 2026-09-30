@@ -19,6 +19,12 @@ async function openWizard(page: Page, serve: ServeHandle): Promise<Locator> {
   return wizard;
 }
 
+/** A fresh server has no remembered project, so the wizard opens on its picker. */
+async function pickScratch(wizard: Locator) {
+  await wizard.getByRole("button", { name: "Scratch", exact: true }).click();
+  await wizard.getByRole("button", { name: "Use a scratch folder" }).click();
+}
+
 /** The only session is a scratch session under the app data dir's `scratch/`. */
 async function expectOneScratchSession(serve: ServeHandle) {
   const sessions = await waitForSessions(serve.baseUrl);
@@ -41,8 +47,7 @@ test.describe("wizard", () => {
     // #1841: the structured view toggle defaults on for an ACP-capable agent.
     const serve = await spawnServe({ acp: true });
     const wizard = await openWizard(page, serve);
-    await wizard.getByRole("switch", { name: "Skip project folder" }).click();
-    await wizard.getByRole("button", { name: "More options" }).click();
+    await pickScratch(wizard);
     const acpToggle = wizard.getByRole("switch", {
       name: "Use structured view",
     });
@@ -61,9 +66,10 @@ test.describe("wizard", () => {
       extraEnv: { FAKE_ACP_MODE_VIA_CONFIG_OPTION: "codex" },
     });
     const wizard = await openWizard(page, serve);
-    await wizard.getByRole("switch", { name: "Skip project folder" }).click();
+    await pickScratch(wizard);
+    await wizard.getByTestId("wizard-agent-row").click();
     await wizard.getByRole("button", { name: "codex", exact: true }).click();
-    await wizard.getByRole("button", { name: "More options" }).click();
+    await wizard.getByRole("button", { name: "Done" }).click();
     const autoApprove = wizard.getByRole("switch", {
       name: "Auto-approve actions",
     });
@@ -111,6 +117,35 @@ test.describe("wizard", () => {
 
 // #1324
 test.describe("scratch sessions", () => {
+  test("deleting a scratch session removes its scratch dir", async ({ page, spawnServe }) => {
+    const serve = await spawnServe();
+    const wizard = await openWizard(page, serve);
+    await pickScratch(wizard);
+    await wizard.getByRole("button", { name: /Launch session/ }).click();
+    const [created] = await waitForSessions(serve.baseUrl);
+    const projectPath = created!.project_path as string;
+    expect(existsSync(projectPath)).toBe(true);
+
+    const row = page.locator("[data-testid='sidebar-session-row']").first();
+    await expect(row).toBeVisible({ timeout: 10_000 });
+    await row.click({ button: "right" });
+    await page.locator("[data-testid='sidebar-context-menu-delete']").click();
+    const dialog = page.locator("[data-testid='delete-session-dialog']");
+    await expect(dialog).toBeVisible();
+    // Trash is the default; only a permanent delete purges the directory.
+    await dialog.locator("[data-testid='delete-session-permanent']").click();
+    const deletePromise = page.waitForResponse(
+      (res) => res.url().endsWith(`/api/workspaces`) && res.request().method() === "DELETE",
+    );
+    await dialog.getByRole("button", { name: /^Delete$/ }).click();
+    const deleteRes = await deletePromise;
+    expect(deleteRes.ok()).toBe(true);
+    expect((deleteRes.request().postDataJSON() as { session_ids: string[] }).session_ids).toEqual([created!.id]);
+
+    await expect.poll(async () => (await listSessions(serve.baseUrl)).length, { timeout: 10_000 }).toBe(0);
+    await expect.poll(() => existsSync(projectPath), { timeout: 5_000 }).toBe(false);
+  });
+
   test("palette 'New scratch session' opens the wizard and launches a scratch session", async ({ serve, page }) => {
     // #1643
     await page.goto(serve.baseUrl);
@@ -209,8 +244,7 @@ test.describe("directory browser", () => {
     await expect(option(page, "repo-b")).toHaveAccessibleName(/^repo-b$/);
 
     await option(page, "repo-a").click();
-    await expect(page.getByText("Selected project")).toBeVisible();
-    await expect(page.getByText(`${homePath}/projects/repo-a`)).toBeVisible();
+    await expect(page.getByTestId("wizard-project-row")).toContainText(`${homePath}/projects/repo-a`);
     expect(await page.evaluate(() => window.localStorage.getItem("aoe-last-browse-dir"))).toBe(`${homePath}/projects`);
 
     await page.getByRole("button", { name: "Close" }).click();

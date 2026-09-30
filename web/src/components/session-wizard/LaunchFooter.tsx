@@ -1,5 +1,6 @@
 import { useEffect } from "react";
 import { useServerDown, OFFLINE_TITLE } from "../../lib/connectionState";
+import { hasFinePointer } from "../../lib/platform";
 
 interface LaunchData {
   path: string;
@@ -19,12 +20,21 @@ interface Props {
    *  fetch has failed); a launch before then would submit placeholder
    *  sandbox/worktree/yolo values. Omitted means ready. */
   defaultsReady?: boolean;
+  /** Offered while a create runs: closes the wizard and lets it finish unattended. */
+  onBackground?: () => void;
 }
 
 const isMac = typeof navigator !== "undefined" && /Mac|iPhone|iPad/.test(navigator.userAgent);
-
 /** Launch button, submit gate, Cmd/Ctrl+Enter shortcut, and error banners. */
-export function LaunchFooter({ data, isSubmitting, error, onSubmit, nameOnly = false, defaultsReady = true }: Props) {
+export function LaunchFooter({
+  data,
+  isSubmitting,
+  error,
+  onSubmit,
+  nameOnly = false,
+  defaultsReady = true,
+  onBackground,
+}: Props) {
   const offline = useServerDown();
   // Scratch and name-only sessions get their directory from the server.
   const canSubmit =
@@ -66,10 +76,19 @@ export function LaunchFooter({ data, isSubmitting, error, onSubmit, nameOnly = f
           </span>
         ) : (
           <span>
-            Launch session <span className="opacity-60">({isMac ? "⌘" : "Ctrl"}+Enter)</span>
+            Launch session {hasFinePointer() && <span className="opacity-60">({isMac ? "⌘" : "Ctrl"}+Enter)</span>}
           </span>
         )}
       </button>
+      {isSubmitting && onBackground && (
+        <button
+          type="button"
+          onClick={onBackground}
+          className="w-full mt-2 py-2 text-sm text-text-secondary hover:text-text-primary rounded-lg hover:bg-surface-700/50 cursor-pointer transition-colors"
+        >
+          Continue in background
+        </button>
+      )}
     </div>
   );
 }

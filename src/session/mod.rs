@@ -73,6 +73,7 @@ pub use groups::{
 };
 #[cfg(test)]
 pub(crate) use instance::install_aliases;
+pub(crate) use instance::resolved_agent_for;
 #[cfg(test)]
 pub(crate) use instance::test_helpers::publish_host_pi_transcript;
 #[cfg(test)]
@@ -82,9 +83,8 @@ pub(crate) use instance::{
     ToolLaunchUnavailable, NEWER_GENERATION_BUSY_REASON,
 };
 pub(crate) use instance::{
-    generic_host_config_path_for, resolved_agent_for, sidecar_host_config_path_for,
-    ConversationState, LaunchReservation, ResumeAttemptPolicy, ResumeLaunchOptions,
-    TerminalContextResume,
+    host_hook_agent, host_hook_disclosure, host_hook_disclosure_config_with_repo,
+    host_hook_post_install_notes,
 };
 pub use instance::{
     is_valid_session_color, AuxiliaryObservation, AuxiliaryTarget, ConversationBinding,
@@ -94,6 +94,10 @@ pub use instance::{
     PluginCreateIdempotency, PollerStart, SandboxInfo, SessionBucket, SessionGone, StartBlocked,
     StartOutcome, Status, TerminalInfo, View, WorkspaceInfo, WorkspaceRepo, WorktreeInfo,
     SESSION_COLORS, TMUX_SERVER_UNREACHABLE_ERROR, TMUX_SESSION_GONE_ERROR,
+};
+pub(crate) use instance::{
+    ConversationState, LaunchReservation, ResumeAttemptPolicy, ResumeLaunchOptions,
+    TerminalContextResume,
 };
 #[cfg(test)]
 pub(crate) use move_journal::{

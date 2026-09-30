@@ -130,7 +130,7 @@ When AoE encounters hooks in a repo for the first time, it prompts you to review
 
 - Trust decisions are stored globally (shared across all profiles)
 - If hook commands change (e.g., someone updates `.agent-of-empires/config.toml`), AoE prompts for re-approval
-- Use `--trust-hooks` with `aoe add` to skip the trust prompt (useful for CI or repos you control)
+- Use `--trust-hooks` with `aoe add` to skip the trust prompt (useful for CI or repos you control). It covers this gate only. The hooks AoE writes into the *agent's own* config, not the ones a repo declares, are a separate approval: see [Agent hook approval](configuration.md#agent-hook-approval).
 
 ```bash
 # Trust hooks automatically

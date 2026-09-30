@@ -170,11 +170,8 @@ test("per-profile setting override leaves global state untouched", async ({ serv
     if (req.method() === "PATCH" && req.url().includes("/api/")) patches.push(req.url());
   });
   await page.goto(`${serve.baseUrl}/settings/session`);
-  await expect(page.getByTestId("settings-header").getByText("Profile", { exact: true })).toBeVisible();
-  const profileSelect = page
-    .locator("label", { hasText: /^Profile$/ })
-    .locator("..")
-    .locator("select");
+  const profileSelect = page.getByTestId("settings-profile-picker").locator("select");
+  await expect(profileSelect).toBeVisible();
   await profileSelect.selectOption("work");
   await expect(profileSelect).toHaveValue("work");
 

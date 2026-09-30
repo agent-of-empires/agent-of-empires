@@ -23,6 +23,8 @@ const fetchIsGitRepo = vi.fn().mockResolvedValue(true);
 const fetchRecentProjects = vi.fn();
 
 vi.mock("../../../lib/api", () => ({
+  fetchCreateProgress: vi.fn().mockResolvedValue(null),
+  fetchCreateBootId: vi.fn().mockResolvedValue("boot-1"),
   fetchSettings: (...args: unknown[]) => fetchSettings(...args),
   fetchAgents: vi.fn().mockResolvedValue([]),
   fetchIsGitRepo: (...args: unknown[]) => fetchIsGitRepo(...args),
@@ -97,11 +99,13 @@ describe("SessionWizard last-project memory", () => {
 
   it("ignores a stored value that is not an absolute path", async () => {
     localStorage.setItem(PROJECT_KEY, "not a path");
-    const { getByText } = renderWizard();
+    const { getByRole, queryByText } = renderWizard();
 
     await waitFor(() => expect(fetchSettings).toHaveBeenCalled());
     expect(fetchIsGitRepo).not.toHaveBeenCalled();
-    expect(launchButton(getByText).disabled).toBe(true);
+    // With no project the wizard opens on the picker, which has no Launch.
+    expect(getByRole("button", { name: "Done" })).toBeTruthy();
+    expect(queryByText(/Launch session/)).toBeNull();
   });
 
   it("never seeds the hidden path of a name-only (CityHall) wizard", async () => {
@@ -116,9 +120,7 @@ describe("SessionWizard last-project memory", () => {
   });
 
   it("shows the remembered selection even when the picker has no saved or recent rows", async () => {
-    // With nothing to pick the step would default to Browse, where the
-    // selected-path box is hidden and Launch would be enabled with no target
-    // on screen. A remembered path keeps the Recent tab and its box.
+    // The project row names the target Launch will use.
     fetchRecentProjects.mockResolvedValue({ projects: [] });
     localStorage.setItem(PROJECT_KEY, "/tmp/remembered");
     const { getByText, findByText } = renderWizard();

@@ -15,10 +15,10 @@ impl CreateHookFailed {
     }
 }
 
-/// Hard cap on a single `idempotency_key`'s length, so one request cannot
-/// persist an arbitrarily large string onto its instance. This bounds key
-/// SIZE, not the number of distinct keys; entry count is bounded separately
-/// by the pruning in `AppState::idempotency_lock`.
+/// Hard cap on one `idempotency_key`'s length, so a request cannot persist an
+/// arbitrarily large string. This bounds key SIZE, not the number of distinct
+/// keys; entry count is bounded separately by the pruning in
+/// `AppState::idempotency_lock`.
 const IDEMPOTENCY_KEY_MAX_LEN: usize = 200;
 
 /// Find a prior session created with the given `idempotency_key`. Scans all
@@ -495,9 +495,10 @@ pub(crate) fn resolve_create_hook_plan(
     Ok(CreateHookPlan { hooks, trust_write })
 }
 
-/// Run captured creation hooks with streamed error-tail capture. `progress`,
-/// when present, receives the live command and output for the requesting
-/// surface.
+/// Run the planned `on_create` hooks (#2066) with streamed error-tail capture.
+/// `progress`, when present, receives the live command and output for the
+/// requesting surface; either way the executor's terminal-detach
+/// (credential-prompt suppression) applies.
 pub(crate) fn run_create_hooks(
     instance: &mut Instance,
     plan: &CreateHookPlan,
@@ -511,7 +512,6 @@ pub(crate) fn run_create_hooks(
     }
 
     let hook_env = repo_config::lifecycle_env_vars(instance);
-
     if instance.sandbox_info.is_some() {
         instance.ensure_container_in(store)?;
         let workdir = instance.container_workdir();
@@ -667,6 +667,59 @@ pub async fn create_session(
     let Json(mut body) = match body {
         Ok(b) => b,
         Err(rej) => return rej.into_response(),
+    };
+
+    if let Some(key) = body.idempotency_key.as_deref() {
+        if key.is_empty() || key.len() > IDEMPOTENCY_KEY_MAX_LEN {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "validation_failed",
+                format!("idempotency_key must be 1-{IDEMPOTENCY_KEY_MAX_LEN} characters"),
+            );
+        }
+    }
+
+    // Idempotency first: a known key is answered from its result, replayed failure or
+    // restart fence before any validation that reads mutable state (profiles, agents,
+    // projects), which could otherwise turn a retry of an unknown outcome into a verdict.
+    // The per-key lock is held across the check-and-create so two concurrent requests
+    // sharing a new key cannot both scan-miss and create.
+    let _idempotency_guard = if let Some(key) = body.idempotency_key.as_deref() {
+        let lock = state.idempotency_lock(key).await;
+        let guard = lock.lock_owned().await;
+        let existing = {
+            let instances = state.instances.read().await;
+            find_by_idempotency_key(&instances, key).map(|inst| inst.id.clone())
+        };
+        if let Some(id) = existing {
+            return created_session_response(&state, &id, Vec::new(), StatusCode::OK).await;
+        }
+        if let Some(failure) = state.create_progress.recent_failure(key) {
+            return api_error(failure.status, failure.code, failure.message);
+        }
+        if body
+            .retry_origin
+            .as_deref()
+            .is_some_and(|origin| origin != state.create_progress.boot_id())
+        {
+            return api_error(
+                StatusCode::CONFLICT,
+                "create_outcome_unknown",
+                "The server restarted before confirming this session, so whether it was created is unknown. Check the session list before launching it again.",
+            );
+        }
+        // Forgetting a live failure would let its retry run the create again, so a full
+        // replay map refuses new keyed creates instead.
+        if !state.create_progress.has_failure_capacity() {
+            return api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "create_failures_full",
+                "Too many recent failed session creates; try again later.",
+            );
+        }
+        Some(guard)
+    } else {
+        None
     };
     let default_profile = state
         .canonical_metadata
@@ -1097,41 +1150,6 @@ pub async fn create_session(
         }
     }
 
-    if let Some(key) = body.idempotency_key.as_deref() {
-        if key.is_empty() || key.len() > IDEMPOTENCY_KEY_MAX_LEN {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": "validation_failed",
-                    "message": format!(
-                        "idempotency_key must be 1-{IDEMPOTENCY_KEY_MAX_LEN} characters"
-                    ),
-                })),
-            )
-                .into_response();
-        }
-    }
-
-    // Idempotency: hold a per-key lock across the check-and-create so two
-    // concurrent requests sharing a new key can't both scan-miss and both
-    // create a session. The guard lives until this handler returns (Rust
-    // drops it at end of scope); only requests sharing this exact key
-    // serialize, not general session-create throughput.
-    let _idempotency_guard = if let Some(key) = body.idempotency_key.as_deref() {
-        let lock = state.idempotency_lock(key).await;
-        let guard = lock.lock_owned().await;
-        let existing = {
-            let instances = state.instances.read().await;
-            find_by_idempotency_key(&instances, key).map(|inst| inst.id.clone())
-        };
-        if let Some(id) = existing {
-            return created_session_response(&state, &id, Vec::new(), StatusCode::OK).await;
-        }
-        Some(guard)
-    } else {
-        None
-    };
-
     if let Some(source_id) = body
         .fork_session_id
         .as_deref()
@@ -1147,6 +1165,12 @@ pub async fn create_session(
     }
 
     let profile = body.profile.unwrap_or(default_profile);
+    // Registered after the idempotency lock, so a retry waiting on it cannot
+    // replace the entry the in-flight create is writing to.
+    let progress = body
+        .idempotency_key
+        .as_deref()
+        .map(|key| state.create_progress.register(key));
 
     let spec = crate::server::session_spawn::StructuredSessionSpec {
         title: body.title,
@@ -1175,7 +1199,7 @@ pub async fn create_session(
         trust_review: body.trust_review,
         custom_instruction: body.custom_instruction,
         callback_url: body.callback_url,
-        idempotency_key: body.idempotency_key,
+        idempotency_key: body.idempotency_key.clone(),
         profile,
         // Never decoded from the request body: only the plugin host path
         // stamps these, through create_structured_session. See #2897.
@@ -1189,13 +1213,37 @@ pub async fn create_session(
         agent_effort: body.agent_effort,
         import_acp_session_id: body.import_acp_session_id,
         fork_seed,
+        progress: progress.as_ref().map(|p| Arc::clone(&p.progress)),
     };
 
-    match state
-        .session_service
-        .create_structured_session(spec, None, None, None)
-        .await
-    {
+    // Detached so a client that drops the connection mid-create (a backgrounded
+    // mobile tab) cannot cancel it between persisting and publishing. The guard
+    // and registration move with it, so a retry with the same key waits for
+    // this create and then finds its session.
+    let task_state = Arc::clone(&state);
+    let key = body.idempotency_key;
+    let created = tokio::spawn(async move {
+        let _idempotency_guard = _idempotency_guard;
+        let _progress = progress;
+        let result = task_state
+            .session_service
+            .create_structured_session(spec, None, None, None)
+            .await;
+        if let (Err(e), Some(key)) = (&result, &key) {
+            if let Some(failure) = create_failure(e) {
+                task_state.create_progress.record_failure(key, failure);
+            }
+        }
+        result
+    })
+    .await
+    .unwrap_or_else(|e| {
+        Err(anyhow::Error::new(
+            crate::server::session_spawn::SessionBuildPanicked(e.to_string()),
+        ))
+    });
+
+    match created {
         Ok((outcome, _created)) => {
             let instance = outcome.instance;
             if query.wait.as_deref() == Some("ready") && instance.status == Status::Starting {
@@ -1228,16 +1276,6 @@ pub async fn create_session(
             if e.is::<crate::session::NativeStoreUnavailable>() {
                 return StatusCode::SERVICE_UNAVAILABLE.into_response();
             }
-            if let Some(panicked) =
-                e.downcast_ref::<crate::server::session_spawn::SessionBuildPanicked>()
-            {
-                tracing::error!(target: "http.api.sessions", "Session creation panicked: {}", panicked.0);
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({"error": "internal", "message": "Internal server error"})),
-                )
-                    .into_response();
-            }
             // A repo whose hooks need approval gets a distinct, structured
             // response so the caller can surface the commands and resubmit with
             // `trust_hooks: true` (#2066), rather than the opaque create_failed.
@@ -1255,16 +1293,58 @@ pub async fn create_session(
                 )
                     .into_response();
             }
-            tracing::warn!(target: "http.api.sessions", "Session creation failed: {}", e);
+            if let Some(panicked) =
+                e.downcast_ref::<crate::server::session_spawn::SessionBuildPanicked>()
+            {
+                tracing::error!(target: "http.api.sessions", "Session creation panicked: {}", panicked.0);
+            } else {
+                tracing::warn!(target: "http.api.sessions", "Session creation failed: {}", e);
+            }
             if let Some(response) = local_create_hook_error_response(&e, local_owner) {
                 return response;
             }
-            (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "create_failed", "message": public_create_session_error(&e)})),
-            )
-                .into_response()
+            let failure = create_failure(&e).expect("hooks_need_trust returned above");
+            api_error(failure.status, failure.code, failure.message)
         }
+    }
+}
+
+/// The response for a failed create; `None` for a trust refusal, which the
+/// caller resubmits with the same key.
+fn create_failure(e: &anyhow::Error) -> Option<crate::server::create_progress::CreateFailure> {
+    use crate::server::create_progress::CreateFailure;
+    if e.downcast_ref::<HooksNeedTrust>().is_some() {
+        return None;
+    }
+    // A build-task panic keeps its 500; a plain build failure is a 400.
+    Some(
+        if e.downcast_ref::<crate::server::session_spawn::SessionBuildPanicked>()
+            .is_some()
+        {
+            CreateFailure {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                code: "internal",
+                message: "Internal server error".to_string(),
+            }
+        } else {
+            CreateFailure {
+                status: StatusCode::BAD_REQUEST,
+                code: "create_failed",
+                message: public_create_session_error(e),
+            }
+        },
+    )
+}
+
+/// `GET /api/sessions/create-progress/{key}`: stage and hook output of an
+/// in-flight create sent with this `idempotency_key`. 404 when none is running.
+pub async fn create_session_progress(
+    State(state): State<Arc<AppState>>,
+    Path(key): Path<String>,
+) -> impl IntoResponse {
+    match state.create_progress.snapshot(&key) {
+        Some(snapshot) => Json(snapshot).into_response(),
+        None => bare_not_found(),
     }
 }
 pub(super) fn local_create_hook_error_response(

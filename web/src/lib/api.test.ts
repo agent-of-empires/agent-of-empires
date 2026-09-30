@@ -903,10 +903,38 @@ describe("createSession errors", () => {
       new Response(JSON.stringify({ error: "create_failed", message: "nope" }), { status: 400 }),
     );
     expect(await api.createSession(body)).toEqual({ ok: false, error: "nope" });
+    // A proxy's page is no verdict: the create may still be running behind it.
     fetchSpy.mockResolvedValueOnce(new Response("boom", { status: 500 }));
-    expect(await api.createSession(body)).toEqual({ ok: false, error: "Server error (500): boom" });
+    expect(await api.createSession(body)).toMatchObject({ ok: false, network: true });
+    fetchSpy.mockResolvedValueOnce(new Response("<html>504 Gateway Time-out</html>", { status: 504 }));
+    expect(await api.createSession(body)).toEqual({
+      ok: false,
+      error: "No answer from the server (504)",
+      network: true,
+    });
+    // AoE's own typed errors, and a proxy's refusal to forward, are verdicts.
+    fetchSpy.mockResolvedValueOnce(
+      new Response(JSON.stringify({ error: "create_failures_full", message: "try later" }), { status: 503 }),
+    );
+    expect(await api.createSession(body)).toEqual({ ok: false, error: "try later" });
+    fetchSpy.mockResolvedValueOnce(new Response("too large", { status: 413 }));
+    expect(await api.createSession(body)).toEqual({ ok: false, error: "Server error (413): too large" });
+    // A restarted daemon that cannot see the first attempt: settled, and not a failure.
+    fetchSpy.mockResolvedValueOnce(
+      new Response(JSON.stringify({ error: "create_outcome_unknown", message: "restarted" }), { status: 409 }),
+    );
+    expect(await api.createSession(body)).toEqual({ ok: false, error: "restarted", outcomeUnknown: true });
     offline();
-    expect(await api.createSession(body)).toEqual({ ok: false, error: "Network error: offline" });
+    expect(await api.createSession(body)).toEqual({ ok: false, error: "Network error: offline", network: true });
+  });
+
+  it("reads create progress, null once the create has finished", async () => {
+    const progress = { stage: "running_hooks", hook: "npm ci", output: ["ok"] };
+    fetchSpy.mockResolvedValueOnce(json(progress));
+    expect(await api.fetchCreateProgress("k/1")).toEqual(progress);
+    expect(lastCall().url).toBe("/api/sessions/create-progress/k%2F1");
+    fetchSpy.mockResolvedValueOnce(empty(404));
+    expect(await api.fetchCreateProgress("k")).toBeNull();
   });
 });
 

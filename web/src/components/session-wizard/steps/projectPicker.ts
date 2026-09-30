@@ -99,20 +99,22 @@ export function splitSavedAndRecent(
   return { saved, recent: recent.filter((r) => !savedPaths.has(normalizePath(r.path))) };
 }
 
-/** Saved paths are always read for the workflow's resolved profile. */
+/** Saved paths are read for the workflow's resolved profile; with none resolved
+ *  yet the server reads its default profile, so the load must not wait for one. */
 export function useProjectPicker(profile: string | undefined, excludePaths: string[] = []) {
   const [recent, setRecent] = useState<RecentProject[]>([]);
   const [saved, setSaved] = useState<ProjectInfo[]>([]);
-  const [loadedProfile, setLoadedProfile] = useState<string>();
-  const [failedProfile, setFailedProfile] = useState<string>();
+  const [loadedScope, setLoadedScope] = useState<string | null>(null);
+  const [failedScope, setFailedScope] = useState<string | null>(null);
   const [retryAttempt, setRetryAttempt] = useState(0);
-  const loading = !profile || loadedProfile !== profile;
+  // `""` is the unresolved-profile scope, distinct from "nothing loaded yet".
+  const scope = profile ?? "";
+  const loading = loadedScope !== scope;
   const [query, setQuery] = useState("");
 
   useEffect(() => {
-    if (!profile) return;
     let cancelled = false;
-    Promise.all([fetchSessions(), fetchRecentProjects(), fetchProjects({ profile })]).then(
+    Promise.all([fetchSessions(), fetchRecentProjects(), fetchProjects(profile ? { profile } : {})]).then(
       ([envelope, recentEnvelope, savedProjects]) => {
         if (cancelled) return;
         const sessionDerived = envelope ? collectRecentProjects(envelope.sessions) : [];
@@ -120,14 +122,14 @@ export function useProjectPicker(profile: string | undefined, excludePaths: stri
         const split = splitSavedAndRecent(savedProjects ?? [], merged);
         setSaved(split.saved);
         setRecent(split.recent);
-        setFailedProfile(savedProjects === null ? profile : undefined);
-        setLoadedProfile(profile);
+        setFailedScope(savedProjects === null ? scope : null);
+        setLoadedScope(scope);
       },
     );
     return () => {
       cancelled = true;
     };
-  }, [profile, retryAttempt]);
+  }, [profile, scope, retryAttempt]);
   const excluded = useMemo(() => new Set(excludePaths.map(normalizePath)), [excludePaths]);
   const visibleSaved = useMemo(
     () => (loading ? [] : saved.filter((s) => !excluded.has(normalizePath(s.path)))),
@@ -155,10 +157,11 @@ export function useProjectPicker(profile: string | undefined, excludePaths: stri
 
   return {
     loading,
-    error: failedProfile === profile,
+    // Only a load of this scope that came back empty is a failure.
+    error: failedScope === scope && loadedScope === scope,
     retry: () => {
-      setFailedProfile(undefined);
-      setLoadedProfile(undefined);
+      setFailedScope(null);
+      setLoadedScope(null);
       setRetryAttempt((attempt) => attempt + 1);
     },
     saved: visibleSaved,

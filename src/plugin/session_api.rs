@@ -518,6 +518,7 @@ async fn admit_and_create(
         agent_effort: None,
         import_acp_session_id: None,
         fork_seed: None,
+        progress: None,
     };
 
     // Resolve an idempotent replay/conflict BEFORE charging admission, so a

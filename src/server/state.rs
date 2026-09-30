@@ -144,6 +144,8 @@ pub struct AppState {
     /// the daemon has ever seen. See #3156.
     pub idempotency_locks:
         Arc<RwLock<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    /// Hook progress of in-flight web creates, keyed by `idempotency_key`.
+    pub create_progress: super::create_progress::CreateProgressRegistry,
     /// Disk config resolutions performed by `list_sessions`, one per unique
     /// `(profile, project_path)` per request, accumulated monotonically.
     /// Every cache a request opens reports here, so the shared-cache

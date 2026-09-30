@@ -13,6 +13,7 @@ import type {
   ProjectInfo,
   ProjectOverrides,
   DockerStatusResponse,
+  CreateProgress,
   CreateSessionRequest,
   CreationTrustFingerprint,
   ClaudeSessionSummary,
@@ -1304,10 +1305,17 @@ export interface ServerAbout {
      *  verified working. */
     backend_available: boolean;
   };
+  /** This daemon run's id; a create's retries send it back as `retry_origin`. */
+  create_boot_id?: string;
 }
 
 export function fetchAbout(): Promise<ServerAbout | null> {
   return fetchJson<ServerAbout>("/api/about");
+}
+
+/** The current daemon run's id, read fresh right before a create's first send. */
+export async function fetchCreateBootId(): Promise<string | null> {
+  return (await fetchAbout())?.create_boot_id ?? null;
 }
 
 export interface TelemetryStatus {
@@ -1603,6 +1611,10 @@ const jsonInit = (method: string, body: unknown): RequestInit => ({
   body: JSON.stringify(body),
 });
 
+const networkError = (e: unknown) => `Network error: ${e instanceof Error ? e.message : "connection failed"}`;
+
+const stringList = (value: unknown) => (Array.isArray(value) ? value : []);
+
 /** Enqueue a prompt server-side (POST /queue). `id` is the client-minted stable
  *  id so an optimistic row reconciles against the returned entry; re-posting the
  *  same id updates it in place rather than duplicating. Returns the stored entry
@@ -1814,7 +1826,7 @@ export async function resolvePluginOptions(
 }
 
 export type ProjectTarget = { scope: "global" } | { scope: "profile"; profile: string };
-export type ProjectReadContext = ProjectTarget | { scope?: never; profile: string };
+export type ProjectReadContext = ProjectTarget | { scope?: never; profile?: string };
 
 export function projectTarget(scope: ProjectInfo["scope"], profile: string): ProjectTarget {
   return scope === "profile" ? { scope, profile } : { scope };
@@ -1823,7 +1835,7 @@ export function projectTarget(scope: ProjectInfo["scope"], profile: string): Pro
 function projectQuery(context: ProjectReadContext): string {
   const query = new URLSearchParams();
   if (context.scope) query.set("scope", context.scope);
-  if ("profile" in context) query.set("profile", context.profile);
+  if ("profile" in context && context.profile) query.set("profile", context.profile);
   return query.toString();
 }
 
@@ -2036,14 +2048,15 @@ export async function createSession(body: CreateSessionRequest): Promise<{
   error?: string;
   session?: SessionResponse;
   hooksNeedTrust?: HooksNeedTrust;
+  /** The repository's hook configuration changed since the trust review; review it again. */
   trustChanged?: boolean;
+  /** No definite answer (dropped request, or a proxy timeout page), so the create may still be running. */
+  network?: boolean;
+  /** A restarted daemon cannot tell whether the first attempt ran; retrying stops here. */
+  outcomeUnknown?: boolean;
 }> {
   try {
-    const res = await fetch("/api/sessions", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
+    const res = await fetch("/api/sessions", jsonInit("POST", body));
     if (res.status === 409 && res.headers.get("aoe-error-code") === "creation_trust_changed") {
       return {
         ok: false,
@@ -2051,40 +2064,46 @@ export async function createSession(body: CreateSessionRequest): Promise<{
         trustChanged: true,
       };
     }
-    if (!res.ok) {
-      const text = await res.text();
-      try {
-        const data = JSON.parse(text);
-        if (data.error === "hooks_need_trust") {
-          return {
-            ok: false,
-            error: data.message || "Repository hooks require trust",
-            hooksNeedTrust: {
-              onCreate: Array.isArray(data.on_create) ? data.on_create : [],
-              onLaunch: Array.isArray(data.on_launch) ? data.on_launch : [],
-              onDestroy: Array.isArray(data.on_destroy) ? data.on_destroy : [],
-              needsMcpTrust: data.needs_mcp_trust === true,
-            },
-          };
-        }
-        return {
-          ok: false,
-          error: data.message || `Server error (${res.status})`,
-        };
-      } catch {
-        return {
-          ok: false,
-          error: `Server error (${res.status}): ${text.slice(0, 200)}`,
-        };
-      }
+    if (res.ok) return { ok: true, session: await res.json() };
+    const text = await res.text();
+    let data: { error?: unknown; message?: string; [k: string]: unknown } | null = null;
+    try {
+      data = JSON.parse(text);
+    } catch {
+      // Not AoE's JSON; classified below.
     }
-    const data = await res.json();
-    return { ok: true, session: data };
-  } catch (e) {
+    // Only AoE's typed error body is a verdict. A reverse proxy's timeout or bad-gateway
+    // page says only that the upstream reply went missing, and the create may still finish.
+    if (typeof data?.error !== "string" && (res.status === 408 || res.status >= 500)) {
+      return { ok: false, error: `No answer from the server (${res.status})`, network: true };
+    }
+    if (!data) return { ok: false, error: `Server error (${res.status}): ${text.slice(0, 200)}` };
+    if (data.error === "create_outcome_unknown") {
+      return { ok: false, error: data.message || "Whether the session was created is unknown.", outcomeUnknown: true };
+    }
+    if (data.error !== "hooks_need_trust") return { ok: false, error: data.message || `Server error (${res.status})` };
     return {
       ok: false,
-      error: `Network error: ${e instanceof Error ? e.message : "connection failed"}`,
+      error: data.message || "Repository hooks require trust",
+      hooksNeedTrust: {
+        onCreate: stringList(data.on_create),
+        onLaunch: stringList(data.on_launch),
+        onDestroy: stringList(data.on_destroy),
+        needsMcpTrust: data.needs_mcp_trust === true,
+      },
     };
+  } catch (e) {
+    return { ok: false, error: networkError(e), network: true };
+  }
+}
+
+/** Progress of an in-flight create sent with `key`; null once it has finished. */
+export async function fetchCreateProgress(key: string): Promise<CreateProgress | null> {
+  try {
+    const res = await fetch(`/api/sessions/create-progress/${encodeURIComponent(key)}`);
+    return res.ok ? ((await res.json()) as CreateProgress) : null;
+  } catch {
+    return null;
   }
 }
 

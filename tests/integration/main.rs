@@ -20,6 +20,7 @@ mod home_isolation;
 mod daemon_client;
 #[cfg(debug_assertions)]
 mod hidden_env_batch;
+mod hooks_cli;
 mod hooks_config;
 mod migration_pipeline;
 mod profile_management;
