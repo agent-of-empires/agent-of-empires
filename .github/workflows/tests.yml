@@ -138,7 +138,18 @@ jobs:
         # rather than passing as a green run with the guard gone.
         run: |
           echo "TMPDIR=${TMPDIR:-unset}"
-          cargo nextest run --no-fail-fast
+          set +e
+          cargo nextest run --no-fail-fast 2>&1 | tee /tmp/aoe-counter-test.log
+          result=${PIPESTATUS[0]}
+          if [ "$result" -ne 0 ]; then
+            python3 - <<'PYLOG'
+          from pathlib import Path
+          log = Path('/tmp/aoe-counter-test.log').read_text()
+          message = log[-18000:].replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
+          print('::error title=Counter port test diagnostic::' + message)
+          PYLOG
+          fi
+          exit "$result"
       # bare-core: the three no-default-features feature corners. `web` is not
       # a default feature, so these runs are also the dashboard-off compile
       # gate that keeps the `cfg(feature = "web")` sites from rotting.
