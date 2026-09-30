@@ -161,9 +161,11 @@ pub(crate) async fn install_rate_limit_continuation(
 }
 
 /// Releases rate-limit parks whose window elapsed: install the interrupted
-/// prompt unless a queued one took the session, publish the breadcrumb for a
-/// delivered continuation, and free the `attempted` slot so this tick
-/// respawns. The park and its times come from the durable event store (#3514).
+/// prompt unless a queued one took the session, publish the marker matching
+/// what happened — the automatic breadcrumb when a continuation was
+/// delivered, the manual disarm when a queued prompt took the session — and
+/// free the `attempted` slot so this tick respawns. The park and its times
+/// come from the durable event store (#3514).
 /// Returns the released ids so the resume loop does not re-hold them.
 pub(super) async fn reap_rate_limit_resumes(
     state: &Arc<AppState>,
@@ -330,6 +332,15 @@ pub(super) async fn reap_rate_limit_resumes(
                 );
             }
             ContinuationOutcome::SupersededByQueue => {
+                // A queued prompt takes the session, so no continuation goes
+                // out. The manual marker is the budget's disarm step rather
+                // than a record of a delivery, so an arming an earlier
+                // automatic resume left behind has to be retired here too, or
+                // it outlives the daemon and charges a redelivery that never
+                // happened.
+                state
+                    .acp_supervisor
+                    .publish_rate_limit_auto_resumed(&id, resume_at, true);
                 tracing::info!(
                     target: "acp.supervisor",
                     session = %id,
@@ -701,20 +712,28 @@ mod tests {
         // The `parked` fixture backdates the limit an hour, so these straddle it.
         let after = Utc::now();
         let before = Utc::now() - chrono::Duration::hours(2);
-        // (label, continuation installed, queued at, turn kept, breadcrumbs)
+        // (label, continuation installed, queued at, turn kept, auto markers, manual markers)
         let cases = [
-            ("queued-after", false, after.to_rfc3339(), None, 0),
+            ("queued-after", false, after.to_rfc3339(), None, 0, 1),
             (
                 "installed-and-queued-after",
                 true,
                 after.to_rfc3339(),
                 None,
                 0,
+                1,
             ),
-            ("queued-before", false, before.to_rfc3339(), Some(true), 1),
-            ("queued-at-unreadable", false, "t0".into(), Some(true), 1),
+            (
+                "queued-before",
+                false,
+                before.to_rfc3339(),
+                Some(true),
+                1,
+                0,
+            ),
+            ("queued-at-unreadable", false, "t0".into(), Some(true), 1, 0),
         ];
-        for (label, installed, queued_at, kept, breadcrumbs) in cases {
+        for (label, installed, queued_at, kept, auto_markers, manual_markers) in cases {
             let id = format!("sess-4092-{label}");
             let (_home, state, _project) = parked(&id, 0).await;
             if installed {
@@ -752,8 +771,8 @@ mod tests {
             assert_eq!(pending_turn(&state, &id).await, kept, "{label}");
             assert_eq!(
                 auto_resumed_breadcrumbs(&state, &id),
-                breadcrumbs,
-                "{label}: a refused continuation must not spend a redelivery"
+                auto_markers + manual_markers,
+                "{label}: marker count"
             );
             assert!(
                 !attempted.contains(&id) && released.contains(&id),
