@@ -362,6 +362,35 @@ pub(super) fn boot_id() -> Option<String> {
     }
 }
 
+/// Whether any process of `pgrp` is still running, ignoring zombies. Darwin has
+/// no `/proc`, so `ps` answers the enumeration. `Err` when it cannot, so a
+/// caller that cannot prove absence treats the group as alive.
+pub(super) fn process_group_has_live_members(pgrp: u32) -> std::io::Result<bool> {
+    // `ps -g` does not mean the same thing on every BSD, so the table is read in
+    // full and the group is matched on an explicit column instead.
+    let output = Command::new("ps")
+        .args(["-o", "pid=,pgid=,state=", "-A"])
+        .output()
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    if !output.status.success() {
+        return Err(std::io::Error::other(format!(
+            "ps exited with {}",
+            output.status
+        )));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let _pid = fields.next()?;
+            let group = fields.next()?;
+            let state = fields.next()?;
+            (group.parse::<u32>() == Ok(pgrp)).then_some(state)
+        })
+        // `ps` prints one state letter per member, `Z` for a zombie.
+        .any(|state| state != "Z"))
+}
+
 /// Whether `pid` has exited and is only waiting to be reaped rather than still
 /// running. Same rule as the Linux probe: a zombie holds nothing, so treating it
 /// as alive makes a torn-down runner unprovable forever.
@@ -370,28 +399,6 @@ pub(super) fn boot_id() -> Option<String> {
 /// reports an exited child without reaping it and leaves the supervisor's own
 /// wait intact. A pid that is not our child answers `ECHILD` and reads as alive,
 /// which is the behaviour the zombie rule never changed.
-/// Whether any process of `pgrp` is still running, ignoring zombies. Darwin has
-/// no `/proc`, so `ps` answers the enumeration. `Err` when it cannot, so a
-/// caller that cannot prove absence treats the group as alive.
-pub(super) fn process_group_has_live_members(pgrp: u32) -> std::io::Result<bool> {
-    let output = Command::new("ps")
-        .args(["-o", "state=", "-g", &pgrp.to_string()])
-        .output()
-        .map_err(|error| std::io::Error::other(error.to_string()))?;
-    if !output.status.success() {
-        return Err(std::io::Error::other(format!(
-            "ps -g {pgrp} exited with {}",
-            output.status
-        )));
-    }
-    let alive = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .map(str::trim)
-        // `ps` prints one state letter per member, `Z` for a zombie.
-        .any(|state| !state.is_empty() && !state.starts_with('Z'));
-    Ok(alive)
-}
-
 pub(super) fn is_terminated(pid: u32) -> bool {
     let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
     // SAFETY: `info` is a live, correctly sized `siginfo_t` and `WNOWAIT` leaves

@@ -316,13 +316,6 @@ fn find_process_in_group(pgrp: u32) -> Option<u32> {
     None
 }
 
-/// Whether `pid` has already terminated, which for a child of this process means
-/// it is waiting to be reaped rather than still running.
-///
-/// A zombie holds nothing: it cannot write, it holds no file descriptors open
-/// on a checkout, and its process group is dead. Treating it as alive makes a
-/// torn-down runner unprovable forever. The repo's own descendant wait already
-/// uses this rule (`process::mod` test helper: "exited or a terminated zombie").
 /// Whether any process of `pgrp` is still running, ignoring zombies: a zombie
 /// holds nothing, so a group made only of zombies is dead.
 ///
@@ -354,6 +347,13 @@ pub(super) fn process_group_has_live_members(pgrp: u32) -> std::io::Result<bool>
     Ok(false)
 }
 
+/// Whether `pid` has already terminated, which for a child of this process means
+/// it is waiting to be reaped rather than still running.
+///
+/// A zombie holds nothing: it cannot write, it holds no file descriptors open
+/// on a checkout, and its process group is dead. Treating it as alive makes a
+/// torn-down runner unprovable forever. The repo's own descendant wait already
+/// uses this rule (`process::mod` test helper: "exited or a terminated zombie").
 pub(super) fn is_terminated(pid: u32) -> bool {
     let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
         return false;
