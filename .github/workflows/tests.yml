@@ -231,6 +231,56 @@ jobs:
             exit 1
           fi
 
+  cargo-coverage:
+    name: Rust Coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          components: llvm-tools-preview
+      - uses: taiki-e/install-action@dfae9bf3d6f6c6f20ef4ebb3486c01a51341ff12 # v2.87.18
+        with:
+          tool: cargo-llvm-cov
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+      - name: Install tmux
+        run: sudo apt-get update && sudo apt-get install -y tmux
+      - name: Install ACP shim deps
+        working-directory: acp-worker/test-shim
+        run: npm ci
+      - name: Collect Rust coverage
+        run: |
+          mkdir -p coverage/cargo
+          cargo llvm-cov --features web --lcov --output-path coverage/cargo/lcov.info
+      - name: Normalize and verify LCOV paths
+        run: |
+          sed -i "s|^SF:${GITHUB_WORKSPACE}/|SF:|" coverage/cargo/lcov.info
+          python3 - <<'PY'
+          from pathlib import Path
+
+          report = Path("coverage/cargo/lcov.info")
+          sources = [line[3:] for line in report.read_text().splitlines() if line.startswith("SF:")]
+          if not any(source.startswith("src/") for source in sources):
+              raise SystemExit("Rust coverage report has no src/ records")
+          for source in sources:
+              if source.startswith("/") or ":" in source or "\\" in source or ".." in Path(source).parts:
+                  raise SystemExit(f"Rust coverage report has non-relative source: {source}")
+          PY
+      - name: Upload to Codecov (cargo flag)
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          disable_search: true
+          files: coverage/cargo/lcov.info
+          flags: cargo
+          name: cargo
+          fail_ci_if_error: false
+
   cargo-macos:
     # macOS runs on pushes to main and on demand, NOT on pull requests.
     #

@@ -1,17 +1,11 @@
 # Codecov configuration for agent-of-empires.
 #
-# Scope today: web/ frontend only (Vitest unit tests + Playwright mocked +
-# Playwright live, all merged into one LCOV by web/scripts/merge-coverage.mjs).
-# Rust backend coverage (cargo-llvm-cov or tarpaulin) is queued as a
-# follow-up; when it lands, add a `cargo` flag and additional components
-# scoped under src/**.
+# Web coverage combines Vitest unit tests with mocked and live Playwright
+# reports. Rust coverage is uploaded separately from cargo-llvm-cov.
 #
-# Components segment the web frontend by user-facing surface so the PR
-# comment shows exactly which area moved (or regressed). Targets are 90%
-# project + patch with a 1% threshold; first PRs after the foundation
-# merges will run well below this, so the report-only philosophy lives
-# in the Codecov "informational" flag at the project level until the
-# follow-ups (#1217-#1224) lift the baseline.
+# Components segment the web frontend and Rust backend so the PR comment
+# shows which area moved. The existing web project gate stays independent
+# of the new Rust baseline; Rust project coverage starts informational.
 # Touched 2026-05-28 to force another YAML re-resolve after reinstalling the Codecov GitHub App on the agent-of-empires org. The 2026-05-27 touch happened before the App install was completed; per-PR processing was still falling back to defaults (bare-bones comment, missing codecov/project status) because the "Current bot" field on the Codecov repo config page stayed at "none".
 
 comment:
@@ -23,19 +17,18 @@ comment:
   hide_project_coverage: false
 
 codecov:
-  # Both LCOV sources already emit repo-root paths ("web/src/..."): the vitest
-  # job rewrites SF: prefixes and the Playwright merge script writes them
-  # directly. Codecov's default path fixer was re-mapping those and dropping
-  # per-line hits for changed web/src files (patch coverage showed freshly
-  # tested lines, and even comment lines, as missed). Disabling it makes
+  # LCOV sources emit repo-root paths ("web/src/..." or "src/..."): the vitest
+  # and Rust jobs rewrite SF: prefixes, while the Playwright merge script
+  # writes them directly. Codecov's default path fixer was re-mapping those
+  # and dropping per-line hits for changed web/src files (patch coverage showed
+  # freshly tested lines, and even comment lines, as missed). Disabling it makes
   # Codecov trust the paths as uploaded. (#2157)
   disable_default_path_fixes: true
-  # Hold all Codecov notifications (PR comment + status checks) until every
-  # coverage upload has landed. Counts UPLOADS, not flags: vitest (1) +
-  # playwright-mocked (1) + playwright-live (2, one per shard) = 4. With a
-  # lower number Codecov posts mid-run, before the last live shard reports,
-  # so the comment/status reflect partial coverage. Keep this in sync with
-  # the playwright-live shard count (`shard: [1, 2]` in tests.yml).
+  # Keep the threshold at the four established web uploads: vitest (1),
+  # playwright-mocked (1), and playwright-live (2 shards). The Rust upload is
+  # optional for notifications, so an upload error cannot hold existing web
+  # statuses pending. wait_for_ci holds evaluation until the workflow ends;
+  # a later fifth upload also updates the report. Counts uploads, not flags.
   # `wait_for_ci: true` additionally holds notifications until GitHub Actions
   # reports the workflow done, so a hung uploader cannot trigger a premature
   # evaluation either.
@@ -50,6 +43,10 @@ codecov:
 # skipping playwright-live) does not zero out that slice; the last
 # known value carries forward instead.
 flags:
+  cargo:
+    paths:
+      - src/
+    carryforward: true
   vitest:
     paths:
       - web/src/
@@ -68,11 +65,37 @@ component_management:
     # No per-component GitHub status checks. Components still appear
     # in the codecov PR comment under the "components" layout block
     # so authors see which surface moved, but we don't spam the merge
-    # box with a separate row per component. The repo-wide gates are
-    # enforced by the aggregate `codecov/project` and `codecov/patch`
-    # statuses defined under `coverage.status` below.
+    # box with a separate row per component. Project and patch statuses use
+    # separate web and Rust flags; the Rust statuses start informational.
     statuses: []
   individual_components:
+    - component_id: "rust-server"
+      name: "Rust Server"
+      paths:
+        - "src/server/**"
+        - "src/daemon/**"
+
+    - component_id: "rust-structured-view"
+      name: "Rust Structured View"
+      paths:
+        - "src/acp/**"
+
+    - component_id: "rust-session"
+      name: "Rust Session"
+      paths:
+        - "src/session/**"
+        - "src/tmux/**"
+
+    - component_id: "rust-tui"
+      name: "Rust TUI"
+      paths:
+        - "src/tui/**"
+
+    - component_id: "rust-hooks"
+      name: "Rust Hooks"
+      paths:
+        - "src/hooks/**"
+
     # ============================================================
     # STRUCTURED VIEW (native structured rendering)
     # ============================================================
@@ -223,7 +246,7 @@ coverage:
   status:
     project:
       default:
-        # Project status compares the whole repo's coverage against the
+        # Project status compares the web flags' coverage against the
         # base (auto-resolved to main on PRs). `auto` target means
         # "don't drop below where main is today", which is the right
         # behavior while the baseline climbs from the foundation
@@ -232,9 +255,19 @@ coverage:
         target: auto
         threshold: 1%
         base: auto
+        flags:
+          - vitest
+          - playwright-mocked
+          - playwright-live
         if_ci_failed: error
         informational: false
         only_pulls: false
+      cargo:
+        target: auto
+        threshold: 1%
+        flags:
+          - cargo
+        informational: true
     patch:
       default:
         # New / changed code on a PR must hit 75% coverage. The eventual
@@ -242,11 +275,22 @@ coverage:
         # follow-up), but the foundation PR adds tiny TSX deltas alongside
         # large test infrastructure, where a single unhit line can tank a
         # short-patch ratio. 75% leaves room for one missed line on small
-        # patches while still requiring that most new code be covered.
+        # patches while still requiring that most new web code be covered.
+        # Rust patch coverage starts informational until its baseline settles.
         target: 75%
         threshold: 1%
         base: auto
+        flags:
+          - vitest
+          - playwright-mocked
+          - playwright-live
         if_ci_failed: error
+      cargo:
+        target: 75%
+        threshold: 1%
+        flags:
+          - cargo
+        informational: true
 
 github_checks:
   annotations: true
