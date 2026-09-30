@@ -87,5 +87,7 @@ mod serve_dynamic_profile_rewire;
 #[cfg(debug_assertions)]
 mod serve_filewatch_propagation;
 #[cfg(debug_assertions)]
+mod serve_settings_layers;
+#[cfg(debug_assertions)]
 mod serve_settings_logging;
 mod telemetry;

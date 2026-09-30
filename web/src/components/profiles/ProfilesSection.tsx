@@ -4,7 +4,7 @@ import {
   createProfile,
   deleteProfile,
   fetchProfiles,
-  fetchSettings,
+  fetchMachineSettings,
   getProfileSettings,
   renameProfile,
   setDefaultProfile,
@@ -57,7 +57,7 @@ export function ProfilesSection({ readOnly }: Props) {
       setError(err);
     };
     if (!name) return clear(null);
-    Promise.all([getProfileSettings(name), fetchSettings()])
+    Promise.all([getProfileSettings(name), fetchMachineSettings()])
       .then(([profile, global]) => {
         if (seq !== loadSeq.current) return;
         setProfileSettings(profile);

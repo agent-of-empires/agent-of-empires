@@ -140,17 +140,6 @@ const CITYHALL_TAB_IDS = new Set<TabId>(["theme", "session", "mcp", "telemetry",
 const CITYHALL_SESSION_FIELDS = ["delete_to_trash", "confirm_delete", "trash_retention_minutes"];
 const CITYHALL_THEME_HIDDEN = ["color_mode", "idle_decay_minutes"];
 
-/** `session.*` fields the app shell reads into its own state and hands down by
- *  context. Saving one has to re-read settings, or the shell keeps the old
- *  value until a reload: the field is written and the surface it drives does
- *  not move. Keep in step with `parseAppSettings` in App.tsx. */
-const SESSION_FIELDS_THE_APP_READS = new Set([
-  "row_tag",
-  "show_session_colors",
-  "show_diagnostics_pane",
-  "unread_indicator",
-]);
-
 // Fields the CityHall settings search may surface: only sections whose tab is in
 // the curated sidebar, and within those only the fields the curated tabs
 // actually render. Without this, search lists every advanced field (type "yolo"
@@ -171,7 +160,6 @@ interface Props {
   tab: string | null;
   onSelectTab: (tab: TabId | string) => void;
   onServerAboutRefresh: () => Promise<void> | void;
-  onSettingsRefresh?: () => Promise<void> | void;
   /** Profile to preselect, sourced from the `?profile=` query so the
    *  Profiles page can deep-link into a specific profile's section. */
   profile?: string | null;
@@ -251,7 +239,6 @@ export function SettingsView({
   tab,
   onSelectTab,
   onServerAboutRefresh,
-  onSettingsRefresh = () => {},
   profile,
   onSelectProfile,
   readOnly,
@@ -396,8 +383,11 @@ export function SettingsView({
       setSaving(true);
       setSaveError(null);
       const patch = { [section]: { [field]: value } };
-      const saveGlobally = schema.some((d) => d.section === section && d.field === field && !d.profile_overridable);
-      const ok = saveGlobally ? await updateSettings(patch) : await updateProfileSettings(selectedProfile, patch);
+      // CityHall denies the general save at its boundary; its curated trash
+      // toggles are profile overrides with their own narrow endpoint.
+      const ok = cityhall
+        ? await updateProfileSettings(selectedProfile, patch)
+        : await updateSettings(patch, selectedProfile);
       setSaving(false);
       if (!ok) {
         setSaveError("Failed to save, please try again");
@@ -405,7 +395,7 @@ export function SettingsView({
       }
       return ok;
     },
-    [selectedProfile, loadSettings, schema],
+    [selectedProfile, loadSettings, cityhall],
   );
 
   const updateLocal = useCallback(
@@ -558,11 +548,6 @@ export function SettingsView({
                 focusRequest={focusRequest}
                 values={session}
                 onSaveField={saveSubField}
-                onAfterSave={(descriptor) => {
-                  if (SESSION_FIELDS_THE_APP_READS.has(descriptor.field)) {
-                    return onSettingsRefresh();
-                  }
-                }}
                 advancedSubtitle="Idle auto-stop, attach modes, live-send, and other session tuning."
               />
             )}

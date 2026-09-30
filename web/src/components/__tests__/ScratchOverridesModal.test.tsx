@@ -6,17 +6,17 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import { ScratchOverridesModal } from "../ScratchOverridesModal";
 
 vi.mock("../../lib/api", () => ({
-  fetchSettings: vi.fn(),
+  fetchMachineSettings: vi.fn(),
   getProfileSettings: vi.fn(),
-  updateSettings: vi.fn(),
+  updateMachineSettings: vi.fn(),
   updateProfileSettings: vi.fn(),
 }));
 
-import { fetchSettings, getProfileSettings, updateProfileSettings, updateSettings } from "../../lib/api";
+import { fetchMachineSettings, getProfileSettings, updateMachineSettings, updateProfileSettings } from "../../lib/api";
 
-const mockFetchGlobal = fetchSettings as ReturnType<typeof vi.fn>;
+const mockFetchGlobal = fetchMachineSettings as ReturnType<typeof vi.fn>;
 const mockFetchProfile = getProfileSettings as ReturnType<typeof vi.fn>;
-const mockUpdateGlobal = updateSettings as ReturnType<typeof vi.fn>;
+const mockUpdateGlobal = updateMachineSettings as ReturnType<typeof vi.fn>;
 const mockUpdateProfile = updateProfileSettings as ReturnType<typeof vi.fn>;
 
 afterEach(() => {
@@ -60,7 +60,7 @@ describe("ScratchOverridesModal", () => {
     await waitFor(() => expect(smartRenameSelect().value).toBe("on"));
   });
 
-  it("saves the selected scope and value via the global settings API, then closes", async () => {
+  it("saves the selected scope and value via the machine-wide settings API, then closes", async () => {
     mockFetchGlobal.mockResolvedValue({ session: {} });
     mockUpdateGlobal.mockResolvedValue(true);
     const onClose = vi.fn();

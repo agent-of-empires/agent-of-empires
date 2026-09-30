@@ -10,6 +10,9 @@ interface AffectedSession {
   isSandboxed: boolean;
 }
 
+const DIALOG_ID = "delete-session-dialog";
+const PROMPT_ID = `${DIALOG_ID}-prompt`;
+
 interface Props {
   sessionTitle: string;
   branchName: string | null;
@@ -103,10 +106,11 @@ export function DeleteSessionDialog({
 
   return (
     <Dialog
-      id="delete-session-dialog"
+      id={DIALOG_ID}
       panelTestId="delete-session-dialog-panel"
       title={workspace ? "Delete Workspace" : "Delete Session"}
       titleClassName="text-status-error"
+      describedBy={PROMPT_ID}
       bodyClassName="px-5 py-4 space-y-3"
       onDismiss={onCancel}
       footer={
@@ -126,7 +130,7 @@ export function DeleteSessionDialog({
     >
       {workspace ? (
         <div className="space-y-2">
-          <p className="text-[13px] text-text-secondary">
+          <p id={PROMPT_ID} className="text-[13px] text-text-secondary">
             {permanent ? "Permanently delete this workspace?" : "Move this workspace to Trash?"}
           </p>
           <p className="text-[12px] text-text-dim" data-testid="delete-session-affected-count">
@@ -144,7 +148,7 @@ export function DeleteSessionDialog({
           </ul>
         </div>
       ) : (
-        <p className="text-[13px] text-text-secondary">
+        <p id={PROMPT_ID} className="text-[13px] text-text-secondary">
           Delete <span className="font-mono text-text-primary break-all">{sessionTitle}</span>?
         </p>
       )}

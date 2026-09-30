@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { fetchProfiles, fetchSettings, getSettingsSchema, updateProfileSettings, updateSettings } from "../lib/api";
+import { fetchProfiles, fetchSettings, getSettingsSchema, updateSettings } from "../lib/api";
 import { reportError, reportInfo } from "../lib/toastBus";
 import type { CommandAction } from "../components/command-palette/types";
 import type { SettingsFieldDescriptor } from "../lib/types";
@@ -32,7 +32,7 @@ export function useSettingsCommands({ open, readOnly, onOpenSettingsTab }: Args)
       if (cancelled) return;
       if (s) setSchema(s);
       const profile = profiles.find((p) => p.is_default)?.name ?? "default";
-      const settings = await fetchSettings(profile);
+      const settings = await fetchSettings();
       if (cancelled) return;
       if (settings) {
         setDefaultProfile(profile);
@@ -77,9 +77,7 @@ export function useSettingsCommands({ open, readOnly, onOpenSettingsTab }: Args)
             const next = !isOn;
             void (async () => {
               const patch = { [f.section]: { [f.field]: next } };
-              const ok = f.profile_overridable
-                ? await updateProfileSettings(defaultProfile, patch)
-                : await updateSettings(patch);
+              const ok = await updateSettings(patch);
               if (!ok) {
                 reportError(`Failed to update ${f.label}`);
                 return;

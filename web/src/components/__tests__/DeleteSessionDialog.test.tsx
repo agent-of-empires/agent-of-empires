@@ -92,6 +92,8 @@ describe("DeleteSessionDialog presentation", () => {
   it("keeps the single-session presentation for one affected session", () => {
     const { container } = setup({ affectedSessions: [{ id: "sess-a", title: "my-session", isSandboxed: false }] });
     expect(screen.getByRole("heading").textContent).toBe("Delete Session");
+    // Only the prompt naming the target, not the cleanup checkboxes, describes the dialog.
+    screen.getByRole("dialog", { description: "Delete my-session?" });
     expect(container.textContent).toMatch(/Delete my-session\?/);
     expect(screen.queryByTestId("delete-session-affected-count")).toBeNull();
     expect(screen.queryByTestId("delete-session-affected-list")).toBeNull();
@@ -102,6 +104,7 @@ describe("DeleteSessionDialog presentation", () => {
     expect(screen.getByRole("heading").textContent).toBe("Delete Workspace");
     expect(screen.getByTestId("delete-session-affected-count").textContent).toMatch(/all 2 sessions/);
     expect(screen.getByTestId("delete-session-affected-list").textContent).toBe("agent-alphaagent-beta");
+    screen.getByRole("dialog", { description: "Permanently delete this workspace?" });
     const text = container.textContent;
     expect(text).not.toMatch(/Delete my-session\?/);
     for (const copy of [

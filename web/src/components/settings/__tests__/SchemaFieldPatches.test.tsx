@@ -62,7 +62,6 @@ vi.mock("../../../lib/api", () => ({
   fetchPlugins: vi.fn(() => Promise.resolve(null)),
   fetchSettings: vi.fn(() => Promise.resolve({ tmux: {}, logging: {}, session: {}, sound: {} })),
   getSettingsSchema: vi.fn(() => Promise.resolve(SCHEMA)),
-  updateProfileSettings: vi.fn(() => Promise.resolve(true)),
   updateSettings: vi.fn(() => Promise.resolve(true)),
   updateTheme: vi.fn(() => Promise.resolve(true)),
   fetchThemes: vi.fn(() => Promise.resolve([])),
@@ -119,7 +118,7 @@ describe("schema-driven settings field PATCH payloads", () => {
     } as never);
   });
 
-  it("saves Sidebar Position globally and reloads the saved value after a failed edit", async () => {
+  it("saves Sidebar Position for the selected profile and reloads the saved value after a failed edit", async () => {
     const { container } = renderTab("session");
     await screen.findByText("Sidebar Position");
     const select = selectByLabel(container, "Sidebar Position");
@@ -128,11 +127,10 @@ describe("schema-driven settings field PATCH payloads", () => {
     for (const value of ["right", "left"]) {
       fireEvent.change(select, { target: { value } });
       await waitFor(() =>
-        expect(api.updateSettings).toHaveBeenLastCalledWith({ session: { sidebar_position: value } }),
+        expect(api.updateSettings).toHaveBeenLastCalledWith({ session: { sidebar_position: value } }, "main"),
       );
       expect(select.value).toBe(value);
     }
-    expect(api.updateProfileSettings).not.toHaveBeenCalled();
 
     vi.mocked(api.updateSettings).mockResolvedValueOnce(false);
     fireEvent.change(select, { target: { value: "right" } });
@@ -155,12 +153,10 @@ describe("schema-driven settings field PATCH payloads", () => {
       target: { value: "disabled" },
     });
 
-    await waitFor(() => expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalled());
-    expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith("main", {
-      tmux: { status_bar: "disabled" },
-    });
+    await waitFor(() => expect(vi.mocked(api.updateSettings)).toHaveBeenCalled());
+    expect(vi.mocked(api.updateSettings)).toHaveBeenCalledWith({ tmux: { status_bar: "disabled" } }, "main");
     // No call carries the untouched `mouse` field.
-    for (const [, updates] of vi.mocked(api.updateProfileSettings).mock.calls) {
+    for (const [updates] of vi.mocked(api.updateSettings).mock.calls) {
       expect((updates as { tmux?: Record<string, unknown> }).tmux).not.toHaveProperty("mouse");
     }
   });
@@ -189,9 +185,10 @@ describe("schema-driven settings field PATCH payloads", () => {
     commit(input, "120");
 
     await waitFor(() =>
-      expect(vi.mocked(api.updateSettings)).toHaveBeenCalledWith({
-        session: { session_id_poller_max_threads: 120 },
-      }),
+      expect(vi.mocked(api.updateSettings)).toHaveBeenCalledWith(
+        { session: { session_id_poller_max_threads: 120 } },
+        "main",
+      ),
     );
   });
 
@@ -202,9 +199,7 @@ describe("schema-driven settings field PATCH payloads", () => {
     clickToggle(container, "Enabled");
 
     await waitFor(() =>
-      expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith("main", {
-        sound: { enabled: true },
-      }),
+      expect(vi.mocked(api.updateSettings)).toHaveBeenCalledWith({ sound: { enabled: true } }, "main"),
     );
   });
 });
