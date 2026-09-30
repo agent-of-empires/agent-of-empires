@@ -75,9 +75,10 @@ const COMMANDS: [&[&str]; 20] = [
 /// all. The harness now carries the exit code beside both streams, so these
 /// are compared on exactly the same three fields as the succeeding rows above.
 ///
-/// A one-character typo in a session id is the case this exists for: the local
-/// command exits 1 in the operator's own words, the served one exits 4 in
-/// `daemon read: <code>`, and nothing in the branch could see that they differ.
+/// A one-character typo in a session id is the case this exists for: the two
+/// halves print the refusal in the operator's own words and both leave 1,
+/// because every row here is a refusal on the user's own state rather than a
+/// wire failure. That shared exit is what made a divergence invisible.
 const REFUSALS: [&[&str]; 4] = [
     &["session", "show", "no-such-session"],
     &["list", "-p", "ghost-profile"],
