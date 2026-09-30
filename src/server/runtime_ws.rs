@@ -1,7 +1,7 @@
-//! Read-only runtime read endpoint: `GET /api/runtime/ws`, protocol version 2.
+//! Read-only runtime read endpoint: `GET /api/runtime/ws`.
 //!
 //! One connection carries exactly two application frames, a Hello handshake
-//! and a Snapshot, and the server then sends `Close(1000)`. The handler only
+//! and a Snapshot, and the server then sends a normal close. The handler only
 //! reads session, profile, group and project state; it never mutates it and
 //! never consults a client-local filesystem.
 //!
@@ -40,11 +40,11 @@ pub(crate) const PROTOCOL_VERSION: u16 = 3;
 /// authenticates and then says nothing is bounded identically either way.
 pub(crate) const CONNECTION_BUDGET: Duration = Duration::from_secs(15);
 /// The message ceiling both transports hand tungstenite, and the ceiling this
-/// module refuses to send past. tungstenite 0.29.0 defaults to 64 MiB for a
-/// message and 16 MiB for a frame, so the frame ceiling already matched
-/// `APPLICATION_LIMIT` on both routes while the WS route was accepting a
-/// message four times what the UDS route accepted. One constant, so the two
-/// routes cannot drift apart again.
+/// module refuses to send past. tungstenite's message limit is larger than the
+/// frame limit it was already accepting here, so the frame ceiling already
+/// matched `APPLICATION_LIMIT` on both routes while the WS route was accepting
+/// more than the UDS route did. One constant, so the two routes cannot drift
+/// apart again.
 pub(crate) const MESSAGE_LIMIT: usize = crate::cli::runtime_read::APPLICATION_LIMIT;
 /// The trusted namespace this build publishes for itself, and the name the
 /// UDS marker files carry.
@@ -308,17 +308,6 @@ pub struct RecordingPins {
     pub observed_at: DateTime<Utc>,
 }
 
-/// Serialise the two frames one read emits, from the same assembly path and the
-/// same serialisers [`run_read`] uses.
-///
-/// This is the recording half of the Contract Pack's wire gate, and it exists
-/// because there was no other way to re-record a transcript: the previous
-/// frames were typed by hand from the published schemas, which is precisely
-/// how `ProjectRead::registered` and the fractional timestamp came to be
-/// missing from every recorded case while the producer emitted both. A
-/// transcript recorded through here cannot disagree with the producer about
-/// which fields exist; `pack::verify` then holds the recorded bytes to the
-/// published schema, so neither side can drift alone again.
 #[cfg(any(test, debug_assertions))]
 #[doc(hidden)]
 pub fn record_exchange(
@@ -1153,6 +1142,68 @@ mod tests {
         parse_hello, parse_snapshot, validate_cross_message, validate_hello, validate_snapshot,
     };
     use crate::session::{WorkspaceInfo, WorkspaceRepo as StoredRepo};
+
+    /// The published schema's `required` list for one `$defs` entry, from the
+    /// document committed beside the fixtures rather than from anything this
+    /// module knows.
+    fn schema_required(definition: &str) -> BTreeSet<String> {
+        let text = std::fs::read_to_string(
+            crate::cli::runtime_read::pack::pack_root()
+                .join(crate::cli::runtime_read::pack::SNAPSHOT_SCHEMA),
+        )
+        .expect("the published snapshot schema");
+        let document: serde_json::Value = serde_json::from_str(&text).expect("it is JSON");
+        document["$defs"][definition]["required"]
+            .as_array()
+            .expect("every wire row requires its fields")
+            .iter()
+            .map(|name| name.as_str().expect("a field name").to_string())
+            .collect()
+    }
+
+    /// Every field the producer serialises is one the published schema
+    /// requires.
+    ///
+    /// The pack holds a recorded transcript to the schema, which proves the
+    /// two agree with each other and says nothing about either against the
+    /// producer. A field the producer grew and the schema and every recorded
+    /// frame left out is the shape that passes: the one this gate is for, and
+    /// the one no version number would catch.
+    #[test]
+    #[serial_test::serial]
+    fn every_field_the_producer_emits_is_required_by_the_published_schema() {
+        let _home = TempHome::new();
+        let mut session = named("a", "main");
+        session.group_path = "team/sub".into();
+        let sampled = build_snapshot(
+            &RuntimeState::new(),
+            &[session],
+            Owner::remote(),
+            Utc::now(),
+        );
+        let frame: serde_json::Value =
+            serde_json::from_slice(&snapshot_frame(&sampled)).expect("the frame is JSON");
+        let profile = &frame["data"]["profiles"][0];
+        let emitted: [(&str, &serde_json::Value); 3] = [
+            ("session_read", &frame["data"]["sessions"][0]),
+            ("project_read", &profile["projects"][0]),
+            ("group_read", &profile["groups"][0]),
+        ];
+        for (definition, row) in emitted {
+            let object = row
+                .as_object()
+                .unwrap_or_else(|| panic!("{definition} is an object"));
+            let required = schema_required(definition);
+            let missing: Vec<&String> = object
+                .keys()
+                .filter(|key| !required.contains(*key))
+                .collect();
+            assert!(
+                missing.is_empty(),
+                "{definition} emits fields the published schema does not require: {missing:?}"
+            );
+        }
+    }
 
     /// The wire carries a session's repos in the order the workspace stored
     /// them, because that is the order the local projection emits them in and

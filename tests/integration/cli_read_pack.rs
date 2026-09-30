@@ -819,10 +819,9 @@ fn a_pattern_inside_a_one_of_branch_is_enforced() {
     fs::write(&schema, format!("{head}{anchor}{to}")).expect("rewrite the document");
     restage(&root);
 
-    // Every recorded resolved default is inside the pattern: "main" on the
-    // nominal frames, the dangling "absent" on the schema-invalid one and
-    // "retired" on the stale-default one. So a compiled pattern inside a branch
-    // does not refuse a conforming frame.
+    // Every recorded `resolved_default_profile` is inside the pattern: "main"
+    // on the frames that carry it and "retired" on the stale-default one. So a
+    // compiled pattern inside a branch does not refuse a conforming frame.
     pack::verify(&root).expect("a frame the branch's pattern admits is accepted");
 
     // And it refuses the frame that breaks it, which is the half the old walk

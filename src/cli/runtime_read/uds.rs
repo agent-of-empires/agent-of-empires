@@ -777,8 +777,8 @@ fn read_marker<T: for<'de> Deserialize<'de>>(dir: RawFd, name: &str) -> Result<T
 
 /// Whether a temporary this client can place is present. A body that does not
 /// parse places none and is skipped rather than refused, because nothing is
-/// writing it: a publisher mid-write holds the lock, which this client fails
-/// to take before it ever reads a marker.
+/// writing it. A publisher mid-write holds the namespace lock, which this
+/// client fails to take before it reads a published marker.
 fn inspect_temporary_markers(dir: RawFd) -> Result<bool, ReadFailure> {
     let duplicate = unsafe { libc::dup(dir) };
     let scan = fd_to_owned(duplicate).map_err(|_| ReadFailure::pre("marker_identity"))?;

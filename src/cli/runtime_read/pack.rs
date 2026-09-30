@@ -13,16 +13,12 @@
 //!
 //! The verifier and its tests require debug assertions; release and
 //! dev-release builds omit them.
-//!
-//! `root-home` is a replay scratch path, never manifest-listed: a harness that
-//! materializes it must remove the subtree before calling `verify`.
 
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use base64::Engine as _;
 use clap::Parser as _;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -697,67 +693,6 @@ fn parse_wire(bytes: &[u8], case_id: &str) -> Result<Vec<WireRecord>> {
     Ok(records)
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct WireJsonlRow {
-    direction: u8,
-    role: u8,
-    bytes_base64: String,
-}
-
-fn verify_wire_jsonl(root: &Path, case_id: &str, wire: &[WireRecord]) -> Result<()> {
-    let path = root.join(format!("cases/{case_id}/wire.jsonl"));
-    let bytes = match fs::read(&path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return fail(format!("cannot read case {case_id} wire.jsonl: {error}")),
-    };
-    if bytes.is_empty() {
-        if wire.is_empty() {
-            return Ok(());
-        }
-        return fail(format!(
-            "case {case_id} has empty wire.jsonl for nonempty wire.raw"
-        ));
-    }
-    if !bytes.ends_with(b"\n") {
-        return fail(format!("case {case_id} wire.jsonl has no final LF"));
-    }
-    let text = std::str::from_utf8(&bytes)
-        .map_err(|_| PackError(format!("case {case_id} wire.jsonl is not UTF-8")))?;
-    let mut rows = Vec::new();
-    for (index, line) in text.lines().enumerate() {
-        let row: WireJsonlRow = serde_json::from_str(line).map_err(|error| {
-            PackError(format!(
-                "case {case_id} wire.jsonl line {}: {error}",
-                index + 1
-            ))
-        })?;
-        rows.push(row);
-    }
-    if rows.len() != wire.len() {
-        return fail(format!(
-            "case {case_id} wire.jsonl record count disagrees with wire.raw"
-        ));
-    }
-    for (index, (row, record)) in rows.iter().zip(wire).enumerate() {
-        let decoded = base64::engine::general_purpose::STANDARD
-            .decode(&row.bytes_base64)
-            .map_err(|_| {
-                PackError(format!(
-                    "case {case_id} wire.jsonl line {} has invalid base64",
-                    index + 1
-                ))
-            })?;
-        if row.direction != record.direction || row.role != record.role || decoded != record.raw() {
-            return fail(format!(
-                "case {case_id} wire.jsonl disagrees with wire.raw at record {index}"
-            ));
-        }
-    }
-    Ok(())
-}
-
 /// Whether a record is an HTTP upgrade request/response rather than a
 /// WebSocket frame.
 fn is_http_record(payload: &[u8]) -> bool {
@@ -1126,10 +1061,7 @@ fn verify_case(
         "expected.stdout".into(),
         "wire.raw".into(),
     ];
-    // `wire.jsonl` is the optional decoded view; `error.json` rides on the exit.
-    if on_disk.iter().any(|name| name == "wire.jsonl") {
-        expected_names.push("wire.jsonl".into());
-    }
+    // `error.json` rides on the exit.
     if on_disk.iter().any(|name| name == "error.json") {
         expected_names.push("error.json".into());
     }
@@ -1174,6 +1106,30 @@ fn verify_case(
                 ));
             }
         }
+    }
+    // The replay drives the case from its inputs, so `wire.raw` is one of them
+    // and the two lists partition what the case has: a file nothing classifies
+    // would leave the replay's own inputs unstated, and a file both classify
+    // would leave it ambiguous which side is driving.
+    let wire_input = format!("{prefix}wire.raw");
+    if !row.input_files.iter().any(|file| file.path == wire_input) {
+        return fail(format!(
+            "case {case_id} input_files does not carry {wire_input}, which the replay reads"
+        ));
+    }
+    let mut classified: Vec<&str> = row
+        .input_files
+        .iter()
+        .chain(&row.output_files)
+        .map(|file| file.path.as_str())
+        .collect();
+    classified.sort_unstable();
+    if classified.windows(2).any(|pair| pair[0] == pair[1])
+        || classified.len() != row.all_files.len()
+    {
+        return fail(format!(
+            "case {case_id} input_files and output_files do not partition all_files"
+        ));
     }
     for reference in &row.all_files {
         let bytes = read(root, &reference.path)?;
@@ -1272,7 +1228,6 @@ fn verify_case(
     }
 
     let wire = parse_wire(&read(root, &format!("{prefix}wire.raw"))?, case_id)?;
-    verify_wire_jsonl(root, case_id, &wire)?;
     let wire_frames = count_wire_frames(case_id, &wire, &row.replay_role)?;
     if wire_frames != expected.wire_frames {
         return fail(format!(

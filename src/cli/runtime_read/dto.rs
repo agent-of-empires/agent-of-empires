@@ -360,7 +360,7 @@ impl<'de> Deserialize<'de> for HelloVersionProbe {
             type Value = HelloVersionProbe;
 
             fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                formatter.write_str("a protocol 2 hello envelope")
+                formatter.write_str("a hello envelope")
             }
 
             fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>

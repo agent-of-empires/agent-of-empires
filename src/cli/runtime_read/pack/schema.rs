@@ -1,15 +1,11 @@
 //! The Draft 2020-12 subset the published Contract Pack schemas use, evaluated
 //! against a recorded application frame.
 //!
-//! The pack's own claim is that the JSON Schema documents beside the fixtures
-//! describe the wire. Nothing checked that claim, so a producer that grew a
-//! field and a schema that did not follow it both kept passing: the two
-//! documents agreed with each other and nobody compared either to a frame. This
-//! module is the missing comparison, and it is deliberately a validator rather
-//! than a second set of closed structs: a struct would re-derive the contract
-//! in Rust and drift the same way, only further from the published document.
+//! A validator rather than a second set of closed structs: a struct would
+//! re-derive the contract in Rust and drift the same way, only further from the
+//! published document.
 //!
-//! The supported keyword set is exactly what the five shipped schemas use, and
+//! The supported keyword set is exactly what the shipped schemas use, and
 //! [`Schema::compile`] refuses a document that reaches outside it, so a schema
 //! cannot quietly start using a keyword nothing here evaluates. `pattern` is
 //! anchored in the document itself (`^...$`), and the regex dialect is
@@ -21,14 +17,9 @@
 //! reached, every schema is required to be an object, every `pattern` is
 //! compiled under the position of the node that carries it, every keyword value
 //! has the shape the evaluator reads, and every `$ref` is a resolvable
-//! `#/$defs/<name>` that does not close a cycle. Anything the evaluator cannot
-//! read is a load failure. A blind descent cannot do that: it stops at the
-//! first array, so a `pattern` inside a `oneOf` branch was never compiled and
-//! never enforced, and it reads a `const`'s data as though it were a
-//! subschema. The unifying rule is that an unknown must be a refusal, never a
-//! pass: the evaluator answers `None` only for an assertion it actually
-//! evaluated and found to hold, and everything it could not evaluate never
-//! reaches it.
+//! `#/$defs/<name>` that does not close a cycle. An unknown is a refusal, never
+//! a pass: the evaluator answers `None` only for an assertion it actually
+//! evaluated and found to hold.
 //!
 //! One boolean is accepted, and only where it is a value rather than a schema:
 //! `additionalProperties: false`. A `not` or an `items` written as `false` is a
@@ -840,10 +831,10 @@ mod tests {
         }
     }
 
-    /// A `health.profiles` member that is not a profile health object. This is
-    /// the shape `snapshot.schema.json` ships, and before the schema-valued
-    /// `additionalProperties` was evaluated the whole subtree was unchecked
-    /// while the keyword still read as supported.
+    /// A `health.profiles` member that is not a profile health object. The
+    /// subschema of a schema-valued `additionalProperties` reaches every
+    /// member it does not name, which is the shape `snapshot.schema.json`
+    /// ships.
     #[test]
     fn a_schema_valued_additional_properties_constrains_every_undeclared_member() {
         let document = r##"{
@@ -868,9 +859,8 @@ mod tests {
         );
     }
 
-    /// A `pattern` written inside a `oneOf` branch. The walk used to stop at
-    /// the array, so the pattern was never compiled and the check that reads it
-    /// was a no-op.
+    /// A `pattern` written inside a `oneOf` branch, which the walk compiles
+    /// under its own node like any other.
     #[test]
     fn a_pattern_inside_a_one_of_branch_is_compiled_and_enforced() {
         let document = r#"{
@@ -945,8 +935,7 @@ mod tests {
         }
     }
 
-    /// A node that is not a schema at all. `properties: "x"` used to load clean
-    /// and check nothing.
+    /// A node that is not a schema at all, so there is nothing to evaluate.
     #[test]
     fn a_node_that_is_not_a_schema_is_refused_at_load() {
         for (document, fragment) in [
@@ -1016,12 +1005,8 @@ mod tests {
     /// `const` is an identity test on the value, so `2` and `2.0` are one
     /// constant. Two large integers that share an `f64` rounding are not, and
     /// widening them would let a value through a `const` that never named it.
-    /// `enum` is the same identity question asked of each of its values, and
-    /// the two must agree on both: `enum` once compared `Number` spellings
-    /// structurally, so `{"enum": [2]}` refused the `2.0` that `{"const": 2}`
-    /// admitted, and a gate that answered one keyword over the spelling of a
-    /// number and the other over its value was refusing frames for a difference
-    /// no document had written down.
+    /// `enum` is the same identity question asked of each of its values, so the
+    /// two keywords answer it the same way in both directions.
     #[test]
     fn a_constant_compares_integral_values_exactly() {
         let big = "9007199254740992";
@@ -1058,10 +1043,7 @@ mod tests {
 
     /// The value identity a `const` states is the value, and `enum` states the
     /// same identity, so the `2` and `2.0` spellings are one value in both
-    /// keywords and in both directions. `enum` once compared `Number` spellings
-    /// structurally, so `{"enum": [2]}` refused a frame `{"const": 2}` admitted,
-    /// a gate refusing over the spelling of a number no document had written
-    /// down.
+    /// keywords and in both directions.
     #[test]
     fn a_constant_and_an_enumerated_value_are_one_number() {
         assert!(accept(r#"{"const": 2}"#, "2.0").is_ok());
