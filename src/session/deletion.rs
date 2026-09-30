@@ -307,6 +307,12 @@ impl PurgeTransaction {
                     .context("failed to reacquire instance purge lock after hooks")?,
             );
         }
+        // The verdict was taken before the hooks ran without any flock held, so
+        // it cannot decide a row removal that now happens under the full lock
+        // set. Dropping it here makes the next ownership check rescan, which is
+        // what stands between an inventory that turned unreadable in between and
+        // a teardown with no row left to retry it from.
+        self.ownership_verdict = None;
         Ok(())
     }
 

@@ -663,11 +663,22 @@ impl Undo {
             }
         }
         if let Some((main_repo, from, back_to)) = &self.moved_primary {
-            // Putting the session's own worktree back is the one step that
-            // matters for user data, and `back_to` is its recorded path: absent
-            // from disk by construction, so the fail-closed ownership check can
-            // never cover it. The removal steps above are what that check
-            // guards; this one only puts back what we took.
+            // Moving back also removes the source from the path it currently
+            // sits at, so a peer that claimed it in the meantime would lose its
+            // directory. An unknown inventory is not a reason to hold: it has
+            // to leave the session's own checkout reachable, and the source is
+            // the session's own. Only a known claim stops the move.
+            let peer_claimed_source = claimed.is_some_and(|paths| {
+                matches!(paths, crate::session::deletion::PathsInUse::Known(_)) && is_claimed(from)
+            });
+            if peer_claimed_source {
+                tracing::warn!(
+                    target: "session.attach",
+                    "A peer claimed the primary checkout path during the conversion; leaving it \
+                     where it is rather than moving it back"
+                );
+                return;
+            }
             match GitWorktree::new(PathBuf::from(main_repo)) {
                 Ok(git) => {
                     if let Err(e) = git.move_worktree(from, back_to) {

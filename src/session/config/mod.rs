@@ -3516,6 +3516,17 @@ pub fn resolve_theme_palette_mode() -> bool {
 /// deterministic). On a genuine first run, when no profile directory exists
 /// yet, one is bootstrapped (see `ensure_bootstrap_profile`).
 pub fn resolve_default_profile() -> String {
+    resolve_default_profile_inner(false)
+}
+
+/// [`resolve_default_profile`] for a caller that already holds the session
+/// identity flock. Bootstrapping a first profile would otherwise take it again
+/// on a fresh descriptor and wait on its own lock.
+pub(crate) fn resolve_default_profile_locked() -> String {
+    resolve_default_profile_inner(true)
+}
+
+fn resolve_default_profile_inner(identity_lock_held: bool) -> String {
     let config = Config::load_or_warn();
     if !config.default_profile.is_empty() {
         return config.default_profile;
@@ -3523,9 +3534,9 @@ pub fn resolve_default_profile() -> String {
     match super::list_profiles() {
         Ok(profiles) => match profiles.into_iter().next() {
             Some(first) => first,
-            None => ensure_bootstrap_profile(),
+            None => ensure_bootstrap_profile(identity_lock_held),
         },
-        Err(_) => ensure_bootstrap_profile(),
+        Err(_) => ensure_bootstrap_profile(identity_lock_held),
     }
 }
 
@@ -3537,8 +3548,12 @@ const BOOTSTRAP_PROFILE: &str = "main";
 /// AoE always needs at least one profile (somewhere to file sessions). When
 /// `profiles/` has no entries, this creates `main`. It is idempotent: calling
 /// it when `main` already exists just returns the name.
-fn ensure_bootstrap_profile() -> String {
-    let _ = super::get_profile_dir(BOOTSTRAP_PROFILE);
+fn ensure_bootstrap_profile(identity_lock_held: bool) -> String {
+    let _ = if identity_lock_held {
+        super::get_profile_dir_locked(BOOTSTRAP_PROFILE)
+    } else {
+        super::get_profile_dir(BOOTSTRAP_PROFILE)
+    };
     BOOTSTRAP_PROFILE.to_string()
 }
 

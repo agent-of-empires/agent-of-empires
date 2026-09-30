@@ -189,12 +189,17 @@ async fn purge_session_artifacts_inner(
                         "Session is being restored, so it was not purged".to_string(),
                     ))
                 }
-                crate::session::deletion::DeletionDisposition::Busy => Err(PurgeRefusal::Fatal(
-                    result.errors.first().cloned().unwrap_or_else(|| {
-                        "Session is busy with another lifecycle operation, so it was not purged"
+                // Another purge holds the claim, or the session moved to a
+                // newer lifecycle generation. Both are contention that clears,
+                // so this is the retry the first 409 already asked for rather
+                // than a failure worth reporting as fatal.
+                crate::session::deletion::DeletionDisposition::Busy => Err(
+                    PurgeRefusal::Retryable(result.errors.first().cloned().unwrap_or_else(|| {
+                        "Session is busy with another lifecycle operation, so it was not \
+                             purged; retry once that operation finishes"
                             .to_string()
-                    }),
-                )),
+                    })),
+                ),
                 crate::session::deletion::DeletionDisposition::Failed
                 | crate::session::deletion::DeletionDisposition::Removed => {
                     Err(PurgeRefusal::Fatal(result.errors.join("; ")))
@@ -1170,12 +1175,59 @@ mod tests {
         );
     }
 
+    /// A purge that meets a fresh lifecycle reservation is contention, not a
+    /// failure: reporting it fatal turns the retry the first 409 asked for into
+    /// a 500 the caller has no way to act on.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_contended_purge_stays_retryable() {
+        let temp = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+        crate::session::create_profile("contended").unwrap();
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let mut instance = crate::session::Instance::new("Contended", project.to_str().unwrap());
+        instance.id = "contended-purge".to_string();
+        instance.source_profile = "contended".to_string();
+        let storage = Storage::new_unwatched("contended").unwrap();
+        storage
+            .update(|instances, _groups| {
+                let mut held = instance.clone();
+                held.try_acquire_lifecycle_reservation(
+                    LifecycleOperation::Trash,
+                    crate::session::Instance::LIFECYCLE_RESERVATION_TTL,
+                    chrono::Utc::now(),
+                )
+                .unwrap();
+                instances.push(held);
+                Ok(())
+            })
+            .unwrap();
+
+        let state = crate::server::test_support::build_test_app_state(vec![instance.clone()]);
+        let refused = purge_session_artifacts(
+            &state,
+            "contended-purge",
+            instance,
+            &DeleteSessionBody::default(),
+            None,
+        )
+        .await;
+
+        assert!(
+            matches!(&refused, Err(PurgeRefusal::Retryable(_))),
+            "contention that clears must stay retryable, got {refused:?}"
+        );
+    }
+
     /// `on_destroy` scripts are the user's and are not idempotent, so a purge
     /// refused beside a live runner must not have run one: the scheduled
     /// `purge_expired_trash` re-reserves the row and would replay the script on
     /// every attempt.
+    #[serial_test::serial]
     #[tokio::test]
     #[serial_test::serial]
+
     async fn a_refused_purge_never_runs_the_on_destroy_hook() {
         use crate::acp::runner_lifecycle::test_support::FakeProcessControl;
         use std::sync::Arc;

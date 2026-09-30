@@ -166,7 +166,7 @@ fn with_profile_config_locked<T>(
 ) -> Result<T> {
     let _identity_lock = crate::session::acquire_session_identity_lock()?;
     let _namespace_lock = crate::session::storage::acquire_profile_namespace_lock()?;
-    let profile_name = crate::session::resolve_profile_name(profile)?;
+    let profile_name = crate::session::resolve_profile_name_locked(profile)?;
     let dir = crate::session::get_profile_dir_locked(&profile_name)?;
     // Match Storage::update: in-process save mutex first, then the cross-process flock.
     let save_lock = crate::session::storage::save_lock_for(&profile_name);

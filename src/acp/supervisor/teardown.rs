@@ -422,8 +422,25 @@ impl<S: BroadcastSink> Supervisor<S> {
             if !lock_recover(&self.lifecycle).release_running(&lease) {
                 return None;
             }
-            workers.remove(&id)?
+            let handle = workers.remove(&id)?;
+            // The drain kills by the pid the registry currently holds, so a
+            // detached one would kill a replacement runner. Removing the handle
+            // already denies a new epoch the slot, since `begin_resume` admits
+            // through this same map.
+            handle.drain_task.abort();
+            handle
         };
+        // Abort only requests cancellation, so joining is what establishes the
+        // drain stopped working before this path touches the registry again.
+        let WorkerHandle {
+            client,
+            drain_task,
+            restart_history,
+            kind,
+            lease: _,
+            native_session_id,
+        } = handle;
+        let _ = drain_task.await;
         // A marker authorizes a restart only of the generation that was stopped.
         let generation = identity.map_or(0, |i| i.generation);
         let is_restart = worker_registry::take_restart_marker(&id, generation);
@@ -444,7 +461,11 @@ impl<S: BroadcastSink> Supervisor<S> {
                 reason: reason.to_string(),
             },
         );
-        let _ = handle.client.shutdown().await;
+        let _ = client.shutdown().await;
+        // `restart_history`, `kind` and `native_session_id` are read through the
+        // map entry that is now gone; binding them keeps the destructure
+        // exhaustive if a field is added to the handle.
+        let _ = (restart_history, kind, native_session_id);
         Some(is_restart)
     }
 }

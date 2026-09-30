@@ -373,16 +373,16 @@ pub(crate) fn get_profile_dir_locked(profile: &str) -> Result<PathBuf> {
     let base = get_app_dir()?;
     let resolved;
     let profile_name = if profile.is_empty() {
-        resolved = config::resolve_default_profile();
+        resolved = config::resolve_default_profile_locked();
         resolved.as_str()
     } else {
         profile
     };
-    // The traversal guard has to sit next to the join it protects, spelled as
-    // a `contains`: the taint analysis recognises that check and no other, so
-    // moving it behind a helper or a fallible validator leaves the sinks below
-    // unproven. `validate_profile_name` then decides the full grammar.
-    if profile_name.contains("..") || profile_name.contains('/') || profile_name.contains('\\') {
+    // A separator is the only way out of the profiles directory, and
+    // `validate_profile_name` below rejects a `..` component on its own. Only
+    // the separators are checked here, because a name that merely contains two
+    // dots is a single normal component and an existing profile must still open.
+    if profile_name.contains('/') || profile_name.contains('\\') {
         anyhow::bail!("Profile name cannot contain path separators");
     }
     validate_profile_name(profile_name)?;
@@ -409,7 +409,7 @@ pub fn get_profile_dir_path(profile: &str) -> Result<PathBuf> {
     };
     // Same guard as the locked variant: this path feeds the existing-directory
     // shortcut in `get_profile_dir`, which runs before any other check.
-    if profile_name.contains("..") || profile_name.contains('/') || profile_name.contains('\\') {
+    if profile_name.contains('/') || profile_name.contains('\\') {
         anyhow::bail!("Profile name cannot contain path separators");
     }
     validate_profile_name(profile_name)?;
@@ -420,8 +420,22 @@ pub fn get_profile_dir_path(profile: &str) -> Result<PathBuf> {
 /// requiring the directory to exist. Callers that materialise the profile must
 /// do so under the session identity lock.
 pub fn resolve_profile_name(profile: &str) -> Result<String> {
+    resolve_profile_name_inner(profile, false)
+}
+
+/// [`resolve_profile_name`] for a caller that already holds the session identity
+/// flock, so an empty profile cannot reach a bootstrap that re-takes it.
+pub(crate) fn resolve_profile_name_locked(profile: &str) -> Result<String> {
+    resolve_profile_name_inner(profile, true)
+}
+
+fn resolve_profile_name_inner(profile: &str, identity_lock_held: bool) -> Result<String> {
     let name = if profile.is_empty() {
-        config::resolve_default_profile()
+        if identity_lock_held {
+            config::resolve_default_profile_locked()
+        } else {
+            config::resolve_default_profile()
+        }
     } else {
         profile.to_string()
     };
