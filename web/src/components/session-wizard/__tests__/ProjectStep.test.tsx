@@ -44,7 +44,15 @@ afterEach(() => {
 function renderStep(data: Partial<WizardData> = {}, props: { initialTab?: "import"; agents?: AgentInfo[] } = {}) {
   const onChange = vi.fn();
   const onPicked = vi.fn();
-  render(<ProjectStep profile="default" data={{ ...initialData, ...data }} onChange={onChange} onPicked={onPicked} {...props} />);
+  render(
+    <ProjectStep
+      profile="default"
+      data={{ ...initialData, ...data }}
+      onChange={onChange}
+      onPicked={onPicked}
+      {...props}
+    />,
+  );
   return { onChange, onPicked };
 }
 
