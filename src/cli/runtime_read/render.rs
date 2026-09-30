@@ -712,7 +712,7 @@ fn render_projects(
     let projects: Vec<ProjectRead> = match scope {
         ScopeFilter::Global => {
             if !component_healthy(&snapshot.health.global_metadata) {
-                return Err(ReadFailure::post("health_degraded"));
+                return Err(unreadable("The global project registry"));
             }
             snapshot.global_projects.clone()
         }
@@ -726,7 +726,7 @@ fn render_projects(
             let name = selected_profile(snapshot, source)?;
             let profile = profile(snapshot, name)?;
             if !component_healthy(&snapshot.health.global_metadata) {
-                return Err(ReadFailure::post("health_degraded"));
+                return Err(unreadable("The global project registry"));
             }
             require_profile_components(profile, true, true)?;
             // The merged registry in the local order: the global rows, then the
@@ -897,7 +897,7 @@ fn require_selected_profile_health(
     profile: &ProfileRead,
 ) -> Result<(), ReadFailure> {
     if !component_healthy(&snapshot.health.global_enumeration) {
-        return Err(ReadFailure::post("health_degraded"));
+        return Err(unreadable("The profile registry"));
     }
     require_profile_components(profile, true, true)
 }
@@ -910,7 +910,7 @@ fn require_profile_components(
     if (enumeration && !profile_component_healthy(&profile.health.profile_enumeration))
         || (data && !profile_component_healthy(&profile.health.profile_data))
     {
-        return Err(ReadFailure::post("health_degraded"));
+        return Err(profile_unreadable(&profile.name));
     }
     Ok(())
 }
