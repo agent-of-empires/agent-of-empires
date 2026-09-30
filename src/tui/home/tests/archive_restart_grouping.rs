@@ -589,6 +589,17 @@ fn restart_selected_session_tool_swap_resolves_detect_as_for_the_row_profile() {
     env.view
         .restart_selected_session(None, Some("gjc"), None, None)
         .unwrap();
+    // The restart worker re-resolves the profile's config, reinstalling its registry
+    // entries; it must finish before the guards restore them.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while let Err(error) = env.view.restart_poller.try_recv_result() {
+        assert_eq!(error, std::sync::mpsc::TryRecvError::Empty);
+        assert!(
+            std::time::Instant::now() < deadline,
+            "restart worker did not finish"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
 
     let disk = Storage::new_unwatched("test").unwrap().load().unwrap();
     let row = disk.iter().find(|i| i.id == id).unwrap();
