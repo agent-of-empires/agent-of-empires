@@ -481,6 +481,12 @@ impl PurgeTransaction {
         if !matches!(gate, CompletionGate::Proceed) {
             return Err(Box::new(self.result_for_gate(gate, retained)));
         }
+        // Same refresh `gate` performs, on the row captured at the commit: the
+        // sidecars are torn down from here, after the row is gone, so a stale
+        // `project_path` would have nothing left to correct it.
+        if let Some(current) = retained {
+            self.request.instance = current;
+        }
         Ok(CommittedPurge {
             request: DeletionRequest {
                 session_id: self.request.session_id.clone(),

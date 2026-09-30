@@ -295,6 +295,7 @@ mod tests {
     /// dead leader does not answer it: the agent it started can outlive it. The
     /// zombie rule that keeps a torn-down runner provable must not extend to the
     /// group, or a live descendant is missed and its checkout removed.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn a_dead_leader_does_not_hide_a_live_member_of_its_group() {
         // `setsid` makes the process lead a fresh group, so killing it leaves

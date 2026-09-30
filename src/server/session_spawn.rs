@@ -450,7 +450,10 @@ pub(crate) async fn spawn_structured_session(
             // once the row is really gone: a revoked row that failed silently
             // would leave a listed session pointing at a deleted path.
             let revoked = {
-                let _identity_lock = crate::session::acquire_session_identity_lock();
+                // A lock that cannot be taken leaves the row in place, like the
+                // acquisition failures above: the scratch directory then stays
+                // with it rather than being removed from under a listed session.
+                let _identity_lock = crate::session::acquire_session_identity_lock()?;
                 Storage::open(&profile, file_watch_for_create.clone()).and_then(|storage| {
                     storage.update(|all, _groups| {
                         all.retain(|row| row.id != instance.id);

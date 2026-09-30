@@ -33,6 +33,14 @@ mod platform {
     pub(super) fn kill_process_group(_: &std::process::Child) {}
 
     pub(super) fn terminate_process_group(_: &std::process::Child) {}
+
+    pub(super) fn is_terminated(_pid: u32) -> bool {
+        false
+    }
+
+    pub(super) fn process_group_has_live_members(_pgrp: u32) -> std::io::Result<bool> {
+        Ok(false)
+    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]

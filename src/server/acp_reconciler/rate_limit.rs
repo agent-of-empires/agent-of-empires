@@ -641,6 +641,28 @@ mod tests {
         }
     }
 
+    /// The markers each arm published, counted apart: the automatic one arms the
+    /// budget and the manual one disarms it, so a total cannot tell a disarm
+    /// from an arming.
+    fn markers_by_arm(state: &AppState, id: &str) -> (usize, usize) {
+        state
+            .acp_event_store
+            .replay_from(id, 0)
+            .into_iter()
+            .filter_map(|(_, e)| match e {
+                Event::RateLimitAutoResumed { manual: false, .. } => Some(false),
+                Event::RateLimitAutoResumed { manual: true, .. } => Some(true),
+                _ => None,
+            })
+            .fold((0, 0), |(auto, manual), is_manual| {
+                if is_manual {
+                    (auto, manual + 1)
+                } else {
+                    (auto + 1, manual)
+                }
+            })
+    }
+
     fn auto_resumed_breadcrumbs(state: &AppState, id: &str) -> usize {
         state
             .acp_event_store
@@ -772,9 +794,10 @@ mod tests {
 
             assert_eq!(pending_turn(&state, &id).await, kept, "{label}");
             assert_eq!(
-                auto_resumed_breadcrumbs(&state, &id),
-                auto_markers + manual_markers,
-                "{label}: marker count"
+                markers_by_arm(&state, &id),
+                (auto_markers, manual_markers),
+                "{label}: a delivered continuation arms the budget and a superseded one \
+                 disarms it, so the two arms cannot be counted as one"
             );
             assert!(
                 !attempted.contains(&id) && released.contains(&id),
