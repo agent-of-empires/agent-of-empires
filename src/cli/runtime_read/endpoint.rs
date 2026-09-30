@@ -114,14 +114,20 @@ pub(crate) fn select_endpoint(source: &ReadRequestSource) -> Result<SelectedEndp
     })
 }
 
-/// Which profile a read is aimed at, with the local path's rule for an empty
-/// value: a `-p ''` the user typed is honoured as "no selection at all" and
-/// resolves to the default profile, exactly as the local command does
-/// (`resolve_existing_profile("")`), which branches on emptiness alone. A
-/// whitespace-only value is a profile *name*, so `-p '   '` must fail the same
-/// way it fails locally rather than quietly reading the default. An explicit
-/// flag stops the search even when it is empty, because the local path reads
-/// it the same way. An explicit `-p` wins over the variable whatever its value.
+/// Which profile a read is aimed at. An explicit flag stops the search even
+/// when it is empty, and an explicit `-p` wins over the variable whatever its
+/// value.
+///
+/// The two inputs have two different local rules, and unifying them is what
+/// broke parity once already:
+///
+/// - the flag mirrors `resolve_existing_profile` (`src/session/mod.rs:349`),
+///   which branches on emptiness alone and never trims, so `-p '   '` is a
+///   profile *name* and must be refused exactly as the local command refuses
+///   it;
+/// - the variable mirrors the caller that resolves one, which trims first, so
+///   a blank `AGENT_OF_EMPIRES_PROFILE` is the default profile locally and
+///   must be here too.
 pub(crate) fn selected_profile_source(source: &ReadRequestSource) -> ProfileSource<'_> {
     if let Some(value) = source.explicit_profile.as_deref() {
         return if value.is_empty() {
@@ -131,7 +137,7 @@ pub(crate) fn selected_profile_source(source: &ReadRequestSource) -> ProfileSour
         };
     }
     if let Some(value) = source.env_profile.as_deref() {
-        return if value.is_empty() {
+        return if value.to_str().is_some_and(|text| text.trim().is_empty()) {
             ProfileSource::Default
         } else {
             ProfileSource::Environment(value)
@@ -434,12 +440,12 @@ mod tests {
         assert!(select_endpoint(&source_with(None, Some("not a url"), None, None)).is_err());
     }
 
-    /// The local path maps an *empty* profile to the configured default
-    /// (`resolve_existing_profile("")`), so the served half may not refuse it
-    /// with `profile_missing`: least of all when no daemon is published at
-    /// all, where the very same command succeeds. Emptiness is the whole rule:
-    /// a whitespace-only value is a profile *name*, and the local command fails
-    /// it by name, so the served half has to fail it too.
+    /// The flag mirrors `resolve_existing_profile`, which branches on emptiness
+    /// and never trims: `-p ''` is the default profile, and `-p '   '` is a
+    /// profile *name* the local command refuses by name. The variable mirrors
+    /// the caller that resolves one, which trims first, so a blank variable is
+    /// the default profile on both sides. The two rules are different, and
+    /// unifying them is what broke parity for a round.
     #[test]
     fn an_empty_profile_selection_is_the_default_and_a_blank_one_is_a_name() {
         for env_profile in [None, Some("")] {
@@ -449,14 +455,23 @@ mod tests {
                 "{env_profile:?} must select the default profile"
             );
         }
-        let source = source_with(None, None, None, Some("   "));
+        let source = source_with(None, None, Some("   "), None);
         assert!(
             matches!(
                 selected_profile_source(&source),
-                ProfileSource::Environment(_)
+                ProfileSource::Explicit("   ")
             ),
-            "a blank profile is a name that does not exist, not a missing selection"
+            "a blank flag is a profile name, which the local path refuses"
         );
+        // A blank *variable* is the other rule: the local path trims it before
+        // resolving, so it is the default profile here as well.
+        for env_profile in [Some("   "), Some("\t\n")] {
+            let source = source_with(None, None, None, env_profile);
+            assert!(
+                matches!(selected_profile_source(&source), ProfileSource::Default),
+                "{env_profile:?} is trimmed away before it is resolved"
+            );
+        }
         // An explicit `-p ''` also means "no selection", and it still wins
         // over the variable, because that is how the local path reads it.
         let source = source_with(None, None, Some(""), Some("environment"));
@@ -486,7 +501,7 @@ mod tests {
             let _env = crate::session::test_support::EnvGuard::unset(&[PROFILE_ENV]);
             super::super::Cli::parse_from(["aoe", "ps"])
         };
-        for (value, expected_default) in [("", true), ("   ", false)] {
+        for value in ["", "   "] {
             let _env = crate::session::test_support::EnvGuard::set(&[(PROFILE_ENV, value)]);
             let source = read_request_source(&cli);
             assert_eq!(
@@ -494,10 +509,9 @@ mod tests {
                 Some(OsStr::new(value)),
                 "{value:?} must survive capture: `main` derives the write scope from it"
             );
-            assert_eq!(
+            assert!(
                 matches!(selected_profile_source(&source), ProfileSource::Default),
-                expected_default,
-                "{value:?} reads as the default profile exactly when it is empty"
+                "{value:?} is blank, and the local path trims a variable before resolving it"
             );
         }
     }

@@ -99,6 +99,7 @@ pub fn classify(command: Option<&Commands>) -> Option<ScopedCommand<'_>> {
 /// asserts that the code it was handed is in this set, so a new emitter cannot
 /// introduce a code the table does not describe; the pack verifier requires
 /// every code in its table to be in this set, so the table cannot describe a
+/// code this half cannot emit.
 pub(crate) const EMITTABLE_CODES: &[&str] = &[
     // `parser_error` is clap's, raised before any read begins.
     "parser_error",

@@ -217,6 +217,15 @@ async fn an_empty_environment_selection_is_answered_not_refused() {
     for (label, env_url, env_profile) in [
         ("absent", None, None),
         ("empty", Some(OsString::from("")), Some(OsString::from(""))),
+        // A blank variable is the default profile, because the local path
+        // trims a variable before it resolves one. This row and the explicit
+        // flag case below are the two halves of that: the same three spaces
+        // are unset in one input and a profile name in the other.
+        (
+            "whitespace",
+            Some(OsString::from("   ")),
+            Some(OsString::from("  ")),
+        ),
     ] {
         let source = ReadRequestSource {
             explicit_url: None,
@@ -241,6 +250,39 @@ async fn an_empty_environment_selection_is_answered_not_refused() {
             outcome.stdout
         );
     }
+    // The same three spaces as an explicit flag are a profile *name* on both
+    // halves, because `resolve_existing_profile` does not trim what it is
+    // given. The local command refuses it by name, so the served half must
+    // too rather than quietly reading the default.
+    let cli = Cli::try_parse_from(["aoe", "list", "-p", "   "]).expect("list parses");
+    let command = classify(cli.command.as_ref()).expect("list is a scoped read");
+    let source = ReadRequestSource {
+        explicit_url: None,
+        env_url: None,
+        token: None,
+        explicit_profile: Some("   ".into()),
+        env_profile: None,
+    };
+    let outcome = match attempt_read(command, &source).await {
+        ScopedRead::Answered(outcome) => outcome,
+        ScopedRead::NoLocalPublication => panic!("a live daemon must answer"),
+    };
+    assert_eq!(outcome.exit, 1, "{:?}", outcome.stderr);
+    assert!(
+        outcome
+            .stderr
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Profile '   ' does not exist"),
+        "the refusal names the profile the user typed: {:?}",
+        outcome.stderr
+    );
+    assert!(
+        outcome.stdout.as_deref().unwrap_or_default().is_empty(),
+        "a refusal prints no rows: {:?}",
+        outcome.stdout
+    );
+
     state.shutdown.cancel();
     server.join().await;
 }
