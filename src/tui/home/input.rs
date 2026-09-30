@@ -1715,6 +1715,13 @@ impl HomeView {
         key: KeyEvent,
         update_info: Option<&crate::update::UpdateInfo>,
     ) -> Option<Action> {
+        // A key is a context change: a pending native attachment was prepared
+        // for the session, profile, view and terminal mode in force when it was
+        // requested, so reconcile before the keystroke acts on any of them.
+        self.reconcile_native_attachment();
+        if key.code == KeyCode::Esc {
+            self.cancel_native_attachment();
+        }
         // Any keystroke drops a finalized preview selection: the highlight pins to cell
         // coords, so once the user does anything else the cells underneath can change and
         // it would point at unrelated content. Covers the live-send branch below too.
@@ -4047,6 +4054,13 @@ impl HomeView {
                 // sync, which every navigation path runs through, so the release doesn't
                 // hinge on a dwell tick firing during a quick hop.
                 self.manual_unread_hold = None;
+                // A selection change is a context change: a pending native
+                // attachment was prepared for the row the user was on.
+                self.cancel_native_attachment();
+                // And the dwell of the row just left is no longer the dwell
+                // being measured, so the timer behind it must not fire for the
+                // new one.
+                self.unread_dwell = None;
             }
         }
     }
