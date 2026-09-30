@@ -200,8 +200,15 @@ impl<S: BroadcastSink> Supervisor<S> {
                 drop(workers);
                 worker_registry::clear_restart_marker(session_id);
                 let Some(handle) = handle else {
-                    self.settle(&lease, Settlement::Proven);
-                    return Ok(Some(Settlement::Proven));
+                    // No handle in this process's map, which is the state after a
+                    // restart or when the registry record cannot be read at all.
+                    // That is not proof of death: the identity's pid is settled the
+                    // same way a handle's is, so a runner still alive blocks the
+                    // release instead of losing its checkout silently.
+                    let settlement =
+                        tear_down_runner(&*self.process_control, session_id, identity).await;
+                    self.settle(&lease, settlement);
+                    return Ok(Some(settlement));
                 };
                 if delete_adapter_state {
                     try_session_delete(&handle.client, session_id).await;
@@ -255,10 +262,26 @@ impl<S: BroadcastSink> Supervisor<S> {
             // refusal is only final once that wait runs out.
             StopDecision::AlreadyStopping => Ok(None),
             StopDecision::NotOwned => {
-                // A runner from a previous daemon may still be on disk.
-                let Some(record) = worker_registry::load(session_id).ok().flatten() else {
-                    drop(workers);
-                    return Err(SupervisorError::UnknownSession(session_id.into()));
+                // A runner from a previous daemon may still be on disk. A record
+                // that cannot be read is not the absence of a runner: treating it
+                // as one released the checkout of a session whose agent may still
+                // be running in it.
+                let record = match worker_registry::load_strict(session_id) {
+                    Ok(Some(record)) => record,
+                    Ok(None) => {
+                        drop(workers);
+                        return Err(SupervisorError::UnknownSession(session_id.into()));
+                    }
+                    Err(error) => {
+                        warn!(
+                            target: "acp.supervisor",
+                            session = %session_id,
+                            "runner record unreadable; refusing to release agent-side state: \
+                             {error:#}"
+                        );
+                        drop(workers);
+                        return Err(SupervisorError::TeardownPending(session_id.into()));
+                    }
                 };
                 let lease = {
                     let mut table = lock_recover(&self.lifecycle);

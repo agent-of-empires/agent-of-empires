@@ -887,13 +887,12 @@ pub fn attach_planned(
             .iter()
             .map(|repo| PathBuf::from(&repo.worktree_path)),
     );
-    if let Err(error) =
-        crate::session::deletion::ensure_unclaimed_paths(session_id, &candidate_paths)
-    {
-        prepared.rollback_preserving_claimed_locked(session_id);
-        release_reservation();
-        anyhow::bail!("Attach path is already claimed by another session: {error}");
-    }
+    // Taken before the ownership recheck, not after it: `create_profile`,
+    // `delete_profile` and `rename_profile` hold the identity flock and not the
+    // workspace claim, so between those two lines a profile could appear or
+    // vanish and the inventory this reads would be stale. The profile namespace
+    // lock is deliberately not taken again: `with_paths_in_use_locked` runs
+    // under the identity flock without it.
     let _identity_lock = match crate::session::acquire_session_identity_lock() {
         Ok(lock) => lock,
         Err(error) => {
@@ -902,6 +901,13 @@ pub fn attach_planned(
             return Err(error).context("could not reacquire identity lock to publish attach");
         }
     };
+    if let Err(error) =
+        crate::session::deletion::ensure_unclaimed_paths(session_id, &candidate_paths)
+    {
+        prepared.rollback_preserving_claimed_locked(session_id);
+        release_reservation();
+        anyhow::bail!("Attach path is already claimed by another session: {error}");
+    }
     let _lifecycle_lock = match storage.acquire_instance_lifecycle_lock(session_id) {
         Ok(lock) => lock,
         Err(error) => {

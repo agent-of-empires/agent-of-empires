@@ -226,6 +226,13 @@ pub fn load(session_id: &str) -> Result<Option<WorkerRecord>> {
         }
     }
 }
+/// [`load`] without folding a record it cannot read into "no runner": an
+/// unreadable record answers `Err`, which a caller about to destroy a checkout
+/// has to refuse on rather than treat as an absent session.
+pub fn load_strict(session_id: &str) -> Result<Option<WorkerRecord>> {
+    load_strict_unlocked(session_id)
+}
+
 fn load_strict_unlocked(session_id: &str) -> Result<Option<WorkerRecord>> {
     let path = record_path(session_id)?;
     match std::fs::read(&path) {
