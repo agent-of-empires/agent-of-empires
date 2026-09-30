@@ -202,11 +202,16 @@ fn post_token_auth_action(
     login_enabled: bool,
     login_exempt: bool,
     client_ip: IpAddr,
+    behind_ingress: bool,
 ) -> PostTokenAuthAction {
     if !login_enabled || login_exempt {
         return PostTokenAuthAction::Bypass;
     }
-    if is_local_trusted(client_ip) {
+    // Behind an external ingress, loopback is not evidence of anything: the
+    // caller reached this process through the proxy, and a forwarded header is
+    // all it takes to look local. The same guard governs whether those headers
+    // are read at all. See #3843.
+    if !behind_ingress && is_local_trusted(client_ip) {
         PostTokenAuthAction::Bypass
     } else {
         PostTokenAuthAction::RequireLogin
@@ -586,7 +591,9 @@ pub async fn auth_middleware(
     // Rate limit check BEFORE token validation
     if let Some(remaining_secs) = state
         .rate_limiter
-        .check_locked(client_ip, super::rate_limit::AuthBudget::Token)
+        // Every budget, not just the token one: a valid bearer must not reset
+        // a passphrase budget that is already counting down.
+        .check_locked_any(client_ip)
         .await
     {
         tracing::warn!(
@@ -722,7 +729,7 @@ pub async fn auth_middleware(
 
     // When login is enabled, a valid token alone is not enough for non-bootstrap paths.
     let login_exempt = is_login_session_exempt(&path);
-    match post_token_auth_action(login_enabled, login_exempt, client_ip) {
+    match post_token_auth_action(login_enabled, login_exempt, client_ip, state.behind_tunnel) {
         PostTokenAuthAction::Bypass => {
             if login_enabled && !login_exempt && is_local_trusted(client_ip) {
                 log_loopback_bypass_token(client_ip, &path);
@@ -1001,11 +1008,18 @@ mod tests {
         ];
         for (enabled, exempt, client, want) in cases {
             assert_eq!(
-                post_token_auth_action(enabled, exempt, ip(client)),
+                post_token_auth_action(enabled, exempt, ip(client), false),
                 want,
                 "enabled={enabled} exempt={exempt} ip={client}"
             );
         }
+        // Behind an external ingress a loopback caller arrived through the
+        // proxy, so the local bypass no longer applies (#3843).
+        assert_eq!(
+            post_token_auth_action(true, false, ip("127.0.0.1"), true),
+            RequireLogin,
+            "loopback behind an ingress must not bypass the login"
+        );
     }
 
     /// Per-row coverage of the passphrase-wall entry policy added in #1525. The

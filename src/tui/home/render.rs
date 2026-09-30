@@ -2743,6 +2743,7 @@ impl HomeView {
 
     /// Paint the preview and refresh geometry used by selection and live-send.
     fn render_preview(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
+        self.structured_transcript_painted = false;
         if self.system_health_open {
             self.preview_outer_area = area;
             self.preview_area = area;
@@ -3073,6 +3074,10 @@ impl HomeView {
                     .as_mut()
                     .and_then(|v| v.render(frame, layout.output, theme));
                 self.structured_preview = view;
+                // The preview now carries the mounted transcript, so the live
+                // geometry no longer describes what is on screen: the link and
+                // copy guards read this to refuse the stale mapping.
+                self.structured_transcript_painted = true;
                 self.preview_pane_area = layout.output;
                 if let Some(g) = geometry {
                     self.preview_visible_rows = g.text_area.height as usize;
