@@ -1024,13 +1024,22 @@ impl HomeView {
                         self.info_dialog =
                             Some(InfoDialog::new("Quarantine Retained", &error.to_string()));
                     }
+                    // Drop the row this dialog was opened for. Removing the
+                    // head instead would strand a different row: the queue can
+                    // grow while the dialog is open, so the head is not
+                    // necessarily the row being resolved, and a quarantined row
+                    // that loses its prompt has no way out.
+                    if let Some(at) = self
+                        .pending_indeterminate_queue
+                        .iter()
+                        .position(|(queued, _)| *queued == id)
+                    {
+                        self.pending_indeterminate_queue.remove(at);
+                    }
                 }
-                // The rest of the batch keeps its own unlock prompt, so a
-                // second quarantined row is never left with no way out.
-                if !self.pending_indeterminate_queue.is_empty() {
-                    self.pending_indeterminate_queue.remove(0);
-                    self.promote_next_indeterminate();
-                }
+                // The rest of the batch keeps its own prompt, so a second
+                // quarantined row is never left with no way out.
+                self.promote_next_indeterminate();
                 None
             }
             "stop_auxiliary" => {
