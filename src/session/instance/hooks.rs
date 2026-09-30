@@ -98,6 +98,10 @@ pub(crate) struct HostHookDisclosure {
     /// `(what it holds, path)`. A consent covers a write, so a file the
     /// installer creates belongs here even when no event lands in it.
     pub extra_settings_paths: Vec<(String, String)>,
+    /// `(agent, what its post-install hook does)` for the agents a launch can
+    /// reach, not only the one on screen: the approval is install-wide, so it
+    /// covers an agent the user is not creating a session for right now.
+    pub post_install_notes: Vec<(String, &'static str)>,
     /// False when the resolved events carry no status, which is what
     /// `agent_status_hooks = false` leaves behind, and what an agent that
     /// declares no status event leaves behind too.
@@ -156,6 +160,7 @@ pub(crate) fn host_hook_disclosure(
         status_hooks_enabled: false,
         disabled_by_agent: None,
         extra_settings_paths: Vec::new(),
+        post_install_notes: Vec::new(),
     };
     let host_env = config.environment.as_slice();
     let home = host_home(host_env).unwrap_or_else(|| std::path::PathBuf::from("~"));
@@ -187,6 +192,16 @@ pub(crate) fn host_hook_disclosure(
                     dir.join(extra.file).to_string_lossy().into_owned(),
                 )
             }));
+    }
+    if agent
+        .sidecar_hooks
+        .as_ref()
+        .and_then(|s| s.post_install_note)
+        .is_some()
+    {
+        disclosure
+            .post_install_notes
+            .extend(host_hook_post_install_notes());
     }
     // Only Codex reads a feature flag, and only beside its hooks.json. Kimi
     // and settl name their own `config.toml` but install their hooks whatever
@@ -235,6 +250,20 @@ pub(crate) fn host_hook_disclosure(
     // both surfaces say.
     disclosure.status_hooks_enabled = status_events > 0;
     disclosure
+}
+
+/// Every agent in the registry whose post-install hook changes something the
+/// consent has to name. Reads no agent config and runs no process: the binary
+/// and the current setting can change between the approval and a later launch,
+/// so the surfaces state what is permitted, not what happened today.
+pub(crate) fn host_hook_post_install_notes() -> Vec<(String, &'static str)> {
+    crate::agents::AGENTS
+        .iter()
+        .filter_map(|agent| {
+            let note = agent.sidecar_hooks.as_ref()?.post_install_note?;
+            Some((agent.name.to_string(), note))
+        })
+        .collect()
 }
 
 impl Instance {

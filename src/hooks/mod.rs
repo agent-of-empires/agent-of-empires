@@ -44,6 +44,7 @@ pub use json_settings::{
     install_cursor_hooks_with_events, install_hooks, uninstall_cursor_hooks, uninstall_hooks,
 };
 pub use kimi::{install_kimi_hooks_with_events, uninstall_kimi_hooks};
+pub use kiro::KIRO_DEFAULT_AGENT_NOTE;
 pub use kiro::{
     install_kiro_hooks_with_events, resolve_kiro_agent_file, set_kiro_default_agent_if_builtin,
     uninstall_kiro_hooks, KIRO_HOOKS_AGENT_FILE,

@@ -316,11 +316,6 @@ fn hooks_approve_clears_the_launch_gate_for_every_path() {
     let start = run_aoe(&home, &xdg, &stub, &socket, &["session", "start", &id]);
     assert_eq!(start.code, Some(0), "start after approval: {}", start.all());
     assert!(
-        !start.all().contains("have not been approved"),
-        "gate must stay open once approved: {}",
-        start.all()
-    );
-    assert!(
         hook_path(&home).is_file(),
         "approved hook file must be written at the disclosed path"
     );

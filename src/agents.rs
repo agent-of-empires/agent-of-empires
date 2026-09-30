@@ -241,6 +241,10 @@ pub struct SidecarHooks {
     pub events: &'static [SidecarHookEvent],
     /// Files this agent writes beside its host config, beyond `host_config_subpath`.
     pub sibling_settings: &'static [SiblingSettings],
+    /// What [`Self::post_install_host`] does beyond the files, in the words of
+    /// whoever wrote it. A post-install hook can change launcher state, which is
+    /// not a file AoE resolves, so the consent surfaces have to name it.
+    pub post_install_note: Option<&'static str>,
 }
 
 #[derive(Debug)]
@@ -649,6 +653,7 @@ pub const AGENTS: &[AgentDef] = &[
             format: SidecarFormat::KiroJson,
             events: CURSOR_HOOK_EVENTS,
             sibling_settings: &[],
+            post_install_note: None,
         }),
         session_support: session_support(
             ResumeStrategy::Flag("--resume"),
@@ -710,6 +715,7 @@ pub const AGENTS: &[AgentDef] = &[
             format: SidecarFormat::SettlToml,
             events: SETTL_SIDECAR_EVENTS,
             sibling_settings: &[],
+            post_install_note: None,
         }),
         host_only: true,
         ..agent(
@@ -735,6 +741,7 @@ pub const AGENTS: &[AgentDef] = &[
                 label: "Hermes shell-hook consent allowlist",
                 file: crate::hooks::HERMES_ALLOWLIST_FILE,
             }],
+            post_install_note: None,
         }),
         session_support: session_support(
             ResumeStrategy::Flag("--resume"),
@@ -766,6 +773,7 @@ pub const AGENTS: &[AgentDef] = &[
             format: SidecarFormat::KiroJson,
             events: KIRO_SIDECAR_EVENTS,
             sibling_settings: &[],
+            post_install_note: Some(crate::hooks::KIRO_DEFAULT_AGENT_NOTE),
         }),
         ..agent(
             "kiro",
@@ -809,6 +817,7 @@ pub const AGENTS: &[AgentDef] = &[
             format: SidecarFormat::KimiToml,
             events: KIMI_SIDECAR_EVENTS,
             sibling_settings: &[],
+            post_install_note: None,
         }),
         session_support: session_support(
             ResumeStrategy::Flag("--session"),

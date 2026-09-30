@@ -16,6 +16,7 @@ pub struct HooksInstallDialog {
     needs_codex_trust_note: bool,
     disabled_by_agent: Option<PathBuf>,
     extra_settings_paths: Vec<(String, String)>,
+    post_install_notes: Vec<(String, &'static str)>,
     selected: bool, // true = Accept, false = Cancel
     scroll_offset: u16,
     accept_button_area: Rect,
@@ -41,6 +42,7 @@ impl HooksInstallDialog {
             disabled_by_agent: disclosure.disabled_by_agent,
             status_hooks_enabled: disclosure.status_hooks_enabled,
             extra_settings_paths: disclosure.extra_settings_paths,
+            post_install_notes: crate::session::host_hook_post_install_notes(),
             selected: true,
             scroll_offset: 0,
             accept_button_area: Rect::default(),
@@ -130,6 +132,23 @@ impl HooksInstallDialog {
             )));
         }
 
+        if !self.post_install_notes.is_empty() {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "This approval covers every agent and profile.",
+                Style::default().bold(),
+            )));
+            lines.push(Line::from(
+                "Besides the files above, installing hooks for these agents",
+            ));
+            lines.push(Line::from("also changes launcher state:"));
+            for (agent, note) in &self.post_install_notes {
+                for line in note.split(". ") {
+                    lines.push(Line::from(format!("  {agent}: {line}.")));
+                }
+            }
+        }
+
         if !self.hook_commands.is_empty() {
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
@@ -155,9 +174,8 @@ impl HooksInstallDialog {
             )));
         } else if self.hook_commands.is_empty() {
             lines.push(Line::from(
-                "No status hook survives here, and this agent installs none:",
+                "No status hook survives here, and none is listed:",
             ));
-            lines.push(Line::from("its own config turns its hooks off."));
         } else {
             lines.push(Line::from(
                 "No status hook survives here, so these only publish the id",
@@ -227,7 +245,11 @@ impl HooksInstallDialog {
             ])
             .split(inner);
 
-        let header = Paragraph::new(if self.status_hooks_enabled {
+        // Three cases, not two: an agent that turned its own hooks off installs
+        // nothing, and promising an install there contradicts the body below.
+        let header = Paragraph::new(if self.disabled_by_agent.is_some() {
+            "This agent's own config turns its hooks off,\nso AoE installs nothing for it."
+        } else if self.status_hooks_enabled {
             "AoE needs to install hooks into your agent's settings\nto detect session status (running/waiting/idle)."
         } else {
             "AoE needs to install identity hooks into your agent's settings\nfor native resume. No status hook survives for this config."
@@ -392,8 +414,12 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn the_disclosure_names_the_files_and_events_it_will_touch() {
-        // The dialog follows the resolved config root, so a developer with
-        // `CLAUDE_CONFIG_DIR` exported would otherwise see their own path.
+        // The dialog follows the resolved config root and the disclosure reads
+        // the agent's own config beside it, so both the environment and HOME
+        // must be this test's own or the assertions see the developer's.
+        let temp = tempfile::TempDir::new().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(&temp.path().join("app"));
+        let _home = crate::session::test_support::isolate_home(temp.path());
         let _overrides = EnvGuard::unset(&["CLAUDE_CONFIG_DIR", "CODEX_HOME"]);
 
         let claude = content_text(&hook_dialog("claude", None));

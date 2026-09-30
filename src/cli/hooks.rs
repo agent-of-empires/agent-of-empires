@@ -127,6 +127,16 @@ fn print_disclosure(profile: &str) {
         .iter()
         .filter(|(_, disclosure)| !disclosure.hook_commands.is_empty())
         .collect();
+    let notes = crate::session::host_hook_post_install_notes();
+    if !notes.is_empty() {
+        println!();
+        println!("This approval covers every agent and profile. Besides the files");
+        println!("above, installing hooks for these agents also changes launcher state:");
+        for (agent, note) in &notes {
+            println!("  {agent}: {note}");
+        }
+    }
+
     if !events.is_empty() {
         println!();
         println!("Hook events added:");
