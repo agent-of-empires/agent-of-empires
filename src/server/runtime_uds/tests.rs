@@ -598,12 +598,16 @@ fn a_symlinked_prefix_resolves_to_the_directory_it_verified() {
 /// The producer applies the client's POSIX-ACL rule, so it cannot publish into a
 /// namespace the client would refuse. An ACL naming a user who may write is
 /// refused wherever in the chain it is found.
+///
+/// The named entry holds `rw` while the mask holds only `r`, so the mode the
+/// kernel derives is `0740` and the walk's own mode gate admits it: the
+/// refusal this lane asserts can only come from reading the ACL. Every step
+/// before the refusal is asserted, because a lane that quietly returns
+/// leaves a green test over a path nothing ran.
 #[test]
 #[serial_test::serial]
 fn a_named_user_write_acl_is_refused_on_an_intermediate_component() {
-    let Some(namespace) = namespace_or_skip() else {
-        return;
-    };
+    let namespace = namespace().expect("a private ancestor chain exists on this host");
     let intermediate = namespace.base.path().join("intermediate");
     let app = intermediate.join(crate::session::APP_DIR_NAME_XDG);
     std::fs::create_dir_all(&app).expect("app dir under the intermediate prefix");
@@ -613,17 +617,199 @@ fn a_named_user_write_acl_is_refused_on_an_intermediate_component() {
     );
 
     let other = unsafe { libc::geteuid() }.wrapping_add(1);
-    if !set_named_user_write_acl(&intermediate, other) {
-        // A filesystem without POSIX ACL support cannot be given one, so there
-        // is nothing to assert here. Skipping is the same call `namespace_or_skip`
-        // makes for a chain this host will not admit.
-        return;
-    }
+    let value = acl_v2(0o6, other);
+    set_acl(&intermediate, &value);
+    assert_eq!(
+        read_acl(&intermediate),
+        value,
+        "the walk must see the access ACL that was set, byte for byte"
+    );
+    assert_eq!(
+        stat_mode(&intermediate),
+        0o740,
+        "the mode gate is not what refuses this directory"
+    );
 
     assert_eq!(
         open_trusted_app_dir(&app).err().map(|error| error.code()),
         Some("app_dir_untrusted"),
         "a named-user write ACL is refused wherever it appears in the chain"
+    );
+    let refusal = client_refusal(&app);
+    assert!(
+        refusal.contains(&intermediate.display().to_string()),
+        "the refusal names the component it refused: {refusal}"
+    );
+    assert!(
+        refusal.contains("0740"),
+        "the refusal carries the mode read off the descriptor: {refusal}"
+    );
+    assert!(
+        refusal.contains("grants a named user or group write access"),
+        "the refusal names the ACL cause, not some other one: {refusal}"
+    );
+}
+
+/// The counterpart of the lane above: the same directory, the same `0740` mode
+/// and the same mask, with a named entry that holds no write. Both walks admit
+/// it, so the refusal above is about the named write and not about the ACL
+/// being there at all.
+#[test]
+#[serial_test::serial]
+fn a_named_user_readonly_acl_is_admitted_by_both_walks() {
+    let namespace = namespace().expect("a private ancestor chain exists on this host");
+    let intermediate = namespace.base.path().join("readonly");
+    let app = intermediate.join(crate::session::APP_DIR_NAME_XDG);
+    std::fs::create_dir_all(&app).expect("app dir under the intermediate prefix");
+    assert!(
+        client_admits(&app),
+        "the chain is admitted before the ACL lands"
+    );
+
+    let other = unsafe { libc::geteuid() }.wrapping_add(1);
+    let value = acl_v2(0o4, other);
+    set_acl(&intermediate, &value);
+    assert_eq!(
+        read_acl(&intermediate),
+        value,
+        "the walk must see the access ACL that was set, byte for byte"
+    );
+    assert_eq!(
+        stat_mode(&intermediate),
+        0o740,
+        "the two lanes differ only in the named entry's permissions"
+    );
+
+    assert!(client_admits(&app), "a named read is not a named write");
+    assert!(
+        open_trusted_app_dir(&app).is_ok(),
+        "the producer admits what the client admits"
+    );
+}
+
+/// The POSIX-ACL layout the kernel writes: a 4-byte little-endian version,
+/// then 8-byte entries of a little-endian `u16` tag, a little-endian `u16` of
+/// permissions and a little-endian `u32` id.
+const ACL_VERSION: u32 = 2;
+const ACL_ENTRY_LEN: usize = 8;
+const ACL_USER_OBJ: u8 = 0x01;
+const ACL_USER: u8 = 0x02;
+const ACL_GROUP_OBJ: u8 = 0x04;
+const ACL_MASK: u8 = 0x10;
+const ACL_OTHER: u8 = 0x20;
+
+/// The id a base entry carries, and the only one the kernel accepts for them.
+const ACL_UNDEFINED_ID: u32 = u32::MAX;
+
+/// One access ACL in the bytes the kernel serves, in the order it requires:
+/// the owner, the named users, the group, the named groups, the mask, other.
+/// The mask holds read only, so the mode the kernel derives is `0740` whatever
+/// the named entry says, and the walk's own mode gate cannot refuse it before
+/// the ACL is read.
+fn acl_v2(named_permissions: u8, uid: u32) -> Vec<u8> {
+    let mut value = ACL_VERSION.to_le_bytes().to_vec();
+    for (tag, permissions) in [
+        (ACL_USER_OBJ, 0o7u8),
+        (ACL_USER, named_permissions),
+        (ACL_GROUP_OBJ, 0),
+        (ACL_MASK, 0o4),
+        (ACL_OTHER, 0),
+    ] {
+        value.extend_from_slice(&u16::from(tag).to_le_bytes());
+        value.extend_from_slice(&u16::from(permissions).to_le_bytes());
+        let id = if tag == ACL_USER {
+            uid
+        } else {
+            ACL_UNDEFINED_ID
+        };
+        value.extend_from_slice(&id.to_le_bytes());
+    }
+    assert_eq!(value.len(), 4 + 5 * ACL_ENTRY_LEN);
+    value
+}
+
+/// Set `system.posix_acl_access`, panicking unless the filesystem took it: the
+/// lanes above assert a refusal, so a host that cannot be given the ACL is a
+/// failure to report rather than a reason to pass quietly.
+fn set_acl(dir: &Path, value: &[u8]) {
+    let path = std::ffi::CString::new(dir.as_os_str().as_bytes()).expect("path");
+    let name = std::ffi::CString::new("system.posix_acl_access").expect("name");
+    let set = unsafe {
+        libc::setxattr(
+            path.as_ptr(),
+            name.as_ptr(),
+            value.as_ptr().cast(),
+            value.len(),
+            0,
+        )
+    };
+    assert_eq!(
+        set,
+        0,
+        "the filesystem must take the access ACL: {}",
+        std::io::Error::last_os_error()
+    );
+}
+
+/// Read the ACL back through a descriptor on the directory, so what is
+/// asserted is the bytes the walk will see rather than the bytes that were sent.
+fn read_acl(dir: &Path) -> Vec<u8> {
+    use std::os::unix::io::AsRawFd;
+    let file = std::fs::File::open(dir).expect("open the directory");
+    let name = std::ffi::CString::new("system.posix_acl_access").expect("name");
+    let needed =
+        unsafe { libc::fgetxattr(file.as_raw_fd(), name.as_ptr(), std::ptr::null_mut(), 0) };
+    assert!(needed > 0, "the directory must carry the access ACL");
+    let mut value = vec![0u8; needed as usize];
+    let read = unsafe {
+        libc::fgetxattr(
+            file.as_raw_fd(),
+            name.as_ptr(),
+            value.as_mut_ptr().cast(),
+            value.len(),
+        )
+    };
+    assert!(read > 0, "read the access ACL back");
+    value.truncate(read as usize);
+    value
+}
+
+/// The mode bits the walk judges, as `fstat` reports them.
+fn stat_mode(dir: &Path) -> u32 {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(dir).expect("stat").mode() & 0o7777
+}
+
+/// The client's own refusal, printed, so a lane can name the component and the
+/// cause rather than only the code the producer collapses it to.
+fn client_refusal(path: &Path) -> String {
+    let walked =
+        crate::cli::runtime_read::uds::open_trusted_directory(path, unsafe { libc::geteuid() });
+    format!("{walked:?}")
+}
+
+/// Whether this host's filesystem takes an access ACL at all, printed. It
+/// exists so a failing lane can be read against the platform's answer rather
+/// than guessed at, and it neither returns nor skips: the lanes that depend on
+/// ACL support are strict.
+#[test]
+fn the_hosts_posix_acl_capability_is_reported() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let value = acl_v2(0o4, 1);
+    let path = std::ffi::CString::new(dir.path().as_os_str().as_bytes()).expect("path");
+    let name = std::ffi::CString::new("system.posix_acl_access").expect("name");
+    let set = unsafe {
+        libc::setxattr(
+            path.as_ptr(),
+            name.as_ptr(),
+            value.as_ptr().cast(),
+            value.len(),
+            0,
+        )
+    };
+    eprintln!(
+        "posix acl capability: setxattr={set} ({})",
+        std::io::Error::last_os_error()
     );
 }
 
@@ -668,25 +854,6 @@ fn a_symlinked_prefix_to_a_world_writable_directory_is_refused() {
         Some("app_dir_untrusted"),
         "the resolved directory is judged on its own attributes"
     );
-}
-
-/// `system.posix_acl_access` in the text spelling the kernel writes, with one
-/// named user holding the write bit. Returns whether the filesystem took it:
-/// a kernel or filesystem without POSIX ACL support refuses, and the caller
-/// skips rather than asserting a chain this host cannot build.
-fn set_named_user_write_acl(dir: &Path, uid: u32) -> bool {
-    let value = format!("u::rw-,g::r--,o::r--,u:{uid}:rwx");
-    let path = std::ffi::CString::new(dir.as_os_str().as_bytes()).expect("path");
-    let name = std::ffi::CString::new("system.posix_acl_access").expect("name");
-    unsafe {
-        libc::setxattr(
-            path.as_ptr(),
-            name.as_ptr(),
-            value.as_ptr().cast(),
-            value.len(),
-            0,
-        ) == 0
-    }
 }
 
 /// A shutdown that happens while a client holds the namespace shared for its

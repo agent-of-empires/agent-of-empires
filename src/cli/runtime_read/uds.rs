@@ -446,15 +446,20 @@ fn validate_directory_stat(
             )));
         }
     }
-    // The ACL check reports a named user or group holding a write the mode
-    // does not show, so the mode alone cannot explain this refusal; the
-    // component and its mode are still printed, because they are what tells
-    // the operator which directory now carries one.
-    validate_posix_acl(file.as_raw_fd()).map_err(|_| {
+    // A named write is a fact read off the ACL; an ACL this walk cannot parse
+    // is a component it cannot admit, and the two sentences are different
+    // because the operator can only act on the first by reading it.
+    validate_posix_acl(file.as_raw_fd()).map_err(|cause| {
+        let message = match cause {
+            AclError::NamedWrite => {
+                "carrying a POSIX ACL that grants a named user or group write access"
+            }
+            AclError::Unverifiable => "carrying a POSIX ACL whose entries could not be read",
+        };
         TrustedPathError::Refused(RefusedComponent::new(
             path,
             mode,
-            "carrying a POSIX ACL that grants a named user or group write access",
+            message,
             "setfacl -b {path}",
         ))
     })?;
@@ -472,15 +477,15 @@ fn group_other_writes_allowed(stat: &libc::stat, final_component: bool) -> bool 
         || (!final_component && stat.st_uid == 0 && stat.st_mode & libc::S_ISVTX != 0)
 }
 
-fn validate_posix_acl(fd: RawFd) -> Result<(), TrustedPathError> {
-    let names = xattr_names(fd)?;
+fn validate_posix_acl(fd: RawFd) -> Result<(), AclError> {
+    let names = xattr_names(fd).map_err(|_| AclError::Unverifiable)?;
     let Some(name) = names
         .into_iter()
         .find(|name| name.as_slice() == b"system.posix_acl_access")
     else {
         return Ok(());
     };
-    validate_acl_value(&xattr_value(fd, &name)?)
+    validate_acl_value(&xattr_value(fd, &name).map_err(|_| AclError::Unverifiable)?)
 }
 
 fn xattr_names(fd: RawFd) -> Result<Vec<Vec<u8>>, TrustedPathError> {
@@ -525,46 +530,69 @@ fn xattr_value(fd: RawFd, name: &[u8]) -> Result<Vec<u8>, TrustedPathError> {
     Ok(value)
 }
 
-/// The kernel serves `system.posix_acl_access` in its text form, one entry per
-/// comma, each `tag[:id]:perms` with `perms` spelled in `rwx` letters: for
-/// example `u::rw-,g::r--,o::r--,u:1002:rwx`. Only a *named* user or group
-/// holding `w` is refused here: the base owner, group and other entries are
-/// already reflected in the directory mode, and the mask entry applies to
-/// them. Anything that does not parse is a refusal, so a value this code
-/// cannot read is never treated as a chain it may trust.
-fn validate_acl_value(value: &[u8]) -> Result<(), TrustedPathError> {
-    let text = std::str::from_utf8(value).map_err(|_| TrustedPathError::Invalid)?;
-    for entry in text.split(',') {
-        let mut fields = entry.split(':');
-        let tag = fields.next().ok_or(TrustedPathError::Invalid)?;
-        let id = fields.next().unwrap_or_default();
-        let permissions = fields.next().ok_or(TrustedPathError::Invalid)?;
-        if fields.next().is_some() || !matches!(tag, "u" | "g" | "o" | "m") {
-            return Err(TrustedPathError::Invalid);
+/// The kernel serves `system.posix_acl_access` in its binary form: a 4-byte
+/// little-endian version, then 8-byte entries of a little-endian `u16` tag, a
+/// little-endian `u16` of permission bits and a little-endian `u32` id. Only a
+/// *named* user or group holding `w` is refused here: the base owner, group
+/// and other entries are already reflected in the directory mode, and the
+/// mask entry applies to them. Anything this code cannot read is a refusal
+/// too, so a value it cannot interpret is never treated as a chain it may
+/// trust.
+fn validate_acl_value(value: &[u8]) -> Result<(), AclError> {
+    let header = value.get(..4).ok_or(AclError::Unverifiable)?;
+    if u32::from_le_bytes([header[0], header[1], header[2], header[3]]) != ACL_VERSION {
+        // A version this code does not know carries entries of an unknown
+        // width, so nothing in it can be read as a named write or as safe.
+        return Err(AclError::Unverifiable);
+    }
+    let entries = value[4..].chunks_exact(ACL_ENTRY_LEN);
+    if value[4..].len() % ACL_ENTRY_LEN != 0 {
+        return Err(AclError::Unverifiable);
+    }
+    for entry in entries {
+        let tag = u16::from_le_bytes([entry[0], entry[1]]);
+        let permissions = u16::from_le_bytes([entry[2], entry[3]]);
+        let Ok(tag) = u8::try_from(tag) else {
+            return Err(AclError::Unverifiable);
+        };
+        if !matches!(
+            tag,
+            ACL_USER_OBJ | ACL_USER | ACL_GROUP_OBJ | ACL_GROUP | ACL_MASK | ACL_OTHER
+        ) {
+            return Err(AclError::Unverifiable);
         }
-        // Permission letters are `rwx` with a dash standing in for an absent
-        // bit, so `r-x` and `rw-` are spellings, not separators.
-        if permissions.is_empty()
-            || permissions.len() > 3
-            || !permissions
-                .chars()
-                .all(|permission| matches!(permission, 'r' | 'w' | 'x' | '-'))
-        {
-            return Err(TrustedPathError::Invalid);
+        if permissions & !u16::from(ACL_PERMISSION_MASK) != 0 {
+            return Err(AclError::Unverifiable);
         }
-        if id.is_empty() {
-            // A base entry: the directory mode already carries it.
-            continue;
-        }
-        if !id.bytes().all(|byte| byte.is_ascii_digit()) {
-            return Err(TrustedPathError::Invalid);
-        }
-        if permissions.contains('w') {
-            return Err(TrustedPathError::Invalid);
+        // A base entry is the directory mode; only a named user or group is a
+        // grant the mode cannot show.
+        if matches!(tag, ACL_USER | ACL_GROUP) && permissions & u16::from(ACL_WRITE) != 0 {
+            return Err(AclError::NamedWrite);
         }
     }
     Ok(())
 }
+
+/// The two ways a chain can fail to be admissible, told apart because the
+/// operator's sentence differs: a named write is a fact this walk read off the
+/// ACL, and anything else is an admission this walk could not complete.
+#[derive(Debug, PartialEq, Eq)]
+enum AclError {
+    NamedWrite,
+    Unverifiable,
+}
+
+/// The version the kernel writes: little-endian 2, the only layout there is.
+const ACL_VERSION: u32 = 2;
+const ACL_ENTRY_LEN: usize = 8;
+const ACL_USER_OBJ: u8 = 0x01;
+const ACL_USER: u8 = 0x02;
+const ACL_GROUP_OBJ: u8 = 0x04;
+const ACL_GROUP: u8 = 0x08;
+const ACL_MASK: u8 = 0x10;
+const ACL_OTHER: u8 = 0x20;
+const ACL_WRITE: u8 = 0x02;
+const ACL_PERMISSION_MASK: u8 = 0x07;
 
 async fn connect_admission(
     namespace: OwnedNamespace,
@@ -1169,38 +1197,97 @@ fn errno() -> i32 {
 mod tests {
     use super::*;
 
-    /// The kernel serves `system.posix_acl_access` in text form, so the parser
-    /// is exercised on the spelling the kernel produces. Testing the parser
-    /// rather than the syscall keeps this deterministic on a filesystem with
-    /// no POSIX ACL support, where the syscall itself cannot be exercised.
+    /// The kernel serves `system.posix_acl_access` as a version word followed
+    /// by 8-byte entries, so the parser is exercised on bytes laid out that
+    /// way. Building them here rather than reading them back keeps the case
+    /// deterministic on a filesystem with no POSIX ACL support, and laying
+    /// them out by hand means a wrong ABI shows up as a failing test.
     #[test]
-    fn a_posix_acl_is_read_in_the_spelling_the_kernel_writes() {
+    fn a_posix_acl_is_read_in_the_bytes_the_kernel_writes() {
         for admitted in [
-            "u::rw-,g::r--,o::r--",
-            "u::rwx,g::r-x,o::r--,m::rwx",
-            "u::rw-,g::r--,o::r--,u:1002:r-x",
+            acl_value(&[(ACL_USER_OBJ, 6), (ACL_GROUP_OBJ, 4), (ACL_OTHER, 4)]),
+            acl_value(&[
+                (ACL_USER_OBJ, 7),
+                (ACL_GROUP_OBJ, 5),
+                (ACL_MASK, 7),
+                (ACL_OTHER, 4),
+            ]),
+            acl_value(&[
+                (ACL_USER_OBJ, 6),
+                (ACL_USER, 4),
+                (ACL_GROUP_OBJ, 4),
+                (ACL_MASK, 4),
+                (ACL_OTHER, 0),
+            ]),
         ] {
             assert_eq!(
-                validate_acl_value(admitted.as_bytes()),
+                validate_acl_value(&admitted),
                 Ok(()),
-                "{admitted} grants nobody a write the mode does not already show"
+                "nobody is named with a write the mode does not already show"
             );
         }
-        for refused in [
-            "u::rw-,g::r--,o::r--,u:1002:rwx",
-            "u::rw-,g::r--,o::r--,g:1002:-w-",
-            "u::rw-x,zz:1002:rwx",
-            "u::rw-,g::r--,o::q--",
-            "u::",
-            "u::rw-,g::r--,o::r--,u:1002:rwx:extra",
-            "u::rw-,g::r--,o::r--,u:notanid:r--",
+        for (refused, cause) in [
+            (
+                acl_value(&[
+                    (ACL_USER_OBJ, 7),
+                    (ACL_USER, 7),
+                    (ACL_GROUP_OBJ, 0),
+                    (ACL_MASK, 4),
+                    (ACL_OTHER, 0),
+                ]),
+                AclError::NamedWrite,
+            ),
+            (
+                acl_value(&[
+                    (ACL_USER_OBJ, 7),
+                    (ACL_GROUP, 6),
+                    (ACL_GROUP_OBJ, 0),
+                    (ACL_MASK, 4),
+                    (ACL_OTHER, 0),
+                ]),
+                AclError::NamedWrite,
+            ),
+            // An unknown version, an unknown tag, a permission bit outside
+            // `rwx` and a trailing partial entry are all unreadable, and an
+            // unreadable value is refused without claiming a named write.
+            (acl_version(3), AclError::Unverifiable),
+            (
+                acl_value(&[(ACL_USER_OBJ, 6), (0x40, 6), (ACL_OTHER, 4)]),
+                AclError::Unverifiable,
+            ),
+            (
+                acl_value(&[(ACL_USER_OBJ, 6), (ACL_OTHER, 4 | 0x08)]),
+                AclError::Unverifiable,
+            ),
+            (
+                acl_value(&[(ACL_USER_OBJ, 6)])[..10].to_vec(),
+                AclError::Unverifiable,
+            ),
+            (vec![0x02, 0x00], AclError::Unverifiable),
         ] {
             assert_eq!(
-                validate_acl_value(refused.as_bytes()),
-                Err(TrustedPathError::Invalid),
-                "{refused} is a named write or a value this code cannot read"
+                validate_acl_value(&refused),
+                Err(cause),
+                "the cause says whether a named write was read or nothing could be read"
             );
         }
+    }
+
+    /// The version word followed by one 8-byte entry per tag and permission
+    /// pair, in the layout the kernel writes: a `u16` tag, a `u16` of
+    /// permissions and a `u32` id.
+    fn acl_value(entries: &[(u8, u8)]) -> Vec<u8> {
+        let mut value = ACL_VERSION.to_le_bytes().to_vec();
+        for (tag, permissions) in entries {
+            value.extend_from_slice(&u16::from(*tag).to_le_bytes());
+            value.extend_from_slice(&u16::from(*permissions).to_le_bytes());
+            value.extend_from_slice(&0u32.to_le_bytes());
+        }
+        value
+    }
+
+    fn acl_version(version: u32) -> Vec<u8> {
+        version.to_le_bytes().to_vec()
     }
 
     #[test]
