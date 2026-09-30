@@ -102,7 +102,15 @@ async fn main() -> Result<()> {
     let answered = match cli::runtime_read::classify(cli.command.as_ref()) {
         Some(command) => match cli::runtime_read::attempt(command, &read_source).await {
             cli::runtime_read::ScopedRead::Answered(outcome) => Some(outcome),
-            cli::runtime_read::ScopedRead::NoLocalPublication => None,
+            cli::runtime_read::ScopedRead::NoLocalPublication(notice) => {
+                // Ahead of the local command's own output, and on stderr, so
+                // the store's rows read as the local command's rows. Dropped
+                // with no endpoint named, which is the ordinary local read.
+                if let Some(notice) = notice {
+                    let _ = std::io::stderr().lock().write_all(notice.as_bytes());
+                }
+                None
+            }
         },
         None => None,
     };

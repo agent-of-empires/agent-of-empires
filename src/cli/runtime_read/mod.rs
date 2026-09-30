@@ -1,3 +1,21 @@
+//! The daemon-served read: one WebSocket exchange, two application frames, and
+//! a projection the CLI prints verbatim.
+//!
+//! What this module owes the operator is where the bytes came from. Every
+//! answer it returns was rendered by a daemon from a snapshot, so a command
+//! whose bytes came from the local store instead has to say so, or its output
+//! is indistinguishable from a read that was served.
+//!
+//! `--daemon-url` and `AOE_DAEMON_URL` are not in the same position and do not
+//! behave the same way. The flag names an endpoint, so refusing it (or failing
+//! to reach it) is what the user asked for by name and stays a refusal. The
+//! variable names a remote that may simply not be running, which is a state a
+//! local command still answers in, so a variable naming an endpoint that does
+//! not answer still lets the command run, and says on stderr that the local
+//! store answered. What it never does is fall over silently: the notice names
+//! the variable rather than its value, so a URL carrying a token is not echoed
+//! to a terminal or a log.
+
 /// `pub(crate)` so the server's wire contract test can drive the client's real
 /// decoders; the two halves then cannot drift on a field name or member order.
 pub(crate) mod dto;
@@ -57,6 +75,10 @@ use super::{Cli, Commands};
 use crate::server::runtime_ws::CONNECTION_BUDGET;
 const CLOSE_BUDGET: Duration = Duration::from_millis(200);
 pub(crate) const APPLICATION_LIMIT: usize = 16 * 1024 * 1024;
+/// The line a read prints when a variable named an endpoint that did not
+/// answer, so the store's rows were printed by the local command.
+pub(crate) const LOCAL_STORE_NOTICE: &str =
+    "notice: AOE_DAEMON_URL named an endpoint that did not answer, so this answer is the local store's.\n";
 
 #[derive(Clone, Copy)]
 pub enum ScopedCommand<'a> {
@@ -256,7 +278,12 @@ pub enum ScopedRead {
     /// local transport, so the caller runs the command against the local store
     /// exactly as it did before the read existed, including its best-effort
     /// `agent_session_id` backfill, which an answered read does not run.
-    NoLocalPublication,
+    ///
+    /// The notice is `Some` only when a variable named an endpoint that did
+    /// not answer, the one case where the local store answers a command the
+    /// user aimed somewhere else. With no endpoint named this is the ordinary
+    /// local read and has nothing to report.
+    NoLocalPublication(Option<&'static str>),
 }
 
 pub async fn attempt(command: ScopedCommand<'_>, source: &ReadRequestSource) -> ScopedRead {
@@ -273,7 +300,9 @@ pub async fn attempt(command: ScopedCommand<'_>, source: &ReadRequestSource) -> 
                 exit: 0,
             })
         }
-        Err(error) if absent_local_publication(&error, source) => ScopedRead::NoLocalPublication,
+        Err(error) if absent_local_publication(&error, source) => {
+            ScopedRead::NoLocalPublication(source.env_url_is_set().then_some(LOCAL_STORE_NOTICE))
+        }
         Err(error) => ScopedRead::Answered(error.into()),
     }
 }
@@ -765,6 +794,49 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The one case where the local store answers a command the user aimed
+    /// somewhere else: `AOE_DAEMON_URL` names an endpoint, the endpoint is
+    /// refused while the URL is parsed, and the command runs locally anyway.
+    /// That is the right fallback, and it is only right if the operator is told,
+    /// because the transport's premise is that the bytes are a daemon's.
+    ///
+    /// The flag is the contrast, on the same refused URL: naming an endpoint by
+    /// hand is a request for a served answer, so it stays a refusal and no
+    /// notice is owed. Both refuse during parsing, so neither opens a socket.
+    #[tokio::test]
+    async fn a_variable_naming_an_endpoint_that_did_not_answer_says_the_store_answered() {
+        let refused = "http://remote.test";
+        let source = |explicit_url: Option<&str>| ReadRequestSource {
+            explicit_url: explicit_url.map(str::to_string),
+            env_url: Some(OsString::from(refused)),
+            token: None,
+            explicit_profile: None,
+            env_profile: None,
+        };
+        let cli = Cli::try_parse_from(["aoe", "list"]).expect("the argv parses");
+        let command = classify(cli.command.as_ref()).expect("`aoe list` is scoped");
+
+        let read = attempt(command, &source(None)).await;
+        let ScopedRead::NoLocalPublication(notice) = read else {
+            panic!("a refused endpoint must not be answered by a daemon");
+        };
+        assert_eq!(
+            notice,
+            Some(LOCAL_STORE_NOTICE),
+            "the local store's rows have to say they are the local store's"
+        );
+
+        let flagged = attempt(command, &source(Some(refused))).await;
+        let ScopedRead::Answered(outcome) = flagged else {
+            panic!("a flag naming an endpoint is a request for a served answer");
+        };
+        assert_eq!(
+            outcome.exit, 2,
+            "a refused endpoint leaves the refusal's exit"
+        );
+        assert!(outcome.stdout.is_none(), "a refusal prints no answer");
     }
 
     #[test]
