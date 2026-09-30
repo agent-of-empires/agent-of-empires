@@ -247,6 +247,20 @@ impl Fixture {
             .expect("seed the unreadable registry");
     }
 
+    /// A global `projects.json` that is not the JSON the store expects. Only
+    /// the project listing consumes this registry, so every other read stays
+    /// answerable and the served transport must not refuse on it.
+    fn write_broken_global_projects(&self) {
+        std::fs::write(self.global_projects_path(), b"not json").expect("break the registry");
+    }
+
+    fn global_projects_path(&self) -> PathBuf {
+        self.path()
+            .join(".config")
+            .join(agent_of_empires::session::APP_DIR_NAME_XDG)
+            .join("projects.json")
+    }
+
     fn path(&self) -> &Path {
         &self.home
     }
@@ -696,6 +710,38 @@ async fn a_profile_that_cannot_be_read_is_refused_by_both_transports() {
             refusal.stdout.is_empty(),
             "a refusal prints no rows on either transport: {:?}",
             refusal.stdout
+        );
+    }
+}
+
+/// A store whose global project registry will not parse is still a store the
+/// session reads can answer from: no session, status, group or profile read
+/// consults the registry. The served renderer refused all of them anyway,
+/// turning one corrupt file into `health_degraded` on commands that never read
+/// it. These three are the ones that were refused, and `usize::MAX` is the
+/// refusal index because every one of them must succeed: a served refusal
+/// against a local success is a difference the comparison reports rather than
+/// two agreeing refusals.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_broken_global_registry_does_not_refuse_the_reads_that_ignore_it() {
+    let fixture = Fixture::new();
+    fixture.write_broken_global_projects();
+    let served = compare_transports(
+        &fixture,
+        &[
+            &["list", "--json"],
+            &["status", "--json"],
+            &["session", "list-trash"],
+        ],
+        usize::MAX,
+    )
+    .await;
+    for run in &served {
+        assert_eq!(
+            run.exit, 0,
+            "a read that never opens the project registry still answers: {:?}",
+            run.stderr
         );
     }
 }

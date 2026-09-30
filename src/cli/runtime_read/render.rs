@@ -876,15 +876,15 @@ fn require_list_all_health(snapshot: &SnapshotData) -> Result<(), ReadFailure> {
     Ok(())
 }
 
-/// Every command that names one profile still needs the global components: the
-/// profile list it prints is built from the global registry.
+/// Every command that names one profile needs the global registry to
+/// enumerate and the named profile's own components. The global project
+/// registry is not one of them: only the project listing consumes it, and it
+/// checks it itself.
 fn require_selected_profile_health(
     snapshot: &SnapshotData,
     profile: &ProfileRead,
 ) -> Result<(), ReadFailure> {
-    if !component_healthy(&snapshot.health.global_enumeration)
-        || !component_healthy(&snapshot.health.global_metadata)
-    {
+    if !component_healthy(&snapshot.health.global_enumeration) {
         return Err(ReadFailure::post("health_degraded"));
     }
     require_profile_components(profile, true, true)
