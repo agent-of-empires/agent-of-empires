@@ -1138,6 +1138,56 @@ mod tests {
         }
     }
 
+    /// A Hello that claims a local owner is only believed about the uid the
+    /// client admitted, which is the one it proved from the socket's peer
+    /// credentials. A recorded transcript cannot produce a disagreement here,
+    /// so the refusal had no test: it needs an admitted uid the Hello does not
+    /// carry, which is what a second process of another user produces and what
+    /// no committed case can.
+    fn local_hello(uid: Option<u32>) -> HelloData {
+        HelloData {
+            protocol_version: crate::server::runtime_ws::PROTOCOL_VERSION,
+            runtime_epoch: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".into(),
+            prebind_instance_id: "bbbbbbbb-cccc-dddd-eeee-ffffffffffff".into(),
+            runtime_instance_id: "cccccccc-dddd-eeee-ffff-000000000000".into(),
+            namespace: "debug:agent-of-empires-dev".into(),
+            owner: Owner {
+                kind: OwnerKind::LocalOwner,
+                uid,
+            },
+            local_owner: true,
+            health: AggregateHealth::Healthy,
+            profiles: vec![ProfileHello {
+                name: "main".into(),
+                health: health(),
+            }],
+            status_freshness: StatusFreshness::Observed {
+                revision: 1,
+                observed_at: "2026-01-01T00:00:00Z".into(),
+            },
+        }
+    }
+
+    #[test]
+    fn a_local_owner_the_admitted_uid_does_not_match_is_a_peer_identity_refusal() {
+        let value = snapshot();
+        assert_eq!(
+            validate_cross_message(&local_hello(Some(501)), &value, Some(501)),
+            Ok(()),
+            "the uid the client admitted is the uid the Hello claims"
+        );
+        assert_eq!(
+            validate_cross_message(&local_hello(Some(501)), &value, Some(0)),
+            Err("peer_identity"),
+            "a publisher claiming a uid other than the admitted one is not the publisher"
+        );
+        assert_eq!(
+            validate_cross_message(&local_hello(None), &value, Some(501)),
+            Err("peer_identity"),
+            "a local owner that names no uid cannot be the uid that was admitted"
+        );
+    }
+
     #[test]
     fn strict_uuid_and_namespace_grammar() {
         assert!(valid_uuid("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"));

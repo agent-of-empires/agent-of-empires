@@ -2,6 +2,18 @@
 //! Contract Pack: the recorded transcripts must decode through the real
 //! decoders, the frozen goldens must be what the real renderer produces, and
 //! the upgrade failures must classify exactly as the phase/code matrix says.
+//!
+//! One code in the phase/code table is a refusal no committed case can
+//! produce. `peer_identity` means a peer was reached and is not the publisher,
+//! and every refusal case here was recorded from a transcript that was not: a
+//! disagreeing one would have had to be recorded from a publisher of another
+//! user, which is not a thing this pack can record. It stays in the table
+//! because the table may not name a code the client cannot emit and three
+//! sites emit it. The disagreement branch is driven directly instead, in
+//! `dto`'s own tests, which is where the rule lives. What is still without a
+//! test is the same code at two other sites, and both need a peer this process
+//! cannot be: `uds`'s `SO_PEERCRED` walk, and the Hello-against-admitted-
+//! identity comparison in `mod`.
 
 use std::net::SocketAddr;
 
