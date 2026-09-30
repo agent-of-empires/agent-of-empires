@@ -351,20 +351,6 @@ fn wheel_forward_key(
     }
 }
 
-fn resolve_hook_install_agent(
-    tool_name: &str,
-    session_config: &crate::session::config::SessionConfig,
-) -> Option<&'static crate::agents::AgentDef> {
-    crate::agents::get_agent(tool_name)
-        .or_else(|| {
-            session_config
-                .agent_detect_as
-                .get(tool_name)
-                .and_then(|detect_as| crate::agents::get_agent(detect_as))
-        })
-        .filter(|agent| agent.hook_config.is_some() || agent.sidecar_hooks.is_some())
-}
-
 pub(super) fn parse_hotkey(s: &str) -> Option<(KeyCode, KeyModifiers)> {
     let (modifier, key) = s.split_once('+')?;
     if !modifier.eq_ignore_ascii_case("alt") {
@@ -1657,12 +1643,20 @@ impl HomeView {
                     data.tool.clone()
                 };
 
-                let resolved_config = crate::session::resolve_config_with_repo_or_warn(
+                let resolved_config = crate::session::host_hook_disclosure_config_with_repo(
                     &data.profile,
                     std::path::Path::new(&data.path),
                 );
+                // The wizard's command field wins over the config, the same
+                // order the builder applies, so the dialog describes this
+                // session and not the one the config would produce.
+                let command = if data.command_override.is_empty() {
+                    resolved_config.session.launch_command_for(&tool_name)
+                } else {
+                    data.command_override.clone()
+                };
                 if let Some(hook_agent) =
-                    resolve_hook_install_agent(&tool_name, &resolved_config.session)
+                    crate::session::host_hook_agent(&tool_name, &command, &resolved_config.session)
                 {
                     let config = crate::session::config::load_config().ok().flatten();
                     let hooks_enabled = resolved_config.session.agent_status_hooks;
@@ -1671,15 +1665,18 @@ impl HomeView {
                         .map(|c| c.app_state.has_acknowledged_agent_hooks)
                         .unwrap_or(false);
 
-                    if crate::agents::hook_install_required(hook_agent, hooks_enabled)
+                    // A sandboxed session stages its hooks in its own container
+                    // config and the launch gate never asks, so asking here
+                    // would consent to a write that cannot happen.
+                    if !data.sandbox
+                        && crate::agents::hook_install_required(hook_agent, hooks_enabled)
                         && !acknowledged
                     {
-                        self.hooks_install_dialog =
-                            Some(HooksInstallDialog::new_for_profile_resolved(
-                                &tool_name,
-                                hook_agent.name,
-                                Some(&data.profile),
-                            ));
+                        self.hooks_install_dialog = Some(HooksInstallDialog::new(
+                            &tool_name,
+                            hook_agent,
+                            &resolved_config,
+                        ));
                         self.pending_hooks_install_data = Some(data);
                         return None;
                     }
@@ -6582,7 +6579,7 @@ impl HomeView {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::config::{SessionConfig, ToolSessionConfig};
+    use crate::session::config::ToolSessionConfig;
 
     /// Wheel and button reports in both encodings: SGR is 1-based `<b;x;yM|m`, legacy X10
     /// adds 32 to each byte and clamps coordinates at 223; cells clamp to the pane rect.
@@ -6939,28 +6936,6 @@ mod tests {
                 count: WHEEL_PAGE_STEP,
             })
         );
-    }
-
-    #[test]
-    fn hook_install_agent_resolves_detect_as_after_builtins() {
-        // (tool, detect_as target, resolved agent)
-        let cases = [
-            ("wrapped-codex", "codex", Some("codex")),
-            // A built-in name resolves as itself first, never via detect_as.
-            ("opencode", "codex", None),
-            ("wrapped-agent", "missing-agent", None),
-        ];
-        for (tool, target, want) in cases {
-            let mut config = SessionConfig::default();
-            config
-                .agent_detect_as
-                .insert(tool.to_string(), target.to_string());
-            assert_eq!(
-                resolve_hook_install_agent(tool, &config).map(|agent| agent.name),
-                want,
-                "{tool} -> {target}"
-            );
-        }
     }
 
     #[test]

@@ -173,8 +173,8 @@ test("new-session wizard is name-only in CityHall mode", async ({ page }) => {
   await openWizard(page);
 
   await expect(wizard(page).getByPlaceholder("Auto-generated if empty")).toBeVisible();
-  await expect(wizard(page).getByText("Which AI agent?")).toHaveCount(0);
-  await expect(wizard(page).getByRole("button", { name: "More options" })).toHaveCount(0);
+  for (const row of ["wizard-project-row", "wizard-agent-row", "wizard-worktree-row"])
+    await expect(wizard(page).getByTestId(row)).toHaveCount(0);
 
   await expect(wizard(page).getByRole("button", { name: /Launch session/ })).toBeEnabled();
 });

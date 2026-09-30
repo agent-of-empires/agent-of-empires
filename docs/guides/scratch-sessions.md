@@ -12,7 +12,7 @@ aoe add --scratch -t "Quick question" -c claude
 
 You pass no project path; it is provisioned for you, and the summary prints the resolved `Path:` and `Scratch: yes`. Passing a path alongside `--scratch` is rejected, as is combining it with any worktree flag (`-w`, `--new-branch`, `--base-branch`, `--repo`, `--project`, `--no-submodules`), which fails at parse time.
 
-**Web**: the wizard's Project step has a **Skip project folder** toggle above the Recent / Browse / Clone tabs; picking a real project turns it back off, so the wizard never submits both. `Cmd/Ctrl+Shift+N` opens the wizard with scratch already on, and `Cmd/Ctrl+Enter` launches, so two keystrokes is enough. The command palette has "New scratch session" too. Scratch sessions are bucketed into one synthetic **Scratch** group at the bottom of the sidebar rather than one group per directory.
+**Web**: the wizard's Project panel has a **Scratch** tab beside Recent / Browse / Clone; picking a real project turns scratch back off, so the wizard never submits both. `Cmd/Ctrl+Shift+N` opens the wizard with scratch already on, and `Cmd/Ctrl+Enter` launches, so two keystrokes is enough. The command palette has "New scratch session" too. Scratch sessions are bucketed into one synthetic **Scratch** group at the bottom of the sidebar rather than one group per directory.
 
 **TUI**: press `Ctrl+T` from any field in the new-session dialog. The Path input becomes a `(scratch directory)` marker and the worktree toggle is forced off; `Ctrl+T` again reverts.
 

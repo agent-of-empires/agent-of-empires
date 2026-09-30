@@ -144,8 +144,10 @@ export function renderRow(ws: Workspace, options: RowOptions = {}) {
 }
 
 /** Renders a row and opens its context menu; returns the menu element. */
-export function openRowMenu(ws: Workspace, options: RowOptions = {}) {
+export function openRowMenu(ws: Workspace, options: RowOptions & { expandMore?: boolean } = {}) {
   renderRow(ws, options);
   fireEvent.contextMenu(screen.getByTestId("sidebar-session-row"));
+  const more = screen.queryByTestId("sidebar-context-menu-more");
+  if (more && options.expandMore !== false) fireEvent.click(more);
   return screen.getByTestId("sidebar-context-menu");
 }

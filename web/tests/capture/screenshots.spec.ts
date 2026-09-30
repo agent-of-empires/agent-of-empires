@@ -98,7 +98,7 @@ base("web dashboard surfaces", async ({ page }, testInfo) => {
     }
     await shot(page, "web/diff.png");
 
-    await page.goto(`${serve.baseUrl}/settings`);
+    await page.goto(`${serve.baseUrl}/settings/session`);
     await page.waitForTimeout(600);
     await shot(page, "web/settings.png");
   } finally {

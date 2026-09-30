@@ -1578,6 +1578,9 @@ pub struct ServerAbout {
     pub web_build_id: Option<&'static str>,
     /// Read-only runtime state of the daemon's sleep-inhibit reconciler.
     pub sleep_inhibit: SleepInhibitStatus,
+    /// This daemon run's id, which the web client sends back as a create's
+    /// `retry_origin` so a restarted daemon never re-runs an attempt it cannot see.
+    pub create_boot_id: String,
 }
 
 pub async fn get_about(State(state): State<Arc<AppState>>) -> Json<ServerAbout> {
@@ -1619,6 +1622,7 @@ pub async fn get_about(State(state): State<Arc<AppState>>) -> Json<ServerAbout> 
         },
         web_build_id: crate::server::web_build_id(),
         sleep_inhibit,
+        create_boot_id: state.create_progress.boot_id().to_string(),
     })
 }
 

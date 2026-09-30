@@ -1,4 +1,3 @@
-import { ProfileSelector } from "./ProfileSelector";
 import { SettingsSearch } from "./SettingsSearch";
 import type { SettingsFieldDescriptor } from "../../lib/types";
 import type { SettingsSearchHit } from "./settingsSearchIndex";
@@ -7,32 +6,37 @@ interface Props {
   onClose: () => void;
   saving: boolean;
   saveError: string | null;
-  selectedProfile: string;
-  onSelectProfile: (profile: string) => void;
   schema: SettingsFieldDescriptor[];
   schemaLoading: boolean;
   onSearchJump: (hit: SettingsSearchHit) => void;
-  hideProfileSelector?: boolean;
+  /** Set on a tab page: mobile Back returns to the section list instead of closing. */
+  onBackToList?: () => void;
 }
 
-// On mobile the search and profile picker wrap onto their own rows.
+// On mobile the search wraps onto its own row.
 export function SettingsHeader({
   onClose,
   saving,
   saveError,
-  selectedProfile,
-  onSelectProfile,
   schema,
   schemaLoading,
   onSearchJump,
-  hideProfileSelector = false,
+  onBackToList,
 }: Props) {
   return (
     <div
       data-testid="settings-header"
       className="bg-surface-850 border-b border-surface-700 shrink-0 flex flex-wrap items-center gap-x-3 gap-y-2 px-4 py-2 md:flex-nowrap md:h-12 md:py-0"
     >
-      <button onClick={onClose} className="text-brand-500 cursor-pointer text-sm shrink-0">
+      {onBackToList && (
+        <button onClick={onBackToList} className="md:hidden text-brand-500 cursor-pointer text-sm shrink-0">
+          &larr; All settings
+        </button>
+      )}
+      <button
+        onClick={onClose}
+        className={`text-brand-500 cursor-pointer text-sm shrink-0 ${onBackToList ? "hidden md:inline" : ""}`}
+      >
         &larr; Back
       </button>
       <span className="text-xs font-mono text-text-bright shrink-0">Settings</span>
@@ -48,11 +52,6 @@ export function SettingsHeader({
       <div className="basis-full md:basis-auto md:flex-1 md:min-w-0 md:max-w-sm md:ml-auto">
         <SettingsSearch schema={schema} loading={schemaLoading} onJump={onSearchJump} />
       </div>
-      {!hideProfileSelector && (
-        <div className="basis-full flex justify-center overflow-x-auto md:basis-auto md:overflow-visible md:justify-end shrink-0">
-          <ProfileSelector selectedProfile={selectedProfile} onSelect={onSelectProfile} />
-        </div>
-      )}
     </div>
   );
 }

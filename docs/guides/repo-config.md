@@ -69,6 +69,6 @@ auto_cleanup = true
 
 The first time AoE sees hooks in a repo it prompts you to review and approve them, so an untrusted repo cannot run arbitrary commands. Trust decisions are stored globally, shared across profiles, and keyed to the commands themselves, so a change to `.agent-of-empires/config.toml` re-prompts. The same gate covers a repo's [project-local MCP servers](mcp-servers.md#project-local-servers-need-repo-trust).
 
-`aoe add --trust-hooks .` skips the prompt, for CI or repos you control.
+`aoe add --trust-hooks .` skips the prompt, for CI or repos you control. It covers this gate only. The hooks AoE writes into the *agent's own* config, not the ones a repo declares, are a separate approval: see [Agent hook approval](configuration.md#agent-hook-approval).
 
 Repo values are the last layer of the [configuration precedence](configuration.md), overriding global and profile values field by field.

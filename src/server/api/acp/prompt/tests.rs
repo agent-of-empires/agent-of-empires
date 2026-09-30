@@ -299,7 +299,7 @@ async fn rate_limit_park_is_sendable_at_the_shared_decision_point() {
                 .await
                 .expect("session exists");
             service
-                .prompt_dispatch_under_submission(id_ref, false)
+                .prompt_dispatch_under_submission(id_ref, false, false)
                 .await
         };
         assert_eq!(
@@ -513,6 +513,66 @@ async fn no_revive_refuses_a_prompt_on_a_rate_limit_park() {
             "{park}: no_revive refusal must not clear the pending initial turn"
         );
     }
+}
+
+/// #4109: a rate-limit park can retain a stale active-turn latch until the
+/// worker's `Stopped` event is persisted. `no_revive` still refuses while the
+/// worker is absent, regardless of the dispatch queue reason.
+#[tokio::test]
+async fn no_revive_refuses_a_workerless_rate_limit_park_with_a_stale_turn() {
+    let _app_dir = crate::session::test_support::isolate_app_dir();
+    let id = "sess-no-revive-stale-rate-limit".to_string();
+    let (state, launches) = failing_start_state(&id, true);
+    seed_elapsed_rate_limit_park(&state, &id, true);
+    state.instances.write().await[0].pending_initial_turn =
+        Some(crate::session::PendingInitialTurn {
+            text: "queued before the park".to_string(),
+            attachments: Vec::new(),
+            synthesized: true,
+        });
+
+    assert!(!state.acp_supervisor.is_running(&id).await);
+    assert!(
+        state
+            .session_service
+            .fold_control_state(&id)
+            .await
+            .turn_active,
+        "the fixture must retain a stale active-turn latch"
+    );
+
+    let response = acp_prompt(
+        State(Arc::clone(&state)),
+        Path(id.clone()),
+        no_revive_prompt_req("hello"),
+    )
+    .await
+    .into_response();
+
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        launches.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "no_revive must not start a worker"
+    );
+    assert!(
+        state
+            .session_service
+            .queued_prompts_snapshot(&id)
+            .await
+            .is_empty(),
+        "a refusal must not enqueue the prompt"
+    );
+    assert!(
+        state.acp_event_store.rate_limit_park(&id).is_some(),
+        "the rate-limit park must remain intact"
+    );
+    assert!(
+        state.instances.read().await[0]
+            .pending_initial_turn
+            .is_some(),
+        "the refusal must preserve the pending initial turn"
+    );
 }
 
 /// #3621: a direct prompt parks while a drain owns the session, and the drain

@@ -491,12 +491,19 @@
       "id": "settings.mobile-header",
       "kind": "mocked-playwright",
       "risk": "medium",
-      "specs": ["tests/mobile-panes.spec.ts"],
+      "specs": ["tests/mobile-panes.spec.ts", "src/components/__tests__/SettingsView.navigation.test.tsx"],
       "components": [
         "web/src/components/SettingsView.tsx",
         "web/src/components/settings/SettingsHeader.tsx",
         "web/src/components/settings/ProfileSelector.tsx"
       ]
+    },
+    {
+      "id": "settings.tui-only-fold",
+      "kind": "vitest",
+      "risk": "low",
+      "specs": ["src/components/settings/__tests__/SchemaSection.test.tsx"],
+      "components": ["web/src/components/settings/SchemaSection.tsx"]
     },
     {
       "id": "settings.header-branches",
@@ -949,15 +956,53 @@
         "web/src/components/DirectoryBrowser.tsx",
         "web/src/components/session-wizard/SessionWizard.tsx",
         "web/src/components/session-wizard/LaunchFooter.tsx",
-        "web/src/components/session-wizard/steps/AgentStep.tsx",
         "web/src/components/session-wizard/steps/AgentPickerEssentials.tsx",
-        "web/src/components/session-wizard/steps/AgentOptions.tsx",
+        "web/src/components/session-wizard/steps/AgentPanel.tsx",
         "web/src/components/session-wizard/steps/Toggle.tsx",
         "web/src/components/session-wizard/steps/ExtraReposPicker.tsx",
         "web/src/components/session-wizard/steps/ProjectStep.tsx",
-        "web/src/components/session-wizard/steps/SessionStep.tsx",
+        "web/src/components/session-wizard/steps/WorktreePanel.tsx",
         "web/src/components/session-wizard/steps/projectPicker.ts",
-        "web/src/components/session-wizard/steps/ProjectSearchList.tsx"
+        "web/src/components/session-wizard/steps/ProjectSearchList.tsx",
+        "web/src/components/session-wizard/WizardRows.tsx",
+        "web/src/components/session-wizard/steps/SandboxPanel.tsx",
+        "web/src/components/session-wizard/steps/LaunchFields.tsx"
+      ]
+    },
+    {
+      "id": "wizard.create-progress",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": [
+        "tests/wizard.spec.ts",
+        "src/components/session-wizard/__tests__/SessionWizard.test.tsx",
+        "src/lib/api.test.ts",
+        "src/components/session-wizard/__tests__/CreateProgressView.test.tsx",
+        "src/lib/pendingCreates.test.ts",
+        "src/lib/__tests__/createRecovery.test.ts"
+      ],
+      "components": [
+        "web/src/components/session-wizard/CreateProgressView.tsx",
+        "web/src/components/session-wizard/SessionWizard.tsx",
+        "web/src/components/session-wizard/LaunchFooter.tsx",
+        "web/src/lib/api.ts",
+        "web/src/lib/pendingCreates.ts"
+      ]
+    },
+    {
+      "id": "wizard.rows-and-panels",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/components/session-wizard/__tests__/SessionWizard.test.tsx",
+        "src/components/session-wizard/__tests__/WorktreePanel.test.tsx",
+        "src/components/session-wizard/__tests__/AgentPanel.test.tsx"
+      ],
+      "components": [
+        "web/src/components/session-wizard/WizardRows.tsx",
+        "web/src/components/session-wizard/SessionWizard.tsx",
+        "web/src/components/session-wizard/steps/WorktreePanel.tsx",
+        "web/src/components/session-wizard/steps/AgentPanel.tsx"
       ]
     },
     {
@@ -975,7 +1020,7 @@
       "id": "wizard.agent-lifecycle",
       "kind": "vitest",
       "risk": "low",
-      "specs": ["src/components/session-wizard/__tests__/AgentOptions.test.tsx"],
+      "specs": ["src/components/session-wizard/__tests__/AgentPanel.test.tsx"],
       "components": ["web/src/components/session-wizard/steps/AgentPickerEssentials.tsx"]
     },
     {
@@ -1046,7 +1091,7 @@
         "web/src/components/session-wizard/steps/AgentStep.tsx",
         "web/src/components/session-wizard/steps/AgentPickerEssentials.tsx",
         "web/src/components/session-wizard/wizardReducer.ts",
-        "web/src/components/session-wizard/steps/AgentOptions.tsx"
+        "web/src/components/session-wizard/steps/AgentPanel.tsx"
       ]
     },
     {
@@ -1056,7 +1101,7 @@
       "specs": ["tests/wizard.spec.ts"],
       "components": [
         "web/src/components/session-wizard/profileDefaults.ts",
-        "web/src/components/session-wizard/steps/AgentOptions.tsx",
+        "web/src/components/session-wizard/steps/AgentPanel.tsx",
         "web/src/components/session-wizard/wizardReducer.ts"
       ]
     },
@@ -1067,11 +1112,11 @@
       "specs": [
         "src/components/session-wizard/wizardReducer.test.ts",
         "src/components/session-wizard/__tests__/SessionWizard.test.tsx",
-        "src/components/session-wizard/__tests__/AgentOptions.test.tsx"
+        "src/components/session-wizard/__tests__/AgentPanel.test.tsx"
       ],
       "components": [
         "web/src/components/session-wizard/profileDefaults.ts",
-        "web/src/components/session-wizard/steps/AgentOptions.tsx",
+        "web/src/components/session-wizard/steps/AgentPanel.tsx",
         "web/src/components/session-wizard/wizardReducer.ts"
       ]
     },
@@ -1082,12 +1127,12 @@
       "specs": [
         "src/lib/__tests__/acpEligibility.test.ts",
         "src/components/session-wizard/__tests__/SessionWizard.test.tsx",
-        "src/components/session-wizard/__tests__/AgentOptions.test.tsx"
+        "src/components/session-wizard/__tests__/AgentPanel.test.tsx"
       ],
       "components": [
         "web/src/lib/acpCapableTools.ts",
         "web/src/components/session-wizard/SessionWizard.tsx",
-        "web/src/components/session-wizard/steps/AgentOptions.tsx"
+        "web/src/components/session-wizard/steps/AgentPanel.tsx"
       ]
     },
     {
@@ -1104,7 +1149,7 @@
       "specs": ["src/components/session-wizard/__tests__/SessionWizard.test.tsx"],
       "components": [
         "web/src/components/session-wizard/steps/AgentStep.tsx",
-        "web/src/components/session-wizard/steps/AgentOptions.tsx"
+        "web/src/components/session-wizard/steps/AgentPanel.tsx"
       ]
     },
     {
@@ -1116,7 +1161,7 @@
         "web/src/components/session-wizard/SessionWizard.tsx",
         "web/src/components/session-wizard/steps/AgentStep.tsx",
         "web/src/components/TerminalView.tsx",
-        "web/src/components/session-wizard/steps/AgentOptions.tsx"
+        "web/src/components/session-wizard/steps/AgentPanel.tsx"
       ]
     },
     {
@@ -1126,8 +1171,8 @@
       "specs": ["tests/wizard.spec.ts"],
       "components": [
         "web/src/components/session-wizard/steps/AgentStep.tsx",
-        "web/src/components/session-wizard/steps/AgentOptions.tsx",
-        "web/src/components/session-wizard/steps/AdvancedLaunchFields.tsx",
+        "web/src/components/session-wizard/steps/AgentPanel.tsx",
+        "web/src/components/session-wizard/steps/LaunchFields.tsx",
         "web/src/components/session-wizard/steps/ProfilePresetPicker.tsx"
       ]
     },
@@ -1154,10 +1199,10 @@
       "kind": "vitest",
       "risk": "medium",
       "specs": [
-        "src/components/session-wizard/__tests__/SessionStep.test.tsx",
+        "src/components/session-wizard/__tests__/WorktreePanel.test.tsx",
         "src/components/session-wizard/wizardReducer.test.ts"
       ],
-      "components": ["web/src/components/session-wizard/steps/SessionStep.tsx"]
+      "components": ["web/src/components/session-wizard/steps/WorktreePanel.tsx"]
     },
     {
       "id": "wizard.scratch-launch",
@@ -1179,7 +1224,7 @@
         "web/src/components/session-wizard/SessionWizard.tsx",
         "web/src/components/session-wizard/steps/AgentStep.tsx",
         "web/src/components/session-wizard/steps/AgentPickerEssentials.tsx",
-        "web/src/components/session-wizard/steps/AgentOptions.tsx"
+        "web/src/components/session-wizard/steps/AgentPanel.tsx"
       ]
     },
     {
@@ -3711,24 +3756,24 @@
       "kind": "mocked-playwright",
       "risk": "medium",
       "specs": ["tests/wizard.spec.ts"],
-      "components": ["web/src/components/session-wizard/steps/SessionStep.tsx"]
+      "components": ["web/src/components/session-wizard/steps/WorktreePanel.tsx"]
     },
     {
       "id": "story.wizard-worktree-toggle",
       "kind": "vitest",
       "risk": "medium",
       "specs": [
-        "src/components/session-wizard/__tests__/SessionStep.test.tsx",
+        "src/components/session-wizard/__tests__/WorktreePanel.test.tsx",
         "src/components/session-wizard/__tests__/SessionWizard.projectWorktreeOverride.test.tsx"
       ],
-      "components": ["web/src/components/session-wizard/steps/SessionStep.tsx"]
+      "components": ["web/src/components/session-wizard/steps/WorktreePanel.tsx"]
     },
     {
       "id": "story.wizard-group-field",
       "kind": "mocked-playwright",
       "risk": "low",
       "specs": ["tests/wizard.spec.ts"],
-      "components": ["web/src/components/session-wizard/steps/SessionStep.tsx"]
+      "components": ["web/src/components/session-wizard/steps/WorktreePanel.tsx"]
     },
     {
       "id": "story.wizard-extra-repos",
@@ -3769,7 +3814,7 @@
       "specs": ["src/components/session-wizard/wizardReducer.test.ts"],
       "components": [
         "web/src/components/session-wizard/sessionNames.ts",
-        "web/src/components/session-wizard/steps/SessionStep.tsx"
+        "web/src/components/session-wizard/steps/WorktreePanel.tsx"
       ]
     },
     {

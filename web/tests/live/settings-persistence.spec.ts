@@ -233,6 +233,8 @@ test("global settings migrate from profiles and reject stale profile writes", as
   const { current: temporaryFilter } = await runtimeLog.json();
 
   await page.goto(`${serve.baseUrl}/settings/session`);
+  // Sidebar Position is TUI-only, so it sits in the Terminal UI fold.
+  await page.getByRole("button", { name: /Terminal UI/ }).click();
   const position = labelledSelect(page, /^Sidebar Position$/);
   await expect(position).toHaveValue("left");
   const [saveResponse] = await Promise.all([
@@ -257,6 +259,7 @@ test("global settings migrate from profiles and reject stale profile writes", as
 
   await serve.restart();
   await page.reload();
+  await page.getByRole("button", { name: /Terminal UI/ }).click();
   await expect(position).toHaveValue("right");
   const persisted = await fetch(machineUrl).then((r) => r.json());
   expect(persisted.session.sidebar_position).toBe("right");
