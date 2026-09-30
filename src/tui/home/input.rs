@@ -484,6 +484,9 @@ impl HomeView {
             if toggle_current
                 && matches!(&self.view_mode, ViewMode::Tool(current) if current == &tool_name)
             {
+                // The pending native preparation was bound to the mode being
+                // left, so its lease must not outlive it.
+                self.cancel_native_attachment();
                 self.view_mode = ViewMode::Structured;
                 return None;
             } else {
@@ -2592,6 +2595,7 @@ impl HomeView {
                 return None;
             }
             KeyCode::Esc if matches!(self.view_mode, ViewMode::Tool(_)) => {
+                self.cancel_native_attachment();
                 self.view_mode = ViewMode::Structured;
                 return None;
             }
@@ -2750,6 +2754,7 @@ impl HomeView {
             }
             ActionId::ToolPicker => {
                 if matches!(self.view_mode, ViewMode::Tool(_)) {
+                    self.cancel_native_attachment();
                     self.view_mode = ViewMode::Structured;
                 } else if !self.tool_configs.is_empty() {
                     self.open_tool_picker();
@@ -2777,6 +2782,10 @@ impl HomeView {
             ActionId::NewFromProject => self.open_project_session_picker(),
             ActionId::AttachTerminal => return self.attach_terminal_for_selected(),
             ActionId::ToggleView => {
+                // Same contract as the terminal-mode and profile switches: a
+                // pending native preparation is bound to the mode it was
+                // prepared for.
+                self.cancel_native_attachment();
                 self.view_mode = match self.view_mode {
                     ViewMode::Structured => ViewMode::Terminal,
                     ViewMode::Terminal | ViewMode::Tool(_) => ViewMode::Structured,
