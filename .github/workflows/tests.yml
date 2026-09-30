@@ -138,20 +138,7 @@ jobs:
         # rather than passing as a green run with the guard gone.
         run: |
           echo "TMPDIR=${TMPDIR:-unset}"
-          set +e
-          cargo nextest run --no-fail-fast 2>&1 | tee /tmp/aoe-counter-test.log
-          result=${PIPESTATUS[0]}
-          if [ "$result" -ne 0 ]; then
-            python3 - <<'PYLOG'
-          from pathlib import Path
-          import re
-          log = re.sub(r'\x1b\[[0-9;]*m', '', Path('/tmp/aoe-counter-test.log').read_text())[-14000:]
-          for offset in range(0, len(log), 2000):
-              message = log[offset:offset + 2000].replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
-              print(f'::error title=Counter diagnostic {offset}::' + message)
-          PYLOG
-          fi
-          exit "$result"
+          cargo nextest run --no-fail-fast
       # bare-core: the three no-default-features feature corners. `web` is not
       # a default feature, so these runs are also the dashboard-off compile
       # gate that keeps the `cfg(feature = "web")` sites from rotting.

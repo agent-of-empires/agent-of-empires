@@ -882,6 +882,7 @@ mod tests {
                 docker_env: None,
                 pane_env: Vec::new(),
                 identity_extension: None,
+                usage_tracking: false,
             },
             program: std::path::PathBuf::new(),
             capture: None,

@@ -1174,7 +1174,7 @@ mod tests {
             if status_hooks {
                 assert_aoe_codex_hooks(&hooks);
             } else {
-                // The `SessionStart` identity publisher is not optional; only it remains.
+                // Identity and usage hooks survive when status reporting is disabled.
                 let parsed: serde_json::Value =
                     serde_json::from_str(&std::fs::read_to_string(&hooks).unwrap()).unwrap();
                 assert!(
