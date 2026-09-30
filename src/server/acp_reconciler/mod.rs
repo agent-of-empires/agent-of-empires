@@ -318,10 +318,11 @@ pub async fn reconcile_acp_workers(
         return;
     }
 
-    // The cap is read live, from the served profile's configuration, so an
-    // operator lowering `[acp] max_concurrent_workers` takes effect without
-    // restarting the daemon. Upstream read it this way too; the supervisor's
-    // snapshot is captured once at startup, so it cannot see the change.
+    // Read live from the served profile's configuration rather than from the
+    // supervisor's snapshot, which is captured once at startup. This governs
+    // only how many cold resumes one tick starts concurrently; the hard cap on
+    // simultaneously running agent subprocesses is the supervisor's own, and it
+    // still needs a restart to move.
     let served = state
         .canonical_metadata
         .read()
