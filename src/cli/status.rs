@@ -56,17 +56,18 @@ pub(crate) const VERBOSE_GROUPS: [(&str, &str, Status); 5] = [
 /// One verbose group: the heading, one padded row per session, and the blank
 /// line after it. Empty when the group has no members, exactly as the local
 /// command prints nothing at all for an empty group.
-pub(crate) fn verbose_group(
-    label: &str,
-    symbol: &str,
-    rows: &[(String, String, String)],
-) -> String {
+/// `title` and `path` are borrowed because both callers hold the sessions for
+/// the length of the call, so a row cost two clones it does not need. Only the
+/// path is owned: collapsing it under a home is the one step that builds a new
+/// string.
+pub(crate) fn verbose_group(label: &str, symbol: &str, rows: &[(String, &str, &str)]) -> String {
+    use std::fmt::Write;
     if rows.is_empty() {
         return String::new();
     }
     let mut output = format!("{label} ({}):\n", rows.len());
     for (title, tool, path) in rows {
-        output.push_str(&format!("  {symbol} {title:<16} {tool:<10} {path}\n"));
+        let _ = writeln!(output, "  {symbol} {title:<16} {tool:<10} {path}");
     }
     output.push('\n');
     output
@@ -157,14 +158,14 @@ pub async fn run(profile: &str, args: StatusArgs) -> Result<()> {
         println!("{}", counts.waiting);
     } else if args.verbose {
         for (label, symbol, status) in VERBOSE_GROUPS {
-            let rows: Vec<(String, String, String)> = instances
+            let rows: Vec<(String, &str, &str)> = instances
                 .iter()
                 .filter(|inst| inst.status == status)
                 .map(|inst| {
                     (
-                        inst.title.clone(),
-                        inst.tool.clone(),
                         crate::util::collapse_tilde(&inst.project_path),
+                        inst.title.as_str(),
+                        inst.tool.as_str(),
                     )
                 })
                 .collect();

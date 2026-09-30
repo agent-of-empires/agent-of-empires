@@ -344,14 +344,17 @@ fn render_status(
     if args.verbose {
         let mut output = String::new();
         for (label, symbol, status) in VERBOSE_GROUPS {
-            let rows: Vec<(String, String, String)> = sessions
+            // Borrowed rather than cloned: `sessions` are rows of the snapshot,
+            // which outlives this projection, and the local path it replaced
+            // borrowed the same way.
+            let rows: Vec<(String, &str, &str)> = sessions
                 .iter()
                 .filter(|session| session.status.session_status() == status)
                 .map(|session| {
                     (
-                        session.title.clone(),
-                        session.tool.clone(),
                         collapse_home(&session.project_path, local_home),
+                        session.title.as_str(),
+                        session.tool.as_str(),
                     )
                 })
                 .collect();
@@ -530,22 +533,22 @@ fn find_session<'a>(
     sessions: &[&'a SessionRead],
     identifier: &str,
 ) -> Result<&'a SessionRead, ReadFailure> {
-    let exact: Vec<&SessionRead> = sessions
+    // One pass each, and a `Vec` only in the arm whose refusal has to name
+    // every candidate it found.
+    let mut exact = sessions
         .iter()
         .copied()
-        .filter(|session| session.id == identifier)
-        .collect();
-    if exact.len() == 1 {
-        return Ok(exact[0]);
+        .filter(|session| session.id == identifier);
+    if let Some(only) = exact.next() {
+        if exact.next().is_none() {
+            return Ok(only);
+        }
     }
-    let matches = |test: &dyn Fn(&SessionRead) -> bool| -> Vec<&SessionRead> {
-        sessions
-            .iter()
-            .copied()
-            .filter(|session| test(session))
-            .collect()
-    };
-    let prefix = matches(&|session| session.id.starts_with(identifier));
+    let prefix: Vec<&SessionRead> = sessions
+        .iter()
+        .copied()
+        .filter(|session| session.id.starts_with(identifier))
+        .collect();
     if !prefix.is_empty() {
         return match prefix.as_slice() {
             [only] => Ok(*only),
@@ -559,15 +562,17 @@ fn find_session<'a>(
     // resolved a duplicated title differently would refuse a command the user
     // can already run. An ambiguous id *prefix* is refused on both sides, which
     // is the one case the local command calls ambiguous.
-    if let Some(session) = matches(&|session| session.title == identifier)
-        .into_iter()
-        .next()
+    if let Some(session) = sessions
+        .iter()
+        .copied()
+        .find(|session| session.title == identifier)
     {
         return Ok(session);
     }
-    if let Some(session) = matches(&|session| session.project_path == identifier)
-        .into_iter()
-        .next()
+    if let Some(session) = sessions
+        .iter()
+        .copied()
+        .find(|session| session.project_path == identifier)
     {
         return Ok(session);
     }
