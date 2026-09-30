@@ -1793,9 +1793,17 @@ impl HomeView {
         if let Some(ref mut diff_view) = self.diff_view {
             let action = diff_view.handle_key(key);
             if let Some((session_id, new_override)) = diff_view.take_pending_override() {
-                if let Err(e) = self.apply_user_action(&session_id, |inst| {
-                    inst.base_branch_override = new_override.clone();
-                }) {
+                // A base branch is session state the daemon owns: submit it and
+                // let the canonical snapshot update the row, so a read-only,
+                // disconnected or quarantined runtime can refuse it.
+                let submitted = self.session_feed.submit(
+                    session_id,
+                    crate::daemon::SessionMutation::DiffBase(crate::daemon::UpdateDiffBaseBody {
+                        base_branch: new_override,
+                        repo: None,
+                    }),
+                );
+                if let Err(e) = submitted {
                     tracing::warn!(
                         target: "tui.home",
                         "Failed to persist base_branch_override: {}",
@@ -2407,6 +2415,14 @@ impl HomeView {
                         }
                     }
                     ProfilePickerAction::Deleted(name) => {
+                        // Deleting a profile is a write this process performs
+                        // on disk, so it is refused under the same policy as
+                        // creating one.
+                        if let Some(reason) = self.local_write_block() {
+                            self.profile_picker_dialog = None;
+                            self.refuse_local_write(reason);
+                            return None;
+                        }
                         match crate::session::delete_profile(&name) {
                             Ok(()) => {
                                 self.rewire_after_profile_delete(&name);
