@@ -573,10 +573,10 @@ fn build_snapshot(
         let mut identities: HashSet<(String, String)> = HashSet::new();
         projects.retain(|project| identities.insert((project.name.clone(), project.path.clone())));
         let owned: Vec<Instance> = scoped_instances.into_iter().cloned().collect();
-        let groups = group_reads(&GroupTree::new_with_groups(
-            &owned,
-            &entry.groups.clone().unwrap_or_default(),
-        ));
+        let mut tree =
+            GroupTree::new_with_groups(&owned, &entry.groups.clone().unwrap_or_default());
+        drop_unusable_groups(&mut tree);
+        let groups = group_reads(&tree);
         let health = ProfileHealth {
             profile_enumeration: if entry.projects.is_ok() && entry.groups.is_ok() {
                 ComponentHealth::Healthy
@@ -677,6 +677,20 @@ fn drop_unusable_projects(projects: &mut Vec<ProjectRead>) {
         .retain(|project| crate::cli::runtime_read::dto::valid_stored_project_path(&project.path));
 }
 
+/// Drop a group the client could not admit, and everything under it.
+///
+/// The tree is pruned before it is projected: a row dropped only from the
+/// output would stay in its parent's `children`, and the client refuses a
+/// snapshot over a child whose path is not in the profile's own set just as
+/// hard as it refuses the row itself.
+fn drop_unusable_groups(tree: &mut GroupTree) {
+    for group in tree.get_all_groups() {
+        if !crate::cli::runtime_read::dto::valid_group_path(&group.path) {
+            tree.delete_group(&group.path);
+        }
+    }
+}
+
 /// Reconcile the stored rows against the rules a read projects under, field by
 /// field, so one legacy row cannot make the client refuse a whole snapshot.
 ///
@@ -684,8 +698,10 @@ fn drop_unusable_projects(projects: &mut Vec<ProjectRead>) {
 /// relation it forms is acyclic; otherwise the child nests at the top level,
 /// which is what the local `aoe list` shows for a parent it cannot resolve. A
 /// project path is spelled the way the store itself compares paths, trailing
-/// separators aside. Every other field is projected as stored, so the client's
-/// validation stays fail-closed rather than learning to tolerate more.
+/// separators aside, and a group path the client's grammar refuses is cleared,
+/// which nests the row at the top level. Every other field is projected as
+/// stored, so the client's validation stays fail-closed rather than learning to
+/// tolerate more.
 fn reconcile_legacy_rows(sessions: &mut [SessionRead]) {
     let index: HashMap<&str, usize> = sessions
         .iter()
@@ -721,6 +737,11 @@ fn reconcile_legacy_rows(sessions: &mut [SessionRead]) {
     for (row, resolved) in sessions.iter_mut().zip(resolved) {
         if !resolved {
             row.parent_session_id = None;
+        }
+        if !row.group_path.is_empty()
+            && !crate::cli::runtime_read::dto::valid_group_path(&row.group_path)
+        {
+            row.group_path.clear();
         }
     }
 }
@@ -1510,7 +1531,9 @@ mod tests {
         orphan.parent_session_id = Some("deleted".into());
         let mut trailing = named("trailing", "main");
         trailing.project_path = "/repo/".into();
-        let instances = vec![named("a", "main"), orphan, trailing];
+        let mut grouped = named("grouped", "main");
+        grouped.group_path = "team/".into();
+        let instances = vec![named("a", "main"), orphan, trailing, grouped];
 
         let sampled = build_snapshot(
             &RuntimeState::new(),
@@ -1539,6 +1562,7 @@ mod tests {
                 ("a", None, "/repo"),
                 ("orphan", Some("deleted"), "/repo"),
                 ("trailing", None, "/repo/"),
+                ("grouped", None, "/repo"),
             ]
         );
     }

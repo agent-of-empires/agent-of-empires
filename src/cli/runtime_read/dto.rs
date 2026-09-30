@@ -1046,7 +1046,10 @@ fn parse_timestamp(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
         .map(|parsed| parsed.with_timezone(&chrono::Utc))
 }
 
-fn valid_group_path(value: &str) -> bool {
+/// The grammar a group path must satisfy, shared with the producer for the
+/// reason [`valid_absolute_path`] names: one stored row the client refuses
+/// fails the whole snapshot.
+pub(crate) fn valid_group_path(value: &str) -> bool {
     !value.is_empty()
         && value.split('/').all(|component| {
             !component.is_empty() && component != "." && component != ".." && valid_text(component)
