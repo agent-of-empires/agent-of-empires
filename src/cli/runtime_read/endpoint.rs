@@ -224,6 +224,15 @@ fn parse_endpoint(raw: &str) -> Result<(String, bool), ReadFailure> {
     ))
 }
 
+/// An IPv6 authority without its brackets, which is how `http` spells it and
+/// therefore what every rule downstream of this module reads. A host that is
+/// not bracketed comes back as it stands.
+pub(super) fn unbracketed(host: &str) -> &str {
+    host.strip_prefix('[')
+        .and_then(|inner| inner.strip_suffix(']'))
+        .unwrap_or(host)
+}
+
 fn split_authority(authority: &str) -> Option<(&str, Option<u16>)> {
     if let Some(end) = authority.strip_prefix('[') {
         let close = end.find(']')?;
@@ -249,8 +258,8 @@ fn parse_port(raw: &str) -> Option<u16> {
 }
 
 fn valid_https_host(host: &str) -> bool {
-    if let Some(inner) = host.strip_prefix('[').and_then(|v| v.strip_suffix(']')) {
-        return inner.parse::<std::net::Ipv6Addr>().is_ok();
+    if host.starts_with('[') {
+        return unbracketed(host).parse::<std::net::Ipv6Addr>().is_ok();
     }
     if host.is_empty() || host.len() > 253 || host.starts_with('.') || host.ends_with('.') {
         return false;
@@ -330,6 +339,8 @@ mod tests {
             "http://127.0.0.1:8080",
             "http://127.0.0.1:8080/",
             "http://[::1]",
+            "http://[::1]:8080",
+            "https://[fe80::1]",
             "HTTP://127.0.0.1:8080",
             "HtTpS://example.test",
             "https://example.test/base/",
@@ -340,6 +351,7 @@ mod tests {
             "",
             "http://localhost:8080",
             "http://127.0.0.2",
+            "http://[::2]",
             "https://[fe80::1%25eth0]",
             "https://user@example.test",
             "https://example.test?x=1",

@@ -349,12 +349,10 @@ async fn execute_inner(
         SelectedEndpoint::Http { request } => {
             // `~` in `aoe status --verbose` is a display convention meaning
             // "this machine's home", the same shorthand the local command
-            // prints. A loopback host is therefore given one: a read aimed at
-            // 127.0.0.1 is normally this machine's own daemon over TCP, and it
-            // is the same daemon the socket transport reaches. The host string
+            // prints. A loopback host is therefore given one. The host string
             // does not prove the peer shares this home, since a forwarded
-            // 127.0.0.1 reaches another machine, and nothing here treats it
-            // as proof. The collapse only ever shows *less* than the wire
+            // loopback reaches another machine, and nothing here treats it as
+            // proof. The collapse only ever shows *less* than the wire
             // carries, so a wrong assumption widens the output rather than
             // narrowing it.
             let local_home = loopback_home(&request);
@@ -387,11 +385,12 @@ async fn execute_inner(
 
 /// This machine's home, when the endpoint names a loopback host. The rule is
 /// the host, not the transport: direct loopback to the local daemon is the
-/// same peer the socket reaches, and its rows are this machine's paths.
+/// same peer the socket reaches, and its rows are this machine's paths. An
+/// IPv6 host arrives bracketed, so the brackets come off before it is read.
 fn loopback_home(
     request: &tokio_tungstenite::tungstenite::handshake::client::Request,
 ) -> Option<std::path::PathBuf> {
-    let host = request.uri().host()?;
+    let host = endpoint::unbracketed(request.uri().host()?);
     let is_loopback = match host {
         "localhost" => true,
         host => host
@@ -632,6 +631,32 @@ mod tests {
     use super::*;
     use clap::Parser;
     use std::ffi::OsString;
+
+    /// The home collapse is a loopback question, so every spelling of a
+    /// loopback host has to answer it the same way and no other host does. A
+    /// bracketed IPv6 authority arrives bracketed, and the reachable
+    /// bracketed hosts a TLS endpoint may name are exactly the ones that must
+    /// not collapse.
+    #[test]
+    fn only_a_loopback_host_answers_with_this_machines_home() {
+        let cases: [(&str, bool); 8] = [
+            ("http://127.0.0.1:8080/api/runtime/ws", true),
+            ("http://[::1]:8080/api/runtime/ws", true),
+            ("https://[::1]/api/runtime/ws", true),
+            ("https://localhost:8080/api/runtime/ws", true),
+            ("https://example.test/api/runtime/ws", false),
+            ("wss://[fe80::1]/api/runtime/ws", false),
+            ("wss://[2001:db8::1]/api/runtime/ws", false),
+            ("http://192.168.1.10:8080/api/runtime/ws", false),
+        ];
+        for (url, expected) in cases {
+            let request = tokio_tungstenite::tungstenite::http::Request::builder()
+                .uri(url)
+                .body(())
+                .expect("the uri parses");
+            assert_eq!(loopback_home(&request).is_some(), expected, "{url}");
+        }
+    }
 
     /// The local take-over is gated on the environment naming no endpoint, so
     /// it has to read "names no endpoint" through the same definition the
