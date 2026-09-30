@@ -843,4 +843,54 @@ mod tests {
             instance.lifecycle_reservation_is_owned(LifecycleOperation::Restore, new_generation,)
         );
     }
+    /// The reconciler skips a row a purge holds, so the next tick does not
+    /// respawn the runner the purge just settled from the registry. A
+    /// reservation that has expired, or that another operation owns, is not a
+    /// purge and must still let the row resume.
+    #[test]
+    fn only_a_fresh_purge_reservation_marks_the_row_as_purging() {
+        let now = Utc::now();
+        let mut instance = Instance::new("Reconciler", "/tmp/reconciler");
+        assert!(
+            !instance.is_purge_reserved(now),
+            "a row with no reservation is resumable"
+        );
+
+        instance
+            .try_acquire_lifecycle_reservation(
+                LifecycleOperation::Launch,
+                Instance::LIFECYCLE_RESERVATION_TTL,
+                now,
+            )
+            .unwrap();
+        assert!(
+            !instance.is_purge_reserved(now),
+            "a launch reservation is not a purge and must not hide the row"
+        );
+
+        assert!(
+            instance.release_lifecycle_reservation_if_owned(
+                LifecycleOperation::Launch,
+                instance.lifecycle_generation,
+            ),
+            "the launch reservation is released before the purge takes the row"
+        );
+        instance
+            .try_acquire_lifecycle_reservation(
+                LifecycleOperation::Purge,
+                Instance::LIFECYCLE_RESERVATION_TTL,
+                now,
+            )
+            .unwrap();
+        assert!(
+            instance.is_purge_reserved(now),
+            "a fresh purge reservation must keep the reconciler off this row"
+        );
+
+        let later = now + Instance::LIFECYCLE_RESERVATION_TTL + chrono::Duration::seconds(1);
+        assert!(
+            !instance.is_purge_reserved(later),
+            "an expired purge reservation releases the row again"
+        );
+    }
 }
