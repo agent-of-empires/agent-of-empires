@@ -88,7 +88,9 @@ fn read_source(address: SocketAddr, token: Option<&str>) -> ReadRequestSource {
 async fn execute(command: ScopedCommand<'_>, source: &ReadRequestSource) -> ReadOutcome {
     match attempt(command, source).await {
         ScopedRead::Answered(outcome) => outcome,
-        ScopedRead::NoLocalPublication => panic!("a named endpoint must answer"),
+        ScopedRead::NoLocalPublication(notice) => {
+            panic!("a named endpoint must answer, not a local take-over ({notice:?})")
+        }
     }
 }
 

@@ -66,7 +66,9 @@ async fn attempt_read(command: ScopedCommand<'_>, source: &ReadRequestSource) ->
 async fn read(command: ScopedCommand<'_>) -> ReadOutcome {
     match attempt_read(command, &local_source()).await {
         ScopedRead::Answered(outcome) => outcome,
-        ScopedRead::NoLocalPublication => panic!("a live daemon publication must answer"),
+        ScopedRead::NoLocalPublication(notice) => {
+            panic!("a live daemon publication must answer, not a local take-over ({notice:?})")
+        }
     }
 }
 
@@ -189,7 +191,7 @@ async fn no_daemon_publication_leaves_the_command_to_the_local_path() {
     let read = attempt_read(command, &local_source()).await;
 
     assert!(
-        matches!(read, ScopedRead::NoLocalPublication),
+        matches!(read, ScopedRead::NoLocalPublication(_)),
         "an app dir no daemon published into must not read as an error"
     );
 }
@@ -238,7 +240,9 @@ async fn an_empty_environment_selection_is_answered_not_refused() {
         let command = classify(cli.command.as_ref()).expect("list is a scoped read");
         let outcome = match attempt_read(command, &source).await {
             ScopedRead::Answered(outcome) => outcome,
-            ScopedRead::NoLocalPublication => panic!("{label}: a live daemon must answer"),
+            ScopedRead::NoLocalPublication(notice) => {
+                panic!("{label}: a live daemon must answer, not a local take-over ({notice:?})")
+            }
         };
         assert_eq!(outcome.exit, 0, "{label}: {:?}", outcome.stderr);
         assert!(
@@ -265,7 +269,9 @@ async fn an_empty_environment_selection_is_answered_not_refused() {
     };
     let outcome = match attempt_read(command, &source).await {
         ScopedRead::Answered(outcome) => outcome,
-        ScopedRead::NoLocalPublication => panic!("a live daemon must answer"),
+        ScopedRead::NoLocalPublication(notice) => {
+            panic!("a live daemon must answer, not a local take-over ({notice:?})")
+        }
     };
     assert_eq!(outcome.exit, 1, "{:?}", outcome.stderr);
     assert!(
@@ -321,7 +327,7 @@ async fn shutdown_retracts_the_socket_and_closes_admission() {
     }
     let read = attempt_read(ScopedCommand::Profile, &local_source()).await;
     assert!(
-        matches!(read, ScopedRead::NoLocalPublication),
+        matches!(read, ScopedRead::NoLocalPublication(_)),
         "a retracted publication must not serve a read"
     );
 }
@@ -456,7 +462,7 @@ async fn a_dead_publisher_hands_the_read_back_at_once() {
     let read = attempt_read(ScopedCommand::Profile, &local_source()).await;
     let elapsed = started.elapsed();
     assert!(
-        matches!(read, ScopedRead::NoLocalPublication),
+        matches!(read, ScopedRead::NoLocalPublication(_)),
         "a dead publisher is an absence, not a refusal"
     );
     assert!(

@@ -88,6 +88,34 @@ const REFUSALS: [&[&str]; 4] = [
     &["list", "-p", "   ", "--json"],
 ];
 
+/// The rows of [`COMMANDS`] and [`REFUSALS`] that emptying the session
+/// registry cannot witness, written down so that an unwitnessed row is a
+/// declared fact rather than a silent pass. Each has a reason that holds for
+/// any store, not for this fixture:
+///
+/// - `aoe profile` enumerates profile directories and opens none of them, so a
+///   store with every session removed still answers it in full. On this path
+///   the two transports read the same bytes off the same disk, so no amount of
+///   emptying separates a served picker from a local one.
+/// - `aoe project list` prints the registered rows and no session count, so
+///   nothing it prints is derived from the sessions.
+/// - the three refusals that name something other than a session: a session
+///   that does not exist, a profile that does not exist, a profile name that is
+///   blank. Their words do not depend on what the store holds, so an empty
+///   store refuses in exactly the same words.
+///
+/// `aoe session show k-amb` is not here and is the row that proves the
+/// distinction is worth drawing: its refusal lists the candidates it found, so
+/// emptying the store changes the answer it gives.
+const NOT_WITNESSED_BY_EMPTYING: &[&[&str]] = &[
+    &["profile"],
+    &["project", "list"],
+    &["project", "list", "--json"],
+    &["session", "show", "no-such-session"],
+    &["list", "-p", "ghost-profile"],
+    &["list", "-p", "   ", "--json"],
+];
+
 /// One `aoe` invocation as the user sees it: the exit code and both streams.
 /// The three are what a refusal is made of, so they are what a comparison of a
 /// refusal has to be made of.
@@ -266,6 +294,43 @@ impl Fixture {
             .join(".config")
             .join(agent_of_empires::session::APP_DIR_NAME_XDG)
             .join("projects.json")
+    }
+
+    fn app_dir(&self) -> PathBuf {
+        self.path()
+            .join(".config")
+            .join(agent_of_empires::session::APP_DIR_NAME_XDG)
+    }
+
+    fn sessions_path(&self) -> PathBuf {
+        self.app_dir()
+            .join("profiles")
+            .join(PROFILE)
+            .join("sessions.json")
+    }
+
+    /// The one registry the daemon does not read per connection: its sessions
+    /// come from the watcher's cache, which this test filled from the store when
+    /// the daemon started. Emptied, the client can no longer answer any
+    /// question about a session and the daemon still can, which is the whole
+    /// difference the probe is made of. The profile and project registries are
+    /// re-read from disk on every connection, so emptying those would change
+    /// the daemon's own answer and prove nothing about the client.
+    fn take_sessions(&self) -> Option<Vec<u8>> {
+        let path = self.sessions_path();
+        let saved = std::fs::read(&path).ok();
+        std::fs::write(&path, "[]").expect("empty the session registry");
+        saved
+    }
+
+    fn restore_sessions(&self, saved: Option<Vec<u8>>) {
+        let path = self.sessions_path();
+        match saved {
+            Some(bytes) => std::fs::write(path, bytes).expect("restore the session registry"),
+            None => {
+                std::fs::remove_file(path).expect("remove the registry this fixture did not have")
+            }
+        }
     }
 
     fn path(&self) -> &Path {
@@ -669,6 +734,13 @@ async fn one_directory_under_two_spellings_is_one_project_on_both_transports() {
             &["project", "list", "--scope", "profile", "--json"],
         ],
         usize::MAX,
+        // A registry fixture and no sessions, so nothing these rows read
+        // depends on the session rows the probe empties.
+        &[
+            &["project", "list", "--json"],
+            &["project", "list"],
+            &["project", "list", "--scope", "profile", "--json"],
+        ],
     )
     .await;
 }
@@ -703,6 +775,14 @@ async fn a_profile_that_cannot_be_read_is_refused_by_both_transports() {
             &["list", "--json", "--all"],
         ],
         1,
+        // The two refusals name the profile the daemon could not read, which
+        // emptying the sessions does not change, and the picker reads profile
+        // directories rather than rows.
+        &[
+            &["profile"],
+            &["list", "--all"],
+            &["list", "--json", "--all"],
+        ],
     )
     .await;
 
@@ -751,6 +831,7 @@ async fn a_broken_global_registry_does_not_refuse_the_reads_that_ignore_it() {
             &["session", "list-trash"],
         ],
         usize::MAX,
+        &[],
     )
     .await;
     for run in &served {
@@ -777,6 +858,7 @@ async fn a_stored_trailing_separator_still_names_its_session() {
             &["list", "--json"],
         ],
         usize::MAX,
+        &[],
     )
     .await;
     assert!(
@@ -805,7 +887,15 @@ async fn a_stored_trailing_separator_still_names_its_session() {
 #[serial_test::serial]
 async fn a_whitespace_profile_is_a_profile_name_on_both_transports() {
     let fixture = Fixture::new();
-    let served = compare_transports(&fixture, &[&["list", "-p", "   ", "--json"]], 0).await;
+    let served = compare_transports(
+        &fixture,
+        &[&["list", "-p", "   ", "--json"]],
+        0,
+        // The refusal is the profile that does not exist, which emptying the
+        // sessions does not change.
+        &[&["list", "-p", "   ", "--json"]],
+    )
+    .await;
     assert_eq!(
         served[0].exit, 1,
         "a profile that does not exist is the operator's own state: {:?}",
@@ -860,7 +950,17 @@ async fn a_whitespace_profile_is_a_profile_name_on_both_transports() {
 async fn compare_both_transports(fixture: &Fixture) {
     let mut commands: Vec<&[&str]> = COMMANDS.to_vec();
     commands.extend_from_slice(&REFUSALS);
-    let _served = compare_transports(fixture, &commands, COMMANDS.len()).await;
+    let _served = compare_transports(
+        fixture,
+        &commands,
+        COMMANDS.len(),
+        // The picker reads profile directories and opens none of them, so a
+        // store with every session removed still answers it in full. No amount
+        // of emptying separates a served profile picker from a local one,
+        // because on this path the two read the same bytes off the same disk.
+        NOT_WITNESSED_BY_EMPTYING,
+    )
+    .await;
 }
 
 /// `refusals_from` is the index at which the succeeding rows end; `usize::MAX`
@@ -868,10 +968,17 @@ async fn compare_both_transports(fixture: &Fixture) {
 /// refused on the served pass: a "refusal" that succeeded would be compared on
 /// stdout alone and would pass whether or not the two transports agreed about
 /// the refusal, which is exactly the gap this row set exists to close.
+///
+/// `not_witnessed` is the set of rows the emptied-store probe cannot reach, and
+/// it belongs to the fixture rather than to the command: whether a row depends
+/// on the session rows is a fact about the store it was given. It is compared
+/// as a set against what the probe actually failed to witness, so a row that
+/// becomes unwitnessed and a row that stops being one both fail here.
 async fn compare_transports(
     fixture: &Fixture,
     commands: &[&[&str]],
     refusals_from: usize,
+    not_witnessed: &[&[&str]],
 ) -> Vec<Run> {
     let xdg_base = fixture.path().join(".config");
     let state = build_test_app_state_with_policy(
@@ -899,24 +1006,23 @@ async fn compare_transports(
             }
             served.push((args, result));
         }
-        // The pass above is only worth comparing if it was served at all. With
-        // the store emptied out from under the client, a local read would answer
-        // "no sessions"; a served one answers from the daemon's own cache. So
-        // this assertion fails loudly if the served pass quietly fell back.
-        let sessions = xdg_base
-            .join(agent_of_empires::session::APP_DIR_NAME_XDG)
-            .join("profiles")
-            .join(PROFILE)
-            .join("sessions.json");
-        let store = std::fs::read(&sessions).expect("the fixture store");
-        std::fs::write(&sessions, "[]").expect("empty the store");
-        let without_a_store = run(home.clone(), vec!["list".to_string()]).await;
-        std::fs::write(&sessions, &store).expect("restore the store");
-        assert!(
-            without_a_store.stdout.contains("long-session"),
-            "the served pass answered from the local store, not from the daemon:\n{}\nSTDERR: {}\nEXIT: {}",
-            without_a_store.stdout, without_a_store.stderr, without_a_store.exit
-        );
+        // The probe, over the whole set rather than one command. With the
+        // session registry emptied underneath it and the daemon still
+        // publishing, every command above has to print exactly what it printed
+        // a moment ago: a client that had fallen back would now be answering
+        // from a store with no sessions in it. One emptying for the whole set,
+        // not one per command, and no second daemon.
+        let saved = fixture.take_sessions();
+        for (args, expected) in &served {
+            let result = run(home.clone(), args.clone()).await;
+            assert_eq!(
+                result,
+                *expected,
+                "`aoe {}` answered from the emptied store, so the served pass was never served",
+                args.join(" ")
+            );
+        }
+        fixture.restore_sessions(saved);
 
         // Shutdown retracts the publication, so the second pass really does
         // find no daemon publishing into this namespace.
@@ -928,6 +1034,37 @@ async fn compare_transports(
         let local = run(home.clone(), args.clone()).await;
         assert_same(args, expected, &local);
     }
+
+    // Which commands the probe above can actually witness, established rather
+    // than assumed. A local run against the emptied store that prints exactly
+    // what the daemon printed is a command the emptying cannot reach, so the
+    // equality asserted over it is vacuous. Those are the commands that read
+    // no session row, and the set of them is written down: a new command that
+    // lands here without a reason fails, and a declared command that starts
+    // reading sessions fails too, because the two are compared as sets.
+    let saved = fixture.take_sessions();
+    let mut unwitnessed: Vec<String> = Vec::new();
+    for (args, expected) in &served {
+        let local = run(home.clone(), args.clone()).await;
+        if &local == expected {
+            unwitnessed.push(args.join(" "));
+        }
+    }
+    fixture.restore_sessions(saved);
+    let mut declared: Vec<String> = not_witnessed
+        .iter()
+        .map(|command| command.join(" "))
+        .filter(|command| served.iter().any(|(args, _)| args.join(" ") == *command))
+        .collect();
+    // Compared as sets, so the declaration is written in the order its reasons
+    // read rather than in the command table's order.
+    unwitnessed.sort();
+    declared.sort();
+    assert_eq!(
+        unwitnessed, declared,
+        "the rows the emptied-store probe cannot witness have changed: say why \
+         here, or take them out of the set"
+    );
     served.into_iter().map(|(_, run)| run).collect()
 }
 
