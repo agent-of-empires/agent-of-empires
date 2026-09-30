@@ -302,7 +302,6 @@ export function useAcpSession(
           await enqueueServerPrompt(sessionId, {
             id: q.id,
             text: q.text,
-            createdAt: q.queuedAt,
             attachments: q.attachments,
           });
         }

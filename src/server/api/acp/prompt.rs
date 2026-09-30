@@ -125,7 +125,6 @@ pub async fn acp_prompt(
             req.text.clone(),
             &attachments,
             None,
-            chrono::Utc::now().to_rfc3339(),
         )
         .await
         {

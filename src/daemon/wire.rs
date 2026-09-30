@@ -52,6 +52,8 @@ pub struct QueuedPromptEntry {
     pub text: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<PromptAttachmentRef>,
+    /// Server-stamped; the resume admission orders queue rows against the
+    /// rate-limit park, so a client clock must not reach it (#4092).
     pub created_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin_device: Option<String>,
