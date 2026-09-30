@@ -1162,32 +1162,87 @@ mod tests {
             .collect()
     }
 
-    /// Every `$defs` entry that names a row the producer emits an instance of.
-    /// A row on the wire is named after the type that made it, so `GroupRead`
-    /// is `group_read`; the Hello's two rows do not follow the type name, and
-    /// are named here. Everything else in `$defs` is a scalar, an enum, or a
-    /// shape only reached through one of these.
+    /// Every field a `$defs` entry declares, required or not. A row that is a
+    /// discriminated union requires only its discriminant.
+    #[cfg(debug_assertions)]
+    fn schema_properties(document: &str, definition: Option<&str>) -> BTreeSet<String> {
+        let parsed = published_schema(document);
+        let node = match definition {
+            Some(definition) => &parsed["$defs"][definition],
+            None => &parsed,
+        };
+        node["properties"]
+            .as_object()
+            .expect("every wire row declares its fields")
+            .keys()
+            .map(|name| name.to_string())
+            .collect()
+    }
+
+    /// Every `$defs` entry that names an object row the frame reaches.
+    ///
+    /// Found by following `$ref`s out of the document rather than by matching
+    /// a name suffix. A suffix filter silently drops every object row whose
+    /// name does not end in `_read` or `_repo`, and the dropped ones are not
+    /// incidental: the cursor, the freshness row and the health rows are
+    /// required on every frame, so a field added inside one of them was emitted
+    /// by the producer, absent from the schema, and let past by a gate whose
+    /// own comment says that is the shape it exists to catch.
     #[cfg(debug_assertions)]
     fn row_definitions(document: &str) -> BTreeSet<String> {
         use crate::cli::runtime_read::pack::{HELLO_SCHEMA, SNAPSHOT_SCHEMA};
-        let defs = published_schema(document)["$defs"]
+        let published = published_schema(document);
+        let defs = published["$defs"]
             .as_object()
             .expect("$defs is an object")
             .clone();
-        let mut rows: BTreeSet<String> = defs
-            .keys()
-            .filter(|name| name.ends_with("_read") || name.ends_with("_repo"))
-            .cloned()
-            .collect();
-        if document == HELLO_SCHEMA {
-            for row in ["owner", "profile_hello"] {
-                assert!(defs.contains_key(row), "hello.schema.json defines {row}");
-                rows.insert(row.to_string());
+        let mut reached: BTreeSet<String> = BTreeSet::new();
+        let mut pending = vec![published.clone()];
+        while let Some(node) = pending.pop() {
+            let Some(reference) = node.get("$ref").and_then(|reference| reference.as_str()) else {
+                match node {
+                    // `$defs` is the dictionary rows are pulled out of, so
+                    // walking into it would reach every definition the schema
+                    // defines rather than every one this frame uses.
+                    serde_json::Value::Object(fields) => pending.extend(
+                        fields
+                            .into_iter()
+                            .filter(|(key, _)| key != "$defs")
+                            .map(|(_, value)| value),
+                    ),
+                    serde_json::Value::Array(items) => pending.extend(items),
+                    _ => {}
+                }
+                continue;
+            };
+            let name = reference
+                .rsplit('/')
+                .next()
+                .expect("a $ref names a definition")
+                .to_string();
+            if !reached.insert(name.clone()) {
+                continue;
             }
+            pending.push(
+                defs.get(&name)
+                    .unwrap_or_else(|| panic!("{document} references an undefined {name}"))
+                    .clone(),
+            );
         }
+        // A row is a shape. A scalar format and an enum have no fields of their
+        // own to hold the producer to, and their parents require them by name.
+        let rows: BTreeSet<String> = reached
+            .into_iter()
+            .filter(|name| defs[name]["type"] == "object")
+            .collect();
         assert_eq!(
             document == SNAPSHOT_SCHEMA,
             rows.contains("session_read"),
+            "the documents are not the ones this gate reads"
+        );
+        assert_eq!(
+            document == HELLO_SCHEMA,
+            rows.contains("profile_hello"),
             "the documents are not the ones this gate reads"
         );
         rows
@@ -1257,7 +1312,7 @@ mod tests {
         let snapshot = &snapshot["data"];
         let profile = &snapshot["profiles"][0];
         let row = &snapshot["sessions"][0];
-        let emitted: [(&str, Option<&str>, &serde_json::Value); 10] = [
+        let emitted: [(&str, Option<&str>, &serde_json::Value); 19] = [
             (HELLO_SCHEMA, None, hello),
             (HELLO_SCHEMA, Some("owner"), &hello["owner"]),
             (HELLO_SCHEMA, Some("profile_hello"), &hello["profiles"][0]),
@@ -1276,6 +1331,42 @@ mod tests {
                 Some("workspace_repo"),
                 &row["workspace_repos"][0],
             ),
+            // The rows the frame reaches that no `_read` or `_repo` name marks:
+            // the cursor and the freshness row are required on every frame, and
+            // the health shapes carry the components the answer rests on.
+            (SNAPSHOT_SCHEMA, Some("cursor"), &snapshot["cursor"]),
+            (
+                SNAPSHOT_SCHEMA,
+                Some("snapshot_health"),
+                &snapshot["health"],
+            ),
+            (
+                SNAPSHOT_SCHEMA,
+                Some("component_health"),
+                &snapshot["health"]["global_enumeration"],
+            ),
+            (SNAPSHOT_SCHEMA, Some("profile_health"), &profile["health"]),
+            (
+                SNAPSHOT_SCHEMA,
+                Some("status_freshness"),
+                &snapshot["status_freshness"],
+            ),
+            (HELLO_SCHEMA, Some("aggregate_health"), &hello["health"]),
+            (
+                HELLO_SCHEMA,
+                Some("profile_health"),
+                &hello["profiles"][0]["health"],
+            ),
+            (
+                HELLO_SCHEMA,
+                Some("component_health"),
+                &hello["profiles"][0]["health"]["profile_enumeration"],
+            ),
+            (
+                HELLO_SCHEMA,
+                Some("status_freshness"),
+                &hello["status_freshness"],
+            ),
         ];
         let mut checked: BTreeMap<&str, BTreeSet<String>> = BTreeMap::new();
         for (document, definition, value) in emitted {
@@ -1284,13 +1375,34 @@ mod tests {
                 .as_object()
                 .unwrap_or_else(|| panic!("{label} is an object"));
             let required = schema_required(document, definition);
-            let unrequired: Vec<&String> = object
+            let declared = schema_properties(document, definition);
+            // Both directions, and neither is the other's. A field the producer
+            // grew that the schema left out is the shape this gate exists for,
+            // and `additionalProperties: false` agrees with it. A field the
+            // schema demands that the producer does not send would reach a
+            // client as `schema_invalid` instead.
+            //
+            // The test is against `properties` rather than `required` because a
+            // health row is a discriminated union: `kind` alone is required and
+            // `code` belongs to the degraded arm only, so demanding that every
+            // emitted field be required rejects the shape rather than a
+            // regression. Every row in the pack but those has no optional
+            // field at all, so on those the two tests are the same test.
+            let unknown: Vec<&String> = object
                 .keys()
-                .filter(|key| !required.contains(*key))
+                .filter(|key| !declared.contains(*key))
                 .collect();
             assert!(
-                unrequired.is_empty(),
-                "{label} emits fields the published schema does not require: {unrequired:?}"
+                unknown.is_empty(),
+                "{label} emits fields the published schema does not declare: {unknown:?}"
+            );
+            let unsent: Vec<&String> = required
+                .iter()
+                .filter(|key| !object.contains_key(*key))
+                .collect();
+            assert!(
+                unsent.is_empty(),
+                "{label} leaves fields the published schema requires unsent: {unsent:?}"
             );
             if let Some(definition) = definition {
                 checked
