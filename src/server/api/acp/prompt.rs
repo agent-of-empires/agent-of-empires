@@ -100,7 +100,7 @@ pub async fn acp_prompt(
     // (#3621). The wake already cleared the dormant marker, hence the flag.
     let dispatch = state
         .session_service
-        .prompt_dispatch_under_submission(&id, woke_idle_dormant)
+        .prompt_dispatch_under_submission(&id, woke_idle_dormant, req.no_revive)
         .await;
     // Refused before touching the pending-turn/queue state below, so a
     // rejected prompt leaves both untouched (#4081 review).
@@ -130,7 +130,6 @@ pub async fn acp_prompt(
             req.text.clone(),
             &attachments,
             None,
-            chrono::Utc::now().to_rfc3339(),
         )
         .await
         {
@@ -252,7 +251,7 @@ pub async fn acp_prompt_diff_comments(
     };
     let dispatch = state
         .session_service
-        .prompt_dispatch_under_submission(&id, woke_idle_dormant)
+        .prompt_dispatch_under_submission(&id, woke_idle_dormant, false)
         .await;
     // There is no queue row for a typed review, so refuse rather than publish
     // a card the agent would then reject as busy.

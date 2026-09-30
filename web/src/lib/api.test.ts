@@ -202,14 +202,12 @@ const requestCases: RequestCase[] = [
       api.enqueueServerPrompt("s1", {
         id: "q1",
         text: "hi",
-        createdAt: "t0",
         attachments: [{ kind: "image", mimeType: "image/png", name: "a.png", dataB64: "AA" }],
       }),
     {
       body: {
         id: "q1",
         text: "hi",
-        created_at: "t0",
         attachments: [{ kind: "image", mime_type: "image/png", data: "AA", name: "a.png" }],
       },
       respond: json({ id: "q1", seq: 3 }),

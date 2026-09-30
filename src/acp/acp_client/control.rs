@@ -1,7 +1,7 @@
 //! The v3 runner control socket: connecting, establishing a session, and
 //! routing ACP frames over it.
 
-use crate::acp::control_protocol::{self, ControlBody, SessionReplayed};
+use crate::acp::control_protocol::{self, ControlBody, PromptCompletedMarker, SessionReplayed};
 use crate::acp::state::Event;
 use agent_client_protocol::schema::v1::PromptResponse;
 use agent_client_protocol::JsonRpcMessage as _;
@@ -50,21 +50,6 @@ type LocalOutcome = (
     oneshot::Sender<control_protocol::PromptOutcome>,
     control_protocol::PromptOutcome,
 );
-
-/// Daemon-minted notification written to the crate after a local prompt's
-/// `PromptCompleted`. The crate handles notifications in order, so the waiter
-/// resolves only after the updates the agent sent before its reply, such as a
-/// rate-limit reset, have been applied.
-#[derive(
-    Debug,
-    Clone,
-    Default,
-    serde::Serialize,
-    serde::Deserialize,
-    agent_client_protocol::JsonRpcNotification,
-)]
-#[notification(method = "_aoe/prompt_completed")]
-pub(super) struct PromptCompletedMarker {}
 
 enum PromptCompletion {
     Adopted,
@@ -1767,7 +1752,21 @@ mod tests {
                             ControlBody::PromptStarted { prompt_req_id: 1 },
                             ControlBody::Notify {
                                 method: "session/update".into(),
-                                params: serde_json::json!({"sessionId":"s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"live"}}}),
+                                params: serde_json::json!({
+                                    "sessionId": "s",
+                                    "update": {
+                                        "sessionUpdate": "usage_update",
+                                        "used": 100,
+                                        "size": 200,
+                                        "_meta": {
+                                            "_claude/rateLimit": {
+                                                "status": "rejected",
+                                                "rateLimitType": "five_hour",
+                                                "resetsAt": 4_102_444_800_i64
+                                            }
+                                        }
+                                    }
+                                }),
                             },
                             ControlBody::PromptCompleted {
                                 prompt_req_id: 1,

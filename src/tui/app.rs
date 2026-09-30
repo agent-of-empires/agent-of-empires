@@ -754,6 +754,9 @@ impl App {
 
         // Initial render
         crate::tui::clear_terminal(terminal)?;
+        // This clear satisfies any pending redraw; honoring it on the first tick
+        // would blank the first frame until the next paint.
+        self.needs_redraw = false;
         // Sync mouse capture before the first paint so any onboarding
         // surface that wants native drag-to-select (intro Welcome page,
         // changelog, info dialog) gets capture turned off on frame 1.

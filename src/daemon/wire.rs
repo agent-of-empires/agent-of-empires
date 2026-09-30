@@ -506,7 +506,9 @@ pub struct QueuedPromptEntry {
     pub text: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<PromptAttachmentRef>,
-    /// RFC3339 enqueue time, for retention and provenance.
+    /// RFC3339 enqueue time, for retention and provenance. Server-stamped: the
+    /// resume admission orders queue rows against the rate-limit park, so a
+    /// client clock must not reach it (#4092).
     pub created_at: String,
     /// Which device enqueued it, for multi-device provenance. `None` for
     /// rows migrated from a pre-server-queue client localStorage.
