@@ -3,7 +3,7 @@ import type { RefObject } from "react";
 import { useHoldRepeat } from "../hooks/useHoldRepeat";
 import { readClipboardText } from "../lib/clipboard";
 import { invalidateRetainedImeContext } from "../lib/mobileKeyboardProxy";
-import { toolbarKeySpec, type ToolbarKeyId, type ToolbarKeySpec } from "../lib/terminalToolbarKeys";
+import { MAX_TOOLBAR_KEYS, toolbarKeySpec, type ToolbarKeyId, type ToolbarKeySpec } from "../lib/terminalToolbarKeys";
 import { StrokeIcon } from "./icons";
 
 function execCommandPaste(): boolean {
@@ -22,7 +22,7 @@ interface Props {
   /** Opens the compose sheet, also the fallback when the clipboard cannot be read. */
   onCompose: () => void;
   keyboardOpen: boolean;
-  /** No soft keyboard: sit lower, smaller, inset from the rounded screen corners, and end with Enter. */
+  /** No soft keyboard: sit lower, smaller, inset from the rounded screen corners, and end with Enter if it fits. */
   compact: boolean;
   ctrlActive: boolean;
   onCtrlToggle: () => void;
@@ -216,8 +216,8 @@ export function MobileTerminalToolbar({
   };
 
   if (keys.length === 0) return null;
-  // The soft keyboard's return key covers Enter only while it is up.
-  const row = compact && !keys.includes("enter") ? [...keys, "enter" as const] : keys;
+  // The soft keyboard's return key covers Enter only while it is up; a full row has no room for it.
+  const row = compact && keys.length < MAX_TOOLBAR_KEYS && !keys.includes("enter") ? [...keys, "enter" as const] : keys;
   return (
     <div
       // The parent drops its home-indicator padding for this bar (index.css .home-indicator-clearance), so the bar

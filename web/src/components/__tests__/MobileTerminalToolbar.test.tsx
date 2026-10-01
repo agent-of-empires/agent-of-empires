@@ -5,7 +5,12 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MobileTerminalToolbar } from "../MobileTerminalToolbar";
 import { HOLD_REPEAT_DELAY_MS, HOLD_REPEAT_INTERVAL_MS } from "../../hooks/useHoldRepeat";
-import { DEFAULT_TOOLBAR_KEYS, TOOLBAR_KEY_CATALOG, type ToolbarKeyId } from "../../lib/terminalToolbarKeys";
+import {
+  DEFAULT_TOOLBAR_KEYS,
+  MAX_TOOLBAR_KEYS,
+  TOOLBAR_KEY_CATALOG,
+  type ToolbarKeyId,
+} from "../../lib/terminalToolbarKeys";
 
 afterEach(() => {
   cleanup();
@@ -62,13 +67,19 @@ describe("MobileTerminalToolbar keys", () => {
     expect(renderToolbar({ keys: [] }).container.firstChild).toBeNull();
   });
 
-  it("ends the compact row with Enter unless the row already has it", () => {
+  it("ends the compact row with Enter unless the row already has it or is full", () => {
     const labels = () => screen.getAllByRole("button").map((b) => b.getAttribute("aria-label"));
     renderToolbar({ keys: ["esc", "tab"], compact: true });
     expect(labels()).toEqual(["Escape", "Tab", "Enter"]);
     cleanup();
     renderToolbar({ keys: ["enter", "esc"], compact: true });
     expect(labels()).toEqual(["Enter", "Escape"]);
+    cleanup();
+    const full = TOOLBAR_KEY_CATALOG.map((k) => k.id)
+      .filter((id) => id !== "enter")
+      .slice(0, MAX_TOOLBAR_KEYS);
+    renderToolbar({ keys: full, compact: true });
+    expect(labels()).not.toContain("Enter");
   });
 
   it.each(TOOLBAR_KEY_CATALOG.filter((k) => k.data).map((k) => [k.name, k.id, k.data!] as const))(
