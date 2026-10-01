@@ -1381,7 +1381,10 @@
       "id": "sidebar.menu-choice-stays-open",
       "kind": "vitest",
       "risk": "medium",
-      "specs": ["src/components/__tests__/SessionRowTriage.test.tsx"],
+      "specs": [
+        "src/components/__tests__/SessionRowTriage.test.tsx",
+        "src/components/sidebar/usePendingSetting.test.ts"
+      ],
       "components": [
         "web/src/components/sidebar/SessionRow.tsx",
         "web/src/components/sidebar/SessionRowMenu.tsx",
