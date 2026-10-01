@@ -4,6 +4,12 @@ All notable changes to Agent of Empires will be documented in this file.
 
 The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 
+## Unreleased
+
+### Bug Fixes
+
+- **daemon:** Preserve acknowledged queued prompts when disk reloads overlap persistence ([#4087](https://github.com/agent-of-empires/agent-of-empires/issues/4087)).
+
 ## [1.18.0](https://github.com/agent-of-empires/agent-of-empires/releases/tag/v1.18.0) - 2026-09-30
 
 
