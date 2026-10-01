@@ -64,7 +64,7 @@ pub struct SpawnConfig {
     /// Trusted environment before the current hook overlay or Claude routing.
     pub base_host_environment: Vec<(String, String)>,
     /// Claude routing flags for the session's provider pick, from
-    /// [`crate::session::environment::provider_override_env`]. Its own field
+    /// `session::environment::provider_override_env`. Its own field
     /// rather than an entry in `provider_env` or `host_environment`: it has to
     /// outrank both, and a respawn that re-derives `host_environment` from
     /// `base_host_environment` must not drop it.

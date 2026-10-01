@@ -330,7 +330,7 @@ pub struct Instance {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_model: Option<String>,
     /// LLM backend this session is pinned to, one of
-    /// [`crate::session::environment::AGENT_PROVIDERS`]. `None` lets the host
+    /// `session::environment::AGENT_PROVIDERS`. `None` lets the host
     /// environment decide.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_provider: Option<String>,
