@@ -366,6 +366,42 @@ mod tests {
     const CLAUDE: &str = "@agentclientprotocol/claude-agent-acp";
 
     #[test]
+    fn auth_status_capability_is_presence_only() {
+        use agent_client_protocol::schema::v1::AgentCapabilities;
+
+        // Mere presence advertises the push; the marker object stays empty.
+        let cases = [
+            ("absent _meta entirely", None, false),
+            (
+                "other extensions only",
+                Some(serde_json::json!({ "claudeCode": { "promptQueueing": true } })),
+                false,
+            ),
+            (
+                "empty marker, as the adapter sends it",
+                Some(serde_json::json!({ "authStatus": {} })),
+                true,
+            ),
+            (
+                "marker alongside other extensions",
+                Some(serde_json::json!({
+                    "claudeCode": { "promptQueueing": true },
+                    "authStatus": {},
+                })),
+                true,
+            ),
+        ];
+        for (name, meta, expected) in cases {
+            let mut caps = AgentCapabilities::new();
+            if let Some(meta) = meta {
+                caps = caps.meta(meta.as_object().unwrap().clone());
+            }
+            let init = init(Some((CLAUDE, "0.85.0"))).agent_capabilities(caps);
+            assert_eq!(supports_auth_status(&init), expected, "{name}");
+        }
+    }
+
+    #[test]
     fn validate_and_steering_gates_per_agent() {
         use ExpectedAgent::*;
         let below_floor = format!("{CLAUDE_AGENT_ACP_MIN_VERSION}-alpha.1");

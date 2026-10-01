@@ -1113,6 +1113,68 @@ mod tests {
         s
     }
 
+    fn auth(kind: AuthStatusKind, label: &str) -> AuthStatus {
+        AuthStatus {
+            kind,
+            label: label.into(),
+            detail: None,
+            account: None,
+        }
+    }
+
+    #[test]
+    fn auth_status_tracks_the_latest_report_and_clears() {
+        let max = auth(AuthStatusKind::Account, "Claude Max");
+        let key = auth(AuthStatusKind::ApiKey, "Anthropic API key");
+
+        // Never reported is not the same as logged out: it renders as nothing.
+        assert_eq!(fresh_state().auth_status, None);
+
+        let s = applied([Event::AuthStatusUpdated {
+            status: Some(max.clone()),
+        }]);
+        assert_eq!(s.auth_status.as_ref(), Some(&max));
+
+        // A later report replaces the earlier one wholesale.
+        let s = applied([
+            Event::AuthStatusUpdated {
+                status: Some(max.clone()),
+            },
+            Event::AuthStatusUpdated {
+                status: Some(key.clone()),
+            },
+        ]);
+        assert_eq!(s.auth_status.as_ref(), Some(&key));
+
+        // An adapter that cannot report clears the previous process's value
+        // rather than leaving it on screen.
+        let s = applied([
+            Event::AuthStatusUpdated { status: Some(max) },
+            Event::AuthStatusUpdated { status: None },
+        ]);
+        assert_eq!(s.auth_status, None);
+    }
+
+    #[test]
+    fn auth_status_drops_the_vendor_bag_but_keeps_the_account() {
+        let status: AuthStatus = serde_json::from_value(serde_json::json!({
+            "kind": "account",
+            "label": "Claude Max",
+            "account": {"email": "a@b.co", "organization": "Acme", "plan": "max"},
+            "vendor": {"claudeCode": {"secret": "x"}},
+        }))
+        .unwrap();
+        assert_eq!(
+            status.account.as_ref().unwrap().email.as_deref(),
+            Some("a@b.co")
+        );
+        let round_tripped = serde_json::to_value(&status).unwrap();
+        assert!(
+            round_tripped.get("vendor").is_none(),
+            "vendor must not reach the event log: {round_tripped}"
+        );
+    }
+
     fn caps(steering: bool) -> Event {
         Event::PromptCapabilities {
             image: false,

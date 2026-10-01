@@ -426,7 +426,7 @@ mod tests {
     use crate::acp::approvals::{Approval, Nonce};
     use crate::acp::elicitations::Elicitation;
     use crate::acp::state::{
-        AcpSessionId, AgentName, Event, Plan, PlanStep, ThinkingSignal, ToolCall,
+        AcpSessionId, AgentName, AuthStatusKind, Event, Plan, PlanStep, ThinkingSignal, ToolCall,
     };
     use crate::acp::transcript::{TranscriptModel, TranscriptRowKind};
     use chrono::Utc;
@@ -468,6 +468,36 @@ mod tests {
             s.apply_event(e.clone()).expect("apply ok");
         }
         s
+    }
+
+    /// The status bar reads `auth_status` straight off the transcript, so a
+    /// report and its clear must both survive `apply_reduced_state`.
+    #[test]
+    fn reduced_state_carries_auth_status_and_its_clear() {
+        let mut t = AcpTranscript::new("s-1");
+        t.apply_reduced_state(
+            1,
+            reduced(&[Event::AuthStatusUpdated {
+                status: Some(AuthStatus {
+                    kind: AuthStatusKind::Account,
+                    label: "Claude Max".into(),
+                    detail: None,
+                    account: None,
+                }),
+            }]),
+            &[],
+        );
+        let status = t.auth_status.as_ref().expect("reported");
+        assert_eq!(status.label, "Claude Max");
+        assert_eq!(status.kind, AuthStatusKind::Account);
+
+        // An adapter that cannot report clears it rather than going stale.
+        t.apply_reduced_state(
+            2,
+            reduced(&[Event::AuthStatusUpdated { status: None }]),
+            &[],
+        );
+        assert!(t.auth_status.is_none());
     }
 
     fn approval(nonce: &str) -> Approval {

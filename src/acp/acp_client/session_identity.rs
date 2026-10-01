@@ -420,9 +420,64 @@ where
 mod tests {
     use super::*;
     use crate::acp::acp_client::test_helpers::text_chunk;
+    use crate::acp::state::AuthStatusKind;
 
     fn notif(id: &str) -> SessionNotification {
         SessionNotification::new(id.to_string(), text_chunk("x", None))
+    }
+
+    #[test]
+    fn auth_status_update_parses_without_a_session_id() {
+        // Table: the wire payloads the extension can send, including a kind
+        // added after this code was written and the vendor bag it drops.
+        let cases = [
+            (
+                "subscription",
+                serde_json::json!({"authStatus": {
+                    "kind": "account",
+                    "label": "Claude Max",
+                    "account": {"email": "a@b.co", "organization": "Acme", "plan": "max"},
+                }}),
+                AuthStatusKind::Account,
+                "Claude Max",
+            ),
+            (
+                "api key, vendor bag dropped",
+                serde_json::json!({"authStatus": {
+                    "kind": "api_key",
+                    "label": "Anthropic API key",
+                    "detail": "apiKeyHelper",
+                    "vendor": {"claudeCode": {"anything": [1, 2, 3]}},
+                }}),
+                AuthStatusKind::ApiKey,
+                "Anthropic API key",
+            ),
+            (
+                "logged out",
+                serde_json::json!({"authStatus": {"kind": "none", "label": "Not logged in"}}),
+                AuthStatusKind::None,
+                "Not logged in",
+            ),
+            (
+                "kind added upstream later",
+                serde_json::json!({"authStatus": {"kind": "quantum", "label": "Future Auth"}}),
+                AuthStatusKind::Unknown,
+                "Future Auth",
+            ),
+        ];
+        for (name, params, kind, label) in cases {
+            let parsed =
+                SessionIngressNotification::parse_message(AUTH_STATUS_UPDATE_METHOD, &params)
+                    .unwrap_or_else(|e| panic!("{name}: {e}"));
+            let SessionIngressNotification::AuthStatus(status) = parsed else {
+                panic!("{name}: expected AuthStatus");
+            };
+            assert_eq!(status.kind, kind, "{name}");
+            assert_eq!(status.label, label, "{name}");
+        }
+        assert!(SessionIngressNotification::matches_method(
+            AUTH_STATUS_UPDATE_METHOD
+        ));
     }
 
     #[tokio::test]
