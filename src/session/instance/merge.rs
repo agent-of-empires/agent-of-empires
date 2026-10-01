@@ -424,6 +424,9 @@ impl Instance {
         if pre.color != post.color {
             self.color = post.color.clone();
         }
+        if pre.sort_index != post.sort_index {
+            self.sort_index = post.sort_index;
+        }
         // Worktree workdir edit (move dir / rename branch) mutates these two;
         // both the TUI and the CLI can write them, so they go through the
         // same conditional-diff path as the triage fields. See #1723.

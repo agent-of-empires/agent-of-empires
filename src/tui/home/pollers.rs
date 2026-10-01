@@ -456,36 +456,7 @@ impl HomeView {
     /// `flat_items[cursor]`. Mirrors the canonical sequence in `reload()`.
     /// Shared by `apply_recovery_updates` and `apply_restart_results`.
     fn refresh_rows_preserving_selection(&mut self) {
-        let prev_selected_session = self.selected_session.clone();
-        let prev_selected_group = self.selected_group.clone();
-
-        self.rebuild_flat_items();
-
-        let mut restored = false;
-        if let Some(ref sid) = prev_selected_session {
-            for (idx, item) in self.flat_items.iter().enumerate() {
-                if let Item::Session { id, .. } = item {
-                    if id == sid {
-                        self.cursor = idx;
-                        restored = true;
-                        break;
-                    }
-                }
-            }
-        } else if let Some(ref gpath) = prev_selected_group {
-            for (idx, item) in self.flat_items.iter().enumerate() {
-                if let Item::Group { path, .. } = item {
-                    if path == gpath {
-                        self.cursor = idx;
-                        restored = true;
-                        break;
-                    }
-                }
-            }
-        }
-        if !restored && self.cursor >= self.flat_items.len() && !self.flat_items.is_empty() {
-            self.cursor = self.flat_items.len() - 1;
-        }
+        self.rebuild_flat_items_keeping_cursor();
 
         if self.search_active && !self.search_query.value().is_empty() {
             self.update_search();

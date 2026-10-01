@@ -38,6 +38,19 @@ pub(super) fn rename_exclusive(
 pub(crate) fn unix_peer_uid(stream: &tokio::net::UnixStream) -> std::io::Result<u32> {
     Ok(stream.peer_cred()?.uid())
 }
+/// Run the child at background priority so a mass file delete does not saturate
+/// `fseventsd` and stall the rest of the machine.
+pub(super) fn throttle_child(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt;
+
+    // SAFETY: `setpriority` is async-signal-safe and the closure allocates nothing.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setpriority(libc::PRIO_DARWIN_PROCESS, 0, libc::PRIO_DARWIN_BG);
+            Ok(())
+        });
+    }
+}
 
 /// Collect `pid` and every descendant by parsing `ps -A` once and walking the map.
 pub(super) fn collect_pid_tree(pid: u32) -> Vec<u32> {

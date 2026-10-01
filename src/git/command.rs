@@ -20,10 +20,19 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    run(cwd, args, false)
+    run(cwd, args, false, false)
 }
 
-fn run<I, S>(cwd: &Path, args: I, quiet: bool) -> std::io::Result<Output>
+/// [`run_git`] at background priority, for git commands that delete many files.
+pub fn run_git_throttled<I, S>(cwd: &Path, args: I) -> std::io::Result<Output>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    run(cwd, args, false, true)
+}
+
+fn run<I, S>(cwd: &Path, args: I, quiet: bool, throttled: bool) -> std::io::Result<Output>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
@@ -39,11 +48,12 @@ where
     );
     // Callers classify several Git failures. Keep diagnostics deterministic
     // instead of depending on the launching shell's locale.
-    let output = Command::new("git")
-        .args(&argv)
-        .current_dir(cwd)
-        .env("LC_ALL", "C")
-        .output()?;
+    let mut command = Command::new("git");
+    command.args(&argv).current_dir(cwd).env("LC_ALL", "C");
+    if throttled {
+        crate::process::throttle_child(&mut command);
+    }
+    let output = command.output()?;
     let dur = start.elapsed().as_millis() as u64;
     if output.status.success() {
         tracing::debug!(

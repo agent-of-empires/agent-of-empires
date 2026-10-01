@@ -223,6 +223,9 @@ struct PendingCreation {
 }
 
 fn set_grant(grant: &AtomicU64, allowed: bool) {
+    // Renamed to try_update in the standard library; the MSRV this builds against
+    // does not have it yet. Upstream carries the same allowance.
+    #[allow(deprecated)]
     let _ = grant.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
         ((value & 1 == 1) != allowed).then(|| value + 1)
     });

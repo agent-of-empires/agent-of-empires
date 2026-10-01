@@ -163,7 +163,13 @@ fn claim_context_reset(
         "starts a fresh"
     };
     let labelled = agent.unwrap_or(instance.tool.as_str());
-    Some((format!("Sandbox native history was isolated; this launch {context} {labelled} conversation. The existing AoE transcript is retained. Complete originals: {}", recovery.into_iter().collect::<Vec<_>>().join(", ")), slots))
+    Some((
+        format!(
+            "Sandbox native history was isolated; this launch {context} {labelled} conversation. The existing AoE transcript is retained. Complete originals: {}",
+            recovery.into_iter().collect::<Vec<_>>().join(", ")
+        ),
+        slots,
+    ))
 }
 
 pub(crate) struct AcpLaunchContext {
@@ -447,7 +453,7 @@ pub(crate) fn canonical_expected_path(path: &Path) -> Result<PathBuf> {
                 existing = existing.parent().context("content path has no parent")?;
             }
             Err(error) => {
-                return Err(error).with_context(|| format!("resolving {}", path.display()))
+                return Err(error).with_context(|| format!("resolving {}", path.display()));
             }
         }
     }
@@ -539,7 +545,10 @@ fn guard_other_transactions(
             .iter()
             .any(|part| roots.iter().any(|root| root.path == part.root.path))
         {
-            bail!("sandbox {instance} has an unfinished {} content transition; restore that tool's original configuration and finish aoe migrate before sharing its roots", receipt.tool);
+            bail!(
+                "sandbox {instance} has an unfinished {} content transition; restore that tool's original configuration and finish aoe migrate before sharing its roots",
+                receipt.tool
+            );
         }
     }
     Ok(())
@@ -875,7 +884,7 @@ fn retain_legacy_original_with(
     let app = crate::session::get_app_dir()?;
     let recovery = recovery_root(host)?;
     if let Some(message) =
-        recovery_exposure(&app, &[canonical_expected_path(&recovery)?], exposure)?
+        recovery_exposure(&app, &[canonical_expected_path(&recovery)?], exposure)?.refusal(None)
     {
         progress::notice(format!(
             "{message}; the shared store stays where it is until that mount is gone"
@@ -1026,13 +1035,19 @@ fn ordinary_mount_masks_bind(inspected: &crate::containers::InspectedContainer) 
 }
 
 /// Whether a bind's in-container `stat -L` line (`dev:ino:links:hexmode`)
-/// matches the host source it declares, which must hold still across the probe.
+/// matches the host source it declares, which must hold still across the probe
+/// (`None` is a source that does not exist).
 ///
-/// A file source replaced by rename (#4224) leaves the bind on the old inode.
-/// That mount is still accepted when it is an unlinked regular file on the
-/// source's device: with no name left anywhere, it cannot be or contain any
-/// part of the recovery namespace.
-fn bind_identifies_mount(line: Option<&str>, before: (u64, u64), after: &fs::Metadata) -> bool {
+/// A source replaced by rename (#4224) or recreated, or removed outright
+/// (#4239), leaves the bind on the old inode. That mount is still accepted when
+/// it is unlinked: a regular file with no name, or a removed directory, which
+/// the kernel keeps empty, cannot be or contain any part of the recovery
+/// namespace. A replaced source must be the same kind on the same device.
+fn bind_identifies_mount(
+    line: Option<&str>,
+    before: Option<(u64, u64)>,
+    after: Option<&fs::Metadata>,
+) -> bool {
     use std::os::unix::fs::MetadataExt;
     let observed = line.and_then(|line| {
         let mut fields = line.split(':');
@@ -1047,11 +1062,50 @@ fn bind_identifies_mount(line: Option<&str>, before: (u64, u64), after: &fs::Met
     let Some((device, inode, links, mode)) = observed else {
         return false;
     };
-    // S_IFMT and S_IFREG as the container's Linux kernel reports them.
+    // S_IFMT, S_IFREG and S_IFDIR as the container's Linux kernel reports them.
     let regular = mode & 0o170000 == 0o100000;
-    before == (after.dev(), after.ino())
-        && ((device, inode) == before
-            || (links == 0 && regular && after.is_file() && device == before.0))
+    let directory = mode & 0o170000 == 0o040000;
+    let unlinked = links == 0 && (regular || directory);
+    match (before, after) {
+        (Some(before), Some(after)) => {
+            before == (after.dev(), after.ino())
+                && ((device, inode) == before
+                    || (unlinked
+                        && device == before.0
+                        && (regular && after.is_file() || directory && after.is_dir())))
+        }
+        (None, None) => unlinked,
+        _ => false,
+    }
+}
+
+fn source_identity(source: &Path) -> std::io::Result<Option<fs::Metadata>> {
+    match fs::metadata(source) {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// Check the per-bind lines of a live mount proof against the declared sources
+/// and their identities from before the probe ran.
+fn prove_binds<'a>(
+    id: &str,
+    sources: &[PathBuf],
+    before: Vec<Option<(u64, u64)>>,
+    mut lines: impl Iterator<Item = &'a str>,
+) -> Result<()> {
+    for (source, before) in sources.iter().zip(before) {
+        if !bind_identifies_mount(lines.next(), before, source_identity(source)?.as_ref()) {
+            bail!(
+                "live sandbox {id} source spelling does not identify its actual mount; defer native content isolation"
+            );
+        }
+    }
+    if lines.next().is_some() {
+        bail!("unexpected live mount proof output");
+    }
+    Ok(())
 }
 
 fn live_bind_sources(id: &str) -> Result<Vec<PathBuf>> {
@@ -1094,7 +1148,10 @@ fn live_bind_sources(id: &str) -> Result<Vec<PathBuf>> {
     let boot = uuid::Uuid::parse_str(&boot).context("host kernel identity is malformed")?;
     let before: Vec<_> = sources
         .iter()
-        .map(|source| fs::metadata(source).map(|metadata| (metadata.dev(), metadata.ino())))
+        .map(|source| {
+            source_identity(source)
+                .map(|metadata| metadata.map(|metadata| (metadata.dev(), metadata.ino())))
+        })
         .collect::<std::io::Result<_>>()?;
     // Pin Docker/Podman's immutable runtime id.
     container.name = inspected.id;
@@ -1138,27 +1195,50 @@ fn live_bind_sources(id: &str) -> Result<Vec<PathBuf>> {
     {
         return Ok(sources);
     }
-    for (source, before) in sources.iter().zip(before) {
-        if !bind_identifies_mount(lines.next(), before, &fs::metadata(source)?) {
-            bail!("live sandbox {id} source spelling does not identify its actual mount; defer native content isolation");
-        }
-    }
-    if lines.next().is_some() {
-        bail!("unexpected live mount proof output");
-    }
+    prove_binds(id, &sources, before, lines)?;
     Ok(sources)
 }
 
 type ExposureProbe<'a> = dyn Fn(&str) -> Result<Vec<PathBuf>> + 'a;
 
-/// The refusal a live mount deserves, or `None` when the recovery namespace
-/// stays private. Callers that can leave work pending report this instead of
-/// failing, so one exposed mount cannot stop every other session from moving.
+/// Every sandbox that keeps the recovery namespace from being proven private.
+#[derive(Default)]
+struct Exposure {
+    /// Declared or live mounts that reach the namespace or cannot be resolved.
+    exposed: Vec<String>,
+    /// Live sandboxes whose actual mounts cannot be proven, by id.
+    unproven: Vec<(String, String)>,
+}
+
+impl Exposure {
+    /// The refusal a caller owes, naming every blocker. A transaction that
+    /// retires content into the namespace is held by any unproven sandbox; one
+    /// that only admits `fresh` is held by that sandbox's own mounts alone.
+    fn refusal(&self, fresh: Option<&str>) -> Option<String> {
+        let messages: Vec<_> = self
+            .exposed
+            .iter()
+            .chain(
+                self.unproven
+                    .iter()
+                    .filter(|(id, _)| fresh.is_none_or(|fresh| fresh == id))
+                    .map(|(_, message)| message),
+            )
+            .map(String::as_str)
+            .collect();
+        (!messages.is_empty()).then(|| messages.join("; "))
+    }
+}
+
+/// What keeps the recovery namespace from being proven private. Callers that
+/// can leave work pending report it instead of failing, so one exposed mount
+/// cannot stop every other session from moving.
 fn recovery_exposure(
     app: &Path,
     targets: &[PathBuf],
     exposure: &ExposureProbe<'_>,
-) -> Result<Option<String>> {
+) -> Result<Exposure> {
+    let mut found = Exposure::default();
     for (path, registry) in read_registries(app)? {
         let profile = layout::profile_for_registry(app, &path);
         let config = crate::session::config::profile_config::resolve_config(&profile)?;
@@ -1179,13 +1259,13 @@ fn recovery_exposure(
                 .context("sandbox row has no id")?;
             let mut sources = match exposure(id) {
                 Ok(sources) => sources,
-                // A mount that cannot be proved clear is not proved clear, and
-                // one unanswerable container must not stop every other session
-                // from moving, so this defers rather than fails the pass.
+                // A mount that cannot be proved clear is not proved clear, but
+                // its declared mounts below are still checked.
                 Err(error) => {
-                    return Ok(Some(format!(
+                    found.unproven.push((id.to_owned(), format!(
                         "sandbox {id}: cannot prove its mounts stay clear of the isolation recovery namespace ({error}); stop it and retry"
-                    )))
+                    )));
+                    Vec::new()
                 }
             };
             for entry in &config.sandbox.extra_volumes {
@@ -1220,10 +1300,11 @@ fn recovery_exposure(
                     // privacy, and one unanswerable entry must not stop every
                     // other session from moving.
                     Err(error) => {
-                        return Ok(Some(format!(
+                        found.exposed.push(format!(
                             "sandbox {id} declares the mount {} that cannot be resolved ({error}); remove it and retry",
                             source.display()
-                        )))
+                        ));
+                        break;
                     }
                 };
                 if targets.iter().any(|target| {
@@ -1232,25 +1313,28 @@ fn recovery_exposure(
                         || target.starts_with(&canonical)
                         || canonical.starts_with(target)
                 }) {
-                    return Ok(Some(format!(
+                    found.exposed.push(format!(
                         "sandbox {id} exposes the isolation recovery namespace through {}; remove that mount before migrating",
                         source.display()
-                    )));
+                    ));
+                    break;
                 }
             }
         }
     }
-    Ok(None)
+    Ok(found)
 }
 
-/// Retained originals must stay invisible to a running sandbox, so an exposed
-/// namespace is a hard refusal where the caller cannot leave work pending.
+/// Fresh admission refuses an exposed namespace, but it retires no original
+/// into it, so another live sandbox whose mounts cannot be proven defers only
+/// its own isolation instead of every launch.
 fn ensure_private_recovery(
     app: &Path,
+    instance: &str,
     targets: &[PathBuf],
     exposure: &ExposureProbe<'_>,
 ) -> Result<()> {
-    match recovery_exposure(app, targets, exposure)? {
+    match recovery_exposure(app, targets, exposure)?.refusal(Some(instance)) {
         Some(message) => bail!(message),
         None => Ok(()),
     }
@@ -1991,7 +2075,9 @@ fn checked_receipt(
     if let Some(receipt) = read_receipt(&path)? {
         let matches = receipt_matches(&receipt, id, tool, roots);
         if !matches && receipt.phase != Phase::Committed {
-            bail!("unfinished content transition has a different root or role plan; restore the original configuration and finish aoe migrate; its originals and journal are retained");
+            bail!(
+                "unfinished content transition has a different root or role plan; restore the original configuration and finish aoe migrate; its originals and journal are retained"
+            );
         }
         uuid::Uuid::parse_str(&receipt.transaction)
             .context("invalid content transaction identity")?;
@@ -2086,7 +2172,9 @@ fn migrate_target(
         ));
         return Ok(false);
     }
-    if let Some(message) = recovery_exposure(app, &migration_targets(app, &roots)?, exposure)? {
+    if let Some(message) =
+        recovery_exposure(app, &migration_targets(app, &roots)?, exposure)?.refusal(None)
+    {
         progress::notice(format!("{message}; this sandbox stays pending"));
         return Ok(false);
     }
@@ -2167,7 +2255,9 @@ fn migrate_target(
         discard_stage(app, &mut receipt, &path)?;
         return Ok(false);
     }
-    if let Some(message) = recovery_exposure(app, &migration_targets(app, &roots)?, exposure)? {
+    if let Some(message) =
+        recovery_exposure(app, &migration_targets(app, &roots)?, exposure)?.refusal(None)
+    {
         progress::notice(format!("{message}; this sandbox stays pending"));
         discard_stage(app, &mut receipt, &path)?;
         return Ok(false);
@@ -2233,7 +2323,9 @@ fn reconcile_in(
                     return Err(error);
                 }
                 tracing::warn!(target: "session.profile", %error, %id, %tool, "Native source kept changing during content isolation");
-                progress::notice(format!("sandbox {id}: native configuration kept changing; content isolation remains pending"));
+                progress::notice(format!(
+                    "sandbox {id}: native configuration kept changing; content isolation remains pending"
+                ));
             }
         } else {
             let config = crate::session::config::profile_config::resolve_config(
@@ -2248,7 +2340,9 @@ fn reconcile_in(
                 }
                 let roots = row_roots(&row, &tool, home, &config)?;
                 if !roots_ready(app, &id, &tool, &roots)? {
-                    progress::notice(format!("sandbox {id}: native content isolation pending; originals will be preserved before a fresh native session starts"));
+                    progress::notice(format!(
+                        "sandbox {id}: native content isolation pending; originals will be preserved before a fresh native session starts"
+                    ));
                 }
             }
         }
@@ -2356,6 +2450,26 @@ pub(crate) fn ensure_fresh_content(
     config: &crate::session::Config,
     workspace: &Path,
 ) -> Result<crate::session::StorageFlock> {
+    ensure_fresh_content_with(
+        app,
+        home,
+        (instance, tool),
+        roots,
+        config,
+        workspace,
+        &live_exposure,
+    )
+}
+
+fn ensure_fresh_content_with(
+    app: &Path,
+    home: &Path,
+    (instance, tool): (&str, &str),
+    roots: &[ContentRoot],
+    config: &crate::session::Config,
+    workspace: &Path,
+    exposure: &ExposureProbe<'_>,
+) -> Result<crate::session::StorageFlock> {
     crate::session::validate_instance_id(instance)?;
     if !roots_ready(app, instance, tool, roots)? {
         // Never wait for a cohort held by a migrator while already holding the
@@ -2374,11 +2488,13 @@ pub(crate) fn ensure_fresh_content(
                         && (identity(&root.path)?.is_some()
                             || certificate_path(app, instance, &root.path)?.exists())
                     {
-                        bail!("sandbox {instance} has unproven native content; stop it and run aoe migrate before relaunch");
+                        bail!(
+                            "sandbox {instance} has unproven native content; stop it and run aoe migrate before relaunch"
+                        );
                     }
                 }
             }
-            ensure_private_recovery(app, &migration_targets(app, &planned)?, &live_bind_sources)?;
+            ensure_private_recovery(app, instance, &migration_targets(app, &planned)?, exposure)?;
             let row = serde_json::json!({"id":instance,"tool":tool});
             let (path, mut receipt) = checked_receipt(app, &row, tool, &planned)?;
             if receipt.roots.iter().any(|part| part.original.is_some()) {
@@ -2402,7 +2518,7 @@ pub(crate) fn ensure_fresh_content(
             if current != planned {
                 bail!("native content configuration changed during role preparation");
             }
-            ensure_private_recovery(app, &migration_targets(app, &planned)?, &live_bind_sources)?;
+            ensure_private_recovery(app, instance, &migration_targets(app, &planned)?, exposure)?;
             publish_receipt(&mut receipt, &path)?;
             receipt.phase = Phase::Committed;
             write_receipt(&path, &receipt)?;
@@ -2449,7 +2565,10 @@ pub(crate) fn admit_fresh_instance(
     instance: &crate::session::Instance,
 ) -> Result<crate::session::StorageFlock> {
     if instance.sandbox_store_generation < container_config::CURRENT_SANDBOX_STORE_GENERATION {
-        bail!("sandbox {} still uses a legacy shared store; stop the other owners and run aoe migrate", instance.id);
+        bail!(
+            "sandbox {} still uses a legacy shared store; stop the other owners and run aoe migrate",
+            instance.id
+        );
     }
     let app = crate::session::get_app_dir()?;
     let home = dirs::home_dir().context("home directory unavailable for content isolation")?;
@@ -2753,96 +2872,130 @@ mod tests {
         assert!(!can_prove_mounts(&inspected(false, None), true));
     }
 
-    /// #4224: Claude Code saves `$CLAUDE_CONFIG_DIR/.claude.json` by rename, so
-    /// the separate `~/.claude.json` file bind keeps the deleted old inode. An
-    /// open handle stands in for the container's view of that bind.
-    #[test]
-    fn a_bind_proves_only_its_source_or_an_unlinked_replaced_file() {
+    /// Formats the `stat -L` line the container prints for a bind, from an open
+    /// handle that stands in for the container's view of the mounted object.
+    fn mount_line(mounted: &fs::File) -> String {
         use std::os::unix::fs::MetadataExt;
-        let line = |metadata: &fs::Metadata| {
-            format!(
-                "{}:{}:{}:{:x}",
-                metadata.dev(),
-                metadata.ino(),
-                metadata.nlink(),
-                metadata.mode()
-            )
-        };
-        let key = |metadata: &fs::Metadata| (metadata.dev(), metadata.ino());
+        let metadata = mounted.metadata().unwrap();
+        format!(
+            "{}:{}:{}:{:x}",
+            metadata.dev(),
+            metadata.ino(),
+            metadata.nlink(),
+            metadata.mode()
+        )
+    }
+
+    fn source_key(source: &Path) -> Option<(u64, u64)> {
+        use std::os::unix::fs::MetadataExt;
+        source_identity(source)
+            .unwrap()
+            .map(|metadata| (metadata.dev(), metadata.ino()))
+    }
+
+    /// Whether the proof accepts `mounted` for `source` when the source held
+    /// still across the probe.
+    fn proves(mounted: &fs::File, source: &Path) -> bool {
+        bind_identifies_mount(
+            Some(&mount_line(mounted)),
+            source_key(source),
+            source_identity(source).unwrap().as_ref(),
+        )
+    }
+
+    /// #4224: Claude Code saves `$CLAUDE_CONFIG_DIR/.claude.json` by rename,
+    /// leaving the `~/.claude.json` bind on the deleted inode. #4239: a project
+    /// directory recreated on the host, or a hook directory removed from it,
+    /// leaves the bind on a removed directory.
+    #[test]
+    fn a_bind_proves_only_its_source_or_an_unlinked_object() {
+        use std::os::unix::fs::MetadataExt;
         let temporary = tempfile::tempdir().unwrap();
-        let source = temporary.path().join(".claude.json");
+        let file = temporary.path().join(".claude.json");
+        let directory = temporary.path().join("project");
         let replace = |content: &str| {
             let staged = temporary.path().join("staged");
             fs::write(&staged, content).unwrap();
-            fs::rename(&staged, &source).unwrap();
+            fs::rename(&staged, &file).unwrap();
         };
 
-        fs::write(&source, "{}").unwrap();
-        let mounted = fs::File::open(&source).unwrap();
-        let current = fs::metadata(&source).unwrap();
-        assert!(bind_identifies_mount(
-            Some(&line(&current)),
-            key(&current),
-            &current
-        ));
+        fs::write(&file, "{}").unwrap();
+        let mounted = fs::File::open(&file).unwrap();
+        assert!(proves(&mounted, &file));
         for malformed in [None, Some("1:2"), Some("1:2:0"), Some("1:2:0:81a4:x")] {
-            assert!(!bind_identifies_mount(malformed, key(&current), &current));
+            let current = fs::metadata(&file).unwrap();
+            assert!(!bind_identifies_mount(
+                malformed,
+                source_key(&file),
+                Some(&current)
+            ));
         }
 
         replace(r#"{"saved":true}"#);
-        let replaced = fs::metadata(&source).unwrap();
-        let stale = mounted.metadata().unwrap();
-        assert_eq!(stale.nlink(), 0);
-        assert!(bind_identifies_mount(
-            Some(&line(&stale)),
-            key(&replaced),
-            &replaced
-        ));
+        assert_eq!(mounted.metadata().unwrap().nlink(), 0);
+        assert!(proves(&mounted, &file));
         // The host spelling must still hold still across the probe.
+        let stale = mounted.metadata().unwrap();
         assert!(!bind_identifies_mount(
-            Some(&line(&stale)),
-            key(&stale),
-            &replaced
+            Some(&mount_line(&mounted)),
+            Some((stale.dev(), stale.ino())),
+            Some(&fs::metadata(&file).unwrap())
+        ));
+        // Nor is a deleted file on another device accepted.
+        let foreign = format!("{}:{}:0:{:x}", stale.dev() + 1, stale.ino(), stale.mode());
+        assert!(!bind_identifies_mount(
+            Some(&foreign),
+            source_key(&file),
+            source_identity(&file).unwrap().as_ref()
         ));
 
         // A replaced file whose old inode is still linked elsewhere, possibly
         // inside the recovery namespace, is not proved clear.
-        fs::write(&source, "{}").unwrap();
-        let retained = temporary.path().join("retained");
-        fs::hard_link(&source, &retained).unwrap();
+        let linked = fs::File::open(&file).unwrap();
+        fs::hard_link(&file, temporary.path().join("retained")).unwrap();
         replace("{}");
-        let replaced = fs::metadata(&source).unwrap();
-        assert!(!bind_identifies_mount(
-            Some(&line(&fs::metadata(&retained).unwrap())),
-            key(&replaced),
-            &replaced
-        ));
+        assert!(!proves(&linked, &file));
 
-        // Only a regular file qualifies: a directory mount is never excused.
-        let directory = fs::metadata(temporary.path()).unwrap();
-        let unlinked_directory = format!(
-            "{}:{}:0:{:x}",
-            directory.dev(),
-            directory.ino(),
-            directory.mode()
-        );
+        // The proof runs only on a Linux host, and macOS does not report a
+        // removed directory's link count as 0.
+        if !cfg!(target_os = "linux") {
+            return;
+        }
+        // A recreated directory leaves the bind on the removed one.
+        fs::create_dir(&directory).unwrap();
+        let mounted_directory = fs::File::open(&directory).unwrap();
+        assert!(proves(&mounted_directory, &directory));
+        fs::remove_dir(&directory).unwrap();
+        fs::create_dir(&directory).unwrap();
+        assert_eq!(mounted_directory.metadata().unwrap().nlink(), 0);
+        assert!(proves(&mounted_directory, &directory));
+        // A directory renamed away is still linked and could hold anything.
+        let renamed = fs::File::open(&directory).unwrap();
+        fs::rename(&directory, temporary.path().join("moved")).unwrap();
+        fs::create_dir(&directory).unwrap();
+        assert!(!proves(&renamed, &directory));
+        // An unlinked object must match the kind of the source it replaced.
+        assert!(!proves(&mounted_directory, &file));
+        assert!(!proves(&mounted, &directory));
+
+        // A removed source: only an unlinked object is proved clear.
+        let hooks = temporary.path().join("hooks");
+        fs::create_dir(&hooks).unwrap();
+        let mounted_hooks = fs::File::open(&hooks).unwrap();
+        fs::remove_dir(&hooks).unwrap();
+        assert!(proves(&mounted_hooks, &hooks));
+        assert!(proves(&mounted, &hooks));
+        assert!(!proves(&renamed, &hooks));
+        // A source that appears or vanishes during the probe proves nothing.
         assert!(!bind_identifies_mount(
-            Some(&unlinked_directory),
-            key(&replaced),
-            &replaced
+            Some(&mount_line(&mounted_hooks)),
+            None,
+            Some(&fs::metadata(&directory).unwrap())
         ));
-        // Nor is a deleted file on another device, or excused for a source
-        // that is no longer a regular file.
-        let foreign = format!("{}:{}:0:{:x}", stale.dev() + 1, stale.ino(), stale.mode());
         assert!(!bind_identifies_mount(
-            Some(&foreign),
-            key(&replaced),
-            &replaced
-        ));
-        assert!(!bind_identifies_mount(
-            Some(&line(&stale)),
-            key(&directory),
-            &directory
+            Some(&mount_line(&mounted_hooks)),
+            source_key(&directory),
+            None
         ));
     }
 
@@ -3254,9 +3407,11 @@ mod tests {
         let elsewhere = |_: &str| Ok(vec![temporary.path().join("elsewhere")]);
         assert!(recovery_exposure(&app, &targets, &elsewhere)
             .unwrap()
+            .refusal(None)
             .is_none());
         assert!(recovery_exposure(&app, &targets, &exposing)
             .unwrap()
+            .refusal(None)
             .is_some());
         // A probe that cannot answer is not proof of privacy, and it defers
         // rather than failing every other session's move with it.
@@ -3264,6 +3419,7 @@ mod tests {
             "runtime unavailable"
         ))
         .unwrap()
+        .refusal(None)
         .is_some());
         assert!(
             !migrate_target(
@@ -3283,6 +3439,174 @@ mod tests {
         );
         assert!(!roots_ready(&app, &instance.id, "codex", &roots).unwrap());
         assert!(!receipt_path(&app, &instance.id, "codex").unwrap().exists());
+    }
+
+    /// A stopped codex sandbox holding an unproven original, registered beside
+    /// one more sandbox row per `others` id, so a test can drive a live probe
+    /// for those rows.
+    fn stopped_original_beside(
+        temporary: &Path,
+        others: &[&str],
+    ) -> (PathBuf, PathBuf, crate::session::Instance, Vec<ContentRoot>) {
+        let home = dirs::home_dir().unwrap();
+        let app = crate::session::get_app_dir().unwrap();
+        let project = temporary.join("project");
+        fs::create_dir_all(&project).unwrap();
+        let mut instance = crate::session::Instance::new("codex", project.to_str().unwrap());
+        instance.tool = "codex".to_owned();
+        let roots = container_config::sandbox_content_roots(
+            "codex",
+            None,
+            &crate::session::Config::default().session,
+            &home,
+            &instance.id,
+        )
+        .unwrap();
+        fs::create_dir_all(roots[0].path.join("sessions")).unwrap();
+        fs::write(
+            roots[0].path.join("sessions/original.jsonl"),
+            b"PRIVATE_ORIGINAL_CONTEXT",
+        )
+        .unwrap();
+        let sandbox = serde_json::json!({
+            "enabled": true,
+            "image": "img",
+            "container_name": "aoe-sandbox-fixture",
+        });
+        let mut rows = Vec::new();
+        for id in others.iter().copied().chain([instance.id.as_str()]) {
+            let mut row = serde_json::to_value(&instance).unwrap();
+            row["id"] = serde_json::json!(id);
+            row["sandbox_info"] = sandbox.clone();
+            rows.push(row);
+        }
+        let registry = app.join("sessions.json");
+        fs::write(&registry, serde_json::to_vec(&rows).unwrap()).unwrap();
+        (app, registry, instance, roots)
+    }
+
+    /// #4239: a live sandbox whose hook directory was removed from the host
+    /// and whose project directory was recreated left a stopped session
+    /// unstartable, because its mount proof failed and `aoe migrate` held every
+    /// other sandbox pending on it. Both binds sit on removed directories, so
+    /// the proof now accepts them and the stopped session moves.
+    #[test]
+    // A removed directory's link count is 0 only on Linux, the one host that runs the proof.
+    #[cfg(target_os = "linux")]
+    #[serial_test::serial]
+    fn a_removed_or_recreated_live_bind_no_longer_holds_a_stopped_sandbox() {
+        let temporary = tempfile::tempdir().unwrap();
+        let _environment = crate::session::test_support::isolate_app_dir_at(temporary.path());
+        let home = dirs::home_dir().unwrap();
+        let live = "2222222222222222";
+        let (app, registry, instance, roots) = stopped_original_beside(temporary.path(), &[live]);
+        let hooks = temporary.path().join("aoe-hooks").join(live);
+        let workspace = temporary.path().join("GNSSReceiver");
+        fs::create_dir_all(&hooks).unwrap();
+        fs::create_dir_all(&workspace).unwrap();
+        let mounted = [
+            fs::File::open(&hooks).unwrap(),
+            fs::File::open(&workspace).unwrap(),
+        ];
+        fs::remove_dir(&hooks).unwrap();
+        fs::remove_dir(&workspace).unwrap();
+        fs::create_dir(&workspace).unwrap();
+        let sources = vec![hooks, workspace];
+        let probe = |id: &str| {
+            if id != live {
+                return Ok(Vec::new());
+            }
+            let before = sources.iter().map(|source| source_key(source)).collect();
+            let output = mounted.iter().map(mount_line).collect::<Vec<_>>();
+            prove_binds(id, &sources, before, output.iter().map(String::as_str))?;
+            Ok(sources.clone())
+        };
+        assert!(
+            recovery_exposure(&app, &migration_targets(&app, &roots).unwrap(), &probe)
+                .unwrap()
+                .refusal(None)
+                .is_none()
+        );
+        assert!(migrate_target(
+            &app,
+            &home,
+            (&registry, &instance.id, "codex"),
+            &|id| Ok(id == live),
+            &|_| Ok(true),
+            &probe,
+        )
+        .unwrap());
+        assert!(roots_ready(&app, &instance.id, "codex", &roots).unwrap());
+        let retained: Vec<_> = fs::read_dir(recovery_root(&roots[0].host).unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(retained.len(), 1);
+        assert_eq!(
+            fs::read(retained[0].join("0/original/sessions/original.jsonl")).unwrap(),
+            b"PRIVATE_ORIGINAL_CONTEXT"
+        );
+    }
+
+    /// A live sandbox whose mounts cannot be proven still holds any transaction
+    /// that retires an original into the recovery namespace, and every such
+    /// sandbox is named. Fresh admission retires nothing there, so only the
+    /// admitted sandbox's own proof can refuse it.
+    #[test]
+    #[serial_test::serial]
+    fn an_unproven_live_sandbox_holds_retirement_but_not_other_fresh_launches() {
+        let temporary = tempfile::tempdir().unwrap();
+        let _environment = crate::session::test_support::isolate_app_dir_at(temporary.path());
+        let home = dirs::home_dir().unwrap();
+        let unproven = ["2222222222222222", "3333333333333333"];
+        let (app, registry, instance, roots) = stopped_original_beside(temporary.path(), &unproven);
+        let probe = |id: &str| {
+            if unproven.contains(&id) {
+                anyhow::bail!("live sandbox mount proof failed");
+            }
+            Ok(Vec::new())
+        };
+        let refusal = recovery_exposure(&app, &migration_targets(&app, &roots).unwrap(), &probe)
+            .unwrap()
+            .refusal(None)
+            .unwrap();
+        assert!(unproven.iter().all(|id| refusal.contains(id)), "{refusal}");
+        assert!(!migrate_target(
+            &app,
+            &home,
+            (&registry, &instance.id, "codex"),
+            &|id| Ok(unproven.contains(&id)),
+            &|_| Ok(true),
+            &probe,
+        )
+        .unwrap());
+        assert_eq!(
+            fs::read(roots[0].path.join("sessions/original.jsonl")).unwrap(),
+            b"PRIVATE_ORIGINAL_CONTEXT"
+        );
+
+        let config = crate::session::Config::default();
+        let admit = |id: &str| {
+            let roots =
+                container_config::sandbox_content_roots("codex", None, &config.session, &home, id)
+                    .unwrap();
+            ensure_fresh_content_with(
+                &app,
+                &home,
+                (id, "codex"),
+                &roots,
+                &config,
+                temporary.path(),
+                &probe,
+            )
+            .map(drop)
+        };
+        admit("4444444444444444").unwrap();
+        let own = admit(unproven[0]).unwrap_err().to_string();
+        assert!(
+            own.contains(unproven[0]) && !own.contains(unproven[1]),
+            "{own}"
+        );
     }
 
     /// One store can be resolved by more than one row: the same instance id in

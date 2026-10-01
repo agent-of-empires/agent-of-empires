@@ -157,7 +157,7 @@ impl NativeSessionStore {
             self.state.runtime.request_publish();
             error.context(NativeStoreUnavailable)
         };
-        let transition = transition.map_err(&unavailable)?;
+        let transition = transition.map_err(unavailable)?;
         {
             let metadata = self.state.canonical_metadata.blocking_read();
             for profile in [self.storage.profile(), target.storage.profile()] {

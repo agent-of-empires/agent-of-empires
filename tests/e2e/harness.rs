@@ -509,6 +509,14 @@ last_seen_version = "{}"
         parts.join(":")
     }
 
+    /// Tear the TUI's own tmux session down so a test can `spawn_tui` again and assert on
+    /// what a fresh start reads from disk.
+    pub fn kill_tui(&mut self) {
+        let name = self.session_name.clone();
+        self.tmux_kill_session(&name);
+        self.spawned = false;
+    }
+
     /// Export an extra env var on every spawned process (tmux + `run_cli`).
     pub fn set_env(&mut self, key: &str, value: &str) {
         self.extra_env.push((key.to_string(), value.to_string()));
@@ -1179,7 +1187,8 @@ last_seen_version = "{}"
         assert!(
             !screen.contains(text),
             "Expected screen NOT to contain {:?}.\n\n--- Screen capture ---\n{}\n--- End screen capture ---",
-            text, screen
+            text,
+            screen
         );
     }
 

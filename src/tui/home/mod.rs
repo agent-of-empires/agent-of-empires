@@ -22,6 +22,7 @@ mod preview;
 mod profiles;
 mod projects;
 pub(crate) mod render;
+mod reorder;
 mod rows;
 mod selection;
 mod send;

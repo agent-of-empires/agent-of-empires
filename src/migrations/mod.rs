@@ -52,6 +52,7 @@ mod v035_serve_passphrase_policy;
 mod v036_pending_purge_owners;
 mod v037_capture_purge_runners;
 mod v038_canonical_sidebar;
+mod v039_custom_sort_order;
 
 /// Fixtures shared by migrations that rewrite agent hook files.
 #[cfg(test)]
@@ -93,8 +94,9 @@ use std::fs;
 use tracing::{debug, info};
 
 // v034 is upstream's trash-retention migration; it fills the gap the branch
-// left between 33 and 35, so the current version is unchanged at 38.
-const CURRENT_VERSION: u32 = 38;
+// left between 33 and 35. Upstream's custom-sort schema step arrived claiming
+// 35, which the branch had already spent, so it takes the next free number.
+const CURRENT_VERSION: u32 = 39;
 const VERSION_FILE: &str = ".schema_version";
 
 struct Migration {
@@ -293,6 +295,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 38,
         name: "canonical_sidebar",
         run: v038_canonical_sidebar::run,
+    },
+    Migration {
+        version: 39,
+        name: "custom_sort_order",
+        run: v039_custom_sort_order::run,
     },
 ];
 
@@ -534,6 +541,46 @@ mod tests {
         if let Some(last) = MIGRATIONS.last() {
             assert_eq!(CURRENT_VERSION, last.version);
         }
+    }
+
+    /// v039 is a schema step and nothing more: an install on the previous version with a
+    /// non-default sort order comes out on a newer version with `state.toml` byte for byte
+    /// as it was, and running the migrations again changes neither.
+    #[test]
+    #[serial_test::serial]
+    fn schema_34_advances_and_keeps_its_sort_order() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let app = crate::session::get_app_dir().unwrap();
+        fs::create_dir_all(&app).unwrap();
+        fs::write(app.join(VERSION_FILE), "34").unwrap();
+        let state = "sort_order = \"oldest\"\n";
+        fs::write(app.join("state.toml"), state).unwrap();
+        assert_eq!(
+            crate::session::config::AppStateConfig::load()
+                .unwrap()
+                .sort_order,
+            Some(crate::session::config::SortOrder::Oldest),
+            "the fixture holds a non-default order the previous schema can read"
+        );
+
+        run_migrations().unwrap();
+        let advanced = get_current_version();
+        assert!(advanced > 34, "the version advances past 34, to {advanced}");
+        assert_eq!(advanced, CURRENT_VERSION);
+        assert_eq!(
+            fs::read_to_string(app.join("state.toml")).unwrap(),
+            state,
+            "the state is not rewritten"
+        );
+
+        run_migrations().unwrap();
+        assert_eq!(get_current_version(), advanced, "a second run stays put");
+        assert_eq!(
+            fs::read_to_string(app.join("state.toml")).unwrap(),
+            state,
+            "and leaves the state alone"
+        );
     }
 
     #[test]

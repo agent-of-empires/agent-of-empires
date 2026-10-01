@@ -993,7 +993,7 @@ fn run_pass(
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                     Err(error) => {
                         return Err(error)
-                            .with_context(|| format!("inspecting {}", shared.display()))
+                            .with_context(|| format!("inspecting {}", shared.display()));
                     }
                 }
                 if stored_plans.is_none() {
@@ -2017,7 +2017,7 @@ fn publish_store(
         ),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
         Err(error) => {
-            return Err(error).with_context(|| format!("inspecting {}", source.display()))
+            return Err(error).with_context(|| format!("inspecting {}", source.display()));
         }
     };
     let Some(publication) = Publication::prepare(destination)? else {
@@ -2080,7 +2080,7 @@ fn publish_store(
         Ok(_) => true,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
         Err(error) => {
-            return Err(error).with_context(|| format!("inspecting {}", destination.display()))
+            return Err(error).with_context(|| format!("inspecting {}", destination.display()));
         }
     };
     if destination_exists {
@@ -2188,7 +2188,7 @@ fn relocate_store(source: &Path, destination: &Path) -> Result<bool> {
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => {
-            return Err(error).with_context(|| format!("inspecting {}", destination.display()))
+            return Err(error).with_context(|| format!("inspecting {}", destination.display()));
         }
     }
     if let Err(error) = fs::rename(source, destination) {
@@ -2317,7 +2317,7 @@ fn copy_tree_from_fd(
                 Ok(_) => bail!("v027 copy destination already exists: {}", target.display()),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => {
-                    return Err(error).with_context(|| format!("inspecting {}", target.display()))
+                    return Err(error).with_context(|| format!("inspecting {}", target.display()));
                 }
             }
             std::os::unix::fs::symlink(&link, &target)
@@ -2363,7 +2363,7 @@ fn copy_tree_from_fd(
                     false
                 }
                 Err(error) => {
-                    return Err(error).with_context(|| format!("inspecting {}", target.display()))
+                    return Err(error).with_context(|| format!("inspecting {}", target.display()));
                 }
             };
             copy_tree_from_fd(child, &target, None, &path, overwrite_newer, false, copied)?;
@@ -2406,7 +2406,7 @@ fn copy_tree_from_fd(
                 ),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
                 Err(error) => {
-                    return Err(error).with_context(|| format!("inspecting {}", target.display()))
+                    return Err(error).with_context(|| format!("inspecting {}", target.display()));
                 }
             };
             // A clone has to create its own destination, so an entry being
@@ -2510,7 +2510,7 @@ fn copy_tree_no_links(
                 Err(error)
                     if overwrite_newer && error.kind() == std::io::ErrorKind::AlreadyExists => {}
                 Err(error) => {
-                    return Err(error).with_context(|| format!("creating {}", target.display()))
+                    return Err(error).with_context(|| format!("creating {}", target.display()));
                 }
             }
             copy_tree_no_links(&path, &target, None, overwrite_newer, false, copied)?;
@@ -2534,7 +2534,7 @@ fn copy_tree_no_links(
                 ),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
                 Err(error) => {
-                    return Err(error).with_context(|| format!("inspecting {}", target.display()))
+                    return Err(error).with_context(|| format!("inspecting {}", target.display()));
                 }
             };
             if should_copy {
@@ -3051,11 +3051,23 @@ mod tests {
         let current = serde_json::json!({"id": "cccccccccccccccc", "tool": "gemini",
             "sandbox_info": {"enabled": true}, "sandbox_store_generation": 2});
         let cases: [(&str, Vec<Value>, Option<&str>); 4] = [
-            ("movable only", vec![movable("aaaaaaaaaaaaaaaa"), movable("bbbbbbbbbbbbbbbb")],
-                Some("2 sandboxed session(s) still use the shared agent store; each moves")),
+            (
+                "movable only",
+                vec![movable("aaaaaaaaaaaaaaaa"), movable("bbbbbbbbbbbbbbbb")],
+                Some("2 sandboxed session(s) still use the shared agent store; each moves"),
+            ),
             ("held only", vec![held("aaaaaaaaaaaaaaaa")], None),
-            ("mixed", vec![movable("aaaaaaaaaaaaaaaa"), held("bbbbbbbbbbbbbbbb"), current.clone()],
-                Some("1 sandboxed session(s) still use the shared agent store, plus 1 trashed or archived")),
+            (
+                "mixed",
+                vec![
+                    movable("aaaaaaaaaaaaaaaa"),
+                    held("bbbbbbbbbbbbbbbb"),
+                    current.clone(),
+                ],
+                Some(
+                    "1 sandboxed session(s) still use the shared agent store, plus 1 trashed or archived",
+                ),
+            ),
             ("nothing pending", vec![current.clone()], None),
         ];
         for (name, rows, expected) in cases {

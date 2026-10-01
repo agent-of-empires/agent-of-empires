@@ -695,6 +695,9 @@ pub enum SortOrder {
     Oldest,
     AZ,
     ZA,
+    /// User-defined order: rows keep the position the user moved them to
+    /// (`Instance::sort_index` for sessions, `groups.json` order for groups).
+    Custom,
 }
 
 impl SortOrder {
@@ -705,13 +708,15 @@ impl SortOrder {
             SortOrder::LastActivity => SortOrder::Oldest,
             SortOrder::Oldest => SortOrder::AZ,
             SortOrder::AZ => SortOrder::ZA,
-            SortOrder::ZA => SortOrder::Newest,
+            SortOrder::ZA => SortOrder::Custom,
+            SortOrder::Custom => SortOrder::Newest,
         }
     }
 
     pub fn cycle_reverse(self) -> Self {
         match self {
-            SortOrder::Newest => SortOrder::ZA,
+            SortOrder::Newest => SortOrder::Custom,
+            SortOrder::Custom => SortOrder::ZA,
             SortOrder::Attention => SortOrder::Newest,
             SortOrder::LastActivity => SortOrder::Attention,
             SortOrder::Oldest => SortOrder::LastActivity,
@@ -728,6 +733,21 @@ impl SortOrder {
             SortOrder::Oldest => "Oldest",
             SortOrder::AZ => "A-Z",
             SortOrder::ZA => "Z-A",
+            SortOrder::Custom => "Custom",
+        }
+    }
+
+    /// Letter that selects this order in the sort picker. Unique across the variants, so a
+    /// press applies one order rather than stepping through the ones sharing a first letter.
+    pub fn mnemonic(self) -> char {
+        match self {
+            SortOrder::Newest => 'n',
+            SortOrder::Attention => 't',
+            SortOrder::LastActivity => 'r',
+            SortOrder::Oldest => 'o',
+            SortOrder::AZ => 'a',
+            SortOrder::ZA => 'z',
+            SortOrder::Custom => 'c',
         }
     }
 }
@@ -756,6 +776,15 @@ impl GroupByMode {
             GroupByMode::Manual => "Manual",
             GroupByMode::Project => "Project",
             GroupByMode::Org => "Org",
+        }
+    }
+
+    /// Letter that selects this mode in the group-by picker. See [`SortOrder::mnemonic`].
+    pub fn mnemonic(self) -> char {
+        match self {
+            GroupByMode::Manual => 'm',
+            GroupByMode::Project => 'p',
+            GroupByMode::Org => 'g',
         }
     }
 }

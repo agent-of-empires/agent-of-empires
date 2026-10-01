@@ -86,6 +86,67 @@ struct TestEnv {
     _temp: TempDir,
 }
 
+/// An isolated app dir for a fixture; the guard must outlive every storage
+/// write, so it's handed back alongside the `TempDir` for the caller to own.
+fn test_home() -> (TempDir, AppDirGuard) {
+    let temp = TempDir::new().unwrap();
+    let guard = setup_test_home(&temp);
+    (temp, guard)
+}
+
+/// A bare `HomeView` over `profile` (`None` for a unified view over every
+/// profile). The caller seeds storage and sets up grouping itself.
+fn test_view(profile: Option<&str>) -> HomeView {
+    HomeView::new_for_test(
+        profile.map(str::to_string),
+        AvailableTools::with_tools(&["claude"]),
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap()
+}
+
+/// Persist `instances` (with derived groups) to `profile`, creating the
+/// profile dir if it doesn't exist yet.
+fn seed_profile(profile: &str, instances: &[Instance]) {
+    Storage::new_unwatched(profile)
+        .unwrap()
+        .update(|i, g| {
+            *i = instances.to_vec();
+            *g = GroupTree::new_with_groups(instances, &[]).get_all_groups();
+            Ok(())
+        })
+        .unwrap();
+}
+
+/// A view over profile "test" seeded with `instances`. `manual` switches to
+/// manual grouping and rebuilds the rows, which most fixtures want.
+fn seeded_env(
+    (temp, guard): (TempDir, AppDirGuard),
+    instances: &[Instance],
+    manual: bool,
+) -> TestEnv {
+    use crate::session::config::GroupByMode;
+    seed_profile("test", instances);
+    let mut view = test_view(Some("test"));
+    if manual {
+        view.group_by = GroupByMode::Manual;
+        view.flat_items = view.build_flat_items();
+        view.update_selected();
+    }
+    TestEnv {
+        view,
+        _guard: guard,
+        _temp: temp,
+    }
+}
+
+/// An `Instance` filed under `group`. Empty group means ungrouped.
+fn instance_in(title: &str, path: &str, group: &str) -> Instance {
+    let mut inst = Instance::new(title, path);
+    inst.group_path = group.to_string();
+    inst
+}
+
 fn create_test_env_empty() -> TestEnv {
     use crate::session::config::GroupByMode;
     let temp = TempDir::new().unwrap();

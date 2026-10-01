@@ -56,6 +56,10 @@ pub enum ActionId {
     Update,
     ToggleArchive,
     ToggleFavorite,
+    MoveRowUp,
+    MoveRowDown,
+    JumpPrevFinished,
+    JumpNextFinished,
     ToggleSnooze,
     /// Toggle the selected session's unread marker (read -> manual-unread;
     /// unread -> read). Gated behind the `session.unread_indicator` config
@@ -136,12 +140,14 @@ impl ActionId {
 pub struct Chord {
     pub code: KeyCode,
     pub ctrl: bool,
+    pub alt: bool,
 }
 
 const fn k(c: char) -> Chord {
     Chord {
         code: KeyCode::Char(c),
         ctrl: false,
+        alt: false,
     }
 }
 
@@ -149,6 +155,7 @@ const fn ctrl(c: char) -> Chord {
     Chord {
         code: KeyCode::Char(c),
         ctrl: true,
+        alt: false,
     }
 }
 
@@ -156,6 +163,23 @@ const fn f(n: u8) -> Chord {
     Chord {
         code: KeyCode::F(n),
         ctrl: false,
+        alt: false,
+    }
+}
+
+const fn ctrl_code(code: KeyCode) -> Chord {
+    Chord {
+        code,
+        ctrl: true,
+        alt: false,
+    }
+}
+
+const fn alt_code(code: KeyCode) -> Chord {
+    Chord {
+        code,
+        ctrl: false,
+        alt: true,
     }
 }
 
@@ -177,6 +201,9 @@ pub enum Context {
     /// off, the binding is removed from dispatch so the key isn't swallowed by
     /// a dead action; help and the command palette skip it separately.
     UnreadEnabled,
+    /// Rows can be arranged by hand. Under a computed sort the action still resolves, so
+    /// the keys are not silently swallowed by cursor movement: it explains itself instead.
+    CustomSortable,
 }
 
 /// Help-overlay section. Ordering mirrors `components/help.rs`.
@@ -219,11 +246,15 @@ pub struct Ctx {
 }
 
 fn chord_matches(c: &Chord, key: &KeyEvent) -> bool {
-    // Match the Ctrl modifier exactly: a non-ctrl chord must NOT fire when
-    // Ctrl is held. Otherwise `k('q')` would also match Ctrl+Q (reserved for
-    // exiting live-send mode, #1569) and `k('d')` would match Ctrl+D, letting
-    // a modified chord trigger a bare-letter action.
-    key.code == c.code && key.modifiers.contains(KeyModifiers::CONTROL) == c.ctrl
+    // Match the Ctrl and Alt modifiers exactly: a bare chord must NOT fire
+    // when Ctrl or Alt is held. Otherwise `k('q')` would also match Ctrl+Q
+    // (reserved for exiting live-send mode, #1569) and `k('d')` would match
+    // Ctrl+D, letting a modified chord trigger a bare-letter action. The Alt
+    // term is what keeps Alt+Up/Alt+Down (the custom-sort reorder chords) from
+    // also firing on the unmodified arrows.
+    key.code == c.code
+        && key.modifiers.contains(KeyModifiers::CONTROL) == c.ctrl
+        && key.modifiers.contains(KeyModifiers::ALT) == c.alt
 }
 
 fn context_holds(context: Context, ctx: &Ctx) -> bool {
@@ -237,6 +268,7 @@ fn context_holds(context: Context, ctx: &Ctx) -> bool {
         Context::SearchActive => ctx.has_search,
         Context::ProjectGroupSelected => ctx.project_group_selected,
         Context::UnreadEnabled => crate::session::unread_enabled(),
+        Context::CustomSortable => true,
     }
 }
 
@@ -369,7 +401,11 @@ pub fn parse_chord(s: &str) -> Option<Chord> {
             .and_then(|n| n.parse::<u8>().ok())?;
         KeyCode::F(n)
     };
-    Some(Chord { code, ctrl })
+    Some(Chord {
+        code,
+        ctrl,
+        alt: false,
+    })
 }
 
 /// Whether a core binding already claims `chord` in either mode. Used by
@@ -395,11 +431,23 @@ pub fn label(id: ActionId, strict: bool) -> String {
 }
 
 fn format_chord(c: &Chord) -> String {
-    match c.code {
-        KeyCode::Char(ch) if c.ctrl => format!("Ctrl+{}", ch.to_ascii_uppercase()),
-        KeyCode::Char(ch) => ch.to_string(),
+    let key = match c.code {
+        KeyCode::Char(ch) => ch.to_ascii_uppercase().to_string(),
         KeyCode::F(n) => format!("F{n}"),
-        _ => String::new(),
+        KeyCode::Up => "Up".to_string(),
+        KeyCode::Down => "Down".to_string(),
+        KeyCode::Left => "Left".to_string(),
+        KeyCode::Right => "Right".to_string(),
+        _ => return String::new(),
+    };
+    // A bare letter keeps its lone-character form; every modified chord is spelled out, or
+    // the help overlay and the palette show the new arrow bindings with no key at all.
+    match (c.ctrl, c.alt, c.code) {
+        (false, false, KeyCode::Char(ch)) => ch.to_string(),
+        (true, true, _) => format!("Ctrl+Alt+{key}"),
+        (true, false, _) => format!("Ctrl+{key}"),
+        (false, true, _) => format!("Alt+{key}"),
+        (false, false, _) => key,
     }
 }
 
@@ -417,6 +465,67 @@ pub static BINDINGS: &[Binding] = &[
         context: Context::SearchActive,
         help: None,
         palette: None,
+    },
+    // --- manual row ordering (Custom sort) ---
+    Binding {
+        id: ActionId::MoveRowUp,
+        non_strict: &[ctrl_code(KeyCode::Up)],
+        strict: &[ctrl_code(KeyCode::Up)],
+        context: Context::CustomSortable,
+        help: Some(HelpMeta {
+            section: HelpSection::Actions,
+            desc: "Move row up (Custom sort)",
+        }),
+        palette: Some(PaletteMeta {
+            title: "Move row up",
+            keywords: &["order", "reorder", "move", "up"],
+            group: PaletteGroup::Actions,
+        }),
+    },
+    Binding {
+        id: ActionId::MoveRowDown,
+        non_strict: &[ctrl_code(KeyCode::Down)],
+        strict: &[ctrl_code(KeyCode::Down)],
+        context: Context::CustomSortable,
+        help: Some(HelpMeta {
+            section: HelpSection::Actions,
+            desc: "Move row down (Custom sort)",
+        }),
+        palette: Some(PaletteMeta {
+            title: "Move row down",
+            keywords: &["order", "reorder", "move", "down"],
+            group: PaletteGroup::Actions,
+        }),
+    },
+    Binding {
+        id: ActionId::JumpPrevFinished,
+        non_strict: &[alt_code(KeyCode::Up)],
+        strict: &[alt_code(KeyCode::Up)],
+        context: Context::Always,
+        help: Some(HelpMeta {
+            section: HelpSection::Attention,
+            desc: "Previous just-finished session",
+        }),
+        palette: Some(PaletteMeta {
+            title: "Previous just-finished session",
+            keywords: &["finished", "done", "idle", "jump", "prev"],
+            group: PaletteGroup::Actions,
+        }),
+    },
+    Binding {
+        id: ActionId::JumpNextFinished,
+        non_strict: &[alt_code(KeyCode::Down)],
+        strict: &[alt_code(KeyCode::Down)],
+        context: Context::Always,
+        help: Some(HelpMeta {
+            section: HelpSection::Attention,
+            desc: "Next just-finished session",
+        }),
+        palette: Some(PaletteMeta {
+            title: "Next just-finished session",
+            keywords: &["finished", "done", "idle", "jump", "next"],
+            group: PaletteGroup::Actions,
+        }),
     },
     // --- attention-sort triage ---
     Binding {
@@ -1039,6 +1148,10 @@ pub fn palette_id(id: ActionId) -> &'static str {
         ActionId::Restart => "restart",
         ActionId::ToggleArchive => "archive",
         ActionId::ToggleFavorite => "favorite",
+        ActionId::MoveRowUp => "move row up",
+        ActionId::MoveRowDown => "move row down",
+        ActionId::JumpPrevFinished => "previous working or just-finished session",
+        ActionId::JumpNextFinished => "next working or just-finished session",
         ActionId::ToggleSnooze => "snooze",
         ActionId::ToggleUnread => "toggle-unread",
         ActionId::TogglePreviewInfo => "toggle-preview-info",
@@ -1086,7 +1199,13 @@ mod tests {
 
     #[test]
     fn parse_chord_accepts_ctrl_or_bare_keys_only() {
-        let chord = |code, ctrl| Some(Chord { code, ctrl });
+        let chord = |code, ctrl| {
+            Some(Chord {
+                code,
+                ctrl,
+                alt: false,
+            })
+        };
         let cases = [
             ("Ctrl+K", chord(KeyCode::Char('k'), true)),
             ("Shift+D", chord(KeyCode::Char('D'), false)),
@@ -1113,7 +1232,8 @@ mod tests {
         assert!(core_shadows(&parse_chord("q").unwrap()));
         assert!(!core_shadows(&Chord {
             code: KeyCode::Char('z'),
-            ctrl: true
+            ctrl: true,
+            alt: false
         }));
         let c = ctx();
         assert_eq!(
@@ -1333,5 +1453,22 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Modified chords spell out their key: without this the arrow bindings reach help and
+    /// the palette with an empty label, which is how they were invisible when first added.
+    #[test]
+    fn modified_chords_render_a_visible_key_label() {
+        for (id, expected) in [
+            (ActionId::MoveRowUp, "Ctrl+Up"),
+            (ActionId::MoveRowDown, "Ctrl+Down"),
+            (ActionId::JumpPrevFinished, "Alt+Up"),
+            (ActionId::JumpNextFinished, "Alt+Down"),
+        ] {
+            for strict in [false, true] {
+                assert_eq!(label(id, strict), expected, "{id:?} strict={strict}");
+            }
+        }
+        assert_eq!(label(ActionId::ToggleFavorite, false), "f");
     }
 }

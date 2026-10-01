@@ -334,6 +334,8 @@ pub(super) fn decrement_reported_count(counter: &std::sync::atomic::AtomicU32, r
         return;
     }
     use std::sync::atomic::Ordering;
+    // `try_update` needs Rust 1.99; this keeps the 1.85 MSRV and the Nix toolchain building.
+    #[allow(deprecated)]
     let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
         Some(current.saturating_sub(reported))
     });
