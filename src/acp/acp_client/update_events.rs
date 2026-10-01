@@ -126,9 +126,10 @@ fn wake_tool_event(
     }
 }
 
-/// The wire string for a notice severity. An unrecognized level is carried
-/// through verbatim rather than flattened, so a future ACP level still reaches
-/// the surfaces intact.
+/// The wire string for a notice severity. An unknown level deserializes into
+/// `Other` and is carried through verbatim, so a future ACP level still reaches
+/// the surfaces intact; the wildcard only covers a variant upstream names
+/// later, which reads as advisory until it is mapped here.
 fn notice_severity_str(severity: &NoticeSeverity) -> &str {
     match severity {
         NoticeSeverity::Info => "info",
