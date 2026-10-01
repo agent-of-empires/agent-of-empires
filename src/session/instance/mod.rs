@@ -320,6 +320,9 @@ pub struct Instance {
     pub base_branch_override: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub color: Option<String>,
+    /// Position within its group under `SortOrder::Custom`. `None` sorts last.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sort_index: Option<u32>,
     #[serde(default, skip_serializing_if = "View::is_terminal")]
     pub view: View,
     #[serde(default, skip_serializing_if = "Option::is_none")]

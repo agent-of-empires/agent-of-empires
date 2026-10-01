@@ -353,7 +353,7 @@ fn fork_from_refusals_persist_nothing() {
 
         let stderr = h.run_cli_err(&args);
         assert!(
-            stderr.contains(&expect),
+            stderr.contains(expect),
             "{args:?}: expected {expect:?} in:\n{stderr}"
         );
         assert_not_persisted(&h, "Child");

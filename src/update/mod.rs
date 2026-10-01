@@ -399,7 +399,7 @@ mod tests {
         assert_eq!(classify_update_status("1.2.3", Some("1.3.0")), MinorBehind);
         assert_eq!(classify_update_status("1.2.3", Some("2.0.0")), MajorBehind);
 
-        let releases = vec![
+        let releases = [
             make_release("1.3.0"),
             make_release("1.2.5"),
             make_release("1.2.3"),

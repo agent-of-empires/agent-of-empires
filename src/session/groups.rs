@@ -240,6 +240,35 @@ impl GroupTree {
         self.groups_by_path.contains_key(path)
     }
 
+    /// Move `path` one slot toward the start (`delta < 0`) or end (`delta > 0`) among the
+    /// groups sharing its parent, which is the order `get_all_groups` and therefore
+    /// `groups.json` preserve. Returns false when it is already at that end, or unknown.
+    pub fn move_group(&mut self, path: &str, delta: isize) -> bool {
+        let parent = |p: &str| p.rsplit_once('/').map(|(head, _)| head.to_string());
+        let Some(anchor_parent) = self.groups_by_path.get(path).map(|_| parent(path)) else {
+            return false;
+        };
+        let siblings: Vec<usize> = self
+            .insertion_order
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| parent(p) == anchor_parent)
+            .map(|(idx, _)| idx)
+            .collect();
+        let Some(at) = siblings
+            .iter()
+            .position(|idx| self.insertion_order[*idx] == path)
+        else {
+            return false;
+        };
+        let Some(target) = at.checked_add_signed(delta).filter(|t| *t < siblings.len()) else {
+            return false;
+        };
+        self.insertion_order.swap(siblings[at], siblings[target]);
+        self.rebuild_tree();
+        true
+    }
+
     pub fn get_all_groups(&self) -> Vec<Group> {
         // Return in insertion order so groups.json preserves creation order
         self.insertion_order
@@ -396,7 +425,11 @@ where
     match sort_order {
         SortOrder::AZ => items.sort_by_key(|a| key(a).to_lowercase()),
         SortOrder::ZA => items.sort_by_key(|b| std::cmp::Reverse(key(b).to_lowercase())),
-        SortOrder::Newest | SortOrder::Oldest | SortOrder::LastActivity | SortOrder::Attention => {}
+        SortOrder::Newest
+        | SortOrder::Oldest
+        | SortOrder::LastActivity
+        | SortOrder::Attention
+        | SortOrder::Custom => {}
     }
 }
 
@@ -418,6 +451,12 @@ fn sort_sessions_inner(sessions: &mut [&Instance], sort_order: SortOrder, favori
             return;
         }
         SortOrder::AZ | SortOrder::ZA => sort_by_name(sessions, sort_order, |i| &i.title),
+        SortOrder::Custom => {
+            // The user placed these rows by hand; nothing else may reorder them,
+            // not even the favorites pass. Sessions never moved sort last, newest first.
+            sessions.sort_by_key(|i| (i.sort_index.unwrap_or(u32::MAX), Reverse(i.created_at)));
+            return;
+        }
     }
     if favorites_first {
         sessions.sort_by_key(|i| !is_live_favorite(i));
@@ -479,6 +518,8 @@ fn sort_groups_inner<T, N, P, A>(
             return;
         }
         SortOrder::AZ | SortOrder::ZA => sort_by_name(items, sort_order, name),
+        // Groups arrive in `groups.json` order, which is what the user arranged.
+        SortOrder::Custom => return,
     }
     if favorites_first {
         items.sort_by_key(|g| !has_live_favorite(path(g), instances));
@@ -731,7 +772,11 @@ pub fn flatten_tree_all_profiles(
 
     // Collect and flatten groups from all profiles at depth 0
     let mut all_roots: Vec<(&str, &Group, Vec<Instance>)> = Vec::new();
-    for (profile_name, tree) in group_trees {
+    // Iterating the map directly would order the profile blocks differently on every rebuild
+    // under Custom, which keeps whatever order it is handed.
+    let mut profiles: Vec<(&String, &GroupTree)> = group_trees.iter().collect();
+    profiles.sort_by(|a, b| a.0.cmp(b.0));
+    for (profile_name, tree) in profiles {
         let profile_instances: Vec<Instance> = instances
             .iter()
             .filter(|i| i.source_profile == *profile_name)
@@ -762,9 +807,13 @@ pub fn flatten_tree_all_profiles(
         SortOrder::AZ | SortOrder::ZA => {
             sort_by_name(&mut all_roots, sort_order, |(_, g, _)| &*g.name)
         }
+        // Groups keep the order the user arranged; see `sort_groups_inner`.
+        SortOrder::Custom => {}
     }
     // Favorites-first second pass, matching `sort_groups_inner`.
-    if sort_order != SortOrder::Attention && crate::session::favorites_first() {
+    if !matches!(sort_order, SortOrder::Attention | SortOrder::Custom)
+        && crate::session::favorites_first()
+    {
         all_roots.sort_by_key(|(_, g, insts)| !has_live_favorite(&g.path, insts));
     }
 
@@ -1044,7 +1093,7 @@ fn sort_archived_project_buckets(buckets: &mut [(String, Vec<&Instance>)], sort_
                     .unwrap_or(DateTime::<Utc>::MAX_UTC)
             });
         }
-        SortOrder::Newest | SortOrder::Attention => {
+        SortOrder::Custom | SortOrder::Newest | SortOrder::Attention => {
             buckets.sort_by_key(|(_, sessions)| {
                 Reverse(
                     sessions
@@ -1119,6 +1168,55 @@ mod tests {
 
     fn titles<'a>(sessions: &[&'a Instance]) -> Vec<&'a str> {
         sessions.iter().map(|i| i.title.as_str()).collect()
+    }
+
+    /// Under `SortOrder::Custom` a session's stored `sort_index` is the whole order, and a
+    /// session that was never moved sorts behind every session that was.
+    #[test]
+    fn custom_sort_follows_sort_index_then_unplaced() {
+        let mut placed_second = inst("b", "work");
+        placed_second.sort_index = Some(1);
+        let mut placed_first = inst("a", "work");
+        placed_first.sort_index = Some(0);
+        let unplaced = inst("c", "work");
+        let instances = [placed_second, placed_first, unplaced];
+
+        let mut refs: Vec<&Instance> = instances.iter().collect();
+        sort_sessions_inner(&mut refs, SortOrder::Custom, true);
+
+        let titles: Vec<&str> = refs.iter().map(|i| i.title.as_str()).collect();
+        assert_eq!(titles, ["a", "b", "c"]);
+    }
+
+    /// Moving a group swaps it with the sibling on that side and leaves every other group
+    /// where it was; a group already at the end it is moving toward does not move at all.
+    #[test]
+    fn move_group_permutes_siblings_only() {
+        let instances = vec![
+            inst("s1", "alpha"),
+            inst("s2", "beta"),
+            inst("s3", "gamma"),
+            inst("s4", "beta/nested"),
+        ];
+        let mut tree = GroupTree::new_with_groups(&instances, &[]);
+        let paths = |t: &GroupTree| -> Vec<String> {
+            t.get_all_groups().into_iter().map(|g| g.path).collect()
+        };
+        assert_eq!(paths(&tree), ["alpha", "beta", "gamma", "beta/nested"]);
+
+        assert!(tree.move_group("gamma", -1));
+        assert_eq!(paths(&tree), ["alpha", "gamma", "beta", "beta/nested"]);
+
+        assert!(
+            !tree.move_group("alpha", -1),
+            "already first among its siblings"
+        );
+        assert!(
+            !tree.move_group("beta/nested", 1),
+            "only child of its parent"
+        );
+        assert!(!tree.move_group("missing", 1));
+        assert_eq!(paths(&tree), ["alpha", "gamma", "beta", "beta/nested"]);
     }
 
     #[test]
