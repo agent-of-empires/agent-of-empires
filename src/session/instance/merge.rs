@@ -581,6 +581,64 @@ mod tests {
         }
     }
 
+    /// A drag under `SortOrder::Custom` rewrites `sort_index`: the reorder writes a position
+    /// for every row in the new order, so the dragged row and every row it passes shift.
+    /// The `sort_index` arm is what carries that rewrite onto the locked disk row; drop it
+    /// and the persisted order silently reverts on the next load while the TUI keeps
+    /// drawing the dragged one.
+    ///
+    /// Exercised at the splice level, not through the drag: `reorder.rs` writes through
+    /// `Storage::update`, so this covers the merge the storage layer would fall back to.
+    /// The `pre != post` guard is the other half of the arm — a row the action left alone
+    /// keeps disk's own index, so the merge neither places an unplaced row nor erases an
+    /// index a peer placed while the action was renaming it.
+    #[test]
+    fn user_action_diff_splices_sort_index_only_when_the_action_moved_it() {
+        fn placed(id: &str, sort_index: Option<u32>) -> Instance {
+            let mut instance = Instance::new(id, "/tmp/x");
+            instance.sort_index = sort_index;
+            instance
+        }
+        // (label, on disk, pre snapshot, post snapshot, expected on disk)
+        for (label, disk_index, pre_index, post_index, expected) in [
+            (
+                "dragged below its sibling",
+                Some(0),
+                Some(0),
+                Some(1),
+                Some(1),
+            ),
+            (
+                "shifted up past the drag",
+                Some(1),
+                Some(1),
+                Some(0),
+                Some(0),
+            ),
+            ("never moved, never placed", None, None, None, None),
+            (
+                "peer drag lands while the action renames it",
+                Some(4),
+                None,
+                None,
+                Some(4),
+            ),
+        ] {
+            let pre = placed(label, pre_index);
+            let mut post = pre.clone();
+            post.sort_index = post_index;
+            let mut disk = pre.clone();
+            disk.sort_index = disk_index;
+            // The action's own edit is the index alone. A peer renamed the row on disk
+            // between the pre snapshot and the merge; the diff guard must leave that
+            // rename alone rather than treat the whole post snapshot as authoritative.
+            disk.title = "peer rename".to_string();
+            disk.merge_user_action_diff(&pre, &post);
+            assert_eq!(disk.sort_index, expected, "{label}");
+            assert_eq!(disk.title, "peer rename", "{label}: peer title survives");
+        }
+    }
+
     #[test]
     fn archive_through_every_merge_settles_live_status() {
         for status in [Status::Running, Status::Waiting, Status::Starting] {

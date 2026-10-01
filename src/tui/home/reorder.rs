@@ -41,6 +41,16 @@ impl HomeView {
     /// its parent. Refuses where a move would be discarded or would write a membership the
     /// list is not showing.
     pub(super) fn move_row_at_cursor(&mut self, delta: isize) -> anyhow::Result<()> {
+        // Every path below renumbers `sort_index` on disk or rewrites the stored group
+        // order, and neither rides the wire: `SessionResponse` carries `group_path` and
+        // nothing more, so a runtime that owns these rows never learns this process
+        // reordered them and republishes the order it still holds. The local gate is
+        // therefore the only barrier here, and it belongs before the move is computed:
+        // `sort_order` is read from the store, and the list is rebuilt from it after.
+        if let Some(reason) = self.local_write_block() {
+            self.refuse_local_write(reason);
+            return Ok(());
+        }
         if self.sort_order != SortOrder::Custom {
             self.flash_status("Press o for the Custom sort to arrange rows by hand");
             return Ok(());
@@ -277,6 +287,13 @@ impl HomeView {
         id: &str,
         delta: isize,
     ) -> anyhow::Result<()> {
+        // A second entry point of its own: a move that lands on a group boundary runs
+        // its own transaction from here, so the same gate is consulted at the same point
+        // rather than relying on the caller above.
+        if let Some(reason) = self.local_write_block() {
+            self.refuse_local_write(reason);
+            return Ok(());
+        }
         let Some((current, profile)) = self
             .instances
             .get(id)
@@ -466,6 +483,160 @@ impl HomeView {
 #[cfg(test)]
 mod tests {
     use super::group_contains;
+    use super::*;
+    use crate::session::test_support::{isolate_app_dir_at, AppDirGuard};
+    use crate::session::{GroupTree, Storage};
+    use crate::tmux::AvailableTools;
+    use crate::tui::dialogs::InfoDialog;
+    use crate::tui::session_feed::SidebarSource;
+    use serial_test::serial;
+    use tempfile::TempDir;
+
+    /// A one-profile view whose rows and groups are already on disk, with the
+    /// runtime attached the way a feed's first snapshot attaches it: that
+    /// transition is what makes the runtime the owner of these rows. The temp
+    /// dir and its guard are held by the fixture, because every storage write
+    /// under test has to land inside them.
+    struct AttachedRuntime {
+        _temp: TempDir,
+        _guard: AppDirGuard,
+        view: HomeView,
+        /// The seeded rows' ids, in the order they were written.
+        ids: Vec<String>,
+    }
+
+    /// Seed `labels` as rows numbered by their position, each filed under
+    /// `groups[at % groups.len()]`, and hand back a view arranging them by hand.
+    fn attached_runtime_view(labels: &[&str], groups: &[&str]) -> AttachedRuntime {
+        let temp = TempDir::new().unwrap();
+        let guard = isolate_app_dir_at(temp.path());
+        let instances: Vec<Instance> = labels
+            .iter()
+            .enumerate()
+            .map(|(at, label)| {
+                let mut inst = Instance::new(label, &format!("/tmp/{label}"));
+                inst.group_path = groups[at % groups.len()].to_string();
+                inst.sort_index = Some(at as u32);
+                inst
+            })
+            .collect();
+        let disk_groups = GroupTree::new_with_groups(&instances, &[]).get_all_groups();
+        Storage::new_unwatched("test")
+            .unwrap()
+            .update(|rows, disk| {
+                *rows = instances.clone();
+                *disk = disk_groups.clone();
+                Ok(())
+            })
+            .unwrap();
+
+        let mut view = HomeView::new_for_test(
+            Some("test".to_string()),
+            AvailableTools::with_tools(&["claude"]),
+            crate::file_watch::FileWatchService::noop(),
+        )
+        .unwrap();
+        // `new_for_test` labels the source Daemon without going through the
+        // transition, so drive the transition a real connection drives. The
+        // feed is never connected here: this is a runtime that published rows
+        // and does not take mutations back.
+        view.set_sidebar_source(SidebarSource::Disconnected, Some("fixture"));
+        view.set_sidebar_source(SidebarSource::Daemon, None);
+        view.sort_order = SortOrder::Custom;
+        view.group_by = GroupByMode::Manual;
+        view.flat_items = view.build_flat_items();
+        AttachedRuntime {
+            _temp: temp,
+            _guard: guard,
+            ids: instances.iter().map(|i| i.id.clone()).collect(),
+            view,
+        }
+    }
+
+    /// What `sessions.json` carries: each row's id against its stored index.
+    fn disk_order() -> Vec<(String, Option<u32>)> {
+        let mut rows: Vec<(String, Option<u32>)> = Storage::new_unwatched("test")
+            .unwrap()
+            .load()
+            .unwrap()
+            .into_iter()
+            .map(|inst| (inst.id, inst.sort_index))
+            .collect();
+        rows.sort();
+        rows
+    }
+
+    /// The stored group order, which `groups.json` keeps as creation order.
+    fn disk_group_paths() -> Vec<String> {
+        Storage::new_unwatched("test")
+            .unwrap()
+            .load_with_groups()
+            .unwrap()
+            .1
+            .into_iter()
+            .map(|group| group.path)
+            .collect()
+    }
+
+    fn refusal(view: &HomeView) -> &InfoDialog {
+        view.info_dialog
+            .as_ref()
+            .expect("the refusal reaches the operator")
+    }
+
+    /// A row's position is `sort_index`, and it rides on no mutation: the wire
+    /// carries `group_path` alone, and the rows are reloaded from the store
+    /// rather than from the projection. A runtime that owns them therefore
+    /// never sees a mirror reorder, and republishes the order it still holds —
+    /// so the local gate is the only thing between `Ctrl+Down` and a
+    /// second writer, exactly as it is for the favorite row.
+    #[test]
+    #[serial]
+    fn a_row_move_is_refused_while_the_runtime_owns_the_rows() {
+        let mut fixture =
+            attached_runtime_view(&["alpha-one", "beta-two", "gamma-three"], &["work"]);
+        fixture.view.selected_group = None;
+        fixture.view.selected_session = Some(fixture.ids[1].clone());
+        let before = disk_order();
+
+        fixture.view.move_row_at_cursor(1).unwrap();
+
+        assert_eq!(
+            disk_order(),
+            before,
+            "sessions.json was renumbered behind the runtime"
+        );
+        assert_eq!(refusal(&fixture.view).title(), "Read-only");
+        assert_eq!(
+            refusal(&fixture.view).message(),
+            "The runtime is read-only or unreachable, so this process may not write session or group data locally"
+        );
+    }
+
+    /// The same gate on the group header: a group's position in `groups.json`
+    /// is this process's too, and the runtime publishes its own.
+    #[test]
+    #[serial]
+    fn a_group_move_is_refused_while_the_runtime_owns_the_rows() {
+        let mut fixture = attached_runtime_view(&["a1", "b1"], &["aaa", "bbb"]);
+        fixture.view.selected_session = None;
+        fixture.view.selected_group = Some("aaa".to_string());
+        assert_eq!(
+            disk_group_paths(),
+            ["aaa", "bbb"],
+            "the fixture must start on a group a move can displace"
+        );
+        let before = disk_group_paths();
+
+        fixture.view.move_row_at_cursor(1).unwrap();
+
+        assert_eq!(
+            disk_group_paths(),
+            before,
+            "groups.json was reordered behind the runtime"
+        );
+        assert_eq!(refusal(&fixture.view).title(), "Read-only");
+    }
 
     /// Membership is decided on whole path components: a session in `ab` does not keep a
     /// deleted `a` alive, while one in `a/b` does.
