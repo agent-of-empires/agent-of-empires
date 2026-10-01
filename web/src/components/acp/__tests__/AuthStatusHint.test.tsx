@@ -54,5 +54,8 @@ describe("AuthStatusHint", () => {
     expect(el.textContent).not.toContain("someone@example.com");
     expect(el.textContent).not.toContain("Acme");
     expect(el.getAttribute("aria-label")).toContain("someone@example.com");
+    // Named and focusable, so keyboard and screen reader users reach the details.
+    expect(screen.getByRole("img", { name: /someone@example\.com/ })).toBe(el);
+    expect(el.tabIndex).toBe(0);
   });
 });

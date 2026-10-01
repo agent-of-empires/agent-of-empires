@@ -305,6 +305,8 @@ export function AuthStatusHint({ authStatus }: { authStatus: AcpState["authStatu
       <span
         data-testid="composer-auth-status"
         data-auth-kind={authStatus.kind}
+        role="img"
+        tabIndex={0}
         className={`inline-flex max-w-[12rem] items-center gap-1 truncate text-[11px] ${loggedOut ? "text-rose-400" : "text-text-dim"}`}
         aria-label={explanation}
       >
