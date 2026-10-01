@@ -24,8 +24,6 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         // Static segment; registered before /api/sessions/{id} so the
         // literal "search" never resolves as a session id. See #2515.
         .route("/api/sessions/search", get(api::search_sessions))
-        // Also a static segment, and for the same reason: "create-progress" is a
-        // literal that must not resolve as a session id.
         .route(
             "/api/sessions/create-progress/{key}",
             get(api::create_session_progress),
