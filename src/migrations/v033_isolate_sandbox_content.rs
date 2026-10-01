@@ -1025,6 +1025,35 @@ fn ordinary_mount_masks_bind(inspected: &crate::containers::InspectedContainer) 
     })
 }
 
+/// Whether a bind's in-container `stat -L` line (`dev:ino:links:hexmode`)
+/// matches the host source it declares, which must hold still across the probe.
+///
+/// A file source replaced by rename (#4224) leaves the bind on the old inode.
+/// That mount is still accepted when it is an unlinked regular file on the
+/// source's device: with no name left anywhere, it cannot be or contain any
+/// part of the recovery namespace.
+fn bind_identifies_mount(line: Option<&str>, before: (u64, u64), after: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let observed = line.and_then(|line| {
+        let mut fields = line.split(':');
+        let stat = (
+            fields.next()?.parse::<u64>().ok()?,
+            fields.next()?.parse::<u64>().ok()?,
+            fields.next()?.parse::<u64>().ok()?,
+            u32::from_str_radix(fields.next()?, 16).ok()?,
+        );
+        fields.next().is_none().then_some(stat)
+    });
+    let Some((device, inode, links, mode)) = observed else {
+        return false;
+    };
+    // S_IFMT and S_IFREG as the container's Linux kernel reports them.
+    let regular = mode & 0o170000 == 0o100000;
+    before == (after.dev(), after.ino())
+        && ((device, inode) == before
+            || (links == 0 && regular && after.is_file() && device == before.0))
+}
+
 fn live_bind_sources(id: &str) -> Result<Vec<PathBuf>> {
     use std::os::unix::fs::MetadataExt;
     let mut container = crate::containers::DockerContainer::from_session_id(id);
@@ -1072,7 +1101,7 @@ fn live_bind_sources(id: &str) -> Result<Vec<PathBuf>> {
     let mut command = vec![
         "/bin/sh".to_owned(),
         "-c".to_owned(),
-        r#"PATH=/usr/bin:/bin; export PATH; stat -f -c %t /proc/sys/kernel/random/boot_id && cat /proc/sys/kernel/random/boot_id && stat -L -c %d:%i -- "$@""#.to_owned(),
+        r#"PATH=/usr/bin:/bin; export PATH; stat -f -c %t /proc/sys/kernel/random/boot_id && cat /proc/sys/kernel/random/boot_id && stat -L -c %d:%i:%h:%f -- "$@""#.to_owned(),
         "aoe-content-mount-proof".to_owned(),
     ];
     command.extend(
@@ -1109,16 +1138,8 @@ fn live_bind_sources(id: &str) -> Result<Vec<PathBuf>> {
     {
         return Ok(sources);
     }
-    for (source, expected) in sources.iter().zip(before) {
-        let observed =
-            lines
-                .next()
-                .and_then(|line| line.split_once(':'))
-                .and_then(|(device, inode)| {
-                    Some((device.parse::<u64>().ok()?, inode.parse::<u64>().ok()?))
-                });
-        let after = fs::metadata(source)?;
-        if observed != Some(expected) || expected != (after.dev(), after.ino()) {
+    for (source, before) in sources.iter().zip(before) {
+        if !bind_identifies_mount(lines.next(), before, &fs::metadata(source)?) {
             bail!("live sandbox {id} source spelling does not identify its actual mount; defer native content isolation");
         }
     }
@@ -2730,6 +2751,99 @@ mod tests {
         ));
         assert!(!can_prove_mounts(&inspected(true, None), false));
         assert!(!can_prove_mounts(&inspected(false, None), true));
+    }
+
+    /// #4224: Claude Code saves `$CLAUDE_CONFIG_DIR/.claude.json` by rename, so
+    /// the separate `~/.claude.json` file bind keeps the deleted old inode. An
+    /// open handle stands in for the container's view of that bind.
+    #[test]
+    fn a_bind_proves_only_its_source_or_an_unlinked_replaced_file() {
+        use std::os::unix::fs::MetadataExt;
+        let line = |metadata: &fs::Metadata| {
+            format!(
+                "{}:{}:{}:{:x}",
+                metadata.dev(),
+                metadata.ino(),
+                metadata.nlink(),
+                metadata.mode()
+            )
+        };
+        let key = |metadata: &fs::Metadata| (metadata.dev(), metadata.ino());
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join(".claude.json");
+        let replace = |content: &str| {
+            let staged = temporary.path().join("staged");
+            fs::write(&staged, content).unwrap();
+            fs::rename(&staged, &source).unwrap();
+        };
+
+        fs::write(&source, "{}").unwrap();
+        let mounted = fs::File::open(&source).unwrap();
+        let current = fs::metadata(&source).unwrap();
+        assert!(bind_identifies_mount(
+            Some(&line(&current)),
+            key(&current),
+            &current
+        ));
+        for malformed in [None, Some("1:2"), Some("1:2:0"), Some("1:2:0:81a4:x")] {
+            assert!(!bind_identifies_mount(malformed, key(&current), &current));
+        }
+
+        replace(r#"{"saved":true}"#);
+        let replaced = fs::metadata(&source).unwrap();
+        let stale = mounted.metadata().unwrap();
+        assert_eq!(stale.nlink(), 0);
+        assert!(bind_identifies_mount(
+            Some(&line(&stale)),
+            key(&replaced),
+            &replaced
+        ));
+        // The host spelling must still hold still across the probe.
+        assert!(!bind_identifies_mount(
+            Some(&line(&stale)),
+            key(&stale),
+            &replaced
+        ));
+
+        // A replaced file whose old inode is still linked elsewhere, possibly
+        // inside the recovery namespace, is not proved clear.
+        fs::write(&source, "{}").unwrap();
+        let retained = temporary.path().join("retained");
+        fs::hard_link(&source, &retained).unwrap();
+        replace("{}");
+        let replaced = fs::metadata(&source).unwrap();
+        assert!(!bind_identifies_mount(
+            Some(&line(&fs::metadata(&retained).unwrap())),
+            key(&replaced),
+            &replaced
+        ));
+
+        // Only a regular file qualifies: a directory mount is never excused.
+        let directory = fs::metadata(temporary.path()).unwrap();
+        let unlinked_directory = format!(
+            "{}:{}:0:{:x}",
+            directory.dev(),
+            directory.ino(),
+            directory.mode()
+        );
+        assert!(!bind_identifies_mount(
+            Some(&unlinked_directory),
+            key(&replaced),
+            &replaced
+        ));
+        // Nor is a deleted file on another device, or excused for a source
+        // that is no longer a regular file.
+        let foreign = format!("{}:{}:0:{:x}", stale.dev() + 1, stale.ino(), stale.mode());
+        assert!(!bind_identifies_mount(
+            Some(&foreign),
+            key(&replaced),
+            &replaced
+        ));
+        assert!(!bind_identifies_mount(
+            Some(&line(&stale)),
+            key(&directory),
+            &directory
+        ));
     }
 
     #[test]

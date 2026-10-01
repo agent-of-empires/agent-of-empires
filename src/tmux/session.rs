@@ -4553,10 +4553,14 @@ mod tests {
                 &[&["split-window", "-v"], &["split-window", "-v"]],
             ),
         ];
+        // Killing the only session makes the server exit, racing the next
+        // new-session; hold every guard until the test ends.
+        let mut guards = Vec::new();
         for (name, splits) in layouts {
             let guard = TmuxTestSession::new(name);
             let session =
                 start_composite_session(guard.name(), 80, 24, "sh -c 'printf MARKER; sleep 60'");
+            guards.push(guard);
             for args in splits {
                 let status = crate::tmux::tmux_command()
                     .args(args.iter().copied().chain(["-t", session.name.as_str()]))
