@@ -1313,7 +1313,17 @@ pub async fn create_session(
 /// caller resubmits with the same key.
 fn create_failure(e: &anyhow::Error) -> Option<crate::server::create_progress::CreateFailure> {
     use crate::server::create_progress::CreateFailure;
-    if e.downcast_ref::<HooksNeedTrust>().is_some() {
+    // A refusal the caller corrects and resends under the same idempotency key must not
+    // be frozen into the replay map: recording it would make every later attempt on that
+    // key short-circuit on the first refusal for a whole FAILURE_TTL. `HooksNeedTrust` is
+    // the same contract, and so is each refusal this branch added.
+    if e.downcast_ref::<HooksNeedTrust>().is_some()
+        || e.downcast_ref::<CreationTrustChanged>().is_some()
+        || e.downcast_ref::<crate::server::session_service::CreationCancelled>()
+            .is_some()
+        || e.downcast_ref::<crate::session::NativeStoreUnavailable>()
+            .is_some()
+    {
         return None;
     }
     // A build-task panic keeps its 500; a plain build failure is a 400.

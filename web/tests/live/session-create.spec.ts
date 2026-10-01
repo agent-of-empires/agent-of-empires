@@ -1,7 +1,7 @@
 // Creating sessions against a real server: the wizard, scratch sessions, the palette, directory browsing, worktrees.
 
 import { spawnSync } from "node:child_process";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import type { Locator, Page } from "@playwright/test";
 import { test, expect, type ServeHandle } from "../helpers/liveTest";

@@ -6709,6 +6709,35 @@ async fn post_create(
     (status, serde_json::from_slice(&bytes).unwrap())
 }
 
+/// [`post_create`] plus the `aoe-error-code` header, which is the only thing
+/// telling a refusal that corrects itself (`creation_trust_changed`,
+/// `creation_cancelled`) apart from an ordinary `create_failed`.
+async fn post_create_raw(
+    state: &std::sync::Arc<AppState>,
+    body: serde_json::Value,
+) -> (axum::http::StatusCode, Option<String>, serde_json::Value) {
+    use axum::response::IntoResponse;
+    let response = create_session(
+        axum::extract::State(state.clone()),
+        axum::extract::Query(CreateSessionQuery { wait: None }),
+        None,
+        Ok(axum::Json(serde_json::from_value(body).unwrap())),
+    )
+    .await
+    .into_response();
+    let status = response.status();
+    let code = response
+        .headers()
+        .get(axum::http::HeaderName::from_static(
+            crate::daemon::ERROR_CODE_HEADER,
+        ))
+        .map(|value| value.to_str().unwrap().to_string());
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (status, code, serde_json::from_slice(&bytes).unwrap())
+}
+
 async fn wait_for(what: &str, mut ready: impl FnMut() -> bool) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while !ready() {
@@ -6997,4 +7026,143 @@ async fn a_retry_across_a_restart_is_fenced_before_profile_validation() {
     assert_eq!(status, axum::http::StatusCode::CONFLICT, "{refused}");
     assert_eq!(refused["error"], "create_outcome_unknown");
     assert_eq!(effects(), 1);
+}
+
+/// A refusal the caller corrects and resends **under the same idempotency key**
+/// must never reach the replay map. `create_failure` returning `None` is what
+/// keeps such a key live; a recorded failure instead short-circuits every later
+/// attempt on that key for a whole `FAILURE_TTL`.
+///
+/// This is the web wizard's own `creation_trust_changed` recovery: it re-reviews
+/// the hooks and resubmits the same body, key included. A fresh key creates
+/// first, so a broken environment cannot be mistaken for the regression.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_trust_changed_refusal_does_not_freeze_its_idempotency_key() {
+    use crate::server::test_support as support;
+    let _home = crate::session::test_support::isolate_app_dir();
+    crate::session::config::update_app_state(|state| {
+        state.has_acknowledged_agent_hooks = true;
+    })
+    .expect("acknowledge the agent hook paths");
+    support::seed_instances_on_disk_for_test("test", Vec::new());
+    let (launcher, _launches) = support::counting_failing_launcher();
+    let state = support::build_test_app_state_with_launcher(Vec::new(), launcher);
+    support::refresh_canonical_metadata_for_test(&state).await;
+    let workspace = tempfile::tempdir().unwrap();
+    let path = workspace.path().join("stale-review");
+    std::fs::create_dir_all(&path).unwrap();
+    let body = |key: &str, reviewed: bool| {
+        let mut body = serde_json::json!({
+            "title": "stale-review", "path": path, "tool": "claude",
+            "view": "structured", "profile": "test", "trust_hooks": true,
+            "idempotency_key": key,
+        });
+        if reviewed {
+            // Re-read for every send, as `openHooksTrust` does: an approved
+            // create records the repo trust, which moves the fingerprint.
+            body["trust_review"] =
+                serde_json::to_value(reviewed_creation_trust("test", &path)).unwrap();
+        }
+        body
+    };
+
+    // The control: this environment can create at all.
+    let (created, session) = post_create(&state, body("control", true)).await;
+    assert_eq!(created, axum::http::StatusCode::CREATED, "{session}");
+
+    // Trust asked for without a review is refused, and named as such.
+    let (refused, code, body_json) = post_create_raw(&state, body("retry", false)).await;
+    assert_eq!(refused, axum::http::StatusCode::CONFLICT, "{body_json}");
+    assert_eq!(
+        code.as_deref(),
+        Some("creation_trust_changed"),
+        "{body_json}"
+    );
+
+    // The wizard re-reviewed and resent the same key. That create must run.
+    let (retried, session) = post_create(&state, body("retry", true)).await;
+    assert_eq!(
+        retried,
+        axum::http::StatusCode::CREATED,
+        "{retried} {session}"
+    );
+    assert!(
+        state.create_progress.recent_failure("retry").is_none(),
+        "a refusal the caller corrects must not occupy a replay slot"
+    );
+}
+
+/// A cancelled create is the refusal a user asked for, so its key stays live
+/// too. Each distinct cancelled key also occupies one of the registry's
+/// `MAX_FAILURES` slots for a whole `FAILURE_TTL`, and when those run out every
+/// keyed create is refused with `create_failures_full` — including the TUI's,
+/// which has no way to release one.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_cancelled_create_does_not_freeze_its_idempotency_key() {
+    use crate::server::test_support as support;
+    let _home = crate::session::test_support::isolate_app_dir();
+    crate::session::config::update_app_state(|state| {
+        state.has_acknowledged_agent_hooks = true;
+    })
+    .expect("acknowledge the agent hook paths");
+    // The refused create rolls its row back through the purge-owner registry,
+    // which a fresh app dir has not initialized, and the retry would then find
+    // that half-created row instead of running again.
+    crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+    support::seed_instances_on_disk_for_test("test", Vec::new());
+    let (launcher, _launches) = support::counting_failing_launcher();
+    let state = support::build_test_app_state_with_launcher(Vec::new(), launcher);
+    support::refresh_canonical_metadata_for_test(&state).await;
+    let gate = tempfile::tempdir().unwrap();
+    let (started, release) = (gate.path().join("started"), gate.path().join("release"));
+    let hook = format!(
+        ": > '{}'; while [ ! -e '{}' ]; do sleep 0.01; done",
+        started.display(),
+        release.display()
+    );
+    let project = project_with_on_create_hooks(&[hook.as_str()]);
+    let mut body = serde_json::json!({
+        "title": "cancelled-create", "path": project.path(), "tool": "claude",
+        "view": "structured", "profile": "test", "trust_hooks": true,
+        "trust_review": reviewed_creation_trust("test", project.path()),
+        "idempotency_key": "cancelled-create",
+    });
+    body["path"] = serde_json::to_value(project.path()).unwrap();
+
+    let create = tokio::spawn({
+        let (state, body) = (state.clone(), body.clone());
+        async move { post_create_raw(&state, body).await }
+    });
+    wait_for("the on_create hook to start", || started.exists()).await;
+
+    // The reservation is published before provisioning, and the hook running
+    // means the creation is registered, so its id addresses a live entry.
+    let reserved = {
+        let instances = state.instances.read().await;
+        instances
+            .iter()
+            .find(|row| row.idempotency_key.as_deref() == Some("cancelled-create"))
+            .map(|row| row.id.clone())
+            .expect("a reserved row carries the create's idempotency key")
+    };
+    assert!(
+        state.session_service.cancel_creation(&reserved),
+        "the in-flight creation must be cancellable"
+    );
+    std::fs::write(&release, "").unwrap();
+    let (status, code, body_json) = create.await.unwrap();
+    assert_eq!(status, axum::http::StatusCode::CONFLICT, "{body_json}");
+    assert_eq!(code.as_deref(), Some("creation_cancelled"), "{body_json}");
+
+    let (again, session) = post_create(&state, body).await;
+    assert_eq!(again, axum::http::StatusCode::CREATED, "{again} {session}");
+    assert!(
+        state
+            .create_progress
+            .recent_failure("cancelled-create")
+            .is_none(),
+        "a cancelled create must not occupy a replay slot"
+    );
 }

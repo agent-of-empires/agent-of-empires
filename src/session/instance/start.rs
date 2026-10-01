@@ -282,7 +282,7 @@ impl Instance {
         self.stop_poller();
         self.session_id_poller = None;
         if !self.is_sandboxed() {
-            self.install_agent_status_hooks(self.status_agent(), prepared.execution.as_ref());
+            self.install_agent_status_hooks(self.status_agent());
         }
         self.report_store_override(prepared.execution.as_ref());
         let canonicalized = prepared.canonical_conversation.is_some();

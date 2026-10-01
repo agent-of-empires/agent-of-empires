@@ -199,14 +199,6 @@ on_error = "notify-send -u critical -a aoe 'AoE: Error' \"$AOE_SESSION_TITLE err
 
 Commands run in the session project directory and receive context through environment variables:
 
-## Agent hook approval
-
-`agent_status_hooks` (above) makes AoE write hook entries into the agent's own config, which lives under your home directory unless `agent_config_dir`, the profile `environment`, or a config-dir variable exported in the launching shell moves it, so status comes from the agent reporting it rather than from reading its pane. That writes into files you own and runs a command whenever the agent fires a hook, so it is gated behind a one-time approval. The TUI offers it as a dialog when you create a session that writes to the host; `aoe hooks approve` is the same approval for a launch with no TUI, and `aoe hooks status` reports the current answer alongside the files and hook events the effective profile resolves. That list is a disclosure, not a manifest: a launch that routes through a native store, merges into a selected agent, or targets a selected or recorded Claude conversation store resolves its own target at launch time.
-
-The approval is per installation and is not bound to a profile, so every profile and every agent resolves its own paths under it. One agent's hooks also change launcher state: installing Kiro hooks may run `kiro-cli agent set-default aoe-hooks`, which Kiro keeps as its persistent default, so it affects later Kiro sessions including ones outside AoE. `aoe hooks status` prints that next to the files. There is no revoke command: set `has_acknowledged_agent_hooks = false` in `<app_dir>/state.toml` to take it back. A sandboxed session stages its hooks inside its own container config and is never gated. It is not the repo trust gate: `aoe add --trust-hooks` covers the hooks a repository declares in `.agent-of-empires/config.toml` and its project-local MCP servers, which are a separate decision. See [Hook trust](repo-config.md#hook-trust).
-
-Turning `agent_status_hooks` off stops AoE installing status hooks, but it does not end the gate: identity hooks, which native resume depends on, stay installed. How many agents remain gated then depends on which ones declare an identity event, so check `aoe hooks status` for the list under a given profile. A session launched with its own command resolves the file that command names, which the TUI creation dialog describes exactly. `aoe hooks status` has neither a session nor a project directory: it resolves each tool from the profile config, so for a repository that sets `session.agent_detect_as` it can name a different agent than the same session launched inside that repository.
-
 | Variable | Description |
 |----------|-------------|
 | `AOE_SESSION_ID` | Session UUID |
@@ -219,6 +211,15 @@ Turning `agent_status_hooks` off stops AoE installing status hooks, but it does 
 | `AOE_STATUS_CHANGED_AT` | Timestamp when the core observed the published transition |
 
 When both a status-specific hook and `on_change` fire, AoE runs them sequentially (status-specific first), outside session locks. Each command has a 30-second timeout and owns its process group; remaining group members are killed when it exits. Stopping the daemon cancels pending hooks and terminates running hook groups. Disabling or changing the profile hook configuration, removing a session, or moving it to another profile invalidates its debounced transition. Hooks use the session profile's effective global and profile settings, never repo config, because they run arbitrary local commands.
+
+## Agent hook approval
+
+`agent_status_hooks` (above) makes AoE write hook entries into the agent's own config, which lives under your home directory unless `agent_config_dir`, the profile `environment`, or a config-dir variable exported in the launching shell moves it, so status comes from the agent reporting it rather than from reading its pane. That writes into files you own and runs a command whenever the agent fires a hook, so it is gated behind a one-time approval. The TUI offers it as a dialog when you create a session that writes to the host; `aoe hooks approve` is the same approval for a launch with no TUI, and `aoe hooks status` reports the current answer alongside the files and hook events the effective profile resolves. That list is a disclosure, not a manifest: a launch that routes through a native store, merges into a selected agent, or targets a selected or recorded Claude conversation store resolves its own target at launch time.
+
+The approval is per installation and is not bound to a profile, so every profile and every agent resolves its own paths under it. One agent's hooks also change launcher state: installing Kiro hooks may run `kiro-cli agent set-default aoe-hooks`, which Kiro keeps as its persistent default, so it affects later Kiro sessions including ones outside AoE. `aoe hooks status` prints that next to the files. There is no revoke command: set `has_acknowledged_agent_hooks = false` in `<app_dir>/state.toml` to take it back. A sandboxed session stages its hooks inside its own container config and is never gated. It is not the repo trust gate: `aoe add --trust-hooks` covers the hooks a repository declares in `.agent-of-empires/config.toml` and its project-local MCP servers, which are a separate decision. See [Hook Trust System](repo-config.md#hook-trust-system).
+
+Turning `agent_status_hooks` off stops AoE installing status hooks, but it does not end the gate: identity hooks, which native resume depends on, stay installed. How many agents remain gated then depends on which ones declare an identity event, so check `aoe hooks status` for the list under a given profile. A session launched with its own command resolves the file that command names, which the TUI creation dialog describes exactly. `aoe hooks status` has neither a session nor a project directory: it resolves each tool from the profile config, so for a repository that sets `session.agent_detect_as` it can name a different agent than the same session launched inside that repository.
+
 
 ### Custom Agents
 
