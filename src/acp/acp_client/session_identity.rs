@@ -78,7 +78,7 @@ impl JsonRpcMessage for SessionIngressNotification {
             Self::Replayed(marker) => marker.to_untyped_message(),
             Self::PromptCompleted(marker) => marker.to_untyped_message(),
             Self::AuthStatus(status) => {
-                UntypedMessage::new(self.method(), &serde_json::json!({ "authStatus": status }))
+                UntypedMessage::new(self.method(), serde_json::json!({ "authStatus": status }))
             }
         }
     }

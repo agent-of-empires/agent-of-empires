@@ -3689,6 +3689,13 @@
       "components": ["web/src/hooks/useAcpSession.ts", "web/src/lib/acpTypes.ts", "web/src/components/acp/Composer.tsx"]
     },
     {
+      "id": "acp.auth-status",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/components/acp/__tests__/AuthStatusHint.test.tsx", "src/lib/acpTypes.test.ts"],
+      "components": ["web/src/components/acp/ComposerControls.tsx", "web/src/lib/acpTypes.ts"]
+    },
+    {
       "id": "story.wizard-open-close",
       "kind": "mocked-playwright",
       "risk": "low",
