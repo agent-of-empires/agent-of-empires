@@ -41,11 +41,12 @@ pub(super) fn take_injected_fresh_handshake_failure() -> bool {
             .unwrap_or(0);
         AtomicI64::new(n)
     });
-    remaining
-        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
-            (n > 0).then_some(n - 1)
-        })
-        .is_ok()
+    // `try_update` needs Rust 1.99; this keeps the 1.85 MSRV and the Nix toolchain building.
+    #[allow(deprecated)]
+    let claimed = remaining.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+        (n > 0).then_some(n - 1)
+    });
+    claimed.is_ok()
 }
 
 /// The runner owns the agent subprocess and outlives the daemon, so no `Child`
