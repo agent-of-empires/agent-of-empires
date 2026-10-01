@@ -394,7 +394,8 @@ impl<S: BroadcastSink> Drain<S> {
         // The hook above may re-enter aoe, so the lifecycle lock is taken only for each check.
         let admission = admit_durable_launch(session_id, config.source_profile.clone()).await;
         if let Err(refused) = admission {
-            self.refuse_respawn(&respawn_lease, None, refused).await;
+            self.refuse_respawn(&respawn_lease, previous, None, refused)
+                .await;
             return None;
         }
         if let Some((wrapper, base)) = &config.wrapper_substitution {
@@ -416,7 +417,8 @@ impl<S: BroadcastSink> Drain<S> {
                 generation: respawn_lease.epoch(),
             });
             let _ = client.shutdown().await;
-            self.refuse_respawn(&respawn_lease, identity, refused).await;
+            self.refuse_respawn(&respawn_lease, previous, identity, refused)
+                .await;
             return None;
         }
         let Some(inbound) = client.take_inbound() else {
@@ -625,10 +627,12 @@ impl<S: BroadcastSink> Drain<S> {
     }
 
     /// The stored row was archived, trashed or purged since the crash: retire any replacement
-    /// this respawn launched and leave the session stopped.
+    /// this respawn launched, plus the runner it replaced when a stop is pending, and leave the
+    /// session stopped.
     async fn refuse_respawn(
         &self,
         respawn_lease: &Lease,
+        previous: Option<RunnerIdentity>,
         launched: Option<RunnerIdentity>,
         refused: SupervisorError,
     ) {
@@ -649,20 +653,29 @@ impl<S: BroadcastSink> Drain<S> {
                     generation: r.generation,
                 })
         });
-        if launched.is_some() {
+        let cancelled = lock_recover(&self.lifecycle).cancel_requested(respawn_lease);
+        let previous = previous.filter(|_| cancelled.is_some());
+        if launched.is_some() || previous.is_some() {
             // Closing the connection does not end the process, so terminate it even when a
             // peer's stop already took the lease.
             let owned = lock_recover(&self.lifecycle).convert_to_stopping(respawn_lease);
-            let settlement = tear_down_runner(&*self.process_control, session_id, launched).await;
+            let settlement = match launched {
+                Some(_) => {
+                    tear_down_replacement(&*self.process_control, session_id, launched, previous)
+                        .await
+                }
+                None => tear_down_runner(&*self.process_control, session_id, previous).await,
+            };
             if owned {
                 settle_lease(&self.lifecycle, &self.notify, respawn_lease, settlement);
             }
         }
-        self.publish(match refused {
-            SupervisorError::Blocked(blocked) => Event::Stopped {
+        self.publish(match (cancelled, refused) {
+            (Some(reason), _) => Event::Stopped { reason },
+            (None, SupervisorError::Blocked(blocked)) => Event::Stopped {
                 reason: blocked.code().into(),
             },
-            other => Event::AgentStartupError {
+            (None, other) => Event::AgentStartupError {
                 message: format!("ACP agent respawn refused: {other}"),
             },
         });
@@ -1134,6 +1147,7 @@ mod tests {
 
     /// #4206: a row archived or trashed while the crash respawn awaits its `before_session` hook
     /// never reaches the launcher; one dismissed during the handshake retires the replacement.
+    /// A stop that follows the dismissal also retires the runner the respawn replaced.
     #[tokio::test]
     #[serial_test::serial]
     async fn crash_respawn_refuses_a_row_shelved_during_hook_or_handshake() {
@@ -1148,8 +1162,9 @@ mod tests {
             (crate::session::Instance::trash, StartBlocked::Trashed),
         ];
         for (shelve, want) in shelves {
-            for during_hook in [true, false] {
-                let id = format!("s-{}-{}", want.code(), during_hook);
+            for (during_hook, stop) in [(true, false), (false, false), (true, true), (false, true)]
+            {
+                let id = format!("s-{}-{during_hook}-{stop}", want.code());
                 let ready = temp.path().join(format!("{id}-ready"));
                 let release = temp.path().join(format!("{id}-release"));
                 let hook = if during_hook {
@@ -1227,6 +1242,10 @@ mod tests {
                         })
                         .unwrap();
                 }
+                if stop {
+                    // An archive that kills the session stops its worker after the row commits.
+                    sup.shutdown(&id).await.unwrap();
+                }
                 std::fs::write(&release, b"release").unwrap();
                 gate.open.notify_one();
 
@@ -1242,10 +1261,26 @@ mod tests {
                     "{id}: the handshake's replacement is retired: {:?}",
                     control.signals()
                 );
+                assert_eq!(
+                    control.signals().contains(&(4242, "TERM")),
+                    stop,
+                    "{id}: a pending stop retires the runner the respawn replaced: {:?}",
+                    control.signals()
+                );
+                assert_eq!(
+                    worker_registry::load(&id).unwrap().is_none(),
+                    stop || !during_hook,
+                    "{id}: every retired runner's record is cleared"
+                );
                 assert!(!sup.workers.lock().await.contains_key(&id), "{id}");
                 assert_eq!(sup.worker_state(&id).await, AcpWorkerState::Absent, "{id}");
                 assert!(sup.take_respawned_in_place().is_empty(), "{id}");
-                assert_eq!(stopped_reasons(&sink, &id), vec![want.code().to_string()]);
+                let reason = if stop { "user_stopped" } else { want.code() };
+                assert_eq!(
+                    stopped_reasons(&sink, &id),
+                    vec![reason.to_string()],
+                    "{id}"
+                );
                 let stored = storage.load().unwrap().remove(0);
                 assert_eq!(stored.ensure_startable(), Err(want), "{id}");
             }
@@ -1312,6 +1347,11 @@ mod tests {
         assert!(
             control.signals().contains(&(4343, "TERM")),
             "the replacement is terminated: {:?}",
+            control.signals()
+        );
+        assert!(
+            control.signals().contains(&(4242, "TERM")),
+            "the purge's stop retires the runner the respawn replaced: {:?}",
             control.signals()
         );
         assert!(
