@@ -1,7 +1,7 @@
 //! The handshake: `initialize`, then resume, fork, load, or create the
 //! session and apply configured defaults.
 
-use crate::acp::agent_compat::{self, ExpectedAgent};
+use crate::acp::agent_compat::{self, supports_auth_status, ExpectedAgent};
 use crate::acp::mcp_config;
 use crate::acp::state::{Event, StartupErrorDetail};
 use agent_client_protocol::schema::v1::{
@@ -133,6 +133,12 @@ pub(super) async fn establish(
             steering: steering_capable,
         })
         .await;
+    // An adapter that advertises the extension always pushes its own identity
+    // on first probe, because the dedupe state is per process. One that does
+    // not would otherwise leave an earlier process's report on screen.
+    if !supports_auth_status(&init) {
+        shared.emit(Event::AuthStatusUpdated { status: None }).await;
+    }
     if steering_capable {
         info!(
             target: "acp.protocol",

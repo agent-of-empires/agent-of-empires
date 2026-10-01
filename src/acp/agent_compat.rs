@@ -3,7 +3,7 @@
 use agent_client_protocol::schema::v1::InitializeResponse;
 use agent_client_protocol::schema::ProtocolVersion;
 
-use super::state::StartupErrorDetail;
+use super::state::{StartupErrorDetail, AUTH_STATUS_CAPABILITY_KEY};
 
 /// Single source of truth for the `claude-agent-acp` minimum-version floor.
 pub const CLAUDE_AGENT_ACP_MIN_VERSION: &str = "0.55.0";
@@ -263,6 +263,15 @@ pub fn validate(expected: ExpectedAgent, init: &InitializeResponse) -> Result<()
     }
 
     Ok(())
+}
+
+/// Whether this agent pushes `_auth/status_update`. The marker is an empty
+/// object, so only its presence is meaningful.
+pub fn supports_auth_status(init: &InitializeResponse) -> bool {
+    init.agent_capabilities
+        .meta
+        .as_ref()
+        .is_some_and(|meta| meta.get(AUTH_STATUS_CAPABILITY_KEY).is_some())
 }
 
 /// Whether AoE may steer this agent's running turn via the

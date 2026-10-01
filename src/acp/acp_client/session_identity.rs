@@ -13,6 +13,7 @@ use super::errors::acp_internal_error;
 use crate::acp::control_protocol::{
     PromptCompletedMarker, SessionReplayed, MAX_CONTROL_QUEUE_BYTES, MAX_CONTROL_QUEUE_FRAMES,
 };
+use crate::acp::state::{AuthStatus, AUTH_STATUS_UPDATE_METHOD};
 
 // The replayed backlog a reattach flushes is exactly the runner's detached
 // control queue, so this buffer is sized against the same contract: a
@@ -41,6 +42,17 @@ pub(super) enum SessionIngressNotification {
     Replayed(SessionReplayed),
     /// Daemon-minted barrier releasing a local prompt's outcome.
     PromptCompleted(PromptCompletedMarker),
+    /// `_auth/status_update`: the agent's own identity. Connection-scoped, so
+    /// it carries no session id and never passes the ingress fence (#4241).
+    AuthStatus(AuthStatus),
+}
+
+/// Params of `_auth/status_update`. Unknown fields, including the upstream
+/// `vendor` bag, are dropped here rather than persisted.
+#[derive(serde::Deserialize)]
+struct AuthStatusParams {
+    #[serde(rename = "authStatus")]
+    auth_status: AuthStatus,
 }
 
 impl JsonRpcMessage for SessionIngressNotification {
@@ -48,6 +60,7 @@ impl JsonRpcMessage for SessionIngressNotification {
         SessionNotification::matches_method(method)
             || SessionReplayed::matches_method(method)
             || PromptCompletedMarker::matches_method(method)
+            || method == AUTH_STATUS_UPDATE_METHOD
     }
 
     fn method(&self) -> &str {
@@ -55,6 +68,7 @@ impl JsonRpcMessage for SessionIngressNotification {
             Self::Update(_) => "session/update",
             Self::Replayed(marker) => marker.method(),
             Self::PromptCompleted(marker) => marker.method(),
+            Self::AuthStatus(_) => AUTH_STATUS_UPDATE_METHOD,
         }
     }
 
@@ -63,6 +77,9 @@ impl JsonRpcMessage for SessionIngressNotification {
             Self::Update(params) => UntypedMessage::new(self.method(), params),
             Self::Replayed(marker) => marker.to_untyped_message(),
             Self::PromptCompleted(marker) => marker.to_untyped_message(),
+            Self::AuthStatus(status) => {
+                UntypedMessage::new(self.method(), &serde_json::json!({ "authStatus": status }))
+            }
         }
     }
 
@@ -79,6 +96,10 @@ impl JsonRpcMessage for SessionIngressNotification {
             return Ok(Self::PromptCompleted(PromptCompletedMarker::parse_message(
                 method, params,
             )?));
+        }
+        if method == AUTH_STATUS_UPDATE_METHOD {
+            let parsed: AuthStatusParams = serde_json::from_value(serde_json::to_value(params)?)?;
+            return Ok(Self::AuthStatus(parsed.auth_status));
         }
         if !SessionNotification::matches_method(method) {
             return Err(agent_client_protocol::Error::method_not_found());

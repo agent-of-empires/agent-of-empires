@@ -29,7 +29,7 @@
 
 use crate::acp::elicitations::ElicitationQuestion;
 use crate::acp::state::{
-    AcpState, AvailableCommand, DiffPreview, ModeInfo, PlanStepStatus, SessionUsage,
+    AcpState, AuthStatus, AvailableCommand, DiffPreview, ModeInfo, PlanStepStatus, SessionUsage,
 };
 use crate::acp::transcript::{
     patch_transcript_row, upsert_transcript_row, TranscriptDelta, TranscriptRow, TranscriptRowKind,
@@ -63,6 +63,9 @@ pub struct AcpTranscript {
     /// Permission modes the agent advertised (`ModesAvailable`). Drives
     /// the `m` mode picker; empty when the agent never announced any.
     pub available_modes: Vec<ModeInfo>,
+    /// Auth identity the agent reported for itself. `None` when it never
+    /// reported, which renders as nothing rather than as logged out.
+    pub auth_status: Option<AuthStatus>,
     /// Slash commands the agent has advertised. Drives the composer's
     /// `/` picker (followup #1018).
     pub available_commands: Vec<AvailableCommand>,
@@ -209,6 +212,7 @@ impl AcpTranscript {
             status_text: None,
             current_mode: None,
             available_modes: Vec::new(),
+            auth_status: None,
             available_commands: Vec::new(),
             locally_resolved: Vec::new(),
             steering: false,
@@ -317,6 +321,7 @@ impl AcpTranscript {
             self.available_modes = state.available_modes;
         }
         self.current_mode = state.current_mode_id;
+        self.auth_status = state.auth_status;
         self.current_plan = state
             .current_plan
             .map(|plan| {
