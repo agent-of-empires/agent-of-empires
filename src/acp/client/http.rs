@@ -13,7 +13,7 @@ use super::passphrase_session::{self, PassphraseSessionCache};
 use crate::acp::elicitations::ElicitationResolution;
 use crate::acp::protocol::{
     ApprovalDecisionWire, FilesResponse, PromptRequest, ReplayResponse, ResolveApprovalRequest,
-    SwitchAgentRequest, SwitchAgentResponse,
+    SwitchAgentRequest, SwitchAgentResponse, SwitchProviderRequest, SwitchProviderResponse,
 };
 use crate::acp::transcript::TranscriptRow;
 use crate::plugin::ui_state::UiSnapshot;
@@ -435,6 +435,25 @@ impl HttpClient {
             reason: reason.map(str::to_string),
         };
         let path = format!("/api/sessions/{session_id}/acp/switch-agent");
+        let res = self
+            .send(
+                || self.request(Method::POST, &path).json(&body),
+                Scope::Session(session_id),
+            )
+            .await?;
+        Ok(res.json().await?)
+    }
+
+    /// Re-route the session to another LLM provider, keeping the transcript.
+    pub async fn switch_provider(
+        &self,
+        session_id: &str,
+        provider: &str,
+    ) -> Result<SwitchProviderResponse, HttpError> {
+        let body = SwitchProviderRequest {
+            provider: provider.to_string(),
+        };
+        let path = format!("/api/sessions/{session_id}/acp/switch-provider");
         let res = self
             .send(
                 || self.request(Method::POST, &path).json(&body),
