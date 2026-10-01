@@ -481,38 +481,33 @@ pub async fn switch_acp_agent(
 /// respawn, because the container reconcile and the spawn request both read it
 /// off the row. `agent_model` goes with it: model ids are provider-specific, so
 /// re-asserting the old one against the new provider fails the next turn.
-async fn persist_provider_switch(state: &AppState, profile: &str, id: &str, provider: &str) {
+///
+/// Disk first, and the error is returned rather than logged: a respawn from a
+/// memory row the disk never got would be undone by the next reload, leaving
+/// the live worker on a provider the stored session does not name.
+async fn persist_provider_switch(
+    state: &AppState,
+    profile: &str,
+    id: &str,
+    provider: &str,
+) -> anyhow::Result<()> {
     let switch = |inst: &mut crate::session::Instance| {
         inst.agent_provider = Some(provider.to_string());
         inst.agent_model = None;
     };
-    {
-        let mut instances = state.instances.write().await;
-        if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
-            switch(inst);
-        }
-    }
-    match crate::session::Storage::new(profile, state.file_watch.clone()) {
-        Ok(storage) => {
-            if let Err(e) = storage.update(|instances, _groups| {
-                if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
-                    switch(inst);
-                }
-                Ok(())
-            }) {
-                tracing::error!(
-                    target: "http.api.acp",
-                    session = %id,
-                    "failed to persist agent_provider after switch: {e}"
-                );
+    crate::session::Storage::new(profile, state.file_watch.clone())?.update(
+        |instances, _groups| {
+            if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
+                switch(inst);
             }
-        }
-        Err(e) => tracing::error!(
-            target: "http.api.acp",
-            session = %id,
-            "failed to open storage to persist agent_provider after switch: {e}"
-        ),
+            Ok(())
+        },
+    )?;
+    let mut instances = state.instances.write().await;
+    if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
+        switch(inst);
     }
+    Ok(())
 }
 
 /// Re-route a structured session to another LLM provider, keeping the
@@ -558,6 +553,11 @@ pub async fn switch_acp_provider(
     else {
         return session_not_found();
     };
+    // Held from the first read through the respawn, as `spawn_acp` takes it:
+    // between the shutdown and the persisted pick the reconciler would
+    // otherwise resume the worker off the old row, and win.
+    let inst_lock = state.instance_lock(&id).await;
+    let _guard = inst_lock.lock().await;
     let Some(instance) = find_instance(&state, &id).await else {
         return session_not_found();
     };
@@ -597,12 +597,17 @@ pub async fn switch_acp_provider(
     }
 
     let model_cleared = instance.agent_model.is_some();
-    persist_provider_switch(&state, &instance.source_profile, &id, &provider).await;
+    if let Err(e) = persist_provider_switch(&state, &instance.source_profile, &id, &provider).await
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to persist the provider switch: {e}"),
+        )
+            .into_response();
+    }
 
-    let inst_lock = state.instance_lock(&id).await;
-    let sandbox_info = match crate::acp::sandbox::ensure_container_for_session(
+    let sandbox_info = match crate::acp::sandbox::ensure_container_for_session_locked(
         &state.instances,
-        &inst_lock,
         &id,
         false,
     )
@@ -716,7 +721,9 @@ mod tests {
             );
             let state = crate::server::test_support::build_test_app_state(vec![inst]);
 
-            persist_provider_switch(&state, profile, &id, provider).await;
+            persist_provider_switch(&state, profile, &id, provider)
+                .await
+                .expect("persisting the pick");
 
             let on_disk = crate::server::test_support::load_instances_from_disk_for_test(profile);
             let stored = on_disk.iter().find(|i| i.id == id).expect("seeded row");
