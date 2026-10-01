@@ -1,6 +1,7 @@
 //! Moving a worktree, including the manual path for worktrees with submodules
 //! and the classification of moves that timed out.
 
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 use super::{
@@ -386,10 +387,10 @@ impl GitWorktree {
         let gitdir = &checkout.gitdir;
 
         let pointer = Self::diff_paths(gitdir, &canonical).unwrap_or_else(|| gitdir.clone());
-        std::fs::write(
-            path.join(".git"),
-            format!("gitdir: {}\n", pointer.display()),
-        )?;
+        let mut gitfile = b"gitdir: ".to_vec();
+        gitfile.extend_from_slice(pointer.as_os_str().as_encoded_bytes());
+        gitfile.push(b'\n');
+        std::fs::write(path.join(".git"), gitfile)?;
 
         let core_worktree =
             Self::diff_paths(&canonical, gitdir).unwrap_or_else(|| canonical.clone());
@@ -397,11 +398,11 @@ impl GitWorktree {
         run_bounded(
             worktree_path,
             [
-                "config",
-                "--file",
-                path_str(&config)?,
-                "core.worktree",
-                path_str(&core_worktree)?,
+                OsStr::new("config"),
+                OsStr::new("--file"),
+                config.as_os_str(),
+                OsStr::new("core.worktree"),
+                core_worktree.as_os_str(),
             ],
             "git config core.worktree",
         )
@@ -492,7 +493,7 @@ mod tests {
     /// `main -> .claude -> .claude/nested`, each served from a bare `file://`
     /// clone, with `branch` on the main repo's HEAD. Two levels, since the
     /// moved pointers sit at different depths.
-    fn repo_with_nested_submodules(branch: &str, outer_path: &str) -> Vec<TempDir> {
+    fn repo_with_nested_submodules(branch: &str, outer_path: &Path) -> Vec<TempDir> {
         fn commit_all(dir: &Path, message: &str) {
             run_git(dir, &["add", "-A"]);
             run_git(
@@ -531,18 +532,26 @@ mod tests {
             dirs.push(parent);
             format!("file://{}", bare.display())
         }
-        fn add_submodule(repo: &Path, url: &str, path: &str) {
-            run_git(
-                repo,
-                &[
+        fn add_submodule(repo: &Path, url: &str, path: &Path) {
+            let output = std::process::Command::new("git")
+                .current_dir(repo)
+                .args([
                     "-c",
                     "protocol.file.allow=always",
                     "submodule",
                     "add",
                     "-q",
-                    url,
-                    path,
-                ],
+                    "--name",
+                    "fixture",
+                ])
+                .arg(url)
+                .arg(path)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git submodule add failed: {}",
+                String::from_utf8_lossy(&output.stderr)
             );
             commit_all(repo, "add submodule");
         }
@@ -551,7 +560,7 @@ mod tests {
         let inner = seed("inner");
         let inner_url = bare_url(inner.path(), &mut dirs);
         let mid = seed("mid");
-        add_submodule(mid.path(), &inner_url, "nested");
+        add_submodule(mid.path(), &inner_url, Path::new("nested"));
         let mid_url = bare_url(mid.path(), &mut dirs);
         let repo = seed("README");
         add_submodule(repo.path(), &mid_url, outer_path);
@@ -571,7 +580,7 @@ mod tests {
         let home_dir = TempDir::new().unwrap();
         let _home = crate::session::test_support::isolate_home(home_dir.path());
 
-        let dirs = repo_with_nested_submodules("test-move", ".claude");
+        let dirs = repo_with_nested_submodules("test-move", Path::new(".claude"));
         let repo_path = dirs[0].path().to_path_buf();
         let git_wt = GitWorktree::new(repo_path.clone())
             .unwrap()
@@ -668,7 +677,7 @@ mod tests {
         let _home = crate::session::test_support::isolate_home(home_dir.path());
 
         let outer_path = " spaced ";
-        let dirs = repo_with_nested_submodules("test-move-whitespace", outer_path);
+        let dirs = repo_with_nested_submodules("test-move-whitespace", Path::new(outer_path));
         let repo_path = dirs[0].path().to_path_buf();
         let git_wt = GitWorktree::new(repo_path.clone())
             .unwrap()
@@ -706,12 +715,97 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    #[serial_test::serial]
+    fn move_worktree_relocates_non_utf8_submodule_paths() {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+        let home_dir = TempDir::new().unwrap();
+        let _home = crate::session::test_support::isolate_home(home_dir.path());
+
+        let outer_path = PathBuf::from(std::ffi::OsString::from_vec(b"module-\xff".to_vec()));
+        let dirs = repo_with_nested_submodules("test-move-non-utf8", &outer_path);
+        let repo_path = dirs[0].path().to_path_buf();
+        let git_wt = GitWorktree::new(repo_path.clone())
+            .unwrap()
+            .allow_submodule_file_transport();
+        let parent = TempDir::new().unwrap();
+        let from = parent.path().join("source");
+        git_wt
+            .create_worktree("test-move-non-utf8", &from, false, None)
+            .unwrap();
+
+        let source_checkout = from.join(&outer_path);
+        run_git(&source_checkout, &["submodule", "deinit", "-f", "nested"]);
+        let gitdir_output = std::process::Command::new("git")
+            .current_dir(&source_checkout)
+            .args(["rev-parse", "--absolute-git-dir"])
+            .output()
+            .unwrap();
+        assert!(gitdir_output.status.success());
+        let gitdir_bytes = gitdir_output
+            .stdout
+            .strip_suffix(b"\n")
+            .unwrap_or(&gitdir_output.stdout);
+        let gitdir = PathBuf::from(std::ffi::OsString::from_vec(gitdir_bytes.to_vec()));
+        let non_utf8_gitdir =
+            gitdir.with_file_name(std::ffi::OsString::from_vec(b"fixture-\xff".to_vec()));
+        std::fs::rename(&gitdir, &non_utf8_gitdir).unwrap();
+        let mut source_gitfile = b"gitdir: ".to_vec();
+        source_gitfile.extend_from_slice(non_utf8_gitdir.as_os_str().as_encoded_bytes());
+        source_gitfile.push(b'\n');
+        std::fs::write(source_checkout.join(".git"), source_gitfile).unwrap();
+
+        let to = parent.path().join("nested-dest/moved");
+        std::fs::create_dir_all(to.parent().unwrap()).unwrap();
+        git_wt.move_worktree(&from, &to).unwrap();
+
+        assert!(!from.exists());
+        let checkout = to.join(&outer_path);
+        assert!(run_git(&checkout, &["status", "--short"]).is_empty());
+        assert!(run_git(&checkout, &["rev-parse", "--show-toplevel"]).contains("moved"));
+        run_git(&to, &["submodule", "status", "--recursive"]);
+
+        let gitfile = std::fs::read(checkout.join(".git")).unwrap();
+        let pointer = gitfile
+            .strip_prefix(b"gitdir: ")
+            .unwrap()
+            .strip_suffix(b"\n")
+            .unwrap();
+        assert!(pointer.contains(&0xff), "gitfile pointer: {gitfile:?}");
+        let gitdir = checkout
+            .join(PathBuf::from(std::ffi::OsString::from_vec(
+                pointer.to_vec(),
+            )))
+            .canonicalize()
+            .unwrap();
+        assert!(gitdir.join("config").is_file());
+
+        let config = std::process::Command::new("git")
+            .current_dir(&to)
+            .args(["config", "--file"])
+            .arg(gitdir.join("config"))
+            .args(["--get", "core.worktree"])
+            .output()
+            .unwrap();
+        assert!(
+            config.status.success(),
+            "git config failed: {}",
+            String::from_utf8_lossy(&config.stderr)
+        );
+        let actual = config.stdout.strip_suffix(b"\n").unwrap_or(&config.stdout);
+        let expected = GitWorktree::diff_paths(&checkout.canonicalize().unwrap(), &gitdir).unwrap();
+        assert!(expected.as_os_str().as_bytes().contains(&0xff));
+        assert_eq!(actual, expected.as_os_str().as_bytes());
+    }
+
+    #[test]
     #[serial_test::serial]
     fn move_worktree_fails_before_rename_when_submodule_inventory_is_invalid() {
         let home_dir = TempDir::new().unwrap();
         let _home = crate::session::test_support::isolate_home(home_dir.path());
 
-        let dirs = repo_with_nested_submodules("test-move-invalid-submodule", ".claude");
+        let dirs = repo_with_nested_submodules("test-move-invalid-submodule", Path::new(".claude"));
         let repo_path = dirs[0].path().to_path_buf();
         let git_wt = GitWorktree::new(repo_path)
             .unwrap()

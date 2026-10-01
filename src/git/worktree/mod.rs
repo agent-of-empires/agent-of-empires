@@ -55,7 +55,11 @@ fn command_failed(output: &Output) -> GitError {
 
 /// Runs a bounded git command in `cwd`, turning a timeout or non-zero exit
 /// into `WorktreeCommandFailed`.
-fn run_bounded<const N: usize>(cwd: &Path, args: [&str; N], what: &str) -> Result<Output> {
+fn run_bounded<const N: usize, S: AsRef<OsStr>>(
+    cwd: &Path,
+    args: [S; N],
+    what: &str,
+) -> Result<Output> {
     let Some(output) = super::command::run_git_with_timeout(cwd, args, WORKTREE_MUTATION_TIMEOUT)?
     else {
         return Err(GitError::WorktreeCommandFailed(format!(
