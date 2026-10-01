@@ -24,6 +24,40 @@ pub(crate) fn host_vertex_enabled() -> bool {
         .is_some_and(|v| !v.is_empty())
 }
 
+/// The LLM backends a session can be pinned to. `None` on a session means the
+/// host environment decides, which is the behavior before a pick is made.
+pub(crate) const AGENT_PROVIDERS: &[&str] = &["api", "bedrock", "vertex"];
+
+/// The Claude routing flags that pin a session to `provider`, or `None` when
+/// the name is not one of [`AGENT_PROVIDERS`].
+///
+/// Both flags are written for every pick, because the override has to beat an
+/// inherited host value rather than merely be absent. Off is the empty string,
+/// never `"0"`: the adapter reads these with a JavaScript truthiness test, for
+/// which `"0"` is on. Credentials are not touched; they stay wherever the host
+/// put them.
+pub(crate) fn provider_override_env(provider: &str) -> Option<Vec<(String, String)>> {
+    let (bedrock, vertex) = match provider {
+        "api" => ("", ""),
+        "bedrock" => ("1", ""),
+        "vertex" => ("", "1"),
+        _ => return None,
+    };
+    Some(vec![
+        ("CLAUDE_CODE_USE_BEDROCK".to_string(), bedrock.to_string()),
+        ("CLAUDE_CODE_USE_VERTEX".to_string(), vertex.to_string()),
+    ])
+}
+
+/// Whether Vertex is in effect: a session's pick wins, and without one the
+/// host flag decides.
+pub(crate) fn vertex_enabled(provider: Option<&str>) -> bool {
+    match provider {
+        Some(pick) if AGENT_PROVIDERS.contains(&pick) => pick == "vertex",
+        _ => host_vertex_enabled(),
+    }
+}
+
 /// Returns the user's preferred shell from `$SHELL`, falling back to `bash`.
 pub(crate) fn user_shell() -> String {
     std::env::var("SHELL")
@@ -425,9 +459,19 @@ pub(crate) fn collect_environment(
         .as_deref()
         .unwrap_or(&sandbox_config.environment);
 
-    // Terminal defaults, plus Vertex provider vars when Vertex is enabled on the host. A key is
-    // claimed even when unset on the host, so later entries cannot supply it.
-    let vertex: &[&str] = if host_vertex_enabled() {
+    // A session's provider pick is claimed before everything else: this list wins a shared key
+    // against both the request auth payload and the per-adapter allowlist, so the routing flags
+    // have to be set here to beat whatever the host exported.
+    let provider = sandbox_info.provider.as_deref();
+    for (key, value) in provider.and_then(provider_override_env).unwrap_or_default() {
+        if seen_keys.insert(key.clone()) {
+            result.push(EnvEntry::Literal { key, value });
+        }
+    }
+
+    // Terminal defaults, plus Vertex provider vars when Vertex is in effect. A key is claimed
+    // even when unset on the host, so later entries cannot supply it.
+    let vertex: &[&str] = if vertex_enabled(provider) {
         AUTO_FORWARD_VERTEX_ENV_VARS
     } else {
         &[]

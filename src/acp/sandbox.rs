@@ -43,6 +43,7 @@ pub async fn ensure_container_for_session_locked(
     let session_id_owned = session_id.to_string();
     let (sandbox_info, container_workdir, hooks, hook_env) =
         tokio::task::spawn_blocking(move || -> Result<_> {
+            reconcile_provider_container(&mut instance_clone)?;
             let _container = instance_clone
                 .get_container_for_instance()
                 .context("ensuring sandbox container")?;
@@ -67,6 +68,7 @@ pub async fn ensure_container_for_session_locked(
                     sb.container_id = info.container_id.clone();
                 }
                 sb.before_start_env = info.before_start_env.clone();
+                sb.provider = info.provider.clone();
             }
         }
     }
@@ -110,4 +112,44 @@ pub async fn ensure_container_for_session_locked(
     }
 
     Ok(sandbox_info)
+}
+
+/// Rebuild the container when the session's provider pick no longer matches the
+/// provider it was built for, then stamp the new pick so the build picks up the
+/// matching credential mounts.
+///
+/// The GCP ADC bind mount is decided at container-create time, so a session
+/// switched to Vertex inside a container built without it would get the routing
+/// flag and no credentials. Recreating in the other direction matters too: it
+/// drops a mount the session no longer routes through. A container built before
+/// the pick existed records `None`, which matches no explicit pick and so is
+/// rebuilt once on the first switch.
+fn reconcile_provider_container(instance: &mut Instance) -> Result<()> {
+    let Some(sandbox) = instance.sandbox_info.as_mut() else {
+        return Ok(());
+    };
+    if sandbox.provider == instance.agent_provider {
+        return Ok(());
+    }
+    let built_for = sandbox.provider.clone();
+    sandbox.provider = instance.agent_provider.clone();
+
+    let container = crate::containers::DockerContainer::from_session_id(&instance.id);
+    match container.discard() {
+        crate::containers::Teardown::Removed | crate::containers::Teardown::AlreadyGone => {
+            tracing::info!(
+                target: "acp.sandbox",
+                session = %instance.id,
+                built_for = ?built_for,
+                provider = ?instance.agent_provider,
+                "recreating sandbox container for the new provider"
+            );
+            Ok(())
+        }
+        crate::containers::Teardown::Failed(e) => anyhow::bail!(
+            "failed to remove sandbox container {} built for a different provider; remove it \
+             before switching, or the session keeps the old provider's credential mounts: {e}",
+            container.name
+        ),
+    }
 }

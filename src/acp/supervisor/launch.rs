@@ -373,6 +373,11 @@ impl<S: BroadcastSink> Supervisor<S> {
                 wrapper_substitution,
                 generation,
                 claude_store_pin,
+                provider_routing: req
+                    .provider
+                    .as_deref()
+                    .and_then(crate::session::environment::provider_override_env)
+                    .unwrap_or_default(),
             },
             context_reset,
         ))
