@@ -495,6 +495,8 @@ export interface ReducedState {
   turn_active: boolean;
   cancelling: boolean;
   compacting: boolean;
+  /** Absent on a daemon that predates session notices. */
+  session_notices?: SessionNotice[];
 }
 
 export interface AcpState {
@@ -961,12 +963,16 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
   }
   if ("SessionNotice" in event) {
     const notice = event.SessionNotice;
+    // Matches the id the daemon mints, so a replayed frame cannot double up on
+    // the same notice already adopted from a `reduced_state` snapshot.
+    const id = `notice-${frame.seq}`;
+    if (next.sessionNotices.some((n) => n.id === id)) {
+      return next;
+    }
     next.sessionNotices = [
       ...next.sessionNotices,
       {
-        // Matches the id the daemon mints, so a later snapshot does not
-        // resurrect a notice dismissed from this delta.
-        id: `notice-${frame.seq}`,
+        id,
         severity: notice.severity,
         title: notice.title,
         description: notice.description ?? null,
@@ -1291,6 +1297,9 @@ export function applyReducedState(state: AcpState, reduced: ReducedState, unchan
     }),
     cancelling: reduced.cancelling,
     compacting: reduced.compacting,
+    // The daemon's list is authoritative: a cold open whose replay window
+    // starts after the notice would otherwise miss it, while the TUI shows it.
+    sessionNotices: reduced.session_notices ?? [],
     locallyResolved,
   };
 }

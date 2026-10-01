@@ -272,6 +272,44 @@ describe("applyEvent control state", () => {
     expect(acpHookReducer(dismissed, { kind: "dismiss_session_notice", id: "notice-1" })).toBe(dismissed);
   });
 
+  // The daemon's list is authoritative, and a replayed frame for a notice the
+  // connect snapshot already carried must not show it twice.
+  it("adopts session notices from reduced_state without doubling a replayed frame", () => {
+    const reduced = (notices?: AcpState["sessionNotices"]): ReducedState =>
+      ({
+        agent: "claude",
+        model: null,
+        mode: "default",
+        current_plan: null,
+        in_flight_tool: null,
+        pending_approvals: [],
+        pending_elicitations: [],
+        thinking: null,
+        rate_limit: null,
+        available_commands: [],
+        available_modes: [],
+        current_mode_id: null,
+        turn_active: false,
+        cancelling: false,
+        compacting: false,
+        ...(notices ? { session_notices: notices } : {}),
+      }) as ReducedState;
+
+    const snapshot = [{ id: "notice-7", severity: "warning", title: "Model fallback", description: null }];
+    const adopted = applyReducedState(emptyAcpState(), reduced(snapshot));
+    expect(adopted.sessionNotices).toEqual(snapshot);
+
+    const replayed = applyEvent(adopted, {
+      session_id: "s-1",
+      seq: 7,
+      event: { SessionNotice: { severity: "warning", title: "Model fallback" } },
+    });
+    expect(replayed.sessionNotices).toEqual(snapshot);
+
+    // A daemon without the field must not blow up the picker-style adoption.
+    expect(applyReducedState(adopted, reduced()).sessionNotices).toEqual([]);
+  });
+
   it("codex /new drops usage to the post-reset baseline (#2979)", () => {
     let state = fold(emptyAcpState(), usage(75_000), prompt("/new"), "SessionCleared", reset("cleared"), assigned);
     expect(state).toMatchObject({ sessionUsage: null, usageBaseline: null });
