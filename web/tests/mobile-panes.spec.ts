@@ -83,14 +83,17 @@ test.describe("Mobile right panel picker (#1452)", () => {
         return box && { right: Math.round(box.x + box.width), top: box.y, narrow: box.width < viewport.width * 0.9 };
       })
       .toEqual({ right: viewport.width, top: 48, narrow: true });
+    // Tailwind v4 `translate-x-*` sets `translate`, so a transition on
+    // `transform` alone snaps the drawer instead of sliding it.
+    expect(await picker(page).evaluate((el) => getComputedStyle(el).transitionProperty)).toContain("translate");
     // Options hug the bottom of the drawer, not its top.
     const option = await page.getByTestId("mobile-right-panel-pick-agent").boundingBox();
     expect(option!.y).toBeGreaterThan(viewport.height / 2);
 
     await swipe(page, viewport.width / 2, viewport.width / 2 + 160, y);
     await expect(picker(page)).toBeHidden();
-    // Both swipe hooks see the same touchmove, so the sidebar would have
-    // committed its open state by the time the picker hides.
+    // The same touchmove would have opened the sidebar, so it has committed by
+    // the time the picker hides.
     await expect(page.locator('[data-tour="sidebar"]')).toHaveClass(/-translate-x-full/);
   });
 

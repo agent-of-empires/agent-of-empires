@@ -27,6 +27,20 @@ const THRESHOLD_PX = 90;
 const VERTICAL_CANCEL_PX = 16;
 const MOBILE_BREAKPOINT = 768;
 
+/** Which swipe directions a horizontal scroller under the touch would consume. */
+function scrollRoom(path: EventTarget[]): Record<SwipeDirection, boolean> {
+  const room = { left: false, right: false };
+  for (const node of path) {
+    if (!(node instanceof HTMLElement) || node.scrollWidth <= node.clientWidth) continue;
+    const { overflowX } = getComputedStyle(node);
+    if (overflowX !== "auto" && overflowX !== "scroll") continue;
+    // A left swipe scrolls toward the end, a right swipe back toward the start.
+    if (node.scrollLeft + node.clientWidth < node.scrollWidth - 1) room.left = true;
+    if (node.scrollLeft > 0) room.right = true;
+  }
+  return room;
+}
+
 /** Mobile horizontal swipes that open and close the side drawers. */
 export function useDrawerSwipe(state: DrawerSwipeState, onAction: (action: DrawerSwipeAction) => void) {
   const latestState = useLatestRef(state);
@@ -36,6 +50,7 @@ export function useDrawerSwipe(state: DrawerSwipeState, onAction: (action: Drawe
     let startX = 0;
     let startY = 0;
     let tracking = false;
+    let room: Record<SwipeDirection, boolean> = { left: false, right: false };
 
     const onTouchStart = (e: TouchEvent) => {
       tracking = false;
@@ -44,6 +59,7 @@ export function useDrawerSwipe(state: DrawerSwipeState, onAction: (action: Drawe
       if (!t) return;
       if (t.clientX <= SYSTEM_EDGE_GUARD_PX || t.clientX >= window.innerWidth - SYSTEM_EDGE_GUARD_PX) return;
       tracking = true;
+      room = scrollRoom(e.composedPath());
       startX = t.clientX;
       startY = t.clientY;
     };
@@ -56,7 +72,9 @@ export function useDrawerSwipe(state: DrawerSwipeState, onAction: (action: Drawe
       const dy = t.clientY - startY;
       if (Math.abs(dx) > THRESHOLD_PX && Math.abs(dx) > Math.abs(dy)) {
         tracking = false;
-        const action = drawerSwipeAction(dx > 0 ? "right" : "left", latestState.current);
+        const dir = dx > 0 ? "right" : "left";
+        if (room[dir]) return;
+        const action = drawerSwipeAction(dir, latestState.current);
         if (!action) return;
         // Dismiss the on-screen keyboard so it does not cover the drawer.
         if (document.activeElement instanceof HTMLElement) document.activeElement.blur();

@@ -98,7 +98,7 @@ export function MobileRightPanelPicker({
         data-testid="mobile-right-panel-picker-backdrop"
       />
       <div
-        className={`fixed top-12 right-0 bottom-0 z-50 w-[280px] max-w-[85vw] bg-surface-800 border-l border-surface-700/60 flex flex-col pr-[env(safe-area-inset-right)] pb-[env(safe-area-inset-bottom)] transition-[transform,visibility] duration-300 ease-in-out motion-reduce:transition-none ${
+        className={`fixed top-12 right-0 bottom-0 z-50 w-[280px] max-w-[85vw] bg-surface-800 border-l border-surface-700/60 flex flex-col pr-[env(safe-area-inset-right)] pb-[env(safe-area-inset-bottom)] transition-[translate,visibility] duration-300 ease-in-out motion-reduce:transition-none ${
           open ? "translate-x-0" : "translate-x-full invisible"
         }`}
         role="dialog"

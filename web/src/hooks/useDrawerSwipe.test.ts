@@ -13,16 +13,29 @@ function setWidth(px: number) {
 
 type Point = [x: number, y: number];
 
-function dispatchTouch(type: string, points: Point[]) {
-  const ev = new Event(type) as Event & { touches: { clientX: number; clientY: number }[] };
+function dispatchTouch(type: string, points: Point[], target: EventTarget = window) {
+  const ev = new Event(type, { bubbles: true }) as Event & { touches: { clientX: number; clientY: number }[] };
   ev.touches = points.map(([clientX, clientY]) => ({ clientX, clientY }));
-  window.dispatchEvent(ev);
+  target.dispatchEvent(ev);
 }
 
 /** Start a one-finger touch at `start`, then move through `moves`. */
 function swipe(start: Point, ...moves: Point[]) {
   dispatchTouch("touchstart", [start]);
   for (const m of moves) dispatchTouch("touchmove", [m]);
+}
+
+/** A 200px-wide `overflow-x: auto` box holding 600px of content, scrolled to `scrollLeft`. */
+function horizontalScroller(scrollLeft: number) {
+  const el = document.createElement("div");
+  el.style.overflowX = "auto";
+  Object.defineProperties(el, {
+    scrollWidth: { value: 600 },
+    clientWidth: { value: 200 },
+    scrollLeft: { value: scrollLeft },
+  });
+  document.body.appendChild(el);
+  return el;
 }
 
 const CLOSED: DrawerSwipeState = { sidebarOpen: false, sidebarSide: "left", panelsOpen: false, panelsAvailable: true };
@@ -91,6 +104,21 @@ describe("useDrawerSwipe", () => {
   ])("%s", (_label, start, moves, action) => {
     const { onAction } = mount();
     swipe(start, ...moves);
+    if (action) expect(onAction).toHaveBeenCalledExactlyOnceWith(action);
+    else expect(onAction).not.toHaveBeenCalled();
+  });
+
+  it.each<[string, number, Point, Point, string | null]>([
+    ["left swipe at the scroll start scrolls instead", 0, [300, 100], [150, 100], null],
+    ["right swipe at the scroll start opens the sidebar", 0, [150, 100], [300, 100], "open-sidebar"],
+    ["right swipe mid-scroll scrolls instead", 200, [150, 100], [300, 100], null],
+    ["left swipe at the scroll end opens the panels", 400, [300, 100], [150, 100], "open-panels"],
+  ])("inside a horizontal scroller: %s", (_label, scrollLeft, start, end, action) => {
+    const el = horizontalScroller(scrollLeft);
+    const { onAction } = mount();
+    dispatchTouch("touchstart", [start], el);
+    dispatchTouch("touchmove", [end], el);
+    el.remove();
     if (action) expect(onAction).toHaveBeenCalledExactlyOnceWith(action);
     else expect(onAction).not.toHaveBeenCalled();
   });

@@ -2515,9 +2515,9 @@ function AppContent({
           />
         )}
 
-        {activeWorkspace && activeSession && (
+        {singlePane && activeWorkspace && activeSession && (
           <MobileRightPanelPicker
-            open={pickerOpen && singlePane}
+            open={pickerOpen}
             active={rightPanelView}
             sessionTitle={activeSession.title}
             availablePanes={mobilePaneIds}
