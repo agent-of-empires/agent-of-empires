@@ -567,6 +567,7 @@ mod tests {
             );
         }
         config.sandbox_info = Some(SandboxInfo {
+            provider: None,
             enabled: true,
             container_id: None,
             image: "alpine:latest".into(),

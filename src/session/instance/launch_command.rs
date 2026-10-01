@@ -1729,6 +1729,7 @@ mod tests {
         inst.command = "claude".into();
         inst.source_profile = profile.into();
         inst.sandbox_info = Some(crate::session::SandboxInfo {
+            provider: None,
             enabled: true,
             container_id: None,
             image: "fixture".into(),
