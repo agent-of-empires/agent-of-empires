@@ -148,6 +148,7 @@ pub(crate) const EMITTABLE_CODES: &[&str] = &[
     "session_ambiguous",
     "session_missing",
     "socket_identity",
+    "server_error",
     "unauthorized",
     "unavailable",
 ];
@@ -330,16 +331,18 @@ fn absent_local_publication(error: &ReadFailure, source: &ReadRequestSource) -> 
         // connected socket has been proved to be that publisher's, so failing
         // to get an answer out of it is a fact about the environment.
         "marker_missing" => !source.env_url_is_set(),
-        "invalid_endpoint"
-        | "invalid_token"
-        | "unavailable"
-        | "establishment_timeout"
-        | "publisher_absent" => source.env_url_is_set(),
-        // What stays a refusal, and why: a peer was reached and found not to
-        // be the publisher, and a connection dropped after the publisher had
-        // spoken is a read failure the user has to see rather than a missing
-        // daemon. The constant local request that cannot be built is this
-        // client's own fault, even though nothing reaches it.
+        // Only what proves the endpoint was not there. A stall is kept because
+        // a silent peer and a dead host are the same observable from here, and
+        // `publisher_absent` now also carries the TCP connect failing, which is
+        // the other half of the same question.
+        //
+        // Everything else leaves this arm: `invalid_endpoint` and
+        // `invalid_token` are configuration faults that no socket can fix,
+        // `unavailable` is a peer that was reached and then failed, and
+        // `server_error` is a peer that answered and would not serve. Falling
+        // back on any of those prints this machine's sessions as though they
+        // came from the remote.
+        "establishment_timeout" | "publisher_absent" => source.env_url_is_set(),
         _ => false,
     }
 }
@@ -395,17 +398,33 @@ async fn execute_inner(
             // carries, so a wrong assumption widens the output rather than
             // narrowing it.
             let local_home = loopback_home(&request);
-            let connected = tokio::time::timeout_at(
+            // The TCP connect is separate from the handshake, as it already is
+            // on the local path, and for the same reason: a peer that was
+            // reached and did not serve us is not a peer that was absent, and
+            // only the split can tell the two apart. `connect_async` fuses
+            // them, and under this build's rustls connector a refused
+            // certificate and a dead port both arrive as an `Io` error of the
+            // same kind, so the fused call cannot be classified afterwards
+            // either.
+            let (connect_host, connect_port) = host_port(request.uri())?;
+            let stream = tokio::time::timeout_at(
                 establishment_deadline,
-                tokio_tungstenite::connect_async_with_config(
+                tokio::net::TcpStream::connect((connect_host, connect_port)),
+            )
+            .await
+            .map_err(|_| ReadFailure::pre("establishment_timeout"))?
+            .map_err(|_| ReadFailure::pre("publisher_absent"))?;
+            let (stream, _) = tokio::time::timeout_at(
+                establishment_deadline,
+                tokio_tungstenite::client_async_with_config(
                     *request,
+                    stream,
                     Some(websocket_config()),
-                    false,
                 ),
             )
             .await
-            .map_err(|_| ReadFailure::pre("establishment_timeout"))?;
-            let (stream, _) = connected.map_err(map_upgrade_error)?;
+            .map_err(|_| ReadFailure::pre("establishment_timeout"))?
+            .map_err(map_upgrade_error)?;
             // One budget per read: the exchange rides the establishment
             // window rather than opening a second one behind it.
             let exchange_deadline = establishment_deadline;
@@ -420,6 +439,20 @@ async fn execute_inner(
             .await
         }
     }
+}
+
+/// The `(host, port)` an endpoint names, defaulting the port the way the
+/// handshake would so the connect and the request cannot disagree about it.
+fn host_port(uri: &tokio_tungstenite::tungstenite::http::Uri) -> Result<(&str, u16), ReadFailure> {
+    let host = uri
+        .host()
+        .filter(|host| !host.is_empty())
+        .ok_or_else(|| ReadFailure::pre("invalid_endpoint"))?;
+    let port = uri.port_u16().unwrap_or(match uri.scheme_str() {
+        Some("wss") | Some("https") => 443,
+        _ => 80,
+    });
+    Ok((host, port))
 }
 
 /// This machine's home, when the endpoint names a loopback address, and
@@ -662,6 +695,10 @@ fn map_upgrade_error(error: WsError) -> ReadFailure {
         {
             ReadFailure::post("unauthorized")
         }
+        // The peer answered and would not serve us, which is not the same as
+        // being absent, and a local store answering here would report this
+        // machine's sessions as the remote's.
+        WsError::Http(_) => ReadFailure::post("server_error"),
         _ => ReadFailure::post("unavailable"),
     }
 }
@@ -760,11 +797,8 @@ mod tests {
     /// every combination of endpoint inputs.
     #[test]
     fn only_the_endpoint_codes_take_over_and_nothing_else_does() {
-        const TAKES_OVER: [&str; 6] = [
+        const TAKES_OVER: [&str; 3] = [
             "marker_missing",
-            "invalid_endpoint",
-            "invalid_token",
-            "unavailable",
             "establishment_timeout",
             "publisher_absent",
         ];
@@ -801,21 +835,25 @@ mod tests {
     }
 
     /// The one case where the local store answers a command the user aimed
-    /// somewhere else: `AOE_DAEMON_URL` names an endpoint, the endpoint is
-    /// refused while the URL is parsed, and the command runs locally anyway.
-    /// That is the right fallback, and it is only right if the operator is told,
-    /// because the transport's premise is that the bytes are a daemon's.
+    /// somewhere else: `AOE_DAEMON_URL` names an endpoint, nothing answers
+    /// there, and the command runs locally anyway. That is the right fallback,
+    /// and it is only right if the operator is told, because the transport's
+    /// premise is that the bytes are a daemon's.
     ///
-    /// The flag is the contrast, on the same refused URL: naming an endpoint by
-    /// hand is a request for a served answer, so it stays a refusal and no
-    /// notice is owed. Both refuse during parsing, so neither opens a socket.
+    /// A token is supplied so the read reaches the network and fails for the
+    /// reason this test is about. Without one it never dials, and a missing
+    /// token is a configuration fault rather than an absent endpoint, which the
+    /// companion test below pins separately.
+    ///
+    /// `.test` is reserved and never resolves, so the absence is the host's
+    /// and not this test's timing.
     #[tokio::test]
     async fn a_variable_naming_an_endpoint_that_did_not_answer_says_the_store_answered() {
-        let refused = "http://remote.test";
+        let absent = "http://127.0.0.1:9";
         let source = |explicit_url: Option<&str>| ReadRequestSource {
             explicit_url: explicit_url.map(str::to_string),
-            env_url: Some(OsString::from(refused)),
-            token: None,
+            env_url: Some(OsString::from(absent)),
+            token: Some(OsString::from("t")),
             explicit_profile: None,
             env_profile: None,
         };
@@ -824,7 +862,7 @@ mod tests {
 
         let read = attempt(command, &source(None)).await;
         let ScopedRead::NoLocalPublication(notice) = read else {
-            panic!("a refused endpoint must not be answered by a daemon");
+            panic!("an endpoint that is not there must not be answered by a daemon");
         };
         assert_eq!(
             notice,
@@ -832,15 +870,43 @@ mod tests {
             "the local store's rows have to say they are the local store's"
         );
 
-        let flagged = attempt(command, &source(Some(refused))).await;
+        let flagged = attempt(command, &source(Some(absent))).await;
         let ScopedRead::Answered(outcome) = flagged else {
             panic!("a flag naming an endpoint is a request for a served answer");
         };
         assert_eq!(
             outcome.exit, 2,
-            "a refused endpoint leaves the refusal's exit"
+            "a named endpoint that is not there leaves the refusal's exit"
         );
         assert!(outcome.stdout.is_none(), "a refusal prints no answer");
+    }
+
+    /// The other side of the same line: a variable naming an endpoint with no
+    /// bearer token never opens a socket, so nothing was ever asked whether it
+    /// was there. Falling back would print this machine's rows under a notice
+    /// claiming a remote did not answer, when the remote was never contacted.
+    #[tokio::test]
+    async fn a_variable_without_a_token_refuses_rather_than_claiming_the_endpoint_was_absent() {
+        let source = ReadRequestSource {
+            explicit_url: None,
+            env_url: Some(OsString::from("http://127.0.0.1:9")),
+            token: None,
+            explicit_profile: None,
+            env_profile: None,
+        };
+        let cli = Cli::try_parse_from(["aoe", "list"]).expect("the argv parses");
+        let command = classify(cli.command.as_ref()).expect("`aoe list` is scoped");
+
+        let ScopedRead::Answered(outcome) = attempt(command, &source).await else {
+            panic!("a configuration fault is not an absent endpoint");
+        };
+        assert_eq!(outcome.exit, 2, "the refusal keeps its exit");
+        assert!(outcome.stdout.is_none(), "a refusal prints no answer");
+        assert_eq!(
+            outcome.stderr.as_deref(),
+            Some("daemon read: invalid_token\n"),
+            "and it says what is actually wrong"
+        );
     }
 
     #[test]

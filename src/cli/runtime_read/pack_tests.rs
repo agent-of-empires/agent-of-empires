@@ -384,14 +384,26 @@ async fn a_401_or_403_upgrade_is_unauthorized_at_exit_four() {
     }
 }
 
+/// A redirect and a 500 are the same class and the opposite of an absent
+/// endpoint: the peer answered and would not serve us. Answering from the local
+/// store here would print this machine's sessions as the remote's, so both
+/// refuse, under a name that says which happened.
 #[tokio::test]
 #[serial_test::parallel]
-async fn a_redirect_or_error_upgrade_is_unavailable() {
+async fn a_redirect_or_error_upgrade_is_a_server_error() {
     for response in [REDIRECT, SERVER_ERROR] {
         let error = upgrade_against(response)
             .await
             .expect_err("a non-101 upgrade must not connect");
-        assert_eq!(map_upgrade_error(error).code(), "unavailable");
+        let failure = map_upgrade_error(error);
+        assert_eq!(failure.code(), "server_error");
+        let outcome = ReadOutcome::from(failure);
+        assert_eq!(outcome.stdout, None);
+        assert_eq!(
+            outcome.stderr.as_deref(),
+            Some("daemon read: server_error\n")
+        );
+        assert_eq!(outcome.exit, 4);
     }
 }
 
