@@ -2630,7 +2630,9 @@ pub(crate) fn build_container_config(
     // `CLAUDE_CODE_USE_VERTEX` is Claude-specific, so a globally exported flag
     // must not hand GCP creds to other agents. `GOOGLE_APPLICATION_CREDENTIALS`
     // is not forwarded: client libraries find the well-known path themselves.
-    if agent_selection.tool == "claude" && crate::session::environment::host_vertex_enabled() {
+    if agent_selection.tool == "claude"
+        && crate::session::environment::vertex_enabled(sandbox_info.provider.as_deref())
+    {
         let container_cred_path = format!(
             "{}/.config/gcloud/application_default_credentials.json",
             CONTAINER_HOME

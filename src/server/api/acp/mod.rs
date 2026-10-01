@@ -110,6 +110,7 @@ fn spawn_request_for(
         cwd: PathBuf::from(&instance.project_path),
         additional_dirs: vec![],
         provider_env: vec![],
+        provider: instance.agent_provider.clone(),
         model: instance.agent_model.clone(),
         effort: instance.acp_effort.clone(),
         effort_explicit: instance.acp_effort.is_some(),

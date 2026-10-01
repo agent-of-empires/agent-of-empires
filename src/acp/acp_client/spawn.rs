@@ -63,6 +63,12 @@ pub struct SpawnConfig {
     pub claude_store_pin: Option<crate::session::capture::ClaudeStorePin>,
     /// Trusted environment before the current hook overlay or Claude routing.
     pub base_host_environment: Vec<(String, String)>,
+    /// Claude routing flags for the session's provider pick, from
+    /// [`crate::session::environment::provider_override_env`]. Its own field
+    /// rather than an entry in `provider_env` or `host_environment`: it has to
+    /// outrank both, and a respawn that re-derives `host_environment` from
+    /// `base_host_environment` must not drop it.
+    pub provider_routing: Vec<(String, String)>,
 }
 
 /// Request-sourced keys may not redirect infrastructure the operator env
@@ -280,9 +286,14 @@ fn apply_stdio_env(
 ) -> EnvKeys {
     cmd.env_clear();
     let mut keys = apply_env_filter(cmd.as_std_mut(), config, extra_path_dirs);
-    // Last, so trusted operator config outranks request-sourced env. The
-    // runner path carries these on `ACP_AGENT_ENV` instead.
-    for (key, value) in &config.host_environment {
+    // Last, so trusted operator config outranks request-sourced env, and the
+    // session's provider pick outranks even that. The runner path carries both
+    // on `ACP_AGENT_ENV` instead.
+    for (key, value) in config
+        .host_environment
+        .iter()
+        .chain(&config.provider_routing)
+    {
         if let Some(reason) = host_environment_denyreason(key) {
             warn!(target: "acp", key = %key, reason, "rejecting configured host environment key");
             continue;

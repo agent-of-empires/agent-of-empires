@@ -75,6 +75,7 @@ impl Instance {
             view: View::Terminal,
             agent_name: None,
             agent_model: None,
+            agent_provider: None,
             acp_effort: None,
             acp_session_id: None,
             import_pending: None,
