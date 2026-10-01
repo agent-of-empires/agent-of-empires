@@ -1006,12 +1006,13 @@ fn cli_list_and_show_expose_lifecycle_state() {
 #[test]
 #[parallel]
 fn cli_acp_doctor_flags_adapters_below_the_version_floor() {
+    let at_floor = agent_of_empires::acp::agent_compat::CLAUDE_AGENT_ACP_MIN_VERSION;
     // (PATH adapter version, bundled adapter version, expected mark)
     let cases = [
         (Some("0.37.0"), None, "[!! ] claude"),
-        (Some("0.37.0"), Some("0.65.0"), "[OK] claude"),
+        (Some("0.37.0"), Some(at_floor), "[OK] claude"),
         (Some("0.37.0"), Some("0.44.0"), "[!! ] claude"),
-        (None, Some("0.65.0"), "[OK] claude"),
+        (None, Some(at_floor), "[OK] claude"),
         (None, Some("0.44.0"), "[!! ] claude"),
     ];
     for (path_version, bundle_version, expected) in cases {
