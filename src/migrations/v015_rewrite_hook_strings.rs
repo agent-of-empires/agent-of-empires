@@ -446,11 +446,12 @@ mod tests {
         assert!(allow.exists(), "allowlist must be created alongside config");
         let parsed: Value = serde_json::from_str(&fs::read_to_string(&allow).unwrap()).unwrap();
         let approvals = parsed["approvals"].as_array().unwrap();
+        // `pre_llm_call` also approves the foreground identity publisher.
         for approval in approvals {
             let cmd = approval["command"].as_str().unwrap();
             assert!(
-                cmd.contains("case \"$AOE_INSTANCE_ID\""),
-                "allowlist must key on the new hardened command"
+                cmd.contains("case \"$AOE_INSTANCE_ID\"") || cmd.contains("__extract-session-id"),
+                "allowlist must key on the new hardened command; got: {cmd}"
             );
         }
     }
