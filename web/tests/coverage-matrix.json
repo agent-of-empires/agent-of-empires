@@ -2813,6 +2813,20 @@
       "components": ["web/src/components/acp/StructuredView.tsx", "web/src/components/acp/PromptStrips.tsx"]
     },
     {
+      "id": "acp.session-notices",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/components/acp/SessionNoticesStrip.test.tsx", "src/lib/acpTypes.test.ts"],
+      "components": [
+        "web/src/components/acp/PromptStrips.tsx",
+        "web/src/components/acp/StructuredView.tsx",
+        "web/src/components/acp/AcpRuntime.tsx",
+        "web/src/hooks/useAcpSession.ts",
+        "web/src/hooks/acpSession/reducer.ts",
+        "web/src/lib/acpTypes.ts"
+      ]
+    },
+    {
       "id": "acp.queue-send-now",
       "kind": "vitest",
       "risk": "medium",

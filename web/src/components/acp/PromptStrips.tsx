@@ -2,7 +2,7 @@ import { Fragment, useState } from "react";
 import { AlertTriangle, Check, Clock, Info, Paperclip, RotateCcw, SendHorizontal, X } from "lucide-react";
 
 import { useIsCoarsePointer } from "../../hooks/useIsCoarsePointer";
-import type { QueuedPrompt, RejectedPrompt } from "../../lib/acpTypes";
+import type { QueuedPrompt, RejectedPrompt, SessionNotice } from "../../lib/acpTypes";
 import { useClearAliases } from "../../lib/agentProfileContext";
 import { isClearAlias } from "../../lib/agentProfiles";
 import { isQueuedPromptLong, queuedStripLayout } from "./queuedPromptsLayout";
@@ -77,6 +77,89 @@ export function RejectedPromptsStrip({
             </button>
           </li>
         ))}
+      </ul>
+    </Strip>
+  );
+}
+
+interface NoticeTone {
+  strip: string;
+  row: string;
+  icon: string;
+  dismiss: string;
+}
+
+const ERROR_TONE: NoticeTone = {
+  strip: "border-red-900/40 bg-red-950/20",
+  row: "flex items-start gap-2 rounded-lg border border-red-700/30 bg-red-950/15 px-2.5 py-1.5",
+  icon: "mt-0.5 h-4 w-4 shrink-0 text-red-300",
+  dismiss:
+    "inline-flex shrink-0 items-center justify-center rounded-md border border-red-700/40 bg-red-900/20 p-1 text-red-200 hover:bg-red-900/60",
+};
+
+const WARNING_TONE: NoticeTone = {
+  strip: AMBER_STRIP,
+  row: AMBER_ROW,
+  icon: "mt-0.5 h-4 w-4 shrink-0 text-amber-300",
+  dismiss: AMBER_DISMISS,
+};
+
+const INFO_TONE: NoticeTone = {
+  strip: "border-sky-900/40 bg-sky-950/20",
+  row: "flex items-start gap-2 rounded-lg border border-sky-700/30 bg-sky-950/15 px-2.5 py-1.5",
+  icon: "mt-0.5 h-4 w-4 shrink-0 text-sky-300",
+  dismiss:
+    "inline-flex shrink-0 items-center justify-center rounded-md border border-sky-700/40 bg-sky-900/20 p-1 text-sky-200 hover:bg-sky-900/60",
+};
+
+/** An unknown future ACP level reads as advisory rather than alarming. */
+function noticeTone(severity: string): NoticeTone {
+  if (severity === "error") return ERROR_TONE;
+  if (severity === "warning") return WARNING_TONE;
+  return INFO_TONE;
+}
+
+/** Live advisories the agent pushed outside the turn flow (an approaching rate
+ *  limit, a model fallback). Dismissal is local to this tab. */
+export function SessionNoticesStrip({
+  notices,
+  onDismiss,
+}: {
+  notices: SessionNotice[];
+  onDismiss: (id: string) => void;
+}) {
+  if (notices.length === 0) return null;
+  const strongest = notices.some((n) => n.severity === "error")
+    ? "error"
+    : notices.some((n) => n.severity === "warning")
+      ? "warning"
+      : "info";
+  return (
+    <Strip tone={noticeTone(strongest).strip}>
+      <ul className="space-y-1">
+        {notices.map((notice) => {
+          const tone = noticeTone(notice.severity);
+          const Icon = notice.severity === "error" ? AlertTriangle : Info;
+          return (
+            <li key={notice.id} className={tone.row}>
+              <Icon className={tone.icon} />
+              <div className="min-w-0 flex-1">
+                <p className="text-xs leading-5 text-slate-100">{notice.title}</p>
+                {notice.description ? (
+                  <p className="mt-0.5 text-[11px] leading-4 text-slate-300/80">{notice.description}</p>
+                ) : null}
+              </div>
+              <button
+                type="button"
+                onClick={() => onDismiss(notice.id)}
+                className={tone.dismiss}
+                aria-label={`Dismiss notice: ${notice.title}`}
+              >
+                <X className="h-3 w-3" />
+              </button>
+            </li>
+          );
+        })}
       </ul>
     </Strip>
   );
