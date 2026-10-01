@@ -477,6 +477,7 @@
       "specs": ["src/components/settings/__tests__/StructuredWidgets.test.tsx"],
       "components": [
         "web/src/components/settings/StructuredWidgets.tsx",
+        "web/src/components/settings/FormFields.tsx",
         "web/src/components/settings/SchemaSection.tsx"
       ]
     },
