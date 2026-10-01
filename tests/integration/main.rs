@@ -26,6 +26,7 @@ mod cli_read_server;
 mod cli_read_uds;
 mod common;
 mod home_isolation;
+mod hooks_cli;
 
 mod daemon_client;
 #[cfg(debug_assertions)]

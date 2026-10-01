@@ -654,6 +654,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         runtime_read_semaphore: Arc::new(tokio::sync::Semaphore::new(
             crate::server::runtime_ws::RUNTIME_READ_CONCURRENCY,
         )),
+        create_progress: Default::default(),
         recently_restarted: crate::session::recovery::new_recently_restarted(),
         mutation_epoch: Arc::clone(&mutation_epoch),
         recovery_pending: crate::session::recovery::new_recovery_pending(),
