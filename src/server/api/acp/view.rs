@@ -490,7 +490,8 @@ pub async fn acp_disable(
 /// The tail of a disable: drop the ACP projection, forget the session, and
 /// bring the tmux pane back. Best-effort by construction: the view switch is
 /// already committed, so a failed event deletion must not strand the session
-/// in a wedged state. The residual transcript is swept later, the same way the
+/// in a wedged state. Any residual transcript is left in place; only a purge that
+/// still sees a structured session removes it.
 /// purge path treats a post-commit sidecar failure.
 async fn finish_terminal_switch(
     state: &Arc<AppState>,

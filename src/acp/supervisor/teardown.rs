@@ -182,8 +182,10 @@ impl<S: BroadcastSink> Supervisor<S> {
     }
 
     /// `None` when this call established no settlement of its own; the stop
-    /// was a cancel, or a teardown is already parked. Destructive callers must
-    /// treat that as "not proven dead" and leave their work to the retry pass.
+    /// was a cancel, or a teardown is already parked. A destructive caller
+    /// treats that as "not proven dead" and leaves its work to the retry pass,
+    /// except for a first spawn that never installed a worker under
+    /// `WorktreeIntent::Remove`, which owns no process to wait for.
     async fn shutdown_with_reason(
         &self,
         session_id: &str,

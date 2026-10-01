@@ -402,18 +402,19 @@ pub(super) fn process_group_has_live_members(pgrp: u32) -> std::io::Result<bool>
 /// recognised.
 pub(super) fn is_terminated(pid: u32) -> bool {
     match process_state(pid) {
-        Ok(Some(state)) => state.starts_with('Z'),
-        // `ps` answered and the pid is not there: it is gone, which for this
-        // probe is the same as terminated.
-        Ok(None) => true,
-        // The state could not be read, so it could not be proven gone.
-        Err(_) => false,
+        Ok(state) => state.starts_with('Z'),
+        // Either `ps` could not run, or it ran and found nothing: `ps` exits
+        // non-zero rather than succeeding with no row, so the two cannot be
+        // told apart here and neither proves the process is gone. A live pid that
+        // survives this reads as alive, which is the safe direction for a probe
+        // that authorises a teardown.
+        _ => false,
     }
 }
 
 /// The BSD state field of one process. BSD `ps` prints the state letter
 /// followed by its flags, so a zombie reads `ZN` rather than `Z`.
-fn process_state(pid: u32) -> Result<Option<String>, std::io::Error> {
+fn process_state(pid: u32) -> Result<String, std::io::Error> {
     let output = Command::new("ps")
         .args(["-o", "state=", "-p", &pid.to_string()])
         .output()
@@ -424,13 +425,13 @@ fn process_state(pid: u32) -> Result<Option<String>, std::io::Error> {
             output.status
         )));
     }
-    Ok(String::from_utf8_lossy(&output.stdout)
+    String::from_utf8_lossy(&output.stdout)
         .lines()
         .map(str::trim)
         .find(|line| !line.is_empty())
-        .map(str::to_string))
+        .map(str::to_string)
+        .ok_or_else(|| std::io::Error::other(format!("ps -p {pid} printed no state")))
 }
-
 pub(super) fn parent_and_argv0(pid: u32) -> Option<(u32, String)> {
     let output = Command::new("ps")
         .args(["-o", "ppid=,args=", "-p", &pid.to_string()])

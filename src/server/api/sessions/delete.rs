@@ -218,8 +218,8 @@ async fn purge_session_artifacts_inner(
     // and are not guaranteed idempotent, so a refusal that drops this
     // transaction must not have run one: the scheduled `purge_expired_trash`
     // re-reserves and would replay it. The wait is ~2.5s, so the process-wide
-    // flocks are released across it; the durable reservation stays, and
-    // `run_hooks` and the commit reacquire the canonical order.
+    // flocks are released across it; the durable reservation stays. The hooks
+    // then run without them, and the commit reacquires the canonical order.
     let transaction = transaction.release_locks_for_teardown();
     if transcript_purged {
         // What matters is whether this purge destroys the directory the session's
