@@ -10,6 +10,7 @@ import { useFocusTerminalTarget } from "../../hooks/useFocusTerminalTarget";
 import { useMobileKeyboard } from "../../hooks/useMobileKeyboard";
 import { useSkillIndex } from "../../hooks/useSkillIndex";
 import { switchAcpProvider } from "../../lib/api";
+import { reportError } from "../../lib/toastBus";
 import { clearDraft, clearDraftAttachments } from "../../lib/acpDrafts";
 import type { AcpState, PromptAttachmentInput, PromptCapabilities, QueuedPrompt } from "../../lib/acpTypes";
 import { isIOS, isStandalone } from "../../lib/platform";
@@ -389,11 +390,11 @@ export function Composer(props: Props) {
  *  for every other agent and the server refuses the call anyway.
  *
  *  The switch has no event of its own, so the session row carrying
- *  `acp_provider` only catches up on the next poll. The accepted value stands
- *  in until then. It is scoped to the session it was accepted for and dropped
- *  once the row agrees, so neither a session change nor a switch made in
- *  another tab leaves a stale pick on screen. */
-type ProviderEcho = { sessionId: string; value: string } | null;
+ *  `acp_provider` only catches up on the next poll. The echo stands in until
+ *  then. It records the value it replaced and applies only while the row still
+ *  reports that one, so the server stays authoritative: the confirming poll
+ *  retires it, and so does a switch made from another tab or the CLI. */
+type ProviderEcho = { sessionId: string; value: string; from: string | null } | null;
 
 function useProviderSwitch(sessionId: string, agent: string | null, serverProvider: string | null) {
   const [pending, setPending] = useState<ProviderEcho>(null);
@@ -401,19 +402,21 @@ function useProviderSwitch(sessionId: string, agent: string | null, serverProvid
   const supported = agent === "claude" || agent === "claude-code";
 
   const live = (echo: ProviderEcho) =>
-    echo && echo.sessionId === sessionId && echo.value !== serverProvider ? echo.value : null;
+    echo && echo.sessionId === sessionId && echo.from === serverProvider ? echo.value : null;
 
   const set = useCallback(
     async (next: string) => {
-      setPending({ sessionId, value: next });
+      setPending({ sessionId, value: next, from: serverProvider });
       try {
         const result = await switchAcpProvider(sessionId, next);
-        if (result) setAccepted({ sessionId, value: result.provider });
+        setAccepted({ sessionId, value: result.provider, from: serverProvider });
+      } catch (e) {
+        reportError(`Provider switch failed: ${e instanceof Error ? e.message : String(e)}`);
       } finally {
         setPending(null);
       }
     },
-    [sessionId],
+    [sessionId, serverProvider],
   );
 
   if (!supported) return { current: null, pending: null, set: undefined };
