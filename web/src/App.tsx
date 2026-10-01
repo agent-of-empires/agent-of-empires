@@ -1587,7 +1587,7 @@ function AppContent({
     // The swipe-right-to-open gesture only makes sense for a left-anchored
     // drawer; with the sidebar on the right edge it would slide in from the
     // opposite side of the drag, so disable it there (#2244).
-    enabled: !sidebarOpen && webSettings.sidebarSide !== "right",
+    enabled: !sidebarOpen && !pickerOpen && webSettings.sidebarSide !== "right",
     onSwipe: openSidebar,
     blurOnSwipe: true,
     // A swipe-right anywhere on screen opens the sidebar, not just from the
@@ -1599,6 +1599,9 @@ function AppContent({
     enabled: rightDockCollapsed && !!activeSessionId,
     onSwipe: openDiff,
   });
+  // Swiping right anywhere dismisses the right-hand view drawer.
+  const closePicker = useCallback(() => setPickerOpen(false), []);
+  useEdgeSwipe({ edge: "left", enabled: pickerOpen, onSwipe: closePicker, anywhere: true });
 
   // Read-only mode hides mutation UI. Guard creation at the handler so every
   // caller (keyboard shortcut, command palette) is a no-op rather than opening
@@ -2533,7 +2536,7 @@ function AppContent({
             pluginPanes={pluginPanes}
             availablePanes={mobilePaneIds}
             onSelect={handlePickView}
-            onClose={() => setPickerOpen(false)}
+            onClose={closePicker}
           />
         )}
 

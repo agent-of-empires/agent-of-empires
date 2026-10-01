@@ -36,7 +36,8 @@ interface Props {
   onClose: () => void;
 }
 
-/** Mobile-only bottom sheet that promotes the chosen view into the single full-viewport main pane. */
+/** Mobile-only right drawer that promotes the chosen view into the single
+ *  full-viewport main pane. Options sit at the bottom, within thumb reach. */
 export function MobileRightPanelPicker({ open, active, pluginPanes, availablePanes, onSelect, onClose }: Props) {
   // Close on Escape, matching the other dismissible overlays.
   useEffect(() => {
@@ -48,25 +49,28 @@ export function MobileRightPanelPicker({ open, active, pluginPanes, availablePan
     return () => window.removeEventListener("keydown", onKey);
   }, [open, onClose]);
 
-  if (!open) return null;
+  // Stays mounted so it can slide out; `invisible` flips after the transform
+  // finishes, which also takes the closed drawer out of focus and the a11y tree.
   return (
-    <div className="md:hidden fixed inset-0 z-50 flex flex-col justify-end">
+    <div className="md:hidden">
       <div
-        className="absolute inset-0 bg-black/50"
+        className={`fixed top-12 inset-x-0 bottom-0 z-40 bg-black/50 transition-[opacity,visibility] duration-300 motion-reduce:transition-none ${
+          open ? "opacity-100" : "opacity-0 invisible"
+        }`}
         onClick={onClose}
         data-testid="mobile-right-panel-picker-backdrop"
       />
       <div
-        className="relative bg-surface-900 border-t border-surface-700/20 rounded-t-lg pb-[env(safe-area-inset-bottom)]"
+        className={`fixed top-12 right-0 bottom-0 z-50 w-[min(80vw,300px)] bg-surface-800 border-l border-surface-700/60 flex flex-col justify-end pr-[env(safe-area-inset-right)] pb-[env(safe-area-inset-bottom)] transition-[transform,visibility] duration-300 ease-in-out motion-reduce:transition-none ${
+          open ? "translate-x-0" : "translate-x-full invisible"
+        }`}
         role="dialog"
         aria-modal="true"
         aria-label="Select view"
         data-testid="mobile-right-panel-picker"
       >
-        <div className="flex justify-center py-2">
-          <div className="w-9 h-1 rounded-full bg-surface-500/40" />
-        </div>
-        <ul className="px-2 pb-2">
+        <div className="px-5 pb-1 text-[11px] font-mono uppercase text-text-muted">Views</div>
+        <ul className="px-2 pb-3 overflow-y-auto">
           {[...ALWAYS_ENTRIES, ...GATED_ENTRIES.filter((entry) => availablePanes.includes(entry.view))].map((entry) => {
             const isActive = entry.view === active;
             return (
@@ -75,7 +79,7 @@ export function MobileRightPanelPicker({ open, active, pluginPanes, availablePan
                   onClick={() => onSelect(entry.view)}
                   aria-current={isActive ? "true" : undefined}
                   data-testid={`mobile-right-panel-pick-${entry.view}`}
-                  className={`w-full flex flex-col items-start gap-0.5 px-3 py-2 rounded-lg text-left cursor-pointer transition-colors ${
+                  className={`w-full flex flex-col items-start gap-0.5 px-3 py-3 rounded-lg text-left cursor-pointer transition-colors ${
                     isActive ? "bg-brand-600/10 text-brand-500" : "text-text-secondary hover:bg-surface-800"
                   }`}
                 >
@@ -95,7 +99,7 @@ export function MobileRightPanelPicker({ open, active, pluginPanes, availablePan
                     onClick={() => onSelect(pane.id as RightPanelView)}
                     aria-current={isActive ? "true" : undefined}
                     data-testid={`mobile-right-panel-pick-${pane.id}`}
-                    className={`w-full flex flex-col items-start gap-0.5 px-3 py-2 rounded-lg text-left cursor-pointer transition-colors ${
+                    className={`w-full flex flex-col items-start gap-0.5 px-3 py-3 rounded-lg text-left cursor-pointer transition-colors ${
                       isActive ? "bg-brand-600/10 text-brand-500" : "text-text-secondary hover:bg-surface-800"
                     }`}
                   >
