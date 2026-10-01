@@ -16,6 +16,16 @@ const ANYWHERE_THRESHOLD_PX = 90;
 const VERTICAL_CANCEL_PX = 16;
 const MOBILE_BREAKPOINT = 768;
 
+/** True when the touch began inside an element that scrolls horizontally, e.g. a code block. */
+function startsInHorizontalScroller(target: EventTarget | null): boolean {
+  for (let el = target instanceof Element ? target : null; el; el = el.parentElement) {
+    if (el.scrollWidth <= el.clientWidth) continue;
+    const { overflowX } = getComputedStyle(el);
+    if (overflowX === "auto" || overflowX === "scroll") return true;
+  }
+  return false;
+}
+
 export function useEdgeSwipe({ edge, enabled, onSwipe, blurOnSwipe = false, anywhere = false }: EdgeSwipeOptions) {
   useEffect(() => {
     if (!enabled) return;
@@ -32,6 +42,7 @@ export function useEdgeSwipe({ edge, enabled, onSwipe, blurOnSwipe = false, anyw
       const inEdge = edge === "left" ? t.clientX <= EDGE_PX : t.clientX >= window.innerWidth - EDGE_PX;
       if (!anywhere && !inEdge) return;
       if (anywhere && edge === "left" && t.clientX <= SYSTEM_BACK_GUARD_PX) return;
+      if (anywhere && startsInHorizontalScroller(e.target)) return;
       tracking = true;
       startX = t.clientX;
       startY = t.clientY;

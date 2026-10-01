@@ -107,6 +107,28 @@ describe("useEdgeSwipe", () => {
     expect(onSwipe).not.toHaveBeenCalled();
   });
 
+  it.each<[string, string, number, number]>([
+    ["an overflowing scroller", "auto", 300, 1],
+    ["a scroller with nothing to scroll", "auto", 100, 0],
+    ["a non-scrolling overflow", "visible", 300, 0],
+  ])("anywhere mode starting in %s", (_label, overflowX, scrollWidth, ignored) => {
+    const pre = document.createElement("pre");
+    pre.style.overflowX = overflowX;
+    Object.defineProperty(pre, "clientWidth", { value: 100 });
+    Object.defineProperty(pre, "scrollWidth", { value: scrollWidth });
+    const code = document.createElement("code");
+    pre.appendChild(code);
+    document.body.appendChild(pre);
+
+    const { onSwipe } = mount({ anywhere: true });
+    const start = new Event("touchstart", { bubbles: true }) as Event & { touches: unknown[] };
+    start.touches = [{ clientX: 200, clientY: 100 }];
+    code.dispatchEvent(start);
+    dispatchTouch("touchmove", [[200 + 100, 100]]);
+    expect(onSwipe).toHaveBeenCalledTimes(ignored ? 0 : 1);
+    pre.remove();
+  });
+
   it("blurs the active element before invoking onSwipe", () => {
     const input = document.createElement("input");
     document.body.appendChild(input);

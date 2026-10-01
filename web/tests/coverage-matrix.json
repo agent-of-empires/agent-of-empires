@@ -1350,6 +1350,13 @@
       ]
     },
     {
+      "id": "sidebar.edge-swipe",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/hooks/useEdgeSwipe.test.ts"],
+      "components": ["web/src/hooks/useEdgeSwipe.ts"]
+    },
+    {
       "id": "sidebar.compact-mode",
       "kind": "mocked-playwright",
       "risk": "medium",
