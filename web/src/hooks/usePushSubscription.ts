@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { isIOS, isStandalone } from "../lib/platform";
 import {
   classifyPushHealth,
+  hasFreshGoneFailure,
   readPushWanted,
   writePushWanted,
   type PushHealth,
@@ -188,10 +189,21 @@ export function usePushSubscription() {
       const { public_key } = (await vapidResp.json()) as { public_key: string };
       const reg = await navigator.serviceWorker.ready;
       let sub = await reg.pushManager.getSubscription();
-      if (sub && keyMatches(sub, public_key) !== true) {
+      // A 404/410 permanently retires a browser endpoint. Re-subscribing the same
+      // endpoint only stores a dead subscription again, so renew it before posting.
+      const status = sub ? await fetchStatus(sub.endpoint).catch(() => null) : null;
+      const keyMismatch = sub && keyMatches(sub, public_key) !== true;
+      const gone = hasFreshGoneFailure(status?.subscription ?? null);
+      if (sub && (keyMismatch || gone)) {
         const stale = sub.endpoint;
-        await sub.unsubscribe().catch(() => {});
-        await postPush("unsubscribe", { endpoint: stale }).catch(() => {});
+        const unsubscribed = await sub.unsubscribe().catch(() => false);
+        if (!unsubscribed) throw new Error("Could not unsubscribe the expired notification subscription");
+        if (gone && status?.subscription?.registered && status.subscription.owned) {
+          const response = await postPush("unsubscribe", { endpoint: stale }).catch(() => null);
+          if (!response?.ok) throw new Error("Could not remove the expired notification subscription");
+        } else {
+          await postPush("unsubscribe", { endpoint: stale }).catch(() => {});
+        }
         sub = null;
       }
       sub ??= await reg.pushManager.subscribe({
