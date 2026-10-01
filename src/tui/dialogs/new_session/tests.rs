@@ -319,6 +319,16 @@ fn the_tool_row_cycles_and_submits_the_picked_tool() {
         assert_eq!(dialog.tool_index, expected);
     }
 
+    // Digits jump straight to a tool; out-of-range digits are ignored.
+    for (c, expected) in [('3', 2), ('1', 0), ('9', 0), ('2', 1)] {
+        dialog.handle_key(key(KeyCode::Char(c)));
+        assert_eq!(dialog.tool_index, expected);
+    }
+    assert_eq!(
+        submitted(dialog.handle_key(key(KeyCode::Enter))).tool,
+        "opencode"
+    );
+
     let mut dialog = multi_tool_dialog();
     dialog.focused_field = 2;
     dialog.handle_key(key(KeyCode::Char(' ')));
@@ -328,11 +338,12 @@ fn the_tool_row_cycles_and_submits_the_picked_tool() {
         "opencode"
     );
 
-    // Space is ordinary text on a text field, and a lone tool never cycles.
+    // Space and digits are ordinary text on a text field, and a lone tool never cycles.
     let mut dialog = multi_tool_dialog();
     dialog.focused_field = 1;
     dialog.handle_key(key(KeyCode::Char(' ')));
-    assert_eq!(dialog.title.value(), " ");
+    dialog.handle_key(key(KeyCode::Char('2')));
+    assert_eq!(dialog.title.value(), " 2");
     assert_eq!(dialog.tool_index, 0);
 
     let mut dialog = single_tool_dialog();
