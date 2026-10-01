@@ -17,7 +17,7 @@ use agent_of_empires::acp::acp_client::{AcpClient, SpawnConfig};
 use agent_of_empires::acp::agent_registry::AgentSpec;
 use agent_of_empires::acp::state::{AcpSessionId, Event};
 
-use crate::common::{shim_path, shim_ready};
+use crate::common::{shim_path, shim_ready, EnvGuard};
 
 /// The flags `provider_override_env` produces, restated here because the
 /// crate does not export it. Its own table test covers the mapping; what this
@@ -125,12 +125,19 @@ fn pair(value: &str) -> Vec<(String, String)> {
 /// `session/load` resume a respawn takes, and an unpinned session is left
 /// alone so it keeps today's host-driven behavior.
 #[tokio::test]
-#[serial_test::parallel]
+#[serial_test::serial]
 async fn provider_pick_reaches_the_adapter_on_load_and_new() {
     if let Err(reason) = shim_ready() {
         eprintln!("skipping: {reason}");
         return;
     }
+    // A profile with `inherit_host_environment` forwards the host's own
+    // routing flags, so the unpinned case would read whatever the developer's
+    // shell exports. Cleared here and restored on drop, which is why this test
+    // is serial.
+    let _env = EnvGuard::new(&["CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX"]);
+    std::env::remove_var("CLAUDE_CODE_USE_BEDROCK");
+    std::env::remove_var("CLAUDE_CODE_USE_VERTEX");
     // (pick, expected bedrock flag, expected vertex flag)
     let picks = [
         (Some("api"), Some(""), Some("")),
