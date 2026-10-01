@@ -356,6 +356,18 @@ mod tests {
 
     const CLAUDE: &str = "@agentclientprotocol/claude-agent-acp";
 
+    /// The semver in the first `key"..."` of `source` at or after `anchor`.
+    fn quoted_after(source: &str, anchor: &str, key: &str) -> semver::Version {
+        let (_, tail) = source
+            .split_once(anchor)
+            .unwrap_or_else(|| panic!("no {anchor:?}"));
+        let (_, tail) = tail
+            .split_once(key)
+            .unwrap_or_else(|| panic!("no {key:?} after {anchor:?}"));
+        let raw = tail.split('"').next().expect("unterminated string");
+        semver::Version::parse(raw).unwrap_or_else(|e| panic!("{raw:?} is not semver: {e}"))
+    }
+
     #[test]
     fn validate_and_steering_gates_per_agent() {
         use ExpectedAgent::*;
@@ -545,6 +557,32 @@ mod tests {
             pins,
             [CLAUDE_AGENT_ACP_MIN_VERSION],
             "docker/Dockerfile claude-agent-acp pin must match CLAUDE_AGENT_ACP_MIN_VERSION",
+        );
+
+        // The fake adapters answer the real handshake, so a floor bump that
+        // leaves them behind fails every test spawn, not just a version case.
+        let fake_agent = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/web/tests/helpers/fakeAcpAgent.mjs"
+        ));
+        let shim = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/acp-worker/test-shim/shim.mjs"
+        ));
+        for (path, source) in [
+            ("web/tests/helpers/fakeAcpAgent.mjs", fake_agent),
+            ("acp-worker/test-shim/shim.mjs", shim),
+        ] {
+            let advertised = quoted_after(source, &format!("name: \"{CLAUDE}\""), "version: \"");
+            assert!(
+                advertised >= floor(CLAUDE_AGENT_ACP_MIN_VERSION),
+                "{path} advertises {advertised}, below CLAUDE_AGENT_ACP_MIN_VERSION",
+            );
+        }
+        let fake_steering = quoted_after(fake_agent, "", "STEERING_MIN_VERSION = \"");
+        assert!(
+            fake_steering >= floor(CLAUDE_AGENT_ACP_STEERING_MIN_VERSION),
+            "fakeAcpAgent.mjs steers at {fake_steering}, below the steering floor",
         );
 
         // `from_command` finds the adapter binary in any launch shape.
