@@ -19,7 +19,12 @@ function secureContext(value: boolean) {
 }
 
 function renderToolbar(
-  opts: { keys?: readonly ToolbarKeyId[]; inputEl?: HTMLTextAreaElement | null; keyboardOpen?: boolean } = {},
+  opts: {
+    keys?: readonly ToolbarKeyId[];
+    inputEl?: HTMLTextAreaElement | null;
+    keyboardOpen?: boolean;
+    compact?: boolean;
+  } = {},
 ) {
   const sendData = vi.fn<(data: string) => boolean>(() => true);
   const sendPaste = vi.fn<(text: string, submit: boolean) => boolean>(() => true);
@@ -32,7 +37,7 @@ function renderToolbar(
       onCompose={onCompose}
       inputElRef={{ current: opts.inputEl ?? null }}
       keyboardOpen={opts.keyboardOpen ?? false}
-      compact={false}
+      compact={opts.compact ?? false}
       ctrlActive={false}
       onCtrlToggle={vi.fn()}
     />,
@@ -55,6 +60,15 @@ describe("MobileTerminalToolbar keys", () => {
     expect(screen.getAllByRole("button").map((b) => b.getAttribute("aria-label"))).toEqual(["Enter", "Escape"]);
     cleanup();
     expect(renderToolbar({ keys: [] }).container.firstChild).toBeNull();
+  });
+
+  it("ends the compact row with Enter unless the row already has it", () => {
+    const labels = () => screen.getAllByRole("button").map((b) => b.getAttribute("aria-label"));
+    renderToolbar({ keys: ["esc", "tab"], compact: true });
+    expect(labels()).toEqual(["Escape", "Tab", "Enter"]);
+    cleanup();
+    renderToolbar({ keys: ["enter", "esc"], compact: true });
+    expect(labels()).toEqual(["Enter", "Escape"]);
   });
 
   it.each(TOOLBAR_KEY_CATALOG.filter((k) => k.data).map((k) => [k.name, k.id, k.data!] as const))(
