@@ -17,7 +17,7 @@ async function openPicker(page: Page) {
   await expect(picker(page)).toBeVisible({ timeout: 5_000 });
 }
 
-/** One-finger horizontal swipe dispatched on the window, where useEdgeSwipe listens. */
+/** One-finger horizontal swipe dispatched on the window, where useDrawerSwipe listens. */
 async function swipe(page: Page, fromX: number, toX: number, y: number) {
   await page.evaluate(
     ({ fromX, toX, y }) => {
@@ -67,14 +67,14 @@ async function expectSafeAreaInset(page: Page, testId: string) {
 test.describe("Mobile right panel picker (#1452)", () => {
   test.use(iPhone13);
 
-  test("right-edge swipe opens a right-anchored drawer with thumb-reachable options; swipe right closes it", async ({
+  test("swipe left from mid-screen opens a right-anchored drawer with thumb-reachable options; swipe right closes it", async ({
     page,
   }) => {
     await openLiveTerminal(page, { mobile: true, settings: null });
     const viewport = page.viewportSize()!;
     const y = viewport.height / 2;
 
-    await swipe(page, viewport.width - 4, viewport.width - 160, y);
+    await swipe(page, viewport.width / 2 + 80, viewport.width / 2 - 80, y);
     await expect(picker(page)).toBeVisible();
     // A full-height panel flush with the right edge, not a full-width bottom sheet.
     await expect

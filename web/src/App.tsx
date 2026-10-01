@@ -46,7 +46,7 @@ import { SendCommentsDialog } from "./components/diff/comments/SendCommentsDialo
 import { useCommandActions, buildConversationActions, type SessionStateAction } from "./hooks/useCommandActions";
 import { usePluginCommands } from "./hooks/usePluginCommands";
 import { useSettingsCommands } from "./hooks/useSettingsCommands";
-import { useEdgeSwipe } from "./hooks/useEdgeSwipe";
+import { useDrawerSwipe, type DrawerSwipeAction } from "./hooks/useDrawerSwipe";
 import { useIsCoarsePointer } from "./hooks/useIsCoarsePointer";
 import { useMobileViewportLock } from "./hooks/useMobileViewportLock";
 import { useIsWideViewport } from "./hooks/useIsWideViewport";
@@ -1574,34 +1574,20 @@ function AppContent({
     setSidebarOpen((o) => !o);
   }, []);
 
-  const openSidebar = useCallback(() => setSidebarOpen(true), []);
-  const openDiff = useCallback(() => {
-    if (isMdUp) {
-      openTab("diff", "right");
-    } else {
-      setPickerOpen(true);
-    }
-  }, [isMdUp, openTab]);
-  useEdgeSwipe({
-    edge: "left",
-    // The swipe-right-to-open gesture only makes sense for a left-anchored
-    // drawer; with the sidebar on the right edge it would slide in from the
-    // opposite side of the drag, so disable it there (#2244).
-    enabled: !sidebarOpen && !pickerOpen && webSettings.sidebarSide !== "right",
-    onSwipe: openSidebar,
-    blurOnSwipe: true,
-    // A swipe-right anywhere on screen opens the sidebar, not just from the
-    // left edge. The right-edge (diff) swipe stays edge-only below.
-    anywhere: true,
-  });
-  useEdgeSwipe({
-    edge: "right",
-    enabled: rightDockCollapsed && !!activeSessionId,
-    onSwipe: openDiff,
-  });
-  // Swiping right anywhere dismisses the right-hand view drawer.
   const closePicker = useCallback(() => setPickerOpen(false), []);
-  useEdgeSwipe({ edge: "left", enabled: pickerOpen, onSwipe: closePicker, anywhere: true });
+  const handleDrawerSwipe = useCallback((action: DrawerSwipeAction) => {
+    if (action === "open-sidebar" || action === "close-sidebar") setSidebarOpen(action === "open-sidebar");
+    else setPickerOpen(action === "open-panels");
+  }, []);
+  useDrawerSwipe(
+    {
+      sidebarOpen,
+      sidebarSide: webSettings.sidebarSide,
+      panelsOpen: pickerOpen,
+      panelsAvailable: !!activeWorkspace && !!activeSession,
+    },
+    handleDrawerSwipe,
+  );
 
   // Read-only mode hides mutation UI. Guard creation at the handler so every
   // caller (keyboard shortcut, command palette) is a no-op rather than opening
