@@ -45,6 +45,11 @@ pub fn render(
     if layout.approval.height > 0 {
         render_approval_shelf(frame, layout.approval, theme, state, active);
     }
+    // After the approval shelf, which replaces the button list wholesale.
+    if layout.notices.height > 0 {
+        let close = render_notices(frame, layout.notices, theme, state);
+        state.mouse_targets.borrow_mut().buttons.extend(close);
+    }
     if layout.queue.height > 0 {
         render_queue(frame, layout.queue, theme, state);
     }
@@ -213,7 +218,8 @@ pub(super) fn compute_layout(area: Rect, state: &StructuredViewState) -> ViewLay
         .constraints([
             Constraint::Min(5), // transcript
             Constraint::Length(approval_height),
-            Constraint::Length(queue_height), // queued prompts strip (0 when empty)
+            Constraint::Length(notices_strip_height(state)), // 0 when none
+            Constraint::Length(queue_height),                // queued prompts strip (0 when empty)
             Constraint::Length(composer_height(state)),
             Constraint::Length(1), // status line
         ])
@@ -221,9 +227,10 @@ pub(super) fn compute_layout(area: Rect, state: &StructuredViewState) -> ViewLay
     ViewLayout {
         transcript: chunks[0],
         approval: chunks[1],
-        queue: chunks[2],
-        composer: chunks[3],
-        status: chunks[4],
+        notices: chunks[2],
+        queue: chunks[3],
+        composer: chunks[4],
+        status: chunks[5],
     }
 }
 
@@ -303,6 +310,78 @@ fn render_pane_panel(frame: &mut Frame, area: Rect, theme: &Theme, state: &Struc
 
 fn queued_strip_height(state: &StructuredViewState) -> u16 {
     u16::from(!state.queue.is_empty())
+}
+
+/// One line per undismissed advisory. Capped daemon-side, so this never
+/// starves the transcript.
+fn notices_strip_height(state: &StructuredViewState) -> u16 {
+    state.visible_notices().count() as u16
+}
+
+/// Agent-pushed advisories, toned by severity, each dismissable with `x` or a
+/// click on its `×`. Dismissal is local, so it never clears another client.
+fn render_notices(
+    frame: &mut Frame,
+    area: Rect,
+    theme: &Theme,
+    state: &StructuredViewState,
+) -> Vec<(Rect, Intent)> {
+    let mut buttons = Vec::new();
+    for (row, notice) in state.visible_notices().enumerate() {
+        let Some(y) = area
+            .y
+            .checked_add(row as u16)
+            .filter(|y| *y < area.bottom())
+        else {
+            break;
+        };
+        let colour = match notice.severity.as_str() {
+            "error" => theme.error,
+            "warning" => theme.title,
+            // An unknown future level reads as advisory rather than alarming.
+            _ => theme.hint,
+        };
+        let mut text = format!(" {} ", notice.title);
+        if let Some(description) = notice.description.as_deref().map(str::trim) {
+            if !description.is_empty() {
+                text.push_str(description);
+                text.push(' ');
+            }
+        }
+        let line = Line::from(vec![
+            Span::styled(
+                format!(" {} ", notice.severity),
+                Style::default().fg(colour).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(text, Style::default().fg(theme.hint)),
+        ]);
+        let row_area = Rect {
+            x: area.x,
+            y,
+            width: area.width,
+            height: 1,
+        };
+        frame.render_widget(Paragraph::new(line), row_area);
+        let label = " × ";
+        if let Some(x) = row_area
+            .right()
+            .checked_sub(label.len() as u16)
+            .filter(|x| *x > row_area.x)
+        {
+            let close = Rect {
+                x,
+                y,
+                width: label.len() as u16,
+                height: 1,
+            };
+            frame.render_widget(
+                Paragraph::new(Span::styled(label, Style::default().fg(colour))),
+                close,
+            );
+            buttons.push((close, Intent::DismissNotice(Some(notice.id.clone()))));
+        }
+    }
+    buttons
 }
 
 fn render_queue(frame: &mut Frame, area: Rect, theme: &Theme, state: &StructuredViewState) {
@@ -1019,7 +1098,11 @@ fn render_status(
         }
     }
     let hint = if active {
-        help_hint(state.focus, selected_approval_is_choice(state))
+        help_hint(
+            state.focus,
+            selected_approval_is_choice(state),
+            state.visible_notices().next().is_some(),
+        )
     } else {
         " Enter reply · wheel history "
     };
@@ -1768,11 +1851,12 @@ fn selected_approval_is_choice(state: &StructuredViewState) -> bool {
         .any(|pending| pending.nonce == selected && pending.choice && !pending.options.is_empty())
 }
 
-fn help_hint(focus: Focus, approval_is_choice: bool) -> &'static str {
+fn help_hint(focus: Focus, approval_is_choice: bool, has_notices: bool) -> &'static str {
     match focus {
         Focus::Composer => " Enter to send · Ctrl+Q to exit ",
         // `render_status` drops the hint unless it has `len + 24` spare columns,
         // so keep these short.
+        Focus::Transcript if has_notices => " x dismiss · scroll · p pane · Ctrl+Q exit ",
         Focus::Transcript => " scroll · p pane · Ctrl+Q exit ",
         Focus::Approval if approval_is_choice => " a answer · d deny · Esc stop ",
         Focus::Approval => " a allow · A always · d deny · Esc stop ",
@@ -1785,7 +1869,7 @@ mod tests {
     use super::*;
     use crate::acp::client::discovery::Source;
     use crate::acp::client::{DaemonEndpoint, HttpClient};
-    use crate::acp::state::{AvailableCommand, Event};
+    use crate::acp::state::{AvailableCommand, Event, SessionNotice};
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
@@ -1793,6 +1877,66 @@ mod tests {
         let endpoint = DaemonEndpoint::new("http://127.0.0.1:8080".into(), None, Source::Env);
         let http = HttpClient::new(endpoint.clone()).unwrap();
         StructuredViewState::new("s-1".into(), endpoint, http, None)
+    }
+
+    /// #4242: the strip is the TUI's only dismissible advisory surface, and the
+    /// transcript row must outlive a dismissal so the history stays complete.
+    #[test]
+    fn session_notices_render_in_a_strip_and_dismiss_locally() {
+        let mut state = test_state();
+        state.transcript.session_notices = vec![
+            SessionNotice {
+                id: "notice-1".into(),
+                severity: "warning".into(),
+                title: "Model fallback".into(),
+                description: Some("Switched to Sonnet.".into()),
+            },
+            SessionNotice {
+                id: "notice-2".into(),
+                severity: "info".into(),
+                title: "Fast mode turned off".into(),
+                description: None,
+            },
+        ];
+        state
+            .transcript
+            .merge_server_rows(server_rows(&[Event::SessionNotice {
+                severity: "warning".into(),
+                title: "Model fallback".into(),
+                description: Some("Switched to Sonnet.".into()),
+            }]));
+
+        // One strip row per undismissed notice, each with its own close target.
+        let strip_rows = |state: &StructuredViewState| -> Vec<String> {
+            render_rows(state, 80, 24, true)
+                .into_iter()
+                .filter(|row| row.contains('×'))
+                .collect()
+        };
+
+        let rows = strip_rows(&state);
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert!(rows[0].contains("Model fallback"), "{rows:?}");
+        assert!(rows[1].contains("Fast mode turned off"), "{rows:?}");
+        assert!(
+            help_hint(Focus::Transcript, false, true).contains("x dismiss"),
+            "the key is advertised while a notice is up"
+        );
+
+        state.dismissed_notices.insert("notice-1".into());
+        let rows = strip_rows(&state);
+        assert_eq!(rows.len(), 1, "the dismissed notice leaves the strip");
+        assert!(rows[0].contains("Fast mode turned off"), "{rows:?}");
+        let painted = render_rows(&state, 80, 24, true).join("\n");
+        assert!(
+            painted.contains("· warning: Model fallback: Switched to Sonnet."),
+            "the transcript row survives the dismissal: {painted}"
+        );
+
+        // The daemon retiring the notice must not leave the id behind.
+        state.transcript.session_notices.clear();
+        state.prune_dismissed_notices();
+        assert!(state.dismissed_notices.is_empty());
     }
 
     fn line_text(line: &Line) -> String {
@@ -1922,9 +2066,9 @@ mod tests {
         assert!(approval_actions_line(&Theme::default(), false, false)
             .1
             .is_empty());
-        assert!(help_hint(Focus::Approval, true).contains("a answer"));
-        assert!(!help_hint(Focus::Approval, true).contains("always"));
-        assert!(help_hint(Focus::Approval, false).contains("A always"));
+        assert!(help_hint(Focus::Approval, true, false).contains("a answer"));
+        assert!(!help_hint(Focus::Approval, true, false).contains("always"));
+        assert!(help_hint(Focus::Approval, false, false).contains("A always"));
     }
 
     #[test]

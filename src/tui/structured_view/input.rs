@@ -48,6 +48,10 @@ pub enum Intent {
     CancelInFlight,
     /// Drop every queued (not-yet-sent) prompt.
     ClearQueue,
+    /// Hide a session notice in this view, `None` meaning the oldest visible
+    /// one (the `x` key; a click names its own). Local, so another client
+    /// keeps it.
+    DismissNotice(Option<String>),
     /// Browse the prompt queue shell-history style: negative toward older
     /// entries (ArrowUp), positive toward newer. The view loads the entry into
     /// the composer for editing.
@@ -124,6 +128,8 @@ pub struct InputContext {
     pub choice_numbered: bool,
     /// The agent advertised permission modes; gates the transcript `m` key.
     pub has_modes: bool,
+    /// Whether any undismissed session notice is on screen, gating `x`.
+    pub has_notices: bool,
     /// The agent is generating. Gates `Esc` in the composer: it interrupts the
     /// turn while busy, and is an inert no-op when idle.
     pub agent_busy: bool,
@@ -360,6 +366,7 @@ fn transcript_keys(key: &KeyEvent, ctx: InputContext) -> Intent {
             Intent::CancelElicitation
         }
         // Permission-mode picker, when the agent advertised modes.
+        (m, KeyCode::Char('x')) if m.is_empty() && ctx.has_notices => Intent::DismissNotice(None),
         (m, KeyCode::Char('m')) if m.is_empty() && ctx.has_modes => Intent::OpenModePicker,
         // Esc backs out one level to the composer (the home base) rather than
         // leaving the view.
@@ -496,6 +503,7 @@ mod tests {
     fn ctx_modes() -> InputContext {
         InputContext {
             has_modes: true,
+            has_notices: false,
             ..InputContext::default()
         }
     }
@@ -876,6 +884,7 @@ mod tests {
             transcript: Rect::new(0, 0, 80, 20),
             status: Rect::new(0, 20, 80, 1),
             approval: Rect::new(0, 21, 80, 0),
+            notices: Rect::new(0, 21, 80, 0),
             queue: Rect::new(0, 21, 80, 0),
             composer: Rect::new(0, 21, 80, 3),
         }
