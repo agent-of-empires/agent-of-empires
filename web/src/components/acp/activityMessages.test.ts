@@ -329,4 +329,20 @@ describe("user and callout rows", () => {
       "> 📝 **Summary of conversation so far**\n>\n> - fixed the login bug\n> - next: wire the UI",
     );
   });
+
+  it("keeps an advisory in the timeline after its banner is dismissed", () => {
+    const advisory: TranscriptRow = {
+      id: "notice-7",
+      group_id: "g-7",
+      kind: "advisory",
+      at: AT,
+      text: "warning: Model fallback: Switched to Sonnet.",
+    };
+    const action = transcriptDeltaAction({ Append: advisory }, "s");
+    let state = reducer(emptyAcpState(), action!);
+    state = reducer(state, { kind: "dismiss_session_notice", id: "notice-7" });
+    expect(assistantParts(state.activity)[0]!.text).toBe(
+      "> ℹ️ **Notice**; warning: Model fallback: Switched to Sonnet.",
+    );
+  });
 });

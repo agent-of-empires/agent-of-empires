@@ -1398,7 +1398,8 @@ fn transcript_lines(
             | TranscriptRowKind::SessionCleared
             | TranscriptRowKind::Compacted
             | TranscriptRowKind::Summary
-            | TranscriptRowKind::Notice => {
+            | TranscriptRowKind::Notice
+            | TranscriptRowKind::Advisory => {
                 let kind = match row.kind {
                     // Failures the user must see.
                     TranscriptRowKind::Notice => NoteKind::Error,

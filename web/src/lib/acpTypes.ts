@@ -665,6 +665,7 @@ export interface ActivityRow {
     | "empty_output"
     | "context_reset"
     | "notice"
+    | "advisory"
     | "session_cleared"
     | "compacted"
     | "summary";

@@ -57,6 +57,9 @@ pub enum TranscriptRowKind {
     Summary,
     /// An error or lifecycle notice the user needs in the timeline.
     Notice,
+    /// An agent session advisory. Unlike `Notice`, every surface keeps it in
+    /// the timeline, since its banner is capped and retired by the next turn.
+    Advisory,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -79,8 +82,7 @@ pub enum TranscriptDelta {
     Remove(String),
 }
 
-/// A notice row is toned as an error like every other producer of its kind, so
-/// the severity is spelled out in the text rather than left to colour alone.
+/// The row carries no severity field, so the text spells it out.
 fn session_notice_text(severity: &str, title: &str, description: &Option<String>) -> String {
     match description
         .as_deref()
@@ -342,7 +344,11 @@ impl TranscriptModel {
                 severity,
                 title,
                 description,
-            } => vec![self.notice(seq, session_notice_text(severity, title, description))],
+            } => vec![self.push(
+                format!("notice-{seq}"),
+                TranscriptRowKind::Advisory,
+                session_notice_text(severity, title, description),
+            )],
             Event::RateLimitAutoResumed { resets_at, manual } => {
                 let how = if *manual { "resumed" } else { "auto-resumed" };
                 vec![self.notice(seq, format!("{how} at {resets_at} after rate-limit park"))]
@@ -836,19 +842,17 @@ mod tests {
                     description: Some("Switched to Sonnet.".into()),
                 },
                 "notice-1",
-                TranscriptRowKind::Notice,
+                TranscriptRowKind::Advisory,
                 "warning: Model fallback: Switched to Sonnet.".to_string(),
             ),
             (
-                // The row is toned as an error whatever the severity, so an
-                // info notice has to read correctly from its text alone.
                 Event::SessionNotice {
                     severity: "info".into(),
                     title: "Task stopped by user".into(),
                     description: None,
                 },
                 "notice-1",
-                TranscriptRowKind::Notice,
+                TranscriptRowKind::Advisory,
                 "info: Task stopped by user".to_string(),
             ),
             (
