@@ -188,10 +188,6 @@ pub struct ModeInfo {
 
 /// Agent-to-client notification carrying the agent's own auth identity.
 pub const AUTH_STATUS_UPDATE_METHOD: &str = "_auth/status_update";
-/// Key under `agentCapabilities._meta` whose presence means the agent pushes
-/// `AUTH_STATUS_UPDATE_METHOD`. The value is an empty object and carries
-/// nothing itself.
-pub const AUTH_STATUS_CAPABILITY_KEY: &str = "authStatus";
 
 /// Which auth identity the agent process resolved for itself. An interim
 /// `_meta` extension, so an unrecognised kind still renders from `label`
