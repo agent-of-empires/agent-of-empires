@@ -4,15 +4,28 @@
 import { ChevronUp } from "lucide-react";
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 
-import type { ConfigOptionDescriptor, AcpState } from "../../lib/acpTypes";
+import type { ConfigOptionChoice, ConfigOptionDescriptor, AcpState } from "../../lib/acpTypes";
 
 interface Props {
   configOptions: AcpState["configOptions"];
   pendingConfigOption: AcpState["pendingConfigOption"];
   onSetConfigOption: (configId: string, value: string) => void | Promise<void>;
+  /** Pinned LLM backend, or null when the host environment decides. */
+  provider?: string | null;
+  /** The provider value in flight, if any. */
+  providerPending?: string | null;
+  /** Absent for a session whose agent does not route through a provider. */
+  onSetProvider?: (provider: string) => void | Promise<void>;
 }
 
 const MODEL_LABEL_MAX = 24;
+/** Synthetic id; aoe owns this pick, so it is not an agent config option. */
+const PROVIDER_OPTION_ID = "aoe-provider";
+const PROVIDERS: ConfigOptionChoice[] = [
+  { value: "api", name: "Anthropic API", description: "Direct api.anthropic.com" },
+  { value: "bedrock", name: "Bedrock", description: "AWS credentials from the host" },
+  { value: "vertex", name: "Vertex AI", description: "GCP credentials from the host" },
+];
 // The floor only picks the open direction; height always clamps to the available space.
 const MENU_MAX_HEIGHT_CAP = 288;
 const MENU_MAX_HEIGHT_FLOOR = 120;
@@ -32,11 +45,35 @@ function findByCategory(
   return options.find((o) => o.category === category);
 }
 
-export function SessionConfigControls({ configOptions, pendingConfigOption, onSetConfigOption }: Props) {
+/** Reuses the config-option dropdown so the provider pick gets its placement,
+ *  keyboard handling and pending state for free. While unpinned the list leads
+ *  with a non-selectable entry naming that state: the dropdown already refuses
+ *  to re-pick the current value, and there is no way back to unpinned once a
+ *  provider is chosen. */
+function providerDescriptor(provider: string | null | undefined): ConfigOptionDescriptor {
+  return {
+    id: PROVIDER_OPTION_ID,
+    name: "Provider",
+    category: "provider",
+    current_value: provider ?? "",
+    options: provider
+      ? PROVIDERS
+      : [{ value: "", name: "Host default", description: "Set by the host environment" }, ...PROVIDERS],
+  };
+}
+
+export function SessionConfigControls({
+  configOptions,
+  pendingConfigOption,
+  onSetConfigOption,
+  provider,
+  providerPending,
+  onSetProvider,
+}: Props) {
   const model = findByCategory(configOptions, "model");
   const effort = findByCategory(configOptions, "thought_level");
 
-  if (!model && !effort) return null;
+  if (!model && !effort && !onSetProvider) return null;
 
   return (
     <div data-testid="session-config-controls" className="flex flex-wrap items-center gap-1.5">
@@ -52,6 +89,13 @@ export function SessionConfigControls({ configOptions, pendingConfigOption, onSe
           option={effort}
           pending={pendingConfigOption?.configId === effort.id ? pendingConfigOption.value : null}
           onSelect={(value) => onSetConfigOption(effort.id, value)}
+        />
+      )}
+      {onSetProvider && (
+        <ModelDropdown
+          option={providerDescriptor(provider)}
+          pending={providerPending ?? null}
+          onSelect={(value) => onSetProvider(value)}
         />
       )}
     </div>
