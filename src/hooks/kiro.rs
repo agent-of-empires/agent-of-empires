@@ -140,6 +140,18 @@ fn find_kiro_agent_file_by_name(agents_dir: &Path, name: &str) -> Option<PathBuf
 
 /// Make `aoe-hooks` the default Kiro agent while the user is still on Kiro's
 /// built-in default. Best-effort: failures are logged and ignored.
+/// What the consent surfaces print about [`set_kiro_default_agent_if_builtin`].
+/// Declared beside the function so the wording cannot drift from what it does,
+/// and conditional throughout: a custom default that cannot be read is treated
+/// as unset, and `kiro-cli` may be absent when a launch runs.
+pub const KIRO_DEFAULT_AGENT_NOTE: &str = concat!(
+    "After installing Kiro hooks, AoE may run `kiro-cli agent set-default ",
+    "aoe-hooks`. Kiro keeps that as its persistent default, so it affects ",
+    "later Kiro sessions, including ones outside AoE. A default that Kiro ",
+    "reports as custom is left alone; one that cannot be read is treated as ",
+    "unset. Kiro owns that setting, AoE does not choose its path."
+);
+
 pub fn set_kiro_default_agent_if_builtin() {
     let current_default = std::process::Command::new("kiro-cli")
         .args(["settings", "chat.defaultAgent", "--format", "json"])

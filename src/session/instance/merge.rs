@@ -321,6 +321,7 @@ impl Instance {
             &post.base_branch_override,
         );
         splice(&mut self.color, &pre.color, &post.color);
+        splice(&mut self.sort_index, &pre.sort_index, &post.sort_index);
         // Worktree workdir edit (move dir / rename branch) mutates these two.
         splice(
             &mut self.project_path,

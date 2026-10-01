@@ -21,10 +21,23 @@ impl HomeView {
         self.rebuild_flat_items();
         let restored = match (&self.selected_session, &self.selected_group) {
             (Some(sid), _) => self.session_row(sid),
-            (None, Some(gpath)) => self
-                .flat_items
-                .iter()
-                .position(|item| matches!(item, Item::Group { path, .. } if path == gpath)),
+            (None, Some(gpath)) => {
+                // Two profiles can hold the same group path in the all-profiles list, and
+                // landing on the wrong one leaves `selected_group_profile` pointing at the
+                // other profile, which the next action would act on.
+                let selected_profile = self.selected_group_profile.clone();
+                self.flat_items
+                    .iter()
+                    .position(|item| {
+                        matches!(item, Item::Group { path, profile, .. }
+                            if path == gpath && *profile == selected_profile)
+                    })
+                    .or_else(|| {
+                        self.flat_items.iter().position(
+                            |item| matches!(item, Item::Group { path, .. } if path == gpath),
+                        )
+                    })
+            }
             (None, None) => None,
         };
         match restored {

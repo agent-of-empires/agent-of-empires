@@ -43,8 +43,9 @@ afterEach(() => {
 
 function renderStep(data: Partial<WizardData> = {}, props: { initialTab?: "import"; agents?: AgentInfo[] } = {}) {
   const onChange = vi.fn();
-  render(<ProjectStep data={{ ...initialData, ...data }} onChange={onChange} {...props} />);
-  return { onChange };
+  const onPicked = vi.fn();
+  render(<ProjectStep data={{ ...initialData, ...data }} onChange={onChange} onPicked={onPicked} {...props} />);
+  return { onChange, onPicked };
 }
 
 const sessions = (...list: ReturnType<typeof mockSession>[]) =>
@@ -68,14 +69,13 @@ const recentEntries = (entries: Partial<RecentProjectEntry>[]) =>
 // The Recent tab button also reads "Recent"; section headers are <p>.
 const header = (text: string) => screen.queryByText(text, { selector: "p" });
 
-describe("scratch toggle", () => {
-  it("toggles scratch once per click on the switch", () => {
-    const { onChange } = renderStep();
-    const toggle = screen.getByRole("switch", { name: "Skip project folder" });
-    expect(toggle.getAttribute("aria-checked")).toBe("false");
-    fireEvent.click(toggle);
-    expect(onChange).toHaveBeenCalledTimes(1);
-    expect(onChange).toHaveBeenCalledWith("scratch", true);
+describe("scratch tab", () => {
+  it("sets scratch and reports the pick", async () => {
+    const { onChange, onPicked } = renderStep();
+    fireEvent.click(await screen.findByRole("button", { name: "Scratch" }));
+    fireEvent.click(screen.getByRole("button", { name: "Use a scratch folder" }));
+    expect(onChange.mock.calls).toEqual([["scratch", true]]);
+    expect(onPicked).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -113,9 +113,10 @@ describe("recent and saved projects", () => {
     ["recent", () => sessions(mockSession({ project_path: "/repo/beta" })), "/repo/beta"],
   ])("selects a %s project's path on click", async (_, seed, path) => {
     seed();
-    const { onChange } = renderStep();
+    const { onChange, onPicked } = renderStep();
     fireEvent.click((await screen.findByText(path)).closest("button")!);
     expect(onChange).toHaveBeenCalledWith("path", path);
+    expect(onPicked).toHaveBeenCalledTimes(1);
   });
 
   it("reports each selection's saved worktree override, undefined when there is none", async () => {

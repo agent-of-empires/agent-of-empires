@@ -117,7 +117,10 @@ pub(crate) use types::{
 
 // Sibling items the submodules reach through `use super::*`.
 use hooks::status_hook_env_prefix;
-pub(crate) use hooks::{generic_host_config_path_for, sidecar_host_config_path_for};
+pub(crate) use hooks::{
+    host_hook_agent, host_hook_disclosure, host_hook_disclosure_config_with_repo,
+    host_hook_post_install_notes,
+};
 use launch_command::{
     append_resume_flags, build_fork_flags, parse_launch_command, shell_stdin_command,
     splice_subcommand_or_append, PreparedLaunch,
@@ -317,6 +320,9 @@ pub struct Instance {
     pub base_branch_override: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub color: Option<String>,
+    /// Position within its group under `SortOrder::Custom`. `None` sorts last.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sort_index: Option<u32>,
     #[serde(default, skip_serializing_if = "View::is_terminal")]
     pub view: View,
     #[serde(default, skip_serializing_if = "Option::is_none")]

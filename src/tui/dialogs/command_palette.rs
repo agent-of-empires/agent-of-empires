@@ -477,9 +477,10 @@ mod tests {
             PaletteGroup::Actions
         );
 
-        // (query, id of the entry it should surface). "move" only matches the
-        // rename entry through its keywords.
-        for (query, id) in [("ren", "rename"), ("move", "rename")] {
+        // (query, id of the entry it should surface). "move" reaches the row-move
+        // entries by title and the rename entry ("Rename or move to group") mid-title,
+        // so the prefix match wins.
+        for (query, id) in [("ren", "rename"), ("move", "move row up")] {
             let mut dialog = make_dialog();
             type_query(&mut dialog, query);
             assert!(!dialog.matches.is_empty(), "{query} matched nothing");

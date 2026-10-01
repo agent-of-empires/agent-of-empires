@@ -3,6 +3,8 @@
 import type { Page } from "@playwright/test";
 import { test, expect } from "./helpers/mockedTest";
 import { installSidebarMocks, threeSessionsInOneRepo, type MockSessionInput } from "./helpers/sidebarMocks";
+import { openMobileSidebar } from "./helpers/sidebar";
+import { iPhone13 } from "./helpers/viewports";
 
 async function openSidebar(page: Page, sessions: MockSessionInput[]) {
   await installSidebarMocks(page, { sessions });
@@ -165,8 +167,28 @@ test.describe("row chips and naming actions", () => {
     await openSidebar(page, [structured("sess-1", "Fix login bug", false)]);
     for (const item of ["auto-name", "summarize"]) {
       await openMenu(page, "Fix login bug");
+      await page.getByTestId("sidebar-context-menu-more").click();
       await page.getByTestId(`sidebar-context-menu-${item}`).click();
     }
     await expect.poll(() => posted).toEqual(["/api/sessions/sess-1/smart-rename", "/api/sessions/sess-1/summarize"]);
+  });
+});
+
+test.describe("mobile overlay on a notched phone", () => {
+  test.use(iPhone13);
+
+  test("starts below the inset header and keeps its footer above the home indicator", async ({ page }) => {
+    const cdp = await page.context().newCDPSession(page);
+    await cdp.send("Emulation.setSafeAreaInsetsOverride", { insets: { top: 47, bottom: 34 } });
+    await installSidebarMocks(page, { sessions: threeSessionsInOneRepo() });
+    await page.goto("/");
+    await openMobileSidebar(page);
+
+    const header = (await page.locator("header").boundingBox())!;
+    const sidebar = (await page.locator("[data-tour='sidebar']").boundingBox())!;
+    expect(header.y).toBe(47);
+    expect(sidebar.y).toBe(header.y + header.height);
+    const settings = (await page.getByRole("button", { name: "Settings" }).boundingBox())!;
+    expect(settings.y + settings.height).toBeLessThanOrEqual(page.viewportSize()!.height - 34);
   });
 });

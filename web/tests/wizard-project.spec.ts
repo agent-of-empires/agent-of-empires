@@ -2,7 +2,7 @@
 
 import type { Page } from "@playwright/test";
 import { test, expect } from "./helpers/mockedTest";
-import { mockWizardApis, openWizard, sessionStub, startWizard, wizard } from "./helpers/wizard";
+import { mockWizardApis, openPanel, openWizard, sessionStub, startWizard, wizard } from "./helpers/wizard";
 
 const option = (page: Page, text: string) => page.getByRole("option").filter({ hasText: text });
 
@@ -20,9 +20,9 @@ async function mockBrowse(page: Page, entries: { name: string; is_git_repo?: boo
   });
 }
 
+/** A pick returns to the form, whose Project row names it. */
 async function expectSelected(page: Page, path: string) {
-  await expect(page.getByText("Selected project")).toBeVisible();
-  await expect(page.getByText(path, { exact: false })).toBeVisible();
+  await expect(wizard(page).getByTestId("wizard-project-row")).toContainText(path);
 }
 
 test.describe("project tabs", () => {
@@ -84,7 +84,7 @@ test.describe("extra repos", () => {
         { name: "docs", path: "/tmp/docs", scope: "profile" },
       ],
     });
-    await expect(page.getByText("Extra repos (optional)")).toBeVisible();
+    await openPanel(page, "Extra repos");
     // Scoped: the sidebar and the step's Saved projects list render the same projects.
     const picker = page.getByTestId("extra-repos-picker");
     const chip = (name: string) => picker.getByRole("button").filter({ hasText: new RegExp(`^${name}`) });
@@ -111,8 +111,7 @@ test.describe("scratch sessions", () => {
     await page.keyboard.press("ControlOrMeta+Shift+KeyN");
     const w = wizard(page);
     await expect(w.getByRole("button", { name: /Launch session/ })).toBeVisible();
-    await expect(w.getByText(/Scratch session/).first()).toBeVisible();
-    await expect(w.getByRole("switch", { name: "Skip project folder" })).toHaveAttribute("aria-checked", "true");
+    await expect(w.getByTestId("wizard-project-row")).toContainText("Scratch folder");
     // Launch and its shortcut stay disabled until the profile defaults settle.
     await expect(w.getByRole("button", { name: /Launch session/ })).toBeEnabled();
     await page.keyboard.press("ControlOrMeta+Enter");

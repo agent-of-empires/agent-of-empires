@@ -39,7 +39,7 @@ test.describe("Live terminal mobile controls", () => {
   test("the default key row fits one line, and an eight-key row still does not scroll", async ({ page }) => {
     const handle = await openLiveTerminal(page, { mobile: true });
     const row = ["Escape", "Tab", "Ctrl", "Paste from clipboard", "Compose"];
-    for (const name of row) await expect(page.getByRole("button", { name, exact: true })).toBeVisible();
+    for (const name of [...row, "Enter"]) await expect(page.getByRole("button", { name, exact: true })).toBeVisible();
     await page.getByRole("button", { name: "Tab", exact: true }).tap();
     await expect.poll(() => handle.liveInput.map((b) => b.toString())).toContain("\t");
 
@@ -73,9 +73,9 @@ test.describe("Live terminal mobile controls", () => {
           height: cap.height,
         };
       });
-    // 34 - 22 below the keys, and 0.7 * 34 in from each corner.
+    // 34 - 8 below the keys, and 0.7 * 34 in from each corner.
     const closed = await layout();
-    expect(closed).toMatchObject({ barGap: 0, keyGap: 12, height: 36 });
+    expect(closed).toMatchObject({ barGap: 0, keyGap: 26, height: 36 });
     expect(closed.left).toBeCloseTo(23.8, 0);
 
     await page.getByLabel("Live terminal input").focus();

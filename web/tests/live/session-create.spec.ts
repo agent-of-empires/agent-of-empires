@@ -19,6 +19,12 @@ async function openWizard(page: Page, serve: ServeHandle): Promise<Locator> {
   return wizard;
 }
 
+/** A fresh server has no remembered project, so the wizard opens on its picker. */
+async function pickScratch(wizard: Locator) {
+  await wizard.getByRole("button", { name: "Scratch", exact: true }).click();
+  await wizard.getByRole("button", { name: "Use a scratch folder" }).click();
+}
+
 /** The only session is a scratch session under the app data dir's `scratch/`. */
 async function expectOneScratchSession(serve: ServeHandle) {
   const sessions = await waitForSessions(serve.baseUrl);
@@ -41,8 +47,7 @@ test.describe("wizard", () => {
     // #1841: the structured view toggle defaults on for an ACP-capable agent.
     const serve = await spawnServe({ acp: true });
     const wizard = await openWizard(page, serve);
-    await wizard.getByRole("switch", { name: "Skip project folder" }).click();
-    await wizard.getByRole("button", { name: "More options" }).click();
+    await pickScratch(wizard);
     const acpToggle = wizard.getByRole("switch", { name: "Use structured view" });
     await expect(acpToggle).toBeVisible({ timeout: 10_000 });
     await expect(acpToggle).toBeChecked();
@@ -56,9 +61,10 @@ test.describe("wizard", () => {
   test("wizard auto-approve starts Codex in full-access mode", async ({ page, spawnServe }) => {
     const serve = await spawnServe({ acp: true, extraEnv: { FAKE_ACP_MODE_VIA_CONFIG_OPTION: "codex" } });
     const wizard = await openWizard(page, serve);
-    await wizard.getByRole("switch", { name: "Skip project folder" }).click();
+    await pickScratch(wizard);
+    await wizard.getByTestId("wizard-agent-row").click();
     await wizard.getByRole("button", { name: "codex", exact: true }).click();
-    await wizard.getByRole("button", { name: "More options" }).click();
+    await wizard.getByRole("button", { name: "Done" }).click();
     const autoApprove = wizard.getByRole("switch", { name: "Auto-approve actions" });
     await autoApprove.click();
     await expect(autoApprove).toBeChecked();
@@ -96,7 +102,7 @@ test.describe("scratch sessions", () => {
   test("deleting a scratch session removes its scratch dir", async ({ page, spawnServe }) => {
     const serve = await spawnServe();
     const wizard = await openWizard(page, serve);
-    await wizard.getByRole("switch", { name: "Skip project folder" }).click();
+    await pickScratch(wizard);
     await wizard.getByRole("button", { name: /Launch session/ }).click();
     const [created] = await waitForSessions(serve.baseUrl);
     const projectPath = created!.project_path as string;
@@ -216,8 +222,7 @@ test.describe("directory browser", () => {
     await expect(option(page, "repo-b")).toHaveAccessibleName(/^repo-b$/);
 
     await option(page, "repo-a").click();
-    await expect(page.getByText("Selected project")).toBeVisible();
-    await expect(page.getByText(`${homePath}/projects/repo-a`)).toBeVisible();
+    await expect(page.getByTestId("wizard-project-row")).toContainText(`${homePath}/projects/repo-a`);
     expect(await page.evaluate(() => window.localStorage.getItem("aoe-last-browse-dir"))).toBe(`${homePath}/projects`);
 
     await page.getByRole("button", { name: "Close" }).click();

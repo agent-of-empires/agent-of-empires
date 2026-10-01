@@ -9,10 +9,9 @@ use std::sync::Arc;
 use std::sync::Mutex as StateMutex;
 use tokio::sync::{oneshot, Mutex, MutexGuard, Notify};
 
-use super::control::PromptCompletedMarker;
 use super::errors::acp_internal_error;
 use crate::acp::control_protocol::{
-    SessionReplayed, MAX_CONTROL_QUEUE_BYTES, MAX_CONTROL_QUEUE_FRAMES,
+    PromptCompletedMarker, SessionReplayed, MAX_CONTROL_QUEUE_BYTES, MAX_CONTROL_QUEUE_FRAMES,
 };
 
 // The replayed backlog a reattach flushes is exactly the runner's detached

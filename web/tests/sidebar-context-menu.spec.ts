@@ -396,6 +396,45 @@ test.describe("Long-press menu (mobile)", () => {
 
   const LONG_PRESS_MS = 500;
 
+  test("the row menu is a bottom sheet with every action reachable without scrolling", async ({ page }) => {
+    await installSidebarMocks(page, { sessions: threeSessionsInOneRepo() });
+    await page.goto("/");
+    await openMobileSidebar(page);
+    await rows(page).first().click({ button: "right" });
+    const sheet = menu(page);
+    await expect(sheet).toBeVisible();
+    const viewport = page.viewportSize()!;
+    const box = (await sheet.boundingBox())!;
+    expect(box.x).toBe(0);
+    expect(box.width).toBe(viewport.width);
+    expect(Math.round(box.y + box.height)).toBe(viewport.height);
+    await expect(page.getByTestId("sidebar-context-menu-delete")).toBeInViewport({ ratio: 1 });
+    expect(await sheet.evaluate((el) => el.scrollHeight <= el.clientHeight)).toBe(true);
+  });
+
+  test("dragging the sheet header down past the threshold closes it; a short drag snaps back", async ({ page }) => {
+    await installSidebarMocks(page, { sessions: threeSessionsInOneRepo() });
+    await page.goto("/");
+    await openMobileSidebar(page);
+    await rows(page).first().click({ button: "right" });
+    await expect(menu(page)).toBeVisible();
+    const box = (await menu(page).boundingBox())!;
+    const x = box.x + box.width / 2;
+    const y = box.y + 8;
+
+    const cdp = await page.context().newCDPSession(page);
+    const drag = async (dy: number) => {
+      await cdp.send("Input.dispatchTouchEvent", { type: "touchStart", touchPoints: [{ x, y, id: 1 }] });
+      await cdp.send("Input.dispatchTouchEvent", { type: "touchMove", touchPoints: [{ x, y: y + dy, id: 1 }] });
+      await cdp.send("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
+    };
+    await drag(30);
+    await expect(menu(page)).toBeVisible();
+    await expect.poll(async () => (await menu(page).boundingBox())!.y).toBeCloseTo(box.y, 0);
+    await drag(120);
+    await expect(menu(page)).toBeHidden();
+  });
+
   test("a native contextmenu after the long-press does not dismiss the row menu", async ({ page }) => {
     await installSidebarMocks(page, { sessions: threeSessionsInOneRepo() });
     await page.goto("/");
@@ -415,16 +454,13 @@ test.describe("Long-press menu (mobile)", () => {
     await page.waitForFunction((sel) => document.querySelector(sel) !== null, MENU, { polling: "raf" });
     await expect(menu(page)).toBeVisible();
 
-    // The menu sits under the finger, which is what makes the inside-menu guard matter.
-    const topmostIsMenu = await page.evaluate(
-      ({ px, py, sel }) => {
-        const target = document.elementFromPoint(px, py);
-        const el = document.querySelector(sel);
-        return !!target && !!el && el.contains(target);
-      },
-      { px: x, py: y, sel: MENU },
+    // The sheet's backdrop sits under the finger, so the trailing native
+    // contextmenu lands outside the menu and only the time guard keeps it open.
+    const topmostIsRow = await page.evaluate(
+      ({ px, py }) => !!document.elementFromPoint(px, py)?.closest("[data-testid='sidebar-session-row']"),
+      { px: x, py: y },
     );
-    expect(topmostIsMenu).toBe(true);
+    expect(topmostIsRow).toBe(false);
 
     await page.evaluate(
       ({ px, py }) =>
@@ -463,20 +499,11 @@ test.describe("Long-press menu (mobile)", () => {
       touchPoints: [],
     });
 
-    // The guard is a time window: later, a tap outside still dismisses. Tap
-    // beside the menu, which is nearly full height on a phone and so attracts
-    // near-miss taps above or below.
+    // The guard is a time window: later, a tap on the backdrop above the sheet dismisses.
     await page.waitForTimeout(LONG_PRESS_MS + 100);
-    const outside = await menu(page).evaluate((el) => {
-      const r = el.getBoundingClientRect();
-      const gapLeft = r.left;
-      const gapRight = window.innerWidth - r.right;
-      if (Math.max(gapLeft, gapRight) < 12) throw new Error("no horizontal gap beside the menu");
-      return {
-        x: Math.round(gapLeft >= gapRight ? gapLeft / 2 : (r.right + window.innerWidth) / 2),
-        y: Math.round(r.top + r.height / 2),
-      };
-    });
+    const top = (await menu(page).boundingBox())!.y;
+    expect(top).toBeGreaterThan(24);
+    const outside = { x: Math.round(box.x + box.width / 2), y: Math.round(top / 2) };
     const urlBefore = page.url();
     await page.touchscreen.tap(outside.x, outside.y);
     await expect(menu(page)).toBeHidden();

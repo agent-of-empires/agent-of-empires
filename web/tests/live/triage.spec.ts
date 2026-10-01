@@ -44,7 +44,7 @@ test("pin → unpin survives reload; snooze presets, a 1h pick, and unsnooze rou
 
   // Archiving or snoozing a pinned session clears the pin server-side, so the menu offers both.
   await row.click({ button: "right" });
-  await expect(menuItem(page, "pin")).toContainText("Unpin");
+  await expect(menuItem(page, "pin")).toHaveAttribute("aria-pressed", "true");
   await expect(menuItem(page, "archive")).toHaveCount(1);
   await expect(menuItem(page, "snooze")).toHaveCount(1);
   await expect.poll(field(serve, "pinned_at"), { timeout: 5_000 }).toBeTruthy();

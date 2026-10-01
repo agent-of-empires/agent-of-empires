@@ -454,6 +454,7 @@ async fn admit_and_create(
         agent_effort: None,
         import_acp_session_id: None,
         fork_seed: None,
+        progress: None,
     };
 
     if let Some(key) = req.idempotency_key.as_deref() {
@@ -610,7 +611,7 @@ async fn sessions_turn_send(
         };
         let dispatch = deps
             .session_service
-            .prompt_dispatch_under_submission(&req.session_id, woke_idle_dormant)
+            .prompt_dispatch_under_submission(&req.session_id, woke_idle_dormant, false)
             .await;
         if let crate::acp::dispatch::PromptDispatch::Queued { reason } = dispatch {
             if !matches!(reason, crate::acp::dispatch::QueueReason::WorkerDown) {

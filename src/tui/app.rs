@@ -48,6 +48,8 @@ fn clear_reported_session_creates(reported: u32, outcome: crate::telemetry::Send
         return;
     }
     use std::sync::atomic::Ordering;
+    // `try_update` needs Rust 1.99; this keeps the 1.85 MSRV and the Nix toolchain building.
+    #[allow(deprecated)]
     let _ = TUI_SESSION_CREATES.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
         Some(current.saturating_sub(reported))
     });
@@ -527,6 +529,9 @@ impl App {
         crate::tmux::spawn_snapshot_poller();
 
         crate::tui::clear_terminal(terminal)?;
+        // This clear satisfies any pending redraw; honoring it on the first tick
+        // would blank the first frame until the next paint.
+        self.needs_redraw = false;
         self.draw(terminal)?;
         #[cfg(feature = "e2e-tests")]
         e2e_render_ack(true)?;

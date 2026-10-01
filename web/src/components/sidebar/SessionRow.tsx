@@ -30,11 +30,12 @@ import { StatusGlyph } from "../StatusGlyph";
 import { useContextMenu } from "../useContextMenu";
 import { AddProjectModal } from "./AddProjectModal";
 import { RowSubRows, RowTrailingBadges } from "./RowBadges";
-import { deriveRowModel, type RowModel } from "./rowModel";
+import { deriveRowModel, SESSION_COLOR_OPTIONS, type RowModel } from "./rowModel";
 import { BulkTriageMenuItems, SingleRowMenuItems, type SingleRowActions } from "./SessionRowMenu";
 import { SnoozeModal } from "./SnoozeModal";
 import type { RowActivate, RowBulkApi, RowContextScope } from "./types";
 import { useLongPress } from "./useLongPress";
+import { usePendingSetting } from "./usePendingSetting";
 import { WorkdirNameModal } from "./WorkdirNameModal";
 
 type Modal = "snooze" | "workdir" | "addProject" | "group" | null;
@@ -67,14 +68,33 @@ export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
   const unreadIndicatorEnabled = useUnreadIndicatorEnabled();
   const sessionColorsEnabled = useSessionColorsEnabled();
   const compact = useSidebarCompact();
-  const model = deriveRowModel(workspace, props.optimistic, { idleDecayWindowMs, isActive, unreadIndicatorEnabled });
-  const { label, sessionId, isDeleting, navigationSession } = model;
+  const derived = deriveRowModel(workspace, props.optimistic, { idleDecayWindowMs, isActive, unreadIndicatorEnabled });
+  const { label, sessionId, isDeleting, navigationSession } = derived;
+  const [notifyPreset, setNotify] = usePendingSetting(
+    derived.notifyPreset,
+    (preset) => (sessionId ? setSessionNotifications(sessionId, preset) : Promise.resolve(false)),
+    () => reportError("Could not change notifications. Please try again."),
+  );
+  const [sessionColor, setColor] = usePendingSetting(
+    derived.sessionColor,
+    // The row shows any session's color, so every session must change for the pick to stick.
+    async (color) =>
+      (await Promise.all(workspace.sessions.map((s) => setSessionColor(s.id, color)))).every((r) => r != null),
+    () => reportError("Could not change the session color. Please try again."),
+  );
+  const model: RowModel = {
+    ...derived,
+    notifyPreset,
+    sessionColor,
+    sessionColorDot: SESSION_COLOR_OPTIONS.find((o) => o.key === sessionColor)?.dotClass ?? null,
+  };
 
   const [modal, setModal] = useState<Modal>(null);
   const [addProjectOptions, setAddProjectOptions] = useState<{ name: string; path: string }[]>([]);
   const [renaming, setRenaming] = useState(false);
   const [renameValue, setRenameValue] = useState(label);
   const renameRef = useRef<HTMLInputElement>(null);
+  const rowRef = useRef<HTMLAnchorElement>(null);
 
   const openedAtRef = useRef(0);
   const { menu, menuRef, openMenu, closeMenu } = useContextMenu<{ x: number; y: number; scope: RowContextScope }>(
@@ -107,7 +127,12 @@ export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
     setRenaming(true);
     requestAnimationFrame(() => renameRef.current?.select());
   };
-  const actions = { ...buildRowActions(props, model, closeMenu, setModal), rename: startRename };
+  const actions = {
+    ...buildRowActions(props, model, closeMenu, setModal),
+    rename: startRename,
+    notify: setNotify,
+    color: setColor,
+  };
   const openAddProject = () => {
     actions.addProject();
     void fetchProjects().then((projects) =>
@@ -148,6 +173,7 @@ export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
   return (
     <>
       <a
+        ref={rowRef}
         href={navigationSessionId ? `/session/${encodeURIComponent(navigationSessionId)}` : "/"}
         tabIndex={isDeleting ? -1 : undefined}
         aria-disabled={isDeleting || undefined}
@@ -227,14 +253,38 @@ export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
         </div>
       </a>
       {menu && (
-        <ContextMenu menu={menu} menuRef={menuRef} testId="sidebar-context-menu" minWidth="min-w-[180px]">
+        <ContextMenu
+          menu={menu}
+          menuRef={menuRef}
+          testId="sidebar-context-menu"
+          minWidth="min-w-[240px]"
+          sheetOnMobile
+          label={menu.scope.kind === "bulk" ? `${menu.scope.count} selected sessions` : `${label} actions`}
+          heading={
+            menu.scope.kind === "bulk" ? (
+              <span className="text-sm text-text-primary">{menu.scope.count} selected</span>
+            ) : (
+              <span className="flex items-center gap-2 text-sm font-mono text-text-primary">
+                <span className={`shrink-0 leading-none ${model.textClass}`}>
+                  <StatusGlyph
+                    status={model.status}
+                    createdAt={model.createdAt}
+                    idleEnteredAt={model.idleEnteredAt}
+                    dormant={model.dormant}
+                  />
+                </span>
+                {model.sessionColorDot && sessionColorsEnabled && (
+                  <span className={`h-2 w-2 shrink-0 rounded-full ${model.sessionColorDot}`} aria-hidden="true" />
+                )}
+                <span className="truncate">{label}</span>
+              </span>
+            )
+          }
+          onClose={closeMenu}
+          returnFocusTo={rowRef}
+        >
           {menu.scope.kind === "bulk" ? (
-            <BulkTriageMenuItems
-              count={menu.scope.count}
-              buckets={menu.scope.buckets}
-              api={bulkApi}
-              onDone={closeMenu}
-            />
+            <BulkTriageMenuItems buckets={menu.scope.buckets} api={bulkApi} onDone={closeMenu} />
           ) : (
             <SingleRowMenuItems
               model={model}
@@ -261,15 +311,16 @@ export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
   );
 });
 
-/** Menu actions; each closes the menu first so its dismiss listener cannot race a modal mount. */
+/** Menu actions; each closes the menu first so its dismiss listener cannot race a modal mount.
+ *  Pin, unread, notify and color are in-place toggles that keep it open; the row supplies the last two. */
 function buildRowActions(
   props: SessionRowProps,
   model: RowModel,
   closeMenu: () => void,
   setModal: (m: Modal) => void,
-): Omit<SingleRowActions, "rename"> {
+): Omit<SingleRowActions, "rename" | "notify" | "color"> {
   const { workspace } = props;
-  const { firstSession: first, acpSession: acp, sessionId } = model;
+  const { firstSession: first, acpSession: acp } = model;
   const after = (fn: () => unknown) => () => {
     closeMenu();
     void fn();
@@ -314,27 +365,14 @@ function buildRowActions(
     }),
     stop: after(() => first && props.onStop?.(first.id)),
     start: after(() => first && props.onStart?.(first.id)),
-    notify: (preset) =>
-      after(async () => {
-        if (!sessionId || preset === model.notifyPreset) return;
-        await setSessionNotifications(sessionId, preset);
-      })(),
-    // No optimistic overlay for color; the dot updates on the next poll.
-    color: (color) =>
-      after(async () => {
-        if (!sessionId || color === model.sessionColor) return;
-        if (!(await setSessionColor(sessionId, color))) {
-          reportError(color ? "Failed to set session color" : "Failed to clear session color");
-        }
-      })(),
-    pin: after(() => props.onPinToggle(workspace, !model.effectivePinned)),
+    pin: () => props.onPinToggle(workspace, !model.effectivePinned),
     archive: after(() => props.onArchiveToggle(workspace, !model.effectiveArchived)),
     openSnooze: after(() => setModal("snooze")),
     unsnooze: after(() => {
       setModal(null);
       props.onSnooze(workspace, null);
     }),
-    unread: after(() => props.onUnreadToggle(workspace, !model.effectiveUnread)),
+    unread: () => props.onUnreadToggle(workspace, !model.effectiveUnread),
     remove: after(() => props.onDelete?.(workspace.sessions.map((s) => s.id))),
   };
 }

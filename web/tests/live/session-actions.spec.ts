@@ -86,6 +86,7 @@ test.describe("group edit (#1726)", () => {
     const patch = page.waitForResponse(
       (res) => res.url().endsWith(`/api/sessions/${sessionId}/group`) && res.request().method() === "PATCH",
     );
+    await menuItem(page, "more").click();
     await menuItem(page, "edit-group").click();
     const modal = page.locator("[data-testid='session-group-modal']");
     await expect(modal).toBeVisible();

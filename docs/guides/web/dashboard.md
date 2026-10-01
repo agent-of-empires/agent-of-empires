@@ -13,14 +13,14 @@ The dashboard is the home screen of the web app: a workspace sidebar on the left
 
 ## Creating a session
 
-The **New session** wizard is one screen with these sections:
+The **New session** wizard is one screen of one-line rows, like the TUI dialog; a row with a chevron opens its details in a panel:
 
 - **Project**: pick the working directory from the Recent tab (saved projects first, then the directories of recent sessions), browse for one, clone a URL, or start a [scratch session](../scratch-sessions.md) with no path.
-- **Session**: set the title, which auto-slugifies into a worktree branch name unless you edit it, or attach an existing branch instead.
-- **Agent**: pick the tool and profile, plus per-session knobs (auto-approve, sandbox, command override, extra args and env).
-- **Review**: confirm before the session spawns.
+- **Title**: auto-slugifies into a worktree branch name unless you edit the branch.
+- **Agent**: the tool, plus instructions, command override, and extra args.
+- **Structured**, **Auto-approve**, **Worktree**, and **Sandbox** switches; the Worktree and Sandbox rows open their branch, base, image, and env options.
 
-Choosing a profile seeds the agent-step defaults; switching profiles after you have edited a field asks first.
+Choosing a profile (the **Profile** row, shown when there is more than one) seeds these defaults; switching profiles after you have edited a field asks first. A create that runs `on_create` hooks shows their output while it runs, and **Continue in background** closes the wizard and reports the result when it finishes.
 
 A plain New session opens on the project you launched last; pick another from Recent or Browse to change it.
 
@@ -68,11 +68,11 @@ Add one with the **+** on the section header (browse or type a path, optionally 
 
 ## Settings and profiles
 
-![The settings view with its tab groups and profile picker](../../assets/web/settings.png)
+![The settings view with its section groups and the profile picker on the Session tab](../../assets/web/settings.png)
 
-Settings are grouped into the same tabs as the TUI: **Appearance** (Theme), **Sessions** (session defaults and Structured view), **Environment** (Sandbox, Worktree, Tmux), **Notifications** (Sound and [web push](../../push-notifications.md)), **Web Dashboard** (Terminal, Security, Connected Devices), and **System** (Updates, Logging). The panel is generated from the same settings schema as the TUI, so a field declared once appears on both and they cannot drift. The host environment list is the one config knob the dashboard does not surface.
+Settings are grouped into **Dashboard** (Theme, Notifications for [web push](../../push-notifications.md), Terminal, Panels, Diff, Devices, Security), **Sessions** (Profiles, session defaults, Structured view, MCP servers, Skills), **Environment** (Sandbox, Worktree, Tmux, Sound), and **System** (Updates, Telemetry, Logging, Plugins). On a phone, Settings opens on this grouped list. The panel is generated from the same settings schema as the TUI, so a field declared once appears on both and they cannot drift; fields only the TUI reads sit under a **Terminal UI** fold. The host environment list is the one config knob the dashboard does not surface.
 
-The profile picker scopes which profile you are editing; global settings apply where a profile does not override a field. The **Profiles** tab (`/settings/profiles`) creates, renames, deletes, and sets the default profile, and its **Edit configuration** buttons deep-link into a tab scoped to that profile. Lifecycle hooks are shown read-only with their source, since hooks run arbitrary shell commands; the same applies to agent-command and environment fields. Creating, deleting, or renaming a profile, and saving global settings, are [step-up](../web-dashboard.md#security) actions.
+The profile picker, shown beside the title of tabs that hold profile-overridable fields, scopes which profile you are editing; global settings apply where a profile does not override a field. The **Profiles** tab (`/settings/profiles`) creates, renames, deletes, and sets the default profile, and its **Edit configuration** buttons deep-link into a tab scoped to that profile. Lifecycle hooks are shown read-only with their source, since hooks run arbitrary shell commands; the same applies to agent-command and environment fields. Creating, deleting, or renaming a profile, and saving global settings, are [step-up](../web-dashboard.md#security) actions.
 
 **Conversation display** (Sessions > Structured view) sets the base font size of the structured-view transcript, separately for mobile and desktop, from 6px to 28px with a 14px default. Prose, headings, lists, tables, and code all scale from it. The mobile value applies on a coarse pointer under 768px, switching live as you resize or rotate. The size is relative to your browser's own font setting, so it stacks with zoom and accessibility preferences. Both values are dashboard preferences stored with your web settings, not agent config, so they follow you across devices and never appear in `config.toml`.
 

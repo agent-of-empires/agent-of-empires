@@ -53,7 +53,7 @@ jobs:
           # toolchain hash, so successive pushes to the same PR reuse
           # the slot rather than thrashing the 10GB repo cache budget.
           save-if: true
-      - uses: taiki-e/install-action@dfae9bf3d6f6c6f20ef4ebb3486c01a51341ff12 # v2.87.18
+      - uses: taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172 # v2.87.20
         if: matrix.leg != 'web-e2e'
         with:
           tool: cargo-nextest
@@ -310,7 +310,7 @@ jobs:
       - name: Install tmux
         if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci-macos')
         run: brew install tmux
-      - uses: taiki-e/install-action@dfae9bf3d6f6c6f20ef4ebb3486c01a51341ff12 # v2.87.18
+      - uses: taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172 # v2.87.20
         if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci-macos')
         with:
           tool: cargo-nextest

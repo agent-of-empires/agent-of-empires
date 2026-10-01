@@ -51,11 +51,15 @@ jobs:
       # The web-dist placeholder stands in for the npm bundle that build.rs
       # would otherwise build, so this job still needs no Node setup; same
       # trick as the rustdoc step in the docs job.
+      #
+      # `--all-targets` so the test binaries join this gate: without it a bare
+      # `cargo clippy` checks the lib and bins only, and the Format job cannot
+      # stand in for it, since rustfmt type-checks and lints nothing.
       - name: Clippy (all features)
         run: |
           mkdir -p target/ci-web-dist
           printf '<!doctype html><title>aoe clippy placeholder</title>\n' > target/ci-web-dist/index.html
-          AOE_WEB_DIST="$PWD/target/ci-web-dist" cargo clippy --all-features -- -D warnings
+          AOE_WEB_DIST="$PWD/target/ci-web-dist" cargo clippy --all-features --all-targets -- -D warnings
       # `serve` is a deprecated alias that only turns on `web` (#3619). A
       # `cfg(feature = "serve")` would therefore compile out under
       # `--features web` while still working under the alias: a silent split.

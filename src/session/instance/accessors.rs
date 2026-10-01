@@ -13,6 +13,7 @@ impl Instance {
             id: generate_id(),
             title: title.to_string(),
             last_auto_title: None,
+            sort_index: None,
             smart_rename_attempted: false,
             project_path: project_path.to_string(),
             group_path: String::new(),
