@@ -95,6 +95,12 @@ test.describe("Mobile right panel picker (#1452)", () => {
     // The same touchmove would have opened the sidebar, so it has committed by
     // the time the picker hides.
     await expect(page.locator('[data-tour="sidebar"]')).toHaveClass(/-translate-x-full/);
+
+    // The header stays reachable above the drawer; its sidebar toggle swaps drawers rather than stacking them.
+    await openPicker(page);
+    await page.getByRole("button", { name: "Toggle sidebar" }).click();
+    await expect(picker(page)).toBeHidden();
+    await expect(page.locator('[data-tour="sidebar"]')).not.toHaveClass(/-translate-x-full/);
   });
 
   test("picker promotes the paired terminal and it survives the keyboard", async ({ page }) => {

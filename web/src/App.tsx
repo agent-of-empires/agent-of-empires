@@ -1572,6 +1572,7 @@ function AppContent({
 
   const handleToggleSidebar = useCallback(() => {
     setSidebarOpen((o) => !o);
+    setPickerOpen(false);
   }, []);
 
   const closePicker = useCallback(() => setPickerOpen(false), []);

@@ -19,10 +19,14 @@ function dispatchTouch(type: string, points: Point[], target: EventTarget = wind
   target.dispatchEvent(ev);
 }
 
+function swipeMoves(...moves: Point[]) {
+  for (const m of moves) dispatchTouch("touchmove", [m]);
+}
+
 /** Start a one-finger touch at `start`, then move through `moves`. */
 function swipe(start: Point, ...moves: Point[]) {
   dispatchTouch("touchstart", [start]);
-  for (const m of moves) dispatchTouch("touchmove", [m]);
+  swipeMoves(...moves);
 }
 
 /** A 200px-wide `overflow-x: auto` box holding 600px of content, scrolled to `scrollLeft`. */
@@ -119,6 +123,19 @@ describe("useDrawerSwipe", () => {
     dispatchTouch("touchstart", [start], el);
     dispatchTouch("touchmove", [end], el);
     el.remove();
+    if (action) expect(onAction).toHaveBeenCalledExactlyOnceWith(action);
+    else expect(onAction).not.toHaveBeenCalled();
+  });
+
+  it.each<[string, number, string | null]>([
+    ["a quick swipe acts", 100, "close-sidebar"],
+    ["a hold before moving is a drag, not a swipe", 150, null],
+  ])("%s", (_label, holdMs, action) => {
+    const now = vi.spyOn(performance, "now").mockReturnValue(1000);
+    const { onAction } = mount({ sidebarOpen: true });
+    dispatchTouch("touchstart", [[300, 100]]);
+    now.mockReturnValue(1000 + holdMs);
+    swipeMoves([280, 100], [200, 100], [150, 100]);
     if (action) expect(onAction).toHaveBeenCalledExactlyOnceWith(action);
     else expect(onAction).not.toHaveBeenCalled();
   });

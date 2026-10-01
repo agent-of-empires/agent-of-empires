@@ -26,6 +26,10 @@ const SYSTEM_EDGE_GUARD_PX = 32;
 const THRESHOLD_PX = 90;
 const VERTICAL_CANCEL_PX = 16;
 const MOBILE_BREAKPOINT = 768;
+// A touch that stays within the slop this long is a hold (drag-and-drop,
+// long-press), not a swipe. Matches the dnd-kit touch activation constraint.
+const HOLD_SLOP_PX = 8;
+const HOLD_MS = 150;
 
 /** Which swipe directions a horizontal scroller under the touch would consume. */
 function scrollRoom(path: EventTarget[]): Record<SwipeDirection, boolean> {
@@ -49,6 +53,8 @@ export function useDrawerSwipe(state: DrawerSwipeState, onAction: (action: Drawe
   useEffect(() => {
     let startX = 0;
     let startY = 0;
+    let startTime = 0;
+    let moved = false;
     let tracking = false;
     let room: Record<SwipeDirection, boolean> = { left: false, right: false };
 
@@ -62,6 +68,8 @@ export function useDrawerSwipe(state: DrawerSwipeState, onAction: (action: Drawe
       room = scrollRoom(e.composedPath());
       startX = t.clientX;
       startY = t.clientY;
+      startTime = performance.now();
+      moved = false;
     };
 
     const onTouchMove = (e: TouchEvent) => {
@@ -70,6 +78,13 @@ export function useDrawerSwipe(state: DrawerSwipeState, onAction: (action: Drawe
       if (!t) return;
       const dx = t.clientX - startX;
       const dy = t.clientY - startY;
+      if (!moved && Math.max(Math.abs(dx), Math.abs(dy)) > HOLD_SLOP_PX) {
+        moved = true;
+        if (performance.now() - startTime >= HOLD_MS) {
+          tracking = false;
+          return;
+        }
+      }
       if (Math.abs(dx) > THRESHOLD_PX && Math.abs(dx) > Math.abs(dy)) {
         tracking = false;
         const dir = dx > 0 ? "right" : "left";
