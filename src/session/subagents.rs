@@ -4,7 +4,7 @@
 //! Subagents run inside the parent `claude` process, so they have no pane.
 //! Claude writes each one to
 //! `<store>/projects/<cwd>/<sid>/subagents/agent-<id>.{jsonl,meta.json}`,
-//! which is all this module reads. Every read goes through [`AnchoredDir`]
+//! which is all this module reads. Every read goes through `AnchoredDir`
 //! because a sandboxed session's store is writable from inside the container.
 
 use std::collections::{HashMap, HashSet};
@@ -252,14 +252,16 @@ fn tail_lines(bytes: &[u8], truncated: bool) -> impl DoubleEndedIterator<Item = 
 }
 
 /// State and time of the newest message, the only lines parsed here: it is
-/// done once that message is an assistant turn that ended, and stopped when
-/// it is Claude's interrupt marker.
+/// done once that message is an assistant turn that ended, failed when it is
+/// an API error, and stopped when it is Claude's interrupt marker.
 fn summarize_tail(bytes: &[u8], truncated: bool) -> (SubagentState, Option<SystemTime>) {
     for line in tail_lines(bytes, truncated).rev() {
         let Ok(entry) = serde_json::from_slice::<Value>(line) else {
             continue;
         };
         let state = match entry["type"].as_str() {
+            // Claude's synthetic error turn also ends with `stop_sequence`.
+            Some("assistant") if entry["isApiErrorMessage"] == true => SubagentState::Failed,
             Some("assistant") => match entry["message"]["stop_reason"].as_str() {
                 Some("end_turn" | "stop_sequence") => SubagentState::Done,
                 _ => SubagentState::Running,
@@ -733,8 +735,15 @@ mod tests {
         );
         let interrupted = user(json!([{"type": "text", "text": "[Request interrupted by user]"}]));
         let attachment = line(json!({"type": "attachment", "attachment": {"type": "date"}}));
+        // Claude Code's synthetic API error turn carries `stop_reason: "stop_sequence"`.
+        let api_error = line(json!({
+            "type": "assistant",
+            "isApiErrorMessage": true,
+            "message": {"content": [{"type": "text", "text": "API Error: 529 Overloaded"}],
+                        "stop_reason": "stop_sequence"},
+        }));
 
-        let cases: [(&str, String, bool, SubagentState, usize); 6] = [
+        let cases: [(&str, String, bool, SubagentState, usize); 7] = [
             (
                 "tool call pending",
                 [prompt.clone(), tool.clone()].concat(),
@@ -762,6 +771,13 @@ mod tests {
                 false,
                 SubagentState::Done,
                 1,
+            ),
+            (
+                "api error",
+                [tool.clone(), result.clone(), api_error].concat(),
+                false,
+                SubagentState::Failed,
+                2,
             ),
             (
                 "interrupted",
