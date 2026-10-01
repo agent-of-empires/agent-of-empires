@@ -144,9 +144,9 @@ export function SessionNoticesStrip({
             <li key={notice.id} className={tone.row}>
               <Icon className={tone.icon} />
               <div className="min-w-0 flex-1">
-                <p className="text-xs leading-5 text-slate-100">{notice.title}</p>
+                <p className="text-xs leading-5 text-text-primary">{notice.title}</p>
                 {notice.description ? (
-                  <p className="mt-0.5 text-[11px] leading-4 text-slate-300/80">{notice.description}</p>
+                  <p className="mt-0.5 text-[11px] leading-4 text-text-secondary">{notice.description}</p>
                 ) : null}
               </div>
               <button
