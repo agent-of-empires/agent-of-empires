@@ -1102,6 +1102,52 @@ mod tests {
         s
     }
 
+    fn notice(title: &str) -> Event {
+        Event::SessionNotice {
+            severity: "warning".into(),
+            title: title.into(),
+            description: None,
+        }
+    }
+
+    /// #4242: notices are live advisories, so they are capped and retired on
+    /// the next turn rather than accumulating for the life of the session.
+    #[test]
+    fn session_notices_are_capped_and_retired_by_the_next_turn() {
+        let titles = |s: &AcpState| -> Vec<String> {
+            s.session_notices.iter().map(|n| n.title.clone()).collect()
+        };
+
+        let one = applied([notice("first")]);
+        assert_eq!(titles(&one), ["first"]);
+        assert_eq!(one.session_notices[0].id, "notice-1", "id keys dismissal");
+
+        let overflowed =
+            applied((0..AcpState::MAX_SESSION_NOTICES + 2).map(|i| notice(&format!("n{i}"))));
+        assert_eq!(
+            overflowed.session_notices.len(),
+            AcpState::MAX_SESSION_NOTICES
+        );
+        assert_eq!(titles(&overflowed), ["n2", "n3", "n4"], "oldest drop first");
+
+        assert!(
+            titles(&applied([notice("stale"), prompt("next")])).is_empty(),
+            "a new turn retires the previous turn's advisories"
+        );
+        assert!(
+            titles(&applied([
+                notice("stale"),
+                Event::AgentSwitched {
+                    from: "claude".into(),
+                    to: "codex".into(),
+                    reason: "user".into(),
+                },
+            ]))
+            .is_empty(),
+            "the prior agent's advisories do not carry over"
+        );
+    }
+
     fn caps(steering: bool) -> Event {
         Event::PromptCapabilities {
             image: false,

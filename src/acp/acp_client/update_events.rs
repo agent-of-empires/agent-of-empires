@@ -800,6 +800,47 @@ mod tests {
         }
     }
 
+    /// #4242: deserialized from the wire rather than built, so a serde rename
+    /// upstream fails here instead of silently routing notices to the
+    /// `RawAgentUpdate` fallback.
+    #[test]
+    fn session_notices_map_from_the_wire() {
+        for (severity, want_severity, description, want_description) in [
+            (
+                "info",
+                "info",
+                Some("Switched to Sonnet."),
+                Some("Switched to Sonnet."),
+            ),
+            ("warning", "warning", None, None),
+            ("error", "error", None, None),
+            // Reserved for future ACP levels; carried through, not flattened.
+            ("critical", "critical", None, None),
+        ] {
+            let mut wire = serde_json::json!({
+                "sessionUpdate": "notice",
+                "severity": severity,
+                "title": "Model fallback",
+            });
+            if let Some(description) = description {
+                wire["description"] = serde_json::json!(description);
+            }
+            let update: SessionUpdate = serde_json::from_value(wire).expect("notice parses");
+            let events = claude(update);
+            let [Event::SessionNotice {
+                severity,
+                title,
+                description,
+            }] = events.as_slice()
+            else {
+                panic!("expected one SessionNotice, got {events:?}");
+            };
+            assert_eq!(severity, want_severity);
+            assert_eq!(title, "Model fallback");
+            assert_eq!(description.as_deref(), want_description);
+        }
+    }
+
     #[test]
     fn mode_and_config_option_updates() {
         use agent_client_protocol::schema::v1::CurrentModeUpdate;

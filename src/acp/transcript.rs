@@ -830,6 +830,28 @@ mod tests {
                 "mode switch to \"bypassPermissions\" failed: denied".to_string(),
             ),
             (
+                Event::SessionNotice {
+                    severity: "warning".into(),
+                    title: "Model fallback".into(),
+                    description: Some("Switched to Sonnet.".into()),
+                },
+                "notice-1",
+                TranscriptRowKind::Notice,
+                "warning: Model fallback: Switched to Sonnet.".to_string(),
+            ),
+            (
+                // The row is toned as an error whatever the severity, so an
+                // info notice has to read correctly from its text alone.
+                Event::SessionNotice {
+                    severity: "info".into(),
+                    title: "Task stopped by user".into(),
+                    description: None,
+                },
+                "notice-1",
+                TranscriptRowKind::Notice,
+                "info: Task stopped by user".to_string(),
+            ),
+            (
                 Event::RateLimitAutoResumed {
                     resets_at,
                     manual: false,
