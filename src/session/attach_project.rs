@@ -671,29 +671,32 @@ impl Undo {
             let peer_claimed_source = claimed.is_some_and(|paths| {
                 matches!(paths, crate::session::deletion::PathsInUse::Known(_)) && is_claimed(from)
             });
+            // Only the move is skipped: the rest of the undo still runs, so a
+            // workspace directory this attach created is not left behind with
+            // nothing pointing at it.
             if peer_claimed_source {
                 tracing::warn!(
                     target: "session.attach",
                     "A peer claimed the primary checkout path during the conversion; leaving it \
                      where it is rather than moving it back"
                 );
-                return;
-            }
-            match GitWorktree::new(PathBuf::from(main_repo)) {
-                Ok(git) => {
-                    if let Err(e) = git.move_worktree(from, back_to) {
-                        tracing::error!(
-                            target: "session.attach",
-                            from = %from.display(),
-                            to = %back_to.display(),
-                            "could not move the session's worktree back after a failed attach: {e:#}"
-                        );
+            } else {
+                match GitWorktree::new(PathBuf::from(main_repo)) {
+                    Ok(git) => {
+                        if let Err(e) = git.move_worktree(from, back_to) {
+                            tracing::error!(
+                                target: "session.attach",
+                                from = %from.display(),
+                                to = %back_to.display(),
+                                "could not move the session's worktree back after a failed attach: {e:#}"
+                            );
+                        }
                     }
+                    Err(e) => tracing::error!(
+                        target: "session.attach",
+                        "could not open {main_repo} to move the session's worktree back: {e:#}"
+                    ),
                 }
-                Err(e) => tracing::error!(
-                    target: "session.attach",
-                    "could not open {main_repo} to move the session's worktree back: {e:#}"
-                ),
             }
         }
         if let Some(dir) = &self.workspace_dir {

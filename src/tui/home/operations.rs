@@ -559,7 +559,7 @@ impl HomeView {
                 }
             }
             // `reload()` reconciles cross-profile duplicates, and a journal-driven
-            // repair re-acquires identity, then title, then lifecycle — the very
+            // repair re-acquires identity, then title, then lifecycle, the very
             // flocks held here, so the reload would wait on its own lock. All three
             // guards go first; they are reacquired in the canonical order, and the
             // row is re-read from the committed profile before the save below.
@@ -1717,7 +1717,7 @@ impl HomeView {
                     },
                 )?;
                 // `reload()` reconciles cross-profile duplicates, and a journal-driven
-                // repair re-acquires identity, then title, then lifecycle — the very
+                // repair re-acquires identity, then title, then lifecycle, the very
                 // flocks still held here, so the reload would wait on its own lock.
                 // Every guard goes first and the canonical order is restored after
                 // it; the tmux rekey is tmux-side, so it runs with the guards back.

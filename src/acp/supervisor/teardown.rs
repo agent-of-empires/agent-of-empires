@@ -92,9 +92,9 @@ impl<S: BroadcastSink> Supervisor<S> {
     /// writing the ACP event store.
     ///
     /// The threat this guards is a *live runner*. A resume that has not
-    /// installed yet publishes nothing — nothing drains the ACP connection
+    /// installed yet publishes nothing: nothing drains the ACP connection
     /// before `install`, and `begin_stop` has already posted the cancel that
-    /// stops it from ever installing one — so whether such an epoch is safe
+    /// stops it from ever installing one, so whether such an epoch is safe
     /// depends on what the caller does next, which is [`Self::WorktreeIntent`].
     ///
     /// So the answer is read, not waited for: only a runner this call could not
@@ -181,7 +181,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         Ok(())
     }
 
-    /// `None` when this call established no settlement of its own — the stop
+    /// `None` when this call established no settlement of its own; the stop
     /// was a cancel, or a teardown is already parked. Destructive callers must
     /// treat that as "not proven dead" and leave their work to the retry pass.
     async fn shutdown_with_reason(
@@ -1350,7 +1350,7 @@ mod tests {
     }
 
     /// A resume that never installed a worker publishes nothing, so a caller
-    /// that also removes the worktree — the purge — may proceed: refusing made
+    /// that also removes the worktree, as the purge may, proceed: refusing made
     /// deleting a session the daemon was still starting a permanent conflict.
     /// A caller that relocates the worktree instead must refuse, because the
     /// agent was launched with that working directory before `install`.

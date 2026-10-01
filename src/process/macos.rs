@@ -387,36 +387,48 @@ pub(super) fn process_group_has_live_members(pgrp: u32) -> std::io::Result<bool>
             let state = fields.next()?;
             (group.parse::<u32>() == Ok(pgrp)).then_some(state)
         })
-        // `ps` prints one state letter per member, `Z` for a zombie.
-        .any(|state| state != "Z"))
+        // BSD `ps` prints the state letter followed by its flags, so a zombie
+        // reads `ZN` rather than `Z`: the letter has to be read on its own.
+        .any(|state| !state.starts_with('Z')))
 }
 
 /// Whether `pid` has exited and is only waiting to be reaped rather than still
-/// running. Same rule as the Linux probe: a zombie holds nothing, so treating it
-/// as alive makes a torn-down runner unprovable forever.
+/// running. A zombie holds nothing, so treating it as alive makes a torn-down
+/// runner unprovable forever.
 ///
-/// macOS has no `/proc`, so the state comes from `waitid` with `WNOWAIT`, which
-/// reports an exited child without reaping it and leaves the supervisor's own
-/// wait intact. A pid that is not our child answers `ECHILD` and reads as alive,
-/// which is the behaviour the zombie rule never changed.
+/// Darwin has no `/proc`, and `waitid` only answers for a child of this process,
+/// so the state comes from `ps`: the settlement runs from the daemon, the TUI
+/// and the CLI alike, and a runner this process never parented still has to be
+/// recognised.
 pub(super) fn is_terminated(pid: u32) -> bool {
-    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-    // SAFETY: `info` is a live, correctly sized `siginfo_t` and `WNOWAIT` leaves
-    // the zombie waitable, so nothing is reaped behind the supervisor's back.
-    let matched = unsafe {
-        libc::waitid(
-            libc::P_PID,
-            pid as libc::id_t,
-            &mut info,
-            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
-        )
-    };
-    if matched != 0 {
-        return false;
+    match process_state(pid) {
+        Ok(Some(state)) => state.starts_with('Z'),
+        // `ps` answered and the pid is not there: it is gone, which for this
+        // probe is the same as terminated.
+        Ok(None) => true,
+        // The state could not be read, so it could not be proven gone.
+        Err(_) => false,
     }
-    // SAFETY: the kernel filled `info`, and `waitid` returned success.
-    let reaped_pid = unsafe { info.si_pid() };
-    reaped_pid != 0
+}
+
+/// The BSD state field of one process. BSD `ps` prints the state letter
+/// followed by its flags, so a zombie reads `ZN` rather than `Z`.
+fn process_state(pid: u32) -> Result<Option<String>, std::io::Error> {
+    let output = Command::new("ps")
+        .args(["-o", "state=", "-p", &pid.to_string()])
+        .output()
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    if !output.status.success() {
+        return Err(std::io::Error::other(format!(
+            "ps -p {pid} exited with {}",
+            output.status
+        )));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(str::to_string))
 }
 
 pub(super) fn parent_and_argv0(pid: u32) -> Option<(u32, String)> {

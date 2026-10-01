@@ -1145,8 +1145,8 @@ fn apply_creation_results_rolls_back_on_peer_collision() {
 
 /// A delivered creation result must not still own the global ownership flocks.
 /// `apply_creation_results` takes the workspace-claim and identity pair itself
-/// while it publishes, and any other path needing them — `save`, a peer
-/// duplicate repair during `reload` — would block forever behind flocks the
+/// while it publishes, and any other path needing them (`save`, a peer
+/// duplicate repair during `reload`) would block forever behind flocks the
 /// builder thread still held across the channel.
 #[test]
 #[serial]

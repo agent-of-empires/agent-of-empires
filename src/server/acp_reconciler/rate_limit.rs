@@ -163,8 +163,8 @@ pub(crate) async fn install_rate_limit_continuation(
 
 /// Releases rate-limit parks whose window elapsed: install the interrupted
 /// prompt unless a queued one took the session, publish the marker matching
-/// what happened — the automatic breadcrumb when a continuation was
-/// delivered, the manual disarm when a queued prompt took the session — and
+/// what happened: the automatic breadcrumb when a continuation was
+/// delivered, the manual disarm when a queued prompt took the session, and
 /// free the `attempted` slot so this tick respawns. The park and its times
 /// come from the durable event store (#3514).
 /// Returns the released ids so the resume loop does not re-hold them.

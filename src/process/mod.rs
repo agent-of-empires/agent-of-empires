@@ -584,7 +584,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn a_zombie_child_is_not_alive() {
-        let child = Command::new("/bin/sh")
+        let mut child = Command::new("/bin/sh")
             .args(["-c", "exit 0"])
             .spawn()
             .expect("spawn a child that exits at once");
@@ -603,7 +603,9 @@ mod tests {
             !worker::is_pid_alive(pid) && !worker::is_pid_alive_and_ours(pid),
             "a zombie holds nothing, so neither liveness probe may call it alive"
         );
-        drop(child);
+        // `Drop` for `Child` does not reap, so the zombie would outlive the test
+        // and sit in the process table for the serial tests that follow.
+        let _ = child.wait();
     }
 
     #[test]

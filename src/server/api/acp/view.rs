@@ -367,7 +367,7 @@ pub async fn acp_disable(
             Ok(Some(_)) => {
                 // The terminal view is already committed, which is also what a
                 // 409'd first attempt committed. A lease is not proof the
-                // runner is dead — it stays owned through `Stopping` — so the
+                // runner is dead; it stays owned through `Stopping`, so the
                 // gate runs again here and the queue is only finished once the
                 // runner is proven gone.
                 if state.acp_supervisor.is_owned(&id).await
@@ -488,7 +488,7 @@ pub async fn acp_disable(
 }
 
 /// The tail of a disable: drop the ACP projection, forget the session, and
-/// bring the tmux pane back. Best-effort by construction — the view switch is
+/// bring the tmux pane back. Best-effort by construction: the view switch is
 /// already committed, so a failed event deletion must not strand the session
 /// in a wedged state. The residual transcript is swept later, the same way the
 /// purge path treats a post-commit sidecar failure.

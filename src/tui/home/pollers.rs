@@ -154,7 +154,7 @@ impl HomeView {
                 let mut changed = false;
                 let mut applied_authoritative = false;
                 // A restore of a newer generation can land while this result sits in
-                // the channel. The durable row is the authority — comparing against
+                // the channel. The durable row is the authority: comparing against
                 // the local generation would not see it, because a restore does not
                 // mirror the durable generation back. The value applied is that
                 // durable row, never the result, which is what the generation
