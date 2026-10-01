@@ -158,7 +158,9 @@ The first start can therefore be slower; the TUI shows progress. `aoe migrate` m
 A sandbox still running during an upgrade remains pending: transcript capture
 pauses until it is stopped, isolated and launched again. If native configuration
 changes throughout isolation, that session remains pending; `aoe migrate`
-continues with other sessions and retries later.
+continues with other sessions and retries later. A running sandbox whose mounts
+AoE cannot prove clear of `.aoe-sandbox-recovery` holds back moving any original
+there, and `aoe migrate` names it; launches that retire no original proceed.
 
 ### Shared credentials
 
