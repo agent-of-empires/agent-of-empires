@@ -77,7 +77,9 @@ export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
   );
   const [sessionColor, setColor] = usePendingSetting(
     derived.sessionColor,
-    async (color) => !!sessionId && !!(await setSessionColor(sessionId, color)),
+    // The row shows any session's color, so every session must change for the pick to stick.
+    async (color) =>
+      (await Promise.all(workspace.sessions.map((s) => setSessionColor(s.id, color)))).every((r) => r != null),
     () => reportError("Could not change the session color. Please try again."),
   );
   const model: RowModel = {

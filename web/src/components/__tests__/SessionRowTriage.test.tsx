@@ -291,6 +291,17 @@ describe("SessionRow triage actions", () => {
     expect(testId("sidebar-context-menu")).not.toBeNull();
   });
 
+  it("No color on a multi-session row clears every session, including the one carrying the color", async () => {
+    openRowMenu(makeWorkspace("w", [makeSession({ id: "s1" }), makeSession({ id: "s2", color: "red" })]));
+    expect(testId("sidebar-context-menu-color-red")!.getAttribute("aria-pressed")).toBe("true");
+    click("sidebar-context-menu-color-clear");
+    await vi.waitFor(() => expect(fetchSpy).toHaveBeenCalledTimes(2));
+    expect(fetchSpy.mock.calls.map(([url]) => url).sort()).toEqual([
+      "/api/sessions/s1/color",
+      "/api/sessions/s2/color",
+    ]);
+  });
+
   it("the close button closes the menu", () => {
     openRowMenu(ws());
     click("sidebar-context-menu-close");
