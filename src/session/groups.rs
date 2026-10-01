@@ -407,6 +407,12 @@ pub enum Item {
         id: String,
         depth: usize,
     },
+    /// A Claude subagent running inside the session `parent_id`; read-only.
+    Subagent {
+        parent_id: String,
+        agent_id: String,
+        depth: usize,
+    },
 }
 
 impl Item {
@@ -414,6 +420,7 @@ impl Item {
         match self {
             Item::Group { depth, .. } => *depth,
             Item::Session { depth, .. } => *depth,
+            Item::Subagent { depth, .. } => *depth,
         }
     }
 }

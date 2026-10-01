@@ -26,6 +26,8 @@ Press `n` and fill in the path to your project (or leave `.`), or run `aoe add /
 
 Press `t` to toggle between the structured view and the paired shell terminal, where you can run builds and git commands without interrupting the agent.
 
+When Claude Code starts subagents in a terminal session, its row shows a count such as `▶2`. Click the row or press `l` to list them beneath it, and `h` to fold them away. A subagent row is read-only: its preview shows the subagent's recent activity, and `Enter` opens the parent session.
+
 ## Projects and groups
 
 A **project** is a saved directory path you register once so you can start sessions from it without retyping. Registering is only a convenience: `n` and `aoe add <path>` work on any path. Add one with `aoe project add /path/to/repo`, or press `p` in the TUI and then `a`. Once a project exists, `b` starts a session from it. See [Multi-repo workspaces](guides/multi-repo-workspaces.md#the-project-registry).

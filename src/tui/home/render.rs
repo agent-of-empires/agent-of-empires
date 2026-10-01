@@ -342,7 +342,7 @@ fn clamp_scroll_to_capture(
     scroll_offset.min(real_max)
 }
 
-fn spinner_running(created_at: &DateTime<Utc>) -> &'static str {
+pub(super) fn spinner_running(created_at: &DateTime<Utc>) -> &'static str {
     spinners::dots()
         .set_interval(Duration::from_millis(220))
         .offset(session_offset(created_at))
@@ -1752,6 +1752,14 @@ impl HomeView {
                     )
                 }
             }
+            Item::Subagent {
+                parent_id,
+                agent_id,
+                ..
+            } => {
+                let (icon, text, style) = self.subagent_row_parts(parent_id, agent_id, theme);
+                (icon, Cow::Owned(text), style)
+            }
         };
 
         let mut line_spans = Vec::with_capacity(5);
@@ -1773,6 +1781,9 @@ impl HomeView {
         line_spans.push(Span::styled(text.into_owned(), text_style));
 
         if let Item::Session { id, .. } = item {
+            if let Some(badge) = self.subagent_badge(id, theme) {
+                line_spans.push(badge);
+            }
             if let Some(inst) = self.get_instance(id) {
                 // Config-driven suffix next to the title; it owns the
                 // branch/profile/sandbox slot, so `None` means no suffix. Counted into
@@ -2562,6 +2573,10 @@ impl HomeView {
                 &self.metrics,
                 self.system_health_scroll,
             );
+            return;
+        }
+        if self.render_subagent_preview(frame, area, theme) {
+            self.sync_preview_capture_worker(None);
             return;
         }
         let compact = area.width < responsive::STACKED_BREAKPOINT;
@@ -3829,7 +3844,7 @@ impl HomeView {
             Some(Item::Group {
                 collapsed: false, ..
             }) => (Some("Collapse"), None),
-            Some(Item::Session { id, .. }) => {
+            Some(Item::Session { id, .. } | Item::Subagent { parent_id: id, .. }) => {
                 if self
                     .get_instance(id)
                     .is_some_and(|inst| inst.is_structured())
@@ -3846,6 +3861,8 @@ impl HomeView {
             }
             None => (None, None),
         };
+        // Enter on a subagent row opens its parent; Tab has no target there.
+        let tab_action_text = tab_action_text.filter(|_| self.selected_subagent.is_none());
         if let Some(enter_action_text) = enter_action_text {
             // U+21B5 renders Enter in one cell across most fonts, saving 4 cols over the
             // word and matching k9s/lazygit/fzf. The trailing space adds a second visual

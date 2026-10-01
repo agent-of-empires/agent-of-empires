@@ -34,6 +34,7 @@ pub mod skills_model;
 pub mod smart_rename;
 pub mod stop;
 mod storage;
+pub mod subagents;
 pub(crate) mod sync;
 #[cfg(test)]
 pub(crate) mod test_support;
@@ -47,7 +48,7 @@ pub(crate) use anchored_fs::AnchoredDir;
 pub(crate) use capture::is_valid_session_id;
 pub use config::{
     get_telemetry_settings, get_update_settings, load_config, update_app_state, update_config,
-    validate_snooze_duration, AgentRuntimeConfig, AttachMode, CapabilityGrant, ClickAction, Config,
+    validate_snooze_duration, AgentRuntimeConfig, AttachMode, CapabilityGrant, Config,
     ContainerRuntimeName, DefaultTerminalMode, GroupByMode, NewSessionMode, PluginConfig,
     RowTagMode, SandboxConfig, SessionConfig, TelemetryConfig, ThemeConfig, TmuxSettingMode,
     UpdatesConfig, VolumeIgnoresStrategy, WorktreeConfig,

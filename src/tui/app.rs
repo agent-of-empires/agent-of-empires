@@ -581,6 +581,7 @@ impl App {
         const REFRESH_COOLDOWN: Duration = Duration::from_millis(15);
         let mut last_status_refresh = std::time::Instant::now();
         let mut last_metrics_sample = std::time::Instant::now();
+        let mut last_subagent_refresh = std::time::Instant::now();
         let mut last_session_feed_refresh = std::time::Instant::now();
         let mut last_disk_refresh = std::time::Instant::now();
         let mut full_heartbeat_deferred = false;
@@ -1195,6 +1196,12 @@ impl App {
                 last_metrics_sample = std::time::Instant::now();
             }
             refresh_needed |= self.home.apply_metrics_updates();
+
+            if last_subagent_refresh.elapsed() >= self.home.subagent_refresh_interval() {
+                self.home.request_subagent_refresh();
+                last_subagent_refresh = std::time::Instant::now();
+            }
+            full |= self.home.apply_subagent_updates();
 
             if last_session_feed_refresh.elapsed() >= SESSION_FEED_REFRESH_INTERVAL {
                 self.home.request_session_feed_refresh();

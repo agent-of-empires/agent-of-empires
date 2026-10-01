@@ -255,6 +255,8 @@ impl HomeView {
                     }
                     _ => continue,
                 },
+                // The parent session row already counts for its group.
+                Item::Subagent { .. } => continue,
             };
             if crate::session::is_within_archived_section(&path)
                 || crate::session::is_within_trash_section(&path)

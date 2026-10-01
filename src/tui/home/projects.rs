@@ -126,17 +126,6 @@ impl HomeView {
         inst.tie_workdir_applies(tie)
     }
 
-    /// Resolve `click_action` for a single click on an existing row in Structured view. See
-    /// `resolve_session_config_for` for the rules; the caller treats `None` as falling
-    /// through to the live-send path, which `start_live_send` short-circuits anyway.
-    pub(in crate::tui) fn click_action(
-        &self,
-        session_id: &str,
-    ) -> Option<crate::session::ClickAction> {
-        self.resolve_session_config_for(session_id)
-            .map(|s| s.click_action)
-    }
-
     /// Resolve `default_attach_mode` for activating an existing row in Structured view. See
     /// `resolve_session_config_for` for the rules; callers short-circuit to the
     /// structured-specific activation path before consulting it.

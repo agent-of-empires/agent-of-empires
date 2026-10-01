@@ -125,7 +125,8 @@ impl HomeView {
         }
         if let Some(item) = self.flat_items.get(cursor) {
             match item {
-                crate::session::Item::Session { id, .. } => {
+                crate::session::Item::Session { id, .. }
+                | crate::session::Item::Subagent { parent_id: id, .. } => {
                     return self
                         .get_instance(id.as_str())
                         .map(|i| i.source_profile.clone());
