@@ -89,6 +89,20 @@ impl HomeView {
         }
     }
 
+    /// Apply a single click's subagent toggle once the double-click window has passed
+    /// without a second click. Returns true when the rows changed.
+    pub fn tick_pending_subagent_toggle(&mut self, now: std::time::Instant) -> bool {
+        let Some((id, clicked_at)) = self.pending_subagent_toggle.clone() else {
+            return false;
+        };
+        if now.duration_since(clicked_at) <= super::input::DOUBLE_CLICK_THRESHOLD {
+            return false;
+        }
+        self.pending_subagent_toggle = None;
+        let expanded = self.expanded_subagents.contains(&id);
+        self.set_subagents_expanded(&id, !expanded)
+    }
+
     /// Show or hide `session_id`'s subagent rows. Returns false when it has none.
     pub(super) fn set_subagents_expanded(&mut self, session_id: &str, expanded: bool) -> bool {
         if !self.subagents.contains_key(session_id) {

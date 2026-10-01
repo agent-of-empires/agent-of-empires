@@ -267,6 +267,9 @@ pub struct HomeView {
     pub(super) expanded_subagents: HashSet<String>,
     /// `(parent session id, agent id)` of the subagent row under the cursor.
     pub(super) selected_subagent: Option<(String, String)>,
+    /// A session whose subagent rows a single click will toggle, and when it was
+    /// clicked; dropped if a second click makes it a double-click.
+    pub(super) pending_subagent_toggle: Option<(String, std::time::Instant)>,
     /// `(agent id, width, wrapped lines)` of the last subagent preview frame,
     /// so scrolling has a limit and new output does not move a scrolled view.
     pub(super) subagent_preview_layout: Option<(String, u16, usize)>,

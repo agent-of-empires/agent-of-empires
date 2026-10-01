@@ -198,7 +198,7 @@ fn selected_subagent_that_ages_out_falls_back_to_parent() {
 
 #[test]
 #[serial]
-fn single_click_toggles_subagent_rows() {
+fn single_click_toggles_subagent_rows_but_double_click_does_not() {
     let mut env = create_test_env_with_sessions(2);
     env.view.list_inner_area = ratatui::layout::Rect::new(1, 1, 40, 10);
     env.view.cursor = 1;
@@ -211,14 +211,33 @@ fn single_click_toggles_subagent_rows() {
             vec![subagent("a1", SubagentState::Running, "x")],
         )]),
     );
+    let ms = std::time::Duration::from_millis;
 
+    // A single click selects at once and toggles once no second click can follow.
     let t0 = std::time::Instant::now();
     assert_eq!(env.view.handle_click_at(t0, 5, 1), None);
-    assert_eq!(subagent_rows(&env.view).len(), 1);
     assert_eq!(env.view.selected_session.as_deref(), Some(parent.as_str()));
+    assert!(!env.view.tick_pending_subagent_toggle(t0 + ms(100)));
+    assert!(
+        subagent_rows(&env.view).is_empty(),
+        "still inside the window"
+    );
+    assert!(env.view.tick_pending_subagent_toggle(t0 + ms(500)));
+    assert_eq!(subagent_rows(&env.view).len(), 1);
 
-    let t1 = t0 + std::time::Duration::from_secs(2);
-    assert_eq!(env.view.handle_click_at(t1, 5, 1), None);
+    let t1 = t0 + ms(2000);
+    env.view.handle_click_at(t1, 5, 1);
+    env.view.tick_pending_subagent_toggle(t1 + ms(500));
+    assert!(subagent_rows(&env.view).is_empty());
+
+    // A double-click attaches and leaves the rows as they were.
+    let t2 = t1 + ms(2000);
+    assert_eq!(env.view.handle_click_at(t2, 5, 1), None);
+    assert_eq!(
+        env.view.handle_click_at(t2 + ms(150), 5, 1),
+        Some(Action::AttachSession(parent.clone()))
+    );
+    assert!(!env.view.tick_pending_subagent_toggle(t2 + ms(1000)));
     assert!(subagent_rows(&env.view).is_empty());
 }
 

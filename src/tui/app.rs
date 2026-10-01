@@ -1173,6 +1173,9 @@ impl App {
             // Diffed redraw, not `needs_redraw`: a clear per tick strobes.
             full |= self.home.tick_preview_autoscroll();
             refresh_needed |= self.home.tick_unread_dwell(std::time::Instant::now());
+            full |= self
+                .home
+                .tick_pending_subagent_toggle(std::time::Instant::now());
 
             // Banner changes shift the layout, so they need a full clear.
             let banner_changed = self.poll_update_check()

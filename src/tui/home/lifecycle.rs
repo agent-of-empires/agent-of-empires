@@ -352,6 +352,7 @@ impl HomeView {
             subagents: HashMap::new(),
             expanded_subagents: HashSet::new(),
             selected_subagent: None,
+            pending_subagent_toggle: None,
             subagent_preview_layout: None,
             subagent_activity: None,
             subagent_activity_generation: 0,

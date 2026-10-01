@@ -31,7 +31,8 @@ use crate::tui::settings::{SettingsAction, SettingsView};
 
 /// Longest gap between two left-clicks on one row that still counts as a double-click;
 /// 400ms matches most desktop environments.
-const DOUBLE_CLICK_THRESHOLD: std::time::Duration = std::time::Duration::from_millis(400);
+pub(super) const DOUBLE_CLICK_THRESHOLD: std::time::Duration =
+    std::time::Duration::from_millis(400);
 
 /// The two synthetic bottom-of-sidebar sections. Their headers look like groups in
 /// `flat_items` but carry sentinel paths, so the section-scoped context-menu actions
@@ -5339,10 +5340,10 @@ impl HomeView {
     }
 
     /// Route a left-click inside the session list. A single click on a session row
-    /// selects it and requests live-send for that row (the same `Action::EnterLiveSend`
-    /// Tab emits); a single click on a group row toggles its collapse; a second click on
-    /// the same session row within `DOUBLE_CLICK_THRESHOLD` activates it, as `Enter`
-    /// would, so a full tmux attach stays reachable. Returns the action to dispatch, or
+    /// selects it and, once no second click follows, toggles its subagent rows; a single
+    /// click on a group row toggles its collapse; a second click on the same session row
+    /// within `DOUBLE_CLICK_THRESHOLD` activates it, as `Enter` would. Returns the action
+    /// to dispatch, or
     /// `None` for no-op clicks. The caller redraws unconditionally so the moved cursor
     /// paints before the action runs. Gated by `has_dialog()` through
     /// `resolve_row_to_index`, so clicks don't shift selection under an open modal.
@@ -5367,11 +5368,13 @@ impl HomeView {
                     && now.duration_since(prev_time) <= DOUBLE_CLICK_THRESHOLD
         );
         self.last_click = Some((now, col, row));
+        // Any later click supersedes a toggle the previous one left pending.
+        self.pending_subagent_toggle = None;
 
         let item = self.flat_items[abs_idx].clone();
         if is_double_click {
-            // The first click already selected the row and toggled its group or subagents,
-            // so the second only activates a session; re-toggling would undo the first.
+            // The first click already selected the row and toggled its group, so the
+            // second only activates a session; re-toggling would undo the first.
             //
             // `cursor` is re-synced to `abs_idx` before activating because anything
             // between the clicks (an arrow key, a poll-driven re-sort) can move it, and
@@ -5421,8 +5424,11 @@ impl HomeView {
                 if let Some(state) = self.live_send.clone() {
                     self.exit_live_send_and_restore_sizing(&state);
                 }
-                let expanded = self.expanded_subagents.contains(&id);
-                self.set_subagents_expanded(&id, !expanded);
+                // Wait out the double-click window so a double-click attaches without
+                // also expanding or collapsing the rows.
+                if self.subagents.contains_key(&id) {
+                    self.pending_subagent_toggle = Some((id, now));
+                }
                 None
             }
         }
