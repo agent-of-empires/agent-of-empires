@@ -3,12 +3,13 @@
 
 import { ComposerPrimitive } from "@assistant-ui/react";
 import { unstable_defaultDirectiveFormatter as defaultDirectiveFormatter } from "@assistant-ui/core";
-import { useCallback, useEffect, useMemo, useRef, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { AtSign, Paperclip, Pencil, Slash } from "lucide-react";
 
 import { useFocusTerminalTarget } from "../../hooks/useFocusTerminalTarget";
 import { useMobileKeyboard } from "../../hooks/useMobileKeyboard";
 import { useSkillIndex } from "../../hooks/useSkillIndex";
+import { switchAcpProvider } from "../../lib/api";
 import { clearDraft, clearDraftAttachments } from "../../lib/acpDrafts";
 import type { AcpState, PromptAttachmentInput, PromptCapabilities, QueuedPrompt } from "../../lib/acpTypes";
 import { isIOS, isStandalone } from "../../lib/platform";
@@ -63,6 +64,8 @@ import { useDictationBurstGuard } from "./useDictationBurstGuard";
 interface Props {
   sessionId: string;
   currentAgent: AcpState["agent"];
+  /** Pinned LLM backend, or null when the host environment decides. */
+  currentProvider: string | null;
   availableModes: AcpState["availableModes"];
   currentModeId: AcpState["currentModeId"];
   /** Fallback when the agent advertises no modes. */
@@ -108,6 +111,7 @@ export function Composer(props: Props) {
   const iosPwa = useMemo(() => isIOS() && isStandalone(), []);
   const recall = useQueueRecall(queuedPrompts, client, loadText);
   const canSend = composerText.trim().length > 0 || attachments.supported.length > 0;
+  const provider = useProviderSwitch(sessionId, props.currentAgent, props.currentProvider);
 
   const submitComposer = useCallback(() => {
     const cur = recall.recallRef.current;
@@ -341,6 +345,9 @@ export function Composer(props: Props) {
                   configOptions={props.configOptions}
                   pendingConfigOption={props.pendingConfigOption}
                   onSetConfigOption={props.setConfigOption}
+                  provider={provider.current}
+                  providerPending={provider.pending}
+                  onSetProvider={provider.set}
                 />
                 <AuthStatusHint authStatus={props.authStatus} />
                 <UsageHint usage={props.sessionUsage} />
@@ -376,6 +383,41 @@ export function Composer(props: Props) {
       />
     </div>
   );
+}
+
+/** The routing flags only mean something to Claude, so the picker is absent
+ *  for every other agent and the server refuses the call anyway.
+ *
+ *  The switch has no event of its own, so the session row carrying
+ *  `acp_provider` only catches up on the next poll. The accepted value stands
+ *  in until then. It is scoped to the session it was accepted for and dropped
+ *  once the row agrees, so neither a session change nor a switch made in
+ *  another tab leaves a stale pick on screen. */
+type ProviderEcho = { sessionId: string; value: string } | null;
+
+function useProviderSwitch(sessionId: string, agent: string | null, serverProvider: string | null) {
+  const [pending, setPending] = useState<ProviderEcho>(null);
+  const [accepted, setAccepted] = useState<ProviderEcho>(null);
+  const supported = agent === "claude" || agent === "claude-code";
+
+  const live = (echo: ProviderEcho) =>
+    echo && echo.sessionId === sessionId && echo.value !== serverProvider ? echo.value : null;
+
+  const set = useCallback(
+    async (next: string) => {
+      setPending({ sessionId, value: next });
+      try {
+        const result = await switchAcpProvider(sessionId, next);
+        if (result) setAccepted({ sessionId, value: result.provider });
+      } finally {
+        setPending(null);
+      }
+    },
+    [sessionId],
+  );
+
+  if (!supported) return { current: null, pending: null, set: undefined };
+  return { current: live(accepted) ?? serverProvider, pending: live(pending), set };
 }
 
 function pluginSnapshot(client: ComposerClient, taRef: React.RefObject<HTMLTextAreaElement | null>) {

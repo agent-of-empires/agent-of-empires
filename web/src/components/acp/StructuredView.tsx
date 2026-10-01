@@ -47,6 +47,7 @@ interface Props {
   tool: string | null | undefined;
   /** Resolved ACP agent key; the switch-agent modal's fallback before any `AgentSwitched`. */
   acpAgent: string | null;
+  acpProvider: string | null;
   /** Server-owned conversation-reset slash aliases (`/clear`, `/new`). */
   clearAliases?: readonly string[];
   archivedAt: string | null;
@@ -373,7 +374,7 @@ function ComposerDock({
   collapsed: boolean;
   onToggleCollapsed: () => void;
 }) {
-  const { sessionId, acpWorkerState, acpAgent } = view;
+  const { sessionId, acpWorkerState, acpAgent, acpProvider } = view;
   const { state, status } = ctx;
   return (
     <>
@@ -438,6 +439,7 @@ function ComposerDock({
         <Composer
           sessionId={sessionId}
           currentAgent={state.agent ?? acpAgent}
+          currentProvider={acpProvider}
           availableModes={state.availableModes}
           currentModeId={state.currentModeId}
           legacyMode={state.mode}

@@ -1082,6 +1082,22 @@ export function switchAcpAgent(
   );
 }
 
+export interface SwitchProviderResponse {
+  session_id: string;
+  provider: string;
+  /** Model ids are provider-specific, so the switch drops the session's pick. */
+  model_cleared: boolean;
+  status: string;
+}
+
+/** Re-route a Claude session to `provider`, keeping the transcript. */
+export function switchAcpProvider(sessionId: string, provider: string): Promise<SwitchProviderResponse | null> {
+  return fetchJson<SwitchProviderResponse>(
+    `/api/sessions/${encodeURIComponent(sessionId)}/acp/switch-provider`,
+    jsonInit("POST", { provider }),
+  );
+}
+
 export interface ViewSwitchResponse {
   session_id: string;
   view?: "structured" | "terminal";
