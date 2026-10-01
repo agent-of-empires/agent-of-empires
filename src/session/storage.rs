@@ -1137,6 +1137,10 @@ impl Storage {
                     instance.id
                 );
             }
+            // Same as `load`: a row read here belongs to this store, and the
+            // ownership scan excludes the caller by (profile, id). Leaving this
+            // blank made every inventoried row look like it had no owner.
+            instance.source_profile = self.profile.clone();
             instance.set_file_watch(self.file_watch.clone());
             instances.push(instance);
         }

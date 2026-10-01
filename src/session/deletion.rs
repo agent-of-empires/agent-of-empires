@@ -708,7 +708,12 @@ pub async fn settle_runner_of(
     )
     .await;
     match outcome {
-        Ok(()) => Ok(released),
+        // A registry record is removed the moment a runner exits, so a stopped
+        // session has none. That is "nothing to stop", the same answer the
+        // supervisor gives for an unknown session (`shutdown_and_delete` treats
+        // it as settled too). Only a runner that exists and cannot be proven
+        // dead refuses.
+        Ok(()) | Err(crate::acp::supervisor::SupervisorError::UnknownSession(_)) => Ok(released),
         Err(error) => {
             let retained = released.release_reservation().ok().flatten();
             released.active = false;
@@ -781,6 +786,7 @@ fn is_protected_default_branch(main_repo: &Path, branch: &str) -> bool {
 }
 
 /// Every path a session outside `except_ids` works in or will restore to.
+///
 fn other_sessions_paths(instances: &[Instance], except_ids: &[&str]) -> Vec<PathBuf> {
     instances
         .iter()
@@ -3115,13 +3121,16 @@ mod tests {
             }
         }
     }
-    /// The barrier the TUI and the CLI now share with the daemon: a structured
-    /// session's runner has to be settled before anything runs a hook or removes
-    /// its checkout. A non-structured session has no agent to stop, so it must
-    /// not be refused for a runner that never existed.
+    /// The barrier the TUI and the CLI share with the daemon, in both
+    /// directions. A runner record is deleted the moment a runner exits, so a
+    /// stopped structured session has none: that is "nothing to stop", and the
+    /// purge proceeds exactly as the daemon path already does. A runner whose
+    /// record is still there and cannot be read is what the barrier is for, and
+    /// it has to refuse before any hook or checkout removal.
     #[tokio::test]
     #[serial_test::serial]
     async fn a_structured_purge_settles_its_runner_before_the_hooks() {
+        use crate::process::worker_registry;
         let temp = tempfile::tempdir().unwrap();
         let _home = isolate_app_dir_at(&temp.path().join("home"));
         let project = temp.path().join("project");
@@ -3130,17 +3139,39 @@ mod tests {
         let mut structured = Instance::new("Structured", project.to_str().unwrap());
         structured.id = "structured-purge".to_string();
         structured.view = crate::session::View::Structured;
-        let storage = Storage::new_unwatched("owner").unwrap();
         structured.source_profile = "owner".to_string();
-        storage
+        Storage::new_unwatched("owner")
+            .unwrap()
             .update(|instances, _groups| {
                 instances.push(structured.clone());
                 Ok(())
             })
             .unwrap();
 
-        // No registry record names a runner, so nothing can be proven dead.
-        let transaction = match PurgeTransaction::reserve_unwatched(DeletionRequest {
+        // A runner that already exited leaves no record, and there is nothing
+        // left to stop.
+        let stopped = match PurgeTransaction::reserve_unwatched(DeletionRequest {
+            delete_worktree: true,
+            ..request(structured.clone())
+        })
+        .unwrap()
+        {
+            PurgeReservation::Reserved(transaction) => transaction,
+            PurgeReservation::Rejected(result) => panic!("refused too early: {result:?}"),
+        };
+        let mut settled = settle_runner_of(stopped)
+            .await
+            .expect("a stopped structured session has no runner to stop");
+        // Released here rather than left to `Drop`, which hands the release to a
+        // detached thread and would race the next reservation.
+        let _ = settled.release_reservation();
+
+        // A record that cannot be read is the refusal the barrier has to make:
+        // nothing can be proven about a runner whose identity is unknown, and it
+        // fails before any signal is sent, so the test stays safe to run.
+        let record_path = worker_registry::record_path(&structured.id).unwrap();
+        std::fs::create_dir_all(&record_path).unwrap();
+        let unprovable = match PurgeTransaction::reserve_unwatched(DeletionRequest {
             delete_worktree: true,
             ..request(structured)
         })
@@ -3149,11 +3180,11 @@ mod tests {
             PurgeReservation::Reserved(transaction) => transaction,
             PurgeReservation::Rejected(result) => panic!("refused too early: {result:?}"),
         };
-        let refused = settle_runner_of(transaction).await;
-
+        let refused = settle_runner_of(unprovable).await;
+        let _ = std::fs::remove_dir(&record_path);
         assert!(
             refused.is_err(),
-            "a structured purge with no discoverable runner must not proceed"
+            "a runner whose record cannot be read must stop the purge"
         );
     }
 }
