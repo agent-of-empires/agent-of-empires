@@ -312,6 +312,11 @@ fn queued_strip_height(state: &StructuredViewState) -> u16 {
     u16::from(!state.queue.is_empty())
 }
 
+/// `×` is one column wide but two bytes, so the width is stated rather than
+/// taken from the string's length.
+const CLOSE_LABEL: &str = " × ";
+const CLOSE_LABEL_WIDTH: u16 = 3;
+
 /// One line per undismissed advisory. Capped daemon-side, so this never
 /// starves the transcript.
 fn notices_strip_height(state: &StructuredViewState) -> u16 {
@@ -355,27 +360,24 @@ fn render_notices(
             ),
             Span::styled(text, Style::default().fg(theme.hint)),
         ]);
-        let row_area = Rect {
-            x: area.x,
+        // The close button keeps its columns; the text wraps short of them so a
+        // long advisory is clipped rather than painted under the `×`.
+        let close = Rect {
+            x: area.right().saturating_sub(CLOSE_LABEL_WIDTH),
             y,
-            width: area.width,
+            width: CLOSE_LABEL_WIDTH,
             height: 1,
         };
-        frame.render_widget(Paragraph::new(line), row_area);
-        let label = " × ";
-        if let Some(x) = row_area
-            .right()
-            .checked_sub(label.len() as u16)
-            .filter(|x| *x > row_area.x)
-        {
-            let close = Rect {
-                x,
-                y,
-                width: label.len() as u16,
-                height: 1,
-            };
+        let text_area = Rect {
+            x: area.x,
+            y,
+            width: area.width.saturating_sub(CLOSE_LABEL_WIDTH),
+            height: 1,
+        };
+        frame.render_widget(Paragraph::new(line), text_area);
+        if close.x > text_area.x {
             frame.render_widget(
-                Paragraph::new(Span::styled(label, Style::default().fg(colour))),
+                Paragraph::new(Span::styled(CLOSE_LABEL, Style::default().fg(colour))),
                 close,
             );
             buttons.push((close, Intent::DismissNotice(Some(notice.id.clone()))));
@@ -1931,6 +1933,13 @@ mod tests {
         assert!(
             painted.contains("· warning: Model fallback: Switched to Sonnet."),
             "the transcript row survives the dismissal: {painted}"
+        );
+
+        // A narrow terminal clips the text rather than painting under the `×`.
+        let narrow = render_rows(&state, 24, 24, true);
+        assert!(
+            narrow.iter().any(|row| row.contains('×')),
+            "the close target survives a narrow frame: {narrow:?}"
         );
 
         // The daemon retiring the notice must not leave the id behind.
