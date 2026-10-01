@@ -1457,6 +1457,13 @@ pub struct SessionConfig {
     )]
     pub row_tag: RowTagMode,
 
+    /// Show the age column at the right edge of each session row: time since
+    /// the agent stopped on Idle rows, time since last access otherwise, and
+    /// remaining snooze time under the Attention sort.
+    #[serde(default = "default_true")]
+    #[setting(label = "Show Session Age", widget = "toggle", tui_only)]
+    pub show_activity_age: bool,
+
     /// Comma-separated chord specs that exit live-send mode. Tmux-style: C-q,
     /// M-x, F12. The first chord in the list that matches an event ends live
     /// mode. Default `C-q` works in every terminal we ship to; add entries for
@@ -1909,6 +1916,7 @@ impl Default for SessionConfig {
             prevent_sleep_idle_grace_minutes: default_prevent_sleep_idle_grace_minutes(),
             restart_wake_message: default_restart_wake_message(),
             row_tag: RowTagMode::default(),
+            show_activity_age: true,
             live_send_exit_chord: default_live_send_exit_chord(),
             live_send_leader: default_live_send_leader(),
             default_attach_mode: AttachMode::default(),
@@ -2275,7 +2283,7 @@ pub struct ThemeConfig {
     /// Idle session keeps a fresh-idle tint and an animated breathe icon for
     /// this many minutes before snapping back to the static look, and is
     /// treated as actionable by the `w` keybind. The time-since-stop column
-    /// on Idle rows shows regardless of this setting.
+    /// is `session.show_activity_age`.
     #[serde(default = "default_idle_decay_minutes")]
     #[setting(label = "Idle Decay (minutes)", widget = "number", min = 0)]
     pub idle_decay_minutes: u64,

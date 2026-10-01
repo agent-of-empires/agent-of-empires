@@ -785,11 +785,6 @@ fn format_snooze_remaining(delta: chrono::Duration) -> String {
     format!("{}d", days)
 }
 
-/// Minimum list width for the last-activity column; below it the column is hidden.
-/// Compared against `inner.width` (the pane minus its border), so 30 lets the column
-/// appear for `home_list_width` in the common 35-45 range and on tight mobile panes, where
-/// the 6-char age slot plus ~24 chars of title/branch still fits.
-///
 /// Width reserved for the right-aligned column: 5 for the label (`"<1m"`, `"30mo"`) plus
 /// one of left padding.
 const LAST_ACTIVITY_SLOT: usize = 6;
@@ -814,22 +809,53 @@ fn selected_row_style(style: Style, theme: &Theme) -> Style {
 /// Where the right-aligned activity column lives on a session row.
 ///
 /// `prefix_width` is the display width of the spans already pushed, `list_width` the inner
-/// width of the list pane, `badge_width` 0 when no terminal-mode badge follows. `Some(pad)`
-/// is the padding to push between prefix and column when it fits with
-/// `LAST_ACTIVITY_SLOT`, the badge and `LAST_ACTIVITY_RIGHT_MARGIN`; `None` means the row
-/// is too wide and the title wins.
+/// width of the list pane, `slot_width` 0 when the age is hidden, `badge_width` 0 when no
+/// terminal-mode badge follows. `Some(pad)` is the padding to push between prefix and
+/// column when it fits with the slot, the badge and `LAST_ACTIVITY_RIGHT_MARGIN`; `None`
+/// means the row is too wide and the title wins.
 fn activity_column_padding(
     prefix_width: usize,
     list_width: u16,
+    slot_width: usize,
     badge_width: usize,
 ) -> Option<usize> {
-    let trailing = LAST_ACTIVITY_SLOT + badge_width + LAST_ACTIVITY_RIGHT_MARGIN;
+    let trailing = slot_width + badge_width + LAST_ACTIVITY_RIGHT_MARGIN;
     let total = prefix_width.checked_add(trailing)?;
     if total <= list_width as usize {
         Some(list_width as usize - total)
     } else {
         None
     }
+}
+
+/// Fewest title cells kept before a row gives up its right-edge column instead.
+const MIN_TITLE_CELLS: usize = 8;
+
+/// Cells the title gets on a session row. `room` is what is left after the prefix and
+/// row tag, `trailing` the right-edge column (age slot, badge, margin). A title that does
+/// not fit beside the column is shortened down to `MIN_TITLE_CELLS`; below that the
+/// column is dropped and the title takes all of `room`.
+fn title_width_for_column(title_width: usize, room: usize, trailing: usize) -> usize {
+    let beside_column = room.saturating_sub(trailing);
+    let budget = if beside_column >= MIN_TITLE_CELLS {
+        beside_column
+    } else {
+        room
+    };
+    title_width.min(budget)
+}
+
+/// The activity column's text: remaining snooze under Attention sort, else time since
+/// the agent stopped on Idle rows, else blank. `last_accessed_at` is only a fallback for
+/// a missing `idle_entered_at`; on an active row it reads as idle time.
+fn row_age(inst: &crate::session::Instance, in_attention: bool) -> String {
+    if let Some(remaining) = in_attention.then(|| inst.snooze_remaining()).flatten() {
+        return format_snooze_remaining(remaining);
+    }
+    if inst.status != Status::Idle {
+        return String::new();
+    }
+    format_relative_age(inst.idle_entered_at.or(inst.last_accessed_at))
 }
 
 impl HomeView {
@@ -1770,122 +1796,116 @@ impl HomeView {
             text_style = text_style.add_modifier(ratatui::style::Modifier::BOLD);
         }
         line_spans.push(Span::styled(format!("{} ", icon), icon_style));
-        line_spans.push(Span::styled(text.into_owned(), text_style));
+        let prefix_width: usize = line_spans.iter().map(|s| s.width()).sum();
+        let room = (list_width as usize).saturating_sub(prefix_width);
 
-        if let Item::Session { id, .. } = item {
-            if let Some(inst) = self.get_instance(id) {
-                // Config-driven suffix next to the title; it owns the
-                // branch/profile/sandbox slot, so `None` means no suffix. Counted into
-                // `used_width` so the activity column still right-aligns past it.
-                if let Some(tag) =
-                    compute_row_tag(inst, self.row_tag_mode, self.active_profile.is_none())
-                {
-                    let tag_style =
-                        Style::default().fg(if self.row_tag_mode == RowTagMode::Branch {
-                            theme.branch
-                        } else {
-                            theme.dimmed
-                        });
-                    line_spans.push(Span::styled(
-                        format!("  {}", tag.rendered()),
-                        if is_selected {
-                            selected_row_style(tag_style, theme)
-                        } else {
-                            tag_style
-                        },
-                    ));
-                }
+        let inst = match item {
+            Item::Session { id, .. } => self.get_instance(id).map(|inst| (id, inst)),
+            _ => None,
+        };
+        let Some((id, inst)) = inst else {
+            line_spans.push(Span::styled(truncate_to_width(&text, room), text_style));
+            return Line::from(line_spans);
+        };
 
-                // Right edge of the row: an optional terminal-mode badge and the
-                // activity column, both pinned to the pane's right edge so the column
-                // lines up down the list. The column shows only if the prefix plus the
-                // slot and badge fit inside `list_width`; on a narrow pane the row drops
-                // the column rather than mangling the title.
-                //
-                // Idle rows drive off `idle_entered_at`, not `last_accessed_at`, which
-                // user interaction bumps and would lie about how long the agent has been
-                // stopped.
-                //
-                // Acp-mode sessions get a badge because Enter opens an info dialog rather
-                // than attaching to a pane that doesn't exist; it takes precedence over
-                // the container/host badge in Structured view, while Terminal view keeps
-                // its own badging since the host terminal still works.
-                let badge_text: Option<&'static str> =
-                    if inst.is_structured() && self.view_mode != ViewMode::Terminal {
-                        // `[structured]` rather than `[web]`: the TUI renders these
-                        // sessions natively now, so the badge marks the view.
-                        Some(" [structured]")
-                    } else if self.view_mode == ViewMode::Terminal && inst.is_sandboxed() {
-                        Some(match self.get_terminal_mode(id) {
-                            TerminalMode::Container => " [container]",
-                            TerminalMode::Host => " [host]",
-                        })
-                    } else if inst.is_structured() {
-                        // Terminal view, non-sandboxed: the container/host badge does
-                        // not apply, but structured rows still need marking or Enter
-                        // opening the structured view surprises the user.
-                        Some(" [structured]")
+        // Config-driven suffix next to the title; it owns the branch/profile/sandbox
+        // slot, so `None` means no suffix.
+        let tag_span =
+            compute_row_tag(inst, self.row_tag_mode, self.active_profile.is_none()).map(|tag| {
+                let tag_style = Style::default().fg(if self.row_tag_mode == RowTagMode::Branch {
+                    theme.branch
+                } else {
+                    theme.dimmed
+                });
+                Span::styled(
+                    format!("  {}", tag.rendered()),
+                    if is_selected {
+                        selected_row_style(tag_style, theme)
                     } else {
-                        None
-                    };
-                let badge_width = badge_text.map_or(0, |s| s.len());
+                        tag_style
+                    },
+                )
+            });
 
-                let used_width: usize = line_spans.iter().map(|s| s.width()).sum();
-                let column_pad = activity_column_padding(used_width, list_width, badge_width);
-                let column_fits = column_pad.is_some();
-                if let Some(pad_len) = column_pad {
-                    if pad_len > 0 {
-                        line_spans.push(Span::raw(" ".repeat(pad_len)));
-                    }
-                    // Snoozed rows show remaining sleep time under Attention sort; in
-                    // other sorts snooze is invisible and the column falls through to the
-                    // normal age. Idle rows show time-since-stop (`idle_entered_at`),
-                    // falling back to `last_accessed_at` when it is missing, which would
-                    // otherwise lie after an attach or send.
-                    let snooze_remaining = if in_attention {
-                        inst.snooze_remaining()
-                    } else {
-                        None
-                    };
-                    let age = if let Some(remaining) = snooze_remaining {
-                        format_snooze_remaining(remaining)
-                    } else {
-                        let age_ts = if inst.status == Status::Idle {
-                            inst.idle_entered_at.or(inst.last_accessed_at)
-                        } else {
-                            inst.last_accessed_at
-                        };
-                        format_relative_age(age_ts)
-                    };
-                    let padded = format!("{:>width$}", age, width = LAST_ACTIVITY_SLOT);
-                    let activity_style = Style::default().fg(theme.dimmed);
-                    line_spans.push(Span::styled(
-                        padded,
-                        if is_selected {
-                            selected_row_style(activity_style, theme)
-                        } else {
-                            activity_style
-                        },
-                    ));
-                }
+        // Right edge of the row: an optional terminal-mode badge and the activity column,
+        // both pinned to the pane's right edge so the column lines up down the list.
+        //
+        // Acp-mode sessions get a badge because Enter opens an info dialog rather than
+        // attaching to a pane that doesn't exist; it takes precedence over the
+        // container/host badge in Structured view, while Terminal view keeps its own
+        // badging since the host terminal still works.
+        let badge_text: Option<&'static str> =
+            if inst.is_structured() && self.view_mode != ViewMode::Terminal {
+                // `[structured]` rather than `[web]`: the TUI renders these sessions
+                // natively now, so the badge marks the view.
+                Some(" [structured]")
+            } else if self.view_mode == ViewMode::Terminal && inst.is_sandboxed() {
+                Some(match self.get_terminal_mode(id) {
+                    TerminalMode::Container => " [container]",
+                    TerminalMode::Host => " [host]",
+                })
+            } else if inst.is_structured() {
+                // Terminal view, non-sandboxed: the container/host badge does not apply,
+                // but structured rows still need marking or Enter opening the structured
+                // view surprises the user.
+                Some(" [structured]")
+            } else {
+                None
+            };
+        let badge_width = badge_text.map_or(0, |s| s.len());
+        let slot_width = if self.show_activity_age {
+            LAST_ACTIVITY_SLOT
+        } else {
+            0
+        };
 
-                if let Some(badge) = badge_text {
-                    let badge_style = Style::default().fg(theme.sandbox);
-                    line_spans.push(Span::styled(
-                        badge,
-                        if is_selected {
-                            selected_row_style(badge_style, theme)
-                        } else {
-                            badge_style
-                        },
-                    ));
-                }
-                if column_fits {
-                    let trailing_margin: String =
-                        std::iter::repeat_n(' ', LAST_ACTIVITY_RIGHT_MARGIN).collect();
-                    line_spans.push(Span::raw(trailing_margin));
-                }
-            }
+        let tag_width = tag_span.as_ref().map_or(0, |s| s.width());
+        let title_width = title_width_for_column(
+            rendered_width(&text),
+            room.saturating_sub(tag_width),
+            slot_width + badge_width + LAST_ACTIVITY_RIGHT_MARGIN,
+        );
+        line_spans.push(Span::styled(
+            truncate_to_width(&text, title_width),
+            text_style,
+        ));
+        line_spans.extend(tag_span);
+
+        let used_width: usize = line_spans.iter().map(|s| s.width()).sum();
+        let column_pad = activity_column_padding(used_width, list_width, slot_width, badge_width);
+        let column_fits = column_pad.is_some();
+        if let Some(pad_len) = column_pad.filter(|&p| p > 0) {
+            line_spans.push(Span::raw(" ".repeat(pad_len)));
+        }
+        if column_fits && self.show_activity_age {
+            let age = row_age(inst, in_attention);
+            let padded = format!("{:>width$}", age, width = LAST_ACTIVITY_SLOT);
+            let activity_style = Style::default().fg(theme.dimmed);
+            line_spans.push(Span::styled(
+                padded,
+                if is_selected {
+                    selected_row_style(activity_style, theme)
+                } else {
+                    activity_style
+                },
+            ));
+        }
+
+        if let Some(badge) = badge_text {
+            let badge_style = Style::default().fg(theme.sandbox);
+            line_spans.push(Span::styled(
+                badge,
+                if is_selected {
+                    selected_row_style(badge_style, theme)
+                } else {
+                    badge_style
+                },
+            ));
+        }
+        if column_fits {
+            let trailing_margin: String =
+                std::iter::repeat_n(' ', LAST_ACTIVITY_RIGHT_MARGIN).collect();
+            line_spans.push(Span::raw(trailing_margin));
         }
 
         Line::from(line_spans)
@@ -4647,26 +4667,75 @@ mod tests {
 
     #[test]
     fn activity_column_padding_cases() {
-        // Trailing block = SLOT(6) + badge + MARGIN(1). A badge that fits alone does not
+        // Trailing block = slot + badge + MARGIN(1). A badge that fits alone does not
         // keep the column: the badge has its own unconditional render path.
         let cases = [
-            ("room to spare", 12, 35, 0, Some(16)),
-            ("exact fit", 13, 20, 0, Some(0)),
-            ("one column over", 14, 20, 0, None),
+            ("room to spare", 12, 35, 6, 0, Some(16)),
+            ("exact fit", 13, 20, 6, 0, Some(0)),
+            ("one column over", 14, 20, 6, 0, None),
             // No fixed 30-column floor: a narrow pane with room keeps the column.
-            ("narrow pane", 8, 25, 0, Some(10)),
-            ("host badge", 10, 35, 7, Some(11)),
-            ("container badge", 10, 35, 12, Some(6)),
-            ("long title with badge", 20, 35, 12, None),
-            ("prefix overflow saturates", usize::MAX, 1000, 0, None),
+            ("narrow pane", 8, 25, 6, 0, Some(10)),
+            ("host badge", 10, 35, 6, 7, Some(11)),
+            ("container badge", 10, 35, 6, 12, Some(6)),
+            ("long title with badge", 20, 35, 6, 12, None),
+            // Hidden age: the badge alone sits against the margin.
+            ("hidden age with badge", 20, 35, 0, 12, Some(2)),
+            ("prefix overflow saturates", usize::MAX, 1000, 6, 0, None),
         ];
-        for (name, prefix, width, badge, expected) in cases {
+        for (name, prefix, width, slot, badge, expected) in cases {
             assert_eq!(
-                activity_column_padding(prefix, width, badge),
+                activity_column_padding(prefix, width, slot, badge),
                 expected,
                 "{name}"
             );
         }
+    }
+
+    #[test]
+    fn title_width_for_column_cases() {
+        // (name, title, room, trailing, expected); MIN_TITLE_CELLS is 8.
+        let cases = [
+            ("fits beside column", 10, 25, 7, 10),
+            ("shortened to keep column", 20, 25, 7, 18),
+            ("too narrow, column dropped", 20, 14, 7, 14),
+            ("short title keeps column on narrow pane", 5, 12, 7, 5),
+            ("no room", 5, 0, 7, 0),
+        ];
+        for (name, title, room, trailing, expected) in cases {
+            assert_eq!(
+                title_width_for_column(title, room, trailing),
+                expected,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn row_age_only_on_idle_or_snoozed_rows() {
+        let five_min_ago = Some(Utc::now() - chrono::Duration::minutes(5));
+        let mut inst = crate::session::Instance::new("a", "/tmp/a");
+        inst.idle_entered_at = five_min_ago;
+        inst.last_accessed_at = five_min_ago;
+        for (status, expected) in [
+            (Status::Idle, "5m"),
+            (Status::Running, ""),
+            (Status::Waiting, ""),
+            (Status::Error, ""),
+        ] {
+            inst.status = status;
+            assert_eq!(row_age(&inst, false), expected, "{status:?}");
+        }
+        inst.idle_entered_at = None;
+        inst.status = Status::Idle;
+        assert_eq!(row_age(&inst, false), "5m", "falls back to last access");
+
+        inst.status = Status::Running;
+        inst.snooze(30);
+        assert_eq!(row_age(&inst, false), "", "snooze hidden outside Attention");
+        assert!(
+            !row_age(&inst, true).is_empty(),
+            "snooze shown under Attention"
+        );
     }
 
     /// The bracketed tag must occupy `max_width + 2` cells as the renderer paints them:
