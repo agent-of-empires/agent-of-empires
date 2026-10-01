@@ -201,6 +201,79 @@ impl Instance {
         Ok(())
     }
 
+    /// Publish the outcome of a creation that released its reservation when
+    /// its registration window closed.
+    ///
+    /// A structured creation has nothing left to fence once the row, its
+    /// worktree, branch, sandbox and scratch dir are durable, so it drops the
+    /// reservation rather than hold a purge off for the whole ACP handshake —
+    /// a wait with no durable effect. What remains after the release is
+    /// ownership proof, and the durable generation is exactly that: every peer
+    /// transition mints a newer one, so a mismatch means an archive, trash,
+    /// restore, stop or purge took the row and this write is refused instead of
+    /// stamping a status onto it. The reservation release is a no-op here, the
+    /// creation having already given it up, and is kept so one commit serves
+    /// both shapes.
+    pub(crate) fn commit_created_launch(
+        &mut self,
+        storage: &dyn crate::session::SessionStore,
+        generation: u64,
+        status: Status,
+    ) -> Result<()> {
+        let idle = status == Status::Idle;
+        let committed = storage.update(|instances, _groups| {
+            let Some(stored) = instances.iter_mut().find(|instance| instance.id == self.id) else {
+                return Ok(false);
+            };
+            if stored.lifecycle_generation != generation {
+                return Ok(false);
+            }
+            stored.status = status;
+            stored.idle_entered_at = if idle { self.idle_entered_at } else { None };
+            stored.last_accessed_at = self.last_accessed_at;
+            stored.sandbox_info = self.sandbox_info.clone();
+            stored.capture_started_at = self.capture_started_at;
+            stored.active_execution = self.active_execution.clone();
+            stored.release_lifecycle_reservation_if_owned(LifecycleOperation::Launch, generation);
+            Ok(true)
+        })?;
+        anyhow::ensure!(committed, LifecycleReservationError::Superseded);
+        self.lifecycle_reservation = None;
+        self.status = status;
+        self.idle_entered_at = if idle { self.idle_entered_at } else { None };
+        Ok(())
+    }
+
+    /// Settle a created launch that no longer owns a reservation, keeping a
+    /// failure to commit from masking the refusal that caused it.
+    fn stamp_created_launch_status(
+        &mut self,
+        storage: &dyn crate::session::SessionStore,
+        generation: u64,
+        status: Status,
+    ) {
+        if let Err(error) = self.commit_created_launch(storage, generation, status) {
+            tracing::warn!(
+                target: "session.store",
+                session = %self.id,
+                "could not settle a created launch as {status:?}: {error:#}"
+            );
+        }
+    }
+
+    /// Whether the row still carries the generation a creation published.
+    fn creation_generation_is_current(
+        &self,
+        storage: &dyn crate::session::SessionStore,
+        generation: u64,
+    ) -> Result<bool> {
+        Ok(storage
+            .load()?
+            .iter()
+            .find(|instance| instance.id == self.id)
+            .is_some_and(|stored| stored.lifecycle_generation == generation))
+    }
+
     pub(crate) fn acquire_lifecycle_reservation(
         &mut self,
         storage: &dyn crate::session::SessionStore,
@@ -350,6 +423,63 @@ impl Instance {
             return Err(error);
         }
         self.ensure_reservation_current_or_fail(storage, generation)?;
+        Ok((title_lock, lifecycle_lock))
+    }
+
+    /// Reacquire the launch locks after the ACP handshake, for a creation
+    /// whose reservation its registration window already released.
+    ///
+    /// The handshake is a wait, not a durable effect, and it is fenced by the
+    /// supervisor instead: `acp::supervisor::launch::admit_durable_launch`
+    /// re-reads the row under this same lifecycle lock before and after the
+    /// handshake and retires the runner when a peer took it meanwhile. What
+    /// this adds is the settle, which must not stamp a status onto a row a
+    /// peer now owns — hence the generation the creation published in place of
+    /// the reservation it gave up.
+    pub(crate) fn reacquire_created_launch_locks_after_handshake(
+        &mut self,
+        storage: &dyn crate::session::SessionStore,
+        generation: u64,
+        handshake: Result<()>,
+    ) -> Result<(
+        crate::session::storage::StorageFlock,
+        crate::session::storage::StorageFlock,
+    )> {
+        let title_lock = match crate::session::storage::acquire_session_title_lock(&self.id) {
+            Ok(lock) => lock,
+            Err(error) => {
+                self.stamp_created_launch_status(storage, generation, Status::Error);
+                return Err(error).context("failed to reacquire instance title lock after hooks");
+            }
+        };
+        let lifecycle_lock = match storage.storage().acquire_instance_lifecycle_lock(&self.id) {
+            Ok(lock) => lock,
+            Err(error) => {
+                self.stamp_created_launch_status(storage, generation, Status::Error);
+                return Err(error)
+                    .context("failed to reacquire instance lifecycle lock after hooks");
+            }
+        };
+        // The supervisor's admission ran without these flocks, so reread the
+        // row under the one just taken back before deciding anything from it.
+        if let Err(error) = self.reconcile_from_store(storage) {
+            self.stamp_created_launch_status(storage, generation, Status::Error);
+            return Err(error);
+        }
+        // A structured launch owns no pane, so a refusal settles as stopped
+        // where `release_blocked_launch` would have kept a live pane idle.
+        if let Err(blocked) = self.ensure_startable() {
+            self.stamp_created_launch_status(storage, generation, Status::Stopped);
+            return Err(blocked.into());
+        }
+        if let Err(error) = handshake {
+            self.stamp_created_launch_status(storage, generation, Status::Error);
+            return Err(error);
+        }
+        anyhow::ensure!(
+            self.creation_generation_is_current(storage, generation)?,
+            LifecycleReservationError::Superseded
+        );
         Ok((title_lock, lifecycle_lock))
     }
 

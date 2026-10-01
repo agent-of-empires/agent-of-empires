@@ -139,6 +139,13 @@ test.describe("scratch sessions", () => {
     );
     await dialog.getByRole("button", { name: /^Delete$/ }).click();
     const deleteRes = await deletePromise;
+    // This is the assertion the launch reservation used to break: a structured
+    // create released that reservation when its registration window closed —
+    // row, worktree, branch, sandbox, scratch dir — so a delete issued while
+    // the agent's ACP handshake is still unanswered is answered at once rather
+    // than refused as Busy(Launch) for the length of that handshake. Nothing
+    // below waits on the reservation, so re-holding it fails here instead of
+    // being absorbed by the polls.
     expect(deleteRes.ok()).toBe(true);
     expect((deleteRes.request().postDataJSON() as { session_ids: string[] }).session_ids).toEqual([created!.id]);
 

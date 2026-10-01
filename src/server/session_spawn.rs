@@ -601,8 +601,22 @@ pub(crate) async fn spawn_structured_session(
                     anyhow::ensure!(row.lifecycle_reservation_is_owned(LifecycleOperation::Launch, generation),
                         crate::session::LifecycleReservationError::Superseded);
                     row.sandbox_info = instance.sandbox_info.clone();
+                    // The registration window closes here: the row, its worktree,
+                    // branch, sandbox and scratch dir are all durable and both
+                    // flocks are held, so the launch has nothing left to fence.
+                    // The ACP handshake that follows is a wait, not a durable
+                    // effect, and it is fenced by the supervisor instead —
+                    // `admit_durable_launch` re-reads the row under this same
+                    // lifecycle lock before and after it and retires the runner
+                    // when a peer took the row meanwhile. Holding the launch
+                    // across the whole wait instead made a create-then-delete
+                    // unresolvable for as long as the agent took to answer
+                    // its socket. Ownership from here is the generation this
+                    // creation published; see `commit_created_launch`.
+                    row.release_lifecycle_reservation_if_owned(LifecycleOperation::Launch, generation);
                     Ok(())
                 })?;
+                instance.lifecycle_reservation = None;
                 native.adopt_runtime_fields(&instance)?;
             } else {
                 let outcome = instance.finish_reserved_launch(
@@ -724,7 +738,7 @@ pub(crate) async fn spawn_structured_session(
                     let guard = inst_lock.lock().await;
                     let check_id = id.clone();
                     let checked = tokio::task::spawn_blocking(move || {
-                        use crate::session::{LifecycleOperation, SessionStore};
+                        use crate::session::SessionStore;
                         let validation = (|| -> anyhow::Result<()> {
                             let _title = crate::session::acquire_session_title_lock(&check_id)?;
                             let _lifecycle = native
@@ -737,15 +751,16 @@ pub(crate) async fn spawn_structured_session(
                                 .find(|row| row.id == check_id)
                                 .ok_or(crate::session::LifecycleReservationError::Superseded)?;
                             // A peer archived or trashed the row while the
-                            // `before_session` hook ran: the reservation is
-                            // still ours, but the session may no longer
-                            // launch (#4116).
+                            // `before_session` hook ran: the session may no
+                            // longer launch (#4116).
                             row.ensure_startable()?;
+                            // The creation dropped its launch reservation when
+                            // its registration window closed, so the generation
+                            // it published is the ownership proof here. Every
+                            // peer transition mints a newer one, and a row
+                            // removed outright was already caught above.
                             anyhow::ensure!(
-                                row.lifecycle_reservation_is_owned(
-                                    LifecycleOperation::Launch,
-                                    generation
-                                ),
+                                row.lifecycle_generation == generation,
                                 crate::session::LifecycleReservationError::Superseded
                             );
                             Ok(())
@@ -854,13 +869,14 @@ async fn finish_created_structured_session(
         .cloned()
         .ok_or(crate::session::LifecycleReservationError::Superseded)?;
     let result = tokio::task::spawn_blocking(move || {
-        let ownership = instance.reacquire_launch_locks_after_hooks(&native, generation, outcome);
+        let ownership =
+            instance.reacquire_created_launch_locks_after_handshake(&native, generation, outcome);
         if ownership.is_err() {
             native.adopt_runtime_fields(&instance)?;
             return ownership.map(|_| ());
         }
-        instance.status = crate::session::Status::Idle;
-        let result = instance.commit_lifecycle_launch(&native, generation, false);
+        let result =
+            instance.commit_created_launch(&native, generation, crate::session::Status::Idle);
         native.adopt_runtime_fields(&instance)?;
         result
     })
@@ -1028,5 +1044,111 @@ mod tests {
         .expect("the refused spawn reports a startup error");
         assert_eq!(launches.load(std::sync::atomic::Ordering::SeqCst), 0);
         assert!(!state.acp_supervisor.is_running(&id).await);
+    }
+
+    /// A create that answered has registered every resource the launch owns,
+    /// so a delete issued while its ACP handshake is still unanswered must
+    /// claim the row. Holding the launch reservation for that wait instead made
+    /// the pair unresolvable for as long as the agent took to answer.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_created_structured_session_is_purgeable_before_its_handshake_answers() {
+        use crate::server::test_support as support;
+        use axum::extract::{Query, State};
+        use axum::response::IntoResponse;
+        use axum::Json;
+
+        let temp = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
+        crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+        crate::session::config::update_app_state(|state| {
+            state.has_acknowledged_agent_hooks = true;
+        })
+        .expect("acknowledge the agent hook paths");
+        support::seed_instances_on_disk_for_test("test", Vec::new());
+        // A launcher that never answers pins the detached spawn inside the
+        // handshake, so the row is observed in the state a user meets it: the
+        // handshake outstanding, the registration window closed.
+        let handshaking = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let release = Arc::new(tokio::sync::Notify::new());
+        let launcher: crate::acp::supervisor::Launcher = {
+            let handshaking = Arc::clone(&handshaking);
+            let release = Arc::clone(&release);
+            Arc::new(move |_config, _id| {
+                let handshaking = Arc::clone(&handshaking);
+                let release = Arc::clone(&release);
+                Box::pin(async move {
+                    handshaking.store(true, std::sync::atomic::Ordering::SeqCst);
+                    release.notified().await;
+                    Err::<crate::acp::acp_client::AcpClient, _>(
+                        crate::acp::acp_client::AcpError::Spawn("test launcher".into()),
+                    )
+                })
+            })
+        };
+        let state = support::build_test_app_state_with_launcher(Vec::new(), launcher);
+        support::refresh_canonical_metadata_for_test(&state).await;
+        let body: crate::daemon::CreateSessionBody = serde_json::from_value(serde_json::json!({
+            "title": "created-then-purged", "path": "", "tool": "claude",
+            "scratch": true, "view": "structured", "profile": "test",
+        }))
+        .unwrap();
+        let response = crate::server::api::sessions::create_session(
+            State(Arc::clone(&state)),
+            Query(crate::server::api::sessions::CreateSessionQuery { wait: None }),
+            None,
+            Ok(Json(body)),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::CREATED);
+        let stored = support::load_instances_from_disk_for_test("test")
+            .into_iter()
+            .find(|row| row.title == "created-then-purged")
+            .expect("create persisted its row");
+        let id = stored.id.clone();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while !handshaking.load(std::sync::atomic::Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the detached spawn reached the ACP handshake");
+
+        let request = crate::session::deletion::DeletionRequest {
+            session_id: stored.id.clone(),
+            delete_worktree: false,
+            delete_branch: false,
+            delete_sandbox: false,
+            force_delete: true,
+            detach_hooks: true,
+            keep_scratch: false,
+            instance: stored,
+        };
+        let reservation = crate::session::deletion::PurgeTransaction::reserve_unwatched(request)
+            .expect("a purge of a just-created session reserves");
+        assert!(
+            matches!(
+                reservation,
+                crate::session::deletion::PurgeReservation::Reserved(_)
+            ),
+            "a delete issued right after a create must not find the row busy"
+        );
+
+        // Let the refused handshake settle before the isolated app dir goes
+        // away, so the detached task cannot touch a restored one.
+        release.notify_waiters();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while !state
+                .acp_event_store
+                .replay_from(&id, 0)
+                .iter()
+                .any(|(_, event)| matches!(event, crate::acp::Event::AgentStartupError { .. }))
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the refused handshake reports a startup error");
     }
 }
