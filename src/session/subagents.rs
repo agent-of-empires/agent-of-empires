@@ -29,8 +29,9 @@ const META_MAX_BYTES: usize = 16 * 1024;
 const SUBAGENT_SCAN_MAX: usize = 1024;
 const ACTIVITY_MAX: usize = 200;
 const DETAIL_MAX_CHARS: usize = 120;
-/// Finished subagents kept per session, newest first. Running ones are always kept.
-pub const FINISHED_SHOWN: usize = 5;
+/// How long a finished subagent stays listed after it ends. Claude drops it at once;
+/// the grace period lets the ✓ register and the row be opened.
+const FINISHED_LINGER: Duration = Duration::from_secs(60);
 /// How long a missing parent transcript waits before `projects/` is scanned again.
 const LOCATE_RETRY: Duration = Duration::from_secs(5);
 /// How often a found conversation is located again, to pick up a transcript
@@ -436,7 +437,8 @@ fn parse_task_notification(line: &[u8]) -> Option<(String, SubagentState, Option
 /// Settle subagents whose own transcript still reads as running: a parent
 /// notification newer than their last message is final, and one whose idle
 /// parent has heard nothing from it for [`STALE_AFTER`] is orphaned. Each
-/// subagent comes with the time of its newest message.
+/// subagent comes with the time of its newest message, which a notification
+/// moves to when it ended.
 fn settle(
     subagents: &mut [(Subagent, Option<SystemTime>)],
     ended: &Ended,
@@ -452,6 +454,7 @@ fn settle(
             let resumed = matches!((*last_entry_at, at), (Some(last), Some(at)) if last > *at);
             if !resumed {
                 subagent.state = *state;
+                *last_entry_at = at.or(*last_entry_at);
                 continue;
             }
         }
@@ -500,22 +503,27 @@ fn tool_detail(input: &Value) -> String {
     }
 }
 
-/// Keep every running subagent plus the [`FINISHED_SHOWN`] most recently
-/// started finished ones, in their original order.
-pub fn retain_recent(subagents: &mut Vec<Subagent>) {
-    let mut finished_seen = 0;
-    let keep: Vec<bool> = subagents
-        .iter()
-        .rev()
-        .map(|subagent| {
-            subagent.state == SubagentState::Running || {
-                finished_seen += 1;
-                finished_seen <= FINISHED_SHOWN
-            }
+/// The rows to list: every running subagent, a finished one that ended within
+/// [`FINISHED_LINGER`] of `now`, and `open`, whose preview is showing. Each
+/// subagent comes with the time it last wrote or ended.
+fn visible(
+    subagents: Vec<(Subagent, Option<SystemTime>)>,
+    open: Option<&str>,
+    now: SystemTime,
+) -> Vec<Subagent> {
+    subagents
+        .into_iter()
+        .filter(|(subagent, ended_at)| {
+            subagent.state == SubagentState::Running
+                || open == Some(subagent.agent_id.as_str())
+                // A time ahead of `now` is clock skew, so it counts as recent.
+                || ended_at.is_some_and(|at| {
+                    now.duration_since(at)
+                        .map_or(true, |age| age <= FINISHED_LINGER)
+                })
         })
-        .collect();
-    let mut keep = keep.into_iter().rev();
-    subagents.retain(|_| keep.next().unwrap_or(false));
+        .map(|(subagent, _)| subagent)
+        .collect()
 }
 
 /// A session whose subagents the TUI should list: its Claude store, current
@@ -624,11 +632,13 @@ impl SubagentScanner {
                     .then_with(|| a.agent_id.cmp(&b.agent_id))
             });
             settle(&mut subagents, &ended, source.parent_busy, now);
-            let mut subagents: Vec<Subagent> = subagents
-                .into_iter()
-                .map(|(subagent, _)| subagent)
-                .collect();
-            retain_recent(&mut subagents);
+            let open = focus
+                .filter(|(instance, _)| *instance == source.instance_id)
+                .map(|(_, agent)| agent.as_str());
+            let subagents = visible(subagents, open, now);
+            if subagents.is_empty() {
+                continue;
+            }
             if let Some(focus) = focus.filter(|(instance, agent)| {
                 *instance == source.instance_id && subagents.iter().any(|s| s.agent_id == *agent)
             }) {
@@ -962,31 +972,33 @@ mod tests {
     }
 
     #[test]
-    fn retain_recent_keeps_running_and_newest_finished() {
-        let make = |id: usize, state| Subagent {
-            agent_id: id.to_string(),
+    fn finished_subagents_linger_briefly_unless_open() {
+        let now = parse_timestamp("2026-10-01T15:30:00.000Z").unwrap();
+        let ago = |secs: u64| Some(now - Duration::from_secs(secs));
+        let make = |id: &str, state| Subagent {
+            agent_id: id.into(),
             agent_type: "Explore".into(),
             description: String::new(),
             state,
             started_at: None,
         };
-        let mut subagents: Vec<Subagent> = (0..FINISHED_SHOWN + 3)
-            .map(|id| {
-                make(
-                    id,
-                    if id == 0 {
-                        SubagentState::Running
-                    } else {
-                        SubagentState::Done
-                    },
-                )
-            })
+        let rows = vec![
+            (make("running", SubagentState::Running), ago(3600)),
+            (make("just-done", SubagentState::Done), ago(30)),
+            (make("old-done", SubagentState::Done), ago(120)),
+            (make("old-failed", SubagentState::Failed), ago(120)),
+            (make("open", SubagentState::Stopped), ago(3600)),
+            (make("untimed", SubagentState::Done), None),
+            (
+                make("skewed", SubagentState::Done),
+                Some(now + Duration::from_secs(5)),
+            ),
+        ];
+        let ids: Vec<String> = visible(rows, Some("open"), now)
+            .into_iter()
+            .map(|s| s.agent_id)
             .collect();
-        retain_recent(&mut subagents);
-        let ids: Vec<String> = subagents.iter().map(|s| s.agent_id.clone()).collect();
-        let mut expected = vec!["0".to_string()];
-        expected.extend((3..FINISHED_SHOWN + 3).map(|id| id.to_string()));
-        assert_eq!(ids, expected);
+        assert_eq!(ids, ["running", "just-done", "open", "skewed"]);
     }
 
     #[test]
@@ -1005,11 +1017,18 @@ mod tests {
             r#"{"agentType":"Explore","description":"find callers"}"#,
         )
         .unwrap();
+        let finished = |at: &str| {
+            line(json!({
+                "type": "assistant",
+                "timestamp": at,
+                "message": {"content": [{"type": "text", "text": "done"}], "stop_reason": "end_turn"},
+            }))
+        };
         std::fs::write(
             dir.join("agent-a01.jsonl"),
             [
                 prompt("2026-10-01T15:26:00.000Z"),
-                assistant(json!([{"type": "text", "text": "done"}]), Some("end_turn")),
+                finished("2026-10-01T15:29:30.000Z"),
             ]
             .concat(),
         )
@@ -1083,19 +1102,23 @@ mod tests {
             .unwrap();
         std::io::Write::write_all(
             &mut parent,
-            notification("a02", "killed", "2026-10-01T15:26:00.000Z").as_bytes(),
+            notification("a02", "killed", "2026-10-01T15:29:45.000Z").as_bytes(),
         )
         .unwrap();
         assert_eq!(summary(&mut scanner)[0].3, SubagentState::Stopped);
 
         // A grown transcript is re-read rather than served from the cache.
         let mut file = std::fs::OpenOptions::new().append(true).open(&a02).unwrap();
-        std::io::Write::write_all(
-            &mut file,
-            assistant(json!([{"type": "text", "text": "ok"}]), Some("end_turn")).as_bytes(),
-        )
-        .unwrap();
+        std::io::Write::write_all(&mut file, finished("2026-10-01T15:29:50.000Z").as_bytes())
+            .unwrap();
         assert_eq!(summary(&mut scanner)[0].3, SubagentState::Done);
+
+        // A minute after both ended, neither is listed.
+        let later = parse_timestamp("2026-10-01T15:31:00.000Z").unwrap();
+        assert!(scanner
+            .scan_at(std::slice::from_ref(&source), None, later)
+            .subagents
+            .is_empty());
 
         let other = SubagentSource {
             session_id: "11111111-2222-3333-4444-555555555555".into(),
