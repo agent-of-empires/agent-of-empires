@@ -2533,8 +2533,9 @@ function AppContent({
           <MobileRightPanelPicker
             open={pickerOpen && singlePane}
             active={rightPanelView}
-            pluginPanes={pluginPanes}
+            sessionTitle={activeSession.title}
             availablePanes={mobilePaneIds}
+            describePane={paneDescriptor}
             onSelect={handlePickView}
             onClose={closePicker}
           />
