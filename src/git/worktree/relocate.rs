@@ -720,19 +720,27 @@ mod tests {
     fn move_worktree_relocates_non_utf8_submodule_paths() {
         use std::os::unix::ffi::{OsStrExt, OsStringExt};
 
-        // APFS refuses any name that is not valid UTF-8, so this fixture cannot
-        // be built there. The control directory keeps an unrelated failure from
-        // reading as a name refusal.
-        fn non_utf8_name_refused(dir: &Path) -> bool {
-            let named = |bytes: &[u8]| dir.join(std::ffi::OsString::from_vec(bytes.to_vec()));
-            std::fs::create_dir(dir.join("probe-utf8")).expect("probe dir must be writable");
-            let created = named(b"probe-\xff");
-            std::fs::create_dir(&created).is_err()
-                || std::fs::rename(&created, named(b"probe-\xff-moved")).is_err()
+        // macOS refuses any name that is not valid UTF-8, so this fixture cannot
+        // be built there. Only such a refusal may skip, so the errno decides;
+        // anything else is a real fault.
+        fn refused(result: std::io::Result<()>) -> bool {
+            match result {
+                Ok(()) => false,
+                Err(err)
+                    if matches!(err.raw_os_error(), Some(libc::EILSEQ) | Some(libc::EINVAL)) =>
+                {
+                    true
+                }
+                Err(err) => panic!("non-UTF-8 name probe failed for another reason: {err}"),
+            }
         }
 
         let probe = TempDir::new().unwrap();
-        if non_utf8_name_refused(probe.path()) {
+        let named = |bytes: &[u8]| probe.path().join(OsStr::from_bytes(bytes));
+        let control = named(b"probe-utf8");
+        std::fs::create_dir(&control).expect("probe dir must be writable");
+        let created = named(b"probe-\xff");
+        if refused(std::fs::create_dir(&created)) || refused(std::fs::rename(&control, created)) {
             eprintln!(
                 "skipping move_worktree_relocates_non_utf8_submodule_paths: {} refuses non-UTF-8 names",
                 probe.path().display()
