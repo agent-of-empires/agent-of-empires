@@ -720,9 +720,7 @@ mod tests {
     fn move_worktree_relocates_non_utf8_submodule_paths() {
         use std::os::unix::ffi::{OsStrExt, OsStringExt};
 
-        // macOS refuses any name that is not valid UTF-8, so this fixture cannot
-        // be built there. Only such a refusal may skip, so the errno decides;
-        // anything else is a real fault.
+        // EILSEQ and EINVAL can signal a filesystem rejecting non-UTF-8 names.
         fn refused(result: std::io::Result<()>) -> bool {
             match result {
                 Ok(()) => false,
