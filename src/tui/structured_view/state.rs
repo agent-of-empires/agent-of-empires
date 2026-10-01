@@ -13,8 +13,7 @@ use super::reducer::AcpTranscript;
 use super::slash;
 use crate::acp::client::{DaemonEndpoint, HttpClient, PluginCommandView, WsHandle};
 use crate::acp::session_paths::SessionPathRoots;
-use crate::acp::state::AvailableCommand;
-use crate::acp::state::SessionNotice;
+use crate::acp::state::{AvailableCommand, SessionNotice};
 use crate::daemon::QueuedPromptEntry;
 use crate::plugin::ui_state::{Notification, UiSnapshot};
 use crate::tui::components::hover::HoverState;
@@ -43,8 +42,7 @@ pub struct StructuredViewState {
     pub toast: Option<ToastBanner>,
     /// Ids of session notices dismissed here. Local on purpose: the daemon's
     /// list is shared, and dismissing in this view must not clear the web's
-    /// banner. Ids outlive the notice, so the set is pruned against the live
-    /// list in [`Self::visible_notices`].
+    /// banner. Pruned by [`Self::prune_dismissed_notices`].
     pub dismissed_notices: HashSet<String>,
     /// Mirror of the daemon-owned prompt queue (drained server-side at the turn
     /// edge). Refreshed from `/queue` on connect and at each turn edge, with

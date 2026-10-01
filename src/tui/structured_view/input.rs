@@ -365,8 +365,9 @@ fn transcript_keys(key: &KeyEvent, ctx: InputContext) -> Intent {
         (m, KeyCode::Char('c')) if m.is_empty() && has_pending_elicitation => {
             Intent::CancelElicitation
         }
-        // Permission-mode picker, when the agent advertised modes.
+        // Oldest session notice, while the advisory strip is up.
         (m, KeyCode::Char('x')) if m.is_empty() && ctx.has_notices => Intent::DismissNotice(None),
+        // Permission-mode picker, when the agent advertised modes.
         (m, KeyCode::Char('m')) if m.is_empty() && ctx.has_modes => Intent::OpenModePicker,
         // Esc backs out one level to the composer (the home base) rather than
         // leaving the view.
