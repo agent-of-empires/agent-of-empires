@@ -224,7 +224,7 @@ pub struct SpawnRequest {
     pub additional_dirs: Vec<PathBuf>,
     pub provider_env: Vec<(String, String)>,
     /// LLM backend pinned on the session row, one of
-    /// [`crate::session::environment::AGENT_PROVIDERS`]; `None` defers to the host.
+    /// `session::environment::AGENT_PROVIDERS`; `None` defers to the host.
     pub provider: Option<String>,
     pub model: Option<String>,
     pub effort: Option<String>,
