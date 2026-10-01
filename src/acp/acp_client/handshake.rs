@@ -1,8 +1,9 @@
 //! The `initialize` request aoe sends and the wait for the agent's reply.
 
 use agent_client_protocol::schema::v1::{
-    ClientCapabilities, ElicitationCapabilities, ElicitationFormCapabilities,
-    FileSystemCapabilities, Implementation, InitializeRequest,
+    ClientCapabilities, ClientSessionCapabilities, ElicitationCapabilities,
+    ElicitationFormCapabilities, FileSystemCapabilities, Implementation, InitializeRequest,
+    NoticeCapabilities,
 };
 use agent_client_protocol::schema::ProtocolVersion;
 use std::sync::Arc;
@@ -29,7 +30,11 @@ pub(super) fn build_initialize_request() -> InitializeRequest {
         // Form-mode elicitation re-enables claude-agent-acp's AskUserQuestion,
         // which it otherwise blacklists, and routes it to
         // `handle_elicitation_request`.
-        .elicitation(ElicitationCapabilities::new().form(ElicitationFormCapabilities::new()));
+        .elicitation(ElicitationCapabilities::new().form(ElicitationFormCapabilities::new()))
+        // Without this the adapter must not send `notice` updates, and instead
+        // folds each advisory into a bold-label agent message that reads as the
+        // model's own prose.
+        .session(ClientSessionCapabilities::new().notices(NoticeCapabilities::new()));
     InitializeRequest::new(ProtocolVersion::V1)
         .client_capabilities(capabilities)
         .client_info(

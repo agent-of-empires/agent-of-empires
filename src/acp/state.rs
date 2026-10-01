@@ -144,6 +144,19 @@ impl RateLimitInfo {
     }
 }
 
+/// A live advisory the agent pushed outside the turn flow (approaching a rate
+/// limit, a model fallback), per the ACP session-notices extension. Each
+/// surface derives its own tone from the raw `severity` string.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionNotice {
+    /// Minted from the event seq, so a client keys its local dismissal on it.
+    pub id: String,
+    pub severity: String,
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
 /// Snapshot of the most recent ACP agent handoff.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentSwitchInfo {
@@ -370,6 +383,9 @@ pub struct AcpState {
     /// Notice for the most recent rejected `session/set_config_option`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_option_switch_failed: Option<ConfigOptionSwitchFailure>,
+    /// Undismissed advisories for the current turn; the next prompt clears them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub session_notices: Vec<SessionNotice>,
     #[serde(default)]
     pub background_agents: Vec<BackgroundAgentRecord>,
 
@@ -496,6 +512,14 @@ pub enum Event {
     ThinkingEnded,
     RateLimit {
         info: RateLimitInfo,
+    },
+    /// An ACP session notice: a live advisory, not conversation history.
+    SessionNotice {
+        /// Raw wire severity, so a future ACP level survives the log unchanged.
+        severity: String,
+        title: String,
+        #[serde(default)]
+        description: Option<String>,
     },
     /// Auto-resume breadcrumb; `manual` when the user pressed RESUME NOW.
     RateLimitAutoResumed {
@@ -676,6 +700,8 @@ pub enum Event {
 
 impl AcpState {
     const MAX_RECENT_DIFFS: usize = 16;
+    /// A chatty turn must not push the banner past the strip's useful height.
+    const MAX_SESSION_NOTICES: usize = 3;
 
     pub fn new(session_id: AcpSessionId, agent: AgentName, model: Option<String>) -> Self {
         Self {
@@ -776,6 +802,23 @@ impl AcpState {
             }
             Event::ThinkingEnded => self.thinking = None,
             Event::RateLimit { info } => self.rate_limit = Some(info),
+            Event::SessionNotice {
+                severity,
+                title,
+                description,
+            } => {
+                self.session_notices.push(SessionNotice {
+                    id: format!("notice-{}", self.last_seq.saturating_add(1)),
+                    severity,
+                    title,
+                    description,
+                });
+                let excess = self
+                    .session_notices
+                    .len()
+                    .saturating_sub(Self::MAX_SESSION_NOTICES);
+                self.session_notices.drain(..excess);
+            }
             Event::UsageUpdated { usage } => self.usage = Some(usage),
             Event::ModeChanged { mode } => self.mode = mode,
             Event::ModesAvailable {
@@ -949,6 +992,9 @@ impl AcpState {
             self.cancelling = false;
         }
         self.rate_limit = None;
+        // Advisories describe the turn they arrived in, so a new prompt retires
+        // them. Their transcript rows keep the history.
+        self.session_notices.clear();
     }
 
     /// The turn is over however it ended, so every in-turn phase clears.
@@ -967,6 +1013,8 @@ impl AcpState {
     fn switch_agent(&mut self, from: String, to: String, reason: String) {
         self.agent = AgentName(to.clone());
         self.rate_limit = None;
+        // The prior agent's advisories say nothing about the new one.
+        self.session_notices.clear();
         self.in_flight_tool = None;
         self.thinking = None;
         self.pending_approvals = Vec::new();

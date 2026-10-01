@@ -1105,6 +1105,7 @@ fn event_kind(event: &crate::acp::Event) -> &'static str {
         Event::MonitorArmed { .. } => "monitor_armed",
         Event::PromptRejected { .. } => "prompt_rejected",
         Event::AgentSwitched { .. } => "agent_switched",
+        Event::SessionNotice { .. } => "session_notice",
     }
 }
 

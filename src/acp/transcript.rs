@@ -79,6 +79,19 @@ pub enum TranscriptDelta {
     Remove(String),
 }
 
+/// A notice row is toned as an error like every other producer of its kind, so
+/// the severity is spelled out in the text rather than left to colour alone.
+fn session_notice_text(severity: &str, title: &str, description: &Option<String>) -> String {
+    match description
+        .as_deref()
+        .map(str::trim)
+        .filter(|d| !d.is_empty())
+    {
+        Some(description) => format!("{severity}: {title}: {description}"),
+        None => format!("{severity}: {title}"),
+    }
+}
+
 /// Folds the ACP `Event` stream into an ordered [`TranscriptRow`] list.
 #[derive(Debug, Clone, Default)]
 pub struct TranscriptModel {
@@ -325,6 +338,11 @@ impl TranscriptModel {
                 seq,
                 format!("mode switch to \"{mode_id}\" failed: {reason}"),
             )],
+            Event::SessionNotice {
+                severity,
+                title,
+                description,
+            } => vec![self.notice(seq, session_notice_text(severity, title, description))],
             Event::RateLimitAutoResumed { resets_at, manual } => {
                 let how = if *manual { "resumed" } else { "auto-resumed" };
                 vec![self.notice(seq, format!("{how} at {resets_at} after rate-limit park"))]

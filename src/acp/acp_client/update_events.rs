@@ -7,7 +7,7 @@ use crate::acp::state::{
     AvailableCommand, ConfigOptionDescriptor, Event, Plan, PlanStep, SessionMode, SessionUsage,
     ToolCall, UsageCost,
 };
-use agent_client_protocol::schema::v1::{ContentBlock, MessageId, SessionUpdate};
+use agent_client_protocol::schema::v1::{ContentBlock, MessageId, NoticeSeverity, SessionUpdate};
 use tracing::debug;
 
 use super::config_options::map_acp_config_option;
@@ -123,6 +123,19 @@ fn wake_tool_event(
         "ScheduleWakeup" => wakeup_event_from_raw(raw),
         "Monitor" => monitor_event_from_raw(raw),
         _ => None,
+    }
+}
+
+/// The wire string for a notice severity. An unrecognized level is carried
+/// through verbatim rather than flattened, so a future ACP level still reaches
+/// the surfaces intact.
+fn notice_severity_str(severity: &NoticeSeverity) -> &str {
+    match severity {
+        NoticeSeverity::Info => "info",
+        NoticeSeverity::Warning => "warning",
+        NoticeSeverity::Error => "error",
+        NoticeSeverity::Other(other) => other,
+        _ => "info",
     }
 }
 
@@ -434,6 +447,19 @@ pub(super) fn map_update_to_events(
                 "received ConfigOptionUpdate from agent"
             );
             vec![Event::ConfigOptionsUpdated { options }]
+        }
+        SessionUpdate::Notice(notice) => {
+            let severity = notice_severity_str(&notice.severity);
+            debug!(
+                target: "acp.protocol",
+                severity,
+                "received session Notice from agent"
+            );
+            vec![Event::SessionNotice {
+                severity: severity.to_string(),
+                title: notice.title,
+                description: notice.description,
+            }]
         }
         // AoE owns automatic renaming, so agent titles are ignored.
         SessionUpdate::SessionInfoUpdate(_) => Vec::new(),
