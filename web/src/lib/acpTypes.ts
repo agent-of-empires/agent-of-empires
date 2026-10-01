@@ -360,6 +360,7 @@ export type AcpEvent =
         reason: string;
       };
     }
+  | { AuthStatusUpdated: { status: AuthStatus | null } }
   | { RawAgentUpdate: { payload: unknown } }
   | {
       BackgroundAgentLaunched: {
@@ -474,6 +475,18 @@ export interface AcpFrame {
   event: AcpEvent;
 }
 
+/** Which auth identity the agent process resolved for itself. An interim
+ *  upstream extension, so an unrecognised `kind` still renders from `label`. */
+export type AuthStatusKind = "account" | "api_key" | "gateway" | "external" | "none" | "unknown";
+
+export interface AuthStatus {
+  kind: AuthStatusKind;
+  /** Usable as a UI string on its own ("Claude Max", "Anthropic API key"). */
+  label: string;
+  detail?: string | null;
+  account?: { email?: string | null; organization?: string | null; plan?: string | null } | null;
+}
+
 /** Fields this client adopts from the daemon's folded `AcpState`. */
 export interface ReducedState {
   agent: string;
@@ -488,6 +501,7 @@ export interface ReducedState {
   available_commands: AvailableCommand[];
   available_modes: Array<{ id: string; name: string; description?: string | null }>;
   current_mode_id: string | null;
+  auth_status?: AuthStatus | null;
   turn_active: boolean;
   cancelling: boolean;
   compacting: boolean;
@@ -538,6 +552,9 @@ export interface AcpState {
     description?: string | null;
   }>;
   currentModeId: string | null;
+  /** Null when the agent never reported, which renders as nothing rather than
+   *  as logged out. */
+  authStatus: AuthStatus | null;
   availableCommands: AvailableCommand[];
   /** Adapter rejected `session/set_mode` (commonly bypassPermissions without `ALLOW_BYPASS`). */
   modeSwitchFailed: { modeId: string; reason: string; at: string } | null;
@@ -815,6 +832,7 @@ export function emptyAcpState(): AcpState {
     promptSeq: 0,
     availableModes: [],
     currentModeId: null,
+    authStatus: null,
     availableCommands: [],
     workerStopped: false,
     workerRestarting: false,
@@ -930,6 +948,10 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
   }
   if ("CurrentModeChanged" in event) {
     next.modeSwitchFailed = null;
+    return next;
+  }
+  if ("AuthStatusUpdated" in event) {
+    next.authStatus = event.AuthStatusUpdated.status;
     return next;
   }
   if ("ModeSwitchFailed" in event) {
@@ -1241,6 +1263,7 @@ export function applyReducedState(state: AcpState, reduced: ReducedState, unchan
     availableCommands: holds("available_commands") ? state.availableCommands : reduced.available_commands,
     availableModes: holds("available_modes") ? state.availableModes : reduced.available_modes,
     currentModeId: reduced.current_mode_id,
+    authStatus: reduced.auth_status ?? null,
     // A false frame cannot suppress a prompt whose POST is still unacknowledged.
     serverTurnActive: reduced.turn_active,
     turnActive: deriveTurnActive({
