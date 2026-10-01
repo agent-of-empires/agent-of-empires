@@ -808,7 +808,7 @@ mod tests {
 
             // Back to a healthy journal, so the last step still exercises the
             // retained-owner path on a store that exists.
-            super::super::purge_owners::initialize(&owner_app).unwrap();
+            super::super::purge_owners::initialize(owner_app).unwrap();
             let protected = store(&home, &row.id, 40);
             reclaim_in(&app, &namespaces, &home, NO_GRACE, &gone).unwrap();
             assert!(

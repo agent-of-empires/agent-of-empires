@@ -2713,28 +2713,6 @@ mod tests {
         serde_json::from_slice(&fs::read(app.join("sessions.json")).unwrap()).unwrap()
     }
 
-    fn write_rows(app: &Path, rows: &Value) {
-        fs::write(app.join("sessions.json"), serde_json::to_vec(rows).unwrap()).unwrap();
-    }
-
-    fn pin_agent_dir(app: &Path, root: &Path) {
-        fs::write(
-            app.join("config.toml"),
-            format!(
-                "[session.agent_config_dir]\ngemini = \"{}\"\n",
-                root.display()
-            ),
-        )
-        .unwrap();
-    }
-
-    fn seed_store(parent: &Path, rel: &str, data: &[u8]) -> PathBuf {
-        let root = parent.join(rel);
-        fs::create_dir_all(&root).unwrap();
-        fs::write(root.join("data"), data).unwrap();
-        root
-    }
-
     /// Every runtime error that means "could not answer" must be classified
     /// as such. `InspectFailed` is the catch-all `classify_probe_failure`
     /// returns for an unrecognised stderr, which is what a timed-out probe on

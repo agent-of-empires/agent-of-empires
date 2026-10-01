@@ -45,14 +45,17 @@ pub(super) mod probe_delay {
 }
 
 #[cfg(test)]
+/// Runs once against the instance, after the last Pi poll of a generation.
+type AfterFinalPiDrainHook = Box<dyn FnOnce(&mut Instance)>;
+
+#[cfg(test)]
 thread_local! {
-    static AFTER_FINAL_PI_DRAIN: std::cell::RefCell<
-        Option<Box<dyn FnOnce(&mut Instance)>>,
-    > = std::cell::RefCell::new(None);
+    static AFTER_FINAL_PI_DRAIN: std::cell::RefCell<Option<AfterFinalPiDrainHook>> =
+        std::cell::RefCell::new(None);
 }
 
 #[cfg(test)]
-fn take_after_final_pi_drain_hook() -> Option<Box<dyn FnOnce(&mut Instance)>> {
+fn take_after_final_pi_drain_hook() -> Option<AfterFinalPiDrainHook> {
     AFTER_FINAL_PI_DRAIN.with(|hook| hook.borrow_mut().take())
 }
 

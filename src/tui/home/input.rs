@@ -6829,7 +6829,8 @@ mod tests {
     /// On a composited preview the rect is the whole window while input goes to pane 0
     /// alone, so a pointer over a neighbouring pane must not map against the full rect,
     /// which reported a column past pane 0's right edge. Also round-trips a painted
-
+    /// composite cursor cell through mouse mapping, pinning the bottom-follow clipping.
+    ///
     /// A pane 0 extent larger than the preview rect (an attached client keeping its own
     /// size) must clamp to the rect rather than admit cells outside it.
     #[test]

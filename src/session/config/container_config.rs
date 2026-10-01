@@ -4618,11 +4618,10 @@ mod tests {
     /// The Claude mount without its Keychain source, so a developer's own
     /// login never reaches the assertions on macOS.
     fn claude_mount_without_keychain() -> AgentConfigMount {
-        let mut mount = AGENT_CONFIG_MOUNTS
+        let mut mount = *AGENT_CONFIG_MOUNTS
             .iter()
             .find(|mount| mount.tool_name == "claude")
-            .unwrap()
-            .clone();
+            .unwrap();
         mount.keychain_credential = None;
         mount
     }
