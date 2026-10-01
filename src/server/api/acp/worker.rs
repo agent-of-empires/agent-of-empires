@@ -544,7 +544,7 @@ pub async fn switch_acp_provider(
         return super::super::api_error(
             StatusCode::BAD_REQUEST,
             "unknown_provider",
-            &format!(
+            format!(
                 "unknown provider {provider:?}; expected one of {}",
                 crate::session::environment::AGENT_PROVIDERS.join(", ")
             ),
@@ -573,14 +573,14 @@ pub async fn switch_acp_provider(
         return super::super::api_error(
             StatusCode::CONFLICT,
             "provider_switch_unsupported",
-            &format!("provider switching is Claude-only; this session runs {agent}"),
+            format!("provider switching is Claude-only; this session runs {agent}"),
         );
     }
     if instance.agent_provider.as_deref() == Some(provider.as_str()) {
         return super::super::api_error(
             StatusCode::BAD_REQUEST,
             "provider_unchanged",
-            &format!("session is already pinned to {provider}"),
+            format!("session is already pinned to {provider}"),
         );
     }
 
@@ -687,6 +687,52 @@ mod tests {
             let live = memory.iter().find(|i| i.id == id).expect("instance");
             assert_eq!(live.agent_model.as_deref(), expected);
             assert_eq!(live.agent_name.as_deref(), Some("codex"));
+        }
+    }
+
+    /// The pick reaches both stores, and the model goes with it: ids are
+    /// provider-specific, so a respawn re-asserting the old one would fail the
+    /// next turn. Everything naming the conversation survives, because the
+    /// provider changes where the tokens come from, not which transcript is
+    /// resumed.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_provider_switch_persists_the_pick_and_clears_the_model() {
+        use crate::session::test_support::isolate_app_dir;
+        let profile = "default";
+
+        for provider in crate::session::environment::AGENT_PROVIDERS {
+            let _tmp = isolate_app_dir();
+            let mut inst = crate::session::Instance::new("claude", "/tmp/aoe-switch-provider");
+            inst.view = crate::session::View::Structured;
+            inst.agent_name = Some("claude".to_string());
+            inst.agent_model = Some("claude-fable-5-1".to_string());
+            inst.acp_effort = Some("high".to_string());
+            inst.acp_session_id = Some("acp-old".to_string());
+            let id = inst.id.clone();
+            crate::server::test_support::seed_instances_on_disk_for_test(
+                profile,
+                vec![inst.clone()],
+            );
+            let state = crate::server::test_support::build_test_app_state(vec![inst]);
+
+            persist_provider_switch(&state, profile, &id, provider).await;
+
+            let on_disk = crate::server::test_support::load_instances_from_disk_for_test(profile);
+            let stored = on_disk.iter().find(|i| i.id == id).expect("seeded row");
+            assert_eq!(
+                stored.agent_provider.as_deref(),
+                Some(*provider),
+                "the disk row is what a restart reads"
+            );
+            assert_eq!(stored.agent_model, None);
+            assert_eq!(stored.acp_session_id.as_deref(), Some("acp-old"));
+            assert_eq!(stored.acp_effort.as_deref(), Some("high"));
+
+            let memory = state.instances.read().await;
+            let live = memory.iter().find(|i| i.id == id).expect("instance");
+            assert_eq!(live.agent_provider.as_deref(), Some(*provider));
+            assert_eq!(live.agent_model, None);
         }
     }
 

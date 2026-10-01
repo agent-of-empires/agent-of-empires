@@ -344,6 +344,7 @@ mod tests {
         custom_agent.agent_name = Some("custom-acp".to_string());
         let mut sandboxed = structured("sandboxed", "opencode");
         sandboxed.sandbox_info = Some(crate::session::SandboxInfo {
+            provider: None,
             enabled: true,
             container_id: None,
             image: "ghcr.io/agent-of-empires/aoe-sandbox:latest".to_string(),

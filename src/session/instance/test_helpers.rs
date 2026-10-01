@@ -236,6 +236,7 @@ pub(super) const SIDECAR_TEST_FRESH_UUID: &str = "11111111-2222-4333-8444-555555
 
 pub(super) fn test_sandbox(name: &str, workdir: Option<&str>) -> SandboxInfo {
     SandboxInfo {
+        provider: None,
         enabled: true,
         container_id: None,
         image: "test-image".to_string(),

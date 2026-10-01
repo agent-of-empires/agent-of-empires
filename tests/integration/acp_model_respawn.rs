@@ -29,6 +29,7 @@ fn spawn_config(
     default_effort: Option<String>,
 ) -> SpawnConfig {
     SpawnConfig {
+        provider_routing: Vec::new(),
         wrapper_substitution: None,
         agent_key: "claude".into(),
         tool: "claude".into(),

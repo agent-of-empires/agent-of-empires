@@ -1273,6 +1273,7 @@ mod tests {
 
         let mut sandboxed = Instance::new("claude", temp.path().to_str().unwrap());
         sandboxed.sandbox_info = Some(crate::session::SandboxInfo {
+            provider: None,
             enabled: true,
             container_id: None,
             image: "alpine".to_string(),

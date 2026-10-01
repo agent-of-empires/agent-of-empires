@@ -672,6 +672,14 @@ mod tests {
             custom_instruction: None,
             before_start_env: Vec::new(),
             container_workdir: None,
+            provider: None,
+        }
+    }
+
+    fn sandbox_for(provider: &str) -> SandboxInfo {
+        SandboxInfo {
+            provider: Some(provider.to_string()),
+            ..sandbox(None)
         }
     }
 
@@ -1023,6 +1031,131 @@ mod tests {
         assert_eq!(
             session_host_env_pairs("any-profile", tmp.path(), &info),
             owned(&[("TEST_VAR", "foo"), ("OTHER", "bar")])
+        );
+    }
+
+    /// Every pick writes both flags, so the override beats whatever the host
+    /// exported rather than merely failing to set it. Off is empty, never "0":
+    /// the adapter reads these with a JavaScript truthiness test.
+    #[test]
+    fn provider_override_env_sets_both_flags() {
+        let cases = [("api", "", ""), ("bedrock", "1", ""), ("vertex", "", "1")];
+        for (provider, bedrock, vertex) in cases {
+            assert_eq!(
+                provider_override_env(provider),
+                Some(owned(&[
+                    ("CLAUDE_CODE_USE_BEDROCK", bedrock),
+                    ("CLAUDE_CODE_USE_VERTEX", vertex),
+                ])),
+                "{provider}"
+            );
+        }
+        assert_eq!(provider_override_env("gateway"), None);
+        assert_eq!(provider_override_env(""), None);
+    }
+
+    /// A pick decides Vertex routing on its own; only an unpinned session
+    /// falls back to the host flag, which is the behavior before any pick.
+    #[test]
+    #[serial]
+    fn vertex_enabled_prefers_the_session_pick() {
+        for (host, cases) in [
+            (
+                "1",
+                [(None, true), (Some("api"), false), (Some("vertex"), true)],
+            ),
+            (
+                "",
+                [(None, false), (Some("api"), false), (Some("vertex"), true)],
+            ),
+        ] {
+            let _env = EnvGuard::set(&[("CLAUDE_CODE_USE_VERTEX", host)]);
+            for (pick, expected) in cases {
+                assert_eq!(
+                    vertex_enabled(pick),
+                    expected,
+                    "host={host:?} pick={pick:?}"
+                );
+            }
+            // An unrecognized stored value must not silently mean "not vertex".
+            assert_eq!(vertex_enabled(Some("gateway")), !host.is_empty());
+        }
+    }
+
+    /// The sandbox path claims the first entry for a key, so the pick has to
+    /// land here to outrank the request auth payload and the adapter
+    /// allowlist. A Vertex pick also pulls in the credential vars the host
+    /// flag would otherwise gate.
+    #[test]
+    #[serial]
+    fn collect_environment_applies_the_provider_pick() {
+        let _env = EnvGuard::set(&[
+            ("CLAUDE_CODE_USE_VERTEX", "1"),
+            ("ANTHROPIC_VERTEX_PROJECT_ID", "proj"),
+            ("CLOUD_ML_REGION", "europe-west1"),
+        ]);
+        let config = config(&[]);
+
+        let api = collect_environment(&config, &sandbox_for("api"));
+        assert_eq!(
+            lookup(&api, "CLAUDE_CODE_USE_VERTEX"),
+            vec![(String::new(), false)]
+        );
+        assert_eq!(
+            lookup(&api, "CLAUDE_CODE_USE_BEDROCK"),
+            vec![(String::new(), false)]
+        );
+        assert!(
+            lookup(&api, "ANTHROPIC_VERTEX_PROJECT_ID").is_empty(),
+            "an api pick must not carry the host's vertex credentials"
+        );
+
+        let bedrock = collect_environment(&config, &sandbox_for("bedrock"));
+        assert_eq!(
+            lookup(&bedrock, "CLAUDE_CODE_USE_BEDROCK"),
+            vec![("1".to_string(), false)]
+        );
+        assert_eq!(
+            lookup(&bedrock, "CLAUDE_CODE_USE_VERTEX"),
+            vec![(String::new(), false)]
+        );
+
+        let vertex = collect_environment(&config, &sandbox_for("vertex"));
+        assert_eq!(
+            lookup(&vertex, "CLAUDE_CODE_USE_VERTEX"),
+            vec![("1".to_string(), false)]
+        );
+        assert_eq!(
+            lookup(&vertex, "ANTHROPIC_VERTEX_PROJECT_ID"),
+            vec![("proj".to_string(), true)]
+        );
+
+        // Unpinned keeps the host-driven behavior.
+        let unpinned = collect_environment(&config, &sandbox(None));
+        assert_eq!(
+            lookup(&unpinned, "CLAUDE_CODE_USE_VERTEX"),
+            vec![("1".to_string(), true)]
+        );
+        assert!(lookup(&unpinned, "CLAUDE_CODE_USE_BEDROCK").is_empty());
+    }
+
+    /// A Vertex pick reaches a host that never exported the flag, which is the
+    /// whole point of switching: the credential vars travel with it.
+    #[test]
+    #[serial]
+    fn collect_environment_forwards_vertex_vars_without_the_host_flag() {
+        let _env = EnvGuard::set(&[
+            ("CLAUDE_CODE_USE_VERTEX", ""),
+            ("ANTHROPIC_VERTEX_PROJECT_ID", "proj"),
+        ]);
+        let entries = collect_environment(&config(&[]), &sandbox_for("vertex"));
+        assert_eq!(
+            lookup(&entries, "CLAUDE_CODE_USE_VERTEX"),
+            vec![("1".to_string(), false)]
+        );
+        assert_eq!(
+            lookup(&entries, "ANTHROPIC_VERTEX_PROJECT_ID"),
+            vec![("proj".to_string(), true)]
         );
     }
 

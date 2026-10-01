@@ -245,6 +245,7 @@ pub(super) fn isolate_home() -> (crate::session::test_support::AppDirGuard, temp
 
 pub(super) fn spawn_request(session_id: &str) -> SpawnRequest {
     SpawnRequest {
+        provider: None,
         session_id: session_id.into(),
         agent: "claude-code".into(),
         tool: "claude-code".into(),
@@ -269,6 +270,7 @@ pub(super) fn spawn_request(session_id: &str) -> SpawnRequest {
 
 pub(super) fn runner_config(socket_path: PathBuf) -> SpawnConfig {
     SpawnConfig {
+        provider_routing: Vec::new(),
         wrapper_substitution: None,
         agent_key: "claude".into(),
         tool: "claude".into(),
