@@ -35,7 +35,10 @@ pub use prompt::{
     resolve_approval, resolve_elicitation,
 };
 pub use view::{acp_disable, acp_enable};
-pub use worker::{get_option_catalog, list_acp_agents, shutdown_acp, spawn_acp, switch_acp_agent};
+pub use worker::{
+    get_option_catalog, list_acp_agents, shutdown_acp, spawn_acp, switch_acp_agent,
+    switch_acp_provider,
+};
 
 /// Startup-error banner text for a failed detached structured-view spawn.
 /// `CapacityFull` is surfaced verbatim so the UI shows the capacity banner.

@@ -3,7 +3,9 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::acp::protocol::{SwitchAgentRequest, SwitchAgentResponse};
+use crate::acp::protocol::{
+    SwitchAgentRequest, SwitchAgentResponse, SwitchProviderRequest, SwitchProviderResponse,
+};
 use crate::server::acp_reconciler::install_rate_limit_continuation;
 use crate::server::api::find_instance;
 
@@ -470,6 +472,170 @@ pub async fn switch_acp_agent(
         agent: target,
         before_seq,
         switch_seq,
+        status: "running".to_string(),
+    })
+    .into_response()
+}
+
+/// Record the pick in memory and on disk from one mutation. Written before the
+/// respawn, because the container reconcile and the spawn request both read it
+/// off the row. `agent_model` goes with it: model ids are provider-specific, so
+/// re-asserting the old one against the new provider fails the next turn.
+async fn persist_provider_switch(state: &AppState, profile: &str, id: &str, provider: &str) {
+    let switch = |inst: &mut crate::session::Instance| {
+        inst.agent_provider = Some(provider.to_string());
+        inst.agent_model = None;
+    };
+    {
+        let mut instances = state.instances.write().await;
+        if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
+            switch(inst);
+        }
+    }
+    match crate::session::Storage::new(profile, state.file_watch.clone()) {
+        Ok(storage) => {
+            if let Err(e) = storage.update(|instances, _groups| {
+                if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
+                    switch(inst);
+                }
+                Ok(())
+            }) {
+                tracing::error!(
+                    target: "http.api.acp",
+                    session = %id,
+                    "failed to persist agent_provider after switch: {e}"
+                );
+            }
+        }
+        Err(e) => tracing::error!(
+            target: "http.api.acp",
+            session = %id,
+            "failed to open storage to persist agent_provider after switch: {e}"
+        ),
+    }
+}
+
+/// Re-route a structured session to another LLM provider, keeping the
+/// transcript: the worker stops between turns and the respawn resumes the
+/// stored ACP session.
+///
+/// Unlike an agent switch the pick is persisted before the respawn, because
+/// both the sandbox container reconcile and the spawn request read it from the
+/// row. A failed spawn therefore leaves the pick in place, which is what lets
+/// the user see the error and switch back rather than silently landing on the
+/// old provider.
+pub async fn switch_acp_provider(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    req: Result<Json<SwitchProviderRequest>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    if let Some(resp) = read_only_block(&state) {
+        return resp;
+    }
+    if let Some(resp) = cityhall_block(&state) {
+        return resp;
+    }
+    let Json(req) = match req {
+        Ok(j) => j,
+        Err(rej) => return rej.into_response(),
+    };
+    let provider = req.provider.trim().to_string();
+    if !crate::session::environment::AGENT_PROVIDERS.contains(&provider.as_str()) {
+        return super::super::api_error(
+            StatusCode::BAD_REQUEST,
+            "unknown_provider",
+            &format!(
+                "unknown provider {provider:?}; expected one of {}",
+                crate::session::environment::AGENT_PROVIDERS.join(", ")
+            ),
+        );
+    }
+    // Worker-stopping barrier (#3650).
+    let Some(_submission) = state
+        .session_service
+        .prompt_submission_for_session(&id)
+        .await
+    else {
+        return session_not_found();
+    };
+    let Some(instance) = find_instance(&state, &id).await else {
+        return session_not_found();
+    };
+    if !instance.is_structured() {
+        return not_structured_response();
+    }
+    if let Err(blocked) = instance.ensure_startable() {
+        return crate::server::api::start_blocked_response(blocked);
+    }
+    let agent = pick_agent(&state, &instance, instance.agent_name.as_deref()).await;
+    // The routing flags are Claude-specific; no other adapter reads them.
+    if !matches!(agent.as_str(), "claude" | "claude-code") {
+        return super::super::api_error(
+            StatusCode::CONFLICT,
+            "provider_switch_unsupported",
+            &format!("provider switching is Claude-only; this session runs {agent}"),
+        );
+    }
+    if instance.agent_provider.as_deref() == Some(provider.as_str()) {
+        return super::super::api_error(
+            StatusCode::BAD_REQUEST,
+            "provider_unchanged",
+            &format!("session is already pinned to {provider}"),
+        );
+    }
+
+    if let Err(e) = state
+        .acp_supervisor
+        .shutdown_and_wait(&id, std::time::Duration::from_secs(5))
+        .await
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("shutdown failed before provider switch: {e}"),
+        )
+            .into_response();
+    }
+
+    let model_cleared = instance.agent_model.is_some();
+    persist_provider_switch(&state, &instance.source_profile, &id, &provider).await;
+
+    let inst_lock = state.instance_lock(&id).await;
+    let sandbox_info = match crate::acp::sandbox::ensure_container_for_session(
+        &state.instances,
+        &inst_lock,
+        &id,
+        false,
+    )
+    .await
+    {
+        Ok(info) => info,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("sandbox container ensure failed: {e}"),
+            )
+                .into_response();
+        }
+    };
+
+    state.acp_supervisor.forget_stale_cancel(&id);
+    // Everything that names the conversation survives: the provider changes
+    // where the tokens are served from, not which transcript is resumed.
+    let Some(instance) = find_instance(&state, &id).await else {
+        return session_not_found();
+    };
+    let request = spawn_request_for(&instance, agent, sandbox_info);
+    if let Some(resp) = refuse_if_stored_row_shelved(&state, &instance).await {
+        return resp;
+    }
+    if let Err(e) = state.acp_supervisor.spawn(request).await {
+        return supervisor_error_response("spawn failed after provider switch", &e);
+    }
+
+    Json(SwitchProviderResponse {
+        session_id: id,
+        provider,
+        model_cleared,
         status: "running".to_string(),
     })
     .into_response()
