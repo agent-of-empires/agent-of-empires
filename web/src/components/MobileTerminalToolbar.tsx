@@ -3,7 +3,7 @@ import type { RefObject } from "react";
 import { useHoldRepeat } from "../hooks/useHoldRepeat";
 import { readClipboardText } from "../lib/clipboard";
 import { invalidateRetainedImeContext } from "../lib/mobileKeyboardProxy";
-import { toolbarKeySpec, type ToolbarKeyId, type ToolbarKeySpec } from "../lib/terminalToolbarKeys";
+import { MAX_TOOLBAR_KEYS, toolbarKeySpec, type ToolbarKeyId, type ToolbarKeySpec } from "../lib/terminalToolbarKeys";
 import { StrokeIcon } from "./icons";
 
 function execCommandPaste(): boolean {
@@ -22,7 +22,7 @@ interface Props {
   /** Opens the compose sheet, also the fallback when the clipboard cannot be read. */
   onCompose: () => void;
   keyboardOpen: boolean;
-  /** No soft keyboard: sit lower, smaller, and inset from the rounded screen corners. */
+  /** No soft keyboard: sit lower, smaller, inset from the rounded screen corners, and end with Enter if it fits. */
   compact: boolean;
   ctrlActive: boolean;
   onCtrlToggle: () => void;
@@ -216,22 +216,24 @@ export function MobileTerminalToolbar({
   };
 
   if (keys.length === 0) return null;
+  // The soft keyboard's return key covers Enter only while it is up; a full row has no room for it.
+  const row = compact && keys.length < MAX_TOOLBAR_KEYS && !keys.includes("enter") ? [...keys, "enter" as const] : keys;
   return (
     <div
       // The parent drops its home-indicator padding for this bar (index.css .home-indicator-clearance), so the bar
       // runs to the screen edge and owns the clearance. With the keyboard up iOS may still report the inset, so the
-      // keys keep all of it. Without, they drop to 22px less than the inset and move in from the rounded corners.
+      // keys keep all of it. Without, they drop to 8px less than the inset and move in from the rounded corners.
       data-terminal-toolbar
       data-compact={compact || undefined}
       className={`shrink-0 flex items-center gap-1.5 pt-1.5 bg-surface-900 border-t border-surface-700/50 ${
         compact
-          ? "px-[max(0.5rem,calc(env(safe-area-inset-bottom)*0.7))] pb-[max(0.375rem,calc(env(safe-area-inset-bottom)-1.375rem))] [&_button]:h-9 [&_svg]:size-4 [&_span]:text-[11px]"
+          ? "px-[max(0.5rem,calc(env(safe-area-inset-bottom)*0.7))] pb-[max(0.375rem,calc(env(safe-area-inset-bottom)-0.5rem))] [&_button]:h-9 [&_svg]:size-4 [&_span]:text-[11px]"
           : "px-2 pb-[calc(env(safe-area-inset-bottom)+0.375rem)]"
       }`}
       // Prevent toolbar taps from stealing focus away from the proxy input.
       onMouseDown={(e) => e.preventDefault()}
     >
-      {keys.map((id) => renderKey(toolbarKeySpec(id)))}
+      {row.map((id) => renderKey(toolbarKeySpec(id)))}
     </div>
   );
 }

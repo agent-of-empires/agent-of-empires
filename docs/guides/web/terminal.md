@@ -44,7 +44,7 @@ The phone renders the same live view, tuned for touch:
 
 - **Scrolling** is the browser's own, over the pane's real scrollback. For a full-screen agent, whose scrollback lives inside the app, a drag is forwarded as wheel input, one line at a time and paced to the app's redraws.
 - **Selection** is native: long-press to select and copy.
-- **Typing** goes back over the same WebSocket. Tapping the terminal opens the soft keyboard, except in a full-screen app with mouse support, where a tap is a click; the floating keyboard button toggles it either way. The key row adds Esc, Tab, a `Ctrl` toggle, paste, and compose by default; pick and order its keys under Settings > Terminal. Drag the joystick above the keyboard button for arrow keys. Compose opens a text box for dictation, autocorrect, and long-press paste, and sends the text as one paste. Opening the keyboard never resizes the agent's pane.
+- **Typing** goes back over the same WebSocket. Tapping the terminal opens the soft keyboard, except in a full-screen app with mouse support, where a tap is a click; the floating keyboard button toggles it either way. The key row adds Esc, Tab, a `Ctrl` toggle, paste, and compose by default, and ends with Enter while the soft keyboard is closed if the row has room; pick and order its keys under Settings > Terminal. Drag the joystick above the keyboard button for arrow keys. Compose opens a text box for dictation, autocorrect, and long-press paste, and sends the text as one paste. Opening the keyboard never resizes the agent's pane.
 - **Pinch** adjusts the font size, resizing the pane once the gesture ends.
 
 A "Back to live" pill appears while you are scrolled up, and the pane stays mounted across view switches so the connection and scroll position survive.

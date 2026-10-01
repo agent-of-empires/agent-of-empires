@@ -24,6 +24,7 @@ mod archive_structured;
 mod claude_shared_project_correlation_e2e;
 mod cli;
 mod cli_session_id_capture;
+mod custom_order_tui;
 mod diagnostics_strip;
 mod errors;
 mod filewatch_config_malformed;

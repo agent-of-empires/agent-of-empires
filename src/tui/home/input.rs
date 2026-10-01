@@ -412,6 +412,20 @@ fn slice_line_columns(line: &ratatui::text::Line, from: u16, to_excl: u16, width
     crate::tui::components::text::line_columns(line, width).slice(from, to_excl.min(width))
 }
 
+/// `Alt+Up` / `Alt+Down`: the direction they walk the list, or `None` for any other key.
+fn jump_delta_for(key: &KeyEvent) -> Option<isize> {
+    // The bound chord is Alt alone. Ctrl+Alt+arrow is not one of ours, so inside live send it
+    // stays with the pane instead of breaking the relay.
+    if !key.modifiers.contains(KeyModifiers::ALT) || key.modifiers.contains(KeyModifiers::CONTROL) {
+        return None;
+    }
+    match key.code {
+        KeyCode::Up => Some(-1),
+        KeyCode::Down => Some(1),
+        _ => None,
+    }
+}
+
 impl HomeView {
     pub fn is_diff_open(&self) -> bool {
         self.diff_view.is_some()
@@ -1712,6 +1726,13 @@ impl HomeView {
         // empty-sidebar click, a right-click menu), its keys must go to the overlay, or
         // the user sees a dialog whose Esc / Enter land on the session behind it.
         if self.live_send.is_some() && !self.has_non_live_send_overlay() {
+            // The jump keys are the one exception: they mean "take me to another session",
+            // which is only answerable from the list, so they leave the relay first.
+            if let Some(delta) = jump_delta_for(&key) {
+                self.exit_live_send_if_active();
+                self.jump_to_adjacent_finished(delta);
+                return None;
+            }
             self.handle_live_send_key(key);
             return None;
         }
@@ -2781,6 +2802,20 @@ impl HomeView {
                     tracing::error!("toggle_archive_at_cursor failed: {}", e);
                 }
             }
+            id @ (ActionId::JumpPrevFinished | ActionId::JumpNextFinished) => {
+                let delta = if id == ActionId::JumpPrevFinished {
+                    -1
+                } else {
+                    1
+                };
+                self.jump_to_adjacent_finished(delta);
+            }
+            id @ (ActionId::MoveRowUp | ActionId::MoveRowDown) => {
+                let delta = if id == ActionId::MoveRowUp { -1 } else { 1 };
+                if let Err(e) = self.move_row_at_cursor(delta) {
+                    tracing::error!("move_row_at_cursor failed: {}", e);
+                }
+            }
             ActionId::ToggleFavorite => {
                 if let Err(e) = self.toggle_favorite_at_cursor() {
                     tracing::error!("toggle_favorite_at_cursor failed: {}", e);
@@ -3771,6 +3806,36 @@ impl HomeView {
         if self.selected_session != previous {
             self.preview_scroll_offset = 0;
             self.manual_unread_hold = None;
+        }
+    }
+
+    /// Move the selection to the nearest session that is working or has just stopped:
+    /// `Running`, or Idle for less than `idle_decay_window`. Those are the rows the theme
+    /// paints `running` and `fresh_idle`. Walks in `delta`'s direction and wraps once.
+    fn jump_to_adjacent_finished(&mut self, delta: isize) {
+        let len = self.flat_items.len();
+        if len == 0 {
+            return;
+        }
+        for step in 1..=len {
+            let offset = delta * step as isize;
+            let idx = (self.cursor as isize + offset).rem_euclid(len as isize) as usize;
+            let Some(Item::Session { id, .. }) = self.flat_items.get(idx) else {
+                continue;
+            };
+            let id = id.clone();
+            let window = self.idle_decay_window;
+            let stop_here = self.get_instance(&id).is_some_and(|inst| {
+                // Snoozed, archived and trashed rows are explicit "don't bother me" states,
+                // excluded here as they are in `w`.
+                !inst.is_dismissed()
+                    && (inst.status == Status::Running
+                        || inst.idle_age().is_some_and(|age| age < window))
+            });
+            if stop_here {
+                self.jump_to_session_id(&id);
+                return;
+            }
         }
     }
 
