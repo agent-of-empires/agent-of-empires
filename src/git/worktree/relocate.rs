@@ -741,11 +741,10 @@ mod tests {
         std::fs::create_dir(&control).expect("probe dir must be writable");
         let created = named(b"probe-\xff");
         if refused(std::fs::create_dir(&created)) || refused(std::fs::rename(&control, created)) {
-            eprintln!(
-                "skipping move_worktree_relocates_non_utf8_submodule_paths: {} refuses non-UTF-8 names",
+            panic!(
+                "TEMP-DIAG probe refused non-UTF-8 names at {}",
                 probe.path().display()
             );
-            return;
         }
 
         let home_dir = TempDir::new().unwrap();
