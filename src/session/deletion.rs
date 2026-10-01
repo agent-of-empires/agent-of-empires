@@ -708,12 +708,14 @@ pub async fn settle_runner_of(
     )
     .await;
     match outcome {
-        // A registry record is removed the moment a runner exits, so a stopped
-        // session has none. That is "nothing to stop", the same answer the
-        // supervisor gives for an unknown session (`shutdown_and_delete` treats
-        // it as settled too). Only a runner that exists and cannot be proven
-        // dead refuses.
-        Ok(()) | Err(crate::acp::supervisor::SupervisorError::UnknownSession(_)) => Ok(released),
+        // Only a proven settlement proceeds. `UnknownSession` is NOT accepted
+        // here, unlike on the daemon path: that one comes from `begin_stop`
+        // against the in-memory lifecycle table, which knows whether this
+        // supervisor ever held a lease. A registry-only reader cannot tell a
+        // runner that exited from one that is still stopping, because the
+        // record is deleted before the wait in `stop_worker_records` and before
+        // the agent is reaped in `runner/mod.rs`.
+        Ok(()) => Ok(released),
         Err(error) => {
             let retained = released.release_reservation().ok().flatten();
             released.active = false;
@@ -3159,16 +3161,17 @@ mod tests {
             PurgeReservation::Reserved(transaction) => transaction,
             PurgeReservation::Rejected(result) => panic!("refused too early: {result:?}"),
         };
-        let mut settled = settle_runner_of(stopped)
-            .await
-            .expect("a stopped structured session has no runner to stop");
-        // Released here rather than left to `Drop`, which hands the release to a
-        // detached thread and would race the next reservation.
-        let _ = settled.release_reservation();
+        // No record, but the reader cannot tell a stopped runner from one that is
+        // still stopping, because the record is deleted before the wait. Refusing
+        // is the safe direction; the usability cost is a session that cannot be
+        // purged from the TUI or the CLI until something proves the runner dead.
+        assert!(
+            settle_runner_of(stopped).await.is_err(),
+            "an absent record does not prove the runner stopped, so the purge waits"
+        );
 
-        // A record that cannot be read is the refusal the barrier has to make:
-        // nothing can be proven about a runner whose identity is unknown, and it
-        // fails before any signal is sent, so the test stays safe to run.
+        // A record that cannot be read refuses for the same reason, and fails
+        // before any signal is sent, so the test stays safe to run.
         let record_path = worker_registry::record_path(&structured.id).unwrap();
         std::fs::create_dir_all(&record_path).unwrap();
         let unprovable = match PurgeTransaction::reserve_unwatched(DeletionRequest {
