@@ -154,6 +154,99 @@ fn test_row_tag_profile_modes_in_filtered_view() {
     }
 }
 
+/// `show_activity_age` hides the right-edge age column on an Idle row, and a title too
+/// long for a narrow pane is shortened with an ellipsis so the age stays.
+#[test]
+#[serial]
+fn test_show_activity_age_toggles_age_column() {
+    let (_temp, _guard) = test_home();
+    let mut inst = Instance::new("a-very-long-session-title", "/tmp/a");
+    inst.status = Status::Idle;
+    inst.idle_entered_at = Some(chrono::Utc::now() - chrono::Duration::minutes(5));
+    seed_profile("alpha", &[inst]);
+    let mut view = test_view(Some("alpha"));
+    view.group_by = crate::session::config::GroupByMode::Manual;
+    view.flat_items = view.build_flat_items();
+    let row = view
+        .flat_items
+        .iter()
+        .find(|item| matches!(item, Item::Session { .. }))
+        .cloned()
+        .expect("session row");
+    for (show, expect_age) in [(true, true), (false, false)] {
+        view.show_activity_age = show;
+        let text = rendered_row_text(&view, &row);
+        assert_eq!(
+            text.trim_end().ends_with("5m"),
+            expect_age,
+            "{show}: {text:?}"
+        );
+    }
+
+    view.show_activity_age = true;
+    let text = view
+        .render_item_line(
+            &row,
+            false,
+            false,
+            &crate::tui::styles::Theme::default(),
+            25,
+            false,
+        )
+        .spans
+        .iter()
+        .map(|s| s.content.as_ref())
+        .collect::<String>();
+    assert!(text.contains('\u{2026}'), "{text:?}");
+    assert!(text.trim_end().ends_with("5m"), "{text:?}");
+    assert_eq!(
+        crate::tui::components::rendered_width(&text),
+        25,
+        "{text:?}"
+    );
+}
+
+/// On a row too narrow for title and branch tag, the tag gives way and the title stays.
+#[test]
+#[serial]
+fn test_branch_tag_yields_to_title_on_narrow_row() {
+    let (_temp, _guard) = test_home();
+    seed_profile("alpha", &[worktree_instance("my-session")]);
+    let mut view = test_view(Some("alpha"));
+    view.group_by = crate::session::config::GroupByMode::Manual;
+    view.row_tag_mode = crate::session::config::RowTagMode::Branch;
+    view.show_activity_age = false;
+    view.flat_items = view.build_flat_items();
+    let row = view
+        .flat_items
+        .iter()
+        .find(|item| matches!(item, Item::Session { .. }))
+        .cloned()
+        .expect("session row");
+    let render = |width| -> String {
+        view.render_item_line(
+            &row,
+            false,
+            false,
+            &crate::tui::styles::Theme::default(),
+            width,
+            false,
+        )
+        .spans
+        .iter()
+        .map(|s| s.content.as_ref())
+        .collect()
+    };
+    let wide = render(60);
+    assert!(
+        wide.contains("my-session") && wide.contains("[foo"),
+        "{wide:?}"
+    );
+    let narrow = render(18);
+    assert!(narrow.contains("my-session"), "{narrow:?}");
+    assert!(!narrow.contains("[foo"), "{narrow:?}");
+}
+
 #[test]
 #[serial]
 fn test_create_session_in_all_mode_is_findable() {

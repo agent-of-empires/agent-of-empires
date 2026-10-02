@@ -435,6 +435,7 @@ pub(super) async fn status_poll_loop(
         // Fence every input, including the prior runtime observations.
         let namespace = state.profile_namespace.read().await;
         let reload_lane = state.reload_lane.lock().await;
+        let snapshot_guard = state.session_service.disk_reload_guard().await;
         let read_epoch = state
             .mutation_epoch
             .load(std::sync::atomic::Ordering::SeqCst);
@@ -464,7 +465,9 @@ pub(super) async fn status_poll_loop(
         let file_watch_for_poll = state.file_watch.clone();
         let sandbox_health = health.borrow().clone();
         let updated = tokio::task::spawn_blocking(move || {
-            let loaded = load_all_profiles(&file_watch_for_poll)?;
+            let loaded = load_all_profiles(&file_watch_for_poll);
+            drop(snapshot_guard);
+            let loaded = loaded?;
             let mut instances = loaded.instances;
             seed_tick_tracking(&mut instances, prev_tracking);
             crate::tmux::refresh_session_cache();

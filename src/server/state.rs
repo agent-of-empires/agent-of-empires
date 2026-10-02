@@ -197,11 +197,7 @@ pub struct AppState {
     /// transitions to `Status::Error` for up to 8 seconds while the agent
     /// is still settling. Periodically GC'd by a background task.
     pub recently_restarted: crate::session::recovery::RecentlyRestarted,
-    /// Bumped under the `instances` write lock by any in-memory change an
-    /// earlier disk snapshot would not carry. Reloaders capture the epoch
-    /// before reading disk and drop stale snapshots under the same lock. This
-    /// prevents lost fields, resurrected rows, dropped rows, and restored
-    /// execution backends. See invariant 8 on `reload_state_instances_from_disk`.
+    /// Invalidates earlier disk snapshots at memory mutation and queue persistence completion.
     pub mutation_epoch: Arc<std::sync::atomic::AtomicU64>,
     /// Ids whose startup-recovery cascade is scheduled but not yet complete.
     /// Phase A seeds it; each Phase B worker drains its id on completion. The

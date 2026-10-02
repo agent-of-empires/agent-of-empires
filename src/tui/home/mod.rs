@@ -66,8 +66,8 @@ use super::settings::SettingsView;
 use self::creation::SessionMutationGuards;
 use self::icons::{
     ICON_ARCHIVED_SECTION, ICON_COLLAPSED, ICON_DELETING, ICON_DORMANT, ICON_ERROR, ICON_EXPANDED,
-    ICON_IDLE, ICON_PINNED, ICON_STOPPED, ICON_TRASH_SECTION, ICON_UNKNOWN, ICON_UNREAD,
-    UNREAD_DWELL,
+    ICON_FAVORITE, ICON_IDLE, ICON_PINNED, ICON_STOPPED, ICON_TRASH_SECTION, ICON_UNKNOWN,
+    ICON_UNREAD, UNREAD_DWELL,
 };
 use self::preview::{PreviewCache, PreviewSelection, PreviewTextView, PreviewTimings};
 use self::rows::project_group_key;
@@ -233,12 +233,9 @@ pub struct HomeView {
     /// the render layer reads this rather than re-resolving the config on
     /// every paint.
     pub(super) row_tag_mode: crate::session::config::RowTagMode,
-    /// Whether an agent's OSC 52 clipboard write (surfaced by the VT capture
-    /// worker) is forwarded to the host clipboard (#2420). Cached from
-    /// `[tmux] clipboard != disabled` at construction + config refresh. Auto
-    /// forwards too: that mode's "respect the user's tmux config" rationale
-    /// is about tmux server options, which cannot influence this in-process
-    /// path.
+    pub(super) show_activity_age: bool,
+    /// Forward captured OSC 52 writes unless `[tmux] clipboard` is disabled.
+    /// Tmux's own clipboard options cannot govern this in-process path.
     pub(super) agent_clipboard_forward: bool,
     /// Cells carrying an OSC 8 target in the frame being painted, shared with
     /// the terminal backend so it can re-emit the sequences. Cleared at the top

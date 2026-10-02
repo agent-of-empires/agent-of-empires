@@ -640,6 +640,44 @@ fn stop_in_terminal_view_does_not_target_agent_session() {
     );
 }
 
+#[test]
+#[serial]
+fn second_stop_key_press_confirms_the_stop() {
+    for (strict, stop_key) in [(false, 'x'), (true, 'X')] {
+        for mode in [ViewMode::Structured, ViewMode::Terminal] {
+            let mut env = create_test_env_with_sessions(1);
+            env.view.strict_hotkeys = strict;
+            let id = env.view.instance_at(0).id.clone();
+            env.view.mutate_instance(&id, |inst| {
+                inst.status = crate::session::Status::Idle;
+                inst.auxiliary = vec![crate::session::AuxiliaryObservation {
+                    target: crate::session::AuxiliaryTarget::Host { index: 0 },
+                    pane: crate::session::PaneObservation {
+                        state: crate::session::PanePresence::Alive,
+                        tmux_session: Some("host".into()),
+                    },
+                }];
+            });
+            env.view.selected_session = Some(id.clone());
+            env.view.view_mode = mode;
+            assert_eq!(
+                env.view.handle_key(key(KeyCode::Char(stop_key)), None),
+                None
+            );
+            assert!(env.view.confirm_dialog.is_some(), "strict={strict}");
+            assert_eq!(env.view.handle_key(key(KeyCode::Char('j')), None), None);
+            assert!(env.view.confirm_dialog.is_some(), "strict={strict}");
+            let expected =
+                (env.view.view_mode == ViewMode::Structured).then_some(Action::StopSession(id));
+            assert_eq!(
+                env.view.handle_key(key(KeyCode::Char(stop_key)), None),
+                expected
+            );
+            assert!(env.view.confirm_dialog.is_none(), "strict={strict}");
+        }
+    }
+}
+
 /// Render suppression is cosmetic: archive/snooze leave the `unread` flag on
 /// disk so unarchiving or unsnoozing brings the marker back (#2571).
 #[test]

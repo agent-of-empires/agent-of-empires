@@ -442,6 +442,7 @@ function ComposerDock({
           pendingConfigOption={state.pendingConfigOption}
           setConfigOption={ctx.setConfigOption}
           sessionUsage={state.sessionUsage}
+          authStatus={state.authStatus}
           availableCommands={state.availableCommands}
           connected={status === "open" && !state.workerStopped && !state.workerRestarting}
           turnActive={state.turnActive}

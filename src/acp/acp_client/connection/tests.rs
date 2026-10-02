@@ -1,6 +1,4 @@
-//! Fairness of the in-flight-prompt select: Cancel must not sit behind the
-//! lifecycle arm, which a sustained update stream keeps permanently ready.
-//! A fake agent floods updates until `session/cancel` arrives.
+//! The connection task driven against a fake agent over in-memory pipes.
 
 use super::prompt::{SelectProbe, SELECT_PROBE};
 use super::*;
@@ -20,6 +18,9 @@ async fn write_line(w: &SharedWrite, line: &str) {
     guard.flush().await.unwrap();
 }
 
+/// Fairness of the in-flight-prompt select: Cancel must not sit behind the
+/// lifecycle arm, which a sustained update stream keeps permanently ready.
+/// A fake agent floods updates until `session/cancel` arrives.
 #[tokio::test]
 async fn cancel_reaches_the_agent_while_notifications_remain_queued() {
     // Repeated contested polls make unbiased selection observable; this is
@@ -195,4 +196,111 @@ async fn cancel_under_flood() {
     agent.abort();
     connection.abort();
     let _ = tokio::join!(flood, agent, connection);
+}
+
+/// A new adapter process clears the previous process's identity before it can
+/// report its own; a reattach to the surviving process keeps it.
+#[tokio::test]
+async fn auth_status_is_cleared_per_adapter_process() {
+    let fresh = || ConnectMode::Fresh {
+        stored_acp_session_id: None,
+        seed_history_replay: false,
+        fork_from: None,
+    };
+    let reattach = ConnectMode::Resume {
+        acp_session_id: "s-auth".into(),
+        in_flight_turn: false,
+    };
+    let cases = [
+        ("silent replacement", fresh(), false, vec![false]),
+        (
+            "replacement that reports early",
+            fresh(),
+            true,
+            vec![false, true],
+        ),
+        ("reattach to the surviving process", reattach, false, vec![]),
+    ];
+    for (name, mode, reports, want) in cases {
+        assert_eq!(auth_events(mode, reports).await, want, "{name}");
+    }
+}
+
+/// `AuthStatusUpdated` events up to session commit, as "carries a report".
+async fn auth_events(mode: ConnectMode, reports: bool) -> Vec<bool> {
+    let (daemon_write, agent_read) = tokio::io::duplex(64 * 1024);
+    let (mut agent_write, daemon_read) = tokio::io::duplex(64 * 1024);
+    let (event_tx, mut event_rx) = mpsc::channel(64);
+    let (_cmd_tx, cmd_rx) = mpsc::channel::<ClientCmd>(1);
+    let (ready_tx, _ready_rx) = oneshot::channel();
+    let temp = tempfile::tempdir().unwrap();
+    let cwd = temp.path().to_path_buf();
+    let params = ConnectionParams {
+        event_tx,
+        cmd_rx,
+        child: None,
+        pending_responders: Arc::new(Mutex::new(HashMap::new())),
+        resources: SessionResources {
+            fs_policy: Arc::new(FsPolicy::new(vec![cwd.clone()])),
+            terminals: TerminalManager::new(),
+            cwd,
+            label: "s-auth".to_string(),
+            sandbox: None,
+        },
+        mode,
+        ready_tx,
+        profile: &crate::acp::agent_profiles::GEMINI,
+        expected_agent: ExpectedAgent::Gemini,
+        source_profile: None,
+        default_effort: None,
+        default_mode: None,
+        default_model: None,
+        mcp_servers: Vec::new(),
+        runner: None,
+    };
+    let transport = ByteStreams::new(daemon_write.compat_write(), daemon_read.compat());
+    let connection = tokio::spawn(run_connection_task(transport, params));
+    // Reports right after answering `initialize`, the earliest it can.
+    let agent = tokio::spawn(async move {
+        let mut lines = BufReader::new(agent_read).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            let msg: serde_json::Value = serde_json::from_str(&line).unwrap();
+            let id = &msg["id"];
+            let mut out = match msg["method"].as_str() {
+                Some("initialize") => vec![format!(
+                    r#"{{"jsonrpc":"2.0","id":{id},"result":{{"protocolVersion":1,"agentCapabilities":{{"_meta":{{"authStatus":{{}}}}}}}}}}"#
+                )],
+                Some("session/new") => vec![format!(
+                    r#"{{"jsonrpc":"2.0","id":{id},"result":{{"sessionId":"s-auth"}}}}"#
+                )],
+                _ => vec![],
+            };
+            if reports && msg["method"] == "initialize" {
+                out.push(r#"{"jsonrpc":"2.0","method":"_auth/status_update","params":{"authStatus":{"kind":"account","label":"Claude Max"}}}"#.into());
+            }
+            for line in out {
+                agent_write
+                    .write_all(format!("{line}\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
+        }
+    });
+
+    let (mut seen, mut committed) = (Vec::new(), false);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !committed || (reports && seen.last() != Some(&true)) {
+            match event_rx.recv().await.expect("connection remains open") {
+                Event::AuthStatusUpdated { status } => seen.push(status.is_some()),
+                Event::AcpSessionAssigned { .. } => committed = true,
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("session commits and any report arrives");
+    agent.abort();
+    connection.abort();
+    let _ = tokio::join!(agent, connection);
+    seen
 }

@@ -618,12 +618,8 @@ pub(super) async fn reload_state_instances_from_disk(
     mut metadata: CanonicalMetadata,
     passive: std::collections::HashMap<String, super::status_poll::PassiveTransitionWrites>,
 ) -> Vec<super::push::StatusChange> {
-    // Snapshot suppression here so a worker that unmarks between the
-    // caller's input build and the per-id decision cannot combine a
-    // cleared mark with a stale row to re-emit the phantom Error
-    // transition the suppression exists to prevent. Idempotent on the
-    // poll path, where the caller already applied the same override
-    // inside `spawn_blocking`.
+    let _reload_guard = state.session_service.disk_reload_guard().await;
+    // Keep suppression stable across the reload decision.
     let suppressed_ids =
         crate::session::recovery::snapshot_recently_restarted(&state.recently_restarted);
     // Keep view-transition ownership through the durable repair and publication.

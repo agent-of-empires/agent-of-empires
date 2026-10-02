@@ -219,6 +219,7 @@ impl HomeView {
             sort_order,
             group_by,
             row_tag_mode: resolved.session.row_tag,
+            show_activity_age: resolved.session.show_activity_age,
             sidebar_position: user_config
                 .as_ref()
                 .map(|c| c.session.sidebar_position)

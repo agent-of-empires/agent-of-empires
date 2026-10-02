@@ -228,7 +228,7 @@ export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
           </span>
           <div className="min-w-0 flex-1">
             <span
-              className={`flex items-center gap-1.5 text-[13px] md:text-[14px] ${labelTone} ${model.isFavorited || model.effectivePinned ? "font-semibold" : ""} ${model.effectiveArchived || model.effectiveSnoozed ? "italic opacity-70" : ""}`}
+              className={`flex items-center gap-1.5 text-[13px] md:text-[14px] ${labelTone} ${model.effectivePinned ? "font-semibold" : ""} ${model.effectiveArchived || model.effectiveSnoozed ? "italic opacity-70" : ""}`}
             >
               {sessionColorsEnabled && model.sessionColorDot && (
                 <span
@@ -245,8 +245,8 @@ export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
                 </span>
               )}
               {!compact && model.isFavorited && (
-                <span title="Favorited" aria-label="Favorited" className="shrink-0 text-amber-300">
-                  *
+                <span title="Favorited" aria-label="Favorited" className="shrink-0 text-favorite">
+                  ✦
                 </span>
               )}
               <span className="truncate" title={label}>

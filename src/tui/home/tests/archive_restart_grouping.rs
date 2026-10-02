@@ -1941,125 +1941,105 @@ fn profile_move_group_metadata_survives_reload() {
     assert!(target_groups.iter().any(|group| group.path == "work"));
 }
 
-/// Favorite, snooze, and urgent decorations only render in Attention sort.
-/// With `session.favorites_first` off, the star is Attention-only: in Newest
-/// (or any other sort) the row paints with its plain title and status-driven
-/// color even when the flag is set, so users who don't triage in Attention
-/// don't see decoration for state they didn't opt into managing.
-///
-/// The flag-on case is `favorite_decoration_shows_outside_attention_when_favorites_first`.
+/// The favorite mark sits in a left gutter that shows only where favorites pin (Attention
+/// sort, or any sort with `session.favorites_first`) and only while a visible row is a live
+/// favorite. Every row reserves it so titles stay aligned. Snooze stays Attention-only.
 #[test]
 #[serial]
-fn favorite_decoration_gated_to_attention_sort() {
-    // Favorites-first off: star is Attention-only.
-    {
-        use crate::session::config::SortOrder;
+fn favorite_gutter_follows_pin_predicate() {
+    use crate::session::config::SortOrder;
+    use crate::tui::home::ICON_FAVORITE;
 
-        let original = crate::session::favorites_first();
-
-        let mut env = create_test_env_with_sessions(1);
-        let id = env.view.instance_at(0).id.clone();
-        let title = env.view.instance_at(0).title.clone();
-        env.view.mutate_instance(&id, |inst| inst.favorite());
-
-        // After the env is built: constructing it applies config, which resets the
-        // process-wide flag to the shipped default (on).
-        crate::session::set_favorites_first(false);
-
-        // In Newest: row should NOT have the `* ` prefix or the bold/
-        // underlined favorite styling.
-        env.view.sort_order = SortOrder::Newest;
-        env.view.flat_items = env.view.build_flat_items();
-        let item = env
-            .view
+    let original = crate::session::favorites_first();
+    let mut env = create_test_env_with_sessions(2);
+    let fav = env.view.instance_at(0).id.clone();
+    let other = env.view.instance_at(1).id.clone();
+    let theme = crate::tui::styles::Theme::default();
+    let line = |view: &HomeView, id: &str| {
+        let item = view
             .flat_items
             .iter()
-            .find(|i| matches!(i, Item::Session { id: sid, .. } if *sid == id))
+            .find(|i| matches!(i, Item::Session { id: sid, .. } if sid == id))
             .cloned()
-            .expect("session item present in Newest sort");
-        let text_newest = rendered_row_text(&env.view, &item);
-        assert!(
-            !text_newest.contains("* "),
-            "favorite prefix must be hidden outside Attention sort; got: {:?}",
-            text_newest
-        );
-        assert!(
-            text_newest.contains(&title),
-            "row title must still render; got: {:?}",
-            text_newest
-        );
-
-        // Flip to Attention: the prefix returns.
-        env.view.sort_order = SortOrder::Attention;
-        env.view.flat_items = env.view.build_flat_items();
-        let item_attention = env
-            .view
-            .flat_items
+            .expect("session item present");
+        view.render_item_line(&item, false, false, &theme, 200, view.favorite_gutter())
+    };
+    let text = |view: &HomeView, id: &str| -> String {
+        line(view, id)
+            .spans
             .iter()
-            .find(|i| matches!(i, Item::Session { id: sid, .. } if *sid == id))
-            .cloned()
-            .expect("session item present in Attention sort");
-        let text_attention = rendered_row_text(&env.view, &item_attention);
-        assert!(
-            text_attention.contains("* "),
-            "favorite prefix must surface in Attention sort; got: {:?}",
-            text_attention
-        );
+            .map(|s| s.content.as_ref())
+            .collect()
+    };
+    let star = format!("{ICON_FAVORITE} ");
 
-        crate::session::set_favorites_first(original);
-    }
-    // Favorites-first on: star shows in Newest.
-    {
-        use crate::session::config::SortOrder;
-
-        let original = crate::session::favorites_first();
-
-        let mut env = create_test_env_with_sessions(1);
-        let id = env.view.instance_at(0).id.clone();
-        let title = env.view.instance_at(0).title.clone();
-        env.view.mutate_instance(&id, |inst| inst.favorite());
-
-        // Set after the env is built: constructing it applies config, which would
-        // overwrite the flag.
-        crate::session::set_favorites_first(true);
-
-        env.view.sort_order = SortOrder::Newest;
+    // (sort, favorites_first, favorited, snoozed, gutter expected)
+    for (sort, first, favorited, snoozed, gutter) in [
+        (SortOrder::Newest, false, true, false, false),
+        (SortOrder::Attention, false, true, false, true),
+        (SortOrder::Newest, true, true, false, true),
+        (SortOrder::Newest, true, false, false, false),
+        // A snoozed favorite is not pinned, so it is not marked.
+        (SortOrder::Newest, true, true, true, false),
+    ] {
+        env.view.mutate_instance(&fav, |inst| {
+            inst.unsnooze();
+            inst.unfavorite();
+            if favorited {
+                inst.favorite();
+            }
+            if snoozed {
+                inst.snooze(30);
+            }
+        });
+        // After the env is built: constructing it applies config, which resets the flag.
+        crate::session::set_favorites_first(first);
+        env.view.sort_order = sort;
         env.view.flat_items = env.view.build_flat_items();
-        let row = |view: &HomeView, id: &str| {
-            let item = view
-                .flat_items
-                .iter()
-                .find(|i| matches!(i, Item::Session { id: sid, .. } if sid == id))
-                .cloned()
-                .expect("session item present");
-            rendered_row_text(view, &item)
-        };
+        let case = format!("{sort:?} first={first} fav={favorited} snoozed={snoozed}");
 
-        let text = row(&env.view, &id);
-        assert!(
-            text.contains("* "),
-            "favorite prefix must show in Newest when favorites-first is on; got: {:?}",
-            text
+        let (fav_text, other_text) = (text(&env.view, &fav), text(&env.view, &other));
+        assert!(!fav_text.contains("* "), "{case}: old prefix: {fav_text:?}");
+        assert_eq!(fav_text.starts_with(&star), gutter, "{case}: {fav_text:?}");
+        assert_eq!(
+            other_text.starts_with("  "),
+            gutter,
+            "{case}: {other_text:?}"
         );
-        assert!(
-            text.contains(&title),
-            "row title must still render; got: {:?}",
-            text
-        );
-
-        // Snooze outranks the star: the row is no longer pinned, so it must not
-        // be decorated as a favorite either.
-        env.view.mutate_instance(&id, |inst| inst.snooze(30));
-        env.view.flat_items = env.view.build_flat_items();
-        let text_snoozed = row(&env.view, &id);
-        assert!(
-            !text_snoozed.contains("* "),
-            "a snoozed favorite is not pinned, so it must not show the star; got: {:?}",
-            text_snoozed
-        );
-
-        crate::session::set_favorites_first(original);
+        if gutter {
+            let spans = line(&env.view, &fav).spans;
+            assert_eq!(spans[0].style.fg, Some(theme.favorite), "{case}");
+            assert!(
+                spans.iter().all(|s| !s
+                    .style
+                    .add_modifier
+                    .contains(ratatui::style::Modifier::UNDERLINED)),
+                "{case}: favorite rows are not underlined"
+            );
+        }
     }
+
+    // A selected star that would vanish on the selection background falls back to text.
+    let mut low_contrast = theme.clone();
+    low_contrast.favorite = low_contrast.session_selection;
+    let item = env
+        .view
+        .flat_items
+        .iter()
+        .find(|i| matches!(i, Item::Session { id: sid, .. } if *sid == fav))
+        .cloned()
+        .expect("session item present");
+    env.view.mutate_instance(&fav, |inst| {
+        inst.unsnooze();
+        inst.favorite();
+    });
+    let selected = env
+        .view
+        .render_item_line(&item, true, false, &low_contrast, 200, true);
+    assert_eq!(selected.spans[0].style.fg, Some(low_contrast.text));
+
+    crate::session::set_favorites_first(original);
+
     // Snooze prefix is Attention-only.
     {
         use crate::session::config::SortOrder;
@@ -2542,7 +2522,9 @@ fn every_view_mode_paints_the_same_sunk_row_decoration() {
             inst.archived_at = None;
             inst.snoozed_until = None;
         });
-        let live = env.view.render_item_line(&item, false, false, &theme, 120);
+        let live = env
+            .view
+            .render_item_line(&item, false, false, &theme, 120, false);
         assert_ne!(
             live.spans[1].style.fg,
             Some(theme.dimmed),
@@ -2560,7 +2542,9 @@ fn every_view_mode_paints_the_same_sunk_row_decoration() {
                     snoozed.then(|| chrono::Utc::now() + chrono::Duration::minutes(15));
             });
 
-            let line = env.view.render_item_line(&item, false, false, &theme, 120);
+            let line = env
+                .view
+                .render_item_line(&item, false, false, &theme, 120, false);
             let icon = line.spans[1].content.trim().to_string();
             let rendered = line.spans[2].content.to_string();
 
@@ -2597,7 +2581,9 @@ fn every_view_mode_paints_the_same_sunk_row_decoration() {
                 inst.archived_at = Some(chrono::Utc::now());
                 inst.snoozed_until = None;
             });
-            let line = env.view.render_item_line(&item, false, false, &theme, 120);
+            let line = env
+                .view
+                .render_item_line(&item, false, false, &theme, 120, false);
             let sunk = line.spans[1].style.fg == Some(theme.dimmed);
             assert_eq!(
                 sunk,

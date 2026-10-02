@@ -59,7 +59,8 @@ pub(super) const FIELD_HELP: &[FieldHelp] = &[
     },
     FieldHelp {
         name: "Tool",
-        description: "Which AI tool to use (Ctrl+P to configure command and extra args)",
+        description:
+            "Which AI tool to use (1-9 to pick, Ctrl+P to configure command and extra args)",
     },
     FieldHelp {
         name: "Structured",
@@ -590,12 +591,19 @@ impl NewSessionDialog {
         )
     }
 
-    /// Preselect a tool by name, applying the same per-tool side effects as
-    /// cycling the tool field. No-op when the tool is not available.
+    /// Preselect a tool by name. No-op when the tool is not available.
     pub fn set_tool(&mut self, tool: &str) {
-        let Some(index) = self.available_tools.iter().position(|t| t == tool) else {
+        if let Some(index) = self.available_tools.iter().position(|t| t == tool) {
+            self.select_tool_index(index);
+        }
+    }
+
+    /// Switch tools and reset the per-tool YOLO, sandbox and Ctrl+P fields.
+    /// Reselecting the current tool keeps the user's edits.
+    fn select_tool_index(&mut self, index: usize) {
+        if index == self.tool_index {
             return;
-        };
+        }
         self.tool_index = index;
         if self.selected_tool_always_yolo() {
             self.yolo_mode = true;
@@ -1146,20 +1154,7 @@ impl NewSessionDialog {
                 self.reload_config_defaults();
             }
         } else if self.focused_field == fields.tool {
-            if self.available_tools.len() > 1 {
-                self.tool_index = (self.tool_index + 1) % self.available_tools.len();
-                if self.selected_tool_always_yolo() {
-                    self.yolo_mode = true;
-                } else {
-                    self.yolo_mode = self.yolo_mode_default;
-                }
-                if self.selected_tool_host_only() {
-                    self.sandbox_enabled = false;
-                    self.worktree_enabled = false;
-                    self.worktree_branch.reset();
-                }
-                self.reload_tool_config();
-            }
+            self.select_tool_index((self.tool_index + 1) % self.available_tools.len());
         } else if self.focused_field == fields.structured {
             self.structured_enabled = !self.structured_enabled;
             self.structured_choice = Some(self.structured_enabled);
@@ -1389,26 +1384,22 @@ impl NewSessionDialog {
             KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')
                 if self.focused_field == fields.tool =>
             {
-                if key.code == KeyCode::Left {
-                    self.tool_index = if self.tool_index == 0 {
-                        self.available_tools.len() - 1
-                    } else {
-                        self.tool_index - 1
-                    };
+                let len = self.available_tools.len();
+                let index = if key.code == KeyCode::Left {
+                    (self.tool_index + len - 1) % len
                 } else {
-                    self.tool_index = (self.tool_index + 1) % self.available_tools.len();
+                    (self.tool_index + 1) % len
+                };
+                self.select_tool_index(index);
+                DialogResult::Continue
+            }
+            KeyCode::Char(c @ '1'..='9')
+                if self.focused_field == fields.tool && key.modifiers.is_empty() =>
+            {
+                let index = c as usize - '1' as usize;
+                if index < self.available_tools.len() {
+                    self.select_tool_index(index);
                 }
-                if self.selected_tool_always_yolo() {
-                    self.yolo_mode = true;
-                } else {
-                    self.yolo_mode = self.yolo_mode_default;
-                }
-                if self.selected_tool_host_only() {
-                    self.sandbox_enabled = false;
-                    self.worktree_enabled = false;
-                    self.worktree_branch.reset();
-                }
-                self.reload_tool_config();
                 DialogResult::Continue
             }
             KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')

@@ -3328,15 +3328,20 @@ impl HomeView {
                 }
                 let message = format!("Are you sure you want to stop '{}'?", inst.title);
                 self.pending_stop_session = Some(session_id.clone());
-                self.confirm_dialog =
-                    Some(ConfirmDialog::new("Stop Session", &message, "stop_session"));
+                self.confirm_dialog = Some(
+                    self.confirm_by_repeating(
+                        ActionId::Stop,
+                        "Stop Session",
+                        &message,
+                        "stop_session",
+                    )
+                    .buttons("Stop", "Cancel"),
+                );
             }
         }
     }
 
-    /// Terminal-view Stop: confirm, then kill the paired terminal (host or container,
-    /// whichever the row shows) without touching the agent session. No-op when the
-    /// terminal isn't running, so Stop on an idle row pops no dialog.
+    /// Confirm killing the visible terminal without stopping the agent.
     fn stop_terminal_selected(&mut self) {
         let Some(session_id) = self.selected_session.clone() else {
             return;
@@ -3363,15 +3368,13 @@ impl HomeView {
             TerminalMode::Container => crate::session::AuxiliaryTarget::Container { index: 0 },
         };
         self.pending_stop_auxiliary = Some((session_id, target));
-        self.confirm_dialog = Some(ConfirmDialog::new(
-            "Kill Terminal",
-            &message,
-            "stop_auxiliary",
-        ));
+        self.confirm_dialog = Some(
+            self.confirm_by_repeating(ActionId::Stop, "Kill Terminal", &message, "stop_auxiliary")
+                .buttons("Kill", "Cancel"),
+        );
     }
 
-    /// Tool-view Stop: confirm, then kill the tool session without touching the agent.
-    /// Mirrors `stop_terminal_selected`, including the no-op when nothing runs.
+    /// Confirm killing the selected tool session without stopping the agent.
     fn stop_tool_selected(&mut self, tool_name: &str) {
         let Some(session_id) = self.selected_session.clone() else {
             return;
@@ -3393,7 +3396,10 @@ impl HomeView {
                 tool_name: tool_name.to_owned(),
             },
         ));
-        self.confirm_dialog = Some(ConfirmDialog::new("Kill Tool", &message, "stop_auxiliary"));
+        self.confirm_dialog = Some(
+            self.confirm_by_repeating(ActionId::Stop, "Kill Tool", &message, "stop_auxiliary")
+                .buttons("Kill", "Cancel"),
+        );
     }
 
     fn open_diff_for_selected(&mut self) {
@@ -5222,35 +5228,21 @@ impl HomeView {
                     // while a stray keystroke is harmless; the accept path runs the same
                     // trash_session_by_id.
                     if session_cfg.confirm_delete {
-                        // Read the accept key off the binding table so relocating Delete
-                        // can't drift the hint from the key that opened the dialog. A
-                        // chord that isn't a bare character can't be a confirm char, so it
-                        // falls back to the dialog's own y/Enter.
-                        let delete_key = bindings::label(ActionId::Delete, self.strict_hotkeys);
-                        let mut key_chars = delete_key.chars();
-                        let accept_char = match (key_chars.next(), key_chars.next()) {
-                            (Some(c), None) => Some(c),
-                            _ => None,
-                        };
-                        let hint = match accept_char {
-                            Some(_) => {
-                                format!("Press {delete_key} again to confirm, Esc to cancel.")
-                            }
-                            None => "Press y to confirm, Esc to cancel.".to_string(),
-                        };
-                        let message = format!("Move '{}' to the trash?\n{hint}", inst.title);
+                        let message = format!("Move '{}' to the trash?", inst.title);
                         self.pending_trash_session = Some(sid);
                         // Offer the same in-dialog opt-out the quit confirm has: the
                         // guard is on by default, so a user who wants one-keystroke trash
                         // back shouldn't have to find the setting. Ticking it persists
                         // confirm_delete = false.
-                        let mut dialog =
-                            ConfirmDialog::new("Confirm Delete", &message, "trash_session")
-                                .buttons("Delete", "Cancel")
-                                .offering_dont_ask_again();
-                        if let Some(c) = accept_char {
-                            dialog = dialog.confirmed_by(c);
-                        }
+                        let dialog = self
+                            .confirm_by_repeating(
+                                ActionId::Delete,
+                                "Confirm Delete",
+                                &message,
+                                "trash_session",
+                            )
+                            .buttons("Delete", "Cancel")
+                            .offering_dont_ask_again();
                         self.confirm_dialog = Some(dialog);
                         return;
                     }
@@ -6693,6 +6685,34 @@ impl HomeView {
         let (trust_hooks, trust_review) = decision.into_request();
         self.request_creation(data, trust_hooks, trust_review);
         None
+    }
+
+    /// A confirm the hotkey that opened it also accepts, so the deliberate gesture is two
+    /// taps of one key while a stray keystroke is harmless. The key is read off the binding
+    /// table so the hint can't drift from it; a chord that isn't a bare character falls
+    /// back to the dialog's own y/Enter.
+    fn confirm_by_repeating(
+        &self,
+        opener: ActionId,
+        title: &str,
+        message: &str,
+        action: &str,
+    ) -> ConfirmDialog {
+        let label = bindings::label(opener, self.strict_hotkeys);
+        let mut chars = label.chars();
+        let accept_char = match (chars.next(), chars.next()) {
+            (Some(c), None) => Some(c),
+            _ => None,
+        };
+        let hint = match accept_char {
+            Some(_) => format!("Press {label} again to confirm, Esc to cancel."),
+            None => "Press y to confirm, Esc to cancel.".to_string(),
+        };
+        let dialog = ConfirmDialog::new(title, &format!("{message}\n{hint}"), action);
+        match accept_char {
+            Some(c) => dialog.confirmed_by(c),
+            None => dialog,
+        }
     }
 }
 

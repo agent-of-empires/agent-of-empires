@@ -102,6 +102,19 @@ struct MirroredFields {
     last_accessed_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+/// The blocking writer owns completion and ordering even if its caller is cancelled.
+struct PersistedMutation {
+    epoch: Arc<std::sync::atomic::AtomicU64>,
+    _ordered: tokio::sync::OwnedMutexGuard<()>,
+    _reload: tokio::sync::OwnedRwLockReadGuard<()>,
+}
+
+impl Drop for PersistedMutation {
+    fn drop(&mut self) {
+        self.epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// Result of `SessionService::edit_queued_prompt`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EditQueuedOutcome {
@@ -162,10 +175,8 @@ pub struct SessionService {
     /// Opt-in telemetry create counter, shared with
     /// `AppState.telemetry_session_creates`.
     pub telemetry_session_creates: Arc<std::sync::atomic::AtomicU32>,
-    /// Shared with `AppState.mutation_epoch`. Bumped under the `instances`
-    /// write lock by any in-memory change an earlier disk snapshot would not
-    /// carry. Reloaders drop snapshots whose captured epoch no longer matches.
-    /// See invariant 8 on `reload_state_instances_from_disk`.
+    /// Shared with `AppState.mutation_epoch`; invalidates snapshots at memory
+    /// mutation and mirrored persistence completion.
     pub mutation_epoch: Arc<std::sync::atomic::AtomicU64>,
     /// Owns the per-session ACP agent subprocesses, shared with
     /// `AppState.acp_supervisor`.
@@ -191,6 +202,8 @@ pub struct SessionService {
     /// the other two: the drains hold `prompt_locks` across `send_turn` and
     /// then call this path, so reusing either would self-deadlock.
     persist_locks: RwLock<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Shared by queue transactions, exclusive for disk sampling and reload application.
+    reload_gate: Arc<RwLock<()>>,
     /// Per-session prompt-submission locks. See
     /// [`SessionService::prompt_submission`].
     prompt_locks: RwLock<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
@@ -371,6 +384,7 @@ impl SessionService {
             create_in_flight: std::sync::Mutex::new(HashMap::new()),
             pending_drains: std::sync::Mutex::new(std::collections::HashSet::new()),
             persist_locks: RwLock::new(HashMap::new()),
+            reload_gate: Arc::new(RwLock::new(())),
             prompt_locks: RwLock::new(HashMap::new()),
             #[cfg(test)]
             submission_claims: std::sync::OnceLock::new(),
@@ -1152,11 +1166,15 @@ impl SessionService {
         }
     }
 
-    /// Drop any disk reload that read `sessions.json` before this in-memory change. Call
-    /// under the `instances` write lock; the persist that follows schedules a fresh reload.
+    /// Invalidate earlier disk snapshots under instances.write() or reload_gate.
     fn invalidate_disk_snapshots(&self) {
         self.mutation_epoch
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Hold through epoch sampling and disk load, or through reload application.
+    pub(super) async fn disk_reload_guard(&self) -> tokio::sync::OwnedRwLockWriteGuard<()> {
+        Arc::clone(&self.reload_gate).write_owned().await
     }
 
     /// Apply `mutate` to a session's in-memory `Instance`, then mirror the
@@ -1193,10 +1211,16 @@ impl SessionService {
         F: FnOnce(&mut crate::session::Instance) -> T,
     {
         let persist_lock = self.persist_lock(id).await;
-        let _ordered = persist_lock.lock().await;
-        let (profile, result, mirrored) = {
+        let ordered = persist_lock.lock_owned().await;
+        let reload = Arc::clone(&self.reload_gate).read_owned().await;
+        let (profile, result, mirrored, transaction) = {
             let mut instances = self.instances.write().await;
             let inst = instances.iter_mut().find(|i| i.id == id)?;
+            let transaction = PersistedMutation {
+                epoch: Arc::clone(&self.mutation_epoch),
+                _ordered: ordered,
+                _reload: reload,
+            };
             let r = mutate(inst);
             self.invalidate_disk_snapshots();
             (
@@ -1208,12 +1232,14 @@ impl SessionService {
                     idle_dormant_since: inst.idle_dormant_since,
                     last_accessed_at: inst.last_accessed_at,
                 },
+                transaction,
             )
         };
         match crate::session::Storage::new(&profile, self.file_watch.clone()) {
             Ok(storage) => {
                 let id_persist = id.to_string();
                 let persisted = tokio::task::spawn_blocking(move || {
+                    let _transaction = transaction;
                     storage.update(|instances, _groups| {
                         if let Some(inst) = instances.iter_mut().find(|i| i.id == id_persist) {
                             inst.queued_prompts = mirrored.queued_prompts;
@@ -1232,7 +1258,7 @@ impl SessionService {
                 })
                 .await;
                 if !matches!(persisted, Ok(Ok(()))) {
-                    tracing::warn!(target: "acp.queue", session = %id, "failed to persist queue mutation; it holds this daemon life");
+                    tracing::warn!(target: "acp.queue", session = %id, "queue mutation was not persisted; a later reload may discard it");
                 }
             }
             Err(e) => {
@@ -1664,13 +1690,7 @@ impl SessionService {
         .await;
     }
 
-    /// Same lazy per-instance mutex registry as `AppState::instance_lock`;
-    /// both operate on the shared map, so a lock taken through either handle
-    /// excludes the other.
-    /// Per-session lock ordering the snapshot-and-persist in
-    /// `mutate_instance_persisted`. Always acquired BEFORE `instances.write()`
-    /// and never while holding it, and nothing acquires `instance_lock` while
-    /// holding this, so it cannot form a cycle with either.
+    /// Per-session ordering for mirrored queue writes.
     async fn persist_lock(&self, id: &str) -> Arc<tokio::sync::Mutex<()>> {
         {
             let guard = self.persist_locks.read().await;
@@ -3146,6 +3166,189 @@ mod tests {
         disk_seqs.sort_unstable();
         disk_seqs.dedup();
         assert_eq!(disk_seqs.len(), 32, "no two persisted rows share a seq");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn queue_persistence_cancellation_and_failure_keep_reload_ordered() {
+        use std::{future::Future, task::Poll, time::Duration};
+
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap()
+            .block_on(async {
+                let ids = |queue: &[crate::daemon::QueuedPromptEntry]| {
+                    queue.iter().map(|q| q.id.clone()).collect::<Vec<_>>()
+                };
+                for cancel in [true, false] {
+                    let mut inst = Instance::new("queue", "/tmp/aoe-queue-terminal");
+                    inst.source_profile = "default".into();
+                    inst.view = crate::session::View::Structured;
+                    let id = inst.id.clone();
+                    let mut seed = inst.clone();
+                    seed.title = "disk title".into();
+                    let storage = crate::session::Storage::new_unwatched(&inst.source_profile).unwrap();
+                    storage.update(|rows, _| {
+                        *rows = vec![seed];
+                        Ok(())
+                    }).unwrap();
+                    let state = crate::server::test_support::build_test_app_state(vec![inst]);
+                    let service = &state.session_service;
+                    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+                    let (release_tx, release_rx) = std::sync::mpsc::channel();
+                    let holder = tokio::task::spawn_blocking(move || {
+                        entered_tx.send(()).unwrap();
+                        release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                    });
+                    entered_rx.await.unwrap();
+                    let mut enqueue = Some(Box::pin(service.enqueue_prompt(&id, "A".into(), "first".into(), vec![], None)));
+                    std::future::poll_fn(|cx| {
+                        assert!(enqueue.as_mut().unwrap().as_mut().poll(cx).is_pending());
+                        Poll::Ready(())
+                    }).await;
+                    let read_epoch = state.mutation_epoch.load(std::sync::atomic::Ordering::SeqCst);
+                    let stale = storage.load().unwrap();
+                    assert!(stale[0].queued_prompts.is_empty());
+                    let saved_path = storage.sessions_path().with_extension("saved");
+                    let mut successor = if cancel {
+                        drop(enqueue.take());
+                        let mut b = Box::pin(service.enqueue_prompt(&id, "B".into(), "second".into(), vec![], None));
+                        std::future::poll_fn(|cx| {
+                            assert!(b.as_mut().poll(cx).is_pending());
+                            Poll::Ready(())
+                        }).await;
+                        Some(b)
+                    } else {
+                        std::fs::rename(storage.sessions_path(), &saved_path).unwrap();
+                        std::fs::create_dir(storage.sessions_path()).unwrap();
+                        None
+                    };
+                    assert_eq!(ids(&service.queued_prompts_snapshot(&id).await), ["A"], "before release, cancel={cancel}");
+                    let mut sampler = Box::pin(service.disk_reload_guard());
+                    std::future::poll_fn(|cx| {
+                        assert!(sampler.as_mut().poll(cx).is_pending());
+                        Poll::Ready(())
+                    }).await;
+                    // Remove the exclusive waiter before polling the successor's shared claim.
+                    drop(sampler);
+                    release_tx.send(()).unwrap();
+                    holder.await.unwrap();
+                    if let Some(a) = enqueue.take() {
+                        assert_eq!(tokio::time::timeout(Duration::from_secs(10), a).await.unwrap().unwrap().id, "A");
+                        std::fs::remove_dir(storage.sessions_path()).unwrap();
+                        std::fs::rename(&saved_path, storage.sessions_path()).unwrap();
+                    }
+                    let metadata = state.canonical_metadata.read().await.clone();
+                    crate::server::reload::reload_state_instances_from_disk(
+                        &state, stale, vec![], crate::server::state::StatusSource::DiskOnly, read_epoch,
+                        metadata, Default::default(),
+                    ).await;
+                    assert_eq!(ids(&service.queued_prompts_snapshot(&id).await), ["A"], "stale reload, cancel={cancel}");
+                    let b = match successor.take() {
+                        Some(b) => tokio::time::timeout(Duration::from_secs(10), b).await.unwrap(),
+                        None => service.enqueue_prompt(&id, "B".into(), "second".into(), vec![], None).await,
+                    }.unwrap();
+                    assert_eq!(b.seq, 1);
+                    let guard = tokio::time::timeout(Duration::from_secs(10), service.disk_reload_guard()).await.unwrap();
+                    let epoch = state.mutation_epoch.load(std::sync::atomic::Ordering::SeqCst);
+                    let fresh = storage.load().unwrap();
+                    assert_eq!(ids(&fresh[0].queued_prompts), ["A", "B"]);
+                    let metadata = state.canonical_metadata.read().await.clone();
+                    drop(guard);
+                    crate::server::reload::reload_state_instances_from_disk(
+                        &state, fresh, vec![], crate::server::state::StatusSource::DiskOnly, epoch,
+                        metadata, Default::default(),
+                    ).await;
+                    let memory = state.instances.read().await;
+                    assert_eq!(ids(&memory[0].queued_prompts), ["A", "B"]);
+                    assert_eq!(memory[0].title, "disk title", "fresh reload must apply, cancel={cancel}");
+                    eprintln!("cancel={cancel}: pending sampler excluded; stale reload rejected; fresh reload applied; memory/disk=[A,B]");
+                }
+            });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn reload_during_queue_persistence_keeps_acknowledged_prompts() {
+        use std::{future::Future, task::Poll, time::Duration};
+
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap()
+            .block_on(async {
+                let contents = |queue: &[crate::daemon::QueuedPromptEntry]| {
+                    queue.iter().map(|q| (q.id.clone(), q.seq)).collect::<Vec<_>>()
+                };
+                let mut outcomes = Vec::new();
+                for apply_before_completion in [true, false] {
+                    let mut inst = Instance::new("reload-queue", "/tmp/aoe-reload-queue");
+                    inst.source_profile = "default".into();
+                    inst.view = crate::session::View::Structured;
+                    let id = inst.id.clone();
+                    let storage = crate::session::Storage::new_unwatched(&inst.source_profile).unwrap();
+                    storage.update(|rows, _| {
+                        *rows = vec![inst.clone()];
+                        Ok(())
+                    }).unwrap();
+                    let state = crate::server::test_support::build_test_app_state(vec![inst]);
+                    let service = &state.session_service;
+                    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+                    let (release_tx, release_rx) = std::sync::mpsc::channel();
+                    // Occupy the only blocking thread before the queue writer can run.
+                    let holder = tokio::task::spawn_blocking(move || {
+                        entered_tx.send(()).unwrap();
+                        release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                    });
+                    entered_rx.await.unwrap();
+                    let submission = service.prompt_submission(&id).await;
+                    let mut enqueue = Box::pin(service.enqueue_prompt(&id, "A".into(), "first".into(), vec![], None));
+                    std::future::poll_fn(|cx| {
+                        assert!(enqueue.as_mut().poll(cx).is_pending());
+                        Poll::Ready(())
+                    }).await;
+                    let read_epoch = state.mutation_epoch.load(std::sync::atomic::Ordering::SeqCst);
+                    let fresh = storage.load().unwrap();
+                    assert_eq!(contents(&service.queued_prompts_snapshot(&id).await), [("A".into(), 0)]);
+                    assert!(fresh[0].queued_prompts.is_empty());
+                    let metadata = state.canonical_metadata.read().await.clone();
+                    let mut reload = Box::pin(crate::server::reload::reload_state_instances_from_disk(
+                        &state, fresh, vec![], crate::server::state::StatusSource::DiskOnly, read_epoch,
+                        metadata, Default::default(),
+                    ));
+                    let applied = if apply_before_completion {
+                        std::future::poll_fn(|cx| Poll::Ready(reload.as_mut().poll(cx).is_ready())).await
+                    } else {
+                        false
+                    };
+                    let during = contents(&service.queued_prompts_snapshot(&id).await);
+                    release_tx.send(()).unwrap();
+                    holder.await.unwrap();
+                    let a = tokio::time::timeout(Duration::from_secs(10), enqueue).await.unwrap().unwrap();
+                    assert_eq!(a.id, "A");
+                    assert_eq!(contents(&storage.load().unwrap()[0].queued_prompts), [("A".into(), 0)]);
+                    drop(submission);
+                    if !applied {
+                        tokio::time::timeout(Duration::from_secs(10), reload).await.unwrap();
+                    }
+                    let _submission = service.prompt_submission(&id).await;
+                    service.enqueue_prompt(&id, "B".into(), "second".into(), vec![], None).await.unwrap();
+                    let memory = contents(&service.queued_prompts_snapshot(&id).await);
+                    let disk = contents(&storage.load().unwrap()[0].queued_prompts);
+                    eprintln!("apply_before_completion={apply_before_completion}, captured_epoch={read_epoch}, during={during:?}, memory={memory:?}, disk={disk:?}");
+                    outcomes.push((apply_before_completion, during, memory, disk));
+                }
+                for (before, during, memory, disk) in outcomes {
+                    assert_eq!(during, [("A".into(), 0)], "during persistence, before={before}");
+                    assert_eq!(memory, [("A".into(), 0), ("B".into(), 1)], "memory, before={before}");
+                    assert_eq!(disk, [("A".into(), 0), ("B".into(), 1)], "disk, before={before}");
+                }
+            });
     }
 
     /// A disk reload whose snapshot predates an in-memory row change must not

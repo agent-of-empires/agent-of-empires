@@ -99,6 +99,9 @@ Once you're in tool preview mode:
 - `Enter` attaches you to the tool full-screen.
 - The hotkey **toggles** preview off and back to the structured view.
 - `Esc`, `;`, or `t` returns to the structured view.
+- `x` opens the Stop confirmation for the visible tool, not its agent.
+  Press `x` again to confirm or `Esc` to cancel. Strict hotkeys use `X`.
+  Terminal preview uses the same Stop gesture.
 
 Once you're attached:
 

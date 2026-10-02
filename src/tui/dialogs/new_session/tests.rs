@@ -319,6 +319,16 @@ fn the_tool_row_cycles_and_submits_the_picked_tool() {
         assert_eq!(dialog.tool_index, expected);
     }
 
+    // Digits jump straight to a tool; out-of-range digits are ignored.
+    for (c, expected) in [('3', 2), ('1', 0), ('9', 0), ('2', 1)] {
+        dialog.handle_key(key(KeyCode::Char(c)));
+        assert_eq!(dialog.tool_index, expected);
+    }
+    assert_eq!(
+        submitted(dialog.handle_key(key(KeyCode::Enter))).tool,
+        "opencode"
+    );
+
     let mut dialog = multi_tool_dialog();
     dialog.focused_field = 2;
     dialog.handle_key(key(KeyCode::Char(' ')));
@@ -328,17 +338,45 @@ fn the_tool_row_cycles_and_submits_the_picked_tool() {
         "opencode"
     );
 
-    // Space is ordinary text on a text field, and a lone tool never cycles.
+    // Space and digits are ordinary text on a text field, and a lone tool never cycles.
     let mut dialog = multi_tool_dialog();
     dialog.focused_field = 1;
     dialog.handle_key(key(KeyCode::Char(' ')));
-    assert_eq!(dialog.title.value(), " ");
+    dialog.handle_key(key(KeyCode::Char('2')));
+    assert_eq!(dialog.title.value(), " 2");
     assert_eq!(dialog.tool_index, 0);
 
     let mut dialog = single_tool_dialog();
     dialog.focused_field = 2;
     dialog.handle_key(key(KeyCode::Left));
     assert_eq!(dialog.tool_index, 0);
+}
+
+#[test]
+#[serial_test::serial]
+fn reselecting_the_current_tool_keeps_its_edits() {
+    let mut dialog = NewSessionDialog::new_with_tools(
+        vec!["claude", "opencode", "codex"],
+        TEST_PATH.to_string(),
+    );
+    dialog.focused_field = 2;
+    dialog.handle_key(key(KeyCode::Char('2')));
+    dialog.extra_args = Input::new("--model fast".to_string());
+    dialog.command_override = Input::new("wrapper".to_string());
+    dialog.yolo_mode = !dialog.yolo_mode_default;
+
+    dialog.handle_key(key(KeyCode::Char('2')));
+    // Alt+digit is not a pick.
+    dialog.handle_key(alt_key(KeyCode::Char('3')));
+    assert_eq!(dialog.tool_index, 1);
+    assert_eq!(dialog.extra_args.value(), "--model fast");
+    assert_eq!(dialog.command_override.value(), "wrapper");
+    assert_ne!(dialog.yolo_mode, dialog.yolo_mode_default);
+
+    // The footer and row advertise the digits while the Tool row has focus.
+    let screen = screen_of(&mut dialog, 100, 40);
+    assert!(screen.contains("[2] opencode  →"), "{screen}");
+    assert!(screen.contains("1-3 pick"), "{screen}");
 }
 
 #[test]

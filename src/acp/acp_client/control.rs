@@ -1843,6 +1843,7 @@ mod tests {
                                     SessionIngressNotification::PromptCompleted(marker) => {
                                         control.deliver_prompt_completion(marker);
                                     }
+                                    SessionIngressNotification::AuthStatus(_) => {}
                                     SessionIngressNotification::Update(_) => {
                                         let (entered, release) =
                                             gate.lock().await.recv().await.unwrap();

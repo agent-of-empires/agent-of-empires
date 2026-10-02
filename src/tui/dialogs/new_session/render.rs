@@ -198,6 +198,7 @@ impl NewSessionDialog {
             selected_tool,
             self.tool_index,
             self.available_tools.len(),
+            true,
             is_tool_focused,
             theme,
         );
@@ -477,6 +478,12 @@ impl NewSessionDialog {
                 hint_spans.push(Span::raw(" groups  "));
             }
             if self.focused_field == fields.tool {
+                let last = self.available_tools.len().min(9);
+                hint_spans.push(Span::styled(
+                    format!("1-{last}"),
+                    Style::default().fg(theme.hint),
+                ));
+                hint_spans.push(Span::raw(" pick  "));
                 hint_spans.push(Span::styled("Ctrl+P", Style::default().fg(theme.hint)));
                 hint_spans.push(Span::raw(" configure  "));
             }

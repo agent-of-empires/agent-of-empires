@@ -270,17 +270,17 @@ pub(super) async fn disk_watcher_consumer(state: Arc<AppState>) {
             _ = state.disk_changed.notified() => {}
         }
         let started = std::time::Instant::now();
-        // Invariant 8: read before the disk read, so a delete committing
-        // during it invalidates this snapshot.
         let namespace = state.profile_namespace.read().await;
         let reload_lane = state.reload_lane.lock().await;
+        let snapshot_guard = state.session_service.disk_reload_guard().await;
         let read_epoch = state
             .mutation_epoch
             .load(std::sync::atomic::Ordering::SeqCst);
         let file_watch_for_load = state.file_watch.clone();
         let loaded = match tokio::task::spawn_blocking(move || {
-            load_all_profiles(&file_watch_for_load)
-                .map(|fresh| (fresh, live_structured_worker_records()))
+            let fresh = load_all_profiles(&file_watch_for_load);
+            drop(snapshot_guard);
+            fresh.map(|fresh| (fresh, live_structured_worker_records()))
         })
         .await
         {
