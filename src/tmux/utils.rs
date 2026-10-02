@@ -393,14 +393,31 @@ pub(crate) fn kill_session_if_present(name: &str) -> Result<()> {
         .output()?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        let absent = stderr.contains("can't find session")
-            || stderr.contains("no server running")
-            || stderr.contains("error connecting");
-        if !absent {
+        if !kill_left_session_absent(&stderr, || session_still_present(name)) {
             bail!("Failed to kill tmux session '{}': {}", name, stderr);
         }
     }
     Ok(())
+}
+
+/// Whether a failed `kill-session` leaves `name` gone. A server whose last session just ended
+/// (its pane was killed first) is shutting down under a client that connected meanwhile, which
+/// then reports `no current target` or `server exited unexpectedly`; neither alone proves the
+/// session is gone, so those are checked against a fresh probe.
+fn kill_left_session_absent(stderr: &str, still_present: impl FnOnce() -> bool) -> bool {
+    stderr.contains("can't find session")
+        || stderr.contains("no server running")
+        || stderr.contains("error connecting")
+        || ((stderr.contains("server exited unexpectedly") || stderr.contains("no current target"))
+            && !still_present())
+}
+
+/// A server that cannot be reached holds no session.
+fn session_still_present(name: &str) -> bool {
+    crate::tmux::tmux_query_command()
+        .args(["has-session", "-t", name])
+        .output()
+        .is_ok_and(|output| output.status.success())
 }
 
 /// tmux prefix notation ("C-a", "M-b", "F12") to display form.
@@ -756,6 +773,32 @@ mod tests {
             ]
         );
     }
+    #[test]
+    fn kill_failure_counts_as_absent_only_when_the_session_is_gone() {
+        // (stderr, session still present on a fresh probe, absent)
+        let cases = [
+            ("can't find session: x\n", true, true),
+            ("no server running on /tmp/s\n", true, true),
+            (
+                "error connecting to /tmp/s (No such file or directory)\n",
+                true,
+                true,
+            ),
+            ("server exited unexpectedly\n", false, true),
+            ("server exited unexpectedly\n", true, false),
+            ("no current target\n", false, true),
+            ("no current target\n", true, false),
+            ("permission denied\n", false, false),
+        ];
+        for (stderr, present, absent) in cases {
+            assert_eq!(
+                kill_left_session_absent(stderr, || present),
+                absent,
+                "{stderr:?} present={present}"
+            );
+        }
+    }
+
     #[test]
     #[serial_test::serial]
     fn kill_session_if_present_kills_or_swallows_missing() {
