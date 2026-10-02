@@ -269,6 +269,16 @@ fn web_projection(theme: &Theme, appearance: ThemeAppearance) -> CssVarProjectio
     css.insert("--color-status-idle".into(), hex(theme.idle));
     css.insert("--color-status-unread".into(), hex(theme.unread));
     css.insert("--color-status-error".into(), hex(theme.error));
+    // Some theme reds are a hue, not readable text, on the surfaces below.
+    css.insert(
+        "--color-status-error-text".into(),
+        hex(lift_until(
+            theme.error,
+            bg,
+            &[bg, elevated_1],
+            TEXT_CONTRAST_RATIO,
+        )),
+    );
     css.insert(
         "--color-status-starting".into(),
         hex(mix(theme.waiting, BLACK, 0.1)),
@@ -403,6 +413,7 @@ fn rgba(c: Color, alpha: f32) -> String {
 
 /// WCAG 1.4.11 floor for non-text UI indicators.
 const NON_TEXT_CONTRAST_RATIO: f32 = 3.0;
+const TEXT_CONTRAST_RATIO: f32 = 4.5;
 
 /// Alpha of the multi-selection tint the sidebar lays under a row that is
 /// open and selected at once (`bg-brand-500/15` in
@@ -416,15 +427,17 @@ const SELECTION_TINT_ALPHA: f32 = 0.15;
 /// measured rather than taken from the declared appearance, so a theme whose
 /// `appearance` disagrees with its background still lifts the right way.
 fn active_frame(accent: Color, bg: Color, fill: Color) -> Color {
-    let pole = readable_on(bg);
     let surfaces = [bg, fill, composite(accent, fill, SELECTION_TINT_ALPHA)];
+    lift_until(accent, bg, &surfaces, NON_TEXT_CONTRAST_RATIO)
+}
+
+/// `color` mixed toward `bg`'s readable pole in 10% steps until it clears
+/// `floor` against every surface.
+fn lift_until(color: Color, bg: Color, surfaces: &[Color], floor: f32) -> Color {
+    let pole = readable_on(bg);
     (0..=10)
-        .map(|step| mix(accent, pole, step as f32 / 10.0))
-        .find(|c| {
-            surfaces
-                .iter()
-                .all(|s| contrast_ratio(*c, *s) >= NON_TEXT_CONTRAST_RATIO)
-        })
+        .map(|step| mix(color, pole, step as f32 / 10.0))
+        .find(|c| surfaces.iter().all(|s| contrast_ratio(*c, *s) >= floor))
         .unwrap_or(pole)
 }
 
@@ -572,6 +585,13 @@ mod tests {
                 contrast_ratio(var("--color-text-on-brand"), var("--color-brand-600")) >= 4.5,
                 "{name}: color-text-on-brand must remain readable on brand-600"
             );
+            for surface in ["--color-surface-900", "--color-surface-850"] {
+                let ratio = contrast_ratio(var("--color-status-error-text"), var(surface));
+                assert!(
+                    ratio >= TEXT_CONTRAST_RATIO,
+                    "{name}: status-error-text on {surface} is {ratio:.2}, below body-text AA"
+                );
+            }
             let frame = var("--color-session-active");
             let fill = var("--color-surface-800");
             // The third surface is the fill an open row takes while it is also

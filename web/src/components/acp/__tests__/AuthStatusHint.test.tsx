@@ -26,7 +26,7 @@ describe("AuthStatusHint", () => {
     render(<AuthStatusHint authStatus={{ kind, label } as AuthStatus} />);
     const el = chip()!;
     expect(el.textContent).toContain(label);
-    expect(el.className).not.toContain("rose");
+    expect(el.className).not.toContain("status-error");
   });
 
   it("gives the known logged-out state its own treatment", () => {
@@ -34,7 +34,7 @@ describe("AuthStatusHint", () => {
     const el = chip()!;
     expect(el.textContent).toContain("Not logged in");
     expect(el.getAttribute("data-auth-kind")).toBe("none");
-    expect(el.className).toContain("rose");
+    expect(el.className).toContain("status-error-text");
     // It reports the identity, so it must not claim a credential failed.
     expect(el.getAttribute("aria-label")).not.toMatch(/invalid|expired/i);
   });

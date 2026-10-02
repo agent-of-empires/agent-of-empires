@@ -307,7 +307,7 @@ export function AuthStatusHint({ authStatus }: { authStatus: AcpState["authStatu
         data-auth-kind={authStatus.kind}
         role="img"
         tabIndex={0}
-        className={`inline-flex max-w-[12rem] items-center gap-1 truncate text-[11px] ${loggedOut ? "text-rose-400" : "text-text-dim"}`}
+        className={`inline-flex max-w-[12rem] items-center gap-1 truncate text-[11px] ${loggedOut ? "text-status-error-text" : "text-text-dim"}`}
         aria-label={explanation}
       >
         <ShieldCheck className="size-3 shrink-0 opacity-70" aria-hidden />
