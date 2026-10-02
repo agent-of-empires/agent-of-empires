@@ -288,22 +288,31 @@ fn the_frozen_aliases_select_the_same_command() {
     for case in &pack().cases {
         let cli = Cli::try_parse_from(case.argv.clone()).expect("argv parses");
         let Some(command) = super::classify(cli.command.as_ref()) else {
+            // Not a read command, so this gate has nothing to say about it --
+            // but a *read* command that stopped classifying is not something to
+            // skip over, so the case's own command name decides.
+            if case.command != "none" {
+                panic!(
+                    "case {} names the read command {} but it does not classify",
+                    case.case_id, case.command
+                );
+            }
             continue;
         };
-        let canonical: &[&str] = match (case.command.as_str(), case.alias.as_deref()) {
-            ("list", None) => &["aoe", "list"],
-            ("list", Some("ls")) => &["aoe", "ls"],
-            ("status", _) => &["aoe", "status"],
-            ("session-show", _) => &["aoe", "session", "show", "s-1"],
-            ("session-list-trash", _) => &["aoe", "session", "list-trash"],
-            ("group-list", None) => &["aoe", "group", "list"],
-            ("group-list", Some("group-ls")) => &["aoe", "group", "ls"],
-            ("profile-bare", _) => &["aoe", "profile"],
-            ("profile-list", None) => &["aoe", "profile", "list"],
-            ("profile-list", Some("profile-ls")) => &["aoe", "profile", "ls"],
-            ("project-list", None) => &["aoe", "project", "list"],
-            ("project-list", Some("project-ls")) => &["aoe", "project", "ls"],
-            (other, _) => panic!("unknown command/alias {other}"),
+        // The canonical spelling depends on the *command*, never on which
+        // spelling the case exercised. Deriving it from the alias meant an
+        // alias case parsed `ls` and compared it with `ls`, so a classifier that
+        // sent `ls` to the wrong command while `list` stayed right passed here.
+        let canonical: &[&str] = match case.command.as_str() {
+            "list" => &["aoe", "list"],
+            "status" => &["aoe", "status"],
+            "session-show" => &["aoe", "session", "show", "s-1"],
+            "session-list-trash" => &["aoe", "session", "list-trash"],
+            "group-list" => &["aoe", "group", "list"],
+            "profile-bare" => &["aoe", "profile"],
+            "profile-list" => &["aoe", "profile", "list"],
+            "project-list" => &["aoe", "project", "list"],
+            other => panic!("unknown command {other}"),
         };
         let direct = Cli::try_parse_from(canonical).expect("canonical form parses");
         let expected = super::classify(direct.command.as_ref()).expect("canonical classifies");

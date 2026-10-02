@@ -1030,6 +1030,21 @@ mod tests {
         }
     }
 
+    /// The id of the row a projection actually showed.
+    ///
+    /// A human projection names a title, a group and a status, and any of them
+    /// can contain the letter a test is looking for, so an assertion on the
+    /// printed text passes whether the first or the last match was picked. The
+    /// id is the only part of a row that identifies it.
+    fn shown_id(stdout: &str) -> String {
+        serde_json::from_str::<serde_json::Value>(stdout)
+            .expect("a json projection is json")
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .expect("a session projection carries an id")
+            .to_string()
+    }
+
     #[test]
     fn status_json_is_exact_compact_shape() {
         let value = snapshot(vec![
@@ -1199,10 +1214,14 @@ mod tests {
 
         let args = ShowArgs {
             identifier: Some("same".into()),
-            json: false,
+            json: true,
         };
         let projection = render_show(&args, &value, &source()).expect("the first match answers");
-        assert!(projection.stdout.contains("a"), "{}", projection.stdout);
+        assert_eq!(
+            shown_id(&projection.stdout),
+            "a",
+            "the first match answers, so the assertion has to name the row it picked"
+        );
     }
 
     /// Two sessions in one project is the ordinary "several sessions per
@@ -1216,10 +1235,14 @@ mod tests {
         ]);
         let args = ShowArgs {
             identifier: Some("/repo".into()),
-            json: false,
+            json: true,
         };
         let projection = render_show(&args, &value, &source()).expect("the first match answers");
-        assert!(projection.stdout.contains("a"), "{}", projection.stdout);
+        assert_eq!(
+            shown_id(&projection.stdout),
+            "a",
+            "the first match answers, so the assertion has to name the row it picked"
+        );
     }
 
     /// An ambiguous id prefix is the one ambiguity the local path refuses, and
