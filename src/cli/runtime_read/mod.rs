@@ -903,8 +903,9 @@ mod tests {
     /// token is a configuration fault rather than an absent endpoint, which the
     /// companion test below pins separately.
     ///
-    /// `.test` is reserved and never resolves, so the absence is the host's
-    /// and not this test's timing.
+    /// Port 9 on loopback, where the connection is refused immediately. A name
+    /// would be worse here: resolution of an unresolvable host is the host's
+    /// timing, and this test is about the stage that never completed.
     #[tokio::test]
     async fn a_variable_naming_an_endpoint_that_did_not_answer_says_the_store_answered() {
         let absent = "http://127.0.0.1:9";
