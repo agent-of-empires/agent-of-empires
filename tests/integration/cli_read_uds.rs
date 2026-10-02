@@ -216,18 +216,16 @@ async fn an_empty_environment_selection_is_answered_not_refused() {
         .unwrap_or_else(|reason| panic!("the local read must be publishable: {reason}"));
     agent_of_empires::session::create_profile("main").expect("create fixture profile");
 
+    // Only a genuinely empty variable is unset. A blank one is a profile
+    // *name* on both halves, because nothing in the local path trims it: `main`
+    // hands `cli.profile` the raw value and `resolve_existing_profile` branches
+    // on `is_empty()` alone. Trimming only on this half made a served read
+    // answer a question the local command answers the other way, so the blank
+    // case is asserted below alongside the explicit flag, where the local
+    // command refuses it by name.
     for (label, env_url, env_profile) in [
         ("absent", None, None),
         ("empty", Some(OsString::from("")), Some(OsString::from(""))),
-        // A blank variable is the default profile, because the local path
-        // trims a variable before it resolves one. This row and the explicit
-        // flag case below are the two halves of that: the same three spaces
-        // are unset in one input and a profile name in the other.
-        (
-            "whitespace",
-            Some(OsString::from("   ")),
-            Some(OsString::from("  ")),
-        ),
     ] {
         let source = ReadRequestSource {
             explicit_url: None,

@@ -535,13 +535,11 @@ mod tests {
         ));
     }
 
-    /// What "empty is unset" decides is which sessions a *read* shows, so it
-    /// is applied when the profile is selected, and the capture keeps the raw
-    /// value, because `main` reads the same field to learn whether a profile
-    /// was named at all. An exported-but-empty variable is a selection that
-    /// resolves to the default, not the absence of one: dropping it here is
-    /// what moved `aoe project add` out of the profile registry and into the
-    /// global one.
+    /// The capture keeps the raw value whatever it holds, because `main` reads
+    /// the same field to learn whether a profile was named at all and derives
+    /// the write scope from it. What the *selection* does with the value is the
+    /// local rule: only a genuinely empty variable is unset, and a blank one
+    /// is a profile name the local command refuses.
     #[test]
     fn an_empty_profile_variable_is_captured_and_still_reads_as_the_default() {
         let cli = {
@@ -550,17 +548,33 @@ mod tests {
             let _env = crate::session::test_support::EnvGuard::unset(&[PROFILE_ENV]);
             super::super::Cli::parse_from(["aoe", "ps"])
         };
-        for value in ["", "   "] {
-            let _env = crate::session::test_support::EnvGuard::set(&[(PROFILE_ENV, value)]);
+        {
+            let _env = crate::session::test_support::EnvGuard::set(&[(PROFILE_ENV, "")]);
             let source = read_request_source(&cli);
             assert_eq!(
                 source.env_profile.as_deref(),
-                Some(OsStr::new(value)),
-                "{value:?} must survive capture: `main` derives the write scope from it"
+                Some(OsStr::new("")),
+                "an empty variable must survive capture: `main` derives the write scope from it"
             );
             assert!(
                 matches!(selected_profile_source(&source), ProfileSource::Default),
-                "{value:?} is blank, and the local path trims a variable before resolving it"
+                "an empty variable is unset"
+            );
+        }
+        {
+            let _env = crate::session::test_support::EnvGuard::set(&[(PROFILE_ENV, "   ")]);
+            let source = read_request_source(&cli);
+            assert_eq!(
+                source.env_profile.as_deref(),
+                Some(OsStr::new("   ")),
+                "a blank variable must survive capture too"
+            );
+            assert!(
+                matches!(
+                    selected_profile_source(&source),
+                    ProfileSource::Environment(value) if value == OsStr::new("   ")
+                ),
+                "a blank variable is a profile name, and the local path refuses it"
             );
         }
     }

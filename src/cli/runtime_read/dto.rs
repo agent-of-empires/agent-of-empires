@@ -1076,11 +1076,19 @@ fn parse_timestamp(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
 /// The grammar a group path must satisfy, shared with the producer for the
 /// reason [`valid_absolute_path`] names: one stored row the client refuses
 /// fails the whole snapshot.
+///
+/// `.` and `..` are admitted here, unlike in a filesystem path. A group path is
+/// never resolved against the filesystem -- it is an equality key and a string
+/// the renderer prints -- and `aoe group create work/..` succeeds, after which
+/// the local command lists the group as a child of `work`. Refusing it here
+/// made the producer prune a group the user had just created, with health
+/// `healthy` and no notice, and made a session assigned to it report no group.
+/// A filesystem path keeps the restriction: see [`valid_absolute_path`].
 pub(crate) fn valid_group_path(value: &str) -> bool {
     !value.is_empty()
-        && value.split('/').all(|component| {
-            !component.is_empty() && component != "." && component != ".." && valid_text(component)
-        })
+        && value
+            .split('/')
+            .all(|component| !component.is_empty() && valid_text(component))
 }
 
 /// The grammar a wire path must satisfy, shared with the producer: it drops a
