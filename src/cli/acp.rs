@@ -167,12 +167,12 @@ pub enum AcpCommands {
         model: Option<String>,
     },
     /// Re-route a Claude session to a different LLM provider, keeping the
-    /// transcript. The worker restarts between turns and resumes the same
-    /// conversation. Credentials are not provisioned by this: the target
-    /// provider's own variables must already be set on the host (for
-    /// example `ANTHROPIC_VERTEX_PROJECT_ID` and `CLOUD_ML_REGION` for
-    /// vertex). The session's model pick is cleared, because model ids
-    /// differ between providers.
+    /// transcript. Refused mid-turn; once idle the worker restarts and
+    /// resumes the same conversation. Credentials are not provisioned by
+    /// this: the target provider's own variables must already be set on the
+    /// host (for example `ANTHROPIC_VERTEX_PROJECT_ID` and `CLOUD_ML_REGION`
+    /// for vertex). The model resets to the new provider's default, because
+    /// model ids differ between providers.
     SwitchProvider {
         /// Acp session id.
         session: String,
@@ -1038,7 +1038,7 @@ async fn switch_provider(session: &str, provider: &str) -> Result<()> {
         .map_err(map_http)?;
     println!("switched provider for {session} -> {}", resp.provider);
     if resp.model_cleared {
-        println!("model pick cleared; model ids are provider-specific");
+        println!("model pick replaced by the provider's default; model ids are provider-specific");
     }
     Ok(())
 }

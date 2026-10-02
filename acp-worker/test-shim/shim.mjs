@@ -196,9 +196,11 @@ function withConfigOptions(response) {
   return options ? { ...response, configOptions: options } : response;
 }
 
-// session/load, registered only with SHIM_LOAD_SESSION=1.
+// session/load, registered only with SHIM_LOAD_SESSION=1. SHIM_RESUMED_MODEL
+// resumes on that model, as claude-agent-acp lands on the transcript's last one.
 function handleLoadSession(params) {
   sessions.set(params.sessionId, {});
+  if (process.env.SHIM_RESUMED_MODEL) model = process.env.SHIM_RESUMED_MODEL;
   return withConfigOptions({});
 }
 

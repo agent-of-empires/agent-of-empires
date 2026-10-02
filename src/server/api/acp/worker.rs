@@ -477,10 +477,15 @@ pub async fn switch_acp_agent(
     .into_response()
 }
 
+/// The adapter's always-present model entry, which the CLI resolves to the
+/// running provider's own default.
+const PROVIDER_DEFAULT_MODEL: &str = "default";
+
 /// Record the pick in memory and on disk from one mutation. Written before the
 /// respawn, because the container reconcile and the spawn request both read it
-/// off the row. `agent_model` goes with it: model ids are provider-specific, so
-/// re-asserting the old one against the new provider fails the next turn.
+/// off the row. The model is pinned to `default` rather than cleared: model ids
+/// are provider-specific, and a resumed session otherwise keeps the model its
+/// transcript last ran on, which the new provider may not serve.
 ///
 /// Disk first, and the error is returned rather than logged: a respawn from a
 /// memory row the disk never got would be undone by the next reload, leaving
@@ -493,7 +498,7 @@ async fn persist_provider_switch(
 ) -> anyhow::Result<()> {
     let switch = |inst: &mut crate::session::Instance| {
         inst.agent_provider = Some(provider.to_string());
-        inst.agent_model = None;
+        inst.agent_model = Some(PROVIDER_DEFAULT_MODEL.to_string());
     };
     crate::session::Storage::new(profile, state.file_watch.clone())?.update(
         |instances, _groups| {
@@ -638,7 +643,10 @@ pub async fn switch_acp_provider(
         );
     }
 
-    let model_cleared = instance.agent_model.is_some();
+    let model_cleared = instance
+        .agent_model
+        .as_deref()
+        .is_some_and(|model| model != PROVIDER_DEFAULT_MODEL);
     if let Err(e) = persist_provider_switch(&state, &instance.source_profile, &id, &provider).await
     {
         return (
@@ -752,14 +760,14 @@ mod tests {
         }
     }
 
-    /// The pick reaches both stores, and the model goes with it: ids are
-    /// provider-specific, so a respawn re-asserting the old one would fail the
-    /// next turn. Everything naming the conversation survives, because the
+    /// The pick reaches both stores, and the model resets to the provider's
+    /// default: ids are provider-specific, and a resumed transcript would
+    /// otherwise keep its old one. Everything naming the conversation survives, because the
     /// provider changes where the tokens come from, not which transcript is
     /// resumed.
     #[tokio::test]
     #[serial_test::serial]
-    async fn a_provider_switch_persists_the_pick_and_clears_the_model() {
+    async fn a_provider_switch_persists_the_pick_and_resets_the_model() {
         use crate::session::test_support::isolate_app_dir;
         let profile = "default";
 
@@ -789,14 +797,14 @@ mod tests {
                 Some(*provider),
                 "the disk row is what a restart reads"
             );
-            assert_eq!(stored.agent_model, None);
+            assert_eq!(stored.agent_model.as_deref(), Some(PROVIDER_DEFAULT_MODEL));
             assert_eq!(stored.acp_session_id.as_deref(), Some("acp-old"));
             assert_eq!(stored.acp_effort.as_deref(), Some("high"));
 
             let memory = state.instances.read().await;
             let live = memory.iter().find(|i| i.id == id).expect("instance");
             assert_eq!(live.agent_provider.as_deref(), Some(*provider));
-            assert_eq!(live.agent_model, None);
+            assert_eq!(live.agent_model.as_deref(), Some(PROVIDER_DEFAULT_MODEL));
         }
     }
 
