@@ -42,6 +42,7 @@ pub fn profile_cycler_spans(
 }
 
 /// Spans for a `Label: ← ● value  [n/m] →` cycler, the AI-tool picker style.
+/// With `numbered`, a tool with a digit hotkey reads `← [n] value →` instead.
 ///
 /// `index` is 0-based. When `total` is 1 or 0 the bullet, count badge, and
 /// arrow affordances are dropped and only the value is shown, matching the
@@ -51,6 +52,7 @@ pub fn tool_cycler_spans(
     value: &str,
     index: usize,
     total: usize,
+    numbered: bool,
     focused: bool,
     theme: &Theme,
 ) -> Vec<Span<'static>> {
@@ -78,9 +80,17 @@ pub fn tool_cycler_spans(
     if focused {
         spans.push(Span::styled("← ", dimmed));
     }
-    spans.push(Span::styled("● ", accent));
-    spans.push(Span::styled(value.to_string(), accent));
-    spans.push(Span::styled(format!("  [{}/{}]", index + 1, total), dimmed));
+    if numbered && index < 9 {
+        spans.push(Span::styled(
+            format!("[{}] ", index + 1),
+            Style::default().fg(theme.hint).bold(),
+        ));
+        spans.push(Span::styled(value.to_string(), accent));
+    } else {
+        spans.push(Span::styled("● ", accent));
+        spans.push(Span::styled(value.to_string(), accent));
+        spans.push(Span::styled(format!("  [{}/{}]", index + 1, total), dimmed));
+    }
     if focused {
         spans.push(Span::styled("  →", dimmed));
     }
@@ -116,7 +126,10 @@ mod tests {
         let profile =
             |value, count, focused| profile_cycler_spans("Profile:", value, count, focused, &theme);
         let tool = |value, index, count, focused| {
-            tool_cycler_spans("Tool:", value, index, count, focused, &theme)
+            tool_cycler_spans("Tool:", value, index, count, false, focused, &theme)
+        };
+        let numbered = |value, index, count| {
+            tool_cycler_spans("Tool:", value, index, count, true, true, &theme)
         };
         let cases: Vec<(Vec<Span<'static>>, &[&str], bool)> = vec![
             (
@@ -143,6 +156,17 @@ mod tests {
                 tool("codex", 1, 3, false),
                 &["Tool:", " ", "● ", "codex", "  [2/3]"],
                 false,
+            ),
+            (
+                numbered("codex", 1, 3),
+                &["Tool:", " ", "← ", "[2] ", "codex", "  →"],
+                true,
+            ),
+            // Only 1-9 are hotkeys, so the tenth tool keeps the plain badge.
+            (
+                numbered("droid", 9, 10),
+                &["Tool:", " ", "← ", "● ", "droid", "  [10/10]", "  →"],
+                true,
             ),
             (
                 tool("claude", 0, 1, false),

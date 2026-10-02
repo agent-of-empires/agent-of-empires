@@ -498,6 +498,7 @@ impl RestartDialog {
             value,
             self.tool_index,
             self.available_tools.len(),
+            false,
             self.is_tool_field(),
             theme,
         );

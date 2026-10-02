@@ -353,6 +353,30 @@ fn the_tool_row_cycles_and_submits_the_picked_tool() {
 }
 
 #[test]
+#[serial_test::serial]
+fn reselecting_the_current_tool_keeps_its_edits() {
+    let mut dialog = NewSessionDialog::new_with_tools(
+        vec!["claude", "opencode", "codex"],
+        TEST_PATH.to_string(),
+    );
+    dialog.focused_field = 2;
+    dialog.handle_key(key(KeyCode::Char('2')));
+    dialog.extra_args = Input::new("--model fast".to_string());
+    dialog.command_override = Input::new("wrapper".to_string());
+    dialog.yolo_mode = !dialog.yolo_mode_default;
+
+    dialog.handle_key(key(KeyCode::Char('2')));
+    assert_eq!(dialog.extra_args.value(), "--model fast");
+    assert_eq!(dialog.command_override.value(), "wrapper");
+    assert_ne!(dialog.yolo_mode, dialog.yolo_mode_default);
+
+    // The footer and row advertise the digits while the Tool row has focus.
+    let screen = screen_of(&mut dialog, 100, 40);
+    assert!(screen.contains("[2] opencode  →"), "{screen}");
+    assert!(screen.contains("1-3 pick"), "{screen}");
+}
+
+#[test]
 fn the_deprecated_tool_badge_survives_every_tool_row_layout() {
     let mut read_only = NewSessionDialog::new_with_tools(vec!["gemini"], TEST_PATH.to_string());
     let mut configured =
