@@ -570,7 +570,15 @@ impl Instance {
         if !self.is_sandboxed() {
             return None;
         }
-        let home = self.resolved_host_home()?;
+        // The host home, not `resolved_host_home()`: a sandboxed session
+        // ignores `session.environment`, whose `HOME` entry is the host
+        // command line's, never the container's. The launcher stages the store
+        // under the process home (`container_config::build_container_config`,
+        // `ensure_folder_trust_config_for_active_agent`), so that is where the
+        // identity sidecar, the exclusivity lease and this read all have to
+        // agree; resolving the profile entry instead names a directory nothing
+        // mounts.
+        let home = dirs::home_dir()?;
         let config = crate::session::config::profile_config::resolve_config_or_warn(
             &self.effective_profile(),
         );
@@ -1410,5 +1418,53 @@ mod tests {
         sandboxed.agent_session_binding = Some(legacy());
         assert!(!sandboxed.attest_launch_default_store(Some(&observed)));
         assert_eq!(markers(&sandboxed), vec![None]);
+    }
+
+    /// The store this session's capture reads is the one the container mounts,
+    /// and a sandboxed session ignores `session.environment` — so a `HOME`
+    /// entry in the profile must not move the store off the host home the
+    /// launcher stages it under. Reading the profile entry instead leaves the
+    /// identity sidecar with a bind dir nothing mounted (no sidecar is ever
+    /// produced) and hands the exclusivity lease a path that does not exist,
+    /// which reports "not exclusive" and defers capture for good.
+    #[test]
+    #[serial_test::serial]
+    fn sandbox_capture_store_reads_the_store_the_container_mounts() {
+        let temp = tempfile::tempdir().unwrap();
+        let host_home = temp.path().join("host-home");
+        let profile_home = temp.path().join("profile-home");
+        std::fs::create_dir_all(&host_home).unwrap();
+        std::fs::create_dir_all(&profile_home).unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let _home = crate::session::test_support::isolate_home(&host_home);
+
+        let profile = "capture-store-home";
+        std::fs::write(
+            crate::session::get_profile_dir(profile)
+                .unwrap()
+                .join("config.toml"),
+            format!("environment = [\"HOME={}\"]\n", profile_home.display()),
+        )
+        .unwrap();
+
+        let mut inst = Instance::new("gemini", temp.path().to_str().unwrap());
+        inst.tool = "gemini".to_string();
+        inst.source_profile = profile.to_string();
+        inst.sandbox_info = Some(test_sandbox(&inst.id, Some("/workspace/session")));
+
+        let mounted = crate::session::config::container_config::sandbox_store_dir(
+            "gemini", &host_home, None, &inst.id,
+        )
+        .unwrap()
+        .expect("gemini mounts a private store");
+        assert_eq!(inst.sandbox_capture_store_path(), Some(mounted.clone()));
+
+        // The pair that has to agree with this read: an exclusive-store lease
+        // taken over a path the launcher never stages defers capture forever.
+        std::fs::create_dir_all(&mounted).unwrap();
+        assert_eq!(
+            std::fs::canonicalize(&mounted).unwrap(),
+            std::fs::canonicalize(inst.sandbox_capture_store_path().unwrap()).unwrap()
+        );
     }
 }

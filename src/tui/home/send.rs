@@ -22,24 +22,28 @@ impl HomeView {
         self.mutate_instance(id, |inst| inst.status = status);
     }
 
-    /// Mark a user interaction. The daemon owns archive and snooze transitions;
-    /// ordinary activity only updates the local timestamp.
+    /// Mark a user interaction.
+    ///
+    /// The daemon owns `last_accessed_at` for every row it publishes: it
+    /// stamps the column the activity rendering and `jump-to-finished` read,
+    /// and the next snapshot applies its value over this mirror. Both an
+    /// ordinary gesture and a gesture that un-sinks a row therefore request
+    /// the stamp the same way, because a local `save()` cannot carry it once
+    /// the runtime is authoritative: `save()` skips the write rather than
+    /// refusing, so a local touch would leave the row claiming a recency the
+    /// runtime never committed.
     pub fn stamp_last_accessed(&mut self, id: &str) {
-        let was_sunk = self
-            .instances
-            .get(id)
-            .is_some_and(|i| i.is_archived() || i.snoozed_until.is_some());
-        if was_sunk {
-            if !self.session_feed.has_pending(id) && !self.session_feed.has_queued(id) {
-                if let Err(error) = self
-                    .session_feed
-                    .submit(id.to_owned(), crate::daemon::SessionMutation::Access)
-                {
-                    tracing::warn!(target: "tui.home", session_id = %id, %error, "access request refused");
-                }
-            }
-        } else {
-            self.mutate_instance(id, |inst| inst.touch_last_accessed());
+        // A session with a change in flight is stamped by that change's own
+        // commit, so a second stamp is both redundant and refused by the
+        // per-session command queue.
+        if self.session_feed.has_pending(id) || self.session_feed.has_queued(id) {
+            return;
+        }
+        if let Err(error) = self
+            .session_feed
+            .submit(id.to_owned(), crate::daemon::SessionMutation::Access)
+        {
+            tracing::warn!(target: "tui.home", session_id = %id, %error, "access request refused");
         }
     }
 
@@ -123,9 +127,6 @@ impl HomeView {
             return;
         }
         self.stamp_last_accessed(session_id);
-        if let Err(e) = self.save() {
-            tracing::error!("Failed to save after send: {}", e);
-        }
         if self.sort_order == crate::session::config::SortOrder::Attention {
             self.select_top_attention(None);
             self.selected_session = None;

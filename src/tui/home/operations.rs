@@ -88,6 +88,25 @@ fn worktree_rename_block_message(reason: &WorktreeRenameBlock) -> &'static str {
 }
 
 impl HomeView {
+    /// Why this process may not write `projects.json`, or `None` when it may.
+    ///
+    /// The runtime republishes the registry in every snapshot
+    /// (`global_projects`), so once it owns the rows a local write diverges
+    /// from the state it will send back next. No runtime route exists for a
+    /// client-side pin: the daemon's own project mutations map to
+    /// `POST /api/projects` / `PATCH /api/projects/{name}` /
+    /// `DELETE /api/projects/{name}`, all of which the CityHall policy denies,
+    /// so the refusal is the whole fix rather than a step toward a submission.
+    /// It follows the session/group gate so both refusals speak the same
+    /// vocabulary, with the surface they protect named.
+    fn project_write_block(&self) -> Option<&'static str> {
+        self.local_write_block()?;
+        if self.session_feed.cityhall_mode() {
+            return Some("The attached runtime serves a City Hall client, whose policy does not allow this process to write the project registry locally");
+        }
+        Some("The runtime is read-only or unreachable, so this process may not write the project registry locally")
+    }
+
     /// Pin or unpin the project header under the cursor (project view only).
     ///
     /// Pinning keeps the repo's header in project view even after its last
@@ -103,6 +122,12 @@ impl HomeView {
     /// projects dialog use; canonicalization and conflict rules stay in one
     /// place.
     pub(super) fn toggle_project_pin_at_cursor(&mut self) {
+        if let Some(reason) = self.project_write_block() {
+            // Before the header is even read: every branch below writes the
+            // registry, and none of it can be unwound once started.
+            self.refuse_local_write(reason);
+            return;
+        }
         use crate::session::{projects, Project, ProjectScope};
         use crate::tui::dialogs::InfoDialog;
 
