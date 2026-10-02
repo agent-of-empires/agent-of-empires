@@ -422,6 +422,15 @@ async fn execute_inner(
             .await
             .map_err(|_| ReadFailure::pre("establishment_timeout"))?
             .map_err(|_| ReadFailure::post("publisher_absent"))?;
+            // The second stage is not the same question as the first, and a
+            // timeout on it is not the same failure. The socket exists: a peer
+            // accepted and then stopped, which is a peer that was reached and
+            // would not serve, and the local store does not answer for that. A
+            // connect that never completed means nothing accepted, and that is
+            // what `establishment_timeout` is for — the pack puts it in
+            // `pre_transport` at exit 2, where a stall before a socket exists
+            // belongs, and `unavailable` in `transport` at exit 4, where a stall
+            // after one does.
             let (stream, _) = tokio::time::timeout_at(
                 establishment_deadline,
                 tokio_tungstenite::client_async_tls_with_config(
@@ -432,7 +441,7 @@ async fn execute_inner(
                 ),
             )
             .await
-            .map_err(|_| ReadFailure::pre("establishment_timeout"))?
+            .map_err(|_| ReadFailure::post("unavailable"))?
             .map_err(map_upgrade_error)?;
             // One budget per read: the exchange rides the establishment
             // window rather than opening a second one behind it.
@@ -845,6 +854,42 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The stage a timeout happened in is the whole question, and the two
+    /// codes it produces sit on opposite sides of the take-over line. A
+    /// connect that never completed means nothing accepted, which is the case
+    /// a variable naming a remote that may not be running describes. A
+    /// handshake that never completed means a socket exists: something accepted
+    /// and then stopped serving, and answering from the local store there would
+    /// report this machine's sessions as the remote's.
+    ///
+    /// The existing test at this boundary used a closed port, so it exercised
+    /// the first stage and passed whichever way the second was mapped. That is
+    /// why the distinction needs saying in terms of the codes rather than in
+    /// terms of a connection this test does not make.
+    #[test]
+    fn a_stall_after_the_socket_exists_is_not_the_same_as_a_stall_before_it() {
+        let source = ReadRequestSource {
+            explicit_url: None,
+            env_url: Some(OsString::from("http://127.0.0.1:9")),
+            token: Some(OsString::from("t")),
+            explicit_profile: None,
+            env_profile: None,
+        };
+
+        let before = ReadFailure::pre("establishment_timeout");
+        let after = ReadFailure::post("unavailable");
+
+        assert_ne!(before.code(), after.code(), "the two stages must differ");
+        assert!(
+            absent_local_publication(&before, &source),
+            "a connect that never completed takes over"
+        );
+        assert!(
+            !absent_local_publication(&after, &source),
+            "a peer that accepted and then stopped does not take over"
+        );
     }
 
     /// The one case where the local store answers a command the user aimed
