@@ -58,9 +58,13 @@ jobs:
           set -euo pipefail
           # github-actions[bot] is nix-npm-hash-fix-pr.yml's flake.nix commit;
           # any other author means a person changed the PR, so leave it to them.
-          others="$(gh api "repos/${BASE_REPO}/pulls/${PR_NUMBER}/commits" --paginate \
-            --jq '.[].author.login // "<unknown>"' \
-            | grep -vxE 'dependabot\[bot\]|github-actions\[bot\]' || true)"
+          # Dependabot's commits are GitHub-signed, so a pushed commit that only
+          # claims its email fails `verified`.
+          others="$(gh api "repos/${BASE_REPO}/pulls/${PR_NUMBER}/commits" --paginate --jq '
+            .[] | select(
+              (.author.login == "dependabot[bot]" and .commit.verification.verified == true)
+              or .author.login == "github-actions[bot]" | not)
+            | .author.login // "<unknown>"')"
           if [ -n "$others" ]; then
             echo "::error::PR has commits from: $others"
             exit 1
