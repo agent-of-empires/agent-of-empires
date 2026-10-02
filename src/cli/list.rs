@@ -337,7 +337,7 @@ pub async fn run(profile: &str, args: ListArgs) -> Result<()> {
         return run_all_profiles(args.json, scope).await;
     }
 
-    let storage = Storage::open_unwatched(profile)?;
+    let storage = Storage::open_reference(profile)?;
     let (all_instances, _) = storage.load_with_groups()?;
     let instances: Vec<Instance> = all_instances
         .into_iter()

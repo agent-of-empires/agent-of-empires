@@ -84,7 +84,14 @@ async function mockApis(page: Page, sessions: MockSession[], projects: MockProje
   for (const path of ["settings", "themes", "agents", "profiles", "groups", "devices", "docker/status", "about"]) {
     await page.route(`**/api/${path}`, (r) =>
       r.fulfill({
-        json: path === "profiles" ? [{ name: "default", is_default: true }] : path === "docker/status" ? {} : [],
+        json:
+          path === "about"
+            ? { profile: "default" }
+            : path === "profiles"
+              ? [{ name: "default", is_default: true }]
+              : path === "docker/status"
+                ? {}
+                : [],
       }),
     );
   }

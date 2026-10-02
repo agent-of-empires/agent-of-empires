@@ -51,15 +51,12 @@ pub fn web_disabled() -> bool {
         .is_some_and(|p| !p.enabled)
 }
 
-/// Whether a fresh `aoe serve` start must be rejected as an unrecognized
-/// subcommand: the command is `serve`, it is not a daemon lifecycle verb
-/// (`--stop` / `--status` / `--restart`, which must always reach a running
-/// daemon), and the `aoe.web` plugin is disabled.
+/// Reject fresh web starts when `aoe.web` is disabled, not core recovery.
 pub fn serve_start_blocked(cli: &Cli, web_disabled: bool) -> bool {
     let Some(super::definition::Commands::Serve(args)) = &cli.command else {
         return false;
     };
-    if args.core_only || args.stop || args.status || args.restart {
+    if args.core_only || args.stop || args.status || args.restart || args.rollback {
         return false;
     }
     web_disabled
@@ -175,15 +172,19 @@ mod tests {
         let start = parse(&["aoe", "serve"]);
         assert!(serve_start_blocked(&start, true));
         assert!(!serve_start_blocked(&start, false));
-        // Lifecycle verbs always reach the daemon, even with the plugin off.
-        for verb in ["--core-only", "--stop", "--status", "--restart"] {
+        for verb in [
+            "--core-only",
+            "--stop",
+            "--status",
+            "--restart",
+            "--rollback",
+        ] {
             let c = parse(&["aoe", "serve", verb]);
             assert!(
                 !serve_start_blocked(&c, true),
                 "{verb} must bypass the gate"
             );
         }
-        // A command other than `serve` is never blocked.
         assert!(!serve_start_blocked(&parse(&["aoe", "agents"]), true));
     }
 }

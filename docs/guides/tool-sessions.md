@@ -137,6 +137,9 @@ handoff. A cancelled attachment does not become active when preparation ends.
 The daemon reports each tool as alive, dead, absent, or unknown. Unknown
 means ownership or liveness could not be established; targeted launch,
 recovery, and stop requests are refused rather than guessing an owner.
+
+If a TUI runtime change loses its acknowledgement, its session stays blocked because the outcome is unknown. Check the current daemon state before choosing **Unlock**; resolution does not replay the lost change. **Keep Blocked** leaves the quarantine intact. Reopen the prompt with `Ctrl+K`, then **Resolve unknown runtime change**, even if the session has disappeared from the list. A failed resolution remains blocked until a healthy, current daemon snapshot has been applied.
+
 New tool panes record their full session ID and configured tool name in
 tmux. Panes created by older versions without this identity must be closed
 manually before AoE can recreate them. Renaming a session does not transfer

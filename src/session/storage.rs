@@ -1283,7 +1283,9 @@ impl SessionStore for Storage {
     fn check_available(&self) -> Result<()> {
         match self.files.as_deref() {
             Some(files) => files.verify_current(&self.sessions_path),
-            None => ProfileFiles::open(&self.sessions_path).map(|_| ()),
+            None => {
+                ProfileFiles::open(&self.sessions_path, ProfileRootPolicy::Canonical).map(|_| ())
+            }
         }
     }
 
@@ -1361,21 +1363,31 @@ impl SessionStore for Storage {
     }
 }
 
+#[derive(Clone, Copy)]
+enum ProfileRootPolicy {
+    Canonical,
+    Reference,
+}
+
 struct ProfileFiles {
+    policy: ProfileRootPolicy,
     directory: super::anchored_fs::AnchoredDir,
     sessions: super::anchored_fs::ResolvedDataFile,
     groups: super::anchored_fs::ResolvedDataFile,
 }
 
 impl ProfileFiles {
-    fn open(path: &Path) -> Result<Self> {
-        let directory = super::anchored_fs::AnchoredDir::open(
-            path.parent().context("sessions path needs a parent")?,
-        )?;
+    fn open(path: &Path, policy: ProfileRootPolicy) -> Result<Self> {
+        let root = path.parent().context("sessions path needs a parent")?;
+        let directory = match policy {
+            ProfileRootPolicy::Canonical => super::anchored_fs::AnchoredDir::open(root)?,
+            ProfileRootPolicy::Reference => super::anchored_fs::AnchoredDir::open_reference(root)?,
+        };
         let sessions =
             directory.resolve_file(path.file_name().context("sessions path needs a leaf")?)?;
         let groups = directory.resolve_file(std::ffi::OsStr::new("groups.json"))?;
         Ok(Self {
+            policy,
             directory,
             sessions,
             groups,
@@ -1383,7 +1395,7 @@ impl ProfileFiles {
     }
 
     fn verify_current(&self, path: &Path) -> Result<()> {
-        let current = Self::open(path)?;
+        let current = Self::open(path, self.policy)?;
         if !self.directory.same_directory(&current.directory)?
             || !self.sessions.same_target(&current.sessions)?
             || !self.groups.same_target(&current.groups)?
@@ -1616,6 +1628,23 @@ impl Storage {
 
     /// Bind an existing profile and its data files without creating directories.
     pub fn open(profile: &str, file_watch: Arc<FileWatchService>) -> Result<Self> {
+        Self::open_bound(profile, file_watch, ProfileRootPolicy::Canonical)
+    }
+
+    /// Read an admitted profile reference, including an account-switcher alias.
+    pub fn open_reference(profile: &str) -> Result<Self> {
+        Self::open_bound(
+            profile,
+            FileWatchService::noop(),
+            ProfileRootPolicy::Reference,
+        )
+    }
+
+    fn open_bound(
+        profile: &str,
+        file_watch: Arc<FileWatchService>,
+        policy: ProfileRootPolicy,
+    ) -> Result<Self> {
         let profile_name = resolve_existing_profile(profile)?;
         let profile_dir = get_profile_dir_path(&profile_name)?;
         let sessions_path = profile_dir.join("sessions.json");
@@ -1623,7 +1652,7 @@ impl Storage {
 
         Ok(Self {
             profile: profile_name,
-            files: Some(Box::new(ProfileFiles::open(&sessions_path)?)),
+            files: Some(Box::new(ProfileFiles::open(&sessions_path, policy)?)),
             sessions_path,
             save_lock,
             file_watch,
@@ -1899,7 +1928,7 @@ impl Storage {
         let files = match self.files.as_deref() {
             Some(files) => files,
             None => {
-                opened = ProfileFiles::open(&self.sessions_path)?;
+                opened = ProfileFiles::open(&self.sessions_path, ProfileRootPolicy::Canonical)?;
                 &opened
             }
         };
@@ -2018,7 +2047,7 @@ impl Storage {
         let files = match self.files.as_deref() {
             Some(files) => files,
             None => {
-                opened = ProfileFiles::open(&self.sessions_path)?;
+                opened = ProfileFiles::open(&self.sessions_path, ProfileRootPolicy::Canonical)?;
                 &opened
             }
         };
@@ -3835,6 +3864,46 @@ mod tests {
 
     fn serialize_u64(v: &u64) -> Result<String> {
         Ok(v.to_string())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn reference_alias_is_readable_and_complete_snapshots_reject_retargeting() -> Result<()> {
+        use std::os::unix::fs::symlink;
+        let _guard = crate::session::test_support::isolate_app_dir();
+        let original = Storage::new_unwatched("original")?;
+        let replacement = Storage::new_unwatched("replacement")?;
+        replacement.update(|rows, _| {
+            rows.push(Instance::new("replacement row", "/tmp/replacement-row"));
+            Ok(())
+        })?;
+        let row = Instance::new("retained row", "/tmp/retained-row");
+        original.update(|rows, groups| {
+            rows.push(row.clone());
+            groups.push(Group::new("retained", "retained"));
+            Ok(())
+        })?;
+        let alias = get_profile_dir_path("account")?;
+        symlink(get_profile_dir_path("original")?, &alias)?;
+        assert!(Storage::open_unwatched("account").is_err());
+        let reference = Storage::open_reference("account")?;
+        let (rows, groups) = reference.load_complete_with_groups()?;
+        assert_eq!(rows[0].id, row.id);
+        assert_eq!(groups[0].path, "retained");
+        let original_bytes = fs::read(original.sessions_path())?;
+        let replacement_bytes = fs::read(replacement.sessions_path())?;
+        fs::remove_file(&alias)?;
+        symlink(get_profile_dir_path("replacement")?, &alias)?;
+        assert!(reference.load_complete_with_groups().is_err());
+        assert!(reference
+            .update_with_snapshot(|rows, _| {
+                rows.clear();
+                Ok(())
+            })
+            .is_err());
+        assert_eq!(fs::read(original.sessions_path())?, original_bytes);
+        assert_eq!(fs::read(replacement.sessions_path())?, replacement_bytes);
+        Ok(())
     }
 
     #[test]

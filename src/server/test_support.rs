@@ -152,13 +152,7 @@ fn build_test_app_state_impl(
     ));
     let shutdown = session_service.work.shutdown.clone();
     let mut state = AppState {
-        // A test constructor, not the daemon's `start_server`, so there is no
-        // `ServerConfig` to read a launch `--profile` from. It seeds the same
-        // answer both ways a test can observe it: the served profile and the
-        // canonical default below, kept equal so a handler reading either
-        // sees one profile. Tests that need them to differ set `profile` in
-        // their `configure` closure.
-        profile: "test".into(),
+        profile: "test".to_owned().into(),
         core_only: false,
         read_only: false,
         cityhall_mode,

@@ -47,8 +47,7 @@ pub async fn get_mcp_servers(
     if let Some(resp) = super::cityhall_block(&state) {
         return resp;
     }
-    // MCP servers are resolved out of the served profile's config tree, so
-    // they follow the daemon's `--profile`.
+    let _namespace = state.profile_namespace.read().await;
     let profile = state.served_profile().to_string();
     let agent = resolve_agent(&profile, query.agent);
     let result = tokio::task::spawn_blocking(move || {
@@ -129,8 +128,7 @@ pub async fn resolve_mcp_conflict(
         }
     };
 
-    // Same served profile as the read above: a conflict the operator did not
-    // serve is not this daemon's conflict to adjudicate.
+    let _namespace = state.profile_namespace.read().await;
     let profile = state.served_profile().to_string();
     let result = tokio::task::spawn_blocking(move || {
         // Re-resolve the current conflicts and find the one for `name`; the

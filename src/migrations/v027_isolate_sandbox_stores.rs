@@ -306,16 +306,11 @@ impl MigrationScope<'_> {
     }
 
     fn configuration(self, profile: &str) -> Result<crate::session::config::Config> {
-        let profile = (!profile.is_empty()).then_some(profile);
         if let Some(store) = self.store {
-            return store.configuration(profile);
+            return store.configuration(Some(profile));
         }
-        // An empty profile is the default profile, not "no profile": its
-        // overrides of `agent_config_dir` and friends must apply, so resolve
-        // through the same path a named profile takes.
-        Ok(crate::session::resolve_config_or_warn(
-            profile.unwrap_or(""),
-        ))
+        // An empty name still selects the default profile, not global-only config.
+        Ok(crate::session::resolve_config_or_warn(profile))
     }
 }
 
@@ -3936,6 +3931,67 @@ gemini = "{}"
     /// archived session without unparking it, so a parked peer can be writing
     /// the shared store while an unparked peer is started. Dropping it from
     /// the cohort would publish that store mid-write, at generation 2.
+    #[test]
+    #[serial_test::serial]
+    fn scoped_store_keeps_a_live_legacy_peer_in_the_default_profiles_cohort() -> Result<()> {
+        let (_temp, _guard, app, home) = isolated();
+        let shared = home.join("custom-gemini");
+        fs::create_dir_all(shared.join("sandbox"))?;
+        fs::write(shared.join("sandbox/data"), "retained")?;
+        let selected = crate::session::Storage::new_unwatched("other")?;
+        crate::session::Storage::new_unwatched("default")?;
+        crate::session::set_default_profile("default")?;
+        for profile in ["default", "other"] {
+            fs::write(
+                crate::session::get_profile_dir_path(profile)?.join("config.toml"),
+                format!("[session.agent_config_dir]\ngemini = {:?}\n", shared),
+            )?;
+        }
+        let selected_id = "1111111111111111";
+        let peer_id = "2222222222222222";
+        fs::write(selected.sessions_path(), format!("[{}]", row(selected_id)))?;
+        fs::write(
+            app.join("sessions.json"),
+            serde_json::to_vec(
+                &serde_json::json!([{ "id":peer_id, "tool":"gemini", "sandbox_info":{"enabled":true}, "archived_at":"2026-09-05T00:00:00Z" }]),
+            )?,
+        )?;
+        let scope = MigrationScope {
+            only: Some(selected_id),
+            store: Some(&selected),
+        };
+        super::run_in(
+            &app,
+            &home,
+            &|id| Ok(id == peer_id),
+            &|_| Ok(true),
+            false,
+            false,
+            scope,
+        )?;
+        assert!(shared.join("sandbox/data").is_file());
+        assert!(!shared.join("sandbox-v2").join(selected_id).exists());
+        let before: Value = serde_json::from_slice(&fs::read(selected.sessions_path())?)?;
+        assert_ne!(before[0]["sandbox_store_generation"], 2);
+        super::run_in(
+            &app,
+            &home,
+            &|_| Ok(false),
+            &|_| Ok(true),
+            false,
+            false,
+            scope,
+        )?;
+        assert_eq!(
+            fs::read_to_string(shared.join("sandbox-v2").join(selected_id).join("data"))?,
+            "retained"
+        );
+        let after: Value = serde_json::from_slice(&fs::read(selected.sessions_path())?)?;
+        assert_eq!(after[0]["sandbox_store_generation"], 2);
+        assert!(shared.join("sandbox/data").is_file());
+        Ok(())
+    }
+
     #[test]
     #[serial_test::serial]
     fn a_live_parked_peer_blocks_its_cohort() {

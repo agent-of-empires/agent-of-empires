@@ -51,11 +51,11 @@ Run only the private local API, without TCP or a dashboard, with:
 aoe serve --core-only --daemon
 ```
 
-An explicit `aoe serve` request replaces an existing managed core under the daemon lifecycle lock. It validates the requested exposure before stopping the core, then waits for the replacement to become ready. Existing terminal sessions remain running.
+An explicit `aoe serve` request replaces an existing managed core under the daemon lifecycle lock. It validates the requested exposure before stopping the core, then waits for the dashboard to become ready. Existing terminal sessions remain running. A successful promotion retains the previous core launch so it can still be restored explicitly.
 
-`aoe serve --restart` replays the current managed launch. If a replacement fails after stopping the daemon, there is no automatic fallback. Run `aoe serve --rollback` to restore the retained launch explicitly. Rollback also works after `--stop`; it refuses missing or mismatched credentials instead of dropping authentication. The retained launch can still fail if its prerequisites are no longer available.
+`aoe serve --restart` replays the current managed launch. If a replacement fails after stopping the daemon, there is no automatic fallback. Run `aoe serve --rollback` to restore the retained launch explicitly. Rollback also works after `--stop`, including when the web plugin is disabled and the retained launch is core-only. It refuses missing or mismatched credentials instead of dropping authentication. The retained launch can still fail if its prerequisites are no longer available.
 
-The retained policy and any passphrase are one-shot recovery credentials: they remain private (`0600`) while a replacement is pending, then are consumed after the replacement reaches readiness. A failed replacement keeps them available for an explicit retry; a successful replacement makes that policy non-replayable. Foreground and service-supervised processes must be stopped through their owning shell or service manager before rollback can replace them.
+The retained launch and its credential remain private (`0600`). Successful restart or rollback consumes the retained pair only after the replay reaches readiness; failed replay keeps it available for retry. Successful core-to-dashboard promotion does not consume the core recovery pair. Foreground and service-supervised processes must be stopped through their owning shell or service manager before rollback can replace them.
 
 ### Retrieving the live URL
 

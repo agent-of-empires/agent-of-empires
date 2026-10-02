@@ -66,7 +66,9 @@ async function mockApis(page: Page, sessions: MockSession[], projects: MockProje
     return r.fulfill({ status: 400 });
   });
   for (const path of ["settings", "themes", "agents", "groups", "devices", "docker/status", "about"]) {
-    await page.route(`**/api/${path}`, (r) => r.fulfill({ json: path === "docker/status" ? {} : [] }));
+    await page.route(`**/api/${path}`, (r) =>
+      r.fulfill({ json: path === "about" ? { profile: "default" } : path === "docker/status" ? {} : [] }),
+    );
   }
   await page.route("**/api/profiles", (r) =>
     r.fulfill({ json: [{ name: "default", description: null, is_default: true }] }),

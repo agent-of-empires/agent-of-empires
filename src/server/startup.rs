@@ -761,12 +761,12 @@ pub(crate) async fn start_server(
         .and_then(|path| path.to_str().map(str::to_owned));
     let shutdown = session_service.work.shutdown.clone();
     let state = Arc::new(AppState {
-        // The launch `--profile`, resolved once here through
-        // `effective_profile` (empty means "the configured default") so every
-        // served-surface handler reads the same answer through
-        // `AppState::served_profile`. `canonical_metadata.default_profile` is
-        // the machine-wide default and must never stand in for it.
-        profile: crate::session::config::effective_profile(profile),
+        profile: if profile.is_empty() {
+            canonical_metadata.default_profile.clone()
+        } else {
+            profile.to_owned()
+        }
+        .into(),
         core_only,
         read_only,
         cityhall_mode: std::env::var_os("AOE_CITYHALL_MODE").is_some(),

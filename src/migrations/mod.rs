@@ -53,6 +53,7 @@ mod v036_pending_purge_owners;
 mod v037_capture_purge_runners;
 mod v038_canonical_sidebar;
 mod v039_custom_sort_order;
+mod v040_reconcile_serve_passphrase_policy;
 
 /// Fixtures shared by migrations that rewrite agent hook files.
 #[cfg(test)]
@@ -93,10 +94,7 @@ use anyhow::Result;
 use std::fs;
 use tracing::{debug, info};
 
-// v034 is upstream's trash-retention migration; it fills the gap the branch
-// left between 33 and 35. Upstream's custom-sort schema step arrived claiming
-// 35, which the branch had already spent, so it takes the next free number.
-const CURRENT_VERSION: u32 = 39;
+const CURRENT_VERSION: u32 = 40;
 const VERSION_FILE: &str = ".schema_version";
 
 struct Migration {
@@ -300,6 +298,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 39,
         name: "custom_sort_order",
         run: v039_custom_sort_order::run,
+    },
+    Migration {
+        version: 40,
+        name: "reconcile_serve_passphrase_policy",
+        run: v040_reconcile_serve_passphrase_policy::run,
     },
 ];
 

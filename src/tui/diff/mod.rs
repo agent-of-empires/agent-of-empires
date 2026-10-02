@@ -100,12 +100,7 @@ pub struct DiffView {
     /// Warning dialog shown when merge-base can't be computed
     pub(crate) warning_dialog: Option<InfoDialog>,
 
-    /// Override that has been persisted to disk but not yet propagated
-    /// back to HomeView's in-memory `Instance.base_branch_override`.
-    /// HomeView consumes this after each key event via
-    /// `take_pending_override` and applies it to its cache; without
-    /// this hand-off, HomeView's next `commit` would overwrite the
-    /// disk value with its stale memory copy. See #1175.
+    /// Staged for HomeView to submit through the runtime after keyboard or mouse input.
     pub(crate) pending_override: Option<(String, Option<String>)>,
 
     /// Inner rect of the file-list panel, captured during `render`.
@@ -363,10 +358,7 @@ impl DiffView {
         }
     }
 
-    /// Stage the new base branch for the owner to persist. This view holds no
-    /// runtime handle, so writing `sessions.json` from here would land behind
-    /// the daemon's back; `HomeView` submits the change through the runtime,
-    /// or through the gated local write when the runtime does not own the row.
+    /// Stage a base branch for HomeView; this view never writes session storage.
     fn stage_base_override(&mut self) -> anyhow::Result<()> {
         let Some(session_id) = self.session_id.clone() else {
             return Ok(());
@@ -375,10 +367,7 @@ impl DiffView {
         Ok(())
     }
 
-    /// Drain a pending base-branch override that was just persisted to
-    /// disk. HomeView calls this after each key event so its in-memory
-    /// `Instance.base_branch_override` stays consistent with disk;
-    /// otherwise its next `commit` would overwrite the persisted value.
+    /// Consume the staged override exactly once for runtime submission.
     pub fn take_pending_override(&mut self) -> Option<(String, Option<String>)> {
         self.pending_override.take()
     }

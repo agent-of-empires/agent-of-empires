@@ -51,8 +51,6 @@ describe("usePendingSetting", () => {
     expect(h.onError).toHaveBeenCalledOnce();
   });
 
-  // Returning to the server value cancels the earlier pick, so the row must keep reading "no color"
-  // even while that first pick's PATCH is still in flight and the next poll reports it.
   it("holds a pick that returns to the server value while an earlier pick is still in flight", () => {
     const h = setup(null);
     h.pick("red");
@@ -62,6 +60,30 @@ describe("usePendingSetting", () => {
     expect(h.value()).toBeNull();
     // Holding through the echo must not mask a genuine change from another writer.
     h.poll("blue");
+    expect(h.value()).toBe("blue");
+  });
+  it.each([null, "normal"])("releases an acknowledged cancellation to %s for a later writer", async (initial) => {
+    const h = setup(initial);
+    h.pick("red");
+    h.pick(initial);
+    h.poll("red");
+    expect(h.value()).toBe(initial);
+    await h.settle(0, true);
+    await h.settle(1, true);
+    h.poll(initial);
+    h.poll("red");
+    expect(h.value()).toBe("red");
+  });
+
+  it("ignores an old completion after an acknowledged cancellation and a new pick", async () => {
+    const h = setup(null);
+    h.pick("red");
+    h.pick(null);
+    await h.settle(1, true);
+    h.pick("blue");
+    await h.settle(0, true);
+    expect(h.value()).toBe("blue");
+    h.poll(null);
     expect(h.value()).toBe("blue");
   });
 });

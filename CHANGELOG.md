@@ -4,6 +4,21 @@ All notable changes to Agent of Empires will be documented in this file.
 
 The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 
+## Unreleased
+
+### Bug Fixes
+
+- **daemon:** Keep the served profile coherent through renames and reject unknown restart targets without degrading healthy session access.
+- **migrations:** Reconcile persisted launch policy at schema 40 and defer sandbox-store isolation while a legacy peer is still writing.
+- **cli:** Restore explicit profile-reference reads and allow private-core rollback when the dashboard plugin is disabled.
+- **tui:** Keep unknown runtime changes recoverable through the command palette and persist mouse-confirmed diff-base changes immediately.
+- **web:** Scope projects to the served profile and release acknowledged setting cancellations for subsequent external updates.
+- **acp:** Apply the served profile’s live worker limit and classify missing approval or elicitation targets consistently.
+
+### Documentation
+
+- **serve:** Clarify which managed launch operations retain or consume the private recovery pair.
+
 ## [1.18.0](https://github.com/agent-of-empires/agent-of-empires/releases/tag/v1.18.0) - 2026-09-30
 
 

@@ -1411,7 +1411,7 @@ async fn attach_session(profile: &str, args: SessionIdArgs) -> Result<()> {
 }
 
 async fn show_session(profile: &str, args: ShowArgs) -> Result<()> {
-    let storage = Storage::open_unwatched(profile)?;
+    let storage = Storage::open_reference(profile)?;
     let (instances, _) = storage.load_with_groups()?;
 
     let mut inst = if let Some(id) = &args.identifier {

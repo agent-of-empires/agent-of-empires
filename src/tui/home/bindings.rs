@@ -32,6 +32,7 @@ use crate::tui::dialogs::PaletteGroup;
 pub enum ActionId {
     Quit,
     Help,
+    ResolveIndeterminate,
     ToolPicker,
     SearchStart,
     SearchNext,
@@ -1122,6 +1123,18 @@ pub static BINDINGS: &[Binding] = &[
             group: PaletteGroup::Actions,
         }),
     },
+    Binding {
+        id: ActionId::ResolveIndeterminate,
+        non_strict: &[],
+        strict: &[],
+        context: Context::Always,
+        help: None,
+        palette: Some(PaletteMeta {
+            title: "Resolve unknown runtime change",
+            keywords: &["resolve", "unknown", "quarantine", "unlock", "runtime"],
+            group: PaletteGroup::Actions,
+        }),
+    },
 ];
 
 /// Stable palette/test id for an action (matches the legacy `builtin_commands`
@@ -1160,6 +1173,7 @@ pub fn palette_id(id: ActionId) -> &'static str {
         ActionId::SortPicker => "pick-sort",
         ActionId::GroupBy => "pick-group-by",
         ActionId::Help => "help",
+        ActionId::ResolveIndeterminate => "resolve-indeterminate",
         ActionId::NextWaiting => "next-waiting",
         ActionId::Quit => "quit",
         ActionId::ToolPicker => "tool-picker",

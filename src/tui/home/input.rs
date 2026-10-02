@@ -1021,14 +1021,12 @@ impl HomeView {
             "resolve_indeterminate" => {
                 if let Some(id) = self.pending_indeterminate_resolution.take() {
                     if let Err(error) = self.session_feed.resolve_indeterminate(&id) {
-                        self.info_dialog =
-                            Some(InfoDialog::new("Quarantine Retained", &error.to_string()));
+                        self.info_dialog = Some(InfoDialog::new(
+                            "Quarantine Retained",
+                            &format!("{error}\n\nReopen resolution with Ctrl+K: Resolve unknown runtime change."),
+                        ));
+                        return None;
                     }
-                    // Drop the row this dialog was opened for. Removing the
-                    // head instead would strand a different row: the queue can
-                    // grow while the dialog is open, so the head is not
-                    // necessarily the row being resolved, and a quarantined row
-                    // that loses its prompt has no way out.
                     if let Some(at) = self
                         .pending_indeterminate_queue
                         .iter()
@@ -1037,8 +1035,6 @@ impl HomeView {
                         self.pending_indeterminate_queue.remove(at);
                     }
                 }
-                // The rest of the batch keeps its own prompt, so a second
-                // quarantined row is never left with no way out.
                 self.promote_next_indeterminate();
                 None
             }
@@ -1346,6 +1342,7 @@ impl HomeView {
                     DialogResult::Continue => {}
                     DialogResult::Cancel => {
                         self.confirm_dialog = None;
+                        self.pending_indeterminate_resolution = None;
                         self.pending_stop_session = None;
                         self.pending_stop_auxiliary = None;
                         self.pending_force_remove_session = None;
@@ -1398,6 +1395,7 @@ impl HomeView {
         // stale list rect underneath would otherwise outrank `hit_diff` in `app.rs`.
         if let Some(view) = &mut self.diff_view {
             view.handle_click(col, row);
+            self.drain_pending_diff_override();
             return true;
         }
         if let Some(dialog) = &self.info_dialog {
@@ -1805,24 +1803,7 @@ impl HomeView {
         // Handle diff view (full-screen takeover)
         if let Some(ref mut diff_view) = self.diff_view {
             let action = diff_view.handle_key(key);
-            if let Some((session_id, new_override)) = diff_view.take_pending_override() {
-                // A base branch is session state the daemon owns: submit it and
-                // let the canonical snapshot update the row, so a read-only,
-                // disconnected or quarantined runtime can refuse it.
-                let submitted = self.session_feed.submit(
-                    session_id,
-                    crate::daemon::SessionMutation::DiffBase(crate::daemon::UpdateDiffBaseBody {
-                        base_branch: new_override,
-                        repo: None,
-                    }),
-                );
-                if let Err(e) = submitted {
-                    self.info_dialog = Some(InfoDialog::new(
-                        "Diff Base Not Saved",
-                        &format!("Failed to set the base branch: {e}"),
-                    ));
-                }
-            }
+            self.drain_pending_diff_override();
             match action {
                 DiffAction::Continue => return None,
                 DiffAction::Close => {
@@ -2135,6 +2116,7 @@ impl HomeView {
                 DialogResult::Continue => {}
                 DialogResult::Cancel => {
                     self.confirm_dialog = None;
+                    self.pending_indeterminate_resolution = None;
                     self.pending_stop_session = None;
                     self.pending_stop_auxiliary = None;
                     self.pending_force_remove_session = None;
@@ -2727,6 +2709,28 @@ impl HomeView {
         None
     }
 
+    fn drain_pending_diff_override(&mut self) {
+        let Some((session_id, base_branch)) = self
+            .diff_view
+            .as_mut()
+            .and_then(|view| view.take_pending_override())
+        else {
+            return;
+        };
+        if let Err(error) = self.session_feed.submit(
+            session_id,
+            crate::daemon::SessionMutation::DiffBase(crate::daemon::UpdateDiffBaseBody {
+                base_branch,
+                repo: None,
+            }),
+        ) {
+            self.info_dialog = Some(InfoDialog::new(
+                "Diff Base Not Saved",
+                &format!("Failed to set the base branch: {error}"),
+            ));
+        }
+    }
+
     /// Execute a resolved [`ActionId`], the single home for each action's behavior, so
     /// the keyboard dispatcher and the command palette cannot diverge.
     fn run_action(
@@ -2743,6 +2747,13 @@ impl HomeView {
         }
         match id {
             ActionId::Quit => return Some(Action::Quit),
+            ActionId::ResolveIndeterminate => {
+                if self.pending_indeterminate_queue.is_empty() {
+                    self.flash_status("No unknown runtime changes to resolve");
+                } else {
+                    self.promote_next_indeterminate();
+                }
+            }
             ActionId::Help => {
                 self.show_help = true;
                 self.help_scroll = 0;

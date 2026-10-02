@@ -189,7 +189,7 @@ pub struct ServeArgs {
     )]
     pub restart: bool,
 
-    /// Restore the retained daemon policy after a failed replacement.
+    /// Restore the retained managed launch, including a core replaced by the dashboard.
     #[arg(long, conflicts_with_all = [
         "stop", "status", "restart", "daemon", "daemon_child", "core_only",
         "remote", "no_auth", "auth", "behind_proxy", "read_only", "cityhall",
@@ -572,12 +572,8 @@ fn retain_rollback_launch(
     record.replace(&serde_json::to_vec_pretty(launch)?)
 }
 
-/// Consume the retained pair only after its replacement has reached readiness.
-/// The lifecycle transaction serializes this with both replacement commands;
-/// checking both slots before removing either prevents a partial pair from
-/// being reported as a successful rollback policy. Once secret removal starts,
-/// a later failure is fail-closed: the policy is no longer replayable and the
-/// caller is told rather than silently ignored.
+/// Consume the retained pair after successful restart or rollback readiness.
+/// Removing credentials first makes partial consumption fail closed.
 fn complete_rollback_after(result: Result<()>) -> Result<()> {
     result?;
     let launch = launch_file("serve.rollback.launch")?;

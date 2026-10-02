@@ -1628,7 +1628,7 @@ Start the aoe daemon: REST/WebSocket API, plus the web dashboard in builds that 
 * `--passphrase <PASSPHRASE>` — Require a passphrase for login (second-factor auth). Can also be set via AOE_SERVE_PASSPHRASE environment variable
 * `--open` — Open the dashboard URL in the default browser once the server is ready. Ignored in a build with no dashboard bundle, under --daemon or --remote, and whenever no browser the user could see is reachable (see `tui::open_url`): over SSH without a forwarded display, or on Linux/BSD with no display server. `BROWSER` overrides the check on platforms whose launcher reads it, which excludes macOS
 * `--restart` — Restart the running managed daemon with its recorded policy. Missing credentials are rejected before stopping it
-* `--rollback` — Restore the retained daemon policy after a failed replacement
+* `--rollback` — Restore the retained managed launch, including a core replaced by the dashboard
 
 
 

@@ -415,6 +415,8 @@ async fn restart_refusal_preserves_authoritative_launch_fields() -> anyhow::Resu
         "degraded",
         "reserved",
         "profile_collision",
+        "missing_profile",
+        "empty_profile",
     ] {
         let _home = crate::session::test_support::isolate_app_dir();
         let mut row = Instance::new("restart refusal", "/tmp/restart-refusal");
@@ -464,7 +466,12 @@ async fn restart_refusal_preserves_authoritative_launch_fields() -> anyhow::Resu
             State(state.clone()),
             Path(id.clone()),
             Ok(Some(Json(crate::daemon::RestartSessionBody {
-                profile: (refusal == "profile_collision").then(|| "target".into()),
+                profile: match refusal {
+                    "profile_collision" => Some("target".into()),
+                    "missing_profile" => Some("missing".into()),
+                    "empty_profile" => Some(String::new()),
+                    _ => None,
+                },
                 tool: Some("codex".into()),
                 command_override: Some("replacement-wrapper".into()),
                 extra_args: Some("--replacement".into()),
@@ -478,6 +485,13 @@ async fn restart_refusal_preserves_authoritative_launch_fields() -> anyhow::Resu
         assert!(!response
             .headers()
             .contains_key(crate::daemon::RUNTIME_REVISION_HEADER));
+        if matches!(refusal, "missing_profile" | "empty_profile") {
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert!(matches!(
+                *state.canonical_health.read().await,
+                crate::daemon::RuntimeHealth::Healthy
+            ));
+        }
         let stored = storage.load()?;
         let live = state.instances.read().await;
         for row in [

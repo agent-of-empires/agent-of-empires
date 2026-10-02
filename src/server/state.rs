@@ -88,13 +88,8 @@ pub(crate) enum StatusSource {
 
 /// Shared application state accessible by all request handlers.
 pub struct AppState {
-    /// The profile this server serves: the `--profile` it was launched with,
-    /// else the configured default. Immutable for the daemon's lifetime, and
-    /// deliberately distinct from `canonical_metadata.default_profile`, which
-    /// is the machine-wide default the operator configured rather than the one
-    /// this process runs. Read it through [`AppState::served_profile`] rather
-    /// than reaching for either directly.
-    pub(crate) profile: String,
+    /// Selected at launch, follows its rename, and does not follow default changes.
+    pub(crate) profile: std::sync::RwLock<String>,
     pub core_only: bool,
     pub read_only: bool,
     /// CityHall client mode, resolved once at launch from `AOE_CITYHALL_MODE`.
@@ -347,13 +342,21 @@ pub struct AppState {
 }
 
 impl AppState {
-    /// The profile this server serves, as every served-surface handler must
-    /// read it. `profile` is the launch `--profile` already resolved through
-    /// `config::effective_profile`, so this is a borrow, not a re-resolution:
-    /// one rule, one place, and no handler can drift onto the machine-wide
-    /// `canonical_metadata.default_profile` the operator merely configured.
-    pub fn served_profile(&self) -> &str {
-        &self.profile
+    /// Namespace exclusion must cover profile selection and configuration resolution.
+    pub fn served_profile(&self) -> std::sync::RwLockReadGuard<'_, String> {
+        self.profile
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    pub(crate) fn rename_served_profile(&self, old_name: &str, new_name: &str) {
+        let mut profile = self
+            .profile
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *profile == old_name {
+            new_name.clone_into(&mut *profile);
+        }
     }
 
     pub(crate) async fn mark_reload_failure(&self, health: crate::daemon::RuntimeHealth) {

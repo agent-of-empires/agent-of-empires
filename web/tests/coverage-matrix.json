@@ -1381,8 +1381,11 @@
       "id": "sidebar.session-color",
       "kind": "vitest",
       "risk": "low",
-      "specs": ["src/components/__tests__/SessionRowTriage.test.tsx"],
-      "components": ["web/src/components/WorkspaceSidebar.tsx"]
+      "specs": [
+        "src/components/__tests__/SessionRowTriage.test.tsx",
+        "src/components/sidebar/usePendingSetting.test.ts"
+      ],
+      "components": ["web/src/components/WorkspaceSidebar.tsx", "web/src/components/sidebar/usePendingSetting.ts"]
     },
     {
       "id": "sidebar.menu-choice-stays-open",
@@ -1433,8 +1436,16 @@
       "id": "sidebar.session-color-toggle",
       "kind": "vitest",
       "risk": "low",
-      "specs": ["src/lib/__tests__/sessionColors.test.ts", "src/components/__tests__/SessionRowTriage.test.tsx"],
-      "components": ["web/src/lib/sessionColors.ts", "web/src/components/WorkspaceSidebar.tsx"]
+      "specs": [
+        "src/lib/__tests__/sessionColors.test.ts",
+        "src/components/__tests__/SessionRowTriage.test.tsx",
+        "src/components/sidebar/usePendingSetting.test.ts"
+      ],
+      "components": [
+        "web/src/lib/sessionColors.ts",
+        "web/src/components/WorkspaceSidebar.tsx",
+        "web/src/components/sidebar/usePendingSetting.ts"
+      ]
     },
     {
       "id": "sidebar.dormant-dot",
@@ -4248,6 +4259,13 @@
         "web/src/components/acp/Composer.tsx",
         "web/src/components/acp/ComposerControls.tsx"
       ]
+    },
+    {
+      "id": "projects.served-profile-registry",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": ["src/hooks/__tests__/useProjects.test.tsx"],
+      "components": ["web/src/hooks/useProjects.ts", "web/src/hooks/app/useProjectActions.ts"]
     }
   ]
 }

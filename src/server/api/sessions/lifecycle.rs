@@ -1401,6 +1401,21 @@ pub(super) async fn prepare_agent_session(
         Ok(body) => body.map(|Json(body)| body).unwrap_or_default(),
         Err(rejection) => return rejection.into_response(),
     };
+    if let Some(target) = restart.as_ref().and_then(|body| body.profile.as_deref()) {
+        if !state
+            .canonical_metadata
+            .read()
+            .await
+            .profiles
+            .iter()
+            .any(|profile| profile.name == target)
+        {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "profile_not_found", "message": format!("Profile '{target}' does not exist")})),
+            ).into_response();
+        }
+    }
     let size = restart
         .as_ref()
         .and_then(|body| body.size.as_ref())

@@ -247,19 +247,8 @@ impl HomeView {
         })
     }
 
-    /// Surface every command error the feed drained, and return whether there
-    /// was anything to surface.
-    ///
-    /// The single sink for both drain sites (`apply_session_feed` and
-    /// `apply_restart_results`): draining the feed is destructive, so an error
-    /// presented anywhere else would be a diagnostic no one ever saw. Nothing
-    /// is dropped here:
-    ///
-    /// - every error's message is rendered, including the ones whose id drives
-    ///   the indeterminate dialog, so a multi-error batch is fully readable;
-    /// - EVERY unknown-outcome id is queued, not just the first. The row stays
-    ///   quarantined until the user resolves it, so keeping only the head would
-    ///   leave the rest blocked with no dialog left to release them.
+    /// Present every drained error and retain every unknown-outcome ID until resolution.
+    /// Both feed-drain paths use this sink so diagnostics and quarantines cannot be lost.
     pub(super) fn present_command_errors(
         &mut self,
         errors: Vec<crate::tui::session_feed::SessionCommandError>,
@@ -326,7 +315,7 @@ impl HomeView {
             ConfirmDialog::new(
                 "Resolve Unknown Outcome",
                 &format!(
-                    "The previous runtime change for '{id}' has an unknown outcome: {message}\n\nVerify the current canonical state, then unlock this row for a new action. No mutation is submitted by this resolution."
+                    "The previous runtime change for '{id}' has an unknown outcome: {message}\n\nVerify the current canonical state, then unlock this row for a new action. Resolution submits no mutation. To reopen after Keep Blocked, use Ctrl+K: Resolve unknown runtime change."
                 ),
                 "resolve_indeterminate",
             )
@@ -660,9 +649,7 @@ impl HomeView {
         }
     }
 
-    /// Promote the next queued unknown-outcome id to a dialog, if any is
-    /// waiting. Called after one is resolved so a batch of them all get their
-    /// unlock prompt.
+    /// Open the oldest unresolved outcome without replaying its mutation.
     pub(super) fn promote_next_indeterminate(&mut self) {
         let Some((id, message)) = self.pending_indeterminate_queue.first().cloned() else {
             return;

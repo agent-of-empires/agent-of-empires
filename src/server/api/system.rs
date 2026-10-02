@@ -175,9 +175,7 @@ fn build_custom_agent_infos(
 }
 
 pub async fn list_agents(State(state): State<Arc<AppState>>) -> Json<Vec<AgentInfo>> {
-    // The profile the daemon was launched with, by the same rule
-    // `/api/about` reports: an operator's `--profile work` must list `work`'s
-    // agents, not the machine-wide default's.
+    let _namespace = state.profile_namespace.read().await;
     let profile = state.served_profile().to_string();
     let result = tokio::task::spawn_blocking(move || {
         let config = crate::session::config::profile_config::resolve_config_or_warn(&profile);
@@ -300,8 +298,9 @@ pub async fn get_settings(
     State(state): State<Arc<AppState>>,
     axum::extract::Query(query): axum::extract::Query<SettingsQuery>,
 ) -> axum::response::Response {
+    let _namespace = state.profile_namespace.read().await;
     let served = state.served_profile();
-    let profile = match SettingsLayer::resolve(&query, served) {
+    let profile = match SettingsLayer::resolve(&query, &served) {
         Ok(SettingsLayer::Profile(name)) => Some(name),
         Ok(SettingsLayer::Machine) => None,
         Err(message) => return bad_request(message),
@@ -511,7 +510,8 @@ pub async fn update_settings(
         Ok(b) => b,
         Err(rej) => return rej.into_response(),
     };
-    let target = match SettingsLayer::resolve(&query, state.served_profile()) {
+    let _namespace = state.profile_namespace.read().await;
+    let target = match SettingsLayer::resolve(&query, &state.served_profile()) {
         Ok(layer) => layer,
         Err(message) => return bad_request(message),
     };
@@ -530,7 +530,15 @@ pub async fn update_settings(
         SettingsLayer::Profile(name) => Some(name),
         SettingsLayer::Machine => None,
     };
-    save_settings_patch(state, profile, machine, profile_patch, session, loopback).await
+    save_settings_patch(
+        state.clone(),
+        profile,
+        machine,
+        profile_patch,
+        session,
+        loopback,
+    )
+    .await
 }
 
 /// Write the two halves of a split settings patch and answer with the
@@ -1362,10 +1370,7 @@ pub async fn get_resolved_theme(
 pub async fn get_current_theme(
     State(state): State<Arc<AppState>>,
 ) -> Json<crate::tui::styles::ResolvedTheme> {
-    // Log line only, but it names the served profile, so it reads the same
-    // one `/api/about` advertises.
-    let profile = state.served_profile().to_string();
-    tracing::debug!(profile = %profile, "GET /api/theme/current");
+    tracing::debug!(profile = %*state.served_profile(), "GET /api/theme/current");
     let resolved = tokio::task::spawn_blocking(move || {
         let name = crate::session::config::resolve_theme_name();
         crate::tui::styles::resolve_theme(&name)
@@ -1813,6 +1818,7 @@ pub async fn get_about(State(state): State<Arc<AppState>>) -> Json<ServerAbout> 
     let passphrase_enabled = state.login_manager.is_enabled();
     let auth_mode =
         crate::server::resolve_auth_mode(&state.token_manager, &state.login_manager).await;
+    let _namespace = state.profile_namespace.read().await;
     let profile = state.served_profile().to_string();
     let acp_cfg = crate::session::config::profile_config::resolve_config_or_warn(&profile).acp;
     let acp_show_tool_durations = acp_cfg.show_tool_durations;
@@ -1877,10 +1883,10 @@ pub struct UpdateStatusResponse {
 }
 
 pub async fn get_update_status(State(state): State<Arc<AppState>>) -> Json<UpdateStatusResponse> {
-    // `update_check_mode` is a profile override, so the answer is the
-    // profile this daemon serves.
+    let namespace = state.profile_namespace.read().await;
     let profile = state.served_profile().to_string();
     let cfg = crate::session::config::profile_config::resolve_config_or_warn(&profile);
+    drop(namespace);
     let current = env!("CARGO_PKG_VERSION").to_string();
     let mode = cfg.updates.update_check_mode;
 
@@ -2016,19 +2022,24 @@ async fn commit_profile(
     }
     let file_watch = state.file_watch.clone();
     let committed = tokio::task::spawn_blocking(move || {
+        let mut directory_moved = false;
         let result = match &mutation {
             ProfileMutation::Create(body) => catalogue.create(&body.name),
-            ProfileMutation::Rename { name, body } => catalogue.rename(name, &body.new_name),
+            ProfileMutation::Rename { name, body } => {
+                let outcome = catalogue.rename(name, &body.new_name);
+                directory_moved = outcome.directory_moved;
+                outcome.result
+            }
             ProfileMutation::Delete { name, query } => catalogue
                 .delete(name, query.replacement_default.as_deref())
                 .map(|_| ()),
             ProfileMutation::SetDefault(body) => catalogue.set_default(&body.name),
         };
         let loaded = load_all_profiles(&file_watch);
-        (catalogue, mutation, result, loaded)
+        (catalogue, mutation, directory_moved, result, loaded)
     })
     .await;
-    let (catalogue, mutation, result, loaded) = match committed {
+    let (catalogue, mutation, directory_moved, result, loaded) = match committed {
         Ok(committed) => committed,
         Err(error) => {
             tracing::warn!(%error, "profile catalogue commit task failed");
@@ -2040,6 +2051,12 @@ async fn commit_profile(
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
         }
     };
+    if directory_moved {
+        if let ProfileMutation::Rename { name, body } = &mutation {
+            state.rename_served_profile(name, &body.new_name);
+            crate::server::rename_profile_disk_watch(&state, name, &body.new_name).await;
+        }
+    }
     let loaded = match loaded {
         Ok(loaded) => loaded,
         Err(error) => {
@@ -2069,9 +2086,7 @@ async fn commit_profile(
             ProfileMutation::Create(body) => {
                 crate::server::add_profile_disk_watch(&state, &body.name).await
             }
-            ProfileMutation::Rename { name, body } => {
-                crate::server::rename_profile_disk_watch(&state, name, &body.new_name).await
-            }
+            ProfileMutation::Rename { .. } => {}
             ProfileMutation::Delete { name, .. } => {
                 crate::server::remove_profile_disk_watch(&state, name).await
             }

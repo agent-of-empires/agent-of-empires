@@ -251,6 +251,15 @@ impl AnchoredDir {
 
     /// Follow ancestors, but never a symlink at the anchor leaf or below it.
     pub(crate) fn open(path: &Path) -> Result<Self> {
+        Self::open_with_root_links(path, false)
+    }
+
+    /// Follow a user-managed profile reference, retaining its pathname for revalidation.
+    pub(crate) fn open_reference(path: &Path) -> Result<Self> {
+        Self::open_with_root_links(path, true)
+    }
+
+    fn open_with_root_links(path: &Path, follow_root: bool) -> Result<Self> {
         let root = path.to_path_buf();
         for component in path.components() {
             if !matches!(
@@ -280,7 +289,11 @@ impl AnchoredDir {
         let fd = openat(
             &parent_fd,
             leaf,
-            resolving | OFlag::O_NOFOLLOW,
+            if follow_root {
+                resolving
+            } else {
+                resolving | OFlag::O_NOFOLLOW
+            },
             Mode::empty(),
         )
         .with_context(|| format!("opening anchored root {}", root.display()))?;

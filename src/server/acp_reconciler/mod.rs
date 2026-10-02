@@ -318,27 +318,17 @@ pub async fn reconcile_acp_workers(
         return;
     }
 
-    // Read live from the served profile's configuration rather than from the
-    // supervisor's snapshot, which is captured once at startup. This governs
-    // only how many cold resumes one tick starts concurrently; the hard cap on
-    // simultaneously running agent subprocesses is the supervisor's own, and it
-    // still needs a restart to move.
-    let served = state
-        .canonical_metadata
-        .read()
-        .await
-        .default_profile
-        .clone();
-    let live_max_workers = tokio::task::spawn_blocking({
-        let served = served.clone();
-        move || {
-            crate::session::config::profile_config::resolve_config_or_warn(&served)
-                .acp
-                .max_concurrent_workers
-        }
+    // Live served-profile config bounds cold resumes; the supervisor owns the total cap.
+    let namespace = state.profile_namespace.read().await;
+    let served = state.served_profile().to_string();
+    let live_max_workers = tokio::task::spawn_blocking(move || {
+        crate::session::config::profile_config::resolve_config_or_warn(&served)
+            .acp
+            .max_concurrent_workers
     })
     .await
     .unwrap_or_else(|_| state.acp_supervisor.max_concurrent_workers());
+    drop(namespace);
     let resume_limit = MAX_CONCURRENT_RESUMES.min(live_max_workers).max(1);
     let semaphore = Arc::new(Semaphore::new(resume_limit as usize));
     let mut set: JoinSet<(String, ResumeOutcome)> = JoinSet::new();

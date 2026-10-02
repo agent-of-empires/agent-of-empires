@@ -408,6 +408,7 @@ pub async fn resolve_approval(
         // The nonce echo lets clients match the 404 to the card (#1821).
         Err(SupervisorError::Acp(AcpError::UnknownNonce)) => (
             StatusCode::NOT_FOUND,
+            crate::daemon::ApiErrorCode::PendingTargetGone.header(),
             format!("no pending approval with nonce {nonce_str}"),
         )
             .into_response(),
@@ -440,6 +441,7 @@ pub async fn resolve_elicitation(
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(SupervisorError::Acp(AcpError::UnknownNonce)) => (
             StatusCode::NOT_FOUND,
+            crate::daemon::ApiErrorCode::PendingTargetGone.header(),
             format!("no pending elicitation with nonce {nonce_str}"),
         )
             .into_response(),

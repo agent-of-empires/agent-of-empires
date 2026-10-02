@@ -719,9 +719,7 @@ pub async fn create_session(
     } else {
         None
     };
-    // What a create with no `body.profile` falls back to: the served profile,
-    // not the machine-wide default. Read once here and used by the
-    // ACP-capability check, the tool-identity validation, and the spawn.
+    let namespace = state.profile_namespace.read().await;
     let default_profile = state.served_profile().to_string();
 
     if state.cityhall_mode {
@@ -810,6 +808,10 @@ pub async fn create_session(
                 .into_response();
         }
     }
+    let _creation_profile = state
+        .session_service
+        .claim_creation_profile(body.profile.as_deref().unwrap_or(&default_profile));
+    drop(namespace);
 
     // Scratch sessions are server-provisioned; the worktree path is the
     // wrong model for them. Reject the combination before reaching the
@@ -1224,6 +1226,7 @@ pub async fn create_session(
     let created = tokio::spawn(async move {
         let _idempotency_guard = _idempotency_guard;
         let _progress = progress;
+        let _creation_profile = _creation_profile;
         let result = task_state
             .session_service
             .create_structured_session(spec, None, None, None)

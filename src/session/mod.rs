@@ -732,6 +732,12 @@ pub(crate) struct ProfileCatalogueTransaction {
     lifecycle: crate::daemon::lifecycle::Transaction,
 }
 
+// Configuration or launch publication can fail after the directory has moved.
+pub(crate) struct ProfileRenameOutcome {
+    pub(crate) directory_moved: bool,
+    pub(crate) result: Result<()>,
+}
+
 impl ProfileCatalogueTransaction {
     fn acquire() -> Result<Self> {
         // Bounded on purpose: the daemon holds this lock for as long as a start
@@ -799,28 +805,39 @@ impl ProfileCatalogueTransaction {
         Ok(replacement)
     }
 
-    pub(crate) fn rename(&self, old_name: &str, new_name: &str) -> Result<()> {
-        validate_profile_name(old_name)?;
-        validate_new_profile_name(new_name)?;
-        let old_dir = self.root.join("profiles").join(old_name);
-        let new_dir = self.root.join("profiles").join(new_name);
-        anyhow::ensure!(old_dir.exists(), "Profile '{}' does not exist", old_name);
-        anyhow::ensure!(
-            !new_dir.try_exists()?,
-            "Profile '{}' already exists",
-            new_name
-        );
-        Config::load()?;
-        let launches =
-            crate::cli::serve::LaunchProfileUpdates::prepare(&self.lifecycle, old_name, new_name)?;
-        fs::rename(&old_dir, &new_dir)?;
-        update_config(|config| {
-            if config.default_profile == old_name {
-                config.default_profile = new_name.to_owned();
-            }
-        })?;
-        launches.commit()?;
-        Ok(())
+    pub(crate) fn rename(&self, old_name: &str, new_name: &str) -> ProfileRenameOutcome {
+        let mut directory_moved = false;
+        let result = (|| {
+            validate_profile_name(old_name)?;
+            validate_new_profile_name(new_name)?;
+            let old_dir = self.root.join("profiles").join(old_name);
+            let new_dir = self.root.join("profiles").join(new_name);
+            anyhow::ensure!(old_dir.exists(), "Profile '{}' does not exist", old_name);
+            anyhow::ensure!(
+                !new_dir.try_exists()?,
+                "Profile '{}' already exists",
+                new_name
+            );
+            Config::load()?;
+            let launches = crate::cli::serve::LaunchProfileUpdates::prepare(
+                &self.lifecycle,
+                old_name,
+                new_name,
+            )?;
+            fs::rename(&old_dir, &new_dir)?;
+            directory_moved = true;
+            update_config(|config| {
+                if config.default_profile == old_name {
+                    new_name.clone_into(&mut config.default_profile);
+                }
+            })?;
+            launches.commit()?;
+            Ok(())
+        })();
+        ProfileRenameOutcome {
+            directory_moved,
+            result,
+        }
     }
 
     pub(crate) fn set_default(&self, name: &str) -> Result<()> {
@@ -846,7 +863,9 @@ pub fn delete_profile(name: &str) -> Result<()> {
 
 /// Renaming can repair an old source name; the destination uses the create grammar.
 pub fn rename_profile(old_name: &str, new_name: &str) -> Result<()> {
-    ProfileCatalogueTransaction::acquire()?.rename(old_name, new_name)
+    ProfileCatalogueTransaction::acquire()?
+        .rename(old_name, new_name)
+        .result
 }
 
 pub fn set_default_profile(name: &str) -> Result<()> {

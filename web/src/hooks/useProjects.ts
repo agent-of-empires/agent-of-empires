@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { fetchProfiles, fetchProjects } from "../lib/api";
+import { fetchAbout, fetchProjects } from "../lib/api";
 import type { ProjectInfo } from "../lib/types";
 
 interface ProjectRegistry {
@@ -14,7 +14,7 @@ export function useProjects(): ProjectRegistry & { refresh: () => Promise<void> 
   const generation = useRef(0);
   const load = useCallback(async () => {
     const request = ++generation.current;
-    const profile = (await fetchProfiles()).find((profile) => profile.is_default)?.name;
+    const profile = (await fetchAbout())?.profile;
     if (request !== generation.current || !profile) return;
     setRegistry((current) => (current.profile === profile ? current : { profile, projects: [], ready: false }));
     const projects = await fetchProjects({ profile });

@@ -63,8 +63,7 @@ pub async fn resolve_option_source(
     source: OptionSource,
     depends: &[String],
 ) -> anyhow::Result<Vec<SelectOption>> {
-    // Every option source below reads the served profile, so an option list
-    // always describes the profile this daemon actually runs.
+    let _namespace = state.profile_namespace.read().await;
     let served = state.served_profile().to_string();
     match source {
         OptionSource::AcpAgents => Ok(acp_agent_options(&served).await),
