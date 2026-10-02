@@ -304,3 +304,34 @@ fn wheel_scrolls_subagent_preview_and_holds_while_output_grows() {
         "changing rows resets the scroll"
     );
 }
+
+#[test]
+#[serial]
+fn click_on_subagent_row_exits_live_mode() {
+    let mut env = create_test_env_with_sessions(2);
+    env.view.list_inner_area = ratatui::layout::Rect::new(1, 1, 40, 10);
+    env.view.cursor = 0;
+    env.view.update_selected();
+    let parent = session_id_at(&env.view, 0).unwrap();
+    let other = session_id_at(&env.view, 1).unwrap();
+    apply(
+        &mut env.view,
+        SubagentSnapshot::from([(
+            parent.clone(),
+            vec![subagent("a1", SubagentState::Running, "x")],
+        )]),
+    );
+    env.view.set_subagents_expanded(&parent, true);
+    env.view.live_send = Some(crate::tui::home::live_send::LiveSendState {
+        session_id: other.clone(),
+        title: "live".to_string(),
+        tmux_name: format!("aoe_test_{other}"),
+        target: crate::tui::home::live_send::LiveSendTarget::Agent,
+        exit_chords: Vec::new(),
+        leader: None,
+    });
+
+    assert_eq!(env.view.handle_click(5, 2), None);
+    assert_eq!(env.view.selected_subagent, Some((parent, "a1".to_string())));
+    assert!(env.view.live_send.is_none());
+}

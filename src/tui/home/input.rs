@@ -5410,6 +5410,10 @@ impl HomeView {
                     self.cursor = abs_idx;
                     self.update_selected();
                 }
+                // The subagent preview replaces the live pane, so stop relaying keys to it.
+                if let Some(state) = self.live_send.clone() {
+                    self.exit_live_send_and_restore_sizing(&state);
+                }
                 None
             }
             Item::Session { id, .. } => {
