@@ -2917,6 +2917,16 @@ Final prose line.\n";
         let cases = [
             OMP_LIVE_APPROVAL_PANEL,
             "\
+╭─ Tool approval required ─────────────────────────────────╮
+│ Tool: custom_tool                                        │
+│                                                          │
+│  ❯ Allow this request                                    │
+│    Always allow                                          │
+│    Cancel                                                │
+│                                                          │
+│ ↑/↓ navigate · Enter select · Esc cancel                │
+╰──────────────────────────────────────────────────────────╯",
+            "\
 ╭─ Allow tool: bash ───────────────────────────────────────╮
 │                                                          │
 │ Command: for f in $(find . -type f | head -400); do      │
@@ -3018,7 +3028,8 @@ Final prose line.\n";
 │                                                          │
 ╰──────────────────────────────────────────────────────────╯";
         let cases = [
-            ("unicode default", format!("⠋ Working… ⟦esc⟧\n{box_unicode}")),
+("unicode default", format!("⠋ Working… ⟦esc⟧\n{box_unicode}")),
+("interrupt hint without spinner", format!("Processing… ⟦esc⟧\n{box_unicode}")),
             (
                 "unicode intent",
                 format!("⠴ Set permissions on audit bait path ⟦esc⟧\n{box_unicode}"),
