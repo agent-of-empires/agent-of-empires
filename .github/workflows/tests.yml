@@ -256,10 +256,10 @@ jobs:
     # drop the per-step conditions.
     #
     # To run it on a pull request, add the `ci-macos` label; labeler.yml adds
-    # it for the paths in .github/labeler.yml and for `target_os = "macos"`
-    # diffs. Every step below is gated on `not a PR, or that label`, so
-    # labelling runs this job for real and the required context reports a
-    # pass either way. Add it by hand for anything else filesystem-shaped:
+    # it for macOS-sensitive paths and `target_os = "macos"` diffs. Every
+    # step below is gated on `not a PR, or that label`, so labelling runs this
+    # job for real and the required context reports a pass either way. Add it
+    # by hand for anything else filesystem-shaped:
     # macOS resolves `/tmp` and the per-user temp root through symlinks and its
     # `mode_t` is 16 bits, and both have already reached main unnoticed because
     # this suite does not run here by default.
