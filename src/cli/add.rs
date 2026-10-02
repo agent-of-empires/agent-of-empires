@@ -1075,15 +1075,6 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
 
 fn resolve_session_title(args: &AddArgs, instances: &[Instance]) -> Result<String> {
     if let Some(title) = &args.title {
-        // A control character in a title corrupts a table row that is padded
-        // by hand, so the served reader refuses it and the local path would
-        // print a broken table. The HTTP create path already refuses it; this
-        // is the same rule on the path that did not have one. An empty title is
-        // still admitted -- the local command prints it and the reader accepts
-        // it -- so this is not a validation the writer invents for symmetry.
-        if title.chars().any(|c| (c as u32) < 0x20 || c as u32 == 0x7f) {
-            anyhow::bail!("session title may not contain control characters");
-        }
         return Ok(title.trim().to_string());
     }
     let default_title = if let Some(branch) = explicit_worktree_branch(args) {

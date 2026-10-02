@@ -853,17 +853,9 @@ fn validate_projects(projects: &[ProjectRead], scope: ProjectScope) -> Result<()
 }
 
 fn validate_session(session: &SessionRead) -> Result<(), &'static str> {
-    // `id` and `profile` are names this half chose, so they are never empty.
-    // `title` is not: `aoe add --title "   "` stores an empty title, the
-    // local command prints it, and refusing the whole snapshot over it took
-    // every served read down for a row the local path is happy with. A title
-    // still may not carry a control character, which is what `valid_text`
-    // refuses -- see the writer-side check in `cli/add.rs`.
+    // Titles preserve persisted display text; only identities require safe text.
     for value in [&session.id, &session.profile] {
         validate_safe_text(value)?;
-    }
-    if !valid_text(&session.title) {
-        return Err("schema_invalid");
     }
     for value in [&session.tool, &session.command] {
         if !valid_text(value) {
@@ -1383,6 +1375,23 @@ mod tests {
             })
             .collect();
         value
+    }
+
+    #[test]
+    fn accepted_stored_titles_do_not_refuse_the_snapshot() {
+        let mut value = parent_chain_snapshot(1);
+        for title in [
+            "",
+            "line1\nline2",
+            "left\u{0085}right",
+            "\u{202e}title",
+            "\u{1b}[31mred",
+        ] {
+            value.sessions[0].title = title.into();
+            assert_eq!(validate_snapshot(&value), Ok(()), "{title:?}");
+        }
+        value.sessions[0].id = "invalid\nidentifier".into();
+        assert_eq!(validate_snapshot(&value), Err("schema_invalid"));
     }
 
     /// Each row's ancestry is walked from the row, so a long chain costs a

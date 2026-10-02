@@ -612,6 +612,41 @@ fn a_producer_frame_the_schema_once_refused_is_accepted() {
     pack::verify(&root).expect("a frame the producer emits is accepted");
 }
 
+#[test]
+#[parallel]
+fn stored_titles_are_strings_not_identity_text() {
+    let (_dir, root) = staged_pack();
+    let path = case_dir(&root, "uds-list-nominal").join("wire.raw");
+    let recorded = fs::read(&path).expect("recorded exchange");
+    for title in [
+        serde_json::json!("line1\nline2"),
+        serde_json::json!("left\u{0085}right"),
+        serde_json::json!(""),
+    ] {
+        let replacement = format!("\"title\":{title}");
+        fs::write(
+            &path,
+            splice_text(&recorded, r#""title":"Alpha session""#, &replacement),
+        )
+        .unwrap();
+        restage(&root);
+        pack::verify(&root).expect("accepted stored titles pass the published schema");
+    }
+    fs::write(
+        &path,
+        splice_text(&recorded, r#""title":"Alpha session""#, r#""title":123"#),
+    )
+    .unwrap();
+    restage(&root);
+    let error = pack::verify(&root).expect_err("a title still must be a JSON string");
+    assert!(
+        error
+            .to_string()
+            .contains("does not satisfy snapshot.schema.json"),
+        "{error}"
+    );
+}
+
 /// And the refusing direction: the gate is not a rubber stamp. A field spelled
 /// as a string where the schema says boolean is what a producer that changed
 /// the type would emit, and it must be caught by the schema rather than by any
