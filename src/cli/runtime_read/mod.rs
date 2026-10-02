@@ -331,18 +331,19 @@ fn absent_local_publication(error: &ReadFailure, source: &ReadRequestSource) -> 
         // connected socket has been proved to be that publisher's, so failing
         // to get an answer out of it is a fact about the environment.
         "marker_missing" => !source.env_url_is_set(),
-        // Only what proves the endpoint was not there. A stall is kept because
-        // a silent peer and a dead host are the same observable from here, and
-        // `publisher_absent` now also carries the TCP connect failing, which is
-        // the other half of the same question.
+        // What proves the endpoint was not there, plus `unavailable`, which is
+        // the states the fused connect cannot tell apart: a refused
+        // certificate, a dead port and a name that does not resolve are the
+        // same `ErrorKind` by the time the call returns, so this arm still
+        // covers a TLS handshake this client refused. That is a real residual,
+        // not a decision, and separating it means wrapping TLS between the
+        // connect and the handshake, which means naming `rustls` here.
         //
-        // Everything else leaves this arm: `invalid_endpoint` and
-        // `invalid_token` are configuration faults that no socket can fix,
-        // `unavailable` is a peer that was reached and then failed, and
-        // `server_error` is a peer that answered and would not serve. Falling
-        // back on any of those prints this machine's sessions as though they
-        // came from the remote.
-        "establishment_timeout" | "publisher_absent" => source.env_url_is_set(),
+        // What leaves the arm: `invalid_endpoint` and `invalid_token` are
+        // configuration faults no socket can fix, and `server_error` is a peer
+        // that answered and would not serve. Falling back on either of those
+        // prints this machine's sessions as though they came from the remote.
+        "unavailable" | "establishment_timeout" | "publisher_absent" => source.env_url_is_set(),
         _ => false,
     }
 }
@@ -398,33 +399,24 @@ async fn execute_inner(
             // carries, so a wrong assumption widens the output rather than
             // narrowing it.
             let local_home = loopback_home(&request);
-            // The TCP connect is separate from the handshake, as it already is
-            // on the local path, and for the same reason: a peer that was
-            // reached and did not serve us is not a peer that was absent, and
-            // only the split can tell the two apart. `connect_async` fuses
-            // them, and under this build's rustls connector a refused
-            // certificate and a dead port both arrive as an `Io` error of the
-            // same kind, so the fused call cannot be classified afterwards
-            // either.
-            let (connect_host, connect_port) = host_port(request.uri())?;
-            let stream = tokio::time::timeout_at(
+            // `connect_async` is one call because the TLS wrap lives inside it:
+            // the internal `connect` is the only thing that reaches
+            // `client_async_tls_with_config`, and `client_async_with_config` on
+            // a raw `TcpStream` never wraps. Splitting the connect out to tell
+            // a refused certificate from a dead port therefore drops TLS, and
+            // `wss://` stops being a transport at all. So the two stay fused
+            // here, and the residual below is what that costs.
+            let connected = tokio::time::timeout_at(
                 establishment_deadline,
-                tokio::net::TcpStream::connect((connect_host, connect_port)),
-            )
-            .await
-            .map_err(|_| ReadFailure::pre("establishment_timeout"))?
-            .map_err(|_| ReadFailure::pre("publisher_absent"))?;
-            let (stream, _) = tokio::time::timeout_at(
-                establishment_deadline,
-                tokio_tungstenite::client_async_with_config(
+                tokio_tungstenite::connect_async_with_config(
                     *request,
-                    stream,
                     Some(websocket_config()),
+                    false,
                 ),
             )
             .await
-            .map_err(|_| ReadFailure::pre("establishment_timeout"))?
-            .map_err(map_upgrade_error)?;
+            .map_err(|_| ReadFailure::pre("establishment_timeout"))?;
+            let (stream, _) = connected.map_err(map_upgrade_error)?;
             // One budget per read: the exchange rides the establishment
             // window rather than opening a second one behind it.
             let exchange_deadline = establishment_deadline;
@@ -439,20 +431,6 @@ async fn execute_inner(
             .await
         }
     }
-}
-
-/// The `(host, port)` an endpoint names, defaulting the port the way the
-/// handshake would so the connect and the request cannot disagree about it.
-fn host_port(uri: &tokio_tungstenite::tungstenite::http::Uri) -> Result<(&str, u16), ReadFailure> {
-    let host = uri
-        .host()
-        .filter(|host| !host.is_empty())
-        .ok_or_else(|| ReadFailure::pre("invalid_endpoint"))?;
-    let port = uri.port_u16().unwrap_or(match uri.scheme_str() {
-        Some("wss") | Some("https") => 443,
-        _ => 80,
-    });
-    Ok((host, port))
 }
 
 /// This machine's home, when the endpoint names a loopback address, and
@@ -797,8 +775,9 @@ mod tests {
     /// every combination of endpoint inputs.
     #[test]
     fn only_the_endpoint_codes_take_over_and_nothing_else_does() {
-        const TAKES_OVER: [&str; 3] = [
+        const TAKES_OVER: [&str; 4] = [
             "marker_missing",
+            "unavailable",
             "establishment_timeout",
             "publisher_absent",
         ];
@@ -875,8 +854,8 @@ mod tests {
             panic!("a flag naming an endpoint is a request for a served answer");
         };
         assert_eq!(
-            outcome.exit, 2,
-            "a named endpoint that is not there leaves the refusal's exit"
+            outcome.exit, 4,
+            "a named endpoint that is not there leaves the transport refusal's exit"
         );
         assert!(outcome.stdout.is_none(), "a refusal prints no answer");
     }
