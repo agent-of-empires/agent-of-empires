@@ -650,6 +650,24 @@ fn carries_transcript(agent: &'static AgentDef) -> bool {
         .is_some_and(|capture| capture.backend == SessionCaptureBackend::Claude)
 }
 
+/// The Claude config root a terminal session's conversation lives in, or
+/// `None` when the session does not run Claude.
+pub(crate) fn claude_store_root(instance: &Instance) -> Option<PathBuf> {
+    let agent = crate::session::resolved_agent_for(
+        &instance.source_profile,
+        &instance.tool,
+        &instance.detect_as,
+    )
+    .filter(|agent| carries_transcript(agent))?;
+    config_root(
+        instance,
+        &instance.effective_profile(),
+        &instance.tool,
+        agent,
+        &dirs::home_dir()?,
+    )
+}
+
 /// The ids whose transcripts a carry copies: the terminal conversation, the
 /// structured one, or both when the row holds each.
 pub(crate) fn conversation_ids(instance: &Instance) -> Vec<String> {
@@ -707,7 +725,7 @@ fn config_root(
 /// sandboxed session is the container's workspace path rather than the host's,
 /// so this scans `projects/` instead of recomputing it. A session that moved
 /// between directories has one transcript per cwd it spoke in.
-fn claude_transcripts_for(root: &AnchoredDir, session_id: &str) -> Result<Vec<PathBuf>> {
+pub(crate) fn claude_transcripts_for(root: &AnchoredDir, session_id: &str) -> Result<Vec<PathBuf>> {
     let projects = Path::new("projects");
     if root.directory_modified(projects)?.is_none() {
         return Ok(Vec::new());

@@ -31,7 +31,8 @@ use crate::tui::settings::{SettingsAction, SettingsView};
 
 /// Longest gap between two left-clicks on one row that still counts as a double-click;
 /// 400ms matches most desktop environments.
-const DOUBLE_CLICK_THRESHOLD: std::time::Duration = std::time::Duration::from_millis(400);
+pub(super) const DOUBLE_CLICK_THRESHOLD: std::time::Duration =
+    std::time::Duration::from_millis(400);
 
 /// The two synthetic bottom-of-sidebar sections. Their headers look like groups in
 /// `flat_items` but carry sentinel paths, so the section-scoped context-menu actions
@@ -2631,7 +2632,11 @@ impl HomeView {
             KeyCode::Enter => {
                 if self.selected_session.is_some() {
                     return self.activate_selected_session();
-                } else if let Some(Item::Group { path, .. }) = self.flat_items.get(self.cursor) {
+                }
+                if self.selected_subagent.is_some() {
+                    return self.activate_subagent_parent();
+                }
+                if let Some(Item::Group { path, .. }) = self.flat_items.get(self.cursor) {
                     let path = path.clone();
                     self.toggle_group_collapsed(&path);
                 }
@@ -2667,28 +2672,39 @@ impl HomeView {
                     return Some(action);
                 }
             }
-            KeyCode::Left | KeyCode::Char('h') => {
-                if let Some(Item::Group {
-                    path, collapsed, ..
-                }) = self.flat_items.get(self.cursor)
-                {
-                    if !collapsed {
-                        let path = path.clone();
-                        self.toggle_group_collapsed(&path);
-                    }
+            KeyCode::Left | KeyCode::Char('h') => match self.flat_items.get(self.cursor) {
+                Some(Item::Group {
+                    path,
+                    collapsed: false,
+                    ..
+                }) => {
+                    let path = path.clone();
+                    self.toggle_group_collapsed(&path);
                 }
-            }
-            KeyCode::Right | KeyCode::Char('l') => {
-                if let Some(Item::Group {
-                    path, collapsed, ..
-                }) = self.flat_items.get(self.cursor)
-                {
-                    if *collapsed {
-                        let path = path.clone();
-                        self.toggle_group_collapsed(&path);
-                    }
+                Some(Item::Session { id, .. }) => {
+                    let id = id.clone();
+                    self.set_subagents_expanded(&id, false);
                 }
-            }
+                Some(Item::Subagent { .. }) => {
+                    self.select_subagent_parent();
+                }
+                _ => {}
+            },
+            KeyCode::Right | KeyCode::Char('l') => match self.flat_items.get(self.cursor) {
+                Some(Item::Group {
+                    path,
+                    collapsed: true,
+                    ..
+                }) => {
+                    let path = path.clone();
+                    self.toggle_group_collapsed(&path);
+                }
+                Some(Item::Session { id, .. }) => {
+                    let id = id.clone();
+                    self.set_subagents_expanded(&id, true);
+                }
+                _ => {}
+            },
             // Strict-mode typing guard: a bare lowercase letter bound to nothing opens
             // the compose dialog pre-filled with that character (the
             // no-destructive-lowercase contract).
@@ -3688,6 +3704,7 @@ impl HomeView {
                         payload: PaletteAction::JumpToCursor(idx),
                     });
                 }
+                Item::Subagent { .. } => {}
                 Item::Group { name, path, .. } => {
                     // The synthetic Archived header (and its Project-mode sub-folders)
                     // is not a real group, so skip it: the palette must not surface the
@@ -3850,7 +3867,7 @@ impl HomeView {
             .iter()
             .filter_map(|item| match item {
                 Item::Session { id, .. } => Some(id.clone()),
-                Item::Group { .. } => None,
+                Item::Group { .. } | Item::Subagent { .. } => None,
             })
             .collect();
         let current_session = self.selected_session.clone();
@@ -4077,11 +4094,24 @@ impl HomeView {
     pub(super) fn update_selected(&mut self) {
         if let Some(item) = self.flat_items.get(self.cursor) {
             let prev_session = self.selected_session.clone();
+            let prev_subagent = self.selected_subagent.take();
             match item {
                 Item::Session { id, .. } => {
                     self.selected_session = Some(id.clone());
                     self.selected_group = None;
                     self.selected_group_profile = None;
+                }
+                // Not a session: leaving `selected_session` unset keeps every session
+                // action (attach, delete, restart) off the parent.
+                Item::Subagent {
+                    parent_id,
+                    agent_id,
+                    ..
+                } => {
+                    self.selected_session = None;
+                    self.selected_group = None;
+                    self.selected_group_profile = None;
+                    self.selected_subagent = Some((parent_id.clone(), agent_id.clone()));
                 }
                 Item::Group { path, .. } => {
                     self.selected_session = None;
@@ -4101,7 +4131,10 @@ impl HomeView {
                     }
                 }
             }
-            if self.selected_session != prev_session {
+            if self.selected_subagent.is_some() && self.selected_subagent != prev_subagent {
+                self.request_subagent_refresh();
+            }
+            if self.selected_session != prev_session || self.selected_subagent != prev_subagent {
                 self.system_health_open = false;
                 self.preview_scroll_offset = 0;
                 // A finalized preview selection pins to the previous pane's cells, so
@@ -4124,6 +4157,9 @@ impl HomeView {
     /// seeking by session id keeps focus on the row the user was looking at. Falls back to
     /// the clamp when there was no prior selection or the session left the flat list.
     pub(super) fn reseat_cursor_after_rebuild(&mut self) {
+        if self.reseat_subagent_cursor() {
+            return;
+        }
         if let Some(sid) = self.selected_session.clone() {
             for (idx, item) in self.flat_items.iter().enumerate() {
                 if let Item::Session { id, .. } = item {
@@ -4450,6 +4486,9 @@ impl HomeView {
                 return false;
             }
         }
+        if self.selected_subagent.is_some() {
+            return self.scroll_subagent_preview(i32::from(STEP));
+        }
         if self.selected_session.is_none() {
             return false;
         }
@@ -4629,6 +4668,9 @@ impl HomeView {
                     return true;
                 }
             }
+            if matches!(self.flat_items[idx], super::Item::Subagent { .. }) {
+                return true;
+            }
             let is_group = matches!(self.flat_items[idx], super::Item::Group { .. });
             // A real project header in project view gets the pin menu; the cursor was
             // just moved onto this row, so `project_group_at_cursor` reflects it.
@@ -4644,7 +4686,9 @@ impl HomeView {
                         .get_instance(id)
                         .map(|inst| (inst.is_archived(), inst.is_snoozed(), inst.is_unread()))
                         .unwrap_or((false, false, false)),
-                    super::Item::Group { .. } => (false, false, false),
+                    super::Item::Group { .. } | super::Item::Subagent { .. } => {
+                        (false, false, false)
+                    }
                 };
                 // Snooze is an Attention-sort triage primitive: the `'h'`
                 // keybinding only fires in Attention sort, so the menu omits
@@ -4660,7 +4704,7 @@ impl HomeView {
                 // refuse. Matches the web sidebar's `acp_can_fork` gating.
                 let can_fork = match &self.flat_items[idx] {
                     super::Item::Session { id, .. } => self.session_can_fork(id),
-                    super::Item::Group { .. } => false,
+                    super::Item::Group { .. } | super::Item::Subagent { .. } => false,
                 };
                 // View switching mirrors the web sidebar's per-session
                 // switch action: offered when a structured session can go
@@ -4668,7 +4712,7 @@ impl HomeView {
                 // ACP-capable. The swap runs through the daemon.
                 let switch_view = match &self.flat_items[idx] {
                     super::Item::Session { id, .. } => self.session_switch_view_target(id),
-                    super::Item::Group { .. } => None,
+                    super::Item::Group { .. } | super::Item::Subagent { .. } => None,
                 };
                 ContextMenuDialog::for_session(
                     anchor,
@@ -5296,10 +5340,10 @@ impl HomeView {
     }
 
     /// Route a left-click inside the session list. A single click on a session row
-    /// selects it and requests live-send for that row (the same `Action::EnterLiveSend`
-    /// Tab emits); a single click on a group row toggles its collapse; a second click on
-    /// the same session row within `DOUBLE_CLICK_THRESHOLD` activates it, as `Enter`
-    /// would, so a full tmux attach stays reachable. Returns the action to dispatch, or
+    /// selects it and, once no second click follows, toggles its subagent rows; a single
+    /// click on a group row toggles its collapse; a second click on the same session row
+    /// within `DOUBLE_CLICK_THRESHOLD` activates it, as `Enter` would. Returns the action
+    /// to dispatch, or
     /// `None` for no-op clicks. The caller redraws unconditionally so the moved cursor
     /// paints before the action runs. Gated by `has_dialog()` through
     /// `resolve_row_to_index`, so clicks don't shift selection under an open modal.
@@ -5324,11 +5368,13 @@ impl HomeView {
                     && now.duration_since(prev_time) <= DOUBLE_CLICK_THRESHOLD
         );
         self.last_click = Some((now, col, row));
+        // Any later click supersedes a toggle the previous one left pending.
+        self.pending_subagent_toggle = None;
 
         let item = self.flat_items[abs_idx].clone();
         if is_double_click {
-            // The first click already selected the row and toggled a group, so the second
-            // only activates a session; re-toggling would undo the first and flicker.
+            // The first click already selected the row and toggled its group, so the
+            // second only activates a session; re-toggling would undo the first.
             //
             // `cursor` is re-synced to `abs_idx` before activating because anything
             // between the clicks (an arrow key, a poll-driven re-sort) can move it, and
@@ -5342,6 +5388,13 @@ impl HomeView {
                     }
                     self.activate_selected_session()
                 }
+                Item::Subagent { .. } => {
+                    if self.cursor != abs_idx {
+                        self.cursor = abs_idx;
+                        self.update_selected();
+                    }
+                    self.activate_subagent_parent()
+                }
                 Item::Group { .. } => None,
             };
         }
@@ -5351,46 +5404,36 @@ impl HomeView {
                 self.toggle_group_collapsed(&path);
                 None
             }
+            Item::Subagent { .. } => {
+                self.system_health_open = false;
+                if self.cursor != abs_idx {
+                    self.cursor = abs_idx;
+                    self.update_selected();
+                }
+                // The subagent preview replaces the live pane, so stop relaying keys to it.
+                if let Some(state) = self.live_send.clone() {
+                    self.exit_live_send_and_restore_sizing(&state);
+                }
+                None
+            }
             Item::Session { id, .. } => {
                 self.system_health_open = false;
                 if self.cursor != abs_idx {
                     self.cursor = abs_idx;
                     self.update_selected();
                 }
-                // An archived row is parked, its pane killed on archive. A single click
-                // is a "let me look at this" gesture, so it must not enter live-send,
-                // which would respawn the pane and auto-unarchive the row through
-                // touch_last_accessed. Stop at the cursor update; bringing it back stays
-                // explicit (`z`, or a deliberate double-click / Enter).
-                let archived = self
-                    .get_instance(&id)
-                    .map(|inst| inst.is_archived())
-                    .unwrap_or(false);
-                // Single-click behavior is otherwise `SessionConfig::click_action`:
-                // `LiveSend` (the default) enters live-send for the clicked row or
-                // switches the live target, while `SelectOnly` stops at the cursor update
-                // so the user can browse previews, exiting live mode if a different row
-                // was live. Double-click still activates via `default_attach_mode`.
-                // `click_action` returns `None` for structured sessions, where
-                // `start_live_send` already short-circuits.
-                if archived
-                    || matches!(
-                        self.click_action(&id),
-                        Some(crate::session::ClickAction::SelectOnly)
-                    )
-                {
-                    // The click only moves the cursor and, if live-sending, leaves live
-                    // mode. That holds for a different row (keystrokes were aimed at the
-                    // old session) and for the row already live: a single click is a "stop
-                    // touching that" gesture. In `LiveSend` mode the `start_live_send`
-                    // branch below retargets instead.
-                    if let Some(state) = self.live_send.clone() {
-                        self.exit_live_send_and_restore_sizing(&state);
-                    }
-                    None
-                } else {
-                    self.start_live_send()
+                // A single click selects and never enters live-send; leaving live mode
+                // keeps keystrokes from staying aimed at the session the user clicked
+                // away from. Double-click activates via `default_attach_mode`.
+                if let Some(state) = self.live_send.clone() {
+                    self.exit_live_send_and_restore_sizing(&state);
                 }
+                // Wait out the double-click window so a double-click attaches without
+                // also expanding or collapsing the rows.
+                if self.subagents.contains_key(&id) {
+                    self.pending_subagent_toggle = Some((id, now));
+                }
+                None
             }
         }
     }
@@ -5703,6 +5746,9 @@ impl HomeView {
                 return false;
             }
         }
+        if self.selected_subagent.is_some() {
+            return self.scroll_subagent_preview(-i32::from(STEP));
+        }
         if self.selected_session.is_none() {
             return false;
         }
@@ -6014,12 +6060,10 @@ impl HomeView {
         }
     }
 
-    /// Exit live-send before an activation hands the terminal to a tmux attach. With
-    /// `click_action = LiveSend` the first click of a double-click already entered
-    /// live-send, and the second resolves to an attach. Without this teardown the
-    /// just-spawned worker keeps dispatching against a pane we are leaving, the attach
-    /// inherits the preview-pinned window size, and detaching drops the user back into
-    /// live mode rather than the home list (#2290). No-op when not live-sending.
+    /// Exit live-send before an activation hands the terminal to a tmux attach. Without
+    /// this teardown the worker keeps dispatching against a pane we are leaving, the
+    /// attach inherits the preview-pinned window size, and detaching drops the user back
+    /// into live mode rather than the home list (#2290). No-op when not live-sending.
     fn exit_live_send_before_attach(&mut self) {
         if let Some(state) = self.live_send.clone() {
             self.exit_live_send_and_restore_sizing(&state);
@@ -6391,6 +6435,7 @@ impl HomeView {
                 Item::Group { name, path, .. } => {
                     format!("{} {}", name, path)
                 }
+                Item::Subagent { .. } => continue,
             };
 
             let haystack_utf32 = Utf32Str::new(&haystack, &mut buf);
@@ -6445,6 +6490,7 @@ impl HomeView {
                 Item::Group { name, path, .. } => {
                     format!("{} {}", name, path)
                 }
+                Item::Subagent { .. } => continue,
             };
 
             let haystack_utf32 = Utf32Str::new(&haystack, &mut buf);

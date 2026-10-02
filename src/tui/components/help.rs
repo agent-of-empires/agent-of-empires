@@ -107,8 +107,8 @@ fn shortcuts(strict: bool, live_on_enter: bool) -> Vec<(&'static str, Vec<(Strin
     let navigation = owned([
         ("j/\u{2193}", "Move down"),
         ("k/\u{2191}", "Move up"),
-        (nav_collapse, "Collapse group"),
-        ("l/\u{2192}", "Expand group"),
+        (nav_collapse, "Collapse group or subagents"),
+        ("l/\u{2192}", "Expand group or subagents"),
         ("Home/End/G", "Go to top / bottom"),
         ("PgUp/Dn", "Move 10 (also Shift+\u{2191}/\u{2193}, { })"),
     ]);

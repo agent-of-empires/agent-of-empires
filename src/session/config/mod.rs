@@ -1527,21 +1527,6 @@ pub struct SessionConfig {
     )]
     pub live_send_on_view_switch: bool,
 
-    /// What a single mouse click on a session row does in the Agent view. Live
-    /// mode (default) enters live-send for the clicked row, the historical
-    /// behavior. Select only just moves the cursor so you can read the preview
-    /// without entering live-send. Double-click still activates via Default
-    /// Attach Mode regardless of this setting.
-    #[serde(default)]
-    #[setting(
-        label = "Mouse Click Action",
-        widget = "select",
-        options = "live_send:Live mode,select_only:Select only",
-        category = "Interaction",
-        tui_only
-    )]
-    pub click_action: ClickAction,
-
     /// Warn before quitting aoe when you press `q` on the home screen (the
     /// dialog can also turn this off). Ctrl+C always force-quits.
     #[serde(default = "default_true")]
@@ -1785,22 +1770,6 @@ pub fn resolve_spawn_model_effort(
     (model, effort)
 }
 
-/// What a single mouse click on a session row does in the Agent view.
-/// See `SessionConfig::click_action`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ClickAction {
-    /// Single-click enters live-send mode for the clicked session
-    /// (the historical behavior on `main` before this setting landed).
-    #[default]
-    LiveSend,
-    /// Single-click only moves the cursor to the clicked row, so the
-    /// user can browse session previews without entering live-send.
-    /// Double-click still activates the session via the configured
-    /// `default_attach_mode`.
-    SelectOnly,
-}
-
 /// How the TUI opens a terminal-mode session after creation. `MatchDefault`
 /// preserves the historical behavior by using
 /// `SessionConfig::default_attach_mode`.
@@ -1914,7 +1883,6 @@ impl Default for SessionConfig {
             default_attach_mode: AttachMode::default(),
             new_session_mode: NewSessionMode::default(),
             live_send_on_view_switch: false,
-            click_action: ClickAction::default(),
             confirm_before_quit: true,
             unread_indicator: true,
             show_session_colors: true,

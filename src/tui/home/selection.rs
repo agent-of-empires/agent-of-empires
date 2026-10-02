@@ -19,6 +19,9 @@ impl HomeView {
     /// Rebuild `flat_items` and move the cursor back onto the selected session or group.
     pub(super) fn rebuild_flat_items_keeping_cursor(&mut self) {
         self.rebuild_flat_items();
+        if self.reseat_subagent_cursor() {
+            return;
+        }
         let restored = match (&self.selected_session, &self.selected_group) {
             (Some(sid), _) => self.session_row(sid),
             (None, Some(gpath)) => {

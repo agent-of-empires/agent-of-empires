@@ -126,11 +126,15 @@ impl HomeView {
                 crate::session::is_within_archived_section(path)
                     || crate::session::is_within_trash_section(path)
             }
-            Item::Session { .. } => false,
+            Item::Session { .. } | Item::Subagent { .. } => false,
         })
     }
 
     pub(in crate::tui) fn build_flat_items(&self) -> Vec<Item> {
+        self.with_subagent_rows(self.build_session_items())
+    }
+
+    fn build_session_items(&self) -> Vec<Item> {
         // Project/org grouping keeps headers under every sort order, Attention included.
         match self.group_by {
             GroupByMode::Project => return self.build_flat_items_by_project(),

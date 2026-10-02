@@ -27,6 +27,7 @@ mod selection;
 mod send;
 mod status;
 mod store_move;
+mod subagents;
 #[cfg(test)]
 mod tests;
 mod user_action;
@@ -257,6 +258,29 @@ pub struct HomeView {
     pub(super) metrics_poller: super::metrics_poller::MetricsPoller,
     pub(super) pending_metrics_refresh: bool,
     pub(super) metrics: crate::process::metrics::MetricsSnapshot,
+
+    pub(super) subagent_poller: super::subagent_poller::SubagentPoller,
+    pub(super) pending_subagent_refresh: bool,
+    /// Subagents per session id; sessions with none are absent.
+    pub(super) subagents: super::subagent_poller::SubagentSnapshot,
+    /// Sessions whose subagent rows are shown. UI state only, never persisted.
+    pub(super) expanded_subagents: HashSet<String>,
+    /// `(parent session id, agent id)` of the subagent row under the cursor.
+    pub(super) selected_subagent: Option<(String, String)>,
+    /// A session whose subagent rows a single click will toggle, and when it was
+    /// clicked; dropped if a second click makes it a double-click.
+    pub(super) pending_subagent_toggle: Option<(String, std::time::Instant)>,
+    /// `(agent id, width, wrapped lines)` of the last subagent preview frame,
+    /// so scrolling has a limit and new output does not move a scrolled view.
+    pub(super) subagent_preview_layout: Option<(String, u16, usize)>,
+    /// Recent activity of the subagent whose preview is open, as last scanned.
+    pub(super) subagent_activity: Option<(
+        crate::session::subagents::SubagentFocus,
+        Vec<crate::session::subagents::SubagentActivity>,
+    )>,
+    pub(super) subagent_activity_generation: u64,
+    /// Wrapped preview lines and what they were built from.
+    subagent_preview: Option<(subagents::PreviewKey, Vec<ratatui::text::Line<'static>>)>,
     pub(super) system_health_open: bool,
     pub(super) system_health_scroll: usize,
     pub(super) diagnostics_area: Rect,

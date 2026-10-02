@@ -10,108 +10,60 @@ fn setup_inner(env: &mut TestEnv) {
     env.view.list_inner_area = Rect::new(1, 1, 28, 10);
 }
 
+fn live_on(view: &mut HomeView, id: &str) {
+    view.live_send = Some(crate::tui::home::live_send::LiveSendState {
+        session_id: id.to_string(),
+        title: "live".to_string(),
+        tmux_name: format!("aoe_test_{id}"),
+        target: crate::tui::home::live_send::LiveSendTarget::Agent,
+        exit_chords: Vec::new(),
+        leader: None,
+    });
+}
+
 #[test]
 #[serial]
 fn click_selects_session_at_clicked_row() {
-    // A single click selects the row and requests live mode. Re-clicking the selected row
-    // past the double-click threshold is a fresh single click: it re-requests live mode and
-    // never attaches.
+    // A single click only selects; re-clicking past the double-click threshold is a fresh
+    // single click and never attaches.
     let mut env = create_test_env_with_sessions(3);
     setup_inner(&mut env);
     env.view.cursor = 0;
     env.view.update_selected();
-    let expected = Some(crate::tui::app::Action::EnterLiveSend(
-        session_id_at(&env.view, 2).unwrap(),
-    ));
 
     let t0 = std::time::Instant::now();
-    assert_eq!(env.view.handle_click_at(t0, 5, 3), expected);
+    assert_eq!(env.view.handle_click_at(t0, 5, 3), None);
     assert_eq!(env.view.cursor, 2);
     let t1 = t0 + std::time::Duration::from_millis(1500);
-    assert_eq!(env.view.handle_click_at(t1, 5, 3), expected);
+    assert_eq!(env.view.handle_click_at(t1, 5, 3), None);
     assert_eq!(env.view.cursor, 2);
 }
 
 #[test]
 #[serial]
-fn select_only_click_on_different_row_exits_live_mode() {
-    // With SelectOnly, clicking a different row while live-sending must leave live mode, or
-    // keystrokes stay aimed at the old session while the cursor and preview walk away. The
-    // click still emits no action and still moves the cursor.
-    use crate::session::config::{update_config, ClickAction};
-    use crate::tui::home::live_send::{LiveSendState, LiveSendTarget};
-    let mut env = create_test_env_with_sessions(3);
-    setup_inner(&mut env);
-    env.view.cursor = 0;
-    env.view.update_selected();
+fn single_click_exits_live_mode() {
+    // Clicking another row or the live row itself leaves live mode, so keystrokes never
+    // stay aimed at a session the user clicked away from.
+    for (label, live_idx) in [("other row", 0), ("live row", 2)] {
+        let mut env = create_test_env_with_sessions(3);
+        setup_inner(&mut env);
+        env.view.cursor = 0;
+        env.view.update_selected();
+        let live_id = session_id_at(&env.view, live_idx).unwrap();
+        live_on(&mut env.view, &live_id);
 
-    update_config(|config| {
-        config.session.click_action = ClickAction::SelectOnly;
-    })
-    .unwrap();
-
-    let live_id = env.view.selected_session.clone().unwrap();
-    env.view.live_send = Some(LiveSendState {
-        session_id: live_id,
-        title: "live".to_string(),
-        tmux_name: "aoe_test_live".to_string(),
-        target: LiveSendTarget::Agent,
-        exit_chords: Vec::new(),
-        leader: None,
-    });
-
-    let action = env.view.handle_click(5, 3);
-    assert_eq!(action, None, "SelectOnly click never emits an action");
-    assert_eq!(env.view.cursor, 2, "the click still moves the cursor");
-    assert!(
-        env.view.live_send.is_none(),
-        "clicking a different row in SelectOnly mode must exit live mode"
-    );
-}
-
-#[test]
-#[serial]
-fn select_only_click_on_live_row_exits_live_mode() {
-    // Clicking the row that is already live-sending is a "leave" gesture: in SelectOnly a
-    // single click selects it and drops out of live mode, rather than stranding keystrokes
-    // the user is stepping away from.
-    use crate::session::config::{update_config, ClickAction};
-    use crate::tui::home::live_send::{LiveSendState, LiveSendTarget};
-    let mut env = create_test_env_with_sessions(3);
-    setup_inner(&mut env);
-    // Row 3 resolves to index 2, so make index 2 the live row.
-    env.view.cursor = 2;
-    env.view.update_selected();
-
-    update_config(|config| {
-        config.session.click_action = ClickAction::SelectOnly;
-    })
-    .unwrap();
-
-    let live_id = env.view.selected_session.clone().unwrap();
-    env.view.live_send = Some(LiveSendState {
-        session_id: live_id,
-        title: "live".to_string(),
-        tmux_name: "aoe_test_live".to_string(),
-        target: LiveSendTarget::Agent,
-        exit_chords: Vec::new(),
-        leader: None,
-    });
-
-    let action = env.view.handle_click(5, 3);
-    assert_eq!(action, None, "SelectOnly click never emits an action");
-    assert!(
-        env.view.live_send.is_none(),
-        "clicking the already-live row must exit live mode"
-    );
+        assert_eq!(env.view.handle_click(5, 3), None, "{label}");
+        assert_eq!(env.view.cursor, 2, "{label}");
+        assert!(env.view.live_send.is_none(), "{label}");
+    }
 }
 
 #[test]
 #[serial]
 fn single_click_on_archived_row_selects_without_reviving() {
     // A parked (archived) session has had its pane killed, so a single click is a "let me
-    // look" gesture: no EnterLiveSend to respawn the pane and no auto-unarchive, even under
-    // the default `click_action = LiveSend`. Bringing it back stays explicit.
+    // look" gesture: no EnterLiveSend to respawn the pane and no auto-unarchive. Bringing
+    // it back stays explicit.
     let mut env = create_test_env_with_sessions(3);
     setup_inner(&mut env);
     // Keep archived rows visible so the archived row is clickable.
@@ -161,96 +113,37 @@ fn single_click_on_archived_row_selects_without_reviving() {
 
 #[test]
 #[serial]
-fn select_only_click_honors_per_profile_override() {
-    // Global stays LiveSend while the test profile pins SelectOnly through
-    // SessionConfigOverride, so the resolver must pick the override: a single click returns
-    // None and the cursor still moves.
-    use crate::session::config::profile_config::{save_profile_config, ProfileConfig};
+fn double_click_attaches() {
+    // Double-click activates through `default_attach_mode` (Tmux by default).
     let mut env = create_test_env_with_sessions(3);
     setup_inner(&mut env);
     env.view.cursor = 0;
     env.view.update_selected();
-
-    let profile_config: ProfileConfig =
-        serde_json::from_value(serde_json::json!({"session": {"click_action": "select_only"}}))
-            .unwrap();
-    save_profile_config("test", &profile_config).unwrap();
-
-    let action = env.view.handle_click(5, 3);
-    assert_eq!(
-        action, None,
-        "per-profile SelectOnly must override the LiveSend global default"
-    );
-    assert_eq!(env.view.cursor, 2);
-}
-
-#[test]
-#[serial]
-fn double_click_still_attaches_under_select_only() {
-    // Defensive: `SelectOnly` changes only single-click, so double-click must still
-    // activate through `default_attach_mode` (Tmux by default), locking the separation
-    // between the two settings.
-    use crate::session::config::{update_config, ClickAction};
-    let mut env = create_test_env_with_sessions(3);
-    setup_inner(&mut env);
-    env.view.cursor = 0;
-    env.view.update_selected();
-
-    update_config(|config| {
-        config.session.click_action = ClickAction::SelectOnly;
-    })
-    .unwrap();
 
     let t0 = std::time::Instant::now();
-    let first = env.view.handle_click_at(t0, 5, 3);
-    assert_eq!(
-        first, None,
-        "first click under SelectOnly must not emit an action"
-    );
+    assert_eq!(env.view.handle_click_at(t0, 5, 3), None);
     let t1 = t0 + std::time::Duration::from_millis(100);
     let second = env.view.handle_click_at(t1, 5, 3);
-    let expected_id = match &env.view.flat_items[2] {
-        crate::session::Item::Session { id, .. } => id.clone(),
-        _ => panic!("flat_items[2] should be a session"),
-    };
     assert_eq!(
         second,
-        Some(crate::tui::app::Action::AttachSession(expected_id)),
-        "double-click must still activate via default_attach_mode (Tmux)"
+        Some(crate::tui::app::Action::AttachSession(
+            session_id_at(&env.view, 2).unwrap()
+        )),
     );
 }
 
 #[test]
 #[serial]
 fn double_click_tears_down_live_send_before_tmux_attach() {
-    // #2290: with `click_action = LiveSend` the first click of a double enters live-send
-    // and the second resolves to a tmux attach, which must exit live mode first or the
-    // worker is stranded against a pane we are leaving and detaching returns to live mode.
-    use crate::session::config::{update_config, ClickAction};
+    // #2290: a double-click from live mode resolves to a tmux attach, which must exit live
+    // mode first or the worker is stranded against a pane we are leaving and detaching
+    // returns to live mode.
     let mut env = create_test_env_with_sessions(3);
     setup_inner(&mut env);
     env.view.cursor = 0;
     env.view.update_selected();
-
-    update_config(|config| {
-        config.session.click_action = ClickAction::LiveSend;
-    })
-    .unwrap();
-
-    // Simulate the first click having already entered live-send (the real install runs in
-    // App::execute_action, which a HomeView unit test can't drive).
-    let expected_id = match &env.view.flat_items[2] {
-        crate::session::Item::Session { id, .. } => id.clone(),
-        _ => panic!("flat_items[2] should be a session"),
-    };
-    env.view.live_send = Some(crate::tui::home::live_send::LiveSendState {
-        session_id: expected_id.clone(),
-        title: "row-2".to_string(),
-        tmux_name: "aoe_test_2290".to_string(),
-        target: crate::tui::home::live_send::LiveSendTarget::Agent,
-        exit_chords: Vec::new(),
-        leader: None,
-    });
+    let expected_id = session_id_at(&env.view, 2).unwrap();
+    live_on(&mut env.view, &expected_id);
 
     let t0 = std::time::Instant::now();
     // Seed last_click so the next click within the threshold is treated
@@ -262,7 +155,6 @@ fn double_click_tears_down_live_send_before_tmux_attach() {
     assert_eq!(
         action,
         Some(crate::tui::app::Action::AttachSession(expected_id)),
-        "double-click must still resolve to a tmux attach under default_attach_mode (Tmux)"
     );
     assert!(
         env.view.live_send.is_none(),
@@ -408,28 +300,13 @@ fn two_clicks_on_different_rows_do_not_activate() {
     env.view.cursor = 0;
     env.view.update_selected();
 
-    let id_row2 = match &env.view.flat_items[1] {
-        crate::session::Item::Session { id, .. } => id.clone(),
-        _ => panic!("flat_items[1] should be a session"),
-    };
-    let id_row3 = match &env.view.flat_items[2] {
-        crate::session::Item::Session { id, .. } => id.clone(),
-        _ => panic!("flat_items[2] should be a session"),
-    };
-
     let t0 = Instant::now();
-    let first = env.view.handle_click_at(t0, 5, 2);
-    assert_eq!(
-        first,
-        Some(crate::tui::app::Action::EnterLiveSend(id_row2)),
-        "first click enters live mode for its row"
-    );
+    assert_eq!(env.view.handle_click_at(t0, 5, 2), None);
     let t1 = t0 + Duration::from_millis(100);
-    let second = env.view.handle_click_at(t1, 5, 3);
     assert_eq!(
-        second,
-        Some(crate::tui::app::Action::EnterLiveSend(id_row3)),
-        "different-row second click is a fresh single click that switches the live target, not a double-click attach"
+        env.view.handle_click_at(t1, 5, 3),
+        None,
+        "a different-row second click is a fresh single click, not a double-click attach"
     );
     assert_eq!(env.view.cursor, 2);
 }
@@ -443,20 +320,10 @@ fn double_click_activates_clicked_row_even_if_cursor_moved_between_clicks() {
     setup_inner(&mut env);
     env.view.cursor = 0;
     env.view.update_selected();
-
-    // Capture the id at flat_items[2] so we know which session
-    // the row-3 click is targeting.
-    let clicked_id = match &env.view.flat_items[2] {
-        crate::session::Item::Session { id, .. } => id.clone(),
-        _ => panic!("flat_items[2] should be a session"),
-    };
+    let clicked_id = session_id_at(&env.view, 2).unwrap();
 
     let t0 = Instant::now();
-    let first = env.view.handle_click_at(t0, 5, 3);
-    assert_eq!(
-        first,
-        Some(crate::tui::app::Action::EnterLiveSend(clicked_id.clone()))
-    );
+    assert_eq!(env.view.handle_click_at(t0, 5, 3), None);
     assert_eq!(env.view.cursor, 2);
 
     // Simulate the cursor drifting away between clicks, as an arrow press or an async list
@@ -478,85 +345,11 @@ fn double_click_activates_clicked_row_even_if_cursor_moved_between_clicks() {
     );
 }
 
-/// Already live on session A, clicking a different row emits `EnterLiveSend(B)` so the
-/// caller can switch the live target.
+/// A Creating row is selectable but not attachable by double-click; a structured row
+/// selects like any other.
 #[test]
 #[serial]
-fn click_on_other_session_while_live_switches_target() {
-    use crate::tui::home::live_send::LiveSendState;
-
-    let mut env = create_test_env_with_sessions(3);
-    setup_inner(&mut env);
-    env.view.cursor = 0;
-    env.view.update_selected();
-
-    let id_a = match &env.view.flat_items[1] {
-        crate::session::Item::Session { id, .. } => id.clone(),
-        _ => panic!("flat_items[1] should be a session"),
-    };
-    let id_b = match &env.view.flat_items[2] {
-        crate::session::Item::Session { id, .. } => id.clone(),
-        _ => panic!("flat_items[2] should be a session"),
-    };
-
-    // Simulate already being in live mode for session A.
-    env.view.live_send = Some(LiveSendState {
-        session_id: id_a.clone(),
-        title: "session1".to_string(),
-        tmux_name: format!("aoe_test_{}", id_a),
-        target: crate::tui::home::live_send::LiveSendTarget::Agent,
-        exit_chords: Vec::new(),
-        leader: None,
-    });
-
-    // Click session B's row.
-    let action = env.view.handle_click(5, 3);
-    assert_eq!(
-        action,
-        Some(crate::tui::app::Action::EnterLiveSend(id_b)),
-        "clicking a different session row while live must switch the live target"
-    );
-}
-
-/// Clicking the row that is already the live-send target is a no-op: re-running
-/// `prepare_live_send` would drop the worker and redo ensure_pane_ready for nothing.
-#[test]
-#[serial]
-fn click_on_already_live_session_is_noop() {
-    use crate::tui::home::live_send::LiveSendState;
-
-    let mut env = create_test_env_with_sessions(3);
-    setup_inner(&mut env);
-    env.view.cursor = 0;
-    env.view.update_selected();
-
-    let id_a = match &env.view.flat_items[2] {
-        crate::session::Item::Session { id, .. } => id.clone(),
-        _ => panic!("flat_items[2] should be a session"),
-    };
-
-    env.view.live_send = Some(LiveSendState {
-        session_id: id_a.clone(),
-        title: "session2".to_string(),
-        tmux_name: format!("aoe_test_{}", id_a),
-        target: crate::tui::home::live_send::LiveSendTarget::Agent,
-        exit_chords: Vec::new(),
-        leader: None,
-    });
-
-    let action = env.view.handle_click(5, 3);
-    assert!(
-        action.is_none(),
-        "clicking the already-live session row should not re-enter live mode"
-    );
-    assert_eq!(env.view.cursor, 2, "selection still updates");
-}
-
-/// Creating and structured (ACP) sessions can't host live mode, so a single click only
-/// selects the row; a Creating row is not attachable by double-click either.
-#[test]
-#[serial]
-fn click_on_session_that_cannot_go_live_only_selects() {
+fn click_on_session_that_cannot_attach_only_selects() {
     use std::time::{Duration, Instant};
 
     let cases: [(&str, fn(&mut Instance)); 2] = [
