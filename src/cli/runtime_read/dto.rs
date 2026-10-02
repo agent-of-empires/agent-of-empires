@@ -902,6 +902,13 @@ fn validate_session(session: &SessionRead) -> Result<(), &'static str> {
     // Compared as instants, not as bytes: a fractional part sorts below the
     // `Z` of a whole second, so a byte comparison would read
     // `…:00.5Z < …:00Z` and reject a session archived after it was created.
+    //
+    // The rule refuses the whole snapshot, so one row out of order -- from a
+    // restore, a clock skew or a hand edit -- stops all seven served reads on
+    // every profile, where the local command prints the same row. That is the
+    // deliberate trade: this transport refuses a state it cannot vouch for
+    // rather than rendering it, and it says why below rather than naming a row
+    // it has not been taught to name.
     let created_at = parse_timestamp(&session.created_at).ok_or("schema_invalid")?;
     for later in [
         session.archived_at.as_deref(),
