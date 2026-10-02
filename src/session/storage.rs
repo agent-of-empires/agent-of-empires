@@ -721,6 +721,7 @@ pub(crate) fn try_acquire_storage_flock(dir: &Path, name: &str) -> Result<Option
     }
 }
 
+#[derive(Clone)]
 pub struct Storage {
     profile: String,
     sessions_path: PathBuf,
@@ -906,6 +907,24 @@ impl Storage {
             .parent()
             .ok_or_else(|| anyhow!("sessions path has no profile directory"))?;
         acquire_storage_flock(
+            profile_dir,
+            &format!("{INSTANCE_LIFECYCLE_LOCK_PREFIX}{instance_id}.lock"),
+        )
+    }
+
+    /// Try to acquire one instance's lifecycle flock without waiting. Startup recovery uses
+    /// this form so a live daemon that is still finishing a hook does not block its own reload.
+    pub(crate) fn try_acquire_instance_lifecycle_lock(
+        &self,
+        instance_id: &str,
+    ) -> Result<Option<StorageFlock>> {
+        super::validate_instance_id(instance_id)
+            .context("refusing lifecycle lock for invalid instance id")?;
+        let profile_dir = self
+            .sessions_path
+            .parent()
+            .ok_or_else(|| anyhow!("sessions path has no profile directory"))?;
+        try_acquire_storage_flock(
             profile_dir,
             &format!("{INSTANCE_LIFECYCLE_LOCK_PREFIX}{instance_id}.lock"),
         )

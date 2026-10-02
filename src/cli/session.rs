@@ -627,7 +627,7 @@ async fn empty_trash(profile: &str) -> Result<()> {
         let delete_sandbox =
             inst.sandbox_info.as_ref().is_some_and(|s| s.enabled) && config.sandbox.auto_cleanup;
         let row_storage = Storage::open_unwatched(profile)?;
-        let reservation = crate::session::deletion::PurgeTransaction::reserve(
+        let reservation = crate::session::deletion::PurgeTransaction::reserve_with_acp_transcript(
             row_storage,
             crate::session::deletion::DeletionRequest {
                 session_id: inst.id.clone(),
