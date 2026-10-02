@@ -942,14 +942,10 @@ pub(super) fn fail_next_proc_read() {
     PROC_READ_UNPROVABLE.store(true, std::sync::atomic::Ordering::SeqCst);
 }
 
-/// A three-way answer about a retained marker's writer. `Live` and `Dead` are
-/// proven; `Unprovable` is everything else, and the only value that may be
-/// reaped is `Dead`. An identity string this platform cannot parse is
-/// unprovable rather than an absence. That rule is stated once, by
-/// [`crate::cli::runtime_read::uds::valid_process_identity`], which the client
-/// half turns into `marker_identity` and this half turns into this enum.
+/// Only a proven-dead writer permits reaping retained artifacts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProcessLiveness {
+    #[cfg(target_os = "linux")]
     Live,
     Dead,
     Unprovable,
@@ -957,6 +953,7 @@ enum ProcessLiveness {
 
 /// Whether the process that wrote a retained marker is still running. A marker
 /// from a boot that has ended, or a pid that has been recycled, is dead.
+#[cfg(target_os = "linux")]
 fn process_liveness(probe: &MarkerProbe) -> ProcessLiveness {
     if !crate::cli::runtime_read::uds::valid_process_identity(&probe.process_start_identity) {
         return ProcessLiveness::Unprovable;
@@ -989,6 +986,11 @@ fn process_liveness(probe: &MarkerProbe) -> ProcessLiveness {
         // kept serving the listener.
         ProcessStart::Unprovable => ProcessLiveness::Unprovable,
     }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_liveness(_: &MarkerProbe) -> ProcessLiveness {
+    ProcessLiveness::Unprovable
 }
 
 // `publish` returns `unsupported_platform` before it touches the filesystem,
