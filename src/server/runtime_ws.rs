@@ -484,7 +484,8 @@ fn build_snapshot(
     // its directory is gone, otherwise every one of its rows would be unprojectable.
     let enumeration = crate::session::list_profiles_readonly();
     let enumeration_healthy = enumeration.is_ok();
-    let mut names: BTreeSet<String> = enumeration.unwrap_or_default().into_iter().collect();
+    let enumerated: BTreeSet<String> = enumeration.unwrap_or_default().into_iter().collect();
+    let mut names = enumerated.clone();
     names.extend(sessions.iter().map(|row| row.profile.clone()));
 
     let disk: BTreeMap<String, ProfileDisk> = names
@@ -608,10 +609,14 @@ fn build_snapshot(
     // saying only that no default exists. Replacing it with some other
     // profile's name would be the worst thing a transport can do.
     //
-    // Resolving is skipped when there is no profile at all, because
-    // resolution bootstraps one and a read must not write to the store. That
-    // is the one state with no name to publish, and it publishes none.
-    let resolved = (!names.is_empty()).then(crate::session::config::resolve_default_profile);
+    // The guard is the *enumeration*, not `names`. `names` is that enumeration
+    // unioned with every session's profile, so a profile that still holds
+    // sessions keeps it non-empty even when its directory is gone — which is
+    // the case the comment above designs for, and the one where resolution
+    // would bootstrap a profile and write to the store a read must not write
+    // to. `get_profile_dir` ends in `create_dir_all`.
+    let resolved = (enumeration_healthy && !enumerated.is_empty())
+        .then(crate::session::config::resolve_default_profile);
     let default_profile = resolved
         .as_ref()
         .filter(|name| names.contains(*name))

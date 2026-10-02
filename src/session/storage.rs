@@ -322,9 +322,19 @@ where
 
 /// A JSON registry's text, or `None` when the file is absent or blank. Both
 /// are legitimately empty, and neither is a reason to write a sidecar.
+///
+/// Absent and unreadable are different facts and this has to keep them apart.
+/// `Path::exists` is `stat(...).is_ok()`, so it answers "no" for a permission
+/// error just as it answers "no" for a file that is not there. Reading a
+/// profile this half cannot open as an empty registry is what let a profile
+/// with a sessions.json in it publish as fully healthy, with its rows simply
+/// absent and every read command reporting nothing at all.
 fn read_nonempty(path: &Path) -> Result<Option<String>> {
-    if !path.exists() {
-        return Ok(None);
+    match fs::metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+        Ok(metadata) if !metadata.is_file() => return Ok(None),
+        Ok(_) => {}
     }
     let content = fs::read_to_string(path)?;
     if content.trim().is_empty() {

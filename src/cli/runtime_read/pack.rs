@@ -836,7 +836,7 @@ fn websocket_frame<'a>(case_id: &str, direction: u8, record: &'a [u8]) -> Result
 /// schema that did not follow both kept passing. `ProjectRead::registered`
 /// and the fractional timestamp both survived several reviews for exactly
 /// that reason. The cost is one JSON parse and one schema walk per application
-/// frame, in a debug-only gate over six cases, and no new dependency.
+/// frame, in a debug-only gate over the shipped cases, and no new dependency.
 ///
 /// A refusal case is not exempt. `http-loopback-snapshot-schema-invalid` is
 /// invalid in a *semantic* field, and a semantic defect still has to be
