@@ -47,13 +47,12 @@ fn test_ctrl_p_browse_dir_picker_renders_as_full_overlay() {
 ///
 /// macOS CI tmux occasionally drops the first Enter when sent right after a
 /// long literal-text burst, leaving the dialog stuck in the input state. We
-/// detect that by polling for the dialog to transition (close, switch to a
-/// loading overlay, or show the create-dir prompt) and re-send Enter if the
-/// dialog still shows its hint line after a grace period. Resending Enter is
-/// idempotent: by the time the dialog has closed it is already gone, so a
-/// late-arriving second Enter falls through to the home view, where Enter is
-/// a no-op when no session row is selected (the Creating stub is auto-selected
-/// only after the dialog closes).
+/// detect that by polling for the dialog to close (or for the create-dir
+/// prompt to appear) and re-send Enter if the dialog is still up after a grace
+/// period. Resending Enter is idempotent: by the time the dialog has closed it
+/// is already gone, so a late-arriving second Enter falls through to the home
+/// view, where Enter is a no-op when no session row is selected (the Creating
+/// stub is auto-selected only after the dialog closes).
 fn submit_new_session_dialog(h: &TuiTestHarness) {
     h.send_keys("Enter");
     let start = std::time::Instant::now();
@@ -64,12 +63,8 @@ fn submit_new_session_dialog(h: &TuiTestHarness) {
             h.send_keys("y");
             return;
         }
-        // Any of these means Enter was accepted by the dialog.
-        if !screen.contains(" New Session ")
-            || screen.contains("Running Hooks")
-            || screen.contains("Creating Session")
-            || screen.contains("Creating...")
-        {
+        // The dialog is gone: Enter was accepted.
+        if !screen.contains(" New Session ") {
             return;
         }
         if !resent && start.elapsed() > Duration::from_millis(800) {
@@ -85,8 +80,8 @@ fn submit_new_session_dialog(h: &TuiTestHarness) {
     }
 }
 
-/// Write a global config with on_create hooks so session creation goes through
-/// the background CreationPoller and shows a Creating stub in the session list.
+/// Write a global config with on_create hooks so the daemon runs them and a
+/// Creating stub shows in the session list.
 fn write_config_with_hooks(h: &TuiTestHarness, hook_cmd: &str) {
     let config_dir = crate::harness::app_dir_in(h.home_path());
     let config_content = format!(

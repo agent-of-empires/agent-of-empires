@@ -1309,15 +1309,13 @@ impl HomeView {
                         self.repo_trust_dialog = None;
                         let fingerprint = self.pending_repo_trust_fingerprint.take();
                         if let Some(data) = self.pending_repo_trust_data.take() {
-                            let (hooks, decision) = match action {
-                                RepoTrustAction::Trust { hooks, .. } => {
-                                    (hooks, RepoTrustDecision::Approve(fingerprint))
+                            let decision = match action {
+                                RepoTrustAction::Trust { .. } => {
+                                    RepoTrustDecision::Approve(fingerprint)
                                 }
-                                RepoTrustAction::Skip { hooks } => {
-                                    (hooks, RepoTrustDecision::Refuse)
-                                }
+                                RepoTrustAction::Skip { .. } => RepoTrustDecision::Refuse,
                             };
-                            let emit = self.create_session_with_hooks(data, hooks, decision);
+                            let emit = self.create_session_with_hooks(data, decision);
                             self.pending_dialog_click_action = emit;
                         }
                     }
@@ -2111,13 +2109,13 @@ impl HomeView {
                     self.repo_trust_dialog = None;
                     let fingerprint = self.pending_repo_trust_fingerprint.take();
                     if let Some(data) = self.pending_repo_trust_data.take() {
-                        let (hooks, decision) = match action {
-                            RepoTrustAction::Trust { hooks, .. } => {
-                                (hooks, RepoTrustDecision::Approve(fingerprint))
+                        let decision = match action {
+                            RepoTrustAction::Trust { .. } => {
+                                RepoTrustDecision::Approve(fingerprint)
                             }
-                            RepoTrustAction::Skip { hooks } => (hooks, RepoTrustDecision::Refuse),
+                            RepoTrustAction::Skip { .. } => RepoTrustDecision::Refuse,
                         };
-                        return self.create_session_with_hooks(data, hooks, decision);
+                        return self.create_session_with_hooks(data, decision);
                     }
                 }
             }
@@ -6603,8 +6601,7 @@ impl HomeView {
             Ok(t) => t,
             Err(e) => {
                 tracing::warn!(target: "tui.input", "Failed to check repo trust: {}", e);
-                let fallback = repo_config::ResolvedHooks::global(&data.profile);
-                return self.create_session_with_hooks(data, fallback, RepoTrustDecision::Refuse);
+                return self.create_session_with_hooks(data, RepoTrustDecision::Refuse);
             }
         };
 
@@ -6616,8 +6613,7 @@ impl HomeView {
             Ok(config) => repo_config::creation_trust_fingerprint(&config.hooks, &trust),
             Err(e) => {
                 tracing::warn!(target: "tui.input", "Failed to resolve trust review base: {}", e);
-                let fallback = repo_config::ResolvedHooks::global(&data.profile);
-                return self.create_session_with_hooks(data, fallback, RepoTrustDecision::Refuse);
+                return self.create_session_with_hooks(data, RepoTrustDecision::Refuse);
             }
         };
 
@@ -6664,7 +6660,7 @@ impl HomeView {
                     RepoTrustDecision::Unpinned(Some(fingerprint))
                 }
             };
-            return self.create_session_with_hooks(data, hooks_on_trust, decision);
+            return self.create_session_with_hooks(data, decision);
         }
 
         use crate::tui::dialogs::RepoTrustDialog;
@@ -6687,23 +6683,13 @@ impl HomeView {
         None
     }
 
-    /// Create a session with optional hooks, delegating to the background
-    /// `CreationPoller` when hooks are present, the session is sandboxed, or a worktree
-    /// branch is requested, so a slow `post-checkout` can't freeze the TUI.
+    /// Hand the trust answer to the daemon, which owns session creation: this
+    /// process only submits the request and lets the runtime report the id.
     pub(super) fn create_session_with_hooks(
         &mut self,
         data: NewSessionData,
-        hooks: Option<repo_config::ResolvedHooks>,
         decision: RepoTrustDecision,
     ) -> Option<Action> {
-        let has_hooks = hooks
-            .as_ref()
-            .is_some_and(|h| !h.hooks().on_create.is_empty() || !h.hooks().on_launch.is_empty());
-        let has_worktree = data.worktree_enabled;
-
-        // The daemon owns creation, so this process does not open the session
-        // itself: submit it and let the runtime report the id.
-        let _ = (hooks, has_hooks, has_worktree);
         let (trust_hooks, trust_review) = decision.into_request();
         self.request_creation(data, trust_hooks, trust_review);
         None

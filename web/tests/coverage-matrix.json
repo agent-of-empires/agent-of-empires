@@ -1403,7 +1403,7 @@
       "kind": "mocked-playwright",
       "risk": "medium",
       "specs": ["tests/sidebar-context-menu.spec.ts"],
-      "components": ["web/src/components/ContextMenu.tsx", "web/src/components/sidebar/SidebarGroupHeader.tsx"]
+      "components": ["web/src/components/ContextMenu.tsx"]
     },
     {
       "id": "sidebar.system-health",

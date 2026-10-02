@@ -15,7 +15,6 @@ use tui_input::Input;
 use super::DialogResult;
 use crate::containers;
 use crate::session::config::profile_config::resolve_config_or_warn;
-use crate::session::config::repo_config::HookProgress;
 use crate::session::config::{load_config, update_app_state, DefaultTerminalMode, SandboxConfig};
 #[cfg(test)]
 use crate::session::Config;
@@ -231,10 +230,6 @@ pub struct NewSessionDialog {
     pub(super) dir_picker: DirPicker,
     pub(super) error_message: Option<String>,
     pub(super) show_help: bool,
-    pub(super) loading: bool,
-    pub(super) has_hooks: bool,
-    pub(super) current_hook: Option<String>,
-    pub(super) hook_output: Vec<String>,
     pub(super) path_invalid_flash_until: Option<Instant>,
     /// Ghost text completion for the path field (fish-shell style).
     path_ghost: Option<PathGhostCompletion>,
@@ -546,10 +541,6 @@ impl NewSessionDialog {
             command_override: Input::new(command_override_value),
             error_message: None,
             show_help: false,
-            loading: false,
-            has_hooks: false,
-            current_hook: None,
-            hook_output: Vec::new(),
             path_invalid_flash_until: None,
             path_ghost: None,
             group_ghost: None,
@@ -666,38 +657,10 @@ impl NewSessionDialog {
             .unwrap_or("")
     }
 
-    pub fn push_hook_progress(&mut self, progress: HookProgress) {
-        match progress {
-            HookProgress::Started(cmd) => {
-                self.current_hook = Some(cmd);
-            }
-            HookProgress::Output(line) => {
-                self.hook_output.push(line);
-            }
-        }
-    }
-
-    pub fn set_loading(&mut self, loading: bool) {
-        self.loading = loading;
-        if loading {
-            self.error_message = None;
-        }
-    }
-
-    pub fn is_loading(&self) -> bool {
-        self.loading
-    }
-
     /// Advance dialog timers (spinner and transient highlights).
     /// Returns true when visual state changed and the UI should redraw.
     pub fn tick(&mut self) -> bool {
         let mut changed = false;
-
-        if self.loading {
-            // rattles computes the frame from elapsed time; just redraw.
-            changed = true;
-        }
-
         if let Some(until) = self.path_invalid_flash_until {
             if Instant::now() >= until {
                 self.path_invalid_flash_until = None;
@@ -941,10 +904,6 @@ impl NewSessionDialog {
             command_override: Input::default(),
             error_message: None,
             show_help: false,
-            loading: false,
-            has_hooks: false,
-            current_hook: None,
-            hook_output: Vec::new(),
             path_invalid_flash_until: None,
             path_ghost: None,
             group_ghost: None,
@@ -1021,10 +980,6 @@ impl NewSessionDialog {
             command_override: Input::default(),
             error_message: None,
             show_help: false,
-            loading: false,
-            has_hooks: false,
-            current_hook: None,
-            hook_output: Vec::new(),
             path_invalid_flash_until: None,
             path_ghost: None,
             group_ghost: None,
@@ -1040,10 +995,6 @@ impl NewSessionDialog {
             hover_rects: Vec::new(),
             hover: HoverState::default(),
         }
-    }
-
-    pub fn set_error(&mut self, error: String) {
-        self.error_message = Some(error);
     }
 }
 
@@ -1248,14 +1199,6 @@ impl NewSessionDialog {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> DialogResult<NewSessionData> {
-        if self.loading {
-            if matches!(key.code, KeyCode::Esc) {
-                self.loading = false;
-                return DialogResult::Cancel;
-            }
-            return DialogResult::Continue;
-        }
-
         if self.show_help {
             if matches!(key.code, KeyCode::Esc | KeyCode::Char('?')) {
                 self.show_help = false;
