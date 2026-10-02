@@ -176,6 +176,7 @@ fn test_show_activity_age_toggles_age_column() {
             false,
             &crate::tui::styles::Theme::default(),
             25,
+            false,
         )
         .spans
         .iter()
@@ -214,6 +215,7 @@ fn test_branch_tag_yields_to_title_on_narrow_row() {
             false,
             &crate::tui::styles::Theme::default(),
             width,
+            false,
         )
         .spans
         .iter()
