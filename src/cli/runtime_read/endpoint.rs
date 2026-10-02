@@ -126,9 +126,11 @@ pub(crate) fn select_endpoint(source: &ReadRequestSource) -> Result<SelectedEndp
 ///   which branches on emptiness alone and never trims, so `-p '   '` is a
 ///   profile *name* and must be refused exactly as the local command refuses
 ///   it;
-/// - the variable mirrors the caller that resolves one, which trims first, so
-///   a blank `AGENT_OF_EMPIRES_PROFILE` is the default profile locally and
-///   must be here too.
+/// - the variable goes through the same emptiness test the local caller uses:
+///   `main` hands the raw value over and `resolve_existing_profile` branches on
+///   `is_empty()` alone. Trimming here made `AGENT_OF_EMPIRES_PROFILE='   '`
+///   select the default profile when served and be refused as a profile *name*
+///   when local, which is the opposite of the parity this transport exists for.
 pub(crate) fn selected_profile_source(source: &ReadRequestSource) -> ProfileSource<'_> {
     if let Some(value) = source.explicit_profile.as_deref() {
         return if value.is_empty() {
@@ -138,7 +140,7 @@ pub(crate) fn selected_profile_source(source: &ReadRequestSource) -> ProfileSour
         };
     }
     if let Some(value) = source.env_profile.as_deref() {
-        return if value.to_str().is_some_and(|text| text.trim().is_empty()) {
+        return if value.is_empty() {
             ProfileSource::Default
         } else {
             ProfileSource::Environment(value)
@@ -496,15 +498,29 @@ mod tests {
             ),
             "a blank flag is a profile name, which the local path refuses"
         );
-        // A blank *variable* is the other rule: the local path trims it before
-        // resolving, so it is the default profile here as well.
+        // A blank *variable* is a profile name here, exactly as a blank flag
+        // is. `main` hands `cli.profile` the raw value and
+        // `resolve_existing_profile` branches on `is_empty()` alone -- nothing
+        // in the local path trims it -- so treating it as the default profile
+        // made a served read answer a question the local command answers the
+        // other way.
         for env_profile in [Some("   "), Some("\t\n")] {
             let source = source_with(None, None, None, env_profile);
             assert!(
-                matches!(selected_profile_source(&source), ProfileSource::Default),
-                "{env_profile:?} is trimmed away before it is resolved"
+                matches!(
+                    selected_profile_source(&source),
+                    ProfileSource::Environment(value) if value == OsStr::new(env_profile.unwrap())
+                ),
+                "{env_profile:?} is a profile name, which the local path refuses"
             );
         }
+        // Only a genuinely empty variable means "no selection", which is what
+        // the loop above the first one covers.
+        let source = source_with(None, None, None, Some(""));
+        assert!(
+            matches!(selected_profile_source(&source), ProfileSource::Default),
+            "an empty variable is unset"
+        );
         // An explicit `-p ''` also means "no selection", and it still wins
         // over the variable, because that is how the local path reads it.
         let source = source_with(None, None, Some(""), Some("environment"));

@@ -853,8 +853,17 @@ fn validate_projects(projects: &[ProjectRead], scope: ProjectScope) -> Result<()
 }
 
 fn validate_session(session: &SessionRead) -> Result<(), &'static str> {
-    for value in [&session.id, &session.title, &session.profile] {
+    // `id` and `profile` are names this half chose, so they are never empty.
+    // `title` is not: `aoe add --title "   "` stores an empty title, the
+    // local command prints it, and refusing the whole snapshot over it took
+    // every served read down for a row the local path is happy with. A title
+    // still may not carry a control character, which is what `valid_text`
+    // refuses -- see the writer-side check in `cli/add.rs`.
+    for value in [&session.id, &session.profile] {
         validate_safe_text(value)?;
+    }
+    if !valid_text(&session.title) {
+        return Err("schema_invalid");
     }
     for value in [&session.tool, &session.command] {
         if !valid_text(value) {
