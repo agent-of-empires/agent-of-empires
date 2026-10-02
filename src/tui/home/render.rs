@@ -434,8 +434,8 @@ enum SunkRow {
 }
 
 /// The archive/trash, snooze and urgent overlays every view mode paints on top of its
-/// [`RowSeed`], plus the matching title prefix. Favorite lives in its own gutter. `sunk` says how this view resolves
-/// a sunk row; see [`SunkRow`].
+/// [`RowSeed`], plus the matching title prefix. `sunk` says how this view resolves a sunk
+/// row; see [`SunkRow`].
 fn decorate_row(
     inst: &crate::session::Instance,
     in_attention: bool,
@@ -1535,15 +1535,16 @@ impl HomeView {
             || serve_open
     }
 
-    /// Reserve the favorite gutter on every row while a visible row is a pinned
-    /// favorite, so titles stay aligned. Favorite pins under Attention sort, or in any
-    /// sort with favorites-first on (the `Context::FavoritesUsable` predicate).
+    /// Reserve the favorite gutter on every row while any session is a pinned favorite,
+    /// so titles stay aligned and collapsing a group does not shift the list. Favorite
+    /// pins under Attention sort, or in any sort with favorites-first on (the
+    /// `Context::FavoritesUsable` predicate).
     pub(super) fn favorite_gutter(&self) -> bool {
         (self.sort_order == SortOrder::Attention || crate::session::favorites_first())
-            && self.flat_items.iter().any(|item| {
-                matches!(item, Item::Session { id, .. }
-                    if self.get_instance(id).is_some_and(crate::session::is_live_favorite))
-            })
+            && self
+                .instances
+                .values()
+                .any(crate::session::is_live_favorite)
     }
 
     pub(super) fn render_item_line(
@@ -1772,9 +1773,14 @@ impl HomeView {
             let favorited = matches!(item, Item::Session { id, .. }
                 if self.get_instance(id).is_some_and(crate::session::is_live_favorite));
             line_spans.push(if favorited {
+                let star_style = Style::default().fg(theme.favorite);
                 Span::styled(
                     format!("{ICON_FAVORITE} "),
-                    Style::default().fg(theme.favorite),
+                    if is_selected {
+                        selected_row_style(star_style, theme)
+                    } else {
+                        star_style
+                    },
                 )
             } else {
                 Span::raw("  ")

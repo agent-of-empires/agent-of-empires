@@ -80,7 +80,7 @@ pub struct Theme {
     /// Color for a session carrying an unread marker, applied to resting rows in
     /// place of the decaying idle color so unread work stands out without being as
     /// loud as Waiting/Error. Gated on `session.unread_indicator`. A TOML omitting
-    /// this inherits that theme's own `accent` via `fill_unread_from_accent`.
+    /// this inherits that theme's own `accent` via `fill_from_accent`.
     #[serde(with = "hex_color")]
     pub unread: Color,
     /// Color of the favorite mark in the session list gutter. A TOML omitting this

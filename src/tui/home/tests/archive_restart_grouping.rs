@@ -2433,6 +2433,25 @@ fn favorite_gutter_follows_pin_predicate() {
         }
     }
 
+    // A selected star that would vanish on the selection background falls back to text.
+    let mut low_contrast = theme.clone();
+    low_contrast.favorite = low_contrast.session_selection;
+    let item = env
+        .view
+        .flat_items
+        .iter()
+        .find(|i| matches!(i, Item::Session { id: sid, .. } if *sid == fav))
+        .cloned()
+        .expect("session item present");
+    env.view.mutate_instance(&fav, |inst| {
+        inst.unsnooze();
+        inst.favorite();
+    });
+    let selected = env
+        .view
+        .render_item_line(&item, true, false, &low_contrast, 200, true);
+    assert_eq!(selected.spans[0].style.fg, Some(low_contrast.text));
+
     crate::session::set_favorites_first(original);
 
     // Snooze prefix is Attention-only.
