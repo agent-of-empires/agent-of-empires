@@ -1458,8 +1458,8 @@ pub struct SessionConfig {
     pub row_tag: RowTagMode,
 
     /// Show the age column at the right edge of each session row: time since
-    /// the agent stopped on Idle rows, time since last access otherwise, and
-    /// remaining snooze time under the Attention sort.
+    /// the agent stopped on Idle rows, time since last access on Unknown rows,
+    /// and remaining snooze time under the Attention sort.
     #[serde(default = "default_true")]
     #[setting(label = "Show Session Age", widget = "toggle", tui_only)]
     pub show_activity_age: bool,

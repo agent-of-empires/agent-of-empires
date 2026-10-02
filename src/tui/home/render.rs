@@ -828,31 +828,39 @@ fn activity_column_padding(
     }
 }
 
-/// Fewest title cells kept before a row gives up its right-edge column instead.
+/// Fewest title cells kept before a row gives up its right-edge column.
 const MIN_TITLE_CELLS: usize = 8;
 
-/// Cells the title gets on a session row. `room` is what is left after the prefix and
-/// row tag, `trailing` the right-edge column (age slot, badge, margin). A title that does
-/// not fit beside the column is shortened down to `MIN_TITLE_CELLS`; below that the
-/// column is dropped and the title takes all of `room`.
-fn title_width_for_column(title_width: usize, room: usize, trailing: usize) -> usize {
+/// Cells the title gets on a session row, and whether the row tag stays. `room` is what
+/// is left after the prefix, `trailing` the right-edge column (age slot, badge, margin).
+/// Space runs out in this order: the tag goes first, then the title shortens down to
+/// `MIN_TITLE_CELLS`, then the column goes and the title takes all of `room`.
+fn title_width_for_column(
+    title_width: usize,
+    room: usize,
+    tag_width: usize,
+    trailing: usize,
+) -> (usize, bool) {
+    if title_width + tag_width + trailing <= room {
+        return (title_width, true);
+    }
     let beside_column = room.saturating_sub(trailing);
     let budget = if beside_column >= MIN_TITLE_CELLS {
         beside_column
     } else {
         room
     };
-    title_width.min(budget)
+    (title_width.min(budget), false)
 }
 
-/// The activity column's text: remaining snooze under Attention sort, else time since
-/// the agent stopped on Idle rows, else blank. `last_accessed_at` is only a fallback for
-/// a missing `idle_entered_at`; on an active row it reads as idle time.
+/// The activity column's text: remaining snooze under Attention sort, else the age of a
+/// resting (Idle or Unknown) row, else blank. `last_accessed_at` is only a fallback for a
+/// missing `idle_entered_at`; on an active row it reads as idle time.
 fn row_age(inst: &crate::session::Instance, in_attention: bool) -> String {
     if let Some(remaining) = in_attention.then(|| inst.snooze_remaining()).flatten() {
         return format_snooze_remaining(remaining);
     }
-    if inst.status != Status::Idle {
+    if !matches!(inst.status, Status::Idle | Status::Unknown) {
         return String::new();
     }
     format_relative_age(inst.idle_entered_at.or(inst.last_accessed_at))
@@ -1853,23 +1861,29 @@ impl HomeView {
                 None
             };
         let badge_width = badge_text.map_or(0, |s| s.len());
-        let slot_width = if self.show_activity_age {
+        let age = if self.show_activity_age {
+            row_age(inst, in_attention)
+        } else {
+            String::new()
+        };
+        // A blank age keeps its slot only to line the badge up with the rows around it.
+        let slot_width = if self.show_activity_age && (!age.is_empty() || badge_text.is_some()) {
             LAST_ACTIVITY_SLOT
         } else {
             0
         };
 
-        let tag_width = tag_span.as_ref().map_or(0, |s| s.width());
-        let title_width = title_width_for_column(
+        let (title_width, keep_tag) = title_width_for_column(
             rendered_width(&text),
-            room.saturating_sub(tag_width),
+            room,
+            tag_span.as_ref().map_or(0, |s| s.width()),
             slot_width + badge_width + LAST_ACTIVITY_RIGHT_MARGIN,
         );
         line_spans.push(Span::styled(
             truncate_to_width(&text, title_width),
             text_style,
         ));
-        line_spans.extend(tag_span);
+        line_spans.extend(tag_span.filter(|_| keep_tag));
 
         let used_width: usize = line_spans.iter().map(|s| s.width()).sum();
         let column_pad = activity_column_padding(used_width, list_width, slot_width, badge_width);
@@ -1877,8 +1891,7 @@ impl HomeView {
         if let Some(pad_len) = column_pad.filter(|&p| p > 0) {
             line_spans.push(Span::raw(" ".repeat(pad_len)));
         }
-        if column_fits && self.show_activity_age {
-            let age = row_age(inst, in_attention);
+        if column_fits && slot_width > 0 {
             let padded = format!("{:>width$}", age, width = LAST_ACTIVITY_SLOT);
             let activity_style = Style::default().fg(theme.dimmed);
             line_spans.push(Span::styled(
@@ -4693,17 +4706,34 @@ mod tests {
 
     #[test]
     fn title_width_for_column_cases() {
-        // (name, title, room, trailing, expected); MIN_TITLE_CELLS is 8.
+        // (name, title, room, tag, trailing, expected); MIN_TITLE_CELLS is 8.
         let cases = [
-            ("fits beside column", 10, 25, 7, 10),
-            ("shortened to keep column", 20, 25, 7, 18),
-            ("too narrow, column dropped", 20, 14, 7, 14),
-            ("short title keeps column on narrow pane", 5, 12, 7, 5),
-            ("no room", 5, 0, 7, 0),
+            ("fits beside column", 10, 25, 0, 7, (10, true)),
+            ("shortened to keep column", 20, 25, 0, 7, (18, false)),
+            ("too narrow, column dropped", 20, 14, 0, 7, (14, false)),
+            ("short title keeps column", 5, 12, 0, 7, (5, true)),
+            ("no room", 5, 0, 0, 7, (0, false)),
+            ("fits beside tag and column", 10, 40, 16, 7, (10, true)),
+            (
+                "tag dropped before title shortens",
+                20,
+                30,
+                16,
+                7,
+                (20, false),
+            ),
+            (
+                "tag dropped, then title shortened",
+                30,
+                30,
+                16,
+                7,
+                (23, false),
+            ),
         ];
-        for (name, title, room, trailing, expected) in cases {
+        for (name, title, room, tag, trailing, expected) in cases {
             assert_eq!(
-                title_width_for_column(title, room, trailing),
+                title_width_for_column(title, room, tag, trailing),
                 expected,
                 "{name}"
             );
@@ -4711,13 +4741,14 @@ mod tests {
     }
 
     #[test]
-    fn row_age_only_on_idle_or_snoozed_rows() {
+    fn row_age_only_on_resting_or_snoozed_rows() {
         let five_min_ago = Some(Utc::now() - chrono::Duration::minutes(5));
         let mut inst = crate::session::Instance::new("a", "/tmp/a");
         inst.idle_entered_at = five_min_ago;
         inst.last_accessed_at = five_min_ago;
         for (status, expected) in [
             (Status::Idle, "5m"),
+            (Status::Unknown, "5m"),
             (Status::Running, ""),
             (Status::Waiting, ""),
             (Status::Error, ""),
