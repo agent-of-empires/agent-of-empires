@@ -89,27 +89,31 @@ interface NoticeTone {
   dismiss: string;
 }
 
+// Solid theme surfaces: a translucent severity wash darkens a light theme's
+// surface below AA for the text on it, so severity rides on border and icon.
+const NOTICE_ROW = "flex items-start gap-2 rounded-lg border bg-surface-850 px-2.5 py-1.5";
+const NOTICE_DISMISS =
+  "inline-flex shrink-0 items-center justify-center rounded-md border border-surface-700 p-1 text-text-primary hover:bg-surface-800";
+
 const ERROR_TONE: NoticeTone = {
-  strip: "border-red-900/40 bg-red-950/20",
-  row: "flex items-start gap-2 rounded-lg border border-red-700/30 bg-red-950/15 px-2.5 py-1.5",
-  icon: "mt-0.5 h-4 w-4 shrink-0 text-red-300",
-  dismiss:
-    "inline-flex shrink-0 items-center justify-center rounded-md border border-red-700/40 bg-red-900/20 p-1 text-red-200 hover:bg-red-900/60",
+  strip: "border-red-700/40 bg-surface-900",
+  row: `${NOTICE_ROW} border-red-700/40`,
+  icon: "mt-0.5 h-4 w-4 shrink-0 text-status-error",
+  dismiss: NOTICE_DISMISS,
 };
 
 const WARNING_TONE: NoticeTone = {
-  strip: AMBER_STRIP,
-  row: AMBER_ROW,
-  icon: "mt-0.5 h-4 w-4 shrink-0 text-amber-300",
-  dismiss: AMBER_DISMISS,
+  strip: "border-amber-700/40 bg-surface-900",
+  row: `${NOTICE_ROW} border-amber-700/40`,
+  icon: "mt-0.5 h-4 w-4 shrink-0 text-status-warning",
+  dismiss: NOTICE_DISMISS,
 };
 
 const INFO_TONE: NoticeTone = {
-  strip: "border-sky-900/40 bg-sky-950/20",
-  row: "flex items-start gap-2 rounded-lg border border-sky-700/30 bg-sky-950/15 px-2.5 py-1.5",
-  icon: "mt-0.5 h-4 w-4 shrink-0 text-sky-300",
-  dismiss:
-    "inline-flex shrink-0 items-center justify-center rounded-md border border-sky-700/40 bg-sky-900/20 p-1 text-sky-200 hover:bg-sky-900/60",
+  strip: "border-sky-700/40 bg-surface-900",
+  row: `${NOTICE_ROW} border-sky-700/40`,
+  icon: "mt-0.5 h-4 w-4 shrink-0 text-accent-500",
+  dismiss: NOTICE_DISMISS,
 };
 
 /** An unknown future ACP level reads as advisory rather than alarming. */
@@ -146,7 +150,7 @@ export function SessionNoticesStrip({
               <div className="min-w-0 flex-1">
                 <p className="text-xs leading-5 text-text-primary">{notice.title}</p>
                 {notice.description ? (
-                  <p className="mt-0.5 text-[11px] leading-4 text-text-secondary">{notice.description}</p>
+                  <p className="mt-0.5 text-[11px] leading-4 text-text-primary">{notice.description}</p>
                 ) : null}
               </div>
               <button

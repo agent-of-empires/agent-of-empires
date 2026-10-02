@@ -572,6 +572,14 @@ mod tests {
                 contrast_ratio(var("--color-text-on-brand"), var("--color-brand-600")) >= 4.5,
                 "{name}: color-text-on-brand must remain readable on brand-600"
             );
+            // The session notices strip sets its text on these solid surfaces.
+            for surface in ["--color-surface-900", "--color-surface-850"] {
+                let ratio = contrast_ratio(var("--color-text-primary"), var(surface));
+                assert!(
+                    ratio >= 4.5,
+                    "{name}: text-primary on {surface} is {ratio:.2}, below AA"
+                );
+            }
             let frame = var("--color-session-active");
             let fill = var("--color-surface-800");
             // The third surface is the fill an open row takes while it is also
