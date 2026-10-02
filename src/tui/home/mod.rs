@@ -148,6 +148,7 @@ pub struct HomeView {
     pub(super) sort_order: SortOrder,
     pub(super) group_by: GroupByMode,
     pub(super) row_tag_mode: crate::session::config::RowTagMode,
+    pub(super) show_activity_age: bool,
     pub(super) agent_clipboard_forward: bool,
     pub(super) hyperlink_cells: crate::tui::hyperlink::SharedHyperlinks,
     pub(super) vt_live_enabled: bool,
