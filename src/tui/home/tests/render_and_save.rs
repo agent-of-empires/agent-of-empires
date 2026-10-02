@@ -190,6 +190,46 @@ fn test_show_activity_age_toggles_age_column() {
     );
 }
 
+/// On a row too narrow for title and branch tag, the tag gives way and the title stays.
+#[test]
+#[serial]
+fn test_branch_tag_yields_to_title_on_narrow_row() {
+    let (_temp, _guard) = test_home();
+    seed_profile("alpha", &[worktree_instance("my-session")]);
+    let mut view = test_view(Some("alpha"));
+    view.group_by = crate::session::config::GroupByMode::Manual;
+    view.row_tag_mode = crate::session::config::RowTagMode::Branch;
+    view.show_activity_age = false;
+    view.flat_items = view.build_flat_items();
+    let row = view
+        .flat_items
+        .iter()
+        .find(|item| matches!(item, Item::Session { .. }))
+        .cloned()
+        .expect("session row");
+    let render = |width| -> String {
+        view.render_item_line(
+            &row,
+            false,
+            false,
+            &crate::tui::styles::Theme::default(),
+            width,
+        )
+        .spans
+        .iter()
+        .map(|s| s.content.as_ref())
+        .collect()
+    };
+    let wide = render(60);
+    assert!(
+        wide.contains("my-session") && wide.contains("[foo"),
+        "{wide:?}"
+    );
+    let narrow = render(18);
+    assert!(narrow.contains("my-session"), "{narrow:?}");
+    assert!(!narrow.contains("[foo"), "{narrow:?}");
+}
+
 #[test]
 #[serial]
 fn test_create_session_in_all_mode_is_findable() {
