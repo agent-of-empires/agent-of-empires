@@ -22,8 +22,10 @@ runs:
       run: |
         set -euo pipefail
         channel="$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)"
-        if [ -z "$channel" ]; then
-          echo "::error::No channel in rust-toolchain.toml"
+        # x.y.z only: a channel name would drift again (#4246), and the value
+        # reaches rustup command lines inside dtolnay/rust-toolchain.
+        if ! [[ "$channel" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+          echo "::error::rust-toolchain.toml channel '$channel' is not a pinned x.y.z version"
           exit 1
         fi
         echo "channel=$channel" >> "$GITHUB_OUTPUT"

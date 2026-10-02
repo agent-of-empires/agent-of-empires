@@ -209,10 +209,11 @@ jobs:
 
       - name: Build PR body
         id: body
+        env:
+          BUMP: ${{ steps.next.outputs.bump }}
         run: |
           VERSION="${{ steps.next.outputs.version }}"
           CURRENT="${{ steps.current.outputs.version }}"
-          BUMP="${{ steps.next.outputs.bump }}"
           {
             echo "<!-- release-version: ${VERSION} -->"
             echo

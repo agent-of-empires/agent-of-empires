@@ -31,6 +31,13 @@ jobs:
           LATEST="$(curl --fail --silent --show-error --retry 3 \
               https://static.rust-lang.org/dist/channel-rust-stable.toml \
             | python3 -c 'import sys, tomllib; print(tomllib.load(sys.stdin.buffer)["pkg"]["rust"]["version"].split()[0])')"
+          # LATEST reaches sed and the PR body; accept nothing but a version.
+          for v in "$CURRENT" "$LATEST"; do
+            if ! [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "::error::unexpected toolchain version '$v'"
+              exit 1
+            fi
+          done
           echo "current=$CURRENT" >> "$GITHUB_OUTPUT"
           echo "latest=$LATEST" >> "$GITHUB_OUTPUT"
           NEWEST="$(printf '%s\n%s\n' "$CURRENT" "$LATEST" | sort -V | tail -1)"
@@ -57,8 +64,17 @@ jobs:
           git diff --exit-code --quiet rust-toolchain.toml && { echo "::error::sed did not change rust-toolchain.toml"; exit 1; }
 
           REMOTE="https://x-access-token:${GH_TOKEN}@github.com/${BASE_REPO}.git"
+          BOT_EMAIL="github-actions[bot]@users.noreply.github.com"
+          # The force-push below rebuilds the branch from main; never discard
+          # lint fixes someone pushed onto an open bump PR.
+          if git fetch --quiet "$REMOTE" "refs/heads/${HEAD_BRANCH}" 2>/dev/null; then
+            if git log --format=%ae HEAD..FETCH_HEAD | grep -qvxF "$BOT_EMAIL"; then
+              echo "::warning::${HEAD_BRANCH} has commits from someone else; not overwriting it with ${LATEST}"
+              exit 0
+            fi
+          fi
           git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.email "$BOT_EMAIL"
           git checkout -B "$HEAD_BRANCH"
           git commit -am "chore: bump Rust toolchain to ${LATEST}"
           # Bot-owned branch, always rebuilt from main.
