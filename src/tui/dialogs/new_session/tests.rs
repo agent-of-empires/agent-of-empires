@@ -324,6 +324,14 @@ fn the_tool_row_cycles_and_submits_the_picked_tool() {
         dialog.handle_key(key(KeyCode::Char(c)));
         assert_eq!(dialog.tool_index, expected);
     }
+    // Re-picking the current tool keeps the user's edits, and Alt+digit is not a pick.
+    dialog.extra_args = Input::new("--model x".to_string());
+    dialog.yolo_mode = !dialog.yolo_mode_default;
+    dialog.handle_key(key(KeyCode::Char('2')));
+    dialog.handle_key(alt_key(KeyCode::Char('3')));
+    assert_eq!(dialog.tool_index, 1);
+    assert_eq!(dialog.extra_args.value(), "--model x");
+    assert_ne!(dialog.yolo_mode, dialog.yolo_mode_default);
     assert_eq!(
         submitted(dialog.handle_key(key(KeyCode::Enter))).tool,
         "opencode"

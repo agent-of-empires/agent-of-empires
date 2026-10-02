@@ -484,6 +484,8 @@ impl NewSessionDialog {
                 hint_spans.push(Span::raw(" groups  "));
             }
             if self.focused_field == fields.tool {
+                hint_spans.push(Span::styled("1-9", Style::default().fg(theme.hint)));
+                hint_spans.push(Span::raw(" pick  "));
                 hint_spans.push(Span::styled("Ctrl+P", Style::default().fg(theme.hint)));
                 hint_spans.push(Span::raw(" configure  "));
             }
