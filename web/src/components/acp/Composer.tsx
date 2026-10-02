@@ -3,14 +3,12 @@
 
 import { ComposerPrimitive } from "@assistant-ui/react";
 import { unstable_defaultDirectiveFormatter as defaultDirectiveFormatter } from "@assistant-ui/core";
-import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useMemo, useRef, useSyncExternalStore } from "react";
 import { AtSign, Paperclip, Pencil, Slash } from "lucide-react";
 
 import { useFocusTerminalTarget } from "../../hooks/useFocusTerminalTarget";
 import { useMobileKeyboard } from "../../hooks/useMobileKeyboard";
 import { useSkillIndex } from "../../hooks/useSkillIndex";
-import { switchAcpProvider } from "../../lib/api";
-import { reportError } from "../../lib/toastBus";
 import { clearDraft, clearDraftAttachments } from "../../lib/acpDrafts";
 import type { AcpState, PromptAttachmentInput, PromptCapabilities, QueuedPrompt } from "../../lib/acpTypes";
 import { isIOS, isStandalone } from "../../lib/platform";
@@ -60,6 +58,7 @@ import {
   type ComposerClient,
 } from "./useComposerHooks";
 import { useDictationBurstGuard } from "./useDictationBurstGuard";
+import { useProviderSwitch } from "./useProviderSwitch";
 
 interface Props {
   sessionId: string;
@@ -347,6 +346,7 @@ export function Composer(props: Props) {
                   provider={provider.current}
                   providerPending={provider.pending}
                   onSetProvider={provider.set}
+                  providerLockedReason={turnActive ? "Switch providers once the turn finishes" : null}
                 />
                 <UsageHint usage={props.sessionUsage} />
               </div>
@@ -381,43 +381,6 @@ export function Composer(props: Props) {
       />
     </div>
   );
-}
-
-/** The routing flags only mean something to Claude, so the picker is absent
- *  for every other agent and the server refuses the call anyway.
- *
- *  The switch has no event of its own, so the session row carrying
- *  `acp_provider` only catches up on the next poll. The echo stands in until
- *  then. It records the value it replaced and applies only while the row still
- *  reports that one, so the server stays authoritative: the confirming poll
- *  retires it, and so does a switch made from another tab or the CLI. */
-type ProviderEcho = { sessionId: string; value: string; from: string | null } | null;
-
-function useProviderSwitch(sessionId: string, agent: string | null, serverProvider: string | null) {
-  const [pending, setPending] = useState<ProviderEcho>(null);
-  const [accepted, setAccepted] = useState<ProviderEcho>(null);
-  const supported = agent === "claude" || agent === "claude-code";
-
-  const live = (echo: ProviderEcho) =>
-    echo && echo.sessionId === sessionId && echo.from === serverProvider ? echo.value : null;
-
-  const set = useCallback(
-    async (next: string) => {
-      setPending({ sessionId, value: next, from: serverProvider });
-      try {
-        const result = await switchAcpProvider(sessionId, next);
-        setAccepted({ sessionId, value: result.provider, from: serverProvider });
-      } catch (e) {
-        reportError(`Provider switch failed: ${e instanceof Error ? e.message : String(e)}`);
-      } finally {
-        setPending(null);
-      }
-    },
-    [sessionId, serverProvider],
-  );
-
-  if (!supported) return { current: null, pending: null, set: undefined };
-  return { current: live(accepted) ?? serverProvider, pending: live(pending), set };
 }
 
 function pluginSnapshot(client: ComposerClient, taRef: React.RefObject<HTMLTextAreaElement | null>) {
