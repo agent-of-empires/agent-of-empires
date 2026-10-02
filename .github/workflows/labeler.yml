@@ -1,0 +1,53 @@
+name: Labeler
+
+# Adds `ci-macos` to PRs that touch macOS-sensitive code, so the macOS suite
+# runs before merge instead of after (#4228, #4245).
+#
+# pull_request_target so fork PRs can be labelled. Safe because nothing from
+# the PR is checked out or executed: labeler reads .github/labeler.yml from
+# the base branch and the PR's file list from the API, and the script below
+# only reads diff text from the API.
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  ci-macos:
+    name: Label macOS-sensitive PRs
+    runs-on: ubuntu-latest
+    steps:
+      # RELEASE_TOKEN, not GITHUB_TOKEN: a label added with GITHUB_TOKEN fires
+      # no `labeled` event, so tests.yml would not start the macOS job until
+      # the next push.
+      - uses: actions/labeler@bf12e9b00b37c5c0ca2b87b79b2daf7891dbda13 # v7.0.0
+        with:
+          repo-token: ${{ secrets.RELEASE_TOKEN }}
+
+      - name: Label diffs that touch a macOS cfg
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          github-token: ${{ secrets.RELEASE_TOKEN }}
+          script: |
+            const label = 'ci-macos';
+            const pr = context.payload.pull_request;
+            const { owner, repo } = context.repo;
+            const { data: current } = await github.rest.issues.listLabelsOnIssue({
+              owner, repo, issue_number: pr.number,
+            });
+            if (current.some(l => l.name === label)) return;
+
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              owner, repo, pull_number: pr.number, per_page: 100,
+            });
+            const cfg = /target_os\s*=\s*"macos"/;
+            const hit = files.find(f => (f.patch || '').split('\n').some(line =>
+              /^[+-](?![+-]{2} )/.test(line) && cfg.test(line)));
+            if (!hit) return;
+            core.info(`${hit.filename} changes a target_os = "macos" line`);
+            await github.rest.issues.addLabels({
+              owner, repo, issue_number: pr.number, labels: [label],
+            });
