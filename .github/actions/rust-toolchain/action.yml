@@ -1,0 +1,34 @@
+name: Install Rust toolchain
+description: >
+  Installs the toolchain pinned in rust-toolchain.toml, so every job builds
+  with the same reviewed version rather than whatever `stable` is today.
+
+inputs:
+  components:
+    description: Extra rustup components, comma separated.
+    required: false
+    default: ''
+  targets:
+    description: Extra compilation targets, comma separated.
+    required: false
+    default: ''
+
+runs:
+  using: composite
+  steps:
+    - name: Read pinned channel
+      id: pin
+      shell: bash
+      run: |
+        set -euo pipefail
+        channel="$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)"
+        if [ -z "$channel" ]; then
+          echo "::error::No channel in rust-toolchain.toml"
+          exit 1
+        fi
+        echo "channel=$channel" >> "$GITHUB_OUTPUT"
+    - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      with:
+        toolchain: ${{ steps.pin.outputs.channel }}
+        components: ${{ inputs.components }}
+        targets: ${{ inputs.targets }}

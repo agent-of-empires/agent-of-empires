@@ -133,7 +133,7 @@ jobs:
         run: cd web && npm install && npm run build
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        uses: ./.github/actions/rust-toolchain
         with:
           targets: ${{ matrix.target }}
 

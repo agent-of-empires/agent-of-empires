@@ -42,7 +42,7 @@ jobs:
           # (zizmor artipacked). Matches the hardened convention in ci.yml and
           # release.yml.
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: ./.github/actions/rust-toolchain
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           # Cache compiled binaries too. Same-PR pushes that don't
@@ -300,7 +300,7 @@ jobs:
           # (zizmor artipacked). Matches the hardened convention in ci.yml and
           # release.yml.
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: ./.github/actions/rust-toolchain
         if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci-macos')
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci-macos')
