@@ -366,6 +366,9 @@ fn reselecting_the_current_tool_keeps_its_edits() {
     dialog.yolo_mode = !dialog.yolo_mode_default;
 
     dialog.handle_key(key(KeyCode::Char('2')));
+    // Alt+digit is not a pick.
+    dialog.handle_key(alt_key(KeyCode::Char('3')));
+    assert_eq!(dialog.tool_index, 1);
     assert_eq!(dialog.extra_args.value(), "--model fast");
     assert_eq!(dialog.command_override.value(), "wrapper");
     assert_ne!(dialog.yolo_mode, dialog.yolo_mode_default);

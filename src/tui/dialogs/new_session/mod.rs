@@ -1450,7 +1450,9 @@ impl NewSessionDialog {
                 self.select_tool_index(index);
                 DialogResult::Continue
             }
-            KeyCode::Char(c @ '1'..='9') if self.focused_field == fields.tool => {
+            KeyCode::Char(c @ '1'..='9')
+                if self.focused_field == fields.tool && key.modifiers.is_empty() =>
+            {
                 let index = c as usize - '1' as usize;
                 if index < self.available_tools.len() {
                     self.select_tool_index(index);
