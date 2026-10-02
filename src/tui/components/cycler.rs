@@ -1,9 +1,7 @@
 //! Shared left/right cycler fields for the New and Restart session dialogs.
 //!
-//! Both modals let the user cycle a profile and an AI tool before launch.
-//! Centralizing the span construction keeps the two dialogs visually
-//! identical; previously the restart dialog carried its own divergent
-//! `AI:` label and `< value >` tool styling.
+//! Both modals let the user cycle a profile and an AI tool before launch and
+//! share these span builders so the rows stay consistent.
 
 use ratatui::prelude::*;
 
