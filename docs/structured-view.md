@@ -60,7 +60,7 @@ Two further effects are worth knowing before you switch:
 - The session's model pick is cleared, because model ids differ between providers. Pick a model again afterwards if you had one pinned.
 - A sandboxed session's container is recreated, since the GCP credential mount is decided when the container is built. Anything written inside the container but outside the workspace volume is lost.
 
-The worker restarts between turns and resumes the same conversation, so an in-flight turn finishes first.
+The switch is refused while a turn or a background agent is running, since it restarts the worker. Once idle, the worker restarts and resumes the same conversation.
 
 ### Feature matrix
 
