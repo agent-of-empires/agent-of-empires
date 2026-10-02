@@ -22,7 +22,7 @@ use super::{
 };
 use crate::acp::acp_client::{AcpError, SpawnConfig};
 use crate::acp::runner_lifecycle::{
-    InstallError, Lease, LifecycleTable, ProcessControl, RunnerIdentity,
+    InstallError, Lease, LifecycleTable, ProcessControl, RunnerIdentity, Settlement,
 };
 use crate::acp::state::{AcpSessionId, Event};
 use crate::process::worker_registry;
@@ -49,6 +49,8 @@ impl<S: BroadcastSink> Supervisor<S> {
             pending_context_resets: Arc::clone(&self.pending_context_resets),
             context_reset,
             respawned_in_place: Arc::clone(&self.respawned_in_place),
+            #[cfg(test)]
+            refusal_gate: self.refusal_gate.clone(),
         };
         crate::task_util::spawn_supervised(
             "supervisor.drain",
@@ -72,6 +74,8 @@ struct Drain<S> {
     pending_context_resets: SharedSet,
     context_reset: Option<PendingContextReset>,
     respawned_in_place: SharedSet,
+    #[cfg(test)]
+    refusal_gate: Option<Arc<super::test_support::Gate>>,
 }
 
 /// What a worker's event stream said before it closed.
@@ -626,9 +630,9 @@ impl<S: BroadcastSink> Drain<S> {
         }
     }
 
-    /// The stored row was archived, trashed or purged since the crash: retire any replacement
-    /// this respawn launched, plus the runner it replaced when a stop is pending, and leave the
-    /// session stopped.
+    /// The stored row was archived, trashed or purged since the crash: retire the replacement
+    /// this respawn launched, if any, and the runner it replaced. The refused session keeps no
+    /// worker, so that runner is an orphan whether or not a stop arrives.
     async fn refuse_respawn(
         &self,
         respawn_lease: &Lease,
@@ -653,22 +657,30 @@ impl<S: BroadcastSink> Drain<S> {
                     generation: r.generation,
                 })
         });
-        let cancelled = lock_recover(&self.lifecycle).cancel_requested(respawn_lease);
-        let previous = previous.filter(|_| cancelled.is_some());
-        if launched.is_some() || previous.is_some() {
-            // Closing the connection does not end the process, so terminate it even when a
-            // peer's stop already took the lease.
-            let owned = lock_recover(&self.lifecycle).convert_to_stopping(respawn_lease);
-            let settlement = match launched {
-                Some(_) => {
-                    tear_down_replacement(&*self.process_control, session_id, launched, previous)
-                        .await
-                }
-                None => tear_down_runner(&*self.process_control, session_id, previous).await,
-            };
-            if owned {
-                settle_lease(&self.lifecycle, &self.notify, respawn_lease, settlement);
+        #[cfg(test)]
+        if let Some(gate) = &self.refusal_gate {
+            gate.entered.notify_one();
+            gate.open.notified().await;
+        }
+        // One lock for the stop reason and the takeover: a later stop finds the teardown claimed.
+        let (cancelled, owned) = {
+            let mut table = lock_recover(&self.lifecycle);
+            let cancelled = table.cancel_requested(respawn_lease);
+            let owned = (launched.is_some() || previous.is_some())
+                && table.convert_to_stopping(respawn_lease);
+            (cancelled, owned)
+        };
+        // Closing the connection does not end the process, so terminate even when a peer's stop
+        // already took the lease.
+        let settlement = match (launched, previous) {
+            (Some(_), _) => {
+                tear_down_replacement(&*self.process_control, session_id, launched, previous).await
             }
+            (None, Some(_)) => tear_down_runner(&*self.process_control, session_id, previous).await,
+            (None, None) => Settlement::Proven,
+        };
+        if owned {
+            settle_lease(&self.lifecycle, &self.notify, respawn_lease, settlement);
         }
         self.publish(match (cancelled, refused) {
             (Some(reason), _) => Event::Stopped { reason },
@@ -1147,7 +1159,7 @@ mod tests {
 
     /// #4206: a row archived or trashed while the crash respawn awaits its `before_session` hook
     /// never reaches the launcher; one dismissed during the handshake retires the replacement.
-    /// A stop that follows the dismissal also retires the runner the respawn replaced.
+    /// Either way the runner the respawn replaced is retired, with or without a following stop.
     #[tokio::test]
     #[serial_test::serial]
     async fn crash_respawn_refuses_a_row_shelved_during_hook_or_handshake() {
@@ -1261,15 +1273,13 @@ mod tests {
                     "{id}: the handshake's replacement is retired: {:?}",
                     control.signals()
                 );
-                assert_eq!(
+                assert!(
                     control.signals().contains(&(4242, "TERM")),
-                    stop,
-                    "{id}: a pending stop retires the runner the respawn replaced: {:?}",
+                    "{id}: the runner the respawn replaced is retired: {:?}",
                     control.signals()
                 );
-                assert_eq!(
+                assert!(
                     worker_registry::load(&id).unwrap().is_none(),
-                    stop || !during_hook,
                     "{id}: every retired runner's record is cleared"
                 );
                 assert!(!sup.workers.lock().await.contains_key(&id), "{id}");
@@ -1351,7 +1361,7 @@ mod tests {
         );
         assert!(
             control.signals().contains(&(4242, "TERM")),
-            "the purge's stop retires the runner the respawn replaced: {:?}",
+            "the runner the respawn replaced is retired: {:?}",
             control.signals()
         );
         assert!(
@@ -1360,6 +1370,170 @@ mod tests {
         );
         assert_eq!(sup.worker_state("s-purged").await, AcpWorkerState::Absent);
         assert!(sup.take_respawned_in_place().is_empty());
+    }
+
+    /// Install a crashed runner (pid 4242) whose stored row is archived, and start its drain.
+    async fn refused_respawn_fixture(
+        id: &str,
+        sup: &Arc<Supervisor<VecSink>>,
+    ) -> tokio::task::JoinHandle<()> {
+        let mut inst = crate::session::Instance::new(id, "/tmp");
+        inst.id = id.to_string();
+        inst.archive();
+        let storage = crate::session::Storage::new_unwatched(&inst.source_profile).unwrap();
+        storage
+            .update(|rows, _| {
+                *rows = vec![inst.clone()];
+                Ok(())
+            })
+            .unwrap();
+        save_record(id, 4242, 0);
+        let mut config = runner_config(worker_registry::socket_path_for(id).unwrap());
+        config.source_profile = Some(inst.source_profile.clone());
+        let lease = sup
+            .test_install_runner(
+                id,
+                config,
+                Some(RunnerIdentity {
+                    pid: 4242,
+                    generation: 0,
+                }),
+            )
+            .await;
+        let (inbound_tx, inbound_rx) = mpsc::channel::<Event>(4);
+        let drain = sup.start_drain_task(id.to_string(), lease, inbound_rx, None);
+        drop(inbound_tx);
+        drain
+    }
+
+    /// #4212: a stop that lands after the refusal decided but before it takes over teardown
+    /// finds the respawn in flight and leaves cleanup to it; the replaced runner must still be
+    /// retired, or stay owned for retry when it survives escalation.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_stop_before_the_refusal_takeover_still_retires_the_replaced_runner() {
+        let _home = isolate_home();
+        for survives in [false, true] {
+            let id = format!("s-late-stop-{survives}");
+            let control =
+                Arc::new(crate::acp::runner_lifecycle::test_support::FakeProcessControl::default());
+            if survives {
+                control.immortal(4242);
+            } else {
+                control.alive(4242);
+            }
+            let gate = Arc::new(Gate::default());
+            let sink = VecSink::new();
+            let sup = Arc::new(
+                Supervisor::new(sink.clone())
+                    .with_process_control(control.clone())
+                    .with_refusal_gate(Arc::clone(&gate)),
+            );
+            let drain = refused_respawn_fixture(&id, &sup).await;
+
+            gate.entered.notified().await;
+            sup.shutdown(&id).await.unwrap();
+            gate.open.notify_one();
+            tokio::time::timeout(Duration::from_secs(10), drain)
+                .await
+                .expect("drain task must finish")
+                .unwrap();
+
+            assert!(
+                control.signals().contains(&(4242, "TERM")),
+                "{id}: {:?}",
+                control.signals()
+            );
+            let (state, record_cleared) = if survives {
+                (AcpWorkerState::Stopping, false)
+            } else {
+                (AcpWorkerState::Absent, true)
+            };
+            assert_eq!(sup.worker_state(&id).await, state, "{id}");
+            assert_eq!(
+                worker_registry::load(&id).unwrap().is_none(),
+                record_cleared,
+                "{id}"
+            );
+            assert_eq!(
+                stopped_reasons(&sink, &id),
+                vec!["user_stopped".to_string()]
+            );
+        }
+    }
+
+    /// #4212: a stop that arrives while the refusal is still tearing down the replacement finds
+    /// the teardown claimed; the replaced runner is retired by that same teardown.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_stop_during_replacement_cleanup_still_retires_the_replaced_runner() {
+        let _home = isolate_home();
+        let id = "s-cleanup-stop";
+        let control =
+            Arc::new(crate::acp::runner_lifecycle::test_support::FakeProcessControl::default());
+        control.alive(4242).immortal(4343);
+        let gate = Gate::default();
+        let sup = Arc::new(
+            Supervisor::new(VecSink::new())
+                .with_process_control(control.clone())
+                .with_launcher(gated_launcher(&gate, 4343)),
+        );
+        let mut inst = crate::session::Instance::new(id, "/tmp");
+        inst.id = id.to_string();
+        let storage = crate::session::Storage::new_unwatched(&inst.source_profile).unwrap();
+        storage
+            .update(|rows, _| {
+                *rows = vec![inst.clone()];
+                Ok(())
+            })
+            .unwrap();
+        save_record(id, 4242, 0);
+        let mut config = runner_config(worker_registry::socket_path_for(id).unwrap());
+        config.source_profile = Some(inst.source_profile.clone());
+        let lease = sup
+            .test_install_runner(
+                id,
+                config,
+                Some(RunnerIdentity {
+                    pid: 4242,
+                    generation: 0,
+                }),
+            )
+            .await;
+        let (inbound_tx, inbound_rx) = mpsc::channel::<Event>(4);
+        let drain = sup.start_drain_task(id.to_string(), lease, inbound_rx, None);
+        drop(inbound_tx);
+
+        gate.entered.notified().await;
+        storage
+            .update(|rows, _| {
+                rows[0].archive();
+                Ok(())
+            })
+            .unwrap();
+        gate.open.notify_one();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !control.signals().contains(&(4343, "TERM")) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "replacement teardown did not start"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        sup.shutdown(id).await.unwrap();
+        control.exit(4343);
+        tokio::time::timeout(Duration::from_secs(10), drain)
+            .await
+            .expect("drain task must finish")
+            .unwrap();
+
+        assert!(
+            control.signals().contains(&(4242, "TERM")),
+            "{:?}",
+            control.signals()
+        );
+        assert_eq!(sup.worker_state(id).await, AcpWorkerState::Absent);
+        assert!(worker_registry::load(id).unwrap().is_none());
     }
 
     /// The reconciler reads this flag to remind the agent its `Monitor` died.
