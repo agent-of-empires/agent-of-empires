@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it } from "vitest";
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 
 import { AuthStatusHint } from "../ComposerControls";
 import type { AuthStatus } from "../../../lib/acpTypes";
@@ -57,5 +57,7 @@ describe("AuthStatusHint", () => {
     // Named and focusable, so keyboard and screen reader users reach the details.
     expect(screen.getByRole("img", { name: /someone@example\.com/ })).toBe(el);
     expect(el.tabIndex).toBe(0);
+    fireEvent.focus(el);
+    expect(screen.getByRole("tooltip").textContent).toContain("someone@example.com");
   });
 });
