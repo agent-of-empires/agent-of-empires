@@ -104,6 +104,37 @@ impl Instance {
         )
     }
 
+    /// Refresh an owned reservation while a bounded or user-defined hook runs. The generation
+    /// remains the identity of the operation; only its liveness timestamp moves forward.
+    pub(crate) fn renew_lifecycle_reservation_if_owned(
+        &mut self,
+        operation: LifecycleOperation,
+        generation: u64,
+        now: DateTime<Utc>,
+    ) -> bool {
+        if self.lifecycle_reservation_is_owned(operation, generation) {
+            if let Some(reservation) = self.lifecycle_reservation.as_mut() {
+                reservation.at = now;
+                return true;
+            }
+        }
+        false
+    }
+
+    pub(crate) fn start_reservation_heartbeat(
+        &self,
+        storage: &crate::session::storage::Storage,
+        operation: LifecycleOperation,
+    ) -> Result<crate::session::ReservationHeartbeat> {
+        crate::session::ReservationHeartbeat::start(
+            storage,
+            &self.id,
+            operation,
+            self.lifecycle_generation,
+            std::time::Duration::from_secs(60),
+        )
+    }
+
     pub fn release_lifecycle_reservation_if_owned(
         &mut self,
         operation: LifecycleOperation,
