@@ -228,6 +228,43 @@ async fn pinned_model_skipped_when_already_current() {
     }
 }
 
+/// A resumed session runs on its transcript's model, which after a provider
+/// switch may be one the new provider does not serve. Dropping the pin leaves
+/// it there; the `default` pin a switch writes moves it to the provider's own.
+#[tokio::test]
+#[serial_test::parallel]
+async fn default_pin_moves_a_resumed_session_off_its_transcript_model() {
+    if let Err(reason) = shim_ready() {
+        eprintln!("skipping: {reason}");
+        return;
+    }
+    for (pin, expect_reset) in [(Some("default"), true), (None, false)] {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let record_path = temp.path().join("config-option-calls.log");
+        let mut env = shim_env(&record_path, true, true);
+        env.push(("SHIM_RESUMED_MODEL".into(), "opus".into()));
+        let config = spawn_config(
+            shim_path(),
+            env,
+            Some("stored-transcript-session".into()),
+            pin.map(str::to_string),
+            Some("high".into()),
+        );
+        run(config, "resumed-model").await;
+
+        let recorded = std::fs::read_to_string(&record_path).unwrap_or_default();
+        assert!(
+            recorded.lines().any(|line| line == "thought_level=high"),
+            "{pin:?}: the post-handshake apply path must have run (recorded: {recorded:?})"
+        );
+        assert_eq!(
+            recorded.lines().any(|line| line == "model=default"),
+            expect_reset,
+            "{pin:?}: recorded {recorded:?}"
+        );
+    }
+}
+
 /// A value the agent rejects (a stale alias after an upgrade, a pick persisted
 /// from another agent's namespace) warns and never fails the spawn: the session
 /// still comes up and answers, on the agent's own model, and the user is told.

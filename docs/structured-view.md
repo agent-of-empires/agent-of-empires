@@ -57,7 +57,7 @@ The pick only sets `CLAUDE_CODE_USE_BEDROCK` and `CLAUDE_CODE_USE_VERTEX`, and i
 
 Two further effects are worth knowing before you switch:
 
-- The session's model pick is cleared, because model ids differ between providers. Pick a model again afterwards if you had one pinned.
+- The model is reset to the new provider's default, because model ids differ between providers and a resumed conversation would otherwise stay on the model it last ran. Pick a model again afterwards if you had one pinned.
 - A sandboxed session's container is recreated, since the GCP credential mount is decided when the container is built. Anything written inside the container but outside the workspace volume is lost.
 
 The switch is refused while a turn or a background agent is running, since it restarts the worker. Once idle, the worker restarts and resumes the same conversation.

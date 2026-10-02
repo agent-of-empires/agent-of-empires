@@ -277,8 +277,8 @@ pub struct SwitchProviderRequest {
 pub struct SwitchProviderResponse {
     pub session_id: String,
     pub provider: String,
-    /// The switch clears the model pick, because model ids are
-    /// provider-specific and the old one would be re-asserted on respawn.
+    /// Whether a model pick was replaced. The switch resets the model to the
+    /// new provider's default, because model ids are provider-specific.
     pub model_cleared: bool,
     pub status: String,
 }

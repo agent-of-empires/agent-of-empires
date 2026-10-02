@@ -1666,7 +1666,7 @@ Manage the ACP structured-view workers (doctor, ps, logs, prompt, approve, ...)
 * `tail` — Stream the agent broadcast for a session to stdout as JSON lines (one frame per line). Press Ctrl-C to stop
 * `attach` — Open the TUI structured view directly for a known session id. Combine with `AOE_DAEMON_URL` (+ `AOE_DAEMON_TOKEN`, or `AOE_DAEMON_PASSPHRASE` against a `--auth=passphrase` daemon) to attach across machines without going through the home session list
 * `switch-agent` — Switch an agent session to a different ACP agent, keeping the transcript. Valid targets are built-in registry agents and any custom agent configured in `[session.agent_acp_cmd]`. The new agent starts fresh; use `aoe acp agents` to list built-in targets. Handy for returning to claude after a rate-limit handoff to codex
-* `switch-provider` — Re-route a Claude session to a different LLM provider, keeping the transcript. The worker restarts between turns and resumes the same conversation. Credentials are not provisioned by this: the target provider's own variables must already be set on the host (for example `ANTHROPIC_VERTEX_PROJECT_ID` and `CLOUD_ML_REGION` for vertex). The session's model pick is cleared, because model ids differ between providers
+* `switch-provider` — Re-route a Claude session to a different LLM provider, keeping the transcript. Refused mid-turn; once idle the worker restarts and resumes the same conversation. Credentials are not provisioned by this: the target provider's own variables must already be set on the host (for example `ANTHROPIC_VERTEX_PROJECT_ID` and `CLOUD_ML_REGION` for vertex). The model resets to the new provider's default, because model ids differ between providers
 
 
 
@@ -1880,7 +1880,7 @@ Switch an agent session to a different ACP agent, keeping the transcript. Valid 
 
 ## `aoe acp switch-provider`
 
-Re-route a Claude session to a different LLM provider, keeping the transcript. The worker restarts between turns and resumes the same conversation. Credentials are not provisioned by this: the target provider's own variables must already be set on the host (for example `ANTHROPIC_VERTEX_PROJECT_ID` and `CLOUD_ML_REGION` for vertex). The session's model pick is cleared, because model ids differ between providers
+Re-route a Claude session to a different LLM provider, keeping the transcript. Refused mid-turn; once idle the worker restarts and resumes the same conversation. Credentials are not provisioned by this: the target provider's own variables must already be set on the host (for example `ANTHROPIC_VERTEX_PROJECT_ID` and `CLOUD_ML_REGION` for vertex). The model resets to the new provider's default, because model ids differ between providers
 
 **Usage:** `aoe acp switch-provider <SESSION> <PROVIDER>`
 
