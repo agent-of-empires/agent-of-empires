@@ -194,6 +194,17 @@ jobs:
           persist-credentials: false
       - run: python3 .github/scripts/select-internal-pr.py --self-test
 
+  dependabot-check-selftest:
+    name: Dependabot Check Self-Test
+    runs-on: ubuntu-latest
+    # Guards the supply-chain checker dependabot-auto-merge.yml runs before
+    # queueing a merge. No toolchain; runs in seconds.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: python3 .github/scripts/check-dependabot-pr.py --self-test
+
   cachix-alert-selftest:
     name: Cachix Alert Self-Test
     runs-on: ubuntu-latest
