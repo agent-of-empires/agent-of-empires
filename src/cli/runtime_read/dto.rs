@@ -1503,6 +1503,21 @@ mod tests {
         value.sessions.push(row.clone());
         assert_eq!(validate_snapshot(&value), Ok(()));
 
+        // The case that actually separates the two comparisons. As instants
+        // `…:00Z` is half a second *before* `…:00.500Z`, so this row is
+        // refused. As bytes `Z` (0x5a) sorts above `.` (0x2e), so a byte
+        // comparison reads it as later and admits the row. The two cases below
+        // this one are admitted or refused by either comparison, so without
+        // this one the test passes unchanged under the bug its name names.
+        let mut truncated = row.clone();
+        truncated.archived_at = Some("2026-01-01T00:00:00Z".into());
+        value.sessions = vec![truncated];
+        assert_eq!(
+            validate_snapshot(&value),
+            Err("schema_invalid"),
+            "an instant before creation is not later, whatever the bytes say"
+        );
+
         let mut earlier = row;
         earlier.archived_at = Some("2026-01-01T00:00:00.100Z".into());
         value.sessions = vec![earlier];
