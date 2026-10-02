@@ -331,19 +331,25 @@ fn absent_local_publication(error: &ReadFailure, source: &ReadRequestSource) -> 
         // connected socket has been proved to be that publisher's, so failing
         // to get an answer out of it is a fact about the environment.
         "marker_missing" => !source.env_url_is_set(),
-        // What proves the endpoint was not there, plus `unavailable`, which is
-        // the states the fused connect cannot tell apart: a refused
-        // certificate, a dead port and a name that does not resolve are the
-        // same `ErrorKind` by the time the call returns, so this arm still
-        // covers a TLS handshake this client refused. That is a real residual,
-        // not a decision, and separating it means wrapping TLS between the
-        // connect and the handshake, which means naming `rustls` here.
+        // What proves the endpoint was not there. `publisher_absent` is the
+        // TCP connect failing, so nothing was listening; a stall stays
+        // because a silent peer and a dead host are the same observable from
+        // here.
         //
-        // What leaves the arm: `invalid_endpoint` and `invalid_token` are
-        // configuration faults no socket can fix, and `server_error` is a peer
-        // that answered and would not serve. Falling back on either of those
+        // `unavailable` leaves, because it now means a peer that was reached
+        // and then did not serve, which is not absence. The two are separated
+        // by which call failed rather than by the error: the connect is its own
+        // step, and a refused certificate arrives from the handshake that
+        // follows it. Measured on this build, a refused certificate is
+        // `ErrorKind::InvalidData`, a refused port is `ConnectionRefused` and a
+        // name that does not resolve is `Uncategorized` -- distinct kinds, so
+        // an earlier note here claiming they were the same was wrong.
+        //
+        // What leaves the arm as well: `invalid_endpoint` and `invalid_token`
+        // are configuration faults no socket can fix, and `server_error` is a
+        // peer that answered and would not serve. Falling back on any of those
         // prints this machine's sessions as though they came from the remote.
-        "unavailable" | "establishment_timeout" | "publisher_absent" => source.env_url_is_set(),
+        "establishment_timeout" | "publisher_absent" => source.env_url_is_set(),
         _ => false,
     }
 }
@@ -399,24 +405,35 @@ async fn execute_inner(
             // carries, so a wrong assumption widens the output rather than
             // narrowing it.
             let local_home = loopback_home(&request);
-            // `connect_async` is one call because the TLS wrap lives inside it:
-            // the internal `connect` is the only thing that reaches
-            // `client_async_tls_with_config`, and `client_async_with_config` on
-            // a raw `TcpStream` never wraps. Splitting the connect out to tell
-            // a refused certificate from a dead port therefore drops TLS, and
-            // `wss://` stops being a transport at all. So the two stay fused
-            // here, and the residual below is what that costs.
-            let connected = tokio::time::timeout_at(
+            // The TCP connect is split from the handshake, as the local path
+            // already does, because a peer that answered and would not serve
+            // us is not a peer that was absent, and only the split says which
+            // happened. The TLS wrap survives the split because
+            // `client_async_tls_with_config` is public and takes the connected
+            // stream with the default connector, so `None` wraps exactly as
+            // `connect_async` would. It is not `client_async_with_config`:
+            // that one never wraps, and a `wss://` endpoint handed to it is
+            // not a transport at all.
+            let (connect_host, connect_port) = host_port(request.uri())?;
+            let stream = tokio::time::timeout_at(
                 establishment_deadline,
-                tokio_tungstenite::connect_async_with_config(
+                tokio::net::TcpStream::connect((connect_host, connect_port)),
+            )
+            .await
+            .map_err(|_| ReadFailure::pre("establishment_timeout"))?
+            .map_err(|_| ReadFailure::post("publisher_absent"))?;
+            let (stream, _) = tokio::time::timeout_at(
+                establishment_deadline,
+                tokio_tungstenite::client_async_tls_with_config(
                     *request,
+                    stream,
                     Some(websocket_config()),
-                    false,
+                    None,
                 ),
             )
             .await
-            .map_err(|_| ReadFailure::pre("establishment_timeout"))?;
-            let (stream, _) = connected.map_err(map_upgrade_error)?;
+            .map_err(|_| ReadFailure::pre("establishment_timeout"))?
+            .map_err(map_upgrade_error)?;
             // One budget per read: the exchange rides the establishment
             // window rather than opening a second one behind it.
             let exchange_deadline = establishment_deadline;
@@ -431,6 +448,24 @@ async fn execute_inner(
             .await
         }
     }
+}
+
+/// The `(host, port)` an endpoint names, defaulting the port the way the
+/// connect does so the two cannot disagree about it. The host arrives
+/// bracketed for IPv6, and the brackets are not part of the address: the
+/// connect resolves what it is given, and `[::1]` is not an address literal.
+/// `endpoint::unbracketed` is the same strip the handshake does.
+fn host_port(uri: &tokio_tungstenite::tungstenite::http::Uri) -> Result<(&str, u16), ReadFailure> {
+    let host = uri
+        .host()
+        .map(endpoint::unbracketed)
+        .filter(|host| !host.is_empty())
+        .ok_or_else(|| ReadFailure::pre("invalid_endpoint"))?;
+    let port = uri.port_u16().unwrap_or(match uri.scheme_str() {
+        Some("wss") | Some("https") => 443,
+        _ => 80,
+    });
+    Ok((host, port))
 }
 
 /// This machine's home, when the endpoint names a loopback address, and
@@ -775,9 +810,8 @@ mod tests {
     /// every combination of endpoint inputs.
     #[test]
     fn only_the_endpoint_codes_take_over_and_nothing_else_does() {
-        const TAKES_OVER: [&str; 4] = [
+        const TAKES_OVER: [&str; 3] = [
             "marker_missing",
-            "unavailable",
             "establishment_timeout",
             "publisher_absent",
         ];
@@ -858,6 +892,35 @@ mod tests {
             "a named endpoint that is not there leaves the transport refusal's exit"
         );
         assert!(outcome.stdout.is_none(), "a refusal prints no answer");
+    }
+
+    /// The connect target has to be an address, not an authority. `uri.host()`
+    /// hands IPv6 back bracketed, and the brackets are not part of the
+    /// literal, so a bracketed endpoint resolved by the connect fails to
+    /// resolve at all -- which, with a variable naming the endpoint, is a
+    /// refusal and so answers from the local store instead of reporting that
+    /// the endpoint could not be reached.
+    #[test]
+    fn a_bracketed_ipv6_endpoint_connects_to_an_address_literal() {
+        for (url, host, port) in [
+            ("http://[::1]:8080/api/runtime/ws", "::1", 8080),
+            ("wss://[fe80::1]/api/runtime/ws", "fe80::1", 443),
+            ("http://127.0.0.1:8080/api/runtime/ws", "127.0.0.1", 8080),
+            ("wss://example.test/api/runtime/ws", "example.test", 443),
+        ] {
+            let request = url.into_client_request().expect("the URL parses");
+            let (resolved, resolved_port) =
+                host_port(request.uri()).expect("the endpoint names a host");
+            assert_eq!(resolved, host, "{url}");
+            assert_eq!(resolved_port, port, "{url}");
+            assert!(
+                resolved.parse::<std::net::IpAddr>().is_ok()
+                    || resolved
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '.'),
+                "{url} yields a name the connect could resolve"
+            );
+        }
     }
 
     /// The other side of the same line: a variable naming an endpoint with no
