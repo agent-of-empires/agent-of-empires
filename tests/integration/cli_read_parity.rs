@@ -129,10 +129,8 @@ struct Run {
 /// The temporary home plus the environment binding that points both the
 /// daemon's own reads and the subprocesses at it, restored on drop.
 struct Fixture {
-    /// The home the store lives in. A temporary one is owned by the fixture and
-    /// removed with it; a named one belongs to the caller.
     home: PathBuf,
-    _owned: Option<tempfile::TempDir>,
+    _owned: tempfile::TempDir,
     previous: Vec<(&'static str, Option<OsString>)>,
 }
 
@@ -166,12 +164,11 @@ impl Fixture {
     /// to count that once whichever transport answers.
     fn new_with_registries(global: serde_json::Value, profile: serde_json::Value) -> Self {
         let home = tempfile::tempdir().expect("temp home");
-        Self::seed_registries(home.path().to_path_buf(), Some(home), global, profile)
+        Self::seed_registries(home, global, profile)
     }
 
-    fn seed(home: PathBuf, owned: Option<tempfile::TempDir>) -> Self {
+    fn seed(owned: tempfile::TempDir) -> Self {
         Self::seed_registries(
-            home,
             owned,
             serde_json::json!([]),
             serde_json::json!([
@@ -181,11 +178,11 @@ impl Fixture {
     }
 
     fn seed_registries(
-        home: PathBuf,
-        owned: Option<tempfile::TempDir>,
+        owned: tempfile::TempDir,
         global: serde_json::Value,
         profile: serde_json::Value,
     ) -> Self {
+        let home = owned.path().to_path_buf();
         let app_dir = home
             .join(".config")
             .join(agent_of_empires::session::APP_DIR_NAME_XDG);
@@ -810,6 +807,28 @@ async fn a_profile_that_cannot_be_read_is_refused_by_both_transports() {
     }
 }
 
+#[tokio::test]
+#[serial_test::serial]
+async fn legacy_native_profile_names_keep_raw_picker_bytes_and_all_profile_refusals() {
+    for name in ["ALL", "legacy\\name"] {
+        let fixture = Fixture::new();
+        std::fs::create_dir_all(fixture.app_dir().join("profiles").join(name)).unwrap();
+        let commands: &[&[&str]] = &[
+            &["profile"],
+            &["list", "--all"],
+            &["list", "--all", "--json"],
+        ];
+        let served = compare_transports(&fixture, commands, 1, commands).await;
+        assert_eq!(served[0].exit, 0);
+        assert!(served[0].stdout.contains(name));
+        for result in served.iter().skip(1) {
+            assert_eq!(result.exit, 1);
+            assert!(result.stdout.is_empty());
+            assert!(result.stderr.contains(name));
+        }
+    }
+}
+
 /// A store whose global project registry will not parse is still a store the
 /// session reads can answer from: no session, status, group or profile read
 /// consults the registry. The served renderer refused all of them anyway,
@@ -987,6 +1006,7 @@ async fn compare_transports(
         Vec::new(),
         None,
     );
+    agent_of_empires::server::test_support::accept_runtime_read_cache_for_test(&state).await;
     let shutdown = state.shutdown.clone();
     let home = fixture.path().to_path_buf();
 
@@ -1105,27 +1125,50 @@ async fn the_fixture_read_reaches_no_network() {
     );
 }
 
-/// The same comparison, against a home the operator names, so a real store can
-/// be replayed through both transports out of band:
-///
-/// ```text
-/// AOE_PARITY_HOME=~/src/my-project cargo test --test integration \
-///   cli_read_parity -- --ignored --nocapture
-/// ```
-///
-/// Ignored by default: the assertion suite above must not read the ambient
-/// environment, and this is the one case that deliberately does.
+/// Run the synthetic parity fixture in a temporary child of an existing parent.
+/// Set AOE_PARITY_HOME to that parent; its existing entries are left untouched.
 #[tokio::test]
 #[serial_test::serial]
-#[ignore = "needs a named home in AOE_PARITY_HOME"]
+#[ignore = "needs an existing temporary parent in AOE_PARITY_HOME"]
 async fn the_named_home_produces_the_same_bytes_on_both_transports() {
-    let home = match std::env::var_os("AOE_PARITY_HOME") {
-        Some(home) => PathBuf::from(home),
-        None => panic!("AOE_PARITY_HOME must name a home for this run"),
-    };
-    std::fs::create_dir_all(&home).expect("the named home");
-    let fixture = Fixture::seed(home, None);
+    let parent = std::env::var_os("AOE_PARITY_HOME")
+        .map(PathBuf::from)
+        .expect("AOE_PARITY_HOME must name an existing temporary parent");
+    let home = tempfile::TempDir::new_in(parent).expect("temporary child of named parent");
+    let fixture = Fixture::seed(home);
     compare_both_transports(&fixture).await;
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn a_named_parent_keeps_every_existing_entry_after_comparison_and_drop() {
+    let parent = tempfile::tempdir().unwrap();
+    std::fs::write(parent.path().join("config.toml"), b"caller configuration\n").unwrap();
+    std::fs::create_dir(parent.path().join("profiles")).unwrap();
+    let sentinel = parent.path().join("profiles/sessions.json");
+    std::fs::write(&sentinel, b"caller session bytes\0\n").unwrap();
+    let before = std::fs::read(&sentinel).unwrap();
+    let child;
+    {
+        let fixture = Fixture::seed(tempfile::TempDir::new_in(parent.path()).unwrap());
+        child = fixture.path().to_path_buf();
+        compare_both_transports(&fixture).await;
+    }
+    assert!(!child.exists());
+    assert_eq!(std::fs::read(&sentinel).unwrap(), before);
+    assert_eq!(
+        std::fs::read(parent.path().join("config.toml")).unwrap(),
+        b"caller configuration\n"
+    );
+    let mut names: Vec<_> = std::fs::read_dir(parent.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        vec![OsString::from("config.toml"), OsString::from("profiles")]
+    );
 }
 
 /// The comparison itself, checked. Two in-session reviews found the same gap

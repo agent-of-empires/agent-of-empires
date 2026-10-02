@@ -21,11 +21,11 @@
     "health": { "$ref": "#/$defs/snapshot_health" },
     "default_profile": {
       "description": "Names a profile this snapshot carries, or names nothing. The client holds the producer to exactly that and refuses any other value as `schema_invalid`. A resolved name this snapshot does not carry is therefore not spelled here; it is spelled in `resolved_default_profile`.",
-      "oneOf": [{ "$ref": "#/$defs/safe_text" }, { "type": "null" }]
+      "oneOf": [{ "$ref": "#/$defs/profile_label" }, { "type": "null" }]
     },
     "resolved_default_profile": {
       "description": "What the daemon resolved as the default, published whether or not `default_profile` resolves. A client that has to refuse can therefore name the profile the user has to create rather than saying only that no default exists, which is what the local resolver's own sentence needs. Absent only when resolving would have created a profile, because a read must not write to the store.",
-      "oneOf": [{ "$ref": "#/$defs/safe_text" }, { "type": "null" }]
+      "oneOf": [{ "$ref": "#/$defs/profile_label" }, { "type": "null" }]
     },
     "profiles": { "type": "array", "items": { "$ref": "#/$defs/profile_read" } },
     "sessions": { "type": "array", "items": { "$ref": "#/$defs/session_read" } },
@@ -46,6 +46,13 @@
     "safe_text": {
       "type": "string",
       "pattern": "^[^\\u0000-\\u001f\\u007f-\\u009f\\u2028\\u2029\\u202a-\\u202e\\u2066-\\u2069]*$"
+    },
+    "profile_label": { "type": "string", "minLength": 1 },
+    "profile_alias": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[^/\\\\]+$",
+      "not": { "enum": [".", "..", "all", "All", "aLl", "alL", "ALl", "AlL", "aLL", "ALL"] }
     },
     "absolute_path": {
       "type": "string",
@@ -191,13 +198,19 @@
     "profile_read": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["name", "groups", "projects", "health"],
+      "required": ["name", "listed", "aliases", "groups", "projects", "health"],
       "properties": {
-        "name": { "$ref": "#/$defs/safe_text" },
+        "name": { "$ref": "#/$defs/profile_label" },
+        "listed": { "type": "boolean" },
+        "aliases": { "type": "array", "items": { "$ref": "#/$defs/profile_alias" } },
         "groups": { "type": "array", "items": { "$ref": "#/$defs/group_read" } },
         "projects": { "type": "array", "items": { "$ref": "#/$defs/project_read" } },
         "health": { "$ref": "#/$defs/profile_health" }
-      }
+      },
+      "oneOf": [
+        { "properties": { "listed": { "const": true } } },
+        { "properties": { "listed": { "const": false }, "name": { "$ref": "#/$defs/profile_alias" } } }
+      ]
     },
     "worktree_read": {
       "type": "object",
@@ -258,8 +271,8 @@
           "oneOf": [{ "$ref": "#/$defs/group_path" }, { "const": "" }]
         },
         "tool": { "$ref": "#/$defs/safe_text" },
-        "command": { "$ref": "#/$defs/safe_text" },
-        "profile": { "$ref": "#/$defs/safe_text" },
+        "command": { "type": "string" },
+        "profile": { "$ref": "#/$defs/profile_label" },
         "status": {
           "type": "string",
           "enum": [

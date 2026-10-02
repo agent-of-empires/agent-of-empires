@@ -894,7 +894,10 @@ fn temporary_kind(name: &str) -> Option<TempKind> {
 }
 
 fn read_named_file(dir: RawFd, name: &str) -> Result<Vec<u8>, ReadFailure> {
-    let (file, entry) = open_entry(dir, name).map_err(|_| ReadFailure::pre("marker_invalid"))?;
+    let (file, entry) = open_entry(dir, name).map_err(|error| match error {
+        EntryError::Missing => ReadFailure::pre("marker_identity"),
+        EntryError::Invalid => ReadFailure::pre("marker_invalid"),
+    })?;
     validate_regular_file(&file, unsafe { libc::geteuid() }, &entry)
         .map_err(|_| ReadFailure::pre("marker_invalid"))?;
     let mut bytes = Vec::new();
@@ -904,7 +907,13 @@ fn read_named_file(dir: RawFd, name: &str) -> Result<Vec<u8>, ReadFailure> {
     if bytes.len() as u64 > MARKER_LIMIT {
         return Err(ReadFailure::pre("marker_invalid"));
     }
-    let after = fstatat(dir, name).map_err(|_| ReadFailure::pre("marker_invalid"))?;
+    let after = fstatat(dir, name).map_err(|error| {
+        ReadFailure::pre(if error.raw_os_error() == Some(libc::ENOENT) {
+            "marker_identity"
+        } else {
+            "marker_invalid"
+        })
+    })?;
     if identity(&after) != entry {
         return Err(ReadFailure::pre("marker_identity"));
     }
@@ -1012,7 +1021,12 @@ fn open_entry(dir: RawFd, name: &str) -> Result<(File, FileIdentity), EntryError
         )
     };
     if fd < 0 {
-        return Err(EntryError::Invalid);
+        let error = std::io::Error::last_os_error();
+        return Err(if error.raw_os_error() == Some(libc::ENOENT) {
+            EntryError::Missing
+        } else {
+            EntryError::Invalid
+        });
     }
     let file = unsafe { File::from_raw_fd(fd) };
     let opened = fstat(file.as_raw_fd()).map_err(|_| EntryError::Invalid)?;
@@ -1174,6 +1188,30 @@ fn errno() -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_remembered_temporary_that_disappears_is_retryable_but_bad_mode_is_not() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let dir = File::open(directory.path()).unwrap();
+        let name =
+            format!("{PREBIND_FILE}{TEMPORARY_SEPARATOR}aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
+        let path = directory.path().join(&name);
+        std::fs::write(&path, b"{}").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(read_named_file(dir.as_raw_fd(), &name).unwrap(), b"{}");
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(
+            read_named_file(dir.as_raw_fd(), &name).unwrap_err().code(),
+            "marker_identity"
+        );
+        std::fs::write(&path, b"{}").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+        assert_eq!(
+            read_named_file(dir.as_raw_fd(), &name).unwrap_err().code(),
+            "marker_invalid"
+        );
+    }
 
     /// The kernel serves `system.posix_acl_access` as a version word followed
     /// by 8-byte entries, so the parser is exercised on bytes laid out that

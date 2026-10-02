@@ -5,7 +5,116 @@ use crate::file_watch::FileWatchService;
 use crate::session::Instance;
 use crate::session::Status;
 use crate::session::Storage;
+use std::os::unix::fs::MetadataExt;
 use std::sync::Arc;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct ProfileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SelectableProfile {
+    pub name: String,
+    pub listed: bool,
+    pub aliases: Vec<String>,
+    pub identity: ProfileIdentity,
+}
+
+/// Physical stores, with local enumeration kept separate from selectable aliases.
+pub(crate) fn selectable_profiles() -> anyhow::Result<Vec<SelectableProfile>> {
+    let root = crate::session::get_profile_dir_path("__inventory__")?
+        .parent()
+        .expect("profile parent")
+        .to_path_buf();
+    let entries = match std::fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut directories = Vec::new();
+    let mut aliases = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let kind = entry.file_type()?;
+        if !kind.is_dir() && !kind.is_symlink() {
+            continue;
+        }
+        if kind.is_symlink() && !crate::session::valid_profile_name(&name) {
+            continue;
+        }
+        let metadata = match std::fs::metadata(entry.path()) {
+            Ok(metadata) if metadata.is_dir() => metadata,
+            Ok(_) => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) if kind.is_symlink() => continue,
+            Err(error) => return Err(error.into()),
+        };
+        let identity = ProfileIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        };
+        if kind.is_dir() {
+            directories.push(SelectableProfile {
+                name,
+                listed: true,
+                aliases: Vec::new(),
+                identity,
+            });
+        } else {
+            aliases.push((name, identity));
+        }
+    }
+    directories.sort_by(|left, right| left.name.cmp(&right.name));
+    aliases.sort_by(|left, right| left.0.cmp(&right.0));
+    for (name, identity) in aliases {
+        if let Some(profile) = directories
+            .iter_mut()
+            .find(|profile| profile.identity == identity)
+        {
+            profile.aliases.push(name);
+        } else {
+            directories.push(SelectableProfile {
+                name,
+                listed: false,
+                aliases: Vec::new(),
+                identity,
+            });
+        }
+    }
+    directories.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok(directories)
+}
+
+#[derive(Default)]
+pub(crate) struct RuntimeReadCache {
+    pub inventory: Vec<SelectableProfile>,
+    pub alias_only_instances: Vec<Instance>,
+    pub health: SessionLoadHealth,
+}
+
+impl RuntimeReadCache {
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) fn accepted_inventory() -> Self {
+        match selectable_profiles() {
+            Ok(inventory) => Self {
+                inventory,
+                ..Self::default()
+            },
+            Err(_) => Self {
+                health: SessionLoadHealth {
+                    enumeration_failed: true,
+                    ..Default::default()
+                },
+                ..Self::default()
+            },
+        }
+    }
+}
 
 use super::state::{AppState, StatusSource};
 use super::structured_repair::{
@@ -22,7 +131,7 @@ pub(crate) struct SessionLoadHealth {
 #[derive(Default)]
 pub(crate) struct LoadedInstances {
     pub instances: Vec<Instance>,
-    pub health: SessionLoadHealth,
+    pub cache: RuntimeReadCache,
 }
 
 #[cfg(any(test, debug_assertions))]
@@ -30,32 +139,46 @@ impl From<Vec<Instance>> for LoadedInstances {
     fn from(instances: Vec<Instance>) -> Self {
         Self {
             instances,
-            health: SessionLoadHealth::default(),
+            cache: RuntimeReadCache::default(),
         }
     }
 }
 
 pub(super) fn load_all_instances(file_watch: &Arc<FileWatchService>) -> LoadedInstances {
     let mut loaded = LoadedInstances::default();
-    let profiles = match crate::session::list_profiles() {
+    loaded.cache.inventory = match selectable_profiles() {
         Ok(profiles) => profiles,
         Err(error) => {
             tracing::warn!(target: "server.file_watch", %error, "profile enumeration failed");
-            loaded.health.enumeration_failed = true;
+            loaded.cache.health.enumeration_failed = true;
             return loaded;
         }
     };
-    for profile in profiles {
-        match Storage::new(&profile, file_watch.clone()).and_then(|storage| storage.load()) {
+    for profile in &loaded.cache.inventory {
+        let rows = if profile.listed {
+            Storage::new(&profile.name, file_watch.clone()).and_then(|storage| storage.load())
+        } else {
+            Storage::open_unwatched(&profile.name)
+                .and_then(|storage| storage.load_instances_readonly())
+        };
+        match rows {
             Ok(mut instances) => {
                 for instance in &mut instances {
-                    instance.source_profile = profile.clone();
+                    instance.source_profile.clone_from(&profile.name);
                 }
-                loaded.instances.extend(instances);
+                if profile.listed {
+                    loaded.instances.extend(instances);
+                } else {
+                    loaded.cache.alias_only_instances.extend(instances);
+                }
             }
             Err(error) => {
-                tracing::warn!(target: "server.file_watch", %profile, %error, "session load failed");
-                loaded.health.unreadable_profiles.insert(profile);
+                tracing::warn!(target: "server.file_watch", profile = %profile.name, %error, "session load failed");
+                loaded
+                    .cache
+                    .health
+                    .unreadable_profiles
+                    .insert(profile.name.clone());
             }
         }
     }
@@ -67,6 +190,10 @@ pub(super) fn load_all_instances(file_watch: &Arc<FileWatchService>) -> LoadedIn
 pub(super) fn merge_runtime_fields(prior: Instance, mut fresh: Instance) -> Instance {
     fresh.adopt_poller(&prior);
     fresh.adopt_poller_repair(&prior);
+    merge_scalar_runtime_fields(prior, fresh)
+}
+
+fn merge_scalar_runtime_fields(prior: Instance, mut fresh: Instance) -> Instance {
     fresh.last_error_check = prior.last_error_check;
     fresh.last_start_time = prior.last_start_time;
     if fresh.status == Status::Error {
@@ -151,6 +278,57 @@ pub(super) fn apply_tick_status_decisions(
     }
 }
 
+pub(super) type SupplementaryTick = std::collections::HashMap<
+    ProfileIdentity,
+    (
+        std::collections::HashMap<String, Status>,
+        std::collections::HashMap<String, PriorTickTracking>,
+    ),
+>;
+
+pub(super) fn supplementary_tick_tracking(cache: &RuntimeReadCache) -> SupplementaryTick {
+    let mut prior = SupplementaryTick::new();
+    for row in &cache.alias_only_instances {
+        if let Some(profile) = cache
+            .inventory
+            .iter()
+            .find(|profile| profile.name == row.source_profile)
+        {
+            let (statuses, tracking) = prior.entry(profile.identity).or_default();
+            statuses.insert(row.id.clone(), row.status);
+            tracking.insert(row.id.clone(), PriorTickTracking::of(row));
+        }
+    }
+    prior
+}
+
+pub(super) fn apply_supplementary_tick(
+    cache: &mut RuntimeReadCache,
+    prior: &SupplementaryTick,
+    pane_metadata: Option<&std::collections::HashMap<String, crate::tmux::PaneMetadata>>,
+) {
+    let empty_statuses = std::collections::HashMap::new();
+    let suppressed = std::collections::HashSet::new();
+    for row in &mut cache.alias_only_instances {
+        let previous = cache
+            .inventory
+            .iter()
+            .find(|profile| profile.name == row.source_profile)
+            .and_then(|profile| prior.get(&profile.identity));
+        if let Some((_, tracking)) = previous {
+            seed_tick_tracking(std::slice::from_mut(row), tracking);
+        }
+        apply_tick_status_decisions(
+            std::slice::from_mut(row),
+            previous
+                .map(|(statuses, _)| statuses)
+                .unwrap_or(&empty_statuses),
+            &suppressed,
+            pane_metadata,
+        );
+    }
+}
+
 /// The real status transitions this tick observed, as `(index into instances, previous
 /// status)` pairs.
 pub(super) fn observed_transitions(
@@ -215,7 +393,7 @@ pub(crate) async fn reload_state_instances_from_disk(
 ) {
     let LoadedInstances {
         instances: fresh,
-        health,
+        mut cache,
     } = loaded;
     // Snapshot suppression here so a worker that unmarks between the caller's input build
     // and the per-id decision cannot combine a cleared mark with a stale row to re-emit the
@@ -281,6 +459,64 @@ pub(crate) async fn reload_state_instances_from_disk(
     }
 
     let prior_by_id = PriorById::drain_from(&mut current);
+    let mut previous_cache = state
+        .runtime_read_cache
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let previous_rows = std::mem::take(&mut previous_cache.alias_only_instances);
+    let mut supplementary_prior: std::collections::HashMap<
+        ProfileIdentity,
+        std::collections::HashMap<String, Instance>,
+    > = std::collections::HashMap::new();
+    for row in previous_rows {
+        if let Some(profile) = previous_cache
+            .inventory
+            .iter()
+            .find(|profile| profile.name == row.source_profile)
+        {
+            supplementary_prior
+                .entry(profile.identity)
+                .or_default()
+                .insert(row.id.clone(), row);
+        }
+    }
+    for row in &mut cache.alias_only_instances {
+        let Some(profile) = cache
+            .inventory
+            .iter()
+            .find(|profile| profile.name == row.source_profile)
+        else {
+            continue;
+        };
+        let Some(prior) = supplementary_prior
+            .get_mut(&profile.identity)
+            .and_then(|rows| rows.remove(&row.id))
+        else {
+            continue;
+        };
+        let prior_status = prior.status;
+        let prior_idle = prior.idle_entered_at;
+        let prior_accessed = prior.last_accessed_at;
+        let tracking = PriorTickTracking::of(&prior);
+        let structured = row.is_structured();
+        row.last_error_check = prior.last_error_check;
+        row.last_start_time = prior.last_start_time;
+        if row.status == Status::Error {
+            row.last_error = prior.last_error;
+        }
+        row.acp_load_session_capable = prior.acp_load_session_capable;
+        row.plugin_revival_pending = prior.plugin_revival_pending;
+        if matches!(status_source, StatusSource::DiskOnly) || structured {
+            row.status = prior_status;
+            row.idle_entered_at = prior_idle.or(row.idle_entered_at);
+        }
+        if matches!(status_source, StatusSource::DiskOnly) {
+            row.ever_confirmed_present = tracking.ever_confirmed_present;
+            row.unknown_since = tracking.unknown_since;
+            row.detection = tracking.detection;
+        }
+        row.last_accessed_at = prior_accessed.max(row.last_accessed_at);
+    }
 
     let mut merged: Vec<Instance> = Vec::with_capacity(fresh.len());
     for mut row in fresh {
@@ -319,10 +555,8 @@ pub(crate) async fn reload_state_instances_from_disk(
     apply_acp_overlay_inplace(&prior_by_id, &mut merged);
 
     *current = merged;
-    *state
-        .session_load_health
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = health;
+    *previous_cache = cache;
+    drop(previous_cache);
     drop(current);
 
     persist_structured_row_repairs(state, repairs, repair_guards);
@@ -1017,5 +1251,93 @@ mod tests {
                 "and neither does the deadline that went with it"
             );
         }
+    }
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn supplementary_tracking_follows_physical_identity_not_display_name_or_canonical_uuid() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let canonical = Storage::new_unwatched("main").unwrap();
+        let mut normal = Instance::new("shared", "/repo");
+        normal.status = Status::Stopped;
+        canonical
+            .update(|rows, _| {
+                *rows = vec![normal];
+                Ok(())
+            })
+            .unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let root = crate::session::get_profile_dir_path("main")
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        for name in ["external-a", "external-z"] {
+            std::os::unix::fs::symlink(outside.path(), root.join(name)).unwrap();
+        }
+        let mut stored = Instance::new("shared", "/repo");
+        stored.status = Status::Running;
+        Storage::open_unwatched("external-a")
+            .unwrap()
+            .update(|rows, _| {
+                *rows = vec![stored];
+                Ok(())
+            })
+            .unwrap();
+        let state = crate::server::test_support::build_test_app_state(Vec::new());
+        crate::server::test_support::accept_runtime_read_cache_for_test(&state).await;
+        let unknown = std::time::Instant::now();
+        let accessed = "2026-01-02T03:04:05Z"
+            .parse::<chrono::DateTime<Utc>>()
+            .unwrap();
+        {
+            let mut cache = state.runtime_read_cache.write().unwrap();
+            let row = &mut cache.alias_only_instances[0];
+            row.status = Status::Waiting;
+            row.ever_confirmed_present = true;
+            row.unknown_since = Some(unknown);
+            row.detection.pending = Some(Status::Idle);
+            row.last_accessed_at = Some(accessed);
+        }
+        std::fs::remove_file(root.join("external-a")).unwrap();
+        for source in [StatusSource::TmuxApplied, StatusSource::DiskOnly] {
+            let prior = supplementary_tick_tracking(&state.runtime_read_cache.read().unwrap());
+            let mut loaded = load_all_instances(&state.file_watch);
+            if matches!(source, StatusSource::TmuxApplied) {
+                apply_supplementary_tick(&mut loaded.cache, &prior, None);
+            }
+            reload_state_instances_from_disk(&state, loaded, vec![], source, 0).await;
+            let cache = state.runtime_read_cache.read().unwrap();
+            let row = &cache.alias_only_instances[0];
+            assert_eq!(row.source_profile, "external-z");
+            assert_eq!(row.status, Status::Waiting);
+            assert!(row.ever_confirmed_present);
+            assert_eq!(row.unknown_since, Some(unknown));
+            assert_eq!(row.detection.pending, Some(Status::Idle));
+            assert_eq!(row.last_accessed_at, Some(accessed));
+            assert!(row.session_id_poller.is_none());
+        }
+        let replacement = tempfile::tempdir().unwrap();
+        std::fs::write(
+            replacement.path().join("sessions.json"),
+            serde_json::to_vec(&vec![Instance::new("shared", "/replacement")]).unwrap(),
+        )
+        .unwrap();
+        std::fs::remove_file(root.join("external-z")).unwrap();
+        std::os::unix::fs::symlink(replacement.path(), root.join("external-z")).unwrap();
+        let prior = supplementary_tick_tracking(&state.runtime_read_cache.read().unwrap());
+        let mut loaded = load_all_instances(&state.file_watch);
+        apply_supplementary_tick(&mut loaded.cache, &prior, None);
+        let replacement_status = loaded.cache.alias_only_instances[0].status;
+        reload_state_instances_from_disk(&state, loaded, vec![], StatusSource::DiskOnly, 0).await;
+        {
+            let cache = state.runtime_read_cache.read().unwrap();
+            let row = &cache.alias_only_instances[0];
+            assert_eq!(row.status, replacement_status);
+            assert!(!row.ever_confirmed_present);
+            assert_eq!(row.unknown_since, None);
+            assert_eq!(row.detection.pending, None);
+            assert_eq!(row.last_accessed_at, None);
+        }
+        assert_eq!(state.instances.read().await[0].status, Status::Stopped);
     }
 }

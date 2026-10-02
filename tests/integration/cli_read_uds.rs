@@ -107,6 +107,11 @@ async fn every_scoped_command_and_alias_round_trips_over_uds() {
     let server = RuntimeUdsTestServer::start(state.clone())
         .unwrap_or_else(|reason| panic!("the local read must be publishable: {reason}"));
     agent_of_empires::session::create_profile("main").expect("create fixture profile");
+    agent_of_empires::server::test_support::seed_instances_on_disk_for_test(
+        "main",
+        state.instances.read().await.clone(),
+    );
+    agent_of_empires::server::test_support::accept_runtime_read_cache_for_test(&state).await;
 
     for argv in [
         vec!["aoe", "list"],
@@ -144,6 +149,7 @@ async fn the_daemon_and_local_status_json_agree_on_an_empty_profile() {
     // A profile that holds nothing: the shape under test is the empty one, not
     // the missing-profile refusal.
     agent_of_empires::session::create_profile("main").expect("create fixture profile");
+    agent_of_empires::server::test_support::accept_runtime_read_cache_for_test(&state).await;
 
     let cli = Cli::try_parse_from(["aoe", "status", "--json"]).expect("status parses");
     let command = classify(cli.command.as_ref()).expect("status is a scoped read");
@@ -215,6 +221,11 @@ async fn an_empty_environment_selection_is_answered_not_refused() {
     let server = RuntimeUdsTestServer::start(state.clone())
         .unwrap_or_else(|reason| panic!("the local read must be publishable: {reason}"));
     agent_of_empires::session::create_profile("main").expect("create fixture profile");
+    agent_of_empires::server::test_support::seed_instances_on_disk_for_test(
+        "main",
+        state.instances.read().await.clone(),
+    );
+    agent_of_empires::server::test_support::accept_runtime_read_cache_for_test(&state).await;
 
     // Only a genuinely empty variable is unset. A blank one is a profile
     // *name* on both halves, because nothing in the local path trims it: `main`
@@ -396,6 +407,7 @@ async fn a_publication_under_a_symlinked_config_home_is_served() {
     // answers, not the missing-profile refusal the renderer would otherwise
     // return for an empty state.
     agent_of_empires::session::create_profile("main").expect("create fixture profile");
+    agent_of_empires::server::test_support::accept_runtime_read_cache_for_test(&state).await;
 
     // All four artifacts exist: a publisher that walked the chain and then
     // published by name would have produced the same two marker files, so the

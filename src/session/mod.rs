@@ -333,9 +333,9 @@ pub fn get_profile_dir(profile: &str) -> Result<PathBuf> {
     Ok(dir)
 }
 
-/// Resolve the on-disk profile directory path WITHOUT creating it.
+/// Explicit names resolve without creation; an empty name retains default-profile bootstrap.
 pub fn get_profile_dir_path(profile: &str) -> Result<PathBuf> {
-    let base = get_app_dir()?;
+    let base = get_app_dir_path()?;
     let resolved;
     let profile_name = if profile.is_empty() {
         resolved = config::resolve_default_profile();
@@ -557,26 +557,53 @@ pub(crate) fn validate_instance_id(id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Validate that `name` is a safe, single-component profile name.
-fn validate_profile_name(name: &str) -> Result<()> {
+#[derive(Clone, Copy)]
+enum ProfileNameError {
+    Empty,
+    Reserved,
+    Separators,
+    Component,
+}
+
+fn profile_name_error(name: &str) -> Option<ProfileNameError> {
     if name.is_empty() {
-        anyhow::bail!("Profile name cannot be empty");
+        return Some(ProfileNameError::Empty);
     }
     if name.eq_ignore_ascii_case("all") {
-        anyhow::bail!("Profile name 'all' is reserved");
+        return Some(ProfileNameError::Reserved);
     }
-    // Unix Path treats `\` as a regular byte, so backslashes pass the components check below.
     if name.contains('\\') {
-        anyhow::bail!("Profile name cannot contain path separators");
+        return Some(ProfileNameError::Separators);
     }
     let mut components = Path::new(name).components();
     let first = components.next();
     if components.next().is_some() {
-        anyhow::bail!("Profile name cannot contain path separators");
+        return Some(ProfileNameError::Separators);
     }
     match first {
-        Some(std::path::Component::Normal(c)) if c == std::ffi::OsStr::new(name) => Ok(()),
-        _ => anyhow::bail!(
+        Some(std::path::Component::Normal(component))
+            if component == std::ffi::OsStr::new(name) =>
+        {
+            None
+        }
+        _ => Some(ProfileNameError::Component),
+    }
+}
+
+pub(crate) fn valid_profile_name(name: &str) -> bool {
+    profile_name_error(name).is_none()
+}
+
+/// Validate the local single-component selection grammar.
+pub(crate) fn validate_profile_name(name: &str) -> Result<()> {
+    match profile_name_error(name) {
+        None => Ok(()),
+        Some(ProfileNameError::Empty) => anyhow::bail!("Profile name cannot be empty"),
+        Some(ProfileNameError::Reserved) => anyhow::bail!("Profile name 'all' is reserved"),
+        Some(ProfileNameError::Separators) => {
+            anyhow::bail!("Profile name cannot contain path separators")
+        }
+        Some(ProfileNameError::Component) => anyhow::bail!(
             "Profile name '{}' is not a valid single-component name",
             name
         ),

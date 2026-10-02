@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 use tracing::warn;
 
-use super::{get_app_dir, get_profile_dir_path};
+use super::{get_app_dir_path, get_profile_dir_path};
 
 /// Distinct failure modes for registry mutations.
 #[derive(Debug, Error)]
@@ -149,7 +149,7 @@ impl Project {
 }
 
 fn global_path() -> Result<PathBuf> {
-    Ok(get_app_dir()?.join("projects.json"))
+    Ok(get_app_dir_path()?.join("projects.json"))
 }
 
 fn profile_path(profile: &str) -> Result<PathBuf> {
@@ -537,6 +537,36 @@ mod tests {
     use crate::session::test_support::isolate_app_dir_at;
     use serial_test::serial;
     use tempfile::tempdir;
+
+    #[test]
+    #[serial]
+    fn readonly_registries_do_not_create_paths_but_mutation_does() {
+        let home = tempdir().unwrap();
+        let _guard = isolate_app_dir_at(home.path());
+        let app = super::super::get_profile_dir_path("explicit")
+            .unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        assert!(load_global().unwrap().is_empty());
+        assert!(load_profile("explicit").unwrap().is_empty());
+        assert!(!app.exists());
+        let repo = home.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        for scope in [ProjectScope::Global, ProjectScope::Profile] {
+            add(
+                "explicit",
+                scope,
+                Project::new(scope.as_str(), repo.to_string_lossy(), scope),
+                true,
+            )
+            .unwrap();
+        }
+        assert_eq!(load_global().unwrap()[0].name, "global");
+        assert_eq!(load_profile("explicit").unwrap()[0].name, "profile");
+    }
 
     #[test]
     fn repo_label_uses_basename_with_root_fallbacks() {

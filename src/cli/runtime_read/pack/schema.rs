@@ -252,12 +252,10 @@ impl Schema {
                 (value < bound).then_some(format!("{at}: {value} is below the minimum {bound}"))
             }
             "minLength" => {
-                // Length in characters, as JSON Schema counts it, so a
-                // multi-byte value is not held to its byte count.
-                let bound = expected.as_u64()?;
+                let bound = nonnegative_integer(expected)?;
                 let text = instance.as_str()?;
-                (text.chars().count() < bound as usize)
-                    .then_some(format!("{at}: {text:?} is shorter than {bound} characters"))
+                ((text.chars().count() as f64) < bound)
+                    .then(|| format!("{at}: {text:?} is shorter than {bound} characters"))
             }
             "required" => {
                 let members = instance.as_object()?;
@@ -429,6 +427,12 @@ fn float_is(number: &Number, exact: i128) -> bool {
         Some(float) => float as i128 == exact && float == exact as f64,
         None => false,
     }
+}
+
+fn nonnegative_integer(value: &Value) -> Option<f64> {
+    value
+        .as_f64()
+        .filter(|number| number.is_finite() && *number >= 0.0 && number.fract() == 0.0)
 }
 
 fn child(pointer: &str, name: &str) -> String {
@@ -714,6 +718,9 @@ fn check_plain(
         }
         "minimum" if value.as_f64().is_none() => {
             return Err(bad("must be a number"));
+        }
+        "minLength" if nonnegative_integer(value).is_none() => {
+            return Err(bad("must be a nonnegative finite integer"));
         }
         // `const`, `default`, `examples` and the annotation keywords carry data
         // the evaluator does not assert on, so any JSON value is correct.
@@ -1246,6 +1253,30 @@ mod tests {
                     "{name} compiles the pattern at {position}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn minlength_normalizes_numeric_spellings_and_counts_unicode_scalars() {
+        for bound in ["0", "1", "1.0", "1e0", "2", "1e100"] {
+            let value: Value = serde_json::from_str(bound).unwrap();
+            let schema =
+                Schema::compile("length", serde_json::json!({"minLength": value})).unwrap();
+            let bound = value.as_f64().unwrap();
+            for (text, scalars) in [("", 0), ("é", 1), ("😀é", 2), ("e\u{301}", 2)] {
+                assert_eq!(
+                    schema.validate(&Value::String(text.into())).is_ok(),
+                    scalars as f64 >= bound,
+                    "{bound}: {text:?}"
+                );
+            }
+        }
+        for invalid in ["-1", "0.5", "\"1\"", "null", "true", "[]", "{}"] {
+            let value: Value = serde_json::from_str(invalid).unwrap();
+            assert!(
+                Schema::compile("length", serde_json::json!({"minLength": value})).is_err(),
+                "{invalid}"
+            );
         }
     }
 

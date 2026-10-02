@@ -124,6 +124,8 @@ pub(crate) enum StatusFreshness {
 #[serde(deny_unknown_fields)]
 pub(crate) struct ProfileHello {
     pub name: String,
+    pub listed: bool,
+    pub aliases: Vec<String>,
     pub health: ProfileHealth,
 }
 
@@ -131,6 +133,8 @@ pub(crate) struct ProfileHello {
 #[serde(deny_unknown_fields)]
 pub(crate) struct ProfileRead {
     pub name: String,
+    pub listed: bool,
+    pub aliases: Vec<String>,
     pub groups: Vec<GroupRead>,
     pub projects: Vec<ProjectRead>,
     pub health: ProfileHealth,
@@ -498,12 +502,7 @@ pub(crate) fn validate_snapshot(snapshot: &SnapshotData) -> Result<(), &'static 
             .profiles
             .get(&profile.name)
             .ok_or("schema_invalid")?;
-        // A derived `PartialEq` is the whole check: the struct denies unknown
-        // fields and renames nothing, so a value that survives the decoder is
-        // compared field by field. The JSON round trip this replaced bought
-        // nothing and cost two `Vec<u8>` and two serde passes per profile row
-        // of every snapshot validation; nothing in the type can fail to
-        // serialise, so its `None == None` arm was unreachable.
+        // The map and profile row must describe the same load.
         if *health != profile.health {
             return Err("schema_invalid");
         }
@@ -516,26 +515,18 @@ pub(crate) fn validate_snapshot(snapshot: &SnapshotData) -> Result<(), &'static 
         if !snapshot
             .profiles
             .iter()
-            .any(|profile| &profile.name == default)
+            .any(|profile| &profile.name == default || profile.aliases.contains(default))
         {
             return Err("schema_invalid");
         }
     }
     if let Some(resolved) = &snapshot.resolved_default_profile {
-        validate_safe_text(resolved)?;
+        if resolved.is_empty() {
+            return Err("schema_invalid");
+        }
     }
 
     validate_freshness(&snapshot.status_freshness)?;
-    // Session rows keep the store's own order, because that is the order a
-    // local `aoe list` prints them in. Distinct ids are the identity rule.
-    let mut unique_ids: HashSet<&str> = HashSet::new();
-    if snapshot
-        .sessions
-        .iter()
-        .any(|session| !unique_ids.insert(session.id.as_str()))
-    {
-        return Err("schema_invalid");
-    }
     validate_projects(&snapshot.global_projects, ProjectScope::Global)?;
     let profile_names: HashSet<&str> = snapshot
         .profiles
@@ -590,10 +581,19 @@ pub(crate) fn validate_snapshot(snapshot: &SnapshotData) -> Result<(), &'static 
         .iter()
         .map(|project| project.path.as_str())
         .collect();
+    let listed_profiles: HashSet<&str> = snapshot
+        .profiles
+        .iter()
+        .filter(|profile| profile.listed)
+        .map(|profile| profile.name.as_str())
+        .collect();
+    let mut listed_ids = HashSet::new();
     let mut session_ids = HashSet::new();
-    let mut parents: HashMap<&str, (&str, Option<&str>)> = HashMap::new();
+    let mut parents: HashMap<(&str, &str), Option<&str>> = HashMap::new();
     for session in &snapshot.sessions {
-        if !session_ids.insert(session.id.as_str())
+        if !session_ids.insert((session.profile.as_str(), session.id.as_str()))
+            || (listed_profiles.contains(session.profile.as_str())
+                && !listed_ids.insert(session.id.as_str()))
             || !profile_names.contains(session.profile.as_str())
         {
             return Err("schema_invalid");
@@ -612,25 +612,18 @@ pub(crate) fn validate_snapshot(snapshot: &SnapshotData) -> Result<(), &'static 
             return Err("schema_invalid");
         }
         parents.insert(
-            session.id.as_str(),
-            (
-                session.profile.as_str(),
-                session.parent_session_id.as_deref(),
-            ),
+            (session.profile.as_str(), session.id.as_str()),
+            session.parent_session_id.as_deref(),
         );
     }
-    for (id, (profile, parent)) in &parents {
+    for ((profile, id), parent) in &parents {
         if let Some(parent) = parent {
-            // A parent that names no row is persisted state, not corruption: the
-            // local path keeps and prints the stored id, and `rm --purge` of a
-            // parent leaves the child pointing at nothing. So the graph rules
-            // that can still be stated apply to the part that is there: the
-            // parent, when it is a row at all, sits in the same profile, and the
-            // edges that do land on a row form no cycle.
-            if let Some((parent_profile, _)) = parents.get(parent) {
-                if parent_profile != profile {
-                    return Err("schema_invalid");
-                }
+            // Hidden copies cannot create an edge in the canonical graph.
+            if listed_profiles.contains(profile)
+                && !parents.contains_key(&(*profile, *parent))
+                && listed_ids.contains(parent)
+            {
+                return Err("schema_invalid");
             }
             let mut seen = HashSet::new();
             let mut cursor = Some(*id);
@@ -640,7 +633,7 @@ pub(crate) fn validate_snapshot(snapshot: &SnapshotData) -> Result<(), &'static 
                     return Err("schema_invalid");
                 }
                 depth += 1;
-                cursor = parents.get(node).and_then(|(_, parent)| *parent);
+                cursor = parents.get(&(*profile, node)).copied().flatten();
             }
         }
     }
@@ -655,17 +648,18 @@ pub(crate) fn validate_cross_message(
     if hello.runtime_epoch != snapshot.cursor.epoch {
         return Err("schema_invalid");
     }
-    let hello_names: Vec<&str> = hello
-        .profiles
-        .iter()
-        .map(|profile| profile.name.as_str())
-        .collect();
-    let snapshot_names: Vec<&str> = snapshot
-        .profiles
-        .iter()
-        .map(|profile| profile.name.as_str())
-        .collect();
-    if hello_names != snapshot_names {
+    if hello.profiles.len() != snapshot.profiles.len()
+        || hello
+            .profiles
+            .iter()
+            .zip(&snapshot.profiles)
+            .any(|(hello, snapshot)| {
+                hello.name != snapshot.name
+                    || hello.listed != snapshot.listed
+                    || hello.aliases != snapshot.aliases
+                    || hello.health != snapshot.health
+            })
+    {
         return Err("schema_invalid");
     }
     match local_owner {
@@ -696,11 +690,20 @@ pub(crate) fn validate_cross_message(
 /// the identity rule is uniqueness rather than a canonical sort.
 fn validate_profiles(profiles: &[ProfileRead]) -> Result<(), &'static str> {
     let mut names = HashSet::new();
+    let mut selectable: HashSet<&str> = profiles
+        .iter()
+        .map(|profile| profile.name.as_str())
+        .collect();
     for profile in profiles {
         if !names.insert(profile.name.as_str()) {
             return Err("schema_invalid");
         }
-        validate_safe_text(&profile.name)?;
+        if profile.name.is_empty()
+            || (!profile.listed && !crate::session::valid_profile_name(&profile.name))
+        {
+            return Err("schema_invalid");
+        }
+        validate_aliases(&profile.aliases, &mut selectable)?;
         validate_profile_health(&profile.health)?;
         validate_groups(&profile.groups)?;
         validate_projects(&profile.projects, ProjectScope::Profile)?;
@@ -708,19 +711,36 @@ fn validate_profiles(profiles: &[ProfileRead]) -> Result<(), &'static str> {
     Ok(())
 }
 
-/// The Hello's half of the same rule. Everything the handshake needs in order
-/// to fail closed before the much larger Snapshot is accepted is here: unique
-/// names, a name that is safe to print, and per-profile health. The inventory
-/// itself belongs to the Snapshot, which carries it and validates every group
-/// and project in it.
+/// Hello names and aliases are correlated with the complete snapshot.
 fn validate_profile_hellos(profiles: &[ProfileHello]) -> Result<(), &'static str> {
     let mut names = HashSet::new();
+    let mut selectable: HashSet<&str> = profiles
+        .iter()
+        .map(|profile| profile.name.as_str())
+        .collect();
     for profile in profiles {
         if !names.insert(profile.name.as_str()) {
             return Err("schema_invalid");
         }
-        validate_safe_text(&profile.name)?;
+        if profile.name.is_empty()
+            || (!profile.listed && !crate::session::valid_profile_name(&profile.name))
+        {
+            return Err("schema_invalid");
+        }
+        validate_aliases(&profile.aliases, &mut selectable)?;
         validate_profile_health(&profile.health)?;
+    }
+    Ok(())
+}
+
+fn validate_aliases<'a>(
+    aliases: &'a [String],
+    names: &mut HashSet<&'a str>,
+) -> Result<(), &'static str> {
+    for alias in aliases {
+        if !crate::session::valid_profile_name(alias) || !names.insert(alias.as_str()) {
+            return Err("schema_invalid");
+        }
     }
     Ok(())
 }
@@ -813,11 +833,6 @@ fn validate_groups(groups: &[GroupRead]) -> Result<(), &'static str> {
                 return Err("schema_invalid");
             }
         }
-        if let Some((parent, _)) = group.path.rsplit_once('/') {
-            if !paths.contains(parent) {
-                return Err("schema_invalid");
-            }
-        }
     }
     Ok(())
 }
@@ -853,14 +868,10 @@ fn validate_projects(projects: &[ProjectRead], scope: ProjectScope) -> Result<()
 }
 
 fn validate_session(session: &SessionRead) -> Result<(), &'static str> {
-    // Titles preserve persisted display text; only identities require safe text.
-    for value in [&session.id, &session.profile] {
-        validate_safe_text(value)?;
-    }
-    for value in [&session.tool, &session.command] {
-        if !valid_text(value) {
-            return Err("schema_invalid");
-        }
+    // Titles and commands preserve persisted display text.
+    validate_safe_text(&session.id)?;
+    if session.profile.is_empty() || !valid_text(&session.tool) {
+        return Err("schema_invalid");
     }
     if session
         .agent_session_id
@@ -1141,6 +1152,8 @@ mod tests {
             resolved_default_profile: Some("main".into()),
             profiles: vec![ProfileRead {
                 name: "main".into(),
+                listed: true,
+                aliases: vec![],
                 groups: vec![],
                 projects: vec![],
                 health: health(),
@@ -1175,6 +1188,8 @@ mod tests {
             health: AggregateHealth::Healthy,
             profiles: vec![ProfileHello {
                 name: "main".into(),
+                listed: true,
+                aliases: vec![],
                 health: health(),
             }],
             status_freshness: StatusFreshness::Observed {
@@ -1315,6 +1330,8 @@ mod tests {
         foreign.profile = "other".into();
         value.profiles.push(ProfileRead {
             name: "other".into(),
+            listed: true,
+            aliases: vec![],
             groups: vec![],
             projects: vec![],
             health: health(),
@@ -1375,6 +1392,53 @@ mod tests {
             })
             .collect();
         value
+    }
+
+    #[test]
+    fn hidden_copies_scope_parent_graphs_without_relaxing_listed_uuid_uniqueness() {
+        let mut value = parent_chain_snapshot(2);
+        let mut hidden = value.profiles[0].clone();
+        hidden.name = "outside".into();
+        hidden.listed = false;
+        value.profiles.push(hidden);
+        value.health.profiles.insert("outside".into(), health());
+        let copy: Vec<_> = value
+            .sessions
+            .iter()
+            .cloned()
+            .map(|mut row| {
+                row.profile = "outside".into();
+                row
+            })
+            .collect();
+        value.sessions.extend(copy);
+        assert_eq!(validate_snapshot(&value), Ok(()));
+        let mut duplicate = value.clone();
+        duplicate.sessions.push(duplicate.sessions[2].clone());
+        assert_eq!(validate_snapshot(&duplicate), Err("schema_invalid"));
+        let mut cycle = value.clone();
+        cycle.sessions[2].parent_session_id = Some("s1".into());
+        assert_eq!(validate_snapshot(&cycle), Err("schema_invalid"));
+        let mut listed_copy = value.clone();
+        listed_copy.profiles[1].listed = true;
+        assert_eq!(validate_snapshot(&listed_copy), Err("schema_invalid"));
+        value.sessions[0].parent_session_id = Some("hidden-only".into());
+        let mut hidden_only = value.sessions[2].clone();
+        hidden_only.id = "hidden-only".into();
+        value.sessions.push(hidden_only);
+        assert_eq!(validate_snapshot(&value), Ok(()));
+    }
+
+    #[test]
+    fn raw_commands_do_not_relax_identity_or_tool_text() {
+        let mut value = parent_chain_snapshot(1);
+        value.sessions[0].command = "printf 'one\tvalue'\nprintf 'two\n'".into();
+        assert_eq!(validate_snapshot(&value), Ok(()));
+        let mut bad_id = value.clone();
+        bad_id.sessions[0].id.push('\n');
+        assert_eq!(validate_snapshot(&bad_id), Err("schema_invalid"));
+        value.sessions[0].tool.push('\n');
+        assert_eq!(validate_snapshot(&value), Err("schema_invalid"));
     }
 
     #[test]
@@ -1682,5 +1746,43 @@ mod tests {
             worktree: None,
             workspace_repos: repos,
         }
+    }
+    #[test]
+    fn aliases_are_unique_disjoint_and_identical_across_frames() {
+        let mut hello = local_hello(Some(501));
+        let mut value = snapshot();
+        value.health.profiles.insert("main".into(), health());
+        for aliases in [
+            vec!["alias".into(), "alias".into()],
+            vec!["main".into()],
+            vec!["".into()],
+        ] {
+            value.profiles[0].aliases = aliases;
+            assert_eq!(validate_snapshot(&value), Err("schema_invalid"));
+        }
+        value.profiles[0].aliases = vec!["alias".into()];
+        value.default_profile = Some("alias".into());
+        value.resolved_default_profile = Some("alias".into());
+        assert_eq!(validate_snapshot(&value), Ok(()));
+        assert_eq!(
+            validate_cross_message(&hello, &value, Some(501)),
+            Err("schema_invalid")
+        );
+        hello.profiles[0].aliases = vec!["alias".into()];
+        assert_eq!(validate_cross_message(&hello, &value, Some(501)), Ok(()));
+        hello.profiles[0].listed = false;
+        assert_eq!(
+            validate_cross_message(&hello, &value, Some(501)),
+            Err("schema_invalid")
+        );
+        value.profiles.push(ProfileRead {
+            name: "other".into(),
+            listed: false,
+            aliases: vec!["alias".into()],
+            groups: vec![],
+            projects: vec![],
+            health: health(),
+        });
+        assert_eq!(validate_profiles(&value.profiles), Err("schema_invalid"));
     }
 }

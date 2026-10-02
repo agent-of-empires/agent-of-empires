@@ -28,11 +28,8 @@ use tokio_tungstenite::tungstenite;
 use super::AppState;
 use crate::session::{GroupTree, Instance, Storage};
 
-/// Wire protocol version. The client refuses anything else and imports this
-/// constant, because a version the two halves spell differently is a handshake
-/// that fails closed for no reason anyone can see. Version 3 adds a project
-/// row's `merge_key`, so a client that cannot read it cannot merge projects.
-pub(crate) const PROTOCOL_VERSION: u16 = 3;
+/// Wire generation 4 adds physical profile aliases and listed membership.
+pub(crate) const PROTOCOL_VERSION: u16 = 4;
 /// A stalled reader must not hold a connection slot, or a full disk rescan's
 /// worth of work, open indefinitely. Both transports spend this one budget,
 /// each for the whole connection from accept to close rather than per stage,
@@ -197,37 +194,35 @@ async fn run_read(
         return;
     };
     let runtime = &RUNTIME;
-    let (instances, load_health, observed_at) = {
+    let (instances, cache, observed_at) = {
         let instances = state.instances.read().await;
-        let health = state
-            .session_load_health
+        let cache = state
+            .runtime_read_cache
             .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
-        (
-            instances.clone(),
-            health,
-            runtime.pinned_now.unwrap_or_else(Utc::now),
-        )
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut rows = Vec::with_capacity(instances.len() + cache.alias_only_instances.len());
+        rows.extend(instances.iter().cloned());
+        rows.extend(cache.alias_only_instances.iter().cloned());
+        let metadata = super::reload::RuntimeReadCache {
+            inventory: cache.inventory.clone(),
+            alias_only_instances: Vec::new(),
+            health: cache.health.clone(),
+        };
+        (rows, metadata, runtime.pinned_now.unwrap_or_else(Utc::now))
     };
-    // Both guards belong to the sample, not to this future. A connection whose
-    // budget expires drops this future while the blocking task is still on the
-    // disk, and dropping a `JoinHandle` does not cancel it: the row set and the
-    // slot it was admitted against would otherwise outlive the thing that
-    // released them, and the next connection would rescan beside a sample this
-    // semaphore no longer counts.
+    // A cancelled blocking sample retains admission until its worker exits.
     let sampled = tokio::task::spawn_blocking(move || {
         let _flight = runtime
             .flight
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _admitted = admitted;
-        build_snapshot(runtime, &instances, owner, observed_at, &load_health)
+        let sample = build_snapshot(runtime, &instances, owner, observed_at, &cache);
+        (sample, admitted)
     })
     .await;
 
-    let snapshot = match sampled {
-        Ok(snapshot) => snapshot,
+    let (snapshot, _admitted) = match sampled {
+        Ok(sample) => sample,
         Err(error) => {
             tracing::error!(target: "runtime.ws", %error, "runtime sample task failed");
             socket.close().await;
@@ -345,7 +340,7 @@ pub fn record_exchange(
         instances,
         owner,
         pins.observed_at,
-        &crate::server::reload::SessionLoadHealth::default(),
+        &crate::server::reload::RuntimeReadCache::accepted_inventory(),
     );
     let encode = |frame: Result<String, serde_json::Error>| {
         frame.expect("a recorded frame encodes").into_bytes()
@@ -484,7 +479,7 @@ fn build_snapshot(
     instances: &[Instance],
     owner: Owner,
     observed_at: DateTime<Utc>,
-    load_health: &super::reload::SessionLoadHealth,
+    cache: &super::reload::RuntimeReadCache,
 ) -> Sampled {
     // `local_owner` mirrors the declared owner so the two can never disagree.
     let local_owner = owner.is_local();
@@ -495,43 +490,141 @@ fn build_snapshot(
     // never runs behind a filesystem call.
     let mut sessions: Vec<SessionRead> = instances.iter().map(SessionRead::from_instance).collect();
 
-    // A profile that still holds sessions must appear in the snapshot even when
-    // its directory is gone, otherwise every one of its rows would be unprojectable.
-    let enumeration = crate::session::list_profiles_readonly();
+    let enumeration = super::reload::selectable_profiles();
     let enumeration_healthy = enumeration.is_ok();
-    let enumerated: BTreeSet<String> = enumeration.unwrap_or_default().into_iter().collect();
-    let mut names = enumerated.clone();
-    names.extend(sessions.iter().map(|row| row.profile.clone()));
-    names.extend(load_health.unreadable_profiles.iter().cloned());
-
-    let disk: BTreeMap<String, ProfileDisk> = names
+    let mut current = enumeration.unwrap_or_default();
+    // A retired cached owner keeps its key. Omitting a conflicting store can expose another conflict.
+    loop {
+        let mut changed = false;
+        let mut position = 0;
+        while position < current.len() {
+            if current[position].listed {
+                position += 1;
+                continue;
+            }
+            let identity = current[position].identity;
+            let reserved = |name: &str| {
+                cache
+                    .inventory
+                    .iter()
+                    .find(|profile| profile.name == name && profile.identity != identity)
+                    .is_some_and(|owner| {
+                        sessions.iter().any(|row| row.profile == owner.name)
+                            && !current
+                                .iter()
+                                .any(|profile| profile.identity == owner.identity)
+                    })
+            };
+            if reserved(&current[position].name) {
+                let replacement = current[position]
+                    .aliases
+                    .iter()
+                    .position(|name| !reserved(name));
+                changed = true;
+                if let Some(replacement) = replacement {
+                    let profile = &mut current[position];
+                    std::mem::swap(&mut profile.name, &mut profile.aliases[replacement]);
+                } else {
+                    current.remove(position);
+                    continue;
+                }
+            }
+            position += 1;
+        }
+        if !changed {
+            break;
+        }
+    }
+    for row in &mut sessions {
+        if let Some(accepted) = cache
+            .inventory
+            .iter()
+            .find(|profile| profile.name == row.profile)
+        {
+            let representative = current
+                .iter()
+                .find(|profile| {
+                    profile.name == accepted.name && profile.identity == accepted.identity
+                })
+                .or_else(|| {
+                    current
+                        .iter()
+                        .find(|profile| profile.identity == accepted.identity)
+                });
+            if let Some(profile) = representative.filter(|profile| profile.name != row.profile) {
+                row.profile.clone_from(&profile.name);
+            }
+        }
+    }
+    let mut inventory: BTreeMap<String, Option<super::reload::SelectableProfile>> = current
+        .into_iter()
+        .map(|profile| (profile.name.clone(), Some(profile)))
+        .collect();
+    for row in &sessions {
+        inventory.entry(row.profile.clone()).or_insert(None);
+    }
+    for name in &cache.health.unreadable_profiles {
+        let represented = cache
+            .inventory
+            .iter()
+            .find(|profile| &profile.name == name)
+            .is_some_and(|accepted| {
+                inventory
+                    .values()
+                    .flatten()
+                    .any(|profile| profile.identity == accepted.identity)
+            });
+        let selected_alias = inventory
+            .values()
+            .flatten()
+            .any(|profile| profile.aliases.contains(name));
+        if !represented && !selected_alias {
+            inventory.entry(name.clone()).or_insert(None);
+        }
+    }
+    // Retained row keys own ambiguous selections until an accepted reload.
+    for profile in inventory.values_mut().flatten() {
+        profile
+            .aliases
+            .retain(|alias| !sessions.iter().any(|row| &row.profile == alias));
+    }
+    let disk: BTreeMap<String, ProfileDisk> = inventory
         .iter()
-        .map(|name| {
-            (
-                name.clone(),
-                ProfileDisk {
-                    projects: crate::session::projects::load_profile(name)
-                        .map(|projects| {
-                            projects
-                                .into_iter()
-                                .map(|project| ProjectRead {
-                                    merge_key: crate::session::projects::canonical_key(
-                                        &project.path,
-                                    ),
-                                    name: project.name,
-                                    path: project.path,
-                                    scope: ProjectScope::Profile,
-                                    default_base_branch: project.default_base_branch,
-                                    registered: true,
-                                })
-                                .collect::<Vec<_>>()
-                        })
-                        .map_err(|_| ()),
-                    groups: Storage::open_unwatched(name)
-                        .and_then(|storage| storage.load_groups_readonly())
-                        .map_err(|_| ()),
-                },
-            )
+        .map(|(name, profile)| {
+            let accepted = profile.as_ref().is_some_and(|profile| {
+                profile.listed
+                    || cache
+                        .inventory
+                        .iter()
+                        .any(|prior| prior.identity == profile.identity)
+            });
+            let projects = if accepted {
+                crate::session::projects::load_profile(name)
+                    .map(|projects| {
+                        projects
+                            .into_iter()
+                            .map(|project| ProjectRead {
+                                merge_key: crate::session::projects::canonical_key(&project.path),
+                                name: project.name,
+                                path: project.path,
+                                scope: ProjectScope::Profile,
+                                default_base_branch: project.default_base_branch,
+                                registered: true,
+                            })
+                            .collect()
+                    })
+                    .map_err(|_| ())
+            } else {
+                Err(())
+            };
+            let groups = if accepted {
+                Storage::open_unwatched(name)
+                    .and_then(|storage| storage.load_groups_readonly())
+                    .map_err(|_| ())
+            } else {
+                Err(())
+            };
+            (name.clone(), ProfileDisk { projects, groups })
         })
         .collect();
 
@@ -558,19 +651,31 @@ fn build_snapshot(
     let mut global_projects = global_projects.unwrap_or_default();
     drop_unusable_projects(&mut global_projects);
 
-    sessions.retain(|row| names.contains(&row.profile));
-    reconcile_legacy_rows(&mut sessions);
+    let listed_names: HashSet<&str> = inventory
+        .iter()
+        .filter(|(name, profile)| {
+            profile
+                .as_ref()
+                .map(|profile| profile.listed)
+                .or_else(|| {
+                    cache
+                        .inventory
+                        .iter()
+                        .find(|profile| &profile.name == *name)
+                        .map(|profile| profile.listed)
+                })
+                .unwrap_or(true)
+        })
+        .map(|(name, _)| name.as_str())
+        .collect();
+    reconcile_legacy_rows(&mut sessions, &listed_names);
 
-    let mut profile_reads = Vec::with_capacity(names.len());
+    let mut profile_reads = Vec::with_capacity(inventory.len());
     let mut profile_health = BTreeMap::new();
     for (name, entry) in disk {
         let projects_healthy = entry.projects.is_ok();
         let groups_healthy = entry.groups.is_ok();
         let scoped: Vec<&SessionRead> = sessions.iter().filter(|row| row.profile == name).collect();
-        let scoped_instances: Vec<&Instance> = instances
-            .iter()
-            .filter(|inst| inst.source_profile == name)
-            .collect();
         let mut projects = entry.projects.unwrap_or_default();
         drop_unusable_projects(&mut projects);
         // Referential integrity: every session's project path is a member of its
@@ -580,21 +685,34 @@ fn build_snapshot(
         // `aoe project list` prints, and the wire carries the presentation.
         let mut identities: HashSet<(String, String)> = HashSet::new();
         projects.retain(|project| identities.insert((project.name.clone(), project.path.clone())));
-        let owned: Vec<Instance> = scoped_instances.into_iter().cloned().collect();
         let stored_groups = entry.groups.unwrap_or_default();
-        let mut tree = GroupTree::new_with_groups(&owned, &stored_groups);
+        let mut tree = GroupTree::new_with_group_paths(
+            scoped.iter().map(|row| row.group_path.as_str()),
+            &stored_groups,
+        );
         drop_unusable_groups(&mut tree);
         let groups = group_reads(&tree);
         let health = ProfileHealth {
             profile_enumeration: component(groups_healthy, HealthCode::ProfileEnumeration),
             metadata: component(projects_healthy, HealthCode::Metadata),
             profile_data: component(
-                !load_health.enumeration_failed && !load_health.unreadable_profiles.contains(&name),
+                !cache.health.enumeration_failed
+                    && inventory[&name].as_ref().is_some_and(|profile| {
+                        cache.inventory.iter().any(|accepted| {
+                            accepted.identity == profile.identity
+                                && !cache.health.unreadable_profiles.contains(&accepted.name)
+                        })
+                    }),
                 HealthCode::ProfileEnumeration,
             ),
         };
         profile_health.insert(name.clone(), health);
         profile_reads.push(ProfileRead {
+            listed: listed_names.contains(name.as_str()),
+            aliases: inventory[&name]
+                .as_ref()
+                .map(|profile| profile.aliases.clone())
+                .unwrap_or_default(),
             name,
             groups,
             projects,
@@ -607,29 +725,27 @@ fn build_snapshot(
         global_metadata: component(global_metadata_healthy, HealthCode::Metadata),
         profiles: profile_health,
     };
-    let aggregate = aggregate_health(&snapshot_health);
-    // The resolved default, not the daemon's active profile: `aoe profile` marks
-    // the resolved one, and a client that resolved a different name would mark
-    // a different row.
-    //
-    // `default_profile` names a row this snapshot carries, or names nothing:
-    // the client's rule, and one it can check against the rows beside it. The
-    // resolved name is published beside it whatever it is, so a client that
-    // has to refuse can name the profile the user has to create instead of
-    // saying only that no default exists. Replacing it with some other
-    // profile's name would be the worst thing a transport can do.
-    //
-    // The guard is the *enumeration*, not `names`. `names` is that enumeration
-    // unioned with every session's profile, so a profile that still holds
-    // sessions keeps it non-empty even when its directory is gone — which is
-    // the case the comment above designs for, and the one where resolution
-    // would bootstrap a profile and write to the store a read must not write
-    // to. `get_profile_dir` ends in `create_dir_all`.
-    let resolved = (enumeration_healthy && !enumerated.is_empty())
-        .then(crate::session::config::resolve_default_profile);
+    let aggregate = aggregate_health(&snapshot_health, &profile_reads);
+    let config = if crate::session::app_dir_exists() {
+        crate::session::config::Config::load_or_warn()
+    } else {
+        crate::session::config::Config::default()
+    };
+    let resolved = if !config.default_profile.is_empty() {
+        Some(config.default_profile)
+    } else {
+        inventory
+            .iter()
+            .find(|(_, profile)| profile.as_ref().is_some_and(|profile| profile.listed))
+            .map(|(name, _)| name.clone())
+    };
     let default_profile = resolved
         .as_ref()
-        .filter(|name| names.contains(*name))
+        .filter(|name| {
+            profile_reads
+                .iter()
+                .any(|profile| &profile.name == *name || profile.aliases.contains(*name))
+        })
         .cloned();
 
     Sampled {
@@ -648,6 +764,8 @@ fn build_snapshot(
                 .iter()
                 .map(|profile| ProfileHello {
                     name: profile.name.clone(),
+                    listed: profile.listed,
+                    aliases: profile.aliases.clone(),
                     health: profile.health,
                 })
                 .collect(),
@@ -697,51 +815,40 @@ fn drop_unusable_groups(tree: &mut GroupTree) {
     }
 }
 
-/// Reconcile the stored rows against the rules a read projects under, field by
-/// field, so one legacy row cannot make the client refuse a whole snapshot.
-///
-/// A parent is kept only when it names a row of the same profile and the
-/// relation it forms is acyclic; otherwise the child nests at the top level,
-/// which is what the local `aoe list` shows for a parent it cannot resolve. A
-/// project path is spelled the way the store itself compares paths, trailing
-/// separators aside, and a group path the client's grammar refuses is cleared,
-/// which nests the row at the top level. Every other field is projected as
-/// stored, so the client's validation stays fail-closed rather than learning to
-/// tolerate more.
-fn reconcile_legacy_rows(sessions: &mut [SessionRead]) {
-    let index: HashMap<&str, usize> = sessions
+/// Preserve scoped orphans, sever cycles and invalid group paths.
+fn reconcile_legacy_rows(sessions: &mut [SessionRead], listed: &HashSet<&str>) {
+    let index: HashMap<(&str, &str), usize> = sessions
         .iter()
         .enumerate()
-        .map(|(position, row)| (row.id.as_str(), position))
+        .map(|(position, row)| ((row.profile.as_str(), row.id.as_str()), position))
         .collect();
-    let mut parents: HashMap<usize, &str> = sessions
+    let listed_ids: HashSet<&str> = sessions
+        .iter()
+        .filter(|row| listed.contains(row.profile.as_str()))
+        .map(|row| row.id.as_str())
+        .collect();
+    let mut parents: HashMap<usize, usize> = sessions
         .iter()
         .enumerate()
         .filter_map(|(position, row)| {
             row.parent_session_id
                 .as_deref()
+                .and_then(|parent| index.get(&(row.profile.as_str(), parent)).copied())
                 .map(|parent| (position, parent))
         })
         .collect();
-    let severed = cycle_entries(&index, &mut parents);
-    // A parent that names no row is left as stored: the local path keeps and
-    // prints the id, and `rm --purge` of a parent is what makes one. What is
-    // cleared is what this projection cannot stand behind: a parent in another
-    // profile, and the members of a cycle.
-    let resolved: Vec<bool> = sessions
-        .iter()
-        .enumerate()
-        .map(|(position, row)| {
-            !severed.contains(&position)
-                && parents.get(&position).is_some_and(|parent| {
-                    index
-                        .get(parent)
-                        .is_none_or(|parent| sessions[*parent].profile == row.profile)
-                })
-        })
-        .collect();
-    for (row, resolved) in sessions.iter_mut().zip(resolved) {
-        if !resolved {
+    let mut severed = cycle_entries(&mut parents);
+    for (position, row) in sessions.iter().enumerate() {
+        if listed.contains(row.profile.as_str())
+            && row.parent_session_id.as_deref().is_some_and(|parent| {
+                !index.contains_key(&(row.profile.as_str(), parent)) && listed_ids.contains(parent)
+            })
+        {
+            severed.insert(position);
+        }
+    }
+    for (position, row) in sessions.iter_mut().enumerate() {
+        if severed.contains(&position) {
             row.parent_session_id = None;
         }
         if !row.group_path.is_empty()
@@ -752,30 +859,20 @@ fn reconcile_legacy_rows(sessions: &mut [SessionRead]) {
     }
 }
 
-/// The row at which each parent cycle closes. The relation gives every row at
-/// most one parent, so a walk from any row that enters a cycle meets that
-/// cycle's entry again, and severing that one edge breaks the cycle while every
-/// tail below it stays nested. Walks start in row order, and rows are already
-/// sorted by id, so the entry chosen for a cycle is the same on every run.
-fn cycle_entries(
-    index: &HashMap<&str, usize>,
-    parents: &mut HashMap<usize, &str>,
-) -> HashSet<usize> {
+/// Sever one edge of each scoped cycle in stored row order.
+fn cycle_entries(parents: &mut HashMap<usize, usize>) -> HashSet<usize> {
     let mut entries = HashSet::new();
     for start in parents.keys().copied().collect::<BTreeSet<_>>() {
         let mut walked = HashSet::new();
         let mut cursor = Some(start);
         while let Some(row) = cursor {
             if !walked.insert(row) {
-                // Severed as it is found, so the next walk down the same cycle
-                // sees the break rather than reporting the cycle again.
+                // Subsequent walks see the severed edge.
                 entries.insert(row);
                 parents.remove(&row);
                 break;
             }
-            cursor = parents
-                .get(&row)
-                .and_then(|parent| index.get(parent).copied());
+            cursor = parents.get(&row).copied();
         }
     }
     entries
@@ -789,18 +886,22 @@ fn component(healthy: bool, code: HealthCode) -> ComponentHealth {
     }
 }
 
-/// The Hello aggregate is a diagnostic roll-up of the same components, worst
-/// first: `enumeration` > `profile_enumeration` > `metadata` > `profile_data`.
-fn aggregate_health(health: &SnapshotHealth) -> AggregateHealth {
+/// Aggregate reads depend only on listed stores.
+fn aggregate_health(health: &SnapshotHealth, profiles: &[ProfileRead]) -> AggregateHealth {
     let worst = [health.global_enumeration, health.global_metadata]
         .into_iter()
-        .chain(health.profiles.values().flat_map(|profile| {
-            [
-                profile.profile_enumeration,
-                profile.metadata,
-                profile.profile_data,
-            ]
-        }))
+        .chain(
+            profiles
+                .iter()
+                .filter(|profile| profile.listed)
+                .flat_map(|profile| {
+                    [
+                        profile.health.profile_enumeration,
+                        profile.health.metadata,
+                        profile.health.profile_data,
+                    ]
+                }),
+        )
         .find_map(|component| match component {
             ComponentHealth::Healthy => None,
             ComponentHealth::Degraded { code } => Some(code),
@@ -913,6 +1014,8 @@ struct SnapshotData {
 #[derive(Serialize, Clone)]
 struct ProfileHello {
     name: String,
+    listed: bool,
+    aliases: Vec<String>,
     health: ProfileHealth,
 }
 
@@ -999,6 +1102,8 @@ enum StatusFreshness {
 #[derive(Serialize, Clone)]
 struct ProfileRead {
     name: String,
+    listed: bool,
+    aliases: Vec<String>,
     groups: Vec<GroupRead>,
     projects: Vec<ProjectRead>,
     health: ProfileHealth,
@@ -1156,7 +1261,7 @@ mod tests {
     use crate::cli::runtime_read::dto::{
         parse_hello, parse_snapshot, validate_cross_message, validate_hello, validate_snapshot,
     };
-    use crate::session::{Group, WorkspaceInfo, WorkspaceRepo as StoredRepo, WorktreeInfo};
+    use crate::session::{Group, Status, WorkspaceInfo, WorkspaceRepo as StoredRepo, WorktreeInfo};
 
     /// One row's `required` list from the published document beside the
     /// fixtures rather than from anything this module knows. `definition` of
@@ -1318,7 +1423,7 @@ mod tests {
             &[session],
             Owner::remote(),
             Utc::now(),
-            &crate::server::reload::SessionLoadHealth::default(),
+            &crate::server::reload::RuntimeReadCache::accepted_inventory(),
         );
         let hello: serde_json::Value =
             serde_json::from_slice(&hello_frame(&sampled)).expect("the Hello is JSON");
@@ -1499,13 +1604,16 @@ mod tests {
 
     async fn cached_snapshot(state: &Arc<AppState>) -> crate::cli::runtime_read::dto::SnapshotData {
         let instances = state.instances.read().await;
-        let health = state.session_load_health.read().unwrap();
+        let cache = state.runtime_read_cache.read().unwrap();
+        let mut rows = Vec::with_capacity(instances.len() + cache.alias_only_instances.len());
+        rows.extend(instances.iter().cloned());
+        rows.extend(cache.alias_only_instances.iter().cloned());
         let sampled = build_snapshot(
             &RuntimeState::new(),
-            &instances,
+            &rows,
             Owner::remote(),
             Utc::now(),
-            &health,
+            &cache,
         );
         let hello = parse_hello(&hello_frame(&sampled)).unwrap();
         let snapshot = parse_snapshot(&snapshot_frame(&sampled)).unwrap();
@@ -1633,7 +1741,7 @@ mod tests {
         std::fs::write(&profiles, "not a directory").unwrap();
         let state = test_support::build_test_app_state(Vec::new());
         let failed = load_all_instances(&state.file_watch);
-        let failed_health = failed.health.clone();
+        let failed_health = failed.cache.health.clone();
         reload_state_instances_from_disk(&state, failed, vec![], StatusSource::DiskOnly, 0).await;
         let snapshot = cached_snapshot(&state).await;
         assert!(!crate::cli::runtime_read::dto::component_healthy(
@@ -1664,7 +1772,10 @@ mod tests {
         std::fs::remove_dir_all(profiles.join("main")).unwrap();
         let failed = crate::server::reload::LoadedInstances {
             instances: vec![],
-            health: failed_health,
+            cache: super::super::reload::RuntimeReadCache {
+                health: failed_health,
+                ..Default::default()
+            },
         };
         reload_state_instances_from_disk(&state, failed, vec![], StatusSource::DiskOnly, 0).await;
         let snapshot = cached_snapshot(&state).await;
@@ -1691,7 +1802,7 @@ mod tests {
             &instances,
             Owner::remote(),
             Utc::now(),
-            &crate::server::reload::SessionLoadHealth::default(),
+            &crate::server::reload::RuntimeReadCache::accepted_inventory(),
         );
 
         let hello = parse_hello(&hello_frame(&sampled)).expect("the client decodes the Hello");
@@ -1773,7 +1884,7 @@ mod tests {
             &[],
             Owner::remote(),
             Utc::now(),
-            &crate::server::reload::SessionLoadHealth::default(),
+            &crate::server::reload::RuntimeReadCache::accepted_inventory(),
         );
 
         let published: Vec<&str> = sampled.data.profiles[0]
@@ -1828,7 +1939,7 @@ mod tests {
             &[instance("a", "zeta")],
             Owner::remote(),
             Utc::now(),
-            &crate::server::reload::SessionLoadHealth::default(),
+            &crate::server::reload::RuntimeReadCache::accepted_inventory(),
         );
         assert_eq!(sampled.data.default_profile, None);
         assert_eq!(sampled.data.profiles.len(), 1);
@@ -1913,7 +2024,7 @@ mod tests {
             &instances,
             Owner::remote(),
             Utc::now(),
-            &crate::server::reload::SessionLoadHealth::default(),
+            &crate::server::reload::RuntimeReadCache::accepted_inventory(),
         );
 
         let hello = parse_hello(&hello_frame(&sampled)).expect("client accepts the Hello");
@@ -1936,7 +2047,7 @@ mod tests {
             &[instance("a", "main")],
             Owner::remote(),
             Utc::now(),
-            &crate::server::reload::SessionLoadHealth::default(),
+            &crate::server::reload::RuntimeReadCache::accepted_inventory(),
         );
         let value: serde_json::Value = serde_json::to_value(&sampled.hello).expect("hello encodes");
 
@@ -1970,14 +2081,14 @@ mod tests {
             &[],
             Owner::remote(),
             Utc::now(),
-            &crate::server::reload::SessionLoadHealth::default(),
+            &crate::server::reload::RuntimeReadCache::accepted_inventory(),
         );
         let second = build_snapshot(
             &runtime,
             &[],
             Owner::remote(),
             Utc::now(),
-            &crate::server::reload::SessionLoadHealth::default(),
+            &crate::server::reload::RuntimeReadCache::accepted_inventory(),
         );
 
         assert_eq!(observed_revision(&first), 1);
@@ -2004,7 +2115,7 @@ mod tests {
             &[],
             Owner::remote(),
             Utc::now(),
-            &crate::server::reload::SessionLoadHealth::default(),
+            &crate::server::reload::RuntimeReadCache::accepted_inventory(),
         );
 
         assert!(matches!(
@@ -2091,7 +2202,7 @@ mod tests {
             &instances,
             Owner::remote(),
             Utc::now(),
-            &crate::server::reload::SessionLoadHealth::default(),
+            &crate::server::reload::RuntimeReadCache::accepted_inventory(),
         );
 
         let snapshot =
@@ -2134,7 +2245,7 @@ mod tests {
         let mut rows = vec![cross, b, orphan];
         rows.append(&mut cycle);
 
-        reconcile_legacy_rows(&mut rows);
+        reconcile_legacy_rows(&mut rows, &HashSet::from(["main", "other"]));
 
         let parents: Vec<(&str, Option<&str>)> = rows
             .iter()
@@ -2168,7 +2279,7 @@ mod tests {
             &[inst],
             Owner::remote(),
             Utc::now(),
-            &crate::server::reload::SessionLoadHealth::default(),
+            &crate::server::reload::RuntimeReadCache::accepted_inventory(),
         );
 
         let row = &sampled.data.sessions[0];
@@ -2192,5 +2303,680 @@ mod tests {
         assert!(has_bearer_header(&headers));
         headers.append(header::AUTHORIZATION, "Bearer second".parse().unwrap());
         assert!(!has_bearer_header(&headers));
+    }
+    #[test]
+    #[serial_test::serial]
+    fn recording_an_empty_store_does_not_create_app_directories() {
+        let home = TempHome::new();
+        let frames = record_exchange(
+            &[],
+            RecordedOwner::Remote,
+            &RecordingPins {
+                runtime_epoch: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".into(),
+                prebind_instance_id: "bbbbbbbb-cccc-dddd-eeee-ffffffffffff".into(),
+                runtime_instance_id: "cccccccc-dddd-eeee-ffff-000000000000".into(),
+                observed_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+            },
+        );
+        let snapshot = parse_snapshot(&frames.snapshot).unwrap();
+        validate_snapshot(&snapshot).unwrap();
+        assert!(snapshot.profiles.is_empty());
+        assert_eq!(snapshot.default_profile, None);
+        assert!(!home.app_dir().exists());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn physical_alias_stores_are_cached_once_and_reload_acceptance_controls_readiness() {
+        use super::super::reload::{load_all_instances, reload_state_instances_from_disk};
+        use super::super::state::StatusSource;
+        use std::sync::atomic::Ordering;
+        let home = TempHome::new();
+        let canonical = Storage::new_unwatched("main").unwrap();
+        canonical
+            .update(|rows, _| {
+                *rows = vec![named("local", "main")];
+                Ok(())
+            })
+            .unwrap();
+        let external = tempfile::tempdir().unwrap();
+        let empty = tempfile::tempdir().unwrap();
+        let root = home.app_dir().join("profiles");
+        std::os::unix::fs::symlink(root.join("main"), root.join("inside")).unwrap();
+        for name in ["remote-a", "remote-b"] {
+            std::os::unix::fs::symlink(external.path(), root.join(name)).unwrap();
+        }
+        std::os::unix::fs::symlink(empty.path(), root.join("empty")).unwrap();
+        std::os::unix::fs::symlink(external.path().join("absent"), root.join("broken")).unwrap();
+        std::fs::write(external.path().join("file"), b"x").unwrap();
+        std::os::unix::fs::symlink(external.path().join("file"), root.join("not-directory"))
+            .unwrap();
+        let remote = Storage::open_unwatched("remote-a").unwrap();
+        remote
+            .update(|rows, _| {
+                *rows = vec![named("outside", "remote-a")];
+                Ok(())
+            })
+            .unwrap();
+        std::fs::write(
+            home.app_dir().join("config.toml"),
+            "default_profile = \"remote-b\"\n",
+        )
+        .unwrap();
+        let state = super::super::test_support::build_test_app_state(Vec::new());
+        let loaded = load_all_instances(&state.file_watch);
+        assert_eq!(
+            loaded
+                .instances
+                .iter()
+                .map(|row| row.id.as_str())
+                .collect::<Vec<_>>(),
+            ["local"]
+        );
+        assert_eq!(
+            loaded
+                .cache
+                .alias_only_instances
+                .iter()
+                .map(|row| row.id.as_str())
+                .collect::<Vec<_>>(),
+            ["outside"]
+        );
+        reload_state_instances_from_disk(&state, loaded, vec![], StatusSource::DiskOnly, 0).await;
+        let snapshot = cached_snapshot(&state).await;
+        assert_eq!(snapshot.default_profile.as_deref(), Some("remote-b"));
+        assert_eq!(
+            snapshot
+                .profiles
+                .iter()
+                .map(|profile| (profile.name.as_str(), profile.listed))
+                .collect::<Vec<_>>(),
+            [("empty", false), ("main", true), ("remote-a", false)]
+        );
+        assert_eq!(snapshot.profiles[1].aliases, ["inside"]);
+        assert_eq!(snapshot.profiles[2].aliases, ["remote-b"]);
+        assert!(cached_data_healthy(&snapshot, "empty"));
+        assert_eq!(
+            state
+                .instances
+                .read()
+                .await
+                .iter()
+                .map(|row| row.id.as_str())
+                .collect::<Vec<_>>(),
+            ["local"]
+        );
+        let rest = super::super::api::list_sessions(
+            axum::extract::State(state.clone()),
+            axum::extract::Query(crate::daemon::ListSessionsQuery { state: None }),
+        )
+        .await;
+        assert_eq!(
+            rest.0
+                .sessions
+                .iter()
+                .map(|row| row.id.as_str())
+                .collect::<Vec<_>>(),
+            ["local"]
+        );
+        std::fs::write(external.path().join("sessions.json"), b"[]").unwrap();
+        assert_eq!(
+            cached_snapshot(&state)
+                .await
+                .sessions
+                .iter()
+                .map(|row| row.id.as_str())
+                .collect::<Vec<_>>(),
+            ["local", "outside"]
+        );
+        std::fs::remove_file(root.join("remote-a")).unwrap();
+        std::fs::write(
+            external.path().join("groups.json"),
+            br#"[{"name":"current","path":"current"}]"#,
+        )
+        .unwrap();
+        let renamed = cached_snapshot(&state).await;
+        assert_eq!(
+            renamed
+                .sessions
+                .iter()
+                .find(|row| row.id == "outside")
+                .unwrap()
+                .profile,
+            "remote-b"
+        );
+        let profile = renamed
+            .profiles
+            .iter()
+            .find(|profile| profile.name == "remote-b")
+            .unwrap();
+        assert_eq!(profile.groups[0].path, "current");
+        assert!(cached_data_healthy(&renamed, "remote-b"));
+        let replacement = tempfile::tempdir().unwrap();
+        std::fs::write(
+            replacement.path().join("sessions.json"),
+            serde_json::to_vec(&vec![named("replacement", "remote-b")]).unwrap(),
+        )
+        .unwrap();
+        std::fs::remove_file(root.join("remote-b")).unwrap();
+        std::os::unix::fs::symlink(replacement.path(), root.join("remote-b")).unwrap();
+        let retargeted = cached_snapshot(&state).await;
+        assert!(!cached_data_healthy(&retargeted, "remote-b"));
+        assert!(retargeted.sessions.iter().any(|row| row.id == "outside"));
+        let loaded = load_all_instances(&state.file_watch);
+        state.mutation_epoch.store(1, Ordering::SeqCst);
+        reload_state_instances_from_disk(&state, loaded, vec![], StatusSource::DiskOnly, 0).await;
+        assert!(!cached_data_healthy(
+            &cached_snapshot(&state).await,
+            "remote-b"
+        ));
+        reload_state_instances_from_disk(
+            &state,
+            load_all_instances(&state.file_watch),
+            vec![],
+            StatusSource::DiskOnly,
+            1,
+        )
+        .await;
+        let accepted = cached_snapshot(&state).await;
+        assert!(cached_data_healthy(&accepted, "remote-b"));
+        assert_eq!(
+            accepted
+                .sessions
+                .iter()
+                .map(|row| row.id.as_str())
+                .collect::<Vec<_>>(),
+            ["local", "replacement"]
+        );
+        std::fs::write(replacement.path().join("sessions.json"), b"not json").unwrap();
+        reload_state_instances_from_disk(
+            &state,
+            load_all_instances(&state.file_watch),
+            vec![],
+            StatusSource::DiskOnly,
+            1,
+        )
+        .await;
+        assert!(!cached_data_healthy(
+            &cached_snapshot(&state).await,
+            "remote-b"
+        ));
+        std::fs::write(replacement.path().join("sessions.json"), b"[]").unwrap();
+        assert!(!cached_data_healthy(
+            &cached_snapshot(&state).await,
+            "remote-b"
+        ));
+        reload_state_instances_from_disk(
+            &state,
+            load_all_instances(&state.file_watch),
+            vec![],
+            StatusSource::DiskOnly,
+            1,
+        )
+        .await;
+        assert!(cached_data_healthy(
+            &cached_snapshot(&state).await,
+            "remote-b"
+        ));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn cached_canonical_rows_follow_a_renamed_directory_with_the_old_name_as_alias() {
+        let home = TempHome::new();
+        Storage::new_unwatched("main")
+            .unwrap()
+            .update(|rows, _| {
+                *rows = vec![named("cached", "main")];
+                Ok(())
+            })
+            .unwrap();
+        std::fs::write(
+            home.app_dir().join("config.toml"),
+            "default_profile = \"main\"\n",
+        )
+        .unwrap();
+        let state = super::super::test_support::build_test_app_state(Vec::new());
+        super::super::test_support::accept_runtime_read_cache_for_test(&state).await;
+        let root = home.app_dir().join("profiles");
+        std::fs::rename(root.join("main"), root.join("zeta")).unwrap();
+        std::os::unix::fs::symlink(root.join("zeta"), root.join("main")).unwrap();
+        std::fs::write(root.join("zeta/sessions.json"), b"[]").unwrap();
+        let snapshot = cached_snapshot(&state).await;
+        assert_eq!(
+            snapshot
+                .profiles
+                .iter()
+                .map(|profile| profile.name.as_str())
+                .collect::<Vec<_>>(),
+            ["zeta"]
+        );
+        assert!(snapshot.profiles[0].listed);
+        assert_eq!(snapshot.profiles[0].aliases, ["main"]);
+        assert_eq!(snapshot.sessions[0].id, "cached");
+        assert_eq!(snapshot.sessions[0].profile, "zeta");
+        assert!(cached_data_healthy(&snapshot, "zeta"));
+        assert_eq!(snapshot.default_profile.as_deref(), Some("main"));
+        assert_eq!(state.instances.read().await[0].source_profile, "main");
+        super::super::test_support::accept_runtime_read_cache_for_test(&state).await;
+        assert!(cached_snapshot(&state).await.sessions.is_empty());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn earlier_alias_representatives_preserve_empty_readiness_and_failed_load_latches() {
+        use super::super::reload::{load_all_instances, reload_state_instances_from_disk};
+        use super::super::state::StatusSource;
+        for unreadable in [false, true] {
+            let home = TempHome::new();
+            let outside = tempfile::tempdir().unwrap();
+            let root = home.app_dir().join("profiles");
+            std::fs::create_dir_all(&root).unwrap();
+            if unreadable {
+                std::fs::write(outside.path().join("sessions.json"), b"not JSON").unwrap();
+            }
+            std::os::unix::fs::symlink(outside.path(), root.join("outside-z")).unwrap();
+            let state = super::super::test_support::build_test_app_state(Vec::new());
+            super::super::test_support::accept_runtime_read_cache_for_test(&state).await;
+            std::os::unix::fs::symlink(outside.path(), root.join("outside-a")).unwrap();
+            let renamed = cached_snapshot(&state).await;
+            assert_eq!(
+                renamed
+                    .profiles
+                    .iter()
+                    .map(|profile| profile.name.as_str())
+                    .collect::<Vec<_>>(),
+                ["outside-a"]
+            );
+            assert_eq!(renamed.profiles[0].aliases, ["outside-z"]);
+            assert_eq!(cached_data_healthy(&renamed, "outside-a"), !unreadable);
+            assert!(renamed.sessions.is_empty());
+            std::fs::write(outside.path().join("sessions.json"), b"[]").unwrap();
+            assert_eq!(
+                cached_data_healthy(&cached_snapshot(&state).await, "outside-a"),
+                !unreadable
+            );
+            state
+                .mutation_epoch
+                .store(1, std::sync::atomic::Ordering::SeqCst);
+            reload_state_instances_from_disk(
+                &state,
+                load_all_instances(&state.file_watch),
+                vec![],
+                StatusSource::DiskOnly,
+                0,
+            )
+            .await;
+            assert_eq!(
+                cached_data_healthy(&cached_snapshot(&state).await, "outside-a"),
+                !unreadable
+            );
+            super::super::test_support::accept_runtime_read_cache_for_test(&state).await;
+            assert!(cached_data_healthy(
+                &cached_snapshot(&state).await,
+                "outside-a"
+            ));
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn raw_lexical_aliases_and_legacy_directories_keep_read_inventory_semantics() {
+        let home = TempHome::new();
+        Storage::new_unwatched("main").unwrap();
+        let root = home.app_dir().join("profiles");
+        for name in ["tab\tname", "all\n", "\u{0085}name", "\u{202e}name"] {
+            std::os::unix::fs::symlink(root.join("main"), root.join(name)).unwrap();
+        }
+        for name in ["ALL", "legacy\\name"] {
+            std::fs::create_dir_all(root.join(name)).unwrap();
+        }
+        let state = super::super::test_support::build_test_app_state(Vec::new());
+        super::super::test_support::accept_runtime_read_cache_for_test(&state).await;
+        let client = cached_snapshot(&state).await;
+        validate_snapshot(&client).unwrap();
+        let main = client
+            .profiles
+            .iter()
+            .find(|profile| profile.name == "main")
+            .unwrap();
+        assert_eq!(
+            main.aliases,
+            ["all\n", "tab\tname", "\u{0085}name", "\u{202e}name"]
+        );
+        for name in ["ALL", "legacy\\name"] {
+            let profile = client
+                .profiles
+                .iter()
+                .find(|profile| profile.name == name)
+                .unwrap();
+            assert!(profile.listed);
+            assert!(!crate::cli::runtime_read::dto::profile_component_healthy(
+                &profile.health.profile_enumeration
+            ));
+            assert!(crate::cli::runtime_read::dto::profile_component_healthy(
+                &profile.health.metadata
+            ));
+            assert!(crate::cli::runtime_read::dto::profile_component_healthy(
+                &profile.health.profile_data
+            ));
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn default_alias_without_listed_profiles_and_parse_fallback_use_existing_config_rules() {
+        let home = TempHome::new();
+        let outside = tempfile::tempdir().unwrap();
+        let root = home.app_dir().join("profiles");
+        std::fs::create_dir_all(&root).unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.join("outside")).unwrap();
+        std::fs::write(
+            home.app_dir().join("config.toml"),
+            "default_profile = \"outside\"\n",
+        )
+        .unwrap();
+        let state = super::super::test_support::build_test_app_state(Vec::new());
+        let not_accepted = cached_snapshot(&state).await;
+        assert_eq!(not_accepted.default_profile.as_deref(), Some("outside"));
+        assert!(!cached_data_healthy(&not_accepted, "outside"));
+        super::super::test_support::accept_runtime_read_cache_for_test(&state).await;
+        assert!(cached_data_healthy(
+            &cached_snapshot(&state).await,
+            "outside"
+        ));
+        Storage::new_unwatched("main").unwrap();
+        std::fs::write(home.app_dir().join("state.toml"), "[").unwrap();
+        let fallback = cached_snapshot(&state).await;
+        assert_eq!(fallback.default_profile.as_deref(), Some("main"));
+        assert_eq!(fallback.resolved_default_profile.as_deref(), Some("main"));
+    }
+
+    async fn socket_pair() -> (ReadSocket, tokio_tungstenite::WebSocketStream<UnixStream>) {
+        let (server, peer) = UnixStream::pair().unwrap();
+        let server = tokio_tungstenite::WebSocketStream::from_raw_socket(
+            server,
+            tungstenite::protocol::Role::Server,
+            None,
+        )
+        .await;
+        let peer = tokio_tungstenite::WebSocketStream::from_raw_socket(
+            peer,
+            tungstenite::protocol::Role::Client,
+            None,
+        )
+        .await;
+        (ReadSocket::Unix(server), peer)
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn admission_is_held_until_the_reading_peer_closes() {
+        let _home = TempHome::new();
+        let mut state = super::super::test_support::build_test_app_state(Vec::new());
+        Arc::get_mut(&mut state).unwrap().runtime_read_semaphore =
+            Arc::new(tokio::sync::Semaphore::new(1));
+        let semaphore = state.runtime_read_semaphore.clone();
+        let (socket, mut peer) = socket_pair().await;
+        let served = tokio::spawn(run_read(socket, state, Owner::remote(), false));
+        for expected in ["hello", "snapshot"] {
+            let frame = tokio::time::timeout(Duration::from_secs(5), peer.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            let value: serde_json::Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+            assert_eq!(value["kind"], expected);
+        }
+        assert_eq!(semaphore.available_permits(), 0);
+        peer.close(None).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), served)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(semaphore.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn cancellation_retains_admission_until_a_blocked_sample_finishes() {
+        let _home = TempHome::new();
+        let mut state = super::super::test_support::build_test_app_state(Vec::new());
+        Arc::get_mut(&mut state).unwrap().runtime_read_semaphore =
+            Arc::new(tokio::sync::Semaphore::new(1));
+        let semaphore = state.runtime_read_semaphore.clone();
+        let (socket, peer) = socket_pair().await;
+        {
+            let flight = RUNTIME.flight.lock().unwrap();
+            let mut read = Box::pin(run_read(socket, state, Owner::remote(), false));
+            let mut context = std::task::Context::from_waker(futures_util::task::noop_waker_ref());
+            assert!(std::future::Future::poll(read.as_mut(), &mut context).is_pending());
+            assert_eq!(semaphore.available_permits(), 0);
+            drop(read);
+            assert_eq!(semaphore.available_permits(), 0);
+            drop(flight);
+        }
+        let permit = tokio::time::timeout(Duration::from_secs(5), semaphore.acquire())
+            .await
+            .unwrap()
+            .unwrap();
+        drop(permit);
+        drop(peer);
+        assert_eq!(semaphore.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn retargeting_a_retired_cached_name_to_a_canonical_store_keeps_other_reads_valid() {
+        let home = TempHome::new();
+        Storage::new_unwatched("main")
+            .unwrap()
+            .update(|rows, _| {
+                *rows = vec![named("canonical", "main")];
+                Ok(())
+            })
+            .unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let root = home.app_dir().join("profiles");
+        std::os::unix::fs::symlink(outside.path(), root.join("outside")).unwrap();
+        Storage::open_unwatched("outside")
+            .unwrap()
+            .update(|rows, _| {
+                *rows = vec![named("retired", "outside")];
+                Ok(())
+            })
+            .unwrap();
+        let state = super::super::test_support::build_test_app_state(Vec::new());
+        super::super::test_support::accept_runtime_read_cache_for_test(&state).await;
+        std::fs::remove_file(root.join("outside")).unwrap();
+        std::os::unix::fs::symlink(root.join("main"), root.join("outside")).unwrap();
+        let snapshot = cached_snapshot(&state).await;
+        let rest = super::super::api::list_sessions(
+            axum::extract::State(state.clone()),
+            axum::extract::Query(crate::daemon::ListSessionsQuery { state: None }),
+        )
+        .await;
+        assert_eq!(
+            rest.0
+                .sessions
+                .iter()
+                .map(|row| row.id.as_str())
+                .collect::<Vec<_>>(),
+            ["canonical"]
+        );
+        assert!(cached_data_healthy(&snapshot, "main"));
+        assert!(!cached_data_healthy(&snapshot, "outside"));
+        assert_eq!(
+            snapshot
+                .sessions
+                .iter()
+                .map(|row| (row.id.as_str(), row.profile.as_str()))
+                .collect::<Vec<_>>(),
+            [("canonical", "main"), ("retired", "outside")]
+        );
+        assert!(snapshot
+            .profiles
+            .iter()
+            .find(|profile| profile.name == "main")
+            .unwrap()
+            .aliases
+            .is_empty());
+        state
+            .mutation_epoch
+            .store(1, std::sync::atomic::Ordering::SeqCst);
+        super::super::reload::reload_state_instances_from_disk(
+            &state,
+            super::super::reload::load_all_instances(&state.file_watch),
+            vec![],
+            super::super::state::StatusSource::DiskOnly,
+            0,
+        )
+        .await;
+        let rejected = cached_snapshot(&state).await;
+        assert_eq!(
+            rejected
+                .sessions
+                .iter()
+                .map(|row| (row.id.as_str(), row.profile.as_str()))
+                .collect::<Vec<_>>(),
+            [("canonical", "main"), ("retired", "outside")]
+        );
+        assert!(!cached_data_healthy(&rejected, "outside"));
+        super::super::test_support::accept_runtime_read_cache_for_test(&state).await;
+        let accepted = cached_snapshot(&state).await;
+        assert_eq!(
+            accepted
+                .sessions
+                .iter()
+                .map(|row| row.id.as_str())
+                .collect::<Vec<_>>(),
+            ["canonical"]
+        );
+        assert_eq!(accepted.profiles[0].aliases, ["outside"]);
+        assert!(cached_data_healthy(&accepted, "main"));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn retargeted_alias_only_copies_reserve_old_keys_without_mixing_physical_stores() {
+        use super::super::reload::{load_all_instances, reload_state_instances_from_disk};
+        use super::super::state::StatusSource;
+        for surviving_alias in [true, false] {
+            let home = TempHome::new();
+            Storage::new_unwatched("main")
+                .unwrap()
+                .update(|rows, _| {
+                    *rows = vec![named("canonical", "main")];
+                    Ok(())
+                })
+                .unwrap();
+            let a = tempfile::tempdir().unwrap();
+            let b = tempfile::tempdir().unwrap();
+            let root = home.app_dir().join("profiles");
+            for (name, directory, title, status) in [
+                ("outside-a", a.path(), "store-a", Status::Waiting),
+                ("outside-z", b.path(), "store-b", Status::Running),
+            ] {
+                std::os::unix::fs::symlink(directory, root.join(name)).unwrap();
+                Storage::open_unwatched(name)
+                    .unwrap()
+                    .update(|rows, _| {
+                        let mut row = named("copy", name);
+                        row.title = title.into();
+                        row.command = format!("printf {title}");
+                        row.status = status;
+                        *rows = vec![row];
+                        Ok(())
+                    })
+                    .unwrap();
+            }
+            let state = super::super::test_support::build_test_app_state(Vec::new());
+            super::super::test_support::accept_runtime_read_cache_for_test(&state).await;
+            std::fs::remove_file(root.join("outside-a")).unwrap();
+            std::os::unix::fs::symlink(b.path(), root.join("outside-a")).unwrap();
+            if !surviving_alias {
+                std::fs::remove_file(root.join("outside-z")).unwrap();
+            }
+            for rejected in [false, true] {
+                if rejected {
+                    state
+                        .mutation_epoch
+                        .store(1, std::sync::atomic::Ordering::SeqCst);
+                    reload_state_instances_from_disk(
+                        &state,
+                        load_all_instances(&state.file_watch),
+                        vec![],
+                        StatusSource::DiskOnly,
+                        0,
+                    )
+                    .await;
+                }
+                let snapshot = cached_snapshot(&state).await;
+                assert_eq!(
+                    snapshot
+                        .sessions
+                        .iter()
+                        .map(|row| (row.id.as_str(), row.profile.as_str(), row.title.as_str()))
+                        .collect::<Vec<_>>(),
+                    [
+                        ("canonical", "main", "Session canonical"),
+                        ("copy", "outside-a", "store-a"),
+                        ("copy", "outside-z", "store-b")
+                    ]
+                );
+                assert!(cached_data_healthy(&snapshot, "main"));
+                assert!(!cached_data_healthy(&snapshot, "outside-a"));
+                assert_eq!(cached_data_healthy(&snapshot, "outside-z"), surviving_alias);
+                let b_row = snapshot
+                    .sessions
+                    .iter()
+                    .find(|row| row.profile == "outside-z")
+                    .unwrap();
+                assert_eq!(b_row.command, "printf store-b");
+                assert_eq!(
+                    b_row.status,
+                    crate::cli::runtime_read::dto::WireStatus::Running
+                );
+                let rest = super::super::api::list_sessions(
+                    axum::extract::State(state.clone()),
+                    axum::extract::Query(crate::daemon::ListSessionsQuery { state: None }),
+                )
+                .await;
+                assert_eq!(
+                    rest.0
+                        .sessions
+                        .iter()
+                        .map(|row| row.id.as_str())
+                        .collect::<Vec<_>>(),
+                    ["canonical"]
+                );
+            }
+            super::super::test_support::accept_runtime_read_cache_for_test(&state).await;
+            let accepted = cached_snapshot(&state).await;
+            assert_eq!(
+                accepted
+                    .profiles
+                    .iter()
+                    .map(|profile| profile.name.as_str())
+                    .collect::<Vec<_>>(),
+                ["main", "outside-a"]
+            );
+            let b_row = accepted
+                .sessions
+                .iter()
+                .find(|row| row.profile == "outside-a")
+                .unwrap();
+            assert_eq!(b_row.title, "store-b");
+            assert_eq!(b_row.command, "printf store-b");
+            assert!(cached_data_healthy(&accepted, "outside-a"));
+            assert_eq!(
+                accepted
+                    .sessions
+                    .iter()
+                    .map(|row| row.id.as_str())
+                    .collect::<Vec<_>>(),
+                ["canonical", "copy"]
+            );
+        }
     }
 }

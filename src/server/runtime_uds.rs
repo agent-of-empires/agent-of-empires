@@ -129,8 +129,8 @@ struct MarkerProbe {
 
 #[derive(Clone, Copy)]
 struct SocketIdentity {
-    device: u64,
-    inode: u64,
+    device: libc::dev_t,
+    inode: libc::ino_t,
 }
 
 /// A live publication: the listener, the namespace directory, the held shared
@@ -327,6 +327,9 @@ fn write_markers(
         namespace: runtime_ws::NAMESPACE,
         socket_path: SOCKET_FILE,
         owner_uid,
+        #[cfg(target_os = "macos")]
+        socket_device: socket.device as u64,
+        #[cfg(not(target_os = "macos"))]
         socket_device: socket.device,
         socket_inode: socket.inode,
         #[cfg(target_os = "linux")]

@@ -151,7 +151,7 @@ fn build_test_app_state_impl(
         read_only: false,
         cityhall_mode,
         instances,
-        session_load_health: Default::default(),
+        runtime_read_cache: Default::default(),
         session_service,
         token_manager: Arc::new(TokenManager::new(token, Duration::from_secs(3600))),
         login_manager: Arc::new(login::LoginManager::new(None)),
@@ -210,6 +210,22 @@ fn build_test_app_state_impl(
         disk_changed: Arc::new(tokio::sync::Notify::new()),
         disk_watch_handles: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
     })
+}
+
+/// Accept a fixture's disk rows and cache through the normal reload commit.
+pub async fn accept_runtime_read_cache_for_test(state: &Arc<AppState>) {
+    let read_epoch = state
+        .mutation_epoch
+        .load(std::sync::atomic::Ordering::SeqCst);
+    let loaded = super::reload::load_all_instances(&state.file_watch);
+    super::reload::reload_state_instances_from_disk(
+        state,
+        loaded,
+        Vec::new(),
+        super::state::StatusSource::DiskOnly,
+        read_epoch,
+    )
+    .await;
 }
 
 pub async fn drain_session_id_updates_for_test(state: &Arc<AppState>) {

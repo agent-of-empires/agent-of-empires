@@ -73,8 +73,8 @@ pub struct AppState {
     /// CityHall client mode, resolved once at launch from `AOE_CITYHALL_MODE`.
     pub cityhall_mode: bool,
     pub instances: Arc<RwLock<Vec<Instance>>>,
-    // Acquire instances before this lock to sample and publish rows with their load health.
-    pub(crate) session_load_health: std::sync::RwLock<super::reload::SessionLoadHealth>,
+    // Lock instances before the cache for coherent reads and reload commits.
+    pub(crate) runtime_read_cache: std::sync::RwLock<super::reload::RuntimeReadCache>,
     /// Session-domain service handle sharing `instances`, `instance_locks`, `file_watch`,
     /// the telemetry create counter, and the ACP supervisor with the fields on this struct,
     /// so a non-HTTP caller (the plugin host, #2897) can drive session create/turn without

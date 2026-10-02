@@ -17,7 +17,7 @@
     "runtime_instance_id"
   ],
   "properties": {
-    "protocol_version": { "const": 3 },
+    "protocol_version": { "const": 4 },
     "runtime_epoch": { "$ref": "#/$defs/uuid" },
     "prebind_instance_id": { "$ref": "#/$defs/uuid" },
     "runtime_instance_id": { "$ref": "#/$defs/uuid" },
@@ -42,6 +42,13 @@
     "safe_text": {
       "type": "string",
       "pattern": "^[^\\u0000-\\u001f\\u007f-\\u009f\\u2028\\u2029\\u202a-\\u202e\\u2066-\\u2069]*$"
+    },
+    "profile_label": { "type": "string", "minLength": 1 },
+    "profile_alias": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[^/\\\\]+$",
+      "not": { "enum": [".", "..", "all", "All", "aLl", "alL", "ALl", "AlL", "aLL", "ALL"] }
     },
     "absolute_path": {
       "type": "string",
@@ -161,14 +168,20 @@
       ]
     },
     "profile_hello": {
-      "description": "What the handshake says about one profile. The inventory is not repeated here, because this list was the second copy of the one snapshot.schema.json carries in full: the client validated every group and project in that copy and then never read it. What stays is what lets the handshake fail closed before the much larger Snapshot is accepted: the name, and whether this daemon could read the profile at all.",
+      "description": "Selectable physical profile, aliases, local enumeration membership and load health.",
       "type": "object",
       "additionalProperties": false,
-      "required": ["name", "health"],
+      "required": ["name", "listed", "aliases", "health"],
       "properties": {
-        "name": { "$ref": "#/$defs/safe_text" },
+        "name": { "$ref": "#/$defs/profile_label" },
+        "listed": { "type": "boolean" },
+        "aliases": { "type": "array", "items": { "$ref": "#/$defs/profile_alias" } },
         "health": { "$ref": "#/$defs/profile_health" }
-      }
+      },
+      "oneOf": [
+        { "properties": { "listed": { "const": true } } },
+        { "properties": { "listed": { "const": false }, "name": { "$ref": "#/$defs/profile_alias" } } }
+      ]
     }
   }
 }

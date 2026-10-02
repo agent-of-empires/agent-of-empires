@@ -630,7 +630,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         read_only,
         cityhall_mode: std::env::var_os("AOE_CITYHALL_MODE").is_some(),
         instances,
-        session_load_health: std::sync::RwLock::new(loaded.health),
+        runtime_read_cache: std::sync::RwLock::new(loaded.cache),
         session_service,
         token_manager: Arc::clone(&token_manager),
         login_manager: Arc::clone(&login_manager),

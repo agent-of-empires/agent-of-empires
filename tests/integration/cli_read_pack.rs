@@ -835,7 +835,7 @@ fn a_pattern_inside_a_one_of_branch_is_enforced() {
     let (_dir, root) = staged_pack();
     let schema = root.join("snapshot.schema.json");
     let text = fs::read_to_string(&schema).expect("read the published document");
-    let branch = r##""oneOf": [{ "$ref": "#/$defs/safe_text" }, { "type": "null" }]"##;
+    let branch = r##""oneOf": [{ "$ref": "#/$defs/profile_label" }, { "type": "null" }]"##;
 
     // The property names the branch, and the first `oneOf` under it is the one
     // the test edits, so a description added to the property cannot move it.
@@ -846,8 +846,8 @@ fn a_pattern_inside_a_one_of_branch_is_enforced() {
     let to = tail.replacen(
         branch,
         &branch.replace(
-            r##"{ "$ref": "#/$defs/safe_text" }"##,
-            r##"{ "$ref": "#/$defs/safe_text", "pattern": "^(main|absent|retired)$" }"##,
+            r##"{ "$ref": "#/$defs/profile_label" }"##,
+            r##"{ "$ref": "#/$defs/profile_label", "pattern": "^(main|absent|retired)$" }"##,
         ),
         1,
     );
@@ -1010,29 +1010,57 @@ fn a_boolean_items_in_a_published_document_is_refused() {
     );
 }
 
-/// `enum` is the same identity test as `const`, and the two must agree on the
-/// spelling of a number: the draft defines both over the *value*, so
-/// `{"enum": [3.0]}` names the value every recorded `protocol_version` carries.
-/// `enum` once compared `Number` spellings structurally, which made this edit
-/// refuse every frame in the pack over a difference no document had written
-/// down.
+/// JSON Schema numeric equality is independent of the number's spelling.
 #[test]
 #[parallel]
 fn an_enumerated_number_names_the_value_and_not_its_spelling() {
     let (_dir, root) = staged_pack();
     let path = root.join("hello.schema.json");
     let text = fs::read_to_string(&path).expect("read the published document");
-    let from = r#""protocol_version": { "const": 3 }"#;
+    let from = r#""protocol_version": { "const": 4 }"#;
     assert!(
         text.contains(from),
         "the document carries the edited keyword"
     );
     fs::write(
         &path,
-        text.replacen(from, r#""protocol_version": { "enum": [3.0] }"#, 1),
+        text.replacen(from, r#""protocol_version": { "enum": [4.0] }"#, 1),
     )
     .expect("rewrite the document");
     restage(&root);
 
-    pack::verify(&root).expect("`enum: [2.0]` names the value the frame carries");
+    pack::verify(&root).expect("enum names the numeric value carried by the frame");
+}
+
+#[test]
+#[parallel]
+fn a_float_spelled_minlength_still_rejects_an_empty_merge_key() {
+    let (_dir, root) = staged_pack();
+    let schema = root.join("snapshot.schema.json");
+    let mut document: serde_json::Value =
+        serde_json::from_slice(&fs::read(&schema).unwrap()).unwrap();
+    document["$defs"]["project_read"]["properties"]["merge_key"]["minLength"] =
+        serde_json::json!(1.0);
+    fs::write(&schema, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
+    restage(&root);
+    pack::verify(&root).expect("nonempty keys satisfy the normalized bound");
+    let wire = case_dir(&root, "uds-list-nominal").join("wire.raw");
+    let recorded = fs::read(&wire).unwrap();
+    fs::write(
+        &wire,
+        splice_text(
+            &recorded,
+            r#""merge_key":"/srv/alpha""#,
+            r#""merge_key":"""#,
+        ),
+    )
+    .unwrap();
+    restage(&root);
+    let reason = pack::verify(&root)
+        .expect_err("empty key violates minLength")
+        .to_string();
+    assert!(
+        reason.contains("merge_key") && reason.contains("shorter than"),
+        "{reason}"
+    );
 }

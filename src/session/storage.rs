@@ -977,6 +977,10 @@ impl Storage {
         }
         Ok(instances)
     }
+    /// Read session rows without quarantine, repair, or writes.
+    pub(crate) fn load_instances_readonly(&self) -> Result<Vec<Instance>> {
+        self.split_instances().map(|(instances, _)| instances)
+    }
 
     /// Deserialise the session rows, keeping the ones that failed apart from
     /// the ones that did not. Pure: quarantining is the caller's decision.

@@ -55,8 +55,8 @@ pub(crate) fn evaluate(
 
 fn selected_profile<'a>(
     snapshot: &'a SnapshotData,
-    source: &super::endpoint::ReadRequestSource,
-) -> Result<&'a str, ReadFailure> {
+    source: &'a super::endpoint::ReadRequestSource,
+) -> Result<(&'a str, &'a ProfileRead), ReadFailure> {
     let selected = match selected_profile_source(source) {
         ProfileSource::Explicit(value) => value,
         ProfileSource::Environment(value) => value.to_str().ok_or_else(|| {
@@ -74,26 +74,26 @@ fn selected_profile<'a>(
             // same way instead of one naming nothing and the other naming a
             // profile.
             None => match &snapshot.resolved_default_profile {
-                Some(name) => return Err(profile_absent("default_missing", name)),
+                Some(name) => {
+                    crate::session::validate_profile_name(name)
+                        .map_err(|error| ReadFailure::exit(1, format!("Error: {error}\n")))?;
+                    return Err(profile_absent("default_missing", name));
+                }
                 // Nothing was resolved, because resolving would have created
                 // the profile this read has to stay out of.
                 None => return Err(ReadFailure::post("default_missing")),
             },
         },
     };
-    if selected.is_empty() {
-        // `session::validate_profile_name` refuses an empty name with this
-        // exact sentence on the local path, and exits 1 for it.
-        return Err(ReadFailure::exit(
-            1,
-            "Error: Profile name cannot be empty\n",
-        ));
-    }
+    crate::session::validate_profile_name(selected)
+        .map_err(|error| ReadFailure::exit(1, format!("Error: {error}\n")))?;
     snapshot
         .profiles
         .iter()
-        .find(|profile| profile.name == selected)
-        .map(|profile| profile.name.as_str())
+        .find(|profile| {
+            profile.name == selected || profile.aliases.iter().any(|alias| alias == selected)
+        })
+        .map(|profile| (selected, profile))
         .ok_or_else(|| profile_absent("profile_missing", selected))
 }
 
@@ -152,12 +152,12 @@ fn render_list(
         // orders it: with no profiles the local command prints its sentence
         // and returns, so a served `--json` prints the same sentence rather
         // than `[]`. The inversion was the whole divergence.
-        if snapshot.profiles.is_empty() {
+        if !snapshot.profiles.iter().any(|profile| profile.listed) {
             return Ok(Projection::text("No profiles found.\n".into()));
         }
         if args.json {
             let mut rows = Vec::new();
-            for profile in &snapshot.profiles {
+            for profile in snapshot.profiles.iter().filter(|profile| profile.listed) {
                 for session in sessions_for_profile(snapshot, &profile.name)
                     .filter(|session| matches_state(session.state, state))
                 {
@@ -169,7 +169,7 @@ fn render_list(
         let show_state = state == StateFilter::All;
         let mut output = String::new();
         let mut total = 0usize;
-        for profile in &snapshot.profiles {
+        for profile in snapshot.profiles.iter().filter(|profile| profile.listed) {
             let sessions: Vec<&SessionRead> = sessions_for_profile(snapshot, &profile.name)
                 .filter(|session| matches_state(session.state, state))
                 .collect();
@@ -194,17 +194,16 @@ fn render_list(
         }
         output.push_str(&format!(
             "\n═══════════════════════════════════════\nTotal: {total} sessions across {} profiles\n",
-            snapshot.profiles.len()
+            snapshot.profiles.iter().filter(|profile| profile.listed).count()
         ));
         return Ok(Projection::text(output));
     }
 
-    let profile_name = selected_profile(snapshot, source)?;
-    let profile = profile(snapshot, profile_name)?;
-    let sessions: Vec<&SessionRead> = sessions_for_profile(snapshot, profile_name)
+    let (profile_name, profile) = selected_profile(snapshot, source)?;
+    let sessions: Vec<&SessionRead> = sessions_for_profile(snapshot, &profile.name)
         .filter(|session| matches_state(session.state, state))
         .collect();
-    require_selected_profile_health(snapshot, profile)?;
+    require_selected_profile_health(snapshot, profile, profile_name)?;
 
     if args.json {
         let rows: Vec<SessionJson> = sessions
@@ -318,10 +317,9 @@ fn render_status(
     source: &super::endpoint::ReadRequestSource,
     local_home: Option<&Path>,
 ) -> Result<Projection, ReadFailure> {
-    let profile_name = selected_profile(snapshot, source)?;
-    let profile = profile(snapshot, profile_name)?;
-    let sessions: Vec<&SessionRead> = sessions_for_profile(snapshot, profile_name).collect();
-    require_selected_profile_health(snapshot, profile)?;
+    let (profile_name, profile) = selected_profile(snapshot, source)?;
+    let sessions: Vec<&SessionRead> = sessions_for_profile(snapshot, &profile.name).collect();
+    require_selected_profile_health(snapshot, profile, profile_name)?;
     if !freshness_observed(&snapshot.status_freshness) {
         return Err(ReadFailure::post("freshness_unavailable"));
     }
@@ -391,13 +389,12 @@ fn render_show(
     snapshot: &SnapshotData,
     source: &super::endpoint::ReadRequestSource,
 ) -> Result<Projection, ReadFailure> {
-    let profile_name = selected_profile(snapshot, source)?;
-    let profile = profile(snapshot, profile_name)?;
-    require_selected_profile_health(snapshot, profile)?;
+    let (profile_name, profile) = selected_profile(snapshot, source)?;
+    require_selected_profile_health(snapshot, profile, profile_name)?;
     if !freshness_observed(&snapshot.status_freshness) {
         return Err(ReadFailure::post("freshness_unavailable"));
     }
-    let sessions: Vec<&SessionRead> = sessions_for_profile(snapshot, profile_name).collect();
+    let sessions: Vec<&SessionRead> = sessions_for_profile(snapshot, &profile.name).collect();
     let identifier = match args.identifier() {
         Some(identifier) => identifier.to_string(),
         None => tmux_session_id(&sessions)?,
@@ -589,12 +586,11 @@ fn render_trash(
     snapshot: &SnapshotData,
     source: &super::endpoint::ReadRequestSource,
 ) -> Result<String, ReadFailure> {
-    let profile_name = selected_profile(snapshot, source)?;
-    let profile = profile(snapshot, profile_name)?;
-    let sessions: Vec<&SessionRead> = sessions_for_profile(snapshot, profile_name)
+    let (profile_name, profile) = selected_profile(snapshot, source)?;
+    let sessions: Vec<&SessionRead> = sessions_for_profile(snapshot, &profile.name)
         .filter(|session| session.state == WireState::Trashed)
         .collect();
-    require_selected_profile_health(snapshot, profile)?;
+    require_selected_profile_health(snapshot, profile, profile_name)?;
     if sessions.is_empty() {
         return Ok("Trash is empty.\n".into());
     }
@@ -618,10 +614,9 @@ fn render_groups(
     snapshot: &SnapshotData,
     source: &super::endpoint::ReadRequestSource,
 ) -> Result<String, ReadFailure> {
-    let profile_name = selected_profile(snapshot, source)?;
-    let profile = profile(snapshot, profile_name)?;
-    let sessions: Vec<&SessionRead> = sessions_for_profile(snapshot, profile_name).collect();
-    require_selected_profile_health(snapshot, profile)?;
+    let (profile_name, profile) = selected_profile(snapshot, source)?;
+    let sessions: Vec<&SessionRead> = sessions_for_profile(snapshot, &profile.name).collect();
+    require_selected_profile_health(snapshot, profile, profile_name)?;
     if args.json() {
         #[derive(Serialize)]
         struct GroupJson {
@@ -676,7 +671,7 @@ fn render_profiles(snapshot: &SnapshotData) -> Result<String, ReadFailure> {
     if !component_healthy(&snapshot.health.global_enumeration) {
         return Err(unreadable("The profile registry"));
     }
-    if snapshot.profiles.is_empty() {
+    if !snapshot.profiles.iter().any(|profile| profile.listed) {
         return Ok(
             "No profiles found.\nRun 'aoe' to create the first profile automatically.\n".into(),
         );
@@ -688,6 +683,7 @@ fn render_profiles(snapshot: &SnapshotData) -> Result<String, ReadFailure> {
     let mut names: Vec<&str> = snapshot
         .profiles
         .iter()
+        .filter(|profile| profile.listed)
         .map(|profile| profile.name.as_str())
         .collect();
     names.sort_by(|a, b| crate::session::profile_display_order(a, b));
@@ -699,7 +695,14 @@ fn render_profiles(snapshot: &SnapshotData) -> Result<String, ReadFailure> {
             output.push_str(&format!("    {name}\n"));
         }
     }
-    output.push_str(&format!("\nTotal: {} profiles\n", snapshot.profiles.len()));
+    output.push_str(&format!(
+        "\nTotal: {} profiles\n",
+        snapshot
+            .profiles
+            .iter()
+            .filter(|profile| profile.listed)
+            .count()
+    ));
     Ok(output)
 }
 
@@ -717,8 +720,7 @@ fn render_projects(
             snapshot.global_projects.clone()
         }
         ScopeFilter::Profile => {
-            let name = selected_profile(snapshot, source)?;
-            let profile = profile(snapshot, name)?;
+            let (name, profile) = selected_profile(snapshot, source)?;
             if !profile_component_healthy(&profile.health.metadata) {
                 return Err(unreadable(&format!(
                     "The project registry for profile '{name}'"
@@ -727,8 +729,7 @@ fn render_projects(
             profile.projects.clone()
         }
         ScopeFilter::All => {
-            let name = selected_profile(snapshot, source)?;
-            let profile = profile(snapshot, name)?;
+            let (_, profile) = selected_profile(snapshot, source)?;
             // The merged registry in the local order: the global rows, then the
             // profile rows that shadow them by identity. A synthesized row is
             // not a registry entry, so it can neither shadow a global row nor
@@ -820,14 +821,6 @@ fn render_projects(
     Ok(output)
 }
 
-fn profile<'a>(snapshot: &'a SnapshotData, name: &str) -> Result<&'a ProfileRead, ReadFailure> {
-    snapshot
-        .profiles
-        .iter()
-        .find(|profile| profile.name == name)
-        .ok_or_else(|| profile_absent("profile_missing", name))
-}
-
 fn sessions_for_profile<'a>(
     snapshot: &'a SnapshotData,
     profile: &'a str,
@@ -875,7 +868,7 @@ fn require_list_all_health(snapshot: &SnapshotData) -> Result<(), ReadFailure> {
     if !component_healthy(&snapshot.health.global_enumeration) {
         return Err(unreadable("The profile registry"));
     }
-    for profile in &snapshot.profiles {
+    for profile in snapshot.profiles.iter().filter(|profile| profile.listed) {
         if !profile_component_healthy(&profile.health.profile_enumeration)
             || !profile_component_healthy(&profile.health.profile_data)
         {
@@ -889,6 +882,7 @@ fn require_list_all_health(snapshot: &SnapshotData) -> Result<(), ReadFailure> {
 fn require_selected_profile_health(
     snapshot: &SnapshotData,
     profile: &ProfileRead,
+    display_name: &str,
 ) -> Result<(), ReadFailure> {
     if !component_healthy(&snapshot.health.global_enumeration) {
         return Err(unreadable("The profile registry"));
@@ -896,7 +890,7 @@ fn require_selected_profile_health(
     if !profile_component_healthy(&profile.health.profile_enumeration)
         || !profile_component_healthy(&profile.health.profile_data)
     {
-        return Err(profile_unreadable(&profile.name));
+        return Err(profile_unreadable(display_name));
     }
     Ok(())
 }
@@ -979,6 +973,8 @@ mod tests {
     fn snapshot(sessions: Vec<SessionRead>) -> SnapshotData {
         let profile = ProfileRead {
             name: "main".into(),
+            listed: true,
+            aliases: vec![],
             groups: vec![],
             projects: vec![],
             health: health(),
@@ -1153,6 +1149,8 @@ mod tests {
         };
         let broken = ProfileRead {
             name: "broken".into(),
+            listed: true,
+            aliases: vec![],
             groups: vec![],
             projects: vec![],
             health: broken_health,
@@ -1372,18 +1370,24 @@ mod tests {
         value.profiles = vec![
             ProfileRead {
                 name: "default".into(),
+                listed: true,
+                aliases: vec![],
                 groups: vec![],
                 projects: vec![],
                 health: health(),
             },
             ProfileRead {
                 name: "main".into(),
+                listed: true,
+                aliases: vec![],
                 groups: vec![],
                 projects: vec![],
                 health: health(),
             },
             ProfileRead {
                 name: "zeta".into(),
+                listed: true,
+                aliases: vec![],
                 groups: vec![],
                 projects: vec![],
                 health: health(),
@@ -1575,5 +1579,393 @@ mod tests {
             default_base_branch: None,
             registered: true,
         }
+    }
+    fn recorded_store(profile: &str) -> SnapshotData {
+        let mut rows = crate::session::Storage::open_unwatched(profile)
+            .unwrap()
+            .load()
+            .unwrap();
+        for row in &mut rows {
+            row.source_profile = profile.into();
+        }
+        recorded_rows(&rows)
+    }
+
+    fn recorded_rows(rows: &[crate::session::Instance]) -> SnapshotData {
+        use crate::server::runtime_ws::{record_exchange, RecordedOwner, RecordingPins};
+        let frames = record_exchange(
+            rows,
+            RecordedOwner::Remote,
+            &RecordingPins {
+                runtime_epoch: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".into(),
+                prebind_instance_id: "bbbbbbbb-cccc-dddd-eeee-ffffffffffff".into(),
+                runtime_instance_id: "cccccccc-dddd-eeee-ffff-000000000000".into(),
+                observed_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+            },
+        );
+        let hello = super::super::dto::parse_hello(&frames.hello).unwrap();
+        let snapshot = super::super::dto::parse_snapshot(&frames.snapshot).unwrap();
+        super::super::dto::validate_hello(&hello).unwrap();
+        super::super::dto::validate_snapshot(&snapshot).unwrap();
+        super::super::dto::validate_cross_message(&hello, &snapshot, None).unwrap();
+        snapshot
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_persisted_multiline_command_round_trips_to_human_and_json_show() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let storage = crate::session::Storage::new_unwatched("main").unwrap();
+        let command = "printf 'first\tpart'\nprintf 'second\nline'";
+        storage
+            .update(|rows, _| {
+                let mut row = crate::session::Instance::new("multiline", "/repo");
+                row.id = "command".into();
+                row.tool = "shell".into();
+                row.command = command.into();
+                rows.push(row);
+                Ok(())
+            })
+            .unwrap();
+        let value = recorded_store("main");
+        let rendered = render_show(
+            &ShowArgs {
+                identifier: Some("command".into()),
+                json: true,
+            },
+            &value,
+            &source(),
+        )
+        .unwrap()
+        .stdout;
+        let json: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+        assert_eq!(json["command"], command);
+        let human = render_show(
+            &ShowArgs {
+                identifier: Some("command".into()),
+                json: false,
+            },
+            &value,
+            &source(),
+        )
+        .unwrap()
+        .stdout;
+        assert!(human.contains(command), "{human}");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_storage_group_move_with_no_immediate_parent_is_read_without_synthesis() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let storage = crate::session::Storage::new_unwatched("main").unwrap();
+        storage
+            .update(|rows, groups| {
+                let mut tree = crate::session::GroupTree::new_with_groups(rows, groups);
+                tree.create_group("work");
+                tree.rename_group("work", "missing/deep");
+                *groups = tree.get_all_groups();
+                Ok(())
+            })
+            .unwrap();
+        let stored = storage.load_groups_readonly().unwrap();
+        assert_eq!(
+            stored
+                .iter()
+                .map(|group| group.path.as_str())
+                .collect::<Vec<_>>(),
+            ["missing/deep"]
+        );
+        let value = recorded_store("main");
+        assert_eq!(
+            value.profiles[0]
+                .groups
+                .iter()
+                .map(|group| group.path.as_str())
+                .collect::<Vec<_>>(),
+            ["missing/deep"]
+        );
+        use clap::Parser;
+        let cli = crate::cli::definition::Cli::try_parse_from(["aoe", "group", "list", "--json"])
+            .unwrap();
+        let command = crate::cli::runtime_read::classify(cli.command.as_ref()).unwrap();
+        let output = evaluate(&command, &value, &source(), None).unwrap().stdout;
+        let json: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(json[0]["path"], "missing/deep");
+        assert_eq!(json[0]["session_count"], 0);
+        assert_eq!(storage.load_groups_readonly().unwrap(), stored);
+    }
+
+    #[test]
+    fn alias_selection_preserves_display_and_excludes_unlisted_profiles_from_aggregate_reads() {
+        let mut value = snapshot(vec![session("canonical", WireStatus::Idle)]);
+        value.profiles[0].aliases = vec!["inside".into()];
+        value.profiles.push(ProfileRead {
+            name: "external".into(),
+            listed: false,
+            aliases: vec!["external-other".into()],
+            groups: vec![],
+            projects: vec![],
+            health: health(),
+        });
+        let mut external = session("outside", WireStatus::Idle);
+        external.profile = "external".into();
+        value.sessions.push(external);
+        let mut selected = source();
+        let args = ListArgs {
+            json: true,
+            all: false,
+            state: StateFilter::All,
+        };
+        for mode in 0..3 {
+            selected.explicit_profile = (mode == 0).then(|| "inside".into());
+            selected.env_profile = (mode == 1).then(|| OsString::from("inside"));
+            value.default_profile = Some("inside".into());
+            value.resolved_default_profile = Some("inside".into());
+            let output = render_list(&args, &value, &selected).unwrap().stdout;
+            let rows: serde_json::Value = serde_json::from_str(&output).unwrap();
+            assert_eq!(rows.as_array().unwrap().len(), 1);
+            assert_eq!(rows[0]["id"], "canonical");
+            assert_eq!(rows[0]["profile"], "inside");
+        }
+        let human = render_list(
+            &ListArgs {
+                json: false,
+                ..args
+            },
+            &value,
+            &selected,
+        )
+        .unwrap()
+        .stdout;
+        assert!(human.starts_with("Profile: inside\n"), "{human}");
+        let all = render_list(
+            &ListArgs {
+                json: true,
+                all: true,
+                state: StateFilter::All,
+            },
+            &value,
+            &selected,
+        )
+        .unwrap()
+        .stdout;
+        let rows: serde_json::Value = serde_json::from_str(&all).unwrap();
+        assert_eq!(rows.as_array().unwrap().len(), 1);
+        assert_eq!(rows[0]["profile"], "main");
+        assert_eq!(
+            render_profiles(&value).unwrap(),
+            "Profiles:\n    main\n\nTotal: 1 profiles\n"
+        );
+        selected.explicit_profile = Some("external-other".into());
+        let output = render_show(
+            &ShowArgs {
+                identifier: Some("outside".into()),
+                json: true,
+            },
+            &value,
+            &selected,
+        )
+        .unwrap()
+        .stdout;
+        let shown: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(shown["id"], "outside");
+        assert_eq!(shown["profile"], "external-other");
+        value.profiles[1].health.profile_data = ComponentHealth::Degraded {
+            code: super::super::dto::HealthCode::ProfileEnumeration,
+        };
+        let error = render_list(&args, &value, &selected).unwrap_err();
+        let outcome = crate::cli::runtime_read::ReadOutcome::from(error);
+        assert!(outcome.stderr.unwrap().contains("external-other"));
+        assert_eq!(
+            render_list(&ListArgs { all: true, ..args }, &value, &selected)
+                .unwrap()
+                .stdout,
+            all
+        );
+    }
+
+    #[test]
+    fn raw_legacy_names_keep_picker_admission_and_local_refusals() {
+        let mut value = snapshot(vec![session("legacy", WireStatus::Idle)]);
+        value.profiles[0]
+            .projects
+            .push(project("repo", Path::new("/repo"), ProjectScope::Profile));
+        let args = ListArgs {
+            json: true,
+            all: true,
+            state: StateFilter::All,
+        };
+        for name in ["ALL", "legacy\\name"] {
+            value.profiles[0].name = name.into();
+            value.sessions[0].profile = name.into();
+            value.default_profile = Some(name.into());
+            value.resolved_default_profile = Some(name.into());
+            value.profiles[0].health.profile_enumeration = ComponentHealth::Degraded {
+                code: super::super::dto::HealthCode::ProfileEnumeration,
+            };
+            value.health.profiles = BTreeMap::from([(name.into(), value.profiles[0].health)]);
+            super::super::dto::validate_snapshot(&value).unwrap();
+            let refusal = crate::cli::runtime_read::ReadOutcome::from(
+                render_list(&args, &value, &source()).unwrap_err(),
+            );
+            assert!(refusal.stderr.unwrap().contains(name));
+            assert!(render_profiles(&value).unwrap().contains(name));
+            let mut selected = source();
+            let expected = crate::session::validate_profile_name(name)
+                .unwrap_err()
+                .to_string();
+            for default_present in [true, false] {
+                selected.explicit_profile = None;
+                selected.env_profile = None;
+                value.default_profile = default_present.then(|| name.into());
+                let outcome = crate::cli::runtime_read::ReadOutcome::from(
+                    render_list(&ListArgs { all: false, ..args }, &value, &selected).unwrap_err(),
+                );
+                assert_eq!(outcome.stderr, Some(format!("Error: {expected}\n")));
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn copied_alias_stores_keep_scoped_titles_commands_projects_and_ancestors() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let main = crate::session::Storage::new_unwatched("main").unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let root = crate::session::get_profile_dir_path("main")
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        std::os::unix::fs::symlink(outside.path(), root.join("outside")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.join("outside-other")).unwrap();
+        let external = crate::session::Storage::open_unwatched("outside").unwrap();
+        let mut rows = Vec::new();
+        for (profile, storage, status, path) in [
+            ("main", main, crate::session::Status::Waiting, "/canonical"),
+            (
+                "outside",
+                external,
+                crate::session::Status::Running,
+                "/external",
+            ),
+        ] {
+            storage
+                .update(|stored, _| {
+                    for (id, parent) in [
+                        ("parent", None),
+                        ("child", Some("parent")),
+                        ("orphan", Some("hidden-only")),
+                    ] {
+                        let mut row =
+                            crate::session::Instance::new(&format!("{profile}-{id}"), path);
+                        row.id = id.into();
+                        row.command = format!("printf '{profile}\n'");
+                        row.status = status;
+                        row.parent_session_id = parent.map(str::to_owned);
+                        stored.push(row);
+                    }
+                    if profile == "outside" {
+                        let mut row = crate::session::Instance::new("outside-hidden-only", path);
+                        row.id = "hidden-only".into();
+                        stored.push(row);
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            std::fs::write(
+                root.join(profile).join("projects.json"),
+                serde_json::to_vec(&serde_json::json!([
+                    {"name": format!("{profile}-project"), "path": path}
+                ]))
+                .unwrap(),
+            )
+            .unwrap();
+            let mut loaded = storage.load().unwrap();
+            for row in &mut loaded {
+                row.source_profile = profile.into();
+            }
+            rows.extend(loaded);
+        }
+        let value = recorded_rows(&rows);
+        let args = ListArgs {
+            json: true,
+            all: false,
+            state: StateFilter::All,
+        };
+        let mut selected = source();
+        for (name, profile, path, status) in [
+            ("main", "main", "/canonical", "waiting"),
+            ("outside-other", "outside", "/external", "running"),
+        ] {
+            selected.explicit_profile = Some(name.into());
+            let shown = render_show(
+                &ShowArgs {
+                    identifier: Some("child".into()),
+                    json: true,
+                },
+                &value,
+                &selected,
+            )
+            .unwrap()
+            .stdout;
+            let shown: serde_json::Value = serde_json::from_str(&shown).unwrap();
+            assert_eq!(shown["title"], format!("{profile}-child"));
+            assert_eq!(shown["command"], format!("printf '{profile}\n'"));
+            assert_eq!(shown["path"], path);
+            assert_eq!(shown["status"], status);
+            assert_eq!(shown["parent_session_id"], "parent");
+            assert_eq!(shown["profile"], name);
+            let human = render_show(
+                &ShowArgs {
+                    identifier: Some("child".into()),
+                    json: false,
+                },
+                &value,
+                &selected,
+            )
+            .unwrap()
+            .stdout;
+            assert!(human.contains(&format!("Parent:  {profile}-parent (parent)")));
+            let projects = render_projects(
+                &ProjectListArgs {
+                    json: true,
+                    scope: ScopeFilter::Profile,
+                },
+                &value,
+                &selected,
+            )
+            .unwrap();
+            let projects: serde_json::Value = serde_json::from_str(&projects).unwrap();
+            assert_eq!(projects[0]["name"], format!("{profile}-project"));
+            assert_eq!(projects[0]["path"], path);
+        }
+        selected.explicit_profile = Some("main".into());
+        let human = render_show(
+            &ShowArgs {
+                identifier: Some("orphan".into()),
+                json: false,
+            },
+            &value,
+            &selected,
+        )
+        .unwrap()
+        .stdout;
+        assert!(human.contains("Parent:  hidden-only\n"));
+        assert!(!human.contains("outside-hidden-only"));
+        let all = render_list(&ListArgs { all: true, ..args }, &value, &selected)
+            .unwrap()
+            .stdout;
+        let all: serde_json::Value = serde_json::from_str(&all).unwrap();
+        assert_eq!(all.as_array().unwrap().len(), 3);
+        assert!(all
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["profile"] == "main"));
+        assert_eq!(
+            render_profiles(&value).unwrap(),
+            "Profiles:\n  * main (default)\n\nTotal: 1 profiles\n"
+        );
     }
 }
