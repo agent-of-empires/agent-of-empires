@@ -60,7 +60,8 @@ pub(super) const FIELD_HELP: &[FieldHelp] = &[
     },
     FieldHelp {
         name: "Tool",
-        description: "Which AI tool to use (Ctrl+P to configure command and extra args)",
+        description:
+            "Which AI tool to use (1-9 to pick, Ctrl+P to configure command and extra args)",
     },
     FieldHelp {
         name: "Structured",
@@ -1466,6 +1467,13 @@ impl NewSessionDialog {
                     self.worktree_branch.reset();
                 }
                 self.reload_tool_config();
+                DialogResult::Continue
+            }
+            KeyCode::Char(c @ '1'..='9') if self.focused_field == fields.tool => {
+                let index = c as usize - '1' as usize;
+                if let Some(tool) = self.available_tools.get(index).cloned() {
+                    self.set_tool(&tool);
+                }
                 DialogResult::Continue
             }
             KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')
