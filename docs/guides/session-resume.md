@@ -14,7 +14,8 @@ Runtime conversation changes such as `/clear`, `/new`, fork, continue, or a fres
 | Pi | Yes | Yes | Pane-scoped AoE extension |
 | OMP | Yes | Yes | Pane-scoped routed terminal store |
 | OpenCode | Opt-in | No | AoE-preassigned native id |
-| Gemini CLI, Hermes, Kimi CLI | No | Yes | Isolated managed store |
+| Hermes | Yes | Yes | `pre_llm_call` hook of the CLI or TUI foreground agent (host; subagents and background tasks are never adopted), isolated managed store (sandbox) |
+| Gemini CLI, Kimi CLI | No | Yes | Isolated managed store |
 | Prime Agent | No | Yes | Root-only publication and isolated managed store |
 | Vibe, Droid, Copilot CLI, Settl, Qwen Code, Kiro CLI, Antigravity | No | No | None verified |
 
