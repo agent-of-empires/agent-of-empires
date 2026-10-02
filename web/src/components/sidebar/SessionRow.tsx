@@ -239,8 +239,8 @@ export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
                 </span>
               )}
               {!compact && model.isFavorited && (
-                <span title="Favorited" aria-label="Favorited" className="shrink-0 text-amber-300">
-                  *
+                <span title="Favorited" aria-label="Favorited" className="shrink-0 text-favorite">
+                  ✦
                 </span>
               )}
               <span className="truncate" title={label}>

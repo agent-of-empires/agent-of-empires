@@ -297,6 +297,7 @@ fn web_projection(theme: &Theme, appearance: ThemeAppearance) -> CssVarProjectio
     css.insert("--color-terminal-active".into(), hex(theme.terminal_active));
     css.insert("--color-branch".into(), hex(theme.branch));
     css.insert("--color-sandbox".into(), hex(theme.sandbox));
+    css.insert("--color-favorite".into(), hex(theme.favorite));
 
     CssVarProjection { css_vars: css }
 }
@@ -768,6 +769,7 @@ mod tests {
                     | "terminal-active"
                     | "branch"
                     | "sandbox"
+                    | "favorite"
             )
     }
 }

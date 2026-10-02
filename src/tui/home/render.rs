@@ -10,8 +10,8 @@ use rattles::presets::prelude as spinners;
 
 use super::{
     live_send, HomeView, TerminalMode, ViewMode, ICON_ARCHIVED_SECTION, ICON_COLLAPSED,
-    ICON_DELETING, ICON_DORMANT, ICON_ERROR, ICON_EXPANDED, ICON_IDLE, ICON_PINNED, ICON_STOPPED,
-    ICON_TRASH_SECTION, ICON_UNKNOWN, ICON_UNREAD,
+    ICON_DELETING, ICON_DORMANT, ICON_ERROR, ICON_EXPANDED, ICON_FAVORITE, ICON_IDLE, ICON_PINNED,
+    ICON_STOPPED, ICON_TRASH_SECTION, ICON_UNKNOWN, ICON_UNREAD,
 };
 use crate::containers::image_update::ImageUpdate;
 use crate::session::config::{GroupByMode, RowTagMode, SidebarPosition, SortOrder};
@@ -433,13 +433,12 @@ enum SunkRow {
     Pane,
 }
 
-/// The archive/trash, snooze, urgent and favorite overlays every view mode paints on top
-/// of its [`RowSeed`], plus the matching title prefix. `sunk` says how this view resolves
+/// The archive/trash, snooze and urgent overlays every view mode paints on top of its
+/// [`RowSeed`], plus the matching title prefix. Favorite lives in its own gutter. `sunk` says how this view resolves
 /// a sunk row; see [`SunkRow`].
 fn decorate_row(
     inst: &crate::session::Instance,
     in_attention: bool,
-    show_favorite: bool,
     seed: RowSeed,
     sunk: SunkRow,
     theme: &Theme,
@@ -478,24 +477,16 @@ fn decorate_row(
             .fg(theme.error)
             .add_modifier(Modifier::BOLD)
             .add_modifier(Modifier::RAPID_BLINK);
-    } else if show_favorite && crate::session::is_live_favorite(inst) {
-        style = style
-            .add_modifier(Modifier::BOLD)
-            .add_modifier(Modifier::UNDERLINED);
     }
 
-    // Prefix priority: archive (none) > snooze (`z `) > urgent (`! `) > favorite (`* `).
-    // Snooze and urgent are Attention-only so other sorts show no decoration for state the
-    // user did not opt into; the star also shows elsewhere because favorites-first pins
-    // the row there too.
+    // Prefix priority: archive (none) > snooze (`z `) > urgent (`! `). Both are
+    // Attention-only so other sorts show no decoration for state the user did not opt into.
     let title_text = if inst.is_archived() || inst.is_trashed() {
         Cow::Owned(inst.title.clone())
     } else if in_attention && inst.is_snoozed() {
         Cow::Owned(format!("z {}", inst.title))
     } else if in_attention && inst.is_urgent() {
         Cow::Owned(format!("! {}", inst.title))
-    } else if show_favorite && crate::session::is_live_favorite(inst) {
-        Cow::Owned(format!("* {}", inst.title))
     } else {
         Cow::Owned(inst.title.clone())
     };
@@ -1304,6 +1295,7 @@ impl HomeView {
         self.shelf_inner_area = shelf_region;
 
         let hover_idx = self.hovered_index();
+        let favorite_gutter = self.favorite_gutter();
 
         // --- Workspace list (every row before the shelf) ---
         let list_visible_height = if self.search_bar_visible() {
@@ -1340,7 +1332,14 @@ impl HomeView {
             let is_hovered = !is_selected && Some(abs_idx) == hover_idx;
             let is_match =
                 !self.search_matches.is_empty() && self.search_matches.contains(&abs_idx);
-            let mut line = self.render_item_line(item, is_selected, is_match, theme, inner.width);
+            let mut line = self.render_item_line(
+                item,
+                is_selected,
+                is_match,
+                theme,
+                inner.width,
+                favorite_gutter,
+            );
             // Selection wins over hover, so the already-selected row under the
             // mouse keeps the brighter selected background.
             if is_selected || is_hovered {
@@ -1414,8 +1413,14 @@ impl HomeView {
                 let is_hovered = !is_selected && Some(abs_idx) == hover_idx;
                 let is_match =
                     !self.search_matches.is_empty() && self.search_matches.contains(&abs_idx);
-                let mut line =
-                    self.render_item_line(item, is_selected, is_match, theme, inner.width);
+                let mut line = self.render_item_line(
+                    item,
+                    is_selected,
+                    is_match,
+                    theme,
+                    inner.width,
+                    favorite_gutter,
+                );
                 if is_selected || is_hovered {
                     let pad = (inner.width as usize).saturating_sub(line.width());
                     if pad > 0 {
@@ -1530,6 +1535,17 @@ impl HomeView {
             || serve_open
     }
 
+    /// Reserve the favorite gutter on every row while a visible row is a pinned
+    /// favorite, so titles stay aligned. Favorite pins under Attention sort, or in any
+    /// sort with favorites-first on (the `Context::FavoritesUsable` predicate).
+    pub(super) fn favorite_gutter(&self) -> bool {
+        (self.sort_order == SortOrder::Attention || crate::session::favorites_first())
+            && self.flat_items.iter().any(|item| {
+                matches!(item, Item::Session { id, .. }
+                    if self.get_instance(id).is_some_and(crate::session::is_live_favorite))
+            })
+    }
+
     pub(super) fn render_item_line(
         &self,
         item: &Item,
@@ -1537,18 +1553,15 @@ impl HomeView {
         is_match: bool,
         theme: &Theme,
         list_width: u16,
+        favorite_gutter: bool,
     ) -> Line<'static> {
         let indent = " ".repeat(item.depth().min(9));
 
-        // Favorite, snooze and urgent visuals render only under Attention sort, so the
-        // sidebar stays clean for users who don't run a triage workflow. Archive is
-        // universal: it is a lifecycle action and its rows live in the pinned Archived
-        // section in every sort mode.
+        // Snooze and urgent visuals render only under Attention sort, so the sidebar
+        // stays clean for users who don't run a triage workflow. Archive is universal:
+        // it is a lifecycle action and its rows live in the pinned Archived section in
+        // every sort mode.
         let in_attention = self.sort_order == SortOrder::Attention;
-        // Favorite is a pin in every sort order once favorites-first is on, so its
-        // decoration follows the keybinding's predicate (`Context::FavoritesUsable`).
-        // Snooze and urgent stay Attention-only, tied to the tier model.
-        let show_favorite = in_attention || crate::session::favorites_first();
 
         use std::borrow::Cow;
 
@@ -1743,7 +1756,7 @@ impl HomeView {
                                 )
                             }
                         };
-                    decorate_row(inst, in_attention, show_favorite, seed, sunk, theme)
+                    decorate_row(inst, in_attention, seed, sunk, theme)
                 } else {
                     (
                         "?",
@@ -1754,7 +1767,19 @@ impl HomeView {
             }
         };
 
-        let mut line_spans = Vec::with_capacity(5);
+        let mut line_spans = Vec::with_capacity(6);
+        if favorite_gutter {
+            let favorited = matches!(item, Item::Session { id, .. }
+                if self.get_instance(id).is_some_and(crate::session::is_live_favorite));
+            line_spans.push(if favorited {
+                Span::styled(
+                    format!("{ICON_FAVORITE} "),
+                    Style::default().fg(theme.favorite),
+                )
+            } else {
+                Span::raw("  ")
+            });
+        }
         line_spans.push(Span::raw(indent));
         // A search match highlights with weight only: recoloring to `theme.search` (amber
         // in most themes) turned a running match's spinner amber and read as "waiting"

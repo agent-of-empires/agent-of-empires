@@ -46,6 +46,16 @@ describe("SessionRow chips", () => {
     },
   );
 
+  it("marks a favorite with the theme-colored star, and nothing otherwise", () => {
+    renderRow(ws({ favorited: true }));
+    const star = label("Favorited")!;
+    expect(star.textContent).toBe("✦");
+    expect(star.className).toContain("text-favorite");
+    cleanup();
+    renderRow(ws({ favorited: false }));
+    expect(label("Favorited")).toBeNull();
+  });
+
   it("shows the snooze remaining time and the payload rate-limit park", () => {
     renderRow(ws({ snoozed_until: inMinutes(90) }));
     expect(label("Snoozed")!.textContent).toMatch(/1h/);
