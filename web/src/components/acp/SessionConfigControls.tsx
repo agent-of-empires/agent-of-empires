@@ -16,6 +16,8 @@ interface Props {
   providerPending?: string | null;
   /** Absent for a session whose agent does not route through a provider. */
   onSetProvider?: (provider: string) => void | Promise<void>;
+  /** Why the provider cannot change right now, if it cannot. */
+  providerLockedReason?: string | null;
 }
 
 const MODEL_LABEL_MAX = 24;
@@ -69,6 +71,7 @@ export function SessionConfigControls({
   provider,
   providerPending,
   onSetProvider,
+  providerLockedReason,
 }: Props) {
   const model = findByCategory(configOptions, "model");
   const effort = findByCategory(configOptions, "thought_level");
@@ -96,6 +99,7 @@ export function SessionConfigControls({
           option={providerDescriptor(provider)}
           pending={providerPending ?? null}
           onSelect={(value) => onSetProvider(value)}
+          lockedReason={providerLockedReason}
         />
       )}
     </div>
@@ -107,6 +111,8 @@ interface SubProps {
   /** The value in flight for this option, if any. */
   pending: string | null;
   onSelect: (value: string) => void | Promise<void>;
+  /** Disables the trigger and explains why. */
+  lockedReason?: string | null;
 }
 
 interface MenuLayout {
@@ -137,7 +143,7 @@ function computeMenuLayout(rect: DOMRect, viewportHeight: number, viewportTop = 
   return { direction, maxHeight: Math.max(0, Math.min(MENU_MAX_HEIGHT_CAP, available)) };
 }
 
-function ModelDropdown({ option, pending, onSelect }: SubProps) {
+function ModelDropdown({ option, pending, onSelect, lockedReason }: SubProps) {
   const [open, setOpen] = useState(false);
   const [menuLayout, setMenuLayout] = useState<MenuLayout>(DEFAULT_MENU_LAYOUT);
   const ref = useRef<HTMLDivElement | null>(null);
@@ -188,16 +194,18 @@ function ModelDropdown({ option, pending, onSelect }: SubProps) {
       <button
         type="button"
         onClick={() => setOpen((v) => !v)}
+        disabled={!!lockedReason}
         aria-haspopup="menu"
         aria-expanded={open}
         aria-controls={open ? menuId : undefined}
-        title={`${option.name}: ${label}`}
+        title={lockedReason ?? `${option.name}: ${label}`}
         aria-label={`${option.name}: ${label}`}
         data-testid={`config-option-${option.id}`}
         className={[
           "inline-flex items-center gap-1 rounded-md border border-surface-700 bg-surface-800/60 px-2 py-1 text-[11px] font-medium",
           "text-text-secondary",
           "transition-colors hover:border-brand-600/60 hover:text-text-primary",
+          "disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:border-surface-700 disabled:hover:text-text-secondary",
         ].join(" ")}
       >
         <span>{truncate(label, MODEL_LABEL_MAX)}</span>
