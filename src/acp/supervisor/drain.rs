@@ -1536,6 +1536,83 @@ mod tests {
         assert!(worker_registry::load(id).unwrap().is_none());
     }
 
+    /// #4212: when the replacement and the runner it replaced both survive SIGKILL, the refused
+    /// respawn keeps teardown ownership of both until each is proven gone.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_refused_respawn_retries_every_runner_that_survives_teardown() {
+        let _home = isolate_home();
+        let id = "s-two-survivors";
+        let control =
+            Arc::new(crate::acp::runner_lifecycle::test_support::FakeProcessControl::default());
+        control.immortal(4242).immortal(4343);
+        let gate = Gate::default();
+        let sup = Arc::new(
+            Supervisor::new(VecSink::new())
+                .with_process_control(control.clone())
+                .with_launcher(gated_launcher(&gate, 4343)),
+        );
+        let mut inst = crate::session::Instance::new(id, "/tmp");
+        inst.id = id.to_string();
+        let storage = crate::session::Storage::new_unwatched(&inst.source_profile).unwrap();
+        storage
+            .update(|rows, _| {
+                *rows = vec![inst.clone()];
+                Ok(())
+            })
+            .unwrap();
+        save_record(id, 4242, 0);
+        let mut config = runner_config(worker_registry::socket_path_for(id).unwrap());
+        config.source_profile = Some(inst.source_profile.clone());
+        let lease = sup
+            .test_install_runner(
+                id,
+                config,
+                Some(RunnerIdentity {
+                    pid: 4242,
+                    generation: 0,
+                }),
+            )
+            .await;
+        let (inbound_tx, inbound_rx) = mpsc::channel::<Event>(4);
+        let drain = sup.start_drain_task(id.to_string(), lease, inbound_rx, None);
+        drop(inbound_tx);
+
+        gate.entered.notified().await;
+        storage
+            .update(|rows, _| {
+                rows[0].archive();
+                Ok(())
+            })
+            .unwrap();
+        gate.open.notify_one();
+        tokio::time::timeout(Duration::from_secs(20), drain)
+            .await
+            .expect("drain task must finish")
+            .unwrap();
+        for pid in [4242, 4343] {
+            assert!(
+                control.signals().contains(&(pid, "KILL")),
+                "{pid} escalated: {:?}",
+                control.signals()
+            );
+        }
+        assert_eq!(sup.worker_state(id).await, AcpWorkerState::Stopping);
+
+        control.exit(4343);
+        sup.retry_pending_teardowns().await;
+        assert_eq!(
+            sup.worker_state(id).await,
+            AcpWorkerState::Stopping,
+            "the replaced runner is still alive, so the session stays owned for retry"
+        );
+
+        control.exit(4242);
+        sup.retry_pending_teardowns().await;
+        assert_eq!(sup.worker_state(id).await, AcpWorkerState::Absent);
+        assert!(worker_registry::load(id).unwrap().is_none());
+    }
+
     /// The reconciler reads this flag to remind the agent its `Monitor` died.
     #[tokio::test]
     #[serial_test::serial]

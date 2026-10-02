@@ -72,7 +72,8 @@ enum Phase {
         since: Instant,
     },
     TeardownRetry {
-        identity: RunnerIdentity,
+        /// Every runner that survived escalation, each retried until proven.
+        identities: Vec<RunnerIdentity>,
         attempts: u32,
     },
 }
@@ -148,21 +149,21 @@ impl ProcessControl for SystemProcessControl {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Settlement {
     /// Process-group exit and registry cleanup were proven.
     Proven,
-    /// The process survived escalation; keep ownership and retry.
-    Unproven(RunnerIdentity),
+    /// These processes survived escalation; keep ownership and retry each.
+    Unproven(Vec<RunnerIdentity>),
 }
 
 /// Pending teardown a retry pass should drive.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetryClaim {
     pub lease: Lease,
-    /// `None` for a reclaimed teardown whose driver never settled; the
+    /// Empty for a reclaimed teardown whose driver never settled; the
     /// registry record then names the runner.
-    pub identity: Option<RunnerIdentity>,
+    pub identities: Vec<RunnerIdentity>,
     pub attempts: u32,
 }
 
@@ -384,9 +385,9 @@ impl LifecycleTable {
             Settlement::Proven => {
                 self.entries.remove(&lease.session_id);
             }
-            Settlement::Unproven(identity) => {
+            Settlement::Unproven(identities) => {
                 entry.phase = Phase::TeardownRetry {
-                    identity,
+                    identities,
                     attempts: attempts + 1,
                 };
             }
@@ -455,10 +456,13 @@ impl LifecycleTable {
         orphaned_after: Duration,
     ) -> Option<RetryClaim> {
         let entry = self.entries.get_mut(session_id)?;
-        let (identity, attempts) = match entry.phase {
-            Phase::TeardownRetry { identity, attempts } => (Some(identity), attempts),
+        let (identities, attempts) = match &entry.phase {
+            Phase::TeardownRetry {
+                identities,
+                attempts,
+            } => (identities.clone(), *attempts),
             Phase::Stopping { attempts, since } if since.elapsed() >= orphaned_after => {
-                (None, attempts)
+                (Vec::new(), *attempts)
             }
             _ => return None,
         };
@@ -469,7 +473,7 @@ impl LifecycleTable {
         let epoch = entry.epoch;
         Some(RetryClaim {
             lease: self.lease(session_id, epoch),
-            identity,
+            identities,
             attempts: attempts + 1,
         })
     }
@@ -720,24 +724,24 @@ mod tests {
             })
         );
         assert_eq!(table.phase(ID), WorkerPhase::Stopping);
-        table.settle(&lease, Settlement::Unproven(identity(9, 1)));
+        table.settle(&lease, Settlement::Unproven(vec![identity(9, 1)]));
         assert_eq!(table.phase(ID), WorkerPhase::Stopping);
 
         let grace = Duration::from_secs(15);
         let claim = table.claim_retry(ID, grace).unwrap();
         assert_eq!(claim.attempts, 2);
-        assert_eq!(claim.identity, Some(identity(9, 1)));
+        assert_eq!(claim.identities, vec![identity(9, 1)]);
         assert!(
             table.claim_retry(ID, grace).is_none(),
             "a claimed retry is Stopping until it goes stale"
         );
         table.age_stopping(ID, grace);
         let orphan = table.claim_retry(ID, grace).unwrap();
-        assert_eq!(
-            orphan.identity, None,
+        assert!(
+            orphan.identities.is_empty(),
             "a stale claim is reclaimed without an identity"
         );
-        table.settle(&orphan.lease, Settlement::Unproven(identity(9, 1)));
+        table.settle(&orphan.lease, Settlement::Unproven(vec![identity(9, 1)]));
         let again = table.claim_retry(ID, grace).unwrap();
         assert_eq!(again.attempts, 3, "attempts accumulate per settled retry");
         table.settle(&again.lease, Settlement::Proven);
@@ -814,7 +818,7 @@ mod tests {
         let lease = table.adopt_for_stop(ID).unwrap();
         assert_eq!(table.phase(ID), WorkerPhase::Stopping);
         assert!(table.adopt_for_stop(ID).is_none());
-        table.settle(&lease, Settlement::Unproven(identity(3, 0)));
+        table.settle(&lease, Settlement::Unproven(vec![identity(3, 0)]));
         assert_eq!(
             table.retry_ids_after(Duration::from_secs(15)),
             vec![ID.to_string()]
@@ -889,7 +893,10 @@ mod tests {
             "the respawn still owns the replacement it built"
         );
         table.forget(ID);
-        table.settle(&respawn, Settlement::Unproven(identity(8, respawn.epoch())));
+        table.settle(
+            &respawn,
+            Settlement::Unproven(vec![identity(8, respawn.epoch())]),
+        );
         assert_eq!(
             table.retry_ids_after(Duration::MAX),
             vec![ID.to_string()],

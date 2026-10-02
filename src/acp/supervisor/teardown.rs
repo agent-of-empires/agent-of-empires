@@ -214,47 +214,65 @@ impl<S: BroadcastSink> Supervisor<S> {
             let Some(claim) = claim else {
                 continue;
             };
-            let pid = claim.identity.map(|i| i.pid);
             if claim.attempts > TEARDOWN_RETRY_CAP
-                && pid.is_none_or(|pid| !self.process_control.is_alive(pid))
+                && claim
+                    .identities
+                    .iter()
+                    .all(|identity| !self.process_control.is_alive(identity.pid))
             {
                 warn!(
                     target: "acp.supervisor",
                     session = %id,
-                    pid,
+                    pids = ?claim.identities.iter().map(|i| i.pid).collect::<Vec<_>>(),
                     attempts = claim.attempts,
                     "runner is dead but its registry record could not be settled; releasing the session"
                 );
                 self.settle(&claim.lease, Settlement::Proven);
                 continue;
             }
-            match claim.identity {
-                // Loud for the first few ticks; past that the process is in the kernel's hands.
-                Some(identity) if claim.attempts <= 3 => warn!(
-                    target: "acp.supervisor",
-                    session = %id,
-                    pid = identity.pid,
-                    attempt = claim.attempts,
-                    "runner still alive after SIGKILL; retrying teardown"
-                ),
-                Some(identity) => debug!(
-                    target: "acp.supervisor",
-                    session = %id,
-                    pid = identity.pid,
-                    attempt = claim.attempts,
-                    "runner still alive after SIGKILL; retrying teardown"
-                ),
-                None => warn!(
+            if claim.identities.is_empty() {
+                warn!(
                     target: "acp.supervisor",
                     session = %id,
                     attempt = claim.attempts,
                     "teardown lost its driver; finishing it from the registry"
-                ),
+                );
+                let settlement =
+                    tear_down_runner_from(&*self.process_control, &id, None, false).await;
+                self.settle(&claim.lease, settlement);
+                continue;
             }
-            let killed_before = claim.identity.is_some();
-            let settlement =
-                tear_down_runner_from(&*self.process_control, &id, claim.identity, killed_before)
-                    .await;
+            let mut survivors = Vec::new();
+            for identity in claim.identities {
+                // Loud for the first few ticks; past that the process is in the kernel's hands.
+                if claim.attempts <= 3 {
+                    warn!(
+                        target: "acp.supervisor",
+                        session = %id,
+                        pid = identity.pid,
+                        attempt = claim.attempts,
+                        "runner still alive after SIGKILL; retrying teardown"
+                    );
+                } else {
+                    debug!(
+                        target: "acp.supervisor",
+                        session = %id,
+                        pid = identity.pid,
+                        attempt = claim.attempts,
+                        "runner still alive after SIGKILL; retrying teardown"
+                    );
+                }
+                if let Settlement::Unproven(left) =
+                    tear_down_runner_from(&*self.process_control, &id, Some(identity), true).await
+                {
+                    survivors.extend(left);
+                }
+            }
+            let settlement = if survivors.is_empty() {
+                Settlement::Proven
+            } else {
+                Settlement::Unproven(survivors)
+            };
             self.settle(&claim.lease, settlement);
         }
     }
@@ -502,7 +520,7 @@ async fn tear_down_runner_from(
             pid,
             "runner survived SIGKILL; holding the session until it exits"
         );
-        return Settlement::Unproven(identity);
+        return Settlement::Unproven(vec![identity]);
     }
     if !worker_registry::delete_if_owned_by(session_id, pid, identity.generation) {
         warn!(
@@ -511,7 +529,7 @@ async fn tear_down_runner_from(
             pid,
             "runner exited but its registry record could not be read; retrying settlement"
         );
-        return Settlement::Unproven(identity);
+        return Settlement::Unproven(vec![identity]);
     }
     Settlement::Proven
 }
@@ -523,15 +541,21 @@ pub(super) async fn tear_down_replacement(
     launched: Option<RunnerIdentity>,
     previous: Option<RunnerIdentity>,
 ) -> Settlement {
-    let settlement = tear_down_runner(control, session_id, launched).await;
-    let Some(previous) = previous.filter(|p| Some(*p) != launched) else {
-        return settlement;
+    let mut survivors = match tear_down_runner(control, session_id, launched).await {
+        Settlement::Proven => Vec::new(),
+        Settlement::Unproven(left) => left,
     };
-    match tear_down_runner(control, session_id, Some(previous)).await {
-        Settlement::Unproven(_) if settlement == Settlement::Proven => {
-            Settlement::Unproven(previous)
+    if let Some(previous) = previous.filter(|p| Some(*p) != launched) {
+        if let Settlement::Unproven(left) =
+            tear_down_runner(control, session_id, Some(previous)).await
+        {
+            survivors.extend(left);
         }
-        _ => settlement,
+    }
+    if survivors.is_empty() {
+        Settlement::Proven
+    } else {
+        Settlement::Unproven(survivors)
     }
 }
 
