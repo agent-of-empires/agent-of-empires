@@ -33,6 +33,11 @@ impl<S: BroadcastSink> Supervisor<S> {
         lock_recover(&self.startup_failures).insert(session_id.to_string());
     }
 
+    /// Leave the session mid-teardown, where an unproven settlement parks it.
+    pub(crate) fn test_hold_stopping(&self, session_id: &str) {
+        lock_recover(&self.lifecycle).adopt_for_stop(session_id);
+    }
+
     /// Reports each session a `wait_for_worker` call starts parking on.
     pub(crate) fn watch_worker_waits(&self) -> broadcast::Receiver<String> {
         self.worker_waits.subscribe()

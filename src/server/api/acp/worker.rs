@@ -510,6 +510,28 @@ async fn persist_provider_switch(
     Ok(())
 }
 
+/// Record on disk which provider the sandbox container was just built for.
+/// Only after a successful ensure: a stamp written ahead of a failed discard
+/// would claim mounts the old container lacks. A reload restores the disk
+/// row, so without this the next resume would rebuild a correct container.
+fn persist_sandbox_stamp(
+    state: &AppState,
+    profile: &str,
+    id: &str,
+    provider: Option<&str>,
+) -> anyhow::Result<()> {
+    crate::session::Storage::new(profile, state.file_watch.clone())?.update(|instances, _groups| {
+        if let Some(sandbox) = instances
+            .iter_mut()
+            .find(|i| i.id == id)
+            .and_then(|i| i.sandbox_info.as_mut())
+        {
+            sandbox.provider = provider.map(str::to_string);
+        }
+        Ok(())
+    })
+}
+
 /// Re-route a structured session to another LLM provider, keeping the
 /// transcript: the worker stops between turns and the respawn resumes the
 /// stored ACP session.
@@ -583,6 +605,16 @@ pub async fn switch_acp_provider(
             format!("session is already pinned to {provider}"),
         );
     }
+    // The submission guard keeps new prompts out but does not wait for the
+    // running one, and the shutdown below aborts it.
+    let control = state.session_service.fold_control_state(&id).await;
+    if control.turn_active || control.has_active_background_agent() {
+        return super::super::api_error(
+            StatusCode::CONFLICT,
+            "turn_active",
+            "the session is mid-turn; switch providers once it finishes",
+        );
+    }
 
     if let Err(e) = state
         .acp_supervisor
@@ -594,6 +626,16 @@ pub async fn switch_acp_provider(
             format!("shutdown failed before provider switch: {e}"),
         )
             .into_response();
+    }
+    // `shutdown_and_wait` gives up at its deadline without saying so. A
+    // teardown it could not prove must not have its row rewritten or its
+    // container discarded underneath it.
+    if state.acp_supervisor.worker_state(&id).await != crate::daemon::AcpWorkerState::Absent {
+        return super::super::api_error(
+            StatusCode::CONFLICT,
+            "worker_not_stopped",
+            "the previous worker has not finished stopping; retry the switch shortly",
+        );
     }
 
     let model_cleared = instance.agent_model.is_some();
@@ -622,6 +664,21 @@ pub async fn switch_acp_provider(
                 .into_response();
         }
     };
+    if let Some(info) = &sandbox_info {
+        if let Err(e) = persist_sandbox_stamp(
+            &state,
+            &instance.source_profile,
+            &id,
+            info.provider.as_deref(),
+        ) {
+            // Costs one needless recreate on the next resume, nothing more.
+            tracing::warn!(
+                target: "http.api.acp",
+                session = %id,
+                "failed to persist the sandbox provider stamp: {e}"
+            );
+        }
+    }
 
     state.acp_supervisor.forget_stale_cancel(&id);
     // Everything that names the conversation survives: the provider changes
@@ -741,6 +798,123 @@ mod tests {
             assert_eq!(live.agent_provider.as_deref(), Some(*provider));
             assert_eq!(live.agent_model, None);
         }
+    }
+
+    /// The switch tears the worker down, so a busy worker, or one whose last
+    /// teardown is unproven, is refused before the row or container changes.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_provider_switch_refuses_a_busy_or_unsettled_worker() {
+        use crate::session::test_support::isolate_app_dir;
+        let profile = "default";
+
+        for (case, code) in [
+            ("mid-turn", "turn_active"),
+            ("unproven stop", "worker_not_stopped"),
+        ] {
+            let _tmp = isolate_app_dir();
+            let mut inst = crate::session::Instance::new("claude", "/tmp/aoe-switch-provider-gate");
+            inst.view = crate::session::View::Structured;
+            inst.agent_name = Some("claude".to_string());
+            inst.agent_model = Some("claude-fable-5-1".to_string());
+            let id = inst.id.clone();
+            crate::server::test_support::seed_instances_on_disk_for_test(
+                profile,
+                vec![inst.clone()],
+            );
+            let state = crate::server::test_support::build_test_app_state(vec![inst]);
+            if code == "turn_active" {
+                state.acp_supervisor.test_insert_worker(&id).await;
+                let prompt = crate::acp::state::Event::UserPromptSent {
+                    prompt_id: None,
+                    text: "still working".to_string(),
+                    attachments: Vec::new(),
+                    synthesized: false,
+                };
+                state
+                    .acp_event_store
+                    .record_at(&id, 1, &prompt, Utc::now().timestamp_millis())
+                    .unwrap();
+            } else {
+                state.acp_supervisor.test_hold_stopping(&id);
+            }
+
+            let response = switch_acp_provider(
+                State(Arc::clone(&state)),
+                Path(id.clone()),
+                Ok(Json(SwitchProviderRequest {
+                    provider: "vertex".to_string(),
+                })),
+            )
+            .await
+            .into_response();
+
+            assert_eq!(response.status(), StatusCode::CONFLICT, "{case}");
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["error"], code, "{case}");
+            if code == "turn_active" {
+                assert!(
+                    state.acp_supervisor.is_running(&id).await,
+                    "{case}: the worker must keep its turn"
+                );
+            }
+            let on_disk = crate::server::test_support::load_instances_from_disk_for_test(profile);
+            let memory = state.instances.read().await;
+            for row in [
+                on_disk.iter().find(|i| i.id == id),
+                memory.iter().find(|i| i.id == id),
+            ] {
+                let row = row.expect("seeded row");
+                assert_eq!(row.agent_provider, None, "{case}");
+                assert_eq!(
+                    row.agent_model.as_deref(),
+                    Some("claude-fable-5-1"),
+                    "{case}"
+                );
+            }
+        }
+    }
+
+    /// A reload restores the disk row, so the stamp has to be there, or the
+    /// next resume reads a mismatch and rebuilds a container already right.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn the_sandbox_stamp_survives_a_reload() {
+        use crate::session::test_support::isolate_app_dir;
+        let profile = "default";
+        let _tmp = isolate_app_dir();
+        let mut inst = crate::session::Instance::new("claude", "/tmp/aoe-switch-provider-stamp");
+        inst.agent_provider = Some("vertex".to_string());
+        inst.sandbox_info = Some(crate::session::SandboxInfo {
+            provider: None,
+            enabled: true,
+            container_id: None,
+            image: "alpine:latest".into(),
+            container_name: "aoe-sandbox-stamp".into(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            container_workdir: None,
+        });
+        let id = inst.id.clone();
+        crate::server::test_support::seed_instances_on_disk_for_test(profile, vec![inst.clone()]);
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+
+        persist_sandbox_stamp(&state, profile, &id, Some("vertex")).expect("persisting the stamp");
+
+        let on_disk = crate::server::test_support::load_instances_from_disk_for_test(profile);
+        let stored = on_disk.iter().find(|i| i.id == id).expect("seeded row");
+        // The equality `reconcile_provider_container` checks before discarding.
+        assert_eq!(
+            stored
+                .sandbox_info
+                .as_ref()
+                .and_then(|s| s.provider.as_deref()),
+            stored.agent_provider.as_deref(),
+        );
     }
 
     #[test]
