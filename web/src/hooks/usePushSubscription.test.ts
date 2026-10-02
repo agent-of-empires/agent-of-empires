@@ -42,6 +42,7 @@ interface FetchOverrides {
   status?: { ok: boolean; body: unknown };
   vapid?: number;
   subscribe?: number;
+  unsubscribe?: number;
   test?: number;
   testBody?: unknown;
 }
@@ -63,7 +64,11 @@ function installFetch(overrides: FetchOverrides = {}) {
       if (url.includes("/test")) {
         return new Response(JSON.stringify(overrides.testBody ?? {}), { status: overrides.test ?? 200 });
       }
-      const status = url.includes("/subscribe") ? overrides.subscribe : 200;
+      const status = url.includes("/unsubscribe")
+        ? overrides.unsubscribe
+        : url.includes("/subscribe")
+          ? overrides.subscribe
+          : 200;
       return new Response("{}", { status: status ?? 200 });
     }),
   );
@@ -266,6 +271,91 @@ describe("usePushSubscription enable() with an existing subscription", () => {
     const { result } = await mountAndSettle();
     await act_(result, "enable");
     expect(Notification.requestPermission).not.toHaveBeenCalled();
+  });
+
+  it("renews an endpoint after a newer gone delivery failure", async () => {
+    const existing = makeSubscription("https://push.example/old", keyBytes("ABC"));
+    const replacement = makeSubscription("https://push.example/new", keyBytes("ABC"));
+    currentSub = existing;
+    subscribeImpl = async () => (currentSub = replacement);
+    installFetch(
+      statusWith(
+        serverSub({
+          registered: false,
+          owned: false,
+          last_failure: "gone",
+          last_failure_at: "2026-09-02T10:00:00Z",
+        }),
+      ),
+    );
+    const { result } = await mountAndSettle();
+    expect(result.current.health).toBe("delivery-failed");
+    calls.length = 0;
+
+    expect(await act_(result, "enable")).toEqual({ kind: "enabled" });
+    expect(existing.unsubscribe).toHaveBeenCalledTimes(1);
+    expect(replacement.unsubscribe).not.toHaveBeenCalled();
+    expect(currentSub?.endpoint).toBe("https://push.example/new");
+    expect(called("/api/push/subscribe")).toBe(true);
+  });
+
+  it("keeps a healthy same-key endpoint", async () => {
+    const existing = makeSubscription("https://push.example/healthy", keyBytes("ABC"));
+    currentSub = existing;
+    installFetch(statusWith(serverSub()));
+    const { result } = await mountAndSettle();
+
+    expect(await act_(result, "enable")).toEqual({ kind: "enabled" });
+    expect(existing.unsubscribe).not.toHaveBeenCalled();
+    expect(currentSub).toBe(existing);
+  });
+
+  it("does not report success when expired endpoint removal fails", async () => {
+    const existing = makeSubscription("https://push.example/expired", keyBytes("ABC"));
+    currentSub = existing;
+    subscribeImpl = vi.fn(async () => makeSubscription("https://push.example/should-not-exist", keyBytes("ABC")));
+    installFetch({
+      ...statusWith(
+        serverSub({
+          registered: true,
+          owned: true,
+          last_failure: "gone",
+          last_failure_at: "2026-09-02T10:00:00Z",
+        }),
+      ),
+      unsubscribe: 500,
+    });
+    const { result } = await mountAndSettle();
+
+    const state = await act_(result, "enable");
+    expect(state.kind).toBe("error");
+    expect(state).toEqual({ kind: "error", message: "Could not remove the expired notification subscription" });
+    expect(existing.unsubscribe).toHaveBeenCalledTimes(1);
+    expect(subscribeImpl).not.toHaveBeenCalled();
+  });
+
+  it("does not replace an endpoint when browser unsubscribe fails", async () => {
+    const existing = makeSubscription("https://push.example/expired", keyBytes("ABC"));
+    existing.unsubscribe.mockResolvedValue(false);
+    currentSub = existing;
+    subscribeImpl = vi.fn(async () => makeSubscription("https://push.example/should-not-exist", keyBytes("ABC")));
+    installFetch(
+      statusWith(
+        serverSub({
+          registered: false,
+          owned: false,
+          last_failure: "gone",
+          last_failure_at: "2026-09-02T10:00:00Z",
+        }),
+      ),
+    );
+    const { result } = await mountAndSettle();
+
+    expect(await act_(result, "enable")).toEqual({
+      kind: "error",
+      message: "Could not unsubscribe the expired notification subscription",
+    });
+    expect(subscribeImpl).not.toHaveBeenCalled();
   });
 });
 
