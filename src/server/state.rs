@@ -88,6 +88,13 @@ pub(crate) enum StatusSource {
 
 /// Shared application state accessible by all request handlers.
 pub struct AppState {
+    /// The profile this server serves: the `--profile` it was launched with,
+    /// else the configured default. Immutable for the daemon's lifetime, and
+    /// deliberately distinct from `canonical_metadata.default_profile`, which
+    /// is the machine-wide default the operator configured rather than the one
+    /// this process runs. Read it through [`AppState::served_profile`] rather
+    /// than reaching for either directly.
+    pub(crate) profile: String,
     pub core_only: bool,
     pub read_only: bool,
     /// CityHall client mode, resolved once at launch from `AOE_CITYHALL_MODE`.
@@ -344,6 +351,15 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// The profile this server serves, as every served-surface handler must
+    /// read it. `profile` is the launch `--profile` already resolved through
+    /// `config::effective_profile`, so this is a borrow, not a re-resolution:
+    /// one rule, one place, and no handler can drift onto the machine-wide
+    /// `canonical_metadata.default_profile` the operator merely configured.
+    pub fn served_profile(&self) -> &str {
+        &self.profile
+    }
+
     pub(crate) async fn mark_reload_failure(&self, health: crate::daemon::RuntimeHealth) {
         let _publication = self.publication.write().await;
         *self.canonical_health.write().await = health;

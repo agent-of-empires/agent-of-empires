@@ -271,34 +271,80 @@ pub(crate) async fn adopt_committed_profiles<const N: usize>(
     Ok(())
 }
 
+/// What a runtime merge may carry of `prior`'s poller: a poller serves one agent
+/// on one execution, and the repair window it paces was armed for the same, so
+/// both are carried only while the fresh row still runs what the prior row ran.
+/// A poller the fresh row cannot use is stopped here rather than handed over,
+/// because its thread keeps reading the launch the row is giving up.
+///
+/// Both decisions are read off `prior` before any inherit consumes it, since
+/// that inherit moves the prior row's own poller state in whatever these say.
+struct PollerHandoff {
+    keeps_poller: bool,
+    keeps_repair: bool,
+}
+
+impl PollerHandoff {
+    fn decide(prior: &Instance, fresh: &Instance) -> Self {
+        Self {
+            keeps_poller: prior.poller_serves(&fresh.tool, fresh.active_execution.as_ref()),
+            keeps_repair: fresh.runs(&prior.tool, prior.active_execution.as_ref()),
+        }
+    }
+
+    /// Stop the poller the fresh row cannot use, before the hand-off moves it.
+    fn stop_unservable(&self, prior: &Instance) {
+        if !self.keeps_poller {
+            prior.stop_poller();
+        }
+    }
+
+    /// Drop whatever the inherit moved in that the fresh row cannot use.
+    fn settle(self, fresh: &mut Instance) {
+        if !self.keeps_poller {
+            fresh.session_id_poller = None;
+        }
+        if !self.keeps_repair {
+            fresh.poller_repair = Default::default();
+            fresh.session_id_poller_retry_after = None;
+        }
+    }
+}
+
 /// Keep process state without replacing the committed lifecycle or identity.
 ///
-/// A poller serves one agent on one execution, and the repair window it paces was
-/// armed for the same, so both are taken only while the fresh row still runs what
-/// the prior row ran; a poller the fresh row cannot use is stopped here rather
-/// than handed over, because its thread keeps reading the launch the row is
-/// giving up. Both decisions are read off `prior` before `inherit_runtime`
-/// consumes it, since that inherit moves the prior row's own poller state in
-/// whatever these two say.
+/// The poller guards live in [`PollerHandoff`], shared with the status-poll
+/// branch of [`merge_loaded_rows`]: both hand a prior row's launch-owned process
+/// state to the fresh row, so both must decide the same way whether that row
+/// still runs what the prior one ran.
 pub(super) fn merge_runtime_fields(prior: Instance, fresh: &mut Instance) {
-    let keeps_poller = prior.poller_serves(&fresh.tool, fresh.active_execution.as_ref());
-    let keeps_repair = fresh.runs(&prior.tool, prior.active_execution.as_ref());
-    if !keeps_poller {
-        prior.stop_poller();
-    }
+    let handoff = PollerHandoff::decide(&prior, fresh);
+    handoff.stop_unservable(&prior);
     // `plugin_revival_pending` is `#[serde(skip)]`, so every fresh disk load
     // defaults it; dropping it here would stop counting a plugin revival that is
     // still waking toward its per-plugin cap.
     let plugin_revival_pending = prior.plugin_revival_pending;
     fresh.last_error_check = prior.last_error_check;
     fresh.inherit_runtime(prior, fresh.status == Status::Error);
-    if !keeps_poller {
-        fresh.session_id_poller = None;
-    }
-    if !keeps_repair {
-        fresh.poller_repair = Default::default();
-        fresh.session_id_poller_retry_after = None;
-    }
+    handoff.settle(fresh);
+    fresh.plugin_revival_pending = plugin_revival_pending;
+}
+
+/// Adopt the prior row's launch-owned process state onto a fresh row whose
+/// status, panes and detection this tick's tmux scrape already decided, and so
+/// must keep them: [`merge_runtime_fields`] would carry the prior row's
+/// observations back over the fresh ones. The poller guards are the same
+/// [`PollerHandoff`] the full merge applies, because the poller and its repair
+/// window are launch-owned whatever decided the status, and `plugin_revival_pending`
+/// is `#[serde(skip)]` like the poller, so a fresh disk load defaults it.
+fn merge_process_runtime_fields(prior: Instance, fresh: &mut Instance) {
+    let handoff = PollerHandoff::decide(&prior, fresh);
+    handoff.stop_unservable(&prior);
+    // `#[serde(skip)]` like the poller, so a fresh disk load defaults it and a
+    // revival slower than one tick would stop counting toward its plugin cap.
+    let plugin_revival_pending = prior.plugin_revival_pending;
+    fresh.inherit_process_runtime(prior);
+    handoff.settle(fresh);
     fresh.plugin_revival_pending = plugin_revival_pending;
 }
 
@@ -355,6 +401,29 @@ pub(super) struct SandboxHealth {
     pub running: bool,
 }
 
+/// Whether the launch that left this row `Starting` on disk is still recent
+/// enough for tmux to keep its hands off it.
+///
+/// The reservation arm of the guard this feeds measures a launch from
+/// `lifecycle_reservation.at` against [`Instance::LIFECYCLE_RESERVATION_TTL`],
+/// and this one protects the same object — the launch — after the reservation is
+/// released, which is exactly when a committed launch's row is still
+/// `Starting`. So it uses the same TTL, but the reservation's own stamp is gone
+/// by then and it reads the row's durable launch stamp instead:
+/// `capture_started_at` is stamped by every launch as it creates the pane and
+/// persisted by the commit that publishes the `Starting` status, so it is the
+/// moment this status was earned.
+///
+/// A row with no stamp never reached a pane, so no launch owns it and nothing
+/// would ever move it again. That is the crashed creation, and it is why this
+/// arm cannot be left open-ended.
+fn starting_launch_is_fresh(inst: &Instance, now: chrono::DateTime<chrono::Utc>) -> bool {
+    let Some(started) = inst.capture_started_at else {
+        return false;
+    };
+    chrono::DateTime::<chrono::Utc>::from(started) + Instance::LIFECYCLE_RESERVATION_TTL > now
+}
+
 /// One tick's per-instance status decision: seed each freshly disk-loaded row's
 /// live baseline from `prev`, then let tmux speak for the rows tmux owns.
 ///
@@ -391,9 +460,13 @@ pub(super) fn apply_tick_status_decisions(
         }
         // Launch owns the row until its reservation is committed or rolled
         // back. In particular, a missing pane during provisioning must not
-        // overwrite Starting (or a reserved sampled status) with Error.
-        if inst.status == Status::Starting
-            || inst.has_fresh_lifecycle_reservation(chrono::Utc::now())
+        // overwrite Starting (or a reserved sampled status) with Error. Both
+        // arms are bounded by the reservation TTL: the reservation one by its
+        // own stamp, the `Starting` one by the durable launch stamp, since a
+        // reservation is released while its row is still `Starting`.
+        let now = chrono::Utc::now();
+        if inst.has_fresh_lifecycle_reservation(now)
+            || (inst.status == Status::Starting && starting_launch_is_fresh(inst, now))
         {
             continue;
         }
@@ -694,7 +767,7 @@ pub(super) fn merge_loaded_rows(
             let prior_last_accessed = prior.last_accessed_at;
             let prior_idle_entered = prior.idle_entered_at;
             if matches!(status_source, StatusSource::TmuxApplied) && !row.is_structured() {
-                row.inherit_process_runtime(prior);
+                merge_process_runtime_fields(prior, &mut row);
             } else {
                 if matches!(status_source, StatusSource::TmuxApplied) {
                     prior.agent_pane = std::mem::take(&mut row.agent_pane);
@@ -1247,15 +1320,46 @@ mod tests {
         // the tick still reports transitions it does own.
     }
 
+    /// Launch owns the row until its reservation is committed or rolled back, and a missing pane
+    /// during provisioning must not overwrite `Starting` (or a reserved sampled status) with
+    /// `Error`. Both arms of that guard are bounded by the reservation TTL: the reservation one by
+    /// its own stamp, the `Starting` one by the durable launch stamp the launch leaves behind once
+    /// it releases the reservation.
+    ///
+    /// Driven with no batch pane metadata, so what is under test is the guard alone and not what
+    /// tmux would decide: a held row keeps its status, and a released one adopts the last live
+    /// value. That makes "the guard let the row go" the observable, with no dependence on a live
+    /// pane or on a tmux session cache this unit test never refreshes.
     #[test]
-    fn tick_preserves_starting_and_fresh_launch_reservations_without_a_pane() {
-        for reserved in [false, true] {
+    fn tick_holds_a_row_only_while_a_launch_owns_it() {
+        let ttl = u64::try_from(Instance::LIFECYCLE_RESERVATION_TTL.num_seconds()).unwrap();
+        let stale = std::time::SystemTime::now() - std::time::Duration::from_secs(ttl + 1);
+        for (case, reserved, launched_at, expected) in [
+            // A launch that is still provisioning: the reservation is held, and the status it
+            // reserved is a sampled `Error` the row must keep.
+            ("reserving", true, None, Status::Error),
+            // A launch that committed and released its reservation: the row is still `Starting`
+            // while the pane settles, and the durable launch stamp still bounds that window.
+            (
+                "just launched",
+                false,
+                Some(std::time::SystemTime::now()),
+                Status::Starting,
+            ),
+            // A crashed creation: `Starting` with no launch behind it at all. Nothing will ever
+            // move this row again, so the tick must take it back.
+            ("no launch", false, None, Status::Running),
+            // Same, but the launch stamp is older than the TTL the reservation arm uses. The guard
+            // protects a launch, not the spelling of a status, so a stale one no longer holds.
+            ("stale launch", false, Some(stale), Status::Running),
+        ] {
             let mut instance = Instance::new("launching", "/tmp/launching");
             instance.status = if reserved {
                 Status::Error
             } else {
                 Status::Starting
             };
+            instance.capture_started_at = launched_at;
             if reserved {
                 instance
                     .try_acquire_lifecycle_reservation(
@@ -1273,18 +1377,11 @@ mod tests {
                 &mut instances,
                 &prev,
                 &std::collections::HashSet::new(),
-                Some(&std::collections::HashMap::new()),
+                None,
                 &Default::default(),
             );
 
-            assert_eq!(
-                instances[0].status,
-                if reserved {
-                    Status::Error
-                } else {
-                    Status::Starting
-                }
-            );
+            assert_eq!(instances[0].status, expected, "{case}");
         }
     }
 
@@ -1850,10 +1947,15 @@ mod tests {
         }
     }
 
-    /// A profile move can change a row's agent on disk while it holds no execution on either side,
-    /// and a poller that watched no execution belongs to an agent just as much. Carrying it would
-    /// leave the row watching the previous agent's capture, and the repair walk skips on a
-    /// running poller, so nothing else would replace it.
+    /// A profile move, a TUI edit or `aoe restart` can change a row's agent on disk while it holds
+    /// no execution on either side, and a poller that watched no execution belongs to an agent just
+    /// as much. Carrying it would leave the row watching the previous agent's capture, and the
+    /// repair walk skips on a running poller, so nothing else would replace it.
+    ///
+    /// Driven through [`merge_loaded_rows`] on the `TmuxApplied` source, not through the function
+    /// it delegates to: that is the only path a status-poll tick takes for a terminal row, so a
+    /// test calling the inner merge alone passes even when the tick's own branch skips the guard
+    /// entirely, once per row per 2s.
     #[test]
     fn a_reload_drops_the_poller_of_an_agent_the_row_no_longer_runs() {
         let mut prior = Instance::new("swapped-agent", "/tmp/swapped-agent");
@@ -1867,20 +1969,43 @@ mod tests {
             poller.start(prior.id.clone(), Box::new(|| None), Box::new(|_| {}), None,),
             crate::session::poller::PollerSpawn::Spawned
         );
-        prior.session_id_poller = Some(std::sync::Arc::new(std::sync::Mutex::new(poller)));
+        let poller = std::sync::Arc::new(std::sync::Mutex::new(poller));
+        prior.session_id_poller = Some(poller.clone());
+        prior.plugin_revival_pending = true;
         assert!(
             prior.active_execution.is_none(),
             "fixture: no execution on either side"
         );
         let mut fresh = Instance::new("swapped-agent", "/tmp/swapped-agent");
+        // The merge is keyed by id, so the fresh disk load must be the same row and not merely a
+        // second session with the same title.
+        fresh.id = prior.id.clone();
         fresh.tool = "codex".to_string();
 
-        merge_runtime_fields(prior, &mut fresh);
+        let mut canonical = vec![prior];
+        merge_loaded_rows(
+            &mut canonical,
+            vec![fresh],
+            StatusSource::TmuxApplied,
+            &Default::default(),
+        );
+        let merged = &canonical[0];
 
-        assert_eq!(fresh.tool, "codex");
+        assert_eq!(merged.tool, "codex");
         assert!(
-            fresh.session_id_poller.is_none(),
+            merged.session_id_poller.is_none(),
             "the previous agent's watcher does not follow the row to a new one"
+        );
+        // `Instance::session_id_poller` holds a `std::sync::Mutex`, so this reads the guard
+        // through `matches!` rather than unwrapping a poisoning error the type can raise.
+        assert!(
+            matches!(poller.lock(), Ok(poller) if !poller.is_running()),
+            "and its thread is stopped, not merely dropped"
+        );
+        assert!(
+            merged.plugin_revival_pending,
+            "the revival mark is `#[serde(skip)]`, so a poll-path merge that drops it \
+             silently un-counts a revival toward its plugin cap every 2s"
         );
     }
 

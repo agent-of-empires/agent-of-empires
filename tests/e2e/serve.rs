@@ -3406,3 +3406,127 @@ fn cli_acp_tail_connects_to_behind_proxy_passphrase_daemon() {
         }
     }
 }
+
+/// The daemon's `--profile` must reach the served layer. `aoe --profile work`
+/// serve ran its own machinery (status rules, push, plugin host) on `work`
+/// while `/api/about` and every unaddressed read answered for the machine-wide
+/// `default_profile` -- two profiles at once, chosen by nobody's intent.
+///
+/// Asserted in one pass:
+///   1. `default_profile = "default"` in machine config, both profiles on
+///      disk, so `default` is what the machine default resolves to.
+///   2. `GET /api/about` reports `work`.
+///   3. `GET /api/settings` with no query resolves over `work`'s overrides:
+///      `work` pins `session.default_tool = "codex"` and the machine pins
+///      `"claude"`, so the served-profile read must report `codex` while
+///      `?layer=machine` reports `claude`. The pair proves the read is
+///      addressed to `work` specifically, not merely that `about` names it.
+#[test]
+#[parallel]
+fn cli_serve_daemon_profile_reaches_the_served_layer() {
+    let mut h = TuiTestHarness::new_in_tmp("serve_served_profile");
+    h.stop_daemon_on_drop();
+    let app = crate::harness::app_dir_in(h.home_path());
+    let version = env!("CARGO_PKG_VERSION");
+
+    // Pin the machine default to `default` so the daemon's `--profile work`
+    // is unambiguously the operator's choice and not the machine's.
+    let machine_config = format!(
+        "default_profile = \"default\"\n\n[updates]\nupdate_check_mode = \"off\"\n\n[session]\ndefault_tool = \"claude\"\n\n[app_state]\nhas_seen_welcome = true\nhas_responded_to_telemetry = true\nhas_acknowledged_agent_hooks = true\nlast_seen_version = \"{version}\"\n"
+    );
+    std::fs::write(app.join("config.toml"), machine_config).expect("write machine config.toml");
+    std::fs::create_dir_all(app.join("profiles").join("default")).expect("default profile dir");
+    let work = app.join("profiles").join("work");
+    std::fs::create_dir_all(&work).expect("work profile dir");
+    std::fs::write(
+        work.join("config.toml"),
+        "[session]\ndefault_tool = \"codex\"\n",
+    )
+    .expect("write work profile config");
+
+    let port = pick_free_port();
+    let port_s = port.to_string();
+    let start = h.run_cli(&[
+        "--profile",
+        "work",
+        "serve",
+        "--daemon",
+        "--port",
+        &port_s,
+        "--no-auth",
+    ]);
+    assert!(
+        start.status.success(),
+        "`aoe --profile work serve --daemon` failed.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&start.stdout),
+        String::from_utf8_lossy(&start.stderr),
+    );
+    assert!(
+        wait_for_port(port, Duration::from_secs(20)),
+        "daemon never bound port {port}"
+    );
+
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    let result: Result<(), String> = rt.block_on(async {
+        let base = format!("http://127.0.0.1:{port}");
+        let client = reqwest::Client::builder()
+            .build()
+            .map_err(|e| format!("build client: {e}"))?;
+
+        let about: serde_json::Value = client
+            .get(format!("{base}/api/about"))
+            .send()
+            .await
+            .map_err(|e| format!("GET /api/about: {e}"))?
+            .json()
+            .await
+            .map_err(|e| format!("decode /api/about: {e}"))?;
+        if about.get("profile").and_then(|v| v.as_str()) != Some("work") {
+            return Err(format!(
+                "/api/about must advertise the launch --profile `work`, got {about}"
+            ));
+        }
+
+        // The user-visible half: a settings read the operator did not address
+        // must come back resolved over `work`, not over `default`.
+        let served: serde_json::Value = client
+            .get(format!("{base}/api/settings"))
+            .send()
+            .await
+            .map_err(|e| format!("GET /api/settings: {e}"))?
+            .json()
+            .await
+            .map_err(|e| format!("decode /api/settings: {e}"))?;
+        if served["session"]["default_tool"] != "codex" {
+            return Err(format!(
+                "GET /api/settings must resolve over the served profile `work` (default_tool=codex), got {}",
+                served["session"]["default_tool"]
+            ));
+        }
+
+        // And the machine layer still reports the machine's own value, so the
+        // assertion above is a real profile switch, not a coincidence.
+        let machine: serde_json::Value = client
+            .get(format!("{base}/api/settings?layer=machine"))
+            .send()
+            .await
+            .map_err(|e| format!("GET /api/settings?layer=machine: {e}"))?
+            .json()
+            .await
+            .map_err(|e| format!("decode machine settings: {e}"))?;
+        if machine["session"]["default_tool"] != "claude" {
+            return Err(format!(
+                "the machine layer must keep its own default_tool=claude, got {}",
+                machine["session"]["default_tool"]
+            ));
+        }
+
+        Ok(())
+    });
+
+    let _ = h.run_cli(&["serve", "--stop"]);
+
+    if let Err(e) = result {
+        panic!("{e}");
+    }
+}

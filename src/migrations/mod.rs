@@ -392,6 +392,15 @@ pub fn run_migrations_announced(reporter: Option<progress::Reporter>) -> Result<
 fn run_migrations_inner(reporter: Option<progress::Reporter>, announce: bool) -> Result<()> {
     let _installed = progress::install(reporter);
     let _announced = progress::install_announced(announce);
+    // `announce` is the explicit `aoe migrate`, and the two reconciliations
+    // below read it under their own names, so state the conversion once here
+    // instead of letting one bool read as "narrate" in one call and "move"
+    // in the next: v027's `explicit_migrate` takes it as narrated-and-bulk
+    // (`defer = !explicit_migrate`), v033's `move_stores` takes it as
+    // migrate-rather-than-notify. Both mean the same thing on this path, which
+    // is why the same value is right for each.
+    let explicit_migrate = announce;
+    let move_stores = announce;
     let current = get_current_version();
     debug!("Current schema version: {}", current);
 
@@ -401,8 +410,8 @@ fn run_migrations_inner(reporter: Option<progress::Reporter>, announce: bool) ->
         );
     }
     if current == CURRENT_VERSION {
-        v027_isolate_sandbox_stores::reconcile_pending(announce)?;
-        v033_isolate_sandbox_content::reconcile_pending(announce)?;
+        v027_isolate_sandbox_stores::reconcile_pending(explicit_migrate)?;
+        v033_isolate_sandbox_content::reconcile_pending(move_stores)?;
         return v037_capture_purge_runners::reconcile();
     }
 
@@ -683,5 +692,84 @@ mod tests {
             .retroactive_capture_excludes
             .contains("legacy-sid"));
         assert_eq!(before[0].pending_initial_turn.as_deref(), Some("go"));
+    }
+
+    /// One `announce`, two reconciliations, one meaning. v027 and v033 both
+    /// read it as "this run may act on a still-pending sandbox move, not just
+    /// report it", but they name the parameter differently because each reads
+    /// it differently: v027 also narrates (`defer = !explicit_migrate`),
+    /// v033 only migrates (`move_stores || only.is_some()`). This pins the
+    /// shared value at the seam: on a current schema, an explicit `aoe
+    /// migrate` acts and a bare startup reports, for both.
+    #[test]
+    #[serial_test::serial]
+    fn an_explicit_migrate_acts_on_both_sandbox_reconciliations_and_a_startup_only_reports() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let app = crate::session::get_app_dir().unwrap();
+        let home = dirs::home_dir().unwrap();
+        fs::create_dir_all(&app).unwrap();
+        fs::create_dir_all(home.join(".gemini/sandbox/history")).unwrap();
+        fs::write(home.join(".gemini/sandbox/history/id.json"), b"legacy").unwrap();
+        let row = serde_json::json!({
+            "id": "one",
+            "title": "One",
+            "tool": "gemini",
+            "project_path": temp.path().join("project"),
+            "sandbox_info": {"enabled": true},
+        });
+        fs::write(
+            app.join("sessions.json"),
+            serde_json::to_vec(&[row]).unwrap(),
+        )
+        .unwrap();
+        fs::write(app.join(VERSION_FILE), CURRENT_VERSION.to_string()).unwrap();
+        crate::session::purge_owners::initialize(&app).unwrap();
+
+        // A bare startup: both reconciliations defer, so neither commits.
+        run_migrations_with(None).unwrap();
+        let reported: serde_json::Value =
+            serde_json::from_slice(&fs::read(app.join("sessions.json")).unwrap()).unwrap();
+        assert_ne!(
+            reported[0]["sandbox_store_generation"],
+            current_store_generation(),
+            "a startup must not act on the store move it reported as pending: {reported}"
+        );
+        assert_eq!(
+            reported[0].get("sandbox_content_policy"),
+            None,
+            "a startup must not isolate the content it reported as pending: {reported}"
+        );
+        assert!(
+            home.join(".gemini/sandbox").is_dir(),
+            "the shared store a startup leaves pending must stay in place"
+        );
+
+        // The explicit `aoe migrate`: the same flag, now acting on both.
+        run_migrations_announced(None).unwrap();
+        let acted: serde_json::Value =
+            serde_json::from_slice(&fs::read(app.join("sessions.json")).unwrap()).unwrap();
+        assert_eq!(
+            acted[0]["sandbox_store_generation"],
+            current_store_generation(),
+            "an explicit migrate must move the store it reported as pending: {acted}"
+        );
+        assert_eq!(
+            acted[0]["sandbox_content_policy"],
+            serde_json::json!(crate::migrations::v033_isolate_sandbox_content::CONTENT_POLICY),
+            "an explicit migrate must isolate the content it reported as pending: {acted}"
+        );
+        assert!(
+            !home.join(".gemini/sandbox").exists(),
+            "a committed move retires the shared store it copied from"
+        );
+    }
+
+    /// The generation a v027-committed row carries, as the JSON the registry
+    /// holds it in.
+    fn current_store_generation() -> serde_json::Value {
+        serde_json::json!(u64::from(
+            crate::session::config::container_config::CURRENT_SANDBOX_STORE_GENERATION
+        ))
     }
 }

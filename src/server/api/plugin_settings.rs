@@ -63,29 +63,18 @@ pub async fn resolve_option_source(
     source: OptionSource,
     depends: &[String],
 ) -> anyhow::Result<Vec<SelectOption>> {
+    // Every option source below reads the served profile, so an option list
+    // always describes the profile this daemon actually runs.
+    let served = state.served_profile().to_string();
     match source {
-        OptionSource::AcpAgents => {
-            let profile = state
-                .canonical_metadata
-                .read()
-                .await
-                .default_profile
-                .clone();
-            Ok(acp_agent_options(&profile).await)
-        }
+        OptionSource::AcpAgents => Ok(acp_agent_options(&served).await),
         OptionSource::AcpModels => {
             // A profile that pins the selected agent's model collapses the
             // picker to that entry. Enforcement lives at creation, so this is
             // presentation only: the wizard must not offer choices the create
             // call will refuse.
             if let Some(agent) = depends.first().filter(|a| !a.is_empty()) {
-                let profile = state
-                    .canonical_metadata
-                    .read()
-                    .await
-                    .default_profile
-                    .clone();
-                if let Some(model) = pinned_model_for_agent(&profile, agent).await {
+                if let Some(model) = pinned_model_for_agent(&served, agent).await {
                     let label = catalog_options(Some(agent), CatalogCategory::Model)
                         .into_iter()
                         .find(|opt| opt.value == model)
@@ -99,15 +88,7 @@ pub async fn resolve_option_source(
         OptionSource::AcpModes => {
             Ok(catalog_options_probing(depends.first(), CatalogCategory::Mode).await)
         }
-        OptionSource::Projects => {
-            let profile = state
-                .canonical_metadata
-                .read()
-                .await
-                .default_profile
-                .clone();
-            project_options(&profile).await
-        }
+        OptionSource::Projects => Ok(project_options(&served).await?),
         OptionSource::Groups => Ok(group_options(state).await),
     }
 }

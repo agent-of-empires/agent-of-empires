@@ -354,14 +354,12 @@ pub async fn review_creation_trust(
     ) {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
+    // An explicit `body.profile` is the caller's authority and overrides the
+    // served one; with none, the trust review runs against the profile this
+    // daemon serves, same as every other unaddressed read.
     let profile = match body.profile {
         Some(profile) => profile,
-        None => state
-            .canonical_metadata
-            .read()
-            .await
-            .default_profile
-            .clone(),
+        None => state.served_profile().to_string(),
     };
     let result = tokio::task::spawn_blocking(
         move || -> anyhow::Result<crate::daemon::CreationTrustReview> {
@@ -721,12 +719,10 @@ pub async fn create_session(
     } else {
         None
     };
-    let default_profile = state
-        .canonical_metadata
-        .read()
-        .await
-        .default_profile
-        .clone();
+    // What a create with no `body.profile` falls back to: the served profile,
+    // not the machine-wide default. Read once here and used by the
+    // ACP-capability check, the tool-identity validation, and the spawn.
+    let default_profile = state.served_profile().to_string();
 
     if state.cityhall_mode {
         // CityHall sessions are server-derived and locked down: they span every
@@ -1165,6 +1161,9 @@ pub async fn create_session(
     }
 
     let profile = body.profile.unwrap_or(default_profile);
+    // `body.profile` is the caller's authority when it names one; otherwise
+    // the served profile resolved above, which is also what the validation
+    // at `validation_profile` checked against, so the two cannot disagree.
     // Registered after the idempotency lock, so a retry waiting on it cannot
     // replace the entry the in-flight create is writing to.
     let progress = body

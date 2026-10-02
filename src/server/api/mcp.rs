@@ -47,12 +47,9 @@ pub async fn get_mcp_servers(
     if let Some(resp) = super::cityhall_block(&state) {
         return resp;
     }
-    let profile = state
-        .canonical_metadata
-        .read()
-        .await
-        .default_profile
-        .clone();
+    // MCP servers are resolved out of the served profile's config tree, so
+    // they follow the daemon's `--profile`.
+    let profile = state.served_profile().to_string();
     let agent = resolve_agent(&profile, query.agent);
     let result = tokio::task::spawn_blocking(move || {
         let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
@@ -132,12 +129,9 @@ pub async fn resolve_mcp_conflict(
         }
     };
 
-    let profile = state
-        .canonical_metadata
-        .read()
-        .await
-        .default_profile
-        .clone();
+    // Same served profile as the read above: a conflict the operator did not
+    // serve is not this daemon's conflict to adjudicate.
+    let profile = state.served_profile().to_string();
     let result = tokio::task::spawn_blocking(move || {
         // Re-resolve the current conflicts and find the one for `name`; the
         // fingerprint guard in resolve_conflict rejects a stale resolution.

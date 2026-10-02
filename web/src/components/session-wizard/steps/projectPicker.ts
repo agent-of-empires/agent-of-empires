@@ -99,8 +99,11 @@ export function splitSavedAndRecent(
   return { saved, recent: recent.filter((r) => !savedPaths.has(normalizePath(r.path))) };
 }
 
-/** Saved paths are read for the workflow's resolved profile; with none resolved
- *  yet the server reads its default profile, so the load must not wait for one. */
+/** Saved paths are read for the workflow's resolved profile. With none resolved
+ * yet the read has no scope to carry, and the daemon answers an unscoped
+ * `profile_required` 400, so that load waits for a profile instead of firing a
+ * request whose only possible answer is the error; recents are scope-free and
+ * still load. */
 export function useProjectPicker(profile: string | undefined, excludePaths: string[] = []) {
   const [recent, setRecent] = useState<RecentProject[]>([]);
   const [saved, setSaved] = useState<ProjectInfo[]>([]);
@@ -114,15 +117,19 @@ export function useProjectPicker(profile: string | undefined, excludePaths: stri
 
   useEffect(() => {
     let cancelled = false;
-    Promise.all([fetchSessions(), fetchRecentProjects(), fetchProjects(profile ? { profile } : {})]).then(
-      ([envelope, recentEnvelope, savedProjects]) => {
+    // Only the saved read is profile-scoped, so it is the only one held back
+    // while the profile is unresolved; recents carry no scope and load either
+    // way, and the effect re-runs once `profile` lands.
+    const savedProjects = profile ? fetchProjects({ profile }) : Promise.resolve<ProjectInfo[] | null>([]);
+    void Promise.all([fetchSessions(), fetchRecentProjects(), savedProjects]).then(
+      ([envelope, recentEnvelope, saved]) => {
         if (cancelled) return;
         const sessionDerived = envelope ? collectRecentProjects(envelope.sessions) : [];
         const merged = mergeRecentProjects(sessionDerived, recentEnvelope?.projects ?? []);
-        const split = splitSavedAndRecent(savedProjects ?? [], merged);
+        const split = splitSavedAndRecent(saved ?? [], merged);
         setSaved(split.saved);
         setRecent(split.recent);
-        setFailedScope(savedProjects === null ? scope : null);
+        setFailedScope(saved === null ? scope : null);
         setLoadedScope(scope);
       },
     );

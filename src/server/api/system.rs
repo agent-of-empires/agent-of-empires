@@ -175,12 +175,10 @@ fn build_custom_agent_infos(
 }
 
 pub async fn list_agents(State(state): State<Arc<AppState>>) -> Json<Vec<AgentInfo>> {
-    let profile = state
-        .canonical_metadata
-        .read()
-        .await
-        .default_profile
-        .clone();
+    // The profile the daemon was launched with, by the same rule
+    // `/api/about` reports: an operator's `--profile work` must list `work`'s
+    // agents, not the machine-wide default's.
+    let profile = state.served_profile().to_string();
     let result = tokio::task::spawn_blocking(move || {
         let config = crate::session::config::profile_config::resolve_config_or_warn(&profile);
         let custom_agents = config.session.custom_agents;
@@ -287,17 +285,6 @@ fn requested_profile(query: &SettingsQuery, served: &str) -> Result<String, Stri
     }
 }
 
-/// The profile `/api/about` advertises as served. A plain settings read and a
-/// plain settings save both target it, so the two never disagree on the layer.
-async fn served_profile(state: &Arc<AppState>) -> String {
-    state
-        .canonical_metadata
-        .read()
-        .await
-        .default_profile
-        .clone()
-}
-
 fn bad_request(message: impl Into<String>) -> axum::response::Response {
     (
         StatusCode::BAD_REQUEST,
@@ -313,8 +300,8 @@ pub async fn get_settings(
     State(state): State<Arc<AppState>>,
     axum::extract::Query(query): axum::extract::Query<SettingsQuery>,
 ) -> axum::response::Response {
-    let served = served_profile(&state).await;
-    let profile = match SettingsLayer::resolve(&query, &served) {
+    let served = state.served_profile();
+    let profile = match SettingsLayer::resolve(&query, served) {
         Ok(SettingsLayer::Profile(name)) => Some(name),
         Ok(SettingsLayer::Machine) => None,
         Err(message) => return bad_request(message),
@@ -524,7 +511,7 @@ pub async fn update_settings(
         Ok(b) => b,
         Err(rej) => return rej.into_response(),
     };
-    let target = match SettingsLayer::resolve(&query, &served_profile(&state).await) {
+    let target = match SettingsLayer::resolve(&query, state.served_profile()) {
         Ok(layer) => layer,
         Err(message) => return bad_request(message),
     };
@@ -1375,12 +1362,9 @@ pub async fn get_resolved_theme(
 pub async fn get_current_theme(
     State(state): State<Arc<AppState>>,
 ) -> Json<crate::tui::styles::ResolvedTheme> {
-    let profile = state
-        .canonical_metadata
-        .read()
-        .await
-        .default_profile
-        .clone();
+    // Log line only, but it names the served profile, so it reads the same
+    // one `/api/about` advertises.
+    let profile = state.served_profile().to_string();
     tracing::debug!(profile = %profile, "GET /api/theme/current");
     let resolved = tokio::task::spawn_blocking(move || {
         let name = crate::session::config::resolve_theme_name();
@@ -1829,7 +1813,7 @@ pub async fn get_about(State(state): State<Arc<AppState>>) -> Json<ServerAbout> 
     let passphrase_enabled = state.login_manager.is_enabled();
     let auth_mode =
         crate::server::resolve_auth_mode(&state.token_manager, &state.login_manager).await;
-    let profile = served_profile(&state).await;
+    let profile = state.served_profile().to_string();
     let acp_cfg = crate::session::config::profile_config::resolve_config_or_warn(&profile).acp;
     let acp_show_tool_durations = acp_cfg.show_tool_durations;
     let acp_replay_events = acp_cfg.replay_events;
@@ -1893,12 +1877,9 @@ pub struct UpdateStatusResponse {
 }
 
 pub async fn get_update_status(State(state): State<Arc<AppState>>) -> Json<UpdateStatusResponse> {
-    let profile = state
-        .canonical_metadata
-        .read()
-        .await
-        .default_profile
-        .clone();
+    // `update_check_mode` is a profile override, so the answer is the
+    // profile this daemon serves.
+    let profile = state.served_profile().to_string();
     let cfg = crate::session::config::profile_config::resolve_config_or_warn(&profile);
     let current = env!("CARGO_PKG_VERSION").to_string();
     let mode = cfg.updates.update_check_mode;

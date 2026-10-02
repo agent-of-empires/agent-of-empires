@@ -521,14 +521,17 @@ thread_local! {
 
 /// Retry cohorts that were live during the schema migration. This is called on
 /// every startup until no pre-v2 row remains, then becomes a cheap read.
-/// `announce` narrates pending rows.
-pub(crate) fn reconcile_pending(announce: bool) -> Result<()> {
+///
+/// `explicit_migrate` is true only for an explicit `aoe migrate`, which both
+/// narrates the pending rows and takes the bulk move path. A bare startup
+/// (`false`) reports what is still pending without copying anything.
+pub(crate) fn reconcile_pending(explicit_migrate: bool) -> Result<()> {
     let runtime = crate::containers::get_container_runtime();
-    let running = batched_running_probe(&runtime, announce);
+    let running = batched_running_probe(&runtime, explicit_migrate);
     #[cfg(test)]
     if let Some(probes) = TEST_RECONCILE_PROBES.get() {
         return reconcile_scoped(
-            announce,
+            explicit_migrate,
             MigrationScope {
                 only: None,
                 store: None,
@@ -538,7 +541,7 @@ pub(crate) fn reconcile_pending(announce: bool) -> Result<()> {
         );
     }
     reconcile_scoped(
-        announce,
+        explicit_migrate,
         MigrationScope {
             only: None,
             store: None,
@@ -589,18 +592,20 @@ pub(crate) fn migrate_instance_with(
     )
 }
 
-/// `only` scopes the move to a single instance; `announce` both narrates and
-/// selects the bulk path, so a bare `aoe` start reports what is pending
-/// without copying while `aoe migrate` moves everything eligible.
+/// `only` scopes the move to a single instance. `explicit_migrate` selects the
+/// bulk path and the narration: true for `aoe migrate`, which moves everything
+/// eligible and says what it moved; false for a bare `aoe` start, which reports
+/// what is pending without copying.
 fn reconcile_scoped(
-    announce: bool,
+    explicit_migrate: bool,
     scope: MigrationScope<'_>,
     is_running: &RunningProbe<'_>,
     reap: &ReapProbe<'_>,
 ) -> Result<()> {
     scope.check_available()?;
     let app_dir = crate::session::get_app_dir()?;
-    if !transition_may_be_pending(&app_dir, !announce && scope.only.is_none())? {
+    let bare_start = !explicit_migrate && scope.only.is_none();
+    if !transition_may_be_pending(&app_dir, bare_start)? {
         return Ok(());
     }
     let home = dirs::home_dir().context("home directory unavailable for sandbox migration")?;
@@ -616,8 +621,8 @@ fn reconcile_scoped(
         &home,
         is_running,
         reap,
-        defer_requested() || (!announce && scope.only.is_none()),
-        announce,
+        defer_requested() || bare_start,
+        explicit_migrate,
         scope,
     )?;
     progress::report(progress::Event::Finished {
