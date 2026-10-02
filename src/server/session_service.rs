@@ -2380,7 +2380,7 @@ mod tests {
             mutate(Arc::clone(&state.session_service)).await;
             crate::server::reload::reload_state_instances_from_disk(
                 &state,
-                vec![inst],
+                vec![inst].into(),
                 vec![],
                 crate::server::state::StatusSource::DiskOnly,
                 read_epoch,

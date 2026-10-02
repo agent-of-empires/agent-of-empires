@@ -151,6 +151,7 @@ fn build_test_app_state_impl(
         read_only: false,
         cityhall_mode,
         instances,
+        session_load_health: Default::default(),
         session_service,
         token_manager: Arc::new(TokenManager::new(token, Duration::from_secs(3600))),
         login_manager: Arc::new(login::LoginManager::new(None)),
@@ -291,7 +292,7 @@ pub async fn reload_disk_only_for_test(
         .load(std::sync::atomic::Ordering::SeqCst);
     super::reload::reload_state_instances_from_disk(
         state,
-        fresh,
+        fresh.into(),
         live_worker_records,
         super::state::StatusSource::DiskOnly,
         read_epoch,
@@ -309,7 +310,7 @@ pub async fn reload_tmux_applied_for_test(
         .load(std::sync::atomic::Ordering::SeqCst);
     super::reload::reload_state_instances_from_disk(
         state,
-        fresh,
+        fresh.into(),
         live_worker_records,
         super::state::StatusSource::TmuxApplied,
         read_epoch,

@@ -719,16 +719,16 @@ fn render_projects(
         ScopeFilter::Profile => {
             let name = selected_profile(snapshot, source)?;
             let profile = profile(snapshot, name)?;
-            require_profile_components(profile, true, true)?;
+            if !profile_component_healthy(&profile.health.metadata) {
+                return Err(unreadable(&format!(
+                    "The project registry for profile '{name}'"
+                )));
+            }
             profile.projects.clone()
         }
         ScopeFilter::All => {
             let name = selected_profile(snapshot, source)?;
             let profile = profile(snapshot, name)?;
-            if !component_healthy(&snapshot.health.global_metadata) {
-                return Err(unreadable("The global project registry"));
-            }
-            require_profile_components(profile, true, true)?;
             // The merged registry in the local order: the global rows, then the
             // profile rows that shadow them by identity. A synthesized row is
             // not a registry entry, so it can neither shadow a global row nor
@@ -875,9 +875,6 @@ fn require_list_all_health(snapshot: &SnapshotData) -> Result<(), ReadFailure> {
     if !component_healthy(&snapshot.health.global_enumeration) {
         return Err(unreadable("The profile registry"));
     }
-    if !component_healthy(&snapshot.health.global_metadata) {
-        return Err(unreadable("The global project registry"));
-    }
     for profile in &snapshot.profiles {
         if !profile_component_healthy(&profile.health.profile_enumeration)
             || !profile_component_healthy(&profile.health.profile_data)
@@ -888,10 +885,7 @@ fn require_list_all_health(snapshot: &SnapshotData) -> Result<(), ReadFailure> {
     Ok(())
 }
 
-/// Every command that names one profile needs the global registry to
-/// enumerate and the named profile's own components. The global project
-/// registry is not one of them: only the project listing consumes it, and it
-/// checks it itself.
+/// Session projections require the profile inventory, groups and cached sessions.
 fn require_selected_profile_health(
     snapshot: &SnapshotData,
     profile: &ProfileRead,
@@ -899,16 +893,8 @@ fn require_selected_profile_health(
     if !component_healthy(&snapshot.health.global_enumeration) {
         return Err(unreadable("The profile registry"));
     }
-    require_profile_components(profile, true, true)
-}
-
-fn require_profile_components(
-    profile: &ProfileRead,
-    enumeration: bool,
-    data: bool,
-) -> Result<(), ReadFailure> {
-    if (enumeration && !profile_component_healthy(&profile.health.profile_enumeration))
-        || (data && !profile_component_healthy(&profile.health.profile_data))
+    if !profile_component_healthy(&profile.health.profile_enumeration)
+        || !profile_component_healthy(&profile.health.profile_data)
     {
         return Err(profile_unreadable(&profile.name));
     }
@@ -1199,6 +1185,88 @@ mod tests {
         let failure = render_list(&args, &value, &broken_source)
             .expect_err("the bad profile reports its own degradation");
         assert_eq!(failure.code(), "health_degraded");
+    }
+
+    #[test]
+    fn projections_require_only_the_registries_they_read() {
+        use crate::cli::runtime_read::dto::HealthCode;
+        let mut value = snapshot(vec![session("known", WireStatus::Idle)]);
+        value.health.global_metadata = ComponentHealth::Degraded {
+            code: HealthCode::Metadata,
+        };
+        value.profiles[0].health.metadata = ComponentHealth::Degraded {
+            code: HealthCode::Metadata,
+        };
+        let mut args = crate::cli::list::ListArgs {
+            json: true,
+            all: true,
+            state: crate::cli::list::StateFilter::All,
+        };
+        for all in [true, false] {
+            args.all = all;
+            let output = render_list(&args, &value, &source())
+                .expect("projects do not affect sessions")
+                .stdout;
+            let rows: serde_json::Value = serde_json::from_str(&output).unwrap();
+            assert_eq!(rows[0]["id"], "known");
+        }
+        value.profiles[0].health = ProfileHealth {
+            profile_enumeration: ComponentHealth::Degraded {
+                code: HealthCode::ProfileEnumeration,
+            },
+            profile_data: ComponentHealth::Degraded {
+                code: HealthCode::ProfileEnumeration,
+            },
+            metadata: ComponentHealth::Healthy,
+        };
+        value.profiles[0].projects.push(ProjectRead {
+            name: "registered".into(),
+            path: "/repo".into(),
+            merge_key: "/repo".into(),
+            scope: ProjectScope::Profile,
+            default_base_branch: None,
+            registered: true,
+        });
+        let args = ProjectListArgs {
+            json: true,
+            scope: ScopeFilter::Profile,
+        };
+        let output = render_projects(&args, &value, &source())
+            .expect("groups and sessions do not affect projects");
+        let rows: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(rows[0]["name"], "registered");
+        value.profiles[0].health.metadata = ComponentHealth::Degraded {
+            code: HealthCode::Metadata,
+        };
+        assert_eq!(
+            render_projects(&args, &value, &source())
+                .unwrap_err()
+                .code(),
+            "health_degraded"
+        );
+        let args = ProjectListArgs {
+            json: true,
+            scope: ScopeFilter::All,
+        };
+        value.profiles[0].projects.clear();
+        value.health.global_metadata = ComponentHealth::Healthy;
+        value.global_projects.push(ProjectRead {
+            name: "global-readable".into(),
+            path: "/global".into(),
+            merge_key: "/global".into(),
+            scope: ProjectScope::Global,
+            default_base_branch: None,
+            registered: true,
+        });
+        let output = render_projects(&args, &value, &source())
+            .expect("a broken profile registry preserves global entries");
+        let rows: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(rows[0]["name"], "global-readable");
+        value.health.global_metadata = ComponentHealth::Degraded {
+            code: HealthCode::Metadata,
+        };
+        value.global_projects.clear();
+        assert_eq!(render_projects(&args, &value, &source()).unwrap(), "[]\n");
     }
 
     /// The local resolver takes the first title match and the first

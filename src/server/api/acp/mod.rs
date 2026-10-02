@@ -515,7 +515,7 @@ mod tests {
                         }
                         crate::server::reload::reload_state_instances_from_disk(
                             &state,
-                            vec![fresh],
+                            vec![fresh].into(),
                             Vec::new(),
                             crate::server::state::StatusSource::DiskOnly,
                             state

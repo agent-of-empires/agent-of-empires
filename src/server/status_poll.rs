@@ -189,8 +189,8 @@ pub(super) async fn status_poll_loop(state: Arc<AppState>) {
             .mutation_epoch
             .load(std::sync::atomic::Ordering::SeqCst);
         let updated = tokio::task::spawn_blocking(move || {
-            let mut instances = load_all_instances(&file_watch_for_poll).unwrap_or_default();
-            seed_tick_tracking(&mut instances, &prev_tracking);
+            let mut loaded = load_all_instances(&file_watch_for_poll);
+            seed_tick_tracking(&mut loaded.instances, &prev_tracking);
             crate::tmux::refresh_session_cache();
             let pane_metadata = crate::tmux::batch_pane_metadata();
             if let Err(error) = &pane_metadata {
@@ -201,16 +201,17 @@ pub(super) async fn status_poll_loop(state: Arc<AppState>) {
                 );
             }
             apply_tick_status_decisions(
-                &mut instances,
+                &mut loaded.instances,
                 &prev_for_poll,
                 &suppressed_ids,
                 pane_metadata.as_ref().ok(),
             );
-            (instances, live_structured_worker_records())
+            (loaded, live_structured_worker_records())
         })
         .await;
 
-        if let Ok((mut instances, live_worker_records)) = updated {
+        if let Ok((mut loaded, live_worker_records)) = updated {
+            let instances = &mut loaded.instances;
             // Diff BEFORE `reload_state_instances_from_disk`.
             let now = chrono::Utc::now();
             let unread_enabled = crate::session::unread_enabled();
@@ -219,7 +220,7 @@ pub(super) async fn status_poll_loop(state: Arc<AppState>) {
             // (plus its unread mark when applicable).
             let mut bundles: std::collections::HashMap<String, PassiveTransitionWrites> =
                 std::collections::HashMap::new();
-            for (idx, old) in observed_transitions(&instances, &prev) {
+            for (idx, old) in observed_transitions(instances, &prev) {
                 let inst = &instances[idx];
                 // First turn's `Running -> Idle` edge.
                 if old == Status::Running && inst.status == Status::Idle {
@@ -247,12 +248,11 @@ pub(super) async fn status_poll_loop(state: Arc<AppState>) {
                     bundle.unread_ids.push(inst.id.clone());
                 }
             }
-            flush_passive_transition_writes(state.file_watch.clone(), &mut instances, bundles)
-                .await;
+            flush_passive_transition_writes(state.file_watch.clone(), instances, bundles).await;
 
             reload_state_instances_from_disk(
                 &state,
-                instances,
+                loaded,
                 live_worker_records,
                 StatusSource::TmuxApplied,
                 read_epoch,

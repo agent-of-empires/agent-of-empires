@@ -6,6 +6,14 @@
 
 Every endpoint requires the token `aoe serve` printed (also visible in the TUI's Serve panel), unless the server runs with `--no-auth`. Send it as `Authorization: Bearer <token>`, as a `?token=` query parameter, or as the `aoe_token` cookie. Read-only mode (`--read-only`) answers every write endpoint with `403 read_only`.
 
+## Runtime CLI reads
+
+The read-only CLI commands use `/api/runtime/ws` when `--daemon-url` or `AOE_DAEMON_URL` names an endpoint. Set `AOE_DAEMON_TOKEN` for the required bearer header. The route uses the shared authentication middleware; requiring a bearer header does not exclude cookie or query-token authentication. See the [CLI transport options](cli/reference.md#aoe) for endpoint selection and fallback behavior.
+
+Each exchange sends a `Hello` followed by a `Snapshot`. Profile inventory, cached session data, group registries and project registries have independent health. A session load failure makes affected session reads exit 1 instead of returning incomplete counts or an empty successful result. The failure clears only after an accepted daemon reload, not merely when the file is repaired. Other healthy profiles and inventory-only reads remain available.
+
+Project listing does not require session or group data. The `global` and `profile` scopes require their respective project registry; `all` retains entries from readable registries, matching the local merged listing. Persisted session titles pass unchanged, including empty titles and controls. JSON preserves the original string; human output follows local rendering without sanitizing title controls.
+
 ## GET /api/sessions
 
 Lists sessions, including trashed and archived ones. Pass `state` to filter server-side: `live` excludes trashed and archived sessions, `trashed` returns only trashed ones, and `all` (the default) filters nothing. An unrecognized value is rejected with `400` rather than ignored.

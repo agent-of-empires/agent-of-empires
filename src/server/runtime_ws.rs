@@ -197,11 +197,19 @@ async fn run_read(
         return;
     };
     let runtime = &RUNTIME;
-    // The observation is the instant the row set left the watcher's cache.
-    // Everything after this is assembly, so stamping later would describe the
-    // assembly rather than what was observed.
-    let observed_at = runtime.pinned_now.unwrap_or_else(Utc::now);
-    let instances: Vec<Instance> = state.instances.read().await.clone();
+    let (instances, load_health, observed_at) = {
+        let instances = state.instances.read().await;
+        let health = state
+            .session_load_health
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        (
+            instances.clone(),
+            health,
+            runtime.pinned_now.unwrap_or_else(Utc::now),
+        )
+    };
     // Both guards belong to the sample, not to this future. A connection whose
     // budget expires drops this future while the blocking task is still on the
     // disk, and dropping a `JoinHandle` does not cancel it: the row set and the
@@ -214,7 +222,7 @@ async fn run_read(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _admitted = admitted;
-        build_snapshot(runtime, &instances, owner, observed_at)
+        build_snapshot(runtime, &instances, owner, observed_at, &load_health)
     })
     .await;
 
@@ -332,7 +340,13 @@ pub fn record_exchange(
         flight: Mutex::new(()),
         pinned_now: Some(pins.observed_at),
     };
-    let sampled = build_snapshot(&runtime, instances, owner, pins.observed_at);
+    let sampled = build_snapshot(
+        &runtime,
+        instances,
+        owner,
+        pins.observed_at,
+        &crate::server::reload::SessionLoadHealth::default(),
+    );
     let encode = |frame: Result<String, serde_json::Error>| {
         frame.expect("a recorded frame encodes").into_bytes()
     };
@@ -470,6 +484,7 @@ fn build_snapshot(
     instances: &[Instance],
     owner: Owner,
     observed_at: DateTime<Utc>,
+    load_health: &super::reload::SessionLoadHealth,
 ) -> Sampled {
     // `local_owner` mirrors the declared owner so the two can never disagree.
     let local_owner = owner.is_local();
@@ -487,6 +502,7 @@ fn build_snapshot(
     let enumerated: BTreeSet<String> = enumeration.unwrap_or_default().into_iter().collect();
     let mut names = enumerated.clone();
     names.extend(sessions.iter().map(|row| row.profile.clone()));
+    names.extend(load_health.unreadable_profiles.iter().cloned());
 
     let disk: BTreeMap<String, ProfileDisk> = names
         .iter()
@@ -547,15 +563,15 @@ fn build_snapshot(
 
     let mut profile_reads = Vec::with_capacity(names.len());
     let mut profile_health = BTreeMap::new();
-    for name in &names {
-        let entry = &disk[name];
-        let scoped: Vec<&SessionRead> =
-            sessions.iter().filter(|row| &row.profile == name).collect();
+    for (name, entry) in disk {
+        let projects_healthy = entry.projects.is_ok();
+        let groups_healthy = entry.groups.is_ok();
+        let scoped: Vec<&SessionRead> = sessions.iter().filter(|row| row.profile == name).collect();
         let scoped_instances: Vec<&Instance> = instances
             .iter()
-            .filter(|inst| &inst.source_profile == name)
+            .filter(|inst| inst.source_profile == name)
             .collect();
-        let mut projects = entry.projects.clone().unwrap_or_default();
+        let mut projects = entry.projects.unwrap_or_default();
         drop_unusable_projects(&mut projects);
         // Referential integrity: every session's project path is a member of its
         // own profile's project list.
@@ -565,27 +581,21 @@ fn build_snapshot(
         let mut identities: HashSet<(String, String)> = HashSet::new();
         projects.retain(|project| identities.insert((project.name.clone(), project.path.clone())));
         let owned: Vec<Instance> = scoped_instances.into_iter().cloned().collect();
-        let mut tree =
-            GroupTree::new_with_groups(&owned, &entry.groups.clone().unwrap_or_default());
+        let stored_groups = entry.groups.unwrap_or_default();
+        let mut tree = GroupTree::new_with_groups(&owned, &stored_groups);
         drop_unusable_groups(&mut tree);
         let groups = group_reads(&tree);
         let health = ProfileHealth {
-            profile_enumeration: if entry.projects.is_ok() && entry.groups.is_ok() {
-                ComponentHealth::Healthy
-            } else {
-                ComponentHealth::Degraded {
-                    code: HealthCode::ProfileEnumeration,
-                }
-            },
-            metadata: ComponentHealth::Healthy,
-            // The component the client's vocabulary gives no health code to:
-            // nothing on this path can fail, so there is no code to name here,
-            // and the client's aggregate union therefore has no entry for it.
-            profile_data: ComponentHealth::Healthy,
+            profile_enumeration: component(groups_healthy, HealthCode::ProfileEnumeration),
+            metadata: component(projects_healthy, HealthCode::Metadata),
+            profile_data: component(
+                !load_health.enumeration_failed && !load_health.unreadable_profiles.contains(&name),
+                HealthCode::ProfileEnumeration,
+            ),
         };
         profile_health.insert(name.clone(), health);
         profile_reads.push(ProfileRead {
-            name: name.clone(),
+            name,
             groups,
             projects,
             health,
@@ -1308,6 +1318,7 @@ mod tests {
             &[session],
             Owner::remote(),
             Utc::now(),
+            &crate::server::reload::SessionLoadHealth::default(),
         );
         let hello: serde_json::Value =
             serde_json::from_slice(&hello_frame(&sampled)).expect("the Hello is JSON");
@@ -1486,10 +1497,185 @@ mod tests {
         }
     }
 
-    /// A profile whose registry cannot be read is a degraded profile, not a
-    /// broken protocol: the Hello aggregate rolls the degradation up, the
-    /// client must still admit the exchange, and the Snapshot stays usable for
-    /// the commands that do not touch that profile.
+    async fn cached_snapshot(state: &Arc<AppState>) -> crate::cli::runtime_read::dto::SnapshotData {
+        let instances = state.instances.read().await;
+        let health = state.session_load_health.read().unwrap();
+        let sampled = build_snapshot(
+            &RuntimeState::new(),
+            &instances,
+            Owner::remote(),
+            Utc::now(),
+            &health,
+        );
+        let hello = parse_hello(&hello_frame(&sampled)).unwrap();
+        let snapshot = parse_snapshot(&snapshot_frame(&sampled)).unwrap();
+        validate_hello(&hello).unwrap();
+        validate_snapshot(&snapshot).unwrap();
+        validate_cross_message(&hello, &snapshot, None).unwrap();
+        snapshot
+    }
+
+    fn cached_data_healthy(
+        snapshot: &crate::cli::runtime_read::dto::SnapshotData,
+        profile: &str,
+    ) -> bool {
+        let profile = snapshot
+            .profiles
+            .iter()
+            .find(|row| row.name == profile)
+            .unwrap();
+        crate::cli::runtime_read::dto::profile_component_healthy(&profile.health.profile_data)
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn session_load_failures_recover_only_with_an_accepted_reload() {
+        use crate::server::{
+            reload::{load_all_instances, reload_state_instances_from_disk},
+            state::StatusSource,
+            test_support,
+        };
+        use std::sync::atomic::Ordering;
+        let home = TempHome::new();
+        for mode in [StatusSource::DiskOnly, StatusSource::TmuxApplied] {
+            for (profile, id) in [("main", "bad"), ("safe", "good")] {
+                Storage::new_unwatched(profile)
+                    .unwrap()
+                    .update(|rows, _| {
+                        *rows = vec![named(id, profile)];
+                        Ok(())
+                    })
+                    .unwrap();
+            }
+            let state = test_support::build_test_app_state(Vec::new());
+            reload_state_instances_from_disk(
+                &state,
+                load_all_instances(&state.file_watch),
+                vec![],
+                mode,
+                0,
+            )
+            .await;
+            let path = home.app_dir().join("profiles/main/sessions.json");
+            let original = std::fs::read(&path).unwrap();
+            std::fs::write(&path, "not json").unwrap();
+            let failed = load_all_instances(&state.file_watch);
+            state.mutation_epoch.store(1, Ordering::SeqCst);
+            reload_state_instances_from_disk(&state, failed, vec![], mode, 0).await;
+            let snapshot = cached_snapshot(&state).await;
+            assert!(
+                cached_data_healthy(&snapshot, "main"),
+                "a stale failed load cannot degrade current rows"
+            );
+            assert!(snapshot.sessions.iter().any(|row| row.id == "bad"));
+            reload_state_instances_from_disk(
+                &state,
+                load_all_instances(&state.file_watch),
+                vec![],
+                mode,
+                1,
+            )
+            .await;
+            let snapshot = cached_snapshot(&state).await;
+            assert!(!cached_data_healthy(&snapshot, "main"));
+            assert!(!snapshot.sessions.iter().any(|row| row.id == "bad"));
+            assert!(cached_data_healthy(&snapshot, "safe"));
+            assert!(snapshot.sessions.iter().any(|row| row.id == "good"));
+            std::fs::write(&path, &original).unwrap();
+            assert!(
+                !cached_data_healthy(&cached_snapshot(&state).await, "main"),
+                "disk repair is not cache recovery"
+            );
+            let recovered = load_all_instances(&state.file_watch);
+            state.mutation_epoch.store(2, Ordering::SeqCst);
+            reload_state_instances_from_disk(&state, recovered, vec![], mode, 1).await;
+            assert!(
+                !cached_data_healthy(&cached_snapshot(&state).await, "main"),
+                "a stale healthy load cannot clear a newer failure"
+            );
+            reload_state_instances_from_disk(
+                &state,
+                load_all_instances(&state.file_watch),
+                vec![],
+                mode,
+                2,
+            )
+            .await;
+            let snapshot = cached_snapshot(&state).await;
+            assert!(cached_data_healthy(&snapshot, "main"));
+            assert!(snapshot.sessions.iter().any(|row| row.id == "bad"));
+            std::fs::write(&path, "[]").unwrap();
+            reload_state_instances_from_disk(
+                &state,
+                load_all_instances(&state.file_watch),
+                vec![],
+                mode,
+                2,
+            )
+            .await;
+            let snapshot = cached_snapshot(&state).await;
+            assert!(cached_data_healthy(&snapshot, "main"));
+            assert!(!snapshot.sessions.iter().any(|row| row.profile == "main"));
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn session_enumeration_failure_does_not_block_recovered_inventory() {
+        use crate::server::{
+            reload::{load_all_instances, reload_state_instances_from_disk},
+            state::StatusSource,
+            test_support,
+        };
+        let home = TempHome::new();
+        let profiles = home.app_dir().join("profiles");
+        std::fs::create_dir_all(home.app_dir()).unwrap();
+        std::fs::write(&profiles, "not a directory").unwrap();
+        let state = test_support::build_test_app_state(Vec::new());
+        let failed = load_all_instances(&state.file_watch);
+        let failed_health = failed.health.clone();
+        reload_state_instances_from_disk(&state, failed, vec![], StatusSource::DiskOnly, 0).await;
+        let snapshot = cached_snapshot(&state).await;
+        assert!(!crate::cli::runtime_read::dto::component_healthy(
+            &snapshot.health.global_enumeration
+        ));
+        std::fs::remove_file(&profiles).unwrap();
+        Storage::new_unwatched("main")
+            .unwrap()
+            .update(|_, _| Ok(()))
+            .unwrap();
+        let snapshot = cached_snapshot(&state).await;
+        assert!(!cached_data_healthy(&snapshot, "main"));
+        assert!(crate::cli::runtime_read::dto::component_healthy(
+            &snapshot.health.global_enumeration
+        ));
+        assert!(crate::cli::runtime_read::dto::profile_component_healthy(
+            &snapshot.profiles[0].health.metadata
+        ));
+        reload_state_instances_from_disk(
+            &state,
+            load_all_instances(&state.file_watch),
+            vec![],
+            StatusSource::DiskOnly,
+            0,
+        )
+        .await;
+        assert!(cached_data_healthy(&cached_snapshot(&state).await, "main"));
+        std::fs::remove_dir_all(profiles.join("main")).unwrap();
+        let failed = crate::server::reload::LoadedInstances {
+            instances: vec![],
+            health: failed_health,
+        };
+        reload_state_instances_from_disk(&state, failed, vec![], StatusSource::DiskOnly, 0).await;
+        let snapshot = cached_snapshot(&state).await;
+        assert!(crate::cli::runtime_read::dto::component_healthy(
+            &snapshot.health.global_enumeration
+        ));
+        assert!(snapshot.profiles.is_empty());
+        assert!(snapshot.sessions.is_empty());
+    }
+
+    /// Project and group registry errors degrade only their own components.
     #[test]
     #[serial_test::serial]
     fn one_unreadable_profile_registry_degrades_only_that_profile() {
@@ -1498,12 +1684,14 @@ mod tests {
         std::fs::create_dir_all(profiles.join("main")).expect("main profile");
         std::fs::create_dir_all(profiles.join("broken").join("projects.json"))
             .expect("a directory where the registry belongs: a read that cannot succeed");
+        std::fs::create_dir_all(profiles.join("broken-groups").join("groups.json")).unwrap();
         let instances = vec![instance("a", "main"), instance("b", "broken")];
         let sampled = build_snapshot(
             &RuntimeState::new(),
             &instances,
             Owner::remote(),
             Utc::now(),
+            &crate::server::reload::SessionLoadHealth::default(),
         );
 
         let hello = parse_hello(&hello_frame(&sampled)).expect("the client decodes the Hello");
@@ -1527,17 +1715,33 @@ mod tests {
             .find(|profile| profile.name == "broken")
             .expect("the profile is still published");
         assert_eq!(
-            serde_json::to_value(broken.health.profile_enumeration).expect("encodes"),
-            serde_json::json!({"kind": "degraded", "code": "profile_enumeration"}),
+            serde_json::to_value(broken.health.metadata).expect("encodes"),
+            serde_json::json!({"kind": "degraded", "code": "metadata"}),
             "the bad profile says so, and the good one is untouched"
         );
+        assert!(crate::cli::runtime_read::dto::profile_component_healthy(
+            &broken.health.profile_enumeration
+        ));
+        assert!(cached_data_healthy(&snapshot, "broken"));
+        let groups = snapshot
+            .profiles
+            .iter()
+            .find(|row| row.name == "broken-groups")
+            .unwrap();
+        assert!(!crate::cli::runtime_read::dto::profile_component_healthy(
+            &groups.health.profile_enumeration
+        ));
+        assert!(crate::cli::runtime_read::dto::profile_component_healthy(
+            &groups.health.metadata
+        ));
+        assert!(cached_data_healthy(&snapshot, "broken-groups"));
         let main = snapshot
             .profiles
             .iter()
             .find(|profile| profile.name == "main")
             .expect("the healthy profile is published");
         assert_eq!(
-            serde_json::to_value(main.health.profile_enumeration).expect("encodes"),
+            serde_json::to_value(main.health.metadata).expect("encodes"),
             serde_json::json!({"kind": "healthy"})
         );
     }
@@ -1564,7 +1768,13 @@ mod tests {
         .expect("a registry with one row that cannot deserialise");
         let before = directory_contents(&profile_dir);
 
-        let sampled = build_snapshot(&RuntimeState::new(), &[], Owner::remote(), Utc::now());
+        let sampled = build_snapshot(
+            &RuntimeState::new(),
+            &[],
+            Owner::remote(),
+            Utc::now(),
+            &crate::server::reload::SessionLoadHealth::default(),
+        );
 
         let published: Vec<&str> = sampled.data.profiles[0]
             .groups
@@ -1618,6 +1828,7 @@ mod tests {
             &[instance("a", "zeta")],
             Owner::remote(),
             Utc::now(),
+            &crate::server::reload::SessionLoadHealth::default(),
         );
         assert_eq!(sampled.data.default_profile, None);
         assert_eq!(sampled.data.profiles.len(), 1);
@@ -1702,6 +1913,7 @@ mod tests {
             &instances,
             Owner::remote(),
             Utc::now(),
+            &crate::server::reload::SessionLoadHealth::default(),
         );
 
         let hello = parse_hello(&hello_frame(&sampled)).expect("client accepts the Hello");
@@ -1724,6 +1936,7 @@ mod tests {
             &[instance("a", "main")],
             Owner::remote(),
             Utc::now(),
+            &crate::server::reload::SessionLoadHealth::default(),
         );
         let value: serde_json::Value = serde_json::to_value(&sampled.hello).expect("hello encodes");
 
@@ -1752,8 +1965,20 @@ mod tests {
     fn each_sample_advances_revision_and_cursor_together() {
         let _home = TempHome::new();
         let runtime = RuntimeState::new();
-        let first = build_snapshot(&runtime, &[], Owner::remote(), Utc::now());
-        let second = build_snapshot(&runtime, &[], Owner::remote(), Utc::now());
+        let first = build_snapshot(
+            &runtime,
+            &[],
+            Owner::remote(),
+            Utc::now(),
+            &crate::server::reload::SessionLoadHealth::default(),
+        );
+        let second = build_snapshot(
+            &runtime,
+            &[],
+            Owner::remote(),
+            Utc::now(),
+            &crate::server::reload::SessionLoadHealth::default(),
+        );
 
         assert_eq!(observed_revision(&first), 1);
         assert_eq!(observed_revision(&second), 2);
@@ -1774,7 +1999,13 @@ mod tests {
         let _home = TempHome::new();
         let runtime = RuntimeState::new();
         runtime.sampler.lock().unwrap().successes = u64::MAX;
-        let sampled = build_snapshot(&runtime, &[], Owner::remote(), Utc::now());
+        let sampled = build_snapshot(
+            &runtime,
+            &[],
+            Owner::remote(),
+            Utc::now(),
+            &crate::server::reload::SessionLoadHealth::default(),
+        );
 
         assert!(matches!(
             sampled.data.status_freshness,
@@ -1860,6 +2091,7 @@ mod tests {
             &instances,
             Owner::remote(),
             Utc::now(),
+            &crate::server::reload::SessionLoadHealth::default(),
         );
 
         let snapshot =
@@ -1931,7 +2163,13 @@ mod tests {
         let mut inst = named("fractional", "main");
         inst.created_at = "2026-01-02T03:04:05.123456789Z".parse().expect("timestamp");
         inst.pinned_at = Some("2026-01-02T03:04:06.5Z".parse().expect("timestamp"));
-        let sampled = build_snapshot(&RuntimeState::new(), &[inst], Owner::remote(), Utc::now());
+        let sampled = build_snapshot(
+            &RuntimeState::new(),
+            &[inst],
+            Owner::remote(),
+            Utc::now(),
+            &crate::server::reload::SessionLoadHealth::default(),
+        );
 
         let row = &sampled.data.sessions[0];
         assert_eq!(row.created_at, "2026-01-02T03:04:05.123456789Z");

@@ -627,7 +627,7 @@ mod tests {
         let id = created.id;
         let reload = crate::server::reload::reload_state_instances_from_disk(
             &state,
-            stale_snapshot,
+            stale_snapshot.into(),
             Vec::new(),
             crate::server::state::StatusSource::DiskOnly,
             epoch,

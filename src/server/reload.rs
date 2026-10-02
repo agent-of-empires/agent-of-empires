@@ -13,42 +13,53 @@ use super::structured_repair::{
     LiveStructuredWorkerRecord,
 };
 
-/// Load sessions from all profiles, matching the TUI's "all profiles" view.
-pub(super) fn load_all_instances(
-    file_watch: &Arc<FileWatchService>,
-) -> anyhow::Result<Vec<Instance>> {
+#[derive(Clone, Default)]
+pub(crate) struct SessionLoadHealth {
+    pub enumeration_failed: bool,
+    pub unreadable_profiles: std::collections::HashSet<String>,
+}
+
+#[derive(Default)]
+pub(crate) struct LoadedInstances {
+    pub instances: Vec<Instance>,
+    pub health: SessionLoadHealth,
+}
+
+#[cfg(any(test, debug_assertions))]
+impl From<Vec<Instance>> for LoadedInstances {
+    fn from(instances: Vec<Instance>) -> Self {
+        Self {
+            instances,
+            health: SessionLoadHealth::default(),
+        }
+    }
+}
+
+pub(super) fn load_all_instances(file_watch: &Arc<FileWatchService>) -> LoadedInstances {
+    let mut loaded = LoadedInstances::default();
     let profiles = match crate::session::list_profiles() {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::warn!(
-                target: "server.file_watch",
-                error = %e,
-                "list_profiles failed; load_all_instances returning empty set"
-            );
-            return Ok(Vec::new());
+        Ok(profiles) => profiles,
+        Err(error) => {
+            tracing::warn!(target: "server.file_watch", %error, "profile enumeration failed");
+            loaded.health.enumeration_failed = true;
+            return loaded;
         }
     };
-    let mut all = Vec::new();
-    for profile in &profiles {
-        match Storage::new(profile, file_watch.clone()).and_then(|s| s.load()) {
+    for profile in profiles {
+        match Storage::new(&profile, file_watch.clone()).and_then(|storage| storage.load()) {
             Ok(mut instances) => {
-                for inst in &mut instances {
-                    inst.source_profile = profile.clone();
+                for instance in &mut instances {
+                    instance.source_profile = profile.clone();
                 }
-                all.extend(instances);
+                loaded.instances.extend(instances);
             }
-            Err(e) => {
-                tracing::warn!(
-                    target: "server.file_watch",
-                    profile = %profile,
-                    error = %e,
-                    "load_all_instances skipped profile; sessions for this profile will be \
-                     absent from state until next successful reload"
-                );
+            Err(error) => {
+                tracing::warn!(target: "server.file_watch", %profile, %error, "session load failed");
+                loaded.health.unreadable_profiles.insert(profile);
             }
         }
     }
-    Ok(all)
+    loaded
 }
 
 /// Carry over the in-memory-only fields from the prior `state.instances` entry into the
@@ -197,11 +208,15 @@ impl PriorById {
 #[doc(hidden)]
 pub(crate) async fn reload_state_instances_from_disk(
     state: &Arc<AppState>,
-    fresh: Vec<Instance>,
+    loaded: LoadedInstances,
     live_worker_records: Vec<LiveStructuredWorkerRecord>,
     status_source: StatusSource,
     read_epoch: u64,
 ) {
+    let LoadedInstances {
+        instances: fresh,
+        health,
+    } = loaded;
     // Snapshot suppression here so a worker that unmarks between the caller's input build
     // and the per-id decision cannot combine a cleared mark with a stale row to re-emit the
     // phantom Error transition the suppression exists to prevent.
@@ -304,6 +319,10 @@ pub(crate) async fn reload_state_instances_from_disk(
     apply_acp_overlay_inplace(&prior_by_id, &mut merged);
 
     *current = merged;
+    *state
+        .session_load_health
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = health;
     drop(current);
 
     persist_structured_row_repairs(state, repairs, repair_guards);
@@ -373,7 +392,7 @@ mod tests {
             .store(1, std::sync::atomic::Ordering::SeqCst);
         reload_state_instances_from_disk(
             &state,
-            vec![row],
+            vec![row].into(),
             vec![record],
             StatusSource::DiskOnly,
             1,
@@ -393,7 +412,7 @@ mod tests {
         crate::process::worker_registry::delete_if_owned(&row.id, std::process::id()).unwrap();
         reload_state_instances_from_disk(
             &state,
-            vec![row],
+            vec![row].into(),
             vec![record],
             StatusSource::DiskOnly,
             0,
@@ -411,7 +430,7 @@ mod tests {
         let lock = state.instance_lock(&row.id).await;
         reload_state_instances_from_disk(
             &state,
-            vec![row.clone()],
+            vec![row.clone()].into(),
             vec![record],
             StatusSource::DiskOnly,
             0,

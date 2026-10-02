@@ -231,7 +231,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         FileWatchService::noop()
     });
 
-    let instances = load_all_instances(&file_watch)?;
+    let loaded = load_all_instances(&file_watch);
 
     // Only `--auth=token` issues a URL token.
     let auth_token = match auth_mode {
@@ -359,7 +359,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         supervisor
     };
     // The Tier 1 plugin worker host.
-    let instances = Arc::new(RwLock::new(instances));
+    let instances = Arc::new(RwLock::new(loaded.instances));
     let instance_locks = Arc::new(RwLock::new(std::collections::HashMap::new()));
     let idempotency_locks = Arc::new(RwLock::new(std::collections::HashMap::new()));
     let telemetry_session_creates = Arc::new(std::sync::atomic::AtomicU32::new(0));
@@ -630,6 +630,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         read_only,
         cityhall_mode: std::env::var_os("AOE_CITYHALL_MODE").is_some(),
         instances,
+        session_load_health: std::sync::RwLock::new(loaded.health),
         session_service,
         token_manager: Arc::clone(&token_manager),
         login_manager: Arc::clone(&login_manager),
