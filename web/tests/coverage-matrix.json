@@ -1357,6 +1357,13 @@
       "components": ["web/src/components/WorkspaceSidebar.tsx"]
     },
     {
+      "id": "sidebar.drawer-swipe",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/hooks/useDrawerSwipe.test.ts"],
+      "components": ["web/src/hooks/useDrawerSwipe.ts"]
+    },
+    {
       "id": "sidebar.context-resume",
       "kind": "mocked-playwright",
       "risk": "medium",

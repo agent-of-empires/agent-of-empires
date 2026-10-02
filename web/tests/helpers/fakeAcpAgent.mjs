@@ -387,7 +387,7 @@ const INITIALIZE_RESULT = {
   agentInfo: {
     name: "@agentclientprotocol/claude-agent-acp",
     // Must stay at or above CLAUDE_AGENT_ACP_MIN_VERSION in src/acp/agent_compat.rs.
-    version: "0.55.0",
+    version: "0.82.0",
   },
   // Omitted rather than empty: some clients read an empty list as auth required.
 };
@@ -396,7 +396,7 @@ const INITIALIZE_RESULT = {
 // name and a version at its floor. FAKE_ACP_STEERING advertises `_session/steering` at the
 // separate steering floor.
 const STEERING_ENABLED = process.env.FAKE_ACP_STEERING === "1";
-const STEERING_MIN_VERSION = "0.64.0";
+const STEERING_MIN_VERSION = "0.82.0";
 
 // Running prompts decide `injected` versus `promptRequired`, as the real adapter's turnQueue does.
 const activeTurns = new Set();

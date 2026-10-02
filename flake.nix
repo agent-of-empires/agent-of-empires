@@ -51,8 +51,10 @@
                 ./acp-worker/aoe-agent/package.json
                 ./acp-worker/aoe-agent/package-lock.json
                 ./acp-worker/aoe-agent/src
+                ./acp-worker/test-shim/shim.mjs
                 ./assets
                 ./docker
+                ./web/tests/helpers/fakeAcpAgent.mjs
               ];
             };
             strictDeps = true;

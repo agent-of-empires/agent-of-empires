@@ -292,8 +292,10 @@ mod tests {
             ("0.37.0", true),
             ("claude-agent-acp 0.37.0", true),
             ("v0.37.0", true),
-            ("0.55.0", false),
-            ("0.56.0", false),
+            // A stale global install that used to clear the floor.
+            ("0.55.0", true),
+            ("0.82.0", false),
+            ("0.83.0", false),
             ("version=0.37.0", false),
             ("0.37.0-beta.1", true),
             ("junk", false),
