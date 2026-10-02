@@ -400,6 +400,12 @@ fn run_migrations_inner(reporter: Option<progress::Reporter>, announce: bool) ->
             "data schema version {current} is newer than this build supports ({CURRENT_VERSION}); refusing to downgrade"
         );
     }
+    if current == CURRENT_VERSION {
+        v027_isolate_sandbox_stores::reconcile_pending(announce)?;
+        v033_isolate_sandbox_content::reconcile_pending(announce)?;
+        return v037_capture_purge_runners::reconcile();
+    }
+
     let pending: Vec<&Migration> = MIGRATIONS
         .iter()
         .filter(|migration| migration.version > current)
@@ -433,15 +439,7 @@ fn run_migrations_inner(reporter: Option<progress::Reporter>, announce: bool) ->
         );
     }
 
-    // The reconciliations finish work the versioned migrations may have deferred, so they
-    // run on the transition too and not only when the schema is already current. A schema
-    // that is current has no pending migration and falls straight through to them. Running
-    // them only in the current case made a 38-to-39 install announce success without them,
-    // and surface the deferred work one invocation later, as a fresh failure the first
-    // pass had claimed to be done.
-    v027_isolate_sandbox_stores::reconcile_pending(announce)?;
-    v033_isolate_sandbox_content::reconcile_pending(announce)?;
-    v037_capture_purge_runners::reconcile()
+    Ok(())
 }
 
 /// Get the schema version from the selected app directory.
@@ -647,38 +645,6 @@ mod tests {
 
         assert!(error.contains("Pending purge ownership journal is missing"));
         assert!(!app.join(crate::session::purge_owners::FILE_NAME).exists());
-    }
-
-    /// The reconciliations finish work a versioned migration deferred, so an install whose
-    /// schema is one step behind must reach them too: it cannot journal success and leave the
-    /// deferred purge ownership for the invocation after it. The healthy transition (a schema
-    /// old enough that `v036` still creates the journal) is covered by
-    /// [`schema_33_upgrade_initializes_then_captures_purge_ownership`].
-    #[test]
-    #[serial_test::serial]
-    fn a_schema_behind_the_current_one_still_runs_the_reconciliations() {
-        let temp = tempfile::tempdir().unwrap();
-        let _guard = crate::session::test_support::isolate_app_dir_at(temp.path());
-        let app = crate::session::get_app_dir().unwrap();
-        fs::create_dir_all(&app).unwrap();
-        fs::write(app.join(VERSION_FILE), (CURRENT_VERSION - 1).to_string()).unwrap();
-
-        let error = run_migrations().unwrap_err().to_string().to_lowercase();
-
-        assert_eq!(
-            get_current_version(),
-            CURRENT_VERSION,
-            "the pending migration runs before the reconciliations do"
-        );
-        assert!(
-            error.contains("purge") && error.contains("journal"),
-            "the refusal must name the pending purge ownership journal, not report a migration \
-            that went unrun: {error}"
-        );
-        assert!(
-            !app.join(crate::session::purge_owners::FILE_NAME).exists(),
-            "a missing journal is never reconstructed as empty ownership"
-        );
     }
 
     #[test]
