@@ -1382,8 +1382,11 @@
       "id": "sidebar.session-color",
       "kind": "vitest",
       "risk": "low",
-      "specs": ["src/components/__tests__/SessionRowTriage.test.tsx"],
-      "components": ["web/src/components/WorkspaceSidebar.tsx"]
+      "specs": [
+        "src/components/__tests__/SessionRowTriage.test.tsx",
+        "src/components/sidebar/usePendingSetting.test.ts"
+      ],
+      "components": ["web/src/components/WorkspaceSidebar.tsx", "web/src/components/sidebar/usePendingSetting.ts"]
     },
     {
       "id": "sidebar.menu-choice-stays-open",
@@ -1411,7 +1414,7 @@
       "kind": "mocked-playwright",
       "risk": "medium",
       "specs": ["tests/sidebar-context-menu.spec.ts"],
-      "components": ["web/src/components/ContextMenu.tsx", "web/src/components/sidebar/SidebarGroupHeader.tsx"]
+      "components": ["web/src/components/ContextMenu.tsx"]
     },
     {
       "id": "sidebar.system-health",
@@ -1434,8 +1437,16 @@
       "id": "sidebar.session-color-toggle",
       "kind": "vitest",
       "risk": "low",
-      "specs": ["src/lib/__tests__/sessionColors.test.ts", "src/components/__tests__/SessionRowTriage.test.tsx"],
-      "components": ["web/src/lib/sessionColors.ts", "web/src/components/WorkspaceSidebar.tsx"]
+      "specs": [
+        "src/lib/__tests__/sessionColors.test.ts",
+        "src/components/__tests__/SessionRowTriage.test.tsx",
+        "src/components/sidebar/usePendingSetting.test.ts"
+      ],
+      "components": [
+        "web/src/lib/sessionColors.ts",
+        "web/src/components/WorkspaceSidebar.tsx",
+        "web/src/components/sidebar/usePendingSetting.ts"
+      ]
     },
     {
       "id": "sidebar.dormant-dot",
@@ -1755,6 +1766,13 @@
       "risk": "medium",
       "specs": ["tests/plugin-row-slots-mobile.spec.ts"],
       "components": ["web/src/components/WorkspaceSidebar.tsx", "web/src/components/plugin/PluginSlots.tsx"]
+    },
+    {
+      "id": "sidebar.plugin-row-badge-link",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/components/plugin/__tests__/PluginSlots.test.tsx"],
+      "components": ["web/src/components/plugin/PluginSlots.tsx", "web/src/components/plugin/SlotChrome.tsx"]
     },
     {
       "id": "sidebar.group-axis-pure",
@@ -3055,7 +3073,7 @@
     {
       "id": "projects-form-modal",
       "kind": "vitest",
-      "risk": "low",
+      "risk": "medium",
       "specs": ["src/components/__tests__/ProjectFormModal.test.tsx"],
       "components": ["web/src/components/ProjectFormModal.tsx"]
     },
@@ -3776,9 +3794,14 @@
     {
       "id": "story.wizard-saved-projects",
       "kind": "mocked-playwright",
-      "risk": "low",
+      "risk": "high",
       "specs": ["tests/wizard-project.spec.ts"],
-      "components": ["web/src/components/session-wizard/steps/ProjectStep.tsx"]
+      "components": [
+        "web/src/components/session-wizard/steps/ProjectStep.tsx",
+        "web/src/components/session-wizard/steps/projectPicker.ts",
+        "web/src/components/session-wizard/SessionWizard.tsx",
+        "web/src/lib/api.ts"
+      ]
     },
     {
       "id": "story.wizard-browse-disk",
@@ -3840,7 +3863,9 @@
       "components": [
         "web/src/components/session-wizard/steps/ExtraReposPicker.tsx",
         "web/src/components/session-wizard/steps/projectPicker.ts",
-        "web/src/components/session-wizard/steps/ProjectSearchList.tsx"
+        "web/src/components/session-wizard/steps/ProjectSearchList.tsx",
+        "web/src/components/session-wizard/SessionWizard.tsx",
+        "web/src/lib/api.ts"
       ]
     },
     {
@@ -3899,7 +3924,7 @@
       "kind": "mocked-playwright",
       "risk": "high",
       "specs": ["tests/sidebar-project-pin.spec.ts"],
-      "components": ["web/src/App.tsx", "web/src/lib/api.ts"]
+      "components": ["web/src/App.tsx", "web/src/lib/api.ts", "web/src/hooks/useProjects.ts"]
     },
     {
       "id": "sidebar.active-project-settings",
@@ -4256,6 +4281,13 @@
         "web/src/components/acp/Composer.tsx",
         "web/src/components/acp/ComposerControls.tsx"
       ]
+    },
+    {
+      "id": "projects.served-profile-registry",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": ["src/hooks/__tests__/useProjects.test.tsx"],
+      "components": ["web/src/hooks/useProjects.ts", "web/src/hooks/app/useProjectActions.ts"]
     }
   ]
 }

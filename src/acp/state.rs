@@ -125,7 +125,7 @@ pub struct ThinkingSignal {
     pub started_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RateLimitInfo {
     pub status: String,
     /// When the quota window clears, if the agent reported it.
@@ -775,8 +775,7 @@ impl AcpState {
         self.background_agents.iter().any(|a| a.ended_at.is_none())
     }
 
-    /// Apply a single event; returns the new `last_seq`.
-    pub fn apply_event(&mut self, event: Event) -> Result<u64, StateError> {
+    pub fn apply_event(&mut self, seq: u64, event: Event) -> Result<u64, StateError> {
         match event {
             Event::PlanUpdated { plan } => self.current_plan = Some(plan),
             Event::TodoListUpdated { todos } => self.todos = todos,
@@ -862,7 +861,7 @@ impl AcpState {
                 description,
             } => {
                 self.session_notices.push(SessionNotice {
-                    id: format!("notice-{}", self.last_seq.saturating_add(1)),
+                    id: format!("notice-{seq}"),
                     severity,
                     title,
                     description,
@@ -1019,7 +1018,7 @@ impl AcpState {
             | Event::WakeupScheduled { .. }
             | Event::MonitorArmed { .. } => {}
         }
-        self.last_seq = self.last_seq.saturating_add(1);
+        self.last_seq = seq;
         self.updated_at = Utc::now();
         Ok(self.last_seq)
     }
@@ -1152,7 +1151,7 @@ mod tests {
     fn applied(events: impl IntoIterator<Item = Event>) -> AcpState {
         let mut s = fresh_state();
         for event in events {
-            s.apply_event(event).unwrap();
+            s.apply_event(s.last_seq.saturating_add(1), event).unwrap();
         }
         s
     }
@@ -1367,10 +1366,13 @@ mod tests {
     fn turn_flags_and_rate_limit_park_follow_their_edges() {
         let mut s = fresh_state();
         assert!(!s.turn_active);
-        s.apply_event(prompt("hi")).unwrap();
-        s.apply_event(Event::ThinkingStarted).unwrap();
+        s.apply_event(s.last_seq.saturating_add(1), prompt("hi"))
+            .unwrap();
+        s.apply_event(s.last_seq.saturating_add(1), Event::ThinkingStarted)
+            .unwrap();
         assert!(s.turn_active && s.thinking.is_some());
-        s.apply_event(stopped("end_turn")).unwrap();
+        s.apply_event(s.last_seq.saturating_add(1), stopped("end_turn"))
+            .unwrap();
         assert!(!s.turn_active && s.thinking.is_none());
 
         for terminal in [
@@ -1417,10 +1419,13 @@ mod tests {
         let mut s = fresh_state();
         let before = s.updated_at;
         let seq = s
-            .apply_event(Event::ModeSwitchFailed {
-                mode_id: "bypassPermissions".into(),
-                reason: "Mode bypassPermissions is not available.".into(),
-            })
+            .apply_event(
+                s.last_seq.saturating_add(1),
+                Event::ModeSwitchFailed {
+                    mode_id: "bypassPermissions".into(),
+                    reason: "Mode bypassPermissions is not available.".into(),
+                },
+            )
             .unwrap();
         assert_eq!(seq, 1);
         assert_eq!(
@@ -1429,10 +1434,13 @@ mod tests {
             "a failed switch changes nothing"
         );
         assert!(s.updated_at >= before);
-        let result = s.apply_event(Event::ApprovalResolved {
-            nonce: Nonce::new(),
-            decision: ApprovalDecision::Allow,
-        });
+        let result = s.apply_event(
+            s.last_seq.saturating_add(1),
+            Event::ApprovalResolved {
+                nonce: Nonce::new(),
+                decision: ApprovalDecision::Allow,
+            },
+        );
         assert!(matches!(result, Err(StateError::UnknownApprovalNonce(_))));
 
         // A rate-limit park ends on a live prompt, session, or organic stop.
@@ -1512,8 +1520,11 @@ mod tests {
 
         let mut richer = tool_call("tc-1");
         richer.name = "Write src/foo.rs".into();
-        s.apply_event(Event::ToolCallStarted { tool_call: richer })
-            .unwrap();
+        s.apply_event(
+            s.last_seq.saturating_add(1),
+            Event::ToolCallStarted { tool_call: richer },
+        )
+        .unwrap();
         let tool = s.in_flight_tool.as_ref().unwrap();
         assert_eq!(tool.name, "Write src/foo.rs", "richer fields still apply");
         assert_eq!(
@@ -1589,16 +1600,20 @@ mod tests {
         assert_eq!(agent.tools[0].name, "Read");
         assert_eq!(agent.last_tool.as_deref(), Some("Read"));
 
-        s.apply_event(Event::BackgroundAgentCompleted {
-            agent_id: "a1".into(),
-            status: BackgroundAgentStatus::Completed,
-            tools: vec![],
-            result: Some("done".into()),
-            warning: None,
-            ended_at: Utc::now(),
-        })
+        s.apply_event(
+            s.last_seq.saturating_add(1),
+            Event::BackgroundAgentCompleted {
+                agent_id: "a1".into(),
+                status: BackgroundAgentStatus::Completed,
+                tools: vec![],
+                result: Some("done".into()),
+                warning: None,
+                ended_at: Utc::now(),
+            },
+        )
         .unwrap();
-        s.apply_event(progress(9, vec![])).unwrap();
+        s.apply_event(s.last_seq.saturating_add(1), progress(9, vec![]))
+            .unwrap();
         let agent = &s.background_agents[0];
         assert_eq!(
             agent.status,
@@ -1678,9 +1693,13 @@ mod tests {
             let mut s = applied([launched()]);
             assert!(s.has_active_background_agent(), "{status:?}");
 
-            s.apply_event(bg_completed(status)).unwrap();
-            s.apply_event(bg_progress(BackgroundAgentStatus::Running, 9))
+            s.apply_event(s.last_seq.saturating_add(1), bg_completed(status))
                 .unwrap();
+            s.apply_event(
+                s.last_seq.saturating_add(1),
+                bg_progress(BackgroundAgentStatus::Running, 9),
+            )
+            .unwrap();
             let agent = &s.background_agents[0];
             assert_eq!(agent.status, status, "{status:?} must not reopen");
             assert!(agent.ended_at.is_some(), "{status:?}");
@@ -1696,8 +1715,11 @@ mod tests {
         let mut s = applied([prompt("go"), launched()]);
         assert!(s.turn_active && s.has_active_background_agent());
 
-        s.apply_event(bg_completed(BackgroundAgentStatus::Completed))
-            .unwrap();
+        s.apply_event(
+            s.last_seq.saturating_add(1),
+            bg_completed(BackgroundAgentStatus::Completed),
+        )
+        .unwrap();
         assert!(
             s.turn_active,
             "the main turn's own Stopped never fired, so it is still live"
@@ -1714,8 +1736,11 @@ mod tests {
             "the display signal stays busy"
         );
 
-        s.apply_event(bg_completed(BackgroundAgentStatus::Completed))
-            .unwrap();
+        s.apply_event(
+            s.last_seq.saturating_add(1),
+            bg_completed(BackgroundAgentStatus::Completed),
+        )
+        .unwrap();
         assert!(!s.turn_active && !s.has_active_background_agent());
     }
 
@@ -1828,20 +1853,25 @@ mod tests {
         );
 
         let mut s = applied(adapter_events());
-        s.apply_event(Event::SessionCleared).unwrap();
+        s.apply_event(s.last_seq.saturating_add(1), Event::SessionCleared)
+            .unwrap();
         assert_eq!(s.config_options.len(), 2);
         assert!(s.available_commands[0].accepts_input);
         assert_eq!(s.available_modes.len(), 1);
         assert_eq!(s.current_mode_id.as_deref(), Some("plan"));
         assert!(s.usage.is_none() && s.current_plan.is_none());
 
-        s.apply_event(Event::ConfigOptionSwitchFailed {
-            config_id: "effort".into(),
-            value: "high".into(),
-            reason: "unsupported".into(),
-        })
+        s.apply_event(
+            s.last_seq.saturating_add(1),
+            Event::ConfigOptionSwitchFailed {
+                config_id: "effort".into(),
+                value: "high".into(),
+                reason: "unsupported".into(),
+            },
+        )
         .unwrap();
-        s.apply_event(switch_agent()).unwrap();
+        s.apply_event(s.last_seq.saturating_add(1), switch_agent())
+            .unwrap();
         assert!(s.config_options.is_empty() && s.config_option_switch_failed.is_none());
         assert!(s.available_commands.is_empty() && s.available_modes.is_empty());
         assert_eq!(s.current_mode_id, None);

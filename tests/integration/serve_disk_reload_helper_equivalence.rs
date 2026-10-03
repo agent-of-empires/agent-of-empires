@@ -97,9 +97,9 @@ async fn reload_state_instances_from_disk_tmux_applied_takes_fresh_status() {
         "TmuxApplied: fresh status must win",
     );
     assert_eq!(
-        row.last_error_check,
-        Some(probe),
-        "runtime field preserved unconditionally"
+        row.last_error_check, None,
+        "TmuxApplied inherits launch-owned runtime without stale error timestamps; \
+         the fresh sampler owns last_error_check"
     );
     assert_eq!(
         row.last_error, None,

@@ -101,7 +101,7 @@ describe("SessionWizard last-project memory", () => {
     localStorage.setItem(PROJECT_KEY, "not a path");
     const { getByRole, queryByText } = renderWizard();
 
-    await waitFor(() => expect(fetchRecentProjects).toHaveBeenCalled());
+    await waitFor(() => expect(fetchSettings).toHaveBeenCalled());
     expect(fetchIsGitRepo).not.toHaveBeenCalled();
     // With no project the wizard opens on the picker, which has no Launch.
     expect(getByRole("button", { name: "Done" })).toBeTruthy();

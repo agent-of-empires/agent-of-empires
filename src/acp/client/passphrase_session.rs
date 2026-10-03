@@ -116,7 +116,10 @@ fn login_client() -> Result<reqwest::Client, HttpError> {
         .timeout(LOGIN_TIMEOUT)
         .redirect(reqwest::redirect::Policy::none())
         .build()
-        .map_err(HttpError::Transport)
+        // `HttpError::Transport` carries no payload (a transport error can
+        // quote a URL with its query string), so the `reqwest::Error` goes
+        // through the crate's `From` impl rather than being attached here.
+        .map_err(|_| HttpError::Transport)
 }
 
 fn extract_session_cookie(headers: &HeaderMap) -> Option<String> {

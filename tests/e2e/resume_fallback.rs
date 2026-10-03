@@ -5,18 +5,36 @@ use std::path::{Path, PathBuf};
 use serde_json::{Map, Value};
 use serial_test::parallel;
 
-use crate::harness::{require_tmux, session_by_title, write_executable, TuiTestHarness};
+use crate::harness::{require_tmux, TuiTestHarness};
 
 const TITLE: &str = "ResumeFallbackE2E";
 const FAKE_AGENT: &str = "claude";
 const STALE_SID: &str = "11111111-1111-4111-8111-111111111111";
 
+fn sessions_path(h: &TuiTestHarness) -> PathBuf {
+    crate::harness::app_dir_in(h.home_path()).join("profiles/default/sessions.json")
+}
+
+fn read_sessions(h: &TuiTestHarness) -> Value {
+    let path = sessions_path(h);
+    let content = fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {}", path.display(), e));
+    serde_json::from_str(&content).expect("invalid sessions JSON")
+}
+
+fn session_by_title<'a>(sessions: &'a Value, title: &str) -> &'a Value {
+    sessions
+        .as_array()
+        .and_then(|arr| arr.iter().find(|s| s["title"].as_str() == Some(title)))
+        .unwrap_or_else(|| panic!("no session titled '{title}' in sessions.json"))
+}
+
 fn patch_session<F>(h: &TuiTestHarness, title: &str, patch: F)
 where
     F: FnOnce(&mut Map<String, Value>),
 {
-    let path = h.sessions_path();
-    let mut sessions = h.read_sessions();
+    let path = sessions_path(h);
+    let mut sessions = read_sessions(h);
     let row = sessions
         .as_array_mut()
         .and_then(|arr| arr.iter_mut().find(|s| s["title"].as_str() == Some(title)))
@@ -48,7 +66,14 @@ fn install_fake_agent(h: &mut TuiTestHarness, reject_stale: bool) -> PathBuf {
         sh_quote(&log),
         rejection,
     );
-    write_executable(&bin.join(FAKE_AGENT), &script);
+    let script_path = bin.join(FAKE_AGENT);
+    fs::write(&script_path, script).expect("write fake agent");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755))
+            .expect("chmod fake agent");
+    }
     log
 }
 
@@ -89,9 +114,7 @@ fn wait_for_logged_args(path: &Path, sid: &str) -> Vec<String> {
     }
 }
 
-/// Seed a Claude transcript at `$HOME/.claude/projects/<encoded project>/
-/// <sid>.jsonl` (every char outside `[A-Za-z0-9-]` maps to `-`) so the restart
-/// takes the `--resume <sid>` path instead of #2700's fresh-pin shortcut.
+/// A stored transcript makes this a resume rather than an empty-thread fresh pin.
 fn seed_claude_transcript(h: &TuiTestHarness, project_path: &Path, sid: &str) -> PathBuf {
     let canonical = fs::canonicalize(project_path).unwrap_or_else(|_| project_path.to_path_buf());
     let encoded: String = canonical

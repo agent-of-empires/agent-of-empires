@@ -1,21 +1,21 @@
 import { useState } from "react";
 import type { ProjectInfo } from "../lib/types";
-import { createProject, updateProject } from "../lib/api";
+import { createProject, projectTarget, updateProject } from "../lib/api";
 import { DirectoryBrowser } from "./DirectoryBrowser";
 
 interface Props {
-  /** The project to edit, or null/undefined to add a new one. */
+  profile: string;
+  /** Editing preserves the registration identity and scope. */
   initial?: ProjectInfo | null;
   onClose: () => void;
-  /** Called after a successful create/update so the caller can refresh the registry. */
+  /** Refresh the registry before closing after a commit. */
   onSaved: () => void | Promise<void>;
 }
 
 const lockedFieldClass =
   "w-full px-3 py-2 text-sm bg-surface-900/60 border border-surface-700/30 rounded-md text-text-dim cursor-not-allowed mb-3";
 
-// Add / edit form for a registered project, shared by the sidebar Projects section.
-export function ProjectFormModal({ initial, onClose, onSaved }: Props) {
+export function ProjectFormModal({ initial, profile, onClose, onSaved }: Props) {
   const isEdit = initial != null;
   const [path, setPath] = useState(initial?.path ?? "");
   const [name, setName] = useState(initial?.name ?? "");
@@ -46,12 +46,17 @@ export function ProjectFormModal({ initial, onClose, onSaved }: Props) {
       const overridesChanged =
         worktreeOverride !== initialWorktreeChoice || smartRenameOverride !== initialSmartRenameChoice;
       const toPatchValue = (c: OverrideChoice): boolean | null => (c === "inherit" ? null : c === "on");
-      const result = overridesChanged
-        ? await updateProject(initial.name, initial.scope, baseBranch.trim() || null, {
-            worktree_enabled: toPatchValue(worktreeOverride),
-            smart_rename: toPatchValue(smartRenameOverride),
-          })
-        : await updateProject(initial.name, initial.scope, baseBranch.trim() || null);
+      const result = await updateProject(initial.path, projectTarget(initial.scope, profile), {
+        default_base_branch: baseBranch.trim() || null,
+        ...(overridesChanged
+          ? {
+              overrides: {
+                worktree_enabled: toPatchValue(worktreeOverride),
+                smart_rename: toPatchValue(smartRenameOverride),
+              },
+            }
+          : {}),
+      });
       if (!result.ok) {
         setSubmitting(false);
         setError(result.error || "Update failed");
@@ -70,6 +75,7 @@ export function ProjectFormModal({ initial, onClose, onSaved }: Props) {
       path: trimmedPath,
       name: name.trim() || undefined,
       scope,
+      profile,
       allow_override: allowOverride || undefined,
       default_base_branch: baseBranch.trim() || undefined,
       overrides: {

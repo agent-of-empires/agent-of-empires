@@ -4,6 +4,11 @@ import { fetchSessions, type SessionsEnvelope } from "../lib/api";
 import { setServerDown } from "../lib/connectionState";
 
 const POLL_INTERVAL = 3000;
+/** How long one poll may stay unanswered before it is written off. Long
+ *  enough that a merely slow daemon keeps its place in the queue, short
+ *  enough that a lost request costs one gap instead of the rest of the
+ *  tab's life. */
+const POLL_DEADLINE_MS = 15000;
 const LOCAL_ORDERING_WINDOW_MS = 4000;
 
 export function useSessions() {
@@ -11,7 +16,6 @@ export function useSessions() {
   const [workspaceOrdering, setWorkspaceOrdering] = useState<string[]>([]);
   const [error, setError] = useState(false);
   const [loaded, setLoaded] = useState(false);
-  const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const lastLocalOrderingAtRef = useRef<number>(0);
 
   const injectSession = useCallback((session: SessionResponse) => {
@@ -43,10 +47,51 @@ export function useSessions() {
   }, []);
 
   useEffect(() => {
-    void fetchSessions().then(applyResult);
-    intervalRef.current = setInterval(() => void fetchSessions().then(applyResult), POLL_INTERVAL);
+    // Recursive setTimeout so polls never overlap: two /api/sessions
+    // responses can cross, and the slower one must not roll the canonical
+    // list back to an older snapshot.
+    //
+    // Each request also carries a deadline. Arming the next poll only from
+    // the previous response hands the whole cadence to one lost request, so
+    // the race is between the answer and the deadline instead: the loser is
+    // superseded and its late answer is dropped by the generation check
+    // rather than applied when it finally lands.
+    let cancelled = false;
+    let generation = 0;
+    let timer: number | undefined;
+    const deadlines = new Set<number>();
+
+    const scheduleNext = () => {
+      if (cancelled) return;
+      timer = setTimeout(() => void tick(), POLL_INTERVAL);
+    };
+
+    const tick = async () => {
+      const mine = ++generation;
+      const deadline = setTimeout(() => {
+        deadlines.delete(deadline);
+        if (cancelled || mine !== generation) return;
+        // Lost, not answered: supersede it and keep the cadence. At most one
+        // superseded request stays in flight alongside its replacement.
+        generation += 1;
+        scheduleNext();
+      }, POLL_DEADLINE_MS);
+      deadlines.add(deadline);
+
+      const data = await fetchSessions();
+      deadlines.delete(deadline);
+      clearTimeout(deadline);
+      if (cancelled || mine !== generation) return;
+      applyResult(data);
+      scheduleNext();
+    };
+
+    void tick();
     return () => {
-      if (intervalRef.current) clearInterval(intervalRef.current);
+      cancelled = true;
+      clearTimeout(timer);
+      for (const deadline of deadlines) clearTimeout(deadline);
+      deadlines.clear();
     };
   }, [applyResult]);
 

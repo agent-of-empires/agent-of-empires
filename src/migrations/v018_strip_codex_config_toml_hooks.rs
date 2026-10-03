@@ -213,9 +213,14 @@ mod tests {
             &[
                 (
                     Some(with_state.as_str()),
-                    Some("[hooks.state]\nexisting = { enabled = true, trusted_hash = \"keep-me\" }\n"),
+                    Some(
+                        "[hooks.state]\nexisting = { enabled = true, trusted_hash = \"keep-me\" }\n",
+                    ),
                 ),
-                (Some(features_off.as_str()), Some("[features]\nhooks = false\n")),
+                (
+                    Some(features_off.as_str()),
+                    Some("[features]\nhooks = false\n"),
+                ),
                 (Some(aoe.as_str()), Some("")),
                 (Some(mixed.as_str()), Some(mixed.as_str())),
                 (Some(user_only), Some(user_only)),

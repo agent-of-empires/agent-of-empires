@@ -63,13 +63,19 @@ mod tests {
             &[
                 (
                     Some("[sandbox]\ndefault_image = \"ghcr.io/njbrake/aoe-sandbox:latest\"\n"),
-                    Some("[sandbox]\ndefault_image = \"ghcr.io/agent-of-empires/aoe-sandbox:latest\"\n"),
+                    Some(
+                        "[sandbox]\ndefault_image = \"ghcr.io/agent-of-empires/aoe-sandbox:latest\"\n",
+                    ),
                 ),
                 (
                     Some("[sandbox]\ndefault_image = \"ghcr.io/njbrake/aoe-dev-sandbox:0.10\"\n"),
-                    Some("[sandbox]\ndefault_image = \"ghcr.io/agent-of-empires/aoe-dev-sandbox:0.10\"\n"),
+                    Some(
+                        "[sandbox]\ndefault_image = \"ghcr.io/agent-of-empires/aoe-dev-sandbox:0.10\"\n",
+                    ),
                 ),
-                unchanged("[sandbox]\ndefault_image = \"ghcr.io/agent-of-empires/aoe-sandbox:latest\"\n"),
+                unchanged(
+                    "[sandbox]\ndefault_image = \"ghcr.io/agent-of-empires/aoe-sandbox:latest\"\n",
+                ),
                 unchanged("[sandbox]\ndefault_image = \"docker.io/library/ubuntu:22.04\"\n"),
                 unchanged("[session]\ndefault_tool = \"claude\"\n"),
                 unchanged("[sandbox]\nenabled_by_default = true\n"),

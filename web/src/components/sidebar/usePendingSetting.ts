@@ -11,8 +11,7 @@ interface Pending<T> {
 export function usePendingSetting<T>(server: T, save: (next: T) => Promise<boolean>, onError: () => void) {
   const [pending, setPending] = useState<Pending<T> | null>(null);
   const latest = useRef(0);
-  // Cleared during render once the server moves, unless it moved to an earlier pick of ours while a later one is in
-  // flight. Waiting for the picked value instead would mask another writer forever.
+  // Ignore earlier picks while the latest save is in flight, but let another writer through.
   if (
     pending &&
     !Object.is(server, pending.from) &&
@@ -25,13 +24,23 @@ export function usePendingSetting<T>(server: T, save: (next: T) => Promise<boole
   const set = (next: T) => {
     if (Object.is(next, value)) return;
     const seq = ++latest.current;
-    setPending((p) =>
-      Object.is(next, server) ? null : { value: next, from: p?.from ?? server, sent: [...(p?.sent ?? []), next] },
-    );
+    // Include cancellations so earlier poll echoes cannot displace the latest pick.
+    setPending((p) => {
+      const prev = p?.sent ?? [];
+      return {
+        value: next,
+        from: p?.from ?? server,
+        sent: prev.some((v) => Object.is(v, next)) ? prev : [...prev, next],
+      };
+    });
     void save(next).then((ok) => {
-      if (ok || seq !== latest.current) return;
-      setPending(null);
-      onError();
+      if (seq !== latest.current) return;
+      if (ok) {
+        setPending((p) => (seq === latest.current && p && Object.is(p.value, p.from) ? null : p));
+      } else {
+        setPending(null);
+        onError();
+      }
     });
   };
   return [value, set] as const;

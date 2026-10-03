@@ -13,7 +13,8 @@ use crate::acp::acp_client::AcpError;
 use crate::acp::supervisor::{SpawnRequest, SupervisorError};
 use crate::server::AppState;
 
-use super::{cityhall_block, read_only_block};
+use super::cityhall_block;
+pub(crate) use super::read_only_block;
 
 mod attachments;
 mod config;
@@ -513,6 +514,7 @@ mod tests {
                             fresh.acp_session_id =
                                 Some("22222222-2222-4222-8222-222222222222".into());
                         }
+                        let metadata = state.canonical_metadata.read().await.clone();
                         crate::server::reload::reload_state_instances_from_disk(
                             &state,
                             vec![fresh],
@@ -521,6 +523,8 @@ mod tests {
                             state
                                 .mutation_epoch
                                 .load(std::sync::atomic::Ordering::SeqCst),
+                            metadata,
+                            Default::default(),
                         )
                         .await;
                     }

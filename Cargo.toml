@@ -147,6 +147,8 @@ rusqlite = { version = "0.40", features = ["bundled"] }
 # Daemon HTTP/WS server. Core: the daemon is the product, the dashboard is one
 # surface on it (see the `web` feature).
 axum = { version = "0.8", features = ["ws"] }
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 # Cross-platform browser launcher: `aoe serve --open`, the plugin host's
 # `ui.open_url`, and structured-view link activation.
 webbrowser = "1"

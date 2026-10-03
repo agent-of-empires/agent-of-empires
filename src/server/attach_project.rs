@@ -154,8 +154,14 @@ pub(crate) async fn attach_project(
         let id_owned = id.to_string();
         let instance = instance.clone();
         match run_blocking(state, &profile, move |storage| {
-            crate::session::attach_project::attach_planned(storage, &id_owned, &instance, plan)
-                .map_err(|e| format!("{e:#}"))
+            crate::session::attach_project::attach_planned(
+                storage,
+                &id_owned,
+                &instance,
+                plan,
+                quiesced.lifecycle_generation,
+            )
+            .map_err(|e| format!("{e:#}"))
         })
         .await
         {

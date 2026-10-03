@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use crate::acp::protocol::{
     ContextPrimerQuery, ContextPrimerResponse, FilesResponse, ReplayQuery, ReplayResponse,
 };
+use crate::server::api::sessions::cityhall_block_non_structured;
 use crate::server::api::{find_instance, instance_exists};
 
 use super::*;
@@ -199,6 +200,9 @@ pub async fn acp_context_primer(
     Path(id): Path<String>,
     axum::extract::Query(q): axum::extract::Query<ContextPrimerQuery>,
 ) -> impl IntoResponse {
+    if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
+        return resp;
+    }
     let events = state.acp_event_store.replay_before(&id, q.before_seq);
     let primer = crate::acp::context_primer::build_context_primer(
         &events,
@@ -226,6 +230,9 @@ pub async fn acp_replay(
     Path(id): Path<String>,
     axum::extract::Query(q): axum::extract::Query<ReplayQuery>,
 ) -> impl IntoResponse {
+    if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
+        return resp;
+    }
     let limit = q
         .limit
         .map(|l| l as usize)
@@ -284,6 +291,11 @@ pub async fn acp_replay(
 /// Claude Code sessions on disk for the import picker, newest first. Blocked in
 /// read-only mode: it exposes titles and paths outside AoE state (#2276).
 pub async fn list_claude_sessions(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    // The import picker enumerates the user's own `claude` runs on disk, which
+    // is host state outside anything this mode owns.
+    if let Some(resp) = cityhall_block(&state) {
+        return resp;
+    }
     if let Some(resp) = read_only_block(&state) {
         return resp;
     }

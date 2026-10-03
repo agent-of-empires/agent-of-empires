@@ -13,8 +13,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::daemon::{
     CleanupDefaults, ContextResumeAvailability, ContextResumeIndeterminateReason,
-    ContextResumeUnavailableReason, ListSessionsQuery, PendingApproval, PlanSummary,
-    SessionResponse, SessionsEnvelope, WorkspaceRepoSummary,
+    ContextResumeUnavailableReason, CreateSessionBody, DeleteSessionBody, ListSessionsQuery,
+    PendingApproval, PlanSummary, PurgeOutcome, SessionResponse, TrashSessionBody, Tristate,
+    UpdateArchiveBody, UpdateColorBody, UpdateDiffBaseBody, UpdateFavoriteBody, UpdateGroupBody,
+    UpdateNotificationsBody, UpdatePinBody, UpdateSnoozeBody, UpdateUnreadBody,
+    WorkspaceRepoSummary,
 };
 
 use crate::git::error::GitError;
@@ -26,7 +29,7 @@ use crate::session::{
 
 use super::validate_no_shell_injection;
 use super::AppState;
-use super::{api_error, bare_not_found, find_instance, session_not_found, validate_display_label};
+use super::{api_error, bare_not_found, session_not_found, validate_display_label};
 
 mod artifacts;
 mod create;
@@ -53,6 +56,20 @@ pub use rename::*;
 pub use search::*;
 pub use send::*;
 pub use update::*;
+
+/// Shell-metacharacter gate for the free-form spawn fields a client can set
+/// on a session, shared by the create and restart routes so the two cannot
+/// drift.
+///
+/// `command_override` is deliberately absent: it is an `argv[0]` program path
+/// rather than shell input, and the create route gates it on the agent
+/// registry and the ACP identity check instead (#7), never on metacharacters.
+pub(super) fn validate_shell_fields(checks: &[(&str, &str)]) -> Result<(), String> {
+    checks
+        .iter()
+        .find_map(|(value, name)| validate_no_shell_injection(value, name).err())
+        .map_or(Ok(()), Err)
+}
 
 #[cfg(test)]
 mod tests;

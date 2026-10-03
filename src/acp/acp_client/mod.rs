@@ -410,7 +410,7 @@ impl AcpClient {
             let runner_sandbox = sandbox.as_ref().map(|(handle, _)| handle);
             let (runner_pid, native_store) =
                 spawn_runner_detached(&config, &socket_path, session_id.0.clone(), runner_sandbox)?;
-            let mut client = Self::connect_via_socket(socket_path, launch(sandbox)).await?;
+            let mut client = Self::connect_via_socket(socket_path, launch(sandbox), None).await?;
             client.runner_pid = Some(runner_pid);
             client.native_store = native_store;
             return Ok(client);
@@ -431,7 +431,7 @@ impl AcpClient {
         let transport = ByteStreams::new(stdin.compat_write(), stdout.compat());
         let events = mpsc::channel(64);
         let (mut client, ready_rx) = launch.start(events, transport, Some(child.clone()), None);
-        wait_for_handshake(&label, ready_rx, Some(&child), &install_binary).await?;
+        wait_for_handshake(&label, ready_rx, Some(&child), &install_binary, None).await?;
         client.native_store = native_store;
         Ok(client)
     }
@@ -439,7 +439,11 @@ impl AcpClient {
     /// Dial a runner's control socket, which carries the whole transport
     /// (#2977). The runner owns the agent, so dropping this client leaves the
     /// worker running.
-    async fn connect_via_socket(socket_path: PathBuf, launch: Launch) -> Result<Self, AcpError> {
+    async fn connect_via_socket(
+        socket_path: PathBuf,
+        launch: Launch,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<Self, AcpError> {
         let control_path = crate::process::worker::control_socket_sibling(&socket_path);
         // Debug-only #1890 hook: fail a fresh handshake after the runner is up.
         #[cfg(debug_assertions)]
@@ -487,7 +491,7 @@ impl AcpClient {
             prompt_in_flight,
         };
         let (client, ready_rx) = launch.start(events, transport, None, Some(runner));
-        wait_for_handshake(&label, ready_rx, None, &install_binary).await?;
+        wait_for_handshake(&label, ready_rx, None, &install_binary, deadline).await?;
         handshake_control.0.take();
         Ok(client)
     }
@@ -508,6 +512,7 @@ impl AcpClient {
         sandbox: Option<(SessionSandbox, SandboxPathMap)>,
         agent_key: String,
         source_profile: Option<String>,
+        deadline: Option<tokio::time::Instant>,
     ) -> Result<Self, AcpError> {
         // The binary name keeps the compatibility gate active on reattach; an
         // unknown agent maps to `Other` anyway.
@@ -534,7 +539,7 @@ impl AcpClient {
             default_model: None,
             mcp_servers: Vec::new(),
         };
-        Self::connect_via_socket(socket_path, launch).await
+        Self::connect_via_socket(socket_path, launch, deadline).await
     }
 
     async fn send_cmd(&self, cmd: ClientCmd) -> Result<(), AcpError> {

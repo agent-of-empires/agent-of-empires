@@ -91,6 +91,7 @@ export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
 
   const [modal, setModal] = useState<Modal>(null);
   const [addProjectOptions, setAddProjectOptions] = useState<{ name: string; path: string }[]>([]);
+  const addProjectGeneration = useRef(0);
   const [renaming, setRenaming] = useState(false);
   const [renameValue, setRenameValue] = useState(label);
   const renameRef = useRef<HTMLInputElement>(null);
@@ -134,10 +135,15 @@ export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
     color: setColor,
   };
   const openAddProject = () => {
+    const first = model.firstSession;
+    if (!sessionId || !first?.profile) return;
     actions.addProject();
-    void fetchProjects().then((projects) =>
-      setAddProjectOptions(projects.map((p) => ({ name: p.name, path: p.path }))),
-    );
+    const generation = ++addProjectGeneration.current;
+    setAddProjectOptions([]);
+    void fetchProjects({ profile: first.profile }).then((projects) => {
+      if (generation !== addProjectGeneration.current || projects === null) return;
+      setAddProjectOptions(projects.map((project) => ({ name: project.name, path: project.path })));
+    });
   };
 
   if (renaming) {

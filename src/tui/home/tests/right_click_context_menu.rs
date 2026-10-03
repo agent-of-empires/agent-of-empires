@@ -99,10 +99,15 @@ fn session_menu_entries_route_like_their_keys() {
             !env.view.get_instance(&id).unwrap().is_archived(),
             "{label}"
         );
-        for _ in 0..downs {
-            env.view.handle_key(key(KeyCode::Down), None);
-        }
-        env.view.handle_key(key(submit), None);
+        // Archive is not optimistic in the daemon-first TUI: the row only flips when
+        // the canonical snapshot lands, so the interaction is settled through the feed
+        // (the helper no-ops for the cases that submit nothing).
+        with_canonical_archive(&mut env, |env| {
+            for _ in 0..downs {
+                env.view.handle_key(key(KeyCode::Down), None);
+            }
+            env.view.handle_key(key(submit), None);
+        });
         assert!(env.view.context_menu.is_none(), "{label}: menu closes");
         assert!(check(&env.view, &id), "{label}");
     }
@@ -120,7 +125,9 @@ fn right_click_unarchive_action_restores_session() {
     env.view.cursor = 0;
     env.view.update_selected();
     let id = env.view.selected_session.clone().unwrap();
-    env.view.toggle_archive_at_cursor().unwrap();
+    with_canonical_archive(&mut env, |env| {
+        env.view.toggle_archive_at_cursor().unwrap();
+    });
     assert!(env.view.get_instance(&id).unwrap().is_archived());
 
     // Right-click the archived row: its menu must read "Unarchive".
@@ -136,9 +143,11 @@ fn right_click_unarchive_action_restores_session() {
     let row = shelf_row_for_idx(&env.view, idx);
     assert!(env.view.handle_right_click(5, row));
 
-    env.view.handle_key(key(KeyCode::Down), None); // New Session -> Rename
-    env.view.handle_key(key(KeyCode::Down), None); // Rename -> Unarchive
-    env.view.handle_key(key(KeyCode::Enter), None);
+    with_canonical_archive(&mut env, |env| {
+        env.view.handle_key(key(KeyCode::Down), None); // New Session -> Rename
+        env.view.handle_key(key(KeyCode::Down), None); // Rename -> Unarchive
+        env.view.handle_key(key(KeyCode::Enter), None);
+    });
     assert!(
         !env.view.get_instance(&id).unwrap().is_archived(),
         "context-menu Unarchive must unarchive the session"

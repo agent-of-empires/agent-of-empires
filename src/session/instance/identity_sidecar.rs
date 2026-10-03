@@ -98,7 +98,11 @@ impl Instance {
             ));
         }
         let bind_dir = self.sandbox_capture_store_dir()?;
-        let config = self.build_container_config().ok()?;
+        let launch_config = crate::session::storage::local_launch_configuration(
+            &self.effective_profile(),
+            Path::new(&self.project_path),
+        );
+        let config = self.build_container_config(&launch_config).ok()?;
         let (container_root, flag, sidecar_root) = match backend {
             SessionCaptureBackend::Pi => {
                 container_config::install_pi_sandbox_extension_at(&bind_dir).ok()?;
@@ -262,21 +266,26 @@ impl Instance {
         )
     }
 
-    pub(crate) fn absorb_published_pi_session(&mut self) {
+    pub(crate) fn absorb_published_pi_session_in(
+        &mut self,
+        storage: &dyn crate::session::SessionStore,
+    ) {
         let Some(observation) = self.pi_published_conversation(true) else {
             return;
         };
         let expected = self.conversation_state();
-        match persist_session_to_storage(
-            &self.effective_profile(),
+        match super::sid_persist::persist_session_with_storage(
+            storage,
             &self.id,
             &observation,
             &expected,
-            &self.resolve_file_watch(),
         ) {
             SidWrite::Applied => self.apply_conversation_observation(&observation),
+            // Nothing was written in any of these arms: a peer wrote between
+            // capture and CAS, a peer durably owns the sid, or the row pins
+            // another conversation. Reloading converges on all three.
             SidWrite::Skipped | SidWrite::OwnershipConflict | SidWrite::PinnedForeign => {
-                self.reconcile_from_disk();
+                let _ = self.reconcile_from_store(storage);
             }
             SidWrite::Failed => {}
         }
@@ -328,6 +337,7 @@ impl Instance {
 
     /// Persist the transcript path a poller observation carried. False only while the write keeps
     /// failing, so the caller holds the observation for a retry.
+    #[cfg(test)]
     pub(crate) fn persist_observed_pi_transcript(
         &mut self,
         observation: &crate::session::poller::SessionIdObservation,
@@ -350,6 +360,7 @@ impl Instance {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn persist_pi_transcript_into(
         &mut self,
         storage: &crate::session::storage::Storage,
@@ -368,6 +379,7 @@ impl Instance {
     }
 
     /// Write a published path only while the durable row still owns its execution and source.
+    #[cfg(test)]
     pub(super) fn store_pi_session_path(
         &self,
         storage: &crate::session::storage::Storage,
@@ -377,14 +389,7 @@ impl Instance {
         match storage.update(|instances, _| {
             #[cfg(test)]
             anyhow::ensure!(
-                !FAIL_PI_PATH_WRITES.with(std::cell::Cell::get)
-                    && !FAIL_NEXT_PI_PATH_WRITE.with(|fail| {
-                        let armed = fail.replace(false);
-                        if armed {
-                            FAIL_NEXT_PI_PATH_WRITE_CONSUMED.with(|consumed| consumed.set(true));
-                        }
-                        armed
-                    }),
+                !Self::pi_path_write_fails_for_test(),
                 "injected transcript path write failure"
             );
             let row = instances
@@ -445,6 +450,22 @@ impl Instance {
             previous_armed,
             previous_consumed,
         }
+    }
+
+    /// Whether this thread's next Pi transcript-path write must fail. Every
+    /// write site consults this, so an armed
+    /// [`Self::fail_next_pi_path_write_for_test`] is consumed by the production
+    /// store write and the arming test can prove that write was attempted.
+    #[cfg(test)]
+    pub(crate) fn pi_path_write_fails_for_test() -> bool {
+        FAIL_PI_PATH_WRITES.with(std::cell::Cell::get)
+            || FAIL_NEXT_PI_PATH_WRITE.with(|fail| {
+                let armed = fail.replace(false);
+                if armed {
+                    FAIL_NEXT_PI_PATH_WRITE_CONSUMED.with(|consumed| consumed.set(true));
+                }
+                armed
+            })
     }
 
     #[cfg(test)]
@@ -901,13 +922,13 @@ pi = "~/.pi-personal"
         );
 
         // No sidecar exists to re-read: only the observation carries the path.
-        storage.set_fail_writes_for_test(true);
+        let failing_writes = storage.fail_writes_for_test();
         assert!(!inst.persist_pi_transcript_into(&storage, &observation, &published));
         assert_eq!(
             inst.pi_session_path, None,
             "an unstored path must not look current"
         );
-        storage.set_fail_writes_for_test(false);
+        drop(failing_writes);
         assert_eq!(stored(&storage), None);
 
         assert!(inst.persist_observed_pi_transcript(&observation));

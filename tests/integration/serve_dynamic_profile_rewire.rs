@@ -15,12 +15,11 @@
 
 use std::path::PathBuf;
 use std::process::{Child, Command};
-use std::sync::Arc;
 use std::time::Duration;
 
 use agent_of_empires::server::test_support::{
-    add_profile_disk_watch, build_test_app_state, disk_watch_handle_count, has_disk_watch_handle,
-    rename_profile_disk_watch,
+    add_profile_disk_watch, build_test_app_state_configured, disk_watch_handle_count,
+    has_disk_watch_handle, rename_profile_disk_watch,
 };
 use serial_test::serial;
 use tempfile::TempDir;
@@ -35,11 +34,10 @@ async fn dynamic_profile_rewire_overwrite_replaces_existing_subscription() {
     let _home = set_temp_home(temp.path());
     let _ = agent_of_empires::session::get_profile_dir("rewire-profile").expect("profile dir");
 
-    let state = build_test_app_state(Vec::new());
     let live = agent_of_empires::file_watch::test_support::new_filewatch().expect("live svc");
-    let mut state_mut = Arc::try_unwrap(state).map_err(|_| ()).expect("unique");
-    agent_of_empires::server::test_support::replace_file_watch(&mut state_mut, live);
-    let state = Arc::new(state_mut);
+    let state = build_test_app_state_configured(Vec::new(), |state| {
+        agent_of_empires::server::test_support::replace_file_watch(state, live);
+    });
 
     add_profile_disk_watch(&state, "rewire-profile").await;
     assert_eq!(
@@ -73,11 +71,10 @@ async fn rewire_after_rename_drops_old_subscribes_new() {
     let _ = agent_of_empires::session::get_profile_dir("rename-old").expect("profile dir");
     let _ = agent_of_empires::session::get_profile_dir("rename-new").expect("profile dir");
 
-    let state = build_test_app_state(Vec::new());
     let live = agent_of_empires::file_watch::test_support::new_filewatch().expect("live svc");
-    let mut state_mut = Arc::try_unwrap(state).map_err(|_| ()).expect("unique");
-    agent_of_empires::server::test_support::replace_file_watch(&mut state_mut, live);
-    let state = Arc::new(state_mut);
+    let state = build_test_app_state_configured(Vec::new(), |state| {
+        agent_of_empires::server::test_support::replace_file_watch(state, live);
+    });
 
     add_profile_disk_watch(&state, "rename-old").await;
     assert!(

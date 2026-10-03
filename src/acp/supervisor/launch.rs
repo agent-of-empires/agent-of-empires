@@ -655,6 +655,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             sandbox_resources,
             agent_key,
             record.source_profile.clone(),
+            Some(tokio::time::Instant::now() + std::time::Duration::from_secs(3)),
         )
         .await?;
 
@@ -1754,8 +1755,8 @@ mod tests {
             AgentName("claude".into()),
             None,
         );
-        for (_, event) in fixture.store.replay_from(session_id, 0) {
-            state.apply_event(event).unwrap();
+        for (seq, event) in fixture.store.replay_from(session_id, 0) {
+            state.apply_event(seq, event).unwrap();
         }
         state
     }

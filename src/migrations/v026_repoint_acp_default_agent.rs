@@ -54,8 +54,12 @@ mod tests {
             run_in,
             &[
                 (
-                    Some("[acp]\ndefault_agent = \"aoe-agent\"\nmax_concurrent_workers = 5\n\n[theme]\nname = \"rose-pine\"\n"),
-                    Some("[acp]\ndefault_agent = \"claude-code\"\nmax_concurrent_workers = 5\n\n[theme]\nname = \"rose-pine\"\n"),
+                    Some(
+                        "[acp]\ndefault_agent = \"aoe-agent\"\nmax_concurrent_workers = 5\n\n[theme]\nname = \"rose-pine\"\n",
+                    ),
+                    Some(
+                        "[acp]\ndefault_agent = \"claude-code\"\nmax_concurrent_workers = 5\n\n[theme]\nname = \"rose-pine\"\n",
+                    ),
                 ),
                 // A deliberate choice of any other agent survives.
                 unchanged("[acp]\ndefault_agent = \"codex\"\n"),

@@ -1,5 +1,5 @@
 //! Misc system endpoints: agents, settings, themes, profiles, filesystem,
-//! groups, docker, system health, devices, about.
+//! groups, docker status, system health, devices, about.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -14,30 +14,35 @@ use serde::{Deserialize, Serialize};
 
 use super::validate_profile_name;
 use super::AppState;
-use super::{api_error, read_only_response};
 use crate::server::auth::AuthenticatedTokenHash;
-use crate::server::auth::{handler_elevated, AuthenticatedSession, LoopbackTrusted};
+use crate::server::auth::{handler_elevated, AuthenticatedSession, LocalAuthorization};
 use crate::session::config::settings_schema::{
     clear_path, rewrite_plugin_sections, runtime_schema, strip_local_only, validate_patch,
     validate_patch_with, PatchRejection, Scope,
 };
 
-/// Foreground state reported by one browser dashboard. Kept out of normal API
-/// traffic so background polling cannot suppress a phone's push notification.
+/// Foreground state reported by one browser dashboard. This is intentionally
+/// separate from normal API traffic: background polling must not suppress a
+/// phone's push notification.
 #[derive(Deserialize)]
 pub struct DashboardPresenceBody {
     pub active: bool,
 }
 
-/// `POST /api/presence`. Records or clears this browser's foreground presence.
-/// The device-binding header is hashed into an ephemeral per-browser key rather
-/// than retained; clients without it fall back to their token owner.
+/// `POST /api/presence`. Record or clear this browser's foreground presence.
+/// The device-binding header is already attached to authenticated dashboard
+/// requests. Hashing it gives each browser an ephemeral server-side key without
+/// retaining the secret itself. Older clients without that header fall back to
+/// their authenticated token owner.
 pub async fn post_dashboard_presence(
     State(state): State<Arc<AppState>>,
-    Extension(owner): Extension<AuthenticatedTokenHash>,
+    owner: Option<Extension<AuthenticatedTokenHash>>,
     headers: HeaderMap,
     Json(body): Json<DashboardPresenceBody>,
 ) -> StatusCode {
+    let Some(Extension(owner)) = owner else {
+        return StatusCode::NO_CONTENT;
+    };
     let client = headers
         .get("x-aoe-device-binding")
         .and_then(|value| value.to_str().ok())
@@ -57,37 +62,57 @@ pub struct AgentInfo {
     pub host_only: bool,
     pub installed: bool,
     pub install_hint: String,
-    /// Whether the agent has a one-shot mode, so it can serve the smart-rename
-    /// title call. Always false for custom agents.
+    /// True when this agent has a one-shot mode (a `oneshot_flag`), so it can
+    /// be used for the smart-rename title call. The settings smart-rename agent
+    /// picker filters on this together with `installed`. Always false for
+    /// custom agents (no built-in one-shot contract).
     pub oneshot_capable: bool,
-    /// Whether the agent can run in the structured ACP UI: a built-in with an ACP
-    /// adapter, or a custom agent declaring a valid `agent_acp_cmd`.
+    /// True when this agent can run in the structured acp UI: a
+    /// built-in with an ACP adapter, or a custom agent that declares a
+    /// valid `agent_acp_cmd`. The web wizard reads this to decide
+    /// whether a session created for the agent runs in acp or tmux.
     pub acp_capable: bool,
-    /// Whether the agent's ACP adapter binary resolves on this host, not just that
-    /// the registry knows one exists. Gates the wizard's "Import from Claude" tab.
+    /// True when the agent's ACP adapter binary (`acp_command`) is actually
+    /// resolvable on this host, not just registered. Distinct from
+    /// `installed` (the agent's own CLI binary) and `acp_capable` (registry
+    /// knows an adapter exists). The wizard's "Import from Claude" tab gates
+    /// on this so it never shows when claude-agent-acp is missing. See #2276.
     pub acp_installed: bool,
-    /// Whether `[acp] allowed_agents` permits this agent. Kept separate from
-    /// `acp_capable`, which states an intrinsic fact that operator policy does not
-    /// change, so settings surfaces can still edit a disallowed agent's defaults.
+    /// True when `[acp] allowed_agents` permits this agent in the structured
+    /// view. Deliberately separate from `acp_capable`, which states an intrinsic
+    /// fact (an ACP adapter exists for this agent) that an operator policy does
+    /// not change. Folding policy into `acp_capable` would hide a disallowed
+    /// agent from the settings surfaces that enumerate this endpoint to edit
+    /// per-agent structured-view defaults, which is a legitimate thing to do for
+    /// an agent that is currently off the allowlist. The wizard gates its
+    /// structured-view option on this in addition to `acp_capable`. See #3241.
     pub acp_allowed: bool,
-    /// The ACP command a built-in agent launches, after `${aoe_data_dir}`
-    /// substitution; it can differ from `binary`. Omitted for custom agents, whose
-    /// command values are never serialized here.
+    /// The ACP command a built-in agent launches in acp, e.g.
+    /// `claude-agent-acp` for claude or `opencode` for opencode. This is
+    /// the registry command (post `${aoe_data_dir}` substitution), which
+    /// can differ from `binary`; the wizard previews it so the user sees
+    /// the real launch command before starting. Omitted for custom
+    /// agents, whose command values are never serialized here (see the
+    /// custom-agent serialization tests below).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub acp_command: Option<String>,
-    /// Registry args appended to `acp_command`. Empty when there are none or for
-    /// custom agents.
+    /// The registry args appended to `acp_command` (e.g. `["acp"]`
+    /// for opencode, `["--acp"]` for gemini). Empty when there are none
+    /// or for custom agents.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub acp_args: Vec<String>,
-    /// Registry lifecycle state. Omitted while Active so the common wire shape is
-    /// unchanged; mirrored by `AgentLifecycleInfo` in `web/src/lib/types.ts`.
+    /// Registry lifecycle state. Omitted while Active so the common wire
+    /// shape is unchanged; the dashboard mirrors the shape in
+    /// `web/src/lib/types.ts` (`AgentLifecycleInfo`) and renders a
+    /// deprecated badge in the wizard picker and switch-agent modal.
     #[serde(skip_serializing_if = "crate::agents::AgentLifecycle::is_active")]
     pub lifecycle: crate::agents::AgentLifecycle,
 }
 
-/// Resolve a built-in agent's ACP command and args from its registry spec,
-/// substituting `${aoe_data_dir}` so the preview matches what the supervisor
-/// runs. `(None, [])` for agents without a registry entry.
+/// Resolve the acp launch command + args for a built-in agent from
+/// its registry spec, substituting `${aoe_data_dir}` so the preview
+/// matches what `supervisor::spawn_inner` actually runs. Returns
+/// `(None, [])` for agents without a registry entry.
 fn acp_command_fields(
     spec: Option<&crate::acp::AgentSpec>,
     data_dir: Option<&std::path::Path>,
@@ -135,9 +160,12 @@ fn build_custom_agent_infos(
                 .is_some_and(|cmd| crate::acp::AgentSpec::from_acp_cmd(name, cmd).is_ok())
                 || crate::acp::inherited_acp_base(name, agent_detect_as).is_some(),
             acp_allowed: policy.allows(name),
-            // A custom agent's acp_command is never serialized (it can hold
-            // hostnames or secrets), so its install state is not probed.
+            // Custom agents' acp_command is never serialized here (it can hold
+            // hostnames or secrets), so we don't probe its install state; the
+            // import tab is claude-only regardless.
             acp_installed: false,
+            // Custom agents' command values are deliberately never
+            // serialized here; they can hold hostnames or secrets.
             acp_command: None,
             acp_args: Vec::new(),
         })
@@ -147,7 +175,8 @@ fn build_custom_agent_infos(
 }
 
 pub async fn list_agents(State(state): State<Arc<AppState>>) -> Json<Vec<AgentInfo>> {
-    let profile = state.profile.clone();
+    let _namespace = state.profile_namespace.read().await;
+    let profile = state.served_profile().to_string();
     let result = tokio::task::spawn_blocking(move || {
         let config = crate::session::config::profile_config::resolve_config_or_warn(&profile);
         let custom_agents = config.session.custom_agents;
@@ -204,84 +233,176 @@ pub async fn list_agents(State(state): State<Arc<AppState>>) -> Json<Vec<AgentIn
 
 #[derive(Deserialize)]
 pub struct SettingsQuery {
+    /// The profile settings are resolved over machine-wide. Defaults to the
+    /// served profile, the one `/api/about` names.
     pub profile: Option<String>,
-    /// `machine` reads the machine-wide layer alone, for editors that show
-    /// where a value lives. Every other read gets the effective view.
+    /// `profile` names the profile layer explicitly, `machine` addresses the
+    /// machine-wide layer alone. Any other value is refused.
     pub layer: Option<String>,
 }
 
-/// The profile this server serves: its `--profile`, else the default profile,
-/// which a plain `aoe serve` follows at runtime.
-fn served_profile(state: &AppState) -> String {
-    crate::session::config::effective_profile(&state.profile)
+/// The store a settings read or write addresses.
+enum SettingsLayer {
+    /// A profile resolved over machine-wide settings.
+    Profile(String),
+    /// Machine-wide `config.toml` alone.
+    Machine,
 }
 
-/// `GET /api/settings` returns the settings as they apply: the served profile's
-/// overrides over the machine-wide values, or `?profile=` for another profile.
-/// A bare read was once the machine-wide layer, so a caller that forgot the
-/// profile silently ignored every profile override (#4144).
+impl SettingsLayer {
+    /// Resolve the layer a request names. The `Err` message is the 400 body.
+    fn resolve(query: &SettingsQuery, served: &str) -> Result<Self, String> {
+        match query.layer.as_deref() {
+            Some("machine") => {
+                if query.profile.is_some() {
+                    return Err(
+                        "`profile` cannot pick a profile when `layer=machine` addresses the \
+                         machine-wide layer"
+                            .to_string(),
+                    );
+                }
+                Ok(Self::Machine)
+            }
+            Some("profile") => Ok(Self::Profile(requested_profile(query, served)?)),
+            Some(other) => Err(format!(
+                "Unknown settings layer '{other}'; expected `profile` or `machine`"
+            )),
+            None => Ok(Self::Profile(requested_profile(query, served)?)),
+        }
+    }
+}
+
+/// The profile a request names, validated before it reaches the filesystem.
+fn requested_profile(query: &SettingsQuery, served: &str) -> Result<String, String> {
+    match &query.profile {
+        Some(name) => {
+            validate_profile_name(name)?;
+            Ok(name.clone())
+        }
+        None => Ok(served.to_string()),
+    }
+}
+
+fn bad_request(message: impl Into<String>) -> axum::response::Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({"error": "validation_failed", "message": message.into()})),
+    )
+        .into_response()
+}
+
+/// `GET /api/settings` reads one settings layer. Without a query it reads the
+/// served profile resolved over the machine-wide values, so a plain read and
+/// a plain save always describe the same state. See #4144.
 pub async fn get_settings(
     State(state): State<Arc<AppState>>,
     axum::extract::Query(query): axum::extract::Query<SettingsQuery>,
-) -> impl IntoResponse {
-    let machine_only = match query.layer.as_deref() {
-        None => false,
-        Some("machine") if query.profile.is_none() => true,
-        Some("machine") => {
-            return api_error(
-                StatusCode::BAD_REQUEST,
-                "validation_failed",
-                "`layer=machine` cannot be combined with `profile`",
-            )
-        }
-        Some(other) => {
-            return api_error(
-                StatusCode::BAD_REQUEST,
-                "validation_failed",
-                format!("Unknown settings layer '{other}'"),
-            )
-        }
+) -> axum::response::Response {
+    let _namespace = state.profile_namespace.read().await;
+    let served = state.served_profile();
+    let profile = match SettingsLayer::resolve(&query, &served) {
+        Ok(SettingsLayer::Profile(name)) => Some(name),
+        Ok(SettingsLayer::Machine) => None,
+        Err(message) => return bad_request(message),
     };
-    let profile = query.profile.unwrap_or_else(|| served_profile(&state));
-    if let Err(e) = validate_profile_name(&profile) {
-        return api_error(StatusCode::BAD_REQUEST, "validation_failed", e);
-    }
-    let config_result = tokio::task::spawn_blocking(move || {
-        if machine_only {
-            crate::session::Config::load()
-        } else {
-            crate::session::resolve_config(&profile)
-        }
-    })
-    .await
-    .unwrap_or_else(|e| Err(anyhow::anyhow!(e)));
+    // The profile layer reads as what a session actually runs with: the
+    // profile's overrides resolved over the machine-wide values.
+    let config_result = match profile {
+        Some(name) => crate::session::resolve_config(&name),
+        None => crate::session::Config::load(),
+    };
 
     match config_result {
         Ok(config) => match serde_json::to_value(&config) {
             Ok(val) => (StatusCode::OK, Json(val)).into_response(),
             Err(e) => {
                 tracing::error!(target: "http.api.system", "Settings serialization failed: {}", e);
-                api_error(
+                (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    "serialize_failed",
-                    "Failed to serialize settings",
+                    Json(serde_json::json!({"error": "serialize_failed", "message": "Failed to serialize settings"})),
                 )
+                    .into_response()
             }
         },
         Err(e) => {
             tracing::error!(target: "http.api.system", "Settings load failed: {}", e);
-            api_error(
+            (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "load_failed",
-                "Failed to load settings",
+                Json(serde_json::json!({"error": "load_failed", "message": "Failed to load settings"})),
             )
+                .into_response()
         }
     }
 }
 
-/// Map a schema [`PatchRejection`] onto the dashboard's HTTP shape.
-/// `elevation_required` mirrors the path-shape gate's 403 so the web client's
-/// interceptor fires the passphrase prompt unchanged.
+/// Route every leaf of a settings patch to the layer `GET /api/settings` reads
+/// it from: the profile override where the field may be overridden, the
+/// machine-wide store otherwise. Unknown fields and `plugin:<id>` leaves are
+/// machine-wide, so the global-scope validation is the one that rejects them.
+fn split_patch_by_layer(
+    descriptors: &[crate::session::config::settings_schema::FieldDescriptor],
+    body: &serde_json::Value,
+) -> (serde_json::Value, serde_json::Value) {
+    let mut machine = serde_json::Map::new();
+    let mut profile = serde_json::Map::new();
+    let Some(root) = body.as_object() else {
+        return (body.clone(), serde_json::Value::Object(profile));
+    };
+    for (section, value) in root {
+        // A non-object section (the top-level `description` string) has no
+        // per-field policy, so it belongs to the machine-wide store.
+        let Some(fields) = value.as_object().filter(|f| !f.is_empty()) else {
+            machine.insert(section.clone(), value.clone());
+            continue;
+        };
+        for (field, leaf) in fields {
+            let overridable = descriptors
+                .iter()
+                .any(|d| d.section == *section && d.field == *field && d.profile_overridable);
+            let target = if overridable {
+                &mut profile
+            } else {
+                &mut machine
+            };
+            let section_entry = target
+                .entry(section.clone())
+                .or_insert_with(|| serde_json::json!({}));
+            if let Some(obj) = section_entry.as_object_mut() {
+                obj.insert(field.clone(), leaf.clone());
+            }
+        }
+    }
+    (
+        serde_json::Value::Object(machine),
+        serde_json::Value::Object(profile),
+    )
+}
+
+/// A patch with no leaf left to write, whether it arrived empty or had every
+/// field stripped as host-only.
+fn is_empty_patch(patch: &serde_json::Value) -> bool {
+    patch.as_object().is_none_or(|obj| {
+        obj.values()
+            .all(|v| v.as_object().is_none_or(|f| f.is_empty()))
+    })
+}
+
+/// Dotted path of the first leaf in a patch, for the message that names the
+/// write an elevated session is missing.
+fn first_leaf(patch: &serde_json::Value) -> Option<String> {
+    let (section, value) = patch.as_object()?.iter().next()?;
+    match value.as_object().filter(|f| !f.is_empty()) {
+        Some(fields) => fields
+            .keys()
+            .next()
+            .map(|field| format!("{section}.{field}")),
+        None => Some(section.clone()),
+    }
+}
+
+/// Map a schema [`PatchRejection`] to the HTTP response shape the dashboard
+/// expects. `elevation_required` mirrors the path-shape gate's 403 so the web
+/// client's interceptor fires the passphrase prompt unchanged.
 fn reject_response(rej: PatchRejection) -> axum::response::Response {
     let status = StatusCode::from_u16(rej.status_code()).unwrap_or(StatusCode::BAD_REQUEST);
     (
@@ -291,285 +412,316 @@ fn reject_response(rej: PatchRejection) -> axum::response::Response {
         .into_response()
 }
 
-/// Split a patch into the leaves each layer owns. Profile-overridable fields
-/// go to the profile; the rest (global-only, plugin sections, and unknown
-/// leaves, which machine-wide validation then rejects) go machine-wide.
-fn split_patch_by_layer(
-    descriptors: &[crate::session::config::settings_schema::FieldDescriptor],
-    patch: serde_json::Map<String, serde_json::Value>,
-) -> (serde_json::Value, serde_json::Value) {
-    let mut machine = serde_json::Map::new();
-    let mut profile = serde_json::Map::new();
-    for (section, value) in patch {
-        let serde_json::Value::Object(fields) = value else {
-            machine.insert(section, value);
-            continue;
-        };
-        // An empty section still reaches validation, so `{"hooks": {}}` is refused.
-        if fields.is_empty() {
-            machine.insert(section, fields.into());
-            continue;
-        }
-        for (field, leaf) in fields {
-            let overridable = descriptors
-                .iter()
-                .any(|d| d.section == section && d.field == field && d.profile_overridable);
-            let target = if overridable {
-                &mut profile
+/// Apply a validated patch to the machine-wide store. Returns the new config
+/// and whether the persisted logging config changed, so the caller can decide
+/// whether to reapply the temporary runtime filters.
+fn apply_machine_patch(
+    patch: &serde_json::Value,
+) -> anyhow::Result<(crate::session::Config, bool)> {
+    crate::session::update_config(|config| -> anyhow::Result<_> {
+        let mut current = serde_json::to_value(&*config)?;
+        crate::session::config::settings_schema::merge_json(&mut current, patch);
+        // The target editor sends the complete map, including removals.
+        if let Some(targets) = patch.pointer("/logging/targets") {
+            current["logging"]["targets"] = if targets.is_null() {
+                serde_json::json!({})
             } else {
-                &mut machine
+                targets.clone()
             };
-            target
-                .entry(section.clone())
-                .or_insert_with(|| serde_json::json!({}))
-                .as_object_mut()
-                .expect("inserted as an object")
-                .insert(field, leaf);
+        }
+        let updated: crate::session::Config = serde_json::from_value(current)?;
+        let logging_changed = config.logging.default_level != updated.logging.default_level
+            || config.logging.targets != updated.logging.targets;
+        *config = updated;
+        Ok((config.clone(), logging_changed))
+    })
+    .and_then(|inner| inner)
+}
+
+/// Apply a validated patch onto a profile's sparse override object and persist
+/// it. A `null` leaf clears the override (reverting to the inherited value);
+/// sections are created lazily so a single-field patch never wipes its
+/// siblings. `description` is a top-level string, handled the same way.
+fn apply_profile_patch(
+    name: &str,
+    patch: &serde_json::Value,
+) -> anyhow::Result<crate::session::ProfileConfig> {
+    // `get_profile_dir` creates a directory that is missing, so loading with a
+    // default would let a save to an unknown name mint a hollow profile: no
+    // storage transition, no disk watch, and it shows up in the picker. Saving
+    // to a profile that does not exist is a caller error, not a creation.
+    crate::session::require_known_profile(name)?;
+    let config = crate::session::load_profile_config(name).unwrap_or_default();
+    let mut current = serde_json::to_value(&config)?;
+    if let Some(update_obj) = patch.as_object() {
+        for (key, value) in update_obj {
+            match value {
+                serde_json::Value::Object(fields) => {
+                    for (field, fval) in fields {
+                        if fval.is_null() {
+                            clear_path(&mut current, key, field);
+                        } else if let Some(root) = current.as_object_mut() {
+                            let section = root
+                                .entry(key.clone())
+                                .or_insert_with(|| serde_json::json!({}));
+                            if let Some(sec) = section.as_object_mut() {
+                                sec.insert(field.clone(), fval.clone());
+                            }
+                        }
+                    }
+                }
+                serde_json::Value::Null => {
+                    if let Some(root) = current.as_object_mut() {
+                        root.remove(key);
+                    }
+                }
+                other => {
+                    if let Some(root) = current.as_object_mut() {
+                        root.insert(key.clone(), other.clone());
+                    }
+                }
+            }
         }
     }
-    (machine.into(), profile.into())
+    let config: crate::session::ProfileConfig = serde_json::from_value(current)?;
+    crate::session::save_profile_config(name, &config)?;
+    Ok(config)
 }
 
-fn first_leaf(patch: &serde_json::Value) -> String {
-    patch
-        .as_object()
-        .and_then(|obj| obj.iter().next())
-        .map(
-            |(section, value)| match value.as_object().and_then(|f| f.keys().next()) {
-                Some(field) => format!("{section}.{field}"),
-                None => section.clone(),
-            },
-        )
-        .unwrap_or_default()
-}
-
-fn is_empty_patch(patch: &serde_json::Value) -> bool {
-    patch.as_object().is_some_and(|obj| obj.is_empty())
-}
-
-/// Every machine-wide write needs elevation, as the whole route did before
-/// saves began routing by layer.
-fn machine_elevation_gate(
-    machine: &serde_json::Value,
-    elevated: bool,
-) -> Result<(), PatchRejection> {
-    if elevated || is_empty_patch(machine) {
-        return Ok(());
-    }
-    Err(PatchRejection::NeedsElevation {
-        path: first_leaf(machine),
-        reason: "machine-wide settings need a recent passphrase".into(),
-    })
-}
-
-/// `PATCH /api/settings` saves each field to the layer it belongs in: the
-/// served profile (or `?profile=`) for profile-overridable fields, machine-wide
-/// for the rest. Callers never pick a layer, so a save always lands where
-/// `GET /api/settings` reads it (#4144). `?layer=machine` writes every field
-/// machine-wide, for editors that set the inherited value on purpose.
-///
-/// The two parts keep their layer's gates: any machine-wide leaf needs
-/// elevation, as the whole route did before it began routing, while profile
-/// leaves need it only where the schema says so. Both are validated before
-/// either is written.
+/// Persist a settings patch, routing each leaf to the layer `GET /api/settings`
+/// reads it from, and answer with the effective config of the layer written.
 pub async fn update_settings(
     State(state): State<Arc<AppState>>,
     axum::extract::Query(query): axum::extract::Query<SettingsQuery>,
-    session: Option<axum::Extension<AuthenticatedSession>>,
-    loopback: Option<axum::Extension<LoopbackTrusted>>,
+    session: Option<Extension<AuthenticatedSession>>,
+    loopback: Option<Extension<LocalAuthorization>>,
     body: Result<Json<serde_json::Value>, axum::extract::rejection::JsonRejection>,
-) -> impl IntoResponse {
-    // CityHall also denies this route at its boundary; its trash toggles save
-    // through the profile endpoint's allowlist (#7).
+) -> axum::response::Response {
+    // CityHall mode exposes only the theme control, which writes through the
+    // dedicated `PATCH /api/theme` endpoint; the general settings PATCH stays
+    // fully closed so advanced settings cannot be reached. See #7.
     if let Some(resp) = super::cityhall_block(&state) {
         return resp;
     }
     if state.read_only {
-        return read_only_response();
+        return super::read_only_response();
     }
     let Json(body) = match body {
         Ok(b) => b,
         Err(rej) => return rej.into_response(),
     };
-    let machine_only = match query.layer.as_deref() {
-        None => false,
-        Some("machine") if query.profile.is_none() => true,
-        Some("machine") => {
-            return api_error(
-                StatusCode::BAD_REQUEST,
-                "validation_failed",
-                "`layer=machine` cannot be combined with `profile`",
-            )
-        }
-        Some(other) => {
-            return api_error(
-                StatusCode::BAD_REQUEST,
-                "validation_failed",
-                format!("Unknown settings layer '{other}'"),
-            )
-        }
+    let _namespace = state.profile_namespace.read().await;
+    let target = match SettingsLayer::resolve(&query, &state.served_profile()) {
+        Ok(layer) => layer,
+        Err(message) => return bad_request(message),
     };
-    let serde_json::Value::Object(body) = body else {
-        return reject_response(PatchRejection::Malformed("(root)".into()));
-    };
-    let profile = query.profile.unwrap_or_else(|| served_profile(&state));
-    if let Err(e) = validate_profile_name(&profile) {
-        return api_error(StatusCode::BAD_REQUEST, "validation_failed", e);
+    if !body.is_object() {
+        return bad_request("A settings patch must be a JSON object");
     }
-    let schema = runtime_schema();
-    let (mut machine, mut overrides) = if machine_only {
-        (body.into(), serde_json::json!({}))
-    } else {
-        split_patch_by_layer(&schema, body)
+    // An explicit machine-wide save writes the whole body machine-wide, so a
+    // profile-overridable field sets the inherited value on purpose. A save
+    // addressed at a profile splits, and each leaf lands where a plain read of
+    // the same layer would find it.
+    let (machine, profile_patch) = match target {
+        SettingsLayer::Profile(_) => split_patch_by_layer(&runtime_schema(), &body),
+        SettingsLayer::Machine => (body, serde_json::json!({})),
     };
+    let profile = match target {
+        SettingsLayer::Profile(name) => Some(name),
+        SettingsLayer::Machine => None,
+    };
+    save_settings_patch(
+        state.clone(),
+        profile,
+        machine,
+        profile_patch,
+        session,
+        loopback,
+    )
+    .await
+}
+
+/// Write the two halves of a split settings patch and answer with the
+/// effective config of the layer written.
+async fn save_settings_patch(
+    state: Arc<AppState>,
+    profile: Option<String>,
+    mut machine: serde_json::Value,
+    mut profile_patch: serde_json::Value,
+    session: Option<Extension<AuthenticatedSession>>,
+    loopback: Option<Extension<LocalAuthorization>>,
+) -> axum::response::Response {
+    // Machine-wide leaves set what every profile inherits, so they are the
+    // privileged half of this surface. The route-level gate cannot see which
+    // layer a request writes, so the check belongs here.
     let elevated = handler_elevated(&state, session.as_deref(), loopback.is_some()).await;
+    if !is_empty_patch(&machine) && !elevated {
+        return reject_response(PatchRejection::NeedsElevation {
+            path: first_leaf(&machine).unwrap_or_else(|| "<root>".to_string()),
+            reason: "machine-wide settings change every profile".to_string(),
+        });
+    }
+    // Strip host-execution surfaces (`local_only`: node_path, agent
+    // argv/command, status-hook commands) in both halves, so a bundled or
+    // echoed-back patch keeps its safe leaves and silently drops the
+    // local-only ones (#1692). They can never reach disk from the web.
+    strip_local_only(&mut machine);
+    strip_local_only(&mut profile_patch);
+    let write_profile = profile.is_some() && !is_empty_patch(&profile_patch);
+    // Every remaining leaf is checked against the runtime schema (core plus
+    // active-plugin `plugin:<id>` sections) in the scope of the layer it lands
+    // in: unknown section/field -> 400, bad value -> 400.
+    if let Err(rej) = validate_patch_with(&runtime_schema(), &machine, Scope::Global, elevated) {
+        return reject_response(rej);
+    }
+    if write_profile {
+        if let Err(rej) = validate_patch(&profile_patch, Scope::Profile, elevated) {
+            return reject_response(rej);
+        }
+    }
 
-    if !is_empty_patch(&machine) {
-        if let Err(rej) = machine_elevation_gate(&machine, elevated) {
-            return reject_response(rej);
-        }
-        // Strip host-execution surfaces (`local_only`) first, so a bundled or
-        // echoed-back patch keeps its safe leaves and drops the rest (#1692).
-        strip_local_only(&mut machine);
-        if let Err(rej) = validate_patch_with(&schema, &machine, Scope::Global, true) {
-            return reject_response(rej);
-        }
-    }
-    if !is_empty_patch(&overrides) {
-        // Validate scope before stripping, including global-only local fields.
-        if let Err(rej) = validate_patch(&overrides, Scope::Profile, elevated) {
-            return reject_response(rej);
-        }
-        strip_local_only(&mut overrides);
-    }
-
-    let profile_saved = !is_empty_patch(&overrides);
-    if profile_saved {
-        if let Err(resp) = write_profile_patch(profile.clone(), overrides).await {
-            return resp;
-        }
-    }
-    if !is_empty_patch(&machine) {
-        if let Err(resp) = write_machine_patch(&state, machine).await {
-            if !profile_saved {
-                return resp;
+    // The profile override is written first: a machine-wide failure then leaves
+    // the narrower half in place, which is what the partial-save message says.
+    if let Some(name) = profile.clone().filter(|_| write_profile) {
+        let patch = profile_patch.clone();
+        let label = name.clone();
+        match tokio::task::spawn_blocking(move || apply_profile_patch(&name, &patch)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => {
+                tracing::warn!(target: "http.api.system", "Profile settings update failed: {e}");
+                return bad_request(format!(
+                    "Failed to save profile settings for '{label}': {e}"
+                ));
             }
-            // Two files cannot be written atomically; say which half landed.
-            return api_error(
-                resp.status(),
-                "partially_saved",
-                "Profile changes were saved, but machine-wide changes failed; retry to finish",
-            );
+            Err(e) => {
+                tracing::error!(target: "http.api.system", "Profile settings update panicked: {e}");
+                return internal_error();
+            }
         }
     }
 
-    let effective = tokio::task::spawn_blocking(move || crate::session::resolve_config(&profile))
-        .await
-        .unwrap_or_else(|e| Err(anyhow::anyhow!(e)))
-        .and_then(|config| Ok(serde_json::to_value(&config)?));
-    match effective {
+    let mut machine_config = None;
+    if !is_empty_patch(&machine) {
+        // Capture which plugins this patch touches (top-level `plugin:<id>`
+        // sections and their changed field keys) BEFORE the rewrite folds them
+        // into `plugins.<id>.settings.*`, so we can emit
+        // `plugin.settings.changed` after a successful write (#2897).
+        let plugin_changes: Vec<(String, Vec<String>)> = machine
+            .as_object()
+            .map(|obj| {
+                obj.iter()
+                    .filter_map(|(section, value)| {
+                        let id =
+                            crate::session::config::settings_schema::section_plugin_id(section)?;
+                        let keys: Vec<String> = value
+                            .as_object()
+                            .map(|m| m.keys().cloned().collect())
+                            .unwrap_or_default();
+                        Some((id.to_string(), keys))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        rewrite_plugin_sections(&mut machine);
+        let written = machine.clone();
+        match tokio::task::spawn_blocking(move || apply_machine_patch(&written)).await {
+            Ok(Ok((config, logging_changed))) => {
+                // No-op and restart-only edits preserve temporary runtime filters.
+                if logging_changed {
+                    if let Ok(app_dir) = crate::session::get_app_dir() {
+                        crate::logging::apply_persisted_config(
+                            &config.logging.default_level,
+                            &config.logging.targets,
+                            &app_dir,
+                        );
+                    }
+                }
+                // Tell each touched plugin's worker its settings changed (#2897),
+                // after the durable write. Best-effort; config.get is the fallback.
+                if !plugin_changes.is_empty() {
+                    if let Some(host) = &state.plugin_host {
+                        host.emit_settings_changed(&plugin_changes).await;
+                    }
+                }
+                machine_config = Some(config);
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(target: "http.api.system", "Settings update failed: {e}");
+                let target = profile.as_deref().unwrap_or("the machine-wide layer");
+                let message = if write_profile {
+                    format!(
+                        "Failed to update machine-wide settings: {e}. The profile layer of \
+                         '{target}' was saved."
+                    )
+                } else {
+                    format!("Failed to update machine-wide settings: {e}")
+                };
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": "update_failed", "message": message})),
+                )
+                    .into_response();
+            }
+            Err(e) => {
+                tracing::error!(target: "http.api.system", "Settings update panicked: {e}");
+                return internal_error();
+            }
+        }
+    }
+
+    // Answer with the same layer the caller addressed, so a save and the read
+    // that follows it never disagree.
+    let effective = match (&profile, machine_config) {
+        (Some(name), _) => {
+            let name = name.clone();
+            tokio::task::spawn_blocking(move || crate::session::resolve_config(&name)).await
+        }
+        (None, Some(config)) => Ok(Ok(config)),
+        (None, None) => tokio::task::spawn_blocking(crate::session::Config::load).await,
+    };
+    let config = match effective {
+        Ok(Ok(config)) => config,
+        Ok(Err(e)) => {
+            tracing::error!(target: "http.api.system", "Settings read-back failed: {e}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "load_failed", "message": "Failed to read back settings"})),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            tracing::error!(target: "http.api.system", "Settings read-back panicked: {e}");
+            return internal_error();
+        }
+    };
+    match serde_json::to_value(&config) {
         Ok(val) => (StatusCode::OK, Json(val)).into_response(),
         Err(e) => {
-            tracing::error!(target: "http.api.system", "Settings reload failed: {}", e);
-            api_error(
+            tracing::error!(target: "http.api.system", "Settings serialization failed: {e}");
+            (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "load_failed",
-                "Saved, but failed to reload settings",
+                Json(serde_json::json!({"error": "serialize_failed", "message": "Failed to serialize settings"})),
             )
+                .into_response()
         }
     }
 }
 
-/// Persist a validated machine-wide patch and apply the side effects of the
-/// sections it changes.
-async fn write_machine_patch(
-    state: &AppState,
-    mut body: serde_json::Value,
-) -> Result<(), axum::response::Response> {
-    // Record which plugins the patch touches BEFORE the rewrite folds them into
-    // `plugins.<id>.settings.*`, so `plugin.settings.changed` can be emitted
-    // after a successful write (#2897).
-    let plugin_changes: Vec<(String, Vec<String>)> = body
-        .as_object()
-        .map(|obj| {
-            obj.iter()
-                .filter_map(|(section, value)| {
-                    let id = crate::session::config::settings_schema::section_plugin_id(section)?;
-                    let keys: Vec<String> = value
-                        .as_object()
-                        .map(|m| m.keys().cloned().collect())
-                        .unwrap_or_default();
-                    Some((id.to_string(), keys))
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    rewrite_plugin_sections(&mut body);
-
-    let result = tokio::task::spawn_blocking(move || {
-        crate::session::update_config(|config| -> anyhow::Result<_> {
-            let mut current = serde_json::to_value(&*config)?;
-            crate::session::config::settings_schema::merge_json(&mut current, &body);
-            // The target editor sends the complete map, including removals.
-            if let Some(targets) = body.pointer("/logging/targets") {
-                current["logging"]["targets"] = if targets.is_null() {
-                    serde_json::json!({})
-                } else {
-                    targets.clone()
-                };
-            }
-            let updated: crate::session::Config = serde_json::from_value(current)?;
-            let logging_changed = config.logging.default_level != updated.logging.default_level
-                || config.logging.targets != updated.logging.targets;
-            *config = updated;
-            Ok((config.clone(), logging_changed))
-        })
-        .and_then(|inner| inner)
-    })
-    .await;
-
-    match result {
-        Ok(Ok((config, logging_changed))) => {
-            // No-op and restart-only edits preserve temporary runtime filters.
-            if logging_changed {
-                if let Ok(app_dir) = crate::session::get_app_dir() {
-                    crate::logging::apply_persisted_config(
-                        &config.logging.default_level,
-                        &config.logging.targets,
-                        &app_dir,
-                    );
-                }
-            }
-            // Notify each touched plugin's worker after the durable write (#2897).
-            if !plugin_changes.is_empty() {
-                if let Some(host) = &state.plugin_host {
-                    host.emit_settings_changed(&plugin_changes).await;
-                }
-            }
-            Ok(())
-        }
-        Ok(Err(e)) => {
-            tracing::warn!(target: "http.api.system", "Settings update failed: {}", e);
-            Err(api_error(
-                StatusCode::BAD_REQUEST,
-                "update_failed",
-                "Failed to update settings",
-            ))
-        }
-        Err(e) => {
-            tracing::error!(target: "http.api.system", "Settings update panicked: {}", e);
-            Err(api_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal",
-                "Internal server error",
-            ))
-        }
-    }
+fn internal_error() -> axum::response::Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({"error": "internal", "message": "Internal server error"})),
+    )
+        .into_response()
 }
 
 /// `GET /api/cityhall/bundle` returns this install's CityHall config bundle as
-/// TOML. Refused in CityHall client mode: `cityhall_gate` only guards
-/// mutations, so this read needs its own block.
+/// TOML, for an admin to paste into CityHall. See
+/// `crate::session::cityhall_bundle`.
+///
+/// Refused in CityHall client mode: this is the surface an admin uses to
+/// configure workspaces, and an end user inside one has no business reading it.
+/// `cityhall_gate` only guards mutations, so a read needs its own block.
 pub async fn get_cityhall_bundle(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
 ) -> axum::response::Response {
@@ -589,34 +741,39 @@ pub async fn get_cityhall_bundle(
             .into_response(),
         Ok(Err(e)) => {
             tracing::error!(target: "http.api.system", "CityHall bundle export failed: {e}");
-            api_error(
+            (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "export_failed",
-                e.to_string(),
+                Json(serde_json::json!({"error": "export_failed", "message": e.to_string()})),
             )
+                .into_response()
         }
         Err(e) => {
             tracing::error!(target: "http.api.system", "CityHall bundle export panicked: {e}");
-            api_error(
+            (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "internal",
-                "Internal server error",
+                Json(serde_json::json!({"error": "internal", "message": "Internal server error"})),
             )
+                .into_response()
         }
     }
 }
 
 /// `GET /api/settings/schema` returns the flat list of settings field
-/// descriptors the dashboard renders generic field components from, so a new
-/// config field appears on the web automatically (#1692). Pure metadata, so
-/// normal authentication is enough.
+/// descriptors (the single source of truth, see #1692). The web dashboard
+/// renders a generic field component from this list instead of hand-written
+/// per-field JSX, so a new config field appears on the web automatically. No
+/// secrets: descriptors are pure metadata (labels, widgets, validation, write
+/// policy), so this needs no elevation, only normal authentication.
 pub async fn get_settings_schema(
 ) -> Json<Vec<crate::session::config::settings_schema::FieldDescriptor>> {
     Json(runtime_schema())
 }
 
 /// `GET /api/settings/resolved` returns every setting's effective value plus
-/// its provenance chain, so the dashboard can show where a value comes from.
+/// its provenance chain (user value > highest-priority plugin default > schema
+/// default for core; stored value > manifest default for plugin settings). The
+/// dashboard uses it to show where a value comes from. Pure metadata derived
+/// from the same schema the surfaces render, so only normal authentication.
 pub async fn get_settings_resolved(
 ) -> Json<Vec<crate::session::config::settings_schema::ResolvedSetting>> {
     Json(
@@ -626,7 +783,8 @@ pub async fn get_settings_resolved(
     )
 }
 
-/// Body of `PATCH /api/theme`. Either field may be omitted to leave it unchanged.
+/// Body of `PATCH /api/theme`. Either field may be omitted to leave it
+/// unchanged.
 #[derive(serde::Deserialize)]
 pub struct ThemePatch {
     #[serde(default)]
@@ -636,42 +794,54 @@ pub struct ThemePatch {
 }
 
 /// `PATCH /api/theme` sets the global theme name and/or color mode and returns
-/// the freshly resolved theme so the caller can repaint. Theme is global, never
-/// per profile. Deliberately non-elevated, like the web-tour flag: a cosmetic
-/// change must not trip the passphrase wall. `read_only` still blocks it.
+/// the freshly resolved theme so the caller can repaint.
+///
+/// The theme is a global preference (see `config::resolve_theme_name`): it
+/// lives in the global config, never a profile, so one theme paints every
+/// surface. This is a dedicated, non-elevated write (like the web-tour flag)
+/// rather than routing through `PATCH /api/settings`: a cosmetic theme change
+/// must not trip the passphrase wall that guards the general settings surface
+/// (`requires_elevation` keeps profile-settings preference writes off that wall
+/// for the same reason). `read_only` still blocks it.
 pub async fn update_theme(
     State(state): State<Arc<AppState>>,
     body: Result<Json<ThemePatch>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     if state.read_only {
-        return read_only_response();
+        return super::read_only_response();
     }
     let Json(mut patch) = match body {
         Ok(b) => b,
         Err(rej) => return rej.into_response(),
     };
-    // CityHall hides the color-mode control, so only the name is writable (#7).
+    // CityHall hides the color-mode control in the Theme tab, so drop any
+    // client-supplied color_mode; only the theme name is writable here (#7).
     if state.cityhall_mode {
         patch.color_mode = None;
     }
-    // Reject an unknown name so a typo cannot silently repaint to `default`.
-    // Empty is allowed and clears back to the default builtin.
+    // Reject an unknown theme name so a typo can't repaint to the `default`
+    // fallback. Empty is allowed (clears back to the default builtin).
     if let Some(name) = &patch.name {
         if !name.is_empty()
             && !crate::tui::styles::available_themes()
                 .iter()
                 .any(|t| t == name)
         {
-            return api_error(
+            return (
                 StatusCode::BAD_REQUEST,
-                "unknown_theme",
-                format!("Unknown theme '{name}'"),
-            );
+                Json(serde_json::json!({
+                    "error": "unknown_theme",
+                    "message": format!("Unknown theme '{name}'"),
+                })),
+            )
+                .into_response();
         }
     }
     let result = tokio::task::spawn_blocking(move || {
-        // `update_config` re-loads via `Config::load()`, so a corrupt
-        // config.toml errors out instead of being replaced with defaults.
+        // `update_config` re-loads via `Config::load()` (not `load_or_warn`),
+        // so a corrupt config.toml surfaces as an error instead of being
+        // silently replaced with defaults, wiping every other setting, just
+        // to change a theme. A parse error surfaces as a 400 below.
         let theme_name = crate::session::update_config(|config| {
             if let Some(name) = patch.name {
                 config.theme.name = name;
@@ -690,41 +860,44 @@ pub async fn update_theme(
             Ok(val) => (StatusCode::OK, Json(val)).into_response(),
             Err(e) => {
                 tracing::error!(target: "http.api.system", "theme serialization failed: {}", e);
-                api_error(
+                (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    "serialize_failed",
-                    "Failed to serialize theme",
+                    Json(serde_json::json!({"error": "serialize_failed", "message": "Failed to serialize theme"})),
                 )
+                    .into_response()
             }
         },
         Ok(Err(e)) => {
             tracing::warn!(target: "http.api.system", "theme update failed: {}", e);
-            api_error(
+            (
                 StatusCode::BAD_REQUEST,
-                "update_failed",
-                "Failed to update theme",
+                Json(serde_json::json!({"error": "update_failed", "message": "Failed to update theme"})),
             )
+                .into_response()
         }
         Err(e) => {
             tracing::error!(target: "http.api.system", "theme update panicked: {}", e);
-            api_error(
+            (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "internal",
-                "Internal server error",
+                Json(serde_json::json!({"error": "internal", "message": "Internal server error"})),
             )
+                .into_response()
         }
     }
 }
 
-/// Marks the web dashboard's first-run tour as seen.
+/// Marks the web dashboard's first-run tour as seen for this server.
 ///
-/// Single-purpose write so the cosmetic flag never widens the security-sensitive
-/// `PATCH /api/settings` surface, and deliberately exempt from the elevation
-/// wall; `read_only` still blocks it. Persisted to `state.toml`, so a corrupt
-/// `config.toml` cannot block it.
+/// Single-purpose write so the cosmetic flag never widens the
+/// `PATCH /api/settings` surface (which carries security-sensitive
+/// sections like `sandbox`/`worktree`). Deliberately exempt from the
+/// elevation/passphrase wall: it flips one cosmetic bool, grants no
+/// capability, and `read_only` still blocks it. Persisted via
+/// `update_app_state` into `state.toml`, entirely separate from
+/// `config.toml`, so a corrupt global config can never block this flag.
 pub async fn mark_web_tour_seen(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     if state.read_only {
-        return read_only_response();
+        return super::read_only_response();
     }
 
     let result = tokio::task::spawn_blocking(|| {
@@ -742,19 +915,19 @@ pub async fn mark_web_tour_seen(State(state): State<Arc<AppState>>) -> impl Into
             .into_response(),
         Ok(Err(e)) => {
             tracing::warn!(target: "http.api.system", "Marking web tour seen failed: {}", e);
-            api_error(
+            (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "save_failed",
-                "Failed to persist tour state",
+                Json(serde_json::json!({"error": "save_failed", "message": "Failed to persist tour state"})),
             )
+                .into_response()
         }
         Err(e) => {
             tracing::error!(target: "http.api.system", "Marking web tour seen panicked: {}", e);
-            api_error(
+            (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "internal",
-                "Internal server error",
+                Json(serde_json::json!({"error": "internal", "message": "Internal server error"})),
             )
+                .into_response()
         }
     }
 }
@@ -769,16 +942,21 @@ pub struct TipDto {
 
 #[derive(Serialize)]
 pub struct TipsResponse {
-    /// Mirror of `session.show_tips`; the dashboard hides the badge and panel
-    /// when false. Written through `POST /api/tips/show`, not here.
+    /// Mirror of `session.show_tips`. The dashboard hides the badge and panel
+    /// when this is false. This payload is a read projection; the toggle is
+    /// written through the dedicated `POST /api/tips/show` ([`set_show_tips`]),
+    /// and the same preference is also editable from the settings schema.
     pub enabled: bool,
-    /// Web-eligible tips in catalog order, each flagged as seen. The frontend
-    /// derives the badge count from the unseen ones.
+    /// Web-eligible tips in catalog order, each flagged with whether it has been
+    /// seen. The frontend derives the badge count from the unseen ones and can
+    /// still show seen tips in a collapsed section.
     pub tips: Vec<TipDto>,
 }
 
 /// Returns the web-surface tips and whether tips are enabled, composed from the
-/// `crate::tips` catalog plus `app_state.tips_seen` and `session.show_tips`.
+/// shared `crate::tips` catalog plus `app_state.tips_seen` and
+/// `session.show_tips`. A read projection, so it stays a plain GET behind the
+/// token wall like [`get_web_ui_state`]; the TUI-only tips never appear here.
 pub async fn get_tips(State(_state): State<Arc<AppState>>) -> impl IntoResponse {
     let result = tokio::task::spawn_blocking(|| {
         let config = crate::session::Config::load()?;
@@ -807,8 +985,8 @@ pub async fn get_tips(State(_state): State<Arc<AppState>>) -> impl IntoResponse 
 
     match result {
         Ok(Ok(resp)) => (StatusCode::OK, Json(resp)).into_response(),
-        // Best-effort: an unreadable config yields an empty, disabled payload
-        // so the dashboard shows no badge rather than erroring.
+        // Best-effort: an unreadable config yields an empty, disabled payload so
+        // the dashboard simply shows no badge rather than erroring.
         _ => (
             StatusCode::OK,
             Json(TipsResponse {
@@ -825,26 +1003,29 @@ pub struct MarkTipSeenBody {
     pub id: String,
 }
 
-/// Marks one tip seen in the shared `app_state.tips_seen`, so mark-seen-on-view
-/// sticks across devices. Rejects an id outside the catalog so junk cannot
-/// accumulate. Exempt from elevation like [`mark_web_tour_seen`].
+/// Marks one tip seen by appending its id to the shared `app_state.tips_seen`
+/// in `state.toml`, so the dashboard's mark-seen-on-view sticks across devices
+/// and matches the TUI. Single-purpose write mirroring [`mark_web_tour_seen`]:
+/// exempt from the elevation wall, still blocked by `read_only`. Rejects an id
+/// that is not in the catalog so junk can't accumulate in the persisted seen
+/// list.
 pub async fn mark_tip_seen(
     State(state): State<Arc<AppState>>,
     body: Result<Json<MarkTipSeenBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     if state.read_only {
-        return read_only_response();
+        return super::read_only_response();
     }
     let Json(MarkTipSeenBody { id }) = match body {
         Ok(b) => b,
         Err(rej) => return rej.into_response(),
     };
     if !crate::tips::id_in_catalog(&id) {
-        return api_error(
+        return (
             StatusCode::BAD_REQUEST,
-            "unknown_tip",
-            format!("Unknown tip id '{id}'"),
-        );
+            Json(serde_json::json!({"error": "unknown_tip", "message": format!("Unknown tip id '{id}'")})),
+        )
+            .into_response();
     }
 
     let result = tokio::task::spawn_blocking(move || {
@@ -860,19 +1041,19 @@ pub async fn mark_tip_seen(
         Ok(Ok(())) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
         Ok(Err(e)) => {
             tracing::warn!(target: "http.api.system", "Marking tip seen failed: {}", e);
-            api_error(
+            (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "save_failed",
-                "Failed to persist tip state",
+                Json(serde_json::json!({"error": "save_failed", "message": "Failed to persist tip state"})),
             )
+                .into_response()
         }
         Err(e) => {
             tracing::error!(target: "http.api.system", "Marking tip seen panicked: {}", e);
-            api_error(
+            (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "internal",
-                "Internal server error",
+                Json(serde_json::json!({"error": "internal", "message": "Internal server error"})),
             )
+                .into_response()
         }
     }
 }
@@ -882,15 +1063,19 @@ pub struct SetShowTipsBody {
     pub enabled: bool,
 }
 
-/// Sets `session.show_tips`, the "Show tips on startup" checkbox. A cosmetic
-/// preference, so it is a dedicated write exempt from the elevation wall that
-/// guards `PATCH /api/settings`; `read_only` still blocks it.
+/// Sets `session.show_tips`, the "Show tips on startup" checkbox in the tip-of-
+/// the-day modal. A dedicated single-purpose write rather than `PATCH
+/// /api/settings`, which the auth middleware elevation-gates: this is a cosmetic
+/// preference and must not trip the passphrase wall on a remote server. Mirrors
+/// [`mark_web_tour_seen`]: exempt from elevation, still blocked by `read_only`,
+/// and uses `Config::load()` so a corrupt config is not silently replaced. The
+/// same preference is also editable from the settings Interaction tab.
 pub async fn set_show_tips(
     State(state): State<Arc<AppState>>,
     body: Result<Json<SetShowTipsBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     if state.read_only {
-        return read_only_response();
+        return super::read_only_response();
     }
     let Json(SetShowTipsBody { enabled }) = match body {
         Ok(b) => b,
@@ -912,19 +1097,19 @@ pub async fn set_show_tips(
             .into_response(),
         Ok(Err(e)) => {
             tracing::warn!(target: "http.api.system", "Setting show_tips failed: {}", e);
-            api_error(
+            (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "save_failed",
-                "Failed to persist tips state",
+                Json(serde_json::json!({"error": "save_failed", "message": "Failed to persist tips state"})),
             )
+                .into_response()
         }
         Err(e) => {
             tracing::error!(target: "http.api.system", "Setting show_tips panicked: {}", e);
-            api_error(
+            (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "internal",
-                "Internal server error",
+                Json(serde_json::json!({"error": "internal", "message": "Internal server error"})),
             )
+                .into_response()
         }
     }
 }
@@ -934,15 +1119,18 @@ pub struct DismissUpdateBody {
     pub version: String,
 }
 
-/// Records the version whose update banner the user dismissed, in the shared
-/// `app_state.dismissed_update_version`, so the dismissal sticks across devices
-/// and matches the TUI. Exempt from elevation like [`mark_web_tour_seen`].
+/// Records that the user dismissed the update banner for a specific version,
+/// persisting to the shared `app_state.dismissed_update_version` in
+/// `state.toml` so the dismissal sticks across devices (and matches the
+/// TUI's snooze) rather than living in per-browser localStorage.
+/// Single-purpose write mirroring [`mark_web_tour_seen`]: exempt from the
+/// elevation wall, still blocked by `read_only`.
 pub async fn dismiss_update(
     State(state): State<Arc<AppState>>,
     body: Result<Json<DismissUpdateBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     if state.read_only {
-        return read_only_response();
+        return super::read_only_response();
     }
     let Json(body) = match body {
         Ok(b) => b,
@@ -966,26 +1154,28 @@ pub async fn dismiss_update(
             .into_response(),
         Ok(Err(e)) => {
             tracing::warn!(target: "http.api.system", "Dismissing update failed: {}", e);
-            api_error(
+            (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "save_failed",
-                "Failed to persist dismissal",
+                Json(serde_json::json!({"error": "save_failed", "message": "Failed to persist dismissal"})),
             )
+                .into_response()
         }
         Err(e) => {
             tracing::error!(target: "http.api.system", "Dismissing update panicked: {}", e);
-            api_error(
+            (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "internal",
-                "Internal server error",
+                Json(serde_json::json!({"error": "internal", "message": "Internal server error"})),
             )
+                .into_response()
         }
     }
 }
 
-/// Returns the dashboard's server-side UI-state blob (`app_state.web_ui_state`):
-/// a flat map of frontend localStorage keys to opaque string values. Exposes only
-/// UI preferences, so the normal token wall is enough.
+/// Return the web dashboard's server-side UI-state blob (`app_state.web_ui_state`):
+/// a flat map of the frontend's localStorage keys to their opaque string values.
+/// Single-tenant, so this is the one user's synced prefs. GET is unauthenticated
+/// beyond the normal token wall (it grants no capability and exposes only UI
+/// preferences).
 pub async fn get_web_ui_state(State(_state): State<Arc<AppState>>) -> impl IntoResponse {
     let result = tokio::task::spawn_blocking(|| {
         let config = crate::session::Config::load()?;
@@ -994,16 +1184,18 @@ pub async fn get_web_ui_state(State(_state): State<Arc<AppState>>) -> impl IntoR
     .await;
     match result {
         Ok(Ok(map)) => (StatusCode::OK, Json(serde_json::json!(map))).into_response(),
-        // Best-effort: an unreadable config yields an empty blob, so the
-        // dashboard falls back to its localStorage cache.
+        // Best-effort: an unreadable config yields an empty blob rather than an
+        // error, so the dashboard just falls back to its localStorage cache.
         _ => (StatusCode::OK, Json(serde_json::json!({}))).into_response(),
     }
 }
 
-/// Merges a partial update into `app_state.web_ui_state`: a string value sets a
-/// key, `null` deletes it. Non-string, non-null values are ignored since
-/// localStorage values are always strings. Exempt from elevation like
-/// [`mark_web_tour_seen`].
+/// Merge a partial update into `app_state.web_ui_state`. The body is a flat JSON
+/// object keyed by the frontend's localStorage keys: a string value sets the
+/// key, `null` deletes it. Mirrors [`mark_web_tour_seen`]'s exemptions (off the
+/// elevation wall, still blocked by `read_only`, `Config::load()` to avoid
+/// clobbering a corrupt config). Non-string, non-null values are ignored since
+/// localStorage values are always strings.
 pub async fn patch_web_ui_state(
     State(state): State<Arc<AppState>>,
     body: Result<
@@ -1012,15 +1204,16 @@ pub async fn patch_web_ui_state(
     >,
 ) -> impl IntoResponse {
     if state.read_only {
-        return read_only_response();
+        return super::read_only_response();
     }
     let Json(patch) = match body {
         Ok(b) => b,
         Err(rej) => return rej.into_response(),
     };
 
-    // Reject anything that is not a string (set) or null (delete), so a client
-    // regression surfaces instead of silently dropping part of the sync.
+    // Values must be string (set) or null (delete); reject anything else
+    // explicitly so a client regression surfaces instead of silently dropping
+    // part of the sync.
     let invalid: Vec<&String> = patch
         .iter()
         .filter(|(_, v)| !v.is_string() && !v.is_null())
@@ -1048,7 +1241,7 @@ pub async fn patch_web_ui_state(
                     serde_json::Value::String(s) => {
                         state.web_ui_state.insert(key, s);
                     }
-                    // Already rejected above; kept exhaustive.
+                    // Already rejected above; keep exhaustive for safety.
                     _ => {}
                 }
             }
@@ -1060,31 +1253,33 @@ pub async fn patch_web_ui_state(
         Ok(Ok(())) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
         Ok(Err(e)) => {
             tracing::warn!(target: "http.api.system", "Persisting web UI state failed: {}", e);
-            api_error(
+            (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "save_failed",
-                "Failed to persist UI state",
+                Json(serde_json::json!({"error": "save_failed", "message": "Failed to persist UI state"})),
             )
+                .into_response()
         }
         Err(e) => {
             tracing::error!(target: "http.api.system", "Persisting web UI state panicked: {}", e);
-            api_error(
+            (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "internal",
-                "Internal server error",
+                Json(serde_json::json!({"error": "internal", "message": "Internal server error"})),
             )
+                .into_response()
         }
     }
 }
 
-/// Records that the user acknowledged glob `volume_ignores` snapshot expansion
-/// (#2045), so the wizard's confirm modal is shown once. Exempt from elevation
-/// like [`mark_web_tour_seen`].
+/// Records that the user has acknowledged glob `volume_ignores` snapshot
+/// expansion (#2045), so the new-session wizard's confirm modal is shown once
+/// and never again. Single-purpose write mirroring [`mark_web_tour_seen`]: it
+/// flips one bool, grants no capability, stays exempt from the elevation wall,
+/// and `read_only` still blocks it.
 pub async fn mark_volume_ignores_globs_acknowledged(
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
     if state.read_only {
-        return read_only_response();
+        return super::read_only_response();
     }
 
     let result = tokio::task::spawn_blocking(|| {
@@ -1102,19 +1297,19 @@ pub async fn mark_volume_ignores_globs_acknowledged(
             .into_response(),
         Ok(Err(e)) => {
             tracing::warn!(target: "http.api.system", "Marking volume_ignores globs acknowledged failed: {}", e);
-            api_error(
+            (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "save_failed",
-                "Failed to persist acknowledgment",
+                Json(serde_json::json!({"error": "save_failed", "message": "Failed to persist acknowledgment"})),
             )
+                .into_response()
         }
         Err(e) => {
             tracing::error!(target: "http.api.system", "Marking volume_ignores globs acknowledged panicked: {}", e);
-            api_error(
+            (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "internal",
-                "Internal server error",
+                Json(serde_json::json!({"error": "internal", "message": "Internal server error"})),
             )
+                .into_response()
         }
     }
 }
@@ -1130,15 +1325,22 @@ pub async fn list_themes() -> Json<Vec<String>> {
     )
 }
 
-/// Upper bound on the `:name` path segment for `/api/themes/:name`. Past the
-/// cap we resolve Empire without logging the body, to keep tracing sane under
-/// fuzzing.
+/// Upper bound on the `:name` path segment for `/api/themes/:name`.
+/// Builtin names are <= 20 chars and custom theme filenames are
+/// inherently capped by the host filesystem; 128 is far past any
+/// real theme name. Past the cap we resolve Empire without logging
+/// the body to keep tracing output sane under fuzzing.
 const MAX_THEME_NAME_LEN: usize = 128;
 
-/// `GET /api/themes/:name` returns the resolved theme projection for the named
-/// theme. Unknown names resolve to the `default` builtin with
-/// `source: "fallback"`, mirroring `load_theme`. Runs in `spawn_blocking`: the
-/// resolver does sync file I/O.
+/// `GET /api/themes/:name` returns the resolved theme projection (web
+/// CSS vars, terminal CSS vars, syntax highlighter selection,
+/// appearance) for the named theme. Unknown names resolve to the
+/// `default` builtin with `source: "fallback"`, mirroring
+/// `load_theme`'s behaviour.
+///
+/// Wrapped in `spawn_blocking`: the resolver does sync file I/O
+/// (`discover_custom_themes` directory scan + TOML parse) which must
+/// not run on a tokio worker thread.
 pub async fn get_resolved_theme(
     axum::extract::Path(name): axum::extract::Path<String>,
 ) -> Json<crate::tui::styles::ResolvedTheme> {
@@ -1161,12 +1363,14 @@ pub async fn get_resolved_theme(
 }
 
 /// `GET /api/theme/current` returns the resolved theme to paint. Theme is a
-/// global preference, not profile-merged, so every surface paints the same one.
+/// global preference, not profile-merged, so this reads the global config
+/// (see `config::resolve_theme_name`); every surface paints the same theme
+/// regardless of the active session profile. Sync work runs in
+/// `spawn_blocking`.
 pub async fn get_current_theme(
     State(state): State<Arc<AppState>>,
 ) -> Json<crate::tui::styles::ResolvedTheme> {
-    let profile = state.profile.clone();
-    tracing::debug!(profile = %profile, "GET /api/theme/current");
+    tracing::debug!(profile = %*state.served_profile(), "GET /api/theme/current");
     let resolved = tokio::task::spawn_blocking(move || {
         let name = crate::session::config::resolve_theme_name();
         crate::tui::styles::resolve_theme(&name)
@@ -1182,48 +1386,37 @@ pub async fn get_current_theme(
 // --- Wizard support ---
 
 #[derive(Serialize)]
-pub struct ProfileInfo {
-    pub name: String,
+pub struct ProfileInfo<'a> {
+    pub name: &'a str,
     pub is_default: bool,
-    /// Optional short description, shown as helper text in the wizard profile
-    /// picker. Omitted when the profile has none.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
+    pub description: Option<&'a str>,
 }
 
-pub async fn list_profiles(State(state): State<Arc<AppState>>) -> Json<Vec<ProfileInfo>> {
-    // Profile enumeration and description lookups all hit disk; keep them off
-    // the async runtime so a slow filesystem cannot stall Tokio workers.
-    let active_profile = state.profile.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        // Resolve the active profile before enumerating: on a genuine first run
-        // resolution bootstraps `main` and creates its directory, which must
-        // happen before `list_profiles()` or the new profile would be missing.
-        let active: String = if active_profile.is_empty() {
-            crate::session::config::resolve_default_profile()
-        } else {
-            active_profile
-        };
-        // Picker order (`default` last); `active` came from the enumeration.
-        let profiles = crate::session::list_profiles_for_display().unwrap_or_default();
-        profiles
-            .into_iter()
-            .map(|name| {
-                let is_default = name == active;
-                let description = crate::session::load_profile_config(&name)
-                    .ok()
-                    .and_then(|c| c.description);
-                ProfileInfo {
-                    name,
-                    is_default,
-                    description,
-                }
-            })
-            .collect::<Vec<ProfileInfo>>()
-    })
-    .await
-    .unwrap_or_default();
-    Json(result)
+impl AsRef<str> for ProfileInfo<'_> {
+    fn as_ref(&self) -> &str {
+        self.name
+    }
+}
+
+pub async fn list_profiles(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let snapshot = match state.runtime.snapshot(&state).await {
+        Ok(snapshot) => snapshot,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let mut profiles: Vec<_> = snapshot
+        .value
+        .contents
+        .profiles
+        .iter()
+        .map(|profile| ProfileInfo {
+            name: &profile.name,
+            is_default: profile.name == snapshot.value.contents.default_profile,
+            description: profile.description.as_deref(),
+        })
+        .collect();
+    crate::session::sort_profiles_for_display(&mut profiles);
+    Json(profiles).into_response()
 }
 
 #[derive(Deserialize)]
@@ -1231,8 +1424,9 @@ pub struct BrowseQuery {
     pub path: String,
     pub limit: Option<usize>,
     pub filter: Option<String>,
-    /// Include dotfile-prefixed directories, mirroring the TUI picker's Ctrl+H
-    /// toggle. Omitted means false.
+    /// Include dotfile-prefixed directories in the listing. Mirrors the TUI
+    /// picker's Ctrl+H toggle (`src/tui/components/dir_picker.rs`). Omitted
+    /// means false, so existing callers keep the old behavior.
     #[serde(default)]
     pub show_hidden: bool,
 }
@@ -1269,9 +1463,10 @@ pub async fn filesystem_home(State(state): State<Arc<AppState>>) -> impl IntoRes
     }
 }
 
-/// Standard system folders directly under $HOME. On macOS several are
-/// TCC-protected, so opening them prompts. None is ever a git repo, so the
-/// browser skips its `.git` probe for them.
+/// Standard system folders that live directly under $HOME. On macOS several
+/// of these (Downloads, Desktop, Pictures/Photos, Music) are TCC-protected:
+/// opening them triggers a permission prompt. None is ever a git repo, so the
+/// directory browser skips its `.git` probe for them and avoids the prompt.
 const HOME_SYSTEM_DIRS: &[&str] = &[
     "Desktop",
     "Documents",
@@ -1283,7 +1478,8 @@ const HOME_SYSTEM_DIRS: &[&str] = &[
     "Library",
 ];
 
-/// The TCC prompt is macOS-only, so gate the skip there.
+/// The TCC prompt only exists on macOS, so gate the skip there. On other
+/// platforms these folders are probed normally and keep their git badge.
 fn skip_git_probe(parent: &std::path::Path, name: &str, home: Option<&std::path::Path>) -> bool {
     if !cfg!(target_os = "macos") {
         return false;
@@ -1337,8 +1533,10 @@ pub async fn browse_filesystem(
                     continue;
                 }
             }
-            // Probing `.git` opens the directory, which prompts under macOS
-            // TCC. None of the standard $HOME folders is ever a repo.
+            // Probing `.git` inside a directory opens it, which on macOS
+            // triggers a TCC permission prompt. Skip the probe for the
+            // standard system folders directly under $HOME (Downloads,
+            // Desktop, Music, Pictures, etc.); none of them is ever a repo.
             let is_git_repo = if skip_git_probe(&canonical, &name, home.as_deref()) {
                 false
             } else {
@@ -1351,8 +1549,8 @@ pub async fn browse_filesystem(
                 is_git_repo,
             });
         }
-        // Cached: `sort_by_cached_key` calls the keyfn O(n) times rather than
-        // O(n log n), so the lowercase String is allocated once per entry.
+        // Cached: avoids re-allocating the lowercase String on every comparison
+        // (sort_by_key calls the keyfn O(n log n) times, sort_by_cached_key calls it O(n)).
         entries.sort_by_cached_key(|e| e.name.to_lowercase());
         let has_more = entries.len() > limit;
         entries.truncate(limit);
@@ -1362,8 +1560,16 @@ pub async fn browse_filesystem(
 
     match result {
         Ok(Ok(resp)) => (StatusCode::OK, Json(serde_json::to_value(resp).unwrap())).into_response(),
-        Ok(Err(msg)) => api_error(StatusCode::BAD_REQUEST, "browse_failed", msg),
-        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string()),
+        Ok(Err(msg)) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "browse_failed", "message": msg})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "internal", "message": e.to_string()})),
+        )
+            .into_response(),
     }
 }
 
@@ -1507,26 +1713,35 @@ pub async fn docker_status() -> Json<DockerStatus> {
     Json(result)
 }
 
-/// Read-only runtime view of the `aoe serve` daemon's sleep-inhibit reconciler,
-/// derived from the poll loop's snapshot plus the live backend latch.
+/// Read-only runtime view of the `aoe serve` daemon's sleep-inhibit reconciler.
+/// Derived from a snapshot the poll loop publishes plus the live backend latch;
+/// never a control surface.
 #[derive(Serialize)]
 pub struct SleepInhibitStatus {
     /// The `session.prevent_sleep_when_active` toggle as the reconciler last
-    /// read it: the raw config toggle only.
+    /// read it: the raw config toggle only, not the reconciler's `desired`
+    /// (which also folds in recent activity), nor whether an assertion is held.
     pub prevent_sleep_enabled: bool,
-    /// Whether the daemon holds an OS sleep assertion as of the last reconcile,
-    /// so it can trail the death of the backing child by up to the poll interval.
-    /// Requires both a retained slot and an available backend.
+    /// Whether the daemon is holding an OS sleep assertion, as of the last
+    /// reconcile. Refreshed on the poll loop's interval, so it can trail the
+    /// death of the backing child (an external kill, or a backend that spawns
+    /// then fails, as on WSL2 with no logind) by up to that interval. Requires
+    /// both a retained inhibitor slot and an available backend, so a slot
+    /// lingering under the unavailable latch does not report held.
     pub currently_held: bool,
-    /// Whether a real OS backend is still believed able to hold the assertion.
-    /// Optimistic: `true` only means no failure has latched yet, since the
-    /// backend is never actively probed.
+    /// Whether a real OS backend is still believed able to hold the assertion
+    /// on this host. Optimistic: `true` means no failure has latched yet, not
+    /// that the backend was verified working. It is never actively probed, so
+    /// while the toggle is off the backend is never exercised and this stays
+    /// `true` even on a host where it would fail. `false` once a failure
+    /// latches, and false on unsupported platforms.
     pub backend_available: bool,
 }
 
-/// Fold the reconciler snapshot and the live backend-availability read into the
-/// reported status. `currently_held` gates the retained slot on the backend being
-/// available, so a doomed slot kept to suppress respawns never reports held.
+/// Fold the reconciler snapshot bits and the live backend-availability read into
+/// the reported status. `currently_held` gates the retained slot on the backend
+/// being available, so the unavailable latch (which keeps a doomed slot around
+/// to suppress respawns) and the no-op platform backend never report held.
 fn derive_sleep_inhibit_status(
     prevent_sleep_enabled: bool,
     slot_present: bool,
@@ -1544,40 +1759,55 @@ pub struct ServerAbout {
     pub version: String,
     pub auth_required: bool,
     pub passphrase_enabled: bool,
-    /// Resolved `--auth` mode: `"token"`, `"passphrase"`, or `"none"`. Derived
-    /// from the token and login managers because the CLI mode itself is not
-    /// retained in `AppState`.
+    /// Resolved value of `--auth`: `"token"`, `"passphrase"`, or
+    /// `"none"`. The frontend Security panel renders the explicit mode
+    /// label off this so `--auth=passphrase` is not mislabeled as
+    /// `--no-auth`. Derived from `token_manager.is_no_auth()` plus
+    /// `login_manager.is_enabled()` because the CLI mode is not
+    /// retained in `AppState` (only its effects are).
     pub auth_mode: &'static str,
     pub read_only: bool,
     pub behind_tunnel: bool,
-    /// CityHall client mode (`AOE_CITYHALL_MODE`), which drives the dashboard's
-    /// locked-down end-user client. See #7.
+    /// CityHall client mode (`AOE_CITYHALL_MODE`). Drives the web
+    /// dashboard's locked-down end-user client: composer + structured
+    /// view only, name-only session creation, theme-only settings, and
+    /// no terminal / diff / project-management surfaces. See #7.
     pub cityhall_mode: bool,
-    /// The profile this server serves, resolved even without `--profile`.
     pub profile: String,
-    /// Resolved `acp.show_tool_durations`, driving the per-tool elapsed-time
-    /// label in the web UI.
+    /// Resolved value of `acp.show_tool_durations` from the active
+    /// profile's config. Drives the per-tool elapsed-time label in the
+    /// web UI; cross-device since it lives in config.toml.
     pub acp_show_tool_durations: bool,
     /// Resolved `acp.wrap_tool_output`: the initial line-wrap state of tool
     /// output blocks in the web UI.
     pub acp_wrap_tool_output: bool,
-    /// Resolved `acp.replay_events`: per-session retention cap on the acp event
-    /// log, 0 for unlimited. The web client mirrors it on its in-memory activity
-    /// buffer instead of clipping at a hard-coded constant (#1111).
+    /// Resolved value of `acp.replay_events` from the active
+    /// profile's config. Per-session retention cap on the acp
+    /// event log; 0 means unlimited. The web client mirrors this on
+    /// its in-memory activity buffer so the rendered transcript
+    /// honours the user's chosen ceiling instead of clipping at a
+    /// hard-coded constant. See #1111.
     pub acp_replay_events: u32,
-    /// Resolved `acp.compaction_reminder`, gating the structured view's
-    /// compaction reminder. Off by default.
+    /// Resolved value of `acp.compaction_reminder` from the active
+    /// profile. Gates the structured view's compaction reminder; off by
+    /// default. See #3253.
     pub acp_compaction_reminder: bool,
-    /// Resolved `acp.compaction_reminder_percent`: the context-window
-    /// percentage at which the reminder appears.
+    /// Resolved value of `acp.compaction_reminder_percent` from the
+    /// active profile. Context-window percentage at which the reminder
+    /// appears.
     pub acp_compaction_reminder_percent: u8,
-    /// `"debug"` when built with `debug_assertions`, else `"release"`. The web
-    /// UI renders a DEV badge from it so concurrent debug (8081) and release
-    /// (8080) instances are distinguishable, PWA installs included.
+    /// `"debug"` when built with `debug_assertions`, `"release"`
+    /// otherwise. The web UI renders a "DEV" badge in the topbar
+    /// when this is `"debug"` so users can tell concurrently-running
+    /// debug (port 8081) and release (port 8080) instances apart at
+    /// a glance, including PWA installs where the port disappears
+    /// from the window chrome. See #1055.
     pub build_flavor: &'static str,
-    /// Content-hashed entry bundle name of the embedded dashboard build. The
-    /// client compares it against its own entry script tag and offers a reload
-    /// when they differ, since installed PWAs have no refresh affordance.
+    /// Content-hashed entry bundle name (`index-<hash>.js`) of the
+    /// embedded dashboard build. The client compares this against its
+    /// own entry script tag and offers a reload when they differ, so
+    /// installed PWAs (which have no refresh affordance) pick up new
+    /// dashboard code after the binary updates.
     pub web_build_id: Option<&'static str>,
     /// Read-only runtime state of the daemon's sleep-inhibit reconciler.
     pub sleep_inhibit: SleepInhibitStatus,
@@ -1591,8 +1821,9 @@ pub async fn get_about(State(state): State<Arc<AppState>>) -> Json<ServerAbout> 
     let passphrase_enabled = state.login_manager.is_enabled();
     let auth_mode =
         crate::server::resolve_auth_mode(&state.token_manager, &state.login_manager).await;
-    let acp_cfg =
-        crate::session::config::profile_config::resolve_config_or_warn(&state.profile).acp;
+    let _namespace = state.profile_namespace.read().await;
+    let profile = state.served_profile().to_string();
+    let acp_cfg = crate::session::config::profile_config::resolve_config_or_warn(&profile).acp;
     let acp_show_tool_durations = acp_cfg.show_tool_durations;
     let acp_wrap_tool_output = acp_cfg.wrap_tool_output;
     let acp_replay_events = acp_cfg.replay_events;
@@ -1614,7 +1845,7 @@ pub async fn get_about(State(state): State<Arc<AppState>>) -> Json<ServerAbout> 
         read_only: state.read_only,
         behind_tunnel: state.behind_tunnel,
         cityhall_mode: state.cityhall_mode,
-        profile: served_profile(&state),
+        profile,
         acp_show_tool_durations,
         acp_wrap_tool_output,
         acp_replay_events,
@@ -1634,8 +1865,9 @@ pub async fn get_about(State(state): State<Arc<AppState>>) -> Json<ServerAbout> 
 // --- Update status ---
 
 /// Web-facing snapshot of `update::check_for_update`. `update_check_mode`
-/// mirrors `updates.update_check_mode` so the frontend can hide its banner or
-/// skip nagging during a background install without fetching settings.
+/// mirrors `updates.update_check_mode` so the frontend can hide its banner
+/// (mode = `off`) or skip nagging while a background install runs
+/// (mode = `auto`) without separately fetching settings. See #984 and #1140.
 #[derive(Serialize)]
 pub struct UpdateStatusResponse {
     pub update_check_mode: crate::session::config::UpdateCheckMode,
@@ -1656,7 +1888,10 @@ pub struct UpdateStatusResponse {
 }
 
 pub async fn get_update_status(State(state): State<Arc<AppState>>) -> Json<UpdateStatusResponse> {
-    let cfg = crate::session::config::profile_config::resolve_config_or_warn(&state.profile);
+    let namespace = state.profile_namespace.read().await;
+    let profile = state.served_profile().to_string();
+    let cfg = crate::session::config::profile_config::resolve_config_or_warn(&profile);
+    drop(namespace);
     let current = env!("CARGO_PKG_VERSION").to_string();
     let mode = cfg.updates.update_check_mode;
 
@@ -1707,170 +1942,297 @@ pub async fn get_update_status(State(state): State<Arc<AppState>>) -> Json<Updat
 
 // --- Profile management ---
 
-#[derive(Deserialize)]
-pub struct CreateProfileBody {
-    pub name: String,
+async fn commit_profile(
+    state: Arc<AppState>,
+    mutation: crate::daemon::ProfileMutation,
+) -> axum::response::Response {
+    use crate::daemon::{ProfileMutation, ReloadFailureCode, RuntimeHealth};
+    use crate::server::reload::{load_all_profiles, merge_loaded_rows};
+
+    let names = match &mutation {
+        ProfileMutation::Create(body) => [Some(body.name.as_str()), None],
+        ProfileMutation::Rename { name, body } => {
+            [Some(name.as_str()), Some(body.new_name.as_str())]
+        }
+        ProfileMutation::Delete { name, query } => {
+            [Some(name.as_str()), query.replacement_default.as_deref()]
+        }
+        ProfileMutation::SetDefault(body) => [Some(body.name.as_str()), None],
+    };
+    for name in names.into_iter().flatten() {
+        if let Err(error) = validate_profile_name(name) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "validation_failed", "message": error,
+                })),
+            )
+                .into_response();
+        }
+    }
+    let transaction = tokio::select! {
+        _ = state.shutdown.cancelled() => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        transaction = crate::daemon::lifecycle::Transaction::acquire() => match transaction {
+            Ok(transaction) => transaction,
+            Err(error) => {
+                tracing::warn!(%error, "profile catalogue ownership unavailable");
+                return (StatusCode::CONFLICT, crate::daemon::ApiErrorCode::LifecycleLocked.header(),
+                    Json(serde_json::json!({"error": "lifecycle_busy", "message": "Daemon lifecycle is busy"}))).into_response();
+            }
+        },
+    };
+    let namespace = tokio::select! {
+        _ = state.shutdown.cancelled() => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        namespace = state.profile_namespace.write() => namespace,
+    };
+    if *state.canonical_health.read().await != RuntimeHealth::Healthy {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    let creation_active = match &mutation {
+        ProfileMutation::Rename { name, .. } | ProfileMutation::Delete { name, .. } => {
+            state.session_service.has_profile_creation(name)
+        }
+        _ => false,
+    };
+    if creation_active {
+        return (
+            StatusCode::CONFLICT,
+            crate::daemon::ApiErrorCode::LifecycleLocked.header(),
+            Json(serde_json::json!({"error": "lifecycle_busy", "message": "Profile has an active creation"})),
+        ).into_response();
+    }
+    let file_watch = state.file_watch.clone();
+    let prepared = tokio::task::spawn_blocking(move || {
+        let catalogue = crate::session::ProfileCatalogueTransaction::with_transaction(transaction)?;
+        let loaded = load_all_profiles(&file_watch).map(|_| ());
+        Ok::<_, anyhow::Error>((catalogue, loaded))
+    })
+    .await
+    .map_err(anyhow::Error::from)
+    .and_then(|result| result);
+    let (catalogue, preflight) = match prepared {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            tracing::warn!(%error, "profile catalogue preparation failed");
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+    };
+    if let Err(error) = preflight {
+        state.mark_reload_failure(error.health).await;
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    let publication = state.publication.write().await;
+    if *state.canonical_health.read().await != RuntimeHealth::Healthy {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    let file_watch = state.file_watch.clone();
+    let committed = tokio::task::spawn_blocking(move || {
+        let mut directory_moved = false;
+        let result = match &mutation {
+            ProfileMutation::Create(body) => catalogue.create(&body.name),
+            ProfileMutation::Rename { name, body } => {
+                let outcome = catalogue.rename(name, &body.new_name);
+                directory_moved = outcome.directory_moved;
+                outcome.result
+            }
+            ProfileMutation::Delete { name, query } => catalogue
+                .delete(name, query.replacement_default.as_deref())
+                .map(|_| ()),
+            ProfileMutation::SetDefault(body) => catalogue.set_default(&body.name),
+        };
+        let loaded = load_all_profiles(&file_watch);
+        (catalogue, mutation, directory_moved, result, loaded)
+    })
+    .await;
+    let (catalogue, mutation, directory_moved, result, loaded) = match committed {
+        Ok(committed) => committed,
+        Err(error) => {
+            tracing::warn!(%error, "profile catalogue commit task failed");
+            *state.canonical_health.write().await = RuntimeHealth::Degraded {
+                code: ReloadFailureCode::Metadata,
+                profiles: Vec::new(),
+            };
+            state.runtime.request_publish();
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+    };
+    if directory_moved {
+        if let ProfileMutation::Rename { name, body } = &mutation {
+            state.rename_served_profile(name, &body.new_name);
+            crate::server::rename_profile_disk_watch(&state, name, &body.new_name).await;
+        }
+    }
+    let loaded = match loaded {
+        Ok(loaded) => loaded,
+        Err(error) => {
+            *state.canonical_health.write().await = error.health;
+            state.runtime.request_publish();
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+    };
+    let suppressed =
+        crate::session::recovery::snapshot_recently_restarted(&state.recently_restarted);
+    merge_loaded_rows(
+        &mut *state.instances.write().await,
+        loaded.instances,
+        crate::server::state::StatusSource::DiskOnly,
+        &suppressed,
+    );
+    *state.canonical_metadata.write().await = loaded.metadata;
+    *state.canonical_health.write().await = RuntimeHealth::Healthy;
+    state
+        .mutation_epoch
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    state.runtime.request_publish();
+    drop(publication);
+
+    if result.is_ok() {
+        match &mutation {
+            ProfileMutation::Create(body) => {
+                crate::server::add_profile_disk_watch(&state, &body.name).await
+            }
+            ProfileMutation::Rename { .. } => {}
+            ProfileMutation::Delete { name, .. } => {
+                crate::server::remove_profile_disk_watch(&state, name).await
+            }
+            ProfileMutation::SetDefault(_) => {}
+        }
+    }
+    drop(namespace);
+    drop(catalogue);
+    let snapshot = match state.runtime.publish(&state).await {
+        Ok(snapshot) => snapshot,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    if let Err(error) = result {
+        let code = match mutation {
+            ProfileMutation::Create(_) => "create_failed",
+            ProfileMutation::Rename { .. } => "rename_failed",
+            ProfileMutation::Delete { .. } => "delete_failed",
+            ProfileMutation::SetDefault(_) => "update_failed",
+        };
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": code, "message": error.to_string()})),
+        )
+            .into_response();
+    }
+    let status = if matches!(mutation, ProfileMutation::Create(_)) {
+        StatusCode::CREATED
+    } else {
+        StatusCode::OK
+    };
+    crate::server::runtime::mutation_response(
+        &snapshot.value.cursor,
+        (status, Json(serde_json::json!({"ok": true}))),
+    )
 }
 
 pub async fn create_profile(
     State(state): State<Arc<AppState>>,
-    body: Result<Json<CreateProfileBody>, axum::extract::rejection::JsonRejection>,
+    body: Result<Json<crate::daemon::CreateProfileBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     if state.read_only {
-        return read_only_response();
+        return super::read_only_response();
     }
-    // Profiles are hidden entirely in CityHall (no picker, no CRUD UI).
-    if let Some(resp) = super::cityhall_block(&state) {
-        return resp;
+    if let Some(response) = super::cityhall_block(&state) {
+        return response;
     }
     let Json(body) = match body {
-        Ok(b) => b,
-        Err(rej) => return rej.into_response(),
+        Ok(body) => body,
+        Err(error) => return error.into_response(),
     };
-    if let Err(e) = validate_profile_name(&body.name) {
-        return api_error(StatusCode::BAD_REQUEST, "validation_failed", e);
-    }
-    let name_for_create = body.name.clone();
-    match tokio::task::spawn_blocking(move || crate::session::create_profile(&name_for_create))
-        .await
-    {
-        Ok(Ok(())) => {
-            crate::server::add_profile_disk_watch(&state, &body.name).await;
-            (StatusCode::CREATED, Json(serde_json::json!({"ok": true}))).into_response()
-        }
-        Ok(Err(e)) => api_error(StatusCode::BAD_REQUEST, "create_failed", e.to_string()),
-        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string()),
-    }
+    commit_profile(state, crate::daemon::ProfileMutation::Create(body)).await
 }
 
 pub async fn delete_profile(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(name): axum::extract::Path<String>,
+    query: Result<
+        axum::extract::Query<crate::daemon::DeleteProfileQuery>,
+        axum::extract::rejection::QueryRejection,
+    >,
 ) -> impl IntoResponse {
     if state.read_only {
-        return read_only_response();
+        return super::read_only_response();
     }
-    // Profiles are hidden entirely in CityHall (no picker, no CRUD UI).
-    if let Some(resp) = super::cityhall_block(&state) {
-        return resp;
+    if let Some(response) = super::cityhall_block(&state) {
+        return response;
     }
-    if let Err(e) = validate_profile_name(&name) {
-        return api_error(StatusCode::BAD_REQUEST, "validation_failed", e);
-    }
-    if name == state.profile {
-        return api_error(
-            StatusCode::BAD_REQUEST,
-            "active_profile",
-            "Cannot delete the active profile",
-        );
-    }
-    let name_for_delete = name.clone();
-    match tokio::task::spawn_blocking(move || crate::session::delete_profile(&name_for_delete))
-        .await
-    {
-        Ok(Ok(())) => {
-            crate::server::remove_profile_disk_watch(&state, &name).await;
-            (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response()
-        }
-        Ok(Err(e)) => api_error(StatusCode::BAD_REQUEST, "delete_failed", e.to_string()),
-        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string()),
-    }
-}
-
-#[derive(Deserialize)]
-pub struct RenameProfileBody {
-    pub new_name: String,
+    let axum::extract::Query(query) = match query {
+        Ok(query) => query,
+        Err(error) => return error.into_response(),
+    };
+    commit_profile(
+        state,
+        crate::daemon::ProfileMutation::Delete { name, query },
+    )
+    .await
 }
 
 pub async fn rename_profile(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(name): axum::extract::Path<String>,
-    body: Result<Json<RenameProfileBody>, axum::extract::rejection::JsonRejection>,
+    body: Result<Json<crate::daemon::RenameProfileBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     if state.read_only {
-        return read_only_response();
+        return super::read_only_response();
     }
-    // Profiles are hidden entirely in CityHall (no picker, no CRUD UI).
-    if let Some(resp) = super::cityhall_block(&state) {
-        return resp;
+    if let Some(response) = super::cityhall_block(&state) {
+        return response;
     }
     let Json(body) = match body {
-        Ok(b) => b,
-        Err(rej) => return rej.into_response(),
+        Ok(body) => body,
+        Err(error) => return error.into_response(),
     };
-    if let Err(e) = validate_profile_name(&name) {
-        return api_error(StatusCode::BAD_REQUEST, "validation_failed", e);
-    }
-    if let Err(e) = validate_profile_name(&body.new_name) {
-        return api_error(StatusCode::BAD_REQUEST, "validation_failed", e);
-    }
-    let old = name;
-    let new = body.new_name;
-    let old_for_rewire = old.clone();
-    let new_for_rewire = new.clone();
-    match tokio::task::spawn_blocking(move || crate::session::rename_profile(&old, &new)).await {
-        Ok(Ok(())) => {
-            crate::server::rename_profile_disk_watch(&state, &old_for_rewire, &new_for_rewire)
-                .await;
-            (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response()
-        }
-        Ok(Err(e)) => api_error(StatusCode::BAD_REQUEST, "rename_failed", e.to_string()),
-        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string()),
-    }
-}
-
-#[derive(Deserialize)]
-pub struct DefaultProfileBody {
-    pub name: String,
+    commit_profile(state, crate::daemon::ProfileMutation::Rename { name, body }).await
 }
 
 pub async fn default_profile(
     State(state): State<Arc<AppState>>,
-    body: Result<Json<DefaultProfileBody>, axum::extract::rejection::JsonRejection>,
+    body: Result<Json<crate::daemon::DefaultProfileBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     if state.read_only {
-        return read_only_response();
+        return super::read_only_response();
     }
-    // Profiles are hidden entirely in CityHall (no picker, no CRUD UI).
-    if let Some(resp) = super::cityhall_block(&state) {
-        return resp;
+    if let Some(response) = super::cityhall_block(&state) {
+        return response;
     }
     let Json(body) = match body {
-        Ok(b) => b,
-        Err(rej) => return rej.into_response(),
+        Ok(body) => body,
+        Err(error) => return error.into_response(),
     };
-    if let Err(e) = validate_profile_name(&body.name) {
-        return api_error(StatusCode::BAD_REQUEST, "validation_failed", e);
-    }
-    let name = body.name;
-    match tokio::task::spawn_blocking(move || crate::session::set_default_profile(&name)).await {
-        Ok(Ok(())) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
-        Ok(Err(e)) => api_error(StatusCode::BAD_REQUEST, "update_failed", e.to_string()),
-        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string()),
-    }
+    commit_profile(state, crate::daemon::ProfileMutation::SetDefault(body)).await
 }
 
 pub async fn get_profile_settings(
     axum::extract::Path(name): axum::extract::Path<String>,
 ) -> impl IntoResponse {
     if let Err(e) = validate_profile_name(&name) {
-        return api_error(StatusCode::BAD_REQUEST, "validation_failed", e);
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "validation_failed", "message": e})),
+        )
+            .into_response();
     }
     let result = tokio::task::spawn_blocking(move || {
         let profile = crate::session::load_profile_config(&name)?;
         let global = crate::session::Config::load_or_warn();
         let mut val = serde_json::to_value(&profile)?;
-        // `logging` lives on the global Config with no profile override
-        // surface, so splice it in; otherwise the settings dropdowns reset on
-        // every page load even after a successful PATCH.
+        // The `logging` section lives on global Config (no profile
+        // override surface yet). Splice it into the response so the
+        // settings UI can render its current values from a single
+        // GET — without this the dropdowns would reset on every page
+        // load even after a successful PATCH.
         if let Some(obj) = val.as_object_mut() {
             obj.insert(
                 "logging".to_string(),
                 serde_json::to_value(&global.logging)?,
             );
-            // Plugin settings are global-only at Tier 0, so splice them in or
-            // the dashboard reverts to manifest defaults on every profile-view
-            // load (#2094).
+            // Plugin settings live in the global config (global-only at Tier 0),
+            // not the profile override. Splice them in so the dashboard's plugin
+            // settings render their persisted values instead of reverting to the
+            // manifest default on every profile-view load (#2094).
             obj.insert(
                 "plugins".to_string(),
                 serde_json::to_value(&global.plugins)?,
@@ -1881,18 +2243,23 @@ pub async fn get_profile_settings(
     .await;
     match result {
         Ok(Ok(val)) => (StatusCode::OK, Json(val)).into_response(),
-        Ok(Err(e)) => api_error(
+        Ok(Err(e)) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            "load_failed",
-            e.to_string(),
-        ),
-        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string()),
+            Json(serde_json::json!({"error": "load_failed", "message": e.to_string()})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "internal", "message": e.to_string()})),
+        )
+            .into_response(),
     }
 }
 
-/// Leaf paths CityHall mode may write through the profile-settings PATCH: only
-/// the curated trash cluster the Sessions tab exposes, so an endpoint that must
-/// stay open cannot double as an arbitrary profile-override writer (#7).
+/// Leaf paths CityHall mode may write via the profile-settings PATCH: only the
+/// curated trash cluster the Sessions tab exposes. Everything else is closed so
+/// the endpoint (which must stay open for those toggles) cannot double as an
+/// arbitrary profile-override writer. See #7.
 const CITYHALL_PROFILE_LEAVES: &[&str] = &[
     "session.delete_to_trash",
     "session.confirm_delete",
@@ -1928,38 +2295,42 @@ pub async fn update_profile_settings(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(name): axum::extract::Path<String>,
     session: Option<axum::Extension<AuthenticatedSession>>,
-    loopback: Option<axum::Extension<LoopbackTrusted>>,
+    loopback: Option<axum::Extension<LocalAuthorization>>,
     body: Result<Json<serde_json::Value>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     if state.read_only {
-        return read_only_response();
+        return super::read_only_response();
     }
     let Json(mut body) = match body {
         Ok(b) => b,
         Err(rej) => return rej.into_response(),
     };
     if let Err(e) = validate_profile_name(&name) {
-        return api_error(StatusCode::BAD_REQUEST, "validation_failed", e);
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "validation_failed", "message": e})),
+        )
+            .into_response();
     }
-    // Reject any leaf outside the CityHall allowlist, so the endpoint kept open
-    // for the Sessions trash toggles cannot write arbitrary overrides (#7).
+    // Keep the CityHall profile endpoint restricted to its explicit allowlist.
+
     if state.cityhall_mode {
         if let Some(bad) = first_non_cityhall_profile_leaf(&body) {
-            return api_error(
+            return (
                 StatusCode::FORBIDDEN,
-                "cityhall_mode",
-                format!("Field '{bad}' is not writable in CityHall mode"),
-            );
+                crate::daemon::ApiErrorCode::CityhallMode.header(),
+                Json(serde_json::json!({
+                    "error": "cityhall_mode",
+                    "message": format!("Field '{bad}' is not writable in CityHall mode"),
+                })),
+            )
+                .into_response();
         }
     }
-    // Elevation up front: login disabled means always elevated, a
-    // loopback-trusted caller is elevated per the #1168 carve-out (#2610).
     let elevated = handler_elevated(&state, session.as_deref(), loopback.is_some()).await;
 
-    // Validate every leaf against the schema (#1692). An
-    // elevation_required 403 mirrors the path-shape gate's payload so
-    // web/src/lib/fetchInterceptor.ts fires the passphrase prompt (#1510).
-    // `description` is profile-only and rejected on the global endpoint.
+    // Validate every leaf against the schema. Global-only fields are invalid here.
+    // Elevation failures retain the payload consumed by the web prompt.
     if let Err(rej) = validate_patch(&body, Scope::Profile, elevated) {
         return reject_response(rej);
     }
@@ -1967,78 +2338,28 @@ pub async fn update_profile_settings(
     // Validate scope before stripping, including global-only local fields.
     strip_local_only(&mut body);
 
-    match write_profile_patch(name, body).await {
-        Ok(config) => match serde_json::to_value(&config) {
-            Ok(val) => (StatusCode::OK, Json(val)).into_response(),
-            Err(e) => api_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "serialize_failed",
-                e.to_string(),
-            ),
-        },
-        Err(resp) => resp,
-    }
-}
-
-/// Apply a validated patch onto a profile's sparse override file.
-async fn write_profile_patch(
-    name: String,
-    body: serde_json::Value,
-) -> Result<crate::session::ProfileConfig, axum::response::Response> {
-    let result = tokio::task::spawn_blocking(move || {
-        let config = crate::session::load_profile_config(&name).unwrap_or_default();
-        let mut current = serde_json::to_value(&config)?;
-        // Apply each validated leaf onto the sparse override object: null
-        // clears it, anything else sets it. Sections are created lazily so a
-        // single-field patch never wipes its siblings.
-        if let Some(update_obj) = body.as_object() {
-            for (key, value) in update_obj {
-                match value {
-                    serde_json::Value::Object(fields) => {
-                        for (field, fval) in fields {
-                            if fval.is_null() {
-                                clear_path(&mut current, key, field);
-                            } else if let Some(root) = current.as_object_mut() {
-                                let section = root
-                                    .entry(key.clone())
-                                    .or_insert_with(|| serde_json::json!({}));
-                                if let Some(sec) = section.as_object_mut() {
-                                    sec.insert(field.clone(), fval.clone());
-                                }
-                            }
-                        }
-                    }
-                    serde_json::Value::Null => {
-                        if let Some(root) = current.as_object_mut() {
-                            root.remove(key);
-                        }
-                    }
-                    other => {
-                        if let Some(root) = current.as_object_mut() {
-                            root.insert(key.clone(), other.clone());
-                        }
-                    }
-                }
-            }
-        }
-        let config: crate::session::ProfileConfig = serde_json::from_value(current)?;
-        crate::session::save_profile_config(&name, &config)?;
-        Ok::<_, anyhow::Error>(config)
-    })
-    .await;
+    let written = body.clone();
+    let result = tokio::task::spawn_blocking(move || apply_profile_patch(&name, &written)).await;
 
     match result {
-        Ok(Ok(config)) => Ok(config),
-        Ok(Err(e)) => Err(api_error(
+        Ok(Ok(config)) => match serde_json::to_value(&config) {
+            Ok(val) => (StatusCode::OK, Json(val)).into_response(),
+            Err(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "serialize_failed", "message": e.to_string()})),
+            )
+                .into_response(),
+        },
+        Ok(Err(e)) => (
             StatusCode::BAD_REQUEST,
-            "update_failed",
-            e.to_string(),
-        )),
-        Err(e) => Err(api_error(
+            Json(serde_json::json!({"error": "update_failed", "message": e.to_string()})),
+        )
+            .into_response(),
+        Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            "internal",
-            e.to_string(),
-        )),
+            Json(serde_json::json!({"error": "internal", "message": e.to_string()})),
+        )
+            .into_response(),
     }
 }
 
@@ -2048,14 +2369,19 @@ pub async fn list_sounds() -> Json<Vec<String>> {
     Json(crate::sound::list_available_sounds())
 }
 
-/// Serve a sound file by name so the acp's browser-side approval player can
-/// fetch it same-origin. The name is validated against
-/// `list_available_sounds()`, so this cannot read arbitrary disk paths.
+/// Serve a sound file by name so the acp's browser-side approval
+/// player can fetch it from the same origin as the dashboard. The name
+/// is validated against `list_available_sounds()` to block path
+/// traversal: an attacker who can hit `/api/sounds/file/<x>` cannot
+/// read arbitrary disk paths, only files already present in the user's
+/// `sounds/` directory.
 pub async fn serve_sound_file(
     axum::extract::Path(name): axum::extract::Path<String>,
 ) -> impl IntoResponse {
-    // `list_available_sounds` does a sync `read_dir`, so validation stays on
-    // the blocking pool; the file read uses `tokio::fs::read`.
+    // The validation step (directory enumeration) stays on the blocking
+    // pool because `list_available_sounds` does sync `read_dir`. The
+    // file read itself uses `tokio::fs::read` so the larger I/O cost
+    // does not block a runtime worker.
     let lookup_name = name.clone();
     let validated = tokio::task::spawn_blocking(move || {
         if !crate::sound::list_available_sounds().contains(&lookup_name) {
@@ -2103,121 +2429,195 @@ mod tests {
     use axum::body::to_bytes;
     use std::collections::HashMap;
 
-    #[test]
-    fn settings_save_routes_each_leaf_to_its_layer() {
-        use serde_json::json;
-        let schema = crate::session::config::settings_schema::schema();
-        let patch = json!({
-            "session": {"default_tool": "codex", "sidebar_position": "right"},
-            "plugin:demo": {"level": 3},
-            "nosuch": {"field": 1},
-            "theme": "flat",
-        });
-        let serde_json::Value::Object(patch) = patch else {
-            unreachable!()
-        };
-        let (machine, profile) = split_patch_by_layer(&schema, patch);
-        assert_eq!(profile, json!({"session": {"default_tool": "codex"}}));
-        assert_eq!(
-            machine,
-            json!({
-                "session": {"sidebar_position": "right"},
-                "plugin:demo": {"level": 3},
-                "nosuch": {"field": 1},
-                "theme": "flat",
-            })
-        );
-    }
-
-    /// End to end through the handler with login on: without a recent
-    /// passphrase a machine-wide leaf is refused, a plain profile leaf saves,
-    /// and a save mixing both writes neither.
     #[tokio::test]
     #[serial_test::serial]
-    async fn settings_save_elevates_only_machine_wide_leaves() {
-        use serde_json::json;
-        let home = tempfile::TempDir::new().unwrap();
-        let _home = crate::session::test_support::isolate_home(home.path());
-        let mut state = crate::server::test_support::build_test_app_state(Vec::new());
-        Arc::get_mut(&mut state).expect("fresh state").login_manager =
-            Arc::new(crate::server::login::LoginManager::new(Some("pw")));
-        let session = state
-            .login_manager
-            .create_session(b"bind", "127.0.0.1", "t")
-            .await;
-        let save = |body: serde_json::Value| {
-            let state = state.clone();
-            let session = session.clone();
-            async move {
-                update_settings(
-                    State(state),
-                    axum::extract::Query(SettingsQuery {
-                        profile: None,
-                        layer: None,
-                    }),
-                    Some(axum::Extension(AuthenticatedSession(session))),
-                    None,
-                    Ok(Json(body)),
+    async fn profile_catalogue_mutations_publish_before_receipt() -> anyhow::Result<()> {
+        use axum::{
+            body::Body,
+            http::Request,
+            routing::{delete, get, patch},
+            Router,
+        };
+        use tower::ServiceExt;
+
+        let temp = tempfile::tempdir()?;
+        let _guard = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let state = crate::server::test_support::build_test_app_state(Vec::new());
+        crate::session::Storage::new("alpha", state.file_watch.clone())?;
+        crate::session::save_profile_config(
+            "alpha",
+            &crate::session::ProfileConfig {
+                description: Some("retained catalogue description".into()),
+                ..Default::default()
+            },
+        )?;
+        crate::session::set_default_profile("alpha")?;
+
+        *state.canonical_metadata.write().await =
+            crate::server::reload::load_all_profiles(&state.file_watch)?.metadata;
+        let mut revision = state.runtime.publish(&state).await?.value.cursor.revision;
+        let router = Router::new()
+            .route("/api/profiles", get(list_profiles).post(create_profile))
+            .route("/api/profiles/{name}", delete(delete_profile))
+            .route("/api/profiles/{name}/rename", patch(rename_profile))
+            .route("/api/default-profile", patch(default_profile))
+            .with_state(state.clone());
+
+        for (method, uri, body, status, expected_default, expected_names) in [
+            (
+                "POST",
+                "/api/profiles",
+                r#"{"name":"beta"}"#,
+                StatusCode::CREATED,
+                "alpha",
+                &["alpha", "beta"][..],
+            ),
+            (
+                "PATCH",
+                "/api/default-profile",
+                r#"{"name":"beta"}"#,
+                StatusCode::OK,
+                "beta",
+                &["alpha", "beta"][..],
+            ),
+            (
+                "PATCH",
+                "/api/profiles/beta/rename",
+                r#"{"new_name":"gamma"}"#,
+                StatusCode::OK,
+                "gamma",
+                &["alpha", "gamma"][..],
+            ),
+            (
+                "DELETE",
+                "/api/profiles/gamma?replacement_default=alpha",
+                "",
+                StatusCode::OK,
+                "alpha",
+                &["alpha"][..],
+            ),
+        ] {
+            if method == "DELETE" {
+                for replacement in ["gamma", "missing"] {
+                    let response = router
+                        .clone()
+                        .oneshot(
+                            Request::builder()
+                                .method("DELETE")
+                                .uri(format!(
+                                    "/api/profiles/gamma?replacement_default={replacement}"
+                                ))
+                                .body(Body::empty())?,
+                        )
+                        .await?;
+                    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+                    assert!(crate::session::get_profile_dir_path("gamma")?.is_dir());
+                    assert_eq!(crate::session::Config::load()?.default_profile, "gamma");
+                }
+            }
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(uri)
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))?,
                 )
-                .await
-                .into_response()
-                .status()
-            }
-        };
-        let machine_tool = || crate::session::Config::load().unwrap().session.default_tool;
-        let profile_tool = || {
-            let config = crate::session::load_profile_config("test").unwrap();
-            serde_json::to_value(config).unwrap()["session"]["default_tool"]
-                .as_str()
-                .map(str::to_owned)
-        };
+                .await?;
+            assert_eq!(response.status(), status);
+            let receipt = response
+                .headers()
+                .get(crate::daemon::RUNTIME_REVISION_HEADER)
+                .expect("a successful profile mutation must acknowledge its published snapshot")
+                .to_str()?
+                .parse::<u64>()?;
+            assert!(receipt > revision);
+            revision = receipt;
+            let snapshot = state.runtime.snapshot(&state).await?;
+            assert_eq!(snapshot.value.cursor.revision, receipt);
+            assert_eq!(snapshot.value.contents.default_profile, expected_default);
+            assert_eq!(
+                snapshot
+                    .value
+                    .contents
+                    .profiles
+                    .iter()
+                    .map(|profile| profile.name.as_str())
+                    .collect::<Vec<_>>(),
+                expected_names
+            );
 
-        let mixed = json!({"session": {"default_tool": "codex", "sidebar_position": "right"}});
-        assert_eq!(save(mixed).await, StatusCode::FORBIDDEN);
-        assert_eq!(profile_tool(), None, "a refused save writes neither layer");
-        let machine = json!({"session": {"sidebar_position": "right"}});
-        assert_eq!(save(machine.clone()).await, StatusCode::FORBIDDEN);
-
-        let profile = json!({"session": {"default_tool": "codex"}});
-        assert_eq!(save(profile).await, StatusCode::OK);
-        assert_eq!(profile_tool().as_deref(), Some("codex"));
-        assert_eq!(machine_tool(), None);
-
-        state.login_manager.elevate_session(&session).await;
-        assert_eq!(save(machine).await, StatusCode::OK);
-    }
-
-    #[test]
-    fn machine_wide_leaves_need_elevation() {
-        use serde_json::json;
-        let leaf = json!({"session": {"sidebar_position": "right"}});
-        // (machine part, elevated) -> rejected
-        let cases = [
-            (&leaf, false, true),
-            (&leaf, true, false),
-            (&json!({}), false, false),
-        ];
-        for (machine, elevated, rejected) in cases {
-            let verdict = machine_elevation_gate(machine, elevated);
-            assert_eq!(verdict.is_err(), rejected, "{machine} elevated={elevated}");
-            if let Err(rej) = verdict {
-                assert_eq!(rej.error_code(), "elevation_required");
-            }
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/profiles")
+                        .body(Body::empty())?,
+                )
+                .await?;
+            assert_eq!(response.status(), StatusCode::OK);
+            let profiles: Vec<serde_json::Value> =
+                serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await?)?;
+            assert_eq!(
+                profiles
+                    .iter()
+                    .filter(|profile| profile["is_default"] == true)
+                    .map(|profile| profile["name"].as_str().unwrap())
+                    .collect::<Vec<_>>(),
+                [expected_default]
+            );
         }
+        std::fs::write(
+            crate::session::get_profile_dir_path("alpha")?.join("config.toml"),
+            "description = [",
+        )?;
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/profiles")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"name":"not-committed"}"#))?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(!crate::session::get_profile_dir_path("not-committed")?.exists());
+        let snapshot = state.runtime.publish(&state).await?;
+        assert!(
+            matches!(&snapshot.value.contents.health, crate::daemon::RuntimeHealth::Degraded {
+            code: crate::daemon::ReloadFailureCode::ProfileData, profiles
+        } if profiles == &["alpha"])
+        );
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/profiles")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let profiles: Vec<serde_json::Value> =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await?)?;
+        assert_eq!(profiles[0]["description"], "retained catalogue description");
+        Ok(())
     }
 
     #[test]
     fn derive_sleep_inhibit_status_gates_held_on_backend() {
-        // The last two rows are unreachable from the writer but pin the pure
-        // gate, proving `currently_held` excludes prevent_sleep_enabled.
+        // First three rows are reconciler-reachable states; the last two are
+        // not reachable from the writer (toggle off releases the slot) but pin
+        // the pure gate, proving `currently_held` excludes prevent_sleep_enabled.
         // (prevent_sleep_enabled, slot_present, backend_available) -> currently_held
         let cases = [
             // supported host actively holding the assertion
             ((true, true, true), true),
             // toggle on but every session idle past grace: slot released
             ((true, false, true), false),
-            // backend latched unavailable or no-op platform: the slot is kept
-            // to suppress respawns, yet no real assertion is held
+            // backend latched unavailable (helper missing / WSL2) or no-op
+            // platform: is_held_alive keeps the slot to suppress respawns, yet
+            // no real assertion is held
             ((true, true, false), false),
             // gate guard: enabled must not force held when the backend is down
             ((false, true, false), false),
@@ -2270,10 +2670,12 @@ mod tests {
     fn skip_git_probe_avoids_protected_home_folders() {
         let home = std::path::Path::new("/Users/alice");
 
-        // The TCC prompt is macOS-only, so other platforms probe normally.
+        // The skip is macOS-only: the TCC prompt does not exist elsewhere,
+        // so other platforms probe normally and keep the git badge.
         let macos = cfg!(target_os = "macos");
 
-        // Protected folders directly under $HOME: skipped on macOS.
+        // Protected/system folders directly under $HOME: skipped on macOS so
+        // it never prompts for Downloads/Desktop/Music/Pictures.
         for name in ["Downloads", "Desktop", "Music", "Pictures", "Documents"] {
             assert_eq!(
                 skip_git_probe(home, name, Some(home)),
@@ -2286,7 +2688,8 @@ mod tests {
         // badge is preserved.
         assert!(!skip_git_probe(home, "myproject", Some(home)));
 
-        // A system-looking name that is not directly under $HOME is probed.
+        // A folder named like a system dir but NOT directly under $HOME is
+        // probed normally (only the direct-$HOME set is protected).
         let sub = std::path::Path::new("/Users/alice/code");
         assert!(!skip_git_probe(sub, "Downloads", Some(home)));
 
@@ -2301,14 +2704,17 @@ mod tests {
             .collect()
     }
 
-    /// The default policy, for tests that predate the allowlist.
+    /// The default policy, for the tests that predate the allowlist and care
+    /// about other fields.
     fn unrestricted() -> crate::acp::agent_policy::AgentPolicy {
         crate::acp::agent_policy::AgentPolicy::for_test(false, &[])
     }
 
-    /// #3241: policy is a separate axis from capability. A disallowed agent
-    /// still reports `acp_capable: true` so the settings surfaces can edit its
-    /// per-agent defaults; only `acp_allowed` goes false.
+    /// #3241: policy is a separate axis from capability. A disallowed agent must
+    /// still report `acp_capable: true` so the settings surfaces that enumerate
+    /// this endpoint can keep editing its per-agent structured-view defaults;
+    /// only `acp_allowed` goes false. Overloading `acp_capable` would have hidden
+    /// it from the operator's own settings UI.
     #[test]
     fn acp_allowed_is_independent_of_acp_capable() {
         let custom = custom_agents(&[("oc-sp", "ocp run sp"), ("blocked", "ssh host claude")]);
@@ -2332,6 +2738,22 @@ mod tests {
         // Unrestricted leaves both true, so the default path is unchanged.
         let entries = build_custom_agent_infos(&custom, &acp, &HashMap::new(), &unrestricted());
         assert!(entries.iter().all(|e| e.acp_capable && e.acp_allowed));
+    }
+
+    #[test]
+    fn custom_agent_entries_never_serialize_command_values() {
+        let entries = build_custom_agent_infos(
+            &custom_agents(&[("remote-agent", "ssh -t prod.example claude")]),
+            &HashMap::new(),
+            &HashMap::new(),
+            &unrestricted(),
+        );
+
+        let json = serde_json::to_string(&entries).unwrap();
+        assert!(json.contains("remote-agent"));
+        assert!(!json.contains("ssh"));
+        assert!(!json.contains("prod.example"));
+        assert!(!json.contains("claude"));
     }
 
     #[test]
@@ -2398,9 +2820,13 @@ mod tests {
         assert!(oc_sp.acp_capable, "agent with a valid acp cmd is capable");
         let plain = entries.iter().find(|e| e.name == "plain").unwrap();
         assert!(!plain.acp_capable, "agent with no acp cmd is tmux-only");
+    }
 
-        // A wrapper inheriting a registry-backed base (claude) is capable
-        // through that adapter; one inheriting cursor stays tmux-only.
+    #[test]
+    fn custom_agent_acp_capable_via_detect_as_inheritance() {
+        // A wrapper that inherits a registry-backed base (claude) is
+        // structured-capable through the base adapter, with no agent_acp_cmd.
+        // A wrapper inheriting a terminal-only base (cursor) stays tmux-only.
         let custom = custom_agents(&[
             ("lenovo-claude", "CLAUDE_CONFIG_DIR=/work claude"),
             ("my-cursor", "agent"),
@@ -2460,18 +2886,24 @@ mod tests {
         assert!(!value.to_string().contains("ocp run sp"));
     }
 
-    /// A name outside `list_available_sounds()` is refused, traversal included,
-    /// and a 404 that still streamed a body would be worse than the wrong
-    /// status.
     #[tokio::test]
-    async fn serve_sound_file_rejects_names_outside_the_sounds_dir() {
-        for name in ["does-not-exist-xyz.wav", "../../../etc/passwd"] {
-            let resp = serve_sound_file(axum::extract::Path(name.to_string()))
-                .await
-                .into_response();
-            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{name}");
-            let body = to_bytes(resp.into_body(), 1024).await.unwrap();
-            assert!(body.is_empty(), "{name}: unexpected body bytes: {body:?}");
-        }
+    async fn serve_sound_file_rejects_unknown_name() {
+        let resp = serve_sound_file(axum::extract::Path("does-not-exist-xyz.wav".to_string()))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn serve_sound_file_rejects_path_traversal() {
+        let resp = serve_sound_file(axum::extract::Path("../../../etc/passwd".to_string()))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        // A NOT_FOUND that somehow still streamed a body would be a
+        // worse failure than the wrong status, so assert the body is
+        // empty rather than just "not /etc/passwd".
+        let body = to_bytes(resp.into_body(), 1024).await.unwrap();
+        assert!(body.is_empty(), "unexpected body bytes: {body:?}");
     }
 }

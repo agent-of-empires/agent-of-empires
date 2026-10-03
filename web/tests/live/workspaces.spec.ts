@@ -77,8 +77,19 @@ test("saved-unpinned hidden; pin POSTs; unpin keeps the saved project", async ({
   const sessions = await listSessions(serve.baseUrl);
   expect(sessions).toHaveLength(1);
   const repoA = sessions[0]!.project_path as string;
+  const profiles = (await (await page.request.get(`${serve.baseUrl}/api/profiles`)).json()) as Array<{
+    name: string;
+    is_default?: boolean;
+  }>;
+  const profile = profiles.find((candidate) => candidate.is_default)?.name ?? profiles[0]?.name;
+  expect(profile).toBeTruthy();
   const savedProjects = async () =>
-    (await (await page.request.get(`${serve.baseUrl}/api/projects`)).json()) as { name: string; path: string }[];
+    (await (
+      await page.request.get(`${serve.baseUrl}/api/projects?profile=${encodeURIComponent(profile!)}`)
+    ).json()) as {
+      name: string;
+      path: string;
+    }[];
 
   await page.goto(`${serve.baseUrl}/`);
   const headerA = page.locator(`[data-testid='sidebar-group-header'][data-group-id='${repoA}']`);

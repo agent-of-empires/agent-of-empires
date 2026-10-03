@@ -294,7 +294,9 @@ mode = { specific = "wololo" }
                 unchanged("[session]\nsession_id_poller_max_threads = 4\n"),
                 unchanged("[session]\ndefault_tool = \"claude\"\n"),
                 (
-                    Some("[session]\nnew_session_attach_mode = \"live_send\"\nsmart_rename_timing = \"turn_end\"\n"),
+                    Some(
+                        "[session]\nnew_session_attach_mode = \"live_send\"\nsmart_rename_timing = \"turn_end\"\n",
+                    ),
                     Some("[session]\ndefault_attach_mode = \"live_send\"\n"),
                 ),
                 (None, None),

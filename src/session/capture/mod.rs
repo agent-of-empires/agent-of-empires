@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
+pub(crate) use crate::session::path_identity::canonicalize_or_raw;
 use anyhow::{Context, Result};
 use uuid::Uuid;
 
@@ -40,13 +41,6 @@ pub(crate) use prime::{
     prime_agent_poll_fn_sandboxed, root_session_header, PrimeRootPublication,
     PRIME_AGENT_HEADER_SCAN_BYTES, PRIME_AGENT_MAX_SESSION_FILES,
 };
-
-/// Canonicalizes an existing path, else normalizes lexically so an unnormalized
-/// spelling of a deleted directory still compares equal.
-pub(crate) fn canonicalize_or_raw(path: &str) -> PathBuf {
-    std::fs::canonicalize(path)
-        .unwrap_or_else(|_| crate::git::template::lexical_normalize(Path::new(path)))
-}
 
 pub(crate) fn canonicalize_allowing_missing_leaf(path: &Path) -> Option<PathBuf> {
     let mut resolved = path.to_path_buf();
@@ -120,10 +114,12 @@ fn compose_exclusion_in(
     set
 }
 
+/// compose_exclusion plus every conversation id parked by a same-project
+/// peer's engine swap; the peer still owns those whatever its current tool.
 pub(crate) fn compose_exclusion_with_persisted_peers(
     current_instance_id: &str,
     current_project_path: &str,
-    profile: &str,
+    instances: &[crate::session::Instance],
     retroactive_capture_excludes: &HashSet<crate::session::ConversationBinding>,
     source: Option<&crate::session::ExecutionBinding>,
 ) -> HashSet<String> {
@@ -134,12 +130,6 @@ pub(crate) fn compose_exclusion_with_persisted_peers(
         &live,
         source,
     );
-    let Ok(storage) = crate::session::storage::Storage::new_unwatched(profile) else {
-        return set;
-    };
-    let Ok(instances) = storage.load() else {
-        return set;
-    };
     let canonical_current = canonicalize_or_raw(current_project_path);
     for inst in instances {
         if inst.id == current_instance_id
@@ -372,8 +362,27 @@ mod tests {
         std::fs::create_dir_all(temp.path().join("x")).unwrap();
         let spelled = temp.path().join("x").join("..");
         assert_eq!(
-            canonicalize_or_raw(&spelled.to_string_lossy()),
+            canonicalize_or_raw(&spelled),
             std::fs::canonicalize(temp.path()).unwrap()
+        );
+    }
+
+    /// The resolver normalizes the existing prefix of a path and re-appends
+    /// the missing leaf, so a path spelled through a symlink names the same
+    /// directory as the resolved spelling. Callers key on this: a caller that
+    /// spells a path one way must not silently disagree with a probe that
+    /// spells it the other way.
+    #[test]
+    fn canonicalize_or_raw_resolves_a_symlinked_prefix_for_a_missing_leaf() {
+        let temp = tempfile::tempdir().unwrap();
+        let alias = temp.path().join("alias");
+        let real = temp.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        assert_eq!(
+            canonicalize_or_raw(alias.join("gone")),
+            canonicalize_or_raw(real.join("gone")),
+            "a path spelled through a symlink must name the resolved leaf"
         );
     }
 
@@ -420,7 +429,7 @@ mod tests {
         let exclusions = compose_exclusion_with_persisted_peers(
             "current",
             project,
-            PROFILE,
+            &storage.load().unwrap(),
             &HashSet::new(),
             None,
         );

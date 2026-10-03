@@ -105,7 +105,7 @@ fn merge_hooks_with_config(profile: &str, repo_hooks: HooksConfig) -> Option<Hoo
 }
 
 /// Like the execution merge but keeps `on_destroy` and never collapses, for display.
-fn apply_repo_hook_overrides(mut base: HooksConfig, repo_hooks: &HooksConfig) -> HooksConfig {
+pub fn apply_repo_hook_overrides(mut base: HooksConfig, repo_hooks: &HooksConfig) -> HooksConfig {
     for (base_cmds, repo_cmds) in [
         (&mut base.on_create, &repo_hooks.on_create),
         (&mut base.on_launch, &repo_hooks.on_launch),
@@ -198,6 +198,19 @@ impl ResolvedHooks {
             hooks,
             profile: profile.to_string(),
             repo_root: Some(repo_root.to_path_buf()),
+        })
+    }
+
+    /// Attach source metadata to hooks captured from the canonical config snapshot.
+    pub(crate) fn from_merged(
+        profile: &str,
+        repo_root: Option<&Path>,
+        hooks: HooksConfig,
+    ) -> Option<Self> {
+        has_create_or_launch(hooks).map(|hooks| Self {
+            hooks,
+            profile: profile.to_string(),
+            repo_root: repo_root.map(Path::to_path_buf),
         })
     }
 
@@ -488,7 +501,7 @@ fn run_hook_with_timeout(
 fn run_hooks_streamed(
     commands: &[String],
     target: &HookTarget,
-    progress_tx: &mpsc::Sender<HookProgress>,
+    progress: Option<&dyn Fn(HookProgress)>,
     extra_env: &[(&'static str, String)],
 ) -> Result<()> {
     use std::io::BufRead;
@@ -497,7 +510,9 @@ fn run_hooks_streamed(
 
     for (idx, cmd) in commands.iter().enumerate() {
         tracing::info!(target: "session.store", "Running hook (streamed): {}", cmd);
-        let _ = progress_tx.send(HookProgress::Started(cmd.clone()));
+        if let Some(progress) = progress {
+            progress(HookProgress::Started(cmd.clone()));
+        }
         let opts = HookSpawnOpts {
             merge_stderr: true,
             detach_tty: true,
@@ -520,7 +535,9 @@ fn run_hooks_streamed(
                     tail.pop_front();
                 }
                 tail.push_back(line.clone());
-                let _ = progress_tx.send(HookProgress::Output(line));
+                if let Some(progress) = progress {
+                    progress(HookProgress::Output(line));
+                }
             }
         }
 
@@ -552,7 +569,9 @@ fn run_hooks_streamed(
                 skipped
             ));
         }
-        let _ = progress_tx.send(HookProgress::Output(detail.clone()));
+        if let Some(progress) = progress {
+            progress(HookProgress::Output(detail.clone()));
+        }
         anyhow::bail!(detail);
     }
     Ok(())
@@ -773,25 +792,25 @@ pub fn execute_hooks_in_container_best_effort(
 pub fn execute_hooks_streamed(
     commands: &[String],
     project_path: &Path,
-    progress_tx: &mpsc::Sender<HookProgress>,
+    progress: Option<&dyn Fn(HookProgress)>,
     extra_env: &[(&'static str, String)],
 ) -> Result<()> {
     let target = HookTarget::Local { project_path };
-    run_hooks_streamed(commands, &target, progress_tx, extra_env)
+    run_hooks_streamed(commands, &target, progress, extra_env)
 }
 
 pub fn execute_hooks_in_container_streamed(
     commands: &[String],
     container_name: &str,
     workdir: &str,
-    progress_tx: &mpsc::Sender<HookProgress>,
+    progress: Option<&dyn Fn(HookProgress)>,
     extra_env: &[(&'static str, String)],
 ) -> Result<()> {
     let target = HookTarget::Container {
         container_name,
         workdir,
     };
-    run_hooks_streamed(commands, &target, progress_tx, extra_env)
+    run_hooks_streamed(commands, &target, progress, extra_env)
 }
 
 #[cfg(test)]
@@ -1051,7 +1070,8 @@ mod tests {
             echo "SSH_ASKPASS=${SSH_ASKPASS:-unset}"
         "#;
         let (tx, rx) = mpsc::channel();
-        execute_hooks_streamed(&cmds(&[probe]), tmp.path(), &tx, &[]).unwrap();
+        let progress = |event| tx.send(event).unwrap();
+        execute_hooks_streamed(&cmds(&[probe]), tmp.path(), Some(&progress), &[]).unwrap();
         drop(tx);
         let lines: Vec<String> = rx
             .into_iter()
@@ -1081,11 +1101,10 @@ mod tests {
             "#!/bin/sh\necho 'fatal: dependency xyz not found' >&2\nexit 3\n",
         )
         .unwrap();
-        let (tx, _rx) = mpsc::channel();
         let error = |hooks: &[&str]| {
             format!(
                 "{:#}",
-                execute_hooks_streamed(&cmds(hooks), tmp.path(), &tx, &[]).unwrap_err()
+                execute_hooks_streamed(&cmds(hooks), tmp.path(), None, &[]).unwrap_err()
             )
         };
         let msg = error(&["sh hook.sh"]);
@@ -1212,9 +1231,8 @@ mod tests {
         std::fs::remove_file(tmp.path().join("env.txt")).unwrap();
         assert!(execute_hooks_best_effort(&probe, tmp.path(), false, &env).is_empty());
         assert_eq!(out(), expected, "best-effort");
-        let (tx, _rx) = mpsc::channel();
         std::fs::remove_file(tmp.path().join("env.txt")).unwrap();
-        execute_hooks_streamed(&probe, tmp.path(), &tx, &env).unwrap();
+        execute_hooks_streamed(&probe, tmp.path(), None, &env).unwrap();
         assert_eq!(out(), expected, "streamed");
     }
 }

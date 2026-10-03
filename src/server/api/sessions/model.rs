@@ -3,9 +3,12 @@
 use super::*;
 
 impl SessionResponse {
-    /// Build a response from a session instance plus the user's Claude Code
-    /// fullscreen-renderer preference, which surfaces only when the session's
-    /// agent is Claude.
+    /// Build a response from a session instance plus the user's current
+    /// Claude Code fullscreen-renderer preference.
+    ///
+    /// `claude_fullscreen` is the *user-level* setting (read once per
+    /// request via `crate::claude_settings::read_tui_fullscreen()`); it
+    /// surfaces on the response only when the session's agent is Claude.
     pub fn from_instance(inst: &Instance, claude_fullscreen: bool) -> Self {
         Self::from_instance_with_plan(
             inst,
@@ -18,8 +21,9 @@ impl SessionResponse {
         )
     }
 
-    /// Build a response with the per-session plan snapshot, from the REST
-    /// sessions endpoint's single bulk read of the event store (#1061).
+    /// Build a response with the per-session plan snapshot. Called from
+    /// the REST sessions endpoint after a single bulk read of the
+    /// structured view event store; see #1061.
     pub fn from_instance_with_plan(
         inst: &Instance,
         claude_fullscreen: bool,
@@ -27,16 +31,30 @@ impl SessionResponse {
         acp_worker_state: crate::daemon::AcpWorkerState,
         next_wakeup_at: Option<String>,
         next_wakeup_reason: Option<String>,
-        // `Some(description)` when the session has an armed `Monitor`, `None`
-        // otherwise, mirroring `EventStore::latest_active_monitor`.
+        // `Some(description)` when the session has an armed `Monitor` (the
+        // inner description is itself optional); `None` when none is armed.
+        // Mirrors `EventStore::latest_active_monitor`'s return so the caller
+        // forwards it verbatim.
         active_monitor: Option<Option<String>>,
     ) -> Self {
         let (monitor_active, monitor_description) = match active_monitor {
             Some(description) => (true, description),
             None => (false, None),
         };
+        let status = if inst
+            .lifecycle_reservation
+            .as_ref()
+            .is_some_and(|reservation| reservation.op == crate::session::LifecycleOperation::Purge)
+        {
+            Status::Deleting
+        } else {
+            inst.status
+        };
         Self {
+            agent_pane: inst.agent_pane.clone(),
+            auxiliary: inst.auxiliary.clone(),
             id: inst.id.clone(),
+            idempotency_key: inst.idempotency_key.clone(),
             title: inst.title.clone(),
             project_path: inst.project_path.clone(),
             artifact_dir: crate::session::artifacts::artifact_dir_path(&inst.id)
@@ -44,8 +62,14 @@ impl SessionResponse {
                 .unwrap_or_default(),
             group_path: inst.group_path.clone(),
             tool: inst.tool.clone(),
-            status: inst.status.wire_str().to_string(),
+            command: inst.command.clone(),
+            extra_args: inst.extra_args.clone(),
+            status: status.wire_str().to_string(),
+            lifecycle_reservation: inst.lifecycle_reservation.clone(),
+            lifecycle_generation: inst.lifecycle_generation,
             dormant: inst.is_shown_dormant(),
+            idle_dormant_since: inst.idle_dormant_since.map(|t| t.to_rfc3339()),
+            pane_dead_observed: inst.pane_dead_observed,
             yolo_mode: inst.yolo_mode,
             created_at: inst.created_at.to_rfc3339(),
             last_accessed_at: inst.last_accessed_at.map(|t| t.to_rfc3339()),
@@ -61,25 +85,34 @@ impl SessionResponse {
                 .as_ref()
                 .and_then(|w| w.base_branch.clone()),
             base_branch_override: inst.base_branch_override.clone(),
+            worktree_created_at: inst
+                .worktree_info
+                .as_ref()
+                .map(|w| w.created_at.to_rfc3339()),
             is_sandboxed: inst.is_sandboxed(),
+            sandbox_container_name: inst.sandbox_info.as_ref().map(|s| s.container_name.clone()),
             scratch: inst.scratch,
             favorited: inst.is_favorited(),
+            favorited_at: inst.favorited_at.map(|t| t.to_rfc3339()),
             color: inst.color.clone(),
             urgent: inst.is_urgent(),
             pinned_at: inst.pinned_at.map(|t| t.to_rfc3339()),
             archived_at: inst.archived_at.map(|t| t.to_rfc3339()),
-            // Surface `snoozed_until` only while the snooze is active:
-            // `is_snoozed()` goes false once it expires, even though the
-            // persisted field stays set until the next mutation, and the web
-            // must not show a "snoozed 0m" chip on a row that already woke.
+            // Surface `snoozed_until` only when the snooze is still
+            // active. `is_snoozed()` returns false once the timestamp
+            // has expired, even though the persisted field stays set
+            // until the next mutation rewrites it. Mirroring that
+            // semantics on the wire prevents the web sidebar from
+            // showing a "snoozed 0m" chip on rows that have already
+            // woken on disk.
             snoozed_until: if inst.is_snoozed() {
                 inst.snoozed_until.map(|t| t.to_rfc3339())
             } else {
                 None
             },
             trashed_at: inst.trashed_at.map(|t| t.to_rfc3339()),
-            // Surface the marker; the web gates the visual on the
-            // `session.unread_indicator` setting.
+            // Surface the marker (omitted when read); the web gates the
+            // visual on the `session.unread_indicator` setting.
             unread: inst.unread,
             has_managed_worktree: inst
                 .worktree_info
@@ -107,18 +140,14 @@ impl SessionResponse {
             notify_on_error: inst.notify_on_error,
             view: inst.view,
             context_resume: Some(context_resume_for(inst)),
-            queued_prompts: {
-                let mut q = inst.queued_prompts.clone();
-                q.sort_by_key(|e| e.seq);
-                q
-            },
             acp_worker_state,
             pending_approvals: Vec::new(),
             rate_limit: None,
             rate_limit_auto_resume: None,
-            // Built-in ACP capability resolves here from a process-wide
-            // registry (no IO). Custom agents depend on profile config, which
-            // the list and create handlers overlay without a per-row read.
+            // Built-in ACP capability is resolved here from a process-wide
+            // registry (cheap, no IO). Custom agents depend on profile
+            // config; the list and create handlers overlay that without a
+            // per-row config read.
             acp_capable: {
                 let resolved = inst
                     .agent_name
@@ -128,9 +157,10 @@ impl SessionResponse {
                 builtin_acp_registry().get(resolved).is_some()
             },
             acp_session_id: inst.acp_session_id.clone(),
-            // Resolved like `acp_capable`: `agent_name` when non-empty, else
-            // `tool`. This is the ACP registry key, so it matches the
-            // `/api/acp/agents` names the switch-agent modal filters on (#2803).
+            // Resolved the same way as `acp_capable` above: `agent_name` when
+            // set and non-empty, else `tool`. This is the ACP registry key,
+            // so it matches `/api/acp/agents` names the switch-agent modal
+            // filters against. See #2803.
             acp_agent: {
                 let resolved = inst
                     .agent_name
@@ -141,9 +171,12 @@ impl SessionResponse {
             },
             // The create-time guard calls the same classifier, so the web
             // "Fork" affordance and server-side acceptance cannot drift.
-            acp_can_fork: agent_is_structured_fork_capable(&inst.tool, inst.agent_name.as_deref()),
-            // Same agent resolution as `acp_agent`, computed once here so the
-            // web dashboard and native TUI stop mirroring the gate.
+            acp_can_fork: crate::session::fork::structured_fork_capable(
+                &inst.tool,
+                inst.agent_name.as_deref(),
+            ),
+            // Same agent resolution as `acp_agent` above; computed once here so
+            // the web dashboard and native TUI stop mirroring the gate.
             keeps_context: crate::agents::acp_transcript_cli_resumable(
                 &inst.tool,
                 inst.agent_name
@@ -151,8 +184,8 @@ impl SessionResponse {
                     .filter(|s| !s.is_empty())
                     .unwrap_or(inst.tool.as_str()),
             ),
-            // Same agent resolution as `acp_agent`; the composer palette and
-            // queued-prompt clear-boundary hint read these instead of a
+            // Same agent resolution as `acp_agent` above; the composer palette
+            // and queued-prompt clear-boundary hint read these instead of a
             // client-side per-agent mirror.
             clear_aliases: crate::acp::agent_profiles::resolve(
                 inst.agent_name
@@ -166,7 +199,10 @@ impl SessionResponse {
             .collect(),
             claude_fullscreen: claude_fullscreen && inst.tool == "claude",
             // A session converted by `attach_project` (#3103) has a real
-            // `workspace_info`, so both repos list here with no special case.
+            // `workspace_info`, so this lists both repos with no special case:
+            // the structured view's repo-relative path rendering, the diff-repo
+            // resolver and the sidebar's multi-repo grouping all see the same
+            // shape they see for a session created multi-repo.
             workspace_repos: inst
                 .all_repos()
                 .iter()
@@ -174,8 +210,24 @@ impl SessionResponse {
                     name: r.name.clone(),
                     source_path: r.source_path.clone(),
                     branch: r.branch.clone(),
+                    worktree_path: r.worktree_path.clone(),
+                    main_repo_path: r.main_repo_path.clone(),
+                    managed_by_aoe: r.managed_by_aoe,
+                    branch_preexisting: r.branch_preexisting,
+                    base_branch: r.base_branch.clone(),
+                    base_branch_override: r.base_branch_override.clone(),
                 })
                 .collect(),
+            workspace_dir: inst
+                .workspace_info
+                .as_ref()
+                .map(|w| w.workspace_dir.clone()),
+            workspace_branch: inst.workspace_info.as_ref().map(|w| w.branch.clone()),
+            workspace_created_at: inst
+                .workspace_info
+                .as_ref()
+                .map(|w| w.created_at.to_rfc3339()),
+            workspace_cleanup_on_delete: inst.workspace_info.as_ref().map(|w| w.cleanup_on_delete),
             warnings: Vec::new(),
             plan_summary,
             next_wakeup_at,
@@ -186,9 +238,9 @@ impl SessionResponse {
     }
 }
 
-/// Project a stored `Plan` into the `PlanSummary` the sidebar consumes.
-/// Current step is the first non-Done entry; counts reflect the persisted step
-/// state from the agent's last PlanUpdated.
+/// Project a stored `Plan` into the lightweight `PlanSummary` shape the
+/// sidebar consumes. Current step is the first non-Done entry; counts
+/// reflect the persisted step state from the agent's last PlanUpdated.
 pub(super) fn plan_summary_from_plan(plan: crate::acp::state::Plan) -> PlanSummary {
     use crate::acp::state::PlanStepStatus;
     let total = plan.steps.len() as u32;
@@ -273,16 +325,18 @@ pub(super) fn context_resume_for(inst: &Instance) -> ContextResumeAvailability {
     }
 }
 
-/// Process-wide built-in ACP registry, built once, so `acp_capable` costs no
-/// per-row allocation.
+/// Process-wide built-in ACP registry, built once. Used to compute
+/// `SessionResponse.acp_capable` for built-in agents without allocating
+/// a registry per response row.
 fn builtin_acp_registry() -> &'static crate::acp::AgentRegistry {
     static REG: std::sync::OnceLock<crate::acp::AgentRegistry> = std::sync::OnceLock::new();
     REG.get_or_init(crate::acp::AgentRegistry::with_defaults)
 }
 
 /// True iff this custom agent can run in structured view: it declares a valid
-/// `agent_acp_cmd`, or inherits a registry-backed base via `agent_detect_as`.
-/// Built-in capability is handled in the constructor.
+/// `agent_acp_cmd`, or it inherits a registry-backed base via
+/// `agent_detect_as`. Built-in capability is handled separately in the
+/// constructor, so this only covers the custom case.
 pub(super) fn custom_agent_acp_capable(
     session: &crate::session::config::SessionConfig,
     tool: &str,
@@ -295,14 +349,15 @@ pub(super) fn custom_agent_acp_capable(
 }
 
 /// Per-request cache for `(profile, project_path)` config resolution, shared
-/// across the `list_sessions` overlays so a repo-local override is read once per
-/// unique pair rather than once per row (#2603).
+/// across the `list_sessions` overlays so a repo-local override is read from
+/// disk once per unique pair rather than once per row. See #2603.
 pub(super) struct SessionCfgCache<'a> {
     entries: HashMap<(String, String), SessionConfig>,
     /// Where this cache reports its disk reads. The counter belongs to the
-    /// request, so splitting the shared cache per overlay shows up as extra
-    /// resolutions instead of hiding behind a second private tally. There is no
-    /// counter-less constructor for the same reason.
+    /// request, not to the cache, so every cache the request opens adds to
+    /// one total: splitting the shared cache per overlay then shows up as
+    /// extra resolutions instead of hiding behind a second private tally.
+    /// There is no counter-less constructor for the same reason.
     misses: &'a std::sync::atomic::AtomicUsize,
 }
 
@@ -313,7 +368,6 @@ impl<'a> SessionCfgCache<'a> {
             misses,
         }
     }
-
     /// Resolve `(profile, project_path)`, reading from disk on first miss only.
     pub(super) fn resolve(&mut self, profile: &str, project_path: &str) -> &SessionConfig {
         let misses = self.misses;

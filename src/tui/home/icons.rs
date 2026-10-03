@@ -19,3 +19,20 @@ pub(in crate::tui) const ICON_FAVORITE: &str = "✦";
 // Shelf glyphs stay single-width: wide glyphs break column alignment and hit-testing.
 pub(in crate::tui) const ICON_TRASH_SECTION: &str = "⊘";
 pub(in crate::tui) const ICON_ARCHIVED_SECTION: &str = "▤";
+
+const INDENTS: [&str; 10] = [
+    "",
+    " ",
+    "  ",
+    "   ",
+    "    ",
+    "     ",
+    "      ",
+    "       ",
+    "        ",
+    "         ",
+];
+
+pub(crate) fn get_indent(depth: usize) -> &'static str {
+    INDENTS.get(depth).copied().unwrap_or(INDENTS[9])
+}
