@@ -49,7 +49,8 @@ impl PendingRequests {
         self.entries.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// `generation` identifies the worker instance the request is sent to.
+    /// `generation` is the supervisor id, which an in-place respawn keeps, so an exit fails
+    /// every request of that supervisor.
     pub fn register(
         &self,
         plugin_id: &str,
@@ -85,6 +86,11 @@ impl PendingRequests {
         self.entries().remove(id);
     }
 
+    /// Cancels `id` when the guard drops; a no-op once the request was resolved.
+    pub fn forget_on_drop<'a>(&'a self, id: &'a str) -> ForgetOnDrop<'a> {
+        ForgetOnDrop { pending: self, id }
+    }
+
     /// Drops the senders so every waiter on this worker instance wakes with a closed channel.
     pub fn fail_worker(&self, plugin_id: &str, generation: u64) {
         self.entries()
@@ -97,6 +103,17 @@ impl PendingRequests {
             .values()
             .filter(|e| e.plugin_id == plugin_id)
             .count()
+    }
+}
+
+pub struct ForgetOnDrop<'a> {
+    pending: &'a PendingRequests,
+    id: &'a str,
+}
+
+impl Drop for ForgetOnDrop<'_> {
+    fn drop(&mut self) {
+        self.pending.cancel(self.id);
     }
 }
 

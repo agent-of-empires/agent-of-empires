@@ -237,31 +237,30 @@ impl PluginHost {
             }
         };
         let (id, rx) = self.pending.register(plugin_id, generation);
+        // A dropped caller must not leave its entry behind.
+        let _forget = self.pending.forget_on_drop(&id);
         // Teardown and exit clear the slot before failing entries, so a request registered
         // after that sweep sees the missing worker here instead of waiting for the timeout.
         let still_current = {
             let table = self.state.lock().await;
-            table
-                .running
-                .get(plugin_id)
-                .is_some_and(|w| w.supervisor_id == generation && w.inbound.is_some())
+            table.running.get(plugin_id).is_some_and(|w| {
+                w.inbound
+                    .as_ref()
+                    .is_some_and(|tx| tx.same_channel(&inbound))
+            })
         };
         let line =
             serde_json::json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params })
                 .to_string()
                 + "\n";
         if !still_current || inbound.send(line).is_err() {
-            self.pending.cancel(&id);
             return Err(WorkerRequestError::WorkerGone);
         }
         match tokio::time::timeout(deadline.saturating_duration_since(Instant::now()), rx).await {
             Ok(Ok(Ok(result))) => Ok(result),
             Ok(Ok(Err(_))) => Err(WorkerRequestError::Rejected),
             Ok(Err(_)) => Err(WorkerRequestError::WorkerGone),
-            Err(_) => {
-                self.pending.cancel(&id);
-                Err(WorkerRequestError::Timeout)
-            }
+            Err(_) => Err(WorkerRequestError::Timeout),
         }
     }
 
@@ -1969,6 +1968,46 @@ command = {command}
             elapsed < Duration::from_secs(10),
             "must not wait for the timeout"
         );
+        host.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn dropping_a_pending_request_forgets_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("XDG_CONFIG_HOME", temp.path().to_path_buf()),
+            ("HOME", temp.path().to_path_buf()),
+            ("USERPROFILE", temp.path().to_path_buf()),
+        ]);
+        let plugin_id = "acme.sleeper";
+        install_sleeper(plugin_id);
+        let registry = crate::plugin::reload_registry();
+        let host = PluginHost::new(
+            &temp.path().join("host"),
+            "default",
+            None,
+            Arc::new(crate::server::runtime::RuntimeWork::default()),
+        )
+        .unwrap();
+        host.start(&registry).await;
+
+        let waiter = tokio::spawn({
+            let host = host.clone();
+            async move {
+                host.request_worker(plugin_id, "mcp.rewrite", json!({}), Duration::from_secs(60))
+                    .await
+            }
+        });
+        wait_until("the request to be pending", || async {
+            host.pending.waiting(plugin_id) == 1
+        })
+        .await;
+        waiter.abort();
+        assert!(waiter.await.unwrap_err().is_cancelled());
+        assert_eq!(host.pending.waiting(plugin_id), 0);
         host.shutdown().await;
     }
 
