@@ -115,41 +115,136 @@ pub async fn ensure_container_for_session_locked(
 }
 
 /// Rebuild the container when the session's provider pick no longer matches the
-/// provider it was built for, then stamp the new pick so the build picks up the
-/// matching credential mounts.
-///
-/// The GCP ADC bind mount is decided at container-create time, so a session
-/// switched to Vertex inside a container built without it would get the routing
-/// flag and no credentials. Recreating in the other direction matters too: it
-/// drops a mount the session no longer routes through. A container built before
-/// the pick existed records `None`, which matches no explicit pick and so is
-/// rebuilt once on the first switch.
+/// provider it was built for. The GCP ADC bind mount is decided at
+/// container-create time, so a container built for another provider has the
+/// wrong credential mounts. A container built before the pick existed records
+/// `None`, which matches no explicit pick and so is rebuilt once.
 fn reconcile_provider_container(instance: &mut Instance) -> Result<()> {
+    reconcile_provider_container_with(instance, |id| {
+        crate::containers::DockerContainer::from_session_id(id).discard()
+    })
+    .map(|_| ())
+}
+
+/// Returns whether the old container was discarded.
+///
+/// The new stamp reaches disk after the discard and before the rebuild. A
+/// reload restores the disk row, so a stamp held only in memory would have the
+/// next resume discard the rebuilt, correct container again. Written any
+/// earlier, a failed discard would leave the stamp claiming mounts the old
+/// container lacks. A failed write leaves no container, so the next resume
+/// retries; a failed rebuild leaves the stamp, so the next resume builds for it.
+fn reconcile_provider_container_with(
+    instance: &mut Instance,
+    discard: impl FnOnce(&str) -> crate::containers::Teardown,
+) -> Result<bool> {
     let Some(sandbox) = instance.sandbox_info.as_mut() else {
-        return Ok(());
+        return Ok(false);
     };
     if sandbox.provider == instance.agent_provider {
-        return Ok(());
+        return Ok(false);
     }
     let built_for = sandbox.provider.clone();
-    sandbox.provider = instance.agent_provider.clone();
-
-    let container = crate::containers::DockerContainer::from_session_id(&instance.id);
-    match container.discard() {
-        crate::containers::Teardown::Removed | crate::containers::Teardown::AlreadyGone => {
-            tracing::info!(
-                target: "acp.sandbox",
-                session = %instance.id,
-                built_for = ?built_for,
-                provider = ?instance.agent_provider,
-                "recreating sandbox container for the new provider"
-            );
-            Ok(())
-        }
-        crate::containers::Teardown::Failed(e) => anyhow::bail!(
+    if let crate::containers::Teardown::Failed(e) = discard(&instance.id) {
+        anyhow::bail!(
             "failed to remove sandbox container {} built for a different provider; remove it \
              before switching, or the session keeps the old provider's credential mounts: {e}",
-            container.name
-        ),
+            crate::containers::DockerContainer::from_session_id(&instance.id).name
+        );
+    }
+    sandbox.provider = instance.agent_provider.clone();
+    instance
+        .persist_sandbox_provider()
+        .context("recording the provider the sandbox container is rebuilt for")?;
+    tracing::info!(
+        target: "acp.sandbox",
+        session = %instance.id,
+        built_for = ?built_for,
+        provider = ?instance.agent_provider,
+        "recreating sandbox container for the new provider"
+    );
+    Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::containers::Teardown;
+
+    fn sandboxed(provider_built_for: Option<&str>) -> Instance {
+        let mut inst = Instance::new("claude", "/tmp/aoe-provider-stamp");
+        inst.agent_provider = Some("vertex".to_string());
+        inst.sandbox_info = Some(SandboxInfo {
+            provider: provider_built_for.map(str::to_string),
+            enabled: true,
+            container_id: None,
+            image: "alpine:latest".into(),
+            container_name: "aoe-sandbox-stamp".into(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            container_workdir: None,
+        });
+        inst
+    }
+
+    fn stored_stamp(id: &str) -> Option<String> {
+        crate::server::test_support::load_instances_from_disk_for_test("default")
+            .into_iter()
+            .find(|i| i.id == id)
+            .and_then(|i| i.sandbox_info)
+            .and_then(|s| s.provider)
+    }
+
+    /// The path every resume takes, not only a switch: a rebuild survives a
+    /// reload and the next same-provider resume leaves it alone, while a
+    /// failed discard records nothing.
+    #[test]
+    #[serial_test::serial]
+    fn a_rebuild_is_recorded_on_disk_before_it_runs() {
+        for (case, outcome, rebuilt) in [
+            ("removed", Teardown::Removed, true),
+            ("already gone", Teardown::AlreadyGone, true),
+            (
+                "discard failed",
+                Teardown::Failed(crate::containers::error::DockerError::DaemonNotRunning),
+                false,
+            ),
+        ] {
+            let _tmp = crate::session::test_support::isolate_app_dir();
+            let mut inst = sandboxed(None);
+            let id = inst.id.clone();
+            crate::server::test_support::seed_instances_on_disk_for_test(
+                "default",
+                vec![inst.clone()],
+            );
+
+            let mut discards = 0;
+            let result = reconcile_provider_container_with(&mut inst, |_| {
+                discards += 1;
+                outcome
+            });
+            assert_eq!(result.is_ok(), rebuilt, "{case}: {result:?}");
+            let expected = rebuilt.then(|| "vertex".to_string());
+            assert_eq!(stored_stamp(&id), expected, "{case}");
+            if !rebuilt {
+                continue;
+            }
+
+            let mut reloaded =
+                crate::server::test_support::load_instances_from_disk_for_test("default")
+                    .into_iter()
+                    .find(|i| i.id == id)
+                    .expect("seeded row");
+            let again = reconcile_provider_container_with(&mut reloaded, |_| {
+                discards += 1;
+                Teardown::Removed
+            });
+            assert!(
+                !again.unwrap(),
+                "{case}: the rebuilt container must survive"
+            );
+            assert_eq!(discards, 1, "{case}");
+        }
     }
 }
