@@ -445,6 +445,8 @@ impl HomeView {
                 .and_then(|c| c.app_state.archived_section_collapsed)
                 .unwrap_or(true),
             trashed_section_collapsed: true,
+            hide_stopped_in_groups: false,
+            group_totals: HashMap::new(),
             recovery_rx: None,
             recovery_lock: None,
             recovery_in_flight: std::collections::HashSet::new(),
@@ -556,7 +558,7 @@ impl HomeView {
         }
 
         view.refresh_registered_projects();
-        view.flat_items = view.build_flat_items();
+        view.refresh_flat_items();
         view.update_selected();
         // Disk subscriptions stay scoped to the loaded storages: in single-profile mode
         // the user opted into that profile's instance state only. Sorted so the

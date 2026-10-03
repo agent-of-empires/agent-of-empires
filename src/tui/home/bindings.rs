@@ -61,6 +61,7 @@ pub enum ActionId {
     ToggleUnread,
     ToggleContainer,
     TogglePreviewInfo,
+    ToggleHideStopped,
     /// Toggle the system diagnostics strip (CPU and memory pressure plus agent and
     /// process counts). Persisted via `session.show_diagnostics_pane`.
     ToggleDiagnostics,
@@ -939,6 +940,21 @@ pub static BINDINGS: &[Binding] = &[
         }),
     },
     Binding {
+        id: ActionId::ToggleHideStopped,
+        non_strict: &[k('y')],
+        strict: &[k('Y')],
+        context: Context::Always,
+        help: Some(HelpMeta {
+            section: HelpSection::Views,
+            desc: "Hide stopped sessions in groups (toggle)",
+        }),
+        palette: Some(PaletteMeta {
+            title: "Hide stopped sessions in groups",
+            keywords: &["hide", "show", "stopped", "grey", "compact", "filter"],
+            group: PaletteGroup::Views,
+        }),
+    },
+    Binding {
         id: ActionId::SortPicker,
         // Shift+O sorts in both modes; bare `o` only outside strict.
         non_strict: &[k('o'), k('O'), ctrl('o')],
@@ -1093,6 +1109,7 @@ pub fn palette_id(id: ActionId) -> &'static str {
         ActionId::ToggleSnooze => "snooze",
         ActionId::ToggleUnread => "toggle-unread",
         ActionId::TogglePreviewInfo => "toggle-preview-info",
+        ActionId::ToggleHideStopped => "toggle-hide-stopped",
         ActionId::ToggleDiagnostics => "toggle-diagnostics",
         ActionId::OpenSystemHealth => "open-system-health",
         ActionId::SortPicker => "pick-sort",
@@ -1219,6 +1236,7 @@ mod tests {
             // `u` is Update regardless of whether an update is available.
             (key('u'), ActionId::Update),
             (key('U'), ActionId::ToggleUnread),
+            (key('y'), ActionId::ToggleHideStopped),
             (ctrl_key('o'), ActionId::SortPicker),
         ];
         let strict = [
@@ -1229,6 +1247,7 @@ mod tests {
             (key('P'), ActionId::Projects),
             (key('O'), ActionId::SortPicker),
             (key('U'), ActionId::ToggleUnread),
+            (key('Y'), ActionId::ToggleHideStopped),
             (ctrl_key('d'), ActionId::Diff),
             (ctrl_key('r'), ActionId::Serve),
             (ctrl_key('t'), ActionId::AttachTerminal),
