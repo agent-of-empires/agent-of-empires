@@ -693,6 +693,7 @@ async fn wait_until_left_starting_resolves_on_broadcast() {
         .send(crate::server::push::StatusChange {
             instance_id: "wait-resolves".to_string(),
             instance_title: "starting".to_string(),
+            effective_profile: "default".to_string(),
             old: Status::Starting,
             new: Status::Waiting,
             at: chrono::Utc::now(),
@@ -1923,6 +1924,31 @@ async fn worktree_edits_quiesce_structured_worker_only_when_its_cwd_moves() {
 
 #[test]
 #[serial_test::serial]
+fn sync_live_after_restart_publishes_the_status_move_it_makes() {
+    // The tmux restart, ensure and send paths sync the live row through this wrapper, and
+    // none of them runs without tmux, so the wrapper carries the publish contract.
+    let mut live = make_test_instance();
+    live.status = Status::Stopped;
+    let before = live.clone();
+    let mut started = make_test_instance();
+    started.status = Status::Starting;
+    let (tx, mut rx) = tokio::sync::broadcast::channel(4);
+
+    assert!(sync_live_after_restart(&tx, &mut live, &before, &started));
+
+    let change = rx.try_recv().expect("the status move is published");
+    assert_eq!(
+        (change.old, change.new),
+        (Status::Stopped, Status::Starting)
+    );
+    assert!(rx.try_recv().is_err(), "exactly one move");
+
+    // A sync that moves nothing publishes nothing.
+    assert!(sync_live_after_restart(&tx, &mut live, &before, &started));
+    assert!(rx.try_recv().is_err());
+}
+
+#[test]
 fn apply_post_restart_sync_propagates_agent_session_id() {
     // The rapid double-restart case: in-memory state is stale because the 2s
     // poller has not refreshed, while the just-finished restart produced a
@@ -2652,6 +2678,120 @@ async fn worker_stopping_handlers_wait_for_an_in_flight_submission() {
             .await
             .unwrap_or_else(|_| panic!("{which} must finish once the submission releases"));
     }
+}
+
+/// What an opted-in plugin worker receives: the real forwarder runs over `status_tx`, so a test
+/// sees exactly what a plugin would, including transitions no producer published. Subscribe
+/// before calling the handler under test.
+struct PluginStatusFeed {
+    rx: tokio::sync::mpsc::Receiver<String>,
+    _host: std::sync::Arc<crate::plugin::host::PluginHost>,
+    _dir: tempfile::TempDir,
+}
+
+impl PluginStatusFeed {
+    async fn attach(state: &std::sync::Arc<crate::server::AppState>, profile: &str) -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let host = crate::plugin::host::PluginHost::new(dir.path(), profile, None).unwrap();
+        let rx = host.register_test_worker("acme.watcher", Some(16)).await;
+        tokio::spawn(crate::server::plugin_status::run_forwarder(
+            state.status_tx.subscribe(),
+            host.clone(),
+            state.shutdown.clone(),
+        ));
+        Self {
+            rx,
+            _host: host,
+            _dir: dir,
+        }
+    }
+
+    /// The next `(from, to)` the worker was notified of.
+    async fn next(&mut self) -> (String, String) {
+        let line = tokio::time::timeout(std::time::Duration::from_secs(10), self.rx.recv())
+            .await
+            .expect("the plugin was never notified of the transition")
+            .expect("worker queue closed");
+        let msg: serde_json::Value = serde_json::from_str(line.trim_end()).unwrap();
+        (
+            msg["params"]["from"].as_str().unwrap().to_string(),
+            msg["params"]["to"].as_str().unwrap().to_string(),
+        )
+    }
+}
+
+/// `stop_session` writes `Stopped` straight onto the live row. The next poll tick snapshots
+/// the row already stopped and trailing ACP events are ignored for a stopped row, so unless
+/// the handler publishes the move itself no plugin ever hears of it.
+#[tokio::test]
+async fn stop_session_notifies_plugins() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let mut inst = make_test_instance();
+    inst.view = crate::session::View::Structured;
+    inst.source_profile = "default".to_string();
+    let id = inst.id.clone();
+    let state = crate::server::test_support::build_test_app_state(vec![inst]);
+    let mut feed = PluginStatusFeed::attach(&state, "default").await;
+
+    stop_session(State(std::sync::Arc::clone(&state)), Path(id)).await;
+
+    assert_eq!(feed.next().await, ("Running".into(), "Stopped".into()));
+}
+
+/// The same gap for the explicit structured start, which flips the live row to `Idle`.
+#[tokio::test]
+async fn start_session_notifies_plugins() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let mut inst = Instance::new("start-notify", "/tmp/aoe-start-notify");
+    inst.view = crate::session::View::Structured;
+    inst.source_profile = "default".to_string();
+    inst.status = Status::Stopped;
+    let id = inst.id.clone();
+    Storage::new_unwatched("default")
+        .unwrap()
+        .update(|rows, _| {
+            *rows = vec![inst.clone()];
+            Ok(())
+        })
+        .unwrap();
+    let state = crate::server::test_support::build_test_app_state(vec![inst]);
+    let mut feed = PluginStatusFeed::attach(&state, "default").await;
+
+    start_session(State(std::sync::Arc::clone(&state)), Path(id)).await;
+
+    assert_eq!(feed.next().await, ("Stopped".into(), "Idle".into()));
+}
+
+/// Marking a session `Deleting` is a live-row write too.
+#[tokio::test]
+async fn delete_session_notifies_plugins_that_the_session_is_deleting() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let state = delete_race_state("sess-delete-notify");
+    let mut feed =
+        PluginStatusFeed::attach(&state, &crate::session::config::effective_profile("")).await;
+
+    delete_session(
+        State(std::sync::Arc::clone(&state)),
+        Path("sess-delete-notify".to_string()),
+        Some(Json(DeleteSessionBody::default())),
+    )
+    .await;
+
+    assert_eq!(feed.next().await, ("Idle".into(), "Deleting".into()));
+}
+
+/// A delete whose bookkeeping fails flips `Deleting` to `Error`; that move is published too.
+#[tokio::test]
+async fn failed_delete_notifies_plugins_of_the_error() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let state = delete_race_state("sess-delete-error");
+    state.instances.write().await[0].status = Status::Deleting;
+    let mut feed =
+        PluginStatusFeed::attach(&state, &crate::session::config::effective_profile("")).await;
+
+    super::delete::mark_delete_error(&state, "sess-delete-error", "boom".to_string()).await;
+
+    assert_eq!(feed.next().await, ("Deleting".into(), "Error".into()));
 }
 
 /// A direct stop sets `Stopped` on the live in-memory row without going through

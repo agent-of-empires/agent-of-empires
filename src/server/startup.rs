@@ -32,7 +32,7 @@ use super::token::{
     load_or_generate_token, test_token_grace_override, test_token_lifetime_override,
     write_secret_file, TokenManager, DEFAULT_TOKEN_GRACE,
 };
-use crate::server::{api, callback, login, push, session_service, tunnel};
+use crate::server::{api, callback, login, plugin_status, push, session_service, tunnel};
 
 /// Build the owner-only `serve.url` contents for a remotely exposed daemon.
 pub(super) fn remote_serve_url_contents(
@@ -850,6 +850,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     // Launch plugin workers for every active plugin that declares a runtime.
     if let Some(host) = state.plugin_host.clone() {
         host.start(&crate::plugin::registry()).await;
+        plugin_status::spawn_forwarder(state.clone(), host);
     }
 
     // Opt-in clean-only plugin auto-update sweep (off by default).

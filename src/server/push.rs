@@ -15,9 +15,33 @@ use super::push_send::PUSH_TTL_SECS;
 pub struct StatusChange {
     pub instance_id: String,
     pub instance_title: String,
+    /// The session's effective profile when the change was published, so an async consumer can
+    /// still scope it after the row is gone.
+    pub effective_profile: String,
     pub old: Status,
     pub new: Status,
     pub at: DateTime<Utc>,
+}
+
+/// Publish `inst`'s move from `old` to its current status; a no-op when it did not move. Every
+/// writer of a live row's status calls this right after the write, so consumers see the
+/// transition when it commits instead of the poll loop missing a change made between ticks.
+pub fn publish_status_change(
+    status_tx: &tokio::sync::broadcast::Sender<StatusChange>,
+    inst: &crate::session::Instance,
+    old: Status,
+) {
+    if inst.status == old {
+        return;
+    }
+    let _ = status_tx.send(StatusChange {
+        instance_id: inst.id.clone(),
+        instance_title: inst.title.clone(),
+        effective_profile: inst.effective_profile(),
+        old,
+        new: inst.status,
+        at: Utc::now(),
+    });
 }
 
 /// Capacity of the broadcast channel.
@@ -1108,6 +1132,28 @@ pub async fn test(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn publish_status_change_carries_the_profile_and_skips_a_no_op() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel(4);
+        let mut inst = crate::session::Instance::new("t", "/tmp/p");
+        inst.source_profile = "work".to_string();
+        inst.status = Status::Running;
+        let old = inst.status;
+
+        publish_status_change(&tx, &inst, old);
+        assert!(
+            rx.try_recv().is_err(),
+            "an unmoved status publishes nothing"
+        );
+
+        inst.status = Status::Stopped;
+        publish_status_change(&tx, &inst, old);
+        let change = rx.try_recv().expect("the move is published");
+        assert_eq!(change.instance_id, inst.id);
+        assert_eq!(change.effective_profile, "work");
+        assert_eq!((change.old, change.new), (Status::Running, Status::Stopped));
+    }
+
     use super::*;
 
     #[test]
@@ -1404,6 +1450,7 @@ mod tests {
                 StatusChange {
                     instance_id: id.clone(),
                     instance_title: "my session".to_string(),
+                    effective_profile: "default".to_string(),
                     old,
                     new,
                     at: Utc::now(),

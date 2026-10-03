@@ -12,12 +12,13 @@ use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc, Mutex};
 
-use crate::plugin::host_api::{dispatch, HostApiState, PluginRpcContext};
+use crate::plugin::host_api::{dispatch, HostApiState, PluginRpcContext, CAP_SESSION_READ};
 use crate::plugin::launch::{resolve_launch, OsLaunchResolver};
 use crate::plugin::protocol::{self, codes, RpcResponse};
 use crate::plugin::registry::PluginRegistry;
 use crate::plugin::sandbox::{NoSandbox, SandboxBackend};
 use crate::process::worker;
+use crate::server::push::StatusChange;
 
 const EVENT_RETENTION_PER_TOPIC: usize = 10_000;
 const MAX_WORKERS: usize = 32;
@@ -30,12 +31,20 @@ const REAP_GRACE: Duration = if cfg!(test) {
     Duration::from_secs(2)
 };
 
+/// First manifest schema version whose workers receive `session.status.changed`.
+const SESSION_STATUS_API_VERSION: u32 = 14;
+/// Status notifications a worker may have queued unread before further ones are dropped.
+const STATUS_QUEUE_CAP: usize = 64;
+
 struct RunningWorker {
     supervisor_id: u64,
     pid: u32,
     task: tokio::task::JoinHandle<()>,
     inbound: Option<mpsc::UnboundedSender<String>>,
     ui_generation: Option<u64>,
+    /// Bounded and separate from `inbound`, so a worker that stops reading stdin cannot grow
+    /// daemon memory through status events. `None` unless the plugin opted in.
+    status_inbound: Option<mpsc::Sender<String>>,
 }
 
 struct WorkerTable {
@@ -52,6 +61,20 @@ fn inactive_launch_diagnostic(enabled: bool, granted: bool) -> (tracing::Level, 
     } else {
         (tracing::Level::WARN, "inactive")
     }
+}
+
+fn wants_session_status(api_version: u32, granted: &[String]) -> bool {
+    api_version >= SESSION_STATUS_API_VERSION && granted.iter().any(|c| c == CAP_SESSION_READ)
+}
+
+fn session_status_changed_params(change: &StatusChange) -> Value {
+    serde_json::json!({
+        "session_id": change.instance_id,
+        "title": change.instance_title,
+        "from": change.old.wire_str(),
+        "to": change.new.wire_str(),
+        "at": change.at.to_rfc3339(),
+    })
 }
 
 pub struct PluginHost {
@@ -147,6 +170,40 @@ impl PluginHost {
         }
     }
 
+    /// `session_profile` is the session's effective profile. `sessions.list` only exposes the
+    /// host's own profile, so a session from another profile is not pushed either.
+    pub async fn emit_session_status_changed(&self, change: &StatusChange, session_profile: &str) {
+        if crate::session::config::effective_profile(self.api.profile()) != session_profile {
+            return;
+        }
+        let line = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "session.status.changed",
+            "params": session_status_changed_params(change),
+        })
+        .to_string()
+            + "\n";
+        let table = self.state.lock().await;
+        for (plugin_id, worker) in &table.running {
+            let Some(queue) = &worker.status_inbound else {
+                continue;
+            };
+            match queue.try_send(line.clone()) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => tracing::warn!(
+                    target: "plugin.host",
+                    plugin = %plugin_id,
+                    "session.status.changed dropped: worker is not draining its queue; sessions.list is the fallback"
+                ),
+                Err(mpsc::error::TrySendError::Closed(_)) => tracing::debug!(
+                    target: "plugin.host",
+                    plugin = %plugin_id,
+                    "session.status.changed not delivered (no live worker); sessions.list is the fallback"
+                ),
+            }
+        }
+    }
+
     pub async fn start(self: &Arc<Self>, registry: &PluginRegistry) {
         Self::log_start_observability(registry);
         self.reconcile(registry).await;
@@ -225,6 +282,7 @@ impl PluginHost {
                         task: tokio::spawn(async {}),
                         inbound: None,
                         ui_generation: None,
+                        status_inbound: None,
                     },
                 );
                 (stale, reservation)
@@ -270,6 +328,7 @@ impl PluginHost {
                 task,
                 inbound: None,
                 ui_generation: None,
+                status_inbound: None,
             },
         );
     }
@@ -395,6 +454,7 @@ impl PluginHost {
             .iter()
             .map(|c| c.as_str().to_string())
             .collect();
+        let session_status = wants_session_status(plugin.manifest.api_version, &granted);
         let ui_contributions: HashSet<(UiSlot, String)> = plugin
             .manifest
             .ui
@@ -441,9 +501,16 @@ impl PluginHost {
         let stdout = child.stdout.take().context("worker stdout missing")?;
 
         let (inbound_tx, mut inbound_rx) = mpsc::unbounded_channel::<String>();
+        let (status_tx, mut status_rx) = mpsc::channel::<String>(STATUS_QUEUE_CAP);
+        let status_tx = session_status.then_some(status_tx);
         let writer = tokio::spawn(async move {
             let mut stdin = stdin;
-            while let Some(line) = inbound_rx.recv().await {
+            loop {
+                let line = tokio::select! {
+                    Some(line) = inbound_rx.recv() => line,
+                    Some(line) = status_rx.recv() => line,
+                    else => break,
+                };
                 if stdin.write_all(line.as_bytes()).await.is_err() {
                     break; // worker closed stdin; nothing more to send.
                 }
@@ -458,6 +525,7 @@ impl PluginHost {
                     w.pid = pid;
                     w.inbound = Some(inbound_tx.clone());
                     w.ui_generation = Some(ui_generation);
+                    w.status_inbound = status_tx;
                     true
                 }
                 _ => false,
@@ -499,6 +567,7 @@ impl PluginHost {
             if let Some(w) = table.running.get_mut(plugin_id) {
                 if w.supervisor_id == supervisor_id {
                     w.inbound = None;
+                    w.status_inbound = None;
                     w.ui_generation = None;
                 }
             }
@@ -684,10 +753,157 @@ async fn serve_connection(
 }
 
 #[cfg(test)]
+impl PluginHost {
+    /// Registers a fake worker and returns the receiver of its status queue. `None` models a
+    /// plugin that did not opt in, so the receiver never gets a line.
+    pub(crate) async fn register_test_worker(
+        &self,
+        plugin_id: &str,
+        status_capacity: Option<usize>,
+    ) -> mpsc::Receiver<String> {
+        let (tx, rx) = mpsc::channel(status_capacity.unwrap_or(1));
+        let mut table = self.state.lock().await;
+        let supervisor_id = table.next_supervisor_id;
+        table.next_supervisor_id += 1;
+        table.running.insert(
+            plugin_id.to_string(),
+            RunningWorker {
+                supervisor_id,
+                pid: 0,
+                task: tokio::spawn(async {}),
+                inbound: None,
+                ui_generation: None,
+                status_inbound: status_capacity.map(|_| tx),
+            },
+        );
+        rx
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::plugin::host_api::PluginRpcContext;
+    use crate::server::push::StatusChange;
+    use crate::session::Status;
     use serde_json::json;
+
+    fn status_change(old: Status, new: Status) -> StatusChange {
+        StatusChange {
+            instance_id: "sess-1".to_string(),
+            instance_title: "My session".to_string(),
+            effective_profile: "default".to_string(),
+            old,
+            new,
+            at: chrono::DateTime::parse_from_rfc3339("2026-10-03T12:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+        }
+    }
+
+    #[test]
+    fn session_status_gating() {
+        let caps = |c: &[&str]| c.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let cases = [
+            (14, caps(&["runtime.worker", "session.read"]), true),
+            (13, caps(&["runtime.worker", "session.read"]), false),
+            (14, caps(&["runtime.worker"]), false),
+            (14, caps(&[]), false),
+        ];
+        for (api_version, granted, want) in cases {
+            assert_eq!(
+                wants_session_status(api_version, &granted),
+                want,
+                "api_version={api_version} granted={granted:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn session_status_params_use_wire_spelling() {
+        let cases = [
+            (Status::Running, Status::Idle, "Running", "Idle"),
+            (Status::Idle, Status::Stopped, "Idle", "Stopped"),
+            (Status::Starting, Status::Waiting, "Starting", "Waiting"),
+        ];
+        for (old, new, from, to) in cases {
+            assert_eq!(
+                session_status_changed_params(&status_change(old, new)),
+                json!({
+                    "session_id": "sess-1",
+                    "title": "My session",
+                    "from": from,
+                    "to": to,
+                    "at": "2026-10-03T12:00:00+00:00",
+                })
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn emit_session_status_changed_skips_sessions_of_other_profiles() {
+        let tmp = tempfile::tempdir().unwrap();
+        let host = PluginHost::new(tmp.path(), "default", None).unwrap();
+        let mut worker = host.register_test_worker("acme.flagged", Some(8)).await;
+        let change = status_change(Status::Running, Status::Idle);
+
+        host.emit_session_status_changed(&change, "other").await;
+        assert!(
+            worker.try_recv().is_err(),
+            "a session outside the host profile is invisible to sessions.list, so it must not be pushed"
+        );
+
+        host.emit_session_status_changed(&change, "default").await;
+        assert!(worker.try_recv().is_ok(), "same-profile session is pushed");
+    }
+
+    #[tokio::test]
+    async fn session_status_queue_is_bounded_and_drops_when_full() {
+        let tmp = tempfile::tempdir().unwrap();
+        let host = PluginHost::new(tmp.path(), "default", None).unwrap();
+        // A worker that never drains stdin: nothing reads the queue until the asserts.
+        let mut stuck = host.register_test_worker("acme.stuck", Some(2)).await;
+        let change = status_change(Status::Running, Status::Idle);
+
+        for _ in 0..5 {
+            host.emit_session_status_changed(&change, "default").await;
+        }
+        assert!(stuck.try_recv().is_ok());
+        assert!(stuck.try_recv().is_ok());
+        assert!(
+            stuck.try_recv().is_err(),
+            "events past the bound are dropped, not queued"
+        );
+
+        // Draining frees room again.
+        host.emit_session_status_changed(&change, "default").await;
+        assert!(stuck.try_recv().is_ok());
+    }
+
+    #[tokio::test]
+    async fn emit_session_status_changed_reaches_only_flagged_live_workers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let host = PluginHost::new(tmp.path(), "default", None).unwrap();
+        let mut flagged = host.register_test_worker("acme.flagged", Some(8)).await;
+        let mut unflagged = host.register_test_worker("acme.unflagged", None).await;
+        // Closed inbound must not stop delivery to the others or panic.
+        drop(host.register_test_worker("acme.dead", Some(8)).await);
+
+        host.emit_session_status_changed(&status_change(Status::Running, Status::Idle), "default")
+            .await;
+
+        let line = flagged.try_recv().expect("flagged worker gets a line");
+        let msg: serde_json::Value = serde_json::from_str(line.trim_end()).unwrap();
+        assert_eq!(msg["jsonrpc"], json!("2.0"));
+        assert_eq!(msg["method"], json!("session.status.changed"));
+        assert!(msg.get("id").is_none(), "must be a notification");
+        assert_eq!(msg["params"]["to"], json!("Idle"));
+        assert!(flagged.try_recv().is_err(), "exactly one line");
+        assert!(
+            unflagged.try_recv().is_err(),
+            "unflagged worker gets nothing"
+        );
+    }
 
     #[test]
     fn inactive_launch_diagnostic_warns_only_on_unchosen_states() {

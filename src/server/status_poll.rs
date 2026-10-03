@@ -1,6 +1,6 @@
 //! The status poll loop and the passive transitions it decides and writes.
 
-use crate::server::push::StatusChange;
+use crate::server::push::publish_status_change;
 use crate::session::Instance;
 use crate::session::Status;
 use std::sync::Arc;
@@ -213,7 +213,6 @@ pub(super) async fn status_poll_loop(state: Arc<AppState>) {
 
         if let Ok((mut instances, live_worker_records)) = updated {
             // Diff BEFORE `reload_state_instances_from_disk`.
-            let now = chrono::Utc::now();
             let unread_enabled = crate::session::unread_enabled();
             // Passive status transitions observed this tick, batched per profile so one
             // `Storage::update` flock covers every transitioned session on that profile
@@ -226,13 +225,7 @@ pub(super) async fn status_poll_loop(state: Arc<AppState>) {
                 if old == Status::Running && inst.status == Status::Idle {
                     crate::session::smart_rename::maybe_spawn_terminal_smart_rename(inst);
                 }
-                let _ = state.status_tx.send(StatusChange {
-                    instance_id: inst.id.clone(),
-                    instance_title: inst.title.clone(),
-                    old,
-                    new: inst.status,
-                    at: now,
-                });
+                publish_status_change(&state.status_tx, inst, old);
                 let decision = decide_passive_transition(inst, old, unread_enabled);
                 if decision.patch.is_none() && !decision.mark_unread {
                     continue;
