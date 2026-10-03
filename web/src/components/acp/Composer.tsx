@@ -30,6 +30,7 @@ import {
   SendButton,
   StopButton,
   ToolbarButton,
+  AuthStatusHint,
   UsageHint,
 } from "./ComposerControls";
 import {
@@ -70,6 +71,7 @@ interface Props {
   pendingConfigOption: AcpState["pendingConfigOption"];
   setConfigOption: (configId: string, value: string) => void | Promise<void>;
   sessionUsage: AcpState["sessionUsage"];
+  authStatus: AcpState["authStatus"];
   availableCommands: AcpState["availableCommands"];
   /** WS open and worker healthy. Sends still work when false; they queue until resume. */
   connected: boolean;
@@ -340,6 +342,7 @@ export function Composer(props: Props) {
                   pendingConfigOption={props.pendingConfigOption}
                   onSetConfigOption={props.setConfigOption}
                 />
+                <AuthStatusHint authStatus={props.authStatus} />
                 <UsageHint usage={props.sessionUsage} />
               </div>
 

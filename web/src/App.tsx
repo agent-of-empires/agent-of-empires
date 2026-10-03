@@ -46,7 +46,7 @@ import { SendCommentsDialog } from "./components/diff/comments/SendCommentsDialo
 import { useCommandActions, buildConversationActions, type SessionStateAction } from "./hooks/useCommandActions";
 import { usePluginCommands } from "./hooks/usePluginCommands";
 import { useSettingsCommands } from "./hooks/useSettingsCommands";
-import { useEdgeSwipe } from "./hooks/useEdgeSwipe";
+import { useDrawerSwipe, type DrawerSwipeAction } from "./hooks/useDrawerSwipe";
 import { useIsCoarsePointer } from "./hooks/useIsCoarsePointer";
 import { useMobileViewportLock } from "./hooks/useMobileViewportLock";
 import { useIsWideViewport } from "./hooks/useIsWideViewport";
@@ -1572,33 +1572,23 @@ function AppContent({
 
   const handleToggleSidebar = useCallback(() => {
     setSidebarOpen((o) => !o);
+    setPickerOpen(false);
   }, []);
 
-  const openSidebar = useCallback(() => setSidebarOpen(true), []);
-  const openDiff = useCallback(() => {
-    if (isMdUp) {
-      openTab("diff", "right");
-    } else {
-      setPickerOpen(true);
-    }
-  }, [isMdUp, openTab]);
-  useEdgeSwipe({
-    edge: "left",
-    // The swipe-right-to-open gesture only makes sense for a left-anchored
-    // drawer; with the sidebar on the right edge it would slide in from the
-    // opposite side of the drag, so disable it there (#2244).
-    enabled: !sidebarOpen && webSettings.sidebarSide !== "right",
-    onSwipe: openSidebar,
-    blurOnSwipe: true,
-    // A swipe-right anywhere on screen opens the sidebar, not just from the
-    // left edge. The right-edge (diff) swipe stays edge-only below.
-    anywhere: true,
-  });
-  useEdgeSwipe({
-    edge: "right",
-    enabled: rightDockCollapsed && !!activeSessionId,
-    onSwipe: openDiff,
-  });
+  const closePicker = useCallback(() => setPickerOpen(false), []);
+  const handleDrawerSwipe = useCallback((action: DrawerSwipeAction) => {
+    if (action === "open-sidebar" || action === "close-sidebar") setSidebarOpen(action === "open-sidebar");
+    else setPickerOpen(action === "open-panels");
+  }, []);
+  useDrawerSwipe(
+    {
+      sidebarOpen,
+      sidebarSide: webSettings.sidebarSide,
+      panelsOpen: pickerOpen,
+      panelsAvailable: !!activeWorkspace && !!activeSession,
+    },
+    handleDrawerSwipe,
+  );
 
   // Read-only mode hides mutation UI. Guard creation at the handler so every
   // caller (keyboard shortcut, command palette) is a no-op rather than opening
@@ -2128,12 +2118,14 @@ function AppContent({
   const acpPrefs = useMemo(
     () => ({
       showToolDurations: serverAbout?.acp_show_tool_durations ?? true,
+      wrapToolOutput: serverAbout?.acp_wrap_tool_output ?? false,
       replayEvents: serverAbout?.acp_replay_events ?? 0,
       compactionReminder: serverAbout?.acp_compaction_reminder ?? false,
       compactionReminderPercent: serverAbout?.acp_compaction_reminder_percent ?? 75,
     }),
     [
       serverAbout?.acp_show_tool_durations,
+      serverAbout?.acp_wrap_tool_output,
       serverAbout?.acp_replay_events,
       serverAbout?.acp_compaction_reminder,
       serverAbout?.acp_compaction_reminder_percent,
@@ -2526,14 +2518,15 @@ function AppContent({
           />
         )}
 
-        {activeWorkspace && activeSession && (
+        {singlePane && activeWorkspace && activeSession && (
           <MobileRightPanelPicker
-            open={pickerOpen && singlePane}
+            open={pickerOpen}
             active={rightPanelView}
-            pluginPanes={pluginPanes}
+            sessionTitle={activeSession.title}
             availablePanes={mobilePaneIds}
+            describePane={paneDescriptor}
             onSelect={handlePickView}
-            onClose={() => setPickerOpen(false)}
+            onClose={closePicker}
           />
         )}
 

@@ -187,12 +187,13 @@ pub(super) async fn status_poll_loop(state: Arc<AppState>) {
         // true previous-tick live status) rather than letting `update_status_with_metadata`
         // fall back to comparing against its own possibly-stale disk-loaded `status`.
         let prev_for_poll = prev.clone();
-        // Invariant 8.
+        let snapshot_guard = state.session_service.disk_reload_guard().await;
         let read_epoch = state
             .mutation_epoch
             .load(std::sync::atomic::Ordering::SeqCst);
         let updated = tokio::task::spawn_blocking(move || {
             let mut loaded = load_all_instances(&file_watch_for_poll);
+            drop(snapshot_guard);
             seed_tick_tracking(&mut loaded.instances, &prev_tracking);
             crate::tmux::refresh_session_cache();
             let pane_metadata = crate::tmux::batch_pane_metadata();

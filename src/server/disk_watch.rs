@@ -229,16 +229,15 @@ pub(super) async fn disk_watcher_consumer(state: Arc<AppState>) {
             _ = state.disk_changed.notified() => {}
         }
         let started = std::time::Instant::now();
-        // Invariant 8.
+        let snapshot_guard = state.session_service.disk_reload_guard().await;
         let read_epoch = state
             .mutation_epoch
             .load(std::sync::atomic::Ordering::SeqCst);
         let file_watch_for_load = state.file_watch.clone();
         let loaded = match tokio::task::spawn_blocking(move || {
-            (
-                load_all_instances(&file_watch_for_load),
-                live_structured_worker_records(),
-            )
+            let fresh = load_all_instances(&file_watch_for_load);
+            drop(snapshot_guard);
+            (fresh, live_structured_worker_records())
         })
         .await
         {

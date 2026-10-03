@@ -391,6 +391,7 @@ pub(crate) async fn reload_state_instances_from_disk(
     status_source: StatusSource,
     read_epoch: u64,
 ) {
+    let reload_guard = state.session_service.disk_reload_guard().await;
     let LoadedInstances {
         instances: fresh,
         mut cache,
@@ -558,6 +559,7 @@ pub(crate) async fn reload_state_instances_from_disk(
     *previous_cache = cache;
     drop(previous_cache);
     drop(current);
+    drop(reload_guard);
 
     persist_structured_row_repairs(state, repairs, repair_guards);
 }

@@ -68,9 +68,9 @@ pub enum SessionCommands {
     /// Mark a session as a favorite. With `session.favorites_first` on (the
     /// default), favorited rows pin to the top of their sibling scope in every
     /// sort order; with it off, they pin within their status tier in the
-    /// Attention sort only. Either way the row renders with a leading `*`
-    /// marker plus bold and underline wherever the pin applies. Snoozing a
-    /// favorite suspends the pin until it wakes.
+    /// Attention sort only. Either way the row shows a `✦` in the session list
+    /// gutter wherever the pin applies. Snoozing a favorite suspends the pin
+    /// until it wakes.
     Favorite(SessionIdArgs),
 
     /// Clear the favorite flag on a session.

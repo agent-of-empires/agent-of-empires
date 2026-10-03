@@ -219,6 +219,9 @@ export function isElicitationAnswersPayload(value: unknown): value is Elicitatio
 // Written as an escape so the em dash never appears literally in source; mirrors src/acp/elicitations.rs.
 const OPTION_DESC_SEP = " \u2014 ";
 
+/** Mirrors `AcpState::MAX_SESSION_NOTICES`, so a chatty turn cannot grow the strip. */
+const MAX_SESSION_NOTICES = 3;
+
 // MCP forms send a machine token as the value; AskUserQuestion sends the label itself, so keep it bare.
 function selectLabel(question: ElicitationQuestion, raw: string): string {
   const opt = question.options.find((o) => o.value === raw);
@@ -341,6 +344,7 @@ export type AcpEvent =
   | "ThinkingEnded"
   | { RateLimit: { info: RateLimitInfo } }
   | { RateLimitAutoResumed: { resets_at: string; manual?: boolean } }
+  | { SessionNotice: { severity: string; title: string; description?: string | null } }
   | { UsageUpdated: { usage: SessionUsage } }
   | { ModeChanged: { mode: SessionMode } }
   | {
@@ -360,6 +364,7 @@ export type AcpEvent =
         reason: string;
       };
     }
+  | { AuthStatusUpdated: { status: AuthStatus | null } }
   | { RawAgentUpdate: { payload: unknown } }
   | {
       BackgroundAgentLaunched: {
@@ -474,6 +479,18 @@ export interface AcpFrame {
   event: AcpEvent;
 }
 
+/** Which auth identity the agent process resolved for itself. An interim
+ *  upstream extension, so an unrecognised `kind` still renders from `label`. */
+export type AuthStatusKind = "account" | "api_key" | "gateway" | "external" | "none" | "unknown";
+
+export interface AuthStatus {
+  kind: AuthStatusKind;
+  /** Usable as a UI string on its own ("Claude Max", "Anthropic API key"). */
+  label: string;
+  detail?: string | null;
+  account?: { email?: string | null; organization?: string | null; plan?: string | null } | null;
+}
+
 /** Fields this client adopts from the daemon's folded `AcpState`. */
 export interface ReducedState {
   agent: string;
@@ -488,9 +505,12 @@ export interface ReducedState {
   available_commands: AvailableCommand[];
   available_modes: Array<{ id: string; name: string; description?: string | null }>;
   current_mode_id: string | null;
+  auth_status?: AuthStatus | null;
   turn_active: boolean;
   cancelling: boolean;
   compacting: boolean;
+  /** Absent on a daemon that predates session notices. */
+  session_notices?: SessionNotice[];
 }
 
 export interface AcpState {
@@ -538,6 +558,9 @@ export interface AcpState {
     description?: string | null;
   }>;
   currentModeId: string | null;
+  /** Null when the agent never reported, which renders as nothing rather than
+   *  as logged out. */
+  authStatus: AuthStatus | null;
   availableCommands: AvailableCommand[];
   /** Adapter rejected `session/set_mode` (commonly bypassPermissions without `ALLOW_BYPASS`). */
   modeSwitchFailed: { modeId: string; reason: string; at: string } | null;
@@ -585,6 +608,19 @@ export interface AcpState {
   agentOrphaned: boolean;
   /** Async sub-agents launched this session, oldest first. */
   backgroundAgents: BackgroundAgent[];
+  /** Agent-pushed advisories for the current turn, oldest first. */
+  sessionNotices: SessionNotice[];
+  /** Ids dismissed in this tab. Local, so it never clears another client. */
+  dismissedNoticeIds: string[];
+}
+
+/** Wire mirror of the Rust `SessionNotice` (src/acp/state.rs). */
+export interface SessionNotice {
+  id: string;
+  /** Raw ACP level; `info`, `warning` and `error` are the ones defined today. */
+  severity: string;
+  title: string;
+  description?: string | null;
 }
 
 export type BackgroundAgentStatus = "running" | "stalled" | "completed" | "detached" | "error";
@@ -646,6 +682,7 @@ export interface ActivityRow {
     | "empty_output"
     | "context_reset"
     | "notice"
+    | "advisory"
     | "session_cleared"
     | "compacted"
     | "summary";
@@ -691,6 +728,11 @@ export type TranscriptDelta =
   | { Append: TranscriptRow }
   | { Patch: { id: string; row: TranscriptRow } }
   | { Remove: string };
+
+/** Notices the daemon still reports and this tab has not dismissed. */
+export function visibleSessionNotices(state: Pick<AcpState, "sessionNotices" | "dismissedNoticeIds">): SessionNotice[] {
+  return state.sessionNotices.filter((n) => !state.dismissedNoticeIds.includes(n.id));
+}
 
 /** The web shows `notice` rows as banners driven by folded state, so it skips them here. */
 export function webRendersServerRow(row: TranscriptRow): boolean {
@@ -815,6 +857,7 @@ export function emptyAcpState(): AcpState {
     promptSeq: 0,
     availableModes: [],
     currentModeId: null,
+    authStatus: null,
     availableCommands: [],
     workerStopped: false,
     workerRestarting: false,
@@ -838,6 +881,8 @@ export function emptyAcpState(): AcpState {
     configOptions: [],
     configOptionSwitchFailed: null,
     pendingConfigOption: null,
+    sessionNotices: [],
+    dismissedNoticeIds: [],
   };
 }
 
@@ -872,6 +917,9 @@ function applyNewTurnResets(next: AcpState): void {
   next.monitorWorkSeen = false;
   next.monitorDescription = null;
   next.contextPrimerAvailable = null;
+  // Advisories describe the turn they arrived in; the transcript keeps history.
+  next.sessionNotices = [];
+  next.dismissedNoticeIds = [];
 }
 
 /** Pure reducer. Drops frames whose seq is not above `state.lastSeq` so replays are idempotent. */
@@ -930,6 +978,29 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
   }
   if ("CurrentModeChanged" in event) {
     next.modeSwitchFailed = null;
+    return next;
+  }
+  if ("SessionNotice" in event) {
+    const notice = event.SessionNotice;
+    // Matches the id the daemon mints, so a replayed frame cannot double up on
+    // the same notice already adopted from a `reduced_state` snapshot.
+    const id = `notice-${frame.seq}`;
+    if (next.sessionNotices.some((n) => n.id === id)) {
+      return next;
+    }
+    next.sessionNotices = [
+      ...next.sessionNotices,
+      {
+        id,
+        severity: notice.severity,
+        title: notice.title,
+        description: notice.description ?? null,
+      },
+    ].slice(-MAX_SESSION_NOTICES);
+    return next;
+  }
+  if ("AuthStatusUpdated" in event) {
+    next.authStatus = event.AuthStatusUpdated.status;
     return next;
   }
   if ("ModeSwitchFailed" in event) {
@@ -1241,6 +1312,7 @@ export function applyReducedState(state: AcpState, reduced: ReducedState, unchan
     availableCommands: holds("available_commands") ? state.availableCommands : reduced.available_commands,
     availableModes: holds("available_modes") ? state.availableModes : reduced.available_modes,
     currentModeId: reduced.current_mode_id,
+    authStatus: reduced.auth_status ?? null,
     // A false frame cannot suppress a prompt whose POST is still unacknowledged.
     serverTurnActive: reduced.turn_active,
     turnActive: deriveTurnActive({
@@ -1249,6 +1321,9 @@ export function applyReducedState(state: AcpState, reduced: ReducedState, unchan
     }),
     cancelling: reduced.cancelling,
     compacting: reduced.compacting,
+    // The daemon's list is authoritative: a cold open whose replay window
+    // starts after the notice would otherwise miss it, while the TUI shows it.
+    sessionNotices: reduced.session_notices ?? [],
     locallyResolved,
   };
 }
@@ -1373,6 +1448,8 @@ export function normaliseTurnState(
     configOptionSwitchFailed?: ConfigOptionSwitchFailure | null;
     pendingConfigOption?: { configId: string; value: string } | null;
     compactionReminderDismissed?: SessionUsage | null;
+    sessionNotices?: SessionNotice[];
+    dismissedNoticeIds?: string[];
   },
 ): AcpState {
   const serverTurnActive =
@@ -1390,6 +1467,12 @@ export function normaliseTurnState(
   const pendingConfigOption = state.pendingConfigOption === undefined ? null : state.pendingConfigOption;
   const compactionReminderDismissed =
     state.compactionReminderDismissed === undefined ? null : state.compactionReminderDismissed;
+  const sessionNotices = Array.isArray(state.sessionNotices) ? state.sessionNotices : [];
+  // Dismissals the server no longer reports are dropped, so the list cannot
+  // grow across a long session.
+  const dismissedNoticeIds = (Array.isArray(state.dismissedNoticeIds) ? state.dismissedNoticeIds : []).filter((id) =>
+    sessionNotices.some((n) => n.id === id),
+  );
   const oldestSeq =
     typeof state.oldestSeq === "number" && Number.isFinite(state.oldestSeq)
       ? Math.max(0, Math.floor(state.oldestSeq))
@@ -1405,6 +1488,8 @@ export function normaliseTurnState(
     configOptionSwitchFailed,
     pendingConfigOption,
     compactionReminderDismissed,
+    sessionNotices,
+    dismissedNoticeIds,
     serverTurnActive,
     promptSeq,
     inflightPromptIds: [],

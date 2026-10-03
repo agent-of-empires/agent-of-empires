@@ -31,6 +31,7 @@ const NON_SUBSTANTIVE_EVENT_DISCRIMINANTS: &[&str] = &[
     "CurrentModeChanged",
     "AcpSessionAssigned",
     "PromptCapabilities",
+    "AuthStatusUpdated",
 ];
 
 /// SQLite-backed structured view event log.

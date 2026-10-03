@@ -509,6 +509,11 @@ pub struct AcpConfig {
     #[serde(default = "default_true")]
     #[setting(label = "Show tool-call durations", widget = "toggle")]
     pub show_tool_durations: bool,
+    /// Wrap long lines in tool-call input and output blocks by default. Each
+    /// block still has its own wrap toggle; this only sets where it starts.
+    #[serde(default)]
+    #[setting(label = "Wrap tool output", widget = "toggle")]
+    pub wrap_tool_output: bool,
     /// Show a dismissable reminder in the structured view once the agent's
     /// context window passes `compaction_reminder_percent`, suggesting
     /// `/compact`. Off by default: the composer's usage chip already
@@ -655,6 +660,7 @@ impl Default for AcpConfig {
             replay_events: default_replay_events(),
             node_path: String::new(),
             show_tool_durations: true,
+            wrap_tool_output: false,
             compaction_reminder: false,
             compaction_reminder_percent: default_compaction_reminder_percent(),
             silent_orphan_grace_secs: default_silent_orphan_grace_secs(),
@@ -1457,6 +1463,13 @@ pub struct SessionConfig {
     )]
     pub row_tag: RowTagMode,
 
+    /// Show the age column at the right edge of each session row: time since
+    /// the agent stopped on Idle rows, time since last access on Unknown rows,
+    /// and remaining snooze time under the Attention sort.
+    #[serde(default = "default_true")]
+    #[setting(label = "Show Session Age", widget = "toggle", tui_only)]
+    pub show_activity_age: bool,
+
     /// Comma-separated chord specs that exit live-send mode. Tmux-style: C-q,
     /// M-x, F12. The first chord in the list that matches an event ends live
     /// mode. Default `C-q` works in every terminal we ship to; add entries for
@@ -1909,6 +1922,7 @@ impl Default for SessionConfig {
             prevent_sleep_idle_grace_minutes: default_prevent_sleep_idle_grace_minutes(),
             restart_wake_message: default_restart_wake_message(),
             row_tag: RowTagMode::default(),
+            show_activity_age: true,
             live_send_exit_chord: default_live_send_exit_chord(),
             live_send_leader: default_live_send_leader(),
             default_attach_mode: AttachMode::default(),
@@ -2275,7 +2289,7 @@ pub struct ThemeConfig {
     /// Idle session keeps a fresh-idle tint and an animated breathe icon for
     /// this many minutes before snapping back to the static look, and is
     /// treated as actionable by the `w` keybind. The time-since-stop column
-    /// on Idle rows shows regardless of this setting.
+    /// is `session.show_activity_age`.
     #[serde(default = "default_idle_decay_minutes")]
     #[setting(label = "Idle Decay (minutes)", widget = "number", min = 0)]
     pub idle_decay_minutes: u64,

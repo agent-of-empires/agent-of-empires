@@ -132,3 +132,52 @@ fn test_new_session_enters_live_mode_when_configured() {
     h.wait_for_timeout("LIVE", Duration::from_secs(10));
     h.assert_screen_contains(" aoe ");
 }
+
+/// `N` opens the form from the row under the cursor: a group row gives its group, a session
+/// row its group and its agent too.
+#[test]
+#[parallel]
+fn test_new_from_selection_starts_on_the_selected_sessions_agent() {
+    require_tmux!();
+    let mut h = TuiTestHarness::new("new_from_selection_agent");
+    h.install_path_command("codex");
+    let project = h.project_path();
+    h.add_session(&[
+        project.to_str().unwrap(),
+        "-t",
+        "codex-source",
+        "--tool",
+        "codex",
+        "-g",
+        "work",
+    ]);
+    h.spawn_tui();
+    h.wait_for("codex-source");
+
+    let new_from_selection_shows = |row: &str, tool: &str| {
+        h.send_keys("N");
+        h.wait_for(" New Session ");
+        let screen = h.capture_screen();
+        let tool_row = screen.lines().find_map(|line| {
+            let rest = &line[line.find("Tool: [")? + "Tool: [".len()..];
+            let (digit, rest) = rest.split_once("] ")?;
+            digit.parse::<u8>().ok()?;
+            Some(rest.split_whitespace().next()?.to_string())
+        });
+        assert_eq!(
+            tool_row.as_deref(),
+            Some(tool),
+            "N on the {row} row should show {tool} on the numbered tool row\nscreen:\n{screen}"
+        );
+        assert!(
+            screen.contains("Group: work"),
+            "N on the {row} row should show the work group\nscreen:\n{screen}"
+        );
+        h.send_keys("Escape");
+        h.wait_for_absent(" New Session ", Duration::from_secs(5));
+    };
+
+    new_from_selection_shows("group", "claude");
+    h.send_keys("j");
+    new_from_selection_shows("session", "codex");
+}
