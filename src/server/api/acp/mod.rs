@@ -192,6 +192,7 @@ pub(crate) fn spawn_request_for(
         fork_from: instance.fork_pending.clone(),
         sandbox_continuation: crate::acp::supervisor::SandboxContinuation::Persisted,
         sandbox_info,
+        workspace_info: instance.workspace_info.clone(),
         // Passed even without sandboxing so agent_acp_cmd and worker env
         // resolve from the session's profile.
         source_profile: Some(instance.source_profile.clone()),

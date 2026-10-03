@@ -826,6 +826,7 @@ pub(crate) async fn spawn_structured_session(
                     instance.command.clone(),
                     instance.import_pending == Some(true),
                     instance.fork_pending.clone(),
+                    instance.workspace_info.clone(),
                 ))
             } else {
                 None
@@ -853,6 +854,7 @@ pub(crate) async fn spawn_structured_session(
                 command,
                 seed_history_replay,
                 fork_from,
+                workspace_info,
             )) = acp_spawn_target
             {
                 let reservation = acp_reservation.expect("spawn target owns its ACP lease");
@@ -971,6 +973,7 @@ pub(crate) async fn spawn_structured_session(
                                     sandbox_continuation:
                                         crate::acp::supervisor::SandboxContinuation::Persisted,
                                     sandbox_info,
+                                    workspace_info,
                                     source_profile: source_profile_for_spawn,
                                     yolo_mode,
                                     acp_mode_id,
