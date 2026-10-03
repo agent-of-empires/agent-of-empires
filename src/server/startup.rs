@@ -456,13 +456,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         }
     };
 
-    // Read-only serve never spawns agents, so it needs no rewriter. Otherwise one is always
-    // installed; without a host it fails closed for sessions a hook applies to.
-    if !read_only {
-        crate::acp::mcp_rewrite::set_rewriter(Some(std::sync::Arc::new(
-            crate::plugin::mcp_rewrite::PluginMcpRewriter::new(plugin_host.clone()),
-        )));
-    }
+    install_mcp_rewriter(plugin_host.clone());
 
     // Telemetry (opt-in, no-op otherwise).
     crate::telemetry::spawn_process_start(crate::telemetry::Surface::Serve);
@@ -1149,6 +1143,14 @@ async fn remote_rotation_loop(
     }
 }
 
+/// Always installed, read-only serve included: it still resumes and respawns agents, and with no
+/// host a rewriter fails closed for sessions a hook applies to.
+fn install_mcp_rewriter(plugin_host: Option<std::sync::Arc<crate::plugin::host::PluginHost>>) {
+    crate::acp::mcp_rewrite::set_rewriter(Some(std::sync::Arc::new(
+        crate::plugin::mcp_rewrite::PluginMcpRewriter::new(plugin_host),
+    )));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1327,6 +1329,17 @@ mod tests {
             let n = socket.recv(&mut buf).unwrap();
             assert_eq!(&buf[..n], b"STOPPING=1\n");
         }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn install_mcp_rewriter_sets_the_slot_without_a_plugin_host() {
+        use crate::acp::mcp_rewrite::test_support::{slot_is_set, SlotGuard};
+
+        let _slot = SlotGuard::clear_on_drop();
+        assert!(!slot_is_set());
+        install_mcp_rewriter(None);
+        assert!(slot_is_set());
     }
 
     /// The sweep fires at its interval, not the next recheck, and a window

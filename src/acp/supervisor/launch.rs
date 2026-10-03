@@ -937,6 +937,14 @@ pub(super) async fn resolve_mcp_servers(
         .collect();
     let defs = resolved.into_iter().map(|s| s.def).collect();
     let rewritten = crate::acp::mcp_rewrite::rewrite_servers(&ctx, defs).await;
+    debug!(
+        target: "acp.mcp",
+        session = %session_id,
+        sandboxed,
+        count = rewritten.len(),
+        servers = %crate::session::mcp::mcp_model::summarize_defs(&rewritten),
+        "forwarding MCP servers"
+    );
     // A server the hook added keeps no provenance; treat it as project-local so it
     // never receives session env values.
     let resolved = rewritten
@@ -1589,25 +1597,21 @@ mod tests {
         );
     }
 
+    fn rewritten_server() -> crate::session::mcp::project_mcp::ProjectMcpServer {
+        use crate::session::mcp::project_mcp::{ProjectMcpServer, ProjectMcpTransport};
+        ProjectMcpServer {
+            name: "rewritten".into(),
+            transport: ProjectMcpTransport::Http {
+                url: "http://gateway/mcp".into(),
+                headers: Default::default(),
+            },
+        }
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn resolve_mcp_servers_applies_the_rewrite_hook_after_the_merge() {
-        use crate::acp::mcp_rewrite::{
-            set_rewriter, McpRewriteContext, McpRewriter, RewriteFuture,
-        };
-        use crate::session::mcp::project_mcp::ProjectMcpServer;
-
-        struct DropAll;
-        impl McpRewriter for DropAll {
-            fn rewrite<'a>(
-                &'a self,
-                ctx: &'a McpRewriteContext,
-                _servers: Vec<ProjectMcpServer>,
-            ) -> RewriteFuture<'a> {
-                assert!(ctx.sandboxed, "context must carry the sandbox flag");
-                Box::pin(async { Ok(Vec::new()) })
-            }
-        }
+        use crate::acp::mcp_rewrite::test_support::{RecordingRewriter, SlotGuard};
 
         let (_home, tmp) = isolate_home();
         let _env = crate::session::test_support::EnvGuard::unset(&["CLAUDE_CONFIG_DIR"]);
@@ -1629,16 +1633,70 @@ mod tests {
             )
         };
 
-        set_rewriter(Some(std::sync::Arc::new(DropAll)));
+        let rewriter = RecordingRewriter::returning(Vec::new());
+        let slot = SlotGuard::install(rewriter.clone());
         let sandboxed = resolve(true).await;
-        set_rewriter(None);
+        drop(slot);
         let plain = resolve(false).await;
 
+        assert_eq!(
+            *rewriter.sandboxed_calls.lock().unwrap(),
+            [true],
+            "context must carry the sandbox flag"
+        );
         assert!(
             sandboxed.is_empty(),
             "hook dropped everything for the sandbox"
         );
         assert_eq!(plain.len(), 1, "no rewriter leaves the set alone");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn launch_runs_the_rewrite_hook_with_the_sandbox_flag() {
+        use crate::acp::mcp_rewrite::test_support::{RecordingRewriter, SlotGuard};
+
+        let (_home, _tmp) = isolate_home();
+        let rewriter = RecordingRewriter::returning(vec![rewritten_server()]);
+        let _slot = SlotGuard::install(rewriter.clone());
+        let supervisor = Supervisor::new(VecSink::new());
+
+        let plain = spawn_request("launch-plain");
+        let (config, _) = supervisor.spawn_config(&plain, 1).await.unwrap();
+        assert_eq!(mcp_names(&config.mcp_servers), ["rewritten"]);
+
+        let sandbox_info = crate::session::SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "aoe-sandbox:test".into(),
+            container_name: "aoe-sandbox-launch".into(),
+            extra_env: None,
+            custom_instruction: None,
+            container_workdir: None,
+            before_start_env: Vec::new(),
+            provider: None,
+        };
+        let mut instance = crate::session::Instance::new("launch", "/tmp");
+        instance.id = "launch-sandboxed".into();
+        instance.tool = "claude-code".into();
+        instance.sandbox_info = Some(sandbox_info.clone());
+        drop(
+            crate::migrations::v033_isolate_sandbox_content::admit_fresh_instance(&instance)
+                .unwrap(),
+        );
+        crate::session::Storage::new_unwatched("default")
+            .unwrap()
+            .update(|instances, _| {
+                *instances = vec![instance.clone()];
+                Ok(())
+            })
+            .unwrap();
+        let mut sandboxed = spawn_request("launch-sandboxed");
+        sandboxed.sandbox_info = Some(sandbox_info);
+        let (config, _) = supervisor.spawn_config(&sandboxed, 1).await.unwrap();
+        assert_eq!(mcp_names(&config.mcp_servers), ["rewritten"]);
+
+        assert_eq!(*rewriter.sandboxed_calls.lock().unwrap(), [false, true]);
     }
 
     #[tokio::test]

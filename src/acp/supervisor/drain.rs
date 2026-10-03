@@ -1624,6 +1624,45 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
+    async fn respawn_runs_the_rewrite_hook_with_the_sandbox_flag() {
+        use crate::acp::mcp_rewrite::test_support::{RecordingRewriter, SlotGuard};
+        use crate::session::mcp::project_mcp::{ProjectMcpServer, ProjectMcpTransport};
+        use agent_client_protocol::schema::v1::McpServer;
+
+        let (_home, temp) = isolate_home();
+        let rewriter = RecordingRewriter::returning(vec![ProjectMcpServer {
+            name: "rewritten".into(),
+            transport: ProjectMcpTransport::Http {
+                url: "http://gateway/mcp".into(),
+                headers: Default::default(),
+            },
+        }]);
+        let _slot = SlotGuard::install(rewriter.clone());
+
+        let mut config = runner_config(worker_registry::socket_path_for("s-hook").unwrap());
+        config.cwd = temp.path().to_path_buf();
+        config.sandbox_info = Some(crate::session::SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "aoe-sandbox:test".into(),
+            container_name: "aoe-sandbox-hook".into(),
+            extra_env: None,
+            custom_instruction: None,
+            container_workdir: None,
+            before_start_env: Vec::new(),
+            provider: None,
+        });
+        Drain::<VecSink>::refresh_launch_env("s-hook", &mut config).await;
+
+        assert_eq!(*rewriter.sandboxed_calls.lock().unwrap(), [true]);
+        assert!(matches!(
+            config.mcp_servers.as_slice(),
+            [McpServer::Http(server)] if server.name == "rewritten"
+        ));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn respawn_reapplies_selected_claude_store_before_native_mcp_discovery() {
         use agent_client_protocol::schema::v1::McpServer;
 
