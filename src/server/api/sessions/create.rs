@@ -1271,6 +1271,20 @@ pub(super) fn apply_post_restart_sync(
     true
 }
 
+/// [`apply_post_restart_sync`] on a live row, publishing the status move it makes. The disk
+/// copy is synced with the plain function, since only the live row is what consumers watch.
+pub(super) fn sync_live_after_restart(
+    status_tx: &tokio::sync::broadcast::Sender<crate::server::push::StatusChange>,
+    live: &mut Instance,
+    before: &Instance,
+    started: &Instance,
+) -> bool {
+    let old = live.status;
+    let applied = apply_post_restart_sync(live, before, started);
+    crate::server::push::publish_status_change(status_tx, live, old);
+    applied
+}
+
 /// Narrow sibling of [`apply_post_restart_sync`] that propagates only the
 /// resume path's fields: the post-probe `agent_session_id`, the
 /// `resume_probe_failed_sid` marker, and `retroactive_capture_excludes`.
