@@ -247,6 +247,8 @@ Log in once with [`aoe sandbox login`](../cli/reference.md#aoe-sandbox-login). I
 
 AoE leaves an existing file as it is, so an install that was seeded from the host keeps the host's token after the switch. To switch, stop the sandboxes, delete `sandbox-v2/.credentials.json`, set the option and run `aoe sandbox login`. The option is global only: a profile cannot override it, because every profile that uses the same agent config directory shares the one file. Profiles with their own directory via `session.agent_config_dir` have separate shared files, but still follow the one global value.
 
+MCP servers hold credentials of their own. A plugin can rewrite what a sandboxed session receives with the [`mcp.rewrite` hook](../plugin-api.md#hooks). AoE does not copy host MCP definitions into a Claude sandbox's agent store, but other agents' MCP-bearing config files are still copied verbatim, so for those agents the hook alone does not keep host MCP secrets out of the sandbox.
+
 ### Reclaiming stores
 
 Permanently deleting a sandboxed session removes its store along with its
