@@ -456,6 +456,13 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         }
     };
 
+    // No fail-closed fallback for `None`: read-only serve never spawns ACP workers.
+    if let Some(host) = &plugin_host {
+        crate::acp::mcp_rewrite::set_rewriter(Some(std::sync::Arc::new(
+            crate::plugin::mcp_rewrite::PluginMcpRewriter::new(host.clone()),
+        )));
+    }
+
     // Telemetry (opt-in, no-op otherwise).
     crate::telemetry::spawn_process_start(crate::telemetry::Surface::Serve);
 
