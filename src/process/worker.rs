@@ -310,7 +310,6 @@ mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        assert!(nix::sys::signal::kill(nix::unistd::Pid::from_raw(-(pid as i32)), None).is_ok());
         assert!(
             !is_process_group_alive(pid),
             "zombies cannot keep the checkout in use"

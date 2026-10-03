@@ -1653,7 +1653,7 @@ Manage the ACP structured-view workers (doctor, ps, logs, prompt, approve, ...)
 
 * `doctor` — Verify the structured view can start: Node runtime, configured agents, provider auth (claude login)
 * `agents` — List configured agents (claude-code, aoe-agent, etc.)
-* `stop` — Gracefully stop an agent worker (SIGTERM the runner, agent receives stdin EOF). Sessions can be reattached on the next `aoe serve` only if they are still alive afterward; `stop` destroys the worker
+* `stop` — Authentically stop a session's managed executions and prove their groups quiescent. Unverified legacy history remains protected
 * `kill` — SIGKILL a worker immediately (use when `stop` doesn't take)
 * `logs` — Tail the runner's log file for an agent session
 * `restart` — Restart a wedged agent worker: stop the existing runner, then let the daemon's reconciler spawn a fresh one on the next tick
@@ -1696,7 +1696,7 @@ List configured agents (claude-code, aoe-agent, etc.)
 
 ## `aoe acp stop`
 
-Gracefully stop an agent worker (SIGTERM the runner, agent receives stdin EOF). Sessions can be reattached on the next `aoe serve` only if they are still alive afterward; `stop` destroys the worker
+Authentically stop a session's managed executions and prove their groups quiescent. Unverified legacy history remains protected
 
 **Usage:** `aoe acp stop [OPTIONS] [SESSION]`
 
@@ -1707,7 +1707,7 @@ Gracefully stop an agent worker (SIGTERM the runner, agent receives stdin EOF). 
 ###### **Options:**
 
 * `--all` — Stop every running agent worker
-* `--timeout-secs <TIMEOUT_SECS>` — Seconds to wait after SIGTERM before escalating to SIGKILL
+* `--timeout-secs <TIMEOUT_SECS>` — Maximum seconds to wait for authenticated stop and quiescence proof
 
   Default value: `5`
 
