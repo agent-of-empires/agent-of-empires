@@ -24,7 +24,7 @@ use crate::plugin::protocol::{self, codes, RpcResponse};
 use crate::plugin::registry::PluginRegistry;
 use crate::plugin::sandbox::{NoSandbox, SandboxBackend};
 use crate::plugin::worker_logs;
-use crate::plugin::worker_requests::{PendingRequests, WorkerRequestError};
+use crate::plugin::worker_requests::{PendingRequests, WorkerRef, WorkerRequestError};
 use crate::process::worker;
 use crate::server::push::StatusChange;
 use crate::session::lifecycle::LifecycleChange;
@@ -86,6 +86,9 @@ struct RunningWorker {
     task: tokio::task::JoinHandle<()>,
     /// Sender for host notifications, present only while a generation runs.
     inbound: Option<mpsc::UnboundedSender<String>>,
+    /// The manifest this generation was launched from; requests chosen under another are
+    /// not delivered to it. Empty until it is launched.
+    manifest_hash: String,
     /// Lets teardown retire UI state from this worker generation only.
     ui_generation: Option<u64>,
     /// Bounded and separate from `inbound`, so a worker that stops reading stdin cannot grow
@@ -246,56 +249,62 @@ impl PluginHost {
     }
 
     /// Sends a JSON-RPC request to a running worker and awaits its reply. A worker that is
-    /// still starting is waited for until the timeout elapses.
+    /// still starting is waited for until the timeout elapses. A running worker launched from
+    /// another manifest than `worker.manifest_hash` gets nothing: the request fails closed,
+    /// because it was chosen under a grant that worker does not hold.
     pub async fn request_worker(
         &self,
-        plugin_id: &str,
+        worker: WorkerRef<'_>,
         method: &str,
         params: Value,
         timeout: Duration,
     ) -> Result<Value, WorkerRequestError> {
+        let plugin_id = worker.plugin_id;
         let deadline = Instant::now() + timeout;
         let (generation, inbound) = loop {
             let found = {
                 let table = self.state.lock().await;
-                table
-                    .running
-                    .get(plugin_id)
-                    .and_then(|w| w.inbound.clone().map(|tx| (w.supervisor_id, tx)))
+                table.running.get(plugin_id).and_then(|w| {
+                    w.inbound
+                        .clone()
+                        .map(|tx| (w.manifest_hash == worker.manifest_hash, w.supervisor_id, tx))
+                })
             };
             let remaining = deadline.saturating_duration_since(Instant::now());
             match found {
-                Some(found) => break found,
+                Some((false, ..)) => return Err(WorkerRequestError::Superseded),
+                Some((true, generation, inbound)) => break (generation, inbound),
                 None if remaining.is_zero() => return Err(WorkerRequestError::NoWorker),
                 None => tokio::time::sleep(remaining.min(Duration::from_millis(50))).await,
             }
         };
         let (id, rx) = self.pending.register(plugin_id, generation);
-        // Teardown and exit clear the slot before failing entries, so a request registered
-        // after that sweep sees the missing worker here instead of waiting for the timeout.
-        let still_current = {
-            let table = self.state.lock().await;
-            table
-                .running
-                .get(plugin_id)
-                .is_some_and(|w| w.supervisor_id == generation && w.inbound.is_some())
-        };
+        // A dropped caller must not leave its entry behind.
+        let _forget = self.pending.forget_on_drop(&id);
         let line =
             serde_json::json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params })
                 .to_string()
                 + "\n";
-        if !still_current || inbound.send(line).is_err() {
-            self.pending.cancel(&id);
+        // Teardown and exit clear the slot before failing entries, so a request registered
+        // after that sweep sees the missing worker here instead of waiting for the timeout.
+        // Checking the channel and queueing under one lock keeps a replaced worker from being
+        // handed the call.
+        let queued = {
+            let table = self.state.lock().await;
+            table.running.get(plugin_id).is_some_and(|w| {
+                w.inbound
+                    .as_ref()
+                    .is_some_and(|tx| tx.same_channel(&inbound) && tx.send(line).is_ok())
+            })
+        };
+        if !queued {
             return Err(WorkerRequestError::WorkerGone);
         }
         match tokio::time::timeout(deadline.saturating_duration_since(Instant::now()), rx).await {
             Ok(Ok(Ok(result))) => Ok(result),
             Ok(Ok(Err(_))) => Err(WorkerRequestError::Rejected),
             Ok(Err(_)) => Err(WorkerRequestError::WorkerGone),
-            Err(_) => {
-                self.pending.cancel(&id);
-                Err(WorkerRequestError::Timeout)
-            }
+            Err(_) => Err(WorkerRequestError::Timeout),
         }
     }
 
@@ -538,6 +547,7 @@ impl PluginHost {
                         pid: 0,
                         task: tokio::spawn(async {}),
                         inbound: None,
+                        manifest_hash: String::new(),
                         ui_generation: None,
                         events_inbound: None,
                         lifecycle_events: false,
@@ -590,6 +600,7 @@ impl PluginHost {
                 pid: 0,
                 task,
                 inbound: None,
+                manifest_hash: String::new(),
                 ui_generation: None,
                 events_inbound: None,
                 lifecycle_events: false,
@@ -749,6 +760,7 @@ impl PluginHost {
             .map(|c| c.as_str().to_string())
             .collect();
         let session_status = wants_session_status(plugin.manifest.api_version, &granted);
+        let manifest_hash = plugin.manifest_hash.clone();
         let session_lifecycle = wants_session_lifecycle(plugin.manifest.api_version, &granted);
         let ui_contributions: HashSet<(UiSlot, String)> = plugin
             .manifest
@@ -872,8 +884,12 @@ impl PluginHost {
             let mut table = self.state.lock().await;
             match table.running.get_mut(plugin_id) {
                 Some(w) if w.supervisor_id == supervisor_id => {
+                    // Before the channel is visible, so no request reaches this worker while
+                    // its generation still reads as ended.
+                    self.pending.reopen(plugin_id, supervisor_id);
                     w.pid = pid;
                     w.inbound = Some(inbound_tx.clone());
+                    w.manifest_hash = manifest_hash.clone();
                     w.ui_generation = Some(ui_generation);
                     w.events_inbound = status_tx;
                     w.lifecycle_events = session_lifecycle;
@@ -1277,9 +1293,38 @@ impl PluginHost {
                 pid: 0,
                 task: tokio::spawn(async {}),
                 inbound: None,
+                manifest_hash: String::new(),
                 ui_generation: None,
                 events_inbound: event_capacity.map(|_| tx),
                 lifecycle_events,
+                dropped_events: 0,
+            },
+        );
+        rx
+    }
+
+    /// Registers a fake worker launched from `manifest_hash` and returns what the host writes
+    /// to its stdin.
+    pub(crate) async fn register_test_inbound(
+        &self,
+        plugin_id: &str,
+        manifest_hash: &str,
+    ) -> mpsc::UnboundedReceiver<String> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut table = self.state.lock().await;
+        let supervisor_id = table.next_supervisor_id;
+        table.next_supervisor_id += 1;
+        table.running.insert(
+            plugin_id.to_string(),
+            RunningWorker {
+                supervisor_id,
+                pid: 0,
+                task: tokio::spawn(async {}),
+                inbound: Some(tx),
+                manifest_hash: manifest_hash.to_string(),
+                ui_generation: None,
+                events_inbound: None,
+                lifecycle_events: false,
                 dropped_events: 0,
             },
         );
@@ -2091,17 +2136,25 @@ process.stdout.write(JSON.stringify({jsonrpc:"2.0",id:1,method:"test.hold",param
         );
         let checked = async {
             let outcome = tokio::time::timeout(Duration::from_secs(10), rx).await;
+            // The held call is still running here, so this registers during the drain.
+            let (_late, late_rx) = pending.register(&ctx.plugin_id, 1);
+            let late = tokio::time::timeout(Duration::from_secs(10), late_rx).await;
             // Release the one held call whatever happened, so the loop ends.
             TEST_HOLD.add_permits(1);
-            outcome
+            (outcome, late)
         };
-        let ((), outcome) = tokio::join!(serve, checked);
+        let ((), (outcome, late)) = tokio::join!(serve, checked);
         let _ = child.wait().await;
         assert!(
             outcome
                 .expect("the waiter is woken at EOF, not at its timeout")
                 .is_err(),
             "the waiter sees its worker gone"
+        );
+        assert!(
+            late.expect("a request registered during the drain must not wait")
+                .is_err(),
+            "a request registered after the sweep sees its worker gone"
         );
     }
 
@@ -2222,6 +2275,58 @@ rl.on('line', (line) => {
             .unwrap();
         assert_eq!(result["drop"], "*");
     }
+    fn worker_ref<'a>(plugin_id: &'a str, manifest_hash: &'a str) -> WorkerRef<'a> {
+        WorkerRef {
+            plugin_id,
+            manifest_hash,
+        }
+    }
+
+    /// A request chosen under one manifest is not delivered to a worker launched from
+    /// another; the same manifest gets it.
+    #[tokio::test]
+    async fn a_request_reaches_only_a_worker_launched_from_the_chosen_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let host = PluginHost::new(
+            tmp.path(),
+            "default",
+            None,
+            Arc::new(crate::server::runtime::RuntimeWork::default()),
+        )
+        .unwrap();
+        let mut stdin = host.register_test_inbound("acme.hook", "sha256:v1").await;
+
+        let err = host
+            .request_worker(
+                worker_ref("acme.hook", "sha256:v2"),
+                "mcp.rewrite",
+                json!({ "secret": "credential-bearing" }),
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, WorkerRequestError::Superseded), "{err}");
+        assert!(
+            stdin.try_recv().is_err(),
+            "the superseded worker must receive nothing"
+        );
+
+        let matching = host.request_worker(
+            worker_ref("acme.hook", "sha256:v1"),
+            "mcp.rewrite",
+            json!({}),
+            Duration::from_millis(200),
+        );
+        let received = tokio::time::timeout(Duration::from_secs(10), stdin.recv());
+        let (reply, line) = tokio::join!(matching, received);
+        assert!(matches!(reply.unwrap_err(), WorkerRequestError::Timeout));
+        assert!(
+            line.expect("the matching worker is asked before the deadline")
+                .expect("the host keeps the channel open")
+                .contains("mcp.rewrite"),
+            "the matching worker receives the request"
+        );
+    }
 
     #[tokio::test]
     async fn request_worker_without_a_worker_waits_then_reports_no_worker() {
@@ -2236,7 +2341,10 @@ rl.on('line', (line) => {
         let started = Instant::now();
         let err = host
             .request_worker(
-                "acme.absent",
+                WorkerRef {
+                    plugin_id: "acme.absent",
+                    manifest_hash: "sha256:none",
+                },
                 "mcp.rewrite",
                 json!({}),
                 Duration::from_millis(300),
@@ -2481,10 +2589,16 @@ command = {command}
         )
         .unwrap();
         host.start(&registry).await;
+        let hash = registry.get(plugin_id).unwrap().manifest_hash.clone();
 
         let started = Instant::now();
         let err = host
-            .request_worker(plugin_id, "mcp.rewrite", json!({}), Duration::from_secs(20))
+            .request_worker(
+                worker_ref(plugin_id, &hash),
+                "mcp.rewrite",
+                json!({}),
+                Duration::from_secs(20),
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, WorkerRequestError::WorkerGone), "{err}");
@@ -2517,13 +2631,19 @@ command = {command}
         )
         .unwrap();
         host.start(&registry).await;
+        let hash = registry.get(plugin_id).unwrap().manifest_hash.clone();
 
         let waiter = tokio::spawn({
             let host = host.clone();
             async move {
                 let started = Instant::now();
                 let result = host
-                    .request_worker(plugin_id, "mcp.rewrite", json!({}), Duration::from_secs(20))
+                    .request_worker(
+                        worker_ref(plugin_id, &hash),
+                        "mcp.rewrite",
+                        json!({}),
+                        Duration::from_secs(20),
+                    )
                     .await;
                 (result, started.elapsed())
             }
@@ -2543,6 +2663,52 @@ command = {command}
             elapsed < Duration::from_secs(10),
             "must not wait for the timeout"
         );
+        host.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn dropping_a_pending_request_forgets_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("XDG_CONFIG_HOME", temp.path().to_path_buf()),
+            ("HOME", temp.path().to_path_buf()),
+            ("USERPROFILE", temp.path().to_path_buf()),
+        ]);
+        let plugin_id = "acme.sleeper";
+        install_sleeper(plugin_id);
+        let registry = crate::plugin::reload_registry();
+        let host = PluginHost::new(
+            &temp.path().join("host"),
+            "default",
+            None,
+            Arc::new(crate::server::runtime::RuntimeWork::default()),
+        )
+        .unwrap();
+        host.start(&registry).await;
+        let hash = registry.get(plugin_id).unwrap().manifest_hash.clone();
+
+        let waiter = tokio::spawn({
+            let host = host.clone();
+            async move {
+                host.request_worker(
+                    worker_ref(plugin_id, &hash),
+                    "mcp.rewrite",
+                    json!({}),
+                    Duration::from_secs(60),
+                )
+                .await
+            }
+        });
+        wait_until("the request to be pending", || async {
+            host.pending.waiting(plugin_id) == 1
+        })
+        .await;
+        waiter.abort();
+        assert!(waiter.await.unwrap_err().is_cancelled());
+        assert_eq!(host.pending.waiting(plugin_id), 0);
         host.shutdown().await;
     }
 
