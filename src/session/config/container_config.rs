@@ -58,10 +58,9 @@ struct AgentConfigMount {
 }
 
 /// The sole source-copy registry. Unknown root files never gain copy authority.
-/// A sandbox store must never carry host MCP definitions; the `mcp.rewrite`
-/// hook is the only MCP source for sandboxed agents. Claude holds this (host
-/// `.claude.json` is never copied). Other agents' MCP-bearing config files
-/// below are still copied verbatim, a known gap.
+/// MCP servers reach sandboxed agents only through ACP forwarding, so Claude's host
+/// `.claude.json` is never copied. Other agents' MCP-bearing config files below are
+/// still copied verbatim, a known gap.
 const AGENT_CONFIG_MOUNTS: &[AgentConfigMount] = &[
     AgentConfigMount {
         tool_name: "claude",
