@@ -490,6 +490,8 @@ pub(crate) async fn spawn_structured_session(
                             cwd,
                             additional_dirs: vec![],
                             provider_env: vec![],
+                            // A pick is made on a live session, never at create.
+                            provider: None,
                             model,
                             effort,
                             effort_explicit,

@@ -40,6 +40,23 @@ async function record(envVar, line) {
   if (file) await appendFile(file, line);
 }
 
+// SHIM_ENV_RECORD_FILE: the Claude routing variables as the adapter process
+// actually received them, so a test can assert which provider aoe pinned.
+// Unset and empty are reported differently: an override has to beat an
+// inherited value, not merely fail to set one.
+await record(
+  "SHIM_ENV_RECORD_FILE",
+  JSON.stringify(
+    Object.fromEntries(
+      [
+        "CLAUDE_CODE_USE_BEDROCK",
+        "CLAUDE_CODE_USE_VERTEX",
+        "ANTHROPIC_VERTEX_PROJECT_ID",
+      ].map((key) => [key, process.env[key] ?? null]),
+    ),
+  ) + "\n",
+);
+
 function park() {
   return new Promise((resolve) => {
     parkedPromptResolve = resolve;
@@ -179,9 +196,11 @@ function withConfigOptions(response) {
   return options ? { ...response, configOptions: options } : response;
 }
 
-// session/load, registered only with SHIM_LOAD_SESSION=1.
+// session/load, registered only with SHIM_LOAD_SESSION=1. SHIM_RESUMED_MODEL
+// resumes on that model, as claude-agent-acp lands on the transcript's last one.
 function handleLoadSession(params) {
   sessions.set(params.sessionId, {});
+  if (process.env.SHIM_RESUMED_MODEL) model = process.env.SHIM_RESUMED_MODEL;
   return withConfigOptions({});
 }
 

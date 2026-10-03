@@ -3,7 +3,9 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::acp::protocol::{SwitchAgentRequest, SwitchAgentResponse};
+use crate::acp::protocol::{
+    SwitchAgentRequest, SwitchAgentResponse, SwitchProviderRequest, SwitchProviderResponse,
+};
 use crate::server::acp_reconciler::install_rate_limit_continuation;
 use crate::server::api::find_instance;
 
@@ -475,6 +477,203 @@ pub async fn switch_acp_agent(
     .into_response()
 }
 
+/// The adapter's always-present model entry, which the CLI resolves to the
+/// running provider's own default.
+const PROVIDER_DEFAULT_MODEL: &str = "default";
+
+/// Record the pick in memory and on disk from one mutation. Written before the
+/// respawn, because the container reconcile and the spawn request both read it
+/// off the row. The model is pinned to `default` rather than cleared: model ids
+/// are provider-specific, and a resumed session otherwise keeps the model its
+/// transcript last ran on, which the new provider may not serve.
+///
+/// Disk first, and the error is returned rather than logged: a respawn from a
+/// memory row the disk never got would be undone by the next reload, leaving
+/// the live worker on a provider the stored session does not name.
+async fn persist_provider_switch(
+    state: &AppState,
+    profile: &str,
+    id: &str,
+    provider: &str,
+) -> anyhow::Result<()> {
+    let switch = |inst: &mut crate::session::Instance| {
+        inst.agent_provider = Some(provider.to_string());
+        inst.agent_model = Some(PROVIDER_DEFAULT_MODEL.to_string());
+    };
+    crate::session::Storage::new(profile, state.file_watch.clone())?.update(
+        |instances, _groups| {
+            if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
+                switch(inst);
+            }
+            Ok(())
+        },
+    )?;
+    let mut instances = state.instances.write().await;
+    if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
+        switch(inst);
+    }
+    Ok(())
+}
+
+/// Re-route a structured session to another LLM provider, keeping the
+/// transcript: the worker stops between turns and the respawn resumes the
+/// stored ACP session.
+///
+/// Unlike an agent switch the pick is persisted before the respawn, because
+/// both the sandbox container reconcile and the spawn request read it from the
+/// row. A failed spawn therefore leaves the pick in place, which is what lets
+/// the user see the error and switch back rather than silently landing on the
+/// old provider.
+pub async fn switch_acp_provider(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    req: Result<Json<SwitchProviderRequest>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    if let Some(resp) = read_only_block(&state) {
+        return resp;
+    }
+    if let Some(resp) = cityhall_block(&state) {
+        return resp;
+    }
+    let Json(req) = match req {
+        Ok(j) => j,
+        Err(rej) => return rej.into_response(),
+    };
+    let provider = req.provider.trim().to_string();
+    if !crate::session::environment::AGENT_PROVIDERS.contains(&provider.as_str()) {
+        return super::super::api_error(
+            StatusCode::BAD_REQUEST,
+            "unknown_provider",
+            format!(
+                "unknown provider {provider:?}; expected one of {}",
+                crate::session::environment::AGENT_PROVIDERS.join(", ")
+            ),
+        );
+    }
+    // Worker-stopping barrier (#3650).
+    let Some(_submission) = state
+        .session_service
+        .prompt_submission_for_session(&id)
+        .await
+    else {
+        return session_not_found();
+    };
+    // Held from the first read through the respawn, as `spawn_acp` takes it:
+    // between the shutdown and the persisted pick the reconciler would
+    // otherwise resume the worker off the old row, and win.
+    let inst_lock = state.instance_lock(&id).await;
+    let _guard = inst_lock.lock().await;
+    let Some(instance) = find_instance(&state, &id).await else {
+        return session_not_found();
+    };
+    if !instance.is_structured() {
+        return not_structured_response();
+    }
+    if let Err(blocked) = instance.ensure_startable() {
+        return crate::server::api::start_blocked_response(blocked);
+    }
+    let agent = pick_agent(&state, &instance, instance.agent_name.as_deref()).await;
+    // The routing flags are Claude-specific; no other adapter reads them.
+    if !matches!(agent.as_str(), "claude" | "claude-code") {
+        return super::super::api_error(
+            StatusCode::CONFLICT,
+            "provider_switch_unsupported",
+            format!("provider switching is Claude-only; this session runs {agent}"),
+        );
+    }
+    if instance.agent_provider.as_deref() == Some(provider.as_str()) {
+        return super::super::api_error(
+            StatusCode::BAD_REQUEST,
+            "provider_unchanged",
+            format!("session is already pinned to {provider}"),
+        );
+    }
+    // The submission guard keeps new prompts out but does not wait for the
+    // running one, and the shutdown below aborts it.
+    let control = state.session_service.fold_control_state(&id).await;
+    if control.turn_active || control.has_active_background_agent() {
+        return super::super::api_error(
+            StatusCode::CONFLICT,
+            "turn_active",
+            "the session is mid-turn; switch providers once it finishes",
+        );
+    }
+
+    if let Err(e) = state
+        .acp_supervisor
+        .shutdown_and_wait(&id, std::time::Duration::from_secs(5))
+        .await
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("shutdown failed before provider switch: {e}"),
+        )
+            .into_response();
+    }
+    // `shutdown_and_wait` gives up at its deadline without saying so. A
+    // teardown it could not prove must not have its row rewritten or its
+    // container discarded underneath it.
+    if state.acp_supervisor.worker_state(&id).await != crate::daemon::AcpWorkerState::Absent {
+        return super::super::api_error(
+            StatusCode::CONFLICT,
+            "worker_not_stopped",
+            "the previous worker has not finished stopping; retry the switch shortly",
+        );
+    }
+
+    let model_cleared = instance
+        .agent_model
+        .as_deref()
+        .is_some_and(|model| model != PROVIDER_DEFAULT_MODEL);
+    if let Err(e) = persist_provider_switch(&state, &instance.source_profile, &id, &provider).await
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to persist the provider switch: {e}"),
+        )
+            .into_response();
+    }
+
+    let sandbox_info = match crate::acp::sandbox::ensure_container_for_session_locked(
+        &state.instances,
+        &id,
+        false,
+    )
+    .await
+    {
+        Ok(info) => info,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("sandbox container ensure failed: {e}"),
+            )
+                .into_response();
+        }
+    };
+
+    state.acp_supervisor.forget_stale_cancel(&id);
+    // Everything that names the conversation survives: the provider changes
+    // where the tokens are served from, not which transcript is resumed.
+    let Some(instance) = find_instance(&state, &id).await else {
+        return session_not_found();
+    };
+    let request = spawn_request_for(&instance, agent, sandbox_info);
+    if let Some(resp) = refuse_if_stored_row_shelved(&state, &instance).await {
+        return resp;
+    }
+    if let Err(e) = state.acp_supervisor.spawn(request).await {
+        return supervisor_error_response("spawn failed after provider switch", &e);
+    }
+
+    Json(SwitchProviderResponse {
+        session_id: id,
+        provider,
+        model_cleared,
+        status: "running".to_string(),
+    })
+    .into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -521,6 +720,132 @@ mod tests {
             let live = memory.iter().find(|i| i.id == id).expect("instance");
             assert_eq!(live.agent_model.as_deref(), expected);
             assert_eq!(live.agent_name.as_deref(), Some("codex"));
+        }
+    }
+
+    /// The pick reaches both stores, and the model resets to the provider's
+    /// default: ids are provider-specific, and a resumed transcript would
+    /// otherwise keep its old one. Everything naming the conversation survives, because the
+    /// provider changes where the tokens come from, not which transcript is
+    /// resumed.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_provider_switch_persists_the_pick_and_resets_the_model() {
+        use crate::session::test_support::isolate_app_dir;
+        let profile = "default";
+
+        for provider in crate::session::environment::AGENT_PROVIDERS {
+            let _tmp = isolate_app_dir();
+            let mut inst = crate::session::Instance::new("claude", "/tmp/aoe-switch-provider");
+            inst.view = crate::session::View::Structured;
+            inst.agent_name = Some("claude".to_string());
+            inst.agent_model = Some("claude-fable-5-1".to_string());
+            inst.acp_effort = Some("high".to_string());
+            inst.acp_session_id = Some("acp-old".to_string());
+            let id = inst.id.clone();
+            crate::server::test_support::seed_instances_on_disk_for_test(
+                profile,
+                vec![inst.clone()],
+            );
+            let state = crate::server::test_support::build_test_app_state(vec![inst]);
+
+            persist_provider_switch(&state, profile, &id, provider)
+                .await
+                .expect("persisting the pick");
+
+            let on_disk = crate::server::test_support::load_instances_from_disk_for_test(profile);
+            let stored = on_disk.iter().find(|i| i.id == id).expect("seeded row");
+            assert_eq!(
+                stored.agent_provider.as_deref(),
+                Some(*provider),
+                "the disk row is what a restart reads"
+            );
+            assert_eq!(stored.agent_model.as_deref(), Some(PROVIDER_DEFAULT_MODEL));
+            assert_eq!(stored.acp_session_id.as_deref(), Some("acp-old"));
+            assert_eq!(stored.acp_effort.as_deref(), Some("high"));
+
+            let memory = state.instances.read().await;
+            let live = memory.iter().find(|i| i.id == id).expect("instance");
+            assert_eq!(live.agent_provider.as_deref(), Some(*provider));
+            assert_eq!(live.agent_model.as_deref(), Some(PROVIDER_DEFAULT_MODEL));
+        }
+    }
+
+    /// The switch tears the worker down, so a busy worker, or one whose last
+    /// teardown is unproven, is refused before the row or container changes.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_provider_switch_refuses_a_busy_or_unsettled_worker() {
+        use crate::session::test_support::isolate_app_dir;
+        let profile = "default";
+
+        for (case, code) in [
+            ("mid-turn", "turn_active"),
+            ("unproven stop", "worker_not_stopped"),
+        ] {
+            let _tmp = isolate_app_dir();
+            let mut inst = crate::session::Instance::new("claude", "/tmp/aoe-switch-provider-gate");
+            inst.view = crate::session::View::Structured;
+            inst.agent_name = Some("claude".to_string());
+            inst.agent_model = Some("claude-fable-5-1".to_string());
+            let id = inst.id.clone();
+            crate::server::test_support::seed_instances_on_disk_for_test(
+                profile,
+                vec![inst.clone()],
+            );
+            let state = crate::server::test_support::build_test_app_state(vec![inst]);
+            if code == "turn_active" {
+                state.acp_supervisor.test_insert_worker(&id).await;
+                let prompt = crate::acp::state::Event::UserPromptSent {
+                    prompt_id: None,
+                    text: "still working".to_string(),
+                    attachments: Vec::new(),
+                    synthesized: false,
+                };
+                state
+                    .acp_event_store
+                    .record_at(&id, 1, &prompt, Utc::now().timestamp_millis())
+                    .unwrap();
+            } else {
+                state.acp_supervisor.test_hold_stopping(&id);
+            }
+
+            let response = switch_acp_provider(
+                State(Arc::clone(&state)),
+                Path(id.clone()),
+                Ok(Json(SwitchProviderRequest {
+                    provider: "vertex".to_string(),
+                })),
+            )
+            .await
+            .into_response();
+
+            assert_eq!(response.status(), StatusCode::CONFLICT, "{case}");
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["error"], code, "{case}");
+            if code == "turn_active" {
+                assert!(
+                    state.acp_supervisor.is_running(&id).await,
+                    "{case}: the worker must keep its turn"
+                );
+            }
+            let on_disk = crate::server::test_support::load_instances_from_disk_for_test(profile);
+            let memory = state.instances.read().await;
+            for row in [
+                on_disk.iter().find(|i| i.id == id),
+                memory.iter().find(|i| i.id == id),
+            ] {
+                let row = row.expect("seeded row");
+                assert_eq!(row.agent_provider, None, "{case}");
+                assert_eq!(
+                    row.agent_model.as_deref(),
+                    Some("claude-fable-5-1"),
+                    "{case}"
+                );
+            }
         }
     }
 

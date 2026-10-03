@@ -75,6 +75,7 @@ impl Instance {
             view: View::Terminal,
             agent_name: None,
             agent_model: None,
+            agent_provider: None,
             acp_effort: None,
             acp_session_id: None,
             import_pending: None,
@@ -108,6 +109,24 @@ impl Instance {
         fw: std::sync::Arc<crate::file_watch::FileWatchService>,
     ) {
         self.file_watch = Some(fw);
+    }
+
+    /// Write this row's sandbox provider stamp to disk, leaving every other
+    /// stored field as it is.
+    pub(crate) fn persist_sandbox_provider(&self) -> anyhow::Result<()> {
+        let provider = self.sandbox_info.as_ref().and_then(|s| s.provider.clone());
+        crate::session::Storage::new(&self.source_profile, self.resolve_file_watch())?.update(
+            |instances, _groups| {
+                if let Some(sandbox) = instances
+                    .iter_mut()
+                    .find(|i| i.id == self.id)
+                    .and_then(|i| i.sandbox_info.as_mut())
+                {
+                    sandbox.provider = provider;
+                }
+                Ok(())
+            },
+        )
     }
 
     /// Resolve the live `Arc<FileWatchService>` for this Instance, falling back to a noop service
@@ -1272,6 +1291,7 @@ mod tests {
 
         let mut sandboxed = Instance::new("claude", temp.path().to_str().unwrap());
         sandboxed.sandbox_info = Some(crate::session::SandboxInfo {
+            provider: None,
             enabled: true,
             container_id: None,
             image: "alpine".to_string(),

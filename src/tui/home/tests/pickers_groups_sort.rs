@@ -214,6 +214,7 @@ fn test_group_has_managed_worktrees_and_containers() {
     });
     let mut sandboxed = instance_in("box-session", "/tmp/box", "box");
     sandboxed.sandbox_info = Some(crate::session::SandboxInfo {
+        provider: None,
         enabled: true,
         container_id: None,
         image: "ubuntu:latest".to_string(),

@@ -32,12 +32,16 @@ function mount(
   configOptions: ConfigOptionDescriptor[],
   pendingConfigOption: AcpState["pendingConfigOption"] = null,
   onSetConfigOption = vi.fn(),
+  provider?: { current?: string | null; pending?: string | null; onSet?: () => void },
 ) {
   const utils = render(
     <SessionConfigControls
       configOptions={configOptions}
       pendingConfigOption={pendingConfigOption}
       onSetConfigOption={onSetConfigOption}
+      provider={provider?.current ?? null}
+      providerPending={provider?.pending ?? null}
+      onSetProvider={provider?.onSet}
     />,
   );
   return { ...utils, onSetConfigOption };
@@ -174,5 +178,56 @@ describe("ConfigOptionSwitchFailedNotice", () => {
     for (const s of ["Model", "Claude Sonnet 4.6", "rate limited"]) expect(text).toContain(s);
     fireEvent.click(screen.getByRole("button", { name: "Dismiss notice" }));
     expect(onDismiss).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("provider picker", () => {
+  it("is absent for an agent that does not route through a provider", () => {
+    const { container } = mount([MODEL]);
+    expect(screen.queryByTestId("config-option-aoe-provider")).toBeNull();
+    expect(container.firstChild).not.toBeNull();
+  });
+
+  it("renders alone for a Claude session with no adapter options yet", () => {
+    mount([], null, vi.fn(), { onSet: vi.fn() });
+    expect(screen.getByTestId("config-option-aoe-provider")).toBeTruthy();
+  });
+
+  it.each([
+    ["api", "Anthropic API"],
+    ["bedrock", "Bedrock"],
+    ["vertex", "Vertex AI"],
+    [null, "Host default"],
+  ])("labels %s as %s", (current, label) => {
+    mount([], null, vi.fn(), { current, onSet: vi.fn() });
+    expect(screen.getByTestId("config-option-aoe-provider").textContent).toContain(label);
+  });
+
+  it("posts the picked provider", () => {
+    const onSet = vi.fn();
+    mount([], null, vi.fn(), { current: "api", onSet });
+    fireEvent.click(screen.getByTestId("config-option-aoe-provider"));
+    fireEvent.click(screen.getByTestId("config-option-aoe-provider-value-vertex"));
+    expect(onSet).toHaveBeenCalledWith("vertex");
+  });
+
+  // There is no API for returning to the host default, so the entry naming
+  // that state must not be selectable; the dropdown refuses the current value.
+  it("does not post the host-default entry", () => {
+    const onSet = vi.fn();
+    mount([], null, vi.fn(), { current: null, onSet });
+    fireEvent.click(screen.getByTestId("config-option-aoe-provider"));
+    fireEvent.click(screen.getByTestId("config-option-aoe-provider-value-"));
+    expect(onSet).not.toHaveBeenCalled();
+  });
+
+  it("disables the value in flight", () => {
+    const onSet = vi.fn();
+    mount([], null, vi.fn(), { current: "api", pending: "bedrock", onSet });
+    fireEvent.click(screen.getByTestId("config-option-aoe-provider"));
+    const inFlight = screen.getByTestId("config-option-aoe-provider-value-bedrock");
+    expect(inFlight.hasAttribute("disabled")).toBe(true);
+    fireEvent.click(inFlight);
+    expect(onSet).not.toHaveBeenCalled();
   });
 });
