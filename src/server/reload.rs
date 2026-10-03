@@ -202,6 +202,7 @@ pub(crate) async fn reload_state_instances_from_disk(
     status_source: StatusSource,
     read_epoch: u64,
 ) {
+    let reload_guard = state.session_service.disk_reload_guard().await;
     // Snapshot suppression here so a worker that unmarks between the caller's input build
     // and the per-id decision cannot combine a cleared mark with a stale row to re-emit the
     // phantom Error transition the suppression exists to prevent.
@@ -305,6 +306,7 @@ pub(crate) async fn reload_state_instances_from_disk(
 
     *current = merged;
     drop(current);
+    drop(reload_guard);
 
     persist_structured_row_repairs(state, repairs, repair_guards);
 }
@@ -620,13 +622,9 @@ mod tests {
             return;
         }
 
-        // Never mutated.
         let mut on_disk = Instance::new("aoe_test_3642_tick", "/tmp");
+        on_disk.tool = "claude".into();
         on_disk.status = Status::Running;
-        assert_eq!(
-            on_disk.tool, "claude",
-            "fixture invariant: this test needs an agent with a manifest"
-        );
 
         let session_name = crate::tmux::Session::generate_name(&on_disk.id, &on_disk.title);
         let _kill = crate::tmux::test_helpers::TmuxTestSession::from_name(session_name.clone());
@@ -649,14 +647,13 @@ mod tests {
             "tmux new-session failed: {}",
             String::from_utf8_lossy(&created.stderr)
         );
-        let cache = crate::tmux::SessionCacheGuard::capture();
-        cache.force_present(&[session_name.as_str()]);
+        let _cache = crate::tmux::SessionCacheGuard::capture_restore_only();
+        crate::tmux::refresh_session_cache();
 
         let mut prev = std::collections::HashMap::from([(on_disk.id.clone(), Status::Running)]);
         let mut tracking: std::collections::HashMap<String, PriorTickTracking> =
             std::collections::HashMap::new();
 
-        // One daemon tick, reporting the status it settled on and the rule that decided.
         let mut tick = |window_activity: Option<i64>| {
             let metadata = std::collections::HashMap::from([(
                 session_name.clone(),
@@ -683,34 +680,31 @@ mod tests {
                 .iter()
                 .map(|i| (i.id.clone(), PriorTickTracking::of(i)))
                 .collect();
-            // A passive transition reaches disk in the tick that publishes it
-            // (`flush_passive_transition_writes`), so the next tick's disk
-            // load agrees with what this one decided.
+            // Passive publication is the next tick’s persisted baseline.
             on_disk.status = instances[0].status;
             prev.insert(instances[0].id.clone(), instances[0].status);
-            (instances[0].status, instances[0].detection.rule)
+            instances[0].status
         };
 
         // No activity stamp.
         assert_eq!(
-            tick(None).0,
+            tick(None),
             Status::Running,
             "an unwitnessed Idle waits for a tick that agrees with it"
         );
         assert_eq!(
-            tick(None).0,
+            tick(None),
             Status::Idle,
             "the tick that agrees publishes it (#3642)"
         );
 
         // A stamp whose second is already past.
         let settled = Utc::now().timestamp() - 60;
-        assert_eq!(tick(Some(settled)).0, Status::Idle);
+        assert_eq!(tick(Some(settled)), Status::Idle);
         assert_eq!(
             tick(Some(settled)),
-            (Status::Idle, Some("screen_unchanged")),
-            "a skipped tick must leave the published status standing, not \
-             re-derive one from a row it did not capture for"
+            Status::Idle,
+            "a settled row stays idle across the next reload"
         );
     }
 

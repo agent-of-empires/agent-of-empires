@@ -43,6 +43,14 @@ mod platform {
     }
 }
 
+/// Lower the child's scheduling and I/O priority where the OS supports it.
+pub(crate) fn throttle_child(cmd: &mut std::process::Command) {
+    #[cfg(target_os = "macos")]
+    macos::throttle_child(cmd);
+    #[cfg(not(target_os = "macos"))]
+    let _ = cmd;
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) use platform::HAS_CODEX_MANAGED_PREFERENCES;
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -622,6 +630,21 @@ fn signal_process_tree(pid: u32, signal: Signal) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn throttle_child_lowers_the_child_scheduling_priority() {
+        let priority = |throttled: bool| -> i32 {
+            let mut cmd = std::process::Command::new("sh");
+            cmd.args(["-c", "ps -o pri= -p $$"]);
+            if throttled {
+                throttle_child(&mut cmd);
+            }
+            let out = cmd.output().unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().parse().unwrap()
+        };
+        assert!(priority(true) < priority(false));
+    }
 
     #[test]
     fn processes_matching_empty_input_is_empty() {

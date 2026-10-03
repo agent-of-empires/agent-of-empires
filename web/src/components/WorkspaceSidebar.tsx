@@ -214,10 +214,11 @@ export function WorkspaceSidebar(props: Props) {
     if (!filterOpen) requestAnimationFrame(() => filterRef.current?.focus());
   };
 
+  // The phone overlay starts under the header, which the app root insets below the status bar.
   return (
     <SidebarCompactContext.Provider value={compact}>
       <div
-        className={`fixed top-12 inset-x-0 bottom-0 z-30 md:hidden transition-opacity duration-300 ${
+        className={`fixed top-[calc(3rem+env(safe-area-inset-top))] inset-x-0 bottom-0 z-30 md:hidden transition-opacity duration-300 ${
           open ? "bg-black/50" : "opacity-0 pointer-events-none"
         }`}
         onClick={props.onToggle}
@@ -226,7 +227,7 @@ export function WorkspaceSidebar(props: Props) {
         {...tourAnchor(TOUR_ANCHORS.sidebar)}
         style={{ width: effectiveWidth }}
         data-compact={compact ? "true" : undefined}
-        className={`fixed top-12 bottom-0 z-40 md:static md:z-auto bg-surface-800 border-surface-700/60 flex flex-col md:h-full shrink-0 transition-transform duration-300 ease-in-out md:transition-none ${
+        className={`fixed top-[calc(3rem+env(safe-area-inset-top))] bottom-0 z-40 md:static md:z-auto bg-surface-800 border-surface-700/60 flex flex-col md:h-full shrink-0 transition-transform duration-300 ease-in-out md:transition-none ${
           rightSide ? "right-0 border-l md:border-l-0 md:border-r" : "left-0 border-r"
         } ${open ? "translate-x-0" : `${rightSide ? "translate-x-full" : "-translate-x-full"} md:hidden`}`}
       >
@@ -364,7 +365,7 @@ export function WorkspaceSidebar(props: Props) {
 
         <SidebarSystemHealth />
 
-        <div className="border-t border-surface-700/20 p-2 flex items-center gap-1">
+        <div className="border-t border-surface-700/20 p-2 max-md:pb-[max(0.5rem,env(safe-area-inset-bottom))] flex items-center gap-1">
           {trashedWorkspaces.length > 0 && (
             <TrashMenu
               trashedWorkspaces={trashedWorkspaces}

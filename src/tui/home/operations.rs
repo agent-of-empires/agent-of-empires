@@ -1806,10 +1806,8 @@ impl HomeView {
         )))
     }
 
-    /// Toggle the favorite flag on the cursor's session. Favorites pin above peers in
-    /// the same status tier under the Attention sort and render bold + underline with a
-    /// leading `* ` (see `render.rs`). Favorite survives an unsnooze but not an archive;
-    /// that mutual exclusion lives in `Instance::archive()`.
+    /// Toggle the favorite flag on the cursor's session. Favorite survives an unsnooze
+    /// but not an archive; that mutual exclusion lives in `Instance::archive()`.
     pub(super) fn toggle_favorite_at_cursor(&mut self) -> anyhow::Result<()> {
         let Some(id) = self.selected_session.clone() else {
             return Ok(());

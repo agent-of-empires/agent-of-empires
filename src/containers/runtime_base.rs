@@ -136,7 +136,11 @@ impl RuntimeBase {
     }
 
     pub fn command(&self) -> Command {
-        Command::new(self.binary)
+        let mut command = Command::new(self.binary);
+        if self.binary == "podman" {
+            command.env_remove("INVOCATION_ID");
+        }
+        command
     }
 
     /// Maps a missing binary to `NotInstalled` and a timeout to an `IoError`.
@@ -993,6 +997,19 @@ mod tests {
         assert!(!args.iter().any(|a| a.contains("ghp_secret123")));
         assert_eq!(arg_after(&args, "--cpus"), Some("2"));
         assert_eq!(arg_after(&args, "-m"), Some("4g"));
+    }
+
+    #[test]
+    fn podman_commands_do_not_inherit_systemd_invocation_id() {
+        let removes_invocation_id = |base: &RuntimeBase| {
+            base.command()
+                .get_envs()
+                .any(|(key, value)| key == "INVOCATION_ID" && value.is_none())
+        };
+
+        assert!(removes_invocation_id(&PODMAN));
+        assert!(!removes_invocation_id(&DOCKER));
+        assert!(!removes_invocation_id(&APPLE));
     }
 
     #[test]

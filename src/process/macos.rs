@@ -35,6 +35,20 @@ pub(super) fn rename_exclusive(
     result.map_err(std::io::Error::from)
 }
 
+/// Run the child at background priority so a mass file delete does not saturate
+/// `fseventsd` and stall the rest of the machine.
+pub(super) fn throttle_child(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt;
+
+    // SAFETY: `setpriority` is async-signal-safe and the closure allocates nothing.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setpriority(libc::PRIO_DARWIN_PROCESS, 0, libc::PRIO_DARWIN_BG);
+            Ok(())
+        });
+    }
+}
+
 pub(super) fn collect_pid_tree(pid: u32) -> Vec<u32> {
     let children_map = build_children_map();
     let mut pids = vec![pid];

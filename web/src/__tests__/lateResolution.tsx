@@ -1,4 +1,5 @@
-import { startTransition, useLayoutEffect, useState, type ReactNode } from "react";
+import { act, startTransition, useLayoutEffect, useState, type ReactNode } from "react";
+import { waitFor } from "@testing-library/react";
 import { createRoot } from "react-dom/client";
 import { flushSync } from "react-dom";
 
@@ -10,14 +11,12 @@ interface LateResolutionCase {
   bText: string;
   /** Settles A's pending request. */
   resolveStale: () => void;
-  /** Runs after A mounts, before its effect starts the request. */
+  /** Runs after the initial mount. */
   afterMount?: (host: HTMLElement) => void;
 }
 
-/** Commits `b` in a transition and settles A's request from `b`'s layout
- *  effect, before A's passive cleanup runs. Uses a raw root outside the act
- *  environment, since act flushes that cleanup first and hides the race.
- *  Returns the host HTML after the late write has had a chance to land. */
+/** Resolve A from B's layout effect before passive cleanup, outside act.
+ *  Observe B's commit before flushing the resulting late state updates. */
 export async function renderWithLateResolution({ a, b, bText, resolveStale, afterMount }: LateResolutionCase) {
   let setStage!: (s: "a" | "b") => void;
   function Harness() {
@@ -37,18 +36,22 @@ export async function renderWithLateResolution({ a, b, bText, resolveStale, afte
   const host = document.createElement("div");
   document.body.appendChild(host);
   const root = createRoot(host);
-  const macrotask = () => new Promise<void>((r) => setTimeout(r, 0));
   try {
-    flushSync(() => root.render(<Harness />));
-    afterMount?.(host);
-    await macrotask();
-
+    g.IS_REACT_ACT_ENVIRONMENT = true;
+    await act(async () => {
+      flushSync(() => root.render(<Harness />));
+      afterMount?.(host);
+    });
+    g.IS_REACT_ACT_ENVIRONMENT = false;
     startTransition(() => setStage("b"));
-    for (let i = 0; i < 20 && !host.innerHTML.includes(bText); i++) {
-      await Promise.resolve();
-    }
-    await macrotask();
-    await macrotask();
+    await waitFor(
+      () => {
+        if (!host.textContent?.includes(bText)) throw new Error("Replacement tree has not committed");
+      },
+      { timeout: 5000 },
+    );
+    g.IS_REACT_ACT_ENVIRONMENT = true;
+    await act(async () => {});
     return { html: host.innerHTML, text: host.textContent ?? "" };
   } finally {
     flushSync(() => root.unmount());

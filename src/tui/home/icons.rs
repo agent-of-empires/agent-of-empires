@@ -14,6 +14,8 @@ pub(in crate::tui) const ICON_DELETING: &str = "✕";
 pub(in crate::tui) const ICON_COLLAPSED: &str = "▶";
 pub(in crate::tui) const ICON_EXPANDED: &str = "▼";
 pub(in crate::tui) const ICON_PINNED: &str = "◆";
+/// Neutral-width, so it stays one cell in terminals that widen ambiguous glyphs like `★`.
+pub(in crate::tui) const ICON_FAVORITE: &str = "✦";
 // Shelf glyphs stay single-width: wide glyphs break column alignment and hit-testing.
 pub(in crate::tui) const ICON_TRASH_SECTION: &str = "⊘";
 pub(in crate::tui) const ICON_ARCHIVED_SECTION: &str = "▤";

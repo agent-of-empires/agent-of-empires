@@ -12,7 +12,7 @@ import { STATUS_DOT_CLASS } from "../../lib/session";
 import { workspaceAttentionCount, workspaceIsSunk } from "../../lib/sidebarSort";
 import { useSidebarCompact } from "../../lib/sidebarCompact";
 import { OFFLINE_TITLE } from "../../lib/connectionState";
-import { ContextMenu, MenuHeading, MenuItem, MenuSeparator } from "../ContextMenu";
+import { ContextMenu, MenuChoiceRow, MenuItem, MenuSeparator, MenuSwatches } from "../ContextMenu";
 import { OwnerAvatar } from "../OwnerAvatar";
 import { Tooltip } from "../Tooltip";
 import { useContextMenu } from "../useContextMenu";
@@ -305,31 +305,14 @@ function GroupMenuItems({
             <MenuItem onClick={act(() => onUpdateAppearance(group.id, { alias: null }))}>Clear alias</MenuItem>
           )}
           <MenuSeparator />
-          <MenuHeading>Background</MenuHeading>
-          <div className="grid grid-cols-4 gap-1 px-3 py-1.5">
-            {REPO_COLOR_OPTIONS.map((option) => (
-              <button
-                key={option.id}
-                type="button"
-                onClick={act(() => onUpdateAppearance(group.id, { color: option.id }))}
-                data-testid={`sidebar-group-color-${option.id}`}
-                aria-label={`Set ${option.label} background`}
-                className={`h-8 rounded-md border cursor-pointer transition-colors ${
-                  group.color === option.id ? "border-text-primary" : "border-surface-700"
-                }`}
-                style={repoSwatchStyle(option.id)}
-              />
-            ))}
-            <button
-              type="button"
-              onClick={act(() => onUpdateAppearance(group.id, { color: null }))}
-              data-testid="sidebar-group-color-clear"
-              aria-label="Clear background"
-              className="h-8 rounded-md border border-surface-700 bg-surface-900 text-[10px] font-mono text-text-dim cursor-pointer hover:bg-surface-700/40"
-            >
-              None
-            </button>
-          </div>
+          <MenuChoiceRow label="Color">
+            <MenuSwatches
+              options={REPO_COLOR_OPTIONS.map((o) => ({ key: o.id, label: o.label, style: repoSwatchStyle(o.id) }))}
+              value={group.color}
+              onPick={(color) => onUpdateAppearance(group.id, { color })}
+              testIdPrefix="sidebar-group-color"
+            />
+          </MenuChoiceRow>
         </>
       )}
     </>

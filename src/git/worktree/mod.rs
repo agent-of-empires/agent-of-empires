@@ -280,7 +280,7 @@ impl GitWorktree {
             args.push("--force");
         }
         args.push(path_str(path)?);
-        let output = super::command::run_git(&self.repo_path, &args)?;
+        let output = super::command::run_git_throttled(&self.repo_path, &args)?;
         if !output.status.success() {
             return Err(command_failed(&output));
         }
