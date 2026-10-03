@@ -1,10 +1,14 @@
 //! Plugin rewrite of the MCP servers forwarded to a session's agent.
 
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use tracing::warn;
 
 use crate::session::mcp::project_mcp::{ProjectMcpServer, ProjectMcpTransport};
 
@@ -196,11 +200,79 @@ pub fn apply_edit(servers: Vec<ProjectMcpServer>, edit: McpEdit) -> Vec<ProjectM
     out
 }
 
+#[derive(Debug)]
+pub struct RewriteError {
+    pub plugin: String,
+    pub cause: String,
+}
+
+impl std::fmt::Display for RewriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.plugin, self.cause)
+    }
+}
+
+pub type RewriteFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<Vec<ProjectMcpServer>, RewriteError>> + Send + 'a>>;
+
+/// Rewrites the resolved set for one session. An implementation with no applicable hook
+/// returns the servers unchanged.
+pub trait McpRewriter: Send + Sync {
+    fn rewrite<'a>(
+        &'a self,
+        ctx: &'a McpRewriteContext,
+        servers: Vec<ProjectMcpServer>,
+    ) -> RewriteFuture<'a>;
+}
+
+static REWRITER: Mutex<Option<Arc<dyn McpRewriter>>> = Mutex::new(None);
+
+fn current_rewriter() -> Option<Arc<dyn McpRewriter>> {
+    REWRITER.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+pub fn set_rewriter(rewriter: Option<Arc<dyn McpRewriter>>) {
+    *REWRITER.lock().unwrap_or_else(|e| e.into_inner()) = rewriter;
+}
+
+pub async fn rewrite_servers(
+    ctx: &McpRewriteContext,
+    servers: Vec<ProjectMcpServer>,
+) -> Vec<ProjectMcpServer> {
+    rewrite_servers_with(current_rewriter(), ctx, servers).await
+}
+
+/// A failed hook forwards nothing to a sandboxed session and leaves other sessions unchanged.
+pub async fn rewrite_servers_with(
+    rewriter: Option<Arc<dyn McpRewriter>>,
+    ctx: &McpRewriteContext,
+    servers: Vec<ProjectMcpServer>,
+) -> Vec<ProjectMcpServer> {
+    let Some(rewriter) = rewriter else {
+        return servers;
+    };
+    let original = (!ctx.sandboxed).then(|| servers.clone());
+    match rewriter.rewrite(ctx, servers).await {
+        Ok(rewritten) => rewritten,
+        Err(e) => {
+            warn!(
+                target: "acp.mcp",
+                session = %ctx.session_id,
+                sandboxed = ctx.sandboxed,
+                "mcp.rewrite hook failed ({e}); {}",
+                if ctx.sandboxed { "forwarding no servers" } else { "keeping the original servers" }
+            );
+            original.unwrap_or_default()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
     use std::collections::BTreeMap;
+    use std::sync::Arc;
 
     fn map(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
         pairs
@@ -413,5 +485,61 @@ mod tests {
             },
         );
         assert_eq!(out, vec![http("a", "http://g", &[])]);
+    }
+
+    struct Stub(Result<Vec<ProjectMcpServer>, RewriteError>);
+
+    impl McpRewriter for Stub {
+        fn rewrite<'a>(
+            &'a self,
+            _ctx: &'a McpRewriteContext,
+            _servers: Vec<ProjectMcpServer>,
+        ) -> RewriteFuture<'a> {
+            let out = match &self.0 {
+                Ok(v) => Ok(v.clone()),
+                Err(e) => Err(RewriteError {
+                    plugin: e.plugin.clone(),
+                    cause: e.cause.clone(),
+                }),
+            };
+            Box::pin(async move { out })
+        }
+    }
+
+    fn failing() -> Arc<dyn McpRewriter> {
+        Arc::new(Stub(Err(RewriteError {
+            plugin: "acme.gate".into(),
+            cause: "timed out".into(),
+        })))
+    }
+
+    #[tokio::test]
+    async fn no_rewriter_passes_servers_through() {
+        let servers = vec![stdio("a", &[("K", "v")])];
+        let out = rewrite_servers_with(None, &ctx(), servers.clone()).await;
+        assert_eq!(out, servers);
+    }
+
+    #[tokio::test]
+    async fn successful_rewrite_replaces_the_set() {
+        let ok: Arc<dyn McpRewriter> = Arc::new(Stub(Ok(vec![http("p", "http://g", &[])])));
+        let out = rewrite_servers_with(Some(ok), &ctx(), vec![stdio("a", &[])]).await;
+        assert_eq!(names(&out), ["p"]);
+    }
+
+    #[tokio::test]
+    async fn sandboxed_failure_forwards_nothing() {
+        let out =
+            rewrite_servers_with(Some(failing()), &ctx(), vec![stdio("a", &[("K", "v")])]).await;
+        assert!(out.is_empty());
+    }
+
+    #[tokio::test]
+    async fn non_sandboxed_failure_keeps_the_original_set() {
+        let mut c = ctx();
+        c.sandboxed = false;
+        let servers = vec![stdio("a", &[])];
+        let out = rewrite_servers_with(Some(failing()), &c, servers.clone()).await;
+        assert_eq!(out, servers);
     }
 }
