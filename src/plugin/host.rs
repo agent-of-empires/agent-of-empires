@@ -185,10 +185,11 @@ impl PluginHost {
         // after that sweep sees the missing worker here instead of waiting for the timeout.
         let still_current = {
             let table = self.state.lock().await;
-            table
-                .running
-                .get(plugin_id)
-                .is_some_and(|w| w.supervisor_id == generation && w.inbound.is_some())
+            table.running.get(plugin_id).is_some_and(|w| {
+                w.inbound
+                    .as_ref()
+                    .is_some_and(|tx| tx.same_channel(&inbound))
+            })
         };
         let line =
             serde_json::json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params })

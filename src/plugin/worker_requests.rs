@@ -49,7 +49,8 @@ impl PendingRequests {
         self.entries.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// `generation` identifies the worker instance the request is sent to.
+    /// `generation` is the supervisor id, which an in-place respawn keeps, so an exit fails
+    /// every request of that supervisor.
     pub fn register(
         &self,
         plugin_id: &str,
