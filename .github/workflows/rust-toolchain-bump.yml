@@ -1,0 +1,133 @@
+name: Rust Toolchain Bump
+
+# rust-toolchain.toml pins the CI toolchain so a new stable cannot break every
+# PR at once (#4246). Dependabot cannot bump that file, so this opens a PR
+# whenever a newer stable ships; new lints then surface on one reviewed PR.
+
+on:
+  schedule:
+    # Fridays at 04:41 UTC: stables ship on Thursdays, and an off-peak,
+    # off-hour slot avoids GitHub's scheduler backlog.
+    - cron: '41 4 * * 5'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  bump:
+    name: Open toolchain bump PR
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Compare pin with latest stable
+        id: ver
+        run: |
+          set -euo pipefail
+          CURRENT="$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)"
+          LATEST="$(curl --fail --silent --show-error --retry 3 \
+              https://static.rust-lang.org/dist/channel-rust-stable.toml \
+            | python3 -c 'import sys, tomllib; print(tomllib.load(sys.stdin.buffer)["pkg"]["rust"]["version"].split()[0])')"
+          # LATEST reaches sed and the PR body; accept nothing but a version.
+          for v in "$CURRENT" "$LATEST"; do
+            if ! [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "::error::unexpected toolchain version '$v'"
+              exit 1
+            fi
+          done
+          echo "current=$CURRENT" >> "$GITHUB_OUTPUT"
+          echo "latest=$LATEST" >> "$GITHUB_OUTPUT"
+          NEWEST="$(printf '%s\n%s\n' "$CURRENT" "$LATEST" | sort -V | tail -1)"
+          if [ "$LATEST" != "$CURRENT" ] && [ "$NEWEST" = "$LATEST" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "Bumping $CURRENT -> $LATEST"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Pin $CURRENT is current (latest stable $LATEST)"
+          fi
+
+      - name: Push bump branch and open PR
+        if: steps.ver.outputs.changed == 'true'
+        env:
+          # A PAT, not GITHUB_TOKEN, so the PR's push triggers CI.
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          BASE_REPO: ${{ github.repository }}
+          CURRENT: ${{ steps.ver.outputs.current }}
+          LATEST: ${{ steps.ver.outputs.latest }}
+          HEAD_BRANCH: chore/rust-toolchain-bump
+        run: |
+          set -euo pipefail
+          sed -i "s/^channel *= *\".*\"/channel = \"${LATEST}\"/" rust-toolchain.toml
+          git diff --exit-code --quiet rust-toolchain.toml && { echo "::error::sed did not change rust-toolchain.toml"; exit 1; }
+
+          REMOTE="https://x-access-token:${GH_TOKEN}@github.com/${BASE_REPO}.git"
+          BOT_EMAIL="github-actions[bot]@users.noreply.github.com"
+          # Preserve human authors, committers and racing pushes.
+          OBSERVED_SHA=""
+          if git ls-remote --exit-code "$REMOTE" "refs/heads/${HEAD_BRANCH}" >/dev/null; then
+            git fetch --quiet "$REMOTE" "refs/heads/${HEAD_BRANCH}"
+            OBSERVED_SHA="$(git rev-parse FETCH_HEAD)"
+            IDENTITIES="$(git log --format='%ae%n%ce' HEAD.."$OBSERVED_SHA")"
+            if printf '%s' "$IDENTITIES" | grep -vxF "$BOT_EMAIL" >/dev/null; then
+              echo "::warning::${HEAD_BRANCH} has commits from someone else; not overwriting it with ${LATEST}"
+              exit 0
+            fi
+          else
+            STATUS=$?
+            if [ "$STATUS" -ne 2 ]; then
+              echo "::error::Cannot inspect ${HEAD_BRANCH} (git ls-remote exited $STATUS)"
+              exit "$STATUS"
+            fi
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "$BOT_EMAIL"
+          git checkout -B "$HEAD_BRANCH"
+          git commit -am "chore: bump Rust toolchain to ${LATEST}"
+          git push --force-with-lease="refs/heads/${HEAD_BRANCH}:${OBSERVED_SHA}" "$REMOTE" "HEAD:${HEAD_BRANCH}"
+
+          {
+            echo "## Description"
+            echo
+            echo "Bumps the pinned toolchain in \`rust-toolchain.toml\` from \`${CURRENT}\` to \`${LATEST}\`."
+            echo "Fix any new Clippy lints on this branch. \`rust-version\` in Cargo.toml (the MSRV) is unchanged."
+            echo "Release notes: https://blog.rust-lang.org/releases/"
+            echo
+            echo "## PR Type"
+            echo
+            echo "- [x] Infrastructure / CI"
+            echo
+            echo "## Checklist"
+            echo
+            echo "- [ ] New and existing tests pass"
+            echo
+            echo "## Test Coverage Analysis"
+            echo
+            echo "N/A: toolchain bump, covered by the existing CI suites."
+            echo
+            echo "## AI Usage"
+            echo
+            echo "- [x] No AI was used (opened by \`.github/workflows/rust-toolchain-bump.yml\`)"
+          } > /tmp/pr-body.md
+
+          PR_NUMBER=$(gh pr list \
+            --head "$HEAD_BRANCH" \
+            --state open \
+            --limit 100 \
+            --json number,headRefName,headRepository,baseRefName \
+            | python3 .github/scripts/select-internal-pr.py \
+                --repo "$BASE_REPO" --head "$HEAD_BRANCH" --base main)
+          if [ -z "$PR_NUMBER" ]; then
+            gh pr create \
+              --base main \
+              --head "$HEAD_BRANCH" \
+              --title "chore: bump Rust toolchain to ${LATEST}" \
+              --body-file /tmp/pr-body.md
+          else
+            gh pr edit "$PR_NUMBER" \
+              --title "chore: bump Rust toolchain to ${LATEST}" \
+              --body-file /tmp/pr-body.md
+          fi

@@ -1,0 +1,67 @@
+name: Labeler
+
+# Adds `ci-macos` to PRs that touch macOS-sensitive code, so the macOS suite
+# runs before merge instead of after (#4228, #4245).
+#
+# pull_request_target so fork PRs can be labelled. Nothing from the PR is
+# checked out or executed: `detect` reads the file list and patches from the
+# API as data with a read-only GITHUB_TOKEN, and `label` holds the PAT but
+# runs one fixed `gh api` call whose only input is the PR number.
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+
+permissions: {}
+
+jobs:
+  detect:
+    name: Detect macOS-sensitive changes
+    if: ${{ !contains(github.event.pull_request.labels.*.name, 'ci-macos') }}
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
+    outputs:
+      macos: ${{ steps.match.outputs.macos }}
+    steps:
+      - id: match
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const prefixes = [
+              'src/process/', 'src/git/', 'src/migrations/', 'src/containers/',
+              'src/session/config/container_config/',
+            ];
+            const exact = [
+              'src/session/instance/container.rs',
+              'src/session/sandbox_store_reclaim.rs',
+              'build.rs', 'Cargo.lock', 'rust-toolchain.toml',
+            ];
+            const cfg = /target_os\s*=\s*"macos"/;
+            const sensitive = path => !!path &&
+              (exact.includes(path) || prefixes.some(p => path.startsWith(p)));
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              ...context.repo, pull_number: context.payload.pull_request.number, per_page: 100,
+            });
+            const hit = files.find(f =>
+              sensitive(f.filename) || sensitive(f.previous_filename) ||
+              (f.patch || '').split('\n').some(line =>
+                /^[+-](?![+-]{2} )/.test(line) && cfg.test(line)));
+            if (hit) core.info(`${hit.filename} is macOS-sensitive`);
+            core.setOutput('macos', hit ? 'true' : 'false');
+
+  label:
+    name: Label macOS-sensitive PR
+    needs: detect
+    if: needs.detect.outputs.macos == 'true'
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      # RELEASE_TOKEN, not GITHUB_TOKEN: a label added with GITHUB_TOKEN fires
+      # no `labeled` event, so tests.yml would not start the macOS job until
+      # the next push.
+      - env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: gh api --method POST "repos/${REPO}/issues/${PR_NUMBER}/labels" -f 'labels[]=ci-macos' --silent

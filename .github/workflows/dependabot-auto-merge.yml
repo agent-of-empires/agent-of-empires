@@ -1,0 +1,96 @@
+name: Dependabot Auto-Merge
+
+# Queues GitHub auto-merge (squash) on Dependabot minor and patch PRs once
+# .github/scripts/check-dependabot-pr.py passes. The merge still waits for
+# green checks and one maintainer approval.
+#
+# pull_request_target so the job runs from base with Actions secrets. Safe
+# because the PR head is fetched as git objects and read as data, never
+# checked out or executed.
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+
+concurrency:
+  group: dependabot-auto-merge-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  auto-merge:
+    name: Check and queue auto-merge
+    if: github.event.pull_request.user.login == 'dependabot[bot]' && github.repository == 'agent-of-empires/agent-of-empires'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: read
+    steps:
+      - id: meta
+        uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
+
+      - name: Require a minor or patch update in a checked ecosystem
+        id: eligible
+        env:
+          UPDATE_TYPE: ${{ steps.meta.outputs.update-type }}
+          ECOSYSTEM: ${{ steps.meta.outputs.package-ecosystem }}
+        run: |
+          case "$UPDATE_TYPE" in
+            version-update:semver-minor|version-update:semver-patch) ;;
+            *) echo "Not auto-merging a '$UPDATE_TYPE' update"; echo "ok=false" >> "$GITHUB_OUTPUT"; exit 0 ;;
+          esac
+          case "$ECOSYSTEM" in
+            npm_and_yarn|cargo|github_actions) ;;
+            *) echo "Not auto-merging ecosystem '$ECOSYSTEM'"; echo "ok=false" >> "$GITHUB_OUTPUT"; exit 0 ;;
+          esac
+          echo "ok=true" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: steps.eligible.outputs.ok == 'true'
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Fetch PR head as data
+        if: steps.eligible.outputs.ok == 'true'
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin "refs/pull/${PR_NUMBER}/head"
+          if [ "$(git rev-parse FETCH_HEAD)" != "$HEAD_SHA" ]; then
+            echo "::error::PR head moved past ${HEAD_SHA}; the next synchronize run re-checks it"
+            exit 1
+          fi
+
+      - name: Supply-chain checks
+        if: steps.eligible.outputs.ok == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: python3 .github/scripts/check-dependabot-pr.py --base "$BASE_SHA" --head "$HEAD_SHA" --repo "$BASE_REPO" --pr "$PR_NUMBER"
+
+      - name: Queue auto-merge
+        if: steps.eligible.outputs.ok == 'true'
+        env:
+          # A PAT, not GITHUB_TOKEN: a merge queued with GITHUB_TOKEN lands
+          # without firing the push workflows on main (macOS suite, nix hash).
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: gh pr merge --auto --squash --match-head-commit "$HEAD_SHA" "$PR_URL"
+
+      - name: Withdraw auto-merge after a failed check
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+        run: gh pr merge --disable-auto "$PR_URL" || true
