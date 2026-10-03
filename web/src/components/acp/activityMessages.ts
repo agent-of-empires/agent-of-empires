@@ -39,6 +39,8 @@ const CALLOUTS: Partial<Record<ActivityRow["kind"], (text: string) => string>> =
   // `session/load` fallback after a restart: the model's window is empty.
   context_reset: (text) => `> ⚠️ **Conversation context reset**; ${text}`,
   compacted: (text) => `> ⚠️ **Conversation compacted**; ${text.replace(/^Conversation compacted[;,]?\s*/, "")}`,
+  // The banner is capped and retired by the next prompt, so history lives here.
+  advisory: (text) => `> ℹ️ **Notice**; ${text}`,
   summary: (text) =>
     `> 📝 **Summary of conversation so far**\n>\n${text
       .split("\n")

@@ -600,12 +600,19 @@ impl NewSessionDialog {
         )
     }
 
-    /// Preselect a tool by name, applying the same per-tool side effects as
-    /// cycling the tool field. No-op when the tool is not available.
+    /// Preselect a tool by name. No-op when the tool is not available.
     pub fn set_tool(&mut self, tool: &str) {
-        let Some(index) = self.available_tools.iter().position(|t| t == tool) else {
+        if let Some(index) = self.available_tools.iter().position(|t| t == tool) {
+            self.select_tool_index(index);
+        }
+    }
+
+    /// Switch tools and reset the per-tool YOLO, sandbox and Ctrl+P fields.
+    /// Reselecting the current tool keeps the user's edits.
+    fn select_tool_index(&mut self, index: usize) {
+        if index == self.tool_index {
             return;
-        };
+        }
         self.tool_index = index;
         if self.selected_tool_always_yolo() {
             self.yolo_mode = true;
@@ -618,6 +625,44 @@ impl NewSessionDialog {
             self.worktree_branch.reset();
         }
         self.reload_tool_config();
+    }
+
+    /// Carry a session's agent, view and sandbox, each only as far as this form allows.
+    /// Yolo stays a choice made for each new session.
+    pub fn inherit_session(&mut self, source: &crate::session::Instance) {
+        if !self.available_tools.contains(&source.tool) {
+            return;
+        }
+        self.set_tool(&source.tool);
+        self.inherit_modes(source.is_structured(), source.is_sandboxed());
+    }
+
+    fn inherit_modes(&mut self, structured: bool, sandboxed: bool) {
+        if self.structured_capable {
+            self.structured_enabled = structured;
+            self.structured_choice = Some(structured);
+        }
+        if sandboxed && self.docker_available && !self.selected_tool_host_only() {
+            self.set_sandbox_enabled(true);
+        }
+    }
+
+    /// Switch the sandbox, loading or dropping the environment that goes with it.
+    fn set_sandbox_enabled(&mut self, enabled: bool) {
+        self.sandbox_enabled = enabled;
+        if enabled {
+            let config = self.resolve_config_for_path(&self.profile);
+            self.extra_env = config.sandbox.environment.clone();
+            self.inherited_settings = build_inherited_settings(&config.sandbox);
+            self.extra_env_overridden = false;
+        } else {
+            self.extra_env.clear();
+            self.extra_env_overridden = false;
+            self.env_list_expanded = false;
+            self.env_editing_input = None;
+            self.inherited_settings.clear();
+            self.sandbox_config_mode = false;
+        }
     }
 
     /// Move focus to the title field, for "new from selection" where the path
@@ -634,6 +679,11 @@ impl NewSessionDialog {
     #[cfg(test)]
     pub fn group_value(&self) -> &str {
         self.group.value()
+    }
+
+    #[cfg(test)]
+    pub fn yolo_value(&self) -> bool {
+        self.yolo_mode
     }
 
     #[cfg(test)]
@@ -1196,20 +1246,7 @@ impl NewSessionDialog {
                 self.reload_config_defaults();
             }
         } else if self.focused_field == fields.tool {
-            if self.available_tools.len() > 1 {
-                self.tool_index = (self.tool_index + 1) % self.available_tools.len();
-                if self.selected_tool_always_yolo() {
-                    self.yolo_mode = true;
-                } else {
-                    self.yolo_mode = self.yolo_mode_default;
-                }
-                if self.selected_tool_host_only() {
-                    self.sandbox_enabled = false;
-                    self.worktree_enabled = false;
-                    self.worktree_branch.reset();
-                }
-                self.reload_tool_config();
-            }
+            self.select_tool_index((self.tool_index + 1) % self.available_tools.len());
         } else if self.focused_field == fields.structured {
             self.structured_enabled = !self.structured_enabled;
             self.structured_choice = Some(self.structured_enabled);
@@ -1231,20 +1268,7 @@ impl NewSessionDialog {
                 }
             }
         } else if self.focused_field == fields.sandbox {
-            self.sandbox_enabled = !self.sandbox_enabled;
-            if self.sandbox_enabled {
-                let config = self.resolve_config_for_path(&self.profile);
-                self.extra_env = config.sandbox.environment.clone();
-                self.inherited_settings = build_inherited_settings(&config.sandbox);
-                self.extra_env_overridden = false;
-            } else {
-                self.extra_env.clear();
-                self.extra_env_overridden = false;
-                self.env_list_expanded = false;
-                self.env_editing_input = None;
-                self.inherited_settings.clear();
-                self.sandbox_config_mode = false;
-            }
+            self.set_sandbox_enabled(!self.sandbox_enabled);
         }
     }
 
@@ -1447,32 +1471,21 @@ impl NewSessionDialog {
             KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')
                 if self.focused_field == fields.tool =>
             {
-                if key.code == KeyCode::Left {
-                    self.tool_index = if self.tool_index == 0 {
-                        self.available_tools.len() - 1
-                    } else {
-                        self.tool_index - 1
-                    };
+                let len = self.available_tools.len();
+                let index = if key.code == KeyCode::Left {
+                    (self.tool_index + len - 1) % len
                 } else {
-                    self.tool_index = (self.tool_index + 1) % self.available_tools.len();
-                }
-                if self.selected_tool_always_yolo() {
-                    self.yolo_mode = true;
-                } else {
-                    self.yolo_mode = self.yolo_mode_default;
-                }
-                if self.selected_tool_host_only() {
-                    self.sandbox_enabled = false;
-                    self.worktree_enabled = false;
-                    self.worktree_branch.reset();
-                }
-                self.reload_tool_config();
+                    (self.tool_index + 1) % len
+                };
+                self.select_tool_index(index);
                 DialogResult::Continue
             }
-            KeyCode::Char(c @ '1'..='9') if self.focused_field == fields.tool => {
+            KeyCode::Char(c @ '1'..='9')
+                if self.focused_field == fields.tool && key.modifiers.is_empty() =>
+            {
                 let index = c as usize - '1' as usize;
-                if let Some(tool) = self.available_tools.get(index).cloned() {
-                    self.set_tool(&tool);
+                if index < self.available_tools.len() {
+                    self.select_tool_index(index);
                 }
                 DialogResult::Continue
             }
@@ -1497,20 +1510,7 @@ impl NewSessionDialog {
             KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')
                 if self.focused_field == fields.sandbox =>
             {
-                self.sandbox_enabled = !self.sandbox_enabled;
-                if self.sandbox_enabled {
-                    let config = self.resolve_config_for_path(&self.profile);
-                    self.extra_env = config.sandbox.environment.clone();
-                    self.inherited_settings = build_inherited_settings(&config.sandbox);
-                    self.extra_env_overridden = false;
-                } else {
-                    self.extra_env.clear();
-                    self.extra_env_overridden = false;
-                    self.env_list_expanded = false;
-                    self.env_editing_input = None;
-                    self.inherited_settings.clear();
-                    self.sandbox_config_mode = false;
-                }
+                self.set_sandbox_enabled(!self.sandbox_enabled);
                 DialogResult::Continue
             }
             KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')
@@ -1950,7 +1950,7 @@ impl NewSessionDialog {
 
     fn reload_tool_config(&mut self) {
         let profile = self.selected_profile().to_string();
-        let config = resolve_config_or_warn(&profile);
+        let config = self.resolve_config_for_path(&profile);
         let tool = self
             .available_tools
             .get(self.tool_index)

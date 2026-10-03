@@ -2,7 +2,7 @@
 //! and the websocket handle. Side effects run in the async loop in [`super`],
 //! so this state stays freely borrowable by the render layer.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 
 use ratatui::layout::Rect;
 use ratatui_textarea::TextArea;
@@ -13,7 +13,7 @@ use super::reducer::AcpTranscript;
 use super::slash;
 use crate::acp::client::{DaemonEndpoint, HttpClient, PluginCommandView, WsHandle};
 use crate::acp::session_paths::SessionPathRoots;
-use crate::acp::state::AvailableCommand;
+use crate::acp::state::{AvailableCommand, SessionNotice};
 use crate::daemon::QueuedPromptEntry;
 use crate::plugin::ui_state::{Notification, UiSnapshot};
 use crate::tui::components::hover::HoverState;
@@ -40,6 +40,10 @@ pub struct StructuredViewState {
     /// Toast banner that appears briefly above the composer, e.g.
     /// "prompt sent" or an HTTP error.
     pub toast: Option<ToastBanner>,
+    /// Ids of session notices dismissed here. Local on purpose: the daemon's
+    /// list is shared, and dismissing in this view must not clear the web's
+    /// banner. Pruned by [`Self::prune_dismissed_notices`].
+    pub dismissed_notices: HashSet<String>,
     /// Mirror of the daemon-owned prompt queue (drained server-side at the turn
     /// edge). Refreshed from `/queue` on connect and at each turn edge, with
     /// optimistic edits in between.
@@ -166,6 +170,7 @@ pub struct ViewLayout {
     pub transcript: Rect,
     pub status: Rect,
     pub approval: Rect,
+    pub notices: Rect,
     pub queue: Rect,
     pub composer: Rect,
 }
@@ -258,6 +263,22 @@ pub enum ToastKind {
 }
 
 impl StructuredViewState {
+    /// Notices the daemon still reports and the user has not dismissed here.
+    pub fn visible_notices(&self) -> impl Iterator<Item = &SessionNotice> {
+        self.transcript
+            .session_notices
+            .iter()
+            .filter(|n| !self.dismissed_notices.contains(&n.id))
+    }
+
+    /// Drops dismissal ids the daemon no longer reports, so the set cannot grow
+    /// across a long session. Call after adopting a `reduced_state` frame.
+    pub fn prune_dismissed_notices(&mut self) {
+        let live = &self.transcript.session_notices;
+        self.dismissed_notices
+            .retain(|id| live.iter().any(|n| &n.id == id));
+    }
+
     pub fn new(
         session_id: String,
         endpoint: DaemonEndpoint,
@@ -275,6 +296,7 @@ impl StructuredViewState {
             selected_approval: None,
             ws,
             toast: None,
+            dismissed_notices: HashSet::new(),
             queue: QueueMirror::default(),
             in_flight: false,
             slash_selected: 0,

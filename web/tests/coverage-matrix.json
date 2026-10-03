@@ -477,6 +477,7 @@
       "specs": ["src/components/settings/__tests__/StructuredWidgets.test.tsx"],
       "components": [
         "web/src/components/settings/StructuredWidgets.tsx",
+        "web/src/components/settings/FormFields.tsx",
         "web/src/components/settings/SchemaSection.tsx"
       ]
     },
@@ -1658,9 +1659,9 @@
     },
     {
       "id": "sidebar.favorite-indicator",
-      "kind": "deferred",
-      "issue": "https://github.com/agent-of-empires/agent-of-empires/issues/986",
+      "kind": "vitest",
       "risk": "low",
+      "specs": ["src/components/__tests__/SessionRowTriage.test.tsx"],
       "components": ["web/src/components/WorkspaceSidebar.tsx"]
     },
     {
@@ -2841,11 +2842,32 @@
       "components": ["web/src/components/acp/ToolDisplayMode.tsx"]
     },
     {
+      "id": "acp.tool-output-wrap",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": ["src/components/acp/WrapToggle.test.tsx", "tests/acp-tool-output-wrap.spec.ts"],
+      "components": ["web/src/components/acp/WrapToggle.tsx"]
+    },
+    {
       "id": "acp.queued-prompt-expand-bounds",
       "kind": "vitest",
       "risk": "medium",
       "specs": ["src/components/acp/QueuedPromptsStrip.test.tsx"],
       "components": ["web/src/components/acp/StructuredView.tsx", "web/src/components/acp/PromptStrips.tsx"]
+    },
+    {
+      "id": "acp.session-notices",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/components/acp/SessionNoticesStrip.test.tsx", "src/lib/acpTypes.test.ts"],
+      "components": [
+        "web/src/components/acp/PromptStrips.tsx",
+        "web/src/components/acp/StructuredView.tsx",
+        "web/src/components/acp/AcpRuntime.tsx",
+        "web/src/hooks/useAcpSession.ts",
+        "web/src/hooks/acpSession/reducer.ts",
+        "web/src/lib/acpTypes.ts"
+      ]
     },
     {
       "id": "acp.queue-send-now",
@@ -3722,6 +3744,13 @@
         "src/hooks/useAcpSession.test.ts"
       ],
       "components": ["web/src/hooks/useAcpSession.ts", "web/src/lib/acpTypes.ts", "web/src/components/acp/Composer.tsx"]
+    },
+    {
+      "id": "acp.auth-status",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/components/acp/__tests__/AuthStatusHint.test.tsx", "src/lib/acpTypes.test.ts"],
+      "components": ["web/src/components/acp/ComposerControls.tsx", "web/src/lib/acpTypes.ts"]
     },
     {
       "id": "story.wizard-open-close",

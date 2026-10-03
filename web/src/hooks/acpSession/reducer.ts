@@ -58,6 +58,7 @@ export type Action =
   | { kind: "dismiss_compaction_reminder" }
   | { kind: "dismiss_rejected_prompt"; id: string }
   | { kind: "dismiss_mode_switch_failed" }
+  | { kind: "dismiss_session_notice"; id: string }
   | { kind: "set_pending_config_option"; configId: string; value: string }
   | { kind: "clear_pending_config_option" }
   // Only clears when still matching, so a stale failed request can't wipe a newer click.
@@ -281,6 +282,12 @@ export function reducer(state: AcpState, action: Action): AcpState {
       return { ...state, rejectedPrompts: state.rejectedPrompts.filter((r) => r.id !== action.id) };
     case "dismiss_mode_switch_failed":
       return { ...state, modeSwitchFailed: null };
+    case "dismiss_session_notice":
+      // Recorded rather than removed: the daemon's list is shared, and the next
+      // snapshot would otherwise bring the notice back.
+      return state.dismissedNoticeIds.includes(action.id)
+        ? state
+        : { ...state, dismissedNoticeIds: [...state.dismissedNoticeIds, action.id] };
     case "set_pending_config_option":
       return { ...state, pendingConfigOption: { configId: action.configId, value: action.value } };
     case "clear_pending_config_option":

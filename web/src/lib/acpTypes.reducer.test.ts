@@ -61,7 +61,7 @@ describe("webRendersServerRow", () => {
       text: "x",
     });
     expect(webRendersServerRow(row("notice"))).toBe(false);
-    for (const kind of ["message", "user_prompt", "tool_start", "context_reset", "summary"]) {
+    for (const kind of ["message", "user_prompt", "tool_start", "context_reset", "summary", "advisory"]) {
       expect(webRendersServerRow(row(kind))).toBe(true);
     }
   });

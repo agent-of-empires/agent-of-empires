@@ -287,7 +287,9 @@ fn matched_running_row_keeps_status_color_on_spinner_and_bolds() {
     );
 
     let item = env.view.flat_items[running].clone();
-    let line = env.view.render_item_line(&item, false, true, &theme, 80);
+    let line = env
+        .view
+        .render_item_line(&item, false, true, &theme, 80, false);
 
     // Spans: [indent, spinner, title, ...].
     let spinner = &line.spans[1];
