@@ -14,7 +14,7 @@ pub enum WorkerRequestError {
     NoWorker,
     Timeout,
     WorkerGone,
-    Rejected(String),
+    Rejected,
 }
 
 impl std::fmt::Display for WorkerRequestError {
@@ -23,13 +23,14 @@ impl std::fmt::Display for WorkerRequestError {
             Self::NoWorker => f.write_str("no running worker"),
             Self::Timeout => f.write_str("timed out"),
             Self::WorkerGone => f.write_str("worker exited"),
-            Self::Rejected(msg) => write!(f, "worker rejected the request: {msg}"),
+            Self::Rejected => f.write_str("worker rejected the request"),
         }
     }
 }
 
 struct Entry {
     plugin_id: String,
+    generation: u64,
     tx: oneshot::Sender<Result<Value, String>>,
 }
 
@@ -48,13 +49,19 @@ impl PendingRequests {
         self.entries.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    pub fn register(&self, plugin_id: &str) -> (String, oneshot::Receiver<Result<Value, String>>) {
+    /// `generation` identifies the worker instance the request is sent to.
+    pub fn register(
+        &self,
+        plugin_id: &str,
+        generation: u64,
+    ) -> (String, oneshot::Receiver<Result<Value, String>>) {
         let id = format!("h-{}", self.next.fetch_add(1, Ordering::Relaxed) + 1);
         let (tx, rx) = oneshot::channel();
         self.entries().insert(
             id.clone(),
             Entry {
                 plugin_id: plugin_id.to_string(),
+                generation,
                 tx,
             },
         );
@@ -78,9 +85,18 @@ impl PendingRequests {
         self.entries().remove(id);
     }
 
-    /// Drops the senders so every waiter on this plugin wakes with a closed channel.
-    pub fn fail_plugin(&self, plugin_id: &str) {
-        self.entries().retain(|_, e| e.plugin_id != plugin_id);
+    /// Drops the senders so every waiter on this worker instance wakes with a closed channel.
+    pub fn fail_worker(&self, plugin_id: &str, generation: u64) {
+        self.entries()
+            .retain(|_, e| e.plugin_id != plugin_id || e.generation != generation);
+    }
+
+    #[cfg(test)]
+    pub fn waiting(&self, plugin_id: &str) -> usize {
+        self.entries()
+            .values()
+            .filter(|e| e.plugin_id == plugin_id)
+            .count()
     }
 }
 
@@ -100,7 +116,7 @@ mod tests {
     #[tokio::test]
     async fn resolve_delivers_to_the_registered_receiver() {
         let pending = PendingRequests::new();
-        let (id, rx) = pending.register("acme.a");
+        let (id, rx) = pending.register("acme.a", 1);
         assert!(pending.resolve("acme.a", reply(&id)));
         assert_eq!(rx.await.unwrap().unwrap(), json!({"ok": true}));
     }
@@ -108,7 +124,7 @@ mod tests {
     #[tokio::test]
     async fn another_plugin_cannot_answer_a_request_it_does_not_own() {
         let pending = PendingRequests::new();
-        let (id, mut rx) = pending.register("acme.a");
+        let (id, mut rx) = pending.register("acme.a", 1);
         assert!(
             !pending.resolve("acme.evil", reply(&id)),
             "forged reply must be ignored"
@@ -118,12 +134,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fail_plugin_wakes_only_that_plugins_waiters() {
+    async fn fail_worker_wakes_only_that_worker_instances_waiters() {
         let pending = PendingRequests::new();
-        let (_a, rx_a) = pending.register("acme.a");
-        let (b, mut rx_b) = pending.register("acme.b");
-        pending.fail_plugin("acme.a");
+        let (_a, rx_a) = pending.register("acme.a", 1);
+        let (b, mut rx_b) = pending.register("acme.b", 1);
+        let (_a2, mut rx_a2) = pending.register("acme.a", 2);
+        pending.fail_worker("acme.a", 1);
         assert!(rx_a.await.is_err(), "sender dropped means worker gone");
+        assert!(rx_a2.try_recv().is_err(), "a newer instance is untouched");
         assert!(rx_b.try_recv().is_err());
         assert!(pending.resolve("acme.b", reply(&b)));
     }
@@ -131,7 +149,7 @@ mod tests {
     #[tokio::test]
     async fn cancel_forgets_the_request() {
         let pending = PendingRequests::new();
-        let (id, _rx) = pending.register("acme.a");
+        let (id, _rx) = pending.register("acme.a", 1);
         pending.cancel(&id);
         assert!(!pending.resolve("acme.a", reply(&id)));
     }

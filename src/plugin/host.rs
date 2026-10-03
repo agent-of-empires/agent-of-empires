@@ -165,29 +165,42 @@ impl PluginHost {
         timeout: Duration,
     ) -> Result<Value, WorkerRequestError> {
         let deadline = Instant::now() + timeout;
-        let inbound = loop {
+        let (generation, inbound) = loop {
             let found = {
                 let table = self.state.lock().await;
-                table.running.get(plugin_id).and_then(|w| w.inbound.clone())
+                table
+                    .running
+                    .get(plugin_id)
+                    .and_then(|w| w.inbound.clone().map(|tx| (w.supervisor_id, tx)))
             };
+            let remaining = deadline.saturating_duration_since(Instant::now());
             match found {
-                Some(tx) => break tx,
-                None if Instant::now() >= deadline => return Err(WorkerRequestError::NoWorker),
-                None => tokio::time::sleep(Duration::from_millis(50)).await,
+                Some(found) => break found,
+                None if remaining.is_zero() => return Err(WorkerRequestError::NoWorker),
+                None => tokio::time::sleep(remaining.min(Duration::from_millis(50))).await,
             }
         };
-        let (id, rx) = self.pending.register(plugin_id);
+        let (id, rx) = self.pending.register(plugin_id, generation);
+        // Teardown and exit clear the slot before failing entries, so a request registered
+        // after that sweep sees the missing worker here instead of waiting for the timeout.
+        let still_current = {
+            let table = self.state.lock().await;
+            table
+                .running
+                .get(plugin_id)
+                .is_some_and(|w| w.supervisor_id == generation && w.inbound.is_some())
+        };
         let line =
             serde_json::json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params })
                 .to_string()
                 + "\n";
-        if inbound.send(line).is_err() {
+        if !still_current || inbound.send(line).is_err() {
             self.pending.cancel(&id);
             return Err(WorkerRequestError::WorkerGone);
         }
         match tokio::time::timeout(deadline.saturating_duration_since(Instant::now()), rx).await {
             Ok(Ok(Ok(result))) => Ok(result),
-            Ok(Ok(Err(message))) => Err(WorkerRequestError::Rejected(message)),
+            Ok(Ok(Err(_))) => Err(WorkerRequestError::Rejected),
             Ok(Err(_)) => Err(WorkerRequestError::WorkerGone),
             Err(_) => {
                 self.pending.cancel(&id);
@@ -418,6 +431,7 @@ impl PluginHost {
             async move {
                 w.task.abort();
                 let _ = w.task.await;
+                self.pending.fail_worker(&plugin_id, w.supervisor_id);
                 if let Some(generation) = w.ui_generation {
                     self.api.clear_ui(&plugin_id, generation);
                 }
@@ -651,7 +665,6 @@ impl PluginHost {
             &self.pending,
         )
         .await;
-        self.pending.fail_plugin(plugin_id);
         {
             let mut table = self.state.lock().await;
             if let Some(w) = table.running.get_mut(plugin_id) {
@@ -662,6 +675,7 @@ impl PluginHost {
                 }
             }
         }
+        self.pending.fail_worker(plugin_id, supervisor_id);
         writer.abort();
 
         self.api.clear_ui(plugin_id, ui_generation);
@@ -1227,7 +1241,7 @@ rl.on('line', (line) => {
         let stdout = child.stdout.take().unwrap();
         let tx = stdin_writer(stdin);
 
-        let (id, rx) = pending.register(&ctx.plugin_id);
+        let (id, rx) = pending.register(&ctx.plugin_id, 1);
         tx.send(
             json!({"jsonrpc":"2.0","id":id,"method":"mcp.rewrite","params":{"n":42}}).to_string()
                 + "\n",
@@ -1236,40 +1250,13 @@ rl.on('line', (line) => {
         serve_connection(&api, &ctx, stdout, tx, None, &pending).await;
         let _ = child.wait().await;
 
-        let result = rx.await.unwrap().unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(5), rx)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
         assert_eq!(result["drop"], "*");
         assert_eq!(result["echo"], 42);
-    }
-
-    #[tokio::test]
-    async fn a_worker_that_exits_mid_request_fails_the_waiter_promptly() {
-        if which::which("node").is_err() {
-            eprintln!("skipping: node not found on PATH");
-            return;
-        }
-        let tmp = tempfile::tempdir().unwrap();
-        let (api, ctx) = worker_api(tmp.path());
-        let pending = Arc::new(PendingRequests::new());
-
-        let mut child = spawn_node("process.stdin.once('data', () => process.exit(0));");
-        let stdin = child.stdin.take().unwrap();
-        let stdout = child.stdout.take().unwrap();
-        let tx = stdin_writer(stdin);
-
-        let (id, rx) = pending.register(&ctx.plugin_id);
-        tx.send(
-            json!({"jsonrpc":"2.0","id":id,"method":"mcp.rewrite","params":{}}).to_string() + "\n",
-        )
-        .unwrap();
-        serve_connection(&api, &ctx, stdout, tx, None, &pending).await;
-        let _ = child.wait().await;
-        pending.fail_plugin(&ctx.plugin_id);
-
-        let outcome = tokio::time::timeout(Duration::from_secs(2), rx).await;
-        assert!(
-            matches!(outcome, Ok(Err(_))),
-            "waiter must be woken, not left to time out"
-        );
     }
 
     #[tokio::test]
@@ -1315,6 +1302,10 @@ rl.on('line', (line) => {
     }
 
     fn install_sleeper(plugin_id: &str) {
+        install_worker(plugin_id, r#"["sleep", "600"]"#);
+    }
+
+    fn install_worker(plugin_id: &str, command: &str) {
         use crate::session::{update_config, CapabilityGrant, PluginConfig};
 
         let manifest = format!(
@@ -1328,7 +1319,7 @@ capabilities = ["runtime.worker"]
 [runtime]
 kind = "command"
 system = true
-command = ["sleep", "600"]
+command = {command}
 "#
         );
         let dir = crate::plugin::plugins_dir().unwrap().join(plugin_id);
@@ -1401,6 +1392,81 @@ command = ["sleep", "600"]
         })
         .await;
 
+        host.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn request_worker_fails_promptly_when_the_worker_exits_mid_request() {
+        let temp = tempfile::tempdir().unwrap();
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("XDG_CONFIG_HOME", temp.path().to_path_buf()),
+            ("HOME", temp.path().to_path_buf()),
+            ("USERPROFILE", temp.path().to_path_buf()),
+        ]);
+        let plugin_id = "acme.quitter";
+        install_worker(plugin_id, r#"["sh", "-c", "read line; exit 0"]"#);
+        let registry = crate::plugin::reload_registry();
+        let host = PluginHost::new(&temp.path().join("host"), "default", None).unwrap();
+        host.start(&registry).await;
+
+        let started = Instant::now();
+        let err = host
+            .request_worker(plugin_id, "mcp.rewrite", json!({}), Duration::from_secs(20))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, WorkerRequestError::WorkerGone), "{err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "must not wait for the timeout"
+        );
+        host.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn request_worker_fails_promptly_when_the_worker_is_torn_down() {
+        let temp = tempfile::tempdir().unwrap();
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("XDG_CONFIG_HOME", temp.path().to_path_buf()),
+            ("HOME", temp.path().to_path_buf()),
+            ("USERPROFILE", temp.path().to_path_buf()),
+        ]);
+        let plugin_id = "acme.sleeper";
+        install_sleeper(plugin_id);
+        let registry = crate::plugin::reload_registry();
+        let host = PluginHost::new(&temp.path().join("host"), "default", None).unwrap();
+        host.start(&registry).await;
+
+        let waiter = tokio::spawn({
+            let host = host.clone();
+            async move {
+                let started = Instant::now();
+                let result = host
+                    .request_worker(plugin_id, "mcp.rewrite", json!({}), Duration::from_secs(20))
+                    .await;
+                (result, started.elapsed())
+            }
+        });
+        wait_until("the request to be pending", || async {
+            host.pending.waiting(plugin_id) == 1
+        })
+        .await;
+
+        host.restart_worker(plugin_id, &registry).await;
+        let (result, elapsed) = waiter.await.unwrap();
+        assert!(
+            matches!(result, Err(WorkerRequestError::WorkerGone)),
+            "{result:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "must not wait for the timeout"
+        );
         host.shutdown().await;
     }
 
