@@ -54,6 +54,7 @@ pub use resolve_command::{
 };
 pub(crate) use runner::wrap_in_scope;
 pub use session_sandbox::SessionSandbox;
+pub(crate) use session_sandbox::{known_container_workdir, SandboxLayout};
 pub(crate) use spawn::host_environment_denyreason;
 pub use spawn::SpawnConfig;
 

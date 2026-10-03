@@ -138,7 +138,7 @@ impl McpRewriter for PluginMcpRewriter {
     ) -> RewriteFuture<'a> {
         Box::pin(async move {
             let registry = crate::plugin::registry();
-            let hooks = hooks_for(registry.active().map(|p| &p.manifest), ctx.sandboxed);
+            let hooks = hooks_for(registry.active().map(|p| &p.manifest), ctx.sandboxed());
             let caller = self.host.as_deref().map(|h| h as &dyn WorkerCall);
             run_hooks(caller, &hooks, ctx, servers).await
         })
@@ -269,7 +269,10 @@ mod tests {
         McpRewriteContext {
             session_id: "s".into(),
             agent: "a".into(),
-            sandboxed: true,
+            sandbox: Some(crate::acp::mcp_rewrite::McpSandbox {
+                container_workdir: None,
+                mounts: Vec::new(),
+            }),
             profile: None,
             cwd: "/w".into(),
         }
