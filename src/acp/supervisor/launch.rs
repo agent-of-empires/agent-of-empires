@@ -22,6 +22,7 @@ use crate::acp::runner_lifecycle::{AdmitError, InstallError, Lease, RunnerIdenti
 use crate::acp::state::{AcpSessionId, Event};
 use crate::process::worker_registry;
 use crate::session::config::repo_config::resolve_config_with_repo_or_warn;
+use crate::session::mcp::mcp_model::{McpProvenance, ResolvedMcpServer};
 use crate::session::SandboxInfo;
 use tokio_util::sync::CancellationToken;
 
@@ -528,6 +529,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             },
             host_environment.clone(),
             claude_config_dir,
+            req.sandbox_info.as_ref().is_some_and(|info| info.enabled),
             "MCP resolution task failed",
         )
         .await;
@@ -1429,6 +1431,7 @@ pub(super) struct McpPaths {
     pub(super) sandboxed: bool,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn resolve_mcp_servers(
     agent_key: &str,
     session_id: &str,
@@ -1436,15 +1439,21 @@ pub(super) async fn resolve_mcp_servers(
     paths: McpPaths,
     session_env: Vec<(String, String)>,
     native_config_override: Option<PathBuf>,
+    sandboxed: bool,
     failure: &'static str,
 ) -> Vec<agent_client_protocol::v1::schema::McpServer> {
-    use crate::session::mcp::mcp_model::summarize;
-
+    let ctx = crate::acp::mcp_rewrite::McpRewriteContext {
+        session_id: session_id.to_string(),
+        agent: agent_key.to_string(),
+        sandboxed,
+        profile: profile.clone(),
+        cwd: paths.cwd.clone(),
+    };
     let agent_key = agent_key.to_string();
-    let env = session_env.clone();
-    let sandboxed = paths.sandboxed;
+    let session = session_id.to_string();
+    let projection_env = session_env.clone();
     let resolved = tokio::task::spawn_blocking(move || {
-        resolve_mcp_layers(
+        resolve_mcp_defs(
             &agent_key,
             profile.as_deref(),
             &paths,
@@ -1453,8 +1462,8 @@ pub(super) async fn resolve_mcp_servers(
         )
     })
     .await;
-    let mut merged = match resolved {
-        Ok(merged) => merged,
+    let resolved = match resolved {
+        Ok(resolved) => resolved,
         Err(e) => {
             warn!(
                 target: "acp.mcp",
@@ -1465,38 +1474,57 @@ pub(super) async fn resolve_mcp_servers(
             return Vec::new();
         }
     };
-    // Read the accepted tokens after the definitions so they cover every token those hold.
-    if sandboxed {
-        let daemon = crate::acp::mcp_config::DaemonIdentity::current().await;
-        merged = crate::acp::mcp_config::drop_daemon_servers(merged, &daemon);
-    }
+    let provenance: std::collections::HashMap<String, McpProvenance> = resolved
+        .iter()
+        .map(|s| (s.def.name.clone(), s.provenance.clone()))
+        .collect();
+    let defs = resolved.into_iter().map(|s| s.def).collect();
+    let rewritten = crate::acp::mcp_rewrite::rewrite_servers(&ctx, defs).await;
+    // A server the hook added keeps no provenance; treat it as project-local so it
+    // never receives session env values.
+    let resolved = rewritten
+        .into_iter()
+        .map(|def| ResolvedMcpServer {
+            provenance: provenance
+                .get(&def.name)
+                .cloned()
+                .unwrap_or(McpProvenance::ProjectLocal),
+            def,
+            shadowed: Vec::new(),
+        })
+        .collect();
+    crate::acp::mcp_config::project_servers_to_acp(resolved, &projection_env)
+}
+
+fn resolve_mcp_defs(
+    agent_key: &str,
+    session_id: &str,
+    profile: Option<&str>,
+    cwd: &std::path::Path,
+    config_path: &std::path::Path,
+    session_env: &[(String, String)],
+    native_config_override: Option<&std::path::Path>,
+) -> Vec<crate::session::mcp::mcp_model::ResolvedMcpServer> {
+    use crate::session::mcp::mcp_model::{resolve_effective, summarize};
+
+    let merged = resolve_effective(
+        agent_key,
+        profile,
+        cwd,
+        config_path,
+        session_env,
+        native_config_override,
+    );
     if !merged.is_empty() {
         info!(
             target: "acp.mcp",
             session = %session_id,
             count = merged.len(),
             servers = %summarize(&merged),
-            "forwarding MCP servers"
+            "resolved MCP servers"
         );
     }
-    crate::acp::mcp_config::project_servers_to_acp(merged, &env)
-}
-
-fn resolve_mcp_layers(
-    agent_key: &str,
-    profile: Option<&str>,
-    paths: &McpPaths,
-    session_env: &[(String, String)],
-    native_config_override: Option<&std::path::Path>,
-) -> Vec<crate::session::mcp::mcp_model::ResolvedMcpServer> {
-    crate::session::mcp::mcp_model::resolve_effective(
-        agent_key,
-        profile,
-        &paths.cwd,
-        &paths.config_path,
-        session_env,
-        native_config_override,
-    )
+    merged
 }
 
 /// Apply current model pins and effort defaults to a cached respawn config,
@@ -2677,7 +2705,7 @@ time.sleep(60)
 
     #[tokio::test]
     #[serial_test::serial]
-    async fn resolve_mcp_layers_merges_native_global_profile_and_trusted_project() {
+    async fn resolve_mcp_defs_merges_native_global_profile_and_trusted_project() {
         let (_home, tmp) = isolate_home();
         let _env = crate::session::test_support::EnvGuard::unset(&["CLAUDE_CONFIG_DIR"]);
         let write = |path: std::path::PathBuf, servers: &str| {
@@ -2707,34 +2735,34 @@ time.sleep(60)
         let resolve = |profile: Option<&'static str>,
                        cwd: std::path::PathBuf,
                        config_path: std::path::PathBuf| async move {
-            let merged = resolve_mcp_servers(
-                "claude",
-                "resolve-test",
-                profile.map(String::from),
-                McpPaths {
-                    cwd,
-                    config_path,
-                    sandboxed: false,
-                },
-                Vec::new(),
-                None,
-                "resolve failed",
-            )
-            .await;
-            let val = serde_json::to_value(&merged).unwrap();
-            let mut names: Vec<String> = val
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|s| s["name"].as_str().unwrap().to_string())
-                .collect();
+            let merged = tokio::task::spawn_blocking(move || {
+                resolve_mcp_defs(
+                    "claude",
+                    "resolve-test",
+                    profile,
+                    &cwd,
+                    &config_path,
+                    &[],
+                    None,
+                )
+            })
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|s| s.def)
+            .collect::<Vec<_>>();
+            let mut names: Vec<String> = merged.iter().map(|s| s.name.clone()).collect();
             names.sort();
-            let shared = val
-                .as_array()
-                .unwrap()
+            let shared = merged
                 .iter()
-                .find(|s| s["name"] == "shared")
-                .map(|s| s["command"].as_str().unwrap().to_string());
+                .find(|s| s.name == "shared")
+                .map(|s| match &s.transport {
+                    crate::session::mcp::project_mcp::ProjectMcpTransport::Stdio {
+                        command,
+                        ..
+                    } => command.clone(),
+                    other => panic!("unexpected transport {other:?}"),
+                });
             (names, shared)
         };
 
@@ -2788,6 +2816,61 @@ time.sleep(60)
             !names.contains(&"project-only".to_string()),
             "project servers come from config_path, not cwd"
         );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn resolve_mcp_servers_applies_the_rewrite_hook_after_the_merge() {
+        use crate::acp::mcp_rewrite::{
+            set_rewriter, McpRewriteContext, McpRewriter, RewriteFuture,
+        };
+        use crate::session::mcp::project_mcp::ProjectMcpServer;
+
+        struct DropAll;
+        impl McpRewriter for DropAll {
+            fn rewrite<'a>(
+                &'a self,
+                ctx: &'a McpRewriteContext,
+                _servers: Vec<ProjectMcpServer>,
+            ) -> RewriteFuture<'a> {
+                assert!(ctx.sandboxed, "context must carry the sandbox flag");
+                Box::pin(async { Ok(Vec::new()) })
+            }
+        }
+
+        let (_home, tmp) = isolate_home();
+        let _env = crate::session::test_support::EnvGuard::unset(&["CLAUDE_CONFIG_DIR"]);
+        std::fs::write(
+            tmp.path().join(".claude.json"),
+            r#"{ "mcpServers": { "native": { "command": "n" } } }"#,
+        )
+        .unwrap();
+        let resolve = |sandboxed| {
+            resolve_mcp_servers(
+                "claude",
+                "hook-test",
+                None,
+                McpPaths {
+                    cwd: tmp.path().to_path_buf(),
+                    config_path: tmp.path().join("config.toml"),
+                },
+                Vec::new(),
+                None,
+                sandboxed,
+                "failed",
+            )
+        };
+
+        set_rewriter(Some(std::sync::Arc::new(DropAll)));
+        let sandboxed = resolve(true).await;
+        set_rewriter(None);
+        let plain = resolve(false).await;
+
+        assert!(
+            sandboxed.is_empty(),
+            "hook dropped everything for the sandbox"
+        );
+        assert_eq!(plain.len(), 1, "no rewriter leaves the set alone");
     }
 
     #[tokio::test]
