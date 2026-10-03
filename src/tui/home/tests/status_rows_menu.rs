@@ -1816,8 +1816,11 @@ fn d_with_confirm_delete_prompts_before_trashing() {
         "the pending trash target must be the selected session"
     );
 
-    // Accepting the dialog trashes via the same trash_session_by_id path.
-    env.view.dispatch_confirm_submit("trash_session");
+    let screen = render_home_to_string(&mut env.view, 120, 40);
+    assert!(screen.contains("Press d again to confirm"), "{screen}");
+
+    // A second `d` accepts, trashing via the same trash_session_by_id path.
+    env.view.handle_key(key(KeyCode::Char('d')), None);
     assert!(
         env.view.get_instance(&id).unwrap().is_trashed(),
         "accepting the confirm dialog must trash the session"

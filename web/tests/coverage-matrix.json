@@ -1357,6 +1357,13 @@
       "components": ["web/src/components/WorkspaceSidebar.tsx"]
     },
     {
+      "id": "sidebar.drawer-swipe",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/hooks/useDrawerSwipe.test.ts"],
+      "components": ["web/src/hooks/useDrawerSwipe.ts"]
+    },
+    {
       "id": "sidebar.context-resume",
       "kind": "mocked-playwright",
       "risk": "medium",
@@ -1376,6 +1383,34 @@
       "risk": "low",
       "specs": ["src/components/__tests__/SessionRowTriage.test.tsx"],
       "components": ["web/src/components/WorkspaceSidebar.tsx"]
+    },
+    {
+      "id": "sidebar.menu-choice-stays-open",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/components/__tests__/SessionRowTriage.test.tsx",
+        "src/components/sidebar/usePendingSetting.test.ts"
+      ],
+      "components": [
+        "web/src/components/sidebar/SessionRow.tsx",
+        "web/src/components/sidebar/SessionRowMenu.tsx",
+        "web/src/components/sidebar/usePendingSetting.ts"
+      ]
+    },
+    {
+      "id": "sidebar.mobile-safe-area",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": ["tests/sidebar-chrome.spec.ts"],
+      "components": ["web/src/components/WorkspaceSidebar.tsx"]
+    },
+    {
+      "id": "sidebar.menu-sheet-swipe-close",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": ["tests/sidebar-context-menu.spec.ts"],
+      "components": ["web/src/components/ContextMenu.tsx", "web/src/components/sidebar/SidebarGroupHeader.tsx"]
     },
     {
       "id": "sidebar.system-health",
@@ -1623,9 +1658,9 @@
     },
     {
       "id": "sidebar.favorite-indicator",
-      "kind": "deferred",
-      "issue": "https://github.com/agent-of-empires/agent-of-empires/issues/986",
+      "kind": "vitest",
       "risk": "low",
+      "specs": ["src/components/__tests__/SessionRowTriage.test.tsx"],
       "components": ["web/src/components/WorkspaceSidebar.tsx"]
     },
     {
@@ -3701,6 +3736,13 @@
         "src/hooks/useAcpSession.test.ts"
       ],
       "components": ["web/src/hooks/useAcpSession.ts", "web/src/lib/acpTypes.ts", "web/src/components/acp/Composer.tsx"]
+    },
+    {
+      "id": "acp.auth-status",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/components/acp/__tests__/AuthStatusHint.test.tsx", "src/lib/acpTypes.test.ts"],
+      "components": ["web/src/components/acp/ComposerControls.tsx", "web/src/lib/acpTypes.ts"]
     },
     {
       "id": "story.wizard-open-close",

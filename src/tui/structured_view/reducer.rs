@@ -29,7 +29,8 @@
 
 use crate::acp::elicitations::ElicitationQuestion;
 use crate::acp::state::{
-    AcpState, AvailableCommand, DiffPreview, ModeInfo, PlanStepStatus, SessionNotice, SessionUsage,
+    AcpState, AuthStatus, AvailableCommand, DiffPreview, ModeInfo, PlanStepStatus, SessionNotice,
+    SessionUsage,
 };
 use crate::acp::transcript::{
     patch_transcript_row, upsert_transcript_row, TranscriptDelta, TranscriptRow, TranscriptRowKind,
@@ -66,6 +67,9 @@ pub struct AcpTranscript {
     /// Permission modes the agent advertised (`ModesAvailable`). Drives
     /// the `m` mode picker; empty when the agent never announced any.
     pub available_modes: Vec<ModeInfo>,
+    /// Auth identity the agent reported for itself. `None` when it never
+    /// reported, which renders as nothing rather than as logged out.
+    pub auth_status: Option<AuthStatus>,
     /// Slash commands the agent has advertised. Drives the composer's
     /// `/` picker (followup #1018).
     pub available_commands: Vec<AvailableCommand>,
@@ -213,6 +217,7 @@ impl AcpTranscript {
             session_notices: Vec::new(),
             current_mode: None,
             available_modes: Vec::new(),
+            auth_status: None,
             available_commands: Vec::new(),
             locally_resolved: Vec::new(),
             steering: false,
@@ -322,6 +327,7 @@ impl AcpTranscript {
         }
         self.session_notices = state.session_notices;
         self.current_mode = state.current_mode_id;
+        self.auth_status = state.auth_status;
         self.current_plan = state
             .current_plan
             .map(|plan| {
@@ -426,7 +432,7 @@ mod tests {
     use crate::acp::approvals::{Approval, Nonce};
     use crate::acp::elicitations::Elicitation;
     use crate::acp::state::{
-        AcpSessionId, AgentName, Event, Plan, PlanStep, ThinkingSignal, ToolCall,
+        AcpSessionId, AgentName, AuthStatusKind, Event, Plan, PlanStep, ThinkingSignal, ToolCall,
     };
     use crate::acp::transcript::{TranscriptModel, TranscriptRowKind};
     use chrono::Utc;
@@ -468,6 +474,36 @@ mod tests {
             s.apply_event(e.clone()).expect("apply ok");
         }
         s
+    }
+
+    /// The status bar reads `auth_status` straight off the transcript, so a
+    /// report and its clear must both survive `apply_reduced_state`.
+    #[test]
+    fn reduced_state_carries_auth_status_and_its_clear() {
+        let mut t = AcpTranscript::new("s-1");
+        t.apply_reduced_state(
+            1,
+            reduced(&[Event::AuthStatusUpdated {
+                status: Some(AuthStatus {
+                    kind: AuthStatusKind::Account,
+                    label: "Claude Max".into(),
+                    detail: None,
+                    account: None,
+                }),
+            }]),
+            &[],
+        );
+        let status = t.auth_status.as_ref().expect("reported");
+        assert_eq!(status.label, "Claude Max");
+        assert_eq!(status.kind, AuthStatusKind::Account);
+
+        // An adapter that cannot report clears it rather than going stale.
+        t.apply_reduced_state(
+            2,
+            reduced(&[Event::AuthStatusUpdated { status: None }]),
+            &[],
+        );
+        assert!(t.auth_status.is_none());
     }
 
     fn approval(nonce: &str) -> Approval {

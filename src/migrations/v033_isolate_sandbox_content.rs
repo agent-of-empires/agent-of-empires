@@ -2928,6 +2928,11 @@ mod tests {
         replace("{}");
         assert!(!proves(&linked, &file));
 
+        // The proof runs only on a Linux host, and macOS does not report a
+        // removed directory's link count as 0.
+        if !cfg!(target_os = "linux") {
+            return;
+        }
         // A recreated directory leaves the bind on the removed one.
         fs::create_dir(&directory).unwrap();
         let mounted_directory = fs::File::open(&directory).unwrap();
@@ -3458,6 +3463,8 @@ mod tests {
     /// other sandbox pending on it. Both binds sit on removed directories, so
     /// the proof now accepts them and the stopped session moves.
     #[test]
+    // A removed directory's link count is 0 only on Linux, the one host that runs the proof.
+    #[cfg(target_os = "linux")]
     #[serial_test::serial]
     fn a_removed_or_recreated_live_bind_no_longer_holds_a_stopped_sandbox() {
         let temporary = tempfile::tempdir().unwrap();

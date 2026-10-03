@@ -715,7 +715,8 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
+    // APFS rejects non-UTF-8 file names with EILSEQ.
+    #[cfg(all(unix, not(target_os = "macos")))]
     #[serial_test::serial]
     fn move_worktree_relocates_non_utf8_submodule_paths() {
         use std::os::unix::ffi::{OsStrExt, OsStringExt};

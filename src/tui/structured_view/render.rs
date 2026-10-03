@@ -21,7 +21,7 @@ use super::reducer::{
 use super::state::{FileIndex, PickerKind, PickerTarget, StructuredViewState, ViewLayout};
 use crate::acp::approvals::{tool_target, ToolTarget, CMD_KEYS, PATH_KEYS};
 use crate::acp::session_paths::{relative_display_path, SessionPathRoots};
-use crate::acp::state::{SessionUsage, ToolOutputBlock};
+use crate::acp::state::{AuthStatusKind, SessionUsage, ToolOutputBlock};
 use crate::acp::transcript::{TranscriptRow, TranscriptRowKind};
 use crate::tui::components::hover::paint_hover_bg;
 use crate::tui::plugin_ui;
@@ -1019,6 +1019,19 @@ fn render_status(
         spans.push(Span::styled(
             format!("· {mode} "),
             Style::default().fg(theme.title),
+        ));
+    }
+    // Label only: the payload can carry the account email, which has no place
+    // in a status bar that lives in screenshots and recordings.
+    if let Some(auth) = state.transcript.auth_status.as_ref() {
+        let color = if auth.kind == AuthStatusKind::None {
+            theme.error
+        } else {
+            theme.hint
+        };
+        spans.push(Span::styled(
+            format!("· {} ", auth.label),
+            Style::default().fg(color),
         ));
     }
     if state.transcript.turn_active || state.transcript.background_agent_active {

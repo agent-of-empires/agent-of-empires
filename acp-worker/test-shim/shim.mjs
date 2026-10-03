@@ -103,7 +103,7 @@ function handleInitialize(params) {
     agentInfo: {
       name: "@agentclientprotocol/claude-agent-acp",
       // At or above the floor in src/acp/agent_compat.rs.
-      version: "0.55.0",
+      version: "0.82.0",
     },
   };
 }

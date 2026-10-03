@@ -21,7 +21,7 @@ import {
 } from "lucide-react";
 import { triageMenuShape, triageStateOf } from "../../lib/sidebarSort";
 import type { BulkTriageBuckets } from "../../lib/sidebarBulk";
-import { MenuHeading, MenuItem, MenuSeparator } from "../ContextMenu";
+import { MenuChoiceRow, MenuHeading, MenuItem, MenuSeparator, MenuSwatches } from "../ContextMenu";
 import { SNOOZE_PRESETS } from "./format";
 import { SESSION_COLOR_OPTIONS, type NotifyPreset, type RowModel } from "./rowModel";
 import type { RowBulkApi } from "./types";
@@ -31,12 +31,10 @@ const PinIcon = () => icon(Pin, "-rotate-45");
 
 /** Count-labelled triage for a multi-selection; single-row actions are absent here. */
 export function BulkTriageMenuItems({
-  count,
   buckets,
   api,
   onDone,
 }: {
-  count: number;
   buckets: BulkTriageBuckets;
   api: RowBulkApi;
   onDone: () => void;
@@ -53,7 +51,6 @@ export function BulkTriageMenuItems({
     );
   return (
     <>
-      <MenuHeading>{count} selected</MenuHeading>
       {item(buckets.pinnable, "Pin", "pin", <PinIcon />, () => api.pin(buckets.pinnable, true))}
       {item(buckets.unpinnable, "Unpin", "unpin", <PinIcon />, () => api.pin(buckets.unpinnable, false))}
       {item(buckets.archivable, "Archive", "archive", icon(Archive), () => api.archive(buckets.archivable, true))}
@@ -106,10 +103,10 @@ export interface SingleRowActions {
   remove: () => void;
 }
 
-const NOTIFY_LABELS: [NotifyPreset, string][] = [
-  ["off", "Off"],
-  ["default", "Default"],
-  ["all", "All"],
+const NOTIFY_OPTIONS: { preset: NotifyPreset; label: string; hint: string }[] = [
+  { preset: "off", label: "Off", hint: "No notifications from this session" },
+  { preset: "default", label: "Default", hint: "Follows your notification settings" },
+  { preset: "all", label: "All", hint: "Notifies when waiting, idle, or on error" },
 ];
 
 /** Icon-over-label button for the quick triage row. */
@@ -117,11 +114,14 @@ function QuickAction({
   onClick,
   testId,
   glyph,
+  pressed,
   children,
 }: {
   onClick: () => void;
   testId: string;
   glyph: React.ReactNode;
+  /** For an in-place toggle, which keeps the menu open. */
+  pressed?: boolean;
   children: React.ReactNode;
 }) {
   return (
@@ -129,21 +129,14 @@ function QuickAction({
       type="button"
       onClick={onClick}
       data-testid={testId}
-      className="flex flex-1 min-w-0 flex-col items-center gap-1 rounded-md px-1 py-2 max-md:py-2.5 text-[11px] text-text-secondary hover:bg-surface-700/50 hover:text-text-primary cursor-pointer transition-colors"
+      aria-pressed={pressed}
+      className={`flex flex-1 min-w-0 flex-col items-center gap-1 rounded-md px-1 py-2 text-[11px] hover:text-text-primary cursor-pointer transition-colors ${
+        pressed ? "bg-surface-700 text-text-primary" : "text-text-secondary hover:bg-surface-700/50"
+      }`}
     >
       {glyph}
       <span className="truncate max-w-full">{children}</span>
     </button>
-  );
-}
-
-/** A labelled row of inline choices, replacing a heading plus one item per option. */
-function ChoiceRow({ label, children }: { label: string; children: React.ReactNode }) {
-  return (
-    <div className="flex items-center gap-2 px-3 py-1.5 max-md:py-2">
-      <span className="w-20 shrink-0 text-xs text-text-dim">{label}</span>
-      <div className="flex flex-1 items-center gap-1">{children}</div>
-    </div>
   );
 }
 
@@ -176,9 +169,6 @@ export function SingleRowMenuItems({
   };
   return (
     <>
-      <div className="px-3 pt-1.5 pb-1 text-xs font-mono text-text-muted truncate max-w-[260px] max-md:max-w-none">
-        {model.label}
-      </div>
       {write && <TriageRow model={model} unreadEnabled={unreadEnabled} actions={a} />}
       <MenuSeparator />
       <MenuItem onClick={a.rename} testId="sidebar-context-menu-rename" icon={icon(Pencil)}>
@@ -263,55 +253,39 @@ export function SingleRowMenuItems({
         </>
       )}
       <MenuSeparator />
-      <ChoiceRow label="Notify">
-        {NOTIFY_LABELS.map(([preset, label]) => (
-          <button
-            key={preset}
-            type="button"
-            onClick={() => a.notify(preset)}
-            data-testid={`sidebar-context-menu-notify-${preset}`}
-            aria-pressed={model.notifyPreset === preset}
-            className={`flex-1 rounded-md px-2 py-1 max-md:py-1.5 text-xs cursor-pointer transition-colors ${
-              model.notifyPreset === preset
-                ? "bg-surface-700 text-text-primary"
-                : "text-text-secondary hover:bg-surface-700/50"
-            }`}
-          >
-            {label}
-          </button>
-        ))}
-      </ChoiceRow>
-      {write && colorsEnabled && (
-        <ChoiceRow label="Color">
-          {SESSION_COLOR_OPTIONS.map((opt) => (
+      <MenuChoiceRow label="Notify" hint={NOTIFY_OPTIONS.find((o) => o.preset === model.notifyPreset)?.hint}>
+        <div
+          role="group"
+          aria-label="Notify"
+          className="flex flex-1 rounded-md border border-surface-700 bg-surface-900 p-0.5"
+        >
+          {NOTIFY_OPTIONS.map(({ preset, label }) => (
             <button
-              key={opt.key}
+              key={preset}
               type="button"
-              onClick={() => a.color(opt.key)}
-              data-testid={`sidebar-context-menu-color-${opt.key}`}
-              title={opt.label}
-              aria-label={opt.label}
-              aria-pressed={model.sessionColor === opt.key}
-              className={`flex h-7 w-7 max-md:h-9 max-md:w-9 items-center justify-center rounded-md cursor-pointer hover:bg-surface-700/50 ${
-                model.sessionColor === opt.key ? "bg-surface-700" : ""
+              onClick={() => a.notify(preset)}
+              data-testid={`sidebar-context-menu-notify-${preset}`}
+              aria-pressed={model.notifyPreset === preset}
+              className={`flex-1 rounded px-2 py-1 max-md:py-2 text-xs cursor-pointer transition-colors ${
+                model.notifyPreset === preset
+                  ? "bg-surface-700 text-text-primary"
+                  : "text-text-secondary hover:text-text-primary"
               }`}
             >
-              <span className={`h-3 w-3 rounded-full ${opt.dotClass}`} />
+              {label}
             </button>
           ))}
-          {model.sessionColor && (
-            <button
-              type="button"
-              onClick={() => a.color(null)}
-              data-testid="sidebar-context-menu-color-clear"
-              title="Clear color"
-              aria-label="Clear color"
-              className="flex h-7 w-7 max-md:h-9 max-md:w-9 items-center justify-center rounded-md cursor-pointer hover:bg-surface-700/50"
-            >
-              <span className="h-3 w-3 rounded-full border border-surface-600" />
-            </button>
-          )}
-        </ChoiceRow>
+        </div>
+      </MenuChoiceRow>
+      {write && colorsEnabled && (
+        <MenuChoiceRow label="Color">
+          <MenuSwatches
+            options={SESSION_COLOR_OPTIONS.map((o) => ({ key: o.key, label: o.label, className: o.dotClass }))}
+            value={model.sessionColor}
+            onPick={a.color}
+            testIdPrefix="sidebar-context-menu-color"
+          />
+        </MenuChoiceRow>
       )}
       {write && (
         <>
@@ -351,8 +325,13 @@ function TriageRow({
   return (
     <div className="flex gap-1 px-2 py-1">
       {(shape.showPin || shape.showUnpin) && (
-        <QuickAction onClick={a.pin} testId="sidebar-context-menu-pin" glyph={glyph(Pin, "-rotate-45")}>
-          {shape.showPin ? "Pin" : "Unpin"}
+        <QuickAction
+          onClick={a.pin}
+          testId="sidebar-context-menu-pin"
+          glyph={glyph(Pin, "-rotate-45")}
+          pressed={shape.showUnpin}
+        >
+          {shape.showPin ? "Pin" : "Pinned"}
         </QuickAction>
       )}
       {(shape.showArchive || shape.showUnarchive) && (
@@ -371,8 +350,13 @@ function TriageRow({
         </QuickAction>
       )}
       {unreadEnabled && (
-        <QuickAction onClick={a.unread} testId="sidebar-context-menu-unread" glyph={glyph(CircleDot)}>
-          {model.effectiveUnread ? "Read" : "Unread"}
+        <QuickAction
+          onClick={a.unread}
+          testId="sidebar-context-menu-unread"
+          glyph={glyph(CircleDot)}
+          pressed={model.effectiveUnread}
+        >
+          Unread
         </QuickAction>
       )}
     </div>

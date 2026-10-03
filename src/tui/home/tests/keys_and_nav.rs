@@ -671,6 +671,47 @@ fn stop_in_terminal_view_does_not_target_agent_session() {
     );
 }
 
+/// The stop key opens the stop confirm and a second press of it accepts, in both hotkey
+/// modes; the hint names that key, and an unrelated key leaves the dialog open.
+#[test]
+#[serial]
+fn second_stop_key_press_confirms_the_stop() {
+    for (strict, stop_key) in [(false, 'x'), (true, 'X')] {
+        let mut env = create_test_env_with_sessions(1);
+        env.view.strict_hotkeys = strict;
+        let id = env.view.instance_at(0).id.clone();
+        env.view
+            .mutate_instance(&id, |inst| inst.status = crate::session::Status::Idle);
+        env.view.selected_session = Some(id.clone());
+        env.view.view_mode = ViewMode::Structured;
+
+        assert_eq!(
+            env.view.handle_key(key(KeyCode::Char(stop_key)), None),
+            None
+        );
+        assert_eq!(
+            env.view.confirm_dialog.as_ref().map(|d| d.action()),
+            Some("stop_session"),
+            "strict={strict}"
+        );
+        let screen = render_home_to_string(&mut env.view, 120, 40);
+        assert!(
+            screen.contains(&format!("Press {stop_key} again to confirm")),
+            "strict={strict}\n{screen}"
+        );
+
+        assert_eq!(env.view.handle_key(key(KeyCode::Char('j')), None), None);
+        assert!(env.view.confirm_dialog.is_some(), "strict={strict}");
+
+        assert_eq!(
+            env.view.handle_key(key(KeyCode::Char(stop_key)), None),
+            Some(Action::StopSession(id)),
+            "strict={strict}"
+        );
+        assert!(env.view.confirm_dialog.is_none(), "strict={strict}");
+    }
+}
+
 /// Render suppression is cosmetic: archive/snooze leave the `unread` flag on
 /// disk so unarchiving or unsnoozing brings the marker back (#2571).
 #[test]

@@ -202,6 +202,7 @@ pub(crate) async fn reload_state_instances_from_disk(
     status_source: StatusSource,
     read_epoch: u64,
 ) {
+    let reload_guard = state.session_service.disk_reload_guard().await;
     // Snapshot suppression here so a worker that unmarks between the caller's input build
     // and the per-id decision cannot combine a cleared mark with a stale row to re-emit the
     // phantom Error transition the suppression exists to prevent.
@@ -305,6 +306,7 @@ pub(crate) async fn reload_state_instances_from_disk(
 
     *current = merged;
     drop(current);
+    drop(reload_guard);
 
     persist_structured_row_repairs(state, repairs, repair_guards);
 }

@@ -63,6 +63,7 @@ impl HomeView {
         self.confirm_before_quit = config.session.confirm_before_quit;
         self.host_tab_title = config.session.host_tab_title;
         self.row_tag_mode = config.session.row_tag;
+        self.show_activity_age = config.session.show_activity_age;
         self.set_sidebar_position(sidebar_position);
         self.show_diagnostics = config.session.show_diagnostics_pane;
         self.daemon_sidebar = config.session.daemon_sidebar;

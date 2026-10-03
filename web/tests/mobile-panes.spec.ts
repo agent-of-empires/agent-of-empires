@@ -17,6 +17,29 @@ async function openPicker(page: Page) {
   await expect(picker(page)).toBeVisible({ timeout: 5_000 });
 }
 
+/** One-finger horizontal swipe dispatched on the window, where useDrawerSwipe listens. */
+async function swipe(page: Page, fromX: number, toX: number, y: number) {
+  await page.evaluate(
+    ({ fromX, toX, y }) => {
+      const fire = (type: string, x: number) => {
+        const touch = new Touch({ identifier: 0, target: document.body, clientX: x, clientY: y });
+        const lifted = type === "touchend";
+        document.body.dispatchEvent(
+          new TouchEvent(type, {
+            bubbles: true,
+            touches: lifted ? [] : [touch],
+            changedTouches: [touch],
+          }),
+        );
+      };
+      fire("touchstart", fromX);
+      for (let i = 1; i <= 5; i++) fire("touchmove", fromX + ((toX - fromX) * i) / 5);
+      fire("touchend", toX);
+    },
+    { fromX, toX, y },
+  );
+}
+
 /** Shrink `visualViewport` the way an on-screen keyboard does. */
 async function simulateKeyboardOpen(page: Page, keyboardPx: number) {
   await page.evaluate((keyboardPx) => {
@@ -44,12 +67,48 @@ async function expectSafeAreaInset(page: Page, testId: string) {
 test.describe("Mobile right panel picker (#1452)", () => {
   test.use(iPhone13);
 
+  test("swipe left from mid-screen opens a right-anchored drawer with thumb-reachable options; swipe right closes it", async ({
+    page,
+  }) => {
+    await openLiveTerminal(page, { mobile: true, settings: null });
+    const viewport = page.viewportSize()!;
+    const y = viewport.height / 2;
+
+    await swipe(page, viewport.width / 2 + 80, viewport.width / 2 - 80, y);
+    await expect(picker(page)).toBeVisible();
+    // A full-height panel flush with the right edge, not a full-width bottom sheet.
+    await expect
+      .poll(async () => {
+        const box = await picker(page).boundingBox();
+        return box && { right: Math.round(box.x + box.width), top: box.y, narrow: box.width < viewport.width * 0.9 };
+      })
+      .toEqual({ right: viewport.width, top: 48, narrow: true });
+    // Tailwind v4 `translate-x-*` sets `translate`, so a transition on
+    // `transform` alone snaps the drawer instead of sliding it.
+    expect(await picker(page).evaluate((el) => getComputedStyle(el).transitionProperty)).toContain("translate");
+    // Options hug the bottom of the drawer, not its top.
+    const option = await page.getByTestId("mobile-right-panel-pick-agent").boundingBox();
+    expect(option!.y).toBeGreaterThan(viewport.height / 2);
+
+    await swipe(page, viewport.width / 2, viewport.width / 2 + 160, y);
+    await expect(picker(page)).toBeHidden();
+    // The same touchmove would have opened the sidebar, so it has committed by
+    // the time the picker hides.
+    await expect(page.locator('[data-tour="sidebar"]')).toHaveClass(/-translate-x-full/);
+
+    // The header stays reachable above the drawer; its sidebar toggle swaps drawers rather than stacking them.
+    await openPicker(page);
+    await page.getByRole("button", { name: "Toggle sidebar" }).click();
+    await expect(picker(page)).toBeHidden();
+    await expect(page.locator('[data-tour="sidebar"]')).not.toHaveClass(/-translate-x-full/);
+  });
+
   test("picker promotes the paired terminal and it survives the keyboard", async ({ page }) => {
     await openLiveTerminal(page, { mobile: true, settings: { mobileFontSize: 10 } });
     await openPicker(page);
 
     await page.getByTestId("mobile-right-panel-pick-paired").click();
-    await expect(picker(page)).toHaveCount(0);
+    await expect(picker(page)).toBeHidden();
     const paired = page.locator('[data-term="paired"]');
     await paired.waitFor({ state: "visible", timeout: 10_000 });
     await expectSafeAreaInset(page, "mobile-paired-layer");
@@ -77,7 +136,7 @@ test.describe("Mobile right panel picker (#1452)", () => {
     await openPicker(page);
 
     await page.getByTestId("mobile-right-panel-pick-paired").click();
-    await expect(picker(page)).toHaveCount(0);
+    await expect(picker(page)).toBeHidden();
     const paired = page.locator('[data-term="paired"]');
     await paired.waitFor({ state: "visible", timeout: 10_000 });
 
@@ -105,7 +164,7 @@ test.describe("Desktop right panel split is unchanged (#1452)", () => {
     await expect(page.getByTestId("content-split-resize-handle")).toBeVisible();
     await expect(page.getByTestId("activity-bar")).toBeVisible();
     await expect(page.getByRole("button", { name: "Toggle panels" })).toHaveCount(0);
-    await expect(picker(page)).toHaveCount(0);
+    await expect(picker(page)).toBeHidden();
     await expect(page.getByRole("button", { name: "Compose", exact: true })).toHaveCount(0);
     await expect(page.getByRole("group", { name: "Arrow keys joystick" })).toHaveCount(0);
   });

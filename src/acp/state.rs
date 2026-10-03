@@ -199,6 +199,50 @@ pub struct ModeInfo {
     pub description: Option<String>,
 }
 
+/// Agent-to-client notification carrying the agent's own auth identity.
+pub const AUTH_STATUS_UPDATE_METHOD: &str = "_auth/status_update";
+
+/// Which auth identity the agent process resolved for itself. An interim
+/// `_meta` extension, so an unrecognised kind still renders from `label`
+/// rather than dropping the whole report.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthStatusKind {
+    Account,
+    ApiKey,
+    Gateway,
+    External,
+    /// The agent knows it is logged out. Distinct from never reporting.
+    None,
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthStatusAccount {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub organization: Option<String>,
+    /// Vendor plan string, not normalised.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<String>,
+}
+
+/// The agent's own `_auth/status_update` payload. The upstream `vendor` bag is
+/// deliberately not kept: nothing reads it, and it would persist unbounded
+/// third-party data into the session log.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthStatus {
+    pub kind: AuthStatusKind,
+    /// Usable as a UI string on its own ("Claude Max", "Anthropic API key").
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<AuthStatusAccount>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AvailableCommand {
     pub name: String,
@@ -373,6 +417,10 @@ pub struct AcpState {
     pub available_modes: Vec<ModeInfo>,
     #[serde(default)]
     pub current_mode_id: Option<String>,
+    /// Identity the adapter reported for itself. `None` means it never
+    /// reported, which the UI shows as nothing rather than as logged out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_status: Option<AuthStatus>,
     #[serde(default)]
     pub last_agent_switch: Option<AgentSwitchInfo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -554,6 +602,12 @@ pub enum Event {
         config_id: String,
         value: String,
         reason: String,
+    },
+    /// The agent reported which auth identity it runs under. `None` clears a
+    /// report inherited from an earlier adapter process that this one cannot
+    /// refresh; see `AcpState::auth_status`.
+    AuthStatusUpdated {
+        status: Option<AuthStatus>,
     },
     /// An ACP `session/update` payload with no typed variant yet.
     RawAgentUpdate {
@@ -831,6 +885,7 @@ impl AcpState {
             Event::CurrentModeChanged { current_mode_id } => {
                 self.current_mode_id = Some(current_mode_id)
             }
+            Event::AuthStatusUpdated { status } => self.auth_status = status,
             Event::AvailableCommandsUpdated { commands } => self.available_commands = commands,
             Event::ConfigOptionsUpdated { options } => {
                 // The failed value is now current, so the notice is moot.
@@ -1145,6 +1200,68 @@ mod tests {
             ]))
             .is_empty(),
             "the prior agent's advisories do not carry over"
+        );
+    }
+
+    fn auth(kind: AuthStatusKind, label: &str) -> AuthStatus {
+        AuthStatus {
+            kind,
+            label: label.into(),
+            detail: None,
+            account: None,
+        }
+    }
+
+    #[test]
+    fn auth_status_tracks_the_latest_report_and_clears() {
+        let max = auth(AuthStatusKind::Account, "Claude Max");
+        let key = auth(AuthStatusKind::ApiKey, "Anthropic API key");
+
+        // Never reported is not the same as logged out: it renders as nothing.
+        assert_eq!(fresh_state().auth_status, None);
+
+        let s = applied([Event::AuthStatusUpdated {
+            status: Some(max.clone()),
+        }]);
+        assert_eq!(s.auth_status.as_ref(), Some(&max));
+
+        // A later report replaces the earlier one wholesale.
+        let s = applied([
+            Event::AuthStatusUpdated {
+                status: Some(max.clone()),
+            },
+            Event::AuthStatusUpdated {
+                status: Some(key.clone()),
+            },
+        ]);
+        assert_eq!(s.auth_status.as_ref(), Some(&key));
+
+        // An adapter that cannot report clears the previous process's value
+        // rather than leaving it on screen.
+        let s = applied([
+            Event::AuthStatusUpdated { status: Some(max) },
+            Event::AuthStatusUpdated { status: None },
+        ]);
+        assert_eq!(s.auth_status, None);
+    }
+
+    #[test]
+    fn auth_status_drops_the_vendor_bag_but_keeps_the_account() {
+        let status: AuthStatus = serde_json::from_value(serde_json::json!({
+            "kind": "account",
+            "label": "Claude Max",
+            "account": {"email": "a@b.co", "organization": "Acme", "plan": "max"},
+            "vendor": {"claudeCode": {"secret": "x"}},
+        }))
+        .unwrap();
+        assert_eq!(
+            status.account.as_ref().unwrap().email.as_deref(),
+            Some("a@b.co")
+        );
+        let round_tripped = serde_json::to_value(&status).unwrap();
+        assert!(
+            round_tripped.get("vendor").is_none(),
+            "vendor must not reach the event log: {round_tripped}"
         );
     }
 

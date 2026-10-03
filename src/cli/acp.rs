@@ -1082,6 +1082,7 @@ fn event_kind(event: &crate::acp::Event) -> &'static str {
         Event::AvailableCommandsUpdated { .. } => "available_commands_updated",
         Event::ConfigOptionsUpdated { .. } => "config_options_updated",
         Event::ConfigOptionSwitchFailed { .. } => "config_option_switch_failed",
+        Event::AuthStatusUpdated { .. } => "auth_status_updated",
         Event::RawAgentUpdate { .. } => "raw_agent_update",
         Event::BackgroundAgentLaunched { .. } => "background_agent_launched",
         Event::BackgroundAgentProgress { .. } => "background_agent_progress",
@@ -1316,7 +1317,7 @@ mod tests {
             version_issue: issue,
         };
         let stale_issue = AgentVersionIssue {
-            reason: "installed 0.37.0; requires >=0.55.0".to_string(),
+            reason: "installed 0.37.0; requires >=0.82.0".to_string(),
             install_command: "npm install -g @x/y@latest".to_string(),
         };
         let marks = [
