@@ -105,6 +105,8 @@ pub fn trust_codex_project(
 /// Merge `projects."<project_path>".hasTrustDialogAccepted = true` into Claude
 /// Code's `.claude.json`, which also holds its onboarding state. A persisted
 /// entry, unlike `CLAUDE_CODE_SANDBOXED`, lets the repo's own permission rules load.
+/// Writes trust records only, never MCP definitions: the `mcp.rewrite` hook is
+/// the only MCP source for sandboxed agents.
 pub fn trust_claude_project(
     config_path: &Path,
     project_path: &str,
