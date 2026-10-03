@@ -171,6 +171,10 @@ pub struct Instance {
     /// Last title written by the automatic renamer; a manual rename leaves it stale.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_auto_title: Option<String>,
+    /// The title was typed in the New Session dialog, so the first launch gives it to the agent
+    /// as its own session name and clears this.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub first_launch_names_agent: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub smart_rename_attempted: bool,
     pub project_path: String,

@@ -265,3 +265,21 @@ pub(super) fn admit_sandbox_fixture(inst: &Instance) {
         .unwrap();
     }
 }
+
+/// Seed a resumable Claude conversation in the isolated native store.
+pub(super) fn seed_claude_transcript(instance: &mut Instance, sid: &str) {
+    let home = std::env::var("CLAUDE_CONFIG_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| dirs::home_dir().expect("home dir").join(".claude"));
+    let canonical = std::fs::canonicalize(&instance.project_path)
+        .unwrap_or_else(|_| std::path::PathBuf::from(&instance.project_path));
+    let dir = home
+        .join("projects")
+        .join(crate::session::capture::encode_claude_project_path(
+            &canonical.to_string_lossy(),
+        ));
+    std::fs::create_dir_all(&dir).expect("create claude project dir");
+    std::fs::write(dir.join(format!("{sid}.jsonl")), "seed\n").expect("write transcript");
+    let binding = instance.asserted_resume_binding(sid, None).unwrap();
+    instance.set_agent_conversation(Some(sid.into()), Some(binding), None);
+}

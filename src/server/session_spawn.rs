@@ -166,6 +166,7 @@ pub(crate) async fn spawn_structured_session(
 
         let params = InstanceParams {
             title,
+            title_typed: false,
             path,
             group,
             tool,

@@ -13,6 +13,7 @@ impl Instance {
             id: generate_id(),
             title: title.to_string(),
             last_auto_title: None,
+            first_launch_names_agent: false,
             sort_index: None,
             smart_rename_attempted: false,
             project_path: project_path.to_string(),

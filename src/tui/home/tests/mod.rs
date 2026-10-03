@@ -409,6 +409,7 @@ fn creation_data(project_dir: &std::path::Path, title: &str, group: &str) -> New
     NewSessionData {
         profile: "default".to_string(),
         title: title.to_string(),
+        title_typed: false,
         path: project_dir.to_str().unwrap().to_string(),
         group: group.to_string(),
         tool: "claude".to_string(),
