@@ -206,6 +206,7 @@ pub struct HomeView {
     pub(super) pending_live_send_target: live_send::LiveSendTarget,
     pub(super) live_send: Option<live_send::LiveSendState>,
     pub(super) live_send_worker: Option<live_send::LiveSendWorker>,
+    pub(super) live_send_effects: std::sync::Arc<std::sync::Mutex<()>>,
     pub(super) preview_capture_worker: Option<live_send::LiveCaptureWorker>,
     pub(super) preview_capture_target: Option<String>,
     pub(super) preview_worker_pulse: Option<(u64, std::time::Instant)>,

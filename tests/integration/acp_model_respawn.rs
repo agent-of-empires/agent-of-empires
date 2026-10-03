@@ -29,6 +29,8 @@ fn spawn_config(
     default_effort: Option<String>,
 ) -> SpawnConfig {
     SpawnConfig {
+        execution_admission: None,
+        managed_profile: None,
         wrapper_substitution: None,
         agent_key: "claude".into(),
         tool: "claude".into(),

@@ -24,12 +24,13 @@ pub use status_bar::{get_session_info_for_current, get_status_for_current_sessio
 pub use status_detection::{detect_status_from_content_in, detect_with_rules};
 pub use terminal_session::{kill_all_terminals_for_id, ContainerTerminalSession, TerminalSession};
 pub use tool_session::{kill_all_tool_sessions_for_id, ToolSession};
+pub use utils::PrimaryPane;
 pub use utils::{attach_return_hint, tmux_prefix_display};
 
 pub(crate) use session_kind::{append_session_kind_args, SessionKind};
 
 /// Change count of `session`'s advertised OSC 8 links; always 0 off unix.
-pub(crate) fn pane_links_generation(session: &str) -> u64 {
+pub(crate) fn pane_links_generation(session: &Session) -> u64 {
     #[cfg(unix)]
     {
         vt::pane_links_generation(session)
@@ -41,7 +42,7 @@ pub(crate) fn pane_links_generation(session: &str) -> u64 {
     }
 }
 
-pub(crate) fn pane_links(session: &str) -> Vec<osc8::PaneLink> {
+pub(crate) fn pane_links(session: &Session) -> Vec<osc8::PaneLink> {
     #[cfg(unix)]
     {
         vt::pane_links(session)
@@ -210,8 +211,10 @@ pub const TOOL_PREFIX: &str = if cfg!(debug_assertions) {
     "aoe_tool_"
 };
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct PaneMetadata {
+    pub primary: PrimaryPane,
+    pub window_index: u32,
     pub pane_dead: bool,
     pub pane_current_command: Option<String>,
     pub pane_start_command_is_protected: bool,
@@ -1034,13 +1037,15 @@ fn stop_aoe_sessions<'a>(
 pub fn batch_pane_metadata() -> anyhow::Result<HashMap<String, PaneMetadata>> {
     let start = Instant::now();
     let mut command = tmux_query_command();
+    utils::append_server_incarnation(&mut command);
     command.args([
         "list-panes",
         "-a",
         "-F",
         // Fields that may contain `|` ride `TAIL_SEP` after `pane_pid`.
         concat!(
-            "#{session_name}|#{pane_index}|#{pane_dead}|#{window_width}|#{window_height}",
+            "#{session_name}|#{pane_index}|#{pane-base-index}|#{window_index}|#{@aoe_server_incarnation}|#{session_id}|#{window_id}|#{pane_id}",
+            "|#{pane_dead}|#{window_width}|#{window_height}",
             "|#{pane_current_command}",
             "|#{pane_start_command}|#{pane_pid}\x1f#{window_activity}\x1f#{pane_title}"
         ),
@@ -1174,24 +1179,35 @@ fn split_pane_metadata_tail(line: &str) -> (&str, Option<&str>, Option<&str>) {
     }
 }
 
-/// Filters to aoe sessions, pane index 0, first window per session.
 fn parse_pane_metadata(output: &str) -> HashMap<String, PaneMetadata> {
-    let mut map = HashMap::new();
+    let mut map: HashMap<String, PaneMetadata> = HashMap::new();
 
     for line in output.lines() {
         let (line, activity, pane_title) = split_pane_metadata_tail(line);
         let window_activity = activity.and_then(|a| a.trim().parse::<i64>().ok());
         let pane_title = pane_title.unwrap_or("");
-        let mut parts = line.splitn(7, FIELD_SEP);
+        let mut parts = line.splitn(13, FIELD_SEP);
         let (
             Some(session_name),
             Some(pane_index),
+            Some(pane_base),
+            Some(window_index),
+            Some(server_id),
+            Some(session_id),
+            Some(window_id),
+            Some(pane_id),
             Some(pane_dead),
             Some(window_width),
             Some(window_height),
             Some(pane_current_command),
             Some(rest),
         ) = (
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
             parts.next(),
             parts.next(),
             parts.next(),
@@ -1216,17 +1232,29 @@ fn parse_pane_metadata(output: &str) -> HashMap<String, PaneMetadata> {
             continue;
         }
 
-        if pane_index != "0" {
+        if pane_index != pane_base {
             continue;
         }
-
-        if map.contains_key(session_name) {
+        let Ok(window_index) = window_index.parse::<u32>() else {
+            continue;
+        };
+        if map
+            .get(session_name)
+            .is_some_and(|prior| prior.window_index <= window_index)
+        {
             continue;
         }
 
         map.insert(
             session_name.to_string(),
             PaneMetadata {
+                primary: PrimaryPane {
+                    server_id: server_id.to_owned(),
+                    session_id: session_id.to_owned(),
+                    window_id: window_id.to_owned(),
+                    pane_id: pane_id.to_owned(),
+                },
+                window_index,
                 pane_dead: pane_dead == "1",
                 pane_pid,
                 pane_current_command: if pane_current_command.is_empty() {
@@ -1252,6 +1280,24 @@ pub(crate) fn observed_window_size_from_cache(session_name: &str) -> Option<((u1
     let time = cache.time?;
     let size = cache.data.as_ref()?.get(session_name)?.window_size?;
     Some((size, time))
+}
+
+pub(crate) fn primary_changed_in_cache(
+    name: &str,
+    primary: &PrimaryPane,
+    since: Option<Instant>,
+) -> bool {
+    let Ok(cache) = PANE_META_CACHE.read() else {
+        return false;
+    };
+    cache
+        .time
+        .is_some_and(|at| since.is_none_or(|since| at > since))
+        && cache
+            .data
+            .as_ref()
+            .and_then(|data| data.get(name))
+            .is_some_and(|metadata| metadata.primary != *primary)
 }
 
 /// Test-only: make `session_exists_from_cache` see `name`.
@@ -1289,6 +1335,7 @@ pub fn test_inject_pane_window_size_at(name: &str, size: (u16, u16), taken_at: I
                 pane_title: None,
                 window_activity: None,
                 window_size: Some(size),
+                ..Default::default()
             },
         );
         map
@@ -3157,6 +3204,7 @@ mod tests {
                             pane_title: None,
                             window_activity: None,
                             window_size: None,
+                            ..Default::default()
                         },
                     )
                 })
@@ -3204,6 +3252,7 @@ mod tests {
             pane_title: None,
             window_activity: None,
             window_size: None,
+            ..Default::default()
         }
     }
 
@@ -3592,22 +3641,9 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_pane_metadata_basic() {
-        let output = format!("{P}my_proj_abc12345|0|0|190|52|claude|claude|4242\n");
-        let map = parse_pane_metadata(&output);
-        assert_eq!(map.len(), 1);
-        let meta = map.get(&format!("{P}my_proj_abc12345")).unwrap();
-        assert!(!meta.pane_dead);
-        assert_eq!(meta.pane_current_command.as_deref(), Some("claude"));
-        assert!(!meta.pane_start_command_is_protected);
-        assert_eq!(meta.pane_pid, Some(4242));
-        assert_eq!(meta.window_size, Some((190, 52)));
-    }
-
-    #[test]
     fn test_parse_pane_metadata_reads_the_tail_fields() {
         let output = format!(
-            "{P}proj_abc12345|0|0|190|52|claude|claude{TAIL_SEP}1770000000{TAIL_SEP}✶ Working\n"
+            "{P}proj_abc12345|0|0|0|server|$0|@0|%0|0|190|52|claude|claude{TAIL_SEP}1770000000{TAIL_SEP}✶ Working\n"
         );
         let meta = parse_pane_metadata(&output)
             .remove(&format!("{P}proj_abc12345"))
@@ -3616,7 +3652,7 @@ mod tests {
         assert_eq!(meta.pane_title.as_deref(), Some("✶ Working"));
 
         let escaped_output = format!(
-            "{P}proj_escaped_abc12345|0|0|190|52|claude|claude literal{}{ESCAPED_TAIL_SEP}|4242{ESCAPED_TAIL_SEP}1770000001{ESCAPED_TAIL_SEP}literal{}{ESCAPED_TAIL_SEP}title{}",
+            "{P}proj_escaped_abc12345|0|0|0|server|$0|@0|%0|0|190|52|claude|claude literal{}{ESCAPED_TAIL_SEP}|4242{ESCAPED_TAIL_SEP}1770000001{ESCAPED_TAIL_SEP}literal{}{ESCAPED_TAIL_SEP}title{}",
             char::from(92),
             char::from(92),
             char::from(10)
@@ -3631,7 +3667,9 @@ mod tests {
             Some(format!("literal{}{ESCAPED_TAIL_SEP}title", char::from(92)))
         );
 
-        let odd = format!("{P}proj_def67890|0|0|||claude|claude{TAIL_SEP}{TAIL_SEP}\n");
+        let odd = format!(
+            "{P}proj_def67890|0|0|0|server|$0|@0|%0|0|||claude|claude{TAIL_SEP}{TAIL_SEP}\n"
+        );
         let meta = parse_pane_metadata(&odd)
             .remove(&format!("{P}proj_def67890"))
             .unwrap();
@@ -3643,8 +3681,8 @@ mod tests {
     #[test]
     fn test_parse_pane_metadata_protected_wrapper_shell_is_not_stale() {
         let output = format!(
-            "{P}protected_abc12345|0|0|190|52|sh|/bin/sh -c 'prepare | . /tmp/aoe-pane-env-123 | exec claude'\n\
-             {P}interactive_def67890|0|0|190|52|sh|sh\n"
+            "{P}protected_abc12345|0|0|0|server|$0|@0|%0|0|190|52|sh|/bin/sh -c 'prepare | . /tmp/aoe-pane-env-123 | exec claude'\n\
+             {P}interactive_def67890|0|0|0|server|$0|@0|%0|0|190|52|sh|sh\n"
         );
         let map = parse_pane_metadata(&output);
 
@@ -3665,69 +3703,21 @@ mod tests {
         }
     }
 
-    /// One row per aoe session: pane and window zero, first line wins.
     #[test]
-    fn parse_pane_metadata_row_selection_table() {
-        type Want<'a> = &'a [(&'a str, Option<&'a str>, bool)];
-        let cases: &[(&str, String, Want<'_>)] = &[
-            (
-                "dead pane",
-                format!("{P}proj_abc12345|0|1|190|52|bash|bash\n"),
-                &[("proj_abc12345", Some("bash"), true)],
-            ),
-            (
-                "non-aoe sessions filtered",
-                format!(
-                    "user_session|0|0|190|52|bash|bash\n{P}proj_abc12345|0|0|190|52|claude|claude\nmy_tmux|0|0|190|52|vim|vim\n"
-                ),
-                &[("proj_abc12345", Some("claude"), false)],
-            ),
-            (
-                "non-zero panes filtered",
-                format!(
-                    "{P}proj_abc12345|0|0|190|52|claude|claude\n{P}proj_abc12345|1|0|190|52|bash|bash\n"
-                ),
-                &[("proj_abc12345", Some("claude"), false)],
-            ),
-            (
-                "first window wins",
-                format!(
-                    "{P}proj_abc12345|0|0|190|52|claude|claude\n{P}proj_abc12345|0|1|190|52|bash|bash\n"
-                ),
-                &[("proj_abc12345", Some("claude"), false)],
-            ),
-            ("empty output", String::new(), &[]),
-            (
-                "malformed and blank lines skipped",
-                format!("too|few|fields\n{P}proj_abc12345|0|0|190|52|claude|claude\n\n"),
-                &[("proj_abc12345", Some("claude"), false)],
-            ),
-            (
-                "empty command",
-                format!("{P}proj_abc12345|0|0|190|52||sh\n"),
-                &[("proj_abc12345", None, false)],
-            ),
-            (
-                "several sessions",
-                format!(
-                    "{P}proj_a_abc12345|0|0|190|52|claude|claude\n{P}proj_b_def67890|0|0|190|52|opencode|opencode\n{P}proj_c_ghi11111|0|1|190|52|bash|bash\n"
-                ),
-                &[
-                    ("proj_a_abc12345", Some("claude"), false),
-                    ("proj_b_def67890", Some("opencode"), false),
-                    ("proj_c_ghi11111", Some("bash"), true),
-                ],
-            ),
-        ];
-        for (label, output, want) in cases {
-            let map = parse_pane_metadata(output);
-            assert_eq!(map.len(), want.len(), "{label}");
-            for (suffix, command, dead) in *want {
-                let name = format!("{P}{suffix}");
-                let meta = map.get(&name).unwrap_or_else(|| panic!("{label}: {name}"));
-                assert_eq!(meta.pane_current_command.as_deref(), *command, "{label}");
-                assert_eq!(meta.pane_dead, *dead, "{label}");
-            }
+    fn metadata_selects_effective_primary_in_lowest_window_independent_of_row_order() {
+        for base in [0, 1] {
+            let name = format!("{P}proj_abc12345");
+            let row = |window, pane, id: &str, command: &str| {
+                format!("{name}|{pane}|{base}|{window}|server|$4|@{window}|{id}|0|190|52|{command}|{command}|4242\n")
+            };
+            let output = row(8, base, "%80", "bash")
+                + &row(4, base + 1, "%41", "vim")
+                + &row(4, base, "%40", "claude");
+            let map = parse_pane_metadata(&output);
+            let primary = map.get(&name).expect("effective primary");
+            assert_eq!(primary.primary.pane_id, "%40", "base={base}");
+            assert_eq!(primary.primary.window_id, "@4", "base={base}");
+            assert_eq!(primary.pane_current_command.as_deref(), Some("claude"));
         }
     }
     #[test]

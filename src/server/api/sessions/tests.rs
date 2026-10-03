@@ -1731,6 +1731,93 @@ async fn rename_session_distinguishes_cwd_stable_title_and_branch_changes() {
 
 #[tokio::test]
 #[serial_test::serial]
+async fn terminal_worktree_edits_refuse_unproven_history() {
+    let _app_dir = crate::session::test_support::isolate_app_dir();
+    for tied in [true, false] {
+        let paths = tempfile::tempdir().unwrap();
+        let project_path = paths.path().join("original");
+        std::fs::create_dir(&project_path).unwrap();
+        std::fs::write(project_path.join("retained"), b"original bytes").unwrap();
+        let mut inst = Instance::new("Original", project_path.to_str().unwrap());
+        inst.source_profile = "default".into();
+        inst.status = Status::Idle;
+        inst.view = crate::session::View::Terminal;
+        inst.runner_journal = crate::session::runner_journal::RunnerExecutionJournal::default();
+        inst.worktree_info = Some(worktree(
+            "original",
+            paths
+                .path()
+                .join("missing-repo")
+                .to_string_lossy()
+                .into_owned(),
+            None,
+        ));
+        let id = inst.id.clone();
+        let (storage, state) = build_rename_test_state(vec![inst.clone()], vec![inst]);
+        crate::session::config::profile_config::save_profile_config(
+            "default",
+            &crate::session::config::profile_config::ProfileConfig {
+                description: None,
+                overrides: serde_json::from_value(serde_json::json!({
+                    "session": { "tie_workdir_to_name": tied }
+                }))
+                .unwrap(),
+            },
+        )
+        .unwrap();
+        let response = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            if tied {
+                rename_session(
+                    State(state.clone()),
+                    Path(id.clone()),
+                    Ok(Json(RenameSessionBody {
+                        title: "Renamed".into(),
+                        rename_branch: false,
+                    })),
+                )
+                .await
+                .into_response()
+            } else {
+                set_worktree_name(
+                    State(state.clone()),
+                    Path(id.clone()),
+                    Ok(Json(SetWorktreeNameBody {
+                        name: "renamed".into(),
+                        rename_branch: false,
+                    })),
+                )
+                .await
+                .into_response()
+            }
+        })
+        .await
+        .expect("terminal refusal must settle without filesystem deadlock");
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["error"], "runner_not_quiescent");
+        let stored = storage
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.id == id)
+            .unwrap();
+        assert_eq!(stored.title, "Original");
+        assert_eq!(stored.project_path, project_path.to_string_lossy());
+        assert!(!stored.runner_journal.proves_quiescent());
+        assert_eq!(
+            std::fs::read(project_path.join("retained")).unwrap(),
+            b"original bytes"
+        );
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial]
 async fn worktree_edits_quiesce_structured_worker_only_when_its_cwd_moves() {
     {
         // Invariant #2260: a live structured worker is pinned to its cwd, so a
@@ -1778,6 +1865,7 @@ async fn worktree_edits_quiesce_structured_worker_only_when_its_cwd_moves() {
             // misses and quiesce closes.
             inst.status = Status::Idle;
             inst.view = crate::session::View::Structured;
+            inst.source_profile = "default".into();
             inst.worktree_info = Some(worktree(
                 case.leaf,
                 paths
@@ -1791,15 +1879,19 @@ async fn worktree_edits_quiesce_structured_worker_only_when_its_cwd_moves() {
             let (_storage, state) = build_rename_test_state(vec![inst.clone()], vec![inst]);
             state.acp_supervisor.test_insert_worker(case.id).await;
 
-            let _ = rename_session(
-                State(state.clone()),
-                Path(case.id.to_string()),
-                Ok(Json(RenameSessionBody {
-                    title: case.new_title.to_string(),
-                    rename_branch: false,
-                })),
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                rename_session(
+                    State(state.clone()),
+                    Path(case.id.to_string()),
+                    Ok(Json(RenameSessionBody {
+                        title: case.new_title.to_string(),
+                        rename_branch: false,
+                    })),
+                ),
             )
             .await
+            .expect("worktree edit must settle without retaining its shutdown flocks")
             .into_response();
 
             assert_eq!(
@@ -1897,15 +1989,19 @@ async fn worktree_edits_quiesce_structured_worker_only_when_its_cwd_moves() {
             let state = crate::server::test_support::build_test_app_state(vec![inst]);
             state.acp_supervisor.test_insert_worker(case.id).await;
 
-            let _ = set_worktree_name(
-                State(state.clone()),
-                Path(case.id.to_string()),
-                Ok(Json(SetWorktreeNameBody {
-                    name: case.new_name.to_string(),
-                    rename_branch: false,
-                })),
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                set_worktree_name(
+                    State(state.clone()),
+                    Path(case.id.to_string()),
+                    Ok(Json(SetWorktreeNameBody {
+                        name: case.new_name.to_string(),
+                        rename_branch: false,
+                    })),
+                ),
             )
             .await
+            .expect("worktree edit must settle without retaining its shutdown flocks")
             .into_response();
 
             assert_eq!(
@@ -2657,51 +2753,63 @@ async fn worker_stopping_handlers_wait_for_an_in_flight_submission() {
     }
 }
 
-/// The identity and lifecycle flocks are process-wide files, so holding them
-/// across the ACP stop froze every creation, rename, reconciliation and purge
-/// for as long as the teardown grace lasted. An independent identity mutation
-/// must therefore advance while the stop is still running.
 #[tokio::test]
 #[serial_test::serial]
 async fn a_trash_stop_does_not_hold_the_identity_lock() {
-    use std::sync::Arc;
     use std::time::Duration;
-
-    let temp = tempfile::tempdir().unwrap();
+    use tokio::io::AsyncReadExt;
+    struct Reap(std::process::Child);
+    impl Drop for Reap {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let temp = tempfile::TempDir::new_in("/tmp").unwrap();
     let _app_dir = crate::session::test_support::isolate_app_dir_at(temp.path());
     let profile = "trash-lock";
     crate::session::create_profile(profile).unwrap();
+    let mut command = std::process::Command::new("/bin/sh");
+    command
+        .args(["-c", "read -r ignored || :"])
+        .stdin(std::process::Stdio::piped());
+    crate::process::configure_process_group(&mut command);
+    let mut child = Reap(command.spawn().unwrap());
+    let pid = child.0.id();
+    let incarnation = crate::process::process_incarnation(pid).unwrap().unwrap();
+    let nonce = uuid::Uuid::new_v4();
+    let boot = *uuid::Uuid::parse_str(&crate::process::boot_id().unwrap())
+        .unwrap()
+        .as_bytes();
     let mut inst = crate::session::Instance::new("stuck", temp.path().to_str().unwrap());
-    inst.id = "stuck-runner".to_string();
-    inst.source_profile = profile.to_string();
+    inst.id = "stuck-runner".into();
+    inst.source_profile = profile.into();
     inst.view = crate::session::View::Structured;
+    inst.runner_journal = serde_json::from_value(serde_json::json!({
+        "coverage": "complete", "launches": [{
+            "nonce": *nonce.as_bytes(), "boot": boot, "generation": 1,
+            "incarnation": incarnation,
+        }],
+    }))
+    .unwrap();
     let id = inst.id.clone();
     crate::session::Storage::new_unwatched(profile)
         .unwrap()
-        .update(|all, _| {
-            all.push(inst.clone());
+        .update(|rows, _| {
+            rows.push(inst.clone());
             Ok(())
         })
         .unwrap();
-
-    use crate::acp::runner_lifecycle::test_support::FakeProcessControl;
-    let control = Arc::new(FakeProcessControl::default());
-    control.immortal(9311);
-    let state = crate::server::test_support::build_test_app_state_with_process_control(
-        vec![inst],
-        control.clone(),
-    );
-    state
-        .acp_supervisor
-        .test_install_attached(
-            &id,
-            crate::acp::runner_lifecycle::RunnerIdentity {
-                pid: 9311,
-                generation: 1,
-            },
-        )
-        .await;
-
+    let stop_socket = crate::session::runner_journal::stop_socket(&id, pid).unwrap();
+    let listener = tokio::net::UnixListener::bind(stop_socket).unwrap();
+    let (requested, request_seen) = tokio::sync::oneshot::channel();
+    let receiver = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut frame = [0; 17];
+        stream.read_exact(&mut frame).await.unwrap();
+        requested.send(()).unwrap();
+    });
+    let state = crate::server::test_support::build_test_app_state(vec![inst]);
     let trash = tokio::spawn({
         let state = Arc::clone(&state);
         let id = id.clone();
@@ -2711,27 +2819,34 @@ async fn a_trash_stop_does_not_hold_the_identity_lock() {
                 .into_response()
         }
     });
-    // The teardown grace is ~2.5s; an independent mutation must not queue
-    // behind it.
-    tokio::time::timeout(Duration::from_millis(1500), async {
-        while state.acp_supervisor.worker_state(&id).await
-            != crate::daemon::AcpWorkerState::Stopping
-        {
-            tokio::task::yield_now().await;
-        }
-        tokio::task::spawn_blocking(crate::session::acquire_session_identity_lock)
-            .await
-            .unwrap()
-            .expect("the identity lock is free while the ACP stop runs");
-    })
-    .await
-    .expect("the identity lock must not wait on the ACP teardown");
-
-    control.exit(9311);
-    tokio::time::timeout(Duration::from_secs(20), trash)
+    tokio::time::timeout(Duration::from_secs(2), request_seen)
         .await
-        .expect("the trash must finish, not deadlock on the locks it reacquires")
+        .unwrap()
         .unwrap();
+    assert!(crate::process::worker::is_process_group_alive(pid));
+    tokio::time::timeout(
+        Duration::from_millis(1500),
+        tokio::task::spawn_blocking(crate::session::acquire_session_identity_lock),
+    )
+    .await
+    .expect("identity mutation must progress while actual runner group remains alive")
+    .unwrap()
+    .unwrap();
+    drop(child.0.stdin.take());
+    assert!(child.0.wait().unwrap().success());
+    let response = tokio::time::timeout(Duration::from_secs(10), trash)
+        .await
+        .unwrap()
+        .unwrap();
+    receiver.await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let stored = crate::session::Storage::open_unwatched(profile)
+        .unwrap()
+        .load()
+        .unwrap();
+    assert!(stored
+        .iter()
+        .any(|row| row.id == id && row.is_trashed() && row.lifecycle_reservation.is_none()));
 }
 
 /// A live `Attach` reservation is an expected lifecycle conflict, so the

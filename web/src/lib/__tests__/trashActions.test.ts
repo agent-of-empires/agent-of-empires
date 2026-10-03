@@ -134,11 +134,16 @@ describe("deleteWorkspaceSessions (#2536)", () => {
     await deleteWorkspaceSessions(sessions("a", "b"), {}, "b", d);
 
     expect(d.purgeLocal).not.toHaveBeenCalled();
+    expect(d.navigateHome).not.toHaveBeenCalled();
     expect(d.setStatus).not.toHaveBeenCalledWith("a", "Error");
     expect(d.setStatus).not.toHaveBeenCalledWith("b", "Error");
     expect(d.setStatus).toHaveBeenCalledWith("a", "Stopped");
     expect(d.notify.error).toHaveBeenCalledWith("still tearing down");
     expect(d.notify.info).not.toHaveBeenCalled();
+    deleteMock.mockResolvedValue(ok({ deleted: ["a", "b"] }));
+    await deleteWorkspaceSessions(sessions("a", "b"), {}, "b", d);
+    expect(d.purgeLocal.mock.calls).toEqual([["a"], ["b"]]);
+    expect(d.navigateHome).toHaveBeenCalledTimes(1);
   });
 
   it("navigates home only when the open session was deleted, not when it failed", async () => {

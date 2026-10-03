@@ -26,6 +26,7 @@ pub mod poller;
 pub mod projects;
 pub(crate) mod recovery;
 pub mod restart;
+pub(crate) mod runner_journal;
 pub mod sandbox_store_reclaim;
 pub mod scope;
 pub mod scratch;
@@ -95,7 +96,7 @@ pub use instance::{
 pub(crate) use move_journal::{
     record as record_move_journal, MoveJournalEntry, MOVE_JOURNAL_VERSION,
 };
-pub(crate) use storage::acquire_session_identity_lock;
+pub(crate) use storage::{acquire_session_identity_lock, sync_parent_directory};
 #[cfg(test)]
 pub(crate) use storage::{observe_lock_contention_for_test, observe_updates_for_test};
 pub(crate) use storage::{reconcile_profile_duplicates, DuplicateIdReport};

@@ -306,22 +306,10 @@ fn is_live_send_capturing_tracks_state_and_overlays() {
 #[test]
 #[serial]
 fn ctrl_c_in_live_mode_forwards_to_agent_and_flashes() {
-    use crate::tui::home::live_send::{parse_chord_list, LiveSendState, LiveSendTarget};
-
+    crate::tmux::test_helpers::require_tmux!();
     let mut env = create_test_env_with_sessions(1);
-    let inst = env.view.instance_at(0).clone();
-
-    // Match the generated tmux name so the drift guard doesn't tear live mode
-    // down before the key is translated.
-    let tmux_name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
-    env.view.live_send = Some(LiveSendState {
-        session_id: inst.id.clone(),
-        title: inst.title.clone(),
-        tmux_name,
-        target: LiveSendTarget::Agent,
-        exit_chords: parse_chord_list("C-q"),
-        leader: None,
-    });
+    let id = env.view.instance_at(0).id.clone();
+    env.install_native_preview_input(&id, super::super::live_send::LiveSendTarget::Agent, true);
 
     assert!(!env.view.live_send_ctrl_c_flash_active());
 
@@ -340,6 +328,7 @@ fn ctrl_c_in_live_mode_forwards_to_agent_and_flashes() {
         env.view.live_send_ctrl_c_flash_active(),
         "forwarding Ctrl+C arms the footer reminder"
     );
+    env.assert_native_input(b"\x03");
 }
 
 /// The live-send footer renders the "Ctrl+C sent to agent" reminder only

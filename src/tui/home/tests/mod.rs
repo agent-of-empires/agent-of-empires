@@ -79,8 +79,211 @@ fn setup_test_home(temp: &TempDir) -> AppDirGuard {
 
 struct TestEnv {
     view: HomeView,
+    native_input: Option<NativePreviewInput>,
     _guard: AppDirGuard,
     _temp: TempDir,
+}
+
+struct NativePreviewInput {
+    _guard: crate::tmux::test_helpers::TmuxTestSession,
+    input: std::path::PathBuf,
+    actor: std::sync::Arc<crate::tmux::Session>,
+    effects: std::sync::Arc<std::sync::Mutex<()>>,
+    receipt_offset: std::cell::Cell<usize>,
+    observed: std::cell::RefCell<Vec<u8>>,
+}
+
+fn wait_for_native_fixture<T>(what: &str, mut probe: impl FnMut() -> Option<T>) -> T {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if let Some(value) = probe() {
+            return value;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for {what}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+/// State-only fixtures use this without claiming a prepared input transport.
+fn live_state_for_instance(
+    inst: &Instance,
+    target: super::live_send::LiveSendTarget,
+) -> super::live_send::LiveSendState {
+    use super::live_send::{parse_chord_list, LiveSendState, LiveSendTarget, DEFAULT_EXIT_CHORD};
+    let tmux_name = match &target {
+        LiveSendTarget::Agent => crate::tmux::Session::resolve_name(&inst.id, &inst.title),
+        LiveSendTarget::Terminal => {
+            crate::tmux::TerminalSession::resolve_name(&inst.id, &inst.title)
+        }
+        LiveSendTarget::ContainerTerminal => {
+            crate::tmux::ContainerTerminalSession::resolve_name(&inst.id, &inst.title)
+        }
+        LiveSendTarget::Tool(name) => crate::tmux::ToolSession::new(&inst.id, &inst.title, name)
+            .session_name()
+            .to_owned(),
+    };
+    LiveSendState {
+        session_id: inst.id.clone(),
+        title: inst.title.clone(),
+        tmux_name,
+        target,
+        exit_chords: parse_chord_list(DEFAULT_EXIT_CHORD),
+        leader: None,
+    }
+}
+
+impl TestEnv {
+    /// One raw native receiver, shared by the capture actor and live/passive admission.
+    fn install_native_preview_input(
+        &mut self,
+        id: &str,
+        target: super::live_send::LiveSendTarget,
+        live: bool,
+    ) {
+        use super::live_send::LiveSendWorker;
+        assert!(
+            self.native_input.is_none(),
+            "native receiver already installed"
+        );
+        let inst = self
+            .view
+            .get_instance(id)
+            .expect("native fixture instance")
+            .clone();
+        let state = live_state_for_instance(&inst, target);
+        let guard = crate::tmux::test_helpers::TmuxTestSession::from_name(state.tmux_name.clone());
+        let input = self._temp.path().join("native-preview-input");
+        let receiver = format!(
+            "stty raw -echo; printf 'NATIVE_INPUT_READY'; cat > {}",
+            crate::session::environment::shell_escape_script_word(&input.to_string_lossy()),
+        );
+        let created = crate::tmux::tmux_command()
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                guard.name(),
+                "-x",
+                "80",
+                "-y",
+                "24",
+                &receiver,
+            ])
+            .output()
+            .expect("create native preview receiver");
+        assert!(
+            created.status.success(),
+            "{}",
+            String::from_utf8_lossy(&created.stderr)
+        );
+        crate::tmux::refresh_session_cache();
+        let primary = crate::tmux::utils::resolve_primary(
+            guard.name(),
+            &crate::tmux::TmuxCommandDeadline::new(),
+        )
+        .expect("bind native preview actor");
+        let session =
+            std::sync::Arc::new(crate::tmux::Session::with_primary(guard.name(), primary));
+        self.view.selected_session = Some(id.to_owned());
+        self.view.live_send = live.then_some(state);
+        self.view.vt_live_enabled = false;
+        self.view.agent_clipboard_forward = false;
+        self.view
+            .sync_preview_capture_worker(Some(session.name().to_owned()));
+        let capture = self
+            .view
+            .preview_capture_worker
+            .as_ref()
+            .expect("capture worker");
+        if live {
+            let admission = capture.begin_live_input(session.clone());
+            self.view.live_send_worker =
+                Some(LiveSendWorker::spawn(admission, Some(capture.waker())));
+        }
+        capture.set_capture_lines(40);
+        let frame = wait_for_native_fixture("current native preview frame", || {
+            capture.take_latest().filter(|frame| {
+                capture.frame_is_current(frame)
+                    && frame.content.contains("NATIVE_INPUT_READY")
+                    && frame
+                        .session
+                        .as_ref()
+                        .is_some_and(|actor| actor.captured_primary() == session.captured_primary())
+            })
+        });
+        self.view
+            .preview_cache
+            .store_capture(frame, id.to_owned(), (80, 24));
+        self.native_input = Some(NativePreviewInput {
+            _guard: guard,
+            input,
+            actor: session,
+            effects: capture.effects_for_test(),
+            receipt_offset: std::cell::Cell::new(0),
+            observed: std::cell::RefCell::new(Vec::new()),
+        });
+        wait_for_native_fixture("raw receiver ready", || {
+            self.native_input
+                .as_ref()
+                .unwrap()
+                .input
+                .exists()
+                .then_some(())
+        });
+    }
+
+    fn assert_native_input(&self, expected: &[u8]) {
+        use super::live_send::{oneshot_idle_for_test, TmuxKey};
+        let native = self
+            .native_input
+            .as_ref()
+            .expect("native receiver installed");
+        wait_for_native_fixture("passive dispatch completion", || {
+            oneshot_idle_for_test().then_some(())
+        });
+        let marker = format!("\x1b[4107;{}~", native.receipt_offset.get());
+        if let Some(worker) = self.view.live_send_worker.as_ref() {
+            assert!(worker.send(TmuxKey::HexBytes(marker.as_bytes().to_vec())));
+        } else {
+            // Cancelled live work and completed passive work precede this native receipt.
+            let _fence = native.effects.lock().unwrap();
+            let deadline = crate::tmux::TmuxCommandDeadline::new();
+            let mut send = native
+                .actor
+                .commands_with_deadline(
+                    [[
+                        "send-keys",
+                        "-t",
+                        native.actor.captured_primary().pane_id.as_str(),
+                        "-l",
+                        marker.as_str(),
+                    ]],
+                    &deadline,
+                )
+                .expect("fenced native receipt");
+            assert!(deadline
+                .run(&mut send)
+                .expect("send native receipt")
+                .status
+                .success());
+        }
+        let bytes = wait_for_native_fixture("ordered native input receipt", || {
+            std::fs::read(&native.input)
+                .ok()
+                .filter(|bytes| bytes.ends_with(marker.as_bytes()))
+        });
+        let mut observed = native.observed.borrow_mut();
+        observed.extend_from_slice(&bytes[native.receipt_offset.get()..bytes.len() - marker.len()]);
+        native.receipt_offset.set(bytes.len());
+        assert_eq!(
+            observed.as_slice(),
+            expected,
+            "complete input before its ordered receipt"
+        );
+    }
 }
 
 /// An isolated app dir for a fixture; the guard must outlive every storage write.
@@ -127,6 +330,7 @@ fn seeded_env(
     }
     TestEnv {
         view,
+        native_input: None,
         _guard: guard,
         _temp: temp,
     }

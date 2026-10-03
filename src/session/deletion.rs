@@ -240,7 +240,10 @@ impl PurgeTransaction {
             return verdict.clone();
         }
         let verdict = with_paths_in_use_locked(
-            &self.request.session_id,
+            SessionPathOwner {
+                profile: self.storage.profile(),
+                session_id: &self.request.session_id,
+            },
             self.identity_lock.is_some(),
             |paths| match paths {
                 PathsInUse::Unknown(reason) => Some(format!(
@@ -687,34 +690,21 @@ impl Drop for PurgeTransaction {
     }
 }
 
-/// Prove a structured session's runner is dead before anything destroys the
-/// directory it runs in, settled from the on-disk registry alone so the TUI and
-/// the CLI, which hold no supervisor of their own, get the guarantee the daemon
-/// path has. A refusal keeps the row and the checkout, so the caller retries.
-///
-/// Settling this way leaves no in-memory lease, which is why
-/// `acp_reconciler::is_resumable` also honours the durable purge reservation:
-/// without it the next tick would respawn the runner just killed.
+/// Settle the stored execution journal before hooks or checkout destruction.
+/// Registry absence and daemon memory are not execution coverage.
 pub async fn settle_runner_of(
     transaction: PurgeTransaction,
 ) -> Result<PurgeTransaction, Box<DeletionResult>> {
-    if !transaction.request.instance.is_structured() {
-        return Ok(transaction);
-    }
     let mut released = transaction.release_locks_for_teardown();
-    let outcome = crate::acp::supervisor::settle_runner_from_registry(
-        &crate::acp::runner_lifecycle::SystemProcessControl,
-        &released.request.session_id,
+    let outcome = crate::session::runner_journal::settle(
+        SessionPathOwner {
+            profile: &released.request.instance.source_profile,
+            session_id: &released.request.session_id,
+        },
+        Some((LifecycleOperation::Purge, released.generation)),
     )
     .await;
     match outcome {
-        // Only a proven settlement proceeds. `UnknownSession` is NOT accepted
-        // here, unlike on the daemon path: that one comes from `begin_stop`
-        // against the in-memory lifecycle table, which knows whether this
-        // supervisor ever held a lease. A registry-only reader cannot tell a
-        // runner that exited from one that is still stopping, because the
-        // record is deleted before the wait in `stop_worker_records` and before
-        // the agent is reaped in `runner/mod.rs`.
         Ok(()) => Ok(released),
         Err(error) => {
             let retained = released.release_reservation().ok().flatten();
@@ -723,7 +713,7 @@ pub async fn settle_runner_of(
                 released.request.session_id.clone(),
                 DeletionDisposition::Failed,
                 format!(
-                    "The agent for this session is not proven dead, so nothing was removed: \\
+                    "The agent for this session is not proven dead, so nothing was removed: \
                      {error}. Retry once it exits."
                 ),
                 retained,
@@ -787,24 +777,10 @@ fn is_protected_default_branch(main_repo: &Path, branch: &str) -> bool {
         .is_ok_and(|names| names.contains(branch))
 }
 
-/// Every path a session outside `except_ids` works in or will restore to.
-///
-fn other_sessions_paths(instances: &[Instance], except_ids: &[&str]) -> Vec<PathBuf> {
-    instances
-        .iter()
-        .filter(|instance| !except_ids.contains(&instance.id.as_str()))
-        .flat_map(|instance| {
-            std::iter::once(instance.project_path.as_str())
-                .chain(instance.pre_trash_project_path.as_deref())
-                .chain(
-                    instance
-                        .all_repos()
-                        .iter()
-                        .map(|r| r.worktree_path.as_str()),
-                )
-                .map(PathBuf::from)
-        })
-        .collect()
+#[derive(Clone, Copy)]
+pub(crate) struct SessionPathOwner<'a> {
+    pub profile: &'a str,
+    pub session_id: &'a str,
 }
 
 /// Whether `right` (the candidate) sits at or under `left` (a path another
@@ -918,13 +894,58 @@ fn all_profile_storages() -> std::result::Result<(Vec<String>, Vec<Storage>), St
     Ok((profiles, storages))
 }
 
-fn scan_paths_in_use(storages: &[Storage], except_ids: &[&str]) -> PathsInUse {
+fn scan_paths_in_use(storages: &[Storage], except: &[SessionPathOwner<'_>]) -> PathsInUse {
+    let mut owners = Vec::with_capacity(except.len());
+    for owner in except {
+        if owner.profile.is_empty() || owner.session_id.is_empty() {
+            return PathsInUse::Unknown("session ownership has no explicit profile or id".into());
+        }
+        let identity = crate::session::get_profile_dir_path(owner.profile)
+            .and_then(|dir| std::fs::metadata(dir).map_err(Into::into));
+        let identity = match identity {
+            Ok(identity) if identity.is_dir() => identity,
+            Ok(_) => return PathsInUse::Unknown("owner profile is not a directory".into()),
+            Err(error) => return PathsInUse::Unknown(format!("resolving owner profile: {error}")),
+        };
+        owners.push((identity, owner.session_id, false, false));
+    }
     let mut paths = Vec::new();
     for storage in storages {
-        match storage.load_strict_for_worktree_ownership_locked() {
-            Ok(instances) => {
-                paths.extend(other_sessions_paths(&instances, except_ids));
+        if !owners.is_empty() {
+            let identity = storage
+                .sessions_path()
+                .parent()
+                .and_then(|dir| std::fs::metadata(dir).ok());
+            let Some(identity) = identity else {
+                return PathsInUse::Unknown(format!("resolving profile '{}'", storage.profile()));
+            };
+            for (owner_identity, _, seen, matches) in &mut owners {
+                *matches =
+                    crate::session::storage::same_filesystem_identity(owner_identity, &identity);
+                *seen |= *matches;
             }
+        }
+        match storage.load_strict_for_worktree_ownership_locked() {
+            Ok(instances) => paths.extend(
+                instances
+                    .iter()
+                    .filter(|instance| {
+                        !owners
+                            .iter()
+                            .any(|(_, id, _, matches)| *matches && *id == instance.id)
+                    })
+                    .flat_map(|instance| {
+                        std::iter::once(instance.project_path.as_str())
+                            .chain(instance.pre_trash_project_path.as_deref())
+                            .chain(
+                                instance
+                                    .all_repos()
+                                    .iter()
+                                    .map(|repo| repo.worktree_path.as_str()),
+                            )
+                            .map(PathBuf::from)
+                    }),
+            ),
             Err(error) => {
                 return PathsInUse::Unknown(format!(
                     "reading profile '{}': {error}",
@@ -933,22 +954,25 @@ fn scan_paths_in_use(storages: &[Storage], except_ids: &[&str]) -> PathsInUse {
             }
         }
     }
+    if owners.iter().any(|(_, _, seen, _)| !seen) {
+        return PathsInUse::Unknown("owner profile is missing from the ownership inventory".into());
+    }
     PathsInUse::Known(paths)
 }
 
-/// Unlocked snapshot of [`PathsInUse`], for a preflight that the teardown re-checks under lock.
-pub(crate) fn paths_in_use_except(except_ids: &[&str]) -> PathsInUse {
+/// Unlocked snapshot; destructive callers recheck under the ownership locks.
+pub(crate) fn paths_in_use_except(except: &[SessionPathOwner<'_>]) -> PathsInUse {
     match all_profile_storages() {
-        Ok((_, storages)) => scan_paths_in_use(&storages, except_ids),
+        Ok((_, storages)) => scan_paths_in_use(&storages, except),
         Err(reason) => PathsInUse::Unknown(reason),
     }
 }
 
 pub(crate) fn ensure_unclaimed_paths(
-    session_id: &str,
+    owner: SessionPathOwner<'_>,
     candidates: &[PathBuf],
 ) -> std::result::Result<(), String> {
-    let paths = paths_in_use_except(&[session_id]);
+    let paths = paths_in_use_except(&[owner]);
     match paths {
         PathsInUse::Unknown(reason) => Err(reason),
         PathsInUse::Known(paths)
@@ -973,7 +997,7 @@ thread_local! {
 /// Run `f` with the paths other sessions use while every profile's storage lock is held, so no
 /// session can adopt a path between the check and whatever `f` removes.
 fn with_paths_in_use_locked<R>(
-    except_id: &str,
+    owner: SessionPathOwner<'_>,
     identity_lock_held: bool,
     f: impl FnOnce(&PathsInUse) -> R,
 ) -> R {
@@ -996,7 +1020,7 @@ fn with_paths_in_use_locked<R>(
     let locked = crate::session::storage::with_storages_locked(&storages, || {
         let paths_in_use = match crate::session::list_profiles_for_worktree_inventory() {
             Ok(now) if now.iter().all(|profile| profiles.contains(profile)) => {
-                scan_paths_in_use(&storages, &[except_id])
+                scan_paths_in_use(&storages, &[owner])
             }
             Ok(_) => PathsInUse::Unknown("a profile was created during the deletion".to_string()),
             Err(error) => PathsInUse::Unknown(format!("listing profiles: {error}")),
@@ -1086,9 +1110,18 @@ fn perform_deletion_core(
         &[]
     };
     if lifecycle_locked && request.needs_path_inventory() {
-        return with_paths_in_use_locked(&request.session_id, identity_lock_held, |paths| {
-            perform_deletion_teardown_under_ownership_guard(request, repos, true, paths, teardown)
-        });
+        return with_paths_in_use_locked(
+            SessionPathOwner {
+                profile: &request.instance.source_profile,
+                session_id: &request.session_id,
+            },
+            identity_lock_held,
+            |paths| {
+                perform_deletion_teardown_under_ownership_guard(
+                    request, repos, true, paths, teardown,
+                )
+            },
+        );
     }
     perform_deletion_teardown_under_ownership_guard(
         request,
@@ -1913,9 +1946,10 @@ mod tests {
                 })
                 .unwrap();
         }
-        // A caller with a different id: the duplicate rows are real peers, so
-        // their recorded paths are enforced.
-        let caller = "unrelated-caller";
+        let caller = SessionPathOwner {
+            profile: "dup-a",
+            session_id: "unrelated-caller",
+        };
         assert!(
             ensure_unclaimed_paths(caller, &[PathBuf::from("/tmp/dup-a")]).is_err(),
             "a candidate colliding with a recorded peer path is still refused"
@@ -1928,6 +1962,60 @@ mod tests {
             ensure_unclaimed_paths(caller, &[PathBuf::from("/tmp/unrelated")]).is_ok(),
             "a duplicate id elsewhere must not make unrelated candidates look claimed"
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn same_id_peer_in_another_profile_keeps_ownership() {
+        let _home = isolate_app_dir();
+        for profile in ["owner", "peer"] {
+            let storage = Storage::new_unwatched(profile).unwrap();
+            let mut instance = Instance::new(profile, &format!("/tmp/{profile}-same-id"));
+            instance.id = "same-id".into();
+            instance.source_profile = profile.into();
+            instance.pre_trash_project_path = Some(format!("/tmp/{profile}-restore"));
+            storage
+                .update(|instances, _| {
+                    instances.push(instance);
+                    Ok(())
+                })
+                .unwrap();
+        }
+        std::os::unix::fs::symlink(
+            "owner",
+            crate::session::get_app_dir()
+                .unwrap()
+                .join("profiles/owner-alias"),
+        )
+        .unwrap();
+        for profile in ["owner", "owner-alias"] {
+            let caller = SessionPathOwner {
+                profile,
+                session_id: "same-id",
+            };
+            for claimed in ["/tmp/peer-same-id", "/tmp/peer-restore"] {
+                assert!(
+                    ensure_unclaimed_paths(caller, &[PathBuf::from(claimed)]).is_err(),
+                    "peer retained: {profile}/{claimed}"
+                );
+            }
+            for unclaimed in ["/tmp/owner-same-id", "/tmp/owner-restore", "/tmp/unrelated"] {
+                assert!(
+                    ensure_unclaimed_paths(caller, &[PathBuf::from(unclaimed)]).is_ok(),
+                    "own/unrelated admitted: {profile}/{unclaimed}"
+                );
+            }
+        }
+        for profile in ["", "missing"] {
+            assert!(ensure_unclaimed_paths(
+                SessionPathOwner {
+                    profile,
+                    session_id: "same-id"
+                },
+                &[PathBuf::from("/tmp/unrelated")]
+            )
+            .is_err());
+        }
     }
 
     /// The cs/cxa pattern: `profiles/<alias>` is a symlink to another profile.
@@ -1952,11 +2040,25 @@ mod tests {
         store_peer_session("personal", "/tmp/aliased-peer");
 
         assert!(
-            ensure_unclaimed_paths("caller", &[PathBuf::from("/tmp/aliased-peer")]).is_err(),
+            ensure_unclaimed_paths(
+                SessionPathOwner {
+                    profile: "forit-work",
+                    session_id: "caller"
+                },
+                &[PathBuf::from("/tmp/aliased-peer")]
+            )
+            .is_err(),
             "a peer session in another profile still claims its path"
         );
         assert!(
-            ensure_unclaimed_paths("caller", &[PathBuf::from("/tmp/unrelated")]).is_ok(),
+            ensure_unclaimed_paths(
+                SessionPathOwner {
+                    profile: "forit-work",
+                    session_id: "caller"
+                },
+                &[PathBuf::from("/tmp/unrelated")]
+            )
+            .is_ok(),
             "an alias for a profile already in the inventory must not make every path look claimed"
         );
     }
@@ -1976,11 +2078,25 @@ mod tests {
         store_peer_session("personal", "/tmp/aliased-peer");
 
         assert!(
-            ensure_unclaimed_paths("caller", &[PathBuf::from("/tmp/aliased-peer")]).is_err(),
+            ensure_unclaimed_paths(
+                SessionPathOwner {
+                    profile: "personal",
+                    session_id: "caller"
+                },
+                &[PathBuf::from("/tmp/aliased-peer")]
+            )
+            .is_err(),
             "the profiles that can be read are still inventoried"
         );
         assert!(
-            ensure_unclaimed_paths("caller", &[PathBuf::from("/tmp/unrelated")]).is_ok(),
+            ensure_unclaimed_paths(
+                SessionPathOwner {
+                    profile: "personal",
+                    session_id: "caller"
+                },
+                &[PathBuf::from("/tmp/unrelated")]
+            )
+            .is_ok(),
             "an unresolvable alias must not make every path look claimed"
         );
     }
@@ -2236,8 +2352,83 @@ mod tests {
         assert!(storage.load().unwrap().is_empty());
     }
 
-    /// #4107: a purge keeps a shared worktree when another profile cannot be read, and a session
-    /// adopting the worktree after the ownership scan cannot see it removed.
+    #[test]
+    #[serial]
+    fn purge_rescans_a_peer_changed_while_waiting_for_its_storage_flock() {
+        let (tmp, main_repo, worktree, mut owner) = worktree_fixture("feature/rescan");
+        let _home = isolate_app_dir_at(&tmp.path().join("home"));
+        owner.source_profile = "owner".into();
+        let storage = Storage::new_unwatched("owner").unwrap();
+        storage
+            .update(|rows, _| {
+                rows.push(owner.clone());
+                Ok(())
+            })
+            .unwrap();
+        let peer = Storage::new_unwatched("peer").unwrap();
+        let initial_path = tmp.path().join("initial-peer");
+        std::fs::create_dir(&initial_path).unwrap();
+        let mut adopter = Instance::new("adopter", initial_path.to_str().unwrap());
+        peer.update(|rows, _| {
+            rows.push(adopter.clone());
+            Ok(())
+        })
+        .unwrap();
+        let sentinel = worktree.join("peer-evidence");
+        std::fs::write(&sentinel, "keep").unwrap();
+        let (committed_tx, committed_rx) = std::sync::mpsc::channel();
+        let (continue_tx, continue_rx) = std::sync::mpsc::channel();
+        let (event_tx, event_rx) = std::sync::mpsc::channel();
+        let purge = std::thread::spawn(move || {
+            let transaction = match PurgeTransaction::reserve(
+                storage,
+                DeletionRequest {
+                    delete_worktree: true,
+                    delete_branch: true,
+                    force_delete: true,
+                    ..request(owner)
+                },
+            )
+            .unwrap()
+            {
+                PurgeReservation::Reserved(transaction) => transaction,
+                PurgeReservation::Rejected(_) => panic!("initial inventory must allow purge"),
+            };
+            let transaction = transaction.begin_irreversible().unwrap();
+            committed_tx.send(()).unwrap();
+            continue_rx.recv().unwrap();
+            let _observer = crate::session::storage::observe_lock_contention_for_test(event_tx);
+            transaction.finish()
+        });
+        committed_rx
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .expect("purge commits before the peer lock is held");
+        let held = crate::session::storage::acquire_storage_flock(
+            peer.sessions_path().parent().unwrap(),
+            crate::session::storage::STORAGE_LOCK_FILENAME,
+        )
+        .unwrap();
+        continue_tx.send(()).unwrap();
+        let contended = event_rx.recv_timeout(std::time::Duration::from_secs(3));
+        adopter.project_path = worktree.to_str().unwrap().into();
+        crate::session::storage::atomic_write(
+            peer.sessions_path(),
+            &serde_json::to_vec(&[adopter]).unwrap(),
+        )
+        .unwrap();
+        drop(held);
+        let result = purge.join().unwrap();
+        assert!(result.success, "{:?}", result.errors);
+        contended.expect("purge must actually contend before the peer commits its new path");
+        assert_eq!(std::fs::read_to_string(&sentinel).unwrap(), "keep");
+        assert!(branch_exists(&main_repo, "feature/rescan"));
+        assert_eq!(
+            peer.load().unwrap()[0].project_path,
+            worktree.to_str().unwrap()
+        );
+    }
+
+    /// A purge retains a checkout when ownership is unknown or claimed after the scan.
     #[test]
     #[serial]
     fn purge_keeps_a_worktree_it_cannot_prove_unused() {
@@ -2315,15 +2506,6 @@ mod tests {
             } else {
                 assert_eq!(result.disposition, DeletionDisposition::Failed);
                 assert!(!result.success);
-                assert!(
-                    result
-                        .errors
-                        .iter()
-                        .any(|error| error
-                            .contains("could not prove that session resources are unused")),
-                    "{:?}",
-                    result.errors
-                );
             }
 
             if let Some(writer) = writer {
@@ -2449,69 +2631,39 @@ mod tests {
 
     #[test]
     #[serial]
-    fn profile_creation_waits_for_purge_scan() {
-        let (tmp, _main_repo, worktree, mut owner) = worktree_fixture("feature/profile-race");
-        let _home = isolate_app_dir_at(&tmp.path().join("home"));
-        let storage = Storage::new_unwatched("owner").unwrap();
-        owner.source_profile = "owner".to_string();
-        storage
-            .update(|instances, _groups| {
-                instances.push(owner.clone());
-                Ok(())
-            })
-            .unwrap();
-
-        let (started_tx, started_rx) = std::sync::mpsc::channel();
-        let (published_tx, published_rx) = std::sync::mpsc::channel();
-        let worktree_for_writer = worktree.clone();
-        AFTER_PATHS_IN_USE_SCAN.with(|slot| {
-            *slot.borrow_mut() = Some(Box::new(move || {
-                std::thread::spawn(move || {
-                    started_tx.send(()).unwrap();
-                    crate::session::create_profile("late-peer").unwrap();
-                    let _identity_lock = crate::session::acquire_session_identity_lock().unwrap();
-                    let exists = worktree_for_writer.exists();
-                    if exists {
-                        let mut instance =
-                            Instance::new("late-peer", worktree_for_writer.to_str().unwrap());
-                        instance.source_profile = "late-peer".to_string();
-                        Storage::open_unwatched("late-peer")
-                            .unwrap()
-                            .update(|instances, _groups| {
-                                instances.push(instance);
-                                Ok(())
-                            })
-                            .unwrap();
-                    }
-                    published_tx.send(worktree_for_writer.exists()).unwrap();
-                });
-                started_rx.recv().unwrap();
-            }));
-        });
-
-        let result = match PurgeTransaction::reserve(
-            storage,
-            DeletionRequest {
-                delete_worktree: true,
-                delete_branch: true,
-                ..request(owner)
-            },
-        )
-        .unwrap()
-        {
-            PurgeReservation::Reserved(transaction) => transaction.complete(),
-            PurgeReservation::Rejected(result) => result,
-        };
-        assert!(result.success, "{:?}", result.errors);
-        assert!(!published_rx
-            .recv_timeout(std::time::Duration::from_secs(3))
-            .unwrap());
-        assert!(!worktree.exists());
-        assert!(Storage::open_unwatched("late-peer")
-            .unwrap()
-            .load()
-            .unwrap()
-            .is_empty());
+    fn profile_creation_publication_waits_for_each_inventory_fence() {
+        let _home = isolate_app_dir();
+        for identity in [true, false] {
+            let name = if identity {
+                "identity-peer"
+            } else {
+                "namespace-peer"
+            };
+            let path = crate::session::get_profile_dir_path(name).unwrap();
+            let held = if identity {
+                crate::session::acquire_session_identity_lock().unwrap()
+            } else {
+                crate::session::storage::acquire_profile_namespace_lock().unwrap()
+            };
+            let (event_tx, event_rx) = std::sync::mpsc::channel();
+            let create = std::thread::spawn(move || {
+                let _observer =
+                    crate::session::storage::observe_lock_contention_for_test(event_tx.clone());
+                let result = crate::session::create_profile(name);
+                let _ = event_tx.send(PathBuf::new());
+                result
+            });
+            let observation = event_rx.recv_timeout(std::time::Duration::from_secs(3));
+            let absent_while_fenced = !path.exists();
+            drop(held);
+            create.join().unwrap().unwrap();
+            observation.expect("creation must reach a held fence or finish within the deadline");
+            assert!(
+                absent_while_fenced,
+                "a profile appeared while its inventory fence was held"
+            );
+            assert!(path.is_dir());
+        }
     }
 
     #[test]
@@ -3123,71 +3275,180 @@ mod tests {
             }
         }
     }
-    /// The barrier the TUI and the CLI share with the daemon, in both
-    /// directions. A runner record is deleted the moment a runner exits, so a
-    /// stopped structured session has none: that is "nothing to stop", and the
-    /// purge proceeds exactly as the daemon path already does. A runner whose
-    /// record is still there and cannot be read is what the barrier is for, and
-    /// it has to refuse before any hook or checkout removal.
     #[tokio::test]
     #[serial_test::serial]
-    async fn a_structured_purge_settles_its_runner_before_the_hooks() {
-        use crate::process::worker_registry;
+    async fn stopped_structured_session_can_be_purged_after_registry_cleanup() {
+        use crate::process::worker_registry::{self, WorkerRecord};
         let temp = tempfile::tempdir().unwrap();
         let _home = isolate_app_dir_at(&temp.path().join("home"));
         let project = temp.path().join("project");
         std::fs::create_dir_all(&project).unwrap();
-
-        let mut structured = Instance::new("Structured", project.to_str().unwrap());
-        structured.id = "structured-purge".to_string();
+        let mut structured = Instance::new("Stopped", project.to_str().unwrap());
+        structured.id = "stopped-purge".into();
         structured.view = crate::session::View::Structured;
-        structured.source_profile = "owner".to_string();
+        structured.source_profile = "owner".into();
         Storage::new_unwatched("owner")
             .unwrap()
-            .update(|instances, _groups| {
+            .update(|instances, _| {
                 instances.push(structured.clone());
                 Ok(())
             })
             .unwrap();
-
-        // A runner that already exited leaves no record, and there is nothing
-        // left to stop.
-        let stopped = match PurgeTransaction::reserve_unwatched(DeletionRequest {
-            delete_worktree: true,
-            ..request(structured.clone())
-        })
-        .unwrap()
-        {
-            PurgeReservation::Reserved(transaction) => transaction,
-            PurgeReservation::Rejected(result) => panic!("refused too early: {result:?}"),
-        };
-        // No record, but the reader cannot tell a stopped runner from one that is
-        // still stopping, because the record is deleted before the wait. Refusing
-        // is the safe direction; the usability cost is a session that cannot be
-        // purged from the TUI or the CLI until something proves the runner dead.
-        assert!(
-            settle_runner_of(stopped).await.is_err(),
-            "an absent record does not prove the runner stopped, so the purge waits"
+        let mut command = std::process::Command::new("/bin/sh");
+        command
+            .args(["-c", "read -r ignored || :"])
+            .stdin(std::process::Stdio::piped());
+        crate::process::configure_process_group(&mut command);
+        let mut child = command.spawn().unwrap();
+        let pid = child.id();
+        let incarnation = crate::process::process_incarnation(pid).unwrap().unwrap();
+        let boot = *uuid::Uuid::parse_str(&crate::process::boot_id().unwrap())
+            .unwrap()
+            .as_bytes();
+        structured.runner_journal = serde_json::from_value(serde_json::json!({
+            "coverage": "complete", "launches": [{
+                "nonce": *uuid::Uuid::new_v4().as_bytes(), "boot": boot,
+                "generation": 0, "incarnation": incarnation,
+            }],
+        }))
+        .unwrap();
+        Storage::open_unwatched("owner")
+            .unwrap()
+            .update(|rows, _| {
+                rows.iter_mut()
+                    .find(|row| row.id == structured.id)
+                    .unwrap()
+                    .runner_journal = structured.runner_journal.clone();
+                Ok(())
+            })
+            .unwrap();
+        let record = WorkerRecord::new(
+            structured.id.clone(),
+            pid,
+            worker_registry::socket_path_for(&structured.id).unwrap(),
+            "agent".into(),
+            "agent".into(),
+            project.clone(),
+            None,
+            Vec::new(),
+            Vec::new(),
+            None,
+            Some("owner".into()),
         );
-
-        // A record that cannot be read refuses for the same reason, and fails
-        // before any signal is sent, so the test stays safe to run.
-        let record_path = worker_registry::record_path(&structured.id).unwrap();
-        std::fs::create_dir_all(&record_path).unwrap();
-        let unprovable = match PurgeTransaction::reserve_unwatched(DeletionRequest {
-            delete_worktree: true,
-            ..request(structured)
-        })
-        .unwrap()
-        {
+        worker_registry::save(&record).unwrap();
+        drop(child.stdin.take());
+        assert!(child.wait().unwrap().success());
+        assert!(!crate::process::worker::is_process_group_alive(pid));
+        worker_registry::delete(&structured.id).unwrap();
+        assert!(worker_registry::load_strict(&structured.id)
+            .unwrap()
+            .is_none());
+        let transaction = match PurgeTransaction::reserve_unwatched(request(structured)).unwrap() {
             PurgeReservation::Reserved(transaction) => transaction,
-            PurgeReservation::Rejected(result) => panic!("refused too early: {result:?}"),
+            PurgeReservation::Rejected(result) => panic!("reservation failed: {result:?}"),
         };
-        let refused = settle_runner_of(unprovable).await;
-        let _ = std::fs::remove_dir(&record_path);
-        assert!(
-            refused.is_err(),
-            "a runner whose record cannot be read must stop the purge"
-        );
+        let settled = settle_runner_of(transaction)
+            .await
+            .expect("a proven stopped runner must permit purge");
+        let result = settled.run_hooks_with(|_, _| {}).complete_with(|_| Ok(()));
+        assert_eq!(result.disposition, DeletionDisposition::Removed);
+        assert!(Storage::open_unwatched("owner")
+            .unwrap()
+            .load()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn purge_keeps_unknown_history_and_live_groups_before_hooks() {
+        struct Reap(std::process::Child);
+        impl Drop for Reap {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let _home = isolate_app_dir_at(&temp.path().join("home"));
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let sentinel = project.join("keep");
+        std::fs::write(&sentinel, "checkout content").unwrap();
+        let mut command = std::process::Command::new("/bin/sh");
+        command
+            .args(["-c", "read -r ignored || :"])
+            .stdin(std::process::Stdio::piped());
+        crate::process::configure_process_group(&mut command);
+        let mut child = Reap(command.spawn().unwrap());
+        let pid = child.0.id();
+        let incarnation = crate::process::process_incarnation(pid).unwrap().unwrap();
+        let boot = *uuid::Uuid::parse_str(&crate::process::boot_id().unwrap())
+            .unwrap()
+            .as_bytes();
+        let live = serde_json::from_value(serde_json::json!({
+            "coverage": "complete", "launches": [{
+                "nonce": *uuid::Uuid::new_v4().as_bytes(), "boot": boot,
+                "generation": 0, "incarnation": incarnation,
+            }],
+        }))
+        .unwrap();
+        let storage = Storage::new_unwatched("owner").unwrap();
+        let mut instance = Instance::new("Protected", project.to_str().unwrap());
+        instance.id = "protected-purge".into();
+        instance.source_profile = storage.profile().into();
+        instance.view = crate::session::View::Structured;
+        storage
+            .update(|rows, _| {
+                rows.push(instance.clone());
+                Ok(())
+            })
+            .unwrap();
+        for journal in [
+            crate::session::runner_journal::RunnerExecutionJournal::default(),
+            live,
+        ] {
+            storage
+                .update(|rows, _| {
+                    rows.iter_mut()
+                        .find(|row| row.id == instance.id)
+                        .unwrap()
+                        .runner_journal = journal.clone();
+                    Ok(())
+                })
+                .unwrap();
+            assert!(crate::process::worker::is_process_group_alive(pid));
+            assert!(crate::process::worker_registry::load_strict(&instance.id)
+                .unwrap()
+                .is_none());
+            let transaction =
+                match PurgeTransaction::reserve_unwatched(request(instance.clone())).unwrap() {
+                    PurgeReservation::Reserved(transaction) => transaction,
+                    PurgeReservation::Rejected(result) => panic!("reservation failed: {result:?}"),
+                };
+            let mut hooks = 0;
+            let result = match settle_runner_of(transaction).await {
+                Ok(transaction) => transaction
+                    .run_hooks_with(|_, _| {
+                        hooks += 1;
+                    })
+                    .complete_with(|_| Ok(())),
+                Err(result) => *result,
+            };
+            assert_eq!(result.disposition, DeletionDisposition::Failed);
+            assert_eq!(hooks, 0);
+            assert_eq!(
+                std::fs::read_to_string(&sentinel).unwrap(),
+                "checkout content"
+            );
+            assert!(storage
+                .load()
+                .unwrap()
+                .iter()
+                .any(|row| row.id == instance.id && row.lifecycle_reservation.is_none()));
+            assert!(crate::process::worker::is_process_group_alive(pid));
+        }
+        drop(child.0.stdin.take());
+        assert!(child.0.wait().unwrap().success());
     }
 }

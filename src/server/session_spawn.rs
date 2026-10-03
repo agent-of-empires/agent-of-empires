@@ -415,7 +415,7 @@ pub(crate) async fn spawn_structured_session(
                     .map(|repo| PathBuf::from(&repo.worktree_path)),
             );
             if let Err(error) = crate::session::deletion::ensure_unclaimed_paths(
-                &instance.id,
+                crate::session::deletion::SessionPathOwner { profile: storage.profile(), session_id: &instance.id },
                 &candidate_paths,
             ) {
                 builder::cleanup_instance_under_locks(

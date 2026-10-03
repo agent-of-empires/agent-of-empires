@@ -1128,6 +1128,47 @@ fn trash_teardown_release_clears_durable_claim() {
     );
 }
 
+#[test]
+#[serial]
+fn restore_does_not_steal_peer_trash_reservation() {
+    let mut env = create_test_env_with_sessions(2);
+    let id = env.view.instance_at(0).id.clone();
+    let storage = env.view.storages.get("test").unwrap();
+    let peer = storage
+        .update(|rows, _| {
+            let row = rows.iter_mut().find(|row| row.id == id).unwrap();
+            row.trash();
+            row.try_acquire_lifecycle_reservation(
+                crate::session::LifecycleOperation::Trash,
+                Instance::LIFECYCLE_RESERVATION_TTL,
+                chrono::Utc::now(),
+            )
+            .unwrap();
+            Ok(row.clone())
+        })
+        .unwrap();
+    env.view.instances.insert(id.clone(), peer.clone());
+    env.view.selected_session = Some(id.clone());
+    env.view.restore_selected_from_trash();
+    let retained = env
+        .view
+        .storages
+        .get("test")
+        .unwrap()
+        .load()
+        .unwrap()
+        .into_iter()
+        .find(|row| row.id == id)
+        .unwrap();
+    assert!(
+        retained.is_trashed(),
+        "Restore stole another caller's Trash reservation"
+    );
+    assert!(retained.lifecycle_reservation_is_owned(
+        crate::session::LifecycleOperation::Trash,
+        peer.lifecycle_generation,
+    ));
+}
 /// Restore takes over a fresh Trash reservation before the queued teardown starts.
 #[test]
 #[serial]

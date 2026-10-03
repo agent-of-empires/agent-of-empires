@@ -44,7 +44,28 @@ impl<S: BroadcastSink> Supervisor<S> {
         session_id: &str,
         kind: ResumeKind,
     ) -> Result<ResumeReservationOutcome, SupervisorError> {
-        // Held so a concurrent shutdown observes the lease or its absence, never a torn state.
+        let retained = if matches!(kind, ResumeKind::Spawn) {
+            Some(
+                tokio::task::spawn_blocking(|| {
+                    let mut ids = crate::session::runner_journal::retained_runner_session_ids()?;
+                    for record in worker_registry::list()? {
+                        if worker_registry::is_record_live(&record) {
+                            ids.insert(record.session_id);
+                        }
+                    }
+                    anyhow::Ok(ids)
+                })
+                .await
+                .map_err(|error| {
+                    SupervisorError::Acp(AcpError::Spawn(format!("runner inventory task: {error}")))
+                })?
+                .map_err(|error| {
+                    SupervisorError::Acp(AcpError::Spawn(format!("runner inventory: {error:#}")))
+                })?,
+            )
+        } else {
+            None
+        };
         let _workers = self.workers.lock().await;
         let mut table = lock_recover(&self.lifecycle);
         let lease = match table.admit(session_id, kind) {
@@ -60,18 +81,12 @@ impl<S: BroadcastSink> Supervisor<S> {
                 return Err(SupervisorError::SpawnCancelled(session_id.to_string()));
             }
         };
-        if matches!(kind, ResumeKind::Spawn) {
-            let registry_count = worker_registry::list()
-                .map(|recs| {
-                    recs.into_iter()
-                        .filter(|r| {
-                            worker_registry::is_record_live(r)
-                                && table.counts_registry_record(&r.session_id)
-                        })
-                        .count()
-                })
-                .unwrap_or(0);
-            let combined = table.occupied_slots() + registry_count;
+        if let Some(retained) = retained {
+            let external_count = retained
+                .iter()
+                .filter(|id| table.counts_registry_record(id))
+                .count();
+            let combined = table.occupied_slots() + external_count;
             if combined > self.max_concurrent_workers as usize {
                 table.abandon(&lease);
                 return Err(SupervisorError::CapacityFull {
@@ -84,6 +99,8 @@ impl<S: BroadcastSink> Supervisor<S> {
             lease,
             lifecycle: Arc::clone(&self.lifecycle),
             notify: Arc::clone(&self.worker_notify),
+            execution: None,
+            issued: crate::acp::runner_lifecycle::ExecutionAdmission::new(),
         }))
     }
 
@@ -91,7 +108,7 @@ impl<S: BroadcastSink> Supervisor<S> {
     pub(crate) async fn spawn_inner(
         &self,
         req: SpawnRequest,
-        reservation: ResumeReservation,
+        mut reservation: ResumeReservation,
     ) -> Result<(), SupervisorError> {
         let lease = reservation.lease().clone();
         let session_id = req.session_id.as_str();
@@ -110,7 +127,9 @@ impl<S: BroadcastSink> Supervisor<S> {
             self.sink.clear_session_events(session_id);
         }
 
-        let launched = (self.launcher)(config.clone(), AcpSessionId(session_id.to_string())).await;
+        let mut launch_config = config.clone();
+        launch_config.execution_admission = Some(reservation.issued.clone());
+        let launched = (self.launcher)(launch_config, AcpSessionId(session_id.to_string())).await;
         let mut client = match launched {
             Ok(c) => c,
             Err(err) => {
@@ -119,24 +138,35 @@ impl<S: BroadcastSink> Supervisor<S> {
                     .cancel_requested(&lease)
                     .is_some();
                 if cancelled {
-                    self.reap_failed_launch(&lease).await;
+                    self.reap_failed_launch(&lease, &err, reservation.execution())
+                        .await;
                     return Err(SupervisorError::SpawnCancelled(req.session_id));
                 }
-                if matches!(err, AcpError::IncompatibleAgent(_)) {
+                if matches!(err.underlying(), AcpError::IncompatibleAgent(_)) {
                     self.mark_incompatible_binary(session_id, &config.spec.command);
                 }
                 publish_rejection(&err, |event| {
                     self.publish_next(session_id, &event);
                 });
-                self.reap_failed_launch(&lease).await;
-                return Err(SupervisorError::Acp(err));
+                self.reap_failed_launch(&lease, &err, reservation.execution())
+                    .await;
+                return Err(SupervisorError::Acp(err.into_underlying()));
             }
         };
+        let identity = reservation.execution().or_else(|| {
+            client.runner_pid().map(|pid| RunnerIdentity {
+                pid,
+                generation: lease.epoch(),
+                launch_nonce: client.launch_nonce(),
+            })
+        });
+        reservation.execution = identity;
 
         // A peer that archived or trashed the row during the handshake wins: retire the runner.
         if let Err(refused) = admit_durable_launch(&req).await {
-            drop(client);
-            self.reap_failed_launch(&lease).await;
+            let _ = client.shutdown().await;
+            self.retire_refused_install(&lease, identity, InstallError::Stale)
+                .await;
             return Err(refused);
         }
 
@@ -150,10 +180,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         let inbound = client
             .take_inbound()
             .expect("freshly spawned AcpClient always has inbound receiver");
-        let identity = client.runner_pid().map(|pid| RunnerIdentity {
-            pid,
-            generation: lease.epoch(),
-        });
+
         let kind = WorkerKind::Runner {
             spawn_config: Box::new(config),
         };
@@ -350,6 +377,8 @@ impl<S: BroadcastSink> Supervisor<S> {
 
         Ok((
             SpawnConfig {
+                execution_admission: None,
+                managed_profile: req.source_profile.clone(),
                 agent_key: req.agent.clone(),
                 tool: req.tool.clone(),
                 spec,
@@ -457,24 +486,27 @@ impl<S: BroadcastSink> Supervisor<S> {
         Ok(client)
     }
 
-    /// Retire a runner a failed spawn left behind under this lease's generation.
-    async fn reap_failed_launch(&self, lease: &Lease) {
-        let session_id = lease.session_id();
-        let Ok(Some(record)) = worker_registry::load(session_id) else {
+    async fn reap_failed_launch(
+        &self,
+        lease: &Lease,
+        error: &AcpError,
+        captured: Option<RunnerIdentity>,
+    ) {
+        let reported = error.issued_execution();
+        let Some((identity, settled)) = captured
+            .map(|identity| (Some(identity), reported == Some((Some(identity), true))))
+            .or(reported)
+        else {
             return;
         };
-        if record.generation != lease.epoch() {
-            return;
+        if lock_recover(&self.lifecycle).convert_to_stopping(lease, identity) {
+            let settlement = if settled {
+                crate::acp::runner_lifecycle::Settlement::Proven
+            } else {
+                tear_down_runner(lease.session_id(), identity).await
+            };
+            self.settle(lease, settlement);
         }
-        let identity = RunnerIdentity {
-            pid: record.pid,
-            generation: record.generation,
-        };
-        if !lock_recover(&self.lifecycle).convert_to_stopping(lease) {
-            return;
-        }
-        let settlement = tear_down_runner(&*self.process_control, session_id, Some(identity)).await;
-        self.settle(lease, settlement);
     }
 
     /// Tear down a built worker whose install the lifecycle table refused.
@@ -485,7 +517,9 @@ impl<S: BroadcastSink> Supervisor<S> {
         refusal: InstallError,
     ) -> SupervisorError {
         let session_id = lease.session_id();
-        let settlement = tear_down_runner(&*self.process_control, session_id, identity).await;
+        lock_recover(&self.lifecycle).convert_to_stopping(lease, identity);
+        let settlement = tear_down_runner(session_id, identity).await;
+        self.settle(lease, settlement);
         match refusal {
             InstallError::Cancelled { reason } => {
                 debug!(
@@ -494,7 +528,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                     %reason,
                     "resume cancelled by a concurrent shutdown; runner torn down"
                 );
-                self.settle(lease, settlement);
+
                 self.publish_next(session_id, &Event::Stopped { reason });
             }
             InstallError::Stale => {
@@ -520,8 +554,24 @@ impl<S: BroadcastSink> Supervisor<S> {
     ) -> Result<(), SupervisorError> {
         match self.begin_resume(&session_id, ResumeKind::Attach).await? {
             ResumeReservationOutcome::Reserved(r) => {
-                self.attach_inner(session_id, cwd, additional_dirs, in_flight_turn, sandbox, r)
-                    .await
+                let record = match worker_registry::load(&session_id).map_err(|e| {
+                    SupervisorError::Acp(AcpError::Spawn(format!("registry load: {e}")))
+                })? {
+                    Some(record) if worker_registry::is_record_live(&record) => record,
+                    _ => return Err(SupervisorError::UnknownSession(session_id)),
+                };
+                self.attach_inner(
+                    super::AttachRequest {
+                        session_id,
+                        cwd,
+                        additional_dirs,
+                        in_flight_turn,
+                        sandbox,
+                    },
+                    &record,
+                    r,
+                )
+                .await
             }
             ResumeReservationOutcome::AlreadyPresent => {
                 Err(SupervisorError::AlreadyRunning(session_id))
@@ -532,23 +582,56 @@ impl<S: BroadcastSink> Supervisor<S> {
     /// Attach body, run under a reservation from `begin_resume`.
     pub(crate) async fn attach_inner(
         &self,
-        session_id: String,
-        cwd: PathBuf,
-        additional_dirs: Vec<PathBuf>,
-        in_flight_turn: bool,
-        sandbox: Option<SandboxInfo>,
+        request: super::AttachRequest,
+        record: &worker_registry::WorkerRecord,
         reservation: ResumeReservation,
     ) -> Result<(), SupervisorError> {
-        let record = match worker_registry::load(&session_id)
-            .map_err(|e| SupervisorError::Acp(AcpError::Spawn(format!("registry load: {e}"))))?
-        {
-            Some(r) if worker_registry::is_record_live(&r) => r,
-            _ => return Err(SupervisorError::UnknownSession(session_id)),
-        };
+        let super::AttachRequest {
+            session_id,
+            cwd,
+            additional_dirs,
+            in_flight_turn,
+            sandbox,
+        } = request;
+        let nonce = record.launch_nonce.ok_or_else(|| {
+            SupervisorError::Acp(AcpError::Spawn(
+                "legacy runner lacks an authenticated execution ticket; session remains protected"
+                    .into(),
+            ))
+        })?;
+        let id = session_id.clone();
+        let pid = record.pid;
+        let generation = record.generation;
+        let owner = tokio::task::spawn_blocking(move || {
+            let owner = crate::session::runner_journal::unique_stored_owner(&id)?;
+            crate::session::runner_journal::verify_published_runner(
+                crate::session::deletion::SessionPathOwner {
+                    profile: &owner,
+                    session_id: &id,
+                },
+                nonce,
+                pid,
+                generation,
+            )?;
+            anyhow::Ok(owner)
+        })
+        .await
+        .map_err(|e| {
+            SupervisorError::Acp(AcpError::Spawn(format!(
+                "runner ticket verification task: {e}"
+            )))
+        })?
+        .map_err(|e| {
+            SupervisorError::Acp(AcpError::Spawn(format!(
+                "runner ticket verification: {e:#}"
+            )))
+        })?;
         let identity = RunnerIdentity {
             pid: record.pid,
             generation: record.generation,
+            launch_nonce: Some(nonce),
         };
+        reservation.issued.capture(identity);
         lock_recover(&self.lifecycle).note_generation(&session_id, record.generation);
 
         let agent_key = if record.agent_key.is_empty() {
@@ -570,16 +653,9 @@ impl<S: BroadcastSink> Supervisor<S> {
                 "detached structured view worker runs an agent that [acp] allowed_agents no longer \
                  permits; terminating it instead of reattaching"
             );
-            let id = session_id.clone();
-            if let Err(e) =
-                tokio::task::spawn_blocking(move || worker_registry::terminate(&id)).await
-            {
-                warn!(
-                    target: "acp.supervisor",
-                    session = %session_id,
-                    "terminate task for a disallowed worker failed: {e}; the next \
-                     reconciler tick retries"
-                );
+            let settlement = tear_down_runner(&session_id, Some(identity)).await;
+            if settlement != crate::acp::runner_lifecycle::Settlement::Proven {
+                warn!(target: "acp.supervisor", session = %session_id, "disallowed runner remains protected; stop proof unavailable");
             }
             return Err(SupervisorError::AgentNotAllowed(agent_key));
         }
@@ -593,7 +669,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             Some(info) => {
                 let info = info.clone();
                 let cwd = cwd.clone();
-                let profile = record.source_profile.clone();
+                let profile = Some(owner.clone());
                 Some(
                     tokio::task::spawn_blocking(move || {
                         crate::acp::acp_client::SessionSandbox::from_info(
@@ -611,7 +687,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             None => None,
         };
         let context_reset = if sandbox.as_ref().is_some_and(|info| info.enabled) {
-            let profile = record.source_profile.clone().unwrap_or_default();
+            let profile = owner.clone();
             let id = session_id.clone();
             let native_agent = crate::acp::agent_profiles::resolve(&agent_key).native_config_agent;
             let generation = reservation.lease().epoch();
@@ -654,9 +730,11 @@ impl<S: BroadcastSink> Supervisor<S> {
             AcpSessionId(session_id.clone()),
             sandbox_resources,
             agent_key,
-            record.source_profile.clone(),
+            Some(owner.clone()),
+            nonce,
         )
         .await?;
+        client.capture_runner(record.pid, nonce);
 
         let inbound = client
             .take_inbound()
@@ -701,7 +779,7 @@ pub(super) async fn apply_mode(
 
 /// Publish what a launch rejection means for the session; false for any other error.
 pub(super) fn publish_rejection(err: &AcpError, mut publish: impl FnMut(Event)) -> bool {
-    match err {
+    match err.underlying() {
         AcpError::IncompatibleAgent(payload) => {
             publish(Event::IncompatibleAgent {
                 detail: payload.detail.clone(),
@@ -912,7 +990,6 @@ mod tests {
     use super::super::WorkerKind;
     use super::*;
     use crate::acp::approvals::{ApprovalDecision, Nonce};
-    use crate::acp::runner_lifecycle::test_support::FakeProcessControl;
     use crate::daemon::AcpWorkerState;
 
     fn mcp_names(servers: &[agent_client_protocol::schema::v1::McpServer]) -> Vec<&str> {
@@ -1147,22 +1224,42 @@ mod tests {
     #[serial_test::serial]
     async fn spawn_does_not_rederive_effort_provenance_from_the_value() {
         let _home = isolate_home();
-        let control = Arc::new(FakeProcessControl::default());
-        control.alive(4343);
+        let storage = crate::session::Storage::new_unwatched("default").unwrap();
+        let mut inst = crate::session::Instance::new("s-prov", "/tmp");
+        inst.id = "s-prov".into();
+        inst.source_profile = storage.profile().to_owned();
+        inst.view = crate::session::View::Structured;
+        storage
+            .update(|rows, _| {
+                rows.push(inst.clone());
+                Ok(())
+            })
+            .unwrap();
         let gate = Gate::default();
-        let sup = Arc::new(
-            Supervisor::new(VecSink::new())
-                .with_process_control(control)
-                .with_launcher(gated_launcher(&gate, 4343)),
-        );
+        let sup = Arc::new(Supervisor::new(VecSink::new()).with_launcher(gated_launcher(&gate)));
         let mut req = spawn_request("s-prov");
+        req.source_profile = Some(inst.source_profile.clone());
         req.effort = Some("low".into());
 
-        let spawner = {
+        let mut spawner = {
             let sup = Arc::clone(&sup);
             tokio::spawn(async move { sup.spawn(req).await })
         };
-        gate.entered.notified().await;
+        tokio::select! {
+            result = &mut spawner => {
+                panic!("spawn ended before entering the handshake gate: {result:?}");
+            }
+            entered = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                gate.entered.notified(),
+            ) => {
+                if entered.is_err() {
+                    spawner.abort();
+                    let result = spawner.await;
+                    panic!("spawn did not enter the handshake gate within 5s: {result:?}");
+                }
+            }
+        }
         gate.open.notify_one();
         spawner.await.unwrap().expect("spawn");
 
@@ -1180,6 +1277,7 @@ mod tests {
             !explicit,
             "a resolved default effort must not read as a session pin"
         );
+        sup.shutdown("s-prov").await.expect("fixture shutdown");
     }
 
     /// #4116: the handshake holds no lifecycle lock, so an archive (which a TUI takes on its
@@ -1188,30 +1286,40 @@ mod tests {
     #[serial_test::serial]
     async fn spawn_retires_a_runner_whose_row_was_archived_during_the_handshake() {
         let _home = isolate_home();
-        let control = Arc::new(FakeProcessControl::default());
-        control.alive(4545);
         let gate = Gate::default();
-        let sup = Arc::new(
-            Supervisor::new(VecSink::new())
-                .with_process_control(control.clone())
-                .with_launcher(gated_launcher(&gate, 4545)),
-        );
+        let sup = Arc::new(Supervisor::new(VecSink::new()).with_launcher(gated_launcher(&gate)));
+        let storage = crate::session::Storage::new_unwatched("default").unwrap();
         let mut inst = crate::session::Instance::new("s-archived", "/tmp");
         inst.id = "s-archived".into();
-        let storage = crate::session::Storage::new_unwatched(&inst.source_profile).unwrap();
+        inst.source_profile = storage.profile().to_owned();
+        inst.view = crate::session::View::Structured;
         storage
             .update(|rows, _| {
-                *rows = vec![inst.clone()];
+                rows.push(inst.clone());
                 Ok(())
             })
             .unwrap();
         let mut req = spawn_request("s-archived");
         req.source_profile = Some(inst.source_profile.clone());
-        let spawner = {
+        let mut spawner = {
             let sup = Arc::clone(&sup);
             tokio::spawn(async move { sup.spawn(req).await })
         };
-        gate.entered.notified().await;
+        tokio::select! {
+            result = &mut spawner => {
+                panic!("spawn ended before entering the handshake gate: {result:?}");
+            }
+            entered = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                gate.entered.notified(),
+            ) => {
+                if entered.is_err() {
+                    spawner.abort();
+                    let result = spawner.await;
+                    panic!("spawn did not enter the handshake gate within 5s: {result:?}");
+                }
+            }
+        }
 
         assert!(
             !storage.instance_lifecycle_lock_is_held_for_test("s-archived"),
@@ -1223,7 +1331,10 @@ mod tests {
                 .unwrap();
             storage
                 .update(|rows, _| {
-                    rows[0].archive();
+                    rows.iter_mut()
+                        .find(|row| row.id == "s-archived")
+                        .expect("stored archive fixture")
+                        .archive();
                     Ok(())
                 })
                 .unwrap();
@@ -1237,10 +1348,6 @@ mod tests {
             ))
         ));
         assert_eq!(sup.worker_state("s-archived").await, AcpWorkerState::Absent);
-        assert!(
-            control.signals().iter().any(|(pid, _)| *pid == 4545),
-            "the runner launched for the archived row must be torn down"
-        );
     }
 
     #[tokio::test]
@@ -1449,14 +1556,10 @@ mod tests {
                     .await
                     .unwrap();
                 senders.lock().unwrap().push(tx);
-                Ok(client.with_runner_pid(4345))
+                Ok(client)
             })
         });
-        let control = Arc::new(FakeProcessControl::default());
-        control.alive(4345);
-        let sup = Supervisor::new(sink)
-            .with_process_control(control)
-            .with_launcher(launcher);
+        let sup = Supervisor::new(sink).with_launcher(launcher);
         sup.hydrate_seqs(store.all_session_seqs());
         sup.spawn(spawn_request("s-startup")).await.unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -1488,7 +1591,7 @@ mod tests {
             })
             .collect();
         assert_eq!(events, ["requested:old", "cancelled:old", "requested:live"]);
-        sup.shutdown("s-startup").await.unwrap();
+        let _ = sup.shutdown("s-startup").await;
     }
 
     /// A launch left outstanding by a previous daemon (its tailer died with
@@ -1532,14 +1635,10 @@ mod tests {
             Box::pin(async move {
                 save_record(&session_id.0, 4345, config.generation);
                 let (client, _tx) = AcpClient::fake_for_test(session_id);
-                Ok(client.with_runner_pid(4345))
+                Ok(client)
             })
         });
-        let control = Arc::new(FakeProcessControl::default());
-        control.alive(4345);
-        let sup = Supervisor::new(sink)
-            .with_process_control(control)
-            .with_launcher(launcher);
+        let sup = Supervisor::new(sink).with_launcher(launcher);
         sup.hydrate_seqs(store.all_session_seqs());
         sup.spawn(spawn_request("s-startup")).await.unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -1568,7 +1667,7 @@ mod tests {
             detached,
             "the orphaned launch must be closed out as Detached"
         );
-        sup.shutdown("s-startup").await.unwrap();
+        let _ = sup.shutdown("s-startup").await;
     }
 
     /// Everything [`attach_with_orphaned_background_agent`] sets up. The
@@ -1581,7 +1680,7 @@ mod tests {
         rx: tokio::sync::broadcast::Receiver<crate::server::AcpBroadcastFrame>,
         _sup: Supervisor<super::super::ChannelSink>,
         runner_handshake: tokio::task::JoinHandle<()>,
-        fake_runner: std::process::Child,
+        _execution: PublishedExecution,
         _tmp: tempfile::TempDir,
         _store_tmp: tempfile::TempDir,
         _home: crate::session::test_support::AppDirGuard,
@@ -1590,8 +1689,6 @@ mod tests {
     impl Drop for AttachBackgroundAgentFixture {
         fn drop(&mut self) {
             self.runner_handshake.abort();
-            let _ = self.fake_runner.kill();
-            let _ = self.fake_runner.wait();
         }
     }
 
@@ -1606,7 +1703,6 @@ mod tests {
     ) -> AttachBackgroundAgentFixture {
         use crate::acp::control_protocol::{self, ControlBody};
         use crate::acp::state::BackgroundAgentStatus;
-        use std::os::unix::process::CommandExt as _;
 
         let (_home, tmp) = isolate_home();
         let (sink, store, rx, _store_tmp) = channel_sink();
@@ -1637,13 +1733,12 @@ mod tests {
             },
         );
 
-        // `is_record_live` requires a live pid; `sleep 60` as its own process
-        // group leader keeps the cleanup kill off the test process.
-        let fake_runner = std::process::Command::new("sleep")
-            .arg("60")
-            .process_group(0)
-            .spawn()
-            .expect("spawn stand-in runner");
+        let profile = crate::session::Storage::new_unwatched("default")
+            .unwrap()
+            .profile()
+            .to_owned();
+        let fake_runner = published_execution(session_id, 1, &profile, None);
+        let nonce = fake_runner.nonce;
 
         let socket = tmp.path().join(format!("{session_id}.sock"));
         let control_socket = crate::process::worker::control_socket_sibling(&socket);
@@ -1656,6 +1751,7 @@ mod tests {
                 &ControlBody::Hello {
                     control_protocol_version: control_protocol::CONTROL_PROTOCOL_VERSION,
                     session_id: session_id_owned,
+                    launch_nonce: Some(nonce),
                 },
             )
             .await
@@ -1683,9 +1779,9 @@ mod tests {
         // An agent key absent from the registry resolves to
         // `ExpectedAgent::Other`, skipping the per-adapter compat gate: this
         // fixture tests attach wiring, not agent compatibility.
-        let record = worker_registry::WorkerRecord::new(
+        let mut record = worker_registry::WorkerRecord::new(
             session_id.to_string(),
-            fake_runner.id(),
+            fake_runner.pid,
             socket,
             "test-agent-acp".into(),
             "test-agent".into(),
@@ -1694,8 +1790,10 @@ mod tests {
             vec![],
             vec![],
             Some("acp-sid".into()),
-            None,
-        );
+            Some(profile),
+        )
+        .with_generation(1);
+        record.launch_nonce = Some(nonce);
         worker_registry::save(&record).unwrap();
 
         let sup = Supervisor::new(sink);
@@ -1719,7 +1817,7 @@ mod tests {
             rx,
             _sup: sup,
             runner_handshake,
-            fake_runner,
+            _execution: fake_runner,
             _tmp: tmp,
             _store_tmp,
             _home,
@@ -1824,87 +1922,6 @@ mod tests {
         assert_eq!(
             state.background_agents[0].status,
             BackgroundAgentStatus::Detached
-        );
-    }
-
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn attach_terminates_a_worker_whose_agent_is_no_longer_allowed() {
-        use std::os::unix::process::CommandExt as _;
-        let (_home, tmp) = isolate_home();
-        let mut fake_runner = std::process::Command::new("sleep")
-            .arg("60")
-            .process_group(0)
-            .spawn()
-            .expect("spawn stand-in runner");
-
-        let sup = Supervisor::new(VecSink::new());
-        let socket = worker_registry::socket_path_for("s-policy").unwrap();
-        worker_registry::touch_live_socket(&socket);
-        let mut record = worker_registry::WorkerRecord::new(
-            "s-policy".into(),
-            fake_runner.id(),
-            socket,
-            "codex-acp".into(),
-            "codex".into(),
-            tmp.path().to_path_buf(),
-            None,
-            vec![],
-            vec![],
-            // No stored session: an allowed attach fails fast past the gate
-            // instead of dialing a control socket until the runner deadline.
-            None,
-            None,
-        );
-        record.detached_at = Some(1);
-        let attach = || {
-            sup.attach(
-                "s-policy".into(),
-                tmp.path().to_path_buf(),
-                vec![],
-                false,
-                None,
-            )
-        };
-
-        crate::session::config::update_config(|c| {
-            c.acp.restrict_agents = true;
-            c.acp.allowed_agents = vec!["claude".to_string(), "codex".to_string()];
-        })
-        .unwrap();
-        worker_registry::save(&record).unwrap();
-        let allowed = attach().await;
-        assert!(
-            !matches!(allowed, Err(SupervisorError::AgentNotAllowed(_))),
-            "a permitted agent must clear the policy gate, got {allowed:?}"
-        );
-
-        crate::session::config::update_config(|c| {
-            c.acp.allowed_agents = vec!["claude".to_string()];
-        })
-        .unwrap();
-        worker_registry::save(&record).unwrap();
-        let got = attach().await;
-        assert!(
-            matches!(got, Err(SupervisorError::AgentNotAllowed(ref n)) if n == "codex"),
-            "expected AgentNotAllowed(codex), got {got:?}"
-        );
-        assert!(
-            worker_registry::load("s-policy").unwrap().is_none(),
-            "the disallowed worker's registry record must be cleared"
-        );
-        let exit = (0..50)
-            .find_map(|_| {
-                let got = fake_runner.try_wait().unwrap();
-                if got.is_none() {
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-                }
-                got
-            })
-            .expect("the disallowed runner must be signalled, not left running");
-        assert!(
-            exit.code().is_none(),
-            "the runner must exit from a signal: {exit:?}"
         );
     }
 }

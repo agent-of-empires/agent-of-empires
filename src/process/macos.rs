@@ -345,9 +345,54 @@ Pages wired down:                        300000.
     }
 }
 
-/// `kern.boottime` shifts on clock steps; the session UUID does not.
+pub(super) fn process_incarnation(pid: u32) -> std::io::Result<Option<super::ProcessIncarnation>> {
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
+    let size = std::mem::size_of::<libc::proc_bsdinfo>();
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid as i32,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size as i32,
+        )
+    };
+    if written == 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            return Ok(None);
+        }
+        return Err(error);
+    }
+    if written != size as i32 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "incomplete process incarnation",
+        ));
+    }
+    // PROC_PIDTBSDINFO returned the complete fixed-size structure.
+    let info = unsafe { info.assume_init() };
+    if info.pbi_pid != pid {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "process identity differs",
+        ));
+    }
+    Ok(Some(super::ProcessIncarnation {
+        pid,
+        group: info.pbi_pgid,
+        start: [info.pbi_start_tvsec, info.pbi_start_tvusec],
+        namespace: [0, 0],
+    }))
+}
+
+pub(super) fn process_namespace() -> std::io::Result<[u64; 2]> {
+    Ok([0, 0])
+}
+
+/// The session UUID is independent of clock steps.
 pub(super) fn boot_id() -> Option<String> {
-    let out = Command::new("sysctl")
+    let out = Command::new("/usr/sbin/sysctl")
         .args(["-n", "kern.bootsessionuuid"])
         .output()
         .ok()?;
@@ -355,20 +400,14 @@ pub(super) fn boot_id() -> Option<String> {
         return None;
     }
     let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if s.is_empty() {
-        None
-    } else {
-        Some(s)
-    }
+    (!s.is_empty()).then_some(s)
 }
 
-/// Whether any process of `pgrp` is still running, ignoring zombies. Darwin has
-/// no `/proc`, so `ps` answers the enumeration. `Err` when it cannot, so a
-/// caller that cannot prove absence treats the group as alive.
+/// Report non-zombie group members. Probe failures do not prove absence.
 pub(super) fn process_group_has_live_members(pgrp: u32) -> std::io::Result<bool> {
     // `ps -g` does not mean the same thing on every BSD, so the table is read in
     // full and the group is matched on an explicit column instead.
-    let output = Command::new("ps")
+    let output = Command::new("/bin/ps")
         .args(["-o", "pid=,pgid=,state=", "-A"])
         .output()
         .map_err(|error| std::io::Error::other(error.to_string()))?;
@@ -387,27 +426,15 @@ pub(super) fn process_group_has_live_members(pgrp: u32) -> std::io::Result<bool>
             let state = fields.next()?;
             (group.parse::<u32>() == Ok(pgrp)).then_some(state)
         })
-        // BSD `ps` prints the state letter followed by its flags, so a zombie
-        // reads `ZN` rather than `Z`: the letter has to be read on its own.
+        // BSD state suffixes do not change the leading zombie state.
         .any(|state| !state.starts_with('Z')))
 }
 
-/// Whether `pid` has exited and is only waiting to be reaped rather than still
-/// running. A zombie holds nothing, so treating it as alive makes a torn-down
-/// runner unprovable forever.
-///
-/// Darwin has no `/proc`, and `waitid` only answers for a child of this process,
-/// so the state comes from `ps`: the settlement runs from the daemon, the TUI
-/// and the CLI alike, and a runner this process never parented still has to be
-/// recognised.
+/// Darwin cannot reap an unrelated process, so query its state instead.
 pub(super) fn is_terminated(pid: u32) -> bool {
     match process_state(pid) {
         Ok(state) => state.starts_with('Z'),
-        // Either `ps` could not run, or it ran and found nothing: `ps` exits
-        // non-zero rather than succeeding with no row, so the two cannot be
-        // told apart here and neither proves the process is gone. A live pid that
-        // survives this reads as alive, which is the safe direction for a probe
-        // that authorises a teardown.
+        // Neither query failure nor an absent row proves termination.
         _ => false,
     }
 }
@@ -415,7 +442,7 @@ pub(super) fn is_terminated(pid: u32) -> bool {
 /// The BSD state field of one process. BSD `ps` prints the state letter
 /// followed by its flags, so a zombie reads `ZN` rather than `Z`.
 fn process_state(pid: u32) -> Result<String, std::io::Error> {
-    let output = Command::new("ps")
+    let output = Command::new("/bin/ps")
         .args(["-o", "state=", "-p", &pid.to_string()])
         .output()
         .map_err(|error| std::io::Error::other(error.to_string()))?;

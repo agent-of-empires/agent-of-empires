@@ -502,6 +502,7 @@ mod tests {
             pane_title: None,
             window_activity: None,
             window_size: None,
+            ..Default::default()
         }
     }
 

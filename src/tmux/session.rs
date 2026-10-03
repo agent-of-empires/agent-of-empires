@@ -18,8 +18,10 @@ use crate::session::environment::shell_escape_script_word;
 use crate::session::Status;
 use crate::util::now_ms;
 
+#[derive(Debug)]
 pub struct Session {
     name: String,
+    primary: std::sync::OnceLock<super::utils::PrimaryPane>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -215,13 +217,120 @@ impl Session {
     pub fn new(id: &str, title: &str) -> Result<Self> {
         Ok(Self {
             name: Self::resolve_name(id, title),
+            primary: std::sync::OnceLock::new(),
         })
     }
 
     pub fn from_name(name: &str) -> Self {
         Self {
             name: name.to_string(),
+            primary: std::sync::OnceLock::new(),
         }
+    }
+    pub(crate) fn primary_with_deadline(
+        &self,
+        deadline: &crate::tmux::TmuxCommandDeadline,
+    ) -> std::io::Result<&super::utils::PrimaryPane> {
+        if let Some(primary) = self.primary.get() {
+            return Ok(primary);
+        }
+        let primary = super::utils::resolve_primary(&self.name, deadline)?;
+        let _ = self.primary.set(primary);
+        Ok(self.primary.get().expect("primary identity published"))
+    }
+
+    pub(crate) fn with_primary(name: &str, primary: super::utils::PrimaryPane) -> Self {
+        Self {
+            name: name.to_owned(),
+            primary: std::sync::OnceLock::from(primary),
+        }
+    }
+
+    pub(crate) fn cached_primary(&self) -> Option<&super::utils::PrimaryPane> {
+        self.primary.get()
+    }
+    pub(crate) fn captured_primary(&self) -> &super::utils::PrimaryPane {
+        self.primary
+            .get()
+            .expect("actor captured its primary before starting")
+    }
+    fn primary_target(&self) -> std::io::Result<&str> {
+        Ok(&self
+            .primary_with_deadline(&crate::tmux::TmuxCommandDeadline::new())?
+            .pane_id)
+    }
+
+    pub(crate) fn command<I, S>(&self, args: I) -> std::io::Result<std::process::Command>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        self.command_with_deadline(args, &crate::tmux::TmuxCommandDeadline::new())
+    }
+
+    pub(crate) fn command_with_deadline<I, S>(
+        &self,
+        args: I,
+        deadline: &crate::tmux::TmuxCommandDeadline,
+    ) -> std::io::Result<std::process::Command>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        self.commands_with_deadline(std::iter::once(args), deadline)
+    }
+
+    pub(crate) fn commands_with_deadline<C, I, S>(
+        &self,
+        commands: C,
+        deadline: &crate::tmux::TmuxCommandDeadline,
+    ) -> std::io::Result<std::process::Command>
+    where
+        C: IntoIterator<Item = I>,
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let primary = self.primary_with_deadline(deadline)?;
+        let condition = format!(
+            "#{{==:#{{@aoe_server_incarnation}},{}}}",
+            Self::tmux_format_literal(&primary.server_id)
+        );
+        let mut body = String::new();
+        for args in commands {
+            if !body.is_empty() {
+                body.push_str(" ; ");
+            }
+            let mut first = true;
+            for arg in args {
+                if !first {
+                    body.push(' ');
+                }
+                first = false;
+                body.push('"');
+                for ch in arg.as_ref().chars() {
+                    match ch {
+                        '\n' => body.push_str("\\n"),
+                        '\r' => body.push_str("\\r"),
+                        '\t' => body.push_str("\\t"),
+                        '\\' | '"' | '$' | '~' => {
+                            body.push('\\');
+                            body.push(ch);
+                        }
+                        _ => body.push(ch),
+                    }
+                }
+                body.push('"');
+            }
+        }
+        let mut command = crate::tmux::tmux_query_command();
+        command.args([
+            "if-shell",
+            "-F",
+            &condition,
+            &body,
+            "show-options -sv __aoe_stale_server_incarnation__",
+        ]);
+        Ok(command)
     }
 
     /// The session to act on: the live session carrying this id's tail when the
@@ -430,12 +539,12 @@ impl Session {
             return Ok(false);
         }
 
-        let target = format!("{}:^.0", self.name);
+        let target = self.primary_target()?;
         let mut args: Vec<String> = vec![
             "respawn-pane".to_string(),
             "-k".to_string(),
             "-t".to_string(),
-            target,
+            target.to_owned(),
             "-c".to_string(),
             working_dir.to_string(),
         ];
@@ -443,7 +552,7 @@ impl Session {
             args.push(cmd.to_string());
         }
 
-        let output = crate::tmux::tmux_command().args(&args).output()?;
+        let output = self.command(&args)?.output()?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -551,9 +660,9 @@ impl Session {
     }
 
     pub fn pane_tty(&self) -> Result<String> {
-        let target = format!("{}:^.0", self.name);
-        let output = crate::tmux::tmux_command()
-            .args(["display-message", "-t", &target, "-p", "#{pane_tty}"])
+        let target = self.primary_target()?;
+        let output = self
+            .command(["display-message", "-t", target, "-p", "#{pane_tty}"])?
             .output()?;
         if !output.status.success() {
             bail!("Failed to read pane TTY for tmux session '{}'", self.name);
@@ -570,17 +679,17 @@ impl Session {
             return Ok(String::new());
         }
 
-        let target = format!("{}:^.0", self.name);
-        let output = crate::tmux::tmux_command()
-            .args([
+        let target = self.primary_target()?;
+        let output = self
+            .command([
                 "capture-pane",
                 "-t",
-                &target,
+                target,
                 "-p",
                 "-e",
                 "-S",
                 &format!("-{}", lines),
-            ])
+            ])?
             .output()?;
 
         if output.status.success() {
@@ -622,7 +731,6 @@ impl Session {
     /// Capture the first window with panes composited, plus pane 0's cursor.
     /// Single-pane and zoomed windows cost one fork and keep scrollback; a split
     /// window takes a second chained fork and shows only the visible window.
-    /// Input stays pinned to `^.0`.
     pub fn capture_window_composited_with_cursor(
         &self,
         lines: usize,
@@ -642,43 +750,19 @@ impl Session {
         const CURSOR_SENTINEL: &str = "@@aoe-cur@@";
         const AFTER_CURSOR_SENTINEL: &str = "@@aoe-after-cur@@";
 
-        let window = format!("{}:^", self.name);
-        let pane0 = format!("{}:^.0", self.name);
-        let mut command = crate::tmux::tmux_command();
-        command.args([
-            "display-message",
-            "-p",
-            "-t",
-            &window,
-            "-F",
-            &format!(
-                "{WINDOW_SENTINEL} #{{window_panes}} #{{window_width}} #{{window_height}} #{{window_zoomed_flag}}"
-            ),
-            ";",
-            "display-message",
-            "-p",
-            "-t",
-            &pane0,
-            "-F",
-            &format!("{CURSOR_SENTINEL} {CURSOR_FMT}"),
-            ";",
-            "capture-pane",
-            "-t",
-            &pane0,
-            "-p",
-            "-e",
-            // Keep trailing bg fills, matching the VT path.
-            "-N",
-            "-S",
-            &format!("-{}", lines),
-            ";",
-            "display-message",
-            "-p",
-            "-t",
-            &pane0,
-            "-F",
-            &format!("{AFTER_CURSOR_SENTINEL} {CURSOR_FMT}"),
-        ]);
+        let primary = self.primary_with_deadline(deadline)?;
+        let window = &primary.window_id;
+        let pane0 = &primary.pane_id;
+        let mut command = self.commands_with_deadline(
+            [
+                &["display-message", "-p", "-t", window, "-F", &format!(
+                    "{WINDOW_SENTINEL} #{{window_panes}} #{{window_width}} #{{window_height}} #{{window_zoomed_flag}}"
+                )][..],
+                &["display-message", "-p", "-t", pane0, "-F", &format!("{CURSOR_SENTINEL} {CURSOR_FMT}")],
+                &["capture-pane", "-t", pane0, "-p", "-e", "-N", "-S", &format!("-{lines}")],
+                &["display-message", "-p", "-t", pane0, "-F", &format!("{AFTER_CURSOR_SENTINEL} {CURSOR_FMT}")],
+            ], deadline
+        )?;
         let output = deadline.run(&mut command)?;
 
         if !output.status.success() {
@@ -765,9 +849,7 @@ impl Session {
         Ok((content, cursor))
     }
 
-    /// Window dimensions plus each pane's geometry and visible capture, in one
-    /// chained invocation. `pane-base-index` is pinned to 0, so `^.0..^.{count-1}`
-    /// addresses every pane.
+    /// Captured window dimensions and each pane, starting at its effective base index.
     #[cfg(test)]
     pub(crate) fn capture_window_layout(&self, count: u16) -> Option<WindowLayout> {
         let deadline = crate::tmux::TmuxCommandDeadline::new();
@@ -782,37 +864,23 @@ impl Session {
         const SENTINEL: &str = "@@aoe-pane@@";
         const WINDOW_SENTINEL: &str = "@@aoe-win@@";
 
-        let mut args: Vec<String> = vec![
-            "display-message".to_string(),
-            "-p".to_string(),
-            "-t".to_string(),
-            format!("{}:^", self.name),
-            "-F".to_string(),
-            format!("{WINDOW_SENTINEL} #{{window_width}} #{{window_height}}"),
-        ];
-        for i in 0..count {
-            let target = format!("{}:^.{}", self.name, i);
-            args.push(";".to_string());
-            args.extend([
-                "display-message".to_string(),
-                "-p".to_string(),
-                "-t".to_string(),
-                target.clone(),
-                "-F".to_string(),
-                format!("{SENTINEL} #{{pane_left}} #{{pane_top}} #{{pane_width}} #{{pane_height}}"),
-                ";".to_string(),
-                "capture-pane".to_string(),
-                "-t".to_string(),
-                target,
-                "-p".to_string(),
-                "-e".to_string(),
-                // Keep trailing bg fills, matching the VT path.
-                "-N".to_string(),
-            ]);
+        use std::fmt::Write as _;
+        if count == 0 {
+            return None;
         }
-
-        let mut command = crate::tmux::tmux_command();
-        command.args(&args);
+        let primary = self.primary_with_deadline(deadline).ok()?;
+        let mut body = String::with_capacity(160 + usize::from(count) * 200);
+        write!(body, "display-message -p -t #{{window_id}}.#{{pane-base-index}} \"{WINDOW_SENTINEL} ##{{window_width}} ##{{window_height}} ##{{pane_id}}\"").ok()?;
+        for i in 0..count {
+            let target = format!("{}.#{{e|+:#{{pane-base-index}},{i}}}", primary.window_id);
+            write!(body, " ; display-message -p -t {target} \"{SENTINEL} ##{{pane_left}} ##{{pane_top}} ##{{pane_width}} ##{{pane_height}}\" ; capture-pane -t {target} -p -e -N").ok()?;
+        }
+        let mut command = self
+            .command_with_deadline(
+                ["run-shell", "-t", &primary.window_id, "-C", &body],
+                deadline,
+            )
+            .ok()?;
         let output = deadline.run(&mut command).ok()?;
         if !output.status.success() {
             return None;
@@ -824,6 +892,9 @@ impl Session {
         let mut fields = dims.split_whitespace();
         let window_width: u16 = fields.next().and_then(|f| f.parse().ok())?;
         let window_height: u16 = fields.next().and_then(|f| f.parse().ok())?;
+        if fields.next() != Some(primary.pane_id.as_str()) {
+            return None;
+        }
         if window_width == 0 || window_height == 0 {
             return None;
         }
@@ -857,9 +928,9 @@ impl Session {
         if !self.exists() {
             return Ok(String::new());
         }
-        let target = format!("{}:^.0", self.name);
-        let output = crate::tmux::tmux_command()
-            .args(["capture-pane", "-t", &target, "-p", "-J", "-S", "-"])
+        let target = self.primary_target()?;
+        let output = self
+            .command(["capture-pane", "-t", target, "-p", "-J", "-S", "-"])?
             .output()?;
         if output.status.success() {
             Ok(String::from_utf8_lossy(&output.stdout).to_string())
@@ -880,35 +951,17 @@ impl Session {
         lines: usize,
         deadline: &crate::tmux::TmuxCommandDeadline,
     ) -> Result<(String, Option<PaneCursor>)> {
-        let target = format!("{}:^.0", self.name);
+        let target = self.primary_with_deadline(deadline)?.pane_id.as_str();
         let start = format!("-{}", lines);
         const HEADER_FMT: &str = CURSOR_FMT;
-        let mut command = crate::tmux::tmux_command();
-        command.args([
-            "display-message",
-            "-p",
-            "-t",
-            &target,
-            "-F",
-            HEADER_FMT,
-            ";",
-            "capture-pane",
-            "-t",
-            &target,
-            "-p",
-            "-e",
-            // Keep trailing bg fills, matching the VT path.
-            "-N",
-            "-S",
-            &start,
-            ";",
-            "display-message",
-            "-p",
-            "-t",
-            &target,
-            "-F",
-            HEADER_FMT,
-        ]);
+        let mut command = self.commands_with_deadline(
+            [
+                &["display-message", "-p", "-t", target, "-F", HEADER_FMT][..],
+                &["capture-pane", "-t", target, "-p", "-e", "-N", "-S", &start],
+                &["display-message", "-p", "-t", target, "-F", HEADER_FMT],
+            ],
+            deadline,
+        )?;
         let output = deadline.run(&mut command)?;
 
         if !output.status.success() {
@@ -936,12 +989,14 @@ impl Session {
 
     /// Deliver raw bytes via `send-keys -H`, chunked to stay under ARG_MAX.
     pub fn send_raw_bytes(&self, bytes: &[u8]) -> Result<()> {
-        // A bare session target follows the active pane; pin `^.0` like capture.
-        let target = format!("{}:^.0", self.name);
+        let target = self.primary_target()?;
         for batch in raw_byte_batches(bytes) {
-            let output = crate::tmux::tmux_command()
-                .args(["send-keys", "-t", &target, "-H"])
-                .args(&batch)
+            let output = self
+                .command(
+                    ["send-keys", "-t", target, "-H"]
+                        .into_iter()
+                        .chain(batch.iter().map(String::as_str)),
+                )?
                 .output()?;
             if !output.status.success() {
                 anyhow::bail!(
@@ -956,12 +1011,25 @@ impl Session {
     /// Paste through tmux's paste path so bracketed-paste markers are emitted only
     /// when the program enabled DECSET 2004.
     pub fn paste_text(&self, text: &str) -> Result<()> {
-        let target = format!("{}:^.0", self.name);
-        Self::send_via_paste_buffer(&target, text)
+        let target = self.primary_target()?;
+        self.send_via_paste_buffer(target, text)
     }
 
     pub fn get_pane_pid(&self) -> Option<u32> {
-        process::get_pane_pid(&self.name)
+        let target = self.primary_target().ok()?;
+        let output = self
+            .command(["display-message", "-p", "-t", target, "#{pane_pid}"])
+            .ok()?
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        std::str::from_utf8(&output.stdout)
+            .ok()?
+            .trim()
+            .parse()
+            .ok()
     }
 
     pub fn get_foreground_pid(&self) -> Option<u32> {
@@ -988,7 +1056,7 @@ impl Session {
             bail!("Session does not exist: {}", self.name);
         }
 
-        let target = format!("{}:^.0", self.name);
+        let target = self.primary_target()?;
         let delivery = submit_text(text);
         tracing::debug!(target: "tmux.command",
             "send_keys_with_delay: bytes={} lines={} paste={} target={}",
@@ -999,12 +1067,12 @@ impl Session {
         );
 
         match delivery {
-            SubmitText::Paste(text) => Self::send_via_paste_buffer(&target, text)?,
+            SubmitText::Paste(text) => self.send_via_paste_buffer(target, text)?,
             SubmitText::Literal(payload) => {
                 let (head, semis) = peel_trailing_semicolons(&payload);
                 if !head.is_empty() {
                     // `--` so lines starting with `-` are not read as tmux flags.
-                    Self::tmux_send(&target, &["-l", "--", head])?;
+                    self.tmux_send(target, &["-l", "--", head])?;
                 }
                 if semis > 0 {
                     self.send_raw_bytes(&vec![b';'; semis])?;
@@ -1016,7 +1084,7 @@ impl Session {
             std::thread::sleep(std::time::Duration::from_millis(enter_delay_ms));
         }
 
-        Self::tmux_send(&target, &["Enter"])?;
+        self.tmux_send(target, &["Enter"])?;
 
         Ok(())
     }
@@ -1028,14 +1096,14 @@ impl Session {
             bail!("Session does not exist: {}", self.name);
         }
 
-        let target = format!("{}:^.0", self.name);
+        let target = self.primary_target()?;
         for token in tokens {
             match token {
                 crate::agents::KeyToken::Literal(text) => {
-                    Self::tmux_send(&target, &["-l", "--", text])?;
+                    self.tmux_send(target, &["-l", "--", text])?;
                 }
                 crate::agents::KeyToken::Named(name) => {
-                    Self::tmux_send(&target, &[name])?;
+                    self.tmux_send(target, &[name])?;
                 }
             }
         }
@@ -1049,8 +1117,23 @@ impl Session {
         if !self.exists() {
             return;
         }
-        let mut command = crate::tmux::tmux_command();
-        command.args(["set-option", "-t", &self.name, "window-size", "latest"]);
+        let deadline = crate::tmux::TmuxCommandDeadline::new();
+        let Ok(primary) = self.primary_with_deadline(&deadline) else {
+            return;
+        };
+        let Ok(mut command) = self.command_with_deadline(
+            [
+                "set-option",
+                "-w",
+                "-t",
+                &primary.window_id,
+                "window-size",
+                "latest",
+            ],
+            &deadline,
+        ) else {
+            return;
+        };
         let _ = crate::tmux::run_tmux_command_with_timeout(&mut command);
     }
 
@@ -1059,15 +1142,19 @@ impl Session {
         pane_target: &str,
         deadline: &crate::tmux::TmuxCommandDeadline,
     ) -> Option<u16> {
-        let mut command = crate::tmux::tmux_command();
-        command.args([
-            "display-message",
-            "-p",
-            "-t",
-            pane_target,
-            "-F",
-            "#{window_height} #{pane_height}",
-        ]);
+        let mut command = self
+            .command_with_deadline(
+                [
+                    "display-message",
+                    "-p",
+                    "-t",
+                    pane_target,
+                    "-F",
+                    "#{window_height} #{pane_height}",
+                ],
+                deadline,
+            )
+            .ok()?;
         let output = deadline.run(&mut command).ok()?;
         if !output.status.success() {
             return None;
@@ -1097,6 +1184,18 @@ impl Session {
         self.claim_owner_at_with_deadline(opt, hb_opt, owner_id, ttl, &deadline)
     }
 
+    fn owner_scope(
+        &self,
+        opt: &str,
+        deadline: &crate::tmux::TmuxCommandDeadline,
+    ) -> std::io::Result<(&str, &str)> {
+        let primary = self.primary_with_deadline(deadline)?;
+        if opt == VT_OWNER_OPT {
+            Ok(("-p ", &primary.pane_id))
+        } else {
+            Ok(("", &primary.session_id))
+        }
+    }
     fn set_owner_pair_with_deadline(
         &self,
         opt: &str,
@@ -1105,21 +1204,22 @@ impl Session {
         heartbeat: u64,
         deadline: &crate::tmux::TmuxCommandDeadline,
     ) -> bool {
+        let Ok((scope, target)) = self.owner_scope(opt, deadline) else {
+            return false;
+        };
         let heartbeat = heartbeat.to_string();
-        let mut command = crate::tmux::tmux_command();
-        command.args([
-            "set-option",
-            "-t",
-            &self.name,
-            opt,
-            owner_id,
-            ";",
-            "set-option",
-            "-t",
-            &self.name,
-            hb_opt,
-            &heartbeat,
-        ]);
+        let pane_flag = (!scope.is_empty()).then_some("-p");
+        let commands = [(opt, owner_id), (hb_opt, heartbeat.as_str())]
+            .into_iter()
+            .map(|(option, value)| {
+                ["set-option"]
+                    .into_iter()
+                    .chain(pane_flag)
+                    .chain(["-t", target, option, value])
+            });
+        let Ok(mut command) = self.commands_with_deadline(commands, deadline) else {
+            return false;
+        };
         deadline
             .run(&mut command)
             .is_ok_and(|output| output.status.success())
@@ -1142,12 +1242,15 @@ impl Session {
     ) -> std::io::Result<bool> {
         let condition = Self::owner_pair_condition(opt, hb_opt, observed.0, observed.1);
         let owner_id = Self::tmux_command_string_literal(owner_id);
-        let target = Self::tmux_command_string_literal(&self.name);
+        let (scope, context) = self.owner_scope(opt, deadline)?;
+        let target = Self::tmux_command_string_literal(context);
         let replace = format!(
-            "set-option -t {target} {opt} {owner_id} ; set-option -t {target} {hb_opt} {heartbeat} ; display-message -p aoe-owner-replaced"
+            "set-option {scope}-t {target} {opt} {owner_id} ; set-option {scope}-t {target} {hb_opt} {heartbeat} ; display-message -p aoe-owner-replaced"
         );
-        let mut command = crate::tmux::tmux_command();
-        command.args(["if-shell", "-t", &self.name, "-F", &condition, &replace]);
+        let mut command = self.command_with_deadline(
+            ["if-shell", "-t", context, "-F", &condition, &replace],
+            deadline,
+        )?;
         let output = deadline.run(&mut command)?;
         if !output.status.success() {
             return Err(std::io::Error::other("tmux owner replacement failed"));
@@ -1167,14 +1270,26 @@ impl Session {
         deadline: &crate::tmux::TmuxCommandDeadline,
     ) {
         let condition = Self::owner_pair_condition(opt, hb_opt, owner_id, &heartbeat.to_string());
-        let target = Self::tmux_command_string_literal(&self.name);
-        let mut release =
-            format!("set-option -u -t {target} {opt} ; set-option -u -t {target} {hb_opt}");
+        let Ok((scope, context)) = self.owner_scope(opt, deadline) else {
+            return;
+        };
+        let target = Self::tmux_command_string_literal(context);
+        let mut release = format!(
+            "set-option {scope}-u -t {target} {opt} ; set-option {scope}-u -t {target} {hb_opt}"
+        );
         if restore_window_size {
-            release.push_str(&format!(" ; set-option -t {target} window-size latest"));
+            let Ok(primary) = self.primary_with_deadline(deadline) else {
+                return;
+            };
+            let window = Self::tmux_command_string_literal(&primary.window_id);
+            release.push_str(&format!(" ; set-option -w -t {window} window-size latest"));
         }
-        let mut command = crate::tmux::tmux_command();
-        command.args(["if-shell", "-t", &self.name, "-F", &condition, &release]);
+        let Ok(mut command) = self.command_with_deadline(
+            ["if-shell", "-t", context, "-F", &condition, &release],
+            deadline,
+        ) else {
+            return;
+        };
         let _ = deadline.run(&mut command);
     }
 
@@ -1184,9 +1299,12 @@ impl Session {
         hb_opt: &str,
         deadline: &crate::tmux::TmuxCommandDeadline,
     ) -> std::io::Result<(String, String)> {
+        let (_, context) = self.owner_scope(opt, deadline)?;
         let format = format!("#{{{opt}}}|#{{{hb_opt}}}");
-        let mut command = crate::tmux::tmux_command();
-        command.args(["display-message", "-p", "-t", &self.name, "-F", &format]);
+        let mut command = self.command_with_deadline(
+            ["display-message", "-p", "-t", context, "-F", &format],
+            deadline,
+        )?;
         let output = deadline.run(&mut command)?;
         if !output.status.success() {
             return Err(std::io::Error::other("tmux owner snapshot failed"));
@@ -1289,13 +1407,20 @@ impl Session {
     ) -> bool {
         let owner_id = Self::tmux_format_literal(owner_id);
         let condition = format!("#{{==:#{{{opt}}},{owner_id}}}");
-        let target = Self::tmux_command_string_literal(&self.name);
+        let Ok((scope, context)) = self.owner_scope(opt, deadline) else {
+            return false;
+        };
+        let target = Self::tmux_command_string_literal(context);
         let refresh = format!(
-            "set-option -t {target} {hb_opt} {} ; display-message -p aoe-owner-refreshed",
+            "set-option {scope}-t {target} {hb_opt} {} ; display-message -p aoe-owner-refreshed",
             next_owner_heartbeat(0)
         );
-        let mut command = crate::tmux::tmux_command();
-        command.args(["if-shell", "-t", &self.name, "-F", &condition, &refresh]);
+        let Ok(mut command) = self.command_with_deadline(
+            ["if-shell", "-t", context, "-F", &condition, &refresh],
+            deadline,
+        ) else {
+            return false;
+        };
         deadline.run(&mut command).is_ok_and(|output| {
             output.status.success()
                 && String::from_utf8_lossy(&output.stdout)
@@ -1388,19 +1513,28 @@ impl Session {
         if cols == 0 || rows == 0 {
             return None;
         }
-        let pane_target = format!("{}:^.0", self.name);
+        let primary = self.primary_with_deadline(deadline).ok()?;
         let window_rows = self
-            .pane_chrome_rows_with_deadline(&pane_target, deadline)
+            .pane_chrome_rows_with_deadline(&primary.pane_id, deadline)
             .map(|chrome| rows.saturating_add(chrome))
             .unwrap_or(rows);
-        // `if-shell -F` checks the guard and resizes in one command queue. Target the
-        // first window (`:^`), which the chrome probe and capture also use.
-        let target = Self::tmux_command_string_literal(&format!("{}:^", self.name));
+        let target = Self::tmux_command_string_literal(&primary.window_id);
         let resize = format!(
             "resize-window -t {target} -x {cols} -y {window_rows} ; display-message -p aoe-resize-applied"
         );
-        let mut command = crate::tmux::tmux_command();
-        command.args(["if-shell", "-t", &self.name, "-F", condition, &resize]);
+        let mut command = self
+            .command_with_deadline(
+                [
+                    "if-shell",
+                    "-t",
+                    &primary.session_id,
+                    "-F",
+                    condition,
+                    &resize,
+                ],
+                deadline,
+            )
+            .ok()?;
         deadline
             .run(&mut command)
             .is_ok_and(|output| {
@@ -1422,14 +1556,26 @@ impl Session {
     ) {
         let owner_id = Self::tmux_format_literal(owner_id);
         let condition = format!("#{{==:#{{{opt}}},{owner_id}}}");
-        let target = Self::tmux_command_string_literal(&self.name);
-        let mut release =
-            format!("set-option -u -t {target} {opt} ; set-option -u -t {target} {hb_opt}");
+        let Ok((scope, context)) = self.owner_scope(opt, deadline) else {
+            return;
+        };
+        let target = Self::tmux_command_string_literal(context);
+        let mut release = format!(
+            "set-option {scope}-u -t {target} {opt} ; set-option {scope}-u -t {target} {hb_opt}"
+        );
         if restore_window_size {
-            release.push_str(&format!(" ; set-option -t {target} window-size latest"));
+            let Ok(primary) = self.primary_with_deadline(deadline) else {
+                return;
+            };
+            let window = Self::tmux_command_string_literal(&primary.window_id);
+            release.push_str(&format!(" ; set-option -w -t {window} window-size latest"));
         }
-        let mut command = crate::tmux::tmux_command();
-        command.args(["if-shell", "-t", &self.name, "-F", &condition, &release]);
+        let Ok(mut command) = self.command_with_deadline(
+            ["if-shell", "-t", context, "-F", &condition, &release],
+            deadline,
+        ) else {
+            return;
+        };
         let _ = deadline.run(&mut command);
     }
 
@@ -1462,14 +1608,21 @@ impl Session {
     ) -> bool {
         let owner_format = Self::tmux_format_literal(owner_id);
         let condition = format!("#{{==:#{{{VT_OWNER_OPT}}},{owner_format}}}");
-        let target = Self::tmux_command_string_literal(&format!("{}:^.0", self.name));
+        let Ok(primary) = self.primary_with_deadline(deadline) else {
+            return false;
+        };
+        let target = Self::tmux_command_string_literal(&primary.pane_id);
         let pipe_command = Self::tmux_command_string_literal(pipe_command);
         let owner_command = Self::tmux_command_string_literal(owner_id);
         let arm = format!(
-            "pipe-pane {flags} -t {target} {pipe_command} ; set-option -t {target} {VT_PIPE_OWNER_OPT} {owner_command} ; display-message -p aoe-pipe-armed"
+            "pipe-pane {flags} -t {target} {pipe_command} ; set-option -p -t {target} {VT_PIPE_OWNER_OPT} {owner_command} ; display-message -p aoe-pipe-armed"
         );
-        let mut command = crate::tmux::tmux_command();
-        command.args(["if-shell", "-t", &self.name, "-F", &condition, &arm]);
+        let Ok(mut command) = self.command_with_deadline(
+            ["if-shell", "-t", &primary.pane_id, "-F", &condition, &arm],
+            deadline,
+        ) else {
+            return false;
+        };
         let Ok(output) = deadline.run(&mut command) else {
             return false;
         };
@@ -1497,20 +1650,39 @@ impl Session {
         owner_id: &str,
         deadline: &crate::tmux::TmuxCommandDeadline,
     ) {
+        let Ok(primary) = self.primary_with_deadline(deadline) else {
+            return;
+        };
         let owner_format = Self::tmux_format_literal(owner_id);
-        let condition = format!(
-            "#{{||:#{{==:#{{{VT_PIPE_OWNER_OPT}}},{owner_format}}},#{{==:#{{{VT_OWNER_OPT}}},{owner_format}}}}}"
-        );
+        let condition = format!("#{{==:#{{{VT_PIPE_OWNER_OPT}}},{owner_format}}}");
         let clear_lease_condition = format!("#{{==:#{{{VT_OWNER_OPT}}},{owner_format}}}");
-        let target = Self::tmux_command_string_literal(&format!("{}:^.0", self.name));
-        let clear_lease = format!(
-            "set-option -u -t {target} {VT_OWNER_OPT} ; set-option -u -t {target} {VT_OWNER_HB_OPT}"
-        );
-        let release = format!(
-            "pipe-pane -t {target} ; set-option -u -t {target} {VT_PIPE_OWNER_OPT} ; if-shell -t {target} -F '{clear_lease_condition}' '{clear_lease}'"
-        );
-        let mut command = crate::tmux::tmux_command();
-        command.args(["if-shell", "-t", &self.name, "-F", &condition, &release]);
+        let target = Self::tmux_command_string_literal(&primary.pane_id);
+        let clear_lease = format!("set-option -p -u -t {target} {VT_OWNER_OPT} ; set-option -p -u -t {target} {VT_OWNER_HB_OPT}");
+        let release =
+            format!("pipe-pane -t {target} ; set-option -p -u -t {target} {VT_PIPE_OWNER_OPT}");
+        let Ok(mut command) = self.commands_with_deadline(
+            [
+                &[
+                    "if-shell",
+                    "-t",
+                    &primary.pane_id,
+                    "-F",
+                    &condition,
+                    &release,
+                ][..],
+                &[
+                    "if-shell",
+                    "-t",
+                    &primary.pane_id,
+                    "-F",
+                    &clear_lease_condition,
+                    &clear_lease,
+                ],
+            ],
+            deadline,
+        ) else {
+            return;
+        };
         let _ = deadline.run(&mut command);
     }
 
@@ -1634,14 +1806,19 @@ impl Session {
         &self,
         deadline: &crate::tmux::TmuxCommandDeadline,
     ) -> Option<bool> {
-        let mut command = crate::tmux::tmux_command();
-        command.args([
-            "display-message",
-            "-t",
-            &self.name,
-            "-p",
-            "#{session_attached}",
-        ]);
+        let primary = self.primary_with_deadline(deadline).ok()?;
+        let mut command = self
+            .command_with_deadline(
+                [
+                    "display-message",
+                    "-t",
+                    &primary.session_id,
+                    "-p",
+                    "#{session_attached}",
+                ],
+                deadline,
+            )
+            .ok()?;
         let out = deadline.run(&mut command).ok()?;
         if !out.status.success() {
             return None;
@@ -1731,13 +1908,13 @@ impl Session {
     /// load-buffer + paste-buffer with a per-process, per-call buffer name. `-p`
     /// adds bracketed-paste markers when the pane enabled them; `-d` deletes the
     /// buffer on success.
-    fn send_via_paste_buffer(target: &str, text: &str) -> Result<()> {
+    fn send_via_paste_buffer(&self, target: &str, text: &str) -> Result<()> {
         static SEND_COUNTER: AtomicU64 = AtomicU64::new(0);
         let seq = SEND_COUNTER.fetch_add(1, Ordering::Relaxed);
         let buf_name = format!("aoe-send-{}-{}", std::process::id(), seq);
 
-        let mut child = crate::tmux::tmux_command()
-            .args(["load-buffer", "-b", &buf_name, "-"])
+        let mut child = self
+            .command(["load-buffer", "-b", &buf_name, "-"])?
             .stdin(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()?;
@@ -1749,26 +1926,28 @@ impl Session {
             bail!("tmux load-buffer failed (status={:?})", status.code());
         }
 
-        let output = crate::tmux::tmux_command()
-            .args(["paste-buffer", "-d", "-p", "-b", &buf_name, "-t", target])
+        let output = self
+            .command(["paste-buffer", "-d", "-p", "-b", &buf_name, "-t", target])?
             .output()?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             // `-d` only deletes on success.
-            let _ = crate::tmux::tmux_command()
-                .args(["delete-buffer", "-b", &buf_name])
-                .output();
+            let _ = self
+                .command(["delete-buffer", "-b", &buf_name])
+                .and_then(|mut command| command.output());
             bail!("tmux paste-buffer failed: {}", stderr);
         }
 
         Ok(())
     }
 
-    fn tmux_send(target: &str, args: &[&str]) -> Result<()> {
-        let output = crate::tmux::tmux_command()
-            .arg("send-keys")
-            .args(["-t", target])
-            .args(args)
+    fn tmux_send(&self, target: &str, args: &[&str]) -> Result<()> {
+        let output = self
+            .command(
+                ["send-keys", "-t", target]
+                    .into_iter()
+                    .chain(args.iter().copied()),
+            )?
             .output()?;
 
         if !output.status.success() {
@@ -2027,7 +2206,7 @@ mod tests {
     use super::*;
     use crate::tmux::refresh_session_cache;
     use crate::tmux::test_helpers::require_tmux;
-    use crate::tmux::utils::{append_pane_base_index_args, append_remain_on_exit_args};
+    use crate::tmux::utils::append_remain_on_exit_args;
     struct ReadyCaptureProbe {
         captured: std::sync::mpsc::Sender<String>,
         resume: std::sync::mpsc::Receiver<()>,
@@ -2092,44 +2271,6 @@ mod tests {
             .expect("list windows");
         assert!(listed.status.success());
         assert_eq!(String::from_utf8_lossy(&listed.stdout).trim(), "1");
-    }
-
-    struct GlobalPaneBaseIndex(String);
-
-    impl GlobalPaneBaseIndex {
-        fn set(value: &str) -> Self {
-            let read = crate::tmux::tmux_command()
-                .args(["show-options", "-g", "-v", "pane-base-index"])
-                .output()
-                .expect("tmux show-options -g pane-base-index");
-            assert!(
-                read.status.success(),
-                "failed to read the global pane-base-index: {}",
-                String::from_utf8_lossy(&read.stderr)
-            );
-            let previous = String::from_utf8_lossy(&read.stdout).trim().to_string();
-            assert!(
-                !previous.is_empty(),
-                "tmux reported no global pane-base-index to restore"
-            );
-            let applied = crate::tmux::tmux_command()
-                .args(["set-option", "-g", "pane-base-index", value])
-                .output()
-                .expect("tmux set-option -g pane-base-index");
-            assert!(
-                applied.status.success(),
-                "failed to set a global pane-base-index of {value}"
-            );
-            Self(previous)
-        }
-    }
-
-    impl Drop for GlobalPaneBaseIndex {
-        fn drop(&mut self) {
-            let _ = crate::tmux::tmux_command()
-                .args(["set-option", "-g", "pane-base-index", &self.0])
-                .output();
-        }
     }
 
     /// `tmux new-session -d -s <name> -x <cols> -y <rows> <command…>` with the
@@ -2890,6 +3031,16 @@ mod tests {
         );
     }
 
+    fn set_vt_owner_for_test(session: &Session, owner_id: &str) {
+        assert!(session.set_owner_pair_with_deadline(
+            VT_OWNER_OPT,
+            VT_OWNER_HB_OPT,
+            owner_id,
+            next_owner_heartbeat(0),
+            &crate::tmux::TmuxCommandDeadline::new(),
+        ));
+    }
+
     #[test]
     #[serial_test::serial]
     fn vt_owner_lock_claims_rejects_and_releases_independently() {
@@ -2927,12 +3078,11 @@ mod tests {
             pipe_marker.to_string_lossy()
         );
 
-        let deadline = crate::tmux::TmuxCommandDeadline::new();
         assert!(session.arm_vt_pipe_if_owner_with_deadline(
             "pid-3",
             "-IO",
             &pipe_command,
-            &deadline,
+            &crate::tmux::TmuxCommandDeadline::new(),
         ));
         assert!(pane_is_piped());
         for _ in 0..100 {
@@ -2943,10 +3093,9 @@ mod tests {
         }
         assert!(pipe_marker.exists(), "quoted pipe command must run intact");
 
-        session.set_user_option(VT_OWNER_OPT, "pid-4");
-        session.set_user_option(VT_OWNER_HB_OPT, &now_ms().to_string());
-        let deadline = crate::tmux::TmuxCommandDeadline::new();
-        session.release_vt_pipe_owner_with_deadline("pid-3", &deadline);
+        set_vt_owner_for_test(&session, "pid-4");
+        session
+            .release_vt_pipe_owner_with_deadline("pid-3", &crate::tmux::TmuxCommandDeadline::new());
         assert!(session.refresh_vt_owner("pid-4"));
         assert!(!pane_is_piped());
 
@@ -2954,25 +3103,26 @@ mod tests {
             "pid-4",
             "-O",
             &pipe_command,
-            &deadline,
+            &crate::tmux::TmuxCommandDeadline::new(),
         ));
         assert!(!session.arm_vt_pipe_if_owner_with_deadline(
             "pid-3",
             "-O",
             &pipe_command,
-            &deadline,
+            &crate::tmux::TmuxCommandDeadline::new(),
         ));
-        session.release_vt_pipe_owner_with_deadline("pid-3", &deadline);
+        session
+            .release_vt_pipe_owner_with_deadline("pid-3", &crate::tmux::TmuxCommandDeadline::new());
         assert!(session.refresh_vt_owner("pid-4"));
         assert!(pane_is_piped());
 
-        session.set_user_option(VT_OWNER_OPT, "pid-5");
-        session.set_user_option(VT_OWNER_HB_OPT, &now_ms().to_string());
-        session.release_vt_owner_with_deadline("pid-5", &deadline);
+        set_vt_owner_for_test(&session, "pid-5");
+        session.release_vt_owner_with_deadline("pid-5", &crate::tmux::TmuxCommandDeadline::new());
         assert!(!session.refresh_vt_owner("pid-5"));
         assert!(pane_is_piped());
 
-        session.release_vt_pipe_owner_with_deadline("pid-4", &deadline);
+        session
+            .release_vt_pipe_owner_with_deadline("pid-4", &crate::tmux::TmuxCommandDeadline::new());
         assert!(!session.refresh_vt_owner("pid-4"));
         assert!(!pane_is_piped());
         session.release_size_owner("sz");
@@ -3299,7 +3449,7 @@ mod tests {
 
         let mut args = new_session_argv(&session_name, ("80", "24"), "sleep 30");
         append_remain_on_exit_args(&mut args, &session_name);
-        append_pane_base_index_args(&mut args, &session_name);
+
         let output = crate::tmux::tmux_command()
             .args(&args)
             .output()
@@ -3355,12 +3505,12 @@ mod tests {
         let guard = TmuxTestSession::new("aoe_test_capture_multiwin");
         let session_name = guard.name().to_string();
 
-        let mut args = new_session_argv(
+        let args = new_session_argv(
             &session_name,
             ("80", "24"),
             "sh -c 'echo AOE_FIRST_WINDOW; exec sleep 30'",
         );
-        append_pane_base_index_args(&mut args, &session_name);
+
         let output = crate::tmux::tmux_command()
             .args(&args)
             .output()
@@ -3378,9 +3528,7 @@ mod tests {
 
         wait_for_pane_command(&agent_pane, "sleep");
 
-        let session = Session {
-            name: session_name.clone(),
-        };
+        let session = Session::from_name(&session_name);
 
         let content = session
             .capture_pane(10)
@@ -3848,7 +3996,7 @@ mod tests {
 
         let mut args = new_session_argv(&session_name, ("80", "24"), "sleep 30");
         append_remain_on_exit_args(&mut args, &session_name);
-        append_pane_base_index_args(&mut args, &session_name);
+
         let output = crate::tmux::tmux_command()
             .args(&args)
             .output()
@@ -3908,56 +4056,6 @@ mod tests {
         assert!(
             !is_pane_dead(&session_name),
             "status must target the live agent, not the dead active split"
-        );
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn test_status_checks_with_split_panes_and_pane_base_index_1() {
-        require_tmux!();
-
-        let guard = TmuxTestSession::new("aoe_test_splitpbi");
-        let session_name = guard.name().to_string();
-
-        let mut args = new_session_argv(&session_name, ("80", "24"), "sleep 30");
-        append_remain_on_exit_args(&mut args, &session_name);
-        append_pane_base_index_args(&mut args, &session_name);
-        let output = crate::tmux::tmux_command()
-            .args(&args)
-            .output()
-            .expect("tmux new-session");
-        assert!(output.status.success());
-        let agent_pane = only_pane_id(&session_name);
-
-        let _global_pane_base_index = GlobalPaneBaseIndex::set("1");
-
-        let listed = crate::tmux::tmux_command()
-            .args(["list-panes", "-t", &session_name, "-F", "#{pane_index}"])
-            .output()
-            .expect("tmux list-panes");
-        let indices = String::from_utf8_lossy(&listed.stdout);
-        assert!(
-            indices.lines().any(|line| line.trim() == "0"),
-            "the session pin must keep pane 0 addressable under a global \
-             pane-base-index of 1: {indices:?}"
-        );
-
-        let output = crate::tmux::tmux_command()
-            .args(["split-window", "-t", &session_name])
-            .output()
-            .expect("tmux split-window");
-        assert!(output.status.success());
-
-        wait_for_pane_command(&agent_pane, "sleep");
-
-        assert!(
-            !is_pane_dead(&session_name),
-            "is_pane_dead should check pane 0 (sleep) with pane-base-index pinned to 0"
-        );
-
-        assert!(
-            !is_pane_running_shell(&session_name),
-            "is_pane_running_shell should check pane 0 (sleep) with pane-base-index pinned to 0"
         );
     }
 

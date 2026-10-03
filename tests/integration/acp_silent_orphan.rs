@@ -112,6 +112,7 @@ async fn observe_parked_turn(
         None,
         "claude".into(),
         None,
+        _runner.nonce,
     )
     .await
     .expect("attach to the parked runner");

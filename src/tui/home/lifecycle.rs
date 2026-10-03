@@ -299,6 +299,7 @@ impl HomeView {
             pending_live_send_target: live_send::LiveSendTarget::Agent,
             live_send: None,
             live_send_worker: None,
+            live_send_effects: std::sync::Arc::new(std::sync::Mutex::new(())),
             preview_capture_worker: None,
             preview_capture_target: None,
             preview_worker_pulse: None,

@@ -292,6 +292,8 @@ pub struct Instance {
     /// Monotone token; async merges touch lifecycle-owned fields only when this recent.
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub(crate) lifecycle_generation: u64,
+    #[serde(default)]
+    pub(crate) runner_journal: crate::session::runner_journal::RunnerExecutionJournal,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub(crate) prior_tool_session_ids: HashMap<String, PriorToolSession>,
     /// When equal to `agent_session_id`, startup recovery skips automatic resume.

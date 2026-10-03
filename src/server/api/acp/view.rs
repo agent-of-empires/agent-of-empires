@@ -1,6 +1,5 @@
 //! Switching a session between the terminal (tmux) and structured views.
 
-use crate::acp::supervisor::WorktreeIntent;
 use serde::Serialize;
 
 use crate::server::api::{find_instance, instance_exists};
@@ -138,6 +137,13 @@ pub async fn acp_enable(
     }
 
     let agent_name = pick_agent(&state, &instance, instance.agent_name.as_deref()).await;
+    if let Err(error) = state.acp_supervisor.shutdown_and_require_dead(&id).await {
+        return (
+            StatusCode::CONFLICT,
+            format!("Cannot switch execution views before stored executions are stopped: {error}"),
+        )
+            .into_response();
+    }
     if let Err(resp) =
         commit_structured_view(&state, &mut instance, selected_binding.as_ref()).await
     {
@@ -365,25 +371,35 @@ pub async fn acp_disable(
                 instance = adopt_persisted_structured_instance(instance, durable, &profile);
             }
             Ok(Some(_)) => {
-                // The terminal view is already committed, which is also what a
-                // 409'd first attempt committed. A lease is not proof the
-                // runner is dead; it stays owned through `Stopping`, so the
-                // gate runs again here and the queue is only finished once the
-                // runner is proven gone.
-                if state.acp_supervisor.is_owned(&id).await
-                    || state.acp_event_store.highest_seq(&id) > 0
-                {
-                    let retry = state
-                        .acp_supervisor
-                        .shutdown_and_delete(&id, WorktreeIntent::Keep)
-                        .await;
-                    if !matches!(retry, Ok(()) | Err(SupervisorError::UnknownSession(_))) {
+                // Even an idempotent terminal response must prove stored history:
+                // no daemon handle or ACP projection does not mean no execution.
+                let cleanup_projection = state.acp_supervisor.is_owned(&id).await
+                    || state.acp_event_store.highest_seq(&id) > 0;
+                let retry = if cleanup_projection {
+                    state.acp_supervisor.shutdown_and_delete(&id).await
+                } else {
+                    state.acp_supervisor.shutdown_and_require_dead(&id).await
+                };
+                match retry {
+                    Ok(()) => {}
+                    Err(SupervisorError::TeardownPending(_)) => {
                         return (
                             StatusCode::CONFLICT,
-                            format!("Session {id} is still being torn down; retry once it exits"),
+                            format!(
+                            "Session {id} is not proven stopped; retry once its executions exit"
+                        ),
                         )
-                            .into_response();
+                            .into_response()
                     }
+                    Err(error) => {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("Session {id} cleanup failed: {error}"),
+                        )
+                            .into_response()
+                    }
+                }
+                if cleanup_projection {
                     return finish_terminal_switch(&state, &id, instance).await;
                 }
                 return view_response(id, View::Terminal);
@@ -458,31 +474,30 @@ pub async fn acp_disable(
     } else {
         // The pane is about to reopen on this checkout, so it is kept whatever
         // the row said: a launcher still starting is a live process inside it.
-        state
-            .acp_supervisor
-            .shutdown_and_delete(&id, WorktreeIntent::Keep)
-            .await
+        state.acp_supervisor.shutdown_and_delete(&id).await
     };
-    let acp_teardown_proven = match shutdown_result {
-        Ok(()) | Err(SupervisorError::UnknownSession(_)) => true,
-        Err(SupervisorError::TeardownPending(_)) => false,
-        Err(e) => {
-            tracing::warn!(target: "acp.switch", session = %id, "shutdown structured view failed: {e}");
-            true
+    match shutdown_result {
+        Ok(()) => {}
+        Err(SupervisorError::TeardownPending(_)) => {
+            // The view commit prevents respawn, but cannot itself prove death.
+            return (
+                StatusCode::CONFLICT,
+                format!(
+                    "Session {id} is not proven stopped; the switch to the terminal view is \
+                     already committed, retry after its executions exit"
+                ),
+            )
+                .into_response();
         }
-    };
-    if !acp_teardown_proven {
-        // The view switch is already committed, so the only thing left to
-        // settle is the runner: the client gets a retryable conflict rather
-        // than a success it cannot rely on.
-        return (
-            StatusCode::CONFLICT,
-            format!(
-                "Session {id} is still being torn down; the switch to the terminal view is \
-                 already committed, retry after the runner exits"
-            ),
-        )
-            .into_response();
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!(
+                    "Session {id} cleanup failed after the terminal view was committed: {error}"
+                ),
+            )
+                .into_response()
+        }
     }
     finish_terminal_switch(&state, &id, instance).await
 }
@@ -707,90 +722,37 @@ mod tests {
         assert_eq!(adopted.effective_profile(), "work");
     }
 
-    /// A disable refused with 409 has already committed the terminal view, so
-    /// the retry must finish the queue it left open: the ACP projection, the
-    /// supervisor's record, and the tmux pane. Answering 200 without them left
-    /// the session in a state no sweep recovers.
     #[tokio::test]
     #[serial_test::serial]
-    async fn a_refused_disable_is_finished_by_the_retry() {
-        use crate::acp::runner_lifecycle::test_support::FakeProcessControl;
-        use axum::response::IntoResponse;
-        use std::sync::Arc;
-
+    async fn terminal_disable_requires_history_proof_even_without_a_worker_or_projection() {
         let temp = tempfile::tempdir().unwrap();
         let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
-        let profile = "disable-retry";
-        crate::session::create_profile(profile).unwrap();
-        let mut inst =
-            crate::session::Instance::new("retry", temp.path().join("wt").to_str().unwrap());
-        inst.tool = "shell".into();
-        inst.source_profile = profile.into();
-        inst.view = crate::session::View::Structured;
-        inst.acp_session_id = Some("acp-retry".into());
-        let id = inst.id.clone();
-        crate::session::Storage::new_unwatched(profile)
-            .unwrap()
-            .update(|all, _| {
-                all.push(inst.clone());
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let mut instance = Instance::new("uncovered-terminal", project.to_str().unwrap());
+        instance.source_profile = "disable-history".into();
+        instance.view = View::Terminal;
+        instance.tool = "shell".into();
+        instance.runner_journal = Default::default();
+        let id = instance.id.clone();
+        let storage = crate::session::Storage::new_unwatched("disable-history").unwrap();
+        storage
+            .update(|rows, _| {
+                rows.push(instance.clone());
                 Ok(())
             })
             .unwrap();
-
-        let control = Arc::new(FakeProcessControl::default());
-        control.immortal(9271);
-        let state = crate::server::test_support::build_test_app_state_with_process_control(
-            vec![inst.clone()],
-            control.clone(),
-        );
-        state
-            .acp_supervisor
-            .test_install_attached(
-                &id,
-                crate::acp::runner_lifecycle::RunnerIdentity {
-                    pid: 9271,
-                    generation: 1,
-                },
-            )
-            .await;
-        state
-            .acp_event_store
-            .record(&id, 1, &crate::acp::Event::SessionCleared)
+        let state = crate::server::test_support::build_test_app_state(vec![instance]);
+        let response = acp_disable(State(state), Path(id.clone()))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let durable = storage
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.id == id)
             .unwrap();
-
-        let refused = acp_disable(State(state.clone()), Path(id.clone()))
-            .await
-            .into_response();
-        assert_eq!(refused.status(), StatusCode::CONFLICT);
-        assert!(
-            state.acp_event_store.highest_seq(&id) > 0,
-            "the projection outlives the refusal, so the retry has work to do"
-        );
-
-        control.exit(9271);
-        state.acp_supervisor.retry_pending_teardowns().await;
-
-        let finished = acp_disable(State(state.clone()), Path(id.clone()))
-            .await
-            .into_response();
-        assert_eq!(finished.status(), StatusCode::OK);
-        assert_eq!(
-            state.acp_event_store.highest_seq(&id),
-            0,
-            "the retry must drop the projection the refusal left behind"
-        );
-        assert!(
-            !state.acp_supervisor.is_owned(&id).await,
-            "the retry must forget the session"
-        );
-
-        let again = acp_disable(State(state.clone()), Path(id.clone()))
-            .await
-            .into_response();
-        assert_eq!(
-            again.status(),
-            StatusCode::OK,
-            "a settled session stays idempotent"
-        );
+        assert_eq!(durable.view, View::Terminal);
     }
 }

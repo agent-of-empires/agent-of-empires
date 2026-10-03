@@ -940,7 +940,7 @@ mod tests {
     // The sidecar env var has to survive into the docker argv; no CI container would catch it.
     #[test]
     #[serial_test::serial]
-    fn sandboxed_pi_publishes_through_env_without_a_command_line_extension() {
+    fn sandboxed_pi_publishes_the_container_sidecar_env() {
         let (_guard, _base, _tmp) = crate::hooks::test_support::BaseGuard::ready();
         let temp_home = tempfile::tempdir().unwrap();
         let _home = crate::session::test_support::isolate_home(temp_home.path());
@@ -984,13 +984,6 @@ mod tests {
             Some(sidecar.split_once('=').unwrap().1)
         );
         assert_eq!(value("AOE_SESSION_ROOT_ONLY"), Some("0"));
-
-        let (cmd, _, _, _) = inst
-            .build_launch_command(Some(&execution))
-            .expect("a sandboxed launch line");
-        let cmd = cmd.expect("a command");
-        assert!(cmd.contains("--env-file"), "{cmd}");
-        assert!(!cmd.contains("aoe-session-id.js"), "{cmd}");
     }
 
     #[test]

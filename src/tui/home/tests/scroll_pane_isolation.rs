@@ -9,63 +9,18 @@ fn setup_panes(env: &mut TestEnv) {
     env.view.preview_area = Rect::new(30, 0, 100, 40);
 }
 
-/// A live-send env whose preview-capture worker reports the given cursor, so the
-/// alternate-screen wheel-forwarding branch runs without a real full-screen pane.
-fn live_env_with_cursor(cursor: crate::tmux::PaneCursor) -> TestEnv {
-    use crate::tui::home::live_send::{LiveSendState, LiveSendTarget, LiveSendWorker};
+/// Cursor flags select the forwarding branch; its transport is a real raw receiver.
+fn preview_env_with_cursor(cursor: crate::tmux::PaneCursor, live: bool) -> TestEnv {
     let mut env = create_test_env_with_sessions(3);
     setup_panes(&mut env);
     env.view.cursor = 1;
     env.view.update_selected();
-    env.view.live_send = Some(LiveSendState {
-        session_id: "fake".to_string(),
-        title: "fake".to_string(),
-        tmux_name: "fake".to_string(),
-        target: LiveSendTarget::Agent,
-        exit_chords: crate::tui::home::live_send::parse_chord_list(
-            crate::tui::home::live_send::DEFAULT_EXIT_CHORD,
-        ),
-        leader: None,
-    });
-    env.view.live_send_worker = Some(LiveSendWorker::spawn("fake".to_string(), None));
-    env.view
-        .sync_preview_capture_worker(Some("fake".to_string()));
-    env.view.preview_cache.dimensions = (80, 24);
+    let id = cursor_session_id(&env.view).expect("previewed fixture instance");
+    env.install_native_preview_input(&id, super::super::live_send::LiveSendTarget::Agent, live);
     env.view.preview_cache.captured_lines = 200;
     env.view.preview_scroll_offset = 10;
     env.view.preview_cache.cursor = Some(cursor);
-    env.view.preview_cache.capture_target = Some("fake".to_string());
-    env.view.preview_cache.capture_generation = env
-        .view
-        .preview_capture_worker
-        .as_ref()
-        .expect("capture worker")
-        .current_generation_for_test();
-    env
-}
-
-/// Like `live_env_with_cursor` but without entering live-send: the session is merely
-/// previewed, with the capture worker and target set so `forward_wheel_to_preview` takes
-/// the passive one-shot path.
-fn passive_env_with_cursor(cursor: crate::tmux::PaneCursor) -> TestEnv {
-    let mut env = create_test_env_with_sessions(3);
-    setup_panes(&mut env);
-    env.view.cursor = 1;
-    env.view.update_selected();
-    env.view
-        .sync_preview_capture_worker(Some("fake".to_string()));
-    env.view.preview_cache.dimensions = (80, 24);
-    env.view.preview_cache.captured_lines = 200;
-    env.view.preview_scroll_offset = 10;
-    env.view.preview_capture_target = Some("fake".to_string());
-    env.view.preview_cache.cursor = Some(cursor);
-    env.view.preview_cache.capture_target = Some("fake".to_string());
-    env.view.preview_cache.capture_generation = env
-        .view
-        .preview_capture_worker
-        .as_ref()
-        .expect("capture worker")
-        .current_generation_for_test();
+    env.view.preview_text_view.pane = env.view.preview_area;
     env
 }
 
@@ -96,7 +51,8 @@ fn alt_screen_cursor(
 #[test]
 #[serial]
 fn wheel_over_alt_screen_sgr_mouse_pane_forwards_instead_of_scrollback() {
-    let mut env = live_env_with_cursor(alt_screen_cursor(true, true, true));
+    crate::tmux::test_helpers::require_tmux!();
+    let mut env = preview_env_with_cursor(alt_screen_cursor(true, true, true), true);
 
     let up = env.view.handle_scroll_up(50, 10);
     assert!(up, "wheel over a full-screen SGR-mouse pane is handled");
@@ -104,11 +60,14 @@ fn wheel_over_alt_screen_sgr_mouse_pane_forwards_instead_of_scrollback() {
         env.view.preview_scroll_offset, 0,
         "forwarding pins the preview to the live edge, never the normal-buffer history"
     );
+    env.assert_native_input(b"\x1b[<64;21;11M");
 
     env.view.preview_scroll_offset = 10;
     let down = env.view.handle_scroll_down(50, 10);
     assert!(down);
     assert_eq!(env.view.preview_scroll_offset, 0);
+    env.assert_native_input(b"\x1b[<64;21;11M\x1b[<65;21;11M");
+    assert_eq!(env.view.cursor, 1, "forwarded wheel never moves the list");
 }
 
 /// A full-screen app without mouse tracking reads arrows as cursor navigation rather than
@@ -117,7 +76,8 @@ fn wheel_over_alt_screen_sgr_mouse_pane_forwards_instead_of_scrollback() {
 #[test]
 #[serial]
 fn wheel_over_alt_screen_without_mouse_forwards_page_keys() {
-    let mut env = live_env_with_cursor(alt_screen_cursor(true, false, false));
+    crate::tmux::test_helpers::require_tmux!();
+    let mut env = preview_env_with_cursor(alt_screen_cursor(true, false, false), true);
 
     let up = env.view.handle_scroll_up(50, 10);
     assert!(up, "wheel over a full-screen no-mouse pane is handled");
@@ -125,11 +85,17 @@ fn wheel_over_alt_screen_without_mouse_forwards_page_keys() {
         env.view.preview_scroll_offset, 0,
         "arrow-key forwarding pins the preview to the live edge, never the normal-buffer history"
     );
+    env.assert_native_input(b"\x1b[5~");
 
     env.view.preview_scroll_offset = 10;
     let down = env.view.handle_scroll_down(50, 10);
     assert!(down);
     assert_eq!(env.view.preview_scroll_offset, 0);
+    env.assert_native_input(b"\x1b[5~\x1b[6~");
+    assert_eq!(
+        env.view.cursor, 1,
+        "forwarded page keys never move the list"
+    );
 }
 
 /// The wheel is forwarded (pinning the preview to the live edge) over any full-screen
@@ -138,6 +104,7 @@ fn wheel_over_alt_screen_without_mouse_forwards_page_keys() {
 #[test]
 #[serial]
 fn wheel_over_preview_forwards_only_for_alternate_screen() {
+    crate::tmux::test_helpers::require_tmux!();
     // (label, passive preview, cursor, forwards)
     let cases = [
         (
@@ -160,11 +127,7 @@ fn wheel_over_preview_forwards_only_for_alternate_screen() {
         ),
     ];
     for (label, passive, cursor, forwards) in cases {
-        let mut env = if passive {
-            passive_env_with_cursor(cursor)
-        } else {
-            live_env_with_cursor(cursor)
-        };
+        let mut env = preview_env_with_cursor(cursor, !passive);
         assert_eq!(env.view.live_send.is_none(), passive, "{label}");
         assert!(env.view.handle_scroll_up(50, 10), "{label}");
         if forwards {
@@ -176,6 +139,15 @@ fn wheel_over_preview_forwards_only_for_alternate_screen() {
             );
             assert!(env.view.live_send.is_some(), "{label}: still live");
         }
+        let expected: &[u8] = if !forwards {
+            b""
+        } else if cursor.mouse_sgr {
+            b"\x1b[<64;21;11M"
+        } else {
+            b"\x1b[M`5+"
+        };
+        env.assert_native_input(expected);
+        assert_eq!(env.view.cursor, 1, "{label}: list stays selected");
     }
 }
 
@@ -185,27 +157,39 @@ fn wheel_over_preview_forwards_only_for_alternate_screen() {
 #[test]
 #[serial]
 fn forward_mouse_to_preview_tracks_press_through_release() {
+    crate::tmux::test_helpers::require_tmux!();
     use crossterm::event::{KeyModifiers, MouseButton, MouseEventKind};
     // (label, passive preview, drag/release point)
     for (label, passive, (x, y)) in [("live", false, (1, 1)), ("passive", true, (55, 12))] {
         let cursor = alt_screen_cursor(true, true, true);
-        let mut env = if passive {
-            passive_env_with_cursor(cursor)
-        } else {
-            live_env_with_cursor(cursor)
-        };
+        let mut env = preview_env_with_cursor(cursor, !passive);
+        let mut received = Vec::new();
         let steps = [
             (MouseEventKind::Down(MouseButton::Left), (50, 10), Some(0)),
             (MouseEventKind::Drag(MouseButton::Left), (x, y), Some(0)),
             (MouseEventKind::Up(MouseButton::Left), (x, y), None),
         ];
-        for (kind, (col, row), held) in steps {
+        for (step, (kind, (col, row), held)) in steps.into_iter().enumerate() {
             assert!(
                 env.view
                     .forward_mouse_to_preview(kind, KeyModifiers::NONE, col, row),
                 "{label}: {kind:?}"
             );
             assert_eq!(env.view.mouse_forward_btn, held, "{label}: {kind:?}");
+            let (cx, cy) = if step == 0 {
+                (21, 11)
+            } else if passive {
+                (26, 13)
+            } else {
+                (1, 2)
+            };
+            let (button, suffix) = match step {
+                0 => (0, 'M'),
+                1 => (32, 'M'),
+                _ => (0, 'm'),
+            };
+            received.extend_from_slice(format!("\x1b[<{button};{cx};{cy}{suffix}").as_bytes());
+            env.assert_native_input(&received);
         }
         assert!(env.view.drag_state.is_none(), "{label}");
         assert!(env.view.preview_selection.is_none(), "{label}");
@@ -218,6 +202,7 @@ fn forward_mouse_to_preview_tracks_press_through_release() {
 #[test]
 #[serial]
 fn forward_mouse_to_preview_falls_through_without_a_forwardable_press() {
+    crate::tmux::test_helpers::require_tmux!();
     use crossterm::event::{KeyModifiers, MouseButton, MouseEventKind};
     let cases = [
         (
@@ -246,12 +231,13 @@ fn forward_mouse_to_preview_falls_through_without_a_forwardable_press() {
         ),
     ];
     for (label, cursor, kind, modifiers) in cases {
-        let mut env = live_env_with_cursor(cursor);
+        let mut env = preview_env_with_cursor(cursor, true);
         assert!(
             !env.view.forward_mouse_to_preview(kind, modifiers, 50, 10),
             "{label}"
         );
         assert_eq!(env.view.mouse_forward_btn, None, "{label}");
+        env.assert_native_input(b"");
     }
 }
 
@@ -262,9 +248,10 @@ fn forward_mouse_to_preview_falls_through_without_a_forwardable_press() {
 #[test]
 #[serial]
 fn forward_hover_to_preview_reports_once_per_cell() {
+    crate::tmux::test_helpers::require_tmux!();
     let mut cursor = alt_screen_cursor(true, true, true);
     cursor.mouse_all = true;
-    let mut env = live_env_with_cursor(cursor);
+    let mut env = preview_env_with_cursor(cursor, true);
     // The forward maps cells against the previewed pane's rect; give it
     // the preview area like a rendered frame would.
     env.view.preview_text_view.pane = Rect::new(30, 0, 100, 40);
@@ -281,15 +268,17 @@ fn forward_hover_to_preview_reports_once_per_cell() {
     assert_eq!(env.view.hover_forward_cell, None);
     // ...so re-entering the same cell reports it to the agent again.
     assert!(env.view.forward_hover_to_preview(51, 10));
+    env.assert_native_input(b"\x1b[<35;21;11M\x1b[<35;22;11M\x1b[<35;22;11M");
 
     for cursor in [
         alt_screen_cursor(true, true, true),
         alt_screen_cursor(true, false, false),
     ] {
-        let mut env = live_env_with_cursor(cursor);
+        let mut env = preview_env_with_cursor(cursor, true);
         env.view.preview_text_view.pane = Rect::new(30, 0, 100, 40);
         assert!(!env.view.forward_hover_to_preview(50, 10));
         assert_eq!(env.view.hover_forward_cell, None);
+        env.assert_native_input(b"");
     }
 }
 
@@ -325,6 +314,7 @@ fn stage_edge_drag_no_scrollback(env: &mut TestEnv, at_top: bool) {
 #[test]
 #[serial]
 fn autoscroll_forwards_edge_drag_only_to_alternate_screen_agents() {
+    crate::tmux::test_helpers::require_tmux!();
     // (label, cursor, held at top edge, forwards)
     let cases = [
         (
@@ -353,10 +343,20 @@ fn autoscroll_forwards_edge_drag_only_to_alternate_screen_agents() {
         ),
     ];
     for (label, cursor, at_top, forwards) in cases {
-        let mut env = live_env_with_cursor(cursor);
+        let mut env = preview_env_with_cursor(cursor, true);
         stage_edge_drag_no_scrollback(&mut env, at_top);
         assert_eq!(env.view.tick_preview_autoscroll(), forwards, "{label}");
         assert_eq!(env.view.preview_scroll_offset, 0, "{label}");
+        let expected: &[u8] = if !forwards {
+            b""
+        } else if !cursor.mouse_tracking {
+            b"\x1b[5~"
+        } else if at_top {
+            b"\x1b[<64;11;1M"
+        } else {
+            b"\x1b[<65;11;5M"
+        };
+        env.assert_native_input(expected);
     }
 }
 
@@ -480,51 +480,34 @@ fn wheel_over_list_still_moves_list_cursor() {
 #[test]
 #[serial]
 fn wheel_over_list_in_live_mode_does_not_change_selection() {
-    use crate::tui::home::live_send::LiveSendState;
-    let mut env = create_test_env_with_sessions(3);
-    setup_panes(&mut env);
-    env.view.cursor = 1;
-    env.view.update_selected();
-    env.view.live_send = Some(LiveSendState {
-        session_id: "fake".to_string(),
-        title: "fake".to_string(),
-        tmux_name: "fake".to_string(),
-        target: crate::tui::home::live_send::LiveSendTarget::Agent,
-        exit_chords: crate::tui::home::live_send::parse_chord_list(
-            crate::tui::home::live_send::DEFAULT_EXIT_CHORD,
-        ),
-        leader: None,
-    });
+    let mut env = layout_env_with_leader();
 
     let handled = env.view.handle_scroll_down(5, 10);
     assert!(!handled, "list scroll must be a no-op in live mode");
     assert_eq!(env.view.cursor, 1, "selection must not change in live mode");
 }
 
-/// A live-send env with the default Ctrl+B leader armed and the cursor on a real session,
-/// so leader-menu keys route through `handle_live_send_key`.
+/// Native live input keeps leader routing on the selected instance's captured actor.
 fn live_env_with_leader() -> TestEnv {
-    use crate::tui::home::live_send::LiveSendState;
+    let mut env = preview_env_with_cursor(alt_screen_cursor(false, false, false), true);
+    env.view.live_send.as_mut().unwrap().leader =
+        super::super::live_send::parse_chord(super::super::live_send::DEFAULT_LEADER);
+    env
+}
+
+/// Rendering-only live state: no key forwarding or prepared transport is claimed.
+fn layout_env_with_leader() -> TestEnv {
     let mut env = create_test_env_with_sessions(3);
     setup_panes(&mut env);
     env.view.cursor = 1;
     env.view.update_selected();
-    let id = match env.view.flat_items.get(1) {
-        Some(Item::Session { id, .. }) => id.clone(),
-        _ => panic!("fixture should have a session at flat_items[1]"),
-    };
-    env.view.live_send = Some(LiveSendState {
-        session_id: id,
-        title: "session".to_string(),
-        tmux_name: "fake".to_string(),
-        target: crate::tui::home::live_send::LiveSendTarget::Agent,
-        exit_chords: crate::tui::home::live_send::parse_chord_list(
-            crate::tui::home::live_send::DEFAULT_EXIT_CHORD,
-        ),
-        leader: crate::tui::home::live_send::parse_chord(
-            crate::tui::home::live_send::DEFAULT_LEADER,
-        ),
-    });
+    let id = cursor_session_id(&env.view).expect("layout fixture instance");
+    let mut state = live_state_for_instance(
+        env.view.get_instance(&id).unwrap(),
+        super::super::live_send::LiveSendTarget::Agent,
+    );
+    state.leader = super::super::live_send::parse_chord(super::super::live_send::DEFAULT_LEADER);
+    env.view.live_send = Some(state);
     env
 }
 
@@ -537,6 +520,7 @@ fn ctrl(c: char) -> KeyEvent {
 #[test]
 #[serial]
 fn live_leader_b_toggles_sidebar() {
+    crate::tmux::test_helpers::require_tmux!();
     let mut env = live_env_with_leader();
     assert!(!env.view.sidebar_collapsed);
 
@@ -558,6 +542,7 @@ fn live_leader_b_toggles_sidebar() {
     env.view.handle_key(ctrl('b'), None);
     env.view.handle_key(key(KeyCode::Char('b')), None);
     assert!(!env.view.sidebar_collapsed, "leader+b again shows it");
+    env.assert_native_input(b"");
 }
 
 /// Leader follow-ups: `k` opens the palette over live mode, `q` exits, and an unbound or
@@ -566,6 +551,7 @@ fn live_leader_b_toggles_sidebar() {
 #[test]
 #[serial]
 fn live_leader_follow_up_keys() {
+    crate::tmux::test_helpers::require_tmux!();
     // (label, keys, sidebar collapsed before, still live, palette open)
     let cases = [
         (
@@ -608,6 +594,7 @@ fn live_leader_follow_up_keys() {
         assert_eq!(env.view.live_send.is_some(), live, "{label}");
         assert_eq!(env.view.command_palette.is_some(), palette, "{label}");
         assert_eq!(env.view.sidebar_collapsed, collapsed, "{label}");
+        env.assert_native_input(b"");
     }
 }
 
@@ -617,6 +604,7 @@ fn live_leader_follow_up_keys() {
 #[test]
 #[serial]
 fn palette_command_while_live_exits_live() {
+    crate::tmux::test_helpers::require_tmux!();
     let mut env = live_env_with_leader();
     // Open the palette from within live mode via the leader.
     env.view.handle_key(ctrl('b'), None);
@@ -639,6 +627,7 @@ fn palette_command_while_live_exits_live() {
         !env.view.sidebar_collapsed,
         "sidebar was never collapsed, so it stays expanded"
     );
+    env.assert_native_input(b"");
 }
 
 /// Collapsing the sidebar in live mode hands the preview the full width: the sub-rect grows
@@ -649,7 +638,7 @@ fn collapsed_sidebar_gives_preview_full_width() {
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
-    let mut env = live_env_with_leader();
+    let mut env = layout_env_with_leader();
     let theme = crate::tui::styles::load_theme("empire");
 
     let render = |env: &mut TestEnv| {

@@ -239,10 +239,8 @@ fn collect_descendants_from_map(
 }
 
 pub fn get_pane_pid(session_name: &str) -> Option<u32> {
-    // `^.0` targets the agent pane regardless of base-index or extra windows and splits.
-    let target = format!("{session_name}:^.0");
-    let output = crate::tmux::tmux_command()
-        .args(["display-message", "-t", &target, "-p", "#{pane_pid}"])
+    let output = crate::tmux::utils::primary_command(session_name, "#{pane_pid}", false)
+        .ok()?
         .output()
         .ok()?;
 
@@ -306,6 +304,54 @@ pub fn processes_matching(
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         vec![false; n]
+    }
+}
+
+/// Read-only kernel birth observation, not a signalling handle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ProcessIncarnation {
+    pub(crate) pid: u32,
+    pub(crate) group: u32,
+    pub(crate) start: [u64; 2],
+    pub(crate) namespace: [u64; 2],
+}
+
+pub(crate) fn process_namespace() -> std::io::Result<[u64; 2]> {
+    #[cfg(target_os = "linux")]
+    {
+        linux::process_namespace()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        macos::process_namespace()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "process namespace unavailable",
+        ))
+    }
+}
+
+/// Observe a local process birth; missing processes return `None`, inaccessible metadata an error.
+pub fn process_incarnation(pid: u32) -> std::io::Result<Option<ProcessIncarnation>> {
+    if !(2..=i32::MAX as u32).contains(&pid) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid process id",
+        ));
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        platform::process_incarnation(pid)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "process incarnation unavailable",
+        ))
     }
 }
 
@@ -576,37 +622,6 @@ fn signal_process_tree(pid: u32, signal: Signal) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// A child that exited but has not been reaped is a zombie: it holds
-    /// nothing and cannot touch a checkout, so it must not read as alive. The
-    /// supervisor otherwise finds a torn-down runner unprovable forever and
-    /// refuses every destructive call on that session.
-    #[test]
-    #[cfg(unix)]
-    fn a_zombie_child_is_not_alive() {
-        let mut child = Command::new("/bin/sh")
-            .args(["-c", "exit 0"])
-            .spawn()
-            .expect("spawn a child that exits at once");
-        let pid = child.id();
-        // Never call try_wait: that is what reaps. Poll the state instead, so
-        // the pid stays a zombie for the assertions below.
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while !platform::is_terminated(pid) {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "child never became a zombie"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert!(
-            !worker::is_pid_alive(pid) && !worker::is_pid_alive_and_ours(pid),
-            "a zombie holds nothing, so neither liveness probe may call it alive"
-        );
-        // `Drop` for `Child` does not reap, so the zombie would outlive the test
-        // and sit in the process table for the serial tests that follow.
-        let _ = child.wait();
-    }
 
     #[test]
     fn processes_matching_empty_input_is_empty() {

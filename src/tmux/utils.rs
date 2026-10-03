@@ -92,9 +92,130 @@ pub fn append_remain_on_exit_args(args: &mut Vec<String>, target: &str) {
     chain_set_option(args, &["-p", "-t", target, "remain-on-exit", "on"]);
 }
 
-/// Pins pane indices to 0 so `^.0` always targets the agent's pane.
-pub fn append_pane_base_index_args(args: &mut Vec<String>, target: &str) {
-    chain_set_option(args, &["-t", target, "pane-base-index", "0"]);
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PrimaryPane {
+    pub server_id: String,
+    pub session_id: String,
+    pub window_id: String,
+    pub pane_id: String,
+}
+
+pub(crate) fn append_server_incarnation(command: &mut std::process::Command) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static PROCESS_ID: OnceLock<uuid::Uuid> = OnceLock::new();
+    static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+    let proposal = format!(
+        "{}-{:x}",
+        PROCESS_ID.get_or_init(uuid::Uuid::new_v4),
+        NEXT_ID.fetch_add(1, Ordering::Relaxed)
+    );
+    command.args([
+        "set-option",
+        "-soq",
+        "@aoe_server_incarnation",
+        &proposal,
+        ";",
+    ]);
+}
+
+pub(crate) fn primary_command(
+    session: &str,
+    format: &str,
+    initialize: bool,
+) -> std::io::Result<std::process::Command> {
+    if session.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "empty tmux session",
+        ));
+    }
+    let mut result = crate::tmux::tmux_query_command();
+    if initialize {
+        append_server_incarnation(&mut result);
+    }
+    result.args([
+        "display-message",
+        "-p",
+        "-t",
+        &format!("={session}:^"),
+        "-F",
+        &format!("#{{P:#{{?#{{==:#{{pane_index}},#{{pane-base-index}}}},{format},}}}}"),
+    ]);
+    Ok(result)
+}
+
+fn primary_identity_output(
+    session: &str,
+    deadline: &crate::tmux::TmuxCommandDeadline,
+    initialize: bool,
+) -> std::io::Result<std::process::Output> {
+    let mut command = primary_command(
+        session,
+        "#{@aoe_server_incarnation}|#{session_id}|#{window_id}|#{pane_id}",
+        initialize,
+    )?;
+    let output = deadline.run(&mut command)?;
+    if !output.status.success() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        ));
+    }
+    Ok(output)
+}
+
+pub(crate) fn primary_matches(
+    session: &str,
+    primary: &PrimaryPane,
+    deadline: &crate::tmux::TmuxCommandDeadline,
+) -> std::io::Result<bool> {
+    let output = primary_identity_output(session, deadline, false)?;
+    let text = std::str::from_utf8(&output.stdout)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    let mut fields = text.trim().split('|');
+    Ok(fields.next() == Some(primary.server_id.as_str())
+        && fields.next() == Some(primary.session_id.as_str())
+        && fields.next() == Some(primary.window_id.as_str())
+        && fields.next() == Some(primary.pane_id.as_str())
+        && fields.next().is_none())
+}
+
+pub(crate) fn resolve_primary(
+    session: &str,
+    deadline: &crate::tmux::TmuxCommandDeadline,
+) -> std::io::Result<PrimaryPane> {
+    let output = primary_identity_output(session, deadline, true)?;
+    let text = std::str::from_utf8(&output.stdout)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    let mut fields = text.trim().split('|');
+    let (Some(server_id), Some(session_id), Some(window_id), Some(pane_id), None) = (
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+    ) else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "malformed primary pane identity",
+        ));
+    };
+    if server_id.is_empty()
+        || !session_id.starts_with('$')
+        || !window_id.starts_with('@')
+        || !pane_id.starts_with('%')
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "missing primary pane identity",
+        ));
+    }
+    Ok(PrimaryPane {
+        server_id: server_id.to_owned(),
+        session_id: session_id.to_owned(),
+        window_id: window_id.to_owned(),
+        pane_id: pane_id.to_owned(),
+    })
 }
 
 /// Later splits use the real shell rather than the shared server's possibly
@@ -158,7 +279,6 @@ pub(crate) fn append_session_setup_args(
     kind: SessionKind,
 ) {
     append_remain_on_exit_args(args, target);
-    append_pane_base_index_args(args, target);
     append_window_size_args(args, target);
     if let Some(shell) = default_shell {
         append_default_shell_args(args, target, shell);
@@ -251,16 +371,11 @@ pub(crate) enum PaneProbe {
 }
 
 pub(crate) fn probe_pane(session_name: &str) -> PaneProbe {
-    // An empty name would resolve `:^.0` against the current session.
     if session_name.is_empty() {
         return PaneProbe::Missing;
     }
-    // `^.0` is the agent's pane whatever the base-index or active pane.
-    let target = format!("{session_name}:^.0");
-    // Query command: the no-server match reads a localized `strerror`.
-    let Some(output) = crate::tmux::tmux_query_command()
-        .args(["display-message", "-t", &target, "-p", "#{pane_dead}"])
-        .output()
+    let Some(output) = primary_command(session_name, "#{pane_dead}", false)
+        .and_then(|mut command| command.output())
         .ok()
     else {
         return PaneProbe::Unknown;
@@ -284,12 +399,12 @@ pub fn is_pane_dead(session_name: &str) -> bool {
 }
 
 fn display_first_pane(session_name: &str, format: &str) -> Option<String> {
-    let target = format!("{session_name}:^.0");
-    crate::tmux::tmux_command()
-        .args(["display-message", "-t", &target, "-p", format])
+    primary_command(session_name, format, false)
+        .ok()?
         .output()
         .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
 }
 
 pub(crate) fn pane_current_command(session_name: &str) -> Option<String> {
@@ -791,11 +906,11 @@ mod tests {
         require_tmux!();
         let guard = crate::tmux::test_helpers::TmuxTestSession::new("aoe_test_pane_title");
         let name = guard.name();
-        let mut args: Vec<String> = ["new-session", "-d", "-s", name, "sleep", "30"]
+        let args: Vec<String> = ["new-session", "-d", "-s", name, "sleep", "30"]
             .iter()
             .map(|arg| arg.to_string())
             .collect();
-        append_pane_base_index_args(&mut args, name);
+
         assert!(crate::tmux::tmux_command()
             .args(&args)
             .status()

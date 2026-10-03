@@ -311,9 +311,13 @@ impl HomeView {
                     .iter()
                     .map(|repo| PathBuf::from(&repo.worktree_path)),
             );
-            if let Err(error) =
-                crate::session::deletion::ensure_unclaimed_paths(&instance.id, &candidate_paths)
-            {
+            if let Err(error) = crate::session::deletion::ensure_unclaimed_paths(
+                crate::session::deletion::SessionPathOwner {
+                    profile: &target_profile,
+                    session_id: &instance.id,
+                },
+                &candidate_paths,
+            ) {
                 builder::cleanup_instance(
                     &instance,
                     created_worktree.as_ref(),
@@ -942,39 +946,18 @@ impl HomeView {
         Ok(())
     }
 
-    /// Force-remove a session from storage, for rows stuck in Deleting. Worktree and
-    /// branch cleanup are skipped because the original deletion already attempted them;
-    /// tmux and sandbox teardown run off-thread so a hung call cannot block input.
     pub(super) fn force_remove_session(&mut self, session_id: &str) -> anyhow::Result<()> {
-        let instance = self.instances.get(session_id).cloned();
-        self.remove_instance(session_id);
-        self.rebuild_group_trees();
-        self.save()?;
-        self.reload()?;
-
-        if let Some(inst) = instance {
-            std::thread::spawn(move || {
-                if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    inst.kill_all_tmux_sessions_without_lifecycle_row()
-                })) {
-                    tracing::error!(
-                        target: "session.delete",
-                        session_id = %inst.id,
-                        "force_remove tmux teardown panicked: {:?}",
-                        panic
-                    );
-                }
-                if inst.sandbox_info.as_ref().is_some_and(|s| s.enabled) {
-                    let container = crate::containers::DockerContainer::from_session_id(&inst.id);
-                    if let crate::containers::Teardown::Failed(e) = container.teardown(&inst.id) {
-                        tracing::warn!(
-                            target: "session.delete",
-                            session_id = %inst.id,
-                            "force_remove container teardown failed: {}",
-                            e
-                        );
-                    }
-                }
+        self.set_instance_status(session_id, Status::Deleting);
+        if let Some(instance) = self.instances.get(session_id).cloned() {
+            self.deletion_poller.request_deletion(DeletionRequest {
+                session_id: session_id.to_owned(),
+                instance,
+                delete_worktree: false,
+                delete_branch: false,
+                delete_sandbox: true,
+                force_delete: true,
+                detach_hooks: true,
+                keep_scratch: true,
             });
         }
         Ok(())
@@ -1424,7 +1407,6 @@ impl HomeView {
                 session_id: id.to_string(),
                 profile: instance.source_profile.clone(),
                 repo_path: repo_path.to_path_buf(),
-                is_sandboxed: instance.is_sandboxed(),
             },
         );
         Ok(())
@@ -1989,9 +1971,8 @@ impl HomeView {
     /// relocation, runs on the `TrashPoller` and is reconciled by
     /// [`apply_trash_results`](crate::tui::home::HomeView::apply_trash_results): a live
     /// bind mount makes the worktree move fail EBUSY, but `docker stop` blocks for the
-    /// container's grace period, which froze the input thread inline (#1496). A
-    /// structured-view worker is reaped by the daemon reconciler once the row reads
-    /// trashed.
+    /// container's grace period, which froze the input thread inline (#1496).
+    /// The trash worker settles the durable runner journal before teardown.
     pub(super) fn trash_session_by_id(&mut self, id: &str) {
         let Some((profile, mut request_instance)) = self
             .instances
@@ -2009,9 +1990,16 @@ impl HomeView {
             return;
         };
         let acquisition = (|| -> anyhow::Result<_> {
+            let _workspace_lock = crate::session::acquire_session_workspace_claim_lock()?;
             let _identity_lock = acquire_session_identity_lock()?;
             let storage = &storage.reopen_preserving_watch()?;
             let _lifecycle_lock = storage.acquire_instance_lifecycle_lock(id)?;
+            request_instance = storage
+                .load()?
+                .into_iter()
+                .find(|row| row.id == id)
+                .ok_or_else(|| anyhow::anyhow!("session disappeared before trash"))?;
+            request_instance.source_profile = storage.profile().to_owned();
             if request_instance.has_managed_worktree_or_workspace() {
                 let mut candidate_paths =
                     vec![std::path::PathBuf::from(&request_instance.project_path)];
@@ -2024,10 +2012,16 @@ impl HomeView {
                         .iter()
                         .map(|repo| std::path::PathBuf::from(&repo.worktree_path)),
                 );
-                crate::session::deletion::ensure_unclaimed_paths(id, &candidate_paths)
-                    .map_err(|error| anyhow::anyhow!("{error}"))?;
+                crate::session::deletion::ensure_unclaimed_paths(
+                    crate::session::deletion::SessionPathOwner {
+                        profile: storage.profile(),
+                        session_id: id,
+                    },
+                    &candidate_paths,
+                )
+                .map_err(|error| anyhow::anyhow!("{error}"))?;
             }
-            storage.update(|instances, _groups| {
+            storage.update_under_workspace_claim_lock(|instances, _groups| {
                 let stored = instances
                     .iter_mut()
                     .find(|instance| instance.id == id)
@@ -2077,18 +2071,15 @@ impl HomeView {
         let Some(id) = self.selected_session.clone() else {
             return;
         };
-        let Some((profile, owned_trash_generation)) =
-            self.instances.get(&id).filter(|i| i.is_trashed()).map(|i| {
-                let generation = i
-                    .lifecycle_reservation
-                    .as_ref()
-                    .filter(|reservation| reservation.op == LifecycleOperation::Trash)
-                    .map(|reservation| reservation.generation);
-                (i.source_profile.clone(), generation)
-            })
+        let Some(profile) = self
+            .instances
+            .get(&id)
+            .filter(|i| i.is_trashed())
+            .map(|i| i.source_profile.clone())
         else {
             return;
         };
+        let owned_trash_generation = self.trash_poller.owned_generation(&profile, &id);
         // Restore bypasses the generic user-action diff because lifecycle ownership,
         // worktree movement and the durable untrash must stay under the per-instance
         // flock.
@@ -2363,13 +2354,19 @@ enum RestoreFromTrash {
     PersistFailed,
 }
 
-/// Restore under one per-instance lifecycle flock. Acquisition, worktree move,
-/// and durable commit therefore form one serialized transition.
+/// Restore under workspace -> identity -> lifecycle locks.
 fn restore_from_trash_with_storage(
     storage: &Storage,
     id: &str,
     owned_trash_generation: Option<u64>,
 ) -> RestoreFromTrash {
+    let _workspace_claim_lock = match acquire_session_workspace_claim_lock() {
+        Ok(lock) => lock,
+        Err(error) => {
+            tracing::warn!(target: "tui.home", id = %id, "restore workspace claim lock failed: {error}");
+            return RestoreFromTrash::PersistFailed;
+        }
+    };
     let _identity_lock = match acquire_session_identity_lock() {
         Ok(lock) => lock,
         Err(error) => {
@@ -2420,7 +2417,7 @@ fn restore_from_trash_with_storage(
         }
     };
 
-    let loaded = match storage.load() {
+    let loaded = match storage.load_strict_for_worktree_ownership_locked() {
         Ok(all) => all.into_iter().find(|instance| instance.id == id),
         Err(error) => {
             tracing::warn!(target: "tui.home", id = %id, "restore load failed: {error}");
@@ -2436,49 +2433,113 @@ fn restore_from_trash_with_storage(
             return RestoreFromTrash::PersistFailed;
         }
     };
-    let Some(mut instance) = loaded else {
+    let Some(snapshot) = loaded else {
         return RestoreFromTrash::AlreadyGone;
     };
-
-    if let crate::session::trash::RestoreOutcome::Failed { reason } =
-        crate::session::trash::restore_worktree_location(&mut instance)
-    {
-        let _ = storage.update(|instances, _groups| {
-            if let Some(stored) = instances.iter_mut().find(|candidate| candidate.id == id) {
-                stored.release_lifecycle_reservation_if_owned(
-                    LifecycleOperation::Restore,
-                    generation,
-                );
-            }
-            Ok(())
-        });
-        return RestoreFromTrash::WorktreeFailed { reason };
+    if !snapshot.lifecycle_reservation_is_owned(LifecycleOperation::Restore, generation) {
+        return RestoreFromTrash::Busy(crate::session::NEWER_GENERATION_BUSY_REASON.to_string());
     }
-    let restored_path = instance.project_path.clone();
-    let restored_pre = instance.pre_trash_project_path.clone();
-
-    match storage.update(|instances, _groups| {
-        Ok(crate::session::claim::finalize_restore_commit(
-            instances,
-            id,
-            generation,
-            &restored_path,
-            &restored_pre,
-        ))
-    }) {
-        Ok(crate::session::claim::RestoreCommit::Committed) => RestoreFromTrash::Restored {
+    let needs_move = snapshot
+        .pre_trash_project_path
+        .as_ref()
+        .is_some_and(|original| original != &snapshot.project_path);
+    // Inventory reads precede the profile storage flock.
+    if needs_move {
+        let paths = [
+            std::path::PathBuf::from(&snapshot.project_path),
+            std::path::PathBuf::from(snapshot.pre_trash_project_path.as_ref().unwrap()),
+        ];
+        if let Err(error) = crate::session::deletion::ensure_unclaimed_paths(
+            crate::session::deletion::SessionPathOwner {
+                profile: storage.profile(),
+                session_id: id,
+            },
+            &paths,
+        ) {
+            let _ = storage.update(|instances, _groups| {
+                if let Some(stored) = instances.iter_mut().find(|row| row.id == id) {
+                    stored.release_lifecycle_reservation_if_owned(
+                        LifecycleOperation::Restore,
+                        generation,
+                    );
+                }
+                Ok(())
+            });
+            return RestoreFromTrash::WorktreeFailed {
+                reason: format!("worktree ownership could not be verified: {error}"),
+            };
+        }
+    }
+    let result = storage.update(|instances, _groups| {
+        let Some(stored) = instances.iter_mut().find(|row| row.id == id) else {
+            return Ok(RestoreFromTrash::AlreadyGone);
+        };
+        if !stored.lifecycle_reservation_is_owned(LifecycleOperation::Restore, generation)
+            || !restore_plan_unchanged(&snapshot, stored)
+        {
+            stored.release_lifecycle_reservation_if_owned(LifecycleOperation::Restore, generation);
+            return Ok(RestoreFromTrash::Busy(
+                crate::session::NEWER_GENERATION_BUSY_REASON.to_string(),
+            ));
+        }
+        let mut instance = stored.clone();
+        instance.source_profile = storage.profile().to_owned();
+        if let crate::session::trash::RestoreOutcome::Failed { reason } =
+            crate::session::trash::restore_worktree_location(&mut instance)
+        {
+            stored.release_lifecycle_reservation_if_owned(LifecycleOperation::Restore, generation);
+            return Ok(RestoreFromTrash::WorktreeFailed { reason });
+        }
+        let restored_path = instance.project_path;
+        let restored_pre = instance.pre_trash_project_path;
+        anyhow::ensure!(
+            crate::session::claim::finalize_restore_commit(
+                instances,
+                id,
+                generation,
+                &restored_path,
+                &restored_pre,
+            ) == crate::session::claim::RestoreCommit::Committed,
+            "restore reservation was superseded during worktree move",
+        );
+        Ok(RestoreFromTrash::Restored {
             project_path: restored_path,
             pre_trash_project_path: restored_pre,
-        },
-        Ok(crate::session::claim::RestoreCommit::Superseded) => {
-            RestoreFromTrash::Busy(crate::session::NEWER_GENERATION_BUSY_REASON.to_string())
-        }
-        Ok(crate::session::claim::RestoreCommit::AlreadyGone) => RestoreFromTrash::AlreadyGone,
+        })
+    });
+    match result {
+        Ok(outcome) => outcome,
         Err(error) => {
             tracing::warn!(target: "tui.home", id = %id, "restore commit failed: {error}");
+            let _ = storage.update(|instances, _groups| {
+                if let Some(stored) = instances.iter_mut().find(|row| row.id == id) {
+                    stored.release_lifecycle_reservation_if_owned(
+                        LifecycleOperation::Restore,
+                        generation,
+                    );
+                }
+                Ok(())
+            });
             RestoreFromTrash::PersistFailed
         }
     }
+}
+
+fn restore_plan_unchanged(snapshot: &Instance, durable: &Instance) -> bool {
+    snapshot.is_trashed() == durable.is_trashed()
+        && snapshot.project_path == durable.project_path
+        && snapshot.pre_trash_project_path == durable.pre_trash_project_path
+        && snapshot.worktree_info == durable.worktree_info
+        && snapshot.scratch == durable.scratch
+        && snapshot
+            .workspace_info
+            .as_ref()
+            .map(|workspace| (&workspace.workspace_dir, &workspace.repos))
+            == durable
+                .workspace_info
+                .as_ref()
+                .map(|workspace| (&workspace.workspace_dir, &workspace.repos))
+        && snapshot.is_sandboxed() == durable.is_sandboxed()
 }
 
 #[cfg(test)]

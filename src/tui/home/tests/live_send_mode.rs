@@ -1,41 +1,33 @@
-//! Live-send wiring at the home-view level; translation correctness is covered by unit
-//! tests in src/tui/home/live_send.rs. Here: keys are captured while live mode is active,
-//! Ctrl+q clears the state, the per-keystroke liveness check auto-exits on drift, and the
-//! predicate plumbing treats live mode like a modal capture.
+//! Home-view live-send routing: native delivery, clean chord exit, drift handling, and
+//! modal/overlay focus. Pure key translation is covered in live_send.rs.
 
 use super::super::live_send::LiveSendState;
 use super::*;
 
-/// Seed live-send state pointing at the first instance in the env, with a matching
-/// tmux_name so the drift check passes. Drift tests install a missing id or mutate the
-/// title afterwards.
-fn install_live_for_first_session(env: &mut TestEnv) -> String {
-    let id = env
-        .view
+fn first_session_id(env: &TestEnv) -> String {
+    env.view
         .flat_items
         .iter()
         .find_map(|item| match item {
-            crate::session::Item::Session { id, .. } => Some(id.clone()),
+            Item::Session { id, .. } => Some(id.clone()),
             _ => None,
         })
-        .expect("test env has no sessions; use install_live_orphan instead");
-    let inst = env.view.get_instance(&id).unwrap().clone();
-    let tmux_name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
-    // CI runs the e2e suite in the same `cargo test` invocation, which populates the global
-    // tmux session cache, so the drift check would see this fake name as not in tmux and
-    // clear live_send mid-test. Pre-inject it; orphan tests skip this so the
-    // instance-missing branch fires instead.
-    crate::tmux::test_inject_session_into_cache(&tmux_name);
-    env.view.live_send = Some(LiveSendState {
-        session_id: inst.id.clone(),
-        title: inst.title,
-        tmux_name,
-        target: crate::tui::home::live_send::LiveSendTarget::Agent,
-        exit_chords: crate::tui::home::live_send::parse_chord_list(
-            crate::tui::home::live_send::DEFAULT_EXIT_CHORD,
-        ),
-        leader: None,
-    });
+        .expect("test env has no sessions; use install_live_orphan instead")
+}
+
+fn install_native_live_for_first_session(env: &mut TestEnv) -> String {
+    let id = first_session_id(env);
+    env.install_native_preview_input(&id, super::super::live_send::LiveSendTarget::Agent, true);
+    id
+}
+
+/// No input is sent by the controlled failure-mailbox and modal-predicate fixtures.
+fn install_live_state_for_first_session(env: &mut TestEnv) -> String {
+    let id = first_session_id(env);
+    env.view.live_send = Some(live_state_for_instance(
+        env.view.get_instance(&id).unwrap(),
+        super::super::live_send::LiveSendTarget::Agent,
+    ));
     id
 }
 
@@ -60,10 +52,9 @@ fn install_live_orphan(env: &mut TestEnv) {
 #[test]
 #[serial]
 fn poll_live_send_takeover_exits_live_mode_with_dialog() {
-    use crate::tui::home::live_send::LiveSendWorker;
+    crate::tmux::test_helpers::require_tmux!();
     let mut env = create_test_env_with_sessions(1);
-    install_live_for_first_session(&mut env);
-    env.view.live_send_worker = Some(LiveSendWorker::spawn("fake".to_string(), None));
+    install_native_live_for_first_session(&mut env);
 
     // Flag not set: the poll is a no-op and live mode stays.
     assert!(!env.view.poll_live_send_takeover());
@@ -97,6 +88,7 @@ fn poll_live_send_takeover_exits_live_mode_with_dialog() {
 #[test]
 #[serial]
 fn live_mode_keys_exit_on_chord_or_drift() {
+    crate::tmux::test_helpers::require_tmux!();
     let ctrl_q = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL);
     let x = key(KeyCode::Char('x'));
     // (orphaned session, key, stays live, info dialog)
@@ -112,7 +104,7 @@ fn live_mode_keys_exit_on_chord_or_drift() {
             env
         } else {
             let mut env = create_test_env_with_sessions(1);
-            install_live_for_first_session(&mut env);
+            install_native_live_for_first_session(&mut env);
             env
         };
         let action = env.view.handle_key(key_event, None);
@@ -122,6 +114,9 @@ fn live_mode_keys_exit_on_chord_or_drift() {
         }
         assert_eq!(env.view.live_send.is_some(), stays_live, "{case}");
         assert_eq!(env.view.info_dialog.is_some(), dialog, "{case}");
+        if stays_live {
+            env.assert_native_input(b"x");
+        }
     }
 }
 
@@ -130,9 +125,10 @@ fn live_mode_keys_exit_on_chord_or_drift() {
 #[test]
 #[serial]
 fn page_keys_in_live_mode() {
+    crate::tmux::test_helpers::require_tmux!();
     use std::cmp::Ordering;
     let mut env = create_test_env_with_sessions(1);
-    install_live_for_first_session(&mut env);
+    install_native_live_for_first_session(&mut env);
     for (code, mods, start, moves) in [
         (KeyCode::PageUp, KeyModifiers::SHIFT, 0, Ordering::Greater),
         (KeyCode::PageDown, KeyModifiers::SHIFT, 50, Ordering::Less),
@@ -147,23 +143,42 @@ fn page_keys_in_live_mode() {
         );
         assert!(env.view.live_send.is_some(), "{code:?}+{mods:?}");
     }
+    env.assert_native_input(b"\x1b[5~");
 }
 
 #[test]
 #[serial]
 fn drift_check_auto_exits_when_session_renamed() {
-    // A rename that carried the tmux session with it leaves the worker holding a name tmux
-    // no longer has, so the next keystroke auto-exits. Force the cache to the post-rename
-    // state so the id-anchored resolution has nothing stale to adopt.
+    crate::tmux::test_helpers::require_tmux!();
+    // Rename the native session after entry; the captured actor must not silently rebind.
     let mut env = create_test_env_with_sessions(1);
-    let id = install_live_for_first_session(&mut env);
+    let id = install_native_live_for_first_session(&mut env);
     env.view.mutate_instance(&id, |inst| {
         inst.title = "renamed-after-entry".to_string();
     });
     let inst = env.view.get_instance(&id).unwrap().clone();
     let renamed = crate::tmux::Session::generate_name(&inst.id, &inst.title);
-    let guard = crate::tmux::SessionCacheGuard::capture();
-    guard.force_present(&[renamed.as_str()]);
+    let actor = env.view.preview_cache.capture_session.as_ref().unwrap();
+    let deadline = crate::tmux::TmuxCommandDeadline::new();
+    let mut rename = actor
+        .commands_with_deadline(
+            [[
+                "rename-session",
+                "-t",
+                actor.captured_primary().session_id.as_str(),
+                renamed.as_str(),
+            ]],
+            &deadline,
+        )
+        .expect("fenced native rename");
+    assert!(deadline
+        .run(&mut rename)
+        .expect("rename captured session")
+        .status
+        .success());
+    env.native_input.as_mut().unwrap()._guard =
+        crate::tmux::test_helpers::TmuxTestSession::from_name(renamed);
+    crate::tmux::refresh_session_cache();
 
     env.view
         .handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE), None);
@@ -174,17 +189,16 @@ fn drift_check_auto_exits_when_session_renamed() {
 #[test]
 #[serial]
 fn drift_check_stays_when_retitle_did_not_rename_the_tmux_session() {
+    crate::tmux::test_helpers::require_tmux!();
     // #3157: smart rename moves the title while the tmux session keeps its created name.
     // The worker still holds this session's pane, so that is not drift and auto-exiting
     // would kick the user out of a correct pane.
     let mut env = create_test_env_with_sessions(1);
-    let id = install_live_for_first_session(&mut env);
-    let created = env.view.live_send.as_ref().unwrap().tmux_name.clone();
+    let id = install_native_live_for_first_session(&mut env);
     env.view.mutate_instance(&id, |inst| {
         inst.title = "Refactor billing module".to_string();
     });
-    let guard = crate::tmux::SessionCacheGuard::capture();
-    guard.force_present(&[created.as_str()]);
+    crate::tmux::refresh_session_cache();
 
     env.view
         .handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE), None);
@@ -193,41 +207,25 @@ fn drift_check_stays_when_retitle_did_not_rename_the_tmux_session() {
         "a retitle that never reached tmux must not read as drift"
     );
     assert!(env.view.info_dialog.is_none());
+    env.assert_native_input(b"x");
 }
 
 #[test]
 #[serial]
 fn drift_check_does_not_exit_for_tool_target_named_via_tool_session() {
+    crate::tmux::test_helpers::require_tmux!();
     // The Tool arm of the drift check must resolve the current name the way
     // `prepare_live_send` computed `tmux_name` at entry, through
     // `ToolSession::new(..).session_name()`. Re-deriving it through
     // `Session::generate_name`, the agent-pane scheme, made every Tool-view live-send look
     // renamed on its first keystroke.
     let mut env = create_test_env_with_sessions(1);
-    let id = env
-        .view
-        .flat_items
-        .iter()
-        .find_map(|item| match item {
-            crate::session::Item::Session { id, .. } => Some(id.clone()),
-            _ => None,
-        })
-        .expect("test env has one session");
-    let inst = env.view.get_instance(&id).unwrap().clone();
-    let tmux_name = crate::tmux::ToolSession::new(&inst.id, &inst.title, "lazygit")
-        .session_name()
-        .to_string();
-    crate::tmux::test_inject_session_into_cache(&tmux_name);
-    env.view.live_send = Some(LiveSendState {
-        session_id: inst.id.clone(),
-        title: inst.title,
-        tmux_name,
-        target: crate::tui::home::live_send::LiveSendTarget::Tool("lazygit".to_string()),
-        exit_chords: crate::tui::home::live_send::parse_chord_list(
-            crate::tui::home::live_send::DEFAULT_EXIT_CHORD,
-        ),
-        leader: None,
-    });
+    let id = first_session_id(&env);
+    env.install_native_preview_input(
+        &id,
+        super::super::live_send::LiveSendTarget::Tool("lazygit".to_owned()),
+        true,
+    );
 
     env.view
         .handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE), None);
@@ -237,6 +235,7 @@ fn drift_check_does_not_exit_for_tool_target_named_via_tool_session() {
         "first keystroke in a Tool-view live-send must not trip spurious drift"
     );
     assert!(env.view.info_dialog.is_none());
+    env.assert_native_input(b"x");
 }
 
 /// Live mode counts as a modal capture: every predicate gated on has_dialog() (mouse
@@ -325,7 +324,7 @@ fn has_non_live_send_overlay_false_in_pure_live_mode() {
     // preview-only fast path (#1495) it was meant to enable. `has_non_live_send_overlay()`
     // is what the fast path gates on, and in pure live mode it must be false.
     let mut env = create_test_env_with_sessions(1);
-    install_live_for_first_session(&mut env);
+    install_live_state_for_first_session(&mut env);
     assert!(env.view.has_dialog(), "has_dialog includes live_send");
     assert!(
         !env.view.has_non_live_send_overlay(),
@@ -340,9 +339,10 @@ fn has_non_live_send_overlay_false_in_pure_live_mode() {
 #[test]
 #[serial]
 fn paste_routes_to_rename_dialog_opened_over_live_send() {
+    crate::tmux::test_helpers::require_tmux!();
     let mut env = create_test_env_with_sessions(1);
     env.view.update_selected();
-    install_live_for_first_session(&mut env);
+    install_native_live_for_first_session(&mut env);
     env.view.open_rename_for_selected();
     assert!(env.view.rename_dialog.is_some());
     assert!(
@@ -357,22 +357,24 @@ fn paste_routes_to_rename_dialog_opened_over_live_send() {
         "pasted-title",
         "paste must land in the dialog's focused input, not the pane behind it"
     );
+    env.assert_native_input(b"");
 }
 
-/// Companion pin: with live-send active and no overlay on top, paste keeps streaming to the
-/// pane. The fixture has no worker attached, so the observable contract is that the
-/// live-send branch consumes it, buffering nothing into a dialog or pending_paste.
+/// With live-send active and no overlay, paste reaches the native raw pane and buffers
+/// nothing into a dialog or pending_paste.
 #[test]
 #[serial]
 fn paste_in_pure_live_mode_is_consumed_by_live_send() {
+    crate::tmux::test_helpers::require_tmux!();
     let mut env = create_test_env_with_sessions(1);
     env.view.update_selected();
-    install_live_for_first_session(&mut env);
+    install_native_live_for_first_session(&mut env);
 
     env.view.handle_paste("streamed to pane");
 
     assert!(env.view.send_message_dialog.is_none());
     assert!(env.view.pending_paste.is_none());
+    env.assert_native_input(b"streamed to pane");
 }
 
 /// A finalized preview highlight installed via a mouse drag, which never runs through
@@ -382,9 +384,10 @@ fn paste_in_pure_live_mode_is_consumed_by_live_send() {
 #[test]
 #[serial]
 fn paste_into_dialog_over_live_send_clears_preview_selection() {
+    crate::tmux::test_helpers::require_tmux!();
     let mut env = create_test_env_with_sessions(1);
     env.view.update_selected();
-    install_live_for_first_session(&mut env);
+    install_native_live_for_first_session(&mut env);
     env.view.preview_selection = Some(PreviewSelection {
         anchor: (0, 0),
         extent: (4, 2),
@@ -407,6 +410,7 @@ fn paste_into_dialog_over_live_send_clears_preview_selection() {
         env.view.rename_dialog.as_ref().unwrap().title_value(),
         "pasted-title"
     );
+    env.assert_native_input(b"");
 }
 
 #[test]
@@ -416,7 +420,7 @@ fn refresh_preserves_cache_when_live_capture_fails() {
     use std::time::Duration;
 
     let mut env = create_test_env_with_sessions(1);
-    let id = install_live_for_first_session(&mut env);
+    let id = install_live_state_for_first_session(&mut env);
     env.view.selected_session = Some(id.clone());
     let (capture_tx, capture_rx) = std::sync::mpsc::channel();
     let (worker, completed) =

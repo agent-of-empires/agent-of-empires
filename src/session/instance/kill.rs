@@ -103,9 +103,8 @@ impl Instance {
         }
     }
 
-    /// Tear down the current tmux session cleanly so a fresh `start_with_size_opts` can recreate
-    /// it.
-    pub(super) fn kill_clean_locked(&self) -> Result<()> {
+    /// Stop the pane and poller under the existing lifecycle lock.
+    pub(crate) fn kill_clean_locked(&self) -> Result<()> {
         let session = self.tmux_session()?;
         // The poller watches this pane, so it goes before the pane does, whether or not the pane
         // is still there to kill.
@@ -131,32 +130,6 @@ impl Instance {
         session.kill()?;
         std::thread::sleep(std::time::Duration::from_millis(100));
         Ok(())
-    }
-
-    pub(crate) fn kill_clean(&self) -> Result<()> {
-        let profile = self.effective_profile();
-        let storage = crate::session::storage::Storage::open(&profile, self.resolve_file_watch())
-            .context("failed to open lifecycle lock storage")?;
-        let _lifecycle_lock = storage
-            .acquire_instance_lifecycle_lock(&self.id)
-            .context("failed to acquire instance kill lock")?;
-        let mut lifecycle = self.clone();
-        lifecycle.acquire_lifecycle_reservation(&storage, LifecycleOperation::Stop, None)?;
-        match self.kill_clean_locked() {
-            Ok(()) => lifecycle.commit_lifecycle_status(
-                &storage,
-                LifecycleOperation::Stop,
-                Status::Stopped,
-            ),
-            Err(error) => {
-                let _ = lifecycle.commit_lifecycle_status(
-                    &storage,
-                    LifecycleOperation::Stop,
-                    Status::Error,
-                );
-                Err(error)
-            }
-        }
     }
 
     pub(crate) fn kill_locked(&self) -> Result<()> {

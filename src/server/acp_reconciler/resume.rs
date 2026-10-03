@@ -132,6 +132,27 @@ async fn admit(
     }
 }
 
+async fn retire_captured_record(record: &worker_registry::WorkerRecord) -> bool {
+    let identity = crate::acp::runner_lifecycle::RunnerIdentity {
+        pid: record.pid,
+        generation: record.generation,
+        launch_nonce: record.launch_nonce,
+    };
+    match crate::session::runner_journal::settle_captured_ticket(
+        &record.session_id,
+        identity,
+        false,
+    )
+    .await
+    {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::warn!(session = %record.session_id, %error, "captured runner execution not retired; retained");
+            false
+        }
+    }
+}
+
 pub(super) async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> ResumeOutcome {
     let id = target.id.clone();
     let in_flight_turn = target.in_flight_turn;
@@ -182,48 +203,65 @@ pub(super) async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> Re
                         .find(|i| i.id == id)
                         .and_then(|i| i.sandbox_info.clone())
                 };
+                let attach_lease = reservation.lease().clone();
+                let issuance = reservation.execution_admission();
                 let attach = state.acp_supervisor.attach_inner(
-                    id.clone(),
-                    PathBuf::from(&target.project_path),
-                    vec![],
-                    in_flight_turn,
-                    sandbox,
+                    crate::acp::supervisor::AttachRequest {
+                        session_id: id.clone(),
+                        cwd: PathBuf::from(&target.project_path),
+                        additional_dirs: vec![],
+                        in_flight_turn,
+                        sandbox,
+                    },
+                    &record,
                     reservation,
                 );
-                match timeout(Duration::from_secs(3), attach).await {
-                    Ok(Ok(())) => {
-                        // Flagged only once attached: a failed attach respawns on the current binary.
-                        if decision == AdoptDecision::AdoptStaleForDrain {
-                            state.acp_supervisor.mark_build_respawn_pending(&id);
-                        }
-                        tracing::info!(
-                            target: "acp.supervisor",
-                            session = %id,
-                            pid = record.pid,
-                            in_flight_turn,
-                            "reattached to existing structured view runner"
-                        );
-                        if in_flight_turn {
-                            seed_in_flight_status(&state, &id).await;
-                        }
-                        return ResumeOutcome::Attached;
-                    }
+                let outcome = timeout(Duration::from_secs(3), attach).await;
+                let installed = state.acp_supervisor.worker_state(&id).await
+                    == crate::daemon::AcpWorkerState::Running;
+                let attached = match outcome {
+                    Ok(Ok(())) => true,
                     Ok(Err(SupervisorError::SpawnCancelled(_))) => {
                         return ResumeOutcome::SpawnFinished
                     }
-                    Ok(Err(e)) => {
-                        tracing::warn!(target: "acp.supervisor", session = %id, "attach failed; terminating the worker and falling back to fresh spawn: {e}");
-                        worker_registry::terminate_and_wait(&id).await;
+                    Ok(Err(_)) | Err(_) if installed => true,
+                    Ok(Err(error)) => {
+                        tracing::warn!(target: "acp.supervisor", session = %id, "attach failed; retiring the captured worker before fallback: {error}");
+                        if issuance.snapshot().is_some() {
+                            return ResumeOutcome::AttachFallbackPending {
+                                lease: attach_lease,
+                            };
+                        }
+                        if !retire_captured_record(&record).await {
+                            return ResumeOutcome::SpawnFinished;
+                        }
+                        false
                     }
                     Err(_) => {
-                        tracing::warn!(target: "acp.supervisor", session = %id, "attach timed out after 3s; terminating the worker and falling back to fresh spawn");
-                        worker_registry::terminate_and_wait(&id).await;
+                        tracing::warn!(target: "acp.supervisor", session = %id, "attach timed out after 3s; retiring the captured worker before fallback");
+                        if issuance.snapshot().is_some() {
+                            return ResumeOutcome::AttachFallbackPending {
+                                lease: attach_lease,
+                            };
+                        }
+                        if !retire_captured_record(&record).await {
+                            return ResumeOutcome::SpawnFinished;
+                        }
                         return ResumeOutcome::RetryAfterAttachTimeout;
                     }
+                };
+                if attached {
+                    if decision == AdoptDecision::AdoptStaleForDrain {
+                        state.acp_supervisor.mark_build_respawn_pending(&id);
+                    }
+                    tracing::info!(target: "acp.supervisor", session = %id, pid = record.pid, in_flight_turn, "reattached to existing structured view runner");
+                    if in_flight_turn {
+                        seed_in_flight_status(&state, &id).await;
+                    }
+                    return ResumeOutcome::Attached;
                 }
-                // The failed attach released its lease; the spawn needs one that counts toward capacity.
                 reservation = match admit(&state, &id, ResumeKind::Spawn).await {
-                    Ok(r) => r,
+                    Ok(reservation) => reservation,
                     Err(outcome) => return outcome,
                 };
             }
@@ -235,7 +273,9 @@ pub(super) async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> Re
                     new_runner_version = worker_registry::RUNNER_VERSION,
                     "replacing incompatible structured view runner"
                 );
-                worker_registry::terminate_and_wait(&id).await;
+                if !retire_captured_record(&record).await {
+                    return ResumeOutcome::SpawnFinished;
+                }
             }
             AdoptDecision::RespawnStaleIdle => {
                 tracing::info!(
@@ -245,10 +285,15 @@ pub(super) async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> Re
                     new_build = crate::build_info::BUILD_VERSION,
                     "respawning idle build-stale structured view worker on current binary"
                 );
-                worker_registry::terminate_and_wait(&id).await;
+                if !retire_captured_record(&record).await {
+                    return ResumeOutcome::SpawnFinished;
+                }
             }
-            // A dead record can still hold a live pid whose socket vanished.
-            AdoptDecision::FreshSpawn => worker_registry::terminate_and_wait(&id).await,
+            AdoptDecision::FreshSpawn => {
+                if !retire_captured_record(&record).await {
+                    return ResumeOutcome::SpawnFinished;
+                }
+            }
         }
     }
 
@@ -492,21 +537,65 @@ pub(super) async fn respawn_drained_stale_workers(state: &Arc<AppState>) {
             continue;
         }
         tracing::info!(target: "acp.supervisor", session = %id, reason = "build_stale", "stale structured view worker drained; respawning");
-        let generation = state
-            .acp_supervisor
-            .running_identity(&id)
+        let identity = state.acp_supervisor.running_identity(&id);
+        let record = worker_registry::load(&id).ok().flatten();
+        let generation = identity
             .map(|identity| identity.generation)
-            .or_else(|| {
-                worker_registry::load(&id)
-                    .ok()
-                    .flatten()
-                    .map(|r| r.generation)
-            });
-        // With nothing naming the runner, a marker written by the stop that removed the record stands.
+            .or_else(|| record.as_ref().map(|record| record.generation));
         if let Some(generation) = generation {
             worker_registry::mark_restart_pending(&id, generation);
         }
-        worker_registry::terminate_and_wait(&id).await;
+        let stopped = if let Some(identity) = identity {
+            let lookup = id.clone();
+            let profile = match tokio::task::spawn_blocking(move || {
+                crate::session::runner_journal::unique_stored_owner(&lookup)
+            })
+            .await
+            {
+                Ok(Ok(profile)) => profile,
+                _ => continue,
+            };
+            let owner = crate::session::deletion::SessionPathOwner {
+                profile: &profile,
+                session_id: &id,
+            };
+            let result = match identity.launch_nonce {
+                Some(nonce) => {
+                    crate::session::runner_journal::settle_nonce(owner, nonce, None).await
+                }
+                None => crate::session::runner_journal::require_quiescent(owner, None).await,
+            };
+            result.is_ok()
+                && worker_registry::delete_if_owned_by(
+                    &id,
+                    identity.pid,
+                    identity.generation,
+                    identity.launch_nonce,
+                )
+        } else if let Some(record) = record {
+            retire_captured_record(&record).await
+        } else {
+            let lookup = id.clone();
+            match tokio::task::spawn_blocking(move || {
+                crate::session::runner_journal::unique_stored_owner(&lookup)
+            })
+            .await
+            {
+                Ok(Ok(profile)) => crate::session::runner_journal::require_quiescent(
+                    crate::session::deletion::SessionPathOwner {
+                        profile: &profile,
+                        session_id: &id,
+                    },
+                    None,
+                )
+                .await
+                .is_ok(),
+                _ => false,
+            }
+        };
+        if !stopped {
+            continue;
+        }
         state.acp_supervisor.clear_respawn_pending(&id);
     }
 }
@@ -688,32 +777,6 @@ mod tests {
             &events[0],
             crate::acp::state::Event::Stopped { reason } if reason == "runner_protocol_upgraded"
         ));
-    }
-
-    /// An adopted stale runner's restart marker keeps the generation it stopped.
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn a_drained_stale_respawn_keeps_the_restart_marker_of_its_generation() {
-        let (_home, state, _project) = test_state("s-drain");
-        let identity = crate::acp::runner_lifecycle::RunnerIdentity {
-            pid: 4242,
-            generation: 4,
-        };
-        state
-            .acp_supervisor
-            .test_install_attached("s-drain", identity)
-            .await;
-        for id in ["s-drain", "s-drain-gone"] {
-            state.acp_supervisor.mark_build_respawn_pending(id);
-            worker_registry::mark_restart_pending(id, 4);
-        }
-
-        respawn_drained_stale_workers(&state).await;
-
-        for id in ["s-drain", "s-drain-gone"] {
-            assert_eq!(worker_registry::peek_restart_marker(id), Some(4), "{id}");
-        }
-        assert!(state.acp_supervisor.respawn_pending_ids().is_empty());
     }
 
     #[tokio::test]

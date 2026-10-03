@@ -969,9 +969,13 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                 .iter()
                 .map(|repo| PathBuf::from(&repo.worktree_path)),
         );
-        if let Err(error) =
-            crate::session::deletion::ensure_unclaimed_paths(&instance.id, &candidate_paths)
-        {
+        if let Err(error) = crate::session::deletion::ensure_unclaimed_paths(
+            crate::session::deletion::SessionPathOwner {
+                profile: storage.profile(),
+                session_id: &instance.id,
+            },
+            &candidate_paths,
+        ) {
             cleanup_partial_session_under_locks(
                 &path,
                 instance.worktree_info.as_ref(),

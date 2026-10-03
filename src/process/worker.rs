@@ -12,7 +12,7 @@ pub fn is_pid_alive(pid: u32) -> bool {
     use nix::sys::signal::kill;
     use nix::unistd::Pid;
     match kill(Pid::from_raw(pid as i32), None) {
-        Ok(()) => !crate::process::platform::is_terminated(pid),
+        Ok(()) => true,
         Err(Errno::ESRCH) => false,
         Err(_) => true,
     }
@@ -28,10 +28,7 @@ pub fn is_pid_alive(_pid: u32) -> bool {
 pub fn is_pid_alive_and_ours(pid: u32) -> bool {
     use nix::sys::signal::kill;
     use nix::unistd::Pid;
-    // Same rule as `is_pid_alive`, and this is the one the supervisor's
-    // `ProcessControl` actually calls: a zombie answers to signal 0, holds
-    // nothing, and must not make a torn-down runner unprovable forever.
-    kill(Pid::from_raw(pid as i32), None).is_ok() && !crate::process::platform::is_terminated(pid)
+    kill(Pid::from_raw(pid as i32), None).is_ok()
 }
 
 #[cfg(not(unix))]
@@ -39,15 +36,13 @@ pub fn is_pid_alive_and_ours(_pid: u32) -> bool {
     false
 }
 
-/// Whether a process group still runs anything. A group made only of zombies is
-/// dead, and a group whose members cannot be enumerated is alive: the caller
-/// uses this to authorise a teardown, so absence has to be proven, not assumed.
+/// Kernel-group proofs ignore zombies and fail closed on observation errors.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub fn is_process_group_alive(pgid: u32) -> bool {
     if pgid == 0 {
         return false;
     }
-    if is_pid_alive_and_ours(pgid) {
+    if is_pid_alive_and_ours(pgid) && !crate::process::platform::is_terminated(pgid) {
         return true;
     }
     use nix::errno::Errno;
@@ -164,7 +159,8 @@ pub fn kill_process_group(pid: u32) {
 #[cfg(unix)]
 pub fn kill_own_process_group_if_leader(own_pid: u32) -> bool {
     use nix::unistd::{getpgrp, getpid};
-    if getpgrp() == getpid() {
+    let pid = getpid();
+    if own_pid == pid.as_raw() as u32 && getpgrp() == pid {
         kill_process_group(own_pid);
         true
     } else {
@@ -291,68 +287,90 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    /// The teardown question is whether the group still runs anything, and a
-    /// dead leader does not answer it: the agent it started can outlive it. The
-    /// zombie rule that keeps a torn-down runner provable must not extend to the
-    /// group, or a live descendant is missed and its checkout removed.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_zombie_only_group_is_quiescent_before_its_leader_is_reaped() {
+        struct Reap(std::process::Child);
+        impl Drop for Reap {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let mut command = std::process::Command::new("/bin/sh");
+        command.args(["-c", "exit 0"]);
+        crate::process::configure_process_group(&mut command);
+        let mut child = Reap(command.spawn().unwrap());
+        let pid = child.0.id();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !crate::process::platform::is_terminated(pid) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "child must become an observable zombie"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(nix::sys::signal::kill(nix::unistd::Pid::from_raw(-(pid as i32)), None).is_ok());
+        assert!(
+            !is_process_group_alive(pid),
+            "zombies cannot keep the checkout in use"
+        );
+        assert!(child.0.wait().unwrap().success());
+    }
+
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn a_dead_leader_does_not_hide_a_live_member_of_its_group() {
-        // `setsid` makes the process lead a fresh group, so killing it leaves
-        // that group populated by the background child.
+        struct ReapGroup(std::process::Child);
+        impl Drop for ReapGroup {
+            fn drop(&mut self) {
+                let _ = nix::sys::signal::killpg(
+                    nix::unistd::Pid::from_raw(self.0.id() as i32),
+                    nix::sys::signal::Signal::SIGKILL,
+                );
+                let _ = self.0.wait();
+            }
+        }
         let mut command = std::process::Command::new("/bin/sh");
         command.args(["-c", "sleep 30 & echo $!; wait"]);
-        // The shell leads its own group, so killing it leaves that group
-        // populated by the background child. The crate's own helper does this
-        // on both supported targets; `setsid` would only exist on Linux.
         crate::process::configure_process_group(&mut command);
-        let mut leader = command
-            .stdout(std::process::Stdio::piped())
-            .spawn()
-            .expect("spawn a group leader with a background child");
+        let mut leader = ReapGroup(
+            command
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
         let mut line = String::new();
         {
             use std::io::{BufRead, BufReader};
-            let stdout = leader.stdout.take().expect("piped stdout");
-            BufReader::new(stdout)
+            BufReader::new(leader.0.stdout.take().unwrap())
                 .read_line(&mut line)
-                .expect("read the background pid");
+                .unwrap();
         }
-        let child: u32 = line.trim().parse().expect("the shell prints its child pid");
-        let pid = leader.id();
-
-        // Kill the leader outright: the child keeps running in the group.
-        let _ = nix::sys::signal::kill(
-            nix::unistd::Pid::from_raw(pid as i32),
-            nix::sys::signal::Signal::SIGKILL,
-        );
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while is_pid_alive_and_ours(pid) && std::time::Instant::now() < deadline {
+        let child: u32 = line.trim().parse().unwrap();
+        let pid = leader.0.id();
+        leader.0.kill().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !crate::process::platform::is_terminated(pid) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "leader must become an observable zombie"
+            );
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-
-        // The group still exists and its child is running, so the group probe
-        // must say alive even though the leader is gone. Probed before the
-        // child is killed, or it would answer about an empty group.
+        assert!(is_pid_alive(child));
         assert!(
-            !is_pid_alive_and_ours(pid),
-            "the leader has to be gone for this to test anything"
+            is_process_group_alive(pid),
+            "the live descendant keeps the checkout in use"
         );
-        // Through the trait the supervisor actually calls: a probe that only
-        // asked about the leader would answer dead here.
+        leader.0.wait().expect("reap group leader");
+        assert!(crate::process::platform::process_incarnation(pid)
+            .unwrap()
+            .is_none());
         assert!(
-            {
-                use crate::acp::runner_lifecycle::ProcessControl as _;
-                crate::acp::runner_lifecycle::SystemProcessControl.is_group_alive(pid)
-            },
-            "a live member of the group keeps it alive"
+            is_process_group_alive(pid),
+            "a reaped leader does not release a group with a live descendant"
         );
-
-        let _ = nix::sys::signal::kill(
-            nix::unistd::Pid::from_raw(child as i32),
-            nix::sys::signal::Signal::SIGKILL,
-        );
-        let _ = leader.wait();
     }
     #[test]
     fn is_pid_alive_separates_this_process_from_an_unused_pid() {

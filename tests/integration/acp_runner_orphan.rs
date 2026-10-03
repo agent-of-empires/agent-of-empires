@@ -10,10 +10,8 @@
 //!
 //! These spawn a real runner with `cat` as a trivial long-lived fake agent
 //! (it blocks reading stdin, which the runner keeps open). The runner is
-//! spawned WITHOUT `setsid` here (only the daemon sets that up in
-//! production), so it takes the non-group-leader fallback teardown path,
-//! which is safe under the test's own process group, and is exactly the
-//! path where the superseded-delete bug lived.
+//! spawned in its own process group, with its real birth durably published
+//! before authorization, just like the managed production runner.
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
@@ -62,10 +60,10 @@ fn spawn_runner_and_wait_for_record(home: &Path, xdg: &Path, session_id: &str) -
     let socket = workers.join(format!("{session_id}.sock"));
     let record = workers.join(format!("{session_id}.json"));
 
-    let bin = env!("CARGO_BIN_EXE_aoe");
-    let mut child = Command::new(bin)
+    let launch = crate::common::RunnerLaunchFixture::new(home, xdg, "main", session_id, 0);
+    let mut child = launch
+        .command()
         .args([
-            "__acp-runner",
             "--socket",
             socket.to_str().unwrap(),
             "--session-id",
@@ -83,6 +81,7 @@ fn spawn_runner_and_wait_for_record(home: &Path, xdg: &Path, session_id: &str) -
         .env("AOE_ACP_WATCHDOG_POLL_MS", "150")
         .spawn()
         .expect("spawn acp runner");
+    launch.authorize(&mut child);
 
     let deadline = Instant::now() + Duration::from_secs(10);
     while !record.exists() {
@@ -91,6 +90,7 @@ fn spawn_runner_and_wait_for_record(home: &Path, xdg: &Path, session_id: &str) -
         }
         if Instant::now() > deadline {
             let _ = child.kill();
+            let _ = child.wait();
             panic!(
                 "runner never wrote its registry record at {}",
                 record.display()
@@ -110,6 +110,7 @@ fn assert_exits_within(child: &mut Child, secs: u64, what: &str) {
         }
         if Instant::now() > deadline {
             let _ = child.kill();
+            let _ = child.wait();
             panic!("{what}");
         }
         std::thread::sleep(Duration::from_millis(100));

@@ -35,7 +35,7 @@ pub(super) struct RunnerShared {
     /// Sent resets remain authoritative until their response is committed.
     pub(super) pending_resets: AtomicUsize,
     pub(super) reset_finished: tokio::sync::Notify,
-    pub(super) registry_owner: Option<(String, u32)>,
+    pub(super) registry_owner: Option<(String, u32, u64, uuid::Uuid)>,
     /// A durability failure makes further runner state unsafe to expose.
     pub(super) fatal: AtomicBool,
     pub(super) fatal_wake: tokio::sync::Notify,
@@ -193,7 +193,7 @@ pub(super) async fn write_control_frame(
 pub(super) const MAX_OUTSTANDING_REQUESTS: usize = 1024;
 
 impl RunnerShared {
-    pub(super) fn new(registry_owner: Option<(String, u32)>) -> Self {
+    pub(super) fn new(registry_owner: Option<(String, u32, u64, uuid::Uuid)>) -> Self {
         Self {
             prompt_requests: Mutex::new(HashSet::new()),
             control: Mutex::new(ControlChannel::default()),
@@ -219,12 +219,16 @@ impl RunnerShared {
         &self,
         acp_session_id: &str,
     ) -> std::result::Result<(), control_protocol::JsonRpcError> {
-        let Some((session_id, owner_pid)) = self.registry_owner.as_ref() else {
+        let Some((session_id, owner_pid, generation, nonce)) = self.registry_owner.as_ref() else {
             return Ok(());
         };
-        if let Err(error) =
-            worker_registry::update_stored_acp_session_id(session_id, *owner_pid, acp_session_id)
-        {
+        if let Err(error) = worker_registry::update_stored_acp_session_id(
+            session_id,
+            *owner_pid,
+            *generation,
+            *nonce,
+            acp_session_id,
+        ) {
             warn!(
                 target: "acp.runner",
                 session = %session_id,
@@ -710,10 +714,12 @@ impl RunnerShared {
         &self,
         out: &mut Option<tokio::net::unix::OwnedWriteHalf>,
         session_id: &str,
+        launch_nonce: uuid::Uuid,
     ) -> bool {
         let hello = ControlBody::Hello {
             control_protocol_version: control_protocol::CONTROL_PROTOCOL_VERSION,
             session_id: session_id.to_string(),
+            launch_nonce: Some(launch_nonce),
         };
         write_control_frame(out.as_mut().expect("write half present"), &hello).await
     }

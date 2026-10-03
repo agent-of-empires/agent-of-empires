@@ -390,7 +390,12 @@ mod tests {
         let (state, row, record, storage) = live_repair_fixture();
         // The reload sampled the runner during teardown; disable finished
         // before this reload could acquire the transition lock.
-        crate::process::worker_registry::delete_if_owned(&row.id, std::process::id()).unwrap();
+        assert!(crate::process::worker_registry::delete_if_owned_by(
+            &row.id,
+            std::process::id(),
+            record.0.generation,
+            record.0.launch_nonce
+        ));
         reload_state_instances_from_disk(
             &state,
             vec![row],
@@ -663,6 +668,7 @@ mod tests {
                     pane_title: None,
                     window_activity,
                     window_size: None,
+                    ..Default::default()
                 },
             )]);
             let mut instances = vec![on_disk.clone()];

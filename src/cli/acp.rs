@@ -48,17 +48,15 @@ pub enum AcpCommands {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
-    /// Gracefully stop an agent worker (SIGTERM the runner, agent
-    /// receives stdin EOF). Sessions can be reattached on the next
-    /// `aoe serve` only if they are still alive afterward; `stop`
-    /// destroys the worker.
+    /// Authentically stop a session's managed executions and prove their groups
+    /// quiescent. Unverified legacy history remains protected.
     Stop {
         /// Session id to stop. Mutually exclusive with `--all`.
         session: Option<String>,
         /// Stop every running agent worker.
         #[arg(long, conflicts_with = "session")]
         all: bool,
-        /// Seconds to wait after SIGTERM before escalating to SIGKILL.
+        /// Maximum seconds to wait for authenticated stop and quiescence proof.
         #[arg(long, default_value = "5")]
         timeout_secs: u64,
     },
@@ -184,9 +182,9 @@ pub async fn run(command: AcpCommands) -> Result<()> {
             all,
             timeout_secs,
         } => stop(session, all, timeout_secs).await,
-        AcpCommands::Kill { session } => kill_now(&session),
+        AcpCommands::Kill { session } => kill_now(&session).await,
         AcpCommands::Logs { session, follow } => logs(session, follow),
-        AcpCommands::Restart { session } => restart(&session),
+        AcpCommands::Restart { session } => restart(&session).await,
         AcpCommands::History {
             session,
             since,
@@ -734,75 +732,87 @@ pub(crate) fn ps_trap() -> Result<()> {
 }
 
 async fn stop(session: Option<String>, all: bool, timeout_secs: u64) -> Result<()> {
-    use crate::process::worker_registry;
-    let targets: Vec<crate::process::worker_registry::WorkerRecord> = if all {
-        worker_registry::list().unwrap_or_default()
+    if all {
+        stop_all_workers(timeout_secs).await?;
     } else {
-        let id = match session {
-            Some(s) => s,
-            None => {
-                anyhow::bail!("aoe acp stop requires <session> or --all");
-            }
-        };
-        worker_registry::load(&id)?
-            .map(|r| vec![r])
-            .unwrap_or_default()
-    };
-    if targets.is_empty() {
-        println!("No matching agent workers.");
-        return Ok(());
+        let id =
+            session.ok_or_else(|| anyhow::anyhow!("aoe acp stop requires <session> or --all"))?;
+        stop_worker(&id, timeout_secs).await?;
     }
-    stop_worker_records(&targets, timeout_secs).await;
     Ok(())
 }
 
 pub(crate) async fn stop_all_workers(timeout_secs: u64) -> Result<usize> {
-    use crate::process::worker_registry;
-    let targets = worker_registry::list()?;
-    stop_worker_records(&targets, timeout_secs).await;
-    Ok(targets.len())
+    let targets = tokio::task::spawn_blocking(|| {
+        let mut ids = crate::session::runner_journal::stored_session_ids()?;
+        ids.extend(
+            crate::process::worker_registry::list()?
+                .into_iter()
+                .map(|record| record.session_id),
+        );
+        ids.sort_unstable();
+        ids.dedup();
+        anyhow::Ok(ids)
+    })
+    .await??;
+    let mut refused = Vec::new();
+    let mut stopped = 0;
+    for id in targets {
+        match stop_worker(&id, timeout_secs).await {
+            Ok(()) => stopped += 1,
+            Err(error) => refused.push(format!("{id}: {error:#}")),
+        }
+    }
+    anyhow::ensure!(
+        refused.is_empty(),
+        "some managed sessions remain protected: {}",
+        refused.join("; ")
+    );
+    Ok(stopped)
 }
 
-async fn stop_worker_records(
-    targets: &[crate::process::worker_registry::WorkerRecord],
-    timeout_secs: u64,
-) {
-    use crate::process::worker_registry;
-    for record in targets {
-        worker_registry::delete(&record.session_id).ok();
-        signal_and_wait(record, timeout_secs).await;
-        println!(
-            "Stopped agent worker for {} (PID {}).",
-            record.session_id, record.pid
+async fn stop_worker(id: &str, timeout_secs: u64) -> Result<()> {
+    let record = crate::process::worker_registry::load_strict(id)?;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(timeout_secs),
+        crate::session::runner_journal::settle_unique(id),
+    )
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!("runner stop proof timed out for {id}; session remains protected")
+    })??;
+    if let Some(record) = record {
+        anyhow::ensure!(
+            crate::process::worker_registry::delete_if_owned_by(
+                id,
+                record.pid,
+                record.generation,
+                record.launch_nonce,
+            ),
+            "could not retire settled worker registry entry"
         );
     }
-}
-
-fn kill_now(session: &str) -> Result<()> {
-    use crate::process::worker_registry;
-    let Some(record) = worker_registry::load(session)? else {
-        anyhow::bail!("No agent worker registry entry for session {session}");
-    };
-    worker_registry::delete(session).ok();
-    crate::process::worker::kill_process_group(record.pid);
-    println!("Killed agent worker for {} (PID {}).", session, record.pid);
+    println!("Stopped managed executions for {id}.");
     Ok(())
 }
 
-async fn signal_and_wait(
-    record: &crate::process::worker_registry::WorkerRecord,
-    timeout_secs: u64,
-) {
+async fn kill_now(session: &str) -> Result<()> {
     use crate::process::worker_registry;
-    crate::process::worker::terminate_process_group(record.pid);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
-    while std::time::Instant::now() < deadline {
-        if !worker_registry::is_pid_alive(record.pid) {
-            return;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let record = worker_registry::load_strict(session)?;
+    crate::session::runner_journal::kill_unique(session).await?;
+    if let Some(record) = record {
+        anyhow::ensure!(
+            worker_registry::delete_if_owned_by(
+                session,
+                record.pid,
+                record.generation,
+                record.launch_nonce
+            ),
+            "could not retire settled worker registry entry"
+        );
     }
-    crate::process::worker::kill_process_group(record.pid);
+    println!("Killed managed executions for {session}.");
+    Ok(())
 }
 
 fn logs(session: Option<String>, follow: bool) -> Result<()> {
@@ -857,14 +867,36 @@ fn logs(session: Option<String>, follow: bool) -> Result<()> {
     Ok(())
 }
 
-fn restart(session: &str) -> Result<()> {
+async fn restart(session: &str) -> Result<()> {
     use crate::process::worker_registry;
-    let Some(record) = worker_registry::load(session)? else {
+    let Some(record) = worker_registry::load_strict(session)? else {
         anyhow::bail!("No agent worker registry entry for session {session}");
     };
+    let id = session.to_owned();
+    let profile = tokio::task::spawn_blocking(move || {
+        crate::session::runner_journal::unique_stored_owner(&id)
+    })
+    .await??;
+    let owner = crate::session::deletion::SessionPathOwner {
+        profile: &profile,
+        session_id: session,
+    };
+    if record.launch_nonce.is_none() {
+        crate::session::runner_journal::require_quiescent(owner, None).await?;
+    }
     worker_registry::mark_restart_pending(session, record.generation);
-    worker_registry::delete(session).ok();
-    crate::process::worker::terminate_process_group(record.pid);
+    if let Some(nonce) = record.launch_nonce {
+        crate::session::runner_journal::settle_nonce(owner, nonce, None).await?;
+    }
+    anyhow::ensure!(
+        worker_registry::delete_if_owned_by(
+            session,
+            record.pid,
+            record.generation,
+            record.launch_nonce
+        ),
+        "could not retire settled worker registry entry"
+    );
     println!(
         "Stopped runner for {} (PID {}). `aoe serve` will respawn on its next reconciler tick.",
         session, record.pid

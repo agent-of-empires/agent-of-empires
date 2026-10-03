@@ -63,18 +63,6 @@ pub(crate) fn build_test_app_state_with_launcher(
     })
 }
 
-/// Like [`build_test_app_state`] but every runner is controlled by `control`,
-/// so a test decides which runners refuse to die.
-#[cfg(test)]
-pub(crate) fn build_test_app_state_with_process_control(
-    prior: Vec<Instance>,
-    control: std::sync::Arc<dyn crate::acp::runner_lifecycle::ProcessControl>,
-) -> Arc<AppState> {
-    build_test_app_state_impl(prior, Vec::new(), Vec::new(), None, false, |s| {
-        s.with_process_control(control)
-    })
-}
-
 fn build_test_app_state_impl(
     prior: Vec<Instance>,
     allowed_hosts: Vec<String>,

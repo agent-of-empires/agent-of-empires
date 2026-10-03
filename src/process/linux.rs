@@ -266,6 +266,70 @@ fn parse_psi_some_avg10(psi: &str) -> Option<f32> {
     None
 }
 
+pub(super) fn process_namespace() -> std::io::Result<[u64; 2]> {
+    use std::os::unix::fs::MetadataExt;
+    let status = fs::read_to_string("/proc/self/status")?;
+    let line = status
+        .lines()
+        .find_map(|line| line.strip_prefix("NSpid:"))
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "PID namespace cannot be verified",
+            )
+        })?;
+    let mut ids = line.split_whitespace();
+    if ids.next().and_then(|id| id.parse::<u32>().ok()) != Some(std::process::id())
+        || ids.next().is_some()
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "procfs belongs to another PID namespace",
+        ));
+    }
+    let namespace = fs::metadata("/proc/self/ns/pid")?;
+    Ok([namespace.dev(), namespace.ino()])
+}
+
+pub(super) fn process_incarnation(pid: u32) -> std::io::Result<Option<super::ProcessIncarnation>> {
+    let namespace = process_namespace()?;
+    let stat = match fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => stat,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let end = stat.rfind(')').ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "process stat has no command boundary",
+        )
+    })?;
+    let mut fields = stat[end + 1..].split_whitespace();
+    let group = fields
+        .nth(2)
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "process stat has no group")
+        })?
+        .parse()
+        .map_err(std::io::Error::other)?;
+    let start = fields
+        .nth(16)
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "process stat has no start time",
+            )
+        })?
+        .parse()
+        .map_err(std::io::Error::other)?;
+    Ok(Some(super::ProcessIncarnation {
+        pid,
+        group,
+        start: [start, 0],
+        namespace,
+    }))
+}
+
 pub(super) fn boot_id() -> Option<String> {
     std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
         .ok()

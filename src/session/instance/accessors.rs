@@ -61,6 +61,7 @@ impl Instance {
             active_execution: None,
             omp_capture_generation: None,
             lifecycle_generation: 0,
+            runner_journal: crate::session::runner_journal::RunnerExecutionJournal::new(),
             resume_probe_failed_sid: None,
             resume_intent: ResumeIntent::Default,
             force_fresh_next_launch: false,

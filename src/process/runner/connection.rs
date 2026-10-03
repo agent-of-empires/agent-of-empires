@@ -108,10 +108,14 @@ pub(super) async fn handle_control_connection(
     shared: Arc<RunnerShared>,
     agent_stdin: Arc<Mutex<tokio::process::ChildStdin>>,
     session_id: String,
+    launch_nonce: uuid::Uuid,
 ) -> bool {
     let (mut read_half, write_half) = stream.into_split();
     let mut write_half = Some(write_half);
-    if !shared.install_control(&mut write_half, &session_id).await {
+    if !shared
+        .install_control(&mut write_half, &session_id, launch_nonce)
+        .await
+    {
         return false;
     }
 

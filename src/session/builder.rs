@@ -1057,8 +1057,12 @@ fn cleanup_instance_core(
         }
     }
 
-    let peer_claimed = match crate::session::deletion::paths_in_use_except(&[instance.id.as_str()])
-    {
+    let peer_claimed = match crate::session::deletion::paths_in_use_except(&[
+        crate::session::deletion::SessionPathOwner {
+            profile: &instance.source_profile,
+            session_id: &instance.id,
+        },
+    ]) {
         crate::session::deletion::PathsInUse::Unknown(_) => true,
         crate::session::deletion::PathsInUse::Known(paths) => {
             let paths = crate::session::deletion::PathsInUse::Known(paths);
@@ -1935,10 +1939,8 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn lock_safe_cleanup_blocks_until_the_ownership_locks_are_released() {
-        use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::mpsc;
-        use std::sync::Arc;
-        use std::time::{Duration, Instant};
+        use std::time::Duration;
 
         let _app_guard = crate::session::test_support::isolate_app_dir();
         let id = format!("cleanup-barrier-{}", uuid::Uuid::new_v4());
@@ -1946,6 +1948,9 @@ mod tests {
         let mut instance = Instance::new("Barrier", &scratch_path.to_string_lossy());
         instance.id = id;
         instance.scratch = true;
+        let storage = crate::session::Storage::new_unwatched("default").unwrap();
+        instance.source_profile = storage.profile().to_owned();
+        storage.update(|_, _| Ok(())).unwrap();
 
         let (peer_holds_tx, peer_holds_rx) = mpsc::channel();
         let (peer_release_tx, peer_release_rx) = mpsc::channel::<()>();
@@ -1955,26 +1960,18 @@ mod tests {
             peer_holds_tx.send(()).unwrap();
             peer_release_rx.recv().unwrap();
         });
-        peer_holds_rx.recv().unwrap();
+        peer_holds_rx.recv_timeout(Duration::from_secs(2)).unwrap();
 
-        let (cleaner_entered_tx, cleaner_entered_rx) = mpsc::channel();
-        let done = Arc::new(AtomicBool::new(false));
-        let flag = Arc::clone(&done);
+        let (contended_tx, contended_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
         let cleaner = std::thread::spawn(move || {
-            cleaner_entered_tx.send(()).unwrap();
+            let _observer = crate::session::observe_lock_contention_for_test(contended_tx);
             cleanup_instance_locked(&instance, None, &[], None);
-            flag.store(true, Ordering::SeqCst);
+            done_tx.send(()).unwrap();
         });
-        cleaner_entered_rx.recv().unwrap();
-
-        // The cleaner cannot get past the flock while the peer holds it, so a
-        // bounded wait here can only end with the resource still in place.
-        let deadline = Instant::now() + Duration::from_secs(1);
-        while Instant::now() < deadline && !done.load(Ordering::SeqCst) {
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        contended_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         assert!(
-            !done.load(Ordering::SeqCst),
+            matches!(done_rx.try_recv(), Err(mpsc::TryRecvError::Empty)),
             "cleanup must not proceed while a peer holds the ownership locks"
         );
         assert!(
@@ -1984,6 +1981,7 @@ mod tests {
 
         peer_release_tx.send(()).unwrap();
         peer.join().unwrap();
+        done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         cleaner.join().unwrap();
         assert!(
             !scratch_path.exists(),

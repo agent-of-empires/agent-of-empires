@@ -130,7 +130,7 @@ pub(super) async fn status_poll_loop(state: Arc<AppState>) {
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut attempted_acp_spawns: std::collections::HashSet<String> =
         std::collections::HashSet::new();
-    let mut acp_reap_cadence = acp_reconciler::ReapCadence::default();
+    let mut acp_reap_cadence = acp_reconciler::ReconcilerState::default();
     let mut last_session_idle_reap: Option<std::time::Instant> = None;
     // Loop-local, single-owner sleep-inhibit assertion (single global toggle, so one slot
     // for the whole daemon).

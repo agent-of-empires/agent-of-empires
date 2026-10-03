@@ -710,7 +710,7 @@ mod tests {
         let outcome = instance.restart_discarding_sandbox_container(None, true, false, Some(carry));
         instance.stop_and_flush_poller();
         let observed = std::fs::read_to_string(&record).unwrap();
-        instance.kill_clean().unwrap();
+        instance.kill().unwrap();
         assert!(outcome.is_ok(), "{outcome:?}");
         // Line 0 is the launched CLAUDE_CONFIG_DIR; the remaining lines are
         // the argv.
@@ -1181,7 +1181,7 @@ mod tests {
                 assert_eq!(outcome, StartOutcome::Fresh);
                 assert_ne!(inst.agent_session_id.as_deref(), Some(sid));
             }
-            inst.kill_clean().unwrap();
+            inst.kill().unwrap();
         }
     }
 
@@ -1248,7 +1248,7 @@ mod tests {
         // tree this reproduces the reported bug (identical `ResumeFailed`
         // forever). The fix must instead skip the resume attempt and
         // start fresh.
-        inst.kill_clean().unwrap();
+        inst.kill().unwrap();
         let second = inst
             .start_with_resume_fallback(None, true, ResumeAttemptPolicy::Allow)
             .unwrap();

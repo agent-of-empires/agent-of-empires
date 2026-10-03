@@ -9,7 +9,6 @@ mod requests;
 mod sink;
 mod teardown;
 
-pub use teardown::{settle_runner_from_registry, WorktreeIntent};
 #[cfg(test)]
 mod test_support;
 
@@ -26,9 +25,7 @@ use tracing::warn;
 use super::acp_client::{AcpClient, AcpError, SpawnConfig};
 use super::agent_registry::AgentRegistry;
 pub use super::runner_lifecycle::ResumeKind;
-use super::runner_lifecycle::{
-    Lease, LifecycleTable, ProcessControl, RunnerIdentity, SystemProcessControl, WorkerPhase,
-};
+use super::runner_lifecycle::{Lease, LifecycleTable, RunnerIdentity, WorkerPhase};
 use super::state::AcpSessionId;
 use crate::daemon::AcpWorkerState;
 use crate::session::SandboxInfo;
@@ -152,7 +149,6 @@ pub struct Supervisor<S: BroadcastSink> {
     next_seqs: Arc<SeqMap>,
     /// Owner of every runner epoch. Lock order: `workers` before `lifecycle`.
     lifecycle: Arc<std::sync::Mutex<LifecycleTable>>,
-    process_control: Arc<dyn ProcessControl>,
     launcher: Launcher,
     /// Agents whose first spawn finished; until then spawns serialize on a
     /// per-agent lock so a lazy adapter install is not raced.
@@ -177,23 +173,48 @@ pub struct Supervisor<S: BroadcastSink> {
     max_concurrent_workers: u32,
 }
 
-/// RAII guard over a `Starting` or `Respawning` epoch; dropping it before
-/// install abandons the epoch so a failed resume cannot pin the session.
+/// Retains admission until installation or retirement of a built execution.
 pub(crate) struct ResumeReservation {
     lease: Lease,
     lifecycle: Arc<std::sync::Mutex<LifecycleTable>>,
     notify: Arc<tokio::sync::Notify>,
+    execution: Option<RunnerIdentity>,
+    issued: super::runner_lifecycle::ExecutionAdmission,
 }
 
 impl ResumeReservation {
     pub(crate) fn lease(&self) -> &Lease {
         &self.lease
     }
+    pub(crate) fn execution(&self) -> Option<RunnerIdentity> {
+        self.issued.snapshot().or(self.execution)
+    }
+    pub(crate) fn execution_admission(&self) -> super::runner_lifecycle::ExecutionAdmission {
+        self.issued.clone()
+    }
 }
 
 impl Drop for ResumeReservation {
     fn drop(&mut self) {
-        if lock_recover(&self.lifecycle).abandon(&self.lease) {
+        let execution = self.execution();
+        let changed = {
+            let mut table = lock_recover(&self.lifecycle);
+            match execution {
+                Some(identity) => {
+                    if table.convert_to_stopping(&self.lease, Some(identity)) {
+                        table.settle(
+                            &self.lease,
+                            super::runner_lifecycle::Settlement::Unproven(Some(identity)),
+                        );
+                        true
+                    } else {
+                        false
+                    }
+                }
+                None => table.abandon(&self.lease),
+            }
+        };
+        if changed {
             self.notify.notify_waiters();
         }
     }
@@ -213,6 +234,14 @@ pub enum SandboxContinuation {
     Persisted,
     ImportTerminal,
     Fresh,
+}
+
+pub(crate) struct AttachRequest {
+    pub session_id: String,
+    pub cwd: PathBuf,
+    pub additional_dirs: Vec<PathBuf>,
+    pub in_flight_turn: bool,
+    pub sandbox: Option<SandboxInfo>,
 }
 
 #[derive(Debug, Clone)]
@@ -263,7 +292,6 @@ impl<S: BroadcastSink> Supervisor<S> {
             lifecycle: Arc::new(std::sync::Mutex::new(LifecycleTable::new(
                 chrono::Utc::now().timestamp_millis().max(1) as u64,
             ))),
-            process_control: Arc::new(SystemProcessControl),
             launcher: Arc::new(|config, session_id| Box::pin(AcpClient::spawn(config, session_id))),
             warmed_up_agents: Arc::default(),
             agent_warmup_locks: Arc::default(),
