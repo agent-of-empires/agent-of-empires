@@ -41,7 +41,7 @@ Dispatch the release workflow with the existing tag, subject to the same release
 gh workflow run release.yml -f tag=v1.18.0
 ```
 
-The build checks out the requested tag and reads its `rust-toolchain.toml`. Numeric pins are preserved. Historical tags using `stable` install the current stable compiler through the external setup action, without requiring helper files in the old tree. Such rebuilds do not reproduce the original compiler version.
+The build checks out the requested tag and reads `[toolchain].channel` from its `rust-toolchain.toml`. Numeric pins are preserved. Historical tags using `stable` install the current stable compiler through the external setup action, without requiring helper files in the old tree. Such rebuilds do not reproduce the original compiler version.
 
 ## Versioning
 
