@@ -60,6 +60,10 @@ pub struct PluginManifest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime: Option<RuntimeSpec>,
 
+    /// Host hooks the worker serves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hooks: Option<HooksSpec>,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub aoe_version: Option<String>,
 }
@@ -624,6 +628,41 @@ pub struct UiContribution {
     pub entry: Option<String>,
 }
 
+pub const MCP_REWRITE_DEFAULT_TIMEOUT_MS: u64 = 5_000;
+pub const MCP_REWRITE_MAX_TIMEOUT_MS: u64 = 30_000;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HooksSpec {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_rewrite: Option<McpRewriteHook>,
+}
+
+/// Rewrites the MCP servers AoE forwards to a session's agent (`api_version >= 14`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpRewriteHook {
+    #[serde(default)]
+    pub applies_to: McpRewriteScope,
+    #[serde(default = "default_mcp_rewrite_timeout_ms")]
+    pub timeout_ms: u64,
+    /// Lower runs first; ties break by plugin id.
+    #[serde(default)]
+    pub order: i32,
+}
+
+fn default_mcp_rewrite_timeout_ms() -> u64 {
+    MCP_REWRITE_DEFAULT_TIMEOUT_MS
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum McpRewriteScope {
+    #[default]
+    Sandbox,
+    All,
+}
+
 /// How the plugin's worker is launched.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
@@ -1090,6 +1129,26 @@ impl PluginManifest {
                 "per_project settings require api_version >= 18".into(),
             );
         }
+        if let Some(hook) = self.hooks.as_ref().and_then(|h| h.mcp_rewrite.as_ref()) {
+            check(
+                self.api_version >= 14,
+                "hooks.mcp_rewrite requires api_version >= 14".into(),
+            );
+            check(
+                self.capabilities
+                    .iter()
+                    .any(|c| c.as_str() == "mcp.rewrite"),
+                "hooks.mcp_rewrite requires the mcp.rewrite capability".into(),
+            );
+            check(
+                self.runtime.is_some(),
+                "hooks.mcp_rewrite requires a runtime worker".into(),
+            );
+            check(
+                (1..=MCP_REWRITE_MAX_TIMEOUT_MS).contains(&hook.timeout_ms),
+                format!("hooks.mcp_rewrite.timeout_ms must be 1..={MCP_REWRITE_MAX_TIMEOUT_MS}"),
+            );
+        }
         for key in self.setting_defaults.keys() {
             check(
                 key.contains('.') && !key.starts_with('.') && !key.ends_with('.'),
@@ -1200,6 +1259,85 @@ mod tests {
              [[settings.fields]]\nkey = \"match\"\nlabel = \"URL patterns\"\ntype = \"string_list\"\nrequired = true\n\n\
              [[settings.fields]]\nkey = \"gate\"\nlabel = \"Gate check command\"\ntype = \"string\"\nrequired = true\n"
         )
+    }
+
+    fn mcp_rewrite_toml(api_version: u32, caps: &str, hook_body: &str) -> String {
+        format!(
+            "id = \"acme.gate\"\nname = \"Gate\"\nversion = \"1.0.0\"\napi_version = {api_version}\n\
+             capabilities = [{caps}]\n\n\
+             [runtime]\nkind = \"command\"\ncommand = [\"bin/worker\"]\n\n\
+             [hooks.mcp_rewrite]\n{hook_body}"
+        )
+    }
+
+    #[test]
+    fn mcp_rewrite_hook_parses_with_defaults() {
+        let m = PluginManifest::from_toml_str(&mcp_rewrite_toml(
+            14,
+            "\"runtime.worker\", \"mcp.rewrite\"",
+            "",
+        ))
+        .expect("v14 hook parses");
+        let hook = m.hooks.unwrap().mcp_rewrite.unwrap();
+        assert_eq!(hook.applies_to, McpRewriteScope::Sandbox);
+        assert_eq!(hook.timeout_ms, MCP_REWRITE_DEFAULT_TIMEOUT_MS);
+        assert_eq!(hook.order, 0);
+    }
+
+    #[test]
+    fn mcp_rewrite_hook_parses_explicit_values() {
+        let m = PluginManifest::from_toml_str(&mcp_rewrite_toml(
+            14,
+            "\"runtime.worker\", \"mcp.rewrite\"",
+            "applies_to = \"all\"\ntimeout_ms = 1200\norder = -5\n",
+        ))
+        .unwrap();
+        let hook = m.hooks.unwrap().mcp_rewrite.unwrap();
+        assert_eq!(hook.applies_to, McpRewriteScope::All);
+        assert_eq!(hook.timeout_ms, 1200);
+        assert_eq!(hook.order, -5);
+    }
+
+    #[test]
+    fn mcp_rewrite_hook_is_validated() {
+        let ok_caps = "\"runtime.worker\", \"mcp.rewrite\"";
+        let no_runtime =
+            "id = \"acme.gate\"\nname = \"Gate\"\nversion = \"1.0.0\"\napi_version = 14\n\
+             capabilities = [\"mcp.rewrite\"]\n\n[hooks.mcp_rewrite]\n"
+                .to_string();
+        rejects(&[
+            (
+                "below v14",
+                mcp_rewrite_toml(13, ok_caps, ""),
+                "api_version >= 14",
+            ),
+            (
+                "missing capability",
+                mcp_rewrite_toml(14, "\"runtime.worker\"", ""),
+                "mcp.rewrite capability",
+            ),
+            ("missing runtime", no_runtime, "runtime worker"),
+            (
+                "zero timeout",
+                mcp_rewrite_toml(14, ok_caps, "timeout_ms = 0\n"),
+                "timeout_ms",
+            ),
+            (
+                "huge timeout",
+                mcp_rewrite_toml(14, ok_caps, "timeout_ms = 30001\n"),
+                "timeout_ms",
+            ),
+            (
+                "bad scope",
+                mcp_rewrite_toml(14, ok_caps, "applies_to = \"never\"\n"),
+                "applies_to",
+            ),
+            (
+                "unknown hook key",
+                mcp_rewrite_toml(14, ok_caps, "bogus = 1\n"),
+                "bogus",
+            ),
+        ]);
     }
 
     fn rejects(cases: &[(&str, String, &str)]) {
