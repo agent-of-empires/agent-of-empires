@@ -4,18 +4,6 @@ All notable changes to Agent of Empires will be documented in this file.
 
 The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 
-## Unreleased
-
-### Features
-
-- **runtime:** Publish required `listed` and `aliases` profile metadata in protocol 4 without expanding ordinary session inventories.
-
-### Bug Fixes
-
-- **cli:** Resolve daemon-read aliases from cached physical stores, preserve multiline commands and orphan group paths, and keep explicit project registry reads noncreating.
-- **server:** Hold runtime read admission through connection closure, use native socket identity types, and classify vanished temporary publication names as retryable.
-- **test:** Normalize integer-valued `minLength` bounds and keep named parity fixtures in owned temporary children.
-
 ## [1.18.0](https://github.com/agent-of-empires/agent-of-empires/releases/tag/v1.18.0) - 2026-09-30
 
 
