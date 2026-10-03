@@ -229,7 +229,7 @@ Claude Code empties both tokens after failed authentication, making the shared f
 
 To seed from a new host login, stop every Claude sandbox, delete only `sandbox-v2/.credentials.json`, and start one. Older containers are recreated when stopped; a running one must be stopped before relaunch. `/logout` in any sandbox revokes all sandboxes' tokens but cannot remove the mounted file; log in again to replace the revoked credential.
 
-MCP servers hold credentials of their own. A plugin can rewrite what a sandboxed session receives with the [`mcp.rewrite` hook](../plugin-api.md#hooks). AoE does not copy host MCP definitions into a Claude sandbox's agent store, but other agents' MCP-bearing config files are still copied verbatim, so for those agents the hook alone does not keep host MCP secrets out of the sandbox.
+MCP servers hold credentials of their own. A plugin can rewrite what a sandboxed session receives with the [`mcp.rewrite` hook](../plugin-api.md#hooks). AoE does not copy host MCP definitions into a Claude sandbox's agent store (`.mcp.json` files inside the copied Claude `plugins/` directory are copied as they are), but other agents' MCP-bearing config files are still copied verbatim, so for those agents the hook alone does not keep host MCP secrets out of the sandbox.
 
 ### Reclaiming stores
 
