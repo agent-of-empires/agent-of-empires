@@ -380,12 +380,15 @@ fn find_process_in_group(pgrp: u32) -> Option<u32> {
     None
 }
 
-/// Whether any process of `pgrp` is still running, ignoring zombies: a zombie
-/// holds nothing, so a group made only of zombies is dead.
-///
-/// `Err` when the enumeration itself failed, so a caller that cannot prove
-/// absence treats the group as alive rather than as gone.
+/// Report non-zombie group members; failed observations do not prove absence.
 pub(super) fn process_group_has_live_members(pgrp: u32) -> std::io::Result<bool> {
+    use nix::{errno::Errno, sys::signal::killpg, unistd::Pid};
+
+    match killpg(Pid::from_raw(pgrp as i32), None) {
+        Ok(()) => {}
+        Err(Errno::ESRCH) => return Ok(false),
+        Err(error) => return Err(std::io::Error::from_raw_os_error(error as i32)),
+    }
     for entry in fs::read_dir("/proc")? {
         let entry = entry?;
         if entry.file_name().to_string_lossy().parse::<u32>().is_err() {

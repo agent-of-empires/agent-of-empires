@@ -419,8 +419,15 @@ pub(super) fn boot_id() -> Option<String> {
 
 /// Report non-zombie group members. Probe failures do not prove absence.
 pub(super) fn process_group_has_live_members(pgrp: u32) -> std::io::Result<bool> {
-    // `ps -g` does not mean the same thing on every BSD, so the table is read in
-    // full and the group is matched on an explicit column instead.
+    use nix::{errno::Errno, sys::signal::killpg, unistd::Pid};
+
+    match killpg(Pid::from_raw(pgrp as i32), None) {
+        // Darwin excludes zombies from its permission check.
+        Ok(()) | Err(Errno::EPERM) => {}
+        Err(Errno::ESRCH) => return Ok(false),
+        Err(error) => return Err(std::io::Error::from_raw_os_error(error as i32)),
+    }
+    // Match the explicit group column, not BSD ps -g.
     let output = Command::new("/bin/ps")
         .args(["-o", "pid=,pgid=,state=", "-A"])
         .output()

@@ -4359,8 +4359,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn shared_credential_follows_the_freshest_copy_across_starts() {
-        let (_hook_guard, _, _application) = BaseGuard::ready();
-        let home = TempDir::new().unwrap();
+        let home = IsolatedHome::new();
         let host = home.path().join(".claude");
         fs::create_dir_all(&host).unwrap();
         let mount = claude_mount_without_keychain();

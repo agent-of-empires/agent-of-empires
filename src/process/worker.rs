@@ -45,15 +45,7 @@ pub fn is_process_group_alive(pgid: u32) -> bool {
     if is_pid_alive_and_ours(pgid) && !crate::process::platform::is_terminated(pgid) {
         return true;
     }
-    use nix::errno::Errno;
-    use nix::sys::signal::killpg;
-    use nix::unistd::Pid;
-    match killpg(Pid::from_raw(pgid as i32), None) {
-        // No such group at all: nothing can be running in it.
-        Err(Errno::ESRCH) => false,
-        Ok(()) => crate::process::platform::process_group_has_live_members(pgid).unwrap_or(true),
-        Err(_) => true,
-    }
+    crate::process::platform::process_group_has_live_members(pgid).unwrap_or(true)
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
