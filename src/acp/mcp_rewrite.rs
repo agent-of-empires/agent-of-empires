@@ -268,6 +268,67 @@ pub async fn rewrite_servers_with(
 }
 
 #[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+
+    /// Installs a process-global rewriter and restores the empty slot on drop, panic included.
+    /// Tests that hold one must be `#[serial_test::serial]`.
+    pub(crate) struct SlotGuard;
+
+    impl SlotGuard {
+        pub(crate) fn install(rewriter: Arc<dyn McpRewriter>) -> Self {
+            set_rewriter(Some(rewriter));
+            Self
+        }
+
+        /// For code under test that installs the rewriter itself.
+        pub(crate) fn clear_on_drop() -> Self {
+            Self
+        }
+    }
+
+    impl Drop for SlotGuard {
+        fn drop(&mut self) {
+            set_rewriter(None);
+        }
+    }
+
+    pub(crate) fn slot_is_set() -> bool {
+        current_rewriter().is_some()
+    }
+
+    /// Returns a fixed set and records each call's sandbox flag for assertions after the run.
+    pub(crate) struct RecordingRewriter {
+        pub(crate) sandboxed_calls: Mutex<Vec<bool>>,
+        result: Vec<ProjectMcpServer>,
+    }
+
+    impl RecordingRewriter {
+        pub(crate) fn returning(result: Vec<ProjectMcpServer>) -> Arc<Self> {
+            Arc::new(Self {
+                sandboxed_calls: Mutex::new(Vec::new()),
+                result,
+            })
+        }
+    }
+
+    impl McpRewriter for RecordingRewriter {
+        fn rewrite<'a>(
+            &'a self,
+            ctx: &'a McpRewriteContext,
+            _servers: Vec<ProjectMcpServer>,
+        ) -> RewriteFuture<'a> {
+            self.sandboxed_calls
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(ctx.sandboxed);
+            let result = self.result.clone();
+            Box::pin(async move { Ok(result) })
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
