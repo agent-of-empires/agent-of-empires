@@ -73,6 +73,8 @@ pub struct AppState {
     /// CityHall client mode, resolved once at launch from `AOE_CITYHALL_MODE`.
     pub cityhall_mode: bool,
     pub instances: Arc<RwLock<Vec<Instance>>>,
+    // Lock instances before the cache for coherent reads and reload commits.
+    pub(crate) runtime_read_cache: std::sync::RwLock<super::reload::RuntimeReadCache>,
     /// Session-domain service handle sharing `instances`, `instance_locks`, `file_watch`,
     /// the telemetry create counter, and the ACP supervisor with the fields on this struct,
     /// so a non-HTTP caller (the plugin host, #2897) can drive session create/turn without
@@ -118,6 +120,12 @@ pub struct AppState {
     pub summary_inflight: std::sync::Mutex<std::collections::HashSet<String>>,
     /// Global cap on concurrent conversation-summary one-shots.
     pub summary_semaphore: tokio::sync::Semaphore,
+    /// Global cap on concurrent runtime-read connections, so a burst of clients
+    /// cannot each hold a connection slot and a cloned row set while they wait
+    /// for the one sample in flight. Shared rather than owned because the permit
+    /// is handed to the blocking sample itself, which outlives the connection
+    /// that was admitted against it.
+    pub runtime_read_semaphore: Arc<tokio::sync::Semaphore>,
     /// Suppression set for the startup-recovery cascade.
     pub recently_restarted: crate::session::recovery::RecentlyRestarted,
     /// Invalidates earlier disk snapshots at memory mutation and queue persistence completion.

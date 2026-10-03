@@ -237,19 +237,11 @@ pub(super) async fn disk_watcher_consumer(state: Arc<AppState>) {
         let loaded = match tokio::task::spawn_blocking(move || {
             let fresh = load_all_instances(&file_watch_for_load);
             drop(snapshot_guard);
-            fresh.map(|fresh| (fresh, live_structured_worker_records()))
+            (fresh, live_structured_worker_records())
         })
         .await
         {
-            Ok(Ok(v)) => v,
-            Ok(Err(e)) => {
-                tracing::warn!(
-                    target: "server.file_watch",
-                    error = %e,
-                    "disk reload failed"
-                );
-                continue;
-            }
+            Ok(value) => value,
             Err(e) => {
                 tracing::warn!(
                     target: "server.file_watch",
@@ -260,7 +252,7 @@ pub(super) async fn disk_watcher_consumer(state: Arc<AppState>) {
             }
         };
         let (fresh, live_worker_records) = loaded;
-        let count = fresh.len();
+        let count = fresh.instances.len();
         reload_state_instances_from_disk(
             &state,
             fresh,
@@ -491,8 +483,7 @@ mod tests {
         let file_watch = state.file_watch.clone();
         let fresh = tokio::task::spawn_blocking(move || load_all_instances(&file_watch))
             .await
-            .expect("join")
-            .expect("load");
+            .expect("join");
         reload_state_instances_from_disk(
             &state,
             fresh,
@@ -537,7 +528,7 @@ mod tests {
 
         reload_state_instances_from_disk(
             &state,
-            stale_snapshot,
+            stale_snapshot.into(),
             Vec::new(),
             StatusSource::DiskOnly,
             read_epoch,
@@ -575,7 +566,7 @@ mod tests {
 
         reload_state_instances_from_disk(
             &state,
-            stale_snapshot.clone(),
+            stale_snapshot.clone().into(),
             Vec::new(),
             StatusSource::DiskOnly,
             0,
@@ -602,7 +593,7 @@ mod tests {
         current_snapshot.push(Instance::new("created-elsewhere", "/tmp/elsewhere"));
         reload_state_instances_from_disk(
             &unbumped,
-            current_snapshot,
+            current_snapshot.into(),
             Vec::new(),
             StatusSource::DiskOnly,
             0,
@@ -642,7 +633,7 @@ mod tests {
         let reload = async move {
             reload_state_instances_from_disk(
                 &reload_state,
-                stale_snapshot,
+                stale_snapshot.into(),
                 Vec::new(),
                 StatusSource::DiskOnly,
                 read_epoch,

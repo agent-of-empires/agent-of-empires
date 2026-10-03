@@ -314,21 +314,27 @@ pub fn cached_version_health(current: &str) -> (UpdateStatus, ReleasesBehind) {
     )
 }
 
-pub async fn print_update_notice() {
-    let settings = get_update_settings();
-    if !settings.update_check_mode.notifies() {
-        return;
+/// The notice a command appends after its output, or `None` when the check is
+/// off, fails, or nothing is newer. Returned rather than printed so a caller
+/// that owns its own streams can place it after them.
+pub async fn update_notice() -> Option<String> {
+    if !get_update_settings().update_check_mode.notifies() {
+        return None;
     }
+    let info = check_for_update(env!("CARGO_PKG_VERSION"), false)
+        .await
+        .ok()?;
+    info.available.then(|| {
+        format!(
+            "\n💡 Update available: v{} → v{} (run: aoe update)\n",
+            info.current_version, info.latest_version
+        )
+    })
+}
 
-    let version = env!("CARGO_PKG_VERSION");
-
-    if let Ok(info) = check_for_update(version, false).await {
-        if info.available {
-            eprintln!(
-                "\n💡 Update available: v{} → v{} (run: aoe update)",
-                info.current_version, info.latest_version
-            );
-        }
+pub async fn print_update_notice() {
+    if let Some(notice) = update_notice().await {
+        eprint!("{notice}");
     }
 }
 

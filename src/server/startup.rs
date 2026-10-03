@@ -231,7 +231,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         FileWatchService::noop()
     });
 
-    let instances = load_all_instances(&file_watch)?;
+    let loaded = load_all_instances(&file_watch);
 
     // Only `--auth=token` issues a URL token.
     let auth_token = match auth_mode {
@@ -359,7 +359,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         supervisor
     };
     // The Tier 1 plugin worker host.
-    let instances = Arc::new(RwLock::new(instances));
+    let instances = Arc::new(RwLock::new(loaded.instances));
     let instance_locks = Arc::new(RwLock::new(std::collections::HashMap::new()));
     let idempotency_locks = Arc::new(RwLock::new(std::collections::HashMap::new()));
     let telemetry_session_creates = Arc::new(std::sync::atomic::AtomicU32::new(0));
@@ -630,6 +630,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         read_only,
         cityhall_mode: std::env::var_os("AOE_CITYHALL_MODE").is_some(),
         instances,
+        runtime_read_cache: std::sync::RwLock::new(loaded.cache),
         session_service,
         token_manager: Arc::clone(&token_manager),
         login_manager: Arc::clone(&login_manager),
@@ -652,6 +653,9 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         summary_semaphore: tokio::sync::Semaphore::new(
             crate::session::conversation_summary::MAX_CONCURRENT,
         ),
+        runtime_read_semaphore: Arc::new(tokio::sync::Semaphore::new(
+            crate::server::runtime_ws::RUNTIME_READ_CONCURRENCY,
+        )),
         recently_restarted: crate::session::recovery::new_recently_restarted(),
         mutation_epoch: Arc::clone(&mutation_epoch),
         recovery_pending: crate::session::recovery::new_recovery_pending(),
@@ -701,6 +705,11 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
 
     // Periodic opt-in `usage_snapshot` loop.
     spawn_serve_snapshot_loop(state.clone());
+
+    // The local runtime read shares this AppState: one producer, two
+    // transports. A daemon that cannot own the namespace simply does not
+    // offer it, and the HTTP route is unaffected either way.
+    let runtime_uds = publish_runtime_uds(&state);
 
     // GC the recently_restarted suppression map periodically; the TTL check on read filters
     // but does not remove entries.
@@ -948,6 +957,12 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     .with_graceful_shutdown(shutdown_signal)
     .await?;
 
+    // The signal handler already cancelled `state.shutdown`, so the accept loop
+    // has already returned and retracted its artifacts by the time this joins.
+    if let Some(runtime_uds) = runtime_uds {
+        let _ = runtime_uds.await;
+    }
+
     // Detach (but do NOT kill) every acp ACP worker.
     acp_supervisor.detach_all().await;
 
@@ -961,6 +976,45 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Publish the local runtime read and serve it, unless this daemon is in a mode
+/// that must leave nothing on disk.
+///
+/// CityHall client mode is exactly that: its route refuses the read with the
+/// mode's own 403, so publishing a namespace it will never serve would leave
+/// a lock, two markers and a 0600 socket behind for nothing.
+fn publish_runtime_uds(state: &Arc<AppState>) -> Option<tokio::task::JoinHandle<()>> {
+    if state.cityhall_mode {
+        info!(
+            target: "runtime.uds",
+            "not publishing the local runtime read while CityHall lockdown is on"
+        );
+        return None;
+    }
+    match super::runtime_uds::publish() {
+        Ok(published) => {
+            info!(
+                target: "runtime.uds",
+                namespace = super::runtime_ws::NAMESPACE,
+                "local runtime read published"
+            );
+            Some(crate::task_util::spawn_supervised(
+                "runtime.uds.serve",
+                crate::task_util::PanicPolicy::Log,
+                super::runtime_uds::serve(state.clone(), published),
+            ))
+        }
+        Err(error) => {
+            tracing::warn!(
+                target: "runtime.uds",
+                code = error.code(),
+                %error,
+                "local runtime read not published; the HTTP route is unaffected"
+            );
+            None
+        }
+    }
 }
 
 /// Best-effort launch of `url` in the user's default browser.
@@ -1052,6 +1106,36 @@ async fn remote_rotation_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The mode exists to leave as little as possible on disk, and the local
+    /// read is a lock, two markers and a 0600 socket it refuses to serve, so
+    /// nothing may be published and nothing left behind to retract.
+    // `publish_runtime_uds` returns `unsupported_platform` off Linux, so there
+    // is nothing here to assert, and a body that returns early would report a
+    // pass.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn cityhall_mode_publishes_no_local_runtime_read() {
+        use crate::server::runtime_uds::{LOCK_FILE, POSTBIND_FILE, PREBIND_FILE, SOCKET_FILE};
+
+        let (base, _env) = crate::server::test_support::trusted_namespace()
+            .expect("a private ancestor chain exists on this host");
+        let app_dir = base.path().join(crate::session::APP_DIR_NAME_XDG);
+        std::fs::create_dir_all(&app_dir).expect("app dir");
+        let state = crate::server::test_support::build_test_app_state_cityhall(Vec::new());
+
+        assert!(
+            publish_runtime_uds(&state).is_none(),
+            "the mode must not offer a local read it refuses to serve"
+        );
+        for name in [LOCK_FILE, PREBIND_FILE, POSTBIND_FILE, SOCKET_FILE] {
+            assert!(
+                !app_dir.join(name).exists(),
+                "{name} exists: the mode published what it will not serve"
+            );
+        }
+    }
 
     /// The sweep fires at its interval, not the next recheck, and a window
     /// shortened mid-wait applies at the next recheck.

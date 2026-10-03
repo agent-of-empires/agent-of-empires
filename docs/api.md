@@ -6,6 +6,29 @@
 
 Every endpoint requires the token `aoe serve` printed (also visible in the TUI's Serve panel), unless the server runs with `--no-auth`. Send it as `Authorization: Bearer <token>`, as a `?token=` query parameter, or as the `aoe_token` cookie. Read-only mode (`--read-only`) answers every write endpoint with `403 read_only`.
 
+## Runtime CLI reads
+
+The read-only CLI commands use `/api/runtime/ws` when `--daemon-url` or `AOE_DAEMON_URL` names an endpoint. Set `AOE_DAEMON_TOKEN` for the required bearer header. The route uses the shared authentication middleware; requiring a bearer header does not exclude cookie or query-token authentication. See the [CLI transport options](cli/reference.md#aoe) for endpoint selection and fallback behavior.
+
+The runtime wire protocol is **version 4**. Each exchange sends a `Hello` followed by a `Snapshot`; both frames require each profile's `name`, `listed` boolean and `aliases` array. `name` identifies the representative of a physical directory on the daemon's filesystem. `aliases` contains its other selectable names. Scoped reads and configured defaults retain the requested alias spelling.
+
+Aliases into a real profile reuse its cached sessions. Alias-only external stores have `listed: false` and are available through scoped runtime reads, but remain outside ordinary REST/web/TUI session lists, `list --all` and the profile picker. Only listed profiles contribute to all-profile totals.
+
+Profile inventory, cached session data, group registries and project registries have independent health. A newly observed physical store is not ready until an accepted daemon reload; accepted empty stores are ready too. A session load failure makes affected session reads exit 1 instead of returning incomplete counts or an empty successful result. Repairing the file does not clear that failure until an accepted reload. Transient selector conflicts with retained cached stores also produce a refusal until an accepted reload rather than serving another store's rows. Other healthy profiles and inventory-only reads remain available.
+
+Project listing does not require session or group data. The `global` and `profile` scopes require their respective project registry; `all` retains entries from readable registries, matching the local merged listing. Global project registry reads and explicitly named profile project registry reads do not create app/profile directories. Local empty-profile bootstrap behavior is unchanged.
+
+Profile labels and persisted session titles and commands retain their original strings, including controls. Alias names and scoped selections still follow the local profile-name grammar; a legacy directory label printed by the picker can remain unreadable for session reads. JSON preserves the values; human output follows local formatting without sanitizing their controls.
+
+### Transport parity fixture
+
+The ignored named parity check uses `AOE_PARITY_HOME` as an **existing temporary parent directory**, not a store to replay. It seeds the synthetic fixture in an owned temporary child and removes that child after comparison. Existing parent entries are left untouched.
+
+```bash
+AOE_PARITY_HOME="$temporary_parent" cargo test --test integration \
+  the_named_home_produces_the_same_bytes_on_both_transports -- --ignored --nocapture
+```
+
 ## GET /api/sessions
 
 Lists sessions, including trashed and archived ones. Pass `state` to filter server-side: `live` excludes trashed and archived sessions, `trashed` returns only trashed ones, and `all` (the default) filters nothing. An unrecognized value is rejected with `400` rather than ignored.

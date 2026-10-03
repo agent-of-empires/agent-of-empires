@@ -1,0 +1,82 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://aoe.invalid/schemas/cli-read/v151/cases.schema.json",
+  "title": "cli-read v151 Contract Pack case index",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "artifact_revision", "cases"],
+  "properties": {
+    "schema": { "const": 1 },
+    "artifact_revision": { "const": "v151" },
+    "cases": { "type": "array", "items": { "$ref": "#/$defs/case_row" } }
+  },
+  "$defs": {
+    "case_row": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "case_id",
+        "command",
+        "alias",
+        "parse",
+        "transport",
+        "auth",
+        "argv",
+        "replay_role",
+        "input_files",
+        "output_files",
+        "all_files"
+      ],
+      "properties": {
+        "case_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+        },
+        "command": {
+          "type": "string",
+          "enum": [
+            "list",
+            "status",
+            "session-show",
+            "session-list-trash",
+            "group-list",
+            "profile-bare",
+            "profile-list",
+            "project-list",
+            "unparsable"
+          ]
+        },
+        "alias": {
+          "oneOf": [
+            { "type": "null" },
+            { "type": "string", "enum": ["ls", "group-ls", "profile-ls", "project-ls"] }
+          ]
+        },
+        "parse": { "type": "string", "enum": ["ok", "parser_error"] },
+        "transport": {
+          "type": "string",
+          "enum": ["uds", "http_loopback", "https"]
+        },
+        "auth": {
+          "type": "string",
+          "enum": ["none", "bearer_valid", "bearer_invalid", "bearer_missing"]
+        },
+        "argv": { "type": "array", "items": { "type": "string" } },
+        "replay_role": { "type": "string", "enum": ["client_mode", "server_mode"] },
+        "input_files": { "type": "array", "items": { "$ref": "#/$defs/file_ref" } },
+        "output_files": { "type": "array", "items": { "$ref": "#/$defs/file_ref" } },
+        "all_files": { "type": "array", "items": { "$ref": "#/$defs/file_ref" } }
+      }
+    },
+    "file_ref": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256", "bytes"],
+      "properties": {
+        "path": { "type": "string", "pattern": "^[A-Za-z0-9._/-]+$" },
+        "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "bytes": { "type": "integer", "minimum": 0 }
+      }
+    }
+  }
+}

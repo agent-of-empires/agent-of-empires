@@ -320,6 +320,36 @@ where
     Ok(result)
 }
 
+/// A JSON registry's text, or `None` when the file is absent or blank. Both
+/// are legitimately empty, and neither is a reason to write a sidecar.
+///
+/// Absent and unreadable are different facts and this has to keep them apart.
+/// `Path::exists` is `stat(...).is_ok()`, so it answers "no" for a permission
+/// error just as it answers "no" for a file that is not there. Reading a
+/// profile this half cannot open as an empty registry is what let a profile
+/// with a sessions.json in it publish as fully healthy, with its rows simply
+/// absent and every read command reporting nothing at all.
+///
+/// Only `NotFound` is absence. Something that is there but is not a regular
+/// file -- a directory, most likely -- is not an empty registry either: it used
+/// to surface as `IsADirectory`, and folding it into "empty" would reintroduce
+/// the same silence one level up, with the health model unable to see it.
+fn read_nonempty(path: &Path) -> Result<Option<String>> {
+    let metadata = match fs::metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+        Ok(metadata) => metadata,
+    };
+    if !metadata.is_file() {
+        anyhow::bail!("{} is not a regular file", path.display());
+    }
+    let content = fs::read_to_string(path)?;
+    if content.trim().is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(content))
+}
+
 /// Process-wide registry of per-profile save mutexes.
 fn save_lock_for(profile: &str) -> Arc<Mutex<()>> {
     static REGISTRY: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
@@ -938,19 +968,30 @@ impl Storage {
         &self.sessions_path
     }
 
+    /// The session rows, with the ones that could not be deserialised
+    /// quarantined beside the store.
     pub fn load(&self) -> Result<Vec<Instance>> {
-        if !self.sessions_path.exists() {
-            return Ok(Vec::new());
+        let (instances, corrupt) = self.split_instances()?;
+        if !corrupt.is_empty() {
+            self.quarantine_corrupt_rows(&corrupt);
         }
+        Ok(instances)
+    }
+    /// Read session rows without quarantine, repair, or writes.
+    pub(crate) fn load_instances_readonly(&self) -> Result<Vec<Instance>> {
+        self.split_instances().map(|(instances, _)| instances)
+    }
 
-        let content = fs::read_to_string(&self.sessions_path)?;
-        if content.trim().is_empty() {
-            return Ok(Vec::new());
-        }
+    /// Deserialise the session rows, keeping the ones that failed apart from
+    /// the ones that did not. Pure: quarantining is the caller's decision.
+    fn split_instances(&self) -> Result<(Vec<Instance>, Vec<serde_json::Value>)> {
+        let Some(content) = read_nonempty(&self.sessions_path)? else {
+            return Ok((Vec::new(), Vec::new()));
+        };
 
         let rows: Vec<serde_json::Value> = serde_json::from_str(&content)?;
         let mut instances = Vec::with_capacity(rows.len());
-        let mut corrupt: Vec<serde_json::Value> = Vec::new();
+        let mut corrupt = Vec::new();
         for (idx, row) in rows.into_iter().enumerate() {
             match <Instance as serde::Deserialize>::deserialize(&row) {
                 Ok(mut inst) => {
@@ -973,12 +1014,55 @@ impl Storage {
                 }
             }
         }
+        Ok((instances, corrupt))
+    }
 
-        if !corrupt.is_empty() {
-            self.quarantine_corrupt_rows(&corrupt);
+    fn groups_path(&self) -> std::path::PathBuf {
+        self.sessions_path.with_file_name("groups.json")
+    }
+
+    /// As [`Self::split_instances`], for the group registry.
+    fn split_groups(&self) -> Result<(Vec<Group>, Vec<serde_json::Value>)> {
+        let path = self.groups_path();
+        let Some(content) = read_nonempty(&path)? else {
+            return Ok((Vec::new(), Vec::new()));
+        };
+
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&content)?;
+        let mut groups = Vec::with_capacity(rows.len());
+        let mut corrupt = Vec::new();
+        for (idx, row) in rows.into_iter().enumerate() {
+            match <Group as serde::Deserialize>::deserialize(&row) {
+                Ok(group) => groups.push(group),
+                Err(e) => {
+                    tracing::warn!(
+                        profile = %self.profile,
+                        row = idx,
+                        error = %e,
+                        path = %path.display(),
+                        "skipping corrupt group row"
+                    );
+                    corrupt.push(row);
+                }
+            }
         }
+        Ok((groups, corrupt))
+    }
 
-        Ok(instances)
+    pub fn load_with_groups(&self) -> Result<(Vec<Instance>, Vec<Group>)> {
+        let instances = self.load()?;
+        let (groups, corrupt) = self.split_groups()?;
+        if !corrupt.is_empty() {
+            self.quarantine_corrupt_group_rows(&corrupt);
+        }
+        Ok((instances, groups))
+    }
+
+    /// The group registry alone, with no quarantine sidecar written. The
+    /// served projection already holds the instances in memory, so reading
+    /// `sessions.json` here would buy a discarded result and a write.
+    pub fn load_groups_readonly(&self) -> Result<Vec<Group>> {
+        self.split_groups().map(|(groups, _)| groups)
     }
 
     fn quarantine_corrupt_rows(&self, rows: &[serde_json::Value]) {
@@ -1022,47 +1106,6 @@ impl Storage {
                 "failed to write quarantine file"
             );
         }
-    }
-
-    pub fn load_with_groups(&self) -> Result<(Vec<Instance>, Vec<Group>)> {
-        let instances = self.load()?;
-
-        let groups_path = self.sessions_path.with_file_name("groups.json");
-        let groups = if groups_path.exists() {
-            let content = fs::read_to_string(&groups_path)?;
-            if content.trim().is_empty() {
-                Vec::new()
-            } else {
-                let rows: Vec<serde_json::Value> = serde_json::from_str(&content)?;
-                let mut groups = Vec::with_capacity(rows.len());
-                let mut corrupt: Vec<serde_json::Value> = Vec::new();
-                for (idx, row) in rows.into_iter().enumerate() {
-                    match <Group as serde::Deserialize>::deserialize(&row) {
-                        Ok(group) => groups.push(group),
-                        Err(e) => {
-                            tracing::warn!(
-                                profile = %self.profile,
-                                row = idx,
-                                error = %e,
-                                path = %groups_path.display(),
-                                "skipping corrupt group row"
-                            );
-                            corrupt.push(row);
-                        }
-                    }
-                }
-
-                if !corrupt.is_empty() {
-                    self.quarantine_corrupt_group_rows(&corrupt);
-                }
-
-                groups
-            }
-        } else {
-            Vec::new()
-        };
-
-        Ok((instances, groups))
     }
 
     /// Locked load -> mutate -> save.

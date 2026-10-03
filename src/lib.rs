@@ -26,6 +26,10 @@ mod status_hooks;
 pub mod task_util;
 pub mod telemetry;
 pub mod terminal;
+/// The one lock every test that mutates the process environment holds. See
+/// the module for why it cannot live inside either `test_support`.
+#[cfg(any(test, debug_assertions))]
+pub(crate) mod test_env_lock;
 pub mod tips;
 pub mod tmux;
 pub mod tui;

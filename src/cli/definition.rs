@@ -52,18 +52,41 @@ pub struct Cli {
     /// consume or create profile state require an existing profile: an unknown
     /// name is refused, not created (make one with `aoe profile create`).
     /// Profile-independent commands such as `list --all` and `serve --stop`
-    /// ignore it
-    #[arg(short = 'p', long, global = true, env = "AGENT_OF_EMPIRES_PROFILE")]
+    /// ignore it. `AGENT_OF_EMPIRES_PROFILE` names one too, and an explicit
+    /// `-p` wins over it.
+    // No `env` attribute here on purpose. clap would fold the variable into
+    // `cli.profile` itself, and the two are not the same field: `explicit_profile`
+    // and `env_profile` are read separately, and which of them wins is the
+    // documented precedence. An `env` attribute would erase that distinction
+    // behind what looks like a help-text fix.
+    #[arg(short = 'p', long, global = true)]
     pub profile: Option<String>,
 
-    /// Attach to a remote agent daemon instead of using the local
-    /// session list. Equivalent to setting `AOE_DAEMON_URL`; pair with
-    /// `AOE_DAEMON_TOKEN` for the bearer token. The session list goes
-    /// through a bearer-only client, so `AOE_DAEMON_PASSPHRASE` does not
-    /// work here yet; it works for `aoe acp <verb>` against the same
-    /// `AOE_DAEMON_URL`. Only meaningful at the no-subcommand `aoe`
-    /// invocation (the TUI dashboard); ignored otherwise.
-    #[arg(long, global = true, env = "AOE_DAEMON_URL")]
+    /// Select the transport the read-only commands (`list`, `status`,
+    /// `session show`, `session list-trash`, `group list`, `profile`,
+    /// `project list`) use, and attach the dashboard to a remote agent daemon
+    /// instead of the local session list. `AOE_DAEMON_URL` names the same
+    /// endpoint for the same seven commands, and a bearer token is required
+    /// either way (`AOE_DAEMON_TOKEN`), but **the two are not equivalent when
+    /// the endpoint does not answer**: naming it here is a request for a served
+    /// answer, so it stays a refusal, while the variable names a remote that
+    /// may simply not be running, so it falls back to the local store and says
+    /// so on stderr. A plaintext endpoint must also name a loopback address
+    /// rather than a hostname, because no name is resolved before the bearer
+    /// would be sent. The session list goes through a bearer-only client, so
+    /// `AOE_DAEMON_PASSPHRASE` does not work here yet; it works for
+    /// `aoe acp <verb>` against the same `AOE_DAEMON_URL`. The local socket is
+    /// Linux-only, so on any other platform those seven reads always come from
+    /// the local store while this route is unaffected. A served answer is the
+    /// daemon's own view of the store, so a session started moments ago can
+    /// report a null `agent_session_id` here. At the no-subcommand `aoe`
+    /// invocation (the TUI dashboard) the same URL attaches the whole session
+    /// list instead.
+    // As with `-p`, no `env` attribute: `read_request_source` reads
+    // `AOE_DAEMON_URL` itself and keeps it distinct from an explicit
+    // `--daemon-url`, so the flag can win and an empty variable can still mean
+    // "unset".
+    #[arg(long, global = true)]
     pub daemon_url: Option<String>,
 
     #[command(subcommand)]
@@ -106,6 +129,9 @@ pub enum Commands {
     Send(SendArgs),
 
     /// Show session status summary
+    ///
+    /// `--verbose`, `--quiet` and `--json` each replace the default summary
+    /// instead of composing with it, so they exclude one another.
     Status(StatusArgs),
 
     /// Force-stop everything aoe is running: the serve daemon, all agent
