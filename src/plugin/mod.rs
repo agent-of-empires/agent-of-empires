@@ -22,6 +22,7 @@ pub mod protocol;
 pub mod sandbox;
 pub mod session_api;
 pub mod ui_state;
+pub(crate) mod worker_requests;
 
 pub mod launch;
 
