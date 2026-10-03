@@ -376,6 +376,7 @@ async fn build_spawn_request(
         agent_provider,
         claude_store_pin,
         prior_conversation,
+        workspace_info,
     ) = {
         let _guard = inst_lock.lock().await;
         let instances = service.instances.read().await;
@@ -394,6 +395,7 @@ async fn build_spawn_request(
             // A restart before the first worker assigned an ACP id leaves only
             // the terminal conversation id to announce replacing.
             target.stored_acp_session_id.is_none() && inst.agent_session_id.is_some(),
+            inst.workspace_info.clone(),
         )
     };
     let agent = supervisor
@@ -438,6 +440,7 @@ async fn build_spawn_request(
         fork_from,
         sandbox_continuation: crate::acp::supervisor::SandboxContinuation::Persisted,
         sandbox_info,
+        workspace_info,
         source_profile: Some(target.source_profile.clone()),
         yolo_mode: target.yolo_mode,
         acp_mode_id,

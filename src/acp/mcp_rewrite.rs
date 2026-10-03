@@ -12,7 +12,7 @@ use tracing::warn;
 
 use crate::acp::acp_client::{known_container_workdir, AcpError, SandboxLayout};
 use crate::session::mcp::project_mcp::{ProjectMcpServer, ProjectMcpTransport};
-use crate::session::SandboxInfo;
+use crate::session::{SandboxInfo, WorkspaceInfo};
 
 pub const METHOD: &str = "mcp.rewrite";
 
@@ -48,9 +48,14 @@ pub struct McpSandboxMount {
 
 impl McpSandbox {
     /// Blocking: without a pinned workdir it asks the container runtime.
-    pub fn resolve(info: &SandboxInfo, cwd: &Path, session_id: &str) -> Self {
+    pub fn resolve(
+        info: &SandboxInfo,
+        cwd: &Path,
+        workspace: Option<&WorkspaceInfo>,
+        session_id: &str,
+    ) -> Self {
         Self::from_layout(
-            SandboxLayout::resolve(info, cwd),
+            SandboxLayout::resolve(info, cwd, workspace),
             || known_container_workdir(info),
             session_id,
         )
@@ -371,18 +376,23 @@ pub(crate) mod test_support {
         current_rewriter().is_some()
     }
 
-    /// Returns a fixed set and records each call's sandbox flag for assertions after the run.
+    /// Returns a fixed set and records each call's sandbox for assertions after the run.
     pub(crate) struct RecordingRewriter {
-        pub(crate) sandboxed_calls: Mutex<Vec<bool>>,
+        pub(crate) sandboxes: Mutex<Vec<Option<McpSandbox>>>,
         result: Vec<ProjectMcpServer>,
     }
 
     impl RecordingRewriter {
         pub(crate) fn returning(result: Vec<ProjectMcpServer>) -> Arc<Self> {
             Arc::new(Self {
-                sandboxed_calls: Mutex::new(Vec::new()),
+                sandboxes: Mutex::new(Vec::new()),
                 result,
             })
+        }
+
+        pub(crate) fn sandboxed_calls(&self) -> Vec<bool> {
+            let sandboxes = self.sandboxes.lock().unwrap_or_else(|e| e.into_inner());
+            sandboxes.iter().map(Option::is_some).collect()
         }
     }
 
@@ -392,12 +402,48 @@ pub(crate) mod test_support {
             ctx: &'a McpRewriteContext,
             _servers: Vec<ProjectMcpServer>,
         ) -> RewriteFuture<'a> {
-            self.sandboxed_calls
+            self.sandboxes
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .push(ctx.sandboxed());
+                .push(ctx.sandbox.clone());
             let result = self.result.clone();
             Box::pin(async move { Ok(result) })
+        }
+    }
+
+    /// A workspace at `dir` whose repos have worktrees `dir/<name>` and the given main repos.
+    pub(crate) fn workspace_info(dir: &Path, repos: &[(&str, &Path)]) -> WorkspaceInfo {
+        WorkspaceInfo {
+            branch: "feature".into(),
+            workspace_dir: dir.to_string_lossy().into_owned(),
+            repos: repos
+                .iter()
+                .map(|(name, main)| crate::session::WorkspaceRepo {
+                    name: (*name).into(),
+                    source_path: main.to_string_lossy().into_owned(),
+                    branch: "feature".into(),
+                    worktree_path: dir.join(name).to_string_lossy().into_owned(),
+                    main_repo_path: main.to_string_lossy().into_owned(),
+                    managed_by_aoe: true,
+                    branch_preexisting: false,
+                    base_branch: None,
+                    base_branch_override: None,
+                })
+                .collect(),
+            created_at: chrono::Utc::now(),
+            cleanup_on_delete: true,
+        }
+    }
+
+    /// A main repo that cannot exist, so a fixture needs no git repos: it shares only `/`
+    /// with any workspace dir and mounts at `/workspace` plus its own path.
+    pub(crate) const OUTSIDE_MAIN: &str = "/aoe-test-no-such-dir/alpha";
+
+    pub(crate) fn outside_main_mount() -> McpSandboxMount {
+        McpSandboxMount {
+            host: OUTSIDE_MAIN.into(),
+            container: format!("/workspace{OUTSIDE_MAIN}"),
+            read_only: false,
         }
     }
 }
@@ -496,29 +542,25 @@ mod tests {
         assert!(p.get("sandbox").is_none(), "{p}");
     }
 
-    /// A sibling worktree mounts both itself and its main repo, so both reach the plugin.
-    #[test]
-    fn sandbox_of_a_linked_worktree_lists_worktree_and_main_repo() {
-        let tmp = tempfile::tempdir().unwrap();
-        let repo = tmp.path().join("repo");
-        let worktree = tmp.path().join("repo-feature");
-        {
-            let git = git2::Repository::init(&repo).unwrap();
-            let sig = git2::Signature::now("T", "t@example.com").unwrap();
-            let tree = git
-                .find_tree(git.index().unwrap().write_tree().unwrap())
-                .unwrap();
-            let head = git
-                .commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
-                .unwrap();
-            let branch = git
-                .branch("feature", &git.find_commit(head).unwrap(), false)
-                .unwrap();
-            let mut opts = git2::WorktreeAddOptions::new();
-            opts.reference(Some(branch.get()));
-            git.worktree("feature", &worktree, Some(&opts)).unwrap();
-        }
-        let info = SandboxInfo {
+    fn linked_worktree(repo: &Path, worktree: &Path) {
+        let git = git2::Repository::init(repo).unwrap();
+        let sig = git2::Signature::now("T", "t@example.com").unwrap();
+        let tree = git
+            .find_tree(git.index().unwrap().write_tree().unwrap())
+            .unwrap();
+        let head = git
+            .commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
+            .unwrap();
+        let branch = git
+            .branch("feature", &git.find_commit(head).unwrap(), false)
+            .unwrap();
+        let mut opts = git2::WorktreeAddOptions::new();
+        opts.reference(Some(branch.get()));
+        git.worktree("feature", worktree, Some(&opts)).unwrap();
+    }
+
+    fn sandbox_info(container_workdir: &str) -> SandboxInfo {
+        SandboxInfo {
             enabled: true,
             container_id: None,
             image: "alpine:latest".into(),
@@ -526,13 +568,26 @@ mod tests {
             extra_env: None,
             custom_instruction: None,
             before_start_env: Vec::new(),
-            container_workdir: Some("/workspace/repo-feature".into()),
+            container_workdir: Some(container_workdir.into()),
             provider: None,
-        };
+        }
+    }
 
-        let sandbox = McpSandbox::resolve(&info, &worktree, "s1");
+    fn host(p: &Path) -> String {
+        p.canonicalize().unwrap().to_string_lossy().into_owned()
+    }
 
-        let host = |p: &Path| p.canonicalize().unwrap().to_string_lossy().into_owned();
+    /// A sibling worktree mounts both itself and its main repo, so both reach the plugin.
+    #[test]
+    fn sandbox_of_a_linked_worktree_lists_worktree_and_main_repo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let worktree = tmp.path().join("repo-feature");
+        linked_worktree(&repo, &worktree);
+        let info = sandbox_info("/workspace/repo-feature");
+
+        let sandbox = McpSandbox::resolve(&info, &worktree, None, "s1");
+
         assert_eq!(
             sandbox,
             McpSandbox {
@@ -550,6 +605,72 @@ mod tests {
                     },
                 ],
             }
+        );
+    }
+
+    /// A workspace container mounts the workspace dir plus each main repo outside it.
+    #[test]
+    fn sandbox_of_a_workspace_lists_the_workspace_and_main_repos_outside_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("ws").join("feat");
+        let outside_main = tmp.path().join("projects").join("alpha");
+        let inside_main = ws.join("beta-main");
+        std::fs::create_dir_all(&ws).unwrap();
+        linked_worktree(&outside_main, &ws.join("alpha"));
+        linked_worktree(&inside_main, &ws.join("beta"));
+        let workspace =
+            test_support::workspace_info(&ws, &[("alpha", &outside_main), ("beta", &inside_main)]);
+        let mut info = sandbox_info("unused");
+        info.container_workdir = None;
+        info.container_name = "aoe-sandbox-mcp-workspace-test-no-such-container".into();
+
+        let sandbox = McpSandbox::resolve(&info, &ws, Some(&workspace), "s1");
+
+        let (created, created_workdir) =
+            crate::session::config::container_config::compute_workspace_volume_paths(
+                &ws, &workspace,
+            )
+            .unwrap();
+        let expected = vec![
+            McpSandboxMount {
+                host: host(&ws),
+                container: "/workspace/ws/feat".into(),
+                read_only: false,
+            },
+            McpSandboxMount {
+                host: host(&outside_main),
+                container: "/workspace/projects/alpha".into(),
+                read_only: false,
+            },
+        ];
+        assert_eq!(
+            sandbox,
+            McpSandbox {
+                container_workdir: Some("/workspace/ws/feat".into()),
+                mounts: expected,
+            }
+        );
+        let created: Vec<_> = created
+            .into_iter()
+            .map(|v| (v.host_path, v.container_path))
+            .collect();
+        let reported: Vec<_> = sandbox
+            .mounts
+            .iter()
+            .map(|m| (m.host.clone(), m.container.clone()))
+            .collect();
+        assert_eq!(reported, created, "mounts match container creation");
+        assert_eq!(sandbox.container_workdir, Some(created_workdir));
+
+        let mut c = ctx();
+        c.sandbox = Some(sandbox);
+        let p = request_params(&c, &[]);
+        assert_eq!(
+            p["sandbox"]["mounts"],
+            json!([
+                {"host": host(&ws), "container": "/workspace/ws/feat", "read_only": false},
+                {"host": host(&outside_main), "container": "/workspace/projects/alpha", "read_only": false}
+            ])
         );
     }
 

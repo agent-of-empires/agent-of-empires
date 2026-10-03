@@ -296,6 +296,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             host_environment.clone(),
             claude_config_dir,
             req.sandbox_info.as_ref(),
+            req.workspace_info.as_ref(),
             "MCP resolution task failed",
         )
         .await;
@@ -375,6 +376,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                 stored_acp_session_id,
                 fork_from,
                 sandbox_info: req.sandbox_info.clone(),
+                workspace_info: req.workspace_info.clone(),
                 source_profile,
                 mcp_servers,
                 seed_history_replay,
@@ -896,10 +898,12 @@ pub(super) async fn resolve_mcp_servers(
     session_env: Vec<(String, String)>,
     native_config_override: Option<PathBuf>,
     sandbox_info: Option<&crate::session::SandboxInfo>,
+    workspace_info: Option<&crate::session::WorkspaceInfo>,
     failure: &'static str,
 ) -> Vec<agent_client_protocol::schema::v1::McpServer> {
     let sandbox_info = sandbox_info.filter(|info| info.enabled).cloned();
     let projection_env = session_env.clone();
+    let workspace_info = workspace_info.cloned();
     let resolved = {
         let (agent_key, session, profile, cwd) = (
             agent_key.to_string(),
@@ -908,8 +912,14 @@ pub(super) async fn resolve_mcp_servers(
             cwd.clone(),
         );
         tokio::task::spawn_blocking(move || {
-            let sandbox = sandbox_info
-                .map(|info| crate::acp::mcp_rewrite::McpSandbox::resolve(&info, &cwd, &session));
+            let sandbox = sandbox_info.map(|info| {
+                crate::acp::mcp_rewrite::McpSandbox::resolve(
+                    &info,
+                    &cwd,
+                    workspace_info.as_ref(),
+                    &session,
+                )
+            });
             let defs = resolve_mcp_defs(
                 &agent_key,
                 &session,
@@ -1639,6 +1649,7 @@ mod tests {
                 Vec::new(),
                 None,
                 sandbox_info,
+                None,
                 "failed",
             )
         };
@@ -1666,7 +1677,7 @@ mod tests {
         let plain = resolve(None).await;
 
         assert_eq!(
-            *rewriter.sandboxed_calls.lock().unwrap(),
+            rewriter.sandboxed_calls(),
             [true, false],
             "context must carry the sandbox flag, and a disabled sandbox is none"
         );
@@ -1679,8 +1690,10 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
-    async fn launch_runs_the_rewrite_hook_with_the_sandbox_flag() {
-        use crate::acp::mcp_rewrite::test_support::{RecordingRewriter, SlotGuard};
+    async fn launch_runs_the_rewrite_hook_with_the_sandbox_mounts() {
+        use crate::acp::mcp_rewrite::test_support::{
+            outside_main_mount, workspace_info, RecordingRewriter, SlotGuard, OUTSIDE_MAIN,
+        };
 
         let (_home, _tmp) = isolate_home();
         let rewriter = RecordingRewriter::returning(vec![rewritten_server()]);
@@ -1719,10 +1732,26 @@ mod tests {
             .unwrap();
         let mut sandboxed = spawn_request("launch-sandboxed");
         sandboxed.sandbox_info = Some(sandbox_info);
+        sandboxed.workspace_info = Some(workspace_info(
+            &sandboxed.cwd,
+            &[("alpha", std::path::Path::new(OUTSIDE_MAIN))],
+        ));
         let (config, _) = supervisor.spawn_config(&sandboxed, 1).await.unwrap();
         assert_eq!(mcp_names(&config.mcp_servers), ["rewritten"]);
+        assert_eq!(
+            config.workspace_info.as_ref().map(|w| w.repos.len()),
+            Some(1),
+            "a respawn re-resolves from the same workspace"
+        );
 
-        assert_eq!(*rewriter.sandboxed_calls.lock().unwrap(), [false, true]);
+        let sandboxes = rewriter.sandboxes.lock().unwrap();
+        let [None, Some(sandbox)] = sandboxes.as_slice() else {
+            panic!("a host then a sandboxed call expected: {sandboxes:?}");
+        };
+        assert!(
+            sandbox.mounts.contains(&outside_main_mount()),
+            "launch reports the workspace mounts: {sandbox:?}"
+        );
     }
 
     #[tokio::test]

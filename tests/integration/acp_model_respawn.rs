@@ -58,6 +58,7 @@ fn spawn_config(
         generation: 0,
         artifact_dir: None,
         sandbox_info: None,
+        workspace_info: None,
         source_profile: None,
         mcp_servers: Vec::new(),
         claude_store_pin: None,

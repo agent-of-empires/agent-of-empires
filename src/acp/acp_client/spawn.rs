@@ -46,6 +46,8 @@ pub struct SpawnConfig {
     /// Parent id for a structured `session/fork` (`Instance.fork_pending`).
     pub fork_from: Option<String>,
     pub sandbox_info: Option<SandboxInfo>,
+    /// Selects the workspace mount layout when re-resolving MCP servers on respawn.
+    pub workspace_info: Option<crate::session::WorkspaceInfo>,
     /// Resolves profile-level `sandbox.environment` and settings.
     pub source_profile: Option<String>,
     /// From `<app_dir>/mcp.json`; gated against agent capabilities later.

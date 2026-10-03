@@ -251,6 +251,8 @@ pub struct SpawnRequest {
     pub fork_from: Option<String>,
     pub sandbox_continuation: SandboxContinuation,
     pub sandbox_info: Option<SandboxInfo>,
+    /// `Instance.workspace_info`; a sandboxed workspace container mounts its main repos too.
+    pub workspace_info: Option<crate::session::WorkspaceInfo>,
     /// The stored row's profile. Every production launch sets it, and the launch rechecks that
     /// row before and after the handshake (#4116).
     pub source_profile: Option<String>,

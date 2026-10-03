@@ -3,7 +3,7 @@
 
 use crate::acp::fs_handler::SandboxPathMap;
 use crate::containers::container_interface::VolumeMount;
-use crate::session::SandboxInfo;
+use crate::session::{SandboxInfo, WorkspaceInfo};
 use std::path::{Path, PathBuf};
 
 use super::errors::AcpError;
@@ -39,7 +39,7 @@ impl SessionSandbox {
         project_path: &Path,
         source_profile: Option<String>,
     ) -> Result<(Self, SandboxPathMap), AcpError> {
-        let layout = SandboxLayout::resolve(sandbox, project_path)?;
+        let layout = SandboxLayout::resolve(sandbox, project_path, None)?;
         let mounts: Vec<(PathBuf, PathBuf)> = layout
             .volumes
             .into_iter()
@@ -87,14 +87,21 @@ pub(crate) struct SandboxLayout {
 }
 
 impl SandboxLayout {
-    /// Blocking: without a pinned workdir it asks the container runtime.
-    pub(crate) fn resolve(sandbox: &SandboxInfo, project_path: &Path) -> Result<Self, AcpError> {
-        let (volumes, computed_workdir) =
-            crate::session::config::container_config::compute_volume_paths(
-                project_path,
-                &project_path.to_string_lossy(),
-            )
-            .map_err(|e| AcpError::Spawn(format!("compute container workdir: {e}")))?;
+    /// Blocking: without a pinned workdir it asks the container runtime. Pass the
+    /// session's `workspace_info` so the volumes match the ones its container was created with.
+    pub(crate) fn resolve(
+        sandbox: &SandboxInfo,
+        project_path: &Path,
+        workspace: Option<&WorkspaceInfo>,
+    ) -> Result<Self, AcpError> {
+        use crate::session::config::container_config::{
+            compute_volume_paths, compute_workspace_volume_paths,
+        };
+        let (volumes, computed_workdir) = match workspace {
+            Some(workspace) => compute_workspace_volume_paths(project_path, workspace),
+            None => compute_volume_paths(project_path, &project_path.to_string_lossy()),
+        }
+        .map_err(|e| AcpError::Spawn(format!("compute container workdir: {e}")))?;
         let container_workdir = known_container_workdir(sandbox).unwrap_or(computed_workdir);
         Ok(Self {
             volumes,

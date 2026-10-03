@@ -286,6 +286,7 @@ async fn spawn_worker(state: &Arc<AppState>, id: &str) -> WorkerOutcome {
             fork_from: inst.fork_pending.clone(),
             sandbox_continuation: crate::acp::supervisor::SandboxContinuation::Persisted,
             sandbox_info: inst.sandbox_info.clone(),
+            workspace_info: inst.workspace_info.clone(),
             source_profile: Some(inst.source_profile.clone()),
             yolo_mode: inst.yolo_mode,
             acp_mode_id: inst.acp_mode_id.clone(),
