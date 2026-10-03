@@ -290,11 +290,14 @@ pub async fn update_session_archive(
             );
             return crate::server::api::session_gone_after_persist();
         };
+        let old_status = inst.status;
         if archived {
             inst.archive();
         } else {
             inst.unarchive();
         }
+        // Archiving settles a Running, Waiting or Starting row to Idle.
+        publish_status_change(&state.status_tx, inst, old_status);
         let response =
             SessionResponse::from_instance(&*inst, crate::claude_settings::read_tui_fullscreen());
 
@@ -1004,12 +1007,14 @@ pub async fn stop_session(
             return crate::server::api::session_gone_after_persist();
         };
         if is_structured {
+            let old_status = inst.status;
             inst.status = Status::Stopped;
             inst.mark_idle_dormant();
             // A direct stop bypasses apply_status_intent, which normally releases this on
             // reaching a terminal status; do the same here, on the live in-memory row (the
             // disk-persisted copy above is a fresh load, so this field is always false there).
             inst.plugin_revival_pending = false;
+            publish_status_change(&state.status_tx, inst, old_status);
         }
         inst.clone()
     };
@@ -1054,7 +1059,9 @@ pub async fn stop_session(
                         let mut instances = state.instances.write().await;
                         if let Some(live) = instances.iter_mut().find(|instance| instance.id == id)
                         {
+                            let old_status = live.status;
                             live.merge_post_start(&stopped);
+                            publish_status_change(&state.status_tx, live, old_status);
                         }
                     }
                     Ok(None) => {}
@@ -1183,9 +1190,11 @@ pub async fn start_session(
         {
             let mut instances = state.instances.write().await;
             if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
+                let old_status = inst.status;
                 inst.idle_dormant_since = None;
                 inst.status = Status::Idle;
                 inst.last_error = None;
+                publish_status_change(&state.status_tx, inst, old_status);
             }
         }
         let instances = state.instances.read().await;
@@ -1206,8 +1215,10 @@ pub async fn start_session(
     {
         let mut instances = state.instances.write().await;
         if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
+            let old_status = inst.status;
             inst.status = Status::Starting;
             inst.last_error = None;
+            publish_status_change(&state.status_tx, inst, old_status);
         }
     }
 
@@ -1240,7 +1251,7 @@ pub async fn start_session(
             let mut instances = state.instances.write().await;
             let response = match instances.iter_mut().find(|i| i.id == id) {
                 Some(inst) => {
-                    apply_post_restart_sync(inst, &sync_base, &started);
+                    sync_live_after_restart(&state.status_tx, inst, &sync_base, &started);
                     SessionResponse::from_instance(
                         inst,
                         crate::claude_settings::read_tui_fullscreen(),
@@ -1270,9 +1281,13 @@ pub async fn start_session(
             tracing::warn!(target: "http.api.sessions", "start_session restart failed for {id}: {msg}");
             let mut instances = state.instances.write().await;
             if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
-                if apply_post_restart_sync(inst, &sync_base, &started) && blocked.is_none() {
+                if sync_live_after_restart(&state.status_tx, inst, &sync_base, &started)
+                    && blocked.is_none()
+                {
+                    let synced_status = inst.status;
                     inst.status = Status::Error;
                     inst.last_error = Some(msg.clone());
+                    publish_status_change(&state.status_tx, inst, synced_status);
                 }
             }
             if let Some(blocked) = blocked {

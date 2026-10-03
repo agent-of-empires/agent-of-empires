@@ -157,7 +157,7 @@ pub async fn send_message(
             let mut instances = state.instances.write().await;
             let profile = if let Some(i) = instances.iter_mut().find(|i| i.id == id) {
                 if !matches!(outcome, EnsureReadyOutcome::AlreadyAlive) {
-                    apply_post_restart_sync(i, &sync_base, &started);
+                    sync_live_after_restart(&state.status_tx, i, &sync_base, &started);
                 }
                 i.touch_after_input();
                 i.source_profile.clone()
@@ -219,7 +219,7 @@ pub async fn send_message(
                 SendKeysError::ResumeFailed(sid) => {
                     let mut instances = state.instances.write().await;
                     if let Some(i) = instances.iter_mut().find(|i| i.id == id) {
-                        apply_post_restart_sync(i, &sync_base, &started);
+                        sync_live_after_restart(&state.status_tx, i, &sync_base, &started);
                     }
                     (
                         StatusCode::CONFLICT,
@@ -266,9 +266,11 @@ pub async fn send_message(
                     // back from the clone.
                     let mut instances = state.instances.write().await;
                     if let Some(i) = instances.iter_mut().find(|i| i.id == id) {
-                        if apply_post_restart_sync(i, &sync_base, &started) {
+                        if sync_live_after_restart(&state.status_tx, i, &sync_base, &started) {
+                            let synced_status = i.status;
                             i.status = crate::session::Status::Error;
                             i.last_error = Some(msg);
+                            publish_status_change(&state.status_tx, i, synced_status);
                         }
                     }
                     (
