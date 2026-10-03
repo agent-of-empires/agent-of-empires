@@ -21,6 +21,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Compare pin with latest stable
@@ -65,20 +66,28 @@ jobs:
 
           REMOTE="https://x-access-token:${GH_TOKEN}@github.com/${BASE_REPO}.git"
           BOT_EMAIL="github-actions[bot]@users.noreply.github.com"
-          # The force-push below rebuilds the branch from main; never discard
-          # lint fixes someone pushed onto an open bump PR.
-          if git fetch --quiet "$REMOTE" "refs/heads/${HEAD_BRANCH}" 2>/dev/null; then
-            if git log --format=%ae HEAD..FETCH_HEAD | grep -qvxF "$BOT_EMAIL"; then
+          # Inspect the tip we lease; preserve human lint fixes and racing pushes.
+          OBSERVED_SHA=""
+          if git ls-remote --exit-code "$REMOTE" "refs/heads/${HEAD_BRANCH}" >/dev/null; then
+            git fetch --quiet "$REMOTE" "refs/heads/${HEAD_BRANCH}"
+            OBSERVED_SHA="$(git rev-parse FETCH_HEAD)"
+            AUTHORS="$(git log --format=%ae HEAD.."$OBSERVED_SHA")"
+            if printf '%s' "$AUTHORS" | grep -vxF "$BOT_EMAIL" >/dev/null; then
               echo "::warning::${HEAD_BRANCH} has commits from someone else; not overwriting it with ${LATEST}"
               exit 0
+            fi
+          else
+            STATUS=$?
+            if [ "$STATUS" -ne 2 ]; then
+              echo "::error::Cannot inspect ${HEAD_BRANCH} (git ls-remote exited $STATUS)"
+              exit "$STATUS"
             fi
           fi
           git config user.name "github-actions[bot]"
           git config user.email "$BOT_EMAIL"
           git checkout -B "$HEAD_BRANCH"
           git commit -am "chore: bump Rust toolchain to ${LATEST}"
-          # Bot-owned branch, always rebuilt from main.
-          git push --force "$REMOTE" "HEAD:${HEAD_BRANCH}"
+          git push --force-with-lease="refs/heads/${HEAD_BRANCH}:${OBSERVED_SHA}" "$REMOTE" "HEAD:${HEAD_BRANCH}"
 
           {
             echo "## Description"

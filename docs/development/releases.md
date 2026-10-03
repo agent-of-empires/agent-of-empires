@@ -33,6 +33,16 @@ Tagging the merge SHA rather than `origin/main` is what dissolves the race: a PR
 gh workflow run prepare-release.yml -f version=1.7.2
 ```
 
+## Rebuilding an existing tag
+
+Dispatch the release workflow with the existing tag, subject to the same release-environment approval:
+
+```bash
+gh workflow run release.yml -f tag=v1.18.0
+```
+
+The build checks out the requested tag and reads its `rust-toolchain.toml`. Numeric pins are preserved. Historical tags using `stable` install the current stable compiler through the external setup action, without requiring helper files in the old tree. Such rebuilds do not reproduce the original compiler version.
+
 ## Versioning
 
 Semver, with patch as the autopick. Go **minor** for user-visible features, new CLI subcommands, new config sections, anything behind a `feat:` commit. Go **major** for breaking config changes, removed CLI subcommands, or on-disk breakage needing maintainer attention beyond a migration. When uncertain, take the bigger bump.

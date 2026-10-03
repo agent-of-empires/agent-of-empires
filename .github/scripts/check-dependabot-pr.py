@@ -9,8 +9,9 @@ recognise:
   modified, plus the `npmDepsHash` line in flake.nix that
   nix-npm-hash-fix-pr.yml pushes. No file is added, deleted or renamed.
 - Manifests: only dependency version requirements change.
-- npm: every new or changed `package-lock.json` entry is the registry.npmjs.org
-  tarball for its own name and version, and no entry gains `hasInstallScript`.
+- npm: registry entries use their canonical registry.npmjs.org tarball and
+  integrity; links remain unchanged and existing bundles change versions only.
+  No entry gains `hasInstallScript` or changes its linked/bundled state.
 - cargo: every new or changed `Cargo.lock` package comes from crates.io.
 - GitHub Actions: only `uses:` lines change, each keeps its action, pins a
   40-hex SHA with a `# <tag>` comment, and that tag resolves upstream to the
@@ -18,6 +19,9 @@ recognise:
 
 Usage:
     python3 .github/scripts/check-dependabot-pr.py --base <sha> --head <sha>
+    Add --repo <owner/repo> --pr <number> to enforce commit provenance too.
+    Hash fixes need a nonexpired artifact from the trusted base workflow;
+    older unsigned commits without that proof require manual handling.
     python3 .github/scripts/check-dependabot-pr.py --self-test
 """
 
@@ -76,6 +80,19 @@ def npm_tarball(key, entry):
     return f"{NPM_REGISTRY}{name}/-/{name.rpartition('/')[2]}-{entry.get('version')}.tgz"
 
 
+def bundled_metadata(entry, path, problems):
+    out = dict(entry)
+    if "version" in out:
+        version = out["version"]
+        if not isinstance(version, str) or not VERSION_REQ.fullmatch(version):
+            problems.append(f"{path}: invalid bundled version {version!r}")
+        out["version"] = None
+    for table in ("dependencies", "optionalDependencies", "peerDependencies"):
+        if table in out:
+            out[table] = strip_versions(out[table], path, problems, in_deps=True)
+    return out
+
+
 def check_npm_lock(path, base_text, head_text):
     problems = []
     base_doc, head_doc = json.loads(base_text), json.loads(head_text)
@@ -90,17 +107,23 @@ def check_npm_lock(path, base_text, head_text):
         if before == entry:
             continue
         where = f"{path}: {key}"
-        if entry.get("link") or entry.get("inBundle"):
-            if before is None:
-                problems.append(f"{where}: new linked or bundled entry")
+        if entry.get("hasInstallScript") and not (before or {}).get("hasInstallScript"):
+            problems.append(f"{where}: adds an install script")
+        before_flags = ((before or {}).get("link"), (before or {}).get("inBundle"))
+        after_flags = (entry.get("link"), entry.get("inBundle"))
+        if any(before_flags) or any(after_flags):
+            if before is None or before_flags != after_flags:
+                problems.append(f"{where}: changes linked or bundled state")
+            elif entry.get("link"):
+                problems.append(f"{where}: changes a linked entry")
+            elif bundled_metadata(before, where, []) != bundled_metadata(entry, where, problems):
+                problems.append(f"{where}: changes more than bundled dependency versions")
             continue
         resolved = entry.get("resolved", "")
         if resolved != npm_tarball(key, entry):
             problems.append(f"{where}: resolves from {resolved or '<missing>'}, not {npm_tarball(key, entry)}")
         if not entry.get("integrity"):
             problems.append(f"{where}: no integrity hash")
-        if entry.get("hasInstallScript") and not (before or {}).get("hasInstallScript"):
-            problems.append(f"{where}: adds an install script")
     return problems
 
 
@@ -200,7 +223,8 @@ def check_actions_diff(path, diff_text, resolve_tag):
 
 def check_nix_hash_diff(path, diff_text):
     changes = diff_changes(diff_text)
-    if len(changes) == 2 and all(NPM_DEPS_HASH.match(line) for line in changes):
+    if (len(changes) == 2 and changes[0].startswith("-") and changes[1].startswith("+")
+            and all(NPM_DEPS_HASH.match(line) for line in changes)):
         return []
     return [f"{path}: changes more than the npmDepsHash line"]
 
@@ -233,9 +257,65 @@ def git(*args):
     ).stdout
 
 
-def gh_api(endpoint):
-    out = subprocess.run(["gh", "api", endpoint], check=True, capture_output=True, text=True).stdout
+def gh_api(endpoint, paginate=False):
+    args = ["gh", "api", endpoint]
+    if paginate:
+        args += ["--paginate", "--slurp"]
+    out = subprocess.run(args, check=True, capture_output=True, text=True).stdout
     return json.loads(out)
+
+
+def is_hash_fix_artifact(artifact, run, repo, name, workflow_id):
+    return (
+        artifact.get("name") == name
+        and artifact.get("expired") is False
+        and (artifact.get("workflow_run") or {}).get("id") == run.get("id")
+        and run.get("workflow_id") == workflow_id
+        and run.get("event") == "pull_request_target"
+        and run.get("path") == ".github/workflows/nix-npm-hash-fix-pr.yml"
+        and (run.get("repository") or {}).get("full_name") == repo
+        and (run.get("head_repository") or {}).get("full_name") == repo
+    )
+
+
+def trusted_hash_fix(repo, pr, sha):
+    name = f"nix-npm-hash-fix-{pr}-{sha}"
+    pages = gh_api(f"repos/{repo}/actions/artifacts?name={name}&per_page=100", paginate=True)
+    artifacts = [a for page in pages for a in page["artifacts"]
+                 if a.get("name") == name and a.get("expired") is False]
+    if not artifacts:
+        return False
+    workflow_id = gh_api(f"repos/{repo}/actions/workflows/nix-npm-hash-fix-pr.yml")["id"]
+    for artifact in artifacts:
+        run_id = artifact["workflow_run"]["id"]
+        run = gh_api(f"repos/{repo}/actions/runs/{run_id}")
+        if is_hash_fix_artifact(artifact, run, repo, name, workflow_id):
+            return True
+    return False
+
+
+def check_commits(commits, expected_shas, inspect, trusted):
+    shas = [c["sha"] for c in commits]
+    if len(shas) != len(expected_shas) or set(shas) != set(expected_shas):
+        return ["PR commits differ from the fetched head; refusing stale or incomplete metadata"]
+    problems = []
+    for commit in commits:
+        sha = commit["sha"]
+        author = (commit.get("author") or {}).get("login")
+        verified = commit["commit"].get("verification", {}).get("verified") is True
+        if author == "dependabot[bot]" and verified:
+            continue
+        if author != "github-actions[bot]":
+            problems.append(f"{sha}: not a verified Dependabot commit or a trusted hash fix")
+            continue
+        parents, changed, diff_text = inspect(sha)
+        if len(parents) != 1 or changed != [("M", "flake.nix")]:
+            problems.append(f"{sha}: hash fix must have one parent and modify only flake.nix")
+        elif check_nix_hash_diff("flake.nix", diff_text):
+            problems.append(f"{sha}: hash fix changes more than the canonical npmDepsHash line")
+        elif not trusted(sha):
+            problems.append(f"{sha}: no authentic hash-fixer artifact for this PR and commit")
+    return problems
 
 
 def resolve_tag_upstream(owner, repo, tag):
@@ -250,7 +330,7 @@ def resolve_tag_upstream(owner, repo, tag):
     raise ValueError("tag chain too deep")
 
 
-def run(base, head):
+def run(base, head, repo=None, pr=None):
     merge_base = git("merge-base", base, head).strip()
     revs = {"base": merge_base, "head": head}
 
@@ -262,15 +342,33 @@ def run(base, head):
 
     fields = git("diff", "--name-status", "--no-renames", "-z", merge_base, head).split("\0")[:-1]
     changed = list(zip(fields[0::2], fields[1::2]))
-    return check(changed, read, diff, resolve_tag_upstream)
+    problems = check(changed, read, diff, resolve_tag_upstream)
+    if repo is not None:
+        commits = [c for page in gh_api(f"repos/{repo}/pulls/{pr}/commits?per_page=100", paginate=True) for c in page]
+        expected = git("rev-list", f"{merge_base}..{head}").splitlines()
+
+        def inspect(sha):
+            parents = git("rev-list", "--parents", "-n", "1", sha).split()[1:]
+            if len(parents) != 1:
+                return parents, [], ""
+            fields = git("diff", "--name-status", "--no-renames", "-z", parents[0], sha).split("\0")[:-1]
+            changed = list(zip(fields[0::2], fields[1::2]))
+            diff_text = git("diff", "--no-ext-diff", "--no-textconv", "-U0", parents[0], sha, "--", "flake.nix")
+            return parents, changed, diff_text
+
+        problems += check_commits(commits, expected, inspect, lambda sha: trusted_hash_fix(repo, pr, sha))
+    return problems
 
 
 def self_test():
     sha_a, sha_b = "a" * 40, "b" * 40
+    bundle_entry = {"version": "1.0.0", "inBundle": True, "dependencies": {"left-pad": "^1.0.0"}}
     npm_base = json.dumps({"packages": {
         "": {"name": "web"},
         "node_modules/left-pad": {"version": "1.0.0", "resolved": NPM_REGISTRY + "left-pad/-/left-pad-1.0.0.tgz", "integrity": "sha512-x"},
         "node_modules/esbuild": {"version": "0.1.0", "resolved": NPM_REGISTRY + "esbuild/-/esbuild-0.1.0.tgz", "integrity": "sha512-x", "hasInstallScript": True},
+        "node_modules/bundle": bundle_entry,
+        "node_modules/link": {"link": True, "resolved": "../workspace"},
     }})
 
     def npm_head(**changes):
@@ -306,6 +404,18 @@ def self_test():
         ("npm new install script", [lock], {lock: (npm_base, npm_head(**{"left-pad": {**good_entry, "hasInstallScript": True}}))}, "", 1),
         ("npm existing install script", [lock], {lock: (npm_base, npm_head(esbuild={"version": "0.2.0", "resolved": NPM_REGISTRY + "esbuild/-/esbuild-0.2.0.tgz", "integrity": "sha512-z", "hasInstallScript": True}))}, "", 0),
         ("npm missing integrity", [lock], {lock: (npm_base, npm_head(**{"left-pad": {**good_entry, "integrity": ""}}))}, "", 1),
+        ("npm registry becomes bundle", [lock], {lock: (npm_base, npm_head(**{"left-pad": {"version": "1.1.0", "inBundle": True, "resolved": "https://evil.example/x.tgz", "hasInstallScript": True}}))}, "", 1),
+        ("npm registry becomes link", [lock], {lock: (npm_base, npm_head(**{"left-pad": {"link": True, "resolved": "../evil"}}))}, "", 1),
+        ("npm bundled script acquisition", [lock], {lock: (npm_base, npm_head(bundle={**bundle_entry, "hasInstallScript": True}))}, "", 1),
+        ("npm bundled version requirements", [lock], {lock: (npm_base, npm_head(bundle={**bundle_entry, "version": "1.1.0", "dependencies": {"left-pad": "^1.1.0"}}))}, "", 0),
+        ("npm bundled source change", [lock], {lock: (npm_base, npm_head(bundle={**bundle_entry, "resolved": "https://evil.example/x.tgz"}))}, "", 1),
+        ("npm bundled name change", [lock], {lock: (npm_base, npm_head(bundle={**bundle_entry, "name": "evil"}))}, "", 1),
+        ("npm bundled dependency acquisition", [lock], {lock: (npm_base, npm_head(bundle={**bundle_entry, "dependencies": {"left-pad": "^1.0.0", "evil": "^1.0.0"}}))}, "", 1),
+        ("npm bundled git requirement", [lock], {lock: (npm_base, npm_head(bundle={**bundle_entry, "dependencies": {"left-pad": "github:evil/x"}}))}, "", 1),
+        ("npm bundled version presence", [lock], {lock: (npm_base, npm_head(bundle={k: v for k, v in bundle_entry.items() if k != "version"}))}, "", 1),
+        ("npm bundle becomes registry", [lock], {lock: (npm_base, npm_head(bundle={"version": "1.0.0", "resolved": NPM_REGISTRY + "bundle/-/bundle-1.0.0.tgz", "integrity": "sha512-x"}))}, "", 1),
+        ("npm link retargeting", [lock], {lock: (npm_base, npm_head(link={"link": True, "resolved": "../evil"}))}, "", 1),
+        ("npm new bundled entry", [lock], {lock: (npm_base, npm_head(newbundle=bundle_entry))}, "", 1),
         ("npm top-level change", [lock], {lock: (npm_base, json.dumps({**json.loads(npm_base), "lockfileVersion": 1}))}, "", 1),
         ("npm deleted lockfile", [("D", lock)], {}, "", 1),
         ("cargo crates.io bump", ["Cargo.lock", "Cargo.toml"], {"Cargo.lock": (cargo_base, cargo_ok), "Cargo.toml": (cargo_toml, cargo_toml.replace('"1.0.0"', '"1.0.1"').replace('"1.0"', '"1.2"'))}, "", 0),
@@ -327,6 +437,8 @@ def self_test():
         ("actions traversal tag", [wf], {}, old_co + f"+      - uses: actions/checkout@{sha_a} # v2/../../evil\n", 1),
         ("deleted workflow", [("D", wf)], {}, "", 1),
         ("nix hash only", ["flake.nix"], {}, nix_old + nix_new, 0),
+        ("nix duplicate hash additions", ["flake.nix"], {}, nix_new + nix_new, 1),
+        ("nix hash removal only", ["flake.nix"], {}, nix_old + nix_old, 1),
         ("nix other line", ["flake.nix"], {}, nix_old + nix_new + "+  src = ./evil;\n", 1),
         ("unexpected file", ["build.rs"], {}, "", 1),
     ]
@@ -340,7 +452,52 @@ def self_test():
         if (len(problems) > 0) != bool(expected):
             failed += 1
             print(f"FAIL {name}: {problems}")
-    print(f"{len(cases) - failed}/{len(cases)} self-test cases passed")
+    repo, pr, workflow_id = "owner/repo", 42, 7
+    artifact_name = f"nix-npm-hash-fix-{pr}-{sha_b}"
+    artifact = {"name": artifact_name, "expired": False, "workflow_run": {"id": 8}}
+    producer = {"id": 8, "workflow_id": workflow_id, "event": "pull_request_target",
+                "path": ".github/workflows/nix-npm-hash-fix-pr.yml",
+                "repository": {"full_name": repo}, "head_repository": {"full_name": repo}}
+    provenance_cases = [
+        ("authentic producer", artifact, producer, True),
+        ("wrong PR", {**artifact, "name": f"nix-npm-hash-fix-43-{sha_b}"}, producer, False),
+        ("wrong SHA", {**artifact, "name": f"nix-npm-hash-fix-{pr}-{sha_a}"}, producer, False),
+        ("expired proof", {**artifact, "expired": True}, producer, False),
+        ("different run", artifact, {**producer, "id": 9}, False),
+        ("different workflow", artifact, {**producer, "workflow_id": 9}, False),
+        ("PR-controlled producer", artifact, {**producer, "event": "pull_request"}, False),
+        ("wrong workflow path", artifact, {**producer, "path": ".github/workflows/ci.yml"}, False),
+        ("wrong repository", artifact, {**producer, "repository": {"full_name": "other/repo"}}, False),
+        ("fork producer", artifact, {**producer, "head_repository": {"full_name": "other/repo"}}, False),
+    ]
+    for name, proof, run, expected in provenance_cases:
+        if is_hash_fix_artifact(proof, run, repo, artifact_name, workflow_id) != expected:
+            failed += 1
+            print(f"FAIL provenance {name}")
+
+    dependabot = {"sha": sha_a, "author": {"login": "dependabot[bot]"},
+                  "commit": {"verification": {"verified": True}}}
+    fixer = {"sha": sha_b, "author": {"login": "github-actions[bot]"},
+             "commit": {"verification": {"verified": False}}}
+    commit_cases = [
+        ("signed Dependabot and unsigned authentic fix", fixer, [sha_a], [("M", "flake.nix")], nix_old + nix_new, True, [sha_a, sha_b], False),
+        ("major version in claimed hash fix", fixer, [sha_a], [("M", "web/package.json")], "", True, [sha_a, sha_b], True),
+        ("hash fix with extra file", fixer, [sha_a], [("M", "flake.nix"), ("M", "web/package.json")], nix_old + nix_new, True, [sha_a, sha_b], True),
+        ("hash fix with extra line", fixer, [sha_a], [("M", "flake.nix")], nix_old + nix_new + "+  src = ./evil;", True, [sha_a, sha_b], True),
+        ("unattested unsigned hash", fixer, [sha_a], [("M", "flake.nix")], nix_old + nix_new, False, [sha_a, sha_b], True),
+        ("unattested signed hash", {**fixer, "commit": {"verification": {"verified": True}}}, [sha_a], [("M", "flake.nix")], nix_old + nix_new, False, [sha_a, sha_b], True),
+        ("merge hash fix", fixer, [sha_a, "c" * 40], [("M", "flake.nix")], nix_old + nix_new, True, [sha_a, sha_b], True),
+        ("unsigned claimed Dependabot", {**fixer, "author": {"login": "dependabot[bot]"}}, [sha_a], [("M", "flake.nix")], nix_old + nix_new, True, [sha_a, sha_b], True),
+        ("stale or incomplete API commits", fixer, [sha_a], [("M", "flake.nix")], nix_old + nix_new, True, [sha_a], True),
+    ]
+    for name, commit, parents, changed, diff_text, authentic, expected_shas, expected in commit_cases:
+        problems = check_commits([dependabot, commit], expected_shas,
+                                 lambda _sha: (parents, changed, diff_text), lambda _sha: authentic)
+        if bool(problems) != expected:
+            failed += 1
+            print(f"FAIL commits {name}: {problems}")
+    total = len(cases) + len(provenance_cases) + len(commit_cases)
+    print(f"{total - failed}/{total} self-test cases passed")
     return 1 if failed else 0
 
 
@@ -348,13 +505,17 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--base")
     parser.add_argument("--head")
+    parser.add_argument("--repo")
+    parser.add_argument("--pr", type=int)
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
     if args.self_test:
         return self_test()
     if not (args.base and args.head):
         parser.error("--base and --head are required")
-    problems = run(args.base, args.head)
+    if (args.repo is None) != (args.pr is None):
+        parser.error("--repo and --pr must be supplied together")
+    problems = run(args.base, args.head, args.repo, args.pr)
     for p in problems:
         print(f"::error::{p}")
     if problems:
