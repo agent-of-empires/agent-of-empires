@@ -125,6 +125,93 @@ fn every_nominal_transcript_decodes_and_validates() {
         "expected two nominal transcripts, got {checked}"
     );
 }
+#[test]
+#[serial_test::parallel]
+fn required_nullable_fields_reject_omission_but_accept_null() {
+    let pack = pack();
+    let case = pack.case("uds-list-nominal").expect("nominal case");
+    let frames = application_frames(case);
+    let mut hello: serde_json::Value = serde_json::from_str(&text_payload(&frames[0])).unwrap();
+    let mut snapshot: serde_json::Value = serde_json::from_str(&text_payload(&frames[1])).unwrap();
+    snapshot["data"]["sessions"][0]["worktree"] = serde_json::json!({
+        "branch": "main", "main_repo_path": "/repo", "managed_by_aoe": false, "base_branch": null
+    });
+    let unobserved =
+        serde_json::json!({ "kind": "unobserved", "revision": 0, "observed_at": null });
+    hello["data"]["status_freshness"] = unobserved.clone();
+    snapshot["data"]["status_freshness"] = unobserved;
+    for (frame, paths) in [
+        (
+            &hello,
+            vec!["/data/owner/uid", "/data/status_freshness/observed_at"],
+        ),
+        (
+            &snapshot,
+            vec![
+                "/data/default_profile",
+                "/data/resolved_default_profile",
+                "/data/status_freshness/observed_at",
+                "/data/profiles/0/projects/0/default_base_branch",
+                "/data/sessions/0/last_accessed_at",
+                "/data/sessions/0/idle_entered_at",
+                "/data/sessions/0/last_error",
+                "/data/sessions/0/archived_at",
+                "/data/sessions/0/trashed_at",
+                "/data/sessions/0/active_snoozed_until",
+                "/data/sessions/0/pinned_at",
+                "/data/sessions/0/agent_session_id",
+                "/data/sessions/0/parent_session_id",
+                "/data/sessions/0/worktree",
+                "/data/sessions/0/worktree/base_branch",
+            ],
+        ),
+    ] {
+        for path in paths {
+            let (parent, field) = path.rsplit_once('/').unwrap();
+            let mut value = frame.clone();
+            value
+                .pointer_mut(path)
+                .unwrap_or_else(|| panic!("fixture lacks {path}"));
+            let decodes = |value: &serde_json::Value| {
+                let bytes = serde_json::to_vec(value).unwrap();
+                if value["kind"] == "hello" {
+                    parse_hello(&bytes).is_ok()
+                } else {
+                    parse_snapshot(&bytes).is_ok()
+                }
+            };
+            value
+                .pointer_mut(parent)
+                .unwrap()
+                .as_object_mut()
+                .unwrap()
+                .remove(field);
+            assert!(!decodes(&value), "omission accepted: {path}");
+            value.pointer_mut(parent).unwrap()[field] = serde_json::Value::Null;
+            assert!(decodes(&value), "explicit null refused: {path}");
+        }
+    }
+    for value in [
+        serde_json::json!({"kind":"unobserved","revision":0,"observed_at":null}),
+        serde_json::json!({"kind":"unavailable","revision":null,"observed_at":null}),
+    ] {
+        for field in ["revision", "observed_at"] {
+            let mut omitted = value.clone();
+            omitted.as_object_mut().unwrap().remove(field);
+            assert!(serde_json::from_value::<super::dto::StatusFreshness>(omitted).is_err());
+        }
+        assert!(matches!(
+            serde_json::from_value::<super::dto::StatusFreshness>(value).unwrap(),
+            super::dto::StatusFreshness::Unobserved {
+                observed_at: None,
+                ..
+            } | super::dto::StatusFreshness::Unavailable {
+                revision: None,
+                observed_at: None
+            }
+        ));
+    }
+}
 
 /// The frozen schema-invalid Snapshot decodes structurally and is then rejected
 /// by the DTO validator, which is what makes it a snapshot-phase failure.

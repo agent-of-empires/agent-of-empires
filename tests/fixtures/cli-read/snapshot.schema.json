@@ -65,7 +65,7 @@
     },
     "group_path": {
       "type": "string",
-      "pattern": "^[^/\\u0000-\\u001f\\u007f-\\u009f]+(/[^/\\u0000-\\u001f\\u007f-\\u009f]+)*$"
+      "description": "Opaque stored group key, not a filesystem path."
     },
     "health_code": {
       "type": "string",
@@ -163,9 +163,9 @@
       "additionalProperties": false,
       "required": ["name", "path", "children"],
       "properties": {
-        "name": { "$ref": "#/$defs/safe_text" },
+        "name": { "type": "string" },
         "path": { "$ref": "#/$defs/group_path" },
-        "children": { "type": "array", "items": { "$ref": "#/$defs/safe_text" } }
+        "children": { "type": "array", "items": { "type": "string" } }
       }
     },
     "project_read": {
@@ -267,9 +267,7 @@
         "id": { "$ref": "#/$defs/safe_text" },
         "title": { "type": "string", "description": "Persisted display text, including empty titles and controls, is preserved as on local reads." },
         "project_path": { "$ref": "#/$defs/stored_project_path" },
-        "group_path": {
-          "oneOf": [{ "$ref": "#/$defs/group_path" }, { "const": "" }]
-        },
+        "group_path": { "$ref": "#/$defs/group_path" },
         "tool": { "$ref": "#/$defs/safe_text" },
         "command": { "type": "string" },
         "profile": { "$ref": "#/$defs/profile_label" },

@@ -602,10 +602,10 @@ async fn connect_admission(
     let euid = unsafe { libc::geteuid() };
     // Structural and process-start validation precedes the lock and the
     // marker_missing shortcut, so retained crash state is never hidden.
-    let placed_temporary = inspect_temporary_markers(dir)?;
+    inspect_temporary_markers(dir)?;
     let (lock, lock_identity) = match open_entry(dir, LOCK_FILE) {
         Ok(value) => value,
-        Err(EntryError::Missing) if runtime_entry_present(dir, placed_temporary) => {
+        Err(EntryError::Missing) if runtime_entry_present(dir) => {
             return Err(ReadFailure::pre("marker_identity"));
         }
         Err(EntryError::Missing) => return Err(ReadFailure::pre("marker_missing")),
@@ -659,7 +659,7 @@ async fn connect_admission(
             }
             return Err(ReadFailure::pre("marker_identity"));
         }
-        if runtime_entry_present(dir, placed_temporary) {
+        if runtime_entry_present(dir) {
             return Err(ReadFailure::pre("marker_identity"));
         }
         return Err(ReadFailure::pre("marker_missing"));
@@ -707,11 +707,10 @@ async fn connect_admission(
     })
 }
 
-fn runtime_entry_present(dir: RawFd, placed_temporary: bool) -> bool {
+fn runtime_entry_present(dir: RawFd) -> bool {
     [PREBIND_FILE, POSTBIND_FILE, SOCKET_FILE]
         .iter()
         .any(|name| fstatat(dir, name).is_ok())
-        || placed_temporary
 }
 
 /// A marker the producer spells with a schema this client does not speak is
@@ -775,11 +774,8 @@ fn read_marker<T: for<'de> Deserialize<'de>>(dir: RawFd, name: &str) -> Result<T
     serde_json::from_slice(&bytes).map_err(|_| ReadFailure::pre("marker_invalid"))
 }
 
-/// Whether a temporary this client can place is present. A body that does not
-/// parse places none and is skipped rather than refused, because nothing is
-/// writing it. A publisher mid-write holds the namespace lock, which this
-/// client fails to take before it reads a published marker.
-fn inspect_temporary_markers(dir: RawFd) -> Result<bool, ReadFailure> {
+/// Validate all temporaries; dead and incomplete writes do not establish a publisher.
+fn inspect_temporary_markers(dir: RawFd) -> Result<(), ReadFailure> {
     let duplicate = unsafe { libc::dup(dir) };
     let scan = fd_to_owned(duplicate).map_err(|_| ReadFailure::pre("marker_identity"))?;
     let raw = scan.into_raw_fd();
@@ -793,14 +789,13 @@ fn inspect_temporary_markers(dir: RawFd) -> Result<bool, ReadFailure> {
     result
 }
 
-fn scan_temporary_markers(entries: *mut libc::DIR) -> Result<bool, ReadFailure> {
-    let mut placed = false;
+fn scan_temporary_markers(entries: *mut libc::DIR) -> Result<(), ReadFailure> {
     loop {
         errno_reset();
         let entry = unsafe { libc::readdir(entries) };
         if entry.is_null() {
             return if errno() == 0 {
-                Ok(placed)
+                Ok(())
             } else {
                 Err(ReadFailure::pre("marker_identity"))
             };
@@ -842,9 +837,7 @@ fn scan_temporary_markers(entries: *mut libc::DIR) -> Result<bool, ReadFailure> 
                     )
                 }
                 Ok(_) => return Err(ReadFailure::pre("marker_invalid")),
-                // A body that does not parse is what a publisher killed
-                // between its exclusive create and its rename leaves. Nothing
-                // is writing it, so it places no publisher here.
+                // An incomplete abandoned write establishes no publisher.
                 Err(_) => continue,
             },
             TempKind::Postbind => match serde_json::from_slice::<PostbindMarker>(&bytes) {
@@ -866,14 +859,12 @@ fn scan_temporary_markers(entries: *mut libc::DIR) -> Result<bool, ReadFailure> 
         if content_uuid != suffix {
             return Err(ReadFailure::pre("marker_invalid"));
         }
-        // The same rule the marker paths get from `validate_prebind`: an
-        // identity this half cannot place is not a writer that is gone.
+        // Unprovable liveness is not absence.
         if !valid_process_identity(&process_identity)
             || process_state(pid, &process_identity)? != ProcessState::Dead
         {
             return Err(ReadFailure::pre("marker_identity"));
         }
-        placed = true;
     }
 }
 
@@ -1479,64 +1470,62 @@ mod tests {
         assert!(!valid_uuid("AAAAAAAA-bbbb-cccc-dddd-eeeeeeeeeeee"));
     }
 
-    /// A publisher killed between its exclusive create and its rename leaves a
-    /// temporary whose body does not parse. Nothing is writing it, so it is no
-    /// evidence that a publisher exists: the read has to answer as an absence
-    /// and hand back to the local store, instead of spending the whole
-    /// establishment budget retrying a daemon that was never there.
     #[tokio::test]
-    async fn a_torn_temporary_is_not_a_publisher() {
+    async fn abandoned_temporaries_do_not_establish_a_publication() {
         use std::os::unix::fs::PermissionsExt;
-
-        let dir = tempfile::tempdir().expect("namespace");
-        let torn = dir
-            .path()
-            .join("runtime.prebind.json.tmp.aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
-        std::fs::write(&torn, b"").expect("torn temporary");
-        // The publisher creates its temporary 0600, and another mode is
-        // refused as untrustworthy before the body is ever read.
-        std::fs::set_permissions(&torn, std::fs::Permissions::from_mode(0o600)).expect("mode");
-
-        let opened = File::open(dir.path()).expect("open namespace");
-        let namespace = OwnedNamespace {
-            name: "debug:agent-of-empires-dev".into(),
-            home: dir.path().to_path_buf(),
-            dir: OwnedFd::from(opened),
-        };
-        let Err(error) = connect_admission(
-            namespace,
-            Instant::now() + crate::server::runtime_ws::CONNECTION_BUDGET,
-        )
-        .await
-        else {
-            panic!("a namespace publishing nothing admits nothing");
-        };
-        assert_ne!(
-            error.code(),
-            "marker_identity",
-            "a torn temporary is not a publisher about to appear"
-        );
-
-        std::fs::remove_file(&torn).expect("the publisher reaps it");
-        let opened = File::open(dir.path()).expect("open namespace");
-        let namespace = OwnedNamespace {
-            name: "debug:agent-of-empires-dev".into(),
-            home: dir.path().to_path_buf(),
-            dir: OwnedFd::from(opened),
-        };
-        let Err(error) = connect_admission(
-            namespace,
-            Instant::now() + crate::server::runtime_ws::CONNECTION_BUDGET,
-        )
-        .await
-        else {
-            panic!("the reaped directory admits nothing");
-        };
-        assert_eq!(
-            error.code(),
-            "marker_missing",
-            "both halves answer the same way: no publisher here"
-        );
+        let instance = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let prebind = serde_json::json!({
+            "schema": SCHEMA, "pid": u32::MAX,
+            "process_start_identity": "linux:v1:00000000-0000-0000-0000-000000000000:1",
+            "prebind_instance_id": instance, "namespace": "debug:agent-of-empires-dev",
+        });
+        let mut postbind = prebind.clone();
+        for (key, value) in [
+            ("runtime_instance_id", serde_json::json!(instance)),
+            ("runtime_epoch", serde_json::json!(instance)),
+            ("socket_path", serde_json::json!(SOCKET_FILE)),
+            ("owner_uid", serde_json::json!(unsafe { libc::geteuid() })),
+            ("socket_device", serde_json::json!(1)),
+            ("socket_inode", serde_json::json!(1)),
+            ("socket_creator_pid", serde_json::json!(u32::MAX)),
+        ] {
+            postbind[key] = value;
+        }
+        for with_lock in [false, true] {
+            for (name, bytes) in [
+                (PREBIND_FILE, None),
+                (PREBIND_FILE, Some(Vec::new())),
+                (PREBIND_FILE, Some(serde_json::to_vec(&prebind).unwrap())),
+                (POSTBIND_FILE, Some(serde_json::to_vec(&postbind).unwrap())),
+            ] {
+                let dir = tempfile::tempdir().unwrap();
+                if with_lock {
+                    let lock = dir.path().join(LOCK_FILE);
+                    std::fs::write(&lock, b"").unwrap();
+                    std::fs::set_permissions(lock, std::fs::Permissions::from_mode(0o600)).unwrap();
+                }
+                if let Some(bytes) = bytes {
+                    let temporary = dir.path().join(format!("{name}.tmp.{instance}"));
+                    std::fs::write(&temporary, bytes).unwrap();
+                    std::fs::set_permissions(temporary, std::fs::Permissions::from_mode(0o600))
+                        .unwrap();
+                }
+                let namespace = OwnedNamespace {
+                    name: "debug:agent-of-empires-dev".into(),
+                    home: dir.path().to_path_buf(),
+                    dir: OwnedFd::from(File::open(dir.path()).unwrap()),
+                };
+                let Err(error) = connect_admission(
+                    namespace,
+                    Instant::now() + crate::server::runtime_ws::CONNECTION_BUDGET,
+                )
+                .await
+                else {
+                    panic!("no publication can be admitted");
+                };
+                assert_eq!(error.code(), "marker_missing", "{name}, lock={with_lock}");
+            }
+        }
     }
 
     /// A namespace whose markers are all present, all consistent and all

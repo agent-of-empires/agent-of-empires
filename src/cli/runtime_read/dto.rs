@@ -27,11 +27,13 @@ pub(crate) struct SnapshotData {
     pub namespace: String,
     pub cursor: Cursor,
     pub health: SnapshotHealth,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub default_profile: Option<String>,
     /// What the daemon resolved as the default, published whether or not the
     /// snapshot carries it. `default_profile` says whether that name resolves;
     /// this says which name, so a client that has to refuse can name the
     /// profile the user has to create.
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub resolved_default_profile: Option<String>,
     pub profiles: Vec<ProfileRead>,
     pub sessions: Vec<SessionRead>,
@@ -50,6 +52,7 @@ pub(crate) struct Cursor {
 #[serde(deny_unknown_fields)]
 pub(crate) struct Owner {
     pub kind: OwnerKind,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub uid: Option<u32>,
 }
 
@@ -104,6 +107,7 @@ pub(crate) struct ProfileHealth {
 pub(crate) enum StatusFreshness {
     Unobserved {
         revision: u64,
+        #[serde(deserialize_with = "deserialize_required_nullable")]
         observed_at: Option<String>,
     },
     Observed {
@@ -111,7 +115,9 @@ pub(crate) enum StatusFreshness {
         observed_at: String,
     },
     Unavailable {
+        #[serde(deserialize_with = "deserialize_required_nullable")]
         revision: Option<u64>,
+        #[serde(deserialize_with = "deserialize_required_nullable")]
         observed_at: Option<String>,
     },
 }
@@ -164,6 +170,7 @@ pub(crate) struct ProjectRead {
     /// merged on a path, because that fallback is the defect it replaces.
     pub merge_key: String,
     pub scope: ProjectScope,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub default_base_branch: Option<String>,
     /// Whether the row came from a project registry rather than being
     /// synthesized so a session's project path resolves. Only a synthesized
@@ -196,17 +203,27 @@ pub(crate) struct SessionRead {
     pub status: WireStatus,
     pub state: WireState,
     pub created_at: String,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub last_accessed_at: Option<String>,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub idle_entered_at: Option<String>,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub last_error: Option<String>,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub archived_at: Option<String>,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub trashed_at: Option<String>,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub active_snoozed_until: Option<String>,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub pinned_at: Option<String>,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub agent_session_id: Option<String>,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub parent_session_id: Option<String>,
     pub has_worktree_info: bool,
     pub has_managed_worktree: bool,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub worktree: Option<WorktreeRead>,
     pub workspace_repos: Vec<WorkspaceRepo>,
 }
@@ -300,6 +317,7 @@ pub(crate) struct WorktreeRead {
     pub branch: String,
     pub main_repo_path: String,
     pub managed_by_aoe: bool,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub base_branch: Option<String>,
 }
 
@@ -400,6 +418,14 @@ impl<'de> Deserialize<'de> for HelloVersionProbe {
 
         deserializer.deserialize_map(ProbeVisitor)
     }
+}
+
+fn deserialize_required_nullable<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
 }
 
 fn deserialize_profile_health_map<'de, D>(
@@ -801,10 +827,7 @@ fn validate_profile_component(health: ComponentHealth) -> Result<(), &'static st
     Ok(())
 }
 
-/// Groups in the producer's own order, which is the order a local
-/// `aoe group list` prints them in: the registry's insertion order, then the
-/// groups the sessions imply. Every structural rule still holds; only the
-/// canonical sort is gone, and distinct paths replace it.
+/// Preserve registry order and validate group-tree references, not filesystem syntax.
 fn validate_groups(groups: &[GroupRead]) -> Result<(), &'static str> {
     let mut unique: HashSet<&str> = HashSet::new();
     for group in groups {
@@ -814,18 +837,11 @@ fn validate_groups(groups: &[GroupRead]) -> Result<(), &'static str> {
     }
     let paths = unique;
     for group in groups {
-        if !valid_group_path(&group.path) || !valid_text(&group.name) {
-            return Err("schema_invalid");
-        }
         let expected_name = group.path.rsplit('/').next().unwrap_or_default();
         if group.name != expected_name {
             return Err("schema_invalid");
         }
-        // A child name must name a group that really sits directly under this
-        // one, and no name twice. The producer does not have to list every
-        // child: the local group tree hands out its rows without the child
-        // lists filled in, so demanding completeness would refuse the very
-        // rows the local `aoe group list --json` prints.
+        // Child lists may be incomplete, but every named child must exist.
         let mut child_names: HashSet<&str> = HashSet::new();
         for child in &group.children {
             let child_path = format!("{}/{}", group.path, child);
@@ -891,9 +907,7 @@ fn validate_session(session: &SessionRead) -> Result<(), &'static str> {
     {
         return Err("schema_invalid");
     }
-    if !valid_stored_project_path(&session.project_path)
-        || (!session.group_path.is_empty() && !valid_group_path(&session.group_path))
-    {
+    if !valid_stored_project_path(&session.project_path) {
         return Err("schema_invalid");
     }
     for value in [
@@ -1074,24 +1088,6 @@ fn parse_timestamp(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
     chrono::DateTime::parse_from_rfc3339(value)
         .ok()
         .map(|parsed| parsed.with_timezone(&chrono::Utc))
-}
-
-/// The grammar a group path must satisfy, shared with the producer for the
-/// reason [`valid_absolute_path`] names: one stored row the client refuses
-/// fails the whole snapshot.
-///
-/// `.` and `..` are admitted here, unlike in a filesystem path. A group path is
-/// never resolved against the filesystem -- it is an equality key and a string
-/// the renderer prints -- and `aoe group create work/..` succeeds, after which
-/// the local command lists the group as a child of `work`. Refusing it here
-/// made the producer prune a group the user had just created, with health
-/// `healthy` and no notice, and made a session assigned to it report no group.
-/// A filesystem path keeps the restriction: see [`valid_absolute_path`].
-pub(crate) fn valid_group_path(value: &str) -> bool {
-    !value.is_empty()
-        && value
-            .split('/')
-            .all(|component| !component.is_empty() && valid_text(component))
 }
 
 /// The grammar a wire path must satisfy, shared with the producer: it drops a

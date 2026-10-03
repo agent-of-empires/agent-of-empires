@@ -769,14 +769,22 @@ fn websocket_opcode(case_id: &str, direction: u8, payload: &[u8]) -> Result<u8> 
                 .get(cursor..cursor + 8)
                 .ok_or_else(|| PackError(format!("case {case_id} has a short frame length")))?;
             cursor += 8;
-            u64::from_be_bytes(raw.try_into().expect("eight bytes")) as usize
+            let length = u64::from_be_bytes(raw.try_into().expect("eight bytes"));
+            if length & (1 << 63) != 0 {
+                return fail(format!("case {case_id} has an invalid 64-bit frame length"));
+            }
+            usize::try_from(length).map_err(|_| {
+                PackError(format!(
+                    "case {case_id} has an unrepresentable frame length"
+                ))
+            })?
         }
         other => other as usize,
     };
     if masked {
         cursor += 4;
     }
-    if cursor + length != payload.len() {
+    if cursor.checked_add(length) != Some(payload.len()) {
         return fail(format!(
             "case {case_id} has a WebSocket record whose length disagrees with its bytes"
         ));
@@ -1280,4 +1288,43 @@ pub fn pack_root() -> PathBuf {
         .join("tests")
         .join("fixtures")
         .join("cli-read")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn websocket_record_lengths_report_bounds_errors() {
+        assert_eq!(
+            websocket_opcode("length", DIRECTION_SERVER_TO_CLIENT, &[0x81, 1, b'x']).unwrap(),
+            1
+        );
+        for length in [126usize, 65_536] {
+            let mut frame = vec![0x81, if length == 126 { 126 } else { 127 }];
+            if length == 126 {
+                frame.extend_from_slice(&(length as u16).to_be_bytes());
+            } else {
+                frame.extend_from_slice(&(length as u64).to_be_bytes());
+            }
+            frame.resize(frame.len() + length, b'x');
+            assert_eq!(
+                websocket_opcode("length", DIRECTION_SERVER_TO_CLIENT, &frame).unwrap(),
+                1
+            );
+        }
+        for length in [
+            1u64,
+            127,
+            65_536,
+            u32::MAX as u64,
+            1u64 << 32,
+            i64::MAX as u64,
+            u64::MAX,
+        ] {
+            let mut frame = vec![0x81, 127];
+            frame.extend_from_slice(&length.to_be_bytes());
+            assert!(websocket_opcode("length", DIRECTION_SERVER_TO_CLIENT, &frame).is_err());
+        }
+    }
 }

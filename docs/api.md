@@ -12,13 +12,17 @@ The read-only CLI commands use `/api/runtime/ws` when `--daemon-url` or `AOE_DAE
 
 The runtime wire protocol is **version 4**. Each exchange sends a `Hello` followed by a `Snapshot`; both frames require each profile's `name`, `listed` boolean and `aliases` array. `name` identifies the representative of a physical directory on the daemon's filesystem. `aliases` contains its other selectable names. Scoped reads and configured defaults retain the requested alias spelling.
 
+Where a wire schema allows `null`, the member must still be present. Omitting a required member is `schema_invalid`. This differs from CLI JSON: `session show --json` omits an unknown `agent_session_id`.
+
 Aliases into a real profile reuse its cached sessions. Alias-only external stores have `listed: false` and are available through scoped runtime reads, but remain outside ordinary REST/web/TUI session lists, `list --all` and the profile picker. Only listed profiles contribute to all-profile totals.
+
+For alias-only structured sessions, accepted disk rows determine status. These sessions are not enrolled in the daemon's canonical ACP workers.
 
 Profile inventory, cached session data, group registries and project registries have independent health. A newly observed physical store is not ready until an accepted daemon reload; accepted empty stores are ready too. A session load failure makes affected session reads exit 1 instead of returning incomplete counts or an empty successful result. Repairing the file does not clear that failure until an accepted reload. Transient selector conflicts with retained cached stores also produce a refusal until an accepted reload rather than serving another store's rows. Other healthy profiles and inventory-only reads remain available.
 
 Project listing does not require session or group data. The `global` and `profile` scopes require their respective project registry; `all` retains entries from readable registries, matching the local merged listing. Global project registry reads and explicitly named profile project registry reads do not create app/profile directories. Local empty-profile bootstrap behavior is unchanged.
 
-Profile labels and persisted session titles and commands retain their original strings, including controls. Alias names and scoped selections still follow the local profile-name grammar; a legacy directory label printed by the picker can remain unreadable for session reads. JSON preserves the values; human output follows local formatting without sanitizing their controls.
+Profile labels and persisted session titles, commands and group keys retain their original strings, including controls. Group keys are opaque equality keys, not filesystem paths; empty segments and leading or trailing separators are preserved. Alias names and scoped selections still follow the local profile-name grammar; a legacy directory label printed by the picker can remain unreadable for session reads. JSON preserves the values; human output follows local formatting without sanitizing their controls.
 
 ### Transport parity fixture
 

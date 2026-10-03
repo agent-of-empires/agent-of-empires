@@ -76,10 +76,10 @@ pub struct Cli {
     /// would be sent. The session list goes through a bearer-only client, so
     /// `AOE_DAEMON_PASSPHRASE` does not work here yet; it works for
     /// `aoe acp <verb>` against the same `AOE_DAEMON_URL`. The local socket is
-    /// Linux-only, so on any other platform those seven reads always come from
-    /// the local store while this route is unaffected. A served answer is the
-    /// daemon's own view of the store, so a session started moments ago can
-    /// report a null `agent_session_id` here. At the no-subcommand `aoe`
+    /// Linux-only. Without a named HTTP endpoint, other platforms read the
+    /// local store; HTTP reads work on every platform. A served answer is the
+    /// daemon's view of the store, so an agent identity may not be known yet;
+    /// `session show --json` omits an unknown `agent_session_id`. At the no-subcommand `aoe`
     /// invocation (the TUI dashboard) the same URL attaches the whole session
     /// list instead.
     // As with `-p`, no `env` attribute: `read_request_source` reads

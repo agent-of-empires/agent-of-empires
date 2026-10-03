@@ -56,7 +56,7 @@
     },
     "group_path": {
       "type": "string",
-      "pattern": "^[^/\\u0000-\\u001f\\u007f-\\u009f]+(/[^/\\u0000-\\u001f\\u007f-\\u009f]+)*$"
+      "description": "Opaque stored group key, not a filesystem path."
     },
     "health_code": {
       "type": "string",

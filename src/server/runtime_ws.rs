@@ -686,11 +686,10 @@ fn build_snapshot(
         let mut identities: HashSet<(String, String)> = HashSet::new();
         projects.retain(|project| identities.insert((project.name.clone(), project.path.clone())));
         let stored_groups = entry.groups.unwrap_or_default();
-        let mut tree = GroupTree::new_with_group_paths(
+        let tree = GroupTree::new_with_group_paths(
             scoped.iter().map(|row| row.group_path.as_str()),
             &stored_groups,
         );
-        drop_unusable_groups(&mut tree);
         let groups = group_reads(&tree);
         let health = ProfileHealth {
             profile_enumeration: component(groups_healthy, HealthCode::ProfileEnumeration),
@@ -801,21 +800,7 @@ fn drop_unusable_projects(projects: &mut Vec<ProjectRead>) {
         .retain(|project| crate::cli::runtime_read::dto::valid_stored_project_path(&project.path));
 }
 
-/// Drop a group the client could not admit, and everything under it.
-///
-/// The tree is pruned before it is projected: a row dropped only from the
-/// output would stay in its parent's `children`, and the client refuses a
-/// snapshot over a child whose path is not in the profile's own set just as
-/// hard as it refuses the row itself.
-fn drop_unusable_groups(tree: &mut GroupTree) {
-    for group in tree.get_all_groups() {
-        if !crate::cli::runtime_read::dto::valid_group_path(&group.path) {
-            tree.delete_group(&group.path);
-        }
-    }
-}
-
-/// Preserve scoped orphans, sever cycles and invalid group paths.
+/// Preserve scoped orphans and sever cycles.
 fn reconcile_legacy_rows(sessions: &mut [SessionRead], listed: &HashSet<&str>) {
     let index: HashMap<(&str, &str), usize> = sessions
         .iter()
@@ -850,11 +835,6 @@ fn reconcile_legacy_rows(sessions: &mut [SessionRead], listed: &HashSet<&str>) {
     for (position, row) in sessions.iter_mut().enumerate() {
         if severed.contains(&position) {
             row.parent_session_id = None;
-        }
-        if !row.group_path.is_empty()
-            && !crate::cli::runtime_read::dto::valid_group_path(&row.group_path)
-        {
-            row.group_path.clear();
         }
     }
 }
@@ -2179,55 +2159,70 @@ mod tests {
         row
     }
 
-    /// A stored row the read cannot fix is kept as it stands: a trailing
-    /// separator is the spelling the store holds and stays it, so the row is
-    /// still the identifier a `session show` can be given, and an orphan parent
-    /// is left pointing at a row that is not there: the state `rm --purge`
-    /// leaves behind, and the one the local path prints. The client then
-    /// accepts the snapshot unchanged.
     #[test]
     #[serial_test::serial]
-    fn a_legacy_row_is_reconciled_and_the_client_still_accepts_the_snapshot() {
+    fn persisted_group_keys_and_scoped_orphans_survive_projection() {
         let _home = TempHome::new();
-        let mut orphan = named("orphan", "main");
-        orphan.parent_session_id = Some("deleted".into());
-        let mut trailing = named("trailing", "main");
-        trailing.project_path = "/repo/".into();
-        let mut grouped = named("grouped", "main");
-        grouped.group_path = "team/".into();
-        let instances = vec![named("a", "main"), orphan, trailing, grouped];
-
-        let sampled = build_snapshot(
-            &RuntimeState::new(),
-            &instances,
-            Owner::remote(),
-            Utc::now(),
-            &crate::server::reload::RuntimeReadCache::accepted_inventory(),
-        );
-
-        let snapshot =
-            parse_snapshot(&snapshot_frame(&sampled)).expect("client accepts the Snapshot");
-        validate_snapshot(&snapshot).expect("the reconciled snapshot is projectable");
-        let reconciled: Vec<(&str, Option<&str>, &str)> = snapshot
-            .sessions
-            .iter()
-            .map(|row| {
-                (
-                    row.id.as_str(),
-                    row.parent_session_id.as_deref(),
-                    row.project_path.as_str(),
-                )
-            })
-            .collect();
-        assert_eq!(
-            reconciled,
-            vec![
-                ("a", None, "/repo"),
-                ("orphan", Some("deleted"), "/repo"),
-                ("trailing", None, "/repo/"),
-                ("grouped", None, "/repo"),
-            ]
-        );
+        for key in [
+            "team/",
+            "work//task",
+            "/task",
+            "/",
+            "work///task",
+            "work/.",
+            "work/..",
+            "work/\nleaf",
+        ] {
+            let mut orphan = named("orphan", "main");
+            orphan.parent_session_id = Some("deleted".into());
+            let mut trailing = named("trailing", "main");
+            trailing.project_path = "/repo/".into();
+            let mut grouped = named("grouped", "main");
+            grouped.group_path = key.into();
+            let instances = vec![named("a", "main"), orphan, trailing, grouped];
+            let sampled = build_snapshot(
+                &RuntimeState::new(),
+                &instances,
+                Owner::remote(),
+                Utc::now(),
+                &crate::server::reload::RuntimeReadCache::accepted_inventory(),
+            );
+            let snapshot = parse_snapshot(&snapshot_frame(&sampled)).unwrap();
+            validate_snapshot(&snapshot).unwrap();
+            let grouped = snapshot
+                .sessions
+                .iter()
+                .find(|row| row.id == "grouped")
+                .unwrap();
+            assert_eq!(grouped.group_path, key);
+            let groups = &snapshot
+                .profiles
+                .iter()
+                .find(|profile| profile.name == "main")
+                .unwrap()
+                .groups;
+            for expected in GroupTree::new_with_group_paths([key], &[]).get_all_groups() {
+                assert!(
+                    groups
+                        .iter()
+                        .any(|group| group.path == expected.path && group.name == expected.name),
+                    "missing group {:?}",
+                    expected.path
+                );
+            }
+            let orphan = snapshot
+                .sessions
+                .iter()
+                .find(|row| row.id == "orphan")
+                .unwrap();
+            assert_eq!(orphan.parent_session_id.as_deref(), Some("deleted"));
+            let trailing = snapshot
+                .sessions
+                .iter()
+                .find(|row| row.id == "trailing")
+                .unwrap();
+            assert_eq!(trailing.project_path, "/repo/");
+        }
     }
 
     /// A parent that names a row of another profile, and a cycle, are the two

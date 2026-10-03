@@ -44,9 +44,7 @@ pub(crate) const SOCKET_FILE: &str = "runtime.sock";
 /// Marker schema version. The client refuses anything else, and imports this
 /// constant rather than spelling the number a second time.
 pub(crate) const SCHEMA: u8 = 1;
-/// What a create-then-rename marker is called before its rename: the final
-/// name, this, and the prebind instance id the write belongs to. The client
-/// refuses these names, so both halves have to spell them the one way.
+/// Temporary marker suffix, followed by the prebind instance id.
 pub(crate) const TEMPORARY_SEPARATOR: &str = ".tmp.";
 /// Backoff after an accept error, so a failing accept cannot spin the loop.
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(50);
