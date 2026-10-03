@@ -1,7 +1,15 @@
 /* eslint-disable react-refresh/only-export-components */
 // Shared header, body blocks, and helpers for the per-kind tool cards.
 
-import { useCallback, useEffect, useMemo, useState, type CSSProperties, type SetStateAction } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useState,
+  useSyncExternalStore,
+  type CSSProperties,
+  type SetStateAction,
+} from "react";
 import { ArrowUpRight, ChevronDown, Copy as CopyIcon } from "lucide-react";
 
 import { useShikiTheme } from "../../hooks/useShikiTheme";
@@ -11,7 +19,8 @@ import type { ActivityRow, ToolCall } from "../../lib/acpTypes";
 import { hasAnsi, parseAnsi, type AnsiSegment, type AnsiStyle } from "../../lib/ansi";
 import { highlightSnippet } from "../../lib/snippetHighlighter";
 import { useAcpFileRef } from "./AcpFileRefContext";
-import { useToolDisplayMode, type ToolDensity } from "./ToolDisplayMode";
+import { useToolExpansionStore, useToolId, type ExpansionOverride } from "./ToolExpansion";
+import { useToolDisplayMode } from "./ToolDisplayMode";
 import { WrapBar, WrapLines, WrapToggle, useWrapState } from "./WrapToggle";
 
 export interface ToolCardProps {
@@ -67,25 +76,42 @@ export function spanTimes(items: { tool: ToolCall; result?: ActivityRow }[]) {
 }
 
 /** Expand state. Failed cards open by default and compact density closes the
- *  rest; a user toggle overrides the baseline only for the density it was made in. */
-export function useToolCardExpansion(status: Status, defaultOpen = false) {
+ *  rest; a user toggle overrides the baseline only for the density it was made in.
+ *  Inside a `ToolIdProvider` the toggle lives in the shared store, so it outlives
+ *  a remount. `seed` starts a local card at that state in the current density, as a
+ *  group that absorbs its children's open state. */
+export function useToolCardExpansion(status: Status, defaultOpen = false, seed?: boolean) {
   const density = useToolDisplayMode();
   const baseline = status === "err" ? true : density === "compact" ? false : defaultOpen;
-  const [override, setOverride] = useState<{ density: ToolDensity; open: boolean } | null>(null);
+  const store = useToolExpansionStore();
+  const id = useToolId();
+  const shared = store !== null && id !== null;
+  const [local, setLocal] = useState<ExpansionOverride | null>(() =>
+    seed === undefined ? null : { density, open: seed },
+  );
+  const stored = useSyncExternalStore(
+    store?.subscribe ?? noopSubscribe,
+    () => (shared ? store.get(id) : null),
+    () => null,
+  );
+  const override = shared ? stored : local;
   const active = override && override.density === density ? override.open : null;
   const open = active ?? baseline;
   const setOpen = useCallback(
     (action: SetStateAction<boolean>) => {
-      setOverride((prev) => {
+      const next = (prev: ExpansionOverride | null): ExpansionOverride => {
         const current = prev && prev.density === density ? prev.open : baseline;
-        const next = typeof action === "function" ? action(current) : action;
-        return { density, open: next };
-      });
+        return { density, open: typeof action === "function" ? action(current) : action };
+      };
+      if (shared) store.update(id, next);
+      else setLocal(next);
     },
-    [density, baseline],
+    [density, baseline, shared, store, id],
   );
   return [open, setOpen] as const;
 }
+
+const noopSubscribe = () => () => {};
 
 function StatusDot({ status, neutral }: { status: Status; neutral?: boolean }) {
   const cls =
@@ -153,8 +179,12 @@ export function CardChrome({
   const { showToolDurations } = useAcpPrefs();
   const Header = onToggle ? "button" : "div";
   const showNeutral = neutralOnDone === true && status !== "running";
+  const toolId = useToolId();
   return (
-    <div className="my-1 overflow-hidden rounded-md border border-surface-700 bg-surface-800/50 text-sm">
+    <div
+      data-tool-id={toolId ?? undefined}
+      className="my-1 overflow-hidden rounded-md border border-surface-700 bg-surface-800/50 text-sm"
+    >
       <Header
         type={onToggle ? "button" : undefined}
         onClick={onToggle}

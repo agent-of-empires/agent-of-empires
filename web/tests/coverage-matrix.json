@@ -2868,6 +2868,22 @@
       "components": ["web/src/components/acp/WrapToggle.tsx"]
     },
     {
+      "id": "acp.tool-run-folding",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": [
+        "tests/acp-structured-view.spec.ts",
+        "src/components/acp/ToolExpansion.test.tsx",
+        "src/components/acp/activityMessages.test.ts",
+        "src/lib/toolAnchor.test.ts"
+      ],
+      "components": [
+        "web/src/components/acp/ToolExpansion.tsx",
+        "web/src/components/acp/GroupToolCards.tsx",
+        "web/src/lib/toolAnchor.ts"
+      ]
+    },
+    {
       "id": "acp.queued-prompt-expand-bounds",
       "kind": "vitest",
       "risk": "medium",

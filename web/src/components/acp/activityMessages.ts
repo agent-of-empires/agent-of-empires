@@ -61,9 +61,9 @@ export function activityToThreadMessages(
 
   const messages: ThreadMessageLike[] = [];
   let currentAssistant: AssistantBuilder | null = null;
-  const flushAssistant = () => {
+  const flushAssistant = (tail = false) => {
     if (!currentAssistant) return;
-    messages.push(currentAssistant.build(todosEnabled, profile));
+    messages.push(currentAssistant.build(todosEnabled, profile, tail));
     currentAssistant = null;
   };
   const pushUser = (
@@ -131,7 +131,7 @@ export function activityToThreadMessages(
       currentAssistant.appendText(row.text);
     }
   }
-  flushAssistant();
+  flushAssistant(visiblyBusy);
 
   const last = messages[messages.length - 1];
   if (visiblyBusy && last?.role === "assistant") {
@@ -203,8 +203,9 @@ class AssistantBuilder {
     part.isError = isError || undefined;
   }
 
-  build(todosEnabled: boolean, profile: AgentProfile = DEFAULT_AGENT_PROFILE): ThreadMessageLike {
-    const grouped = collapseToolRuns(collapseSubagents(this.parts, profile), todosEnabled);
+  /** `tail` marks the thread's last message while the agent is busy, whose trailing run may still grow. */
+  build(todosEnabled: boolean, profile: AgentProfile = DEFAULT_AGENT_PROFILE, tail = false): ThreadMessageLike {
+    const grouped = collapseToolRuns(collapseSubagents(this.parts, profile), todosEnabled, tail);
     return {
       id: this.id,
       role: "assistant",
@@ -278,8 +279,10 @@ function collapseSubagents(parts: DraftPart[], profile: AgentProfile): DraftPart
 
 /** Fold runs of 3+ consecutive tool calls between text into groups, splitting
  *  generic runs into chunks of at most TOOL_GROUP_MAX_RUN. Group ids anchor on
- *  each chunk's first child so a growing run keeps its cards and expand state. */
-function collapseToolRuns(parts: DraftPart[], todosEnabled: boolean): DraftPart[] {
+ *  each chunk's first child so a growing run keeps its cards and expand state.
+ *  With `tail`, the trailing run stays flat until later content or the end of
+ *  the turn closes it, so cards the reader has open do not fold away mid-run. */
+function collapseToolRuns(parts: DraftPart[], todosEnabled: boolean, tail: boolean): DraftPart[] {
   const out: DraftPart[] = [];
   let run: ToolPart[] = [];
   const group = (toolName: string, prefix: string, children: ToolPart[]) =>
@@ -289,7 +292,12 @@ function collapseToolRuns(parts: DraftPart[], todosEnabled: boolean): DraftPart[
       toolName,
       argsText: JSON.stringify({ children: children.map(childPayload) }),
     });
-  const flushRun = () => {
+  const flushRun = (closed: boolean) => {
+    if (!closed) {
+      out.push(...run);
+      run = [];
+      return;
+    }
     const isTodo = (p: ToolPart) => isTodoWriteArgsText(p.argsText, todosEnabled);
     if (run.length >= TOOL_GROUP_MIN_RUN && run.every(isTodo)) {
       group(TODO_GROUP_NAME, "todogroup", run);
@@ -312,10 +320,10 @@ function collapseToolRuns(parts: DraftPart[], todosEnabled: boolean): DraftPart[
     if (part.type === "tool-call") {
       run.push(part);
     } else {
-      flushRun();
+      flushRun(true);
       out.push(part);
     }
   }
-  flushRun();
+  flushRun(!tail);
   return out;
 }
