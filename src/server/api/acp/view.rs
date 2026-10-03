@@ -137,6 +137,13 @@ pub async fn acp_enable(
     }
 
     let agent_name = pick_agent(&state, &instance, instance.agent_name.as_deref()).await;
+    if let Err(error) = state.acp_supervisor.shutdown_and_require_dead(&id).await {
+        return (
+            StatusCode::CONFLICT,
+            format!("Cannot switch execution views before stored executions are stopped: {error}"),
+        )
+            .into_response();
+    }
     if let Err(resp) =
         commit_structured_view(&state, &mut instance, selected_binding.as_ref()).await
     {
@@ -165,7 +172,7 @@ async fn commit_structured_view(
     let file_watch = state.file_watch.clone();
     let binding_for_transition = selected_binding.cloned();
     let transition = tokio::task::spawn_blocking(move || -> anyhow::Result<u64> {
-        let storage = crate::session::Storage::new(&profile, file_watch)?;
+        let storage = crate::session::Storage::open(&profile, file_watch)?;
         let _lifecycle_lock = storage
             .acquire_instance_lifecycle_lock(&inst_for_transition.id)
             .map_err(|error| {
@@ -363,7 +370,40 @@ pub async fn acp_disable(
             Ok(Some(durable)) if durable.is_structured() => {
                 instance = adopt_persisted_structured_instance(instance, durable, &profile);
             }
-            Ok(Some(_)) => return view_response(id, View::Terminal),
+            Ok(Some(_)) => {
+                // Even an idempotent terminal response must prove stored history:
+                // no daemon handle or ACP projection does not mean no execution.
+                let cleanup_projection = state.acp_supervisor.is_owned(&id).await
+                    || state.acp_event_store.highest_seq(&id) > 0;
+                let retry = if cleanup_projection {
+                    state.acp_supervisor.shutdown_and_delete(&id).await
+                } else {
+                    state.acp_supervisor.shutdown_and_require_dead(&id).await
+                };
+                match retry {
+                    Ok(()) => {}
+                    Err(SupervisorError::TeardownPending(_)) => {
+                        return (
+                            StatusCode::CONFLICT,
+                            format!(
+                            "Session {id} is not proven stopped; retry once its executions exit"
+                        ),
+                        )
+                            .into_response()
+                    }
+                    Err(error) => {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("Session {id} cleanup failed: {error}"),
+                        )
+                            .into_response()
+                    }
+                }
+                if cleanup_projection {
+                    return finish_terminal_switch(&state, &id, instance).await;
+                }
+                return view_response(id, View::Terminal);
+            }
             Ok(None) => return session_not_found(),
             Err(resp) => return resp,
         }
@@ -425,21 +465,58 @@ pub async fn acp_disable(
     }
 
     // Committed before shutdown so the reconciler cannot respawn a worker in
-    // the teardown window.
+    // the teardown window. A kept-context switch still deletes the ACP
+    // projection below, so it must not report success from an ungated stop:
+    // `shutdown_and_require_dead` surfaces `TeardownPending` while the runner
+    // is not proven dead.
     let shutdown_result = if keep_context {
-        state.acp_supervisor.shutdown(&id).await
+        state.acp_supervisor.shutdown_and_require_dead(&id).await
     } else {
+        // The pane is about to reopen on this checkout, so it is kept whatever
+        // the row said: a launcher still starting is a live process inside it.
         state.acp_supervisor.shutdown_and_delete(&id).await
     };
     match shutdown_result {
-        Ok(()) | Err(SupervisorError::UnknownSession(_)) => {}
-        Err(e) => {
-            tracing::warn!(target: "acp.switch", session = %id, "shutdown structured view failed: {e}");
+        Ok(()) => {}
+        Err(SupervisorError::TeardownPending(_)) => {
+            // The view commit prevents respawn, but cannot itself prove death.
+            return (
+                StatusCode::CONFLICT,
+                format!(
+                    "Session {id} is not proven stopped; the switch to the terminal view is \
+                     already committed, retry after its executions exit"
+                ),
+            )
+                .into_response();
+        }
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!(
+                    "Session {id} cleanup failed after the terminal view was committed: {error}"
+                ),
+            )
+                .into_response()
         }
     }
-    // The tmux pane reprints a kept conversation, so the ACP projection goes.
-    state.acp_supervisor.forget_session(&id);
-    state.acp_event_store.delete_session(&id);
+    finish_terminal_switch(&state, &id, instance).await
+}
+
+/// The tail of a disable: drop the ACP projection, forget the session, and
+/// bring the tmux pane back. Best-effort by construction: the view switch is
+/// already committed, so a failed event deletion must not strand the session
+/// in a wedged state. Any residual transcript is left in place; only a purge that
+/// still sees a structured session removes it.
+/// purge path treats a post-commit sidecar failure.
+async fn finish_terminal_switch(
+    state: &Arc<AppState>,
+    id: &str,
+    mut instance: Instance,
+) -> Response {
+    if let Err(error) = state.acp_event_store.delete_session(id) {
+        tracing::warn!(target: "acp.switch", session = %id, "ACP event deletion failed after the view switch: {error}");
+    }
+    state.acp_supervisor.forget_session(id);
 
     match tokio::task::spawn_blocking(move || instance.start()).await {
         Ok(Ok(())) => {}
@@ -452,7 +529,7 @@ pub async fn acp_disable(
             tracing::error!(target: "acp.switch", session = %id, "spawn_blocking failed: {e}");
         }
     }
-    view_response(id, View::Terminal)
+    view_response(id.to_string(), View::Terminal)
 }
 
 /// Persist the terminal handoff with compare-and-swap guards on both cache and disk.
@@ -488,7 +565,7 @@ async fn persist_terminal_view(
     let profile_for_save = profile.to_string();
     let file_watch = state.file_watch.clone();
     let save_result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-        let storage = crate::session::Storage::new(&profile_for_save, file_watch)?;
+        let storage = crate::session::Storage::open(&profile_for_save, file_watch)?;
         storage.update(|all, _groups| {
             let Some(slot) = all.iter_mut().find(|candidate| candidate.id == snapshot.id) else {
                 anyhow::bail!("session disappeared during terminal handoff");
@@ -643,5 +720,39 @@ mod tests {
 
         let adopted = adopt_persisted_structured_instance(cached, persisted, "work");
         assert_eq!(adopted.effective_profile(), "work");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn terminal_disable_requires_history_proof_even_without_a_worker_or_projection() {
+        let temp = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let mut instance = Instance::new("uncovered-terminal", project.to_str().unwrap());
+        instance.source_profile = "disable-history".into();
+        instance.view = View::Terminal;
+        instance.tool = "shell".into();
+        instance.runner_journal = Default::default();
+        let id = instance.id.clone();
+        let storage = crate::session::Storage::new_unwatched("disable-history").unwrap();
+        storage
+            .update(|rows, _| {
+                rows.push(instance.clone());
+                Ok(())
+            })
+            .unwrap();
+        let state = crate::server::test_support::build_test_app_state(vec![instance]);
+        let response = acp_disable(State(state), Path(id.clone()))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let durable = storage
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.id == id)
+            .unwrap();
+        assert_eq!(durable.view, View::Terminal);
     }
 }

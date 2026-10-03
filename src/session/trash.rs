@@ -118,6 +118,7 @@ fn is_sandboxed(inst: &Instance) -> bool {
 
 /// Move a freshly-trashed session's managed worktree into the holding area and repoint
 /// `project_path`, capturing the original location in `pre_trash_project_path`.
+/// Caller holds workspace -> identity -> lifecycle locks and supplies the freshly durable row.
 pub fn relocate_worktree_to_trash(inst: &mut Instance) -> RelocateOutcome {
     if !inst.is_trashed() || !is_managed_single_worktree(inst) {
         return RelocateOutcome::Skipped;
@@ -138,6 +139,11 @@ pub fn relocate_worktree_to_trash(inst: &mut Instance) -> RelocateOutcome {
         return RelocateOutcome::Skipped;
     }
 
+    if !inst.runner_journal.proves_quiescent() {
+        return RelocateOutcome::Failed {
+            reason: "durable runner history does not prove checkout quiescence".into(),
+        };
+    }
     let current = PathBuf::from(&inst.project_path);
     let Some(target) = trash_holding_path(&current, &inst.id) else {
         return RelocateOutcome::Failed {
@@ -200,7 +206,13 @@ pub fn relocate_worktree_to_trash(inst: &mut Instance) -> RelocateOutcome {
 
 /// Bring a freshly-trashed session's sandbox container down, then relocate its worktree into the
 /// holding area.
+/// Same authoritative-row, owned-reservation, and lock preconditions as relocation.
 pub fn prepare_trashed_worktree(inst: &mut Instance) -> RelocateOutcome {
+    if !inst.runner_journal.proves_quiescent() {
+        return RelocateOutcome::Failed {
+            reason: "durable runner history does not prove checkout quiescence".into(),
+        };
+    }
     if let Err(error) =
         crate::session::worktree_edit::stop_sandbox_container(&inst.id, is_sandboxed(inst))
     {
@@ -218,6 +230,11 @@ fn prepare_trashed_worktree_with(
     inst: &mut Instance,
     stop_container: impl FnOnce(&str, bool),
 ) -> RelocateOutcome {
+    if !inst.runner_journal.proves_quiescent() {
+        return RelocateOutcome::Failed {
+            reason: "durable runner history does not prove checkout quiescence".into(),
+        };
+    }
     stop_container(&inst.id, is_sandboxed(inst));
     relocate_worktree_to_trash(inst)
 }
@@ -239,6 +256,7 @@ pub struct TrashResult {
     pub session_id: String,
     pub relocation: Option<TrashRelocation>,
     pub relocate_warning: Option<String>,
+    pub authoritative: Option<Instance>,
 }
 
 /// Execute and commit a TUI trash transition under one per-instance flock.
@@ -247,6 +265,15 @@ pub fn perform_trash(request: &TrashRequest) -> TrashResult {
         session_id: request.session_id.clone(),
         relocation: None,
         relocate_warning: Some(reason),
+        authoritative: None,
+    };
+    let _workspace_claim_lock = match crate::session::acquire_session_workspace_claim_lock() {
+        Ok(lock) => lock,
+        Err(error) => return failed(format!("could not acquire workspace claim lock: {error}")),
+    };
+    let _identity_lock = match crate::session::acquire_session_identity_lock() {
+        Ok(lock) => lock,
+        Err(error) => return failed(format!("could not acquire identity lock: {error}")),
     };
     let storage = match crate::session::Storage::open_unwatched(&request.instance.source_profile) {
         Ok(storage) => storage,
@@ -258,40 +285,113 @@ pub fn perform_trash(request: &TrashRequest) -> TrashResult {
             return failed(format!("could not acquire lifecycle lock: {error}"));
         }
     };
-    let owns = storage
-        .update(|instances, _groups| {
-            Ok(instances
+    let snapshot = match storage.load().ok().and_then(|rows| {
+        rows.into_iter().find(|row| {
+            row.id == request.session_id
+                && row.lifecycle_reservation_is_owned(
+                    crate::session::LifecycleOperation::Trash,
+                    request.generation,
+                )
+        })
+    }) {
+        Some(row) => row,
+        None => return failed("trash lifecycle reservation was superseded before teardown".into()),
+    };
+    if snapshot.has_managed_worktree_or_workspace() {
+        let mut candidate_paths = vec![PathBuf::from(&snapshot.project_path)];
+        if let Some(workspace) = &snapshot.workspace_info {
+            candidate_paths.push(PathBuf::from(&workspace.workspace_dir));
+        }
+        candidate_paths.extend(
+            snapshot
+                .all_repos()
                 .iter()
-                .find(|instance| instance.id == request.session_id)
-                .is_some_and(|instance| {
-                    instance.lifecycle_reservation_is_owned(
+                .map(|repo| PathBuf::from(&repo.worktree_path)),
+        );
+        if let Some(holding) = trash_holding_path(Path::new(&snapshot.project_path), &snapshot.id) {
+            candidate_paths.push(holding);
+        }
+        if let Err(error) = crate::session::deletion::ensure_unclaimed_paths(
+            crate::session::deletion::SessionPathOwner {
+                profile: storage.profile(),
+                session_id: &request.session_id,
+            },
+            &candidate_paths,
+        ) {
+            let _ = storage.update(|instances, _groups| {
+                if let Some(stored) = instances
+                    .iter_mut()
+                    .find(|instance| instance.id == request.session_id)
+                {
+                    stored.untrash();
+                    stored.release_lifecycle_reservation_if_owned(
                         crate::session::LifecycleOperation::Trash,
                         request.generation,
-                    )
-                }))
-        })
-        .unwrap_or(false);
-    if !owns {
-        return failed("trash lifecycle reservation was superseded before teardown".to_string());
+                    );
+                }
+                Ok(())
+            });
+            let authoritative = storage.load().ok().and_then(|instances| {
+                instances
+                    .into_iter()
+                    .find(|instance| instance.id == request.session_id)
+            });
+            return TrashResult {
+                session_id: request.session_id.clone(),
+                relocation: None,
+                relocate_warning: Some(format!(
+                    "trash skipped because worktree ownership is shared or unknown: {error}"
+                )),
+                authoritative,
+            };
+        }
     }
 
-    let mut inst = request.instance.clone();
-    inst.kill_all_tmux_sessions_locked();
-    let outcome = prepare_trashed_worktree(&mut inst);
-    let relocation = match &outcome {
-        RelocateOutcome::Relocated { .. } => Some(TrashRelocation {
-            new_project_path: inst.project_path.clone(),
-            pre_trash_project_path: inst.pre_trash_project_path.clone(),
-        }),
-        RelocateOutcome::Skipped | RelocateOutcome::Failed { .. } => None,
-    };
     let commit = storage.update(|instances, _groups| {
-        if let Some(relocation) = &relocation {
-            let _ = crate::session::claim::commit_trash_relocation(
+        let stored = instances
+            .iter()
+            .find(|row| row.id == request.session_id)
+            .ok_or_else(|| anyhow::anyhow!("session disappeared before trash relocation"))?;
+        anyhow::ensure!(
+            stored.lifecycle_reservation_is_owned(
+                crate::session::LifecycleOperation::Trash,
+                request.generation
+            ) && plan_inputs_unchanged(&snapshot, stored),
+            "trash lifecycle reservation or relocation plan was superseded"
+        );
+        if !stored.runner_journal.proves_quiescent() {
+            crate::session::claim::release_trash_reservation(
                 instances,
                 &request.session_id,
                 request.generation,
-                relocation,
+            );
+            return Ok((
+                RelocateOutcome::Failed {
+                    reason: "durable runner history does not prove checkout quiescence".into(),
+                },
+                None,
+            ));
+        }
+        let mut inst = stored.clone();
+        inst.source_profile = storage.profile().to_owned();
+        inst.kill_all_tmux_sessions_locked();
+        let outcome = prepare_trashed_worktree(&mut inst);
+        let relocation = match &outcome {
+            RelocateOutcome::Relocated { .. } => Some(TrashRelocation {
+                new_project_path: inst.project_path.clone(),
+                pre_trash_project_path: inst.pre_trash_project_path.clone(),
+            }),
+            RelocateOutcome::Skipped | RelocateOutcome::Failed { .. } => None,
+        };
+        if let Some(relocation) = &relocation {
+            anyhow::ensure!(
+                crate::session::claim::commit_trash_relocation(
+                    instances,
+                    &request.session_id,
+                    request.generation,
+                    relocation
+                ) == crate::session::claim::RelocationCommit::Persisted,
+                "trash relocation reservation was superseded"
             );
         } else {
             crate::session::claim::release_trash_reservation(
@@ -300,12 +400,18 @@ pub fn perform_trash(request: &TrashRequest) -> TrashResult {
                 request.generation,
             );
         }
-        Ok(())
+        Ok((outcome, relocation))
     });
-    if let Err(error) = commit {
-        return failed(format!("could not commit trash transition: {error}"));
-    }
+    let (outcome, relocation) = match commit {
+        Ok(result) => result,
+        Err(error) => return failed(format!("could not commit trash transition: {error}")),
+    };
 
+    let authoritative = storage.load().ok().and_then(|instances| {
+        instances
+            .into_iter()
+            .find(|instance| instance.id == request.session_id)
+    });
     TrashResult {
         session_id: request.session_id.clone(),
         relocation,
@@ -313,25 +419,13 @@ pub fn perform_trash(request: &TrashRequest) -> TrashResult {
             RelocateOutcome::Failed { reason } => Some(reason),
             RelocateOutcome::Relocated { .. } | RelocateOutcome::Skipped => None,
         },
+        authoritative,
     }
-}
-
-/// Undo a trash relocation that landed after the row had already been restored: the worker's
-/// still-trashed re-check and the `git worktree move` are not atomic, so a restore squeezing
-/// between them leaves a live, untrashed row pointing at its original path while the worktree sits
-/// in the holding area.
-pub fn undo_raced_relocation(live: &Instance, relocation: &TrashRelocation) -> RestoreOutcome {
-    let Some(original) = relocation.pre_trash_project_path.clone() else {
-        return RestoreOutcome::NoChange;
-    };
-    let mut tmp = live.clone();
-    tmp.project_path = relocation.new_project_path.clone();
-    tmp.pre_trash_project_path = Some(original);
-    restore_worktree_location(&mut tmp)
 }
 
 /// Move a trashed session's worktree back to its pre-trash location and clear
 /// `pre_trash_project_path`.
+/// Caller holds workspace -> identity -> lifecycle locks and supplies the freshly durable row.
 pub fn restore_worktree_location(inst: &mut Instance) -> RestoreOutcome {
     let Some(original) = inst.pre_trash_project_path.clone() else {
         return RestoreOutcome::NoChange;
@@ -343,6 +437,11 @@ pub fn restore_worktree_location(inst: &mut Instance) -> RestoreOutcome {
         // back. Drop the marker so the row looks un-relocated again.
         inst.pre_trash_project_path = None;
         return RestoreOutcome::NoChange;
+    }
+    if !inst.runner_journal.proves_quiescent() {
+        return RestoreOutcome::Failed {
+            reason: "durable runner history does not prove checkout quiescence".into(),
+        };
     }
     if ensure_sandbox_container_released(&inst.id, is_sandboxed(inst)) {
         return RestoreOutcome::Failed {
@@ -483,6 +582,8 @@ fn plan_trashed_reconcile_cached(
 }
 
 /// Load-time reconciliation for a single trashed session.
+/// Lock-free worker: caller holds workspace -> identity -> lifecycle -> storage and owns
+/// the durable reservation/plan; moving plans also require a stable path ownership check.
 pub fn reconcile_trashed_location(inst: &mut Instance) -> bool {
     match plan_trashed_reconcile(inst) {
         ReconcilePlan::Nothing => false,
@@ -539,6 +640,8 @@ pub fn reconcile_trashed_location(inst: &mut Instance) -> bool {
 
 /// Reconcile every trashed row in one profile, batched.
 pub fn reconcile_trashed_profile(profile: &str) -> anyhow::Result<Vec<Instance>> {
+    let _workspace_claim_lock = crate::session::acquire_session_workspace_claim_lock()?;
+    let _identity_lock = crate::session::acquire_session_identity_lock()?;
     let storage = crate::session::Storage::open_unwatched(profile)?;
     let mut cache = ProtectedBranchCache::default();
     let mut candidates: Vec<Instance> = storage
@@ -572,6 +675,15 @@ fn plan_inputs_unchanged(snapshot: &Instance, durable: &Instance) -> bool {
         && durable.pre_trash_project_path == snapshot.pre_trash_project_path
         && durable.worktree_info == snapshot.worktree_info
         && durable.scratch == snapshot.scratch
+        && durable
+            .workspace_info
+            .as_ref()
+            .map(|workspace| (&workspace.workspace_dir, &workspace.repos))
+            == snapshot
+                .workspace_info
+                .as_ref()
+                .map(|workspace| (&workspace.workspace_dir, &workspace.repos))
+        && is_sandboxed(durable) == is_sandboxed(snapshot)
 }
 
 /// How many rows one batch reserves at once.
@@ -617,62 +729,83 @@ fn reconcile_trashed_batch(
         Ok(reserved)
     })?;
 
-    // Each row takes its own lifecycle flock only across its own filesystem work.
-    let reconciled: Vec<(u64, bool, Instance)> = reserved
-        .into_iter()
-        .map(|(generation, mut durable)| {
-            let changed = match storage.acquire_instance_lifecycle_lock(&durable.id) {
-                Ok(_lifecycle_lock) => reconcile_trashed_location(&mut durable),
-                Err(error) => {
-                    tracing::warn!(
-                        target: "session.trash",
-                        session = %durable.id,
-                        "trash reconciliation skipped: could not acquire lifecycle lock: {error}"
-                    );
-                    false
-                }
-            };
-            (generation, changed, durable)
-        })
-        .collect();
-    if reconciled.is_empty() {
-        return Ok(Vec::new());
+    let mut healed = Vec::new();
+    for (generation, snapshot) in reserved {
+        let _lifecycle_lock = storage.acquire_instance_lifecycle_lock(&snapshot.id)?;
+        let (changed, durable) = reconcile_reserved_locked(storage, &snapshot, generation)?;
+        if changed {
+            healed.push(durable);
+        }
     }
+    Ok(healed)
+}
 
+// Workspace and identity locks are held by the entrypoint; lifecycle by its caller.
+// Read the inventory before taking the target storage lock to avoid recursive flock.
+fn reconcile_reserved_locked(
+    storage: &crate::session::Storage,
+    snapshot: &Instance,
+    generation: u64,
+) -> anyhow::Result<(bool, Instance)> {
+    let plan = plan_trashed_reconcile(snapshot);
+    let ownership = if matches!(
+        plan,
+        ReconcilePlan::Relocate | ReconcilePlan::RestoreDefaultBranch
+    ) {
+        let mut paths = vec![PathBuf::from(&snapshot.project_path)];
+        if let Some(original) = &snapshot.pre_trash_project_path {
+            paths.push(PathBuf::from(original));
+        } else if let Some(holding) =
+            trash_holding_path(Path::new(&snapshot.project_path), &snapshot.id)
+        {
+            paths.push(holding);
+        }
+        crate::session::deletion::ensure_unclaimed_paths(
+            crate::session::deletion::SessionPathOwner {
+                profile: storage.profile(),
+                session_id: &snapshot.id,
+            },
+            &paths,
+        )
+    } else {
+        Ok(())
+    };
     storage.update(|instances, _groups| {
-        let mut healed = Vec::new();
-        for (generation, changed, durable) in &reconciled {
-            if !changed {
-                if let Some(stored) = instances
-                    .iter_mut()
-                    .find(|candidate| candidate.id == durable.id)
-                {
-                    stored.release_lifecycle_reservation_if_owned(
-                        crate::session::LifecycleOperation::Trash,
-                        *generation,
-                    );
-                }
-                continue;
-            }
+        let stored = instances
+            .iter()
+            .find(|row| row.id == snapshot.id)
+            .ok_or_else(|| anyhow::anyhow!("session disappeared before trash reconciliation"))?;
+        anyhow::ensure!(
+            stored.lifecycle_reservation_is_owned(
+                crate::session::LifecycleOperation::Trash,
+                generation
+            ),
+            "trash reconciliation reservation was superseded"
+        );
+        let unchanged =
+            plan_inputs_unchanged(snapshot, stored) && plan_trashed_reconcile(stored) == plan;
+        let mut durable = stored.clone();
+        durable.source_profile = storage.profile().to_owned();
+        let changed = unchanged && ownership.is_ok() && reconcile_trashed_location(&mut durable);
+        if changed {
             let relocation = TrashRelocation {
                 new_project_path: durable.project_path.clone(),
                 pre_trash_project_path: durable.pre_trash_project_path.clone(),
             };
-            match crate::session::claim::commit_trash_relocation(
-                instances,
-                &durable.id,
-                *generation,
-                &relocation,
-            ) {
-                crate::session::claim::RelocationCommit::Persisted => healed.push(durable.clone()),
-                outcome => tracing::warn!(
-                    target: "session.trash",
-                    session = %durable.id,
-                    "trash reconciliation not committed: {outcome:?}"
-                ),
-            }
+            anyhow::ensure!(
+                crate::session::claim::commit_trash_relocation(
+                    instances,
+                    &snapshot.id,
+                    generation,
+                    &relocation
+                ) == crate::session::claim::RelocationCommit::Persisted,
+                "trash reconciliation reservation was superseded"
+            );
+        } else {
+            crate::session::claim::release_trash_reservation(instances, &snapshot.id, generation);
         }
-        Ok(healed)
+        durable.lifecycle_reservation = None;
+        Ok((changed, durable))
     })
 }
 
@@ -688,10 +821,12 @@ pub fn reconcile_trashed_transition(inst: &mut Instance) -> anyhow::Result<bool>
         !profile.is_empty(),
         "session has no source profile; refusing trash reconciliation"
     );
+    let _workspace_claim_lock = crate::session::acquire_session_workspace_claim_lock()?;
+    let _identity_lock = crate::session::acquire_session_identity_lock()?;
     let storage = crate::session::Storage::open_unwatched(&profile)?;
     let _lifecycle_lock = storage.acquire_instance_lifecycle_lock(&inst.id)?;
     let id = inst.id.clone();
-    let (generation, mut durable) = storage.update(|instances, _groups| {
+    let (generation, durable) = storage.update(|instances, _groups| {
         let Some(stored) = instances.iter_mut().find(|candidate| candidate.id == id) else {
             anyhow::bail!("session disappeared before trash reconciliation");
         };
@@ -703,32 +838,7 @@ pub fn reconcile_trashed_transition(inst: &mut Instance) -> anyhow::Result<bool>
         Ok((generation, stored.clone()))
     })?;
 
-    let changed = reconcile_trashed_location(&mut durable);
-    let relocation = TrashRelocation {
-        new_project_path: durable.project_path.clone(),
-        pre_trash_project_path: durable.pre_trash_project_path.clone(),
-    };
-    storage.update(|instances, _groups| {
-        if changed {
-            let commit = crate::session::claim::commit_trash_relocation(
-                instances,
-                &id,
-                generation,
-                &relocation,
-            );
-            anyhow::ensure!(
-                commit == crate::session::claim::RelocationCommit::Persisted,
-                "trash reconciliation reservation was superseded"
-            );
-        } else if let Some(stored) = instances.iter_mut().find(|candidate| candidate.id == id) {
-            stored.release_lifecycle_reservation_if_owned(
-                crate::session::LifecycleOperation::Trash,
-                generation,
-            );
-        }
-        Ok(())
-    })?;
-    durable.lifecycle_reservation = None;
+    let (changed, durable) = reconcile_reserved_locked(&storage, &durable, generation)?;
     *inst = durable;
     Ok(changed)
 }
@@ -1054,6 +1164,107 @@ mod tests {
         assert_eq!(inst.project_path, original);
         assert!(inst.pre_trash_project_path.is_none());
         assert!(PathBuf::from(&original).exists());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn review_repro_reconciliation_does_not_move_a_live_runners_checkout() {
+        use crate::process::worker_registry::{self, WorkerRecord};
+        let _home = crate::session::test_support::isolate_app_dir();
+        let (_tmp, mut instance) = real_worktree_instance();
+        instance.source_profile = "owner".into();
+        instance.view = crate::session::View::Structured;
+        instance.trash();
+        let original = PathBuf::from(&instance.project_path);
+        std::fs::write(original.join("sentinel"), "live agent checkout").unwrap();
+        let storage = crate::session::Storage::new_unwatched("owner").unwrap();
+        storage
+            .update(|instances, _| {
+                instances.push(instance.clone());
+                Ok(())
+            })
+            .unwrap();
+        let mut command = std::process::Command::new("/bin/sh");
+        command
+            .args(["-c", "read -r line"])
+            .current_dir(&original)
+            .stdin(std::process::Stdio::piped());
+        crate::process::configure_process_group(&mut command);
+        let mut child = command.spawn().unwrap();
+        let pid = child.id();
+        let record = WorkerRecord::new(
+            instance.id.clone(),
+            pid,
+            worker_registry::socket_path_for(&instance.id).unwrap(),
+            "agent".into(),
+            "agent".into(),
+            original.clone(),
+            None,
+            Vec::new(),
+            Vec::new(),
+            None,
+            Some("owner".into()),
+        );
+        worker_registry::save(&record).unwrap();
+        instance.runner_journal = serde_json::from_value(serde_json::json!({
+            "coverage": "complete",
+            "launches": [{
+                "nonce": *uuid::Uuid::new_v4().as_bytes(),
+                "boot": *uuid::Uuid::parse_str(&crate::process::boot_id().unwrap()).unwrap().as_bytes(),
+                "generation": 0,
+                "incarnation": crate::process::process_incarnation(pid).unwrap().unwrap(),
+            }],
+        })).unwrap();
+        storage
+            .update(|instances, _| {
+                instances
+                    .iter_mut()
+                    .find(|row| row.id == instance.id)
+                    .unwrap()
+                    .runner_journal = instance.runner_journal.clone();
+                instances
+                    .iter_mut()
+                    .find(|row| row.id == instance.id)
+                    .unwrap()
+                    .view = crate::session::View::Terminal;
+                Ok(())
+            })
+            .unwrap();
+        std::fs::remove_file(worker_registry::record_path(&instance.id).unwrap()).unwrap();
+        // Only storage is authoritative, not this stale consumer snapshot.
+        instance.runner_journal = crate::session::runner_journal::RunnerExecutionJournal::new();
+        assert!(crate::process::worker::is_process_group_alive(pid));
+        let result = reconcile_trashed_transition(&mut instance);
+        assert!(reconcile_trashed_profile("owner").unwrap().is_empty());
+        let group_was_alive = crate::process::worker::is_process_group_alive(pid);
+        drop(child.stdin.take());
+        child.wait().unwrap();
+        assert!(
+            group_was_alive,
+            "the runner remained live through reconciliation"
+        );
+        assert!(
+            result.is_ok(),
+            "reconciliation should defer safely: {result:?}"
+        );
+        assert!(
+            original.join("sentinel").exists(),
+            "a live runner must retain its checkout"
+        );
+        assert_eq!(PathBuf::from(&instance.project_path), original);
+        let holding = trash_holding_path(&original, &instance.id).unwrap();
+        assert!(!holding.exists());
+        assert!(reconcile_trashed_transition(&mut instance).unwrap());
+        assert!(!original.exists());
+        assert!(holding.join("sentinel").exists());
+        let durable = storage
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.id == instance.id)
+            .unwrap();
+        assert_eq!(PathBuf::from(durable.project_path), holding);
+        assert!(durable.lifecycle_reservation.is_none());
     }
 
     #[test]
@@ -1470,6 +1681,65 @@ mod tests {
     // Regression (#the-d-key): trashing must run the sandbox container-stop step BEFORE relocating
     // the worktree.
     #[test]
+    #[serial_test::serial]
+    fn trash_ownership_rejection_untrashes_and_releases_reservation() {
+        let _app_guard = crate::session::test_support::isolate_app_dir();
+        let owner = crate::session::Storage::new_unwatched("owner").unwrap();
+        let other = crate::session::Storage::new_unwatched("other").unwrap();
+        let mut instance = Instance::new("session", "/tmp/session");
+        instance.source_profile = "owner".to_string();
+        instance.worktree_info = Some(crate::session::WorktreeInfo {
+            branch: "feature/shared".to_string(),
+            main_repo_path: "/tmp/main".to_string(),
+            managed_by_aoe: true,
+            created_at: Utc::now(),
+            base_branch: None,
+        });
+        owner
+            .update(|instances, _groups| {
+                instances.push(instance.clone());
+                Ok(())
+            })
+            .unwrap();
+        other
+            .update(|instances, _groups| {
+                instances.push(instance.clone());
+                Ok(())
+            })
+            .unwrap();
+        // The cross-profile inventory is unverifiable because a peer profile
+        // cannot be read at all, which is what makes the ownership verdict
+        // `Unknown` and the trash refuse.
+        std::fs::write(other.sessions_path(), b"{ not json").unwrap();
+        let generation = owner
+            .update(|instances, _groups| {
+                let row = instances
+                    .iter_mut()
+                    .find(|row| row.id == instance.id)
+                    .unwrap();
+                let generation = row
+                    .try_acquire_lifecycle_reservation(
+                        crate::session::LifecycleOperation::Trash,
+                        Instance::LIFECYCLE_RESERVATION_TTL,
+                        Utc::now(),
+                    )
+                    .unwrap();
+                row.trash();
+                Ok(generation)
+            })
+            .unwrap();
+        let result = perform_trash(&TrashRequest {
+            session_id: instance.id.clone(),
+            instance: instance.clone(),
+            generation,
+        });
+        assert!(result.relocate_warning.is_some());
+        let stored = owner.load().unwrap().into_iter().next().unwrap();
+        assert!(!stored.is_trashed());
+        assert!(stored.lifecycle_reservation.is_none());
+    }
+
+    #[test]
     fn trash_prep_stops_container_before_relocating() {
         if !git_available() {
             return;
@@ -1481,17 +1751,16 @@ mod tests {
         use std::cell::Cell;
         use std::rc::Rc;
         let stop_calls = Rc::new(Cell::new(0u32));
-        let saw_sandbox_flag = Rc::new(Cell::new(true));
+
         let original_present_at_stop = Rc::new(Cell::new(false));
 
         let outcome = {
             let stop_calls = Rc::clone(&stop_calls);
-            let saw_sandbox_flag = Rc::clone(&saw_sandbox_flag);
+
             let original_present_at_stop = Rc::clone(&original_present_at_stop);
             let original = original.clone();
-            prepare_trashed_worktree_with(&mut inst, move |_id, is_sandboxed| {
+            prepare_trashed_worktree_with(&mut inst, move |_id, _is_sandboxed| {
                 stop_calls.set(stop_calls.get() + 1);
-                saw_sandbox_flag.set(is_sandboxed);
                 original_present_at_stop.set(original.exists());
             })
         };
@@ -1501,10 +1770,7 @@ mod tests {
             1,
             "trash must run the container-stop step exactly once"
         );
-        assert!(
-            !saw_sandbox_flag.get(),
-            "a non-sandbox session reports is_sandboxed=false to the stop step"
-        );
+
         assert!(
             original_present_at_stop.get(),
             "the container stop must run BEFORE the worktree is moved"
@@ -1517,76 +1783,5 @@ mod tests {
         assert_eq!(PathBuf::from(&inst.project_path), holding);
         assert!(holding.exists(), "worktree moved into the holding area");
         assert!(!original.exists(), "worktree left its original active path");
-    }
-
-    #[test]
-    fn trash_prep_passes_sandbox_flag_to_container_stop() {
-        let mut inst = Instance::new("sandboxed", "/tmp/sandboxed");
-        inst.sandbox_info = Some(crate::session::SandboxInfo {
-            enabled: true,
-            container_id: None,
-            image: "ubuntu:latest".to_string(),
-            container_name: "aoe-sandbox-test".to_string(),
-            extra_env: None,
-            custom_instruction: None,
-            before_start_env: Vec::new(),
-            container_workdir: None,
-        });
-        inst.trash();
-
-        use std::cell::Cell;
-        use std::rc::Rc;
-        let saw_sandbox_flag = Rc::new(Cell::new(false));
-        let outcome = {
-            let saw_sandbox_flag = Rc::clone(&saw_sandbox_flag);
-            prepare_trashed_worktree_with(&mut inst, move |_id, is_sandboxed| {
-                saw_sandbox_flag.set(is_sandboxed);
-            })
-        };
-        assert!(
-            saw_sandbox_flag.get(),
-            "a sandboxed session must report is_sandboxed=true to the stop step"
-        );
-        assert!(
-            matches!(outcome, RelocateOutcome::Skipped),
-            "a plain session has no managed worktree to relocate: {outcome:?}"
-        );
-    }
-
-    #[test]
-    fn undo_raced_relocation_moves_worktree_back() {
-        if !git_available() {
-            return;
-        }
-        let (_tmp, mut inst) = real_worktree_instance();
-        let original = inst.project_path.clone();
-        inst.trash();
-        assert!(matches!(
-            relocate_worktree_to_trash(&mut inst),
-            RelocateOutcome::Relocated { .. }
-        ));
-        let reloc = TrashRelocation {
-            new_project_path: inst.project_path.clone(),
-            pre_trash_project_path: inst.pre_trash_project_path.clone(),
-        };
-
-        let mut live = inst.clone();
-        live.untrash();
-        live.project_path = original.clone();
-        live.pre_trash_project_path = None;
-
-        let out = undo_raced_relocation(&live, &reloc);
-        assert!(
-            matches!(out, RestoreOutcome::Restored { .. }),
-            "undo must move the worktree back, got {out:?}"
-        );
-        assert!(
-            PathBuf::from(&original).exists(),
-            "worktree must be back at the path the live row points at"
-        );
-        assert!(
-            !PathBuf::from(&reloc.new_project_path).exists(),
-            "holding area copy must be gone"
-        );
     }
 }

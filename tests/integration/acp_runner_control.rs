@@ -7,7 +7,7 @@
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
+use std::process::Child;
 use std::time::{Duration, Instant};
 
 use agent_of_empires::acp::acp_client::AcpClient;
@@ -151,29 +151,32 @@ fn runner_proxies_agent_requests_over_the_control_channel() {
     let control = workers.join(format!("{session_id}.control.sock"));
     let record = workers.join(format!("{session_id}.json"));
 
-    let bin = env!("CARGO_BIN_EXE_aoe");
-    let mut child: Child = Command::new(bin)
-        .args([
-            "__acp-runner",
-            "--socket",
-            socket.to_str().unwrap(),
-            "--session-id",
-            session_id,
-            "--agent-name",
-            "fake-agent",
-            "--cwd",
-            home.to_str().unwrap(),
-            "--",
-            // Absolute path: relying on the runner's inherited PATH makes a
-            // non-standard PATH (e.g. nix-first) surface as a confusing
-            // "registry record never appeared" instead of a clear failure.
-            "/bin/cat",
-        ])
-        .env("HOME", &home)
-        .env("XDG_CONFIG_HOME", &xdg)
-        .env("AOE_ACP_WATCHDOG_POLL_MS", "150")
-        .spawn()
-        .expect("spawn acp runner");
+    let launch = crate::common::RunnerLaunchFixture::new(&home, &xdg, "main", session_id, 0);
+    let mut child = KillOnDrop(
+        launch
+            .command()
+            .args([
+                "--socket",
+                socket.to_str().unwrap(),
+                "--session-id",
+                session_id,
+                "--agent-name",
+                "fake-agent",
+                "--cwd",
+                home.to_str().unwrap(),
+                "--",
+                // Absolute path: relying on the runner's inherited PATH makes a
+                // non-standard PATH (e.g. nix-first) surface as a confusing
+                // "registry record never appeared" instead of a clear failure.
+                "/bin/cat",
+            ])
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", &xdg)
+            .env("AOE_ACP_WATCHDOG_POLL_MS", "150")
+            .spawn()
+            .expect("spawn acp runner"),
+    );
+    launch.authorize(&mut child.0);
 
     wait_for(&record, "registry record");
     wait_for(&control, "control socket");
@@ -271,8 +274,8 @@ fn runner_proxies_agent_requests_over_the_control_channel() {
         assert_eq!(call["params"]["index"], index);
     }
 
-    let _ = child.kill();
-    let _ = child.wait();
+    let _ = child.0.kill();
+    let _ = child.0.wait();
 }
 
 /// Read control frames until one is not a `notify`.
@@ -354,10 +357,11 @@ for line in sys.stdin:
     let socket = workers.join(format!("{session_id}.sock"));
     let control = workers.join(format!("{session_id}.control.sock"));
     let record = workers.join(format!("{session_id}.json"));
-    let _child = KillOnDrop(
-        Command::new(env!("CARGO_BIN_EXE_aoe"))
+    let launch = crate::common::RunnerLaunchFixture::new(&home, &xdg, "main", session_id, 0);
+    let mut _child = KillOnDrop(
+        launch
+            .command()
             .args([
-                "__acp-runner",
                 "--socket",
                 socket.to_str().unwrap(),
                 "--session-id",
@@ -378,6 +382,7 @@ for line in sys.stdin:
             .spawn()
             .expect("spawn acp runner"),
     );
+    launch.authorize(&mut _child.0);
 
     wait_for(&record, "registry record");
     wait_for(&control, "control socket");
@@ -513,10 +518,11 @@ for line in sys.stdin:
     let control = workers.join(format!("{session_id}.control.sock"));
     let record = workers.join(format!("{session_id}.json"));
 
-    let _child = KillOnDrop(
-        Command::new(env!("CARGO_BIN_EXE_aoe"))
+    let launch = crate::common::RunnerLaunchFixture::new(&home, &xdg, "main", session_id, 0);
+    let mut _child = KillOnDrop(
+        launch
+            .command()
             .args([
-                "__acp-runner",
                 "--socket",
                 workers.join(format!("{session_id}.sock")).to_str().unwrap(),
                 "--session-id",
@@ -535,6 +541,7 @@ for line in sys.stdin:
             .spawn()
             .expect("spawn acp runner"),
     );
+    launch.authorize(&mut _child.0);
 
     wait_for(&record, "registry record");
     wait_for(&control, "control socket");
@@ -693,11 +700,11 @@ for line in sys.stdin:
     let socket = workers.join(format!("{session_id}.sock"));
     let control = workers.join(format!("{session_id}.control.sock"));
     let record = workers.join(format!("{session_id}.json"));
-    let bin = env!("CARGO_BIN_EXE_aoe");
     let spawn_runner = |delay: &str, fail_load: bool| {
-        Command::new(bin)
+        let launch = crate::common::RunnerLaunchFixture::new(&home, &xdg, "main", session_id, 0);
+        let mut child = launch
+            .command()
             .args([
-                "__acp-runner",
                 "--socket",
                 socket.to_str().unwrap(),
                 "--session-id",
@@ -719,10 +726,13 @@ for line in sys.stdin:
             .env("AOE_FAKE_LOAD_ERROR", if fail_load { "1" } else { "0" })
             .env("AOE_ACP_WATCHDOG_POLL_MS", "5000")
             .spawn()
-            .expect("spawn acp runner")
+            .expect("spawn acp runner");
+        launch.authorize(&mut child);
+        (child, launch.nonce)
     };
 
-    let mut old = KillOnDrop(spawn_runner("2000", false));
+    let (old, old_nonce) = spawn_runner("2000", false);
+    let mut old = KillOnDrop(old);
     wait_for(&record, "old registry record");
     wait_for(&control, "old control socket");
     assert!(
@@ -745,6 +755,7 @@ for line in sys.stdin:
                 None,
                 "fake-agent".into(),
                 None,
+                old_nonce,
             ),
         )
         .await
@@ -762,7 +773,8 @@ for line in sys.stdin:
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        let replacement = KillOnDrop(spawn_runner("750", true));
+        let (replacement, _) = spawn_runner("750", true);
+        let replacement = KillOnDrop(replacement);
         wait_for_record_pid(&record, replacement.0.id());
         replacement
     };
@@ -922,11 +934,11 @@ for line in sys.stdin:
     let control = workers.join(format!("{session_id}.control.sock"));
     let record = workers.join(format!("{session_id}.json"));
 
-    let bin = env!("CARGO_BIN_EXE_aoe");
-    let _child = KillOnDrop(
-        Command::new(bin)
+    let launch = crate::common::RunnerLaunchFixture::new(&home, &xdg, "main", session_id, 0);
+    let mut _child = KillOnDrop(
+        launch
+            .command()
             .args([
-                "__acp-runner",
                 "--socket",
                 socket.to_str().unwrap(),
                 "--session-id",
@@ -946,6 +958,7 @@ for line in sys.stdin:
             .spawn()
             .expect("spawn acp runner"),
     );
+    launch.authorize(&mut _child.0);
 
     wait_for(&record, "registry record");
     wait_for(&control, "control socket");
@@ -1072,11 +1085,11 @@ fn runner_load_uses_requested_id_and_caches_response() {
     let control = workers.join(format!("{session_id}.control.sock"));
     let record = workers.join(format!("{session_id}.json"));
 
-    let bin = env!("CARGO_BIN_EXE_aoe");
-    let _child = KillOnDrop(
-        Command::new(bin)
+    let launch = crate::common::RunnerLaunchFixture::new(&home, &xdg, "main", session_id, 0);
+    let mut _child = KillOnDrop(
+        launch
+            .command()
             .args([
-                "__acp-runner",
                 "--socket",
                 socket.to_str().unwrap(),
                 "--session-id",
@@ -1086,7 +1099,10 @@ fn runner_load_uses_requested_id_and_caches_response() {
                 "--cwd",
                 home.to_str().unwrap(),
                 "--",
-                "node",
+                crate::common::shim_node()
+                    .expect("Node prerequisite")
+                    .to_str()
+                    .unwrap(),
                 fake_agent.to_str().unwrap(),
             ])
             .env("HOME", &home)
@@ -1100,6 +1116,7 @@ fn runner_load_uses_requested_id_and_caches_response() {
             .spawn()
             .expect("spawn acp runner"),
     );
+    launch.authorize(&mut _child.0);
 
     wait_for(&record, "registry record");
     wait_for(&control, "control socket");
@@ -1240,11 +1257,11 @@ for line in sys.stdin:
     let control = workers.join(format!("{session_id}.control.sock"));
     let record = workers.join(format!("{session_id}.json"));
 
-    let bin = env!("CARGO_BIN_EXE_aoe");
-    let _child = KillOnDrop(
-        Command::new(bin)
+    let launch = crate::common::RunnerLaunchFixture::new(&home, &xdg, "main", session_id, 0);
+    let mut _child = KillOnDrop(
+        launch
+            .command()
             .args([
-                "__acp-runner",
                 "--socket",
                 socket.to_str().unwrap(),
                 "--session-id",
@@ -1263,6 +1280,7 @@ for line in sys.stdin:
             .spawn()
             .expect("spawn acp runner"),
     );
+    launch.authorize(&mut _child.0);
 
     wait_for(&record, "registry record");
     wait_for(&control, "control socket");
@@ -1345,10 +1363,11 @@ for line in sys.stdin:
     let session = "reset-resume";
     let socket = scratch.0.join(format!("{session}.sock"));
     let control = agent_of_empires::process::worker::control_socket_sibling(&socket);
-    let _runner = KillOnDrop(
-        Command::new(env!("CARGO_BIN_EXE_aoe"))
+    let launch = crate::common::RunnerLaunchFixture::new(&home, &xdg, "main", session, 0);
+    let mut _runner = KillOnDrop(
+        launch
+            .command()
             .args([
-                "__acp-runner",
                 "--socket",
                 socket.to_str().unwrap(),
                 "--session-id",
@@ -1368,6 +1387,7 @@ for line in sys.stdin:
             .spawn()
             .unwrap(),
     );
+    launch.authorize(&mut _runner.0);
     wait_for(&control, "control socket");
     let mut first = tokio::net::UnixStream::connect(&control).await.unwrap();
     assert!(matches!(
@@ -1430,6 +1450,7 @@ for line in sys.stdin:
         None,
         "review-agent".into(),
         None,
+        launch.nonce,
     )
     .await
     .unwrap();
@@ -1517,10 +1538,11 @@ for line in sys.stdin:
     let session = "stream-reattach";
     let socket = scratch.0.join(format!("{session}.sock"));
     let control = agent_of_empires::process::worker::control_socket_sibling(&socket);
-    let _runner = KillOnDrop(
-        Command::new(env!("CARGO_BIN_EXE_aoe"))
+    let launch = crate::common::RunnerLaunchFixture::new(&home, &xdg, "main", session, 0);
+    let mut _runner = KillOnDrop(
+        launch
+            .command()
             .args([
-                "__acp-runner",
                 "--socket",
                 socket.to_str().unwrap(),
                 "--session-id",
@@ -1540,6 +1562,7 @@ for line in sys.stdin:
             .spawn()
             .unwrap(),
     );
+    launch.authorize(&mut _runner.0);
     wait_for(&control, "control socket");
 
     // First daemon: establish the native session, then detach.
@@ -1598,6 +1621,7 @@ for line in sys.stdin:
         None,
         "stream-agent".into(),
         None,
+        launch.nonce,
     )
     .await
     .unwrap();
@@ -1682,10 +1706,11 @@ for line in sys.stdin:
         let session = "prompt-correlation";
         let socket = scratch.0.join(format!("{session}.sock"));
         let control = agent_of_empires::process::worker::control_socket_sibling(&socket);
-        let _runner = KillOnDrop(
-            Command::new(env!("CARGO_BIN_EXE_aoe"))
+        let launch = crate::common::RunnerLaunchFixture::new(&home, &xdg, "main", session, 0);
+        let mut _runner = KillOnDrop(
+            launch
+                .command()
                 .args([
-                    "__acp-runner",
                     "--socket",
                     socket.to_str().unwrap(),
                     "--session-id",
@@ -1705,6 +1730,7 @@ for line in sys.stdin:
                 .spawn()
                 .unwrap(),
         );
+        launch.authorize(&mut _runner.0);
         wait_for(&control, "control socket");
         let mut first = UnixStream::connect(&control).unwrap();
         first
@@ -1743,6 +1769,7 @@ for line in sys.stdin:
             None,
             "review-agent".into(),
             None,
+            launch.nonce,
         )
         .await
         .unwrap();
@@ -1808,10 +1835,11 @@ for line in sys.stdin:
     let workers = app_dir(&home, &xdg).join("acp-workers");
     let socket = workers.join(format!("{session}.sock"));
     let control = workers.join(format!("{session}.control.sock"));
-    let _child = KillOnDrop(
-        Command::new(env!("CARGO_BIN_EXE_aoe"))
+    let launch = crate::common::RunnerLaunchFixture::new(&home, &xdg, "main", session, 0);
+    let mut _child = KillOnDrop(
+        launch
+            .command()
             .args([
-                "__acp-runner",
                 "--socket",
                 socket.to_str().unwrap(),
                 "--session-id",
@@ -1831,6 +1859,7 @@ for line in sys.stdin:
             .spawn()
             .expect("spawn native-identity runner"),
     );
+    launch.authorize(&mut _child.0);
     wait_for(&control, "native-identity control socket");
     let attach = || {
         let mut stream = UnixStream::connect(&control).unwrap();

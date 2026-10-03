@@ -266,6 +266,70 @@ fn parse_psi_some_avg10(psi: &str) -> Option<f32> {
     None
 }
 
+pub(super) fn process_namespace() -> std::io::Result<[u64; 2]> {
+    use std::os::unix::fs::MetadataExt;
+    let status = fs::read_to_string("/proc/self/status")?;
+    let line = status
+        .lines()
+        .find_map(|line| line.strip_prefix("NSpid:"))
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "PID namespace cannot be verified",
+            )
+        })?;
+    let mut ids = line.split_whitespace();
+    if ids.next().and_then(|id| id.parse::<u32>().ok()) != Some(std::process::id())
+        || ids.next().is_some()
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "procfs belongs to another PID namespace",
+        ));
+    }
+    let namespace = fs::metadata("/proc/self/ns/pid")?;
+    Ok([namespace.dev(), namespace.ino()])
+}
+
+pub(super) fn process_incarnation(pid: u32) -> std::io::Result<Option<super::ProcessIncarnation>> {
+    let namespace = process_namespace()?;
+    let stat = match fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => stat,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let end = stat.rfind(')').ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "process stat has no command boundary",
+        )
+    })?;
+    let mut fields = stat[end + 1..].split_whitespace();
+    let group = fields
+        .nth(2)
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "process stat has no group")
+        })?
+        .parse()
+        .map_err(std::io::Error::other)?;
+    let start = fields
+        .nth(16)
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "process stat has no start time",
+            )
+        })?
+        .parse()
+        .map_err(std::io::Error::other)?;
+    Ok(Some(super::ProcessIncarnation {
+        pid,
+        group,
+        start: [start, 0],
+        namespace,
+    }))
+}
+
 pub(super) fn boot_id() -> Option<String> {
     std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
         .ok()
@@ -314,6 +378,59 @@ fn find_process_in_group(pgrp: u32) -> Option<u32> {
     }
 
     None
+}
+
+/// Report non-zombie group members; failed observations do not prove absence.
+pub(super) fn process_group_has_live_members(pgrp: u32) -> std::io::Result<bool> {
+    use nix::{errno::Errno, sys::signal::killpg, unistd::Pid};
+
+    match killpg(Pid::from_raw(pgrp as i32), None) {
+        Ok(()) => {}
+        Err(Errno::ESRCH) => return Ok(false),
+        Err(error) => return Err(std::io::Error::from_raw_os_error(error as i32)),
+    }
+    for entry in fs::read_dir("/proc")? {
+        let entry = entry?;
+        if entry.file_name().to_string_lossy().parse::<u32>().is_err() {
+            continue;
+        }
+        let stat = match fs::read_to_string(entry.path().join("stat")) {
+            Ok(stat) => stat,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        let invalid = || std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid proc stat");
+        // `comm` may contain spaces and parentheses, so the fields past it start
+        // after the last one: state, ppid, pgrp, then the session id.
+        let (_, fields) = stat.rsplit_once(')').ok_or_else(invalid)?;
+        let mut fields = fields.split_whitespace();
+        let state = fields.next().ok_or_else(invalid)?;
+        let _parent = fields.next().ok_or_else(invalid)?;
+        let group = fields.next().ok_or_else(invalid)?;
+        if state != "Z" && group.parse::<u32>() == Ok(pgrp) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Whether `pid` has already terminated, which for a child of this process means
+/// it is waiting to be reaped rather than still running.
+///
+/// A zombie holds nothing: it cannot write, it holds no file descriptors open
+/// on a checkout, and its process group is dead. Treating it as alive makes a
+/// torn-down runner unprovable forever. The repo's own descendant wait already
+/// uses this rule (`process::mod` test helper: "exited or a terminated zombie").
+pub(super) fn is_terminated(pid: u32) -> bool {
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    // The state letter follows `comm`, which may itself contain spaces and
+    // parentheses, so anchor on the last `)`.
+    let Some(close_paren) = stat.rfind(')') else {
+        return false;
+    };
+    stat[close_paren + 1..].trim_start().starts_with('Z')
 }
 
 pub(super) fn parent_and_argv0(pid: u32) -> Option<(u32, String)> {

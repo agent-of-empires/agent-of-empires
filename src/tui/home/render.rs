@@ -2055,6 +2055,7 @@ impl HomeView {
     /// target is unchanged, so render calls it every frame.
     pub(super) fn sync_preview_capture_worker(&mut self, desired: Option<String>) {
         if desired.is_some() && self.preview_worker_stalled_at(std::time::Instant::now()) {
+            self.teardown_live_send();
             self.preview_capture_worker = None;
             self.preview_capture_target = None;
             self.preview_worker_pulse = None;
@@ -2065,7 +2066,10 @@ impl HomeView {
             return;
         }
         if self.preview_capture_worker.is_none() {
-            let worker = live_send::LiveCaptureWorker::spawn(self.preview_wake.clone());
+            let worker = live_send::LiveCaptureWorker::spawn(
+                self.preview_wake.clone(),
+                self.live_send_effects.clone(),
+            );
             // Shell terminals use capture-pane's authoritative snapshot: their prompt
             // repaint can expose a PROMPT_EOL_MARK to a pipe-pane seed, producing a false
             // frame before the grid reconciles. Slower, but no seed handoff.
@@ -2208,14 +2212,7 @@ impl HomeView {
         // into the cache without copying its content.
         let frame_budget = frame.budget;
         let content_is_empty = frame.content.is_empty();
-        let captured_lines = select(self).store_capture(
-            frame.content,
-            id,
-            frame.target,
-            frame.generation,
-            (width, height),
-            frame.cursor,
-        );
+        let captured_lines = select(self).store_capture(frame, id, (width, height));
 
         // An empty frame always applies: terminal / container panes forward empties so a
         // cleared shell drops its stale text, and there is no offset to clamp anyway.

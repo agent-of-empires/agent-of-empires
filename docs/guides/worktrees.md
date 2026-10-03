@@ -25,6 +25,7 @@ A worktree session's title and its directory stay tied by default (`session.tie_
 - Renaming a session (TUI, web, `aoe session rename`, or `PATCH /api/sessions/{id}`) moves the directory to the title's path-safe slug before committing the title. A failed move leaves the title unchanged.
 - The git branch is never renamed by default, since it may carry an upstream or an open PR. Opt in with the TUI rename dialog's "Also rename git branch", `--rename-branch`, or `rename_branch: true`. The TUI warns when the branch tracks a remote, because the remote branch and any open PR do not follow.
 - A rename that would relocate the checkout or re-point its branch needs a stopped session and is refused while it runs. A title-only rename whose slug leaves the directory unchanged is allowed on a running session from the CLI and REST (the TUI still asks for a stopped session), and leaves a live structured-view worker alone.
+- REST directory moves also require authoritative execution quiescence. An Idle or terminal-view row does not prove its old runners stopped; a live or unknown execution journal keeps the checkout in place and returns a retryable conflict.
 
 Turn the setting off to relabel sessions freely while they run and to edit the directory name independently:
 
@@ -39,7 +40,7 @@ Renaming moves the checkout with `git worktree move`, keeping its parent directo
 
 ### When the directory moves outside aoe
 
-aoe records a worktree's directory at creation, so relocating it from another shell leaves that record stale. aoe repairs it from `git worktree list`, matching on the session's branch, shortly after TUI startup, on a background sweep, at `aoe serve` startup, and on each CLI workdir edit. If exactly one live worktree checks out the branch, the path is rewritten; if two do, aoe leaves it alone rather than guessing. Reconciliation is point-in-time, so a directory moved while a process is already running stays stale until it restarts.
+aoe repairs a relocated checkout from `git worktree list`, matching the session's branch. It adopts a path only when exactly one checkout matches, no lifecycle operation is reserved, and every recorded runner execution is proven quiescent. Startup, background sweeps, and CLI workdir edits retry reconciliation; a live runner keeps the recorded path unchanged.
 
 Two caveats: aoe locks the worktrees it creates, so an out-of-band `git worktree move` needs `git worktree unlock <path>` first, and a plain `mv` is not recoverable on its own, because git's record still names the old path. Run `git worktree repair <new-path>` and aoe will find it.
 
@@ -69,7 +70,11 @@ After `git worktree add`, a checkout with a `.gitmodules` file gets `git submodu
 
 Deleting a session prompts to remove an aoe-managed worktree (or pass `--delete-worktree`); a manual worktree or a non-worktree session is left alone.
 
-**Trashing relocates the worktree** into a sibling `.aoe-trash/<session-id>` holding directory with `git worktree move`, so trashed sessions stop cluttering the active checkouts while staying previewable. Restoring moves it back, and is refused if that path is now occupied. Purging removes it.
+Once teardown is quiescent, Trash relocates the managed checkout into a sibling `.aoe-trash/<session-id>` holding directory with `git worktree move`. Restore moves it back and refuses an occupied destination; Purge removes it.
+
+Checkout relocation and destructive cleanup require proof that the recorded runner process groups have exited. A `Stopped` row, a terminal-view selection, or a missing worker registry is not that proof. When teardown is pending, aoe retains the session and checkout; retry after the recorded executions exit. Cancelling your own pending Trash request does not move the checkout. Force does not bypass the quiescence guard. Unknown legacy execution history remains protected until aoe verifies a different boot.
+
+Cleanup also checks every physical profile for sessions using the same checkout or an overlapping workspace. Unreadable ownership data retains the checkout rather than assuming it is unused.
 
 **The default branch's checkout is never removed.** In a bare-repo layout the default branch lives in a linked worktree other tooling expects to stay put, so aoe refuses to remove that checkout or delete its branch, reports the refusal, and deletes the session anyway. Force does not bypass this, including trash auto-purge and `aoe session empty-trash`, and `aoe worktree cleanup` lists such a checkout as skipped. Detection uses what git states: the bare repo's own `HEAD` plus every remote's `refs/remotes/<remote>/HEAD`, falling back to `main` and `master` by convention when neither exists. To remove one anyway, do it with git and then delete the session.
 

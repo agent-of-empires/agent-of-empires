@@ -77,9 +77,7 @@ pub fn resolve_worktree_path(
     select_live_worktree(entries, &info.branch, Path::new(&info.main_repo_path))
 }
 
-/// Reconcile one session: on [`WorktreePathResolution::Moved`], rewrite `inst.project_path` and
-/// persist it, so every later path-derived decision (the rename pre-flight gates, attach, status,
-/// diff) sees the live location.
+/// Adopt a unique Git checkout only while the authoritative session is quiescent and unreserved.
 pub fn reconcile_and_persist(
     storage: &Storage,
     inst: &mut Instance,
@@ -105,11 +103,27 @@ pub fn reconcile_and_persist(
             let id = inst.id.clone();
             let stale = inst.project_path.clone();
             let new_path = found.to_string_lossy().into_owned();
-            // Both guards below need the storage lock the git lookup ran
-            // without, so they live inside the update rather than beside it.
+            let _workspace = super::acquire_session_workspace_claim_lock()?;
+            let _identity = super::acquire_session_identity_lock()?;
+            let storage = storage.reopen_preserving_watch()?;
+            let _lifecycle = storage.acquire_instance_lifecycle_lock(&id)?;
             let mut claimed_by: Option<String> = None;
-            let applied = storage.update(|instances, _groups| {
-                // Never adopt a checkout another session already records.
+            if let Err(error) = crate::session::deletion::ensure_unclaimed_paths(
+                crate::session::deletion::SessionPathOwner {
+                    profile: storage.profile(),
+                    session_id: &id,
+                },
+                std::slice::from_ref(found),
+            ) {
+                tracing::warn!(
+                    target: "session.worktree",
+                    session = %id,
+                    candidate = %found.display(),
+                    "worktree ownership could not be verified; refusing to adopt it: {error}"
+                );
+                return Ok(WorktreePathResolution::Current);
+            }
+            let applied = storage.update_under_workspace_claim_lock(|instances, _groups| {
                 if let Some(owner) = instances.iter().find(|c| {
                     c.id != id
                         && Path::new(&c.project_path).canonicalize().ok().as_deref()
@@ -118,13 +132,14 @@ pub fn reconcile_and_persist(
                     claimed_by = Some(owner.id.clone());
                     return Ok(false);
                 }
-                // Compare and set: a peer process could have renamed or trashed this session while
-                // the lookup ran, and its path is fresher than a location we resolved from the old
-                // one.
                 let Some(stored) = instances.iter_mut().find(|c| c.id == id) else {
                     return Ok(false);
                 };
-                if stored.project_path != stale {
+                if stored.project_path != stale
+                    || stored.is_trashed()
+                    || !stored.runner_journal.proves_quiescent()
+                    || stored.has_fresh_lifecycle_reservation(chrono::Utc::now())
+                {
                     return Ok(false);
                 }
                 stored.project_path = new_path.clone();

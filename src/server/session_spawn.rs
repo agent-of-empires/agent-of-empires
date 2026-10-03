@@ -1,5 +1,6 @@
 //! Domain core for creating a session.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::session::Instance;
@@ -325,7 +326,7 @@ pub(crate) async fn spawn_structured_session(
             std::path::Path::new(&original_path),
             progress.as_deref(),
         ) {
-            builder::cleanup_instance(
+            builder::cleanup_instance_locked(
                 &instance,
                 created_worktree.as_ref(),
                 &created_workspace_worktrees,
@@ -344,17 +345,102 @@ pub(crate) async fn spawn_structured_session(
             progress.set_stage(crate::server::create_progress::CreateStage::Starting);
         }
 
+        let _workspace_claim_lock = match crate::session::acquire_session_workspace_claim_lock() {
+            Ok(lock) => lock,
+            Err(error) => {
+                builder::cleanup_instance_locked(
+                    &instance,
+                    created_worktree.as_ref(),
+                    &created_workspace_worktrees,
+                    None,
+                );
+                return Err(error);
+            }
+        };
+        let ownership_locks = match crate::session::acquire_session_identity_lock() {
+            Ok(lock) => {
+                builder::CleanupOwnershipLocks::from_held(_workspace_claim_lock, lock)
+            }
+            Err(error) => {
+                // Only the workspace-claim lock is held; release it so the
+                // cleanup path can take the pair itself.
+                drop(_workspace_claim_lock);
+                builder::cleanup_instance_locked(
+                    &instance,
+                    created_worktree.as_ref(),
+                    &created_workspace_worktrees,
+                    None,
+                );
+                return Err(error);
+            }
+        };
+        // Creating a session is one of the two paths that may materialise a profile;
+        // every read and teardown path uses the strict `Storage::open`.
+        let storage = match Storage::open_or_create(&profile, file_watch_for_create.clone()) {
+            Ok(storage) => storage,
+            Err(error) => {
+                builder::cleanup_instance_under_locks(
+                    &instance,
+                    created_worktree.as_ref(),
+                    &created_workspace_worktrees,
+                    None,
+                    &ownership_locks,
+                );
+                return Err(error);
+            }
+        };
+        if let Err(error) = crate::session::validate_managed_workspace(&instance) {
+            builder::cleanup_instance_under_locks(
+                &instance,
+                created_worktree.as_ref(),
+                &created_workspace_worktrees,
+                None,
+                &ownership_locks,
+            );
+            return Err(anyhow::anyhow!(
+                "Managed workspace validation failed before the session was persisted: {error}"
+            ));
+        }
+        let manages_worktree = instance
+            .worktree_info
+            .as_ref()
+            .is_some_and(|worktree| worktree.managed_by_aoe)
+            || instance.workspace_info.is_some();
+        if manages_worktree {
+            let mut candidate_paths = vec![PathBuf::from(&instance.project_path)];
+            candidate_paths.extend(
+                instance
+                    .all_repos()
+                    .iter()
+                    .map(|repo| PathBuf::from(&repo.worktree_path)),
+            );
+            if let Err(error) = crate::session::deletion::ensure_unclaimed_paths(
+                crate::session::deletion::SessionPathOwner { profile: storage.profile(), session_id: &instance.id },
+                &candidate_paths,
+            ) {
+                builder::cleanup_instance_under_locks(
+                    &instance,
+                    created_worktree.as_ref(),
+                    &created_workspace_worktrees,
+                    None,
+                    &ownership_locks,
+                );
+                return Err(anyhow::anyhow!(
+                    "Session path is already claimed by another session: {error}"
+                ));
+            }
+        }
         // Anything that fails between here and the final `Ok(..)` would otherwise orphan
         // the scratch directory `build_instance` already provisioned (Storage::new,
         // storage.update, instance.start). Wrap the tail in an IIFE-equivalent closure so
         // we can run cleanup on Err once, regardless of which step tripped.
-        let mut persist_and_start = || -> anyhow::Result<()> {
-            let storage = Storage::new(&profile, file_watch_for_create.clone())?;
+        let persist_and_start = || -> anyhow::Result<()> {
             let to_persist = instance.clone();
             storage.update(|all, _groups| {
                 all.push(to_persist);
                 Ok(())
             })?;
+            drop(ownership_locks);
 
             // Acp-mode sessions are not backed by tmux; the structured view supervisor
             // spawns the ACP agent on demand.
@@ -366,6 +452,32 @@ pub(crate) async fn spawn_structured_session(
         };
 
         if let Err(e) = persist_and_start() {
+            // The row was already committed, so leaving it behind would point a
+            // listed session at a scratch directory this branch is about to
+            // remove. Take the row back out first, and drop the directory only
+            // once the row is really gone: a revoked row that failed silently
+            // would leave a listed session pointing at a deleted path.
+            let revoked = {
+                // A lock that cannot be taken leaves the row in place, like the
+                // acquisition failures above: the scratch directory then stays
+                // with it rather than being removed from under a listed session.
+                let _identity_lock = crate::session::acquire_session_identity_lock()?;
+                Storage::open(&profile, file_watch_for_create.clone()).and_then(|storage| {
+                    storage.update(|all, _groups| {
+                        all.retain(|row| row.id != instance.id);
+                        Ok(())
+                    })
+                })
+            };
+            if let Err(revoke_error) = revoked {
+                tracing::warn!(
+                    target: "http.api.sessions",
+                    "Kept scratch dir for {}: the committed row could not be revoked: {:#}",
+                    instance.id,
+                    revoke_error
+                );
+                return Err(e);
+            }
             // Guarded the same way as the deletion path.
             if instance.scratch {
                 let scratch_path = std::path::PathBuf::from(&instance.project_path);

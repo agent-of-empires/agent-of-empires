@@ -171,7 +171,7 @@ impl CreationPoller {
         let created_workspace_worktrees = build_result.created_workspace_worktrees;
         let warnings = build_result.warnings;
         let roll_back = |instance: &Instance| {
-            builder::cleanup_instance(
+            builder::cleanup_instance_locked(
                 instance,
                 created_worktree.as_ref(),
                 &created_workspace_worktrees,
@@ -300,6 +300,53 @@ impl CreationPoller {
             return cancelled(&instance);
         }
 
+        let workspace_claim_lock = match crate::session::acquire_session_workspace_claim_lock() {
+            Ok(lock) => lock,
+            Err(error) => {
+                builder::cleanup_instance_locked(
+                    &instance,
+                    created_worktree.as_ref(),
+                    &created_workspace_worktrees,
+                    None,
+                );
+                return CreationResult::Error(format!("{error:#}"));
+            }
+        };
+        match crate::session::acquire_session_identity_lock() {
+            Ok(lock) => {
+                let locks = builder::CleanupOwnershipLocks::from_held(workspace_claim_lock, lock);
+                if let Err(error) = crate::session::validate_managed_workspace(&instance) {
+                    builder::cleanup_instance_under_locks(
+                        &instance,
+                        created_worktree.as_ref(),
+                        &created_workspace_worktrees,
+                        None,
+                        &locks,
+                    );
+                    return CreationResult::Error(format!(
+                        "Managed workspace validation failed before persistence: {error}"
+                    ));
+                }
+                // The ownership flocks are released before the result crosses
+                // the channel. Carrying them would have the worker thread hold
+                // global flocks the UI thread cannot take, and
+                // `HomeView::apply_creation_results` re-validates and persists
+                // under its own window, so no peer claim can slip in between.
+                drop(locks);
+            }
+            Err(error) => {
+                // Only the workspace-claim lock is held; release it so the
+                // cleanup path can take the pair itself.
+                drop(workspace_claim_lock);
+                builder::cleanup_instance_locked(
+                    &instance,
+                    created_worktree.as_ref(),
+                    &created_workspace_worktrees,
+                    None,
+                );
+                return CreationResult::Error(format!("{error:#}"));
+            }
+        }
         let created_worktree_info = created_worktree.as_ref().map(CreatedWorktreeInfo::from);
         let created_workspace_worktree_info = created_workspace_worktrees
             .iter()

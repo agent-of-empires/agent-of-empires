@@ -149,7 +149,7 @@ impl HomeView {
         self.system_health_open = true;
         self.system_health_scroll = 0;
         self.diff_view = None;
-        self.live_send = None;
+        self.teardown_live_send();
         self.request_metrics_refresh();
     }
 

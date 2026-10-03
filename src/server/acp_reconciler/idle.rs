@@ -131,7 +131,9 @@ async fn set_dormant_in_memory(state: &AppState, id: &str, dormant: bool) -> boo
 }
 
 async fn persist_dormant(state: &AppState, profile: &str, id: &str, dormant: bool) -> bool {
-    let Ok(storage) = crate::session::Storage::new(profile, state.file_watch.clone()) else {
+    // Strict: a profile the user deleted must not be re-created by a reaper
+    // holding a row it read before the delete.
+    let Ok(storage) = crate::session::Storage::open(profile, state.file_watch.clone()) else {
         return false;
     };
     let id = id.to_string();

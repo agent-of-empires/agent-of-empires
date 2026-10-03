@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
-use super::{reconcile_acp_workers, ReapCadence};
+use super::{reconcile_acp_workers, ReconcilerState};
 use crate::acp::Event;
 use crate::server::AppState;
 use crate::session::test_support::AppDirGuard;
@@ -55,21 +55,20 @@ pub(super) struct Tick {
     pub(super) respawn_history: HashMap<String, Vec<Instant>>,
     pub(super) parked: HashSet<String>,
     pub(super) capacity_deferred: HashSet<String>,
+    reconciler: ReconcilerState,
 }
 
 impl Tick {
     /// Runs one tick with the cadence-gated passes sitting out.
     pub(super) async fn run(&mut self, state: &Arc<AppState>) {
         let now = Some(Instant::now());
-        let mut cadence = ReapCadence {
-            idle: now,
-            rate_limit: now,
-            terminal_repair: now,
-        };
+        self.reconciler.idle = now;
+        self.reconciler.rate_limit = now;
+        self.reconciler.terminal_repair = now;
         reconcile_acp_workers(
             state,
             &mut self.attempted,
-            &mut cadence,
+            &mut self.reconciler,
             &mut self.respawn_history,
             &mut self.parked,
             &mut self.capacity_deferred,

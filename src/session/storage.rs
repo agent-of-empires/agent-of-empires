@@ -12,7 +12,8 @@ use std::time::{Duration, Instant};
 use crate::file_watch::FileWatchService;
 
 use super::{
-    get_app_dir, get_profile_dir, get_profile_dir_path, resolve_existing_profile, Group, Instance,
+    get_app_dir, get_profile_dir, get_profile_dir_locked, get_profile_dir_path,
+    resolve_existing_profile, resolve_profile_name_locked, Group, Instance,
 };
 
 /// Sidecar lock file name for per-profile storage.
@@ -25,6 +26,34 @@ const INSTANCE_LIFECYCLE_LOCK_PREFIX: &str = ".instance-lifecycle-";
 /// Sidecar lock for every mutation that can create or change a session's `(title,
 /// project_path)` identity.
 const SESSION_IDENTITY_LOCK_FILENAME: &str = ".title-mutation.lock";
+/// Sidecar lock for claims on managed workspace paths.
+const SESSION_WORKSPACE_CLAIM_LOCK_FILENAME: &str = ".workspace-claim.lock";
+/// Sidecar lock for profile namespace rename/delete and storage writes.
+const PROFILE_NAMESPACE_LOCK_FILENAME: &str = ".profile-namespace.lock";
+#[cfg(unix)]
+type DirectoryIdentity = (u64, u64);
+#[cfg(not(unix))]
+type DirectoryIdentity = ();
+
+fn directory_identity(path: &Path) -> Result<DirectoryIdentity> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = fs::metadata(path)
+            .with_context(|| format!("reading profile directory identity {}", path.display()))?;
+        Ok((metadata.dev(), metadata.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = fs::metadata(path)
+            .with_context(|| format!("reading profile directory {}", path.display()))?;
+        Ok(())
+    }
+}
+
+pub(crate) fn acquire_profile_namespace_lock() -> Result<StorageFlock> {
+    acquire_storage_flock(&get_app_dir()?, PROFILE_NAMESPACE_LOCK_FILENAME)
+}
 /// Sidecar lock prefix for one session's title persistence plus tmux rekey.
 const SESSION_TITLE_LOCK_PREFIX: &str = ".session-title-";
 
@@ -321,7 +350,7 @@ where
 }
 
 /// Process-wide registry of per-profile save mutexes.
-fn save_lock_for(profile: &str) -> Arc<Mutex<()>> {
+pub(crate) fn save_lock_for(profile: &str) -> Arc<Mutex<()>> {
     static REGISTRY: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
     let registry = REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
     let mut guard = registry
@@ -374,14 +403,14 @@ fn acquire_transition_flocks_for_profile_dirs(profile_dirs: &[&Path]) -> Result<
 }
 
 #[cfg(unix)]
-fn same_filesystem_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+pub(crate) fn same_filesystem_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
     use std::os::unix::fs::MetadataExt;
 
     left.dev() == right.dev() && left.ino() == right.ino()
 }
 
 #[cfg(not(unix))]
-fn same_filesystem_identity(_left: &fs::Metadata, _right: &fs::Metadata) -> bool {
+pub(crate) fn same_filesystem_identity(_left: &fs::Metadata, _right: &fs::Metadata) -> bool {
     // Portable metadata exposes no stable file identity.
     false
 }
@@ -427,6 +456,43 @@ fn open_storage_lock_file(dir: &Path, name: &str) -> Result<(fs::File, PathBuf)>
         .truncate(false)
         .open(&path)?;
     Ok((file, path))
+}
+
+/// Like [`open_storage_lock_file`] but for a directory that must already
+/// exist: a superseded writer must not bring a deleted or renamed profile back
+/// as an empty directory. The open itself also fails on a directory that
+/// disappeared in between, and `verify_profile_identity` still rejects one that
+/// came back under a new identity.
+fn open_existing_storage_lock_file(dir: &Path, name: &str) -> Result<(fs::File, PathBuf)> {
+    if !dir.is_dir() {
+        anyhow::bail!("profile directory is gone: {}", dir.display());
+    }
+    let path = dir.join(name);
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(&path)?
+    };
+    #[cfg(not(unix))]
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)?;
+    Ok((file, path))
+}
+
+/// [`acquire_storage_flock`] for a directory that must already exist.
+fn acquire_existing_storage_flock(dir: &Path, name: &str) -> Result<StorageFlock> {
+    let (file, path) = open_existing_storage_lock_file(dir, name)?;
+    acquire_open_storage_flock(file, &path)
 }
 
 #[cfg(test)]
@@ -584,6 +650,11 @@ pub(crate) fn acquire_session_identity_lock() -> Result<StorageFlock> {
     acquire_storage_flock(&get_app_dir()?, SESSION_IDENTITY_LOCK_FILENAME)
 }
 
+/// Serialize path ownership claims without holding the global identity lock over Git work.
+pub(crate) fn acquire_session_workspace_claim_lock() -> Result<StorageFlock> {
+    acquire_storage_flock(&get_app_dir()?, SESSION_WORKSPACE_CLAIM_LOCK_FILENAME)
+}
+
 /// Serialize one session's title commit and post-commit tmux rekey across profiles and
 /// processes.
 pub(crate) fn acquire_session_title_lock(instance_id: &str) -> Result<StorageFlock> {
@@ -726,6 +797,7 @@ pub struct Storage {
     sessions_path: PathBuf,
     save_lock: Arc<Mutex<()>>,
     file_watch: Arc<FileWatchService>,
+    profile_identity: Option<DirectoryIdentity>,
     #[cfg(test)]
     fail_writes_for_test: bool,
 }
@@ -850,6 +922,7 @@ impl Storage {
             sessions_path,
             save_lock,
             file_watch,
+            profile_identity: Some(directory_identity(&profile_dir)?),
             #[cfg(test)]
             fail_writes_for_test: false,
         })
@@ -861,12 +934,19 @@ impl Storage {
     }
 
     #[cfg(test)]
+    /// Construct a `Storage` at an explicit `sessions.json` path, for tests
+    /// that need a path the profile registry would not produce. It creates the
+    /// profile directory, which the lock openers no longer do implicitly.
     pub(crate) fn new_for_test_path(profile: &str, sessions_path: PathBuf) -> Self {
+        if let Some(dir) = sessions_path.parent() {
+            std::fs::create_dir_all(dir).expect("test profile directory");
+        }
         Self {
             profile: profile.to_string(),
             sessions_path,
             save_lock: save_lock_for(profile),
             file_watch: FileWatchService::noop(),
+            profile_identity: None,
             fail_writes_for_test: false,
         }
     }
@@ -883,6 +963,34 @@ impl Storage {
             sessions_path,
             save_lock,
             file_watch,
+            profile_identity: Some(directory_identity(&profile_dir)?),
+            #[cfg(test)]
+            fail_writes_for_test: false,
+        })
+    }
+    /// [`Storage::open`] for a path that creates the session it will store, where
+    /// the profile may not exist yet.
+    ///
+    /// The caller must already hold the session identity lock, the one every
+    /// profile delete and rename also takes, so the creation cannot land outside
+    /// that window. A teardown or a read must use [`Storage::open`], which
+    /// refuses a profile that is not there rather than bringing one back.
+    /// Creating constructor: the caller holds the session identity flock, so the
+    /// name is resolved with the locked variant. The unlocked one can reach the
+    /// first-profile bootstrap, which takes that flock again on a fresh
+    /// descriptor and would wait on the caller's own lock.
+    pub(crate) fn open_or_create(profile: &str, file_watch: Arc<FileWatchService>) -> Result<Self> {
+        let profile_name = resolve_profile_name_locked(profile)?;
+        let profile_dir = get_profile_dir_locked(&profile_name)?;
+        let sessions_path = profile_dir.join("sessions.json");
+        let save_lock = save_lock_for(&profile_name);
+
+        Ok(Self {
+            profile: profile_name,
+            sessions_path,
+            save_lock,
+            file_watch,
+            profile_identity: Some(directory_identity(&profile_dir)?),
             #[cfg(test)]
             fail_writes_for_test: false,
         })
@@ -891,6 +999,14 @@ impl Storage {
     /// [`Storage::open`] wired to a noop `FileWatchService`.
     pub fn open_unwatched(profile: &str) -> Result<Self> {
         Self::open(profile, FileWatchService::noop())
+    }
+
+    /// Reopen this profile's store, re-resolving its directory and capturing a
+    /// fresh `(dev, ino)` identity, but keeping the caller's
+    /// `FileWatchService`. A destructive caller reopens under the identity lock
+    /// for that fresh identity, and must not lose the watch it was handed.
+    pub(crate) fn reopen_preserving_watch(&self) -> Result<Storage> {
+        Self::open(&self.profile, self.file_watch.clone())
     }
 
     /// Serialize launch/restart and explicit resume-target mutation for one instance across
@@ -905,7 +1021,7 @@ impl Storage {
             .sessions_path
             .parent()
             .ok_or_else(|| anyhow!("sessions path has no profile directory"))?;
-        acquire_storage_flock(
+        acquire_existing_storage_flock(
             profile_dir,
             &format!("{INSTANCE_LIFECYCLE_LOCK_PREFIX}{instance_id}.lock"),
         )
@@ -978,6 +1094,56 @@ impl Storage {
             self.quarantine_corrupt_rows(&corrupt);
         }
 
+        Ok(instances)
+    }
+
+    /// Read all rows for a destructive ownership check without lossy quarantine.
+    pub(crate) fn load_strict_for_worktree_ownership_locked(&self) -> Result<Vec<Instance>> {
+        // `sessions.corrupt.jsonl` is a write-only forensic sidecar: nothing ever reads it
+        // back, and no path truncates it, so its mere presence says nothing about the
+        // current inventory. The fail-closed guarantee lives in the row-by-row parse and
+        // duplicate-id check below: while the corrupt row is still in `sessions.json` the
+        // bail comes from that row, and once a later write dropped it the sidecar is stale
+        // and bailing on it would be a false positive.
+        // Only a genuinely absent file means "this profile owns nothing". A
+        // permission error answers `exists()` with `false` too, and treating
+        // that as an empty inventory would let a purge delete a peer's
+        // worktree, so every other error propagates.
+        let content = match fs::read_to_string(&self.sessions_path) {
+            Ok(content) => content,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => {
+                return Err(e).with_context(|| format!("reading {}", self.sessions_path.display()))
+            }
+        };
+        if content.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&content)
+            .with_context(|| format!("parsing {}", self.sessions_path.display()))?;
+        let mut ids = std::collections::HashSet::new();
+        let mut instances = Vec::with_capacity(rows.len());
+        for (idx, row) in rows.into_iter().enumerate() {
+            let mut instance =
+                <Instance as serde::Deserialize>::deserialize(&row).with_context(|| {
+                    format!(
+                        "parsing session row {idx} in {}",
+                        self.sessions_path.display()
+                    )
+                })?;
+            if !ids.insert(instance.id.clone()) {
+                anyhow::bail!(
+                    "duplicate session id {} in ownership inventory",
+                    instance.id
+                );
+            }
+            // Same as `load`: a row read here belongs to this store, and the
+            // ownership scan excludes the caller by (profile, id). Leaving this
+            // blank made every inventoried row look like it had no owner.
+            instance.source_profile = self.profile.clone();
+            instance.set_file_watch(self.file_watch.clone());
+            instances.push(instance);
+        }
         Ok(instances)
     }
 
@@ -1070,6 +1236,36 @@ impl Storage {
     where
         F: FnOnce(&mut Vec<Instance>, &mut Vec<Group>) -> Result<R>,
     {
+        self.verify_profile_identity()?;
+        self.update_under_storage_locks(f)
+    }
+
+    /// Update while the caller already owns the workspace claim lock.
+    pub(crate) fn update_under_workspace_claim_lock<F, R>(&self, f: F) -> Result<R>
+    where
+        F: FnOnce(&mut Vec<Instance>, &mut Vec<Group>) -> Result<R>,
+    {
+        self.verify_profile_identity()?;
+        self.update_under_storage_locks(f)
+    }
+
+    /// Update while the caller already owns the workspace claim and profile namespace locks.
+    pub(crate) fn update_under_profile_namespace_lock<F, R>(&self, f: F) -> Result<R>
+    where
+        F: FnOnce(&mut Vec<Instance>, &mut Vec<Group>) -> Result<R>,
+    {
+        self.verify_profile_identity()?;
+        self.update_under_storage_locks(f)
+    }
+
+    /// Take this store's own locks in their fixed order (in-process save lock,
+    /// profile namespace transition lock, storage flock) and update under them.
+    /// No `update*` entry point takes a namespace lock on the caller's behalf;
+    /// this name says what this one actually does.
+    fn update_under_storage_locks<F, R>(&self, f: F) -> Result<R>
+    where
+        F: FnOnce(&mut Vec<Instance>, &mut Vec<Group>) -> Result<R>,
+    {
         #[cfg(test)]
         report_update_for_test(self);
         #[cfg(test)]
@@ -1092,8 +1288,32 @@ impl Storage {
             app_dir_for_profile_dir(profile_dir),
             crate::migrations::v027_isolate_sandbox_stores::LOCK,
         )?;
-        let _flock = acquire_storage_flock(profile_dir, STORAGE_LOCK_FILENAME)?;
+        let _flock = acquire_existing_storage_flock(profile_dir, STORAGE_LOCK_FILENAME)?;
+        self.verify_profile_identity()?;
         self.update_under_lock(f)
+    }
+
+    fn verify_profile_identity(&self) -> Result<()> {
+        let Some(expected) = self.profile_identity else {
+            return Ok(());
+        };
+        let profile_dir = self.sessions_path.parent().ok_or_else(|| {
+            anyhow!(
+                "sessions_path missing parent: {}",
+                self.sessions_path.display()
+            )
+        })?;
+        let actual = directory_identity(profile_dir).with_context(|| {
+            format!(
+                "profile namespace is no longer available: {}",
+                profile_dir.display()
+            )
+        })?;
+        anyhow::ensure!(
+            actual == expected,
+            "profile namespace changed while this Storage writer was open"
+        );
+        Ok(())
     }
 
     /// Apply one storage mutation while the caller already owns this profile's
@@ -1246,9 +1466,9 @@ impl Storage {
         let _transition_flocks =
             acquire_transition_flocks_for_profile_dirs(&[first_dir, second_dir])?;
         let (first_lock_file, first_lock_path) =
-            open_storage_lock_file(first_dir, STORAGE_LOCK_FILENAME)?;
+            open_existing_storage_lock_file(first_dir, STORAGE_LOCK_FILENAME)?;
         let (second_lock_file, second_lock_path) =
-            open_storage_lock_file(second_dir, STORAGE_LOCK_FILENAME)?;
+            open_existing_storage_lock_file(second_dir, STORAGE_LOCK_FILENAME)?;
         if same_filesystem_identity(&first_lock_file.metadata()?, &second_lock_file.metadata()?) {
             return Err(anyhow!(
                 "source and target profiles resolve to the same physical storage lock"
@@ -2140,7 +2360,9 @@ pub(crate) fn with_storages_locked<R>(storages: &[Storage], f: impl FnOnce() -> 
                 .sessions_path
                 .parent()
                 .ok_or_else(|| anyhow!("sessions path has no parent"))?;
-            fs::create_dir_all(dir)?;
+            // The callers here are the cross-profile scans, which list the
+            // profiles that exist; creating one would resurrect a profile a
+            // delete or rename just removed.
             Ok((dir.canonicalize()?, storage))
         })
         .collect::<Result<Vec<_>>>()?;
@@ -2160,7 +2382,7 @@ pub(crate) fn with_storages_locked<R>(storages: &[Storage], f: impl FnOnce() -> 
     let _transition_flocks = acquire_transition_flocks_for_profile_dirs(&dirs)?;
     let mut held: Vec<(fs::Metadata, StorageFlock)> = Vec::with_capacity(dirs.len());
     for dir in dirs {
-        let (file, path) = open_storage_lock_file(dir, STORAGE_LOCK_FILENAME)?;
+        let (file, path) = open_existing_storage_lock_file(dir, STORAGE_LOCK_FILENAME)?;
         let metadata = file.metadata()?;
         // A second flock on a shared lock file would wait on this thread forever.
         if held
@@ -2207,8 +2429,10 @@ where
     let first_dir = first.sessions_path.parent().unwrap();
     let second_dir = second.sessions_path.parent().unwrap();
     let _transition_flocks = acquire_transition_flocks_for_profile_dirs(&[first_dir, second_dir])?;
-    let (first_file, first_path) = open_storage_lock_file(first_dir, STORAGE_LOCK_FILENAME)?;
-    let (second_file, second_path) = open_storage_lock_file(second_dir, STORAGE_LOCK_FILENAME)?;
+    let (first_file, first_path) =
+        open_existing_storage_lock_file(first_dir, STORAGE_LOCK_FILENAME)?;
+    let (second_file, second_path) =
+        open_existing_storage_lock_file(second_dir, STORAGE_LOCK_FILENAME)?;
     if same_filesystem_identity(&first_file.metadata()?, &second_file.metadata()?) {
         anyhow::bail!("source and target resolve to the same physical storage lock");
     }
@@ -2298,6 +2522,9 @@ where
         }
     }
 
+    let _namespace = acquire_profile_namespace_lock()?;
+    source_storage.verify_profile_identity()?;
+    target_storage.verify_profile_identity()?;
     with_two_storage_locks(source_storage, target_storage, || {
         let (source_instances, _source_groups) = source_storage.load_with_groups()?;
         let (target_instances, _) = target_storage.load_with_groups()?;
@@ -3041,6 +3268,24 @@ mod tests {
 
     #[test]
     #[serial]
+    fn stale_storage_writer_cannot_recreate_renamed_or_deleted_profile() {
+        let temp = tempdir().unwrap();
+        let guard = setup_test_home(temp.path());
+        crate::session::create_profile("old").unwrap();
+        crate::session::create_profile("other").unwrap();
+        let stale = Storage::open_unwatched("old").unwrap();
+        crate::session::rename_profile("old", "renamed").unwrap();
+        assert!(stale.update(|_, _| Ok(())).is_err());
+        assert!(!guard.path().join("profiles/old").exists());
+
+        let stale_delete = Storage::open_unwatched("other").unwrap();
+        crate::session::delete_profile("other").unwrap();
+        assert!(stale_delete.update(|_, _| Ok(())).is_err());
+        assert!(!guard.path().join("profiles/other").exists());
+    }
+
+    #[test]
+    #[serial]
     fn corrupt_rows_are_quarantined_and_top_level_corruption_errors() -> Result<()> {
         let temp = tempdir()?;
         let _guard = setup_test_home(temp.path());
@@ -3092,6 +3337,54 @@ mod tests {
                 assert_eq!(mode(quarantine), 0o600);
             }
         }
+        Ok(())
+    }
+
+    /// A non-empty quarantine sidecar is a write-only forensic artifact, never an
+    /// input: once a later write dropped the corrupt row from `sessions.json`, the
+    /// inventory on disk is fully readable and must be usable for a destructive
+    /// ownership check.
+    #[test]
+    #[serial]
+    fn ownership_inventory_ignores_a_stale_quarantine_sidecar() -> Result<()> {
+        let temp = tempdir()?;
+        let _guard = setup_test_home(temp.path());
+        let storage = Storage::new_unwatched("test-profile")?;
+        fs::create_dir_all(storage.sessions_path.parent().unwrap())?;
+        let sessions = serde_json::json!([
+            Instance::new("alpha", "/tmp/alpha"),
+            Instance::new("beta", "/tmp/beta"),
+        ]);
+        fs::write(&storage.sessions_path, serde_json::to_vec(&sessions)?)?;
+        fs::write(
+            storage
+                .sessions_path
+                .with_file_name("sessions.corrupt.jsonl"),
+            "{\"title\":\"long-gone\"}\n",
+        )?;
+
+        let inventory = storage.load_strict_for_worktree_ownership_locked()?;
+        let titles: Vec<_> = inventory.iter().map(|i| i.title.as_str()).collect();
+        assert_eq!(titles, ["alpha", "beta"]);
+        Ok(())
+    }
+
+    /// The fail-closed guarantee the sidecar check used to imply still holds where it
+    /// counts: a row still sitting in `sessions.json` that will not deserialize.
+    #[test]
+    #[serial]
+    fn ownership_inventory_still_refuses_a_corrupt_row_in_sessions_json() -> Result<()> {
+        let temp = tempdir()?;
+        let _guard = setup_test_home(temp.path());
+        let storage = Storage::new_unwatched("test-profile")?;
+        fs::create_dir_all(storage.sessions_path.parent().unwrap())?;
+        let sessions = serde_json::json!([
+            Instance::new("alpha", "/tmp/alpha"),
+            { "title": "corrupt-no-id" },
+        ]);
+        fs::write(&storage.sessions_path, serde_json::to_vec(&sessions)?)?;
+
+        assert!(storage.load_strict_for_worktree_ownership_locked().is_err());
         Ok(())
     }
 
@@ -3249,6 +3542,52 @@ mod tests {
         })?;
         assert_eq!(storage_a.load()?[0].title, "a1");
         assert_eq!(storage_b.load()?[0].title, "b1");
+        Ok(())
+    }
+
+    /// A writer whose profile was deleted mid-flight must not bring it back: the
+    /// lock file opened with `create_dir_all` resurrected an empty directory
+    /// between the two identity checks, and `list_profiles` then reported a
+    /// profile the user had removed.
+    #[test]
+    #[serial]
+    fn a_superseded_writer_does_not_recreate_a_deleted_profile() -> Result<()> {
+        let temp = tempdir()?;
+        let _guard = setup_test_home(temp.path());
+        let storage = Storage::new_unwatched("test-superseded-writer")?;
+        let profile_dir = storage.sessions_path.parent().unwrap().to_path_buf();
+        // Holding the namespace transition flock parks the writer between its
+        // two identity checks, which is the window the recreation lived in.
+        let transition = acquire_storage_flock(
+            app_dir_for_profile_dir(&profile_dir),
+            crate::migrations::v027_isolate_sandbox_stores::LOCK,
+        )?;
+        let (contended_tx, contended_rx) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            let _observer = observe_lock_contention_for_test(contended_tx);
+            storage.update(|instances, _| {
+                instances.push(Instance::new("late", "/tmp/late"));
+                Ok(())
+            })
+        });
+        contended_rx
+            .recv_timeout(Duration::from_secs(2))
+            .context("writer must reach the profile namespace transition lock")?;
+        fs::remove_dir_all(&profile_dir)?;
+        drop(transition);
+
+        assert!(
+            writer.join().unwrap().is_err(),
+            "the write must fail once its profile namespace is gone"
+        );
+        assert!(
+            !profile_dir.exists(),
+            "the writer resurrected the deleted profile directory"
+        );
+        assert!(
+            !crate::session::list_profiles()?.contains(&"test-superseded-writer".to_string()),
+            "a resurrected profile must not be listed"
+        );
         Ok(())
     }
 
@@ -3417,6 +3756,65 @@ mod tests {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// A destructive reopen keeps the caller's watcher, so a write through the
+    /// reopened store still reaches the live subscription instead of the noop
+    /// service an unwatched reopen would wire.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn reopen_preserving_watch_keeps_the_callers_watcher() -> Result<()> {
+        let temp = tempdir()?;
+        let _guard = setup_test_home(temp.path());
+        let _watch_env = crate::session::test_support::EnvGuard::unset(&["AOE_FILE_WATCH"]);
+        let svc = FileWatchService::new().expect("live svc");
+        let storage = Storage::new("test-reopen-watch", svc.clone())?;
+        storage.update(|instances, _groups| {
+            *instances = vec![Instance::new("seed", "/tmp/seed")];
+            Ok(())
+        })?;
+
+        let profile_dir = get_profile_dir("test-reopen-watch")?;
+        let sessions_path = profile_dir.join("sessions.json");
+        let (mut sessions_rx, _sessions_h) = svc
+            .subscribe_channel(
+                WatchSpec {
+                    dir: profile_dir,
+                    matcher: FileMatcher::Exact(sessions_path),
+                    debounce: None,
+                },
+                128,
+            )
+            .expect("subscribe sessions");
+
+        let reopened = storage.reopen_preserving_watch()?;
+        assert_eq!(reopened.profile(), storage.profile());
+        reopened.update(|instances, _groups| {
+            instances.push(Instance::new("published", "/tmp/published"));
+            Ok(())
+        })?;
+
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            crate::file_watch::test_support::dispatch_barrier(&svc),
+        )
+        .await?;
+        let mut local = false;
+        loop {
+            match sessions_rx.try_recv() {
+                Ok(event) => local |= event.source == crate::file_watch::EventSource::Local,
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                    panic!("live dispatcher closed")
+                }
+            }
+        }
+        assert!(
+            local,
+            "a write through the reopened store must reach the caller's watcher"
+        );
         Ok(())
     }
 
@@ -4935,5 +5333,28 @@ mod tests {
             .next()
             .map(|(path, _)| path)
             .expect("journal entry on disk")
+    }
+    /// The creating constructor is called with the session identity flock held.
+    /// Resolving an empty profile the unlocked way can reach the first-profile
+    /// bootstrap, which takes that same flock on a fresh descriptor and waits on
+    /// the caller's own lock, so the call has to come back rather than hang.
+    #[test]
+    fn open_or_create_under_the_identity_lock_resolves_an_empty_profile() {
+        let temp = tempfile::tempdir().unwrap();
+        let _home = isolate_app_dir_at(temp.path());
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let watcher = FileWatchService::noop();
+        std::thread::spawn(move || {
+            let _identity_lock =
+                crate::session::acquire_session_identity_lock().expect("identity lock");
+            let _ = done_tx.send(Storage::open_or_create("", watcher).map(|s| s.profile));
+        });
+
+        let profile = done_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("open_or_create blocked on the identity lock it already holds")
+            .expect("the first profile is created, not an error");
+        assert_eq!(profile, "main");
     }
 }

@@ -16,7 +16,7 @@ impl Instance {
         }
         let profile = self.effective_profile();
         let Ok(storage) =
-            crate::session::storage::Storage::new(&profile, self.resolve_file_watch())
+            crate::session::storage::Storage::open(&profile, self.resolve_file_watch())
         else {
             return;
         };
@@ -103,9 +103,8 @@ impl Instance {
         }
     }
 
-    /// Tear down the current tmux session cleanly so a fresh `start_with_size_opts` can recreate
-    /// it.
-    pub(super) fn kill_clean_locked(&self) -> Result<()> {
+    /// Stop the pane and poller under the existing lifecycle lock.
+    pub(crate) fn kill_clean_locked(&self) -> Result<()> {
         let session = self.tmux_session()?;
         // The poller watches this pane, so it goes before the pane does, whether or not the pane
         // is still there to kill.
@@ -133,32 +132,6 @@ impl Instance {
         Ok(())
     }
 
-    pub(crate) fn kill_clean(&self) -> Result<()> {
-        let profile = self.effective_profile();
-        let storage = crate::session::storage::Storage::new(&profile, self.resolve_file_watch())
-            .context("failed to open lifecycle lock storage")?;
-        let _lifecycle_lock = storage
-            .acquire_instance_lifecycle_lock(&self.id)
-            .context("failed to acquire instance kill lock")?;
-        let mut lifecycle = self.clone();
-        lifecycle.acquire_lifecycle_reservation(&storage, LifecycleOperation::Stop, None)?;
-        match self.kill_clean_locked() {
-            Ok(()) => lifecycle.commit_lifecycle_status(
-                &storage,
-                LifecycleOperation::Stop,
-                Status::Stopped,
-            ),
-            Err(error) => {
-                let _ = lifecycle.commit_lifecycle_status(
-                    &storage,
-                    LifecycleOperation::Stop,
-                    Status::Error,
-                );
-                Err(error)
-            }
-        }
-    }
-
     pub(crate) fn kill_locked(&self) -> Result<()> {
         self.stop_poller();
         let session = self.tmux_session()?;
@@ -170,8 +143,18 @@ impl Instance {
 
     pub fn kill(&self) -> Result<()> {
         let profile = self.effective_profile();
-        let storage = crate::session::storage::Storage::new(&profile, self.resolve_file_watch())
-            .context("failed to open lifecycle lock storage")?;
+        let storage =
+            match crate::session::storage::Storage::open(&profile, self.resolve_file_watch()) {
+                Ok(storage) => storage,
+                Err(error) => {
+                    // A missing profile has no lifecycle row to reserve or commit
+                    // against, so the durable stop cannot be recorded; it is still
+                    // a kill request, so tear the tmux sessions down rather than
+                    // stranding them under an owner that no longer exists.
+                    self.kill_all_tmux_sessions_without_lifecycle_row();
+                    return Err(error).context("failed to open lifecycle lock storage");
+                }
+            };
         let _lifecycle_lock = storage
             .acquire_instance_lifecycle_lock(&self.id)
             .context("failed to acquire instance kill lock")?;
@@ -198,19 +181,22 @@ impl Instance {
     /// tool sub-sessions).
     pub fn kill_all_tmux_sessions(&self) {
         let profile = self.effective_profile();
-        let storage =
-            match crate::session::storage::Storage::new(&profile, self.resolve_file_watch()) {
-                Ok(storage) => storage,
-                Err(error) => {
-                    tracing::warn!(
-                        target: "session.tmux_cleanup",
-                        session_id = %self.id,
-                        %error,
-                        "kill_all_tmux_sessions: lifecycle storage failed"
-                    );
-                    return;
-                }
-            };
+        let storage = match crate::session::storage::Storage::open(
+            &profile,
+            self.resolve_file_watch(),
+        ) {
+            Ok(storage) => storage,
+            Err(error) => {
+                tracing::warn!(
+                    target: "session.tmux_cleanup",
+                    session_id = %self.id,
+                    %error,
+                    "kill_all_tmux_sessions: lifecycle storage failed; tearing tmux down uncoordinated"
+                );
+                self.kill_all_tmux_sessions_without_lifecycle_row();
+                return;
+            }
+        };
         let _lifecycle_lock = match storage.acquire_instance_lifecycle_lock(&self.id) {
             Ok(lock) => lock,
             Err(error) => {
@@ -287,19 +273,22 @@ impl Instance {
     /// session (web terminal, container terminal, tool sub-sessions).
     pub fn kill_ancillary_tmux_sessions(&self) {
         let profile = self.effective_profile();
-        let storage =
-            match crate::session::storage::Storage::new(&profile, self.resolve_file_watch()) {
-                Ok(storage) => storage,
-                Err(error) => {
-                    tracing::warn!(
-                        target: "session.tmux_cleanup",
-                        session_id = %self.id,
-                        %error,
-                        "kill_ancillary_tmux_sessions: lifecycle storage failed"
-                    );
-                    return;
-                }
-            };
+        let storage = match crate::session::storage::Storage::open(
+            &profile,
+            self.resolve_file_watch(),
+        ) {
+            Ok(storage) => storage,
+            Err(error) => {
+                tracing::warn!(
+                    target: "session.tmux_cleanup",
+                    session_id = %self.id,
+                    %error,
+                    "kill_ancillary_tmux_sessions: lifecycle storage failed; tearing tmux down uncoordinated"
+                );
+                self.kill_ancillary_tmux_sessions_locked();
+                return;
+            }
+        };
         let _lifecycle_lock = match storage.acquire_instance_lifecycle_lock(&self.id) {
             Ok(lock) => lock,
             Err(error) => {
@@ -341,7 +330,7 @@ impl Instance {
     /// lock used by launch/restart.
     pub fn stop(&self) -> Result<()> {
         let profile = self.effective_profile();
-        let storage = crate::session::storage::Storage::new(&profile, self.resolve_file_watch())
+        let storage = crate::session::storage::Storage::open(&profile, self.resolve_file_watch())
             .context("failed to open lifecycle lock storage")?;
         let _lifecycle_lock = storage
             .acquire_instance_lifecycle_lock(&self.id)

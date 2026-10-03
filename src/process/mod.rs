@@ -33,6 +33,14 @@ mod platform {
     pub(super) fn kill_process_group(_: &std::process::Child) {}
 
     pub(super) fn terminate_process_group(_: &std::process::Child) {}
+
+    pub(super) fn is_terminated(_pid: u32) -> bool {
+        false
+    }
+
+    pub(super) fn process_group_has_live_members(_pgrp: u32) -> std::io::Result<bool> {
+        Ok(false)
+    }
 }
 
 /// Lower the child's scheduling and I/O priority where the OS supports it.
@@ -145,11 +153,17 @@ pub fn run_until_cancelled(
     run_with_timeout_inner(cmd, timeout, false, Some(cancel))
 }
 
+/// Put a command in a fresh process group, so a signal to the group reaches it
+/// and only it.
+pub(crate) fn configure_process_group(cmd: &mut Command) {
+    platform::configure_process_group(cmd);
+}
+
 pub fn run_with_timeout_process_group(
     cmd: &mut Command,
     timeout: Duration,
 ) -> std::io::Result<Option<Output>> {
-    platform::configure_process_group(cmd);
+    configure_process_group(cmd);
     run_with_timeout_inner(
         cmd,
         timeout,
@@ -233,10 +247,8 @@ fn collect_descendants_from_map(
 }
 
 pub fn get_pane_pid(session_name: &str) -> Option<u32> {
-    // `^.0` targets the agent pane regardless of base-index or extra windows and splits.
-    let target = format!("{session_name}:^.0");
-    let output = crate::tmux::tmux_command()
-        .args(["display-message", "-t", &target, "-p", "#{pane_pid}"])
+    let output = crate::tmux::utils::primary_command(session_name, "#{pane_pid}", false)
+        .ok()?
         .output()
         .ok()?;
 
@@ -300,6 +312,54 @@ pub fn processes_matching(
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         vec![false; n]
+    }
+}
+
+/// Read-only kernel birth observation, not a signalling handle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ProcessIncarnation {
+    pub(crate) pid: u32,
+    pub(crate) group: u32,
+    pub(crate) start: [u64; 2],
+    pub(crate) namespace: [u64; 2],
+}
+
+pub(crate) fn process_namespace() -> std::io::Result<[u64; 2]> {
+    #[cfg(target_os = "linux")]
+    {
+        linux::process_namespace()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        macos::process_namespace()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "process namespace unavailable",
+        ))
+    }
+}
+
+/// Observe a local process birth; missing processes return `None`, inaccessible metadata an error.
+pub fn process_incarnation(pid: u32) -> std::io::Result<Option<ProcessIncarnation>> {
+    if !(2..=i32::MAX as u32).contains(&pid) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid process id",
+        ));
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        platform::process_incarnation(pid)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "process incarnation unavailable",
+        ))
     }
 }
 

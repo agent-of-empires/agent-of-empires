@@ -395,7 +395,10 @@ pub async fn run(profile: &str, command: SessionCommands) -> Result<()> {
         SessionCommands::SetWorktreeName(args) => set_worktree_name(profile, args).await,
         SessionCommands::Current(args) => current_session(args).await,
         SessionCommands::SetSessionId(args) => set_session_id(profile, args).await,
-        SessionCommands::AddProject(args) => add_project(profile, args).await,
+        SessionCommands::AddProject(args) => {
+            let profile = profile.to_owned();
+            tokio::task::spawn_blocking(move || add_project(&profile, args)).await?
+        }
         SessionCommands::SetBase(args) => set_base(profile, args).await,
         SessionCommands::Snooze(args) => snooze_session(profile, args).await,
         SessionCommands::Unsnooze(args) => unsnooze_session(profile, args).await,
@@ -499,67 +502,146 @@ async fn archive_session(profile: &str, args: ArchiveArgs) -> Result<()> {
 
 async fn restore_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     let storage = Storage::open_unwatched(profile)?;
-
     let (instances, _groups) = storage.load_with_groups()?;
-    let trashed: Vec<_> = instances
-        .iter()
-        .filter(|i| i.is_trashed())
-        .cloned()
-        .collect();
-    let mut inst = super::resolve_session(&args.identifier, &trashed)
-        .map_err(|_| anyhow::anyhow!("No trashed session matching '{}'", args.identifier))?
-        .clone();
+    let trashed: Vec<_> = instances.into_iter().filter(Instance::is_trashed).collect();
+    let inst = super::resolve_session(&args.identifier, &trashed)
+        .map_err(|_| anyhow::anyhow!("No trashed session matching '{}'", args.identifier))?;
     let restore_id = inst.id.clone();
-
-    let _lifecycle_lock = storage
-        .acquire_instance_lifecycle_lock(&restore_id)
-        .context("failed to acquire instance restore lock")?;
-    let decision = storage.update(|instances, _groups| {
-        crate::session::claim::decide_restore_claim(instances, &restore_id, chrono::Utc::now())
-            .map_err(anyhow::Error::new)
-    })?;
-    let restore_generation = match decision {
-        crate::session::claim::RestoreClaimDecision::AlreadyGone => {
-            anyhow::bail!("No trashed session matching '{}'", args.identifier)
-        }
-        crate::session::claim::RestoreClaimDecision::Busy(holder) => anyhow::bail!(
-            "Session {} is {}, so it was not restored",
-            inst.title,
-            holder.busy_reason()
-        ),
-        crate::session::claim::RestoreClaimDecision::Claimed(generation) => generation,
+    let (restore_generation, plan) = {
+        let _workspace_claim_lock = crate::session::acquire_session_workspace_claim_lock()?;
+        let _identity_lock = acquire_session_identity_lock()?;
+        let _lifecycle_lock = storage
+            .acquire_instance_lifecycle_lock(&restore_id)
+            .context("failed to acquire instance restore lock")?;
+        storage.update(|instances, _groups| {
+            let decision = crate::session::claim::decide_restore_claim(
+                instances,
+                &restore_id,
+                chrono::Utc::now(),
+            )
+            .map_err(anyhow::Error::new)?;
+            let generation = match decision {
+                crate::session::claim::RestoreClaimDecision::AlreadyGone => {
+                    anyhow::bail!("No trashed session matching '{}'", args.identifier)
+                }
+                crate::session::claim::RestoreClaimDecision::Busy(holder) => anyhow::bail!(
+                    "Session {} is {}, so it was not restored",
+                    inst.title,
+                    holder.busy_reason(),
+                ),
+                crate::session::claim::RestoreClaimDecision::Claimed(generation) => generation,
+            };
+            let stored = instances
+                .iter()
+                .find(|row| row.id == restore_id)
+                .ok_or_else(|| anyhow::anyhow!("Session disappeared before restore"))?;
+            Ok((generation, stored.clone()))
+        })?
     };
-
-    if let crate::session::trash::RestoreOutcome::Failed { reason } =
-        crate::session::trash::restore_worktree_location(&mut inst)
-    {
+    let needs_move = plan
+        .pre_trash_project_path
+        .as_ref()
+        .is_some_and(|original| original != &plan.project_path);
+    let settled = if needs_move {
+        crate::session::runner_journal::settle(
+            crate::session::deletion::SessionPathOwner {
+                profile: storage.profile(),
+                session_id: &restore_id,
+            },
+            Some((LifecycleOperation::Restore, restore_generation)),
+        )
+        .await
+    } else {
+        Ok(())
+    };
+    let _workspace_claim_lock = crate::session::acquire_session_workspace_claim_lock()?;
+    let _identity_lock = acquire_session_identity_lock()?;
+    let _lifecycle_lock = storage.acquire_instance_lifecycle_lock(&restore_id)?;
+    if let Err(error) = settled {
         release_restore_reservation(&storage, &restore_id, restore_generation);
-        anyhow::bail!("Cannot restore worktree: {reason}");
+        anyhow::bail!("Cannot restore worktree: runner shutdown is unproven: {error}");
     }
-    let restored_path = inst.project_path.clone();
-    let restored_pre = inst.pre_trash_project_path.clone();
-
-    let commit = storage.update(|instances, _groups| {
-        Ok(crate::session::claim::finalize_restore_commit(
-            instances,
-            &restore_id,
-            restore_generation,
-            &restored_path,
-            &restored_pre,
-        ))
-    })?;
-    match commit {
-        crate::session::claim::RestoreCommit::Committed => {}
-        crate::session::claim::RestoreCommit::Superseded => anyhow::bail!(
-            "Session {} lost its lifecycle reservation during restore",
-            inst.title
-        ),
-        crate::session::claim::RestoreCommit::AlreadyGone => {
-            anyhow::bail!("No trashed session matching '{}'", args.identifier)
+    // Inventory reads must precede storage.update, which holds this profile's storage flock.
+    if needs_move {
+        let paths = vec![
+            std::path::PathBuf::from(&plan.project_path),
+            std::path::PathBuf::from(plan.pre_trash_project_path.as_ref().unwrap()),
+        ];
+        if let Err(error) = crate::session::deletion::ensure_unclaimed_paths(
+            crate::session::deletion::SessionPathOwner {
+                profile: storage.profile(),
+                session_id: &restore_id,
+            },
+            &paths,
+        ) {
+            release_restore_reservation(&storage, &restore_id, restore_generation);
+            anyhow::bail!(
+                "Cannot restore worktree: worktree ownership could not be verified: {error}"
+            );
         }
     }
-    println!("Restored: {}", inst.title);
+    let restored = storage.update(|instances, _groups| {
+        let stored = instances
+            .iter()
+            .find(|row| row.id == restore_id)
+            .ok_or_else(|| anyhow::anyhow!("No trashed session matching '{}'", args.identifier))?;
+        anyhow::ensure!(
+            stored.lifecycle_reservation_is_owned(LifecycleOperation::Restore, restore_generation)
+                && restore_plan_unchanged(&plan, stored),
+            "Session {} lost its restore reservation or worktree plan",
+            plan.title,
+        );
+        let mut instance = stored.clone();
+        instance.source_profile = storage.profile().to_string();
+        if let crate::session::trash::RestoreOutcome::Failed { reason } =
+            crate::session::trash::restore_worktree_location(&mut instance)
+        {
+            instances
+                .iter_mut()
+                .find(|row| row.id == restore_id)
+                .unwrap()
+                .release_lifecycle_reservation_if_owned(
+                    LifecycleOperation::Restore,
+                    restore_generation,
+                );
+            return Ok(Err(anyhow::anyhow!("Cannot restore worktree: {reason}")));
+        }
+        anyhow::ensure!(
+            crate::session::claim::finalize_restore_commit(
+                instances,
+                &restore_id,
+                restore_generation,
+                &instance.project_path,
+                &instance.pre_trash_project_path,
+            ) == crate::session::claim::RestoreCommit::Committed,
+            "Session {} lost its lifecycle reservation during restore",
+            plan.title,
+        );
+        Ok(Ok(instance))
+    });
+    if restored.is_err() {
+        release_restore_reservation(&storage, &restore_id, restore_generation);
+    }
+    let restored = restored??;
+    println!("Restored: {}", restored.title);
     Ok(())
+}
+
+fn restore_plan_unchanged(snapshot: &Instance, durable: &Instance) -> bool {
+    snapshot.is_trashed() == durable.is_trashed()
+        && snapshot.project_path == durable.project_path
+        && snapshot.pre_trash_project_path == durable.pre_trash_project_path
+        && snapshot.worktree_info == durable.worktree_info
+        && snapshot.scratch == durable.scratch
+        && snapshot
+            .workspace_info
+            .as_ref()
+            .map(|workspace| (&workspace.workspace_dir, &workspace.repos))
+            == durable
+                .workspace_info
+                .as_ref()
+                .map(|workspace| (&workspace.workspace_dir, &workspace.repos))
+        && snapshot.is_sandboxed() == durable.is_sandboxed()
 }
 
 fn release_restore_reservation(storage: &Storage, restore_id: &str, generation: u64) {
@@ -651,6 +733,16 @@ async fn empty_trash(profile: &str) -> Result<()> {
                         being_purged_elsewhere += 1;
                     }
                     _ => {}
+                }
+                continue;
+            }
+        };
+        let transaction = match crate::session::deletion::settle_runner_of(transaction).await {
+            Ok(transaction) => transaction,
+            Err(result) => {
+                kept_for_retry += 1;
+                for error in &result.errors {
+                    eprintln!("Warning ({}): {}", inst.title, error);
                 }
                 continue;
             }
@@ -968,6 +1060,7 @@ async fn import_sessions(profile: &str, args: ImportArgs) -> Result<()> {
     }
 
     let group = args.group.clone().unwrap_or_default();
+    let _identity_lock = acquire_session_identity_lock()?;
     let session_configs: Vec<_> = to_import
         .iter()
         .map(|s| {
@@ -996,6 +1089,7 @@ async fn import_sessions(profile: &str, args: ImportArgs) -> Result<()> {
         }
         Ok(ids)
     })?;
+    drop(_identity_lock);
 
     println!("✓ Imported {} session(s).", created_ids.len());
 
@@ -1622,6 +1716,14 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
 
     let id = inst.id.clone();
     let title_requested = args.title.is_some();
+    let mut reconcile_candidate = inst.clone();
+    if let Err(error) = crate::session::worktree_reconcile::reconcile_and_persist(
+        &storage,
+        &mut reconcile_candidate,
+        &mut Default::default(),
+    ) {
+        tracing::warn!(target: "cli.session", session = %id, "worktree path reconciliation skipped: {error}");
+    }
     let session_lock_required = title_requested || args.rename_branch || args.branch.is_some();
 
     let _identity_lock = acquire_session_identity_lock()?;
@@ -1647,14 +1749,6 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
         .iter()
         .find(|instance| instance.id == id)
         .ok_or_else(|| anyhow::anyhow!("Session not found: {}", id))?;
-    let mut inst = inst.clone();
-    if let Err(error) = crate::session::worktree_reconcile::reconcile_and_persist(
-        &storage,
-        &mut inst,
-        &mut Default::default(),
-    ) {
-        tracing::warn!(target: "cli.session", session = %id, "worktree path reconciliation skipped: {error}");
-    }
     let old_title = inst.title.clone();
     let effective_title = args
         .title
@@ -2416,6 +2510,14 @@ async fn set_worktree_name(profile: &str, args: SetWorktreeNameArgs) -> Result<(
     };
 
     let id = inst.id.clone();
+    let mut reconcile_candidate = inst.clone();
+    if let Err(error) = crate::session::worktree_reconcile::reconcile_and_persist(
+        &storage,
+        &mut reconcile_candidate,
+        &mut Default::default(),
+    ) {
+        tracing::warn!(target: "cli.session", session = %id, "worktree path reconciliation skipped: {error}");
+    }
     let _identity_lock = acquire_session_identity_lock()?;
     let _lifecycle_lock = storage
         .acquire_instance_lifecycle_lock(&id)
@@ -2425,13 +2527,15 @@ async fn set_worktree_name(profile: &str, args: SetWorktreeNameArgs) -> Result<(
         .iter()
         .find(|instance| instance.id == id)
         .ok_or_else(|| anyhow::anyhow!("Session not found: {}", id))?;
-    let mut inst = inst.clone();
-    if let Err(error) = crate::session::worktree_reconcile::reconcile_and_persist(
-        &storage,
-        &mut inst,
-        &mut Default::default(),
-    ) {
-        tracing::warn!(target: "cli.session", session = %id, "worktree path reconciliation skipped: {error}");
+    if inst
+        .lifecycle_reservation
+        .as_ref()
+        .is_some_and(|reservation| {
+            reservation.op == LifecycleOperation::Attach
+                && inst.has_fresh_lifecycle_reservation(chrono::Utc::now())
+        })
+    {
+        bail!("Session is attaching a project; wait for the attach to finish before renaming its worktree");
     }
     let current_path = inst.project_path.clone();
     let Some(worktree_info) = inst.worktree_info.clone() else {
@@ -2631,7 +2735,7 @@ async fn set_session_id(profile: &str, args: SetSessionIdArgs) -> Result<()> {
     Ok(())
 }
 
-async fn add_project(profile: &str, args: AddProjectArgs) -> Result<()> {
+fn add_project(profile: &str, args: AddProjectArgs) -> Result<()> {
     let storage = Storage::open_unwatched(profile)?;
     let instances = storage.load()?;
     let inst = super::resolve_session(&args.identifier, &instances)?;
@@ -2665,11 +2769,12 @@ async fn add_project(profile: &str, args: AddProjectArgs) -> Result<()> {
         crate::session::attach_project::ExistingBranch::Refuse
     };
 
-    let plan = crate::session::attach_project::plan(inst, profile, &repo_path, on_existing)?;
+    let mut plan = crate::session::attach_project::plan(inst, profile, &repo_path, on_existing)?;
+    crate::session::attach_project::reserve_attach(&storage, &id, &mut plan)?;
     let restarts = crate::session::attach_project::needs_restart(&plan, is_sandboxed);
     let quiesced = if restarts {
         println!("Stopping '{title}' so its working directory can move...");
-        crate::session::attach_project::quiesce_for_conversion(&storage, inst)?
+        crate::session::attach_project::quiesce_for_conversion(&storage, inst, &plan)?
     } else {
         crate::session::attach_project::Quiesced::default()
     };

@@ -82,8 +82,9 @@ pub(crate) enum ContinuationOutcome {
     Stands,
     /// A queued prompt owns the next turn, and any continuation an earlier
     /// cadence installed is cleared. That prompt has no other route to a
-    /// worker, so the caller still frees the respawn, but no automatic
-    /// breadcrumb.
+    /// worker, so the caller still frees the respawn, and publishes the
+    /// manual marker to retire an arming an earlier automatic resume left
+    /// behind: no continuation goes out, so nothing may stay armed.
     SupersededByQueue,
 }
 
@@ -161,9 +162,11 @@ pub(crate) async fn install_rate_limit_continuation(
 }
 
 /// Releases rate-limit parks whose window elapsed: install the interrupted
-/// prompt unless a queued one took the session, publish the breadcrumb for a
-/// delivered continuation, and free the `attempted` slot so this tick
-/// respawns. The park and its times come from the durable event store (#3514).
+/// prompt unless a queued one took the session, publish the marker matching
+/// what happened: the automatic breadcrumb when a continuation was
+/// delivered, the manual disarm when a queued prompt took the session, and
+/// free the `attempted` slot so this tick respawns. The park and its times
+/// come from the durable event store (#3514).
 /// Returns the released ids so the resume loop does not re-hold them.
 pub(super) async fn reap_rate_limit_resumes(
     state: &Arc<AppState>,
@@ -330,6 +333,16 @@ pub(super) async fn reap_rate_limit_resumes(
                 );
             }
             ContinuationOutcome::SupersededByQueue => {
+                // A queued prompt takes the session, so no continuation goes
+                // out. The `manual` flag is the budget's disarm step rather
+                // than a claim about who resumed: here it says the opposite
+                // of what it says on the automatic branch, that nothing was
+                // delivered. Without it an arming an earlier automatic resume
+                // left behind outlives the daemon and charges a redelivery
+                // that never happened.
+                state
+                    .acp_supervisor
+                    .publish_rate_limit_auto_resumed(&id, resume_at, true);
                 tracing::info!(
                     target: "acp.supervisor",
                     session = %id,
@@ -628,6 +641,28 @@ mod tests {
         }
     }
 
+    /// The markers each arm published, counted apart: the automatic one arms the
+    /// budget and the manual one disarms it, so a total cannot tell a disarm
+    /// from an arming.
+    fn markers_by_arm(state: &AppState, id: &str) -> (usize, usize) {
+        state
+            .acp_event_store
+            .replay_from(id, 0)
+            .into_iter()
+            .filter_map(|(_, e)| match e {
+                Event::RateLimitAutoResumed { manual: false, .. } => Some(false),
+                Event::RateLimitAutoResumed { manual: true, .. } => Some(true),
+                _ => None,
+            })
+            .fold((0, 0), |(auto, manual), is_manual| {
+                if is_manual {
+                    (auto, manual + 1)
+                } else {
+                    (auto + 1, manual)
+                }
+            })
+    }
+
     fn auto_resumed_breadcrumbs(state: &AppState, id: &str) -> usize {
         state
             .acp_event_store
@@ -701,20 +736,28 @@ mod tests {
         // The `parked` fixture backdates the limit an hour, so these straddle it.
         let after = Utc::now();
         let before = Utc::now() - chrono::Duration::hours(2);
-        // (label, continuation installed, queued at, turn kept, breadcrumbs)
+        // (label, continuation installed, queued at, turn kept, auto markers, manual markers)
         let cases = [
-            ("queued-after", false, after.to_rfc3339(), None, 0),
+            ("queued-after", false, after.to_rfc3339(), None, 0, 1),
             (
                 "installed-and-queued-after",
                 true,
                 after.to_rfc3339(),
                 None,
                 0,
+                1,
             ),
-            ("queued-before", false, before.to_rfc3339(), Some(true), 1),
-            ("queued-at-unreadable", false, "t0".into(), Some(true), 1),
+            (
+                "queued-before",
+                false,
+                before.to_rfc3339(),
+                Some(true),
+                1,
+                0,
+            ),
+            ("queued-at-unreadable", false, "t0".into(), Some(true), 1, 0),
         ];
-        for (label, installed, queued_at, kept, breadcrumbs) in cases {
+        for (label, installed, queued_at, kept, auto_markers, manual_markers) in cases {
             let id = format!("sess-4092-{label}");
             let (_home, state, _project) = parked(&id, 0).await;
             if installed {
@@ -751,9 +794,10 @@ mod tests {
 
             assert_eq!(pending_turn(&state, &id).await, kept, "{label}");
             assert_eq!(
-                auto_resumed_breadcrumbs(&state, &id),
-                breadcrumbs,
-                "{label}: a refused continuation must not spend a redelivery"
+                markers_by_arm(&state, &id),
+                (auto_markers, manual_markers),
+                "{label}: a delivered continuation arms the budget and a superseded one \
+                 disarms it, so the two arms cannot be counted as one"
             );
             assert!(
                 !attempted.contains(&id) && released.contains(&id),

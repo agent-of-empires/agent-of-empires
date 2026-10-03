@@ -26,6 +26,7 @@ pub mod poller;
 pub mod projects;
 pub(crate) mod recovery;
 pub mod restart;
+pub(crate) mod runner_journal;
 pub mod sandbox_store_reclaim;
 pub mod scope;
 pub mod scratch;
@@ -95,11 +96,46 @@ pub use instance::{
 pub(crate) use move_journal::{
     record as record_move_journal, MoveJournalEntry, MOVE_JOURNAL_VERSION,
 };
-pub(crate) use storage::acquire_session_identity_lock;
+pub(crate) use storage::{acquire_session_identity_lock, sync_parent_directory};
 #[cfg(test)]
 pub(crate) use storage::{observe_lock_contention_for_test, observe_updates_for_test};
 pub(crate) use storage::{reconcile_profile_duplicates, DuplicateIdReport};
 
+/// Check that every path a non-scratch session will use is present and inspectable.
+pub(crate) fn validate_managed_workspace(instance: &Instance) -> Result<(), String> {
+    if instance.scratch {
+        return Ok(());
+    }
+
+    let mut paths = vec![std::path::PathBuf::from(&instance.project_path)];
+    if let Some(workspace) = &instance.workspace_info {
+        paths.push(std::path::PathBuf::from(&workspace.workspace_dir));
+        paths.extend(
+            workspace
+                .repos
+                .iter()
+                .map(|repo| std::path::PathBuf::from(&repo.worktree_path)),
+        );
+    }
+    for path in paths {
+        match path.try_exists() {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(format!(
+                    "managed workspace path is missing: {}",
+                    path.display()
+                ))
+            }
+            Err(error) => {
+                return Err(format!(
+                    "could not inspect managed workspace path {}: {error}",
+                    path.display()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Process-wide cache of the `session.unread_indicator` toggle (default on).
@@ -131,9 +167,10 @@ pub fn set_favorites_first(on: bool) {
 
 pub use config::profile_config::{
     load_profile_config, merge_configs, resolve_config, resolve_config_or_warn,
-    save_profile_config, validate_capability_format, validate_check_interval, validate_env_format,
-    validate_memory_limit, validate_network_format, validate_port_mapping_format,
-    validate_security_opt_format, validate_volume_format, ProfileConfig,
+    save_profile_config, update_profile_config, validate_capability_format,
+    validate_check_interval, validate_env_format, validate_memory_limit, validate_network_format,
+    validate_port_mapping_format, validate_security_opt_format, validate_volume_format,
+    ProfileConfig,
 };
 pub use config::repo_config::{
     check_repo_trust, execute_hooks, execute_hooks_in_container, load_repo_config,
@@ -147,8 +184,9 @@ pub use scope::SessionScope;
 #[cfg(test)]
 pub(crate) use storage::migration_backups;
 pub(crate) use storage::{
-    acquire_session_title_lock, acquire_storage_flock, acquire_storage_shared_flock, atomic_write,
-    backup_before_migration, read_file_no_follow, replace_file_no_follow, resolve_symlink_chain,
+    acquire_session_title_lock, acquire_session_workspace_claim_lock, acquire_storage_flock,
+    acquire_storage_shared_flock, atomic_write, backup_before_migration, read_file_no_follow,
+    replace_file_no_follow, resolve_symlink_chain, same_filesystem_identity,
     try_acquire_storage_flock, GroupMovePlan, StorageFlock, STORAGE_LOCK_FILENAME,
 };
 pub use storage::{
@@ -314,19 +352,47 @@ pub fn format_debug_namespace_warning(release: &Path, dev: &Path) -> String {
     )
 }
 
+/// Resolve a profile directory, creating it when absent.
+///
+/// Creation runs under the session identity lock, which every profile rename
+/// and delete also takes, so a config write can never resurrect a directory
+/// outside that lock window.
 pub fn get_profile_dir(profile: &str) -> Result<PathBuf> {
+    if let Ok(dir) = get_profile_dir_path(profile) {
+        if dir.exists() {
+            return Ok(dir);
+        }
+    }
+    let _identity_lock = acquire_session_identity_lock()?;
+    get_profile_dir_locked(profile)
+}
+
+/// [`get_profile_dir`] for callers that already hold the session identity
+/// lock. Taking it again here would deadlock: `flock` is bound to the open
+/// file description, so a second acquisition on a fresh descriptor waits
+/// against the one this thread is holding.
+pub(crate) fn get_profile_dir_locked(profile: &str) -> Result<PathBuf> {
     let base = get_app_dir()?;
     let resolved;
     let profile_name = if profile.is_empty() {
-        resolved = config::resolve_default_profile();
+        resolved = config::resolve_default_profile_locked();
         resolved.as_str()
     } else {
         profile
     };
+    // A separator is the only way out of the profiles directory, and
+    // `validate_profile_name` below rejects a `..` component on its own. Only
+    // the separators are checked here, because a name that merely contains two
+    // dots is a single normal component and an existing profile must still open.
+    if profile_name.contains('/') || profile_name.contains('\\') {
+        anyhow::bail!("Profile name cannot contain path separators");
+    }
+    validate_profile_name(profile_name)?;
     let dir = base.join("profiles").join(profile_name);
     if !dir.exists() {
-        // Only a name about to be created runs the strict grammar; an existing directory still
-        // opens, so older malformed profiles stay listable and deletable.
+        // Only a name about to be created runs the strict grammar; an existing
+        // directory still opens, so older malformed profiles stay listable and
+        // deletable.
         validate_new_profile_name(profile_name)?;
         fs::create_dir_all(&dir)?;
     }
@@ -343,17 +409,45 @@ pub fn get_profile_dir_path(profile: &str) -> Result<PathBuf> {
     } else {
         profile
     };
+    // Same guard as the locked variant: this path feeds the existing-directory
+    // shortcut in `get_profile_dir`, which runs before any other check.
+    if profile_name.contains('/') || profile_name.contains('\\') {
+        anyhow::bail!("Profile name cannot contain path separators");
+    }
+    validate_profile_name(profile_name)?;
     Ok(base.join("profiles").join(profile_name))
 }
 
-/// Resolve the effective profile name for a read/reference operation.
-pub fn resolve_existing_profile(profile: &str) -> Result<String> {
+/// Resolve the effective profile name and check its grammar, without
+/// requiring the directory to exist. Callers that materialise the profile must
+/// do so under the session identity lock.
+pub fn resolve_profile_name(profile: &str) -> Result<String> {
+    resolve_profile_name_inner(profile, false)
+}
+
+/// [`resolve_profile_name`] for a caller that already holds the session identity
+/// flock, so an empty profile cannot reach a bootstrap that re-takes it.
+pub(crate) fn resolve_profile_name_locked(profile: &str) -> Result<String> {
+    resolve_profile_name_inner(profile, true)
+}
+
+fn resolve_profile_name_inner(profile: &str, identity_lock_held: bool) -> Result<String> {
     let name = if profile.is_empty() {
-        config::resolve_default_profile()
+        if identity_lock_held {
+            config::resolve_default_profile_locked()
+        } else {
+            config::resolve_default_profile()
+        }
     } else {
         profile.to_string()
     };
     validate_profile_name(&name)?;
+    Ok(name)
+}
+
+/// Resolve the effective profile name for a read/reference operation.
+pub fn resolve_existing_profile(profile: &str) -> Result<String> {
+    let name = resolve_profile_name(profile)?;
     let dir = get_profile_dir_path(&name)?;
     if !dir.exists() {
         anyhow::bail!("Profile '{name}' does not exist. Create it with: aoe profile create {name}");
@@ -375,6 +469,92 @@ pub fn list_profiles() -> Result<Vec<String>> {
     }
 
     list_profile_names_in(&profiles_dir)
+}
+
+/// The profile stores the worktree-ownership inventory must scan: one entry per
+/// physical store, never two for the same one.
+///
+/// A `profiles/<name>` entry can be a symlink aliasing another profile (the
+/// `cs`/`cxa` pattern pointing at `default`). The alias resolves to the profile
+/// directory it actually is and is dropped when that store is already listed,
+/// so an installation using aliases gets a complete inventory instead of an
+/// error that would make every deletion assume its paths are in use. An alias
+/// that resolves to no existing profile directory is that one profile's
+/// problem: it is skipped, never followed to a store outside `profiles/`.
+pub(crate) fn list_profiles_for_worktree_inventory() -> Result<Vec<String>> {
+    #[cfg(test)]
+    if FAIL_NEXT_LIST_PROFILES.swap(false, std::sync::atomic::Ordering::SeqCst) {
+        anyhow::bail!("list_profiles failure injected for test");
+    }
+    let base = get_app_dir()?;
+    let profiles_dir = base.join("profiles");
+    if !profiles_dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut profiles: Vec<String> = Vec::new();
+    let mut identities: Vec<fs::Metadata> = Vec::new();
+    let mut aliases: Vec<PathBuf> = Vec::new();
+    for entry in fs::read_dir(&profiles_dir)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            aliases.push(entry.path());
+        } else if file_type.is_dir() {
+            let name = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| anyhow::anyhow!("profile directory has a non-UTF-8 name"))?;
+            if let Ok(metadata) = fs::metadata(entry.path()) {
+                identities.push(metadata);
+            }
+            profiles.push(name);
+        }
+    }
+    // Real directories first, so an alias is matched against the name that
+    // owns the store it points at.
+    for alias in aliases {
+        match resolve_profile_alias(&alias, &profiles_dir) {
+            Ok(target) => {
+                let identity = fs::metadata(&target).ok();
+                let already_listed = identity.as_ref().is_some_and(|metadata| {
+                    identities
+                        .iter()
+                        .any(|listed| same_filesystem_identity(listed, metadata))
+                });
+                if already_listed {
+                    continue;
+                }
+                if let Some(metadata) = identity {
+                    identities.push(metadata);
+                }
+                if let Some(name) = alias.file_name().and_then(|name| name.to_str()) {
+                    profiles.push(name.to_string());
+                }
+            }
+            Err(reason) => tracing::warn!(
+                target: "session.profile",
+                alias = %alias.display(),
+                "skipping unresolvable profile alias in the worktree inventory: {reason}"
+            ),
+        }
+    }
+    profiles.sort();
+    Ok(profiles)
+}
+
+/// The profile directory a `profiles/<name>` entry actually names, for an entry
+/// that may be a symlink alias. `canonicalize` fails on a dangling link, and
+/// the target must be a direct child of `profiles_dir`, so neither a missing
+/// profile nor a link out of the profile namespace can pass as one.
+fn resolve_profile_alias(entry: &Path, profiles_dir: &Path) -> Result<PathBuf> {
+    let target = fs::canonicalize(entry)?;
+    if !target.is_dir() || target.parent() != Some(fs::canonicalize(profiles_dir)?.as_path()) {
+        anyhow::bail!(
+            "{} does not resolve to a profile directory",
+            entry.display()
+        );
+    }
+    Ok(target)
 }
 
 /// Picker order: alphabetical, with a profile named `default` last.
@@ -577,18 +757,23 @@ fn validate_new_profile_name(name: &str) -> Result<()> {
 
 pub fn create_profile(name: &str) -> Result<()> {
     validate_new_profile_name(name)?;
+    let _identity_lock = acquire_session_identity_lock()?;
+    let _profile_namespace_lock = crate::session::storage::acquire_profile_namespace_lock()?;
 
     let profiles = list_profiles()?;
     if profiles.contains(&name.to_string()) {
         anyhow::bail!("Profile '{}' already exists", name);
     }
 
-    get_profile_dir(name)?;
+    let dir = get_profile_dir_path(name)?;
+    fs::create_dir_all(&dir)?;
     Ok(())
 }
 
 pub fn delete_profile(name: &str) -> Result<()> {
     validate_profile_name(name)?;
+    let _identity_lock = acquire_session_identity_lock()?;
+    let _profile_namespace_lock = crate::session::storage::acquire_profile_namespace_lock()?;
 
     let base = get_app_dir()?;
     let profile_dir = base.join("profiles").join(name);
@@ -596,6 +781,10 @@ pub fn delete_profile(name: &str) -> Result<()> {
     if !profile_dir.exists() {
         anyhow::bail!("Profile '{}' does not exist", name);
     }
+    let _profile_storage_lock = crate::session::storage::acquire_storage_flock(
+        &profile_dir,
+        crate::session::storage::STORAGE_LOCK_FILENAME,
+    )?;
 
     // The invariant is "at least one profile must exist", a count, not a name.
     // Any profile is deletable as long as deleting it would not leave zero.
@@ -612,6 +801,8 @@ pub fn delete_profile(name: &str) -> Result<()> {
 pub fn rename_profile(old_name: &str, new_name: &str) -> Result<()> {
     validate_profile_name(old_name)?;
     validate_new_profile_name(new_name)?;
+    let _identity_lock = acquire_session_identity_lock()?;
+    let _profile_namespace_lock = crate::session::storage::acquire_profile_namespace_lock()?;
 
     let base = get_app_dir()?;
     let old_dir = base.join("profiles").join(old_name);
@@ -623,6 +814,10 @@ pub fn rename_profile(old_name: &str, new_name: &str) -> Result<()> {
     if new_dir.exists() {
         anyhow::bail!("Profile '{}' already exists", new_name);
     }
+    let _old_profile_storage_lock = crate::session::storage::acquire_storage_flock(
+        &old_dir,
+        crate::session::storage::STORAGE_LOCK_FILENAME,
+    )?;
 
     fs::rename(&old_dir, &new_dir)?;
 
@@ -738,9 +933,8 @@ fn collect_startup_warnings(profile: &str, class: WarningClass) -> Option<String
     } else {
         profile.to_string()
     };
-    // Non-creating resolver: `get_profile_config_path` goes through the creating `get_profile_dir`,
-    // so naming an unknown profile (`aoe list -p ghost`) would birth `profiles/ghost/` here, before
-    // the command's own `resolve_existing_profile` gets to reject it.
+    // Non-creating resolver: naming an unknown profile (`aoe list -p ghost`) would otherwise birth
+    // `profiles/ghost/` here, before the command's own `resolve_existing_profile` gets to reject it.
     let profile_path_display = get_profile_dir_path(&effective)
         .map(|p| p.join("config.toml").display().to_string())
         .unwrap_or_else(|_| format!("profiles/{effective}/config.toml"));
@@ -853,6 +1047,39 @@ pub fn is_tui_active(threshold: Duration) -> bool {
 mod tests {
     use super::test_support::{isolate_app_dir, AppDirGuard};
     use super::*;
+
+    #[test]
+    fn managed_workspace_validator_checks_each_workspace_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let worktree = workspace.join("repo");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let mut instance = Instance::new("workspace", workspace.to_str().unwrap());
+        instance.workspace_info = Some(WorkspaceInfo {
+            branch: "feature".to_string(),
+            workspace_dir: workspace.to_string_lossy().to_string(),
+            repos: vec![WorkspaceRepo {
+                name: "repo".to_string(),
+                source_path: temp.path().join("source").to_string_lossy().to_string(),
+                branch: "feature".to_string(),
+                worktree_path: worktree.to_string_lossy().to_string(),
+                main_repo_path: temp.path().join("source").to_string_lossy().to_string(),
+                managed_by_aoe: true,
+                branch_preexisting: false,
+                base_branch: None,
+                base_branch_override: None,
+            }],
+            created_at: chrono::Utc::now(),
+            cleanup_on_delete: true,
+        });
+        assert!(validate_managed_workspace(&instance).is_ok());
+        std::fs::remove_dir(&worktree).unwrap();
+        let error = validate_managed_workspace(&instance).unwrap_err();
+        assert!(
+            error.contains("managed workspace path is missing"),
+            "unexpected error: {error}"
+        );
+    }
 
     fn app_dir(root: impl AsRef<Path>) -> PathBuf {
         let root = root.as_ref();
@@ -1165,6 +1392,23 @@ mod tests {
                 .err()
                 .unwrap_or_else(|| panic!("expected {bad:?} to be rejected"));
         }
+    }
+
+    /// The path builders reject a traversing name even when its target already
+    /// exists, which is what made `Path::join` resolve outside `profiles/`.
+    #[test]
+    fn profile_dir_path_rejects_traversal_regardless_of_existing_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let escaped = temp.path().join("outside");
+        std::fs::create_dir_all(&escaped).unwrap();
+        let name = format!("../../{}", escaped.file_name().unwrap().to_str().unwrap());
+
+        for bad in [name.as_str(), "a/b", "a\\b", ".."] {
+            get_profile_dir_path(bad)
+                .err()
+                .unwrap_or_else(|| panic!("expected {bad:?} to be rejected before the join"));
+        }
+        assert!(get_profile_dir_path("work").is_ok());
     }
 
     #[test]

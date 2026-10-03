@@ -8,6 +8,15 @@ use thiserror::Error;
 pub enum AcpError {
     #[error("agent spawn failed: {0}")]
     Spawn(String),
+    /// A detached constructor failed after issuing this exact execution ticket.
+    #[error("{source} (execution {launch_nonce}, identity={identity:?}, settled={settled})")]
+    IssuedExecution {
+        identity: Option<crate::acp::runner_lifecycle::RunnerIdentity>,
+        launch_nonce: uuid::Uuid,
+        settled: bool,
+        #[source]
+        source: Box<AcpError>,
+    },
     /// Its own variant because POSIX cannot tell a missing cwd from a missing
     /// binary at the libc level, and the UI needs a different banner (#1089).
     #[error("project path no longer exists: {path}")]
@@ -59,6 +68,30 @@ impl std::fmt::Display for IncompatibleAgentError {
 }
 
 impl AcpError {
+    pub fn underlying(&self) -> &Self {
+        match self {
+            Self::IssuedExecution { source, .. } => source.underlying(),
+            error => error,
+        }
+    }
+
+    pub(crate) fn issued_execution(
+        &self,
+    ) -> Option<(Option<crate::acp::runner_lifecycle::RunnerIdentity>, bool)> {
+        match self {
+            Self::IssuedExecution {
+                identity, settled, ..
+            } => Some((*identity, *settled)),
+            _ => None,
+        }
+    }
+    pub(crate) fn into_underlying(self) -> Self {
+        match self {
+            Self::IssuedExecution { source, .. } => (*source).into_underlying(),
+            error => error,
+        }
+    }
+
     /// POSIX returns ENOENT for both "binary not on PATH" and "cwd is gone",
     /// so only a stat can tell them apart; it runs on the ENOENT branch alone.
     /// The supervisor pre-flights `cwd.exists()`, but the directory can vanish

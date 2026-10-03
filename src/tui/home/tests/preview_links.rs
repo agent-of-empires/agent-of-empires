@@ -263,12 +263,16 @@ fn a_generation_change_re_collects_targets_for_an_unchanged_grid() {
     let mut env = create_test_env_empty();
     let advertised = "see \x1b]8;;https://example.com/a\x1b\\the docs\x1b]8;;\x1b\\ now\n";
     env.view.preview_cache.store_capture(
-        advertised.to_string(),
+        crate::tui::home::live_send::CaptureFrame {
+            content: advertised.to_string(),
+            target: "aoe_s1".to_string(),
+            generation: 1,
+            budget: 0,
+            cursor: None,
+            session: None,
+        },
         "s1".to_string(),
-        "aoe_s1".to_string(),
-        1,
         (40, 4),
-        None,
     );
     env.view.preview_cache.ensure_parsed();
     let painted = env.view.preview_cache.parsed_text.as_ref().unwrap();
@@ -321,12 +325,17 @@ fn capture_frames_carry_their_own_targets_through_the_parse() {
     // the cache collects them as it strips them for `ansi-to-tui`.
     let mut env = create_test_env_empty();
     env.view.preview_cache.store_capture(
-        "see \x1b]8;;https://example.com/aoe\x1b\\the AoE repo\x1b]8;;\x1b\\ now\n".to_string(),
+        crate::tui::home::live_send::CaptureFrame {
+            content: "see \x1b]8;;https://example.com/aoe\x1b\\the AoE repo\x1b]8;;\x1b\\ now\n"
+                .to_string(),
+            target: "aoe_s1".to_string(),
+            generation: 1,
+            budget: 0,
+            cursor: None,
+            session: None,
+        },
         "s1".to_string(),
-        "aoe_s1".to_string(),
-        1,
         (40, 4),
-        None,
     );
     env.view.preview_cache.ensure_parsed();
 

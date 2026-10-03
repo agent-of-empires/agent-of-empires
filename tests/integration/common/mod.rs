@@ -163,6 +163,176 @@ impl TestHome {
     }
 }
 
+/// Publishes genuine runner birth before releasing its private authorization pipe.
+/// All paths and child environment belong to the caller's isolated home.
+pub struct RunnerLaunchFixture {
+    home: PathBuf,
+    xdg: PathBuf,
+    profile: String,
+    session_id: String,
+    generation: u64,
+    pub nonce: uuid::Uuid,
+    sessions: PathBuf,
+}
+
+impl RunnerLaunchFixture {
+    pub fn new(home: &Path, xdg: &Path, profile: &str, session_id: &str, generation: u64) -> Self {
+        let app = if cfg!(any(target_os = "linux", target_os = "macos")) {
+            xdg.join("agent-of-empires-dev")
+        } else {
+            home.join(".agent-of-empires-dev")
+        };
+        let profiles = app.join("profiles");
+        let directory = profiles.join(profile);
+        std::fs::create_dir_all(&directory).expect("create fixture profile");
+        // Migrations run before authorization; suppress rewrites by seeding the
+        // real current schema before spawning, not by racing the runner startup.
+        Self::write_synced(
+            &app.join(".schema_version"),
+            agent_of_empires::migrations::current_schema_version()
+                .to_string()
+                .as_bytes(),
+        )
+        .expect("seed current fixture schema");
+        let sessions = directory.join("sessions.json");
+        let mut rows: Vec<serde_json::Value> = if sessions.exists() {
+            serde_json::from_slice(&std::fs::read(&sessions).unwrap()).unwrap()
+        } else {
+            Vec::new()
+        };
+        if !rows.iter().any(|row| row["id"] == session_id) {
+            let mut instance = agent_of_empires::session::Instance::new(
+                "runner fixture",
+                home.to_str().expect("fixture home UTF-8"),
+            );
+            instance.id = session_id.to_owned();
+            let mut row = serde_json::to_value(instance).expect("serialize fixture owner");
+            row["lifecycle_generation"] = serde_json::json!(generation);
+            row["runner_journal"] = serde_json::json!({"coverage": "complete", "launches": []});
+            rows.push(row);
+            Self::write_synced(&sessions, &serde_json::to_vec(&rows).unwrap())
+                .expect("seed authoritative fixture row");
+        }
+        for parent in [profiles.as_path(), app.as_path(), xdg, home] {
+            std::fs::File::open(parent)
+                .and_then(|file| file.sync_all())
+                .expect("sync fixture directories");
+        }
+        Self {
+            home: home.to_owned(),
+            xdg: xdg.to_owned(),
+            profile: profile.to_owned(),
+            session_id: session_id.to_owned(),
+            generation,
+            nonce: uuid::Uuid::new_v4(),
+            sessions,
+        }
+    }
+
+    pub fn command(&self) -> std::process::Command {
+        use std::os::unix::process::CommandExt;
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_aoe"));
+        command
+            .args([
+                "__acp-runner",
+                "--managed-profile",
+                &self.profile,
+                "--launch-nonce",
+            ])
+            .arg(self.nonce.to_string())
+            .arg("--generation")
+            .arg(self.generation.to_string())
+            .env("HOME", &self.home)
+            .env("XDG_CONFIG_HOME", &self.xdg)
+            .stdin(std::process::Stdio::piped())
+            .process_group(0);
+        command
+    }
+
+    fn write_synced(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+        use std::io::Write;
+        let temporary = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
+        let result = (|| -> anyhow::Result<()> {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary)?;
+            file.write_all(bytes)?;
+            file.sync_all()?;
+            std::fs::rename(&temporary, path)?;
+            std::fs::File::open(path.parent().expect("fixture path parent"))?.sync_all()?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&temporary);
+        }
+        result
+    }
+
+    fn publish(&self, pid: u32) -> anyhow::Result<()> {
+        use anyhow::Context;
+        let incarnation = agent_of_empires::process::process_incarnation(pid)?
+            .context("runner exited before birth publication")?;
+        let boot = agent_of_empires::process::boot_id().context("verified boot unavailable")?;
+        let boot = uuid::Uuid::parse_str(boot.trim())?;
+        anyhow::ensure!(!boot.is_nil(), "verified boot is nil");
+        let mut rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(&self.sessions)?)?;
+        let row = rows
+            .iter_mut()
+            .find(|row| row["id"] == self.session_id)
+            .context("authoritative fixture row disappeared")?;
+        let launches = row["runner_journal"]["launches"]
+            .as_array_mut()
+            .context("fixture launch journal is not an array")?;
+        launches.push(serde_json::json!({
+            "nonce": self.nonce.as_bytes(), "boot": boot.as_bytes(),
+            "generation": self.generation, "incarnation": incarnation,
+        }));
+        Self::write_synced(&self.sessions, &serde_json::to_vec(&rows)?)
+    }
+
+    pub fn authorize(&self, child: &mut std::process::Child) {
+        use std::io::Write;
+        let result = self.publish(child.id()).and_then(|()| {
+            let mut stdin = child
+                .stdin
+                .take()
+                .ok_or_else(|| anyhow::anyhow!("missing authorization pipe"))?;
+            stdin.write_all(self.nonce.as_bytes())?;
+            Ok(())
+        });
+        if let Err(error) = result {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("authorize real fixture runner: {error:#}");
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    pub async fn authorize_tokio(&self, child: &mut tokio::process::Child) {
+        use tokio::io::AsyncWriteExt;
+        let result = async {
+            let pid = child
+                .id()
+                .ok_or_else(|| anyhow::anyhow!("runner exited before authorization"))?;
+            self.publish(pid)?;
+            let mut stdin = child
+                .stdin
+                .take()
+                .ok_or_else(|| anyhow::anyhow!("missing authorization pipe"))?;
+            stdin.write_all(self.nonce.as_bytes()).await?;
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+        if let Err(error) = result {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            panic!("authorize real fixture runner: {error:#}");
+        }
+    }
+}
+
 /// A live `aoe __acp-runner` whose agent is the Node ACP shim: the real runner
 /// rather than a mock, since the daemon speaks the typed control protocol.
 ///
@@ -184,9 +354,9 @@ pub async fn spawn_runner_with_shim(
     let socket_path = temp.path().join(format!("{session_id}.sock"));
     let control = temp.path().join(format!("{session_id}.control.sock"));
 
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_aoe"));
+    let launch = RunnerLaunchFixture::new(&home, &xdg, "main", session_id, 0);
+    let mut cmd = Command::from(launch.command());
     cmd.args([
-        "__acp-runner",
         "--socket",
         socket_path.to_str().unwrap(),
         "--session-id",
@@ -209,7 +379,8 @@ pub async fn spawn_runner_with_shim(
     if env.iter().any(|(key, _)| *key == "SHIM_PRESEED_SESSION_ID") {
         cmd.env("SHIM_LOAD_SESSION", "1");
     }
-    let child = cmd.spawn().expect("spawn acp runner");
+    let mut child = cmd.spawn().expect("spawn acp runner");
+    launch.authorize_tokio(&mut child).await;
 
     // The runner binds the control socket before spawning the agent, so its
     // appearance is the readiness signal the daemon's own probe uses.
@@ -291,6 +462,7 @@ pub async fn spawn_runner_with_shim(
         RunnerGuard {
             _child: child,
             _temp: temp,
+            nonce: launch.nonce,
         },
     )
 }
@@ -300,6 +472,7 @@ pub async fn spawn_runner_with_shim(
 pub struct RunnerGuard {
     _child: tokio::process::Child,
     _temp: tempfile::TempDir,
+    pub nonce: uuid::Uuid,
 }
 
 #[cfg(debug_assertions)]

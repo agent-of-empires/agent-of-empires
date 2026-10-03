@@ -1712,6 +1712,8 @@ export interface DeleteSessionOptions {
 export interface WorkspaceDeleteFailure {
   id: string;
   error: string;
+  /** The runner is still tearing down, so the row was kept and a retry can still succeed. */
+  retryable?: boolean;
 }
 
 export interface DeleteWorkspaceResult {
@@ -1720,6 +1722,8 @@ export interface DeleteWorkspaceResult {
   messages?: string[];
   deleted?: string[];
   failed?: WorkspaceDeleteFailure[];
+  /** Every refusal was transient, so nothing was removed and the same call can be retried. */
+  pending?: boolean;
 }
 
 /** Atomically delete a workspace. `sessionIds[0]` owns the worktree and is removed last. */
@@ -1733,14 +1737,19 @@ export async function deleteWorkspace(
       jsonInit("DELETE", { session_ids: sessionIds, ...options }),
     );
     const failed = payload?.failed as WorkspaceDeleteFailure[] | undefined;
-    if (!ok) return { ok: false, error: rawMessage(payload) || `Server error (${status})`, failed };
+    if (!ok) {
+      // 409 `teardown_pending`: the server kept every row and restored their
+      // status, so this is a "still settling" conflict, not a failed delete.
+      const pending = payload?.error === "teardown_pending";
+      return { ok: false, pending, error: rawMessage(payload) || `Server error (${status})`, failed };
+    }
     // Without a `deleted` array, deletion is unconfirmed; keep local state for those sessions.
     if (!Array.isArray(payload?.deleted)) {
       return { ok: false, error: "Server did not confirm which sessions were deleted" };
     }
     return { ok: true, messages: payload.messages as string[] | undefined, deleted: payload.deleted, failed };
   } catch (e) {
-    return { ok: false, error: networkError(e) };
+    return { ok: false, pending: false, error: networkError(e) };
   }
 }
 

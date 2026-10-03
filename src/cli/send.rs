@@ -152,7 +152,9 @@ mod tests {
             }
             shelve(&mut inst);
             let id = inst.id.clone();
-            Storage::new_unwatched(profile)
+            crate::session::create_profile(profile).unwrap();
+            // Strict: shelving a row must not create the profile it lives in.
+            Storage::open_unwatched(profile)
                 .unwrap()
                 .update(|rows, _| {
                     *rows = vec![inst.clone()];
@@ -188,6 +190,7 @@ mod tests {
             let mut inst = Instance::new("live-archived", "/tmp/x");
             inst.archive();
             let id = inst.id.clone();
+            crate::session::create_profile(profile).unwrap();
             Storage::new_unwatched(profile)
                 .unwrap()
                 .update(|rows, _| {

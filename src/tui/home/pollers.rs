@@ -152,6 +152,31 @@ impl HomeView {
         match self.trash_poller.try_recv_result() {
             Ok(result) => {
                 let mut changed = false;
+                let mut applied_authoritative = false;
+                // A restore of a newer generation can land while this result sits in
+                // the channel. The durable row is the authority: comparing against
+                // the local generation would not see it, because a restore does not
+                // mirror the durable generation back. The value applied is that
+                // durable row, never the result, which is what the generation
+                // comparison is there to reject.
+                if let Some(durable) =
+                    self.load_durable_instance(&result.session_id)
+                        .filter(|durable| {
+                            result.authoritative.as_ref().is_some_and(|authoritative| {
+                                durable.lifecycle_generation >= authoritative.lifecycle_generation
+                            })
+                        })
+                {
+                    if let Some(instance) = self.instances.get_mut(&result.session_id) {
+                        instance.trashed_at = durable.trashed_at;
+                        instance.project_path = durable.project_path;
+                        instance.pre_trash_project_path = durable.pre_trash_project_path;
+                        instance.lifecycle_generation = durable.lifecycle_generation;
+                        instance.lifecycle_reservation = durable.lifecycle_reservation;
+                        changed = true;
+                    }
+                    applied_authoritative = true;
+                }
                 if let Some(relocation) = result.relocation {
                     let durable = self.load_durable_instance(&result.session_id);
                     if let Some(durable) = durable.filter(|instance| {
@@ -166,6 +191,9 @@ impl HomeView {
                             changed = true;
                         }
                     }
+                }
+                if !applied_authoritative && self.reload().is_ok() {
+                    changed = true;
                 }
                 if let Some(reason) = result.relocate_warning {
                     tracing::warn!(

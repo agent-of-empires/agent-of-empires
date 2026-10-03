@@ -219,6 +219,13 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         extra_allowed_origins,
     } = config;
 
+    let default_profile = if profile.is_empty() {
+        Some(crate::session::resolve_profile_name(profile)?)
+    } else {
+        None
+    };
+    let profile = default_profile.as_deref().unwrap_or(profile);
+
     raise_fd_limit();
 
     // Single live `FileWatchService` per daemon.

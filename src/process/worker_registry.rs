@@ -14,15 +14,15 @@ use crate::util::now_secs;
 pub use crate::process::worker::{is_pid_alive, validate_id as validate_session_id};
 
 /// Runner protocol generation. Generation 4 announces authoritative native session identity
-/// before callbacks; the control wire version stays 3. Separate from liveness: a
-/// wrong-generation process is live and must be reaped before its replacement starts.
+/// before callbacks; the control wire version stays 3. A stale live process must
+/// be authenticated and proven quiescent before its replacement starts.
 pub const RUNNER_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerRecord {
     pub runner_version: u32,
     /// Build identity of the runner that wrote the record; independent of `runner_version`.
-    /// Legacy records default to "", which forces a one-time respawn.
+    /// Legacy records default to ""; they still require authenticated teardown proof.
     #[serde(default)]
     pub build_version: String,
     pub session_id: String,
@@ -39,9 +39,12 @@ pub struct WorkerRecord {
     pub stored_acp_session_id: Option<String>,
     #[serde(default)]
     pub source_profile: Option<String>,
-    /// Together with `pid`, identifies the exact runner process. Older records default to 0.
+    /// Lease ordering for restart markers. Authentication uses the launch nonce.
     #[serde(default)]
     pub generation: u64,
+    /// Parent-issued execution ticket; legacy records carry no stop authority.
+    #[serde(default)]
+    pub launch_nonce: Option<uuid::Uuid>,
     pub started_at: u64,
     pub last_attached_at: Option<u64>,
     pub detached_at: Option<u64>,
@@ -77,6 +80,7 @@ impl WorkerRecord {
             stored_acp_session_id,
             source_profile,
             generation: 0,
+            launch_nonce: None,
             started_at: now_secs(),
             last_attached_at: None,
             detached_at: None,
@@ -163,6 +167,28 @@ pub fn save(record: &WorkerRecord) -> Result<()> {
     with_registry_lock(&record.session_id, || save_unlocked(record))
 }
 
+/// Publishes the listener and record under the same fence as owned cleanup.
+#[cfg(unix)]
+pub(crate) fn publish_control_listener(
+    record: &WorkerRecord,
+    socket: &Path,
+) -> Result<tokio::net::UnixListener> {
+    with_registry_lock(&record.session_id, || {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::remove_file(socket);
+        let listener = tokio::net::UnixListener::bind(socket)
+            .with_context(|| format!("binding {}", socket.display()))?;
+        let publish = std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600))
+            .context("securing runner control socket")
+            .and_then(|()| save_unlocked(record));
+        if let Err(error) = publish {
+            let _ = std::fs::remove_file(socket);
+            return Err(error);
+        }
+        Ok(listener)
+    })
+}
+
 fn save_unlocked(record: &WorkerRecord) -> Result<()> {
     let dir = workers_dir()?;
     let final_path = dir.join(format!("{}.json", record.session_id));
@@ -226,6 +252,13 @@ pub fn load(session_id: &str) -> Result<Option<WorkerRecord>> {
         }
     }
 }
+/// [`load`] without folding a record it cannot read into "no runner": an
+/// unreadable record answers `Err`, which a caller about to destroy a checkout
+/// has to refuse on rather than treat as an absent session.
+pub fn load_strict(session_id: &str) -> Result<Option<WorkerRecord>> {
+    load_strict_unlocked(session_id)
+}
+
 fn load_strict_unlocked(session_id: &str) -> Result<Option<WorkerRecord>> {
     let path = record_path(session_id)?;
     match std::fs::read(&path) {
@@ -267,7 +300,8 @@ pub fn list() -> Result<Vec<WorkerRecord>> {
     Ok(out)
 }
 
-pub fn delete(session_id: &str) -> Result<()> {
+#[cfg(test)]
+pub(crate) fn delete(session_id: &str) -> Result<()> {
     with_registry_lock(session_id, || delete_unlocked(session_id))
 }
 
@@ -286,37 +320,21 @@ fn delete_unlocked(session_id: &str) -> Result<()> {
     Ok(())
 }
 
-/// A replacement save uses the same lock, so it lands either before the check or after cleanup.
-pub fn delete_if_owned(session_id: &str, owner_pid: u32) -> Result<bool> {
-    with_registry_lock(session_id, || match load_strict_unlocked(session_id)? {
-        Some(record) if record.pid == owner_pid => {
-            delete_unlocked(session_id)?;
-            Ok(true)
-        }
-        Some(record) => {
-            debug!(
-                target: "acp.registry",
-                session = %session_id,
-                owner_pid,
-                current_pid = record.pid,
-                "skipping cleanup owned by a replacement runner"
-            );
-            Ok(false)
-        }
-        None => Ok(false),
-    })
-}
-
 fn update_if_owned(
     session_id: &str,
     owner_pid: u32,
+    owner_generation: u64,
+    owner_nonce: uuid::Uuid,
     update: impl FnOnce(&mut WorkerRecord),
 ) -> Result<bool> {
     with_registry_lock(session_id, || {
         let Some(mut record) = load_strict_unlocked(session_id)? else {
             return Ok(false);
         };
-        if record.pid != owner_pid {
+        if record.pid != owner_pid
+            || record.generation != owner_generation
+            || record.launch_nonce != Some(owner_nonce)
+        {
             return Ok(false);
         }
         update(&mut record);
@@ -325,18 +343,8 @@ fn update_if_owned(
     })
 }
 
-fn delete_if_absent(session_id: &str) -> Result<bool> {
-    with_registry_lock(session_id, || {
-        if load_strict_unlocked(session_id)?.is_some() {
-            return Ok(false);
-        }
-        delete_unlocked(session_id)?;
-        Ok(true)
-    })
-}
-
-pub fn mark_attached(session_id: &str, owner_pid: u32) {
-    if let Err(error) = update_if_owned(session_id, owner_pid, |record| {
+pub fn mark_attached(session_id: &str, owner_pid: u32, generation: u64, nonce: uuid::Uuid) {
+    if let Err(error) = update_if_owned(session_id, owner_pid, generation, nonce, |record| {
         record.last_attached_at = Some(now_secs());
         record.detached_at = None;
     }) {
@@ -348,8 +356,8 @@ pub fn mark_attached(session_id: &str, owner_pid: u32) {
     }
 }
 
-pub fn mark_detached(session_id: &str, owner_pid: u32) {
-    if let Err(error) = update_if_owned(session_id, owner_pid, |record| {
+pub fn mark_detached(session_id: &str, owner_pid: u32, generation: u64, nonce: uuid::Uuid) {
+    if let Err(error) = update_if_owned(session_id, owner_pid, generation, nonce, |record| {
         record.detached_at = Some(now_secs());
     }) {
         debug!(
@@ -360,9 +368,15 @@ pub fn mark_detached(session_id: &str, owner_pid: u32) {
     }
 }
 
-pub fn update_stored_acp_session_id(session_id: &str, owner_pid: u32, acp_id: &str) -> Result<()> {
+pub fn update_stored_acp_session_id(
+    session_id: &str,
+    owner_pid: u32,
+    generation: u64,
+    nonce: uuid::Uuid,
+    acp_id: &str,
+) -> Result<()> {
     anyhow::ensure!(!acp_id.is_empty(), "ACP session id must not be empty");
-    let updated = update_if_owned(session_id, owner_pid, |record| {
+    let updated = update_if_owned(session_id, owner_pid, generation, nonce, |record| {
         record.stored_acp_session_id = Some(acp_id.to_string());
     })?;
     anyhow::ensure!(updated, "runner no longer owns its registry record");
@@ -443,67 +457,18 @@ fn socket_exists(path: &Path) -> bool {
     }
 }
 
-/// Falls back to `SO_PEERCRED` only when `load` errors; `Ok(None)` means the runner is gone.
-pub fn pid_source_for(session_id: &str) -> Option<u32> {
-    match load(session_id) {
-        Ok(Some(record)) => (record.pid > 0).then_some(record.pid),
-        Ok(None) => None,
-        Err(error) => {
-            let base = socket_path_for(session_id).ok()?;
-            let control = crate::process::worker::control_socket_sibling(&base);
-            let pid = crate::process::worker::peer_pid_from_socket(&control)
-                .or_else(|| crate::process::worker::peer_pid_from_socket(&base));
-            match pid {
-                Some(peer_pid) => warn!(
-                    target: "acp.registry",
-                    session = %session_id,
-                    pid = peer_pid,
-                    "worker registry unreadable; recovered runner PID from its socket: {error}"
-                ),
-                None => warn!(
-                    target: "acp.registry",
-                    session = %session_id,
-                    "worker registry unreadable and no peer PID was available: {error}"
-                ),
-            }
-            pid
-        }
-    }
-}
-
-/// Signals the whole process group, since it can outlive its leader.
-pub fn terminate(session_id: &str) {
-    let terminated_pid = pid_source_for(session_id);
-    if let Some(pid) = terminated_pid {
-        crate::process::worker::terminate_process_group(pid);
-        delete_if_owned(session_id, pid).ok();
-    } else {
-        delete_if_absent(session_id).ok();
-    }
-}
-/// Waits through escalation so the old process cannot clean up after the new one publishes.
-pub async fn terminate_and_wait(session_id: &str) {
-    let terminated_pid = pid_source_for(session_id);
-    if let Some(pid) = terminated_pid {
-        crate::process::worker::terminate_process_group(pid);
-        #[cfg(unix)]
-        {
-            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
-            while is_pid_alive(pid) && tokio::time::Instant::now() < deadline {
-                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-            }
-            crate::process::worker::kill_process_group(pid);
-        }
-        delete_if_owned(session_id, pid).ok();
-    } else {
-        delete_if_absent(session_id).ok();
-    }
-}
-
-pub fn delete_if_owned_by(session_id: &str, pid: u32, generation: u64) -> bool {
-    let identity = crate::acp::runner_lifecycle::RunnerIdentity { pid, generation };
+pub fn delete_if_owned_by(
+    session_id: &str,
+    pid: u32,
+    generation: u64,
+    launch_nonce: Option<uuid::Uuid>,
+) -> bool {
     with_registry_lock(session_id, || match load_strict_unlocked(session_id)? {
-        Some(rec) if !identity.matches_record(rec.pid, rec.generation) => {
+        Some(rec)
+            if rec.pid != pid
+                || rec.generation != generation
+                || rec.launch_nonce != launch_nonce =>
+        {
             debug!(
                 target: "acp.registry",
                 session = %session_id,
@@ -522,15 +487,6 @@ mod tests {
     use super::*;
     use serial_test::serial;
     use tempfile::TempDir;
-
-    struct KillOnDrop(std::process::Child);
-
-    impl Drop for KillOnDrop {
-        fn drop(&mut self) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
-        }
-    }
 
     fn with_temp_home<F: FnOnce()>(f: F) {
         // Keep worker socket paths below macOS sun_path limits.
@@ -642,9 +598,14 @@ mod tests {
             let mut rec = new_record("sess-empty-acp", 1, "/tmp/sess-empty-acp.sock");
             rec.stored_acp_session_id = Some("initial-acp".into());
             save(&rec).unwrap();
-            let error = update_stored_acp_session_id("sess-empty-acp", 1, "")
-                .expect_err("empty session ids are invalid");
-            assert!(error.to_string().contains("must not be empty"));
+            assert!(update_stored_acp_session_id(
+                "sess-empty-acp",
+                1,
+                0,
+                uuid::Uuid::from_u128(1),
+                ""
+            )
+            .is_err());
             let loaded = load("sess-empty-acp").unwrap().unwrap();
             assert_eq!(loaded.stored_acp_session_id.as_deref(), Some("initial-acp"));
         });
@@ -678,10 +639,10 @@ mod tests {
             record.pid = 222;
             save(&record).unwrap();
 
-            assert!(!delete_if_owned(session_id, 111).unwrap());
+            assert!(delete_if_owned_by(session_id, 111, 0, None));
             assert_eq!(load(session_id).unwrap().unwrap().pid, 222);
             assert!(replacement_control.exists());
-            assert!(delete_if_owned(session_id, 222).unwrap());
+            assert!(delete_if_owned_by(session_id, 222, 0, None));
             assert!(load(session_id).unwrap().is_none());
             assert!(!replacement_control.exists());
         });
@@ -692,83 +653,28 @@ mod tests {
     fn mark_attached_clears_detached() {
         with_temp_home(|| {
             let mut rec = new_record("x", 1, "/tmp/x.sock");
+            let nonce = uuid::Uuid::from_u128(1);
+            rec.launch_nonce = Some(nonce);
             rec.detached_at = Some(100);
             save(&rec).unwrap();
-            mark_attached("x", 1);
+            mark_attached("x", 1, 0, nonce);
             let after = load("x").unwrap().unwrap();
             assert!(after.last_attached_at.is_some());
             assert!(after.detached_at.is_none());
             let mut replacement = after;
-            replacement.pid = 2;
+            replacement.launch_nonce = Some(uuid::Uuid::from_u128(2));
+            replacement.stored_acp_session_id = Some("replacement-session".into());
             replacement.detached_at = Some(200);
             save(&replacement).unwrap();
-            mark_attached("x", 1);
+            mark_attached("x", 1, 0, nonce);
+            assert!(update_stored_acp_session_id("x", 1, 0, nonce, "obsolete-session").is_err());
             let preserved = load("x").unwrap().unwrap();
-            assert_eq!(preserved.pid, 2);
+            assert_eq!(preserved.launch_nonce, Some(uuid::Uuid::from_u128(2)));
             assert_eq!(preserved.detached_at, Some(200));
-        });
-    }
-
-    #[test]
-    #[serial]
-    fn terminate_deletes_entry_for_dead_pid() {
-        with_temp_home(|| {
-            let rec = new_record("term-dead", 2_000_000_000, "/tmp/term-dead.sock");
-            save(&rec).unwrap();
-            assert!(record_path("term-dead").unwrap().exists());
-            terminate("term-dead");
-            assert!(!record_path("term-dead").unwrap().exists());
-        });
-    }
-
-    #[test]
-    #[serial]
-    fn terminate_missing_entry_is_noop() {
-        with_temp_home(|| {
-            terminate("does-not-exist");
-            assert!(!record_path("does-not-exist").unwrap().exists());
-        });
-    }
-
-    #[test]
-    #[serial]
-    fn pid_source_for_prefers_record_pid_when_load_ok_some() {
-        with_temp_home(|| {
-            let rec = new_record("sess-ok-some", 4242, "/tmp/unused");
-            save(&rec).unwrap();
-            assert_eq!(pid_source_for("sess-ok-some"), Some(4242));
-        });
-    }
-
-    #[test]
-    #[serial]
-    fn pid_source_for_returns_none_when_load_ok_none() {
-        with_temp_home(|| {
-            assert_eq!(pid_source_for("sess-missing"), None);
-        });
-    }
-
-    #[cfg(unix)]
-    #[test]
-    #[serial]
-    fn pid_source_for_falls_back_to_control_socket_on_load_err() {
-        with_temp_home(|| {
-            let session_id = "sess-load-err";
-            let rec = new_record(session_id, 4242, socket_path_for(session_id).unwrap());
-            save(&rec).unwrap();
-            let rec_path = record_path(session_id).unwrap();
-            // A directory keeps path.exists() true while std::fs::read fails, even for root.
-            std::fs::remove_file(&rec_path).unwrap();
-            std::fs::create_dir(&rec_path).unwrap();
-            assert!(
-                load(session_id).is_err(),
-                "fixture must force load() to return Err"
+            assert_eq!(
+                preserved.stored_acp_session_id.as_deref(),
+                Some("replacement-session")
             );
-
-            let raw_socket = socket_path_for(session_id).unwrap();
-            let control_socket = crate::process::worker::control_socket_sibling(&raw_socket);
-            let _listener = std::os::unix::net::UnixListener::bind(&control_socket).unwrap();
-            assert_eq!(pid_source_for(session_id), Some(std::process::id()));
         });
     }
 
@@ -810,59 +716,6 @@ mod tests {
                 kept_log.exists(),
                 "non-empty worker log should survive delete for post-mortem"
             );
-        });
-    }
-
-    #[test]
-    #[serial]
-    #[cfg(unix)]
-    fn live_legacy_records_are_live_but_stale_and_terminate_reaps_them() {
-        use std::os::unix::process::CommandExt as _;
-
-        with_temp_home(|| {
-            for version in [1, 3] {
-                // Its own process group, so the killpg lands on it alone rather than on
-                // the test runner.
-                let mut victim = KillOnDrop(
-                    std::process::Command::new("sleep")
-                        .arg("60")
-                        .process_group(0)
-                        .spawn()
-                        .expect("spawn stand-in runner"),
-                );
-                let session_id = format!("v{version}sess");
-                let sock = workers_dir().unwrap().join(format!("{session_id}.sock"));
-                let mut rec = new_record(&session_id, victim.0.id(), sock);
-                rec.runner_version = version;
-                // Legacy relay and control-only runners use different socket paths.
-                std::fs::write(expected_socket(&rec), b"").unwrap();
-                save(&rec).unwrap();
-
-                assert!(
-                    is_record_live(&rec),
-                    "a live legacy runner must not read as dead: its record holds the only copy of the pid"
-                );
-                assert!(
-                    !is_runner_current(&rec),
-                    "a legacy runner is a generation behind, so the reconciler must replace it"
-                );
-
-                terminate(&session_id);
-
-                // Signalled, not merely forgotten.
-                let reaped = (0..40).any(|_| {
-                    if matches!(victim.0.try_wait(), Ok(Some(_))) {
-                        return true;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(50));
-                    false
-                });
-                assert!(
-                    reaped,
-                    "terminate must signal the live legacy runner, not orphan it"
-                );
-                assert!(!record_path(&session_id).unwrap().exists());
-            }
         });
     }
 
@@ -955,21 +808,31 @@ mod tests {
     fn delete_if_owned_by_leaves_a_replacement_record() {
         with_temp_home(|| {
             let socket = workers_dir().unwrap().join("g.sock");
-            let rec = new_record("g", 41, socket).with_generation(3);
+            let nonce = uuid::Uuid::from_u128(1);
+            let replacement = uuid::Uuid::from_u128(2);
+            let mut rec = new_record("g", 41, socket).with_generation(3);
+            rec.launch_nonce = Some(nonce);
             save(&rec).unwrap();
             assert!(
-                delete_if_owned_by("g", 40, 3),
+                delete_if_owned_by("g", 40, 3, Some(nonce)),
                 "other pid: settled without touching"
             );
             assert!(load("g").unwrap().is_some());
             assert!(
-                delete_if_owned_by("g", 41, 4),
+                delete_if_owned_by("g", 41, 4, Some(nonce)),
                 "other generation: settled, kept"
             );
             assert!(load("g").unwrap().is_some());
-            assert!(delete_if_owned_by("g", 41, 3));
+            assert!(delete_if_owned_by("g", 41, 3, Some(replacement)));
+            assert_eq!(load("g").unwrap().unwrap().launch_nonce, Some(nonce));
+            assert!(delete_if_owned_by("g", 41, 3, None));
+            assert_eq!(load("g").unwrap().unwrap().launch_nonce, Some(nonce));
+            assert!(delete_if_owned_by("g", 41, 3, Some(nonce)));
             assert!(load("g").unwrap().is_none());
-            assert!(delete_if_owned_by("g", 41, 3), "missing record is settled");
+            assert!(
+                delete_if_owned_by("g", 41, 3, Some(nonce)),
+                "missing record is settled"
+            );
         });
     }
 }

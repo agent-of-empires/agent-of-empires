@@ -359,9 +359,54 @@ Pages wired down:                        300000.
     }
 }
 
-/// `kern.boottime` shifts on clock steps; the session UUID does not.
+pub(super) fn process_incarnation(pid: u32) -> std::io::Result<Option<super::ProcessIncarnation>> {
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
+    let size = std::mem::size_of::<libc::proc_bsdinfo>();
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid as i32,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size as i32,
+        )
+    };
+    if written == 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            return Ok(None);
+        }
+        return Err(error);
+    }
+    if written != size as i32 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "incomplete process incarnation",
+        ));
+    }
+    // PROC_PIDTBSDINFO returned the complete fixed-size structure.
+    let info = unsafe { info.assume_init() };
+    if info.pbi_pid != pid {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "process identity differs",
+        ));
+    }
+    Ok(Some(super::ProcessIncarnation {
+        pid,
+        group: info.pbi_pgid,
+        start: [info.pbi_start_tvsec, info.pbi_start_tvusec],
+        namespace: [0, 0],
+    }))
+}
+
+pub(super) fn process_namespace() -> std::io::Result<[u64; 2]> {
+    Ok([0, 0])
+}
+
+/// The session UUID is independent of clock steps.
 pub(super) fn boot_id() -> Option<String> {
-    let out = Command::new("sysctl")
+    let out = Command::new("/usr/sbin/sysctl")
         .args(["-n", "kern.bootsessionuuid"])
         .output()
         .ok()?;
@@ -369,13 +414,72 @@ pub(super) fn boot_id() -> Option<String> {
         return None;
     }
     let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if s.is_empty() {
-        None
-    } else {
-        Some(s)
+    (!s.is_empty()).then_some(s)
+}
+
+/// Report non-zombie group members. Probe failures do not prove absence.
+pub(super) fn process_group_has_live_members(pgrp: u32) -> std::io::Result<bool> {
+    use nix::{errno::Errno, sys::signal::killpg, unistd::Pid};
+
+    match killpg(Pid::from_raw(pgrp as i32), None) {
+        // Darwin excludes zombies from its permission check.
+        Ok(()) | Err(Errno::EPERM) => {}
+        Err(Errno::ESRCH) => return Ok(false),
+        Err(error) => return Err(std::io::Error::from_raw_os_error(error as i32)),
+    }
+    // Match the explicit group column, not BSD ps -g.
+    let output = Command::new("/bin/ps")
+        .args(["-o", "pid=,pgid=,state=", "-A"])
+        .output()
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    if !output.status.success() {
+        return Err(std::io::Error::other(format!(
+            "ps exited with {}",
+            output.status
+        )));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let _pid = fields.next()?;
+            let group = fields.next()?;
+            let state = fields.next()?;
+            (group.parse::<u32>() == Ok(pgrp)).then_some(state)
+        })
+        // BSD state suffixes do not change the leading zombie state.
+        .any(|state| !state.starts_with('Z')))
+}
+
+/// Darwin cannot reap an unrelated process, so query its state instead.
+pub(super) fn is_terminated(pid: u32) -> bool {
+    match process_state(pid) {
+        Ok(state) => state.starts_with('Z'),
+        // Neither query failure nor an absent row proves termination.
+        _ => false,
     }
 }
 
+/// The BSD state field of one process. BSD `ps` prints the state letter
+/// followed by its flags, so a zombie reads `ZN` rather than `Z`.
+fn process_state(pid: u32) -> Result<String, std::io::Error> {
+    let output = Command::new("/bin/ps")
+        .args(["-o", "state=", "-p", &pid.to_string()])
+        .output()
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    if !output.status.success() {
+        return Err(std::io::Error::other(format!(
+            "ps -p {pid} exited with {}",
+            output.status
+        )));
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| std::io::Error::other(format!("ps -p {pid} printed no state")))
+}
 pub(super) fn parent_and_argv0(pid: u32) -> Option<(u32, String)> {
     let output = Command::new("ps")
         .args(["-o", "ppid=,args=", "-p", &pid.to_string()])

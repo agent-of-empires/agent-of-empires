@@ -10,6 +10,52 @@ use super::spawn::{
     SpawnConfig,
 };
 
+/// Construction guard: cancellation can retire only this issued execution ticket.
+pub(super) struct DetachedLaunch {
+    pub pid: Option<u32>,
+    pub nonce: uuid::Uuid,
+    pub native_store: Option<crate::session::ExecutionBinding>,
+    owner: Option<(String, String)>,
+    runtime: tokio::runtime::Handle,
+}
+
+impl DetachedLaunch {
+    pub fn commit(&mut self) {
+        self.owner = None;
+    }
+
+    pub async fn retire(&mut self) -> anyhow::Result<()> {
+        let Some((profile, id)) = self.owner.as_ref() else {
+            return Ok(());
+        };
+        crate::session::runner_journal::settle_nonce(
+            crate::session::deletion::SessionPathOwner {
+                profile,
+                session_id: id,
+            },
+            self.nonce,
+            None,
+        )
+        .await?;
+        self.owner = None;
+        Ok(())
+    }
+}
+
+impl Drop for DetachedLaunch {
+    fn drop(&mut self) {
+        let Some((profile, id)) = self.owner.take() else {
+            return;
+        };
+        let nonce = self.nonce;
+        self.runtime.spawn(async move {
+            if let Err(error) = crate::session::runner_journal::settle_nonce(crate::session::deletion::SessionPathOwner { profile: &profile, session_id: &id }, nonce, None).await {
+                warn!(target: "acp", session = %id, %nonce, "cancelled launch remains protected: {error:#}");
+            }
+        });
+    }
+}
+
 /// Deadline for the runner socket to appear. 10s suffices in production, but
 /// a debug-build cold start under CI load blows past it deterministically, so
 /// debug builds honor `AOE_ACP_RUNNER_SOCKET_TIMEOUT_MS`.
@@ -52,12 +98,24 @@ pub(super) fn take_injected_fresh_handshake_failure() -> bool {
 /// The runner owns the agent subprocess and outlives the daemon, so no `Child`
 /// handle is kept: the daemon reaches it over the unix socket, and the OS keeps
 /// it alive across `aoe serve` restarts.
-pub(super) fn spawn_runner_detached(
+pub(super) async fn spawn_runner_detached(
     config: &SpawnConfig,
     socket_path: &std::path::Path,
     session_id: String,
     session_sandbox: Option<&SessionSandbox>,
-) -> Result<(u32, Option<crate::session::ExecutionBinding>), AcpError> {
+) -> Result<DetachedLaunch, AcpError> {
+    let profile = config
+        .managed_profile
+        .as_deref()
+        .ok_or_else(|| AcpError::Spawn("detached runner has no stored owner".into()))?;
+    let launch = crate::session::runner_journal::ManagedLaunch::new(
+        crate::session::deletion::SessionPathOwner {
+            profile,
+            session_id: &session_id,
+        },
+        config.generation,
+    )
+    .map_err(|error| AcpError::Spawn(format!("runner authorization: {error:#}")))?;
     let current_exe =
         std::env::current_exe().map_err(|e| AcpError::Spawn(format!("current_exe: {e}")))?;
     let log_path = crate::process::worker_registry::log_path_for(&session_id)
@@ -154,12 +212,11 @@ pub(super) fn spawn_runner_detached(
     if !provider_keys.is_empty() {
         cmd.arg("--provider-env-keys").arg(provider_keys.join(","));
     }
-    if let Some(profile) = config.source_profile.as_deref().filter(|s| !s.is_empty()) {
-        cmd.arg("--source-profile").arg(profile);
-    }
+
     if let Some(stored) = &config.stored_acp_session_id {
         cmd.arg("--stored-acp-session-id").arg(stored);
     }
+    launch.configure(&mut cmd);
     cmd.arg("--generation").arg(config.generation.to_string());
     cmd.arg("--");
     if let Some(s) = &sandbox_argv {
@@ -243,11 +300,8 @@ pub(super) fn spawn_runner_detached(
         }
     }
 
-    // The runner writes its own log file. Inheriting our stdio would put
-    // per-session noise in debug.log and leave the runner reading EOF on its
-    // own stdin once the daemon dies.
-    cmd.stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
+    // Runner logs independently of its daemon.
+    cmd.stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
 
     info!(
@@ -261,21 +315,40 @@ pub(super) fn spawn_runner_detached(
     );
 
     let native_store = super::spawn::native_store_snapshot(config, cmd.as_std(), &host_environment);
-    let mut child = cmd.spawn().map_err(|e| {
-        warn!(
-            target: "acp.protocol.spawn",
-            session = %session_id,
-            "runner spawn failed: {e}"
-        );
-        AcpError::Spawn(format!("spawn runner: {e}"))
-    })?;
-    let pid = child
-        .id()
-        .ok_or_else(|| AcpError::Spawn("runner exited before it could be identified".into()))?;
-    // Reap it, so a finished runner does not linger as a zombie that still
-    // answers `kill(pid, 0)` and keeps a teardown from proving it gone.
-    tokio::spawn(async move {
-        let _ = child.wait().await;
+    let nonce = launch.nonce();
+    let mut captured = None;
+    let spawned = launch.spawn(&mut cmd, |identity| {
+        captured = Some(identity);
+        if let Some(admission) = &config.execution_admission {
+            admission.capture(identity);
+        }
     });
-    Ok((pid, native_store))
+    let mut issued = DetachedLaunch {
+        pid: captured.map(|identity| identity.pid),
+        nonce,
+        native_store,
+        owner: Some((profile.to_owned(), session_id)),
+        runtime: tokio::runtime::Handle::current(),
+    };
+    match spawned {
+        Ok(pid) => issued.pid = Some(pid),
+        Err(error) => {
+            let settled = match issued.retire().await {
+                Ok(()) => true,
+                Err(unproven) => {
+                    warn!(target: "acp", %nonce, "partial launch remains protected: {unproven:#}");
+                    false
+                }
+            };
+            return Err(AcpError::IssuedExecution {
+                identity: captured,
+                launch_nonce: nonce,
+                settled,
+                source: Box::new(AcpError::Spawn(format!(
+                    "spawn authorized runner: {error:#}"
+                ))),
+            });
+        }
+    }
+    Ok(issued)
 }

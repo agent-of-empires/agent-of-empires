@@ -297,6 +297,46 @@ test.describe("Empty Trash", () => {
 // back to the dashboard. The dialog's checkbox-to-DELETE-body mapping is
 // covered by the DeleteSessionDialog vitest.
 test.describe("Delete active session", () => {
+  test("pending delete retains the active row and route until a successful retry", async ({ page }) => {
+    const handle = await installTrashMocks(page, [
+      {
+        id: "sess-pending",
+        title: "story-delete-pending",
+        projectPath: "/tmp/story",
+        trashed: false,
+        status: "Running",
+        deleteToTrash: false,
+      },
+    ]);
+    let pending = true;
+    await page.route("**/api/workspaces", async (route) => {
+      if (route.request().method() === "DELETE" && pending) {
+        pending = false;
+        await route.fulfill({
+          status: 409,
+          json: { error: "teardown_pending", message: "runner execution is still live" },
+        });
+      } else {
+        await route.fallback();
+      }
+    });
+    await page.goto("/session/sess-pending");
+    const row = sessionRows(page).filter({ hasText: "story-delete-pending" }).first();
+    const refused = page.waitForResponse(
+      (response) => response.url().endsWith("/api/workspaces") && response.status() === 409,
+    );
+    const dialog = await openDeleteDialogFromRow(page, row);
+    await confirmDelete(dialog);
+    await refused;
+    await expect(dialog).toHaveCount(0);
+    await expect(page).toHaveURL(/\/session\/sess-pending/);
+    await expect(row).toBeVisible();
+    expect(handle.deletedIds).toEqual([]);
+    await confirmDelete(await openDeleteDialogFromRow(page, row));
+    await expect.poll(() => handle.deletedIds).toEqual(["sess-pending"]);
+    await expect(page).not.toHaveURL(/\/session\/sess-pending/);
+    await expect(row).toHaveCount(0);
+  });
   test("deleting the active session removes the row and falls back to /", async ({ page }) => {
     const handle = await installTrashMocks(page, [
       {

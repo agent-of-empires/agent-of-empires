@@ -112,6 +112,7 @@ async fn observe_parked_turn(
         None,
         "claude".into(),
         None,
+        _runner.nonce,
     )
     .await
     .expect("attach to the parked runner");
@@ -282,7 +283,7 @@ async fn silent_orphan_suppressed_while_off_protocol_work_is_pending() {
 async fn background_bash_wrap_up_ends_as_prompt_complete() {
     skip_without_shim!();
     let outcome = observe_parked_turn(
-        "silent-orphan-background-bash-wrap-up",
+        "so-bash-wrap",
         ("60000", "300"),
         "BACKGROUND_BASH_ORPHAN WRAP_UP trigger",
         None,

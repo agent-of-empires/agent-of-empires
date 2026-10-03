@@ -3076,8 +3076,8 @@ impl HomeView {
     /// view opens through this: both modes route keystrokes away from the home view and
     /// paint the preview pane, so they cannot coexist.
     pub(in crate::tui) fn exit_live_send_if_active(&mut self) {
-        if let Some(state) = self.live_send.clone() {
-            self.exit_live_send_and_restore_sizing(&state);
+        if self.live_send.is_some() {
+            self.teardown_live_send();
         }
     }
 
@@ -3798,8 +3798,8 @@ impl HomeView {
         // target `live_send`. Committing one while still live would desync the two, so
         // leave live mode first. Cancelling never reaches here, so Esc still returns to
         // live mode.
-        if let Some(state) = self.live_send.clone() {
-            self.exit_live_send_and_restore_sizing(&state);
+        if self.live_send.is_some() {
+            self.teardown_live_send();
         }
         match action {
             PaletteAction::Invoke(id) => {
@@ -4321,17 +4321,30 @@ impl HomeView {
     /// the live-send target, so it stays in sequence with typed keystrokes; otherwise a
     /// one-shot send is forked. True when something was dispatched.
     fn send_to_preview_pane(&self, key: live_send::TmuxKey) -> bool {
-        let Some(target) = self.preview_capture_target.as_deref() else {
+        let cache = self.active_preview_cache();
+        let Some(target) = cache.capture_target.as_deref() else {
+            return false;
+        };
+        if self.preview_capture_target.as_deref() != Some(target) {
+            return false;
+        }
+        let Some(session) = cache.capture_session.as_ref() else {
+            return false;
+        };
+        let Some(capture) = self.preview_capture_worker.as_ref() else {
+            return false;
+        };
+        let Some(admission) =
+            capture.preview_input_admission(session.clone(), cache.capture_generation)
+        else {
             return false;
         };
         if let (Some(worker), Some(live)) = (&self.live_send_worker, &self.live_send) {
             if live.tmux_name.as_str() == target {
-                worker.send(key);
-                return true;
+                return worker.send_to(session, key);
             }
         }
-        live_send::send_key_oneshot(target, key);
-        true
+        live_send::send_key_oneshot(admission, key)
     }
 
     /// The previewed agent's cursor when a mouse button event over the preview should go
@@ -5030,8 +5043,8 @@ impl HomeView {
             // A real row resolved here; the regular click path owns it.
             return false;
         }
-        if let Some(state) = self.live_send.clone() {
-            self.exit_live_send_and_restore_sizing(&state);
+        if self.live_send.is_some() {
+            self.teardown_live_send();
             return true;
         }
         false
@@ -5407,8 +5420,8 @@ impl HomeView {
                     // old session) and for the row already live: a single click is a "stop
                     // touching that" gesture. In `LiveSend` mode the `start_live_send`
                     // branch below retargets instead.
-                    if let Some(state) = self.live_send.clone() {
-                        self.exit_live_send_and_restore_sizing(&state);
+                    if self.live_send.is_some() {
+                        self.teardown_live_send();
                     }
                     None
                 } else {
@@ -5758,12 +5771,18 @@ impl HomeView {
         self.clear_preview_selection();
         if !self.has_non_live_send_overlay() {
             if let Some(state) = self.live_send.clone() {
+                if self.end_live_send_on_drift(&state) {
+                    return;
+                }
+                let mut accepted = false;
                 if let Some(worker) = &self.live_send_worker {
                     for key in split_paste_for_live_send(text) {
-                        worker.send(key);
+                        accepted |= worker.send(key);
                     }
                 }
-                self.stamp_last_accessed(&state.session_id);
+                if accepted {
+                    self.stamp_last_accessed(&state.session_id);
+                }
                 return;
             }
         }
@@ -5932,7 +5951,14 @@ impl HomeView {
         let Some(state) = self.live_send.clone() else {
             return;
         };
+        if live_send::chord_list_matches(&state.exit_chords, key) {
+            self.teardown_live_send();
+            return;
+        }
 
+        if self.end_live_send_on_drift(&state) {
+            return;
+        }
         // Leader menu: a prior keystroke matched the configured leader
         // (tmux-style prefix, default Ctrl+B), so this key picks a
         // live-send command instead of being forwarded. Always disarm
@@ -5962,9 +5988,7 @@ impl HomeView {
             match key.code {
                 KeyCode::Char('k') | KeyCode::Char('K') if plain => self.open_command_palette(),
                 KeyCode::Char('b') | KeyCode::Char('B') if plain => self.toggle_sidebar_collapsed(),
-                KeyCode::Char('q') | KeyCode::Char('Q') if plain => {
-                    self.exit_live_send_and_restore_sizing(&state)
-                }
+                KeyCode::Char('q') | KeyCode::Char('Q') if plain => self.teardown_live_send(),
                 // Esc, or any unbound or modified key, cancels the menu without
                 // forwarding: the leader already swallowed the keystroke, as tmux's
                 // prefix does for unknown keys.
@@ -6000,12 +6024,6 @@ impl HomeView {
             }
         }
 
-        // The exit chord is checked before drift: exiting is always safe, and a user
-        // escaping a stuck live mode shouldn't hit a "session ended" dialog on the way.
-        if live_send::chord_list_matches(&state.exit_chords, key) {
-            self.exit_live_send_and_restore_sizing(&state);
-            return;
-        }
         // Leader press: arm the live-send command menu and swallow the keystroke; the
         // next key goes to the pending-leader branch at the top. Checked after the exit
         // chord so a leader misconfigured as the exit chord still exits.
@@ -6015,9 +6033,6 @@ impl HomeView {
                 return;
             }
         }
-        if self.end_live_send_on_drift(&state) {
-            return;
-        }
         // Ctrl+C here is forwarded to the agent rather than quitting aoe (the app-level
         // handler defers to live-send via `is_live_send_capturing`). Flash the footer so
         // the user learns the keystroke landed on the agent; re-armed per press (#2894).
@@ -6026,8 +6041,12 @@ impl HomeView {
         match live_send::translate(key) {
             live_send::LiveDispatch::Ignore => {}
             live_send::LiveDispatch::Send(tmux_key) => {
-                if let Some(worker) = &self.live_send_worker {
-                    worker.send(tmux_key);
+                if !self
+                    .live_send_worker
+                    .as_ref()
+                    .is_some_and(|worker| worker.send(tmux_key))
+                {
+                    return;
                 }
                 if is_ctrl_c {
                     self.flash_ctrl_c_hint();
@@ -6044,28 +6063,17 @@ impl HomeView {
     /// inherits the preview-pinned window size, and detaching drops the user back into
     /// live mode rather than the home list (#2290). No-op when not live-sending.
     fn exit_live_send_before_attach(&mut self) {
-        if let Some(state) = self.live_send.clone() {
-            self.exit_live_send_and_restore_sizing(&state);
+        if self.live_send.is_some() {
+            self.teardown_live_send();
         }
     }
 
-    /// Tear down live-send state and restore the tmux window's automatic sizing:
-    /// live-send's resize loop forces manual sizing, which would leave the next attach
-    /// from a full-size terminal cramped at the preview dimensions. Re-setting
-    /// `window-size latest` is best-effort, so a stuck pane never blocks the exit.
-    fn exit_live_send_and_restore_sizing(&mut self, state: &live_send::LiveSendState) {
-        let session = crate::tmux::Session::from_name(&state.tmux_name);
-        session.reset_size_to_latest_client();
-        self.teardown_live_send();
-    }
-
-    /// Shared live-send teardown that touches no tmux sizing. Normal exits come through
-    /// `exit_live_send_and_restore_sizing`; the lost-lock exit calls this directly,
-    /// because the surface that took over has already sized the window and re-asserting
-    /// `window-size latest` would stomp it.
-    fn teardown_live_send(&mut self) {
+    pub(super) fn teardown_live_send(&mut self) {
         let live_session_id = self.live_send.take().map(|state| state.session_id);
         self.live_send_worker = None;
+        if let Some(capture) = self.preview_capture_worker.as_ref() {
+            capture.end_live_input();
+        }
         // Leave the capture worker running: the same pane is still previewed, just at the
         // idle cadence, which the render reconcile retunes.
         self.live_send_last_resize = None;
@@ -6099,6 +6107,13 @@ impl HomeView {
     ///
     /// The caller shows the message verbatim, so phrase it as a user-facing sentence.
     fn live_send_drift_reason(&self, state: &live_send::LiveSendState) -> Option<&'static str> {
+        if self
+            .live_send_worker
+            .as_ref()
+            .is_some_and(|worker| worker.target_lost())
+        {
+            return Some("The physical tmux pane changed while live mode was active.");
+        }
         let Some(inst) = self.get_instance(&state.session_id) else {
             return Some("Session was deleted while live mode was active.");
         };
@@ -6131,7 +6146,7 @@ impl HomeView {
         let Some(reason) = self.live_send_drift_reason(state) else {
             return false;
         };
-        self.exit_live_send_and_restore_sizing(state);
+        self.teardown_live_send();
         self.info_dialog = Some(InfoDialog::new("Live send ended", reason));
         true
     }
@@ -6144,6 +6159,19 @@ impl HomeView {
     /// Deliberately does not restore the window's sizing: the new owner already resized
     /// the window, and `window-size latest` would stomp it.
     pub(in crate::tui) fn poll_live_send_takeover(&mut self) -> bool {
+        let Some(state) = self.live_send.clone() else {
+            if self.live_send_worker.is_some() {
+                self.teardown_live_send();
+            }
+            return false;
+        };
+        if self
+            .live_send_worker
+            .as_ref()
+            .is_some_and(live_send::LiveSendWorker::target_lost)
+        {
+            return self.end_live_send_on_drift(&state);
+        }
         if !self
             .live_send_worker
             .as_ref()
@@ -6151,12 +6179,6 @@ impl HomeView {
         {
             return false;
         }
-        let Some(state) = self.live_send.clone() else {
-            // Worker outlived the live-send state (already torn down some
-            // other way); just drop it.
-            self.live_send_worker = None;
-            return false;
-        };
         // A dead or renamed session also fails the worker's ownership refresh, so prefer
         // the accurate drift message over blaming a takeover that never happened.
         if self.end_live_send_on_drift(&state) {
@@ -6164,7 +6186,11 @@ impl HomeView {
         }
         // Name the thief where the owner id is unambiguous: the web dashboard's live
         // viewers register as `live-*` (src/server/live_ws.rs), other TUIs as `tui-*`.
-        let message = match crate::tmux::Session::from_name(&state.tmux_name).size_owner() {
+        let message = match self
+            .live_send_worker
+            .as_ref()
+            .and_then(live_send::LiveSendWorker::size_owner)
+        {
             Some((id, _)) if id.starts_with("live-") => {
                 "The web dashboard took over this session's live view."
             }

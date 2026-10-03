@@ -1,21 +1,51 @@
 //! Per-session ownership of a structured-view runner.
 
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// Exact identity of a runner process: its pid plus the generation stamped
-/// into its registry record at spawn. Generation 0 (older records) matches on pid alone.
+/// Captured execution ticket of a runner. Legacy PID/generation alone are not authority.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RunnerIdentity {
     pub pid: u32,
     pub generation: u64,
+    pub launch_nonce: Option<uuid::Uuid>,
 }
 
 impl RunnerIdentity {
     /// Whether a registry record still describes this runner.
-    pub fn matches_record(&self, pid: u32, generation: u64) -> bool {
-        self.pid == pid
-            && (self.generation == 0 || generation == 0 || self.generation == generation)
+    pub fn matches_record(&self, record: &crate::process::worker_registry::WorkerRecord) -> bool {
+        self.launch_nonce.is_some()
+            && self.launch_nonce == record.launch_nonce
+            && self.pid == record.pid
+            && self.generation == record.generation
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ExecutionAdmission {
+    identity: Arc<Mutex<Option<RunnerIdentity>>>,
+}
+
+impl ExecutionAdmission {
+    pub(crate) fn new() -> Self {
+        Self {
+            identity: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    pub(crate) fn capture(&self, identity: RunnerIdentity) {
+        *self
+            .identity
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(identity);
+    }
+
+    pub(crate) fn snapshot(&self) -> Option<RunnerIdentity> {
+        *self
+            .identity
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
     }
 }
 
@@ -65,14 +95,12 @@ enum Phase {
         cancel: Option<String>,
     },
     Stopping {
-        /// Teardown attempts already made under this epoch.
+        identity: Option<RunnerIdentity>,
         attempts: u32,
-        /// When this teardown was claimed, so one whose driver went away
-        /// (a dropped request future) can be reclaimed by the retry pass.
         since: Instant,
     },
     TeardownRetry {
-        identity: RunnerIdentity,
+        identity: Option<RunnerIdentity>,
         attempts: u32,
     },
 }
@@ -117,49 +145,20 @@ pub enum StopDecision {
     AlreadyStopping,
 }
 
-/// Process signalling and liveness, so teardown can be driven against a
-/// fake in tests without spawning anything.
-pub trait ProcessControl: Send + Sync + 'static {
-    fn is_alive(&self, pid: u32) -> bool;
-    fn terminate_group(&self, pid: u32);
-    fn kill_group(&self, pid: u32);
-}
-
-pub struct SystemProcessControl;
-
-impl ProcessControl for SystemProcessControl {
-    /// pid 0 addresses the caller's own group and is never a runner.
-    fn is_alive(&self, pid: u32) -> bool {
-        pid != 0 && crate::process::worker::is_pid_alive_and_ours(pid)
-    }
-
-    fn terminate_group(&self, pid: u32) {
-        if pid != 0 {
-            crate::process::worker::terminate_process_group(pid);
-        }
-    }
-
-    fn kill_group(&self, pid: u32) {
-        if pid != 0 {
-            crate::process::worker::kill_process_group(pid);
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Settlement {
     /// Process-group exit and registry cleanup were proven.
     Proven,
-    /// The process survived escalation; keep ownership and retry.
-    Unproven(RunnerIdentity),
+    /// The execution or its ownership remains unproven; keep protection and retry.
+    Unproven(Option<RunnerIdentity>),
 }
 
 /// Pending teardown a retry pass should drive.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetryClaim {
     pub lease: Lease,
-    /// `None` for a reclaimed teardown whose driver never settled; the
-    /// registry record then names the runner.
+    /// None means no captured authenticated execution ticket; do not reload a
+    /// replacement identity or synthesize a PID to fill the gap.
     pub identity: Option<RunnerIdentity>,
     pub attempts: u32,
 }
@@ -273,6 +272,7 @@ impl LifecycleTable {
         };
         if let Some(reason) = cancel {
             entry.phase = Phase::Stopping {
+                identity,
                 attempts: 0,
                 since: Instant::now(),
             };
@@ -301,8 +301,7 @@ impl LifecycleTable {
         true
     }
 
-    /// Drop a running worker whose runner is left alive on disk (a
-    /// rate-limit park, a burned budget).
+    /// Release a running lease after the caller has proven its captured execution retired.
     pub fn release_running(&mut self, lease: &Lease) -> bool {
         let Some(entry) = self.current(lease) else {
             return false;
@@ -328,6 +327,7 @@ impl LifecycleTable {
             Phase::Running { identity } => {
                 let identity = *identity;
                 entry.phase = Phase::Stopping {
+                    identity,
                     attempts: 0,
                     since: Instant::now(),
                 };
@@ -351,6 +351,7 @@ impl LifecycleTable {
             Entry {
                 epoch,
                 phase: Phase::Stopping {
+                    identity: None,
                     attempts: 0,
                     since: Instant::now(),
                 },
@@ -364,7 +365,12 @@ impl LifecycleTable {
         let Some(entry) = self.current(lease) else {
             return;
         };
-        let Phase::Stopping { attempts, .. } = entry.phase else {
+        let Phase::Stopping {
+            identity: captured,
+            attempts,
+            ..
+        } = entry.phase
+        else {
             return;
         };
         match settlement {
@@ -373,7 +379,7 @@ impl LifecycleTable {
             }
             Settlement::Unproven(identity) => {
                 entry.phase = Phase::TeardownRetry {
-                    identity,
+                    identity: identity.or(captured),
                     attempts: attempts + 1,
                 };
             }
@@ -404,7 +410,7 @@ impl LifecycleTable {
 
     /// Turn a starting or respawning epoch that did build a runner into a
     /// teardown owned by the lease holder, who must then `settle`.
-    pub fn convert_to_stopping(&mut self, lease: &Lease) -> bool {
+    pub fn convert_to_stopping(&mut self, lease: &Lease, identity: Option<RunnerIdentity>) -> bool {
         let Some(entry) = self.current(lease) else {
             return false;
         };
@@ -415,6 +421,7 @@ impl LifecycleTable {
             return false;
         }
         entry.phase = Phase::Stopping {
+            identity,
             attempts: 0,
             since: Instant::now(),
         };
@@ -443,13 +450,16 @@ impl LifecycleTable {
     ) -> Option<RetryClaim> {
         let entry = self.entries.get_mut(session_id)?;
         let (identity, attempts) = match entry.phase {
-            Phase::TeardownRetry { identity, attempts } => (Some(identity), attempts),
-            Phase::Stopping { attempts, since } if since.elapsed() >= orphaned_after => {
-                (None, attempts)
-            }
+            Phase::TeardownRetry { identity, attempts } => (identity, attempts),
+            Phase::Stopping {
+                identity,
+                attempts,
+                since,
+            } if since.elapsed() >= orphaned_after => (identity, attempts),
             _ => return None,
         };
         entry.phase = Phase::Stopping {
+            identity,
             attempts,
             since: Instant::now(),
         };
@@ -502,6 +512,24 @@ impl LifecycleTable {
             Some(Phase::Running { .. }) => WorkerPhase::Running,
             Some(Phase::Stopping { .. } | Phase::TeardownRetry { .. }) => WorkerPhase::Stopping,
         }
+    }
+
+    /// Whether the session holds a spawn that has not installed a worker yet.
+    ///
+    /// Narrower than [`WorkerPhase::Resuming`] on purpose. A respawn's previous
+    /// worker may still be alive, and an `Attach` epoch is by construction a live
+    /// runner re-dialled from disk, which is why `occupied_slots` and
+    /// `counts_registry_record` both special-case that kind. Only a first spawn
+    /// has no runner at all, and nothing drains the ACP connection before
+    /// `install`, so only a first spawn is publishing nothing.
+    pub fn spawn_without_runner(&self, session_id: &str) -> bool {
+        matches!(
+            self.entries.get(session_id).map(|e| &e.phase),
+            Some(Phase::Starting {
+                kind: ResumeKind::Spawn,
+                ..
+            })
+        )
     }
 
     pub fn snapshot(&self) -> HashMap<String, WorkerPhase> {
@@ -558,64 +586,6 @@ impl LifecycleTable {
     }
 }
 
-/// Scripted process control for lifecycle tests.
-#[cfg(test)]
-pub(crate) mod test_support {
-    use super::ProcessControl;
-    use std::collections::HashSet;
-    use std::sync::Mutex;
-
-    #[derive(Default)]
-    pub(crate) struct FakeProcessControl {
-        alive: Mutex<HashSet<u32>>,
-        /// Pids that ignore SIGTERM and SIGKILL.
-        immortal: Mutex<HashSet<u32>>,
-        signals: Mutex<Vec<(u32, &'static str)>>,
-    }
-
-    impl FakeProcessControl {
-        pub(crate) fn alive(&self, pid: u32) -> &Self {
-            self.alive.lock().unwrap().insert(pid);
-            self
-        }
-
-        pub(crate) fn immortal(&self, pid: u32) -> &Self {
-            self.alive(pid);
-            self.immortal.lock().unwrap().insert(pid);
-            self
-        }
-
-        /// Let an immortal process finally exit.
-        pub(crate) fn exit(&self, pid: u32) {
-            self.alive.lock().unwrap().remove(&pid);
-        }
-
-        pub(crate) fn signals(&self) -> Vec<(u32, &'static str)> {
-            self.signals.lock().unwrap().clone()
-        }
-    }
-
-    impl ProcessControl for FakeProcessControl {
-        fn is_alive(&self, pid: u32) -> bool {
-            self.alive.lock().unwrap().contains(&pid)
-        }
-
-        fn terminate_group(&self, pid: u32) {
-            self.signals.lock().unwrap().push((pid, "TERM"));
-            if !self.immortal.lock().unwrap().contains(&pid) {
-                self.alive.lock().unwrap().remove(&pid);
-            }
-        }
-
-        fn kill_group(&self, pid: u32) {
-            self.signals.lock().unwrap().push((pid, "KILL"));
-            if !self.immortal.lock().unwrap().contains(&pid) {
-                self.alive.lock().unwrap().remove(&pid);
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -623,21 +593,45 @@ mod tests {
     const ID: &str = "s-1";
 
     fn identity(pid: u32, generation: u64) -> RunnerIdentity {
-        RunnerIdentity { pid, generation }
+        RunnerIdentity {
+            pid,
+            generation,
+            launch_nonce: Some(uuid::Uuid::from_u128(generation as u128 + 1)),
+        }
     }
 
+    /// `spawn_without_runner` must not answer for a respawn, whose previous
+    /// worker may still be alive, nor for an attach, which re-dials a runner
+    /// that never stopped: a destructive caller reading either as "no runner"
+    /// would remove the ACP event store and the managed worktree under it.
     #[test]
-    fn identity_matches_record_with_legacy_generation() {
-        let cases = [
-            (identity(7, 5), 7, 5, true),
-            (identity(7, 5), 7, 6, false),
-            (identity(7, 5), 8, 5, false),
-            (identity(7, 0), 7, 9, true),
-            (identity(7, 5), 7, 0, true),
-        ];
-        for (id, pid, generation, expected) in cases {
-            assert_eq!(id.matches_record(pid, generation), expected, "{id:?}");
-        }
+    fn spawn_without_runner_excludes_an_installed_worker_a_respawn_and_an_attach() {
+        let mut table = LifecycleTable::new(1);
+        let lease = table.admit(ID, ResumeKind::Spawn).expect("admitted");
+        assert!(table.spawn_without_runner(ID), "a spawn has no runner yet");
+
+        table
+            .install(&lease, Some(identity(4242, 1)))
+            .expect("installed");
+        assert!(
+            !table.spawn_without_runner(ID),
+            "an installed worker is a runner"
+        );
+
+        table.begin_respawn(&lease).expect("respawn");
+        assert!(
+            !table.spawn_without_runner(ID),
+            "a respawn is not a spawn: the previous worker may still be alive"
+        );
+
+        let mut attach = LifecycleTable::new(1);
+        attach
+            .admit("attached", ResumeKind::Attach)
+            .expect("admitted");
+        assert!(
+            !attach.spawn_without_runner("attached"),
+            "an attach epoch re-dials a live runner, so it is never runner-less"
+        );
     }
 
     #[test]
@@ -707,7 +701,7 @@ mod tests {
             })
         );
         assert_eq!(table.phase(ID), WorkerPhase::Stopping);
-        table.settle(&lease, Settlement::Unproven(identity(9, 1)));
+        table.settle(&lease, Settlement::Unproven(Some(identity(9, 1))));
         assert_eq!(table.phase(ID), WorkerPhase::Stopping);
 
         let grace = Duration::from_secs(15);
@@ -720,11 +714,8 @@ mod tests {
         );
         table.age_stopping(ID, grace);
         let orphan = table.claim_retry(ID, grace).unwrap();
-        assert_eq!(
-            orphan.identity, None,
-            "a stale claim is reclaimed without an identity"
-        );
-        table.settle(&orphan.lease, Settlement::Unproven(identity(9, 1)));
+
+        table.settle(&orphan.lease, Settlement::Unproven(Some(identity(9, 1))));
         let again = table.claim_retry(ID, grace).unwrap();
         assert_eq!(again.attempts, 3, "attempts accumulate per settled retry");
         table.settle(&again.lease, Settlement::Proven);
@@ -743,7 +734,7 @@ mod tests {
         assert!(!table.abandon(&old));
         assert!(!table.release_running(&old));
         assert!(table.begin_respawn(&old).is_err());
-        assert!(!table.convert_to_stopping(&old));
+        assert!(!table.convert_to_stopping(&old, None));
         table.settle(&old, Settlement::Proven);
         assert_eq!(table.phase(ID), WorkerPhase::Resuming);
 
@@ -785,7 +776,7 @@ mod tests {
     fn a_failed_start_that_built_a_runner_converts_to_a_teardown() {
         let mut table = LifecycleTable::new(1);
         let lease = table.admit(ID, ResumeKind::Spawn).unwrap();
-        assert!(table.convert_to_stopping(&lease));
+        assert!(table.convert_to_stopping(&lease, Some(identity(42, lease.epoch()))));
         assert_eq!(table.phase(ID), WorkerPhase::Stopping);
         assert!(
             !table.abandon(&lease),
@@ -801,7 +792,7 @@ mod tests {
         let lease = table.adopt_for_stop(ID).unwrap();
         assert_eq!(table.phase(ID), WorkerPhase::Stopping);
         assert!(table.adopt_for_stop(ID).is_none());
-        table.settle(&lease, Settlement::Unproven(identity(3, 0)));
+        table.settle(&lease, Settlement::Unproven(Some(identity(3, 0))));
         assert_eq!(
             table.retry_ids_after(Duration::from_secs(15)),
             vec![ID.to_string()]

@@ -5,28 +5,43 @@ use super::*;
 
 impl HomeView {
     pub fn save(&mut self) -> anyhow::Result<()> {
-        let mut all_peer_deleted: Vec<String> = Vec::new();
+        let _identity_lock = crate::session::acquire_session_identity_lock()?;
+        self.save_with_storage()
+    }
 
-        for (profile_name, storage) in &self.storages {
-            let tui_rows: Vec<Instance> = self.cloned_instances_for_profile(profile_name);
+    pub(super) fn save_with_storage(&mut self) -> anyhow::Result<()> {
+        let mut all_peer_deleted: Vec<String> = Vec::new();
+        let profile_names: Vec<String> = self.storages.keys().cloned().collect();
+
+        for profile_name in profile_names {
+            if !crate::session::get_profile_dir_path(&profile_name).is_ok_and(|path| path.exists())
+            {
+                self.storages.remove(&profile_name);
+                self.pending_deletions.remove(&profile_name);
+                self.pending_group_deletions.remove(&profile_name);
+                self.pending_added.remove(&profile_name);
+                continue;
+            }
+            let storage = Storage::open(&profile_name, self.file_watch.clone())?;
+            let tui_rows: Vec<Instance> = self.cloned_instances_for_profile(&profile_name);
             let dels: HashSet<String> = self
                 .pending_deletions
-                .get(profile_name)
+                .get(&profile_name)
                 .cloned()
                 .unwrap_or_default();
             let added: HashSet<String> = self
                 .pending_added
-                .get(profile_name)
+                .get(&profile_name)
                 .cloned()
                 .unwrap_or_default();
             let group_dels: HashSet<String> = self
                 .pending_group_deletions
-                .get(profile_name)
+                .get(&profile_name)
                 .cloned()
                 .unwrap_or_default();
             let groups_target = self
                 .group_trees
-                .get(profile_name)
+                .get(&profile_name)
                 .map(|t| t.get_all_groups())
                 .unwrap_or_default();
 
@@ -64,9 +79,9 @@ impl HomeView {
                 Ok(peer_deleted)
             })?;
 
-            self.pending_deletions.remove(profile_name);
-            self.pending_group_deletions.remove(profile_name);
-            self.pending_added.remove(profile_name);
+            self.pending_deletions.remove(&profile_name);
+            self.pending_group_deletions.remove(&profile_name);
+            self.pending_added.remove(&profile_name);
             all_peer_deleted.extend(peer_deleted);
         }
 

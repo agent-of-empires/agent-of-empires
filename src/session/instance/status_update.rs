@@ -918,6 +918,7 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
             pane_title: None,
             window_activity,
             window_size: None,
+            ..Default::default()
         }
     }
 
@@ -1048,7 +1049,7 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
         }
 
         let mut inst = Instance::new("aoe_test_3624_activity", "/tmp");
-        assert_eq!(inst.tool, "claude");
+        inst.tool = "claude".into();
 
         // The running frame is Claude's `active_spinner` shape. The idle frame matches no rule at
         // all, which is the unwitnessed Idle that has to wait for a confirming poll.
@@ -1074,8 +1075,8 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
             "running frame never painted"
         );
 
-        let cache = crate::tmux::SessionCacheGuard::capture();
-        cache.force_present(&[session_name.as_str()]);
+        let cache = crate::tmux::SessionCacheGuard::capture_restore_only();
+        crate::tmux::refresh_session_cache();
 
         let poll = |inst: &mut Instance, activity: Option<i64>| {
             let metadata = agent_pane_metadata("claude", activity);
@@ -1098,7 +1099,12 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
             "idle frame never painted"
         );
 
+        cache.force_stale();
         poll(&mut inst, Some(shared));
+        assert!(
+            inst.unknown_since.is_none(),
+            "native existence must refresh before idle observation"
+        );
         assert_eq!(
             inst.status,
             Status::Running,
@@ -1131,9 +1137,7 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
         }
 
         let mut polled = Instance::new("aoe_test_3712_polled", "/tmp");
-        // Guard, not a constant assertion: the manifest path is only reached
-        // for a tool that has one.
-        assert_eq!(polled.tool, "claude");
+        polled.tool = "claude".into();
 
         // A parked Claude prompt carrying half-typed text.
         let pane = "earlier output\n\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n\u{276f} half typed prompt\n\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n  \u{23f5}\u{23f5} auto mode on (shift+tab to cycle)\n";
@@ -1149,8 +1153,8 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
         std::fs::remove_file(&pane_file).ok();
         assert!(painted, "parked prompt never painted into the tmux pane");
 
-        let cache = crate::tmux::SessionCacheGuard::capture();
-        cache.force_present(&[session_name.as_str()]);
+        let cache = crate::tmux::SessionCacheGuard::capture_restore_only();
+        crate::tmux::refresh_session_cache();
         let metadata = agent_pane_metadata("claude", None);
 
         // Both rows come off disk on `Running`, which is what the CLI reads.
@@ -1167,7 +1171,12 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
         // record, and none it can ever meet.
         let mut once = Instance::new("aoe_test_3712_once", "/tmp");
         once.status = Status::Running;
+        cache.force_stale();
         once.update_status_once(Some(&metadata), Some(&session_name));
+        assert!(
+            once.unknown_since.is_none(),
+            "native existence must refresh before one-shot observation"
+        );
         assert_eq!(
             once.status,
             Status::Idle,

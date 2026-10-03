@@ -48,6 +48,8 @@ pub struct SpawnConfig {
     pub sandbox_info: Option<SandboxInfo>,
     /// Resolves profile-level `sandbox.environment` and settings.
     pub source_profile: Option<String>,
+    /// Stored owner, independent of the runtime configuration context.
+    pub managed_profile: Option<String>,
     /// From `<app_dir>/mcp.json`; gated against agent capabilities later.
     pub mcp_servers: Vec<McpServer>,
     /// Seed an empty event store from the load replay instead of suppressing
@@ -60,6 +62,7 @@ pub struct SpawnConfig {
     pub wrapper_substitution: Option<(String, String)>,
     /// Lifecycle epoch stamped on the runner's registry record.
     pub generation: u64,
+    pub execution_admission: Option<crate::acp::runner_lifecycle::ExecutionAdmission>,
     pub claude_store_pin: Option<crate::session::capture::ClaudeStorePin>,
     /// Trusted environment before the current hook overlay or Claude routing.
     pub base_host_environment: Vec<(String, String)>,

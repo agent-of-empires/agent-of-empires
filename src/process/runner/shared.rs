@@ -35,7 +35,7 @@ pub(super) struct RunnerShared {
     /// Sent resets remain authoritative until their response is committed.
     pub(super) pending_resets: AtomicUsize,
     pub(super) reset_finished: tokio::sync::Notify,
-    pub(super) registry_owner: Option<(String, u32)>,
+    pub(super) registry_owner: Option<(String, u32, u64, uuid::Uuid)>,
     /// A durability failure makes further runner state unsafe to expose.
     pub(super) fatal: AtomicBool,
     pub(super) fatal_wake: tokio::sync::Notify,
@@ -68,6 +68,7 @@ pub(super) struct RunnerHandshake {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum DeliveryScope {
     Persistent,
+    AgentConnection,
     Attachment(u64),
 }
 
@@ -193,7 +194,7 @@ pub(super) async fn write_control_frame(
 pub(super) const MAX_OUTSTANDING_REQUESTS: usize = 1024;
 
 impl RunnerShared {
-    pub(super) fn new(registry_owner: Option<(String, u32)>) -> Self {
+    pub(super) fn new(registry_owner: Option<(String, u32, u64, uuid::Uuid)>) -> Self {
         Self {
             prompt_requests: Mutex::new(HashSet::new()),
             control: Mutex::new(ControlChannel::default()),
@@ -219,12 +220,16 @@ impl RunnerShared {
         &self,
         acp_session_id: &str,
     ) -> std::result::Result<(), control_protocol::JsonRpcError> {
-        let Some((session_id, owner_pid)) = self.registry_owner.as_ref() else {
+        let Some((session_id, owner_pid, generation, nonce)) = self.registry_owner.as_ref() else {
             return Ok(());
         };
-        if let Err(error) =
-            worker_registry::update_stored_acp_session_id(session_id, *owner_pid, acp_session_id)
-        {
+        if let Err(error) = worker_registry::update_stored_acp_session_id(
+            session_id,
+            *owner_pid,
+            *generation,
+            *nonce,
+            acp_session_id,
+        ) {
             warn!(
                 target: "acp.runner",
                 session = %session_id,
@@ -334,8 +339,13 @@ impl RunnerShared {
             {
                 return;
             }
+            let scope = if method == crate::acp::state::AUTH_STATUS_UPDATE_METHOD {
+                DeliveryScope::AgentConnection
+            } else {
+                DeliveryScope::Persistent
+            };
             self.enqueue(
-                DeliveryScope::Persistent,
+                scope,
                 QueuedKind::Notify,
                 ControlBody::Notify { method, params },
             )
@@ -710,10 +720,12 @@ impl RunnerShared {
         &self,
         out: &mut Option<tokio::net::unix::OwnedWriteHalf>,
         session_id: &str,
+        launch_nonce: uuid::Uuid,
     ) -> bool {
         let hello = ControlBody::Hello {
             control_protocol_version: control_protocol::CONTROL_PROTOCOL_VERSION,
             session_id: session_id.to_string(),
+            launch_nonce: Some(launch_nonce),
         };
         write_control_frame(out.as_mut().expect("write half present"), &hello).await
     }
@@ -1535,6 +1547,81 @@ mod tests {
                 notify("_aoe/session_replayed", serde_json::json!({})),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn auth_reports_cross_failed_session_admission_and_survive_reattach() {
+        for established in [false, true] {
+            let (shared, stdin, _child) = shared_with_stdin().await;
+            let attachment = shared.begin_attachment().await;
+            let auth_params =
+                serde_json::json!({"authStatus": {"kind": "none", "label": "Log in"}});
+            for notification in [
+                serde_json::json!({"method": "session/update", "params": {"sessionId": "foreign"}}),
+                serde_json::json!({"method": crate::acp::state::AUTH_STATUS_UPDATE_METHOD, "params": auth_params}),
+            ] {
+                shared
+                    .deliver_line(&serde_json::to_vec(&notification).unwrap(), &stdin)
+                    .await;
+            }
+            let outcome = if established {
+                ControlBody::SessionReady {
+                    acp_session_id: "own".into(),
+                    result: serde_json::json!({}),
+                }
+            } else {
+                ControlBody::HandshakeFailed {
+                    error: serde_json::json!({"code": -32000, "message": "session refused"}),
+                }
+            };
+            shared
+                .enqueue_handshake(attachment, outcome.clone(), established)
+                .await;
+            let (id, wire) = shared.next_outbound(attachment).await.expect("handshake");
+            assert_eq!(
+                serde_json::from_slice::<ControlBody>(&wire[4..]).unwrap(),
+                outcome
+            );
+            shared.commit_outbound(attachment, id).await;
+            if established {
+                let (id, wire) = shared
+                    .next_outbound(attachment)
+                    .await
+                    .expect("admitted update");
+                assert_eq!(
+                    serde_json::from_slice::<ControlBody>(&wire[4..]).unwrap(),
+                    ControlBody::Notify {
+                        method: "session/update".into(),
+                        params: serde_json::json!({"sessionId": "foreign"}),
+                    }
+                );
+                shared.commit_outbound(attachment, id).await;
+            }
+            let (id, wire) = shared
+                .next_outbound(attachment)
+                .await
+                .expect("connection auth without session admission");
+            assert_eq!(
+                serde_json::from_slice::<ControlBody>(&wire[4..]).unwrap(),
+                ControlBody::Notify {
+                    method: crate::acp::state::AUTH_STATUS_UPDATE_METHOD.into(),
+                    params: auth_params,
+                }
+            );
+            shared.release_outbound(id).await;
+            shared.disconnect_control(attachment, &stdin, "own").await;
+            let reattached = shared.begin_attachment().await;
+            let (retried_id, retried_wire) = shared
+                .next_outbound(reattached)
+                .await
+                .expect("auth survives reattach before SessionReady");
+            assert_eq!((retried_id, retried_wire), (id, wire));
+            shared.commit_outbound(reattached, retried_id).await;
+            assert!(
+                shared.next_outbound(reattached).await.is_none(),
+                "session updates stay fenced on a new attachment"
+            );
+        }
     }
 
     #[tokio::test]

@@ -13,16 +13,11 @@ use crate::acp::acp_client::{AcpClient, SpawnConfig};
 use crate::acp::agent_registry::AgentSpec;
 use crate::acp::approvals::Nonce;
 use crate::acp::event_store::EventStore;
-use crate::acp::runner_lifecycle::{Lease, ProcessControl, RunnerIdentity};
+use crate::acp::runner_lifecycle::{ExecutionAdmission, Lease, RunnerIdentity};
 use crate::acp::state::{AcpSessionId, Event};
 use crate::process::worker_registry::{self, WorkerRecord};
 
 impl<S: BroadcastSink> Supervisor<S> {
-    pub(crate) fn with_process_control(mut self, control: Arc<dyn ProcessControl>) -> Self {
-        self.process_control = control;
-        self
-    }
-
     pub(crate) fn with_launcher(mut self, launcher: Launcher) -> Self {
         self.launcher = launcher;
         self
@@ -103,12 +98,6 @@ impl<S: BroadcastSink> Supervisor<S> {
         self.test_install_handle(session_id, client, WorkerKind::Stdio, None)
             .await;
         cmds
-    }
-
-    pub(crate) async fn test_install_attached(&self, session_id: &str, identity: RunnerIdentity) {
-        let (client, _tx) = AcpClient::fake_for_test(AcpSessionId(session_id.into()));
-        self.test_install_handle(session_id, client, WorkerKind::Attached, Some(identity))
-            .await;
     }
 
     pub(super) async fn test_install_stdio(&self, session_id: &str) -> Lease {
@@ -269,6 +258,8 @@ pub(super) fn spawn_request(session_id: &str) -> SpawnRequest {
 
 pub(super) fn runner_config(socket_path: PathBuf) -> SpawnConfig {
     SpawnConfig {
+        execution_admission: None,
+        managed_profile: None,
         wrapper_substitution: None,
         agent_key: "claude".into(),
         tool: "claude".into(),
@@ -322,6 +313,96 @@ pub(super) fn save_record(session_id: &str, pid: u32, generation: u64) {
         .unwrap();
 }
 
+/// Real kernel execution published through the production launch journal. Its private
+/// authorization pipe is consumed before the fixture waits for its stop marker.
+pub(super) struct PublishedExecution {
+    pub pid: u32,
+    pub nonce: uuid::Uuid,
+    release: PathBuf,
+    stop: tokio::task::JoinHandle<()>,
+    _directory: tempfile::TempDir,
+}
+
+impl Drop for PublishedExecution {
+    fn drop(&mut self) {
+        std::fs::write(&self.release, b"stop").unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while crate::process::worker::is_process_group_alive(self.pid)
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        self.stop.abort();
+    }
+}
+
+pub(super) fn published_execution(
+    id: &str,
+    generation: u64,
+    profile: &str,
+    admission: Option<&ExecutionAdmission>,
+) -> PublishedExecution {
+    let storage = crate::session::Storage::new_unwatched(profile).unwrap();
+    storage
+        .update(|rows, _| {
+            if !rows.iter().any(|row| row.id == id) {
+                let mut row = crate::session::Instance::new(id, "/tmp");
+                row.id = id.to_owned();
+                row.source_profile = profile.to_owned();
+                row.view = crate::session::View::Structured;
+                rows.push(row);
+            }
+            Ok(())
+        })
+        .unwrap();
+    let directory = tempfile::TempDir::new().unwrap();
+    let release = directory.path().join("stop");
+    let mut command = tokio::process::Command::new("sh");
+    command.arg("-c").arg(r#"received="$(dd bs=1 count=16 2>/dev/null | od -An -tx1 | tr -d '[:space:]')"; [ "$received" = "$2" ] || exit 70; while [ ! -e "$1" ]; do sleep 0.01; done"#)
+        .arg("journal-fixture").arg(&release);
+    unsafe {
+        command.pre_exec(|| {
+            nix::unistd::setsid().map_err(std::io::Error::other)?;
+            Ok(())
+        });
+    }
+    let launch = crate::session::runner_journal::ManagedLaunch::new(
+        crate::session::deletion::SessionPathOwner {
+            profile,
+            session_id: id,
+        },
+        generation,
+    )
+    .unwrap();
+    let nonce = launch.nonce();
+    command.arg(nonce.simple().to_string());
+    let pid = launch
+        .spawn(&mut command, |identity| {
+            if let Some(admission) = admission {
+                admission.capture(identity);
+            }
+        })
+        .unwrap();
+    let listener = tokio::net::UnixListener::bind(
+        crate::session::runner_journal::stop_socket(id, pid).unwrap(),
+    )
+    .unwrap();
+    let stop_release = release.clone();
+    let stop = tokio::spawn(async move {
+        crate::session::runner_journal::wait_for_stop(listener, nonce)
+            .await
+            .unwrap();
+        std::fs::write(stop_release, b"stop").unwrap();
+    });
+    PublishedExecution {
+        pid,
+        nonce,
+        release,
+        stop,
+        _directory: directory,
+    }
+}
+
 /// Holds a gated launch until the test opens it.
 #[derive(Default)]
 pub(super) struct Gate {
@@ -329,23 +410,47 @@ pub(super) struct Gate {
     pub(super) open: Arc<tokio::sync::Notify>,
 }
 
-/// A launcher that parks on `gate`, then records a runner with `pid` and the
-/// spawn's generation. Event senders are retained so drains never see a close.
-pub(super) fn gated_launcher(gate: &Gate, pid: u32) -> Launcher {
+/// Holds a real published execution behind the launch gate. Event senders are retained
+/// until supervisor shutdown, so the drain cannot mistake the handshake for a crash.
+pub(super) fn gated_launcher(gate: &Gate) -> Launcher {
     let entered = Arc::clone(&gate.entered);
     let open = Arc::clone(&gate.open);
     let senders: Arc<std::sync::Mutex<Vec<mpsc::Sender<Event>>>> = Default::default();
+    let executions: Arc<std::sync::Mutex<Vec<PublishedExecution>>> = Default::default();
     Arc::new(move |config: SpawnConfig, session_id: AcpSessionId| {
         let entered = Arc::clone(&entered);
         let open = Arc::clone(&open);
         let senders = Arc::clone(&senders);
+        let executions = Arc::clone(&executions);
         Box::pin(async move {
+            let profile = config
+                .managed_profile
+                .as_deref()
+                .expect("gated launch requires an explicit stored owner");
+            let execution = published_execution(
+                &session_id.0,
+                config.generation,
+                profile,
+                config.execution_admission.as_ref(),
+            );
+            let pid = execution.pid;
+            let nonce = execution.nonce;
+            let mut record = worker_record(
+                &session_id.0,
+                pid,
+                worker_registry::socket_path_for(&session_id.0).unwrap(),
+            )
+            .with_generation(config.generation);
+            record.source_profile = Some(profile.to_owned());
+            record.launch_nonce = Some(nonce);
+            worker_registry::save(&record).unwrap();
+            executions.lock().unwrap().push(execution);
             entered.notify_one();
             open.notified().await;
-            save_record(&session_id.0, pid, config.generation);
-            let (client, tx) = AcpClient::fake_for_test(session_id);
+            let (mut client, tx) = AcpClient::fake_for_test(session_id);
+            client.capture_runner(pid, nonce);
             senders.lock().unwrap().push(tx);
-            Ok(client.with_runner_pid(pid))
+            Ok(client)
         })
     })
 }

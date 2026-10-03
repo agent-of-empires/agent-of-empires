@@ -182,7 +182,8 @@ async fn persist_with<F>(
 where
     F: FnOnce(&mut Vec<Instance>) + Send + 'static,
 {
-    let storage = match Storage::new(&profile, file_watch) {
+    // Strict, like every other reader: writing a row must not create the profile.
+    let storage = match Storage::open(&profile, file_watch) {
         Ok(s) => s,
         Err(e) => {
             tracing::error!(

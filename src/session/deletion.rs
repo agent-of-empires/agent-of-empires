@@ -1,5 +1,6 @@
 //! Shared session deletion logic used by CLI, TUI, and web server.
 
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -48,7 +49,7 @@ pub struct DeletionResult {
 }
 
 impl DeletionResult {
-    fn rejected(
+    pub(crate) fn rejected(
         session_id: String,
         disposition: DeletionDisposition,
         message: impl Into<String>,
@@ -78,7 +79,13 @@ pub struct PurgeTransaction {
     was_trashed: bool,
     generation: u64,
     lifecycle_lock: Option<StorageFlock>,
+    workspace_claim_lock: Option<StorageFlock>,
+    identity_lock: Option<StorageFlock>,
     active: bool,
+    /// The ownership verdict, taken once before any hook runs. Re-scanning after
+    /// the hooks would let a non-idempotent `on_destroy` play on a purge that is
+    /// then refused, and would replay on the next retry.
+    ownership_verdict: Option<Option<String>>,
 }
 
 /// A purge whose durable row has already been removed. The same lifecycle
@@ -87,6 +94,8 @@ pub struct PurgeTransaction {
 pub struct CommittedPurge {
     request: DeletionRequest,
     _lifecycle_lock: StorageFlock,
+    _identity_lock: Option<StorageFlock>,
+    _workspace_claim_lock: StorageFlock,
 }
 
 #[derive(Clone, Copy)]
@@ -95,6 +104,22 @@ enum CompletionGate {
     AlreadyGone,
     KeptRestored,
     Superseded,
+}
+
+impl DeletionRequest {
+    /// Whether this deletion can destroy a path another session owns. A session
+    /// with no managed worktree, no workspace and no scratch has nothing to
+    /// protect, so an inventory it cannot read must not refuse its deletion.
+    fn needs_path_inventory(&self) -> bool {
+        (self.delete_worktree
+            && (self
+                .instance
+                .worktree_info
+                .as_ref()
+                .is_some_and(|wt| wt.managed_by_aoe)
+                || self.instance.workspace_info.is_some()))
+            || self.instance.scratch
+    }
 }
 
 impl PurgeTransaction {
@@ -111,13 +136,18 @@ impl PurgeTransaction {
     pub fn reserve(storage: Storage, mut request: DeletionRequest) -> Result<PurgeReservation> {
         let id = request.session_id.clone();
         let was_trashed = request.instance.is_trashed();
+        let workspace_claim_lock = crate::session::acquire_session_workspace_claim_lock()?;
+        let identity_lock = Some(crate::session::acquire_session_identity_lock()?);
+        // Re-resolve the profile under the identity lock so the storage carries
+        // this generation's directory identity, with the caller's watcher.
+        let storage = storage.reopen_preserving_watch()?;
         let lifecycle_lock = storage
             .acquire_instance_lifecycle_lock(&id)
             .context("failed to acquire instance purge lock")?;
         let now = Utc::now();
         let mut reserved = None;
         let mut rejected = None;
-        storage.update(|instances, _groups| {
+        storage.update_under_workspace_claim_lock(|instances, _groups| {
             let decision =
                 crate::session::claim::decide_purge_claim(instances, &id, was_trashed, now)?;
             let generation = match decision {
@@ -174,10 +204,56 @@ impl PurgeTransaction {
             storage,
             request,
             was_trashed,
+            workspace_claim_lock: Some(workspace_claim_lock),
             generation,
             lifecycle_lock: Some(lifecycle_lock),
+            identity_lock,
             active: true,
+            ownership_verdict: None,
         }))
+    }
+    /// The authoritative instance snapshot captured by the reservation.
+    pub fn instance(&self) -> &Instance {
+        &self.request.instance
+    }
+
+    /// Validate cross-profile ownership before hooks or irreversible row removal.
+    pub fn preflight_ownership(mut self) -> std::result::Result<Self, Box<DeletionResult>> {
+        let Some(message) = self.ownership_error() else {
+            return Ok(self);
+        };
+        let id = self.request.session_id.clone();
+        let retained = self.release_reservation().ok().flatten();
+        Err(Box::new(DeletionResult::rejected(
+            id,
+            DeletionDisposition::Failed,
+            message,
+            retained,
+        )))
+    }
+
+    fn ownership_error(&mut self) -> Option<String> {
+        if !self.request.needs_path_inventory() {
+            return None;
+        }
+        if let Some(verdict) = &self.ownership_verdict {
+            return verdict.clone();
+        }
+        let verdict = with_paths_in_use_locked(
+            SessionPathOwner {
+                profile: self.storage.profile(),
+                session_id: &self.request.session_id,
+            },
+            self.identity_lock.is_some(),
+            |paths| match paths {
+                PathsInUse::Unknown(reason) => Some(format!(
+                    "could not prove that session resources are unused: {reason}"
+                )),
+                PathsInUse::Known(_) => None,
+            },
+        );
+        self.ownership_verdict = Some(verdict.clone());
+        verdict
     }
 
     /// Run best-effort hooks without a lifecycle or storage flock held.
@@ -185,16 +261,48 @@ impl PurgeTransaction {
         self.run_hooks_with(run_on_destroy_hooks)
     }
 
+    /// Drop the global and per-instance flocks ahead of an await that must not
+    /// block every other writer, keeping the durable reservation so a peer
+    /// still sees this purge as claimed. The next phase restores the canonical
+    /// lock order before the destructive effects.
+    pub fn release_locks_for_teardown(mut self) -> Self {
+        self.lifecycle_lock = None;
+        self.workspace_claim_lock = None;
+        self.identity_lock = None;
+        self
+    }
+
     fn run_hooks_with<F>(mut self, run_hooks: F) -> Self
     where
         F: FnOnce(&Instance, bool),
     {
+        let ownership_failed = self.ownership_error().is_some();
         self.lifecycle_lock = None;
-        run_hooks(&self.request.instance, self.request.detach_hooks);
+        self.workspace_claim_lock = None;
+        self.identity_lock = None;
+        if !ownership_failed {
+            run_hooks(&self.request.instance, self.request.detach_hooks);
+        }
         self
     }
 
     fn ensure_lifecycle_lock(&mut self) -> Result<()> {
+        if self.workspace_claim_lock.is_none() {
+            self.workspace_claim_lock = Some(
+                crate::session::acquire_session_workspace_claim_lock()
+                    .context("failed to reacquire workspace claim lock after hooks")?,
+            );
+        }
+        if self.identity_lock.is_none() {
+            self.identity_lock = Some(
+                crate::session::acquire_session_identity_lock()
+                    .context("failed to reacquire session identity lock after hooks")?,
+            );
+        }
+        self.storage = self
+            .storage
+            .reopen_preserving_watch()
+            .context("failed to reopen target profile after destroy hooks")?;
         if self.lifecycle_lock.is_none() {
             self.lifecycle_lock = Some(
                 self.storage
@@ -202,6 +310,12 @@ impl PurgeTransaction {
                     .context("failed to reacquire instance purge lock after hooks")?,
             );
         }
+        // The verdict was taken before the hooks ran without any flock held, so
+        // it cannot decide a row removal that now happens under the full lock
+        // set. Dropping it here makes the next ownership check rescan, which is
+        // what stands between an inventory that turned unreadable in between and
+        // a teardown with no row left to retry it from.
+        self.ownership_verdict = None;
         Ok(())
     }
 
@@ -209,14 +323,17 @@ impl PurgeTransaction {
         let id = self.request.session_id.clone();
         let generation = self.generation;
         let mut retained = None;
-        self.storage.update(|instances, _groups| {
-            if let Some(stored) = instances.iter_mut().find(|instance| instance.id == id) {
-                stored
-                    .release_lifecycle_reservation_if_owned(LifecycleOperation::Purge, generation);
-                retained = Some(stored.clone());
-            }
-            Ok(())
-        })?;
+        self.storage
+            .update_under_workspace_claim_lock(|instances, _groups| {
+                if let Some(stored) = instances.iter_mut().find(|instance| instance.id == id) {
+                    stored.release_lifecycle_reservation_if_owned(
+                        LifecycleOperation::Purge,
+                        generation,
+                    );
+                    retained = Some(stored.clone());
+                }
+                Ok(())
+            })?;
         self.active = false;
         Ok(retained)
     }
@@ -226,32 +343,40 @@ impl PurgeTransaction {
         let generation = self.generation;
         let was_trashed = self.was_trashed;
         let mut outcome = None;
-        self.storage.update(|instances, _groups| {
-            let Some(stored) = instances.iter_mut().find(|instance| instance.id == id) else {
-                outcome = Some((CompletionGate::AlreadyGone, None));
-                return Ok(());
-            };
-            let restored = crate::session::claim::purge_restored_row_must_be_kept(
-                was_trashed,
-                stored.is_trashed(),
-            );
-            let owns = stored.lifecycle_reservation_is_owned(LifecycleOperation::Purge, generation);
-            let gate = if restored {
-                CompletionGate::KeptRestored
-            } else if !owns {
-                CompletionGate::Superseded
-            } else {
-                CompletionGate::Proceed
-            };
-            if !matches!(gate, CompletionGate::Proceed) {
-                stored
-                    .release_lifecycle_reservation_if_owned(LifecycleOperation::Purge, generation);
-            }
-            outcome = Some((gate, Some(stored.clone())));
-            Ok(())
-        })?;
+        self.storage
+            .update_under_workspace_claim_lock(|instances, _groups| {
+                let Some(stored) = instances.iter_mut().find(|instance| instance.id == id) else {
+                    outcome = Some((CompletionGate::AlreadyGone, None));
+                    return Ok(());
+                };
+                let restored = crate::session::claim::purge_restored_row_must_be_kept(
+                    was_trashed,
+                    stored.is_trashed(),
+                );
+                let owns =
+                    stored.lifecycle_reservation_is_owned(LifecycleOperation::Purge, generation);
+                let gate = if restored {
+                    CompletionGate::KeptRestored
+                } else if !owns {
+                    CompletionGate::Superseded
+                } else {
+                    CompletionGate::Proceed
+                };
+                if !matches!(gate, CompletionGate::Proceed) {
+                    stored.release_lifecycle_reservation_if_owned(
+                        LifecycleOperation::Purge,
+                        generation,
+                    );
+                }
+                outcome = Some((gate, Some(stored.clone())));
+                Ok(())
+            })?;
         let outcome = outcome.ok_or_else(|| anyhow::anyhow!("purge gate produced no outcome"))?;
-        if !matches!(outcome.0, CompletionGate::Proceed) {
+        if matches!(outcome.0, CompletionGate::Proceed) {
+            if let Some(current) = outcome.1.clone() {
+                self.request.instance = current;
+            }
+        } else {
             self.active = false;
         }
         Ok(outcome)
@@ -298,33 +423,47 @@ impl PurgeTransaction {
                 None,
             )));
         }
+        if let Some(message) = self.ownership_error() {
+            let retained = self.release_reservation().ok().flatten();
+            return Err(Box::new(DeletionResult::rejected(
+                self.request.session_id.clone(),
+                DeletionDisposition::Failed,
+                message,
+                retained,
+            )));
+        }
         let id = self.request.session_id.clone();
         let generation = self.generation;
         let was_trashed = self.was_trashed;
         let mut commit = None;
-        if let Err(error) = self.storage.update(|instances, _groups| {
-            let Some(index) = instances.iter().position(|instance| instance.id == id) else {
-                commit = Some((CompletionGate::AlreadyGone, None));
-                return Ok(());
-            };
-            let restored = crate::session::claim::purge_restored_row_must_be_kept(
-                was_trashed,
-                instances[index].is_trashed(),
-            );
-            let owns = instances[index]
-                .lifecycle_reservation_is_owned(LifecycleOperation::Purge, generation);
-            if restored {
-                instances[index]
-                    .release_lifecycle_reservation_if_owned(LifecycleOperation::Purge, generation);
-                commit = Some((CompletionGate::KeptRestored, Some(instances[index].clone())));
-            } else if !owns {
-                commit = Some((CompletionGate::Superseded, Some(instances[index].clone())));
-            } else {
-                instances.remove(index);
-                commit = Some((CompletionGate::Proceed, None));
-            }
-            Ok(())
-        }) {
+        if let Err(error) = self
+            .storage
+            .update_under_workspace_claim_lock(|instances, _groups| {
+                let Some(index) = instances.iter().position(|instance| instance.id == id) else {
+                    commit = Some((CompletionGate::AlreadyGone, None));
+                    return Ok(());
+                };
+                let restored = crate::session::claim::purge_restored_row_must_be_kept(
+                    was_trashed,
+                    instances[index].is_trashed(),
+                );
+                let owns = instances[index]
+                    .lifecycle_reservation_is_owned(LifecycleOperation::Purge, generation);
+                if restored {
+                    instances[index].release_lifecycle_reservation_if_owned(
+                        LifecycleOperation::Purge,
+                        generation,
+                    );
+                    commit = Some((CompletionGate::KeptRestored, Some(instances[index].clone())));
+                } else if !owns {
+                    commit = Some((CompletionGate::Superseded, Some(instances[index].clone())));
+                } else {
+                    instances.remove(index);
+                    commit = Some((CompletionGate::Proceed, None));
+                }
+                Ok(())
+            })
+        {
             return Err(Box::new(DeletionResult::rejected(
                 id,
                 DeletionDisposition::Failed,
@@ -345,6 +484,12 @@ impl PurgeTransaction {
         if !matches!(gate, CompletionGate::Proceed) {
             return Err(Box::new(self.result_for_gate(gate, retained)));
         }
+        // Same refresh `gate` performs, on the row captured at the commit: the
+        // sidecars are torn down from here, after the row is gone, so a stale
+        // `project_path` would have nothing left to correct it.
+        if let Some(current) = retained {
+            self.request.instance = current;
+        }
         Ok(CommittedPurge {
             request: DeletionRequest {
                 session_id: self.request.session_id.clone(),
@@ -356,6 +501,11 @@ impl PurgeTransaction {
                 detach_hooks: self.request.detach_hooks,
                 keep_scratch: self.request.keep_scratch,
             },
+            _workspace_claim_lock: self
+                .workspace_claim_lock
+                .take()
+                .expect("active purge transaction must own its workspace claim"),
+            _identity_lock: self.identity_lock.take(),
             _lifecycle_lock: self
                 .lifecycle_lock
                 .take()
@@ -369,6 +519,7 @@ impl PurgeTransaction {
         mut self,
         after_teardown: impl FnOnce(&Instance) -> std::result::Result<(), String>,
         commit_on_teardown_failure: bool,
+        teardown: fn(&str) -> crate::containers::Teardown,
     ) -> DeletionResult {
         if let Err(error) = self.ensure_lifecycle_lock() {
             return DeletionResult::rejected(
@@ -393,47 +544,58 @@ impl PurgeTransaction {
         if !matches!(gate, CompletionGate::Proceed) {
             return self.result_for_gate(gate, retained);
         }
-        let mut result = perform_deletion_teardown_lifecycle_locked(&self.request);
+        if let Some(message) = self.ownership_error() {
+            let retained = self.release_reservation().ok().flatten();
+            return DeletionResult::rejected(id, DeletionDisposition::Failed, message, retained);
+        }
+        let mut result = perform_deletion_core(&self.request, true, true, teardown);
         if !result.success && !commit_on_teardown_failure {
             result.retained_instance = self.release_reservation().ok().flatten();
             result.disposition = DeletionDisposition::Failed;
             return result;
         }
-
         if let Err(error) = after_teardown(&self.request.instance) {
-            result.success = false;
-            result.errors.push(error);
-            result.retained_instance = self.release_reservation().ok().flatten();
-            result.disposition = DeletionDisposition::Failed;
-            return result;
+            let mut failed = DeletionResult::rejected(
+                id,
+                DeletionDisposition::Failed,
+                error,
+                self.release_reservation().ok().flatten(),
+            );
+            failed.teardown_started = result.teardown_started;
+            failed.messages = result.messages;
+            return failed;
         }
 
         let generation = self.generation;
         let was_trashed = self.was_trashed;
         let mut commit = None;
-        let commit_result = self.storage.update(|instances, _groups| {
-            let Some(index) = instances.iter().position(|instance| instance.id == id) else {
-                commit = Some((CompletionGate::AlreadyGone, None));
-                return Ok(());
-            };
-            let restored = crate::session::claim::purge_restored_row_must_be_kept(
-                was_trashed,
-                instances[index].is_trashed(),
-            );
-            let owns = instances[index]
-                .lifecycle_reservation_is_owned(LifecycleOperation::Purge, generation);
-            if restored {
-                instances[index]
-                    .release_lifecycle_reservation_if_owned(LifecycleOperation::Purge, generation);
-                commit = Some((CompletionGate::KeptRestored, Some(instances[index].clone())));
-            } else if !owns {
-                commit = Some((CompletionGate::Superseded, Some(instances[index].clone())));
-            } else {
-                instances.remove(index);
-                commit = Some((CompletionGate::Proceed, None));
-            }
-            Ok(())
-        });
+        let commit_result = self
+            .storage
+            .update_under_workspace_claim_lock(|instances, _groups| {
+                let Some(index) = instances.iter().position(|instance| instance.id == id) else {
+                    commit = Some((CompletionGate::AlreadyGone, None));
+                    return Ok(());
+                };
+                let restored = crate::session::claim::purge_restored_row_must_be_kept(
+                    was_trashed,
+                    instances[index].is_trashed(),
+                );
+                let owns = instances[index]
+                    .lifecycle_reservation_is_owned(LifecycleOperation::Purge, generation);
+                if restored {
+                    instances[index].release_lifecycle_reservation_if_owned(
+                        LifecycleOperation::Purge,
+                        generation,
+                    );
+                    commit = Some((CompletionGate::KeptRestored, Some(instances[index].clone())));
+                } else if !owns {
+                    commit = Some((CompletionGate::Superseded, Some(instances[index].clone())));
+                } else {
+                    instances.remove(index);
+                    commit = Some((CompletionGate::Proceed, None));
+                }
+                Ok(())
+            });
         self.lifecycle_lock = None;
         match commit_result {
             Err(error) => {
@@ -472,11 +634,19 @@ impl PurgeTransaction {
         self,
         after_teardown: impl FnOnce(&Instance) -> std::result::Result<(), String>,
     ) -> DeletionResult {
-        self.complete_inner(after_teardown, false)
+        self.complete_inner(after_teardown, false, default_teardown)
+    }
+    #[cfg(test)]
+    pub(crate) fn complete_with_test_teardown(
+        self,
+        after_teardown: impl FnOnce(&Instance) -> std::result::Result<(), String>,
+        teardown: fn(&str) -> crate::containers::Teardown,
+    ) -> DeletionResult {
+        self.complete_inner(after_teardown, false, teardown)
     }
 
     pub fn complete(self) -> DeletionResult {
-        self.complete_inner(|_| Ok(()), false)
+        self.complete_inner(|_| Ok(()), false, default_teardown)
     }
 }
 
@@ -484,7 +654,7 @@ impl CommittedPurge {
     /// Clean up resources while retaining the lifecycle flock that covered the
     /// irreversible durable-row removal.
     pub fn finish(self) -> DeletionResult {
-        let mut result = perform_deletion_teardown_lifecycle_locked(&self.request);
+        let mut result = perform_deletion_teardown_lifecycle_locked(&self.request, true);
         result.disposition = DeletionDisposition::Removed;
         result
     }
@@ -507,7 +677,7 @@ impl Drop for PurgeTransaction {
                 let Ok(_lifecycle_lock) = storage.acquire_instance_lifecycle_lock(&id) else {
                     return;
                 };
-                let _ = storage.update(|instances, _groups| {
+                let _ = storage.update_under_workspace_claim_lock(|instances, _groups| {
                     if let Some(stored) = instances.iter_mut().find(|instance| instance.id == id) {
                         stored.release_lifecycle_reservation_if_owned(
                             LifecycleOperation::Purge,
@@ -520,18 +690,58 @@ impl Drop for PurgeTransaction {
     }
 }
 
-pub fn execute_deletion(request: DeletionRequest) -> DeletionResult {
+/// Settle the stored execution journal before hooks or checkout destruction.
+/// Registry absence and daemon memory are not execution coverage.
+pub async fn settle_runner_of(
+    transaction: PurgeTransaction,
+) -> Result<PurgeTransaction, Box<DeletionResult>> {
+    let mut released = transaction.release_locks_for_teardown();
+    let outcome = crate::session::runner_journal::settle(
+        SessionPathOwner {
+            profile: &released.request.instance.source_profile,
+            session_id: &released.request.session_id,
+        },
+        Some((LifecycleOperation::Purge, released.generation)),
+    )
+    .await;
+    match outcome {
+        Ok(()) => Ok(released),
+        Err(error) => {
+            let retained = released.release_reservation().ok().flatten();
+            released.active = false;
+            Err(Box::new(DeletionResult::rejected(
+                released.request.session_id.clone(),
+                DeletionDisposition::Failed,
+                format!(
+                    "The agent for this session is not proven dead, so nothing was removed: \
+                     {error}. Retry once it exits."
+                ),
+                retained,
+            )))
+        }
+    }
+}
+
+pub async fn execute_deletion(request: DeletionRequest) -> DeletionResult {
     let id = request.session_id.clone();
     let recent_entry = crate::session::recent_project_entry_for(&request.instance);
-    let result = match PurgeTransaction::reserve_unwatched(request) {
-        Ok(PurgeReservation::Reserved(transaction)) => transaction.run_hooks().complete(),
-        Ok(PurgeReservation::Rejected(result)) => result,
-        Err(error) => DeletionResult::rejected(
-            id,
+    // A structured session's runner has to be proven dead before the hooks run
+    // and before anything removes its checkout, on this surface as on the daemon
+    // one. `on_destroy` scripts are the user's and are not idempotent, so the
+    // refusal has to arrive before they play.
+    let settled = match PurgeTransaction::reserve_unwatched(request) {
+        Ok(PurgeReservation::Reserved(transaction)) => settle_runner_of(transaction).await,
+        Ok(PurgeReservation::Rejected(result)) => Err(Box::new(result)),
+        Err(error) => Err(Box::new(DeletionResult::rejected(
+            id.clone(),
             DeletionDisposition::Failed,
             format!("Could not reserve session deletion: {error}"),
             None,
-        ),
+        ))),
+    };
+    let result = match settled {
+        Ok(transaction) => transaction.run_hooks().complete(),
+        Err(result) => *result,
     };
     if result.disposition == DeletionDisposition::Removed {
         if let Some(entry) = recent_entry {
@@ -567,23 +777,77 @@ fn is_protected_default_branch(main_repo: &Path, branch: &str) -> bool {
         .is_ok_and(|names| names.contains(branch))
 }
 
-/// Every path a session outside `except_ids` works in or will restore to.
-fn other_sessions_paths(instances: &[Instance], except_ids: &[&str]) -> Vec<PathBuf> {
-    instances
-        .iter()
-        .filter(|instance| !except_ids.contains(&instance.id.as_str()))
-        .flat_map(|instance| {
-            std::iter::once(instance.project_path.as_str())
-                .chain(instance.pre_trash_project_path.as_deref())
-                .chain(
-                    instance
-                        .all_repos()
-                        .iter()
-                        .map(|r| r.worktree_path.as_str()),
-                )
-                .map(PathBuf::from)
-        })
-        .collect()
+#[derive(Clone, Copy)]
+pub(crate) struct SessionPathOwner<'a> {
+    pub profile: &'a str,
+    pub session_id: &'a str,
+}
+
+/// Whether `right` (the candidate) sits at or under `left` (a path another
+/// session owns).
+///
+/// A recorded peer path that no longer exists cannot be shown to contain
+/// anything, so it never conflicts. A *candidate* that does not exist yet is
+/// still compared lexically, which is what catches a fresh directory created
+/// underneath an existing peer parent.
+/// Canonical form of a path that need not exist yet, resolved through the
+/// deepest ancestor that does. A candidate about to be created has no canonical
+/// form of its own, but the directory it will land in has one, and on macOS a
+/// temporary path is itself an alias: `/var` resolves to `/private/var`.
+fn resolve_through_existing_ancestor(path: &Path) -> Option<PathBuf> {
+    let mut missing: Vec<&OsStr> = Vec::new();
+    let mut current = path;
+    loop {
+        if let Ok(resolved) = current.canonicalize() {
+            return Some(missing.iter().rev().fold(resolved, |mut acc, part| {
+                acc.push(part);
+                acc
+            }));
+        }
+        missing.push(current.file_name()?);
+        current = current.parent()?;
+    }
+}
+
+fn paths_overlap(left: &Path, right: &Path) -> bool {
+    if left == right {
+        return true;
+    }
+    let left_canonical = left.canonicalize().ok();
+    let right_canonical = right.canonicalize().ok();
+    match (left_canonical, right_canonical) {
+        (Some(left), Some(right)) => left.starts_with(&right),
+        // The recorded peer path is gone, so there is nothing it can contain.
+        (None, _) => false,
+        // The candidate is not on disk yet, so canonicalization proved nothing
+        // either way, and it is the peer whose alias can hide a conflict: the
+        // resolved form and the recorded spelling name the same directory, so
+        // both are tested. Lexical containment still resolves the case that
+        // matters, a missing candidate under an existing peer parent. An
+        // existing path with an unresolved alias is not proof of separation, so
+        // the reverse direction counts too.
+        (Some(peer), None) => {
+            let candidate = resolve_through_existing_ancestor(right);
+            let conflicts = |owner: &Path| {
+                [Some(right.to_path_buf()), candidate.clone()]
+                    .into_iter()
+                    .flatten()
+                    .any(|other| owner.starts_with(&other) || other.starts_with(owner))
+            };
+            conflicts(left) || conflicts(&peer)
+        }
+    }
+}
+fn paths_overlap_destructive(left: &Path, right: &Path) -> bool {
+    if left == right {
+        return true;
+    }
+    let left_canonical = left.canonicalize().ok();
+    let right_canonical = right.canonicalize().ok();
+    match (left_canonical, right_canonical) {
+        (Some(left), Some(right)) => left.starts_with(&right) || right.starts_with(&left),
+        _ => true,
+    }
 }
 
 /// The paths sessions outside a deletion use, across every profile.
@@ -596,7 +860,15 @@ pub(crate) enum PathsInUse {
 impl PathsInUse {
     pub(crate) fn covers(&self, root: &Path) -> bool {
         match self {
-            Self::Known(paths) => paths.iter().any(|path| path.starts_with(root)),
+            Self::Known(paths) => paths.iter().any(|path| paths_overlap(path, root)),
+            Self::Unknown(_) => true,
+        }
+    }
+    pub(crate) fn covers_destructive(&self, root: &Path) -> bool {
+        match self {
+            Self::Known(paths) => paths
+                .iter()
+                .any(|path| paths_overlap_destructive(Path::new(path), root)),
             Self::Unknown(_) => true,
         }
     }
@@ -610,8 +882,8 @@ impl PathsInUse {
 }
 
 fn all_profile_storages() -> std::result::Result<(Vec<String>, Vec<Storage>), String> {
-    let profiles =
-        crate::session::list_profiles().map_err(|error| format!("listing profiles: {error}"))?;
+    let profiles = crate::session::list_profiles_for_worktree_inventory()
+        .map_err(|error| format!("listing profiles: {error}"))?;
     let storages = profiles
         .iter()
         .map(|profile| {
@@ -622,11 +894,58 @@ fn all_profile_storages() -> std::result::Result<(Vec<String>, Vec<Storage>), St
     Ok((profiles, storages))
 }
 
-fn scan_paths_in_use(storages: &[Storage], except_ids: &[&str]) -> PathsInUse {
+fn scan_paths_in_use(storages: &[Storage], except: &[SessionPathOwner<'_>]) -> PathsInUse {
+    let mut owners = Vec::with_capacity(except.len());
+    for owner in except {
+        if owner.profile.is_empty() || owner.session_id.is_empty() {
+            return PathsInUse::Unknown("session ownership has no explicit profile or id".into());
+        }
+        let identity = crate::session::get_profile_dir_path(owner.profile)
+            .and_then(|dir| std::fs::metadata(dir).map_err(Into::into));
+        let identity = match identity {
+            Ok(identity) if identity.is_dir() => identity,
+            Ok(_) => return PathsInUse::Unknown("owner profile is not a directory".into()),
+            Err(error) => return PathsInUse::Unknown(format!("resolving owner profile: {error}")),
+        };
+        owners.push((identity, owner.session_id, false, false));
+    }
     let mut paths = Vec::new();
     for storage in storages {
-        match storage.load() {
-            Ok(instances) => paths.extend(other_sessions_paths(&instances, except_ids)),
+        if !owners.is_empty() {
+            let identity = storage
+                .sessions_path()
+                .parent()
+                .and_then(|dir| std::fs::metadata(dir).ok());
+            let Some(identity) = identity else {
+                return PathsInUse::Unknown(format!("resolving profile '{}'", storage.profile()));
+            };
+            for (owner_identity, _, seen, matches) in &mut owners {
+                *matches =
+                    crate::session::storage::same_filesystem_identity(owner_identity, &identity);
+                *seen |= *matches;
+            }
+        }
+        match storage.load_strict_for_worktree_ownership_locked() {
+            Ok(instances) => paths.extend(
+                instances
+                    .iter()
+                    .filter(|instance| {
+                        !owners
+                            .iter()
+                            .any(|(_, id, _, matches)| *matches && *id == instance.id)
+                    })
+                    .flat_map(|instance| {
+                        std::iter::once(instance.project_path.as_str())
+                            .chain(instance.pre_trash_project_path.as_deref())
+                            .chain(
+                                instance
+                                    .all_repos()
+                                    .iter()
+                                    .map(|repo| repo.worktree_path.as_str()),
+                            )
+                            .map(PathBuf::from)
+                    }),
+            ),
             Err(error) => {
                 return PathsInUse::Unknown(format!(
                     "reading profile '{}': {error}",
@@ -635,14 +954,37 @@ fn scan_paths_in_use(storages: &[Storage], except_ids: &[&str]) -> PathsInUse {
             }
         }
     }
+    if owners.iter().any(|(_, _, seen, _)| !seen) {
+        return PathsInUse::Unknown("owner profile is missing from the ownership inventory".into());
+    }
     PathsInUse::Known(paths)
 }
 
-/// Unlocked snapshot of [`PathsInUse`], for a preflight that the teardown re-checks under lock.
-pub(crate) fn paths_in_use_except(except_ids: &[&str]) -> PathsInUse {
+/// Unlocked snapshot; destructive callers recheck under the ownership locks.
+pub(crate) fn paths_in_use_except(except: &[SessionPathOwner<'_>]) -> PathsInUse {
     match all_profile_storages() {
-        Ok((_, storages)) => scan_paths_in_use(&storages, except_ids),
+        Ok((_, storages)) => scan_paths_in_use(&storages, except),
         Err(reason) => PathsInUse::Unknown(reason),
+    }
+}
+
+pub(crate) fn ensure_unclaimed_paths(
+    owner: SessionPathOwner<'_>,
+    candidates: &[PathBuf],
+) -> std::result::Result<(), String> {
+    let paths = paths_in_use_except(&[owner]);
+    match paths {
+        PathsInUse::Unknown(reason) => Err(reason),
+        PathsInUse::Known(paths)
+            if paths.iter().any(|path| {
+                candidates
+                    .iter()
+                    .any(|candidate| paths_overlap(Path::new(path), candidate))
+            }) =>
+        {
+            Err("another session already claims one of the candidate paths".to_string())
+        }
+        PathsInUse::Known(_) => Ok(()),
     }
 }
 
@@ -654,16 +996,31 @@ thread_local! {
 
 /// Run `f` with the paths other sessions use while every profile's storage lock is held, so no
 /// session can adopt a path between the check and whatever `f` removes.
-fn with_paths_in_use_locked<R>(except_id: &str, f: impl FnOnce(&PathsInUse) -> R) -> R {
+fn with_paths_in_use_locked<R>(
+    owner: SessionPathOwner<'_>,
+    identity_lock_held: bool,
+    f: impl FnOnce(&PathsInUse) -> R,
+) -> R {
+    let identity_lock = if identity_lock_held {
+        None
+    } else {
+        crate::session::acquire_session_identity_lock().ok()
+    };
+    if !identity_lock_held && identity_lock.is_none() {
+        return f(&PathsInUse::Unknown(
+            "could not acquire session identity lock".to_string(),
+        ));
+    }
+    let _identity_lock = identity_lock;
     let (profiles, storages) = match all_profile_storages() {
         Ok(found) => found,
         Err(reason) => return f(&PathsInUse::Unknown(reason)),
     };
     let mut f = Some(f);
     let locked = crate::session::storage::with_storages_locked(&storages, || {
-        let paths_in_use = match crate::session::list_profiles() {
+        let paths_in_use = match crate::session::list_profiles_for_worktree_inventory() {
             Ok(now) if now.iter().all(|profile| profiles.contains(profile)) => {
-                scan_paths_in_use(&storages, &[except_id])
+                scan_paths_in_use(&storages, &[owner])
             }
             Ok(_) => PathsInUse::Unknown("a profile was created during the deletion".to_string()),
             Err(error) => PathsInUse::Unknown(format!("listing profiles: {error}")),
@@ -689,11 +1046,15 @@ pub fn perform_deletion(request: &DeletionRequest) -> DeletionResult {
         DockerContainer::from_session_id(session_id).teardown(session_id)
     })
 }
+fn default_teardown(session_id: &str) -> crate::containers::Teardown {
+    DockerContainer::from_session_id(session_id).teardown(session_id)
+}
 
-fn perform_deletion_teardown_lifecycle_locked(request: &DeletionRequest) -> DeletionResult {
-    perform_deletion_core(request, true, |session_id| {
-        DockerContainer::from_session_id(session_id).teardown(session_id)
-    })
+fn perform_deletion_teardown_lifecycle_locked(
+    request: &DeletionRequest,
+    identity_lock_held: bool,
+) -> DeletionResult {
+    perform_deletion_core(request, true, identity_lock_held, default_teardown)
 }
 
 /// Core deletion routine, parameterized over how the sandbox container is torn down so the
@@ -703,18 +1064,24 @@ fn perform_deletion_with(
     request: &DeletionRequest,
     teardown: impl FnOnce(&str) -> crate::containers::Teardown,
 ) -> DeletionResult {
-    perform_deletion_core(request, false, teardown)
+    perform_deletion_core(request, false, false, teardown)
+}
+
+#[cfg(test)]
+fn perform_deletion_with_lifecycle_locked(
+    request: &DeletionRequest,
+    teardown: impl FnOnce(&str) -> crate::containers::Teardown,
+) -> DeletionResult {
+    perform_deletion_core(request, true, false, teardown)
 }
 
 /// `lifecycle_locked` is the production path, which also keeps any worktree another session uses.
 fn perform_deletion_core(
     request: &DeletionRequest,
     lifecycle_locked: bool,
+    identity_lock_held: bool,
     teardown: impl FnOnce(&str) -> crate::containers::Teardown,
 ) -> DeletionResult {
-    let mut errors = Vec::new();
-    let mut messages = Vec::new();
-
     tracing::debug!(target: "session.delete",
         session_id = %request.session_id,
         title = %request.instance.title,
@@ -729,10 +1096,67 @@ fn perform_deletion_core(
         "perform_deletion: starting"
     );
 
+    // Keep the profile and identity locks around the complete teardown, not just
+    // the ownership scan. A peer must not claim a path between the scan and any
+    // destructive stage.
+    let repos: &[super::WorkspaceRepo] = if request
+        .instance
+        .workspace_info
+        .as_ref()
+        .is_some_and(|w| w.cleanup_on_delete)
+    {
+        request.instance.all_repos()
+    } else {
+        &[]
+    };
+    if lifecycle_locked && request.needs_path_inventory() {
+        return with_paths_in_use_locked(
+            SessionPathOwner {
+                profile: &request.instance.source_profile,
+                session_id: &request.session_id,
+            },
+            identity_lock_held,
+            |paths| {
+                perform_deletion_teardown_under_ownership_guard(
+                    request, repos, true, paths, teardown,
+                )
+            },
+        );
+    }
+    perform_deletion_teardown_under_ownership_guard(
+        request,
+        repos,
+        lifecycle_locked,
+        &PathsInUse::Known(Vec::new()),
+        teardown,
+    )
+}
+
+fn perform_deletion_teardown_under_ownership_guard(
+    request: &DeletionRequest,
+    repos: &[super::WorkspaceRepo],
+    lifecycle_locked: bool,
+    paths_in_use: &PathsInUse,
+    teardown: impl FnOnce(&str) -> crate::containers::Teardown,
+) -> DeletionResult {
+    let mut errors = Vec::new();
+    let mut messages = Vec::new();
+    if let PathsInUse::Unknown(reason) = paths_in_use {
+        return DeletionResult {
+            session_id: request.session_id.clone(),
+            success: false,
+            teardown_started: false,
+            messages,
+            errors: vec![format!(
+                "could not prove that session resources are unused: {reason}"
+            )],
+            disposition: DeletionDisposition::Failed,
+            retained_instance: None,
+        };
+    }
+
     // on_destroy hooks run in the transaction's unlocked hook phase, before
     // this lifecycle-locked resource teardown begins.
-
-    // Stage 2: sever the live agent BEFORE we touch the working tree it may be writing to.
     tracing::debug!(target: "session.delete", session_id = %request.session_id, stage = "tmux_kill", "perform_deletion: stage");
     if lifecycle_locked {
         request.instance.kill_all_tmux_sessions_locked();
@@ -745,67 +1169,26 @@ fn perform_deletion_core(
         .sandbox_info
         .as_ref()
         .is_some_and(|s| s.enabled);
-
-    // Host-side dirty check. The in-container preclean below destroys
-    // worktree contents unconditionally, which would silently violate
-    // the `force_delete=false` safety contract for users with untracked
-    // or modified files. Walk every managed worktree we'd touch and
-    // collect the dirty ones; preclean is skipped if anything is dirty
-    // (the `find -delete` runs at the workspace root and can't easily
-    // skip subpaths), and host-side worktree removal is skipped per
-    // path that's dirty. Container, branch, and hook stages still run
-    // per the user's flags.
-    // Every repo the session works in, whether it was created multi-repo or
-    // converted by `attach_project` (#3103): both end up in
-    // `workspace_info.repos`, so one loop per stage covers them.
-    //
-    // `cleanup_on_delete` is the user's opt-out for the whole workspace, so it
-    // gates the list rather than any individual repo.
-    let repos: &[super::WorkspaceRepo] = if request
-        .instance
-        .workspace_info
-        .as_ref()
-        .is_some_and(|w| w.cleanup_on_delete)
-    {
-        request.instance.all_repos()
+    let container_gone = stage_teardown_worktrees(
+        request,
+        repos,
+        is_sandboxed,
+        paths_in_use,
+        teardown,
+        &mut errors,
+        &mut messages,
+    );
+    let scratch_preserved = if request.instance.scratch {
+        paths_in_use.covers(Path::new(&request.instance.project_path))
     } else {
-        &[]
+        false
     };
+    stage_cleanup_scratch(request, scratch_preserved, &mut errors, &mut messages);
 
-    let removes_managed_worktree = request.delete_worktree
-        && (request
-            .instance
-            .worktree_info
-            .as_ref()
-            .is_some_and(|wt| wt.managed_by_aoe)
-            || request.instance.workspace_info.is_some());
-    let stage = |paths_in_use: &PathsInUse| {
-        stage_teardown_worktrees(
-            request,
-            repos,
-            is_sandboxed,
-            paths_in_use,
-            teardown,
-            &mut errors,
-            &mut messages,
-        )
-    };
-    let container_gone = if lifecycle_locked && removes_managed_worktree {
-        with_paths_in_use_locked(&request.session_id, stage)
-    } else {
-        stage(&PathsInUse::Known(Vec::new()))
-    };
-
-    stage_cleanup_scratch(request, &mut errors, &mut messages);
-
-    // Last, and only when nothing else failed: any error here rolls the purge back
-    // (`PurgeTransaction::complete_inner`), and a session that survives its own purge must survive
-    // with the store holding its login and history.
     if container_gone && errors.is_empty() {
         stage_remove_agent_stores(request, &mut messages);
     }
 
-    // Stage 6: hook status cleanup
     tracing::debug!(target: "session.delete", session_id = %request.session_id, stage = "hook_status_cleanup", "perform_deletion: stage");
     crate::hooks::cleanup_hook_status_dir(&request.instance.id);
 
@@ -1214,9 +1597,14 @@ fn stage_remove_worktrees_and_branches(
 
 fn stage_cleanup_scratch(
     request: &DeletionRequest,
+    preserved_by_peer: bool,
     errors: &mut Vec<String>,
     messages: &mut Vec<String>,
 ) {
+    if preserved_by_peer {
+        messages.push("Scratch directory kept; another session still uses it".to_string());
+        return;
+    }
     // Scratch directory cleanup.
     if request.instance.scratch {
         let path = PathBuf::from(&request.instance.project_path);
@@ -1460,6 +1848,352 @@ mod tests {
         }
     }
 
+    #[test]
+    fn parent_paths_do_not_claim_descendant_sessions() {
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp.path().join("parent");
+        let child = parent.join("child");
+        std::fs::create_dir_all(&child).unwrap();
+        assert!(!paths_overlap(&parent, &child));
+        assert!(paths_overlap(&child, &parent));
+    }
+
+    /// A peer path that no longer exists on disk cannot contain anything, so it
+    /// must not read as a global conflict.
+    #[test]
+    fn missing_recorded_peer_path_is_not_a_conflict() {
+        let temp = tempfile::tempdir().unwrap();
+        let gone = temp.path().join("already-deleted");
+        let candidate = temp.path().join("candidate");
+        std::fs::create_dir_all(&candidate).unwrap();
+
+        assert!(!paths_overlap(&gone, &candidate));
+        assert!(!paths_overlap(&gone, temp.path()));
+    }
+
+    /// The mirror case: a candidate that does not exist yet still has to be
+    /// caught lexically when it would land under a live peer parent, otherwise
+    /// the post-create check would wave it through.
+    #[test]
+    fn missing_candidate_under_an_existing_peer_parent_still_conflicts() {
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp.path().join("peer");
+        std::fs::create_dir_all(&parent).unwrap();
+        let candidate = parent.join("not-created-yet");
+
+        assert!(!candidate.exists());
+        assert!(paths_overlap(&parent, &candidate));
+    }
+
+    /// A peer recorded through a symlink names the same directory as its
+    /// resolved form. Testing only the recorded spelling let a candidate under
+    /// the real path through, which is the normal macOS layout.
+    #[test]
+    fn missing_candidate_under_a_symlinked_peer_parent_still_conflicts() {
+        let temp = tempfile::tempdir().unwrap();
+        let real = temp.path().join("real");
+        let peer = real.join("peer");
+        std::fs::create_dir_all(&peer).unwrap();
+        std::os::unix::fs::symlink(&real, temp.path().join("link")).unwrap();
+
+        let recorded = temp.path().join("link").join("peer");
+        let candidate = peer.join("not-created-yet");
+        assert!(!candidate.exists());
+
+        assert!(
+            paths_overlap(&recorded, &candidate),
+            "the recorded spelling and the candidate name different parents"
+        );
+    }
+
+    /// The macOS shape: the candidate's own parent is reached through an alias,
+    /// `/var` being `/private/var` there. Resolving only the peer cannot see it.
+    #[test]
+    fn missing_candidate_behind_its_own_alias_still_conflicts() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().join("private");
+        let peer = base.join("real/peer");
+        std::fs::create_dir_all(&peer).unwrap();
+        std::os::unix::fs::symlink(&base, temp.path().join("var")).unwrap();
+
+        let candidate = temp.path().join("var/real/peer/not-created-yet");
+        assert!(!candidate.exists());
+
+        assert!(
+            paths_overlap(&peer, &candidate),
+            "the candidate's parent is an alias of the peer's"
+        );
+    }
+
+    /// Two profiles holding the same session id used to make the whole
+    /// cross-profile inventory `Unknown`, so every path in every profile read
+    /// as claimed. The id is not an ownership claim: only the recorded paths
+    /// are, and they must still be enforced.
+    #[test]
+    #[serial_test::serial]
+    fn duplicate_session_ids_do_not_poison_every_ownership_check() {
+        let _app_guard = isolate_app_dir();
+        for profile in ["dup-a", "dup-b"] {
+            crate::session::create_profile(profile).unwrap();
+            let storage = Storage::open_unwatched(profile).unwrap();
+            let mut instance = Instance::new("Dup", &format!("/tmp/{profile}"));
+            instance.id = "dup-shared-id".to_string();
+            instance.source_profile = profile.to_string();
+            storage
+                .update(|instances, _groups| {
+                    instances.push(instance);
+                    Ok(())
+                })
+                .unwrap();
+        }
+        let caller = SessionPathOwner {
+            profile: "dup-a",
+            session_id: "unrelated-caller",
+        };
+        assert!(
+            ensure_unclaimed_paths(caller, &[PathBuf::from("/tmp/dup-a")]).is_err(),
+            "a candidate colliding with a recorded peer path is still refused"
+        );
+        assert!(
+            ensure_unclaimed_paths(caller, &[PathBuf::from("/tmp/dup-b")]).is_err(),
+            "the second profile's recorded path is enforced too"
+        );
+        assert!(
+            ensure_unclaimed_paths(caller, &[PathBuf::from("/tmp/unrelated")]).is_ok(),
+            "a duplicate id elsewhere must not make unrelated candidates look claimed"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn same_id_peer_in_another_profile_keeps_ownership() {
+        let _home = isolate_app_dir();
+        for profile in ["owner", "peer"] {
+            let storage = Storage::new_unwatched(profile).unwrap();
+            let mut instance = Instance::new(profile, &format!("/tmp/{profile}-same-id"));
+            instance.id = "same-id".into();
+            instance.source_profile = profile.into();
+            instance.pre_trash_project_path = Some(format!("/tmp/{profile}-restore"));
+            storage
+                .update(|instances, _| {
+                    instances.push(instance);
+                    Ok(())
+                })
+                .unwrap();
+        }
+        std::os::unix::fs::symlink(
+            "owner",
+            crate::session::get_app_dir()
+                .unwrap()
+                .join("profiles/owner-alias"),
+        )
+        .unwrap();
+        for profile in ["owner", "owner-alias"] {
+            let caller = SessionPathOwner {
+                profile,
+                session_id: "same-id",
+            };
+            for claimed in ["/tmp/peer-same-id", "/tmp/peer-restore"] {
+                assert!(
+                    ensure_unclaimed_paths(caller, &[PathBuf::from(claimed)]).is_err(),
+                    "peer retained: {profile}/{claimed}"
+                );
+            }
+            for unclaimed in ["/tmp/owner-same-id", "/tmp/owner-restore", "/tmp/unrelated"] {
+                assert!(
+                    ensure_unclaimed_paths(caller, &[PathBuf::from(unclaimed)]).is_ok(),
+                    "own/unrelated admitted: {profile}/{unclaimed}"
+                );
+            }
+        }
+        for profile in ["", "missing"] {
+            assert!(ensure_unclaimed_paths(
+                SessionPathOwner {
+                    profile,
+                    session_id: "same-id"
+                },
+                &[PathBuf::from("/tmp/unrelated")]
+            )
+            .is_err());
+        }
+    }
+
+    /// The cs/cxa pattern: `profiles/<alias>` is a symlink to another profile.
+    /// The inventory resolves it to the store it already scans, so an aliased
+    /// installation can still delete and the aliased store's peers still claim
+    /// their recorded paths.
+    #[test]
+    #[serial_test::serial]
+    fn symlinked_profile_alias_does_not_poison_every_ownership_check() {
+        let temp = tempfile::tempdir().unwrap();
+        let _home = isolate_app_dir_at(temp.path());
+        crate::session::create_profile("default").unwrap();
+        crate::session::create_profile("personal").unwrap();
+        // The cs/cxa pattern: an alias symlink pointing at `default`.
+        std::os::unix::fs::symlink(
+            "default",
+            crate::session::get_app_dir()
+                .unwrap()
+                .join("profiles/forit-work"),
+        )
+        .unwrap();
+        store_peer_session("personal", "/tmp/aliased-peer");
+
+        assert!(
+            ensure_unclaimed_paths(
+                SessionPathOwner {
+                    profile: "forit-work",
+                    session_id: "caller"
+                },
+                &[PathBuf::from("/tmp/aliased-peer")]
+            )
+            .is_err(),
+            "a peer session in another profile still claims its path"
+        );
+        assert!(
+            ensure_unclaimed_paths(
+                SessionPathOwner {
+                    profile: "forit-work",
+                    session_id: "caller"
+                },
+                &[PathBuf::from("/tmp/unrelated")]
+            )
+            .is_ok(),
+            "an alias for a profile already in the inventory must not make every path look claimed"
+        );
+    }
+
+    /// A dangling alias, and one pointing out of the profile namespace, name no
+    /// store the inventory can scan. They must cost that entry only.
+    #[test]
+    #[serial_test::serial]
+    fn unresolvable_profile_alias_leaves_the_other_profiles_inventoried() {
+        let temp = tempfile::tempdir().unwrap();
+        let _home = isolate_app_dir_at(temp.path());
+        crate::session::create_profile("personal").unwrap();
+        let profiles_dir = crate::session::get_app_dir().unwrap().join("profiles");
+        std::os::unix::fs::symlink("no-such-profile", profiles_dir.join("forit-work")).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), profiles_dir.join("elsewhere")).unwrap();
+        store_peer_session("personal", "/tmp/aliased-peer");
+
+        assert!(
+            ensure_unclaimed_paths(
+                SessionPathOwner {
+                    profile: "personal",
+                    session_id: "caller"
+                },
+                &[PathBuf::from("/tmp/aliased-peer")]
+            )
+            .is_err(),
+            "the profiles that can be read are still inventoried"
+        );
+        assert!(
+            ensure_unclaimed_paths(
+                SessionPathOwner {
+                    profile: "personal",
+                    session_id: "caller"
+                },
+                &[PathBuf::from("/tmp/unrelated")]
+            )
+            .is_ok(),
+            "an unresolvable alias must not make every path look claimed"
+        );
+    }
+
+    /// A session with no managed worktree, no workspace and no scratch destroys
+    /// no path another session can own, so an inventory it cannot read must not
+    /// refuse its deletion.
+    #[test]
+    #[serial_test::serial]
+    fn a_session_with_nothing_to_protect_is_not_refused_on_an_unknown_inventory() {
+        let temp = tempfile::tempdir().unwrap();
+        let _home = isolate_app_dir_at(&temp.path().join("home"));
+        let storage = Storage::new_unwatched("owner").unwrap();
+        let mut plain = Instance::new("Plain", temp.path().join("plain").to_str().unwrap());
+        plain.source_profile = "owner".to_string();
+        storage
+            .update(|instances, _groups| {
+                instances.push(plain.clone());
+                Ok(())
+            })
+            .unwrap();
+
+        // A neighbouring profile the inventory cannot read.
+        let other = Storage::new_unwatched("other").unwrap();
+        other.update(|_, _| Ok(())).unwrap();
+        std::fs::write(other.sessions_path(), "[{\"id\":1}]").unwrap();
+
+        let transaction = match PurgeTransaction::reserve(
+            storage,
+            DeletionRequest {
+                delete_worktree: true,
+                delete_branch: true,
+                ..request(plain)
+            },
+        )
+        .unwrap()
+        {
+            PurgeReservation::Reserved(transaction) => transaction,
+            PurgeReservation::Rejected(result) => panic!("reservation refused: {result:?}"),
+        };
+        let result = transaction.complete();
+
+        assert!(
+            result.success,
+            "nothing here can be owned, so an unreadable inventory must not refuse: {:?}",
+            result.errors
+        );
+    }
+
+    /// An unreadable profile owns a session, so the inventory cannot be known.
+    /// `Path::exists()` answers `false` for a permission error just as it does
+    /// for a missing file, which silently emptied the inventory and let a purge
+    /// delete a peer's worktree.
+    #[test]
+    #[serial_test::serial]
+    fn unreadable_profile_inventory_is_unknown_not_empty() {
+        // Permission bits do not apply to root, so the setup could not
+        // reproduce anything there.
+        if nix::unistd::geteuid().is_root() {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let _home = isolate_app_dir_at(temp.path());
+        crate::session::create_profile("personal").unwrap();
+        store_peer_session("personal", "/tmp/unreadable-peer");
+        // Open before the profile goes unreadable, so the failure under test is
+        // the inventory read and not opening the store.
+        let storage = Storage::open_unwatched("personal").unwrap();
+        let profile_dir = crate::session::get_app_dir()
+            .unwrap()
+            .join("profiles/personal");
+        let mut perms = std::fs::metadata(&profile_dir).unwrap().permissions();
+        perms.set_mode(0o000);
+        std::fs::set_permissions(&profile_dir, perms).unwrap();
+
+        let outcome = storage.load_strict_for_worktree_ownership_locked();
+        let _ = std::fs::set_permissions(&profile_dir, std::fs::Permissions::from_mode(0o755));
+
+        assert!(
+            outcome.is_err(),
+            "an unreadable inventory must fail closed rather than read as owning nothing"
+        );
+    }
+
+    fn store_peer_session(profile: &str, project_path: &str) {
+        let storage = Storage::open_unwatched(profile).unwrap();
+        let mut instance = Instance::new("Peer", project_path);
+        instance.source_profile = profile.to_string();
+        storage
+            .update(|instances, _groups| {
+                instances.push(instance);
+                Ok(())
+            })
+            .unwrap();
+    }
+
     fn init_repo(path: &Path) {
         std::fs::create_dir_all(path).unwrap();
         let repo = git2::Repository::init(path).unwrap();
@@ -1618,8 +2352,83 @@ mod tests {
         assert!(storage.load().unwrap().is_empty());
     }
 
-    /// #4107: a purge keeps a shared worktree when another profile cannot be read, and a session
-    /// adopting the worktree after the ownership scan cannot see it removed.
+    #[test]
+    #[serial]
+    fn purge_rescans_a_peer_changed_while_waiting_for_its_storage_flock() {
+        let (tmp, main_repo, worktree, mut owner) = worktree_fixture("feature/rescan");
+        let _home = isolate_app_dir_at(&tmp.path().join("home"));
+        owner.source_profile = "owner".into();
+        let storage = Storage::new_unwatched("owner").unwrap();
+        storage
+            .update(|rows, _| {
+                rows.push(owner.clone());
+                Ok(())
+            })
+            .unwrap();
+        let peer = Storage::new_unwatched("peer").unwrap();
+        let initial_path = tmp.path().join("initial-peer");
+        std::fs::create_dir(&initial_path).unwrap();
+        let mut adopter = Instance::new("adopter", initial_path.to_str().unwrap());
+        peer.update(|rows, _| {
+            rows.push(adopter.clone());
+            Ok(())
+        })
+        .unwrap();
+        let sentinel = worktree.join("peer-evidence");
+        std::fs::write(&sentinel, "keep").unwrap();
+        let (committed_tx, committed_rx) = std::sync::mpsc::channel();
+        let (continue_tx, continue_rx) = std::sync::mpsc::channel();
+        let (event_tx, event_rx) = std::sync::mpsc::channel();
+        let purge = std::thread::spawn(move || {
+            let transaction = match PurgeTransaction::reserve(
+                storage,
+                DeletionRequest {
+                    delete_worktree: true,
+                    delete_branch: true,
+                    force_delete: true,
+                    ..request(owner)
+                },
+            )
+            .unwrap()
+            {
+                PurgeReservation::Reserved(transaction) => transaction,
+                PurgeReservation::Rejected(_) => panic!("initial inventory must allow purge"),
+            };
+            let transaction = transaction.begin_irreversible().unwrap();
+            committed_tx.send(()).unwrap();
+            continue_rx.recv().unwrap();
+            let _observer = crate::session::storage::observe_lock_contention_for_test(event_tx);
+            transaction.finish()
+        });
+        committed_rx
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .expect("purge commits before the peer lock is held");
+        let held = crate::session::storage::acquire_storage_flock(
+            peer.sessions_path().parent().unwrap(),
+            crate::session::storage::STORAGE_LOCK_FILENAME,
+        )
+        .unwrap();
+        continue_tx.send(()).unwrap();
+        let contended = event_rx.recv_timeout(std::time::Duration::from_secs(3));
+        adopter.project_path = worktree.to_str().unwrap().into();
+        crate::session::storage::atomic_write(
+            peer.sessions_path(),
+            &serde_json::to_vec(&[adopter]).unwrap(),
+        )
+        .unwrap();
+        drop(held);
+        let result = purge.join().unwrap();
+        assert!(result.success, "{:?}", result.errors);
+        contended.expect("purge must actually contend before the peer commits its new path");
+        assert_eq!(std::fs::read_to_string(&sentinel).unwrap(), "keep");
+        assert!(branch_exists(&main_repo, "feature/rescan"));
+        assert_eq!(
+            peer.load().unwrap()[0].project_path,
+            worktree.to_str().unwrap()
+        );
+    }
+
+    /// A purge retains a checkout when ownership is unknown or claimed after the scan.
     #[test]
     #[serial]
     fn purge_keeps_a_worktree_it_cannot_prove_unused() {
@@ -1674,7 +2483,7 @@ mod tests {
                         Ok(())
                     })
                     .unwrap();
-                std::fs::write(other.sessions_path(), "not json").unwrap();
+                std::fs::write(other.sessions_path(), "[{\"id\":1}]").unwrap();
                 None
             };
 
@@ -1692,7 +2501,12 @@ mod tests {
                 PurgeReservation::Rejected(_) => panic!("purge reservation was refused"),
             };
             let result = transaction.complete();
-            assert_eq!(result.disposition, DeletionDisposition::Removed);
+            if writer.is_some() {
+                assert_eq!(result.disposition, DeletionDisposition::Removed);
+            } else {
+                assert_eq!(result.disposition, DeletionDisposition::Failed);
+                assert!(!result.success);
+            }
 
             if let Some(writer) = writer {
                 let adopted_while_present = writer.recv().unwrap().join().unwrap();
@@ -1701,21 +2515,154 @@ mod tests {
                     "a worktree adopted after the scan was removed"
                 );
             } else {
-                assert!(result.success, "{:?}", result.errors);
-                assert!(
-                    result
-                        .messages
-                        .iter()
-                        .any(|m| m.contains("could not be checked")),
-                    "{:?}",
-                    result.messages
-                );
                 assert!(
                     worktree.exists(),
                     "worktree removed despite unreadable profile"
                 );
                 assert!(branch_exists(&main_repo, "feature/shared"));
             }
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn deletion_unknown_ownership_stops_before_teardown() {
+        let (tmp, main_repo, worktree, mut owner) = worktree_fixture("feature/unknown-owner");
+        let _home = isolate_app_dir_at(&tmp.path().join("home"));
+        let owner_storage = Storage::new_unwatched("owner").unwrap();
+        owner.source_profile = "owner".to_string();
+        owner_storage
+            .update(|instances, _groups| {
+                instances.push(owner.clone());
+                Ok(())
+            })
+            .unwrap();
+        let other = Storage::new_unwatched("other").unwrap();
+        other
+            .update(|instances, _groups| {
+                instances.push(owner.clone());
+                Ok(())
+            })
+            .unwrap();
+        // The inventory is unverifiable because a peer profile cannot be read
+        // at all, which is the surviving way to reach an `Unknown` verdict.
+        std::fs::write(other.sessions_path(), b"{ not json").unwrap();
+        let hook_dir = crate::hooks::hook_status_dir(&owner.id).unwrap();
+        std::fs::create_dir_all(&hook_dir).unwrap();
+        std::fs::write(hook_dir.join("sentinel"), b"keep").unwrap();
+
+        let called = std::cell::Cell::new(false);
+        let result = perform_deletion_with_lifecycle_locked(
+            &DeletionRequest {
+                delete_worktree: true,
+                delete_branch: true,
+                delete_sandbox: true,
+                ..request(owner.clone())
+            },
+            |_id| {
+                called.set(true);
+                crate::containers::Teardown::Removed
+            },
+        );
+        assert!(!result.success);
+        assert!(!result.teardown_started);
+        assert!(!called.get(), "container teardown must not start");
+        assert!(worktree.exists());
+        assert!(branch_exists(&main_repo, "feature/unknown-owner"));
+        assert!(owner_storage
+            .load()
+            .unwrap()
+            .iter()
+            .any(|row| row.id == owner.id));
+        assert!(
+            hook_dir.exists(),
+            "unknown ownership must skip hook status cleanup"
+        );
+        crate::hooks::cleanup_hook_status_dir(&owner.id);
+    }
+
+    #[test]
+    #[serial]
+    fn purge_preflight_rejects_unknown_inventory_before_hooks() {
+        let (tmp, _main_repo, _worktree, mut owner) = worktree_fixture("feature/preflight");
+        let _home = isolate_app_dir_at(&tmp.path().join("home"));
+        let owner_storage = Storage::new_unwatched("owner").unwrap();
+        owner.source_profile = "owner".to_string();
+        owner_storage
+            .update(|instances, _groups| {
+                instances.push(owner.clone());
+                Ok(())
+            })
+            .unwrap();
+        let other = Storage::new_unwatched("other").unwrap();
+        other
+            .update(|instances, _groups| {
+                instances.push(owner.clone());
+                Ok(())
+            })
+            .unwrap();
+        // The inventory is unverifiable because a peer profile cannot be read
+        // at all, which is the surviving way to reach an `Unknown` verdict.
+        std::fs::write(other.sessions_path(), b"{ not json").unwrap();
+        let transaction = match PurgeTransaction::reserve(
+            owner_storage,
+            DeletionRequest {
+                delete_worktree: true,
+                ..request(owner)
+            },
+        )
+        .unwrap()
+        {
+            PurgeReservation::Reserved(transaction) => transaction,
+            PurgeReservation::Rejected(result) => panic!("unexpected rejection: {result:?}"),
+        };
+        let Err(result) = transaction.preflight_ownership() else {
+            panic!("unknown inventory must refuse the purge before hooks");
+        };
+        assert!(!result.success);
+        assert!(result
+            .errors
+            .iter()
+            .any(|error| error.contains("could not prove")));
+        let stored = Storage::open_unwatched("owner").unwrap().load().unwrap();
+        assert_eq!(stored.len(), 1);
+        assert!(stored[0].lifecycle_reservation.is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn profile_creation_publication_waits_for_each_inventory_fence() {
+        let _home = isolate_app_dir();
+        for identity in [true, false] {
+            let name = if identity {
+                "identity-peer"
+            } else {
+                "namespace-peer"
+            };
+            let path = crate::session::get_profile_dir_path(name).unwrap();
+            let held = if identity {
+                crate::session::acquire_session_identity_lock().unwrap()
+            } else {
+                crate::session::storage::acquire_profile_namespace_lock().unwrap()
+            };
+            let (event_tx, event_rx) = std::sync::mpsc::channel();
+            let create = std::thread::spawn(move || {
+                let _observer =
+                    crate::session::storage::observe_lock_contention_for_test(event_tx.clone());
+                let result = crate::session::create_profile(name);
+                let _ = event_tx.send(PathBuf::new());
+                result
+            });
+            let observation = event_rx.recv_timeout(std::time::Duration::from_secs(3));
+            let absent_while_fenced = !path.exists();
+            drop(held);
+            create.join().unwrap().unwrap();
+            observation.expect("creation must reach a held fence or finish within the deadline");
+            assert!(
+                absent_while_fenced,
+                "a profile appeared while its inventory fence was held"
+            );
+            assert!(path.is_dir());
         }
     }
 
@@ -1824,6 +2771,57 @@ mod tests {
                     assert!(store.exists(), "{case:?}: {:?}", result.errors);
                     assert!(case == Case::PreTransition || !result.success, "{case:?}");
                 }
+            }
+        }
+        fn fail(_: &str) -> Teardown {
+            Teardown::Failed(DockerError::RemoveFailed("busy".into()))
+        }
+        fn ok(_: &str) -> Teardown {
+            Teardown::Removed
+        }
+        #[test]
+        #[serial]
+        fn transcript_callback_runs_only_after_successful_teardown() {
+            for (teardown, expect_purged) in [
+                (fail as fn(&str) -> Teardown, false),
+                (ok as fn(&str) -> Teardown, true),
+            ] {
+                let temp = tempfile::TempDir::new().unwrap();
+                let _home = isolate_app_dir_at(temp.path());
+                let profile = "purge-transcript-ordering";
+                let storage = Storage::new_unwatched(profile).unwrap();
+                let mut instance = stored_instance(&storage, profile, "/tmp/test-project");
+                instance.sandbox_info = Some(sandbox_info("aoe-sandbox-ordering"));
+                storage
+                    .update(|instances, _| {
+                        *instances = vec![instance.clone()];
+                        Ok(())
+                    })
+                    .unwrap();
+                let storage = Storage::open_unwatched(profile).unwrap();
+                let transaction = match PurgeTransaction::reserve(
+                    storage,
+                    DeletionRequest {
+                        delete_sandbox: true,
+                        ..request(instance.clone())
+                    },
+                )
+                .unwrap()
+                {
+                    PurgeReservation::Reserved(transaction) => transaction,
+                    PurgeReservation::Rejected(result) => {
+                        panic!("purge reservation was refused: {:?}", result.errors)
+                    }
+                };
+                let purged = std::cell::Cell::new(false);
+                let result = transaction.complete_with_test_teardown(
+                    |_| {
+                        purged.set(true);
+                        Ok(())
+                    },
+                    teardown,
+                );
+                assert_eq!(purged.get(), expect_purged, "result={result:?}");
             }
         }
     }
@@ -2276,5 +3274,181 @@ mod tests {
                 );
             }
         }
+    }
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn stopped_structured_session_can_be_purged_after_registry_cleanup() {
+        use crate::process::worker_registry::{self, WorkerRecord};
+        let temp = tempfile::tempdir().unwrap();
+        let _home = isolate_app_dir_at(&temp.path().join("home"));
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let mut structured = Instance::new("Stopped", project.to_str().unwrap());
+        structured.id = "stopped-purge".into();
+        structured.view = crate::session::View::Structured;
+        structured.source_profile = "owner".into();
+        Storage::new_unwatched("owner")
+            .unwrap()
+            .update(|instances, _| {
+                instances.push(structured.clone());
+                Ok(())
+            })
+            .unwrap();
+        let mut command = std::process::Command::new("/bin/sh");
+        command
+            .args(["-c", "read -r ignored || :"])
+            .stdin(std::process::Stdio::piped());
+        crate::process::configure_process_group(&mut command);
+        let mut child = command.spawn().unwrap();
+        let pid = child.id();
+        let incarnation = crate::process::process_incarnation(pid).unwrap().unwrap();
+        let boot = *uuid::Uuid::parse_str(&crate::process::boot_id().unwrap())
+            .unwrap()
+            .as_bytes();
+        structured.runner_journal = serde_json::from_value(serde_json::json!({
+            "coverage": "complete", "launches": [{
+                "nonce": *uuid::Uuid::new_v4().as_bytes(), "boot": boot,
+                "generation": 0, "incarnation": incarnation,
+            }],
+        }))
+        .unwrap();
+        Storage::open_unwatched("owner")
+            .unwrap()
+            .update(|rows, _| {
+                rows.iter_mut()
+                    .find(|row| row.id == structured.id)
+                    .unwrap()
+                    .runner_journal = structured.runner_journal.clone();
+                Ok(())
+            })
+            .unwrap();
+        let record = WorkerRecord::new(
+            structured.id.clone(),
+            pid,
+            worker_registry::socket_path_for(&structured.id).unwrap(),
+            "agent".into(),
+            "agent".into(),
+            project.clone(),
+            None,
+            Vec::new(),
+            Vec::new(),
+            None,
+            Some("owner".into()),
+        );
+        worker_registry::save(&record).unwrap();
+        drop(child.stdin.take());
+        assert!(child.wait().unwrap().success());
+        assert!(!crate::process::worker::is_process_group_alive(pid));
+        worker_registry::delete(&structured.id).unwrap();
+        assert!(worker_registry::load_strict(&structured.id)
+            .unwrap()
+            .is_none());
+        let transaction = match PurgeTransaction::reserve_unwatched(request(structured)).unwrap() {
+            PurgeReservation::Reserved(transaction) => transaction,
+            PurgeReservation::Rejected(result) => panic!("reservation failed: {result:?}"),
+        };
+        let settled = settle_runner_of(transaction)
+            .await
+            .expect("a proven stopped runner must permit purge");
+        let result = settled.run_hooks_with(|_, _| {}).complete_with(|_| Ok(()));
+        assert_eq!(result.disposition, DeletionDisposition::Removed);
+        assert!(Storage::open_unwatched("owner")
+            .unwrap()
+            .load()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn purge_keeps_unknown_history_and_live_groups_before_hooks() {
+        struct Reap(std::process::Child);
+        impl Drop for Reap {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let _home = isolate_app_dir_at(&temp.path().join("home"));
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let sentinel = project.join("keep");
+        std::fs::write(&sentinel, "checkout content").unwrap();
+        let mut command = std::process::Command::new("/bin/sh");
+        command
+            .args(["-c", "read -r ignored || :"])
+            .stdin(std::process::Stdio::piped());
+        crate::process::configure_process_group(&mut command);
+        let mut child = Reap(command.spawn().unwrap());
+        let pid = child.0.id();
+        let incarnation = crate::process::process_incarnation(pid).unwrap().unwrap();
+        let boot = *uuid::Uuid::parse_str(&crate::process::boot_id().unwrap())
+            .unwrap()
+            .as_bytes();
+        let live = serde_json::from_value(serde_json::json!({
+            "coverage": "complete", "launches": [{
+                "nonce": *uuid::Uuid::new_v4().as_bytes(), "boot": boot,
+                "generation": 0, "incarnation": incarnation,
+            }],
+        }))
+        .unwrap();
+        let storage = Storage::new_unwatched("owner").unwrap();
+        let mut instance = Instance::new("Protected", project.to_str().unwrap());
+        instance.id = "protected-purge".into();
+        instance.source_profile = storage.profile().into();
+        instance.view = crate::session::View::Structured;
+        storage
+            .update(|rows, _| {
+                rows.push(instance.clone());
+                Ok(())
+            })
+            .unwrap();
+        for journal in [
+            crate::session::runner_journal::RunnerExecutionJournal::default(),
+            live,
+        ] {
+            storage
+                .update(|rows, _| {
+                    rows.iter_mut()
+                        .find(|row| row.id == instance.id)
+                        .unwrap()
+                        .runner_journal = journal.clone();
+                    Ok(())
+                })
+                .unwrap();
+            assert!(crate::process::worker::is_process_group_alive(pid));
+            assert!(crate::process::worker_registry::load_strict(&instance.id)
+                .unwrap()
+                .is_none());
+            let transaction =
+                match PurgeTransaction::reserve_unwatched(request(instance.clone())).unwrap() {
+                    PurgeReservation::Reserved(transaction) => transaction,
+                    PurgeReservation::Rejected(result) => panic!("reservation failed: {result:?}"),
+                };
+            let mut hooks = 0;
+            let result = match settle_runner_of(transaction).await {
+                Ok(transaction) => transaction
+                    .run_hooks_with(|_, _| {
+                        hooks += 1;
+                    })
+                    .complete_with(|_| Ok(())),
+                Err(result) => *result,
+            };
+            assert_eq!(result.disposition, DeletionDisposition::Failed);
+            assert_eq!(hooks, 0);
+            assert_eq!(
+                std::fs::read_to_string(&sentinel).unwrap(),
+                "checkout content"
+            );
+            assert!(storage
+                .load()
+                .unwrap()
+                .iter()
+                .any(|row| row.id == instance.id && row.lifecycle_reservation.is_none()));
+            assert!(crate::process::worker::is_process_group_alive(pid));
+        }
+        drop(child.0.stdin.take());
+        assert!(child.0.wait().unwrap().success());
     }
 }

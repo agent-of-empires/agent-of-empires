@@ -91,63 +91,97 @@ pub(crate) async fn attach_project(
     }
 
     // Validation first, with nothing stopped and nothing written.
-    let (instance, plan, restarts) = {
+    let (instance, plan, restarts, worker_record) = {
         let profile = profile.clone();
         let id_owned = id.to_string();
         let repo = repo_path.to_path_buf();
         let file_watch = state.file_watch.clone();
         tokio::task::spawn_blocking(move || {
-            let storage = Storage::new(&profile, file_watch).map_err(|e| e.to_string())?;
+            let storage = Storage::open(&profile, file_watch).map_err(|e| e.to_string())?;
             let instances = storage.load().map_err(|e| format!("{e:#}"))?;
             let instance = instances
                 .into_iter()
                 .find(|i| i.id == id_owned)
                 .ok_or_else(|| format!("session not found: {id_owned}"))?;
-            let plan =
+            let mut plan =
                 crate::session::attach_project::plan(&instance, &profile, &repo, on_existing)
                     .map_err(|e| format!("{e:#}"))?;
+            let worker_record = crate::process::worker_registry::load_strict(&id_owned)
+                .map_err(|e| format!("{e:#}"))?;
+            crate::session::attach_project::reserve_attach(&storage, &id_owned, &mut plan)
+                .map_err(|e| format!("{e:#}"))?;
             let restarts =
                 crate::session::attach_project::needs_restart(&plan, instance.is_sandboxed());
-            Ok::<_, String>((instance, plan, restarts))
+            Ok::<_, String>((instance, plan, restarts, worker_record))
         })
         .await
         .map_err(|e| AttachError::Rejected(format!("attach task panicked: {e}")))?
         .map_err(AttachError::Rejected)?
     };
 
-    // Order is load-bearing.
+    // The reservation rejects late runner authorization. The journal's durable
+    // proof, rather than the supervisor's in-memory map, governs conversion.
+    if restarts {
+        let stop = crate::session::attach_project::settle_for_conversion(
+            crate::session::deletion::SessionPathOwner {
+                profile: &profile,
+                session_id: id,
+            },
+            worker_record.as_ref(),
+            &plan,
+        )
+        .await;
+        if let Err(error) = stop {
+            let id_owned = id.to_string();
+            let _ = run_blocking(state, &profile, move |storage| {
+                crate::session::attach_project::release_attach(storage, &id_owned, &plan);
+                Ok(())
+            })
+            .await;
+            return Err(AttachError::Rejected(format!(
+                "could not settle runner execution: {error:#}"
+            )));
+        }
+    }
     if restarts && was_running {
-        if let Err(e) = state
+        if let Err(error) = state
             .acp_supervisor
             .shutdown_and_wait(id, std::time::Duration::from_secs(5))
             .await
         {
+            let id_owned = id.to_string();
+            let _ = run_blocking(state, &profile, move |storage| {
+                crate::session::attach_project::release_attach(storage, &id_owned, &plan);
+                Ok(())
+            })
+            .await;
             return Err(AttachError::Rejected(format!(
-                "could not stop the current worker: {e}"
+                "could not stop the current worker: {error}"
             )));
         }
     }
 
-    let quiesced = if restarts {
-        // The worker registry entry is already gone, so this takes down the tmux
-        // pane and the sandbox container and reports only what it stopped.
+    let (plan, quiesced) = if restarts {
         match run_blocking(state, &profile, {
             let instance = instance.clone();
             move |storage| {
-                crate::session::attach_project::quiesce_for_conversion(storage, &instance)
-                    .map_err(|e| format!("{e:#}"))
+                let quiesced = crate::session::attach_project::quiesce_for_conversion(
+                    storage, &instance, &plan,
+                )
+                .map_err(|e| format!("{e:#}"))?;
+                Ok((plan, quiesced))
             }
         })
         .await
         {
-            Ok(q) => {
+            Ok(result) => {
                 clear_sandbox_pins(state, id).await;
-                q
+                result
             }
-            Err(e) => return Err(AttachError::Rejected(e)),
+            Err(error) => return Err(AttachError::Rejected(error)),
         }
     } else {
-        crate::session::attach_project::Quiesced::default()
+        (plan, crate::session::attach_project::Quiesced::default())
     };
 
     let outcome = {
@@ -207,7 +241,7 @@ where
     let profile = profile.to_string();
     let file_watch = state.file_watch.clone();
     tokio::task::spawn_blocking(move || {
-        let storage = Storage::new(&profile, file_watch).map_err(|e| e.to_string())?;
+        let storage = Storage::open(&profile, file_watch).map_err(|e| e.to_string())?;
         f(&storage)
     })
     .await
