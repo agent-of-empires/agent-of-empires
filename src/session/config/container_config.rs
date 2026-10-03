@@ -58,6 +58,10 @@ struct AgentConfigMount {
 }
 
 /// The sole source-copy registry. Unknown root files never gain copy authority.
+/// A sandbox store must never carry host MCP definitions; the `mcp.rewrite`
+/// hook is the only MCP source for sandboxed agents. Claude holds this (host
+/// `.claude.json` is never copied). Other agents' MCP-bearing config files
+/// below are still copied verbatim, a known gap.
 const AGENT_CONFIG_MOUNTS: &[AgentConfigMount] = &[
     AgentConfigMount {
         tool_name: "claude",
@@ -3771,6 +3775,60 @@ mod tests {
 
         assert!(!sandbox.join("auth.json").exists());
         assert!(sandbox.join("settings.json").exists());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_claude_store_never_carries_host_mcp_definitions() {
+        const SECRET: &str = "s3cr3t-guard-value";
+        let (_hook_guard, _, _application) = BaseGuard::ready();
+        let dir = TempDir::new().unwrap();
+        let host = dir.path().join(".claude");
+        fs::create_dir_all(&host).unwrap();
+        fs::write(host.join("settings.json"), r#"{"theme":"dark"}"#).unwrap();
+        fs::write(host.join(".credentials.json"), r#"{"claudeAiOauth":{}}"#).unwrap();
+        fs::write(
+            dir.path().join(".claude.json"),
+            serde_json::json!({
+                "hasCompletedOnboarding": false,
+                "mcpServers": {
+                    "stdio": {"command": "srv", "env": {"TOKEN": SECRET}},
+                    "http": {"type": "http", "url": "https://x.invalid",
+                             "headers": {"Authorization": SECRET}}
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let mount = AGENT_CONFIG_MOUNTS
+            .iter()
+            .find(|m| m.tool_name == "claude")
+            .unwrap();
+        let sandbox = prepare_owned_fixture(
+            mount,
+            dir.path(),
+            Some("guardinstance"),
+            CredentialFold::Freshest,
+            &crate::session::config::SessionConfig::default(),
+            dir.path(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(sandbox.join(".claude.json")).unwrap(),
+            r#"{"hasCompletedOnboarding":true}"#
+        );
+        assert!(sandbox.join("settings.json").exists());
+        let mut pending = vec![sandbox.clone()];
+        while let Some(path) = pending.pop() {
+            if path.is_dir() {
+                pending.extend(fs::read_dir(&path).unwrap().map(|e| e.unwrap().path()));
+            } else if let Ok(content) = fs::read_to_string(&path) {
+                assert!(!content.contains("mcpServers"), "{}", path.display());
+                assert!(!content.contains(SECRET), "{}", path.display());
+            }
+        }
     }
 
     #[test]
