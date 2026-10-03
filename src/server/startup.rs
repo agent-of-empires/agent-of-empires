@@ -456,10 +456,11 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         }
     };
 
-    // No fail-closed fallback for `None`: read-only serve never spawns ACP workers.
-    if let Some(host) = &plugin_host {
+    // Read-only serve never spawns agents, so it needs no rewriter. Otherwise one is always
+    // installed; without a host it fails closed for sessions a hook applies to.
+    if !read_only {
         crate::acp::mcp_rewrite::set_rewriter(Some(std::sync::Arc::new(
-            crate::plugin::mcp_rewrite::PluginMcpRewriter::new(host.clone()),
+            crate::plugin::mcp_rewrite::PluginMcpRewriter::new(plugin_host.clone()),
         )));
     }
 

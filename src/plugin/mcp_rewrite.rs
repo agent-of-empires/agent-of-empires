@@ -101,12 +101,31 @@ impl WorkerCall for PluginHost {
     }
 }
 
+/// A missing worker caller fails closed, but only when a hook applies.
+async fn run_hooks(
+    caller: Option<&dyn WorkerCall>,
+    hooks: &[RewriteHook],
+    ctx: &McpRewriteContext,
+    servers: Vec<ProjectMcpServer>,
+) -> Result<Vec<ProjectMcpServer>, RewriteError> {
+    let Some(first) = hooks.first() else {
+        return Ok(servers);
+    };
+    match caller {
+        Some(caller) => run_chain(caller, hooks, ctx, servers).await,
+        None => Err(RewriteError {
+            plugin: first.plugin_id.clone(),
+            cause: "plugin host unavailable".into(),
+        }),
+    }
+}
+
 pub struct PluginMcpRewriter {
-    host: Arc<PluginHost>,
+    host: Option<Arc<PluginHost>>,
 }
 
 impl PluginMcpRewriter {
-    pub fn new(host: Arc<PluginHost>) -> Self {
+    pub fn new(host: Option<Arc<PluginHost>>) -> Self {
         Self { host }
     }
 }
@@ -120,7 +139,8 @@ impl McpRewriter for PluginMcpRewriter {
         Box::pin(async move {
             let registry = crate::plugin::registry();
             let hooks = hooks_for(registry.active().map(|p| &p.manifest), ctx.sandboxed);
-            run_chain(&*self.host, &hooks, ctx, servers).await
+            let caller = self.host.as_deref().map(|h| h as &dyn WorkerCall);
+            run_hooks(caller, &hooks, ctx, servers).await
         })
     }
 }
@@ -285,10 +305,16 @@ mod tests {
             ["g"]
         );
         let seen = caller.seen_params.lock().unwrap();
+        let names: Vec<&str> = seen[1]["servers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["name"].as_str().unwrap())
+            .collect();
         assert_eq!(
-            seen[1]["servers"].as_array().unwrap().len(),
-            2,
-            "second hook sees b and g"
+            names,
+            ["b", "g"],
+            "second hook sees the first hook's output"
         );
     }
 
@@ -326,5 +352,16 @@ mod tests {
             .unwrap();
         assert_eq!(out, servers);
         assert!(caller.seen_params.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn missing_host_fails_closed_only_when_a_hook_applies() {
+        let servers = vec![stdio("a")];
+        let err = run_hooks(None, &[hook("acme.a")], &ctx(), servers.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(err.plugin, "acme.a");
+        let out = run_hooks(None, &[], &ctx(), servers.clone()).await.unwrap();
+        assert_eq!(out, servers);
     }
 }
