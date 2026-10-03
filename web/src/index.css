@@ -672,3 +672,34 @@ select:focus-visible,
      hugs the bottom with no reservation. */
   padding: env(safe-area-inset-top) env(safe-area-inset-right) 0 env(safe-area-inset-left);
 }
+
+/* Line-wrapped code: each source line hangs 2ch, and a corner arrow in that
+   gutter marks every wrapped row after the first. Needs `.wrap-line` or
+   shiki's `.line` per source line. */
+.wrap-lines,
+.wrap-lines :is(pre, code) {
+  white-space: normal;
+}
+.wrap-lines :is(.line, .wrap-line) {
+  display: block;
+  position: relative;
+  min-height: 1lh;
+  padding-left: 2ch;
+  text-indent: -2ch;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.wrap-lines :is(.line, .wrap-line)::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 1lh;
+  bottom: 0;
+  width: 2ch;
+  background-color: var(--color-text-dim);
+  -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M4 3v5h8M9 5l3 3-3 3' fill='none' stroke='black' stroke-width='1.5'/%3E%3C/svg%3E")
+    0 0 / 2ch 1lh repeat-y;
+  mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M4 3v5h8M9 5l3 3-3 3' fill='none' stroke='black' stroke-width='1.5'/%3E%3C/svg%3E")
+    0 0 / 2ch 1lh repeat-y;
+  pointer-events: none;
+}

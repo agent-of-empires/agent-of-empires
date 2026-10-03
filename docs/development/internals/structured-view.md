@@ -108,6 +108,7 @@ max_concurrent_workers = 100
 replay_events = 0                 # 0 = unlimited; caps per-session rows and the client buffer
 node_path = ""
 show_tool_durations = true
+wrap_tool_output = false          # initial line wrap of tool output blocks; each block can toggle
 compaction_reminder = false       # opt-in /compact nudge past the threshold
 compaction_reminder_percent = 75  # 1..99
 silent_orphan_grace_secs = 120    # 0 disables

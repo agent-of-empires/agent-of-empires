@@ -2841,6 +2841,13 @@
       "components": ["web/src/components/acp/ToolDisplayMode.tsx"]
     },
     {
+      "id": "acp.tool-output-wrap",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": ["src/components/acp/WrapToggle.test.tsx", "tests/acp-tool-output-wrap.spec.ts"],
+      "components": ["web/src/components/acp/WrapToggle.tsx"]
+    },
+    {
       "id": "acp.queued-prompt-expand-bounds",
       "kind": "vitest",
       "risk": "medium",
