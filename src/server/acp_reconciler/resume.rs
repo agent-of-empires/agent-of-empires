@@ -430,6 +430,7 @@ async fn build_spawn_request(
         claude_store_pin,
         instance,
         prior_conversation,
+        workspace_info,
     ) = {
         let instances = service.instances.read().await;
         let Some(inst) = instances.iter().find(|i| i.id == target.id) else {
@@ -454,6 +455,7 @@ async fn build_spawn_request(
             inst.clone(),
             target.stored_acp_session_id.is_none()
                 && (inst.agent_session_id.is_some() || inst.pi_session_path.is_some()),
+            inst.workspace_info.clone(),
         )
     };
     let agent = supervisor
@@ -520,6 +522,7 @@ async fn build_spawn_request(
         fork_from,
         sandbox_continuation: crate::acp::supervisor::SandboxContinuation::Persisted,
         sandbox_info,
+        workspace_info,
         source_profile: Some(target.source_profile.clone()),
         yolo_mode: target.yolo_mode,
         acp_mode_id,

@@ -516,9 +516,14 @@ impl<S: BroadcastSink> Supervisor<S> {
             &req.session_id,
             req.source_profile.clone(),
             req.cwd.clone(),
-            host_environment.clone(),
-            claude_config_dir,
-            req.sandbox_info.as_ref(),
+            McpHostEnv {
+                session_env: host_environment.clone(),
+                native_config_override: claude_config_dir,
+            },
+            McpSandboxScope {
+                sandbox_info: req.sandbox_info.as_ref(),
+                workspace_info: req.workspace_info.as_ref(),
+            },
             "MCP resolution task failed",
         )
         .await;
@@ -599,6 +604,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                 stored_acp_session_id,
                 fork_from,
                 sandbox_info: req.sandbox_info.clone(),
+                workspace_info: req.workspace_info.clone(),
                 source_profile,
                 mcp_servers,
                 seed_history_replay,
@@ -1390,19 +1396,36 @@ pub(super) fn discovery_key<'a>(sandboxed: bool, agent: &'a str, native: &'a str
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+/// The session's sandbox and workspace facts the `mcp.rewrite` hook sees.
+#[derive(Clone, Copy, Default)]
+pub(super) struct McpSandboxScope<'a> {
+    pub sandbox_info: Option<&'a crate::session::SandboxInfo>,
+    pub workspace_info: Option<&'a crate::session::WorkspaceInfo>,
+}
+
+/// The host environment MCP discovery reads from.
+#[derive(Default)]
+pub(super) struct McpHostEnv {
+    pub session_env: Vec<(String, String)>,
+    pub native_config_override: Option<PathBuf>,
+}
+
 pub(super) async fn resolve_mcp_servers(
     agent_key: &str,
     session_id: &str,
     profile: Option<String>,
     cwd: PathBuf,
-    session_env: Vec<(String, String)>,
-    native_config_override: Option<PathBuf>,
-    sandbox_info: Option<&crate::session::SandboxInfo>,
+    host: McpHostEnv,
+    scope: McpSandboxScope<'_>,
     failure: &'static str,
 ) -> Vec<agent_client_protocol::v1::schema::McpServer> {
-    let sandbox_info = sandbox_info.filter(|info| info.enabled).cloned();
+    let McpHostEnv {
+        session_env,
+        native_config_override,
+    } = host;
+    let sandbox_info = scope.sandbox_info.filter(|info| info.enabled).cloned();
     let projection_env = session_env.clone();
+    let workspace_info = scope.workspace_info.cloned();
     let resolved = {
         let (agent_key, session, profile, cwd) = (
             agent_key.to_string(),
@@ -1411,8 +1434,14 @@ pub(super) async fn resolve_mcp_servers(
             cwd.clone(),
         );
         tokio::task::spawn_blocking(move || {
-            let sandbox = sandbox_info
-                .map(|info| crate::acp::mcp_rewrite::McpSandbox::resolve(&info, &cwd, &session));
+            let sandbox = sandbox_info.map(|info| {
+                crate::acp::mcp_rewrite::McpSandbox::resolve(
+                    &info,
+                    &cwd,
+                    workspace_info.as_ref(),
+                    &session,
+                )
+            });
             let defs = resolve_mcp_defs(
                 &agent_key,
                 &session,
@@ -1444,9 +1473,9 @@ pub(super) async fn resolve_mcp_servers(
         profile,
         cwd,
     };
-    let provenance: std::collections::HashMap<String, McpProvenance> = resolved
+    let mut originals: std::collections::HashMap<String, (_, McpProvenance)> = resolved
         .iter()
-        .map(|s| (s.def.name.clone(), s.provenance.clone()))
+        .map(|s| (s.def.name.clone(), (s.def.clone(), s.provenance.clone())))
         .collect();
     let defs = resolved.into_iter().map(|s| s.def).collect();
     let defs = crate::acp::mcp_rewrite::rewrite_servers(&ctx, defs).await;
@@ -1458,15 +1487,15 @@ pub(super) async fn resolve_mcp_servers(
         servers = %crate::session::mcp::mcp_model::summarize_defs(&defs),
         "forwarding MCP servers"
     );
-    // A server the hook added keeps no provenance; treat it as project-local so it
-    // never receives session env values.
+    // Only a definition the hook left untouched keeps its provenance; an added or redefined
+    // one is project-local so it never receives session env values.
     let resolved = defs
         .into_iter()
         .map(|def| ResolvedMcpServer {
-            provenance: provenance
-                .get(&def.name)
-                .cloned()
-                .unwrap_or(McpProvenance::ProjectLocal),
+            provenance: match originals.remove(&def.name) {
+                Some((original, provenance)) if original == def => provenance,
+                _ => McpProvenance::ProjectLocal,
+            },
             def,
             shadowed: Vec::new(),
         })
@@ -2688,9 +2717,11 @@ time.sleep(60)
                 "hook-test",
                 None,
                 tmp.path().to_path_buf(),
-                Vec::new(),
-                None,
-                sandbox_info,
+                McpHostEnv::default(),
+                McpSandboxScope {
+                    sandbox_info,
+                    workspace_info: None,
+                },
                 "failed",
             )
         };
@@ -2719,7 +2750,7 @@ time.sleep(60)
         let plain = resolve(None).await;
 
         assert_eq!(
-            *rewriter.sandboxed_calls.lock().unwrap(),
+            rewriter.sandboxed_calls(),
             [true, false],
             "context must carry the sandbox flag, and a disabled sandbox is none"
         );
@@ -2732,8 +2763,92 @@ time.sleep(60)
 
     #[tokio::test]
     #[serial_test::serial]
-    async fn launch_runs_the_rewrite_hook_with_the_sandbox_flag() {
+    async fn hook_replacing_a_server_does_not_inherit_its_provenance() {
         use crate::acp::mcp_rewrite::test_support::{RecordingRewriter, SlotGuard};
+        use crate::session::mcp::project_mcp::{ProjectMcpServer, ProjectMcpTransport};
+
+        let (_home, tmp) = isolate_home();
+        let _env = crate::session::test_support::EnvGuard::unset(&["CLAUDE_CONFIG_DIR"]);
+        let config = |names: &[&str]| {
+            let servers: serde_json::Map<_, _> = names
+                .iter()
+                .map(|name| {
+                    let server = serde_json::json!({
+                        "type": "http",
+                        "url": format!("http://{name}.invalid/mcp"),
+                        "headers": { "X-Token": "Bearer ${FAKE_TOKEN}" },
+                    });
+                    (name.to_string(), server)
+                })
+                .collect();
+            serde_json::json!({ "mcpServers": servers }).to_string()
+        };
+        std::fs::write(
+            tmp.path().join(".claude.json"),
+            config(&["kept", "native-swapped"]),
+        )
+        .unwrap();
+        let app_dir = crate::session::get_app_dir().unwrap();
+        std::fs::write(app_dir.join("mcp.json"), config(&["global-swapped"])).unwrap();
+        let profile_dir = crate::session::get_profile_dir_path("work").unwrap();
+        std::fs::create_dir_all(&profile_dir).unwrap();
+        std::fs::write(profile_dir.join("mcp.json"), config(&["profile-swapped"])).unwrap();
+        let server = |name: &str, url: &str| ProjectMcpServer {
+            name: name.into(),
+            transport: ProjectMcpTransport::Http {
+                url: url.into(),
+                headers: [("X-Token".to_string(), "Bearer ${FAKE_TOKEN}".to_string())].into(),
+            },
+        };
+        let rewriter = RecordingRewriter::returning(vec![
+            server("kept", "http://kept.invalid/mcp"),
+            server("native-swapped", "http://hook-chosen.invalid/mcp"),
+            server("global-swapped", "http://hook-chosen.invalid/mcp"),
+            server("profile-swapped", "http://hook-chosen.invalid/mcp"),
+        ]);
+        let _slot = SlotGuard::install(rewriter);
+
+        let servers = resolve_mcp_servers(
+            "claude",
+            "provenance-test",
+            Some("work".into()),
+            tmp.path().to_path_buf(),
+            McpHostEnv {
+                session_env: vec![("FAKE_TOKEN".into(), "fake-value".into())],
+                native_config_override: None,
+            },
+            McpSandboxScope::default(),
+            "failed",
+        )
+        .await;
+
+        let header = |name: &str| {
+            servers
+                .iter()
+                .find_map(|s| match s {
+                    agent_client_protocol::v1::schema::McpServer::Http(s) if s.name == name => {
+                        Some(s.headers[0].value.clone())
+                    }
+                    _ => None,
+                })
+                .unwrap()
+        };
+        assert_eq!(header("kept"), "Bearer fake-value");
+        for swapped in ["native-swapped", "global-swapped", "profile-swapped"] {
+            assert_eq!(
+                header(swapped),
+                "Bearer ${FAKE_TOKEN}",
+                "{swapped}: a server the hook redefined must not receive session env values"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn launch_runs_the_rewrite_hook_with_the_sandbox_mounts() {
+        use crate::acp::mcp_rewrite::test_support::{
+            outside_main_mount, workspace_info, RecordingRewriter, SlotGuard, OUTSIDE_MAIN,
+        };
 
         let (_home, _tmp) = isolate_home();
         let rewriter = RecordingRewriter::returning(vec![rewritten_server()]);
@@ -2773,10 +2888,26 @@ time.sleep(60)
             .unwrap();
         let mut sandboxed = spawn_request("launch-sandboxed");
         sandboxed.sandbox_info = Some(sandbox_info);
+        sandboxed.workspace_info = Some(workspace_info(
+            &sandboxed.cwd,
+            &[("alpha", std::path::Path::new(OUTSIDE_MAIN))],
+        ));
         let (config, _) = supervisor.spawn_config(&sandboxed, 1).await.unwrap();
         assert_eq!(mcp_names(&config.mcp_servers), ["rewritten"]);
+        assert_eq!(
+            config.workspace_info.as_ref().map(|w| w.repos.len()),
+            Some(1),
+            "a respawn re-resolves from the same workspace"
+        );
 
-        assert_eq!(*rewriter.sandboxed_calls.lock().unwrap(), [false, true]);
+        let sandboxes = rewriter.sandboxes.lock().unwrap();
+        let [None, Some(sandbox)] = sandboxes.as_slice() else {
+            panic!("a host then a sandboxed call expected: {sandboxes:?}");
+        };
+        assert!(
+            sandbox.mounts.contains(&outside_main_mount()),
+            "launch reports the workspace mounts: {sandbox:?}"
+        );
     }
 
     #[tokio::test]
