@@ -112,6 +112,24 @@ impl Instance {
         self.file_watch = Some(fw);
     }
 
+    /// Write this row's sandbox provider stamp to disk, leaving every other
+    /// stored field as it is.
+    pub(crate) fn persist_sandbox_provider(&self) -> anyhow::Result<()> {
+        let provider = self.sandbox_info.as_ref().and_then(|s| s.provider.clone());
+        crate::session::Storage::new(&self.source_profile, self.resolve_file_watch())?.update(
+            |instances, _groups| {
+                if let Some(sandbox) = instances
+                    .iter_mut()
+                    .find(|i| i.id == self.id)
+                    .and_then(|i| i.sandbox_info.as_mut())
+                {
+                    sandbox.provider = provider;
+                }
+                Ok(())
+            },
+        )
+    }
+
     /// Resolve the live `Arc<FileWatchService>` for this Instance, falling back to a noop service
     /// when none was injected (ad-hoc construction or pre-injection state).
     pub(super) fn resolve_file_watch(&self) -> std::sync::Arc<crate::file_watch::FileWatchService> {
