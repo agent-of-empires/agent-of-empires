@@ -2,7 +2,7 @@ name: Dependabot Auto-Merge
 
 # Queues GitHub auto-merge (squash) on Dependabot minor and patch PRs once
 # .github/scripts/check-dependabot-pr.py passes. The merge still waits for
-# green checks and one maintainer approval, which the checker makes safe.
+# green checks and one maintainer approval.
 #
 # pull_request_target so the job runs from base with Actions secrets. Safe
 # because the PR head is fetched as git objects and read as data, never

