@@ -2545,10 +2545,13 @@
         "tests/live/acp-worker-api.spec.ts",
         "tests/acp-config-pickers-ui.spec.ts",
         "src/components/acp/SessionConfigControls.test.tsx",
+        "src/components/acp/__tests__/useProviderSwitch.test.tsx",
+        "src/lib/switchAcpProvider.test.ts",
         "src/hooks/useAcpSession.test.ts"
       ],
       "components": [
         "web/src/components/acp/SessionConfigControls.tsx",
+        "web/src/components/acp/useProviderSwitch.ts",
         "web/src/components/acp/Composer.tsx",
         "web/src/components/acp/StructuredView.tsx",
         "web/src/components/acp/AcpRuntime.tsx",
