@@ -622,6 +622,10 @@ impl<S: BroadcastSink> Drain<S> {
             config.cwd.clone(),
             config.host_environment.clone(),
             claude_config_dir,
+            config
+                .sandbox_info
+                .as_ref()
+                .is_some_and(|info| info.enabled),
             "MCP re-resolution on respawn failed",
         )
         .await;
