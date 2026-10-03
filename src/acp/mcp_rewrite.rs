@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
@@ -10,16 +10,85 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tracing::warn;
 
+use crate::acp::acp_client::{known_container_workdir, AcpError, SandboxLayout};
 use crate::session::mcp::project_mcp::{ProjectMcpServer, ProjectMcpTransport};
+use crate::session::SandboxInfo;
 
 pub const METHOD: &str = "mcp.rewrite";
 
 pub struct McpRewriteContext {
     pub session_id: String,
     pub agent: String,
-    pub sandboxed: bool,
+    /// Present exactly when the session is sandboxed.
+    pub sandbox: Option<McpSandbox>,
     pub profile: Option<String>,
     pub cwd: PathBuf,
+}
+
+impl McpRewriteContext {
+    pub fn sandboxed(&self) -> bool {
+        self.sandbox.is_some()
+    }
+}
+
+/// The workspace volumes a sandboxed session's container mounts, so a plugin can map
+/// container paths back to the host.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct McpSandbox {
+    pub container_workdir: Option<String>,
+    pub mounts: Vec<McpSandboxMount>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct McpSandboxMount {
+    pub host: String,
+    pub container: String,
+    pub read_only: bool,
+}
+
+impl McpSandbox {
+    /// Blocking: without a pinned workdir it asks the container runtime.
+    pub fn resolve(info: &SandboxInfo, cwd: &Path, session_id: &str) -> Self {
+        Self::from_layout(
+            SandboxLayout::resolve(info, cwd),
+            || known_container_workdir(info),
+            session_id,
+        )
+    }
+
+    /// A layout that cannot be computed still marks the session as sandboxed, with no
+    /// mounts and whatever workdir is known, rather than hiding the sandbox from plugins.
+    fn from_layout(
+        layout: Result<SandboxLayout, AcpError>,
+        fallback_workdir: impl FnOnce() -> Option<String>,
+        session_id: &str,
+    ) -> Self {
+        match layout {
+            Ok(layout) => Self {
+                container_workdir: Some(layout.container_workdir),
+                mounts: layout
+                    .volumes
+                    .into_iter()
+                    .map(|v| McpSandboxMount {
+                        host: v.host_path,
+                        container: v.container_path,
+                        read_only: v.read_only,
+                    })
+                    .collect(),
+            },
+            Err(e) => {
+                warn!(
+                    target: "acp.mcp",
+                    session = %session_id,
+                    "cannot compute sandbox mounts for mcp.rewrite ({e}); sending none"
+                );
+                Self {
+                    container_workdir: fallback_workdir(),
+                    mounts: Vec::new(),
+                }
+            }
+        }
+    }
 }
 
 /// The standard `mcpServers` entry shape plus its name, as sent to and received from plugins.
@@ -122,14 +191,18 @@ impl WireServer {
 }
 
 pub fn request_params(ctx: &McpRewriteContext, servers: &[ProjectMcpServer]) -> Value {
-    json!({
+    let mut params = json!({
         "session_id": ctx.session_id,
         "agent": ctx.agent,
-        "sandboxed": ctx.sandboxed,
+        "sandboxed": ctx.sandboxed(),
         "profile": ctx.profile,
         "cwd": ctx.cwd,
         "servers": servers.iter().map(WireServer::from).collect::<Vec<_>>(),
-    })
+    });
+    if let Some(sandbox) = &ctx.sandbox {
+        params["sandbox"] = json!(sandbox);
+    }
+    params
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -251,16 +324,17 @@ pub async fn rewrite_servers_with(
     let Some(rewriter) = rewriter else {
         return servers;
     };
-    let original = (!ctx.sandboxed).then(|| servers.clone());
+    let sandboxed = ctx.sandboxed();
+    let original = (!sandboxed).then(|| servers.clone());
     match rewriter.rewrite(ctx, servers).await {
         Ok(rewritten) => rewritten,
         Err(e) => {
             warn!(
                 target: "acp.mcp",
                 session = %ctx.session_id,
-                sandboxed = ctx.sandboxed,
+                sandboxed,
                 "mcp.rewrite hook failed ({e}); {}",
-                if ctx.sandboxed { "forwarding no servers" } else { "keeping the original servers" }
+                if sandboxed { "forwarding no servers" } else { "keeping the original servers" }
             );
             original.unwrap_or_default()
         }
@@ -321,7 +395,7 @@ pub(crate) mod test_support {
             self.sandboxed_calls
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .push(ctx.sandboxed);
+                .push(ctx.sandboxed());
             let result = self.result.clone();
             Box::pin(async move { Ok(result) })
         }
@@ -371,7 +445,14 @@ mod tests {
         McpRewriteContext {
             session_id: "s1".into(),
             agent: "agent-x".into(),
-            sandboxed: true,
+            sandbox: Some(McpSandbox {
+                container_workdir: Some("/workspace/foo".into()),
+                mounts: vec![McpSandboxMount {
+                    host: "/abs/host/foo".into(),
+                    container: "/workspace/foo".into(),
+                    read_only: false,
+                }],
+            }),
             profile: Some("work".into()),
             cwd: "/w".into(),
         }
@@ -390,12 +471,101 @@ mod tests {
         assert_eq!(p["profile"], "work");
         assert_eq!(p["cwd"], "/w");
         assert_eq!(
+            p["sandbox"],
+            json!({
+                "container_workdir": "/workspace/foo",
+                "mounts": [{"host": "/abs/host/foo", "container": "/workspace/foo", "read_only": false}]
+            })
+        );
+        assert_eq!(
             p["servers"][0],
             json!({"name":"ha","type":"stdio","command":"cmd","args":["--x"],"env":{"TOKEN":"sekret"}})
         );
         assert_eq!(
             p["servers"][1],
             json!({"name":"docs","type":"http","url":"https://e/mcp","headers":{"Authorization":"Bearer t"}})
+        );
+    }
+
+    #[test]
+    fn request_params_omit_sandbox_for_a_host_session() {
+        let mut c = ctx();
+        c.sandbox = None;
+        let p = request_params(&c, &[]);
+        assert_eq!(p["sandboxed"], false);
+        assert!(p.get("sandbox").is_none(), "{p}");
+    }
+
+    /// A sibling worktree mounts both itself and its main repo, so both reach the plugin.
+    #[test]
+    fn sandbox_of_a_linked_worktree_lists_worktree_and_main_repo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let worktree = tmp.path().join("repo-feature");
+        {
+            let git = git2::Repository::init(&repo).unwrap();
+            let sig = git2::Signature::now("T", "t@example.com").unwrap();
+            let tree = git
+                .find_tree(git.index().unwrap().write_tree().unwrap())
+                .unwrap();
+            let head = git
+                .commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
+                .unwrap();
+            let branch = git
+                .branch("feature", &git.find_commit(head).unwrap(), false)
+                .unwrap();
+            let mut opts = git2::WorktreeAddOptions::new();
+            opts.reference(Some(branch.get()));
+            git.worktree("feature", &worktree, Some(&opts)).unwrap();
+        }
+        let info = SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "alpine:latest".into(),
+            container_name: "aoe-sandbox-mcp".into(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            container_workdir: Some("/workspace/repo-feature".into()),
+            provider: None,
+        };
+
+        let sandbox = McpSandbox::resolve(&info, &worktree, "s1");
+
+        let host = |p: &Path| p.canonicalize().unwrap().to_string_lossy().into_owned();
+        assert_eq!(
+            sandbox,
+            McpSandbox {
+                container_workdir: Some("/workspace/repo-feature".into()),
+                mounts: vec![
+                    McpSandboxMount {
+                        host: host(&repo),
+                        container: "/workspace/repo".into(),
+                        read_only: false,
+                    },
+                    McpSandboxMount {
+                        host: host(&worktree),
+                        container: "/workspace/repo-feature".into(),
+                        read_only: false,
+                    },
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn sandbox_without_a_layout_keeps_the_known_workdir_and_no_mounts() {
+        let failed = McpSandbox::from_layout(
+            Err(AcpError::Spawn("no layout".into())),
+            || Some("/workspace/pinned".into()),
+            "s1",
+        );
+        assert_eq!(
+            failed,
+            McpSandbox {
+                container_workdir: Some("/workspace/pinned".into()),
+                mounts: Vec::new(),
+            }
         );
     }
 
@@ -598,7 +768,7 @@ mod tests {
     #[tokio::test]
     async fn non_sandboxed_failure_keeps_the_original_set() {
         let mut c = ctx();
-        c.sandboxed = false;
+        c.sandbox = None;
         let servers = vec![stdio("a", &[])];
         let out = rewrite_servers_with(Some(failing()), &c, servers.clone()).await;
         assert_eq!(out, servers);

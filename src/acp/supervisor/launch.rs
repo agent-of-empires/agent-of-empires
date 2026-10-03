@@ -295,7 +295,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             req.cwd.clone(),
             host_environment.clone(),
             claude_config_dir,
-            req.sandbox_info.as_ref().is_some_and(|info| info.enabled),
+            req.sandbox_info.as_ref(),
             "MCP resolution task failed",
         )
         .await;
@@ -895,31 +895,34 @@ pub(super) async fn resolve_mcp_servers(
     cwd: PathBuf,
     session_env: Vec<(String, String)>,
     native_config_override: Option<PathBuf>,
-    sandboxed: bool,
+    sandbox_info: Option<&crate::session::SandboxInfo>,
     failure: &'static str,
 ) -> Vec<agent_client_protocol::schema::v1::McpServer> {
-    let ctx = crate::acp::mcp_rewrite::McpRewriteContext {
-        session_id: session_id.to_string(),
-        agent: agent_key.to_string(),
-        sandboxed,
-        profile: profile.clone(),
-        cwd: cwd.clone(),
-    };
-    let agent_key = agent_key.to_string();
-    let session = session_id.to_string();
+    let sandbox_info = sandbox_info.filter(|info| info.enabled).cloned();
     let projection_env = session_env.clone();
-    let resolved = tokio::task::spawn_blocking(move || {
-        resolve_mcp_defs(
-            &agent_key,
-            &session,
-            profile.as_deref(),
-            &cwd,
-            &session_env,
-            native_config_override.as_deref(),
-        )
-    })
-    .await;
-    let resolved = match resolved {
+    let resolved = {
+        let (agent_key, session, profile, cwd) = (
+            agent_key.to_string(),
+            session_id.to_string(),
+            profile.clone(),
+            cwd.clone(),
+        );
+        tokio::task::spawn_blocking(move || {
+            let sandbox = sandbox_info
+                .map(|info| crate::acp::mcp_rewrite::McpSandbox::resolve(&info, &cwd, &session));
+            let defs = resolve_mcp_defs(
+                &agent_key,
+                &session,
+                profile.as_deref(),
+                &cwd,
+                &session_env,
+                native_config_override.as_deref(),
+            );
+            (defs, sandbox)
+        })
+        .await
+    };
+    let (resolved, sandbox) = match resolved {
         Ok(resolved) => resolved,
         Err(e) => {
             warn!(
@@ -931,23 +934,30 @@ pub(super) async fn resolve_mcp_servers(
             return Vec::new();
         }
     };
+    let ctx = crate::acp::mcp_rewrite::McpRewriteContext {
+        session_id: session_id.to_string(),
+        agent: agent_key.to_string(),
+        sandbox,
+        profile,
+        cwd,
+    };
     let provenance: std::collections::HashMap<String, McpProvenance> = resolved
         .iter()
         .map(|s| (s.def.name.clone(), s.provenance.clone()))
         .collect();
     let defs = resolved.into_iter().map(|s| s.def).collect();
-    let rewritten = crate::acp::mcp_rewrite::rewrite_servers(&ctx, defs).await;
+    let defs = crate::acp::mcp_rewrite::rewrite_servers(&ctx, defs).await;
     debug!(
         target: "acp.mcp",
         session = %session_id,
-        sandboxed,
-        count = rewritten.len(),
-        servers = %crate::session::mcp::mcp_model::summarize_defs(&rewritten),
+        sandboxed = ctx.sandboxed(),
+        count = defs.len(),
+        servers = %crate::session::mcp::mcp_model::summarize_defs(&defs),
         "forwarding MCP servers"
     );
     // A server the hook added keeps no provenance; treat it as project-local so it
     // never receives session env values.
-    let resolved = rewritten
+    let resolved = defs
         .into_iter()
         .map(|def| ResolvedMcpServer {
             provenance: provenance
@@ -1620,7 +1630,7 @@ mod tests {
             r#"{ "mcpServers": { "native": { "command": "n" } } }"#,
         )
         .unwrap();
-        let resolve = |sandboxed| {
+        let resolve = |sandbox_info| {
             resolve_mcp_servers(
                 "claude",
                 "hook-test",
@@ -1628,21 +1638,37 @@ mod tests {
                 tmp.path().to_path_buf(),
                 Vec::new(),
                 None,
-                sandboxed,
+                sandbox_info,
                 "failed",
             )
+        };
+        let info = crate::session::SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "aoe-sandbox:test".into(),
+            container_name: "aoe-sandbox-hook-test".into(),
+            extra_env: None,
+            custom_instruction: None,
+            container_workdir: Some("/workspace/hook-test".into()),
+            before_start_env: Vec::new(),
+            provider: None,
+        };
+        let disabled = crate::session::SandboxInfo {
+            enabled: false,
+            ..info.clone()
         };
 
         let rewriter = RecordingRewriter::returning(Vec::new());
         let slot = SlotGuard::install(rewriter.clone());
-        let sandboxed = resolve(true).await;
+        let sandboxed = resolve(Some(&info)).await;
+        resolve(Some(&disabled)).await;
         drop(slot);
-        let plain = resolve(false).await;
+        let plain = resolve(None).await;
 
         assert_eq!(
             *rewriter.sandboxed_calls.lock().unwrap(),
-            [true],
-            "context must carry the sandbox flag"
+            [true, false],
+            "context must carry the sandbox flag, and a disabled sandbox is none"
         );
         assert!(
             sandboxed.is_empty(),

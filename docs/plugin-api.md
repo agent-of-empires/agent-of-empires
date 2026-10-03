@@ -308,12 +308,18 @@ After AoE merges the MCP layers and before it hands the set to the agent, on eve
 {
   "session_id": "…", "agent": "…", "sandboxed": true,
   "profile": null, "cwd": "/path",
+  "sandbox": {
+    "container_workdir": "/workspace/foo",
+    "mounts": [ { "host": "/abs/host/foo", "container": "/workspace/foo", "read_only": false } ]
+  },
   "servers": [
     { "name": "docs", "type": "http", "url": "https://…", "headers": { "Authorization": "Bearer …" } },
     { "name": "fs", "type": "stdio", "command": "…", "args": [], "env": { "K": "V" } }
   ]
 }
 ```
+
+`sandbox` is present only when `sandboxed` is true. `mounts` are the workspace volumes AoE mounted into the container, so a plugin can map container paths back to the host; a linked worktree lists both the worktree and its main repo. Host paths are sent as they are: not redacted, and not secret. `container_workdir` is the directory the agent runs in, or `null` when AoE cannot determine it. When AoE cannot compute the mounts, `mounts` is empty and the session is still reported as sandboxed.
 
 The `result` is an edit; unknown fields are rejected:
 

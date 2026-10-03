@@ -2,6 +2,7 @@
 //! agent command is wrapped in.
 
 use crate::acp::fs_handler::SandboxPathMap;
+use crate::containers::container_interface::VolumeMount;
 use crate::session::SandboxInfo;
 use std::path::{Path, PathBuf};
 
@@ -38,33 +39,16 @@ impl SessionSandbox {
         project_path: &Path,
         source_profile: Option<String>,
     ) -> Result<(Self, SandboxPathMap), AcpError> {
-        let project_path_str = project_path.to_string_lossy().to_string();
-        let (volumes, computed_workdir) =
-            crate::session::config::container_config::compute_volume_paths(
-                project_path,
-                &project_path_str,
-            )
-            .map_err(|e| AcpError::Spawn(format!("compute container workdir: {e}")))?;
-        // Must be what the container was created with. `compute_volume_paths`
-        // collapses to `/workspace/<basename>` once the worktree's git linkage
-        // breaks, naming a path the container never mounted (#2414), so prefer
-        // the create-time pin, then the live container, then the recompute.
-        let workdir = sandbox
-            .container_workdir
-            .clone()
-            .or_else(|| {
-                crate::containers::get_container_runtime()
-                    .container_working_dir(&sandbox.container_name)
-            })
-            .unwrap_or(computed_workdir);
-        let mounts: Vec<(PathBuf, PathBuf)> = volumes
+        let layout = SandboxLayout::resolve(sandbox, project_path)?;
+        let mounts: Vec<(PathBuf, PathBuf)> = layout
+            .volumes
             .into_iter()
             .map(|v| (PathBuf::from(v.container_path), PathBuf::from(v.host_path)))
             .collect();
         Ok((
             Self {
                 container_name: sandbox.container_name.clone(),
-                container_workdir: PathBuf::from(workdir),
+                container_workdir: PathBuf::from(layout.container_workdir),
                 sandbox_info: sandbox.clone(),
                 source_profile,
                 project_path: project_path.to_path_buf(),
@@ -94,6 +78,39 @@ impl SessionSandbox {
             crate::session::environment::resolved_sandbox_config(profile, &self.project_path);
         crate::session::environment::collect_environment(&sandbox_config, &self.sandbox_info)
     }
+}
+
+/// The workspace volumes a session's container was built with and the workdir it runs in.
+pub(crate) struct SandboxLayout {
+    pub(crate) volumes: Vec<VolumeMount>,
+    pub(crate) container_workdir: String,
+}
+
+impl SandboxLayout {
+    /// Blocking: without a pinned workdir it asks the container runtime.
+    pub(crate) fn resolve(sandbox: &SandboxInfo, project_path: &Path) -> Result<Self, AcpError> {
+        let (volumes, computed_workdir) =
+            crate::session::config::container_config::compute_volume_paths(
+                project_path,
+                &project_path.to_string_lossy(),
+            )
+            .map_err(|e| AcpError::Spawn(format!("compute container workdir: {e}")))?;
+        let container_workdir = known_container_workdir(sandbox).unwrap_or(computed_workdir);
+        Ok(Self {
+            volumes,
+            container_workdir,
+        })
+    }
+}
+
+/// The workdir the container was created with. `compute_volume_paths` collapses to
+/// `/workspace/<basename>` once a worktree's git linkage breaks, naming a path the
+/// container never mounted (#2414), so the create-time pin, then the live container,
+/// outrank a recompute.
+pub(crate) fn known_container_workdir(sandbox: &SandboxInfo) -> Option<String> {
+    sandbox.container_workdir.clone().or_else(|| {
+        crate::containers::get_container_runtime().container_working_dir(&sandbox.container_name)
+    })
 }
 
 /// `docker_binary` is `argv[0]` (docker/podman). Export `inherit_env` so the
