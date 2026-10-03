@@ -1268,11 +1268,8 @@ export interface ServerAbout {
    *  config. Drives the per-tool elapsed-time label in the acp
    *  web UI; cross-device since it lives in config.toml. */
   acp_show_tool_durations: boolean;
-  /** Resolved `acp.replay_events` from the active profile's
-   *  config. Per-session retention cap on the acp event log;
-   *  0 means unlimited. Mirrored onto the in-memory activity buffer
-   *  so the rendered transcript matches the user's chosen ceiling
-   *  instead of clipping at a hard-coded frontend constant. See #1111. */
+  acp_wrap_tool_output: boolean;
+  /** Active-profile event retention cap; 0 is unlimited. Also bounds client activity. */
   acp_replay_events: number;
   /** Resolved `acp.compaction_reminder` from the active profile's
    *  config; gates the structured view's compaction reminder (#3253). */

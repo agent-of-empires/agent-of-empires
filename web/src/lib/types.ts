@@ -456,7 +456,8 @@ export type SettingsObjectFieldWidget =
   | { kind: "select"; options: SettingsSelectOption[] }
   | { kind: "dynamic_select"; source: SettingsOptionSource; depends_on?: string[] }
   | { kind: "dynamic_multi_select"; source: SettingsOptionSource; depends_on?: string[] }
-  | { kind: "cron" };
+  | { kind: "cron" }
+  | { kind: "list" };
 
 export interface SettingsObjectField {
   field: string;

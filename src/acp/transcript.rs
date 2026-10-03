@@ -57,6 +57,9 @@ pub enum TranscriptRowKind {
     Summary,
     /// An error or lifecycle notice the user needs in the timeline.
     Notice,
+    /// An agent session advisory. Unlike `Notice`, every surface keeps it in
+    /// the timeline, since its banner is capped and retired by the next turn.
+    Advisory,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -77,6 +80,18 @@ pub enum TranscriptDelta {
     },
     /// A row was removed (an AskUserQuestion card superseded by its form).
     Remove(String),
+}
+
+/// The row carries no severity field, so the text spells it out.
+fn session_notice_text(severity: &str, title: &str, description: &Option<String>) -> String {
+    match description
+        .as_deref()
+        .map(str::trim)
+        .filter(|d| !d.is_empty())
+    {
+        Some(description) => format!("{severity}: {title}: {description}"),
+        None => format!("{severity}: {title}"),
+    }
 }
 
 /// Folds the ACP `Event` stream into an ordered [`TranscriptRow`] list.
@@ -324,6 +339,15 @@ impl TranscriptModel {
             Event::ModeSwitchFailed { mode_id, reason } => vec![self.notice(
                 seq,
                 format!("mode switch to \"{mode_id}\" failed: {reason}"),
+            )],
+            Event::SessionNotice {
+                severity,
+                title,
+                description,
+            } => vec![self.push(
+                format!("notice-{seq}"),
+                TranscriptRowKind::Advisory,
+                session_notice_text(severity, title, description),
             )],
             Event::RateLimitAutoResumed { resets_at, manual } => {
                 let how = if *manual { "resumed" } else { "auto-resumed" };
@@ -810,6 +834,26 @@ mod tests {
                 "notice-1",
                 TranscriptRowKind::Notice,
                 "mode switch to \"bypassPermissions\" failed: denied".to_string(),
+            ),
+            (
+                Event::SessionNotice {
+                    severity: "warning".into(),
+                    title: "Model fallback".into(),
+                    description: Some("Switched to Sonnet.".into()),
+                },
+                "notice-1",
+                TranscriptRowKind::Advisory,
+                "warning: Model fallback: Switched to Sonnet.".to_string(),
+            ),
+            (
+                Event::SessionNotice {
+                    severity: "info".into(),
+                    title: "Task stopped by user".into(),
+                    description: None,
+                },
+                "notice-1",
+                TranscriptRowKind::Advisory,
+                "info: Task stopped by user".to_string(),
             ),
             (
                 Event::RateLimitAutoResumed {

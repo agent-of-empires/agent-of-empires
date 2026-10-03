@@ -1778,6 +1778,9 @@ pub struct ServerAbout {
     /// profile's config. Drives the per-tool elapsed-time label in the
     /// web UI; cross-device since it lives in config.toml.
     pub acp_show_tool_durations: bool,
+    /// Resolved `acp.wrap_tool_output`: the initial line-wrap state of tool
+    /// output blocks in the web UI.
+    pub acp_wrap_tool_output: bool,
     /// Resolved value of `acp.replay_events` from the active
     /// profile's config. Per-session retention cap on the acp
     /// event log; 0 means unlimited. The web client mirrors this on
@@ -1822,6 +1825,7 @@ pub async fn get_about(State(state): State<Arc<AppState>>) -> Json<ServerAbout> 
     let profile = state.served_profile().to_string();
     let acp_cfg = crate::session::config::profile_config::resolve_config_or_warn(&profile).acp;
     let acp_show_tool_durations = acp_cfg.show_tool_durations;
+    let acp_wrap_tool_output = acp_cfg.wrap_tool_output;
     let acp_replay_events = acp_cfg.replay_events;
     let acp_compaction_reminder = acp_cfg.compaction_reminder;
     let acp_compaction_reminder_percent = acp_cfg.compaction_reminder_percent;
@@ -1843,6 +1847,7 @@ pub async fn get_about(State(state): State<Arc<AppState>>) -> Json<ServerAbout> 
         cityhall_mode: state.cityhall_mode,
         profile,
         acp_show_tool_durations,
+        acp_wrap_tool_output,
         acp_replay_events,
         acp_compaction_reminder,
         acp_compaction_reminder_percent,

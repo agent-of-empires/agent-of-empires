@@ -718,6 +718,48 @@ fn test_shift_n_opens_prefilled_dialog_from_session() {
     assert_eq!(dialog.group_value(), "work");
 }
 
+/// `N` on a session copies its agent as well as its path and group, but never its yolo; on a
+/// group row there is no session to copy from, so the form keeps its defaults.
+#[test]
+#[serial]
+fn test_shift_n_carries_the_selected_sessions_agent_but_not_its_yolo() {
+    let mut codex = instance_in("work-project", "/tmp/work", "work");
+    codex.tool = "codex".to_string();
+    codex.yolo_mode = true;
+    let mut env = seeded_env(test_home(), &[codex], true);
+    env.view
+        .set_available_tools(AvailableTools::with_tools(&["claude", "codex"]));
+
+    let session_row = env
+        .view
+        .flat_items
+        .iter()
+        .position(|item| matches!(item, Item::Session { .. }))
+        .expect("the session row");
+    let group_row = env
+        .view
+        .flat_items
+        .iter()
+        .position(|item| matches!(item, Item::Group { path, .. } if path == "work"))
+        .expect("the work group row");
+
+    for (row, tool) in [(session_row, "codex"), (group_row, "claude")] {
+        env.view.new_dialog = None;
+        env.view.cursor = row;
+        env.view.update_selected();
+
+        env.view.handle_key(key(KeyCode::Char('N')), None);
+        let dialog = env.view.new_dialog.as_ref().expect("N should open dialog");
+        assert_eq!(dialog.group_value(), "work");
+        assert_eq!(dialog.path_value(), "/tmp/work");
+        assert_eq!(dialog.selected_tool(), tool, "row {row}");
+        assert!(
+            !dialog.yolo_value(),
+            "yolo is never carried over: row {row}"
+        );
+    }
+}
+
 #[test]
 #[serial]
 fn test_shift_n_opens_prefilled_dialog_from_group() {

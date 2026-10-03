@@ -59,6 +59,10 @@ Modes come from `NewSessionResponse.modes`, and the picker shows whatever the ad
 
 Model and reasoning-effort selectors arrive over two wire mechanisms, normalized into one dropdown: `SessionUpdate::ConfigOptionUpdate` (a full snapshot of every selector whenever one changes, so the client replaces its cached list) and the `unstable_session_model` capability (`SessionModelState` on `session/new` and `session/load`, switched with `session/set_model`). With both present, `config_option` wins, since it has a push path; `session/set_model` only acks, so the client synthesizes the confirming update. The UI is pessimistic (the chip keeps the prior value until a confirming update arrives) to avoid snap-back on slow tunnels. The cached list clears on `AgentSwitched` but survives `/clear`, since capabilities are process-scoped.
 
+Session notices (`SessionUpdate::Notice`) are live advisories, not conversation history. The adapter only sends them when the client advertises `clientCapabilities.session.notices`; without that it folds each one into a bold-label agent message indistinguishable from the model's reply, so advertising the capability is what makes them identifiable. They ride on `AcpState` capped and scoped to the current turn, which is what feeds the dismissible strip on both surfaces, and they also land in the transcript as an `advisory` row, which unlike a `notice` row both surfaces render, so the history survives a dismissal. Dismissal is client-local: the folded list is shared, so clearing it server-side would blank every other client.
+
+Notice IDs use the durable event sequence, not the count of retained events, so replay after pruning preserves client-local dismissal.
+
 Approval nonces are server-generated and single-use, and are never revealed to the agent. Resolving an already-resolved approval clears the card quietly.
 
 ## Stuck-turn watchdogs
@@ -112,6 +116,7 @@ max_concurrent_workers = 100
 replay_events = 0                 # 0 = unlimited; caps per-session rows and the client buffer
 node_path = ""
 show_tool_durations = true
+wrap_tool_output = false          # initial line wrap of tool output blocks; each block can toggle
 compaction_reminder = false       # opt-in /compact nudge past the threshold
 compaction_reminder_percent = 75  # 1..99
 silent_orphan_grace_secs = 120    # 0 disables

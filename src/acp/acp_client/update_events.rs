@@ -7,7 +7,7 @@ use crate::acp::state::{
     AvailableCommand, ConfigOptionDescriptor, Event, Plan, PlanStep, SessionMode, SessionUsage,
     ToolCall, UsageCost,
 };
-use agent_client_protocol::schema::v1::{ContentBlock, MessageId, SessionUpdate};
+use agent_client_protocol::schema::v1::{ContentBlock, MessageId, NoticeSeverity, SessionUpdate};
 use tracing::debug;
 
 use super::config_options::map_acp_config_option;
@@ -123,6 +123,20 @@ fn wake_tool_event(
         "ScheduleWakeup" => wakeup_event_from_raw(raw),
         "Monitor" => monitor_event_from_raw(raw),
         _ => None,
+    }
+}
+
+/// The wire string for a notice severity. An unknown level deserializes into
+/// `Other` and is carried through verbatim, so a future ACP level still reaches
+/// the surfaces intact; the wildcard only covers a variant upstream names
+/// later, which reads as advisory until it is mapped here.
+fn notice_severity_str(severity: &NoticeSeverity) -> &str {
+    match severity {
+        NoticeSeverity::Info => "info",
+        NoticeSeverity::Warning => "warning",
+        NoticeSeverity::Error => "error",
+        NoticeSeverity::Other(other) => other,
+        _ => "info",
     }
 }
 
@@ -434,6 +448,19 @@ pub(super) fn map_update_to_events(
                 "received ConfigOptionUpdate from agent"
             );
             vec![Event::ConfigOptionsUpdated { options }]
+        }
+        SessionUpdate::Notice(notice) => {
+            let severity = notice_severity_str(&notice.severity);
+            debug!(
+                target: "acp.protocol",
+                severity,
+                "received session Notice from agent"
+            );
+            vec![Event::SessionNotice {
+                severity: severity.to_string(),
+                title: notice.title,
+                description: notice.description,
+            }]
         }
         // AoE owns automatic renaming, so agent titles are ignored.
         SessionUpdate::SessionInfoUpdate(_) => Vec::new(),
@@ -771,6 +798,47 @@ mod tests {
             assert!(!events
                 .iter()
                 .any(|e| matches!(e, Event::ToolCallUpdated { diffs: Some(_), .. })));
+        }
+    }
+
+    /// #4242: deserialized from the wire rather than built, so a serde rename
+    /// upstream fails here instead of silently routing notices to the
+    /// `RawAgentUpdate` fallback.
+    #[test]
+    fn session_notices_map_from_the_wire() {
+        for (severity, want_severity, description, want_description) in [
+            (
+                "info",
+                "info",
+                Some("Switched to Sonnet."),
+                Some("Switched to Sonnet."),
+            ),
+            ("warning", "warning", None, None),
+            ("error", "error", None, None),
+            // Reserved for future ACP levels; carried through, not flattened.
+            ("critical", "critical", None, None),
+        ] {
+            let mut wire = serde_json::json!({
+                "sessionUpdate": "notice",
+                "severity": severity,
+                "title": "Model fallback",
+            });
+            if let Some(description) = description {
+                wire["description"] = serde_json::json!(description);
+            }
+            let update: SessionUpdate = serde_json::from_value(wire).expect("notice parses");
+            let events = claude(update);
+            let [Event::SessionNotice {
+                severity,
+                title,
+                description,
+            }] = events.as_slice()
+            else {
+                panic!("expected one SessionNotice, got {events:?}");
+            };
+            assert_eq!(severity, want_severity);
+            assert_eq!(title, "Model fallback");
+            assert_eq!(description.as_deref(), want_description);
         }
     }
 

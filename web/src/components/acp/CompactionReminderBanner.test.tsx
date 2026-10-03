@@ -40,6 +40,7 @@ function gateState(over: Partial<GateState> = {}): GateState {
 function prefs(over: Partial<AcpPrefs> = {}): AcpPrefs {
   return {
     showToolDurations: true,
+    wrapToolOutput: false,
     replayEvents: 0,
     compactionReminder: true,
     compactionReminderPercent: 80,

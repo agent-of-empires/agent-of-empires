@@ -14,6 +14,7 @@ The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 - **tui:** Keep unknown runtime changes recoverable through the command palette and persist mouse-confirmed diff-base changes immediately.
 - **web:** Scope projects to the served profile and release acknowledged setting cancellations for subsequent external updates.
 - **acp:** Apply the served profile’s live worker limit and classify missing approval or elicitation targets consistently.
+- **acp:** Keep dismissed session notices stable across reconnects after event-retention pruning.
 
 ### Documentation
 

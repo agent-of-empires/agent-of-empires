@@ -1,5 +1,5 @@
 use super::*;
-use crate::session::{merge_configs, Config, ProfileConfig};
+use crate::session::{merge_configs, Config, Instance, ProfileConfig, SandboxInfo, View};
 use crate::tui::dialogs::test_keys::{alt_key, ctrl_key, key, shift_key};
 use crate::tui::dialogs::test_render::find;
 use std::fs;
@@ -1354,4 +1354,183 @@ fn terminal_fork_hides_structured_despite_structured_default() {
     });
     assert!(!dialog.structured_capable);
     assert!(!dialog.structured_enabled);
+}
+
+/// A session on `tool`, sandboxed and in yolo as asked.
+fn source_session(tool: &str, sandboxed: bool, yolo: bool) -> Instance {
+    let mut inst = Instance::new("source", TEST_PATH);
+    inst.tool = tool.to_string();
+    inst.yolo_mode = yolo;
+    if sandboxed {
+        inst.sandbox_info = Some(SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "ubuntu:latest".to_string(),
+            container_name: "source".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            container_workdir: None,
+        });
+    }
+    inst
+}
+
+/// "New from selection" on a session carries its agent and sandbox into the form. Yolo
+/// follows the configured default whatever the source ran with.
+#[test]
+#[serial_test::serial]
+fn a_selected_session_carries_its_agent_and_modes() {
+    let temp_home = tempfile::tempdir().expect("temp home");
+    let _home = crate::session::test_support::isolate_home(temp_home.path());
+    let mut dialog = multi_tool_dialog();
+    dialog.docker_available = true;
+    assert_eq!(dialog.selected_tool(), "claude");
+    assert!(!dialog.sandbox_enabled);
+
+    dialog.inherit_session(&source_session("opencode", true, true));
+    assert_eq!(dialog.selected_tool(), "opencode");
+    assert!(dialog.sandbox_enabled);
+    assert!(!dialog.yolo_mode, "a yolo source does not turn yolo on");
+
+    // An unsandboxed source never switches a profile's sandbox off: with yolo on by
+    // default that would launch an unsandboxed yolo agent on the host.
+    let mut dialog = multi_tool_dialog();
+    dialog.docker_available = true;
+    dialog.sandbox_enabled = true;
+    dialog.yolo_mode_default = true;
+    dialog.inherit_session(&source_session("opencode", false, false));
+    assert_eq!(dialog.selected_tool(), "opencode");
+    assert!(dialog.sandbox_enabled, "the sandbox default stays on");
+    assert!(
+        dialog.yolo_mode,
+        "nor does a cautious source turn the yolo default off"
+    );
+}
+
+/// The view follows the source session where the agent can back a structured one, over the
+/// configured default in either direction.
+#[test]
+#[serial_test::serial]
+fn a_selected_session_carries_its_view() {
+    let temp_home = tempfile::tempdir().expect("temp home");
+    let _home = crate::session::test_support::isolate_home(temp_home.path());
+    let app_dir = crate::session::get_app_dir().expect("app dir");
+    fs::create_dir_all(app_dir.join("profiles").join("default")).expect("default profile");
+    fs::write(
+        app_dir.join("config.toml"),
+        "[acp]\noffer_structured_in_new_session = true\n",
+    )
+    .expect("global config");
+
+    for (default_structured, source_view) in [(true, View::Terminal), (false, View::Structured)] {
+        let mut dialog = multi_tool_dialog();
+        dialog.reload_tool_config();
+        dialog.structured_default = default_structured;
+        let mut source = source_session("claude", false, false);
+        source.view = source_view;
+        dialog.inherit_session(&source);
+        assert!(
+            dialog.structured_capable,
+            "claude can back a structured view"
+        );
+        let structured = source_view == View::Structured;
+        assert_eq!(dialog.structured_enabled, structured, "{source_view:?}");
+        assert_eq!(
+            dialog.structured_choice,
+            Some(structured),
+            "{source_view:?}"
+        );
+    }
+}
+
+/// The carried agent's structured capability comes from the repo config at the form's path,
+/// as it does for the agent the form opened on, so a repo's `agent_detect_as` still counts.
+#[test]
+#[serial_test::serial]
+fn a_carried_agent_is_judged_by_the_repo_config() {
+    let temp_home = tempfile::tempdir().expect("temp home");
+    let _home = crate::session::test_support::isolate_home(temp_home.path());
+    let app_dir = crate::session::get_app_dir().expect("app dir");
+    fs::create_dir_all(app_dir.join("profiles").join("default")).expect("default profile");
+    fs::write(
+        app_dir.join("config.toml"),
+        "[acp]\noffer_structured_in_new_session = true\n",
+    )
+    .expect("global config");
+    let repo = tempfile::tempdir().expect("repo");
+    fs::create_dir_all(repo.path().join(".agent-of-empires")).expect("repo config dir");
+    fs::write(
+        repo.path().join(".agent-of-empires").join("config.toml"),
+        "[session]\nagent_detect_as = { my-agent = \"claude\" }\n",
+    )
+    .expect("repo config");
+
+    let mut dialog =
+        NewSessionDialog::new_with_tools(vec!["claude", "my-agent"], TEST_PATH.to_string());
+    dialog.set_path(repo.path().to_string_lossy().to_string());
+    let mut source = source_session("my-agent", false, false);
+    source.view = View::Structured;
+    dialog.inherit_session(&source);
+
+    assert_eq!(dialog.selected_tool(), "my-agent");
+    assert!(
+        dialog.structured_capable,
+        "the repo maps my-agent onto claude"
+    );
+    assert!(dialog.structured_enabled);
+}
+
+/// A session whose agent is not offered here leaves the form on its defaults: its modes
+/// belong to that agent.
+#[test]
+#[serial_test::serial]
+fn a_session_on_an_agent_not_offered_here_carries_nothing() {
+    let temp_home = tempfile::tempdir().expect("temp home");
+    let _home = crate::session::test_support::isolate_home(temp_home.path());
+    let mut dialog = multi_tool_dialog();
+    dialog.docker_available = true;
+
+    dialog.inherit_session(&source_session("codex", true, false));
+    assert_eq!(dialog.selected_tool(), "claude");
+    assert!(!dialog.sandbox_enabled);
+}
+
+/// Each mode lands only as the form would let the user pick it.
+#[test]
+#[serial_test::serial]
+fn inherited_modes_stop_where_the_form_does() {
+    let temp_home = tempfile::tempdir().expect("temp home");
+    let _home = crate::session::test_support::isolate_home(temp_home.path());
+
+    let mut dialog = multi_tool_dialog();
+    dialog.set_structured_capable(true);
+    dialog.inherit_modes(true, false);
+    assert!(dialog.structured_enabled);
+    assert_eq!(dialog.structured_choice, Some(true));
+    dialog.set_structured_capable(false);
+    dialog.inherit_modes(true, false);
+    assert!(
+        !dialog.structured_enabled,
+        "no structured view for this agent"
+    );
+
+    let mut dialog =
+        NewSessionDialog::new_with_tools(vec!["claude", "settl"], TEST_PATH.to_string());
+    dialog.docker_available = true;
+    dialog.inherit_session(&source_session("settl", true, false));
+    assert_eq!(dialog.selected_tool(), "settl");
+    assert!(
+        !dialog.sandbox_enabled,
+        "a host-only agent is never sandboxed"
+    );
+
+    let mut dialog = multi_tool_dialog();
+    dialog.docker_available = false;
+    dialog.inherit_session(&source_session("opencode", true, false));
+    assert_eq!(dialog.selected_tool(), "opencode");
+    assert!(
+        !dialog.sandbox_enabled,
+        "no container runtime to sandbox in"
+    );
 }

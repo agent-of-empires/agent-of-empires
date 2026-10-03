@@ -511,6 +511,7 @@ async fn apply_ws_message(
                 .transcript
                 .apply_reduced_state(seq, *reduced, &unchanged);
             state.reconcile_selection();
+            state.prune_dismissed_notices();
             auto_present_elicitation(state, toast_deadline);
             state.reconcile_slash_selection();
             let now_active = state.transcript.turn_active;
@@ -669,6 +670,7 @@ async fn handle_terminal_event(
                     Some(ChoicePurpose::OpenLink)
                 ),
                 has_modes: !state.transcript.available_modes.is_empty(),
+                has_notices: state.visible_notices().next().is_some(),
                 // Esc-to-cancel and other action gates read this: it must
                 // track only the main turn, not a display-only background
                 // sub-agent signal (see `AcpTranscript.background_agent_active`),
@@ -835,6 +837,13 @@ async fn handle_terminal_event(
                 return Ok(false);
             }
             send_prompt_now(state, toast_deadline, &text).await;
+            Ok(false)
+        }
+        Intent::DismissNotice(id) => {
+            let id = id.or_else(|| state.visible_notices().next().map(|n| n.id.clone()));
+            if let Some(id) = id {
+                state.dismissed_notices.insert(id);
+            }
             Ok(false)
         }
         Intent::ClearQueue => {

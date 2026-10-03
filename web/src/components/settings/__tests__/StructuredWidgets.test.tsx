@@ -129,3 +129,40 @@ describe("dynamic_multi_select", () => {
     expect(screen.getByText("models")).toBeTruthy();
   });
 });
+
+describe("list (string_list item field)", () => {
+  it("adds and removes freeform entries", async () => {
+    const schema = jobs(itemField("match", { kind: "list" }, true));
+    const { lastValue } = renderSection(schema, { jobs: [{ id: "j1", match: ["a/*"] }] });
+    expect(screen.getByText("a/*")).toBeTruthy();
+
+    fireEvent.click(screen.getByText("+ Add"));
+    expect(screen.getByLabelText("match")).toBe(screen.getByRole("textbox"));
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "b/*" } });
+    fireEvent.click(screen.getByText("Add"));
+    expect(((await lastValue()) as { match: string[] }[])[0]!.match).toEqual(["a/*", "b/*"]);
+  });
+
+  it("removes one entry while another remains", async () => {
+    const schema = jobs(itemField("match", { kind: "list" }, true));
+    const { lastValue } = renderSection(schema, { jobs: [{ id: "j1", match: ["a/*", "b/*"] }] });
+    fireEvent.click(screen.getAllByTitle("Remove")[0]!);
+    expect(((await lastValue()) as { match: string[] }[])[0]!.match).toEqual(["b/*"]);
+  });
+
+  it("keeps a cleared required list local, but persists an empty optional list", async () => {
+    const required = renderSection(jobs(itemField("match", { kind: "list" }, true)), {
+      jobs: [{ id: "j1", match: ["a/*"] }],
+    });
+    fireEvent.click(screen.getByTitle("Remove"));
+    await waitFor(() => expect(screen.queryByText("a/*")).toBeNull());
+    expect(required.onSave).not.toHaveBeenCalled();
+    required.unmount();
+
+    const optional = renderSection(jobs(itemField("match", { kind: "list" })), {
+      jobs: [{ id: "j1", match: ["a/*"] }],
+    });
+    fireEvent.click(screen.getByTitle("Remove"));
+    expect(((await optional.lastValue()) as { match: string[] }[])[0]!.match).toEqual([]);
+  });
+});

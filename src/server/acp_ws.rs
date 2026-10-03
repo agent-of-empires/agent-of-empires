@@ -216,7 +216,7 @@ async fn handle(
                         // the updated snapshot.
                         if frame.seq > last_applied_seq {
                             last_applied_seq = frame.seq;
-                            let _ = reduced.apply_event((*frame.event).clone());
+                            let _ = reduced.apply_event(frame.seq, (*frame.event).clone());
                         }
                         if !send_reduced_state(&mut socket, &session_id, frame.seq, &reduced, &mut cold).await {
                             break;
@@ -263,7 +263,7 @@ async fn handle(
                         .unwrap_or_default();
                         let mut highest = 0;
                         for (seq, event) in entries {
-                            let _ = rebuilt.apply_event(event);
+                            let _ = rebuilt.apply_event(seq, event);
                             highest = seq;
                         }
                         reduced = rebuilt;
@@ -395,7 +395,7 @@ fn fold_connect_history(
 ) -> Vec<(u64, Event)> {
     let mut to_forward = Vec::new();
     for (seq, event) in entries {
-        let _ = folds.reduced.apply_event(event.clone());
+        let _ = folds.reduced.apply_event(seq, event.clone());
         folds.last_applied_seq = seq;
         if seq <= since {
             continue;
@@ -813,6 +813,61 @@ mod tests {
         assert_eq!(cold_folds.reduced.pending_approvals.len(), 1);
     }
 
+    #[test]
+    fn retained_notice_keeps_its_dismissal_identity_after_reconnect() {
+        let directory = tempfile::tempdir().unwrap();
+        let id = "notice-retention";
+        let store =
+            crate::acp::event_store::EventStore::open(&directory.path().join("events.db"), 2)
+                .unwrap();
+        store
+            .record(
+                id,
+                1,
+                &Event::AvailableCommandsUpdated {
+                    commands: Vec::new(),
+                },
+            )
+            .unwrap();
+        for seq in 2..=4 {
+            store
+                .record(
+                    id,
+                    seq,
+                    &Event::AgentMessageChunk {
+                        text: "output".into(),
+                    },
+                )
+                .unwrap();
+        }
+        store
+            .record(
+                id,
+                5,
+                &Event::SessionNotice {
+                    severity: "warning".into(),
+                    title: "Model fallback".into(),
+                    description: None,
+                },
+            )
+            .unwrap();
+        let retained = store.replay_from(id, 0);
+        assert_eq!(
+            retained.iter().map(|(seq, _)| *seq).collect::<Vec<_>>(),
+            [1, 4, 5]
+        );
+        let mut reduced = AcpState::new(AcpSessionId(id.into()), AgentName("claude".into()), None);
+        let mut transcript = TranscriptModel::new();
+        let mut cold = ColdFieldCache::default();
+        let mut folds = ConnectionFolds {
+            reduced: &mut reduced,
+            transcript: &mut transcript,
+            cold: &mut cold,
+            last_applied_seq: 0,
+        };
+        fold_connect_history(retained, 5, &mut folds);
+        assert_eq!(folds.reduced.session_notices[0].id, "notice-5");
+    }
     /// Prompt dispatch (Tier 3) reads the daemon's own control state through
     /// `fold_control_state`, so the whole decision is only as good as this fold.
     #[tokio::test]
@@ -924,9 +979,7 @@ mod tests {
         assert!(!unknown.turn_active);
     }
 
-    /// `AcpState::apply_event` takes no seq and is not idempotent, and the
-    /// drain overlaps the live broadcast by design, so a duplicated event
-    /// would leave a second, unresolvable approval card in the shelf.
+    /// Replay overlaps live broadcast; duplicates would leave unresolvable approvals.
     type TestSocket = tokio_tungstenite::WebSocketStream<
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
     >;

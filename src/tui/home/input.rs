@@ -2961,6 +2961,14 @@ impl HomeView {
             if let Some(group) = prefill_group {
                 dialog.set_group(group);
             }
+            // After the path: setting it re-resolves the defaults these replace.
+            if let Some(inst) = self
+                .selected_session
+                .as_ref()
+                .and_then(|id| self.get_instance(id))
+            {
+                dialog.inherit_session(inst);
+            }
             // Skip to the title whenever the path is genuinely prefilled, inherited or
             // borrowed, so the user lands on naming. Only an empty group leaves focus on
             // the default cwd to be confirmed.
