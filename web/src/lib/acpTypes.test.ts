@@ -9,6 +9,7 @@ import {
   hasActiveBackgroundAgent,
   isVisiblyBusy,
   normaliseTurnState,
+  visibleSessionNotices,
   type AcpEvent,
   type AcpState,
   type BackgroundAgent,
@@ -243,6 +244,70 @@ describe("applyEvent control state", () => {
 
   it.each(transitions)("%s", (_name, events, expected) => {
     expect(fold(emptyAcpState(), ...events)).toMatchObject(expected);
+  });
+
+  // #4242: advisories are live, so they cap and retire with the turn. The ids
+  // must match the daemon's so a later snapshot cannot resurrect a dismissal.
+  it("session notices cap at three, are retired by the next turn, and dismiss by id", () => {
+    const notice = (title: string, severity = "warning"): AcpEvent => ({
+      SessionNotice: { severity, title },
+    });
+
+    const one = fold(emptyAcpState(), notice("Model fallback"));
+    expect(one.sessionNotices).toEqual([
+      { id: "notice-1", severity: "warning", title: "Model fallback", description: null },
+    ]);
+
+    const many = fold(emptyAcpState(), notice("a"), notice("b"), notice("c"), notice("d"), notice("e"));
+    expect(many.sessionNotices.map((n) => n.title)).toEqual(["c", "d", "e"]);
+
+    expect(fold(emptyAcpState(), notice("stale"), prompt("next")).sessionNotices).toEqual([]);
+
+    const dismissed = acpHookReducer(fold(emptyAcpState(), notice("a"), notice("b")), {
+      kind: "dismiss_session_notice",
+      id: "notice-1",
+    });
+    expect(visibleSessionNotices(dismissed).map((n) => n.title)).toEqual(["b"]);
+    // Re-dismissing is a no-op rather than a duplicate id.
+    expect(acpHookReducer(dismissed, { kind: "dismiss_session_notice", id: "notice-1" })).toBe(dismissed);
+  });
+
+  // The daemon's list is authoritative, and a replayed frame for a notice the
+  // connect snapshot already carried must not show it twice.
+  it("adopts session notices from reduced_state without doubling a replayed frame", () => {
+    const reduced = (notices?: AcpState["sessionNotices"]): ReducedState =>
+      ({
+        agent: "claude",
+        model: null,
+        mode: "default",
+        current_plan: null,
+        in_flight_tool: null,
+        pending_approvals: [],
+        pending_elicitations: [],
+        thinking: null,
+        rate_limit: null,
+        available_commands: [],
+        available_modes: [],
+        current_mode_id: null,
+        turn_active: false,
+        cancelling: false,
+        compacting: false,
+        ...(notices ? { session_notices: notices } : {}),
+      }) as ReducedState;
+
+    const snapshot = [{ id: "notice-7", severity: "warning", title: "Model fallback", description: null }];
+    const adopted = applyReducedState(emptyAcpState(), reduced(snapshot));
+    expect(adopted.sessionNotices).toEqual(snapshot);
+
+    const replayed = applyEvent(adopted, {
+      session_id: "s-1",
+      seq: 7,
+      event: { SessionNotice: { severity: "warning", title: "Model fallback" } },
+    });
+    expect(replayed.sessionNotices).toEqual(snapshot);
+
+    // A daemon without the field must not blow up the picker-style adoption.
+    expect(applyReducedState(adopted, reduced()).sessionNotices).toEqual([]);
   });
 
   it("codex /new drops usage to the post-reset baseline (#2979)", () => {
@@ -620,5 +685,61 @@ describe("context-window latch (upstream claude-agent-acp #596)", () => {
     expect(state.sessionUsage).toBeNull();
     state = fold(state, usage(5_000, undefined, 200_000));
     expect(state.sessionUsage?.size).toBe(200_000);
+  });
+});
+
+describe("auth status", () => {
+  const status = (kind: string, label: string, extra = {}) =>
+    ({ AuthStatusUpdated: { status: { kind, label, ...extra } } }) as AcpEvent;
+
+  it("holds the latest report and distinguishes absent from logged out", () => {
+    // Never reported renders as nothing; the chip reads null as "say nothing".
+    expect(emptyAcpState().authStatus).toBeNull();
+
+    const reported = fold(emptyAcpState(), status("account", "Claude Max"));
+    expect(reported.authStatus).toEqual({ kind: "account", label: "Claude Max" });
+
+    // A known logged-out state is a payload of its own, not an absence.
+    const out = fold(reported, status("none", "Not logged in"));
+    expect(out.authStatus).toEqual({ kind: "none", label: "Not logged in" });
+
+    // An adapter that cannot report clears it rather than going stale.
+    const cleared = fold(out, { AuthStatusUpdated: { status: null } });
+    expect(cleared.authStatus).toBeNull();
+  });
+
+  it("keeps a kind added upstream later, so the label still renders", () => {
+    const state = fold(emptyAcpState(), status("quantum", "Future Auth"));
+    expect(state.authStatus?.label).toBe("Future Auth");
+  });
+
+  it("adopts the daemon's folded value, treating an omitted field as absent", () => {
+    const base = fold(emptyAcpState(), status("api_key", "Anthropic API key"));
+    const reduced = (auth?: unknown) =>
+      ({
+        agent: "claude",
+        model: null,
+        mode: "Default",
+        current_plan: null,
+        in_flight_tool: null,
+        pending_approvals: [],
+        pending_elicitations: [],
+        thinking: null,
+        rate_limit: null,
+        available_commands: [],
+        available_modes: [],
+        current_mode_id: null,
+        auth_status: auth,
+        turn_active: false,
+        cancelling: false,
+        compacting: false,
+      }) as ReducedState;
+
+    expect(applyReducedState(base, reduced({ kind: "account", label: "Claude Max" })).authStatus).toEqual({
+      kind: "account",
+      label: "Claude Max",
+    });
+    // A daemon that omits the field has nothing to report, so neither do we.
+    expect(applyReducedState(base, reduced(undefined)).authStatus).toBeNull();
   });
 });

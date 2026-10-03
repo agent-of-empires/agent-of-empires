@@ -918,6 +918,7 @@ export interface ServerAbout {
   cityhall_mode: boolean;
   profile: string;
   acp_show_tool_durations: boolean;
+  acp_wrap_tool_output: boolean;
   /** Per-session event log retention cap; 0 means unlimited. */
   acp_replay_events: number;
   acp_compaction_reminder: boolean;

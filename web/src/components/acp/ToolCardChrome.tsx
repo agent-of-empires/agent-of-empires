@@ -8,10 +8,11 @@ import { useShikiTheme } from "../../hooks/useShikiTheme";
 import { parseJsonObject } from "../../lib/acpArgs";
 import { useAcpPrefs } from "../../lib/acpPrefs";
 import type { ActivityRow, ToolCall } from "../../lib/acpTypes";
-import { hasAnsi, parseAnsi, type AnsiStyle } from "../../lib/ansi";
+import { hasAnsi, parseAnsi, type AnsiSegment, type AnsiStyle } from "../../lib/ansi";
 import { highlightSnippet } from "../../lib/snippetHighlighter";
 import { useAcpFileRef } from "./AcpFileRefContext";
 import { useToolDisplayMode, type ToolDensity } from "./ToolDisplayMode";
+import { WrapBar, WrapLines, WrapToggle, useWrapState } from "./WrapToggle";
 
 export interface ToolCardProps {
   tool: ToolCall;
@@ -245,16 +246,20 @@ function CopyButton({ text }: { text: string }) {
 
 /** Labelled, copyable raw text block ("input" / "output"). */
 export function RawBlock({ label, text }: { label: "input" | "output"; text: string }) {
+  const [wrapped, toggleWrap] = useWrapState();
   return (
     <div className="border-t border-surface-800 bg-surface-950 px-3 py-2">
       <div className="mb-1 flex items-center justify-between text-[10px] uppercase tracking-wider text-text-dim">
         <span>{label}</span>
-        <CopyButton text={text} />
+        <span className="flex items-center">
+          <WrapToggle wrapped={wrapped} onToggle={toggleWrap} />
+          <CopyButton text={text} />
+        </span>
       </div>
       <pre
-        className={`overflow-x-auto font-mono text-[11px] ${label === "input" ? "text-text-muted" : "text-text-secondary"} whitespace-pre-wrap break-all`}
+        className={`font-mono text-[11px] ${label === "input" ? "text-text-muted" : "text-text-secondary"} ${wrapped ? "wrap-lines" : "overflow-x-auto whitespace-pre"}`}
       >
-        {text}
+        {wrapped ? <WrapLines text={text} /> : text}
       </pre>
     </div>
   );
@@ -304,6 +309,7 @@ export function HighlightedBlock({
   // treat the file as binary) so field concatenations cannot collide.
   const [result, setResult] = useState<{ key: string; html: string } | null>(null);
   const [showAll, setShowAll] = useState(false);
+  const [wrapped, toggleWrap] = useWrapState();
   const shiki = useShikiTheme();
   const unwrapped = unwrapMarkdownFence(text);
   const effectiveLang = unwrapped.lang ?? language;
@@ -341,16 +347,19 @@ export function HighlightedBlock({
 
   return (
     <div className="border-t border-surface-800 bg-surface-950">
+      <WrapBar wrapped={wrapped} onToggle={toggleWrap} />
       {ansi ? (
-        <AnsiBlock text={shown} />
+        <AnsiBlock text={shown} wrapped={wrapped} />
       ) : html ? (
         <div
-          className="overflow-x-auto px-3 py-2 text-xs [&_pre]:!bg-transparent [&_pre]:!m-0 [&_pre]:!p-0"
+          className={`px-3 py-2 text-xs [&_pre]:!bg-transparent [&_pre]:!m-0 [&_pre]:!p-0 ${wrapped ? "wrap-lines" : "overflow-x-auto"}`}
           dangerouslySetInnerHTML={{ __html: html }}
         />
       ) : (
-        <pre className="overflow-x-auto px-3 py-2 text-xs font-mono text-text-secondary whitespace-pre-wrap break-all">
-          {shown}
+        <pre
+          className={`px-3 py-2 text-xs font-mono text-text-secondary ${wrapped ? "wrap-lines" : "overflow-x-auto whitespace-pre"}`}
+        >
+          {wrapped ? <WrapLines text={shown} /> : shown}
         </pre>
       )}
       {truncated > 0 && (
@@ -366,30 +375,53 @@ export function HighlightedBlock({
   );
 }
 
-/** Terminal output is column-sensitive, so no wrapping. */
-function AnsiBlock({ text }: { text: string }) {
+/** Splits styled segments at newlines so each source line can be its own element. */
+export function splitAnsiLines(segments: AnsiSegment[]): AnsiSegment[][] {
+  const lines: AnsiSegment[][] = [[]];
+  for (const seg of segments) {
+    seg.text.split("\n").forEach((part, i) => {
+      if (i > 0) lines.push([]);
+      if (part) lines[lines.length - 1]!.push({ ...seg, text: part });
+    });
+  }
+  return lines;
+}
+
+/** Terminal output is column-sensitive, so it scrolls unless the block is wrapped. */
+function AnsiBlock({ text, wrapped }: { text: string; wrapped: boolean }) {
   const segments = useMemo(() => parseAnsi(text), [text]);
+  const lines = useMemo(() => (wrapped ? splitAnsiLines(segments) : null), [wrapped, segments]);
+  const renderSegments = (segs: AnsiSegment[]) =>
+    segs.map((seg, i) => {
+      const href = seg.url ? safeUri(seg.url, SAFE_LINK_SCHEMES) : null;
+      return href ? (
+        <a
+          key={i}
+          href={href}
+          target="_blank"
+          rel="noopener noreferrer"
+          style={ansiSegmentStyle(seg.style)}
+          className="underline"
+        >
+          {seg.text}
+        </a>
+      ) : (
+        <span key={i} style={ansiSegmentStyle(seg.style)}>
+          {seg.text}
+        </span>
+      );
+    });
   return (
-    <pre className="overflow-x-auto px-3 py-2 text-xs font-mono text-text-primary whitespace-pre">
-      {segments.map((seg, i) => {
-        const href = seg.url ? safeUri(seg.url, SAFE_LINK_SCHEMES) : null;
-        return href ? (
-          <a
-            key={i}
-            href={href}
-            target="_blank"
-            rel="noopener noreferrer"
-            style={ansiSegmentStyle(seg.style)}
-            className="underline"
-          >
-            {seg.text}
-          </a>
-        ) : (
-          <span key={i} style={ansiSegmentStyle(seg.style)}>
-            {seg.text}
-          </span>
-        );
-      })}
+    <pre
+      className={`px-3 py-2 text-xs font-mono text-text-primary ${wrapped ? "wrap-lines" : "overflow-x-auto whitespace-pre"}`}
+    >
+      {lines
+        ? lines.map((segs, i) => (
+            <span key={i} className="wrap-line">
+              {renderSegments(segs)}
+            </span>
+          ))
+        : renderSegments(segments)}
     </pre>
   );
 }

@@ -144,6 +144,19 @@ impl RateLimitInfo {
     }
 }
 
+/// A live advisory the agent pushed outside the turn flow (approaching a rate
+/// limit, a model fallback), per the ACP session-notices extension. Each
+/// surface derives its own tone from the raw `severity` string.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionNotice {
+    /// Minted from the event seq, so a client keys its local dismissal on it.
+    pub id: String,
+    pub severity: String,
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
 /// Snapshot of the most recent ACP agent handoff.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentSwitchInfo {
@@ -184,6 +197,50 @@ pub struct ModeInfo {
     pub name: String,
     #[serde(default)]
     pub description: Option<String>,
+}
+
+/// Agent-to-client notification carrying the agent's own auth identity.
+pub const AUTH_STATUS_UPDATE_METHOD: &str = "_auth/status_update";
+
+/// Which auth identity the agent process resolved for itself. An interim
+/// `_meta` extension, so an unrecognised kind still renders from `label`
+/// rather than dropping the whole report.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthStatusKind {
+    Account,
+    ApiKey,
+    Gateway,
+    External,
+    /// The agent knows it is logged out. Distinct from never reporting.
+    None,
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthStatusAccount {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub organization: Option<String>,
+    /// Vendor plan string, not normalised.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<String>,
+}
+
+/// The agent's own `_auth/status_update` payload. The upstream `vendor` bag is
+/// deliberately not kept: nothing reads it, and it would persist unbounded
+/// third-party data into the session log.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthStatus {
+    pub kind: AuthStatusKind,
+    /// Usable as a UI string on its own ("Claude Max", "Anthropic API key").
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<AuthStatusAccount>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -360,6 +417,10 @@ pub struct AcpState {
     pub available_modes: Vec<ModeInfo>,
     #[serde(default)]
     pub current_mode_id: Option<String>,
+    /// Identity the adapter reported for itself. `None` means it never
+    /// reported, which the UI shows as nothing rather than as logged out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_status: Option<AuthStatus>,
     #[serde(default)]
     pub last_agent_switch: Option<AgentSwitchInfo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -370,6 +431,9 @@ pub struct AcpState {
     /// Notice for the most recent rejected `session/set_config_option`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_option_switch_failed: Option<ConfigOptionSwitchFailure>,
+    /// Undismissed advisories for the current turn; the next prompt clears them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub session_notices: Vec<SessionNotice>,
     #[serde(default)]
     pub background_agents: Vec<BackgroundAgentRecord>,
 
@@ -497,6 +561,14 @@ pub enum Event {
     RateLimit {
         info: RateLimitInfo,
     },
+    /// An ACP session notice: a live advisory, not conversation history.
+    SessionNotice {
+        /// Raw wire severity, so a future ACP level survives the log unchanged.
+        severity: String,
+        title: String,
+        #[serde(default)]
+        description: Option<String>,
+    },
     /// Auto-resume breadcrumb; `manual` when the user pressed RESUME NOW.
     RateLimitAutoResumed {
         resets_at: DateTime<Utc>,
@@ -530,6 +602,12 @@ pub enum Event {
         config_id: String,
         value: String,
         reason: String,
+    },
+    /// The agent reported which auth identity it runs under. `None` clears a
+    /// report inherited from an earlier adapter process that this one cannot
+    /// refresh; see `AcpState::auth_status`.
+    AuthStatusUpdated {
+        status: Option<AuthStatus>,
     },
     /// An ACP `session/update` payload with no typed variant yet.
     RawAgentUpdate {
@@ -676,6 +754,8 @@ pub enum Event {
 
 impl AcpState {
     const MAX_RECENT_DIFFS: usize = 16;
+    /// A chatty turn must not push the banner past the strip's useful height.
+    const MAX_SESSION_NOTICES: usize = 3;
 
     pub fn new(session_id: AcpSessionId, agent: AgentName, model: Option<String>) -> Self {
         Self {
@@ -776,6 +856,23 @@ impl AcpState {
             }
             Event::ThinkingEnded => self.thinking = None,
             Event::RateLimit { info } => self.rate_limit = Some(info),
+            Event::SessionNotice {
+                severity,
+                title,
+                description,
+            } => {
+                self.session_notices.push(SessionNotice {
+                    id: format!("notice-{}", self.last_seq.saturating_add(1)),
+                    severity,
+                    title,
+                    description,
+                });
+                let excess = self
+                    .session_notices
+                    .len()
+                    .saturating_sub(Self::MAX_SESSION_NOTICES);
+                self.session_notices.drain(..excess);
+            }
             Event::UsageUpdated { usage } => self.usage = Some(usage),
             Event::ModeChanged { mode } => self.mode = mode,
             Event::ModesAvailable {
@@ -788,6 +885,7 @@ impl AcpState {
             Event::CurrentModeChanged { current_mode_id } => {
                 self.current_mode_id = Some(current_mode_id)
             }
+            Event::AuthStatusUpdated { status } => self.auth_status = status,
             Event::AvailableCommandsUpdated { commands } => self.available_commands = commands,
             Event::ConfigOptionsUpdated { options } => {
                 // The failed value is now current, so the notice is moot.
@@ -949,6 +1047,9 @@ impl AcpState {
             self.cancelling = false;
         }
         self.rate_limit = None;
+        // Advisories describe the turn they arrived in, so a new prompt retires
+        // them. Their transcript rows keep the history.
+        self.session_notices.clear();
     }
 
     /// The turn is over however it ended, so every in-turn phase clears.
@@ -967,6 +1068,8 @@ impl AcpState {
     fn switch_agent(&mut self, from: String, to: String, reason: String) {
         self.agent = AgentName(to.clone());
         self.rate_limit = None;
+        // The prior agent's advisories say nothing about the new one.
+        self.session_notices.clear();
         self.in_flight_tool = None;
         self.thinking = None;
         self.pending_approvals = Vec::new();
@@ -1052,6 +1155,114 @@ mod tests {
             s.apply_event(event).unwrap();
         }
         s
+    }
+
+    fn notice(title: &str) -> Event {
+        Event::SessionNotice {
+            severity: "warning".into(),
+            title: title.into(),
+            description: None,
+        }
+    }
+
+    /// #4242: notices are live advisories, so they are capped and retired on
+    /// the next turn rather than accumulating for the life of the session.
+    #[test]
+    fn session_notices_are_capped_and_retired_by_the_next_turn() {
+        let titles = |s: &AcpState| -> Vec<String> {
+            s.session_notices.iter().map(|n| n.title.clone()).collect()
+        };
+
+        let one = applied([notice("first")]);
+        assert_eq!(titles(&one), ["first"]);
+        assert_eq!(one.session_notices[0].id, "notice-1", "id keys dismissal");
+
+        let overflowed =
+            applied((0..AcpState::MAX_SESSION_NOTICES + 2).map(|i| notice(&format!("n{i}"))));
+        assert_eq!(
+            overflowed.session_notices.len(),
+            AcpState::MAX_SESSION_NOTICES
+        );
+        assert_eq!(titles(&overflowed), ["n2", "n3", "n4"], "oldest drop first");
+
+        assert!(
+            titles(&applied([notice("stale"), prompt("next")])).is_empty(),
+            "a new turn retires the previous turn's advisories"
+        );
+        assert!(
+            titles(&applied([
+                notice("stale"),
+                Event::AgentSwitched {
+                    from: "claude".into(),
+                    to: "codex".into(),
+                    reason: "user".into(),
+                },
+            ]))
+            .is_empty(),
+            "the prior agent's advisories do not carry over"
+        );
+    }
+
+    fn auth(kind: AuthStatusKind, label: &str) -> AuthStatus {
+        AuthStatus {
+            kind,
+            label: label.into(),
+            detail: None,
+            account: None,
+        }
+    }
+
+    #[test]
+    fn auth_status_tracks_the_latest_report_and_clears() {
+        let max = auth(AuthStatusKind::Account, "Claude Max");
+        let key = auth(AuthStatusKind::ApiKey, "Anthropic API key");
+
+        // Never reported is not the same as logged out: it renders as nothing.
+        assert_eq!(fresh_state().auth_status, None);
+
+        let s = applied([Event::AuthStatusUpdated {
+            status: Some(max.clone()),
+        }]);
+        assert_eq!(s.auth_status.as_ref(), Some(&max));
+
+        // A later report replaces the earlier one wholesale.
+        let s = applied([
+            Event::AuthStatusUpdated {
+                status: Some(max.clone()),
+            },
+            Event::AuthStatusUpdated {
+                status: Some(key.clone()),
+            },
+        ]);
+        assert_eq!(s.auth_status.as_ref(), Some(&key));
+
+        // An adapter that cannot report clears the previous process's value
+        // rather than leaving it on screen.
+        let s = applied([
+            Event::AuthStatusUpdated { status: Some(max) },
+            Event::AuthStatusUpdated { status: None },
+        ]);
+        assert_eq!(s.auth_status, None);
+    }
+
+    #[test]
+    fn auth_status_drops_the_vendor_bag_but_keeps_the_account() {
+        let status: AuthStatus = serde_json::from_value(serde_json::json!({
+            "kind": "account",
+            "label": "Claude Max",
+            "account": {"email": "a@b.co", "organization": "Acme", "plan": "max"},
+            "vendor": {"claudeCode": {"secret": "x"}},
+        }))
+        .unwrap();
+        assert_eq!(
+            status.account.as_ref().unwrap().email.as_deref(),
+            Some("a@b.co")
+        );
+        let round_tripped = serde_json::to_value(&status).unwrap();
+        assert!(
+            round_tripped.get("vendor").is_none(),
+            "vendor must not reach the event log: {round_tripped}"
+        );
     }
 
     fn caps(steering: bool) -> Event {

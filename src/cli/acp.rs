@@ -1082,6 +1082,7 @@ fn event_kind(event: &crate::acp::Event) -> &'static str {
         Event::AvailableCommandsUpdated { .. } => "available_commands_updated",
         Event::ConfigOptionsUpdated { .. } => "config_options_updated",
         Event::ConfigOptionSwitchFailed { .. } => "config_option_switch_failed",
+        Event::AuthStatusUpdated { .. } => "auth_status_updated",
         Event::RawAgentUpdate { .. } => "raw_agent_update",
         Event::BackgroundAgentLaunched { .. } => "background_agent_launched",
         Event::BackgroundAgentProgress { .. } => "background_agent_progress",
@@ -1105,6 +1106,7 @@ fn event_kind(event: &crate::acp::Event) -> &'static str {
         Event::MonitorArmed { .. } => "monitor_armed",
         Event::PromptRejected { .. } => "prompt_rejected",
         Event::AgentSwitched { .. } => "agent_switched",
+        Event::SessionNotice { .. } => "session_notice",
     }
 }
 
