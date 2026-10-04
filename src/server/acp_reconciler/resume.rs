@@ -753,6 +753,33 @@ mod tests {
         assert_eq!(req.model.as_deref(), Some("claude-opus-5"));
     }
 
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn build_spawn_request_carries_the_workspace_layout() {
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let mut ws = crate::server::test_support::workspace_instance(
+            "ws-resume",
+            std::path::Path::new("/tmp/aoe-ws-resume"),
+        );
+        ws.id = "sess-ws-resume".to_string();
+        ws.source_profile = "default".into();
+        ws.view = crate::session::View::Structured;
+        crate::server::test_support::seed_instances_on_disk_for_test("default", vec![ws.clone()]);
+        let state = crate::server::test_support::build_test_app_state(vec![ws.clone()]);
+
+        // The target snapshot carries no workspace; the request must read the live row.
+        let mut target = ResumeTarget::from_instance(&ws);
+        target.project_path = "/tmp/aoe-ws-resume-stale".to_string();
+        let req = build_spawn_request(&state.session_service, &target)
+            .await
+            .unwrap();
+        crate::server::test_support::assert_carries_workspace(
+            req.workspace_info.as_ref(),
+            &ws,
+            "build_spawn_request",
+        );
+    }
+
     /// #4127: a request is not an observation. Building one derives the route
     /// it will carry, but only a launch that attests one may write the marker,
     /// so the row keeps deriving it and a later alias declaration still reaches
