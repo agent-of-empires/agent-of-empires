@@ -157,6 +157,21 @@ async fn pick_agent(
 mod tests {
     use super::*;
 
+    #[test]
+    fn spawn_request_for_carries_the_workspace_layout() {
+        let instance = crate::server::test_support::workspace_instance(
+            "ws-spawn-request",
+            std::path::Path::new("/tmp/aoe-ws-spawn-request"),
+        );
+        let req = spawn_request_for(&instance, "claude".into(), None);
+        crate::server::test_support::assert_carries_workspace(
+            req.workspace_info.as_ref(),
+            &instance,
+            "spawn_request_for",
+        );
+        assert_eq!(req.cwd, PathBuf::from(&instance.project_path));
+    }
+
     #[tokio::test]
     async fn agent_exited_maps_to_the_retryable_status_not_a_fault() {
         let cases = [

@@ -541,3 +541,47 @@ pub(crate) async fn archive_while_hook_waits(
     std::fs::write(release, b"release").expect("release hook");
     target.is_some()
 }
+
+/// An instance whose `workspace_info` is a one-repo workspace rooted at `dir`.
+#[cfg(test)]
+pub(crate) fn workspace_instance(title: &str, dir: &std::path::Path) -> Instance {
+    use crate::acp::mcp_rewrite::test_support::{workspace_info, OUTSIDE_MAIN};
+    let mut instance = Instance::new(title, &dir.to_string_lossy());
+    instance.workspace_info = Some(workspace_info(
+        dir,
+        &[("alpha", std::path::Path::new(OUTSIDE_MAIN))],
+    ));
+    instance
+}
+
+/// Asserts a spawn carries `expected`'s workspace layout, not just some workspace.
+#[cfg(test)]
+pub(crate) fn assert_carries_workspace(
+    actual: Option<&crate::session::WorkspaceInfo>,
+    expected: &Instance,
+    site: &str,
+) {
+    let expected = expected.workspace_info.as_ref().expect("fixture workspace");
+    let actual = actual.unwrap_or_else(|| panic!("{site} dropped the workspace_info"));
+    assert_eq!(actual.workspace_dir, expected.workspace_dir, "{site}");
+    assert_eq!(actual.repos, expected.repos, "{site}");
+}
+
+/// A launcher that records each launch's `workspace_info` and fails the launch.
+#[cfg(test)]
+pub(crate) fn workspace_capturing_launcher() -> (
+    crate::acp::supervisor::Launcher,
+    Arc<std::sync::Mutex<Vec<Option<crate::session::WorkspaceInfo>>>>,
+) {
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&seen);
+    let launcher: crate::acp::supervisor::Launcher = Arc::new(move |config, _id| {
+        recorded.lock().unwrap().push(config.workspace_info.clone());
+        Box::pin(async {
+            Err::<crate::acp::acp_client::AcpClient, _>(crate::acp::acp_client::AcpError::Spawn(
+                "test launcher".into(),
+            ))
+        })
+    });
+    (launcher, seen)
+}
