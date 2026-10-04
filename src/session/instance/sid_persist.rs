@@ -38,25 +38,7 @@ pub(crate) enum SidPersistOutcome {
     Skip,
 }
 
-/// Compare a captured conversation with the complete snapshot read before capture.
 pub(crate) fn persist_session_to_storage(
-    profile: &str,
-    instance_id: &str,
-    observation: &crate::session::poller::SessionIdObservation,
-    expected: &ConversationState,
-    file_watch: &std::sync::Arc<crate::file_watch::FileWatchService>,
-) -> SidWrite {
-    let storage = match crate::session::storage::Storage::new(profile, file_watch.clone()) {
-        Ok(storage) => storage,
-        Err(error) => {
-            tracing::warn!(target: "session.store", "Cannot open capture storage: {error}");
-            return SidWrite::Failed;
-        }
-    };
-    persist_session_with_storage(&storage, instance_id, observation, expected)
-}
-
-pub(super) fn persist_session_with_storage(
     storage: &crate::session::storage::Storage,
     instance_id: &str,
     observation: &crate::session::poller::SessionIdObservation,
@@ -462,7 +444,7 @@ mod tests {
     /// Isolated home plus a profile whose sessions.json holds `insts`.
     fn seeded(
         profile: &str,
-        insts: &[&Instance],
+        insts: &mut [&mut Instance],
     ) -> (TempDir, crate::session::test_support::EnvGuard, Storage) {
         let temp = tempdir().unwrap();
         let guard = crate::session::test_support::isolate_home(temp.path());
@@ -470,10 +452,16 @@ mod tests {
         (temp, guard, Storage::new_unwatched(profile).unwrap())
     }
 
-    fn seed(profile: &str, insts: &[&Instance]) {
-        let owned: Vec<Instance> = insts.iter().map(|i| (*i).clone()).collect();
-        Storage::new_unwatched(profile)
-            .unwrap()
+    fn seed(profile: &str, insts: &mut [&mut Instance]) {
+        let storage = std::sync::Arc::new(Storage::new_unwatched(profile).unwrap());
+        let owned: Vec<Instance> = insts
+            .iter_mut()
+            .map(|instance| {
+                instance.storage_origin = Some(storage.clone());
+                (**instance).clone()
+            })
+            .collect();
+        storage
             .update(|i, g| {
                 *i = owned.clone();
                 *g = GroupTree::new_with_groups(&owned, &[]).get_all_groups();
@@ -509,13 +497,12 @@ mod tests {
             let profile = "cas-persist";
             let mut inst = make_inst(profile, "title");
             inst.agent_session_id = Some("old".to_string());
-            let (_temp, _home, _) = seeded(profile, &[&inst]);
+            let (_temp, _home, storage) = seeded(profile, &mut [&mut inst]);
             let write = persist_session_to_storage(
-                profile,
+                &storage,
                 &inst.id,
                 &observation("new"),
                 &expected_state(prior, ResumeIntent::Default),
-                &FileWatchService::noop(),
             );
             assert_eq!(write, expected);
             assert_eq!(disk_sid(profile, &inst.id).as_deref(), Some(disk));
@@ -530,11 +517,11 @@ mod tests {
         let mut inst = make_inst(profile, "pinned");
         inst.agent_session_id = Some(VALID_SID.into());
         inst.resume_intent = ResumeIntent::Use(VALID_SID.into());
-        let (_temp, _home, storage) = seeded(profile, &[&inst]);
+        let (_temp, _home, storage) = seeded(profile, &mut [&mut inst]);
         let expected = inst.conversation_state();
 
         assert_eq!(
-            persist_session_with_storage(&storage, &inst.id, &observation(OTHER_SID), &expected),
+            persist_session_to_storage(&storage, &inst.id, &observation(OTHER_SID), &expected),
             SidWrite::PinnedForeign
         );
         let disk = storage.load().unwrap();
@@ -542,7 +529,7 @@ mod tests {
         assert_eq!(disk[0].resume_intent, ResumeIntent::Use(VALID_SID.into()));
 
         assert_eq!(
-            persist_session_with_storage(&storage, &inst.id, &observation(VALID_SID), &expected),
+            persist_session_to_storage(&storage, &inst.id, &observation(VALID_SID), &expected),
             SidWrite::Applied,
             "the pin must still accept its own conversation"
         );
@@ -586,7 +573,7 @@ mod tests {
             capture: None,
             container: None,
         });
-        let (_temp, _home, storage) = seeded(profile, &[&owner, &claimant]);
+        let (_temp, _home, storage) = seeded(profile, &mut [&mut owner, &mut claimant]);
         let mut observed =
             crate::session::poller::SessionIdObservation::omp(VALID_SID.into(), generation.into());
         observed.execution = claimant.active_execution.clone();
@@ -594,7 +581,7 @@ mod tests {
         assert!(observed.confirms_omp_pin(&claimant.resume_intent));
 
         assert_eq!(
-            persist_session_with_storage(
+            persist_session_to_storage(
                 &storage,
                 &claimant.id,
                 &observed,
@@ -658,17 +645,16 @@ mod tests {
                     ..Default::default()
                 },
             );
-            let (_tmp, _home, storage) = seeded(profile, &[&parked, &claimant]);
+            let (_tmp, _home, storage) = seeded(profile, &mut [&mut parked, &mut claimant]);
             let mut observed = observation(sid);
             observed.execution = claimant.active_execution.clone();
             observed.scope_to(source);
             assert_eq!(
                 persist_session_to_storage(
-                    profile,
+                    &storage,
                     &claimant.id,
                     &observed,
                     &claimant.conversation_state(),
-                    &FileWatchService::noop()
                 ),
                 expected,
                 "{namespace}"
@@ -688,10 +674,10 @@ mod tests {
         let profile = "sid-foreign-on-disk";
         let mut owner = make_inst(profile, "owner");
         owner.agent_session_id = Some(sid.into());
-        let claimant = make_inst(profile, "claimant");
-        let (_tmp, _home, storage) = seeded(profile, &[&owner, &claimant]);
+        let mut claimant = make_inst(profile, "claimant");
+        let (_tmp, _home, storage) = seeded(profile, &mut [&mut owner, &mut claimant]);
         assert_eq!(
-            persist_session_with_storage(
+            persist_session_to_storage(
                 &storage,
                 &claimant.id,
                 &observation(sid),
@@ -759,7 +745,7 @@ mod tests {
                 }),
                 container: None,
             });
-            let (_temp, _home, storage) = seeded(&profile, &[&owner, &claimant]);
+            let (_temp, _home, storage) = seeded(&profile, &mut [&mut owner, &mut claimant]);
             crate::hooks::write_session_id_via_guard(&claimant.id, sid, Some(launch)).unwrap();
             if publish_transcript {
                 let sidecar = crate::hooks::ensure_instance_dir_path(&claimant.id).unwrap();
@@ -788,7 +774,7 @@ mod tests {
                 publish_transcript
             );
             assert_eq!(
-                persist_session_with_storage(
+                persist_session_to_storage(
                     &storage,
                     &claimant.id,
                     &observed,
@@ -825,7 +811,7 @@ mod tests {
             }),
             container: None,
         });
-        let (_temp, _home, storage) = seeded(profile, &[&claimant]);
+        let (_temp, _home, storage) = seeded(profile, &mut [&mut claimant]);
         crate::hooks::write_session_id_via_guard(&claimant.id, sid, Some(launch)).unwrap();
         let observed = crate::session::capture::read_pi_session_observation(
             &claimant.id,
@@ -835,7 +821,7 @@ mod tests {
         )
         .expect("the unclaimed Pi ID is capturable before publication");
         assert_eq!(
-            persist_session_with_storage(
+            persist_session_to_storage(
                 &storage,
                 &claimant.id,
                 &observed,
@@ -885,7 +871,10 @@ mod tests {
         pinned.resume_intent = ResumeIntent::Use(sid.into());
         pinned.resume_binding = Some(binding.clone());
         let expected = pinned.conversation_state();
-        let (_tmp, _home, storage) = seeded(profile, &[&first, &second, &parked, &pinned]);
+        let (_tmp, _home, storage) = seeded(
+            profile,
+            &mut [&mut first, &mut second, &mut parked, &mut pinned],
+        );
         let mut live = pinned.clone();
         live.set_agent_conversation(Some(sid.into()), Some(binding.clone()), None);
         live.identity_publisher_launched = true;
@@ -927,7 +916,7 @@ mod tests {
             .get_mut("claude")
             .unwrap()
             .agent_session_binding = None;
-        seed(profile, &[&parked, &pinned]);
+        seed(profile, &mut [&mut parked, &mut pinned]);
         let mut refused = pinned.clone();
         refused.set_agent_conversation(Some(sid.into()), Some(binding.clone()), None);
         assert_eq!(
@@ -949,8 +938,8 @@ mod tests {
         );
 
         first.agent_session_id = Some(sid.into());
-        let launcher = make_inst(profile, "stale-launcher");
-        seed(profile, &[&first, &launcher]);
+        let mut launcher = make_inst(profile, "stale-launcher");
+        seed(profile, &mut [&mut first, &mut launcher]);
         let mut stale = launcher.clone();
         stale.agent_session_id = Some(sid.into());
         let stale_expected = ConversationState {
@@ -974,7 +963,7 @@ mod tests {
         let profile = "sid-persist-notify";
         let mut inst = make_inst(profile, "title");
         inst.agent_session_id = Some("old".to_string());
-        let (_temp, _home, _) = seeded(profile, &[&inst]);
+        let (_temp, _home, _) = seeded(profile, &mut [&mut inst]);
 
         let svc = FileWatchService::new().expect("init");
         let profile_dir = crate::session::get_profile_dir_path(profile).unwrap();
@@ -991,11 +980,10 @@ mod tests {
             .expect("subscribe");
 
         let write = persist_session_to_storage(
-            profile,
+            &crate::session::Storage::open(profile, svc.clone()).unwrap(),
             &inst.id,
             &observation("new-sid"),
             &expected_state(Some("old"), ResumeIntent::Default),
-            &svc,
         );
         assert_eq!(write, SidWrite::Applied);
         let evt = tokio::time::timeout(Duration::from_millis(2_500), rx.recv())
@@ -1053,7 +1041,7 @@ mod tests {
         inst.tool = "claude".into();
         inst.agent_session_id = Some(VALID_SID.into());
         inst.resume_intent = ResumeIntent::Use(VALID_SID.into());
-        let (_temp, _home, storage) = seeded(profile, &[&inst]);
+        let (_temp, _home, storage) = seeded(profile, &mut [&mut inst]);
         let expected = inst.conversation_state();
 
         // A peer changes only the intent while this launch is in flight. A
@@ -1105,7 +1093,7 @@ mod tests {
             transcript_path: None,
         });
         inst.active_execution = Some(active.clone());
-        let (_temp, _home, storage) = seeded(profile, &[&inst]);
+        let (_temp, _home, storage) = seeded(profile, &mut [&mut inst]);
         let observation = crate::session::poller::SessionIdObservation {
             execution: Some(active),
             claim: crate::session::poller::ConversationClaim::Scoped(binding(Some(true))),
@@ -1113,7 +1101,7 @@ mod tests {
         };
 
         assert_eq!(
-            persist_session_with_storage(
+            persist_session_to_storage(
                 &storage,
                 &inst.id,
                 &observation,
@@ -1131,7 +1119,7 @@ mod tests {
         inst.tool = "claude".into();
         inst.agent_session_id = Some(VALID_SID.into());
         inst.resume_intent = ResumeIntent::Use(VALID_SID.into());
-        let (_temp, _home, storage) = seeded(profile, &[&inst]);
+        let (_temp, _home, storage) = seeded(profile, &mut [&mut inst]);
 
         let expected = expected_state(Some(VALID_SID), inst.resume_intent.clone());
         let _ = inst.persist_session_id(profile, &expected);
@@ -1151,7 +1139,7 @@ mod tests {
         let next_sid = "019342aa-2222-7eee-8fff-aaaabbbbcccc";
         let expected = storage.load().unwrap()[0].conversation_state();
         assert_eq!(
-            persist_session_with_storage(&storage, &inst.id, &observation(next_sid), &expected),
+            persist_session_to_storage(&storage, &inst.id, &observation(next_sid), &expected),
             SidWrite::Applied
         );
         assert_eq!(disk_sid(profile, &inst.id).as_deref(), Some(next_sid));
@@ -1245,10 +1233,11 @@ mod tests {
             let old_generation = "omp-old-generation";
             let mut inst = omp_inst(profile, "omp-plan-failure");
             inst.omp_capture_generation = Some(old_generation.to_string());
-            seed(profile, &[&inst]);
+            seed(profile, &mut [&mut inst]);
 
             assert!(inst.publish_omp_launch_generation(profile, None, Some(old_generation)));
-            let disk = Storage::new_unwatched(profile).unwrap().load().unwrap();
+            let storage = Storage::new_unwatched(profile).unwrap();
+            let disk = storage.load().unwrap();
             assert!(disk[0].omp_capture_generation.is_some());
             assert_eq!(disk[0].omp_capture_generation, inst.omp_capture_generation);
             assert_ne!(
@@ -1257,14 +1246,13 @@ mod tests {
             );
             assert_eq!(
                 persist_session_to_storage(
-                    profile,
+                    &storage,
                     &inst.id,
                     &crate::session::poller::SessionIdObservation::omp(
                         "019342ab-1234-7def-8901-abcdef012349".into(),
                         old_generation.into(),
                     ),
                     &inst.conversation_state(),
-                    &FileWatchService::noop(),
                 ),
                 SidWrite::Skipped
             );
@@ -1281,7 +1269,7 @@ mod tests {
             let mut inst = omp_inst(profile, "omp-restart-flush");
             inst.omp_capture_generation = Some(generation.to_string());
             inst.status = Status::Stopped;
-            seed(profile, &[&inst]);
+            seed(profile, &mut [&mut inst]);
 
             let poller = crate::session::poller::SessionPoller::new(
                 "unused-tmux".to_string(),
@@ -1367,7 +1355,7 @@ mod tests {
                 .resolve_omp_capture_plan(&context, None)
                 .expect("OMP launch plan");
             let expected_layout = plan.layout.clone();
-            seed(profile, &[&inst]);
+            seed(profile, &mut [&mut inst]);
 
             let tmux = TmuxSession::create(&inst.id, &inst.title);
             // Config drift after the snapshot: finalize publishes the transported plan.
@@ -1597,9 +1585,12 @@ mod tests {
                 match disk {
                     Some(sid) => {
                         inst.agent_session_id = sid.map(str::to_string);
-                        seed(profile, &[&inst]);
+                        seed(profile, &mut [&mut inst]);
                     }
-                    None => drop(Storage::new_unwatched(profile).unwrap()),
+                    None => {
+                        let storage = Storage::new_unwatched(profile).unwrap();
+                        inst.storage_origin = Some(std::sync::Arc::new(storage));
+                    }
                 }
                 let tmux = TmuxSession::create(&inst.id, &inst.title);
                 if let Some(value) = preset {

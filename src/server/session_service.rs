@@ -130,6 +130,8 @@ fn queue_drain_batch<'a>(
 pub struct SessionService {
     /// Live in-memory session list, shared with `AppState.instances`.
     pub instances: Arc<RwLock<Vec<Instance>>>,
+    /// Immutable primary profile authority captured at daemon startup, even when it has no rows.
+    pub(super) primary_storage: Arc<crate::session::Storage>,
     /// Per-instance mutation locks, shared with `AppState.instance_locks`.
     pub instance_locks: Arc<RwLock<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     /// Storage change-notification service, shared with `AppState.file_watch`.
@@ -302,6 +304,7 @@ pub struct AcpDeps {
 impl SessionService {
     pub fn new(
         instances: Arc<RwLock<Vec<Instance>>>,
+        primary_storage: Arc<crate::session::Storage>,
         instance_locks: Arc<RwLock<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
         file_watch: Arc<crate::file_watch::FileWatchService>,
         telemetry_session_creates: Arc<std::sync::atomic::AtomicU32>,
@@ -310,6 +313,7 @@ impl SessionService {
     ) -> Self {
         Self {
             instances,
+            primary_storage,
             instance_locks,
             file_watch,
             telemetry_session_creates,
@@ -1985,7 +1989,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn the_queue_drain_frees_instance_lock_while_it_waits_for_a_resuming_worker() {
-        use crate::acp::supervisor::{ResumeKind, ResumeReservationOutcome};
+        use crate::acp::supervisor::ResumeReservationOutcome;
         use std::time::Duration;
 
         let _home = crate::session::test_support::isolate_app_dir();
@@ -2005,7 +2009,12 @@ mod tests {
         // Hold the reservation for the whole probe so no worker can land.
         let reservation = match service
             .acp_supervisor
-            .begin_resume("sess-3621", ResumeKind::Spawn)
+            .begin_resume(
+                "sess-3621",
+                crate::acp::runner_lifecycle::NativeResume::Spawn,
+                crate::acp::supervisor::test_support::stored_origin("sess-3621"),
+                false,
+            )
             .await
             .expect("begin_resume must not error under capacity")
         {

@@ -1011,7 +1011,10 @@ fn trash_then_restore_round_trip() {
 
     // Restore via the shelve/unshelve key.
     env.view.select_session_by_id(&id);
-    env.view.toggle_archive_at_cursor().unwrap();
+    {
+        env.view.toggle_archive_at_cursor().unwrap();
+        finish_runner_settlements(&mut env.view);
+    };
     assert!(
         !env.view.get_instance(&id).unwrap().is_trashed(),
         "session must be restored out of trash"
@@ -1282,7 +1285,10 @@ fn right_click_trash_header_shows_bulk_menu() {
         env.view.archived_section_collapsed = false;
         env.view.cursor = 0;
         env.view.update_selected();
-        env.view.toggle_archive_at_cursor().unwrap();
+        {
+            env.view.toggle_archive_at_cursor().unwrap();
+            finish_runner_settlements(&mut env.view);
+        };
 
         let header_idx = env
             .view
@@ -1434,7 +1440,10 @@ fn empty_trash_confirm_purges_every_trashed_row() {
         for i in 0..2 {
             env.view.cursor = i;
             env.view.update_selected();
-            env.view.toggle_archive_at_cursor().unwrap();
+            {
+                env.view.toggle_archive_at_cursor().unwrap();
+                finish_runner_settlements(&mut env.view);
+            };
         }
         assert_eq!(
             env.view
@@ -1519,7 +1528,10 @@ fn archived_preview_surfaces_delete_failure() {
     env.view.archived_section_collapsed = false;
     let id = env.view.instance_at(0).id.clone();
     env.view.select_session_by_id(&id);
-    env.view.toggle_archive_at_cursor().unwrap();
+    {
+        env.view.toggle_archive_at_cursor().unwrap();
+        finish_runner_settlements(&mut env.view);
+    };
     env.view.select_session_by_id(&id);
     env.view.mutate_instance(&id, |inst| {
         inst.status = Status::Error;

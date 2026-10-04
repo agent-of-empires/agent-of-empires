@@ -188,9 +188,11 @@ impl Instance {
         storage: &crate::session::storage::Storage,
         operation: LifecycleOperation,
         status: Option<Status>,
+        acknowledgement: Option<&mut Option<std::sync::Arc<crate::session::LaunchOrigin>>>,
     ) -> Result<u64> {
         let now = Utc::now();
         let mut acquired = None;
+        let mut receipt = None;
         storage.update(|instances, _groups| {
             let Some(stored) = instances.iter_mut().find(|instance| instance.id == self.id) else {
                 return Ok(());
@@ -211,6 +213,11 @@ impl Instance {
                     stored.idle_entered_at = None;
                 }
             }
+            if acknowledgement.is_some() {
+                let mut emitted = stored.clone();
+                emitted.storage_origin = Some(std::sync::Arc::new(storage.clone()));
+                receipt = Some(crate::session::LaunchOrigin::capture(&emitted)?);
+            }
             acquired = Some((generation, stored.lifecycle_reservation.clone()));
             Ok(())
         })?;
@@ -224,6 +231,9 @@ impl Instance {
             if status != Status::Idle {
                 self.idle_entered_at = None;
             }
+        }
+        if let Some(destination) = acknowledgement {
+            *destination = receipt;
         }
         Ok(generation)
     }
@@ -431,6 +441,7 @@ mod tests {
                 &storage,
                 LifecycleOperation::Launch,
                 Some(Status::Starting),
+                None,
             )
             .unwrap_err();
         assert!(missing.to_string().contains("no longer exists"));
@@ -446,6 +457,7 @@ mod tests {
                 &storage,
                 LifecycleOperation::Launch,
                 Some(Status::Starting),
+                None,
             )
             .unwrap();
         let generation = instance.lifecycle_generation;
@@ -550,6 +562,7 @@ mod tests {
                 &storage,
                 LifecycleOperation::Launch,
                 Some(Status::Starting),
+                None,
             );
             assert_eq!(result.is_ok(), *allowed, "{}", instance.title);
         }
@@ -616,6 +629,7 @@ mod tests {
             &storage,
             LifecycleOperation::Launch,
             Some(Status::Starting),
+            None,
         )
         .unwrap();
         let reserved_gen = inst.lifecycle_generation;
@@ -660,6 +674,7 @@ mod tests {
         let storage =
             crate::session::storage::Storage::new_unwatched("lifecycle-launch-commit").unwrap();
         let mut committed = Instance::new("committed", "/tmp/test");
+        committed.storage_origin = Some(std::sync::Arc::new(storage.clone()));
         let mut stale = Instance::new("stale", "/tmp/test");
         let mut overflow = Instance::new("overflow", "/tmp/test");
         overflow.lifecycle_generation = u64::MAX;
@@ -670,17 +685,32 @@ mod tests {
             })
             .unwrap();
 
+        let mut own_reservation = None;
         committed
             .acquire_lifecycle_reservation(
                 &storage,
                 LifecycleOperation::Launch,
                 Some(Status::Starting),
+                Some(&mut own_reservation),
             )
             .unwrap();
+        let own_reservation =
+            own_reservation.expect("successful real CAS must return its exact receipt");
+        let reserved_cache = storage
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.id == committed.id)
+            .unwrap();
+        let cached_scope = crate::session::LaunchOrigin::capture(&reserved_cache).unwrap();
         let reserved_generation = committed.lifecycle_generation;
         let capture_floor = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_234_567);
         committed.status = Status::Running;
         committed.capture_started_at = Some(capture_floor);
+        committed.sandbox_info = Some(super::super::test_helpers::test_sandbox(
+            "committed",
+            Some("/workspace/committed"),
+        ));
         committed.commit_lifecycle_launch(&storage, false).unwrap();
         let disk = storage
             .load()
@@ -692,12 +722,28 @@ mod tests {
         assert_eq!(disk.lifecycle_generation, committed.lifecycle_generation);
         assert_eq!(disk.status, Status::Running);
         assert_eq!(disk.capture_started_at, Some(capture_floor));
+        let own_commit = crate::session::LaunchOrigin::capture(&committed).unwrap();
+        assert_eq!(own_reservation.generation(), own_commit.generation());
+        assert!(own_reservation.recognizes_published_snapshot(&cached_scope));
+        assert!(
+            !own_commit.recognizes_published_snapshot(&cached_scope),
+            "same counter alone must not translate a different execution plan"
+        );
+        assert!(
+            own_reservation.with_storage(|_, _| Ok(())).is_err(),
+            "the earlier actual ACK must not authorize the new canonical plan"
+        );
+        assert!(
+            own_commit.with_storage(|_, _| Ok(())).is_ok(),
+            "only the actual committed plan may publish canonical effects"
+        );
 
         stale
             .acquire_lifecycle_reservation(
                 &storage,
                 LifecycleOperation::Launch,
                 Some(Status::Starting),
+                None,
             )
             .unwrap();
         let stale_token = stale.lifecycle_generation;
@@ -738,6 +784,7 @@ mod tests {
                 &storage,
                 LifecycleOperation::Launch,
                 Some(Status::Starting),
+                None,
             )
             .unwrap_err()
             .to_string()

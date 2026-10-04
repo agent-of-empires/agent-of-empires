@@ -267,13 +267,10 @@ impl Instance {
             return;
         };
         let expected = self.conversation_state();
-        match persist_session_to_storage(
-            &self.effective_profile(),
-            &self.id,
-            &observation,
-            &expected,
-            &self.resolve_file_watch(),
-        ) {
+        let Ok(storage) = self.original_storage() else {
+            return;
+        };
+        match persist_session_to_storage(&storage, &self.id, &observation, &expected) {
             SidWrite::Applied => self.apply_conversation_observation(&observation),
             SidWrite::Skipped | SidWrite::OwnershipConflict | SidWrite::PinnedForeign => {
                 self.reconcile_from_disk();
@@ -341,13 +338,10 @@ impl Instance {
         if !pi_transcript_names(path, &observation.sid) {
             return true;
         }
-        match crate::session::storage::Storage::open(
-            &self.effective_profile(),
-            self.resolve_file_watch(),
-        ) {
-            Ok(storage) => self.persist_pi_transcript_into(&storage, observation, path),
-            Err(_) => false,
-        }
+        let Ok(storage) = self.original_storage() else {
+            return false;
+        };
+        self.persist_pi_transcript_into(&storage, observation, path)
     }
 
     pub(super) fn persist_pi_transcript_into(
@@ -883,6 +877,7 @@ pi = "~/.pi-personal"
         inst.sandbox_info = Some(test_sandbox("aoe-pi-path-retry", None));
         inst.agent_session_id = Some(sid.to_string());
         let mut storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
+        inst.storage_origin = Some(std::sync::Arc::new(storage.clone()));
         let seed = inst.clone();
         storage
             .update(|instances, _| {

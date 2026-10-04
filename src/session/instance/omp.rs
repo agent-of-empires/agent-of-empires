@@ -449,7 +449,7 @@ impl Instance {
     }
 
     /// Last-chance exact-pane OMP capture while the old pane still exists.
-    pub(super) fn capture_omp_before_restart(&mut self, profile: &str) {
+    pub(super) fn capture_omp_before_restart(&mut self) {
         self.reconcile_from_disk();
         if self.source_capture_backend() != Some(crate::agents::SessionCaptureBackend::Omp)
             || (self.is_sandboxed() && self.omp_capture_generation.is_none())
@@ -459,12 +459,14 @@ impl Instance {
         let Some(observation) = self.try_retroactive_capture() else {
             return;
         };
+        let Ok(storage) = self.original_storage() else {
+            return;
+        };
         match persist_session_to_storage(
-            profile,
+            &storage,
             &self.id,
             &observation,
             &self.conversation_state(),
-            &self.resolve_file_watch(),
         ) {
             SidWrite::Applied => {
                 self.apply_conversation_observation(&observation);

@@ -33,24 +33,20 @@ impl TrashPoller {
                     let runtime = runtime.as_ref().map_err(|error| {
                         anyhow::anyhow!("could not create trash worker runtime: {error}")
                     })?;
-                    runtime.block_on(crate::session::runner_journal::settle(
-                        crate::session::deletion::SessionPathOwner {
-                            profile: &request.instance.source_profile,
-                            session_id: &request.session_id,
-                        },
-                        Some((
-                            crate::session::LifecycleOperation::Trash,
-                            request.generation,
-                        )),
-                    ))
+                    let native = crate::session::runner_journal::OwnedStop::from_claim(
+                        &request.storage,
+                        &request.instance,
+                        crate::session::LifecycleOperation::Trash,
+                        request.generation,
+                    )?;
+                    runtime.block_on(crate::session::runner_journal::settle(native))
                 })();
                 if let Err(error) = settled {
                     let _ = (|| -> anyhow::Result<()> {
                         let _workspace = crate::session::acquire_session_workspace_claim_lock()?;
                         let _identity = crate::session::acquire_session_identity_lock()?;
-                        let storage = crate::session::Storage::open_unwatched(
-                            &request.instance.source_profile,
-                        )?;
+                        let storage = &request.storage;
+                        storage.verify_profile_identity()?;
                         let _lifecycle =
                             storage.acquire_instance_lifecycle_lock(&request.session_id)?;
                         storage.update(|instances, _groups| {
@@ -145,7 +141,7 @@ mod tests {
     impl Drop for TestPoller {
         fn drop(&mut self) {
             if let Some(poller) = self.0.take() {
-                let _ = poller.worker.finish_for_test();
+                let _ = poller.worker.finish();
             }
         }
     }
@@ -189,6 +185,7 @@ mod tests {
         let session_id = instance.id.clone();
 
         poller.request_trash(TrashRequest {
+            storage: crate::session::Storage::open_unwatched(&instance.source_profile).unwrap(),
             session_id: session_id.clone(),
             instance,
             generation,

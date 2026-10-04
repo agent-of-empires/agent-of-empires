@@ -180,85 +180,77 @@ pub(crate) enum AcpContextUse {
     Attach,
 }
 
-/// Read continuation after sandbox admission, not from a caller's earlier
-/// snapshot. The resolved ACP adapter owns this lane, not the row's TUI tool.
+/// Mutate the already admitted canonical row; the caller owns original storage
+/// and persistence fences. The adapter, not the TUI tool, selects the native lane.
 pub(crate) fn prepare_acp_context(
     profile: &str,
-    id: &str,
+    instance: &mut crate::session::Instance,
     agent: Option<&str>,
     generation: u64,
     usage: AcpContextUse,
     continuation: crate::acp::supervisor::SandboxContinuation,
 ) -> Result<AcpLaunchContext> {
-    let storage = crate::session::Storage::new_unwatched(profile)?;
-    storage.update(|instances, _| {
-        let instance = instances
-            .iter_mut()
-            .find(|instance| instance.id == id)
-            .context("sandbox session disappeared before structured launch")?;
-        if !instance.is_sandboxed() || !instance_ready(instance)? {
-            bail!("sandbox native content is not ready for structured launch");
-        }
-        // An adapter that names no native agent cannot prove which lane it is
-        // about to continue, so it is answered for the whole row: refuse the
-        // attach while any structured lane is pending, and claim them all.
-        let pending = instance.sandbox_content_resets.iter().any(|reset| {
-            reset.tool == instance.tool
-                && agent.is_none_or(|agent| reset.agent == agent)
-                && reset.structured.pending
-                && reset.structured.generation.is_none()
-        });
-        let carried = || {
+    if !instance.is_sandboxed() || !instance_ready(instance)? {
+        bail!("sandbox native content is not ready for structured launch");
+    }
+    // An adapter that names no native agent cannot prove which lane it is
+    // about to continue, so it is answered for the whole row: refuse the
+    // attach while any structured lane is pending, and claim them all.
+    let pending = instance.sandbox_content_resets.iter().any(|reset| {
+        reset.tool == instance.tool
+            && agent.is_none_or(|agent| reset.agent == agent)
+            && reset.structured.pending
+            && reset.structured.generation.is_none()
+    });
+    let carried = || {
+        instance
+            .sandbox_content_resets
+            .iter()
+            .filter(|reset| reset.tool == instance.tool && !reset.structured.pending)
+    };
+    let foreign_adapter =
+        carried().next().is_some() && !carried().any(|reset| agent == Some(reset.agent.as_str()));
+    let unproven_old_id = foreign_adapter
+        && carried().any(|reset| {
             instance
-                .sandbox_content_resets
-                .iter()
-                .filter(|reset| reset.tool == instance.tool && !reset.structured.pending)
-        };
-        let foreign_adapter = carried().next().is_some()
-            && !carried().any(|reset| agent == Some(reset.agent.as_str()));
-        let unproven_old_id = foreign_adapter
-            && carried().any(|reset| {
-                instance
-                    .acp_session_id
-                    .as_ref()
-                    .into_iter()
-                    .chain(instance.fork_pending.as_ref())
-                    .any(|id| reset.retired_structured.contains(id))
-                    || (reset.retired_import && instance.import_pending == Some(true))
-            });
-        if matches!(usage, AcpContextUse::Attach) && (pending || unproven_old_id) {
-            bail!("runner predates its sandbox content reset; a fresh launch is required");
+                .acp_session_id
+                .as_ref()
+                .into_iter()
+                .chain(instance.fork_pending.as_ref())
+                .any(|id| reset.retired_structured.contains(id))
+                || (reset.retired_import && instance.import_pending == Some(true))
+        });
+    if matches!(usage, AcpContextUse::Attach) && (pending || unproven_old_id) {
+        bail!("runner predates its sandbox content reset; a fresh launch is required");
+    }
+    let notice = claim_context_reset(instance, agent, NativeContextView::Structured, generation);
+    let (stored_session_id, fork_from, seed_history_replay) = match continuation {
+        crate::acp::supervisor::SandboxContinuation::Persisted if unproven_old_id => {
+            (None, None, false)
         }
-        let notice =
-            claim_context_reset(instance, agent, NativeContextView::Structured, generation);
-        let (stored_session_id, fork_from, seed_history_replay) = match continuation {
-            crate::acp::supervisor::SandboxContinuation::Persisted if unproven_old_id => {
-                (None, None, false)
-            }
-            crate::acp::supervisor::SandboxContinuation::Persisted => (
-                instance.acp_session_id.clone(),
-                instance.fork_pending.clone(),
-                instance.import_pending == Some(true),
-            ),
-            crate::acp::supervisor::SandboxContinuation::ImportTerminal if notice.is_none() => {
-                let id = instance
-                    .agent_session_id
-                    .as_deref()
-                    .filter(|id| !id.trim().is_empty())
-                    .map(str::to_owned);
-                let replay = id.is_some();
-                (id, None, replay)
-            }
-            crate::acp::supervisor::SandboxContinuation::ImportTerminal
-            | crate::acp::supervisor::SandboxContinuation::Fresh => (None, None, false),
-        };
-        Ok(AcpLaunchContext {
-            profile: storage.profile().to_owned(),
-            stored_session_id,
-            fork_from,
-            seed_history_replay,
-            notice,
-        })
+        crate::acp::supervisor::SandboxContinuation::Persisted => (
+            instance.acp_session_id.clone(),
+            instance.fork_pending.clone(),
+            instance.import_pending == Some(true),
+        ),
+        crate::acp::supervisor::SandboxContinuation::ImportTerminal if notice.is_none() => {
+            let id = instance
+                .agent_session_id
+                .as_deref()
+                .filter(|id| !id.trim().is_empty())
+                .map(str::to_owned);
+            let replay = id.is_some();
+            (id, None, replay)
+        }
+        crate::acp::supervisor::SandboxContinuation::ImportTerminal
+        | crate::acp::supervisor::SandboxContinuation::Fresh => (None, None, false),
+    };
+    Ok(AcpLaunchContext {
+        profile: profile.to_owned(),
+        stored_session_id,
+        fork_from,
+        seed_history_replay,
+        notice,
     })
 }
 
@@ -2584,6 +2576,30 @@ pub(crate) fn guard_preparation(
 mod tests {
     use super::*;
 
+    fn prepare_context_in_store(
+        storage: &crate::session::Storage,
+        id: &str,
+        agent: Option<&str>,
+        generation: u64,
+        usage: AcpContextUse,
+        continuation: crate::acp::supervisor::SandboxContinuation,
+    ) -> Result<AcpLaunchContext> {
+        storage.update(|rows, _| {
+            let row = rows
+                .iter_mut()
+                .find(|row| row.id == id)
+                .context("fixture native context owner disappeared")?;
+            super::prepare_acp_context(
+                storage.profile(),
+                row,
+                agent,
+                generation,
+                usage,
+                continuation,
+            )
+        })
+    }
+
     fn mutate_workspace_after_stage(registry: &Path, id: &str) {
         let mut rows: Vec<Value> = serde_json::from_slice(&fs::read(registry).unwrap()).unwrap();
         let row = rows
@@ -3861,8 +3877,9 @@ mod tests {
             "a carried resume must keep its session id: {}",
             rows[0]
         );
-        let continuation = prepare_acp_context(
-            "default",
+        let storage = crate::session::Storage::open_unwatched("default").unwrap();
+        let continuation = prepare_context_in_store(
+            &storage,
             &instance.id,
             Some("claude"),
             1,
@@ -3876,8 +3893,8 @@ mod tests {
             "the native-backed ACP adapter must load its carried conversation"
         );
         for other_agent in [None, Some("external-acp")] {
-            let outside = prepare_acp_context(
-                "default",
+            let outside = prepare_context_in_store(
+                &storage,
                 &instance.id,
                 other_agent,
                 2,
@@ -3890,8 +3907,8 @@ mod tests {
                 "an unproven adapter cannot load the retired ACP ID"
             );
         }
-        let native_again = prepare_acp_context(
-            "default",
+        let native_again = prepare_context_in_store(
+            &storage,
             &instance.id,
             Some("claude"),
             3,
@@ -4265,8 +4282,9 @@ mod tests {
                 stored["agent_session_id"], "own-context",
                 "{tool} lost native resume"
             );
-            let continuation = prepare_acp_context(
-                "default",
+            let storage = crate::session::Storage::open_unwatched("default").unwrap();
+            let continuation = prepare_context_in_store(
+                &storage,
                 &instance.id,
                 Some(tool),
                 1,
@@ -4422,8 +4440,9 @@ mod tests {
                 stored.get("agent_session_id").is_none(),
                 "{tool} retained an unproven ID"
             );
-            let context = prepare_acp_context(
-                "default",
+            let storage = crate::session::Storage::open_unwatched("default").unwrap();
+            let context = prepare_context_in_store(
+                &storage,
                 &instance.id,
                 Some(tool),
                 1,
@@ -4587,8 +4606,8 @@ mod tests {
             })
             .unwrap();
 
-        let imported = prepare_acp_context(
-            "default",
+        let imported = prepare_context_in_store(
+            &storage,
             &instance.id,
             Some("claude"),
             7,
@@ -4603,8 +4622,8 @@ mod tests {
         assert!(imported.fork_from.is_none());
         assert!(imported.seed_history_replay);
 
-        let fresh = prepare_acp_context(
-            "default",
+        let fresh = prepare_context_in_store(
+            &storage,
             &instance.id,
             Some("claude"),
             8,
@@ -4646,8 +4665,8 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        let reset_import = prepare_acp_context(
-            "default",
+        let reset_import = prepare_context_in_store(
+            &storage,
             &instance.id,
             Some("claude"),
             9,
@@ -4712,9 +4731,10 @@ mod tests {
         fs::create_dir_all(registry.parent().unwrap()).unwrap();
         fs::write(&registry, serde_json::to_vec(&vec![row]).unwrap()).unwrap();
 
+        let storage = crate::session::Storage::open_unwatched("default").unwrap();
         assert!(
-            prepare_acp_context(
-                "default",
+            prepare_context_in_store(
+                &storage,
                 &instance.id,
                 None,
                 1,
@@ -4724,8 +4744,8 @@ mod tests {
             .is_err(),
             "an adapter that names no native agent cannot attach to a moved lane"
         );
-        let context = prepare_acp_context(
-            "default",
+        let context = prepare_context_in_store(
+            &storage,
             &instance.id,
             None,
             1,

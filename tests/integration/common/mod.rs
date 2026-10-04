@@ -173,6 +173,7 @@ pub struct RunnerLaunchFixture {
     generation: u64,
     pub nonce: uuid::Uuid,
     sessions: PathBuf,
+    directory: std::fs::File,
 }
 
 impl RunnerLaunchFixture {
@@ -208,7 +209,8 @@ impl RunnerLaunchFixture {
             instance.id = session_id.to_owned();
             let mut row = serde_json::to_value(instance).expect("serialize fixture owner");
             row["lifecycle_generation"] = serde_json::json!(generation);
-            row["runner_journal"] = serde_json::json!({"coverage": "complete", "launches": []});
+            row["runner_journal"] =
+                serde_json::json!({"coverage": "complete", "launches": [], "preparations": []});
             rows.push(row);
             Self::write_synced(&sessions, &serde_json::to_vec(&rows).unwrap())
                 .expect("seed authoritative fixture row");
@@ -226,6 +228,7 @@ impl RunnerLaunchFixture {
             generation,
             nonce: uuid::Uuid::new_v4(),
             sessions,
+            directory: std::fs::File::open(&directory).expect("pin original fixture profile"),
         }
     }
 
@@ -269,8 +272,20 @@ impl RunnerLaunchFixture {
         result
     }
 
-    fn publish(&self, pid: u32) -> anyhow::Result<()> {
+    fn publish(&self, pid: u32) -> anyhow::Result<[u8; 44]> {
         use anyhow::Context;
+        use std::os::unix::fs::MetadataExt;
+        let original = self.directory.metadata()?;
+        let current = std::fs::metadata(self.sessions.parent().context("fixture profile parent")?)?;
+        let born = original.created()?;
+        anyhow::ensure!(
+            original.dev() == current.dev()
+                && original.ino() == current.ino()
+                && born == current.created()?,
+            "original fixture profile was replaced"
+        );
+        let birth = born.duration_since(std::time::SystemTime::UNIX_EPOCH)?;
+        let profile_identity = serde_json::json!({"device": original.dev(), "inode": original.ino(), "birth_time": born});
         let incarnation = agent_of_empires::process::process_incarnation(pid)?
             .context("runner exited before birth publication")?;
         let boot = agent_of_empires::process::boot_id().context("verified boot unavailable")?;
@@ -288,18 +303,26 @@ impl RunnerLaunchFixture {
         launches.push(serde_json::json!({
             "nonce": self.nonce.as_bytes(), "boot": boot.as_bytes(),
             "generation": self.generation, "incarnation": incarnation,
+            "profile_identity": profile_identity,
         }));
-        Self::write_synced(&self.sessions, &serde_json::to_vec(&rows)?)
+        Self::write_synced(&self.sessions, &serde_json::to_vec(&rows)?)?;
+        let mut frame = [0u8; 44];
+        frame[..16].copy_from_slice(self.nonce.as_bytes());
+        frame[16..24].copy_from_slice(&original.dev().to_le_bytes());
+        frame[24..32].copy_from_slice(&original.ino().to_le_bytes());
+        frame[32..40].copy_from_slice(&birth.as_secs().to_le_bytes());
+        frame[40..].copy_from_slice(&birth.subsec_nanos().to_le_bytes());
+        Ok(frame)
     }
 
     pub fn authorize(&self, child: &mut std::process::Child) {
         use std::io::Write;
-        let result = self.publish(child.id()).and_then(|()| {
+        let result = self.publish(child.id()).and_then(|frame| {
             let mut stdin = child
                 .stdin
                 .take()
                 .ok_or_else(|| anyhow::anyhow!("missing authorization pipe"))?;
-            stdin.write_all(self.nonce.as_bytes())?;
+            stdin.write_all(&frame)?;
             Ok(())
         });
         if let Err(error) = result {
@@ -316,12 +339,12 @@ impl RunnerLaunchFixture {
             let pid = child
                 .id()
                 .ok_or_else(|| anyhow::anyhow!("runner exited before authorization"))?;
-            self.publish(pid)?;
+            let frame = self.publish(pid)?;
             let mut stdin = child
                 .stdin
                 .take()
                 .ok_or_else(|| anyhow::anyhow!("missing authorization pipe"))?;
-            stdin.write_all(self.nonce.as_bytes()).await?;
+            stdin.write_all(&frame).await?;
             Ok::<(), anyhow::Error>(())
         }
         .await;

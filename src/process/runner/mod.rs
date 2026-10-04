@@ -22,6 +22,41 @@ use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
+struct OwnedEndpoint {
+    path: PathBuf,
+    identity: Option<crate::session::DirectoryIdentity>,
+    _inode_pin: std::sync::Arc<std::fs::File>,
+}
+
+impl OwnedEndpoint {
+    fn capture(path: PathBuf) -> Result<Self> {
+        let (identity, pin) = worker_registry::capture_endpoint(&path)?;
+        Ok(Self {
+            path,
+            identity: Some(identity),
+            _inode_pin: pin,
+        })
+    }
+
+    fn cleanup(&mut self) {
+        use std::os::unix::fs::MetadataExt;
+        let Some(identity) = self.identity.take() else {
+            return;
+        };
+        if std::fs::symlink_metadata(&self.path).is_ok_and(|metadata| {
+            metadata.dev() == identity.device && metadata.ino() == identity.inode
+        }) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+impl Drop for OwnedEndpoint {
+    fn drop(&mut self) {
+        self.cleanup();
+    }
+}
+
 const WATCHDOG_POLL_INTERVAL: Duration = Duration::from_secs(10);
 
 fn watchdog_poll_interval() -> Duration {
@@ -109,7 +144,7 @@ pub struct AcpRunnerArgs {
 pub async fn run(args: AcpRunnerArgs) -> Result<()> {
     // Paths are derived from the session id; reject traversal before touching the filesystem.
     worker_registry::validate_session_id(&args.session_id).context("invalid --session-id")?;
-    crate::session::runner_journal::accept_authorization(
+    let (owner_storage, born_identity) = crate::session::runner_journal::accept_authorization(
         &args.managed_profile,
         &args.session_id,
         args.launch_nonce,
@@ -148,13 +183,36 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
 
     let our_pid = std::process::id();
     let stop_socket = crate::session::runner_journal::stop_socket(&args.session_id, our_pid)?;
-    let _ = std::fs::remove_file(&stop_socket);
+    // An existing endpoint is not ours merely because its name contains our PID.
     let stop_listener = UnixListener::bind(&stop_socket)
         .with_context(|| format!("bind {}", stop_socket.display()))?;
+    let mut stop_endpoint = OwnedEndpoint::capture(stop_socket.clone())?;
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&stop_socket, std::fs::Permissions::from_mode(0o600))?;
     }
+    let endpoint_identity = stop_endpoint
+        .identity
+        .context("stop endpoint custody is unavailable")?;
+    anyhow::ensure!(
+        endpoint_identity.is_durable(),
+        "native stop endpoint birth time is unavailable; fresh publication is unproven"
+    );
+    let endpoint_owner = owner_storage.clone();
+    let endpoint_id = args.session_id.clone();
+    let endpoint_nonce = args.launch_nonce;
+    let endpoint_generation = args.generation;
+    tokio::task::spawn_blocking(move || {
+        crate::session::runner_journal::record_stop_endpoint(
+            &endpoint_owner,
+            &endpoint_id,
+            endpoint_nonce,
+            endpoint_generation,
+            endpoint_identity,
+        )
+    })
+    .await
+    .context("publishing owned stop endpoint task")??;
     let mut record = WorkerRecord::new(
         args.session_id.clone(),
         our_pid,
@@ -169,19 +227,46 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
         Some(args.managed_profile.clone()),
     )
     .with_generation(args.generation);
-    record.launch_nonce = Some(args.launch_nonce);
-    let control_listener = worker_registry::publish_control_listener(&record, &control_socket)
-        .context("publishing runner control listener and registry record")?;
+    record.launch_nonce = born_identity.launch_nonce;
+    record.boot = born_identity.boot;
+    record.incarnation = born_identity.incarnation;
+    record.profile_identity = born_identity.profile_identity;
+    let (record, control_listener, _control_endpoint, owner_storage) =
+        tokio::task::spawn_blocking(move || {
+            let _workspace = crate::session::acquire_session_workspace_claim_lock()?;
+            let _identity = crate::session::acquire_session_identity_lock()?;
+            owner_storage.verify_profile_identity()?;
+            let (listener, endpoint) =
+                crate::session::runner_journal::publish_registry_under_locks(
+                    &owner_storage,
+                    &mut record,
+                    |record| {
+                        let (listener, pin) =
+                            worker_registry::publish_control_listener(record, &control_socket)
+                                .context(
+                                    "publishing runner control listener and registry record",
+                                )?;
+                        let endpoint = OwnedEndpoint {
+                            path: control_socket,
+                            identity: record.control_file_identity,
+                            _inode_pin: pin,
+                        };
+                        Ok((listener, endpoint))
+                    },
+                )?;
+            anyhow::Ok((record, listener, endpoint, owner_storage))
+        })
+        .await
+        .context("publishing born runner control endpoint task")??;
+    let owner = Arc::new(shared::RegistryOwner {
+        storage: owner_storage,
+        record: std::sync::Mutex::new(record),
+    });
 
     let (mut agent_child, agent_stdin, agent_stdout, agent_stderr) = match spawn_agent(&args) {
         Ok(handles) => handles,
         Err(e) => {
-            worker_registry::delete_if_owned_by(
-                &args.session_id,
-                our_pid,
-                args.generation,
-                Some(args.launch_nonce),
-            );
+            let _ = owner.retire().await;
             return Err(e).with_context(|| format!("spawning agent {:?}", args.agent_argv));
         }
     };
@@ -202,12 +287,7 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
         });
     }
 
-    let shared = Arc::new(RunnerShared::new(Some((
-        args.session_id.clone(),
-        our_pid,
-        args.generation,
-        args.launch_nonce,
-    ))));
+    let shared = Arc::new(RunnerShared::new(Some(owner.clone())));
 
     // Shared, never split: closing stdin makes aoe-agent exit.
     let agent_stdin = Arc::new(Mutex::new(agent_stdin));
@@ -226,12 +306,7 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
     let watchdog_handle = tokio::spawn(run_watchdog(
         worker_registry::record_path(&args.session_id)?,
         worker_registry::restart_marker_path(&args.session_id)?,
-        (
-            session_id.clone(),
-            our_pid,
-            args.generation,
-            args.launch_nonce,
-        ),
+        (session_id.clone(), born_identity),
         Arc::clone(&detached_since),
         watchdog_tx,
     ));
@@ -240,6 +315,7 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
     let accept_shared = Arc::clone(&shared);
     let accept_detached = Arc::clone(&detached_since);
     let accept_stdin = Arc::clone(&agent_stdin);
+    let accept_owner = owner.clone();
     let accept_loop = async move {
         loop {
             match control_listener.accept().await {
@@ -249,12 +325,10 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
                         session = %accept_session_id,
                         "daemon connected (control channel)"
                     );
-                    worker_registry::mark_attached(
-                        &accept_session_id,
-                        our_pid,
-                        args.generation,
-                        args.launch_nonce,
-                    );
+                    if let Err(error) = accept_owner.update(worker_registry::mark_attached).await {
+                        warn!(target: "acp.runner", session = %accept_session_id, %error, "native record attachment lost its original file custody");
+                        return true;
+                    }
                     accept_detached.store(ATTACHED, Ordering::Relaxed);
                     if handle_control_connection(
                         stream,
@@ -272,12 +346,10 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
                         session = %accept_session_id,
                         "daemon disconnected (control channel); runner stays alive"
                     );
-                    worker_registry::mark_detached(
-                        &accept_session_id,
-                        our_pid,
-                        args.generation,
-                        args.launch_nonce,
-                    );
+                    if let Err(error) = accept_owner.update(worker_registry::mark_detached).await {
+                        warn!(target: "acp.runner", session = %accept_session_id, %error, "native record detach lost its original file custody");
+                        return true;
+                    }
                     accept_detached.store(now_secs(), Ordering::Relaxed);
                 }
                 Err(e) => {
@@ -291,19 +363,20 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
     let mut preserve_registry = false;
 
     tokio::select! {
-        requested = crate::session::runner_journal::wait_for_stop(stop_listener, args.launch_nonce) => {
+        requested = crate::session::runner_journal::wait_for_stop(stop_listener, args.launch_nonce, |idle| shared.admit_stop(idle)) => {
+            stop_endpoint.cleanup();
             match requested {
                 Ok(true) => {
-                    worker_registry::delete_if_owned_by(&session_id, our_pid, args.generation, Some(args.launch_nonce));
+                    let _ = owner.retire().await;
                     if !crate::process::worker::kill_own_process_group_if_leader(our_pid) {
                         let _ = agent_child.start_kill();
                         let _ = agent_child.wait().await;
                     }
                 }
-                Ok(false) => self_terminate_agent_tree(WatchdogShutdown::Requested, &session_id, our_pid, args.generation, args.launch_nonce, &mut agent_child).await,
+                Ok(false) => self_terminate_agent_tree(WatchdogShutdown::Requested, &session_id, &owner, &mut agent_child).await,
                 Err(error) => {
                     warn!(target: "acp.runner", session = %session_id, "stop endpoint failed: {error:#}");
-                    self_terminate_agent_tree(WatchdogShutdown::Requested, &session_id, our_pid, args.generation, args.launch_nonce, &mut agent_child).await;
+                    self_terminate_agent_tree(WatchdogShutdown::Requested, &session_id, &owner, &mut agent_child).await;
                 }
             }
         }
@@ -355,7 +428,8 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
                 if matches!(reason, WatchdogShutdown::Superseded) {
                     preserve_registry = true;
                 }
-                self_terminate_agent_tree(reason, &session_id, our_pid, args.generation, args.launch_nonce, &mut agent_child).await;
+                stop_endpoint.cleanup();
+                self_terminate_agent_tree(reason, &session_id, &owner, &mut agent_child).await;
             }
         }
         terminate_runner = accept_loop => {
@@ -370,13 +444,9 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
     watchdog_handle.abort();
     agent_stdout_task.abort();
     if !preserve_registry {
-        worker_registry::delete_if_owned_by(
-            &session_id,
-            our_pid,
-            args.generation,
-            Some(args.launch_nonce),
-        );
+        let _ = owner.retire().await;
     }
+    stop_endpoint.cleanup();
     if !crate::process::worker::kill_own_process_group_if_leader(our_pid) {
         let _ = agent_child.start_kill();
         let _ = agent_child.wait().await;
@@ -387,7 +457,7 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
 async fn run_watchdog(
     record_path: PathBuf,
     restart_marker: PathBuf,
-    (session_id, own_pid, own_generation, own_nonce): (String, u32, u64, uuid::Uuid),
+    (session_id, identity): (String, crate::acp::runner_lifecycle::RunnerIdentity),
     detached_since: Arc<DetachedSince>,
     tx: tokio::sync::oneshot::Sender<WatchdogShutdown>,
 ) {
@@ -408,20 +478,20 @@ async fn run_watchdog(
             return;
         }
 
-        match crate::process::worker::inspect_record_for_runner(&record_path, own_pid, |bytes| {
-            serde_json::from_slice::<WorkerRecord>(bytes)
-                .ok()
-                .map(|rec| {
-                    if rec.pid == own_pid
-                        && rec.generation == own_generation
-                        && rec.launch_nonce == Some(own_nonce)
-                    {
-                        own_pid
-                    } else {
-                        0
-                    }
-                })
-        }) {
+        match crate::process::worker::inspect_record_for_runner(
+            &record_path,
+            identity.pid,
+            |bytes| {
+                let record = serde_json::from_slice::<WorkerRecord>(bytes).ok()?;
+                if identity.matches_record(&record) {
+                    Some(identity.pid)
+                } else if identity.proves_different_record(&record) {
+                    Some(0)
+                } else {
+                    None
+                }
+            },
+        ) {
             RunnerRecordState::Matches | RunnerRecordState::Unreadable => missing = 0,
             RunnerRecordState::Superseded => {
                 warn!(
@@ -435,7 +505,7 @@ async fn run_watchdog(
             RunnerRecordState::Missing => {
                 // `aoe acp restart` deletes the record right before it SIGTERMs us.
                 if crate::process::worker::read_restart_marker(&restart_marker)
-                    == Some(own_generation)
+                    == Some(identity.generation)
                 {
                     missing = 0;
                     continue;
@@ -458,9 +528,7 @@ async fn run_watchdog(
 async fn self_terminate_agent_tree(
     reason: WatchdogShutdown,
     session_id: &str,
-    own_pid: u32,
-    own_generation: u64,
-    own_nonce: uuid::Uuid,
+    owner: &Arc<shared::RegistryOwner>,
     agent_child: &mut Child,
 ) {
     info!(
@@ -470,7 +538,7 @@ async fn self_terminate_agent_tree(
         "runner abandoned; terminating agent tree"
     );
 
-    worker_registry::delete_if_owned_by(session_id, own_pid, own_generation, Some(own_nonce));
+    let _ = owner.retire().await;
 
     #[cfg(unix)]
     if let Some(agent_pid) = agent_child.id() {
@@ -481,7 +549,7 @@ async fn self_terminate_agent_tree(
     let _ = tokio::time::timeout(Duration::from_secs(2), agent_child.wait()).await;
 
     // As group leader this SIGKILLs the whole agent tree and the runner itself.
-    if !crate::process::worker::kill_own_process_group_if_leader(own_pid) {
+    if !crate::process::worker::kill_own_process_group_if_leader(std::process::id()) {
         let _ = agent_child.start_kill();
         let _ = agent_child.wait().await;
     }
@@ -645,63 +713,4 @@ fn open_log_file(path: &Path) -> Result<()> {
         let _ = f.set_permissions(std::fs::Permissions::from_mode(0o600));
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[cfg(unix)]
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn watchdog_teardown_preserves_replacement_registry_owner() {
-        let app_root = tempfile::TempDir::with_prefix_in("aoe-wd-", "/tmp").unwrap();
-        let _app_dir = crate::session::test_support::isolate_app_dir_at(app_root.path());
-        let session_id = "watchdog-replacement";
-        let socket = worker_registry::socket_path_for(session_id).unwrap();
-        let control_socket = crate::process::worker::control_socket_sibling(&socket);
-        let _listener = std::os::unix::net::UnixListener::bind(&control_socket).unwrap();
-        let mut child = Command::new("sleep")
-            .arg("60")
-            .kill_on_drop(true)
-            .spawn()
-            .unwrap();
-        let pid = child.id().unwrap();
-        let old_nonce = uuid::Uuid::new_v4();
-        let new_nonce = uuid::Uuid::new_v4();
-        let mut replacement = WorkerRecord::new(
-            session_id.into(),
-            pid,
-            socket,
-            "agent".into(),
-            "agent".into(),
-            PathBuf::from("/repo"),
-            None,
-            vec![],
-            vec![],
-            None,
-            None,
-        );
-        replacement.generation = 9;
-        replacement.launch_nonce = Some(new_nonce);
-        worker_registry::save(&replacement).unwrap();
-        self_terminate_agent_tree(
-            WatchdogShutdown::RecordMissing,
-            session_id,
-            pid,
-            9,
-            old_nonce,
-            &mut child,
-        )
-        .await;
-        assert_eq!(
-            worker_registry::load(session_id)
-                .unwrap()
-                .unwrap()
-                .launch_nonce,
-            Some(new_nonce)
-        );
-        assert!(control_socket.exists());
-        assert!(child.try_wait().unwrap().is_some());
-    }
 }

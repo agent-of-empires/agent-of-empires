@@ -107,6 +107,12 @@ fn wait_for_native_fixture<T>(what: &str, mut probe: impl FnMut() -> Option<T>) 
     }
 }
 
+fn finish_runner_settlements(view: &mut HomeView) {
+    wait_for_native_fixture("runner settlement callbacks", || {
+        view.apply_settlement_results();
+        view.settlement_in_flight.is_empty().then_some(())
+    });
+}
 /// State-only fixtures use this without claiming a prepared input transport.
 fn live_state_for_instance(
     inst: &Instance,

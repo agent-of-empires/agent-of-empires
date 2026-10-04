@@ -523,6 +523,13 @@ impl App {
         self.needs_redraw = true;
     }
 
+    pub(super) async fn shutdown_settlements(&mut self) -> Result<()> {
+        if let Some(shutdown) = self.home.settlement_poller.take_shutdown() {
+            tokio::task::spawn_blocking(move || shutdown.finish()).await??;
+        }
+        Ok(())
+    }
+
     pub async fn run(&mut self, terminal: &mut Terminal<TuiBackend>) -> Result<()> {
         // Display snapshots are refreshed off the paint thread. Don't warm the
         // cache here: startup must paint before any tmux deadline.
@@ -1204,6 +1211,7 @@ impl App {
             full |= self.home.apply_structured_approval_results();
             full |= self.home.apply_deletion_results();
             full |= self.home.apply_stop_results();
+            full |= self.home.apply_settlement_results();
             full |= self.home.apply_trash_results();
             full |= self.home.apply_reconcile_results();
 
@@ -2831,6 +2839,8 @@ impl App {
             return Ok(());
         }
 
+        let storage = instance.original_storage()?;
+        storage.verify_profile_identity()?;
         let size = crate::terminal::get_size();
         let tool_session = crate::tmux::ToolSession::new(&instance.id, &instance.title, tool_name);
 
@@ -2861,12 +2871,15 @@ impl App {
             .as_ref()
             .map(|w| w.branch.as_str())
             .or_else(|| instance.workspace_info.as_ref().map(|w| w.branch.as_str()));
+        let captured_session = crate::tmux::Session::from_name(tool_session.session_name());
+        captured_session.primary_with_deadline(&crate::tmux::TmuxCommandDeadline::new())?;
+        storage.verify_profile_identity()?;
         crate::tmux::status_bar::apply_all_tmux_options(
-            tool_session.session_name(),
+            &captured_session,
             &format!("{} ({})", instance.title, tool_name),
             branch,
             None,
-            &instance.effective_profile(),
+            storage.profile(),
         );
 
         let attach_fn: Box<dyn FnOnce() -> Result<()>> = Box::new(move || tool_session.attach());

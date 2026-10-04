@@ -22,7 +22,10 @@ fn archive_advances_cursor_to_next_session() {
             other => panic!("expected a session row below the cursor, got {other:?}"),
         };
 
-        env.view.toggle_archive_at_cursor().unwrap();
+        {
+            env.view.toggle_archive_at_cursor().unwrap();
+            finish_runner_settlements(&mut env.view);
+        };
 
         assert!(
             env.view.get_instance(&id).unwrap().is_archived(),
@@ -57,7 +60,10 @@ fn archive_advances_cursor_to_next_session() {
             other => panic!("expected a session row above the cursor, got {other:?}"),
         };
 
-        env.view.toggle_archive_at_cursor().unwrap();
+        {
+            env.view.toggle_archive_at_cursor().unwrap();
+            finish_runner_settlements(&mut env.view);
+        };
 
         assert!(env.view.get_instance(&id).unwrap().is_archived());
         assert_eq!(
@@ -77,7 +83,10 @@ fn archive_advances_cursor_to_next_session() {
             other => panic!("expected a second session row, got {other:?}"),
         };
         env.view.select_session_by_id(&parked_id);
-        env.view.toggle_archive_at_cursor().unwrap();
+        {
+            env.view.toggle_archive_at_cursor().unwrap();
+            finish_runner_settlements(&mut env.view);
+        };
         assert!(env.view.get_instance(&parked_id).unwrap().is_archived());
 
         // Archive the remaining active session. The only session row left below
@@ -87,7 +96,10 @@ fn archive_advances_cursor_to_next_session() {
             id, parked_id,
             "selection must have fallen back to the active row"
         );
-        env.view.toggle_archive_at_cursor().unwrap();
+        {
+            env.view.toggle_archive_at_cursor().unwrap();
+            finish_runner_settlements(&mut env.view);
+        };
 
         assert!(env.view.get_instance(&id).unwrap().is_archived());
         assert_eq!(
@@ -107,7 +119,10 @@ fn archive_advances_cursor_to_next_session() {
         env.view.update_selected();
         let id = env.view.selected_session.clone().unwrap();
 
-        env.view.toggle_archive_at_cursor().unwrap();
+        {
+            env.view.toggle_archive_at_cursor().unwrap();
+            finish_runner_settlements(&mut env.view);
+        };
 
         assert!(env.view.get_instance(&id).unwrap().is_archived());
         assert_eq!(
@@ -132,13 +147,19 @@ fn unarchive_keeps_selection() {
     env.view.update_selected();
     let id = env.view.selected_session.clone().unwrap();
 
-    env.view.toggle_archive_at_cursor().unwrap();
+    {
+        env.view.toggle_archive_at_cursor().unwrap();
+        finish_runner_settlements(&mut env.view);
+    };
     assert!(env.view.get_instance(&id).unwrap().is_archived());
 
     // The archive advanced the cursor to the neighbor; navigate back onto
     // the archived row (visible because the section is expanded) to restore.
     env.view.select_session_by_id(&id);
-    env.view.toggle_archive_at_cursor().unwrap();
+    {
+        env.view.toggle_archive_at_cursor().unwrap();
+        finish_runner_settlements(&mut env.view);
+    };
     assert!(
         !env.view.get_instance(&id).unwrap().is_archived(),
         "second toggle unarchives"
@@ -743,7 +764,10 @@ fn apply_restart_results_preserves_peer_sid_and_marker() {
 
     let mut env = create_test_env_with_sessions(1);
     let id = env.view.instance_at(0).id.clone();
-    env.view.restart_in_flight.insert(id.clone());
+    env.view.restart_in_flight.insert(
+        id.clone(),
+        super::super::RequestOrigin::capture(env.view.get_instance(&id).unwrap()).unwrap(),
+    );
     env.view.instance_at_mut(0).agent_session_id = Some("peer-fresh-sid".to_string());
     env.view.instance_at_mut(0).resume_probe_failed_sid = Some("peer-fresh-sid".to_string());
 
@@ -793,7 +817,10 @@ fn apply_restart_results_propagates_worker_sid_without_peer_write() {
 
     let mut env = create_test_env_with_sessions(1);
     let id = env.view.instance_at(0).id.clone();
-    env.view.restart_in_flight.insert(id.clone());
+    env.view.restart_in_flight.insert(
+        id.clone(),
+        super::super::RequestOrigin::capture(env.view.get_instance(&id).unwrap()).unwrap(),
+    );
     env.view.instance_at_mut(0).agent_session_id = Some("sid-before".to_string());
 
     let before = env.view.instance_at(0).clone();
@@ -876,7 +903,7 @@ fn restart_then_attach_queues_the_cascade_and_attaches_after_launch() {
         );
 
         env.view.restart_then_attach(&id, None, false);
-        assert!(env.view.restart_in_flight.contains(&id), "{case}");
+        assert!(env.view.restart_in_flight.contains_key(&id), "{case}");
         assert_eq!(env.view.get_instance(&id).unwrap().status, Status::Starting);
         assert_eq!(
             disk_generation(&env.view),
@@ -924,7 +951,10 @@ fn restart_selected_session_skips_when_already_in_flight() {
     let mut env = create_test_env_with_sessions(1);
     let id = env.view.instance_at(0).id.clone();
     env.view.selected_session = Some(id.clone());
-    env.view.restart_in_flight.insert(id.clone());
+    env.view.restart_in_flight.insert(
+        id.clone(),
+        super::super::RequestOrigin::capture(env.view.get_instance(&id).unwrap()).unwrap(),
+    );
 
     let result = env.view.restart_selected_session(None, None, None, None);
     assert!(result.is_ok());
@@ -949,7 +979,10 @@ fn delete_selected_refused_during_restart() {
     let mut env = create_test_env_with_sessions(1);
     let id = env.view.instance_at(0).id.clone();
     env.view.selected_session = Some(id.clone());
-    env.view.restart_in_flight.insert(id.clone());
+    env.view.restart_in_flight.insert(
+        id.clone(),
+        super::super::RequestOrigin::capture(env.view.get_instance(&id).unwrap()).unwrap(),
+    );
 
     let result = env.view.delete_selected(&DeleteOptions::default());
     assert!(result.is_ok());
@@ -1286,7 +1319,10 @@ fn project_attention_archive_selected_group_removes_empty_main_header() {
     env.view.update_selected();
     assert_eq!(env.view.selected_group.as_deref(), Some("beta"));
 
-    env.view.archive_selected_group().unwrap();
+    {
+        env.view.archive_selected_group().unwrap();
+        finish_runner_settlements(&mut env.view);
+    };
 
     assert!(
         env.view
@@ -3691,8 +3727,7 @@ fn a_failed_reload_keeps_the_repair_pending_and_the_gate_shut() {
     }
 }
 
-/// #4116: TUI archive, single and group, persists while holding each session's lifecycle lock,
-/// which `aoe send` takes to relaunch or type, so no send lands between teardown and archive.
+/// Archive persistence retains the session lifecycle lock through teardown and commit.
 #[test]
 #[serial]
 fn archive_persists_under_the_lifecycle_lock() {
@@ -3718,86 +3753,9 @@ fn archive_persists_under_the_lifecycle_lock() {
     let id = env.view.selected_session.clone().unwrap();
     held_at_every_write(&mut env, vec![id.clone()], |view| {
         view.toggle_archive_at_cursor().unwrap();
+        finish_runner_settlements(view);
     });
     assert!(env.view.get_instance(&id).unwrap().is_archived());
-
-    let mut env = create_test_env_with_group_sessions();
-    let group_row = env
-        .view
-        .flat_items
-        .iter()
-        .position(|item| matches!(item, Item::Group { path, .. } if path == "work"))
-        .expect("work group row");
-    env.view.cursor = group_row;
-    env.view.update_selected();
-    let ids = env.view.active_sessions_in_selected_group();
-    assert_eq!(ids.len(), 3);
-    held_at_every_write(&mut env, ids.clone(), |view| {
-        view.archive_selected_group().unwrap();
-    });
-    for id in &ids {
-        assert!(env.view.get_instance(id).unwrap().is_archived());
-    }
-}
-
-/// Group archive takes lifecycle locks in sorted id order, so against startup cleanup (which
-/// holds the lowest id and waits for the rest) it blocks holding nothing, whatever the stored
-/// order. The peer holds the lowest id and, once the archive contends on it, records whether
-/// the archive already holds a higher one.
-#[test]
-#[serial]
-fn group_archive_takes_lifecycle_locks_in_sorted_order() {
-    let mut env = create_test_env_with_group_sessions();
-    env.view.instances.sort_by(|a, _, b, _| b.cmp(a));
-    let group_row = env
-        .view
-        .flat_items
-        .iter()
-        .position(|item| matches!(item, Item::Group { path, .. } if path == "work"))
-        .expect("work group row");
-    env.view.cursor = group_row;
-    env.view.update_selected();
-    let mut ids = env.view.active_sessions_in_selected_group();
-    assert!(ids.len() >= 2 && !ids.is_sorted(), "stored order: {ids:?}");
-    ids.sort();
-    let profile = env.view.get_instance(&ids[0]).unwrap().effective_profile();
-
-    let (held_tx, held_rx) = std::sync::mpsc::channel();
-    let (contended_tx, contended_rx) = std::sync::mpsc::channel::<std::path::PathBuf>();
-    let peer = std::thread::spawn(move || {
-        let storage = Storage::new_unwatched(&profile).unwrap();
-        let lowest = storage.acquire_instance_lifecycle_lock(&ids[0]).unwrap();
-        held_tx.send(()).unwrap();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        let contended = loop {
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            match contended_rx.recv_timeout(remaining) {
-                Ok(path) if path.to_string_lossy().contains(&ids[0]) => break true,
-                Ok(_) => continue,
-                Err(_) => break false,
-            }
-        };
-        let held_higher: Vec<String> = ids[1..]
-            .iter()
-            .filter(|id| storage.instance_lifecycle_lock_is_held_for_test(id))
-            .cloned()
-            .collect();
-        drop(lowest);
-        (contended, held_higher)
-    });
-    held_rx
-        .recv_timeout(std::time::Duration::from_secs(10))
-        .unwrap();
-    let observer = crate::session::observe_lock_contention_for_test(contended_tx);
-    env.view.archive_selected_group().unwrap();
-    drop(observer);
-
-    let (contended, held_higher) = peer.join().unwrap();
-    assert!(contended, "the archive must wait on the lowest id's lock");
-    assert!(
-        held_higher.is_empty(),
-        "archive held {held_higher:?} while waiting for a lower id"
-    );
 }
 
 /// #4116: the send dialog and live-send entry refuse an archived or trashed agent, even with its

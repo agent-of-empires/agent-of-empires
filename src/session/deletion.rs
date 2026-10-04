@@ -1,6 +1,5 @@
 //! Shared session deletion logic used by CLI, TUI, and web server.
 
-use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -75,6 +74,7 @@ pub enum PurgeReservation {
 /// Owned purge transition.
 pub struct PurgeTransaction {
     storage: Storage,
+    original: std::sync::Arc<crate::session::LaunchOrigin>,
     request: DeletionRequest,
     was_trashed: bool,
     generation: u64,
@@ -124,13 +124,8 @@ impl DeletionRequest {
 
 impl PurgeTransaction {
     pub fn reserve_unwatched(request: DeletionRequest) -> Result<PurgeReservation> {
-        let profile = request.instance.source_profile.clone();
-        anyhow::ensure!(
-            !profile.is_empty(),
-            "session has no source profile; refusing to use the default profile"
-        );
-        let storage = Storage::open_unwatched(&profile)?;
-        Self::reserve(storage, request)
+        let storage = request.instance.original_storage()?;
+        Self::reserve(storage.as_ref().clone(), request)
     }
 
     pub fn reserve(storage: Storage, mut request: DeletionRequest) -> Result<PurgeReservation> {
@@ -138,16 +133,38 @@ impl PurgeTransaction {
         let was_trashed = request.instance.is_trashed();
         let workspace_claim_lock = crate::session::acquire_session_workspace_claim_lock()?;
         let identity_lock = Some(crate::session::acquire_session_identity_lock()?);
-        // Re-resolve the profile under the identity lock so the storage carries
-        // this generation's directory identity, with the caller's watcher.
-        let storage = storage.reopen_preserving_watch()?;
+        let origin = request.instance.original_storage()?;
+        anyhow::ensure!(
+            storage.same_origin_as(&origin),
+            "purge request belongs to another physical profile"
+        );
+        origin.verify_profile_identity()?;
+        let original = crate::session::LaunchOrigin::capture(&request.instance)?;
+        storage.verify_profile_identity()?;
         let lifecycle_lock = storage
             .acquire_instance_lifecycle_lock(&id)
             .context("failed to acquire instance purge lock")?;
         let now = Utc::now();
         let mut reserved = None;
         let mut rejected = None;
-        storage.update_under_workspace_claim_lock(|instances, _groups| {
+        storage.update_native_under_workspace_claim_lock(|instances, _groups| {
+            if let Some(stored) = instances.iter().find(|instance| instance.id == id) {
+                if original
+                    .validate_baseline_at(stored, original.generation())
+                    .is_err()
+                    && original
+                        .validate_restored_at(stored, original.generation())
+                        .is_err()
+                {
+                    rejected = Some((
+                        DeletionDisposition::Busy,
+                        "Original purge scope was superseded; retry from the current instance"
+                            .to_owned(),
+                        None,
+                    ));
+                    return Ok(());
+                }
+            }
             let decision =
                 crate::session::claim::decide_purge_claim(instances, &id, was_trashed, now)?;
             let generation = match decision {
@@ -202,6 +219,7 @@ impl PurgeTransaction {
         request.instance = snapshot;
         Ok(PurgeReservation::Reserved(Self {
             storage,
+            original,
             request,
             was_trashed,
             workspace_claim_lock: Some(workspace_claim_lock),
@@ -215,6 +233,15 @@ impl PurgeTransaction {
     /// The authoritative instance snapshot captured by the reservation.
     pub fn instance(&self) -> &Instance {
         &self.request.instance
+    }
+
+    pub(crate) fn native_stop_scope(
+        &self,
+    ) -> std::sync::Arc<crate::session::runner_journal::OwnedStop> {
+        crate::session::runner_journal::OwnedStop::from_purge(
+            self.original.clone(),
+            self.generation,
+        )
     }
 
     /// Validate cross-profile ownership before hooks or irreversible row removal.
@@ -320,12 +347,14 @@ impl PurgeTransaction {
     }
 
     fn release_reservation(&mut self) -> Result<Option<Instance>> {
+        self.ensure_lifecycle_lock()?;
         let id = self.request.session_id.clone();
         let generation = self.generation;
         let mut retained = None;
         self.storage
-            .update_under_workspace_claim_lock(|instances, _groups| {
+            .update_native_under_workspace_claim_lock(|instances, _groups| {
                 if let Some(stored) = instances.iter_mut().find(|instance| instance.id == id) {
+                    self.original.validate_baseline_at(stored, generation)?;
                     stored.release_lifecycle_reservation_if_owned(
                         LifecycleOperation::Purge,
                         generation,
@@ -344,11 +373,23 @@ impl PurgeTransaction {
         let was_trashed = self.was_trashed;
         let mut outcome = None;
         self.storage
-            .update_under_workspace_claim_lock(|instances, _groups| {
+            .update_native_under_workspace_claim_lock(|instances, _groups| {
                 let Some(stored) = instances.iter_mut().find(|instance| instance.id == id) else {
                     outcome = Some((CompletionGate::AlreadyGone, None));
                     return Ok(());
                 };
+                if self
+                    .original
+                    .validate_baseline_at(stored, generation)
+                    .is_err()
+                    && self
+                        .original
+                        .validate_restored_at(stored, generation)
+                        .is_err()
+                {
+                    outcome = Some((CompletionGate::Superseded, None));
+                    return Ok(());
+                }
                 let restored = crate::session::claim::purge_restored_row_must_be_kept(
                     was_trashed,
                     stored.is_trashed(),
@@ -665,20 +706,28 @@ impl Drop for PurgeTransaction {
         if !self.active {
             return;
         }
-        let profile = self.storage.profile().to_string();
+        let original = self.original.clone();
         let id = self.request.session_id.clone();
         let generation = self.generation;
         let _ = std::thread::Builder::new()
             .name("aoe-purge-reservation-release".to_string())
             .spawn(move || {
-                let Ok(storage) = Storage::open_unwatched(&profile) else {
+                let storage = original.storage();
+                let Ok(_workspace) = crate::session::acquire_session_workspace_claim_lock() else {
                     return;
                 };
+                let Ok(_identity) = crate::session::acquire_session_identity_lock() else {
+                    return;
+                };
+                if storage.verify_profile_identity().is_err() {
+                    return;
+                }
                 let Ok(_lifecycle_lock) = storage.acquire_instance_lifecycle_lock(&id) else {
                     return;
                 };
-                let _ = storage.update_under_workspace_claim_lock(|instances, _groups| {
+                let _ = storage.update_native_under_workspace_claim_lock(|instances, _groups| {
                     if let Some(stored) = instances.iter_mut().find(|instance| instance.id == id) {
+                        original.validate_baseline_at(stored, generation)?;
                         stored.release_lifecycle_reservation_if_owned(
                             LifecycleOperation::Purge,
                             generation,
@@ -692,18 +741,30 @@ impl Drop for PurgeTransaction {
 
 /// Settle the stored execution journal before hooks or checkout destruction.
 /// Registry absence and daemon memory are not execution coverage.
-pub async fn settle_runner_of(
+pub fn settle_runner_of(
+    transaction: PurgeTransaction,
+) -> impl std::future::Future<Output = Result<PurgeTransaction, Box<DeletionResult>>> + Send + 'static
+{
+    let id = transaction.request.session_id.clone();
+    let driver = tokio::spawn(settle_runner_of_owned(transaction));
+    async move {
+        driver.await.unwrap_or_else(|error| {
+            Err(Box::new(DeletionResult::rejected(
+                id,
+                DeletionDisposition::Failed,
+                format!("Owned purge settlement driver failed: {error}"),
+                None,
+            )))
+        })
+    }
+}
+
+async fn settle_runner_of_owned(
     transaction: PurgeTransaction,
 ) -> Result<PurgeTransaction, Box<DeletionResult>> {
     let mut released = transaction.release_locks_for_teardown();
-    let outcome = crate::session::runner_journal::settle(
-        SessionPathOwner {
-            profile: &released.request.instance.source_profile,
-            session_id: &released.request.session_id,
-        },
-        Some((LifecycleOperation::Purge, released.generation)),
-    )
-    .await;
+    let scope = released.native_stop_scope();
+    let outcome = crate::session::runner_journal::settle(scope).await;
     match outcome {
         Ok(()) => Ok(released),
         Err(error) => {
@@ -783,68 +844,42 @@ pub(crate) struct SessionPathOwner<'a> {
     pub session_id: &'a str,
 }
 
-/// Whether `right` (the candidate) sits at or under `left` (a path another
-/// session owns).
-///
-/// A recorded peer path that no longer exists cannot be shown to contain
-/// anything, so it never conflicts. A *candidate* that does not exist yet is
-/// still compared lexically, which is what catches a fresh directory created
-/// underneath an existing peer parent.
-/// Canonical form of a path that need not exist yet, resolved through the
-/// deepest ancestor that does. A candidate about to be created has no canonical
-/// form of its own, but the directory it will land in has one, and on macOS a
-/// temporary path is itself an alias: `/var` resolves to `/private/var`.
-fn resolve_through_existing_ancestor(path: &Path) -> Option<PathBuf> {
-    let mut missing: Vec<&OsStr> = Vec::new();
+/// Resolve missing claims only through components proven absent, never broken aliases.
+pub(crate) fn resolve_claim_path(path: &Path) -> Option<PathBuf> {
     let mut current = path;
+    let mut suffix = Vec::new();
     loop {
-        if let Ok(resolved) = current.canonicalize() {
-            return Some(missing.iter().rev().fold(resolved, |mut acc, part| {
-                acc.push(part);
-                acc
-            }));
+        match current.canonicalize() {
+            Ok(mut resolved) => {
+                for component in suffix.into_iter().rev() {
+                    resolved.push(component);
+                }
+                return Some(resolved);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return None,
         }
-        missing.push(current.file_name()?);
+        match std::fs::symlink_metadata(current) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            _ => return None,
+        }
+        let component = match current.components().next_back()? {
+            std::path::Component::Normal(component) => component,
+            _ => return None,
+        };
+        suffix.push(component);
         current = current.parent()?;
+        if current.as_os_str().is_empty() {
+            current = Path::new(".");
+        }
     }
 }
 
-fn paths_overlap(left: &Path, right: &Path) -> bool {
-    if left == right {
-        return true;
-    }
-    let left_canonical = left.canonicalize().ok();
-    let right_canonical = right.canonicalize().ok();
-    match (left_canonical, right_canonical) {
-        (Some(left), Some(right)) => left.starts_with(&right),
-        // The recorded peer path is gone, so there is nothing it can contain.
-        (None, _) => false,
-        // The candidate is not on disk yet, so canonicalization proved nothing
-        // either way, and it is the peer whose alias can hide a conflict: the
-        // resolved form and the recorded spelling name the same directory, so
-        // both are tested. Lexical containment still resolves the case that
-        // matters, a missing candidate under an existing peer parent. An
-        // existing path with an unresolved alias is not proof of separation, so
-        // the reverse direction counts too.
-        (Some(peer), None) => {
-            let candidate = resolve_through_existing_ancestor(right);
-            let conflicts = |owner: &Path| {
-                [Some(right.to_path_buf()), candidate.clone()]
-                    .into_iter()
-                    .flatten()
-                    .any(|other| owner.starts_with(&other) || other.starts_with(owner))
-            };
-            conflicts(left) || conflicts(&peer)
-        }
-    }
-}
 fn paths_overlap_destructive(left: &Path, right: &Path) -> bool {
     if left == right {
         return true;
     }
-    let left_canonical = left.canonicalize().ok();
-    let right_canonical = right.canonicalize().ok();
-    match (left_canonical, right_canonical) {
+    match (resolve_claim_path(left), resolve_claim_path(right)) {
         (Some(left), Some(right)) => left.starts_with(&right) || right.starts_with(&left),
         _ => true,
     }
@@ -860,15 +895,9 @@ pub(crate) enum PathsInUse {
 impl PathsInUse {
     pub(crate) fn covers(&self, root: &Path) -> bool {
         match self {
-            Self::Known(paths) => paths.iter().any(|path| paths_overlap(path, root)),
-            Self::Unknown(_) => true,
-        }
-    }
-    pub(crate) fn covers_destructive(&self, root: &Path) -> bool {
-        match self {
             Self::Known(paths) => paths
                 .iter()
-                .any(|path| paths_overlap_destructive(Path::new(path), root)),
+                .any(|path| paths_overlap_destructive(path, root)),
             Self::Unknown(_) => true,
         }
     }
@@ -894,7 +923,11 @@ fn all_profile_storages() -> std::result::Result<(Vec<String>, Vec<Storage>), St
     Ok((profiles, storages))
 }
 
-fn scan_paths_in_use(storages: &[Storage], except: &[SessionPathOwner<'_>]) -> PathsInUse {
+fn scan_paths_in_use(
+    storages: &[Storage],
+    except: &[SessionPathOwner<'_>],
+    absent_id: Option<&str>,
+) -> PathsInUse {
     let mut owners = Vec::with_capacity(except.len());
     for owner in except {
         if owner.profile.is_empty() || owner.session_id.is_empty() {
@@ -926,26 +959,33 @@ fn scan_paths_in_use(storages: &[Storage], except: &[SessionPathOwner<'_>]) -> P
             }
         }
         match storage.load_strict_for_worktree_ownership_locked() {
-            Ok(instances) => paths.extend(
-                instances
-                    .iter()
-                    .filter(|instance| {
-                        !owners
-                            .iter()
-                            .any(|(_, id, _, matches)| *matches && *id == instance.id)
-                    })
-                    .flat_map(|instance| {
-                        std::iter::once(instance.project_path.as_str())
-                            .chain(instance.pre_trash_project_path.as_deref())
-                            .chain(
-                                instance
-                                    .all_repos()
-                                    .iter()
-                                    .map(|repo| repo.worktree_path.as_str()),
-                            )
-                            .map(PathBuf::from)
-                    }),
-            ),
+            Ok(instances) => {
+                if absent_id.is_some_and(|id| instances.iter().any(|instance| instance.id == id)) {
+                    return PathsInUse::Unknown(
+                        "failed creation id still has a durable owner".into(),
+                    );
+                }
+                paths.extend(
+                    instances
+                        .iter()
+                        .filter(|instance| {
+                            !owners
+                                .iter()
+                                .any(|(_, id, _, matches)| *matches && *id == instance.id)
+                        })
+                        .flat_map(|instance| {
+                            std::iter::once(instance.project_path.as_str())
+                                .chain(instance.pre_trash_project_path.as_deref())
+                                .chain(
+                                    instance
+                                        .all_repos()
+                                        .iter()
+                                        .map(|repo| repo.worktree_path.as_str()),
+                                )
+                                .map(PathBuf::from)
+                        }),
+                );
+            }
             Err(error) => {
                 return PathsInUse::Unknown(format!(
                     "reading profile '{}': {error}",
@@ -963,8 +1003,180 @@ fn scan_paths_in_use(storages: &[Storage], except: &[SessionPathOwner<'_>]) -> P
 /// Unlocked snapshot; destructive callers recheck under the ownership locks.
 pub(crate) fn paths_in_use_except(except: &[SessionPathOwner<'_>]) -> PathsInUse {
     match all_profile_storages() {
-        Ok((_, storages)) => scan_paths_in_use(&storages, except),
+        Ok((_, storages)) => scan_paths_in_use(&storages, except, None),
         Err(reason) => PathsInUse::Unknown(reason),
+    }
+}
+
+/// Caller holds worktree and identity fences after removing its own creation row.
+pub(crate) fn paths_in_use_after_failed_create(session_id: &str) -> PathsInUse {
+    match all_profile_storages() {
+        Ok((_, storages)) => scan_paths_in_use(&storages, &[], Some(session_id)),
+        Err(reason) => PathsInUse::Unknown(reason),
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct ClaimOwner {
+    profile: usize,
+    id: std::sync::Arc<str>,
+}
+
+/// A strict, physically keyed ownership snapshot for one fenced reconciliation pass.
+pub(crate) struct PathClaimIndex {
+    claims: std::collections::BTreeMap<PathBuf, Vec<ClaimOwner>>,
+    owned_paths: Vec<std::collections::HashMap<std::sync::Arc<str>, Vec<PathBuf>>>,
+    targets: Vec<(usize, usize, Vec<Instance>)>,
+    valid: bool,
+}
+
+impl PathClaimIndex {
+    pub(crate) fn load(targets: &[Storage]) -> anyhow::Result<Self> {
+        let target_identities = targets
+            .iter()
+            .map(|target| {
+                target.verify_profile_identity()?;
+                Ok(std::fs::metadata(target.sessions_path().parent().unwrap())?)
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let (_, storages) = all_profile_storages().map_err(anyhow::Error::msg)?;
+        crate::session::storage::with_storages_locked(&storages, || -> anyhow::Result<Self> {
+            let mut result = Self {
+                claims: Default::default(),
+                owned_paths: Vec::new(),
+                targets: Vec::new(),
+                valid: true,
+            };
+            let mut profiles: Vec<std::fs::Metadata> = Vec::new();
+            for storage in &storages {
+                storage.verify_profile_identity()?;
+                let identity = std::fs::metadata(storage.sessions_path().parent().unwrap())?;
+                if profiles.iter().any(|previous| {
+                    crate::session::storage::same_filesystem_identity(previous, &identity)
+                }) {
+                    continue;
+                }
+                let profile = profiles.len();
+                result.owned_paths.push(Default::default());
+                let rows = storage.load_strict_for_worktree_ownership_locked()?;
+                for row in &rows {
+                    result.update(profile, row);
+                }
+                if let Some(target) = target_identities.iter().position(|target| {
+                    crate::session::storage::same_filesystem_identity(target, &identity)
+                }) {
+                    result.targets.push((target, profile, rows));
+                }
+                profiles.push(identity);
+            }
+            for (target, identity) in targets.iter().zip(&target_identities) {
+                anyhow::ensure!(
+                    profiles.iter().any(|profile| {
+                        crate::session::storage::same_filesystem_identity(profile, identity)
+                    }),
+                    "original profile is absent from ownership inventory"
+                );
+                target.verify_profile_identity()?;
+            }
+            Ok(result)
+        })?
+    }
+
+    pub(crate) fn take_targets(&mut self) -> Vec<(usize, usize, Vec<Instance>)> {
+        std::mem::take(&mut self.targets)
+    }
+
+    pub(crate) fn update(&mut self, profile: usize, row: &Instance) {
+        let id = self.owned_paths[profile]
+            .get_key_value(row.id.as_str())
+            .map(|(id, _)| std::sync::Arc::clone(id))
+            .unwrap_or_else(|| std::sync::Arc::from(row.id.as_str()));
+        let owner = ClaimOwner {
+            profile,
+            id: std::sync::Arc::clone(&id),
+        };
+        let previous = self.owned_paths[profile].entry(id).or_default();
+        let mut retained = 0;
+        for path in std::iter::once(row.project_path.as_str())
+            .chain(row.pre_trash_project_path.as_deref())
+            .chain(
+                row.all_repos()
+                    .iter()
+                    .map(|repo| repo.worktree_path.as_str()),
+            )
+        {
+            let Some(path) = resolve_claim_path(Path::new(path)) else {
+                self.valid = false;
+                continue;
+            };
+            if previous[..retained].contains(&path) {
+                continue;
+            }
+            if let Some(offset) = previous[retained..].iter().position(|old| old == &path) {
+                previous.swap(retained, retained + offset);
+            } else {
+                self.claims
+                    .entry(path.clone())
+                    .or_default()
+                    .push(owner.clone());
+                previous.push(path);
+                let last = previous.len() - 1;
+                previous.swap(retained, last);
+            }
+            retained += 1;
+        }
+        for path in previous.drain(retained..) {
+            if let Some(owners) = self.claims.get_mut(&path) {
+                owners.retain(|claim| claim != &owner);
+            }
+            if self.claims.get(&path).is_some_and(Vec::is_empty) {
+                self.claims.remove(&path);
+            }
+        }
+    }
+
+    pub(crate) fn ensure_unclaimed(
+        &self,
+        profile: usize,
+        id: &str,
+        candidates: &[PathBuf],
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(self.valid, "path ownership inventory is uncertain");
+        let is_peer = |owners: &[ClaimOwner]| {
+            owners
+                .iter()
+                .any(|owner| owner.profile != profile || owner.id.as_ref() != id)
+        };
+        for candidate in candidates {
+            let candidate = resolve_claim_path(candidate)
+                .ok_or_else(|| anyhow::anyhow!("candidate path cannot be resolved safely"))?;
+            for ancestor in candidate.ancestors() {
+                anyhow::ensure!(
+                    !self
+                        .claims
+                        .get(ancestor)
+                        .is_some_and(|owners| is_peer(owners)),
+                    "another session claims a candidate ancestor"
+                );
+            }
+            for (path, owners) in self.claims.range::<Path, _>((
+                std::ops::Bound::Included(candidate.as_path()),
+                std::ops::Bound::Unbounded,
+            )) {
+                if !path.starts_with(&candidate) {
+                    break;
+                }
+                anyhow::ensure!(
+                    !is_peer(owners),
+                    "another session claims a candidate descendant"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn invalidate(&mut self) {
+        self.valid = false;
     }
 }
 
@@ -979,7 +1191,7 @@ pub(crate) fn ensure_unclaimed_paths(
             if paths.iter().any(|path| {
                 candidates
                     .iter()
-                    .any(|candidate| paths_overlap(Path::new(path), candidate))
+                    .any(|candidate| paths_overlap_destructive(Path::new(path), candidate))
             }) =>
         {
             Err("another session already claims one of the candidate paths".to_string())
@@ -1020,7 +1232,7 @@ fn with_paths_in_use_locked<R>(
     let locked = crate::session::storage::with_storages_locked(&storages, || {
         let paths_in_use = match crate::session::list_profiles_for_worktree_inventory() {
             Ok(now) if now.iter().all(|profile| profiles.contains(profile)) => {
-                scan_paths_in_use(&storages, &[owner])
+                scan_paths_in_use(&storages, &[owner], None)
             }
             Ok(_) => PathsInUse::Unknown("a profile was created during the deletion".to_string()),
             Err(error) => PathsInUse::Unknown(format!("listing profiles: {error}")),
@@ -1849,26 +2061,231 @@ mod tests {
     }
 
     #[test]
-    fn parent_paths_do_not_claim_descendant_sessions() {
+    #[serial_test::serial]
+    fn indexed_claims_parse_once_and_track_persisted_paths_by_physical_owner() {
         let temp = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let target = Storage::new_unwatched("target").unwrap();
+        let peer = Storage::new_unwatched("peer").unwrap();
+        let mut row = Instance::new("target", temp.path().join("checkout").to_str().unwrap());
+        let mut peer_row = row.clone();
+        peer_row.project_path = temp
+            .path()
+            .join("peer-checkout")
+            .to_string_lossy()
+            .into_owned();
+        target
+            .update(|rows, _| {
+                rows.push(row.clone());
+                Ok(())
+            })
+            .unwrap();
+        peer.update(|rows, _| {
+            rows.push(peer_row.clone());
+            Ok(())
+        })
+        .unwrap();
+        let _workspace = crate::session::acquire_session_workspace_claim_lock().unwrap();
+        let _identity = crate::session::acquire_session_identity_lock().unwrap();
+        crate::session::storage::STRICT_INVENTORY_READS.with(|reads| reads.set(0));
+        let mut index = PathClaimIndex::load(std::slice::from_ref(&target)).unwrap();
+        let reads = crate::session::storage::STRICT_INVENTORY_READS.with(|reads| reads.get());
+        assert_eq!(reads, 2, "one strict read per physical profile");
+        let (_, profile, rows) = index.take_targets().pop().unwrap();
+        assert_eq!(rows.len(), 1);
+        for _ in 0..200 {
+            index
+                .ensure_unclaimed(profile, &row.id, &[PathBuf::from(&row.project_path)])
+                .unwrap();
+            assert!(
+                index
+                    .ensure_unclaimed(profile, &row.id, &[PathBuf::from(&peer_row.project_path)])
+                    .is_err(),
+                "same id in another physical profile remains a peer"
+            );
+        }
+        assert_eq!(
+            crate::session::storage::STRICT_INVENTORY_READS.with(|reads| reads.get()),
+            reads,
+            "candidate queries must not parse stores again"
+        );
+        let previous = row.project_path.clone();
+        row.project_path = temp.path().join("relocated").to_string_lossy().into_owned();
+        row.pre_trash_project_path = Some(previous.clone());
+        target
+            .update(|rows, _| {
+                rows[0] = row.clone();
+                Ok(())
+            })
+            .unwrap();
+        index.update(profile, &row);
+        assert!(index
+            .ensure_unclaimed(profile, "another", &[PathBuf::from(&row.project_path)])
+            .is_err());
+        assert!(index
+            .ensure_unclaimed(profile, "another", &[PathBuf::from(previous)])
+            .is_err());
+        index.invalidate();
+        assert!(index
+            .ensure_unclaimed(profile, &row.id, &[temp.path().join("unused")])
+            .is_err());
+        println!(
+            "indexed ownership: 2 profile parses, 400 candidate queries, no inventory rereads"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn native_legacy_claim_guards_use_strict_symmetric_resolution() {
+        let temp = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let target = Storage::new_unwatched("target").unwrap();
+        let peer = Storage::new_unwatched("peer").unwrap();
+        let row = Instance::new("target", temp.path().join("owned").to_str().unwrap());
+        target
+            .update(|rows, _| {
+                rows.push(row.clone());
+                Ok(())
+            })
+            .unwrap();
         let parent = temp.path().join("parent");
         let child = parent.join("child");
         std::fs::create_dir_all(&child).unwrap();
-        assert!(!paths_overlap(&parent, &child));
-        assert!(paths_overlap(&child, &parent));
+        let alias = temp.path().join("alias");
+        std::os::unix::fs::symlink(&parent, &alias).unwrap();
+        let dangling = temp.path().join("dangling");
+        std::os::unix::fs::symlink(temp.path().join("absent"), &dangling).unwrap();
+        let looped = temp.path().join("loop");
+        std::os::unix::fs::symlink(&looped, &looped).unwrap();
+        let _workspace = crate::session::acquire_session_workspace_claim_lock().unwrap();
+        let _identity = crate::session::acquire_session_identity_lock().unwrap();
+        let owner = SessionPathOwner {
+            profile: target.profile(),
+            session_id: &row.id,
+        };
+        for (claim, candidate, conflict) in [
+            (parent.clone(), child.clone(), true),
+            (child.clone(), parent.clone(), true),
+            (alias, child.clone(), true),
+            (temp.path().join("missing/child"), child.clone(), false),
+            (dangling.join("child"), child.clone(), true),
+            (looped, child.clone(), true),
+            (temp.path().join("absent/../other"), child, true),
+        ] {
+            peer.update(|rows, _| {
+                *rows = vec![Instance::new("peer", claim.to_str().unwrap())];
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(
+                ensure_unclaimed_paths(owner, std::slice::from_ref(&candidate)).is_err(),
+                conflict,
+                "claim {} candidate {}",
+                claim.display(),
+                candidate.display()
+            );
+            assert_eq!(paths_in_use_except(&[owner]).covers(&candidate), conflict);
+        }
     }
 
-    /// A peer path that no longer exists on disk cannot contain anything, so it
-    /// must not read as a global conflict.
     #[test]
-    fn missing_recorded_peer_path_is_not_a_conflict() {
+    #[serial_test::serial]
+    fn indexed_claim_deltas_keep_common_repos_and_release_removed_paths() {
         let temp = tempfile::tempdir().unwrap();
-        let gone = temp.path().join("already-deleted");
-        let candidate = temp.path().join("candidate");
-        std::fs::create_dir_all(&candidate).unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let storage = Storage::new_unwatched("target").unwrap();
+        let primary = temp.path().join("primary");
+        let repository = temp.path().join("repository");
+        std::fs::create_dir_all(&primary).unwrap();
+        std::fs::create_dir_all(&repository).unwrap();
+        let mut row = Instance::new("target", primary.to_str().unwrap());
+        row.workspace_info = Some(crate::session::WorkspaceInfo {
+            branch: "feature".into(),
+            workspace_dir: primary.to_string_lossy().into_owned(),
+            repos: vec![crate::session::WorkspaceRepo {
+                name: "repository".into(),
+                source_path: repository.to_string_lossy().into_owned(),
+                branch: "feature".into(),
+                worktree_path: repository.to_string_lossy().into_owned(),
+                main_repo_path: repository.to_string_lossy().into_owned(),
+                managed_by_aoe: false,
+                branch_preexisting: true,
+                base_branch: None,
+                base_branch_override: None,
+            }],
+            created_at: chrono::Utc::now(),
+            cleanup_on_delete: false,
+        });
+        storage
+            .update(|rows, _| {
+                rows.push(row.clone());
+                Ok(())
+            })
+            .unwrap();
+        let _workspace = crate::session::acquire_session_workspace_claim_lock().unwrap();
+        let _identity = crate::session::acquire_session_identity_lock().unwrap();
+        let mut index = PathClaimIndex::load(std::slice::from_ref(&storage)).unwrap();
+        let (_, profile, _) = index.take_targets().pop().unwrap();
+        let relocated = temp.path().join("relocated");
+        row.project_path = relocated.to_string_lossy().into_owned();
+        row.pre_trash_project_path = Some(primary.to_string_lossy().into_owned());
+        storage
+            .update(|rows, _| {
+                rows[0] = row.clone();
+                Ok(())
+            })
+            .unwrap();
+        index.update(profile, &row);
+        for path in [&primary, &repository, &relocated] {
+            assert!(index
+                .ensure_unclaimed(profile, "peer", std::slice::from_ref(path))
+                .is_err());
+        }
+        row.project_path = temp.path().join("current").to_string_lossy().into_owned();
+        row.pre_trash_project_path = None;
+        storage
+            .update(|rows, _| {
+                rows[0] = row.clone();
+                Ok(())
+            })
+            .unwrap();
+        index.update(profile, &row);
+        for path in [&primary, &relocated] {
+            index
+                .ensure_unclaimed(profile, "peer", std::slice::from_ref(path))
+                .unwrap();
+        }
+        assert!(index
+            .ensure_unclaimed(profile, "peer", std::slice::from_ref(&repository))
+            .is_err());
+        assert!(index
+            .ensure_unclaimed(profile, "peer", &[PathBuf::from(&row.project_path)])
+            .is_err());
+    }
 
-        assert!(!paths_overlap(&gone, &candidate));
-        assert!(!paths_overlap(&gone, temp.path()));
+    #[test]
+    fn destructive_claims_resolve_absence_but_refuse_broken_aliases() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("checkout");
+        std::fs::create_dir(&root).unwrap();
+        let missing = temp.path().join("missing/child");
+        assert!(!paths_overlap_destructive(&missing, &root));
+        assert!(!paths_overlap_destructive(&root, &missing));
+        assert!(paths_overlap_destructive(&root.join("missing"), &root));
+        assert!(paths_overlap_destructive(&root, &root.join("missing")));
+        let alias = temp.path().join("alias");
+        std::os::unix::fs::symlink(&root, &alias).unwrap();
+        assert!(paths_overlap_destructive(&alias.join("missing"), &root));
+        let dangling = temp.path().join("dangling");
+        std::os::unix::fs::symlink(temp.path().join("absent"), &dangling).unwrap();
+        assert!(paths_overlap_destructive(&dangling.join("child"), &root));
+        assert!(paths_overlap_destructive(
+            &temp.path().join("absent/../other"),
+            &root
+        ));
+        let looped = temp.path().join("loop");
+        std::os::unix::fs::symlink(&looped, &looped).unwrap();
+        assert!(paths_overlap_destructive(&looped, &root));
     }
 
     /// The mirror case: a candidate that does not exist yet still has to be
@@ -1882,7 +2299,7 @@ mod tests {
         let candidate = parent.join("not-created-yet");
 
         assert!(!candidate.exists());
-        assert!(paths_overlap(&parent, &candidate));
+        assert!(paths_overlap_destructive(&parent, &candidate));
     }
 
     /// A peer recorded through a symlink names the same directory as its
@@ -1901,7 +2318,7 @@ mod tests {
         assert!(!candidate.exists());
 
         assert!(
-            paths_overlap(&recorded, &candidate),
+            paths_overlap_destructive(&recorded, &candidate),
             "the recorded spelling and the candidate name different parents"
         );
     }
@@ -1920,7 +2337,7 @@ mod tests {
         assert!(!candidate.exists());
 
         assert!(
-            paths_overlap(&peer, &candidate),
+            paths_overlap_destructive(&peer, &candidate),
             "the candidate's parent is an alias of the peer's"
         );
     }
@@ -2112,6 +2529,7 @@ mod tests {
         let storage = Storage::new_unwatched("owner").unwrap();
         let mut plain = Instance::new("Plain", temp.path().join("plain").to_str().unwrap());
         plain.source_profile = "owner".to_string();
+        plain.storage_origin = Some(std::sync::Arc::new(storage.clone()));
         storage
             .update(|instances, _groups| {
                 instances.push(plain.clone());
@@ -2253,7 +2671,12 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        instance
+        storage
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.id == instance.id)
+            .unwrap()
     }
 
     #[test]
@@ -2359,6 +2782,7 @@ mod tests {
         let _home = isolate_app_dir_at(&tmp.path().join("home"));
         owner.source_profile = "owner".into();
         let storage = Storage::new_unwatched("owner").unwrap();
+        owner.storage_origin = Some(std::sync::Arc::new(storage.clone()));
         storage
             .update(|rows, _| {
                 rows.push(owner.clone());
@@ -2437,6 +2861,7 @@ mod tests {
             let _home = isolate_app_dir_at(&tmp.path().join("home"));
             let storage = Storage::new_unwatched("owner").unwrap();
             owner.source_profile = "owner".to_string();
+            owner.storage_origin = Some(std::sync::Arc::new(storage.clone()));
             storage
                 .update(|instances, _groups| {
                     instances.push(owner.clone());
@@ -2588,6 +3013,7 @@ mod tests {
         let _home = isolate_app_dir_at(&tmp.path().join("home"));
         let owner_storage = Storage::new_unwatched("owner").unwrap();
         owner.source_profile = "owner".to_string();
+        owner.storage_origin = Some(std::sync::Arc::new(owner_storage.clone()));
         owner_storage
             .update(|instances, _groups| {
                 instances.push(owner.clone());
@@ -3287,8 +3713,9 @@ mod tests {
         structured.id = "stopped-purge".into();
         structured.view = crate::session::View::Structured;
         structured.source_profile = "owner".into();
-        Storage::new_unwatched("owner")
-            .unwrap()
+        let storage = Storage::new_unwatched("owner").unwrap();
+        structured.storage_origin = Some(std::sync::Arc::new(storage.clone()));
+        storage
             .update(|instances, _| {
                 instances.push(structured.clone());
                 Ok(())
@@ -3306,7 +3733,7 @@ mod tests {
             .unwrap()
             .as_bytes();
         structured.runner_journal = serde_json::from_value(serde_json::json!({
-            "coverage": "complete", "launches": [{
+            "coverage": "complete", "preparations": [], "launches": [{
                 "nonce": *uuid::Uuid::new_v4().as_bytes(), "boot": boot,
                 "generation": 0, "incarnation": incarnation,
             }],
@@ -3387,7 +3814,7 @@ mod tests {
             .unwrap()
             .as_bytes();
         let live = serde_json::from_value(serde_json::json!({
-            "coverage": "complete", "launches": [{
+            "coverage": "complete", "preparations": [], "launches": [{
                 "nonce": *uuid::Uuid::new_v4().as_bytes(), "boot": boot,
                 "generation": 0, "incarnation": incarnation,
             }],
@@ -3398,6 +3825,7 @@ mod tests {
         instance.id = "protected-purge".into();
         instance.source_profile = storage.profile().into();
         instance.view = crate::session::View::Structured;
+        instance.storage_origin = Some(std::sync::Arc::new(storage.clone()));
         storage
             .update(|rows, _| {
                 rows.push(instance.clone());
@@ -3408,6 +3836,7 @@ mod tests {
             crate::session::runner_journal::RunnerExecutionJournal::default(),
             live,
         ] {
+            instance.runner_journal = journal.clone();
             storage
                 .update(|rows, _| {
                     rows.iter_mut()
@@ -3447,6 +3876,9 @@ mod tests {
                 .iter()
                 .any(|row| row.id == instance.id && row.lifecycle_reservation.is_none()));
             assert!(crate::process::worker::is_process_group_alive(pid));
+            instance = result
+                .retained_instance
+                .expect("failed original transaction returns its own released CAS projection");
         }
         drop(child.0.stdin.take());
         assert!(child.0.wait().unwrap().success());

@@ -39,6 +39,8 @@ const NON_SUFFIX_HOST_STATE: Record<string, string> = {
   AOE_E2E_PARTIAL_FRAME_FILE: `${HOST}/partial-frame`,
   AOE_E2E_PROMPT_COMPLETED_FILE: `${HOST}/prompt-completed`,
   AOE_E2E_STORAGE_LOCK_CONTENDED: `${HOST}/lock-contended`,
+  AOE_TEST_NATIVE_ISSUER: JSON.stringify({ release: `${HOST}/native-release`, ready: `${HOST}/native-ready` }),
+  AOE_TEST_RESERVATION_RUNTIME_SHUTDOWN: `${HOST}/reservation-shutdown`,
   AOE_TUI_TEST_CHILD: "host-test-child",
   AOE_TUI_TEST_ENTERED: `${HOST}/test-entered`,
   AOE_GITHUB_CLONE_BASE: `file://${HOST}/plugins`,

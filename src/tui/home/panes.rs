@@ -107,13 +107,29 @@ impl HomeView {
         size: Option<(u16, u16)>,
         skip_on_launch: bool,
     ) {
-        if self.get_instance(id).is_none() {
+        let Some(instance) = self.get_instance(id) else {
+            return;
+        };
+        if self
+            .restart_in_flight
+            .get(id)
+            .is_some_and(|origin| origin.matches(instance))
+        {
+            self.attach_after_restart.insert(id.to_owned());
             return;
         }
-        self.attach_after_restart.insert(id.to_string());
-        if !self.restart_in_flight.insert(id.to_string()) {
-            return;
-        }
+        let origin = match super::RequestOrigin::capture(instance) {
+            Ok(origin) => origin,
+            Err(error) => {
+                self.info_dialog = Some(super::InfoDialog::new(
+                    "Restart Failed",
+                    &format!("{error:#}"),
+                ));
+                return;
+            }
+        };
+        self.attach_after_restart.insert(id.to_owned());
+        self.restart_in_flight.insert(id.to_owned(), origin);
         self.mutate_instance(id, |inst| {
             inst.status = crate::session::Status::Starting;
             inst.last_error = None;

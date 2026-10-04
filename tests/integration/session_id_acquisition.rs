@@ -70,6 +70,14 @@ fn start_with_size_opts_returns_skipped_when_pane_preexists() {
     // Make is_existing=true the path acquire would take if reached, so any
     // fall-through regression builds a real launch command and fails loudly.
     inst.agent_session_id = Some(VALID_CLAUDE_UUID.to_string());
+    let storage = Storage::new_unwatched("default").expect("original fixture storage");
+    storage
+        .update(|rows, groups| {
+            rows.push(inst.clone());
+            *groups = GroupTree::new_with_groups(std::slice::from_ref(&inst), &[]).get_all_groups();
+            Ok(())
+        })
+        .expect("persist preexisting pane owner before start");
     let session_name = tmux::Session::generate_name(&inst.id, &inst.title);
 
     let status = Command::new("tmux")

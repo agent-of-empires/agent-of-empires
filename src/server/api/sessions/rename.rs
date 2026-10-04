@@ -81,25 +81,48 @@ pub(super) fn apply_session_rename_cache_patch(
 
 /// Stop outside filesystem flocks, then reload and prove quiescence under them.
 /// Callers retain submission and instance guards to exclude local respawn.
-async fn quiesce_structured_worker_for_worktree_move(
+async fn reserve_and_settle_worktree_move(
     state: &Arc<AppState>,
-    id: &str,
-) -> Result<(), axum::response::Response> {
-    match state.acp_supervisor.shutdown(id).await {
-        Ok(()) | Err(crate::acp::supervisor::SupervisorError::UnknownSession(_)) => Ok(()),
-        Err(e) => {
-            tracing::warn!(
-                target: "http.api.sessions",
-                session = %id,
-                "could not stop structured-view worker before worktree move: {e}"
-            );
-            Err(api_error(
+    storage: &Storage,
+    expected: &Instance,
+) -> Result<Arc<crate::session::runner_journal::OwnedStop>, axum::response::Response> {
+    let claim_storage = storage.clone();
+    let claim_row = expected.clone();
+    let generation = match tokio::task::spawn_blocking(move || {
+        crate::session::runner_journal::reserve_owned_stop(&claim_storage, &claim_row, true)
+    })
+    .await
+    {
+        Ok(Ok(generation)) => generation,
+        Ok(Err(error)) => {
+            return Err(api_error(
                 StatusCode::CONFLICT,
-                "worker_shutdown_failed",
-                "Could not stop the structured view worker before renaming; retry in a moment",
+                "lifecycle_busy",
+                error.to_string(),
             ))
         }
+        Err(_) => return Err(StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+    };
+    let settled = match crate::session::runner_journal::settle_if_idle(generation.clone()).await {
+        Ok(()) => state
+            .acp_supervisor
+            .shutdown_and_require_dead(generation.clone())
+            .await
+            .map_err(|error| anyhow::anyhow!(error)),
+        Err(error) => Err(error),
+    };
+    if let Err(error) = settled {
+        let _ = tokio::task::spawn_blocking(move || {
+            crate::session::runner_journal::release_owned_stop(&generation)
+        })
+        .await;
+        return Err(api_error(
+            StatusCode::CONFLICT,
+            "runner_not_quiescent",
+            error.to_string(),
+        ));
     }
+    Ok(generation)
 }
 
 /// The worktree rename hit a live `Attach` reservation. A distinct marker so
@@ -155,6 +178,8 @@ pub(super) enum RenamePersistOutcome {
 pub(super) fn persist_rename_metadata(
     storage: &Storage,
     id: &str,
+    expected_generation: u64,
+    expected_path: &str,
     title: &str,
     new_path: Option<&str>,
     new_branch: Option<&str>,
@@ -163,6 +188,10 @@ pub(super) fn persist_rename_metadata(
         let Some(inst) = instances.iter_mut().find(|instance| instance.id == id) else {
             return Ok(RenamePersistOutcome::Missing);
         };
+        anyhow::ensure!(
+            inst.lifecycle_generation == expected_generation && inst.project_path == expected_path,
+            "rename plan was superseded before commit"
+        );
         let old_title = inst.title.clone();
         if let Some(path) = new_path {
             apply_worktree_name_edit(inst, path, new_branch);
@@ -229,7 +258,7 @@ pub async fn rename_session(
         inst.clone()
     };
     let profile = live.source_profile.clone();
-    let mut worker_quiesced = false;
+    let mut stopped: Option<(Storage, Arc<crate::session::runner_journal::OwnedStop>)> = None;
     loop {
         let (_workspace_lock, _identity_lock) = match tokio::task::spawn_blocking(|| {
             let workspace = crate::session::acquire_session_workspace_claim_lock()?;
@@ -251,10 +280,15 @@ pub async fn rename_session(
         let lock_id = id.clone();
         let lock_profile = profile.clone();
         let lock_file_watch = state.file_watch.clone();
+        let retained_storage = stopped.as_ref().map(|(storage, _)| storage.clone());
         let (_session_title_lock, _lifecycle_lock, storage, disk_instances) =
             match tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
                 let session_title_lock = crate::session::acquire_session_title_lock(&lock_id)?;
-                let storage = Storage::open(&lock_profile, lock_file_watch)?;
+                let storage = match retained_storage {
+                    Some(storage) => storage,
+                    None => Storage::open(&lock_profile, lock_file_watch)?,
+                };
+                storage.verify_profile_identity()?;
                 let lifecycle_lock = storage.acquire_instance_lifecycle_lock(&lock_id)?;
                 let instances = storage.load()?;
                 Ok((session_title_lock, lifecycle_lock, storage, instances))
@@ -358,27 +392,36 @@ pub async fn rename_session(
             }
 
             if moves_worktree {
-                if is_structured && !worker_quiesced {
+                if stopped.is_none() {
                     drop(_lifecycle_lock);
                     drop(_session_title_lock);
                     drop(_identity_lock);
                     drop(_workspace_lock);
-                    if let Err(response) =
-                        quiesce_structured_worker_for_worktree_move(&state, &id).await
-                    {
-                        return response;
-                    }
-                    worker_quiesced = true;
+                    let generation =
+                        match reserve_and_settle_worktree_move(&state, &storage, &fresh).await {
+                            Ok(generation) => generation,
+                            Err(response) => return response,
+                        };
+                    stopped = Some((storage, generation));
                     continue;
                 }
-                if fresh.has_fresh_lifecycle_reservation(chrono::Utc::now())
-                    || !fresh.runner_journal.proves_quiescent()
+                let stop = stopped
+                    .as_ref()
+                    .expect("checkout stop was claimed")
+                    .1
+                    .clone();
+                if let Err(error) = tokio::task::spawn_blocking(move || {
+                    crate::session::runner_journal::release_settled_stop_under_locks(&stop)
+                })
+                .await
+                .map_err(anyhow::Error::from)
+                .and_then(|result| result)
                 {
                     return api_error(
-                    StatusCode::CONFLICT,
-                    "runner_not_quiescent",
-                    "Session execution changed while stopping its worker; retry once it is stopped",
-                );
+                        StatusCode::CONFLICT,
+                        "runner_not_quiescent",
+                        error.to_string(),
+                    );
                 }
             }
 
@@ -438,14 +481,23 @@ pub async fn rename_session(
         // Persist BEFORE mutating in-memory state: once a git move has landed, a
         // silent persist failure would leave metadata pointing at the old path
         // after a restart, so it returns 500 rather than a misleading 200.
+        let rekey_target = if !is_structured && title != current_title {
+            crate::tmux::capture_rekey_session(&id, &current_title)
+        } else {
+            Ok(None)
+        };
         let title_clone = title.clone();
         let id_clone = id.clone();
         let new_path_clone = new_path.clone();
         let new_branch_clone = new_branch.clone();
+        let expected_generation = fresh.lifecycle_generation;
+        let expected_path = current_path.clone();
         let persisted = tokio::task::spawn_blocking(move || {
             persist_rename_metadata(
                 &storage,
                 &id_clone,
+                expected_generation,
+                &expected_path,
                 &title_clone,
                 new_path_clone.as_deref(),
                 new_branch_clone.as_deref(),
@@ -517,14 +569,13 @@ pub async fn rename_session(
         // resolved tie value here too; otherwise a managed worktree claims it is
         // untied until the next list refresh (#1927).
         response.tie_workdir_to_name = tied;
-        drop(_identity_lock);
 
         let tmux_warning = if persisted_old_title != title && !is_structured {
             let rekey_id = id.clone();
-            let rekey_old_title = persisted_old_title.clone();
+
             let rekey_new_title = title.clone();
             match tokio::task::spawn_blocking(move || {
-                crate::tmux::rekey_session(&rekey_id, &rekey_old_title, &rekey_new_title)
+                crate::tmux::rekey_session(&rekey_id, &rekey_new_title, rekey_target)
             })
             .await
             {
@@ -545,6 +596,7 @@ pub async fn rename_session(
         } else {
             None
         };
+        drop(_identity_lock);
         if let Some(warning) = tmux_warning {
             response.warnings.push(warning);
         }
@@ -663,7 +715,7 @@ pub async fn set_worktree_name(
         inst.clone()
     };
     let profile = live.source_profile.clone();
-    let mut worker_quiesced = false;
+    let mut stopped: Option<(Storage, Arc<crate::session::runner_journal::OwnedStop>)> = None;
     loop {
         let (_workspace_lock, _identity_lock) = match tokio::task::spawn_blocking(|| {
             let workspace = crate::session::acquire_session_workspace_claim_lock()?;
@@ -685,9 +737,14 @@ pub async fn set_worktree_name(
         let lock_id = id.clone();
         let lock_profile = profile.clone();
         let lock_file_watch = state.file_watch.clone();
+        let retained_storage = stopped.as_ref().map(|(storage, _)| storage.clone());
         let (_lifecycle_lock, storage, authoritative_instances) = match tokio::task::spawn_blocking(
             move || -> anyhow::Result<_> {
-                let storage = Storage::open(&lock_profile, lock_file_watch)?;
+                let storage = match retained_storage {
+                    Some(storage) => storage,
+                    None => Storage::open(&lock_profile, lock_file_watch)?,
+                };
+                storage.verify_profile_identity()?;
                 let lifecycle = storage.acquire_instance_lifecycle_lock(&lock_id)?;
                 let instances = storage.load()?;
                 if instances.iter().any(|instance| {
@@ -740,7 +797,6 @@ pub async fn set_worktree_name(
         let current_path = fresh.project_path.clone();
         let status = fresh.status;
         let is_sandboxed = fresh.is_sandboxed();
-        let is_structured = fresh.is_structured();
 
         let Some(worktree_info) = worktree_info else {
             return (
@@ -799,25 +855,34 @@ pub async fn set_worktree_name(
         }
 
         if moves_worktree {
-            if is_structured && !worker_quiesced {
+            if stopped.is_none() {
                 drop(_lifecycle_lock);
                 drop(_identity_lock);
                 drop(_workspace_lock);
-                if let Err(response) =
-                    quiesce_structured_worker_for_worktree_move(&state, &id).await
-                {
-                    return response;
-                }
-                worker_quiesced = true;
+                let generation =
+                    match reserve_and_settle_worktree_move(&state, &storage, &fresh).await {
+                        Ok(generation) => generation,
+                        Err(response) => return response,
+                    };
+                stopped = Some((storage, generation));
                 continue;
             }
-            if fresh.has_fresh_lifecycle_reservation(chrono::Utc::now())
-                || !fresh.runner_journal.proves_quiescent()
+            let stop = stopped
+                .as_ref()
+                .expect("checkout stop was claimed")
+                .1
+                .clone();
+            if let Err(error) = tokio::task::spawn_blocking(move || {
+                crate::session::runner_journal::release_settled_stop_under_locks(&stop)
+            })
+            .await
+            .map_err(anyhow::Error::from)
+            .and_then(|result| result)
             {
                 return api_error(
                     StatusCode::CONFLICT,
                     "runner_not_quiescent",
-                    "Session execution changed while stopping its worker; retry once it is stopped",
+                    error.to_string(),
                 );
             }
         }
@@ -881,6 +946,8 @@ pub async fn set_worktree_name(
             )
         };
 
+        let expected_generation = fresh.lifecycle_generation;
+        let expected_path = current_path.clone();
         let id_clone = id.clone();
         let new_path_clone = new_path.clone();
         let new_branch_clone = new_branch.clone();
@@ -889,6 +956,11 @@ pub async fn set_worktree_name(
                 let Some(inst) = instances.iter_mut().find(|i| i.id == id_clone) else {
                     return Ok(false);
                 };
+                anyhow::ensure!(
+                    inst.lifecycle_generation == expected_generation
+                        && inst.project_path == expected_path,
+                    "workdir plan was superseded before commit"
+                );
                 apply_worktree_name_edit(inst, &new_path_clone, new_branch_clone.as_deref());
                 Ok(true)
             })
@@ -979,12 +1051,16 @@ pub async fn attach_session_project(
             .into_response();
     }
 
-    let profile = {
+    let (profile, original) = {
         let instances = state.instances.read().await;
-        match instances.iter().find(|i| i.id == id) {
-            Some(inst) => inst.source_profile.clone(),
-            None => return session_not_found(),
-        }
+        let Some(instance) = instances.iter().find(|row| row.id == id) else {
+            return session_not_found();
+        };
+        let original = match state.capture_operation_origin(instance) {
+            Ok(original) => original,
+            Err(error) => return (StatusCode::CONFLICT, error.to_string()).into_response(),
+        };
+        (instance.source_profile.clone(), original)
     };
 
     // A bare name is a registry lookup; anything path-shaped is used as-is, so
@@ -1006,7 +1082,8 @@ pub async fn attach_session_project(
         crate::session::attach_project::ExistingBranch::Refuse
     };
 
-    match crate::server::attach_project::attach_project(&state, &id, &repo_path, on_existing).await
+    match crate::server::attach_project::attach_project(&state, original, &repo_path, on_existing)
+        .await
     {
         Ok((outcome, worker)) => {
             use crate::server::attach_project::WorkerOutcome;

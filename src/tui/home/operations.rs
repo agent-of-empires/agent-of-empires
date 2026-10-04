@@ -34,11 +34,16 @@ enum PersistGroupDelete {
     Restarting,
 }
 
-fn rekey_tmux_after_persist(id: &str, old_title: &str, new_title: &str) -> Option<String> {
+fn rekey_tmux_after_persist(
+    id: &str,
+    old_title: &str,
+    new_title: &str,
+    target: anyhow::Result<Option<crate::tmux::Session>>,
+) -> Option<String> {
     if old_title == new_title {
         return None;
     }
-    match crate::tmux::rekey_session(id, old_title, new_title) {
+    match crate::tmux::rekey_session(id, new_title, target) {
         Ok(_) => None,
         Err(error) => {
             tracing::warn!(target: "tui.home", session = %id, "tmux rename failed after persistence: {error}");
@@ -227,6 +232,11 @@ impl HomeView {
 
     pub(super) fn create_session(&mut self, data: NewSessionData) -> anyhow::Result<String> {
         let target_profile = data.profile.clone();
+        let original_storage = match self.storages.get(&target_profile) {
+            Some(storage) => storage.clone(),
+            None => Storage::open(&target_profile, self.file_watch.clone())?,
+        };
+        original_storage.verify_profile_identity()?;
 
         // In unified mode, all instances are loaded, so use them for title dedup.
         // For the target profile, filter to that profile's instances.
@@ -250,7 +260,7 @@ impl HomeView {
             params,
             &existing_titles,
             &existing_branches,
-            &target_profile,
+            &original_storage,
         )?;
         let mut instance = build_result.instance;
         let created_worktree = build_result.created_worktree;
@@ -292,6 +302,7 @@ impl HomeView {
                 return Err(error);
             }
         };
+        original_storage.verify_profile_identity()?;
         if let Err(error) = crate::session::validate_managed_workspace(&instance) {
             builder::cleanup_instance(
                 &instance,
@@ -330,18 +341,7 @@ impl HomeView {
             }
         }
 
-        let storage = match Storage::open(&target_profile, self.file_watch.clone()) {
-            Ok(storage) => storage,
-            Err(error) => {
-                builder::cleanup_instance(
-                    &instance,
-                    created_worktree.as_ref(),
-                    &created_workspace_worktrees,
-                    None,
-                );
-                return Err(error);
-            }
-        };
+        let storage = original_storage;
         self.storages.insert(target_profile.clone(), storage);
         self.add_instance(instance.clone());
         self.rebuild_group_trees();
@@ -425,7 +425,7 @@ impl HomeView {
         // A cascade for this row is already on the worker. The 1.5s debounce below does
         // not cover a deliberate second press during a multi-second pull, and a duplicate
         // request would restart the row into the container the first one is building.
-        if self.restart_in_flight.contains(&id) {
+        if self.restart_in_flight.contains_key(&id) {
             return Ok(());
         }
 
@@ -613,11 +613,13 @@ impl HomeView {
         // Persist profile/tool/command and the access timestamp while the durable row
         // still carries its prior lifecycle. The worker owns the Starting reservation;
         // publishing that status here would make it reject its own request.
-        self.save_with_storage()?;
-        // Both flocks were released for the profile-move reload and reacquired in
-        // the canonical order, so the save above runs under them again.
-        drop(profile_move_identity);
+        if profile_move_identity.is_some() {
+            self.save_with_storage()?;
+        } else {
+            self.save()?;
+        }
         drop(profile_move_guards);
+        drop(profile_move_identity);
 
         // The cascade shells out to docker and runs the before_start hook, so it stays
         // off the event loop: show Starting locally, let the worker reserve and persist
@@ -642,7 +644,8 @@ impl HomeView {
             .map(|c| c.session.restart_wake_message.clone())
             .unwrap_or_else(|_| "wake up: pick up what you were doing".to_string());
 
-        self.restart_in_flight.insert(id.clone());
+        self.restart_in_flight
+            .insert(id.clone(), super::RequestOrigin::capture(&instance)?);
         self.restart_poller.request_restart(RestartRequest {
             session_id: id,
             instance,
@@ -723,7 +726,7 @@ impl HomeView {
 
             // Deleting a row mid-restart would fire docker commands against the
             // container the restart worker is creating and orphan resources.
-            if self.restart_in_flight.contains(&id) {
+            if self.restart_in_flight.contains_key(&id) {
                 self.info_dialog = Some(InfoDialog::new(
                     "Restart in progress",
                     "This session is still restarting. Wait for it to finish before deleting.",
@@ -804,7 +807,7 @@ impl HomeView {
                 instance.group_path == group_path || instance.group_path.starts_with(&prefix)
             }) {
                 has_creating |= instance.status == Status::Creating;
-                has_restarting |= restart_in_flight.contains(&instance.id);
+                has_restarting |= restart_in_flight.contains_key(&instance.id);
             }
             if has_creating {
                 return Ok(PersistGroupDelete::Creating);
@@ -864,7 +867,7 @@ impl HomeView {
 
             if member_ids
                 .iter()
-                .any(|session_id| self.restart_in_flight.contains(session_id))
+                .any(|session_id| self.restart_in_flight.contains_key(session_id))
             {
                 self.selected_group = Some(group_path);
                 self.selected_group_profile = owning_profile;
@@ -1239,6 +1242,28 @@ impl HomeView {
         Ok(())
     }
 
+    fn queue_runner_settlement(
+        &mut self,
+        instance: &Instance,
+        action: crate::tui::stop_poller::SettlementAction,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.settlement_in_flight.contains_key(&instance.id),
+            "Runner settlement is already pending"
+        );
+        let origin = super::RequestOrigin::capture(instance)?;
+        let storage = origin.storage.as_ref().clone();
+        self.settlement_in_flight
+            .insert(instance.id.clone(), origin);
+        self.settlement_poller
+            .request(crate::tui::stop_poller::SettlementRequest {
+                session_id: instance.id.clone(),
+                storage,
+                instance: instance.clone(),
+                action,
+            });
+        Ok(())
+    }
     /// Edit the selected session's worktree workdir name: move the worktree directory
     /// and, optionally, rename its git branch, persisting both. See #1723.
     pub(super) fn set_worktree_name_for_selected(
@@ -1249,13 +1274,30 @@ impl HomeView {
         let Some(id) = self.selected_session.clone() else {
             return Ok(());
         };
+        self.set_worktree_name_by_id(&id, new_name, rename_branch)
+    }
+
+    pub(super) fn set_worktree_name_by_id(
+        &mut self,
+        id: &str,
+        new_name: &str,
+        rename_branch: bool,
+    ) -> anyhow::Result<()> {
+        let id = id.to_string();
+        let settled = self.settled_edit.take();
         let live = self
             .get_instance(&id)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("Session not found"))?;
         let source_profile = live.source_profile.clone();
+        let _workspace_lock = crate::session::acquire_session_workspace_claim_lock()?;
         let _identity_lock = acquire_session_identity_lock()?;
-        let storage = Storage::open(&source_profile, self.file_watch.clone())?;
+        let storage = self
+            .storages
+            .get(&source_profile)
+            .ok_or_else(|| anyhow::anyhow!("Profile storage no longer exists"))?
+            .clone();
+        storage.verify_profile_identity()?;
         let _lifecycle_lock = storage.acquire_instance_lifecycle_lock(&id)?;
         let authoritative_instances = storage.load()?;
         let mut authoritative = authoritative_instances
@@ -1311,6 +1353,33 @@ impl HomeView {
                  mounting the worktree directory"
             );
         }
+        if let Some(proof) = settled {
+            proof.validate(&authoritative)?;
+            crate::session::runner_journal::release_settled_stop_under_locks(&proof.stop)?;
+            if let Some(active) = self.settled_edit.as_mut() {
+                active.consumed = true;
+            }
+            self.mutate_instance(&id, |row| {
+                row.release_lifecycle_reservation_if_owned(
+                    crate::session::LifecycleOperation::Stop,
+                    proof.stop.generation(),
+                );
+            });
+        } else if crate::session::worktree_edit::worktree_move_required(
+            std::path::Path::new(&project_path),
+            new_name,
+        ) {
+            drop(_lifecycle_lock);
+            drop(_identity_lock);
+            drop(_workspace_lock);
+            return self.queue_runner_settlement(
+                &authoritative,
+                crate::tui::stop_poller::SettlementAction::Workdir {
+                    name: new_name.to_string(),
+                    rename_branch,
+                },
+            );
+        }
 
         let outcome = crate::session::worktree_edit::edit_worktree_workdir(
             crate::session::worktree_edit::WorktreeEditRequest {
@@ -1339,10 +1408,11 @@ impl HomeView {
                 }
             }
         })?;
-        drop(_identity_lock);
-
         self.rebuild_group_trees();
-        self.save()?;
+        self.save_with_storage()?;
+        drop(_lifecycle_lock);
+        drop(_identity_lock);
+        drop(_workspace_lock);
         self.reload()?;
         Ok(())
     }
@@ -1401,11 +1471,11 @@ impl HomeView {
         // Everything blocking runs on the poller thread: `git worktree add` alone takes
         // seconds, and the fetch, submodule init, worker bounce and container removal
         // behind it take longer. `apply_attach_project_results` reloads and reports.
+        let original = crate::session::LaunchOrigin::capture(&instance)?;
         self.attach_project_in_flight.insert(id.to_string());
         self.attach_project_poller.request_attach(
             crate::session::attach_project::AttachProjectRequest {
-                session_id: id.to_string(),
-                profile: instance.source_profile.clone(),
+                original,
                 repo_path: repo_path.to_path_buf(),
             },
         );
@@ -1419,8 +1489,23 @@ impl HomeView {
         new_profile: Option<&str>,
         rename_branch: bool,
     ) -> anyhow::Result<()> {
-        if let Some(id) = &self.selected_session {
-            let id = id.clone();
+        let Some(id) = self.selected_session.clone() else {
+            return Ok(());
+        };
+        self.rename_session_by_id(&id, new_title, new_group, new_profile, rename_branch)
+    }
+
+    pub(super) fn rename_session_by_id(
+        &mut self,
+        id: &str,
+        new_title: &str,
+        new_group: Option<&str>,
+        new_profile: Option<&str>,
+        rename_branch: bool,
+    ) -> anyhow::Result<()> {
+        {
+            let id = id.to_string();
+            let settled = self.settled_edit.take();
 
             let live = self
                 .get_instance(&id)
@@ -1429,6 +1514,7 @@ impl HomeView {
             let title_changed_by_user = !new_title.is_empty() && new_title != live.title;
             // The app-wide identity guard covers profile-changing renames too; the
             // existing-session guards nest beneath it, title -> lifecycle -> Storage.
+            let _workspace_lock = crate::session::acquire_session_workspace_claim_lock()?;
             let _identity_lock = acquire_session_identity_lock()?;
             let _mutation_guards = self.lock_session_mutation_and_reload(&id)?;
             let previous = self
@@ -1503,7 +1589,7 @@ impl HomeView {
             let mut new_path: Option<String> = None;
             let mut new_branch: Option<String> = None;
             // Fire when the title changed (dir follows it) OR the user opted to
-            let current_instance = self
+            let mut current_instance = self
                 .get_instance(&id)
                 .cloned()
                 .ok_or_else(|| anyhow::anyhow!("Session not found"))?;
@@ -1550,6 +1636,50 @@ impl HomeView {
                 ) {
                     return Err(duplicate_session_error(&projected_move.title));
                 }
+            }
+            let real_move = tied_edit
+                && previous.worktree_info.is_some()
+                && crate::session::worktree_edit::worktree_move_required(
+                    std::path::Path::new(&previous.project_path),
+                    &crate::session::worktree_edit::worktree_leaf_from_title(&effective_title),
+                );
+            if let Some(proof) = settled {
+                proof.validate(&previous)?;
+                crate::session::runner_journal::release_settled_stop_under_locks(&proof.stop)?;
+                if let Some(active) = self.settled_edit.as_mut() {
+                    active.consumed = true;
+                }
+                self.mutate_instance(&id, |row| {
+                    row.release_lifecycle_reservation_if_owned(
+                        crate::session::LifecycleOperation::Stop,
+                        proof.stop.generation(),
+                    );
+                });
+                current_instance.release_lifecycle_reservation_if_owned(
+                    crate::session::LifecycleOperation::Stop,
+                    proof.stop.generation(),
+                );
+                projected_move.release_lifecycle_reservation_if_owned(
+                    crate::session::LifecycleOperation::Stop,
+                    proof.stop.generation(),
+                );
+            } else if real_move {
+                anyhow::ensure!(
+                    !previous.status.blocks_worktree_edit(),
+                    "Stop the session before moving its checkout"
+                );
+                drop(_mutation_guards);
+                drop(_identity_lock);
+                drop(_workspace_lock);
+                return self.queue_runner_settlement(
+                    &previous,
+                    crate::tui::stop_poller::SettlementAction::Rename {
+                        title: new_title.to_string(),
+                        group: new_group.map(str::to_string),
+                        profile: new_profile.map(str::to_string),
+                        rename_branch,
+                    },
+                );
             }
             // Fire when the title changed (the dir follows it) or the user asked to
             // rename the branch, which is allowed even with the title unchanged.
@@ -1615,6 +1745,7 @@ impl HomeView {
                 }
             }
 
+            let rekey_target = crate::tmux::capture_rekey_session(&id, &current_title);
             // Cross-profile worktree and container effects run inside the dual-profile
             // transaction; tmux rekeying waits until persistence and publication succeed.
             if let Some(target_profile) = cross_profile_target.as_deref() {
@@ -1698,18 +1829,12 @@ impl HomeView {
                         Ok(())
                     },
                 )?;
-                // `reload()` reconciles cross-profile duplicates, and a journal-driven
-                // repair re-acquires identity, then title, then lifecycle, the very
-                // flocks still held here, so the reload would wait on its own lock.
-                // Every guard goes first and the canonical order is restored after
-                // it; the tmux rekey is tmux-side, so it runs with the guards back.
+                let tmux_warning =
+                    rekey_tmux_after_persist(&id, &current_title, &effective_title, rekey_target);
                 drop(_mutation_guards);
                 drop(_identity_lock);
+                drop(_workspace_lock);
                 self.reload_preserving_profile_move_runtime(std::slice::from_ref(&id))?;
-                let _identity_lock = acquire_session_identity_lock()?;
-                let _mutation_guards = self.lock_session_mutation_and_reload(&id)?;
-                let tmux_warning = rekey_tmux_after_persist(&id, &current_title, &effective_title);
-                drop((_identity_lock, _mutation_guards));
                 if let Some(warning) = tmux_warning {
                     self.info_dialog = Some(InfoDialog::new("Rename Saved with Warning", &warning));
                 }
@@ -1728,9 +1853,11 @@ impl HomeView {
                     }
                 }
             })?;
-            drop(_identity_lock);
-            let tmux_warning = rekey_tmux_after_persist(&id, &current_title, &effective_title);
+            let tmux_warning =
+                rekey_tmux_after_persist(&id, &current_title, &effective_title, rekey_target);
             drop(_mutation_guards);
+            drop(_identity_lock);
+            drop(_workspace_lock);
 
             // Rebuild group trees and create group if needed
             self.rebuild_group_trees();
@@ -1887,9 +2014,15 @@ impl HomeView {
         let Some(id) = self.selected_session.clone() else {
             return Ok(());
         };
+        self.toggle_archive_by_id(&id)
+    }
+
+    pub(super) fn toggle_archive_by_id(&mut self, id: &str) -> anyhow::Result<()> {
+        let id = id.to_string();
+        let settled = self.settled_edit.take();
         // A trashed row cannot be meaningfully archived, so `z` on it restores the
         // session from the trash instead. See #2489.
-        if matches!(self.instances.get(&id), Some(i) if i.is_trashed()) {
+        if settled.is_none() && matches!(self.instances.get(&id), Some(i) if i.is_trashed()) {
             self.restore_selected_from_trash();
             return Ok(());
         }
@@ -1897,7 +2030,7 @@ impl HomeView {
             Some(i) => i.is_archived(),
             None => return Ok(()),
         };
-        if is_archived {
+        if settled.is_none() && is_archived {
             self.apply_user_action(&id, |inst| inst.unarchive())?;
             self.rebuild_flat_items();
             // Re-seat the cursor on the unarchived row: the rebuild moves it from tier
@@ -1906,19 +2039,38 @@ impl HomeView {
             return Ok(());
         }
 
-        // Tear down all tmux before flipping archived (#1868), holding the lifecycle lock
-        // through the archive so `aoe send` cannot relaunch or type into the session between.
-        let lifecycle_lock = match self.instances.get(&id) {
-            Some(inst) => {
-                // Strict: taking a lock for a row that exists must not create the
-                // profile it names, or a deleted profile comes back empty.
-                let storage = Storage::open(&inst.effective_profile(), self.file_watch.clone())?;
-                let lock = storage.acquire_instance_lifecycle_lock(&id)?;
-                inst.stop_all_tmux_sessions_locked(&storage);
-                Some(lock)
-            }
-            None => None,
+        let instance = self
+            .instances
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("Session not found"))?;
+        let Some(proof) = settled else {
+            return self.queue_runner_settlement(
+                &instance,
+                crate::tui::stop_poller::SettlementAction::Archive { reveal: false },
+            );
         };
+        let _workspace_lock = crate::session::acquire_session_workspace_claim_lock()?;
+        let _identity_lock = acquire_session_identity_lock()?;
+        let storage = proof.storage.clone();
+        storage.verify_profile_identity()?;
+        let lifecycle_lock = storage.acquire_instance_lifecycle_lock(&id)?;
+        let mut authoritative = storage
+            .load()?
+            .into_iter()
+            .find(|row| row.id == id)
+            .ok_or_else(|| anyhow::anyhow!("Session not found"))?;
+        proof.validate(&authoritative)?;
+        crate::session::runner_journal::release_settled_stop_under_locks(&proof.stop)?;
+        if let Some(active) = self.settled_edit.as_mut() {
+            active.consumed = true;
+        }
+        authoritative.release_lifecycle_reservation_if_owned(
+            crate::session::LifecycleOperation::Stop,
+            proof.stop.generation(),
+        );
+        authoritative.stop_all_tmux_sessions_locked(&storage);
+        self.instances.insert(id.clone(), authoritative);
 
         // Decide where the cursor lands before the row sinks, against the pre-archive
         // list. Only the non-Attention branch uses it; Attention re-picks from the top.
@@ -1987,6 +2139,7 @@ impl HomeView {
             );
             return;
         };
+        let request_storage = storage.clone();
         let acquisition = (|| -> anyhow::Result<_> {
             let _workspace_lock = crate::session::acquire_session_workspace_claim_lock()?;
             let _identity_lock = acquire_session_identity_lock()?;
@@ -2053,6 +2206,7 @@ impl HomeView {
         }
         self.trash_poller
             .request_trash(crate::session::trash::TrashRequest {
+                storage: request_storage,
                 session_id: id.to_string(),
                 instance: request_instance,
                 generation,
@@ -2196,7 +2350,7 @@ impl HomeView {
             let id = inst.id.clone();
             // A restart cascade still on the worker would race the teardown against the
             // container it is creating; skip the row, as `delete_selected` does.
-            if self.restart_in_flight.contains(&id) {
+            if self.restart_in_flight.contains_key(&id) {
                 continue;
             }
 
@@ -2285,47 +2439,21 @@ impl HomeView {
         }
     }
 
-    /// Archive every active session under the selected group: persist runs inline, then tmux
-    /// teardown runs off-thread. Confirmation upstream. See #1868.
+    /// Queue each original group member for reversible, proven-quiescent archive.
     pub(super) fn archive_selected_group(&mut self) -> anyhow::Result<()> {
-        let ids = self.active_sessions_in_selected_group();
-        if ids.is_empty() {
-            return Ok(());
+        let mut ids = self.active_sessions_in_selected_group();
+        ids.sort();
+        for id in ids {
+            let instance = self
+                .instances
+                .get(&id)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("Session not found"))?;
+            self.queue_runner_settlement(
+                &instance,
+                crate::tui::stop_poller::SettlementAction::Archive { reveal: true },
+            )?;
         }
-        let kill_targets: Vec<_> = ids
-            .iter()
-            .filter_map(|id| self.instances.get(id).cloned())
-            .collect();
-        // Persist under every member's lifecycle lock so `aoe send` cannot relaunch or type
-        // into one mid-archive, and tear down only after: a send that won the lock finishes
-        // first and its pane is then killed. Locks go in sorted id order, like every other
-        // multi-lock holder (startup reservation cleanup), so two holders cannot close a cycle.
-        let mut lock_order: Vec<_> = kill_targets.iter().collect();
-        lock_order.sort_by(|a, b| a.id.cmp(&b.id));
-        let mut lifecycle_locks = Vec::with_capacity(lock_order.len());
-        for inst in lock_order {
-            // Strict, for the same reason as the single-row archive above.
-            let storage = Storage::open(&inst.effective_profile(), self.file_watch.clone())?;
-            lifecycle_locks.push(storage.acquire_instance_lifecycle_lock(&inst.id)?);
-        }
-        self.bulk_apply_user_action(&ids, |inst| inst.archive())?;
-        drop(lifecycle_locks);
-        // Off-thread tmux teardown so N x 4 shellouts don't block the input
-        // thread. Mirrors `force_remove_session`.
-        std::thread::spawn(move || {
-            for inst in kill_targets {
-                if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    inst.kill_all_tmux_sessions()
-                })) {
-                    tracing::error!(
-                        target: "session.tmux_cleanup",
-                        session_id = %inst.id,
-                        "archive_selected_group tmux teardown panicked: {:?}",
-                        panic
-                    );
-                }
-            }
-        });
         self.reveal_archived_section();
         self.rebuild_flat_items();
         // The project header vanishes once its last active member is archived, so the

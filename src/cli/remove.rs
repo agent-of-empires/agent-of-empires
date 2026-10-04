@@ -120,14 +120,13 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
             })?
         };
         // The durable claim excludes launches while every flock is released for the stop wait.
-        let settled = crate::session::runner_journal::settle(
-            crate::session::deletion::SessionPathOwner {
-                profile: storage.profile(),
-                session_id: &removed_id,
-            },
-            Some((LifecycleOperation::Trash, trash_generation)),
-        )
-        .await;
+        let native = crate::session::runner_journal::OwnedStop::from_claim(
+            &storage,
+            &plan,
+            LifecycleOperation::Trash,
+            trash_generation,
+        )?;
+        let settled = crate::session::runner_journal::settle(native).await;
         let _workspace_claim_lock = crate::session::acquire_session_workspace_claim_lock()?;
         let _identity_lock = acquire_session_identity_lock()?;
         let _lifecycle_lock = storage.acquire_instance_lifecycle_lock(&removed_id)?;

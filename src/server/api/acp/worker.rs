@@ -75,26 +75,6 @@ async fn rate_limit_resume_probe(state: &AppState, id: &str) -> Option<DateTime<
     })
 }
 
-/// The memory check runs before the handler's awaits, during which a peer such as
-/// `aoe session archive` or `aoe rm --purge` can shelve or remove the stored row, so
-/// recheck it right before spawning.
-async fn refuse_if_stored_row_shelved(
-    state: &AppState,
-    instance: &crate::session::Instance,
-) -> Option<Response> {
-    match crate::server::api::load_persisted_instance(state, &instance.source_profile, &instance.id)
-        .await
-    {
-        // A purge removes the row while the cache may still hold it.
-        Ok(None) => Some(session_not_found()),
-        Ok(Some(stored)) => stored
-            .ensure_startable()
-            .err()
-            .map(crate::server::api::start_blocked_response),
-        Err(resp) => Some(resp),
-    }
-}
-
 pub async fn spawn_acp(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -131,11 +111,38 @@ pub async fn spawn_acp(
         return crate::server::api::start_blocked_response(blocked);
     }
 
+    let origin = match state.capture_operation_origin(&instance) {
+        Ok(origin) => origin,
+        Err(error) => {
+            return (
+                StatusCode::CONFLICT,
+                format!("original launch authority is no longer valid: {error}"),
+            )
+                .into_response()
+        }
+    };
+    let reservation = match state
+        .acp_supervisor
+        .begin_resume(
+            &id,
+            crate::acp::runner_lifecycle::NativeResume::Spawn,
+            origin.clone(),
+            true,
+        )
+        .await
+    {
+        Ok(crate::acp::supervisor::ResumeReservationOutcome::Reserved(reservation)) => reservation,
+        Ok(crate::acp::supervisor::ResumeReservationOutcome::AlreadyPresent) => {
+            return supervisor_error_response("spawn failed", &SupervisorError::AlreadyRunning(id))
+        }
+        Err(error) => return supervisor_error_response("spawn failed", &error),
+    };
+    let _body_custody = reservation.execution_admission().begin_job();
     let explicit = req.agent.clone().or_else(|| instance.agent_name.clone());
     let agent = pick_agent(&state, &instance, explicit.as_deref()).await;
     let sandbox_info = match crate::acp::sandbox::ensure_container_for_session_locked(
         &state.instances,
-        &id,
+        reservation.execution_admission(),
         false,
     )
     .await
@@ -151,9 +158,6 @@ pub async fn spawn_acp(
     };
     let rate_limit_resume_resets_at = rate_limit_resume_probe(&state, &id).await;
 
-    // An explicit resume overrides a stop kept from a resume that failed
-    // before it installed; only the reconciler's fallback must honor it.
-    state.acp_supervisor.forget_stale_cancel(&id);
     let request = SpawnRequest {
         additional_dirs: req.additional_dirs,
         provider_env: req
@@ -162,12 +166,9 @@ pub async fn spawn_acp(
             .map(|p| (p.key, p.value))
             .collect(),
         model: req.model.or_else(|| instance.agent_model.clone()),
-        ..spawn_request_for(&instance, agent.clone(), sandbox_info)
+        ..spawn_request_for(&instance, agent.clone(), sandbox_info, origin)
     };
-    if let Some(resp) = refuse_if_stored_row_shelved(&state, &instance).await {
-        return resp;
-    }
-    match state.acp_supervisor.spawn(request).await {
+    match state.acp_supervisor.spawn_inner(request, reservation).await {
         Ok(()) => {}
         Err(SupervisorError::AlreadyRunning(_)) if rate_limit_resume_resets_at.is_some() => {}
         Err(e) => return supervisor_error_response("spawn failed", &e),
@@ -207,8 +208,22 @@ pub async fn shutdown_acp(
     else {
         return session_not_found();
     };
-    match state.acp_supervisor.shutdown(&id).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+    let Some(instance) = crate::server::api::find_instance(&state, &id).await else {
+        return session_not_found();
+    };
+    let original = match state.capture_operation_origin(&instance) {
+        Ok(original) => original,
+        Err(error) => return (StatusCode::CONFLICT, error.to_string()).into_response(),
+    };
+    let stop = match crate::session::runner_journal::reserve_stop_from_origin(original, false) {
+        Ok(stop) => stop,
+        Err(error) => return (StatusCode::CONFLICT, error.to_string()).into_response(),
+    };
+    match state.acp_supervisor.shutdown(stop.clone()).await {
+        Ok(()) => match crate::session::runner_journal::release_owned_stop(&stop) {
+            Ok(()) => StatusCode::NO_CONTENT.into_response(),
+            Err(error) => (StatusCode::CONFLICT, error.to_string()).into_response(),
+        },
         Err(e) => supervisor_error_response("shutdown failed", &e),
     }
 }
@@ -303,45 +318,69 @@ async fn check_switch_target(
 /// resolve, which is the rule `Instance::swap_tool` already applies.
 async fn persist_agent_switch(
     state: &AppState,
-    profile: &str,
-    id: &str,
+    issuance: crate::acp::runner_lifecycle::ExecutionAdmission,
+    cached_original: Arc<crate::session::LaunchOrigin>,
     target: &str,
     model: Option<&str>,
-) {
-    let switch = |inst: &mut crate::session::Instance| {
-        inst.agent_name = Some(target.to_string());
-        inst.acp_session_id = None;
-        inst.import_pending = None;
-        inst.acp_effort = None;
-        inst.agent_model = model.map(str::to_string);
-    };
+) -> Result<(), Response> {
+    let original = issuance.origin().ok_or_else(|| {
+        (
+            StatusCode::CONFLICT,
+            "backend switch lost its issued original",
+        )
+            .into_response()
+    })?;
+    let mut instances = state.instances.write().await;
+    let slot = instances
+        .iter_mut()
+        .find(|row| row.id == original.session_id())
+        .ok_or_else(session_not_found)?;
+    let cached = crate::session::LaunchOrigin::capture(slot)
+        .map_err(|error| (StatusCode::CONFLICT, error.to_string()).into_response())?;
+    if !cached_original.recognizes_published_snapshot(&cached)
+        && !original.recognizes_published_snapshot(&cached)
     {
-        let mut instances = state.instances.write().await;
-        if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
-            switch(inst);
-        }
+        return Err((
+            StatusCode::CONFLICT,
+            "backend switch cache original was superseded",
+        )
+            .into_response());
     }
-    match crate::session::Storage::open(profile, state.file_watch.clone()) {
-        Ok(storage) => {
-            if let Err(e) = storage.update(|instances, _groups| {
-                if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
-                    switch(inst);
-                }
-                Ok(())
-            }) {
-                tracing::error!(
-                    target: "http.api.acp",
-                    session = %id,
-                    "failed to persist agent_name after switch: {e}"
-                );
-            }
-        }
-        Err(e) => tracing::error!(
-            target: "http.api.acp",
-            session = %id,
-            "failed to open storage to persist agent_name after switch: {e}"
-        ),
-    }
+    let target = target.to_owned();
+    let model = model.map(str::to_owned);
+    let custody = issuance.begin_job();
+    let emitted = tokio::task::spawn_blocking(move || {
+        let _custody = custody;
+        original.update_storage(|_, row| {
+            issuance.commit_effect(|| {
+                row.agent_name = Some(target);
+                row.acp_session_id = None;
+                row.import_pending = None;
+                row.acp_effort = None;
+                row.agent_model = model;
+                Ok(row.clone())
+            })
+        })
+    })
+    .await
+    .map_err(|error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("original backend metadata job failed: {error}"),
+        )
+            .into_response()
+    })?
+    .map_err(|error| {
+        (
+            StatusCode::CONFLICT,
+            format!("original backend metadata was superseded: {error}"),
+        )
+            .into_response()
+    })?;
+    let mut emitted = emitted;
+    emitted.storage_origin = slot.storage_origin.clone();
+    *slot = crate::server::reload::merge_runtime_fields(slot, emitted);
+    Ok(())
 }
 
 /// Move a structured session to another ACP backend, keeping the transcript.
@@ -376,15 +415,30 @@ pub async fn switch_acp_agent(
     if let Err(blocked) = instance.ensure_startable() {
         return crate::server::api::start_blocked_response(blocked);
     }
+    let origin = match state.capture_operation_origin(&instance) {
+        Ok(origin) => origin,
+        Err(error) => {
+            return (
+                StatusCode::CONFLICT,
+                format!("original switch authority is no longer valid: {error}"),
+            )
+                .into_response()
+        }
+    };
+    let cached_original = origin.clone();
     let from_agent = match check_switch_target(&state, &instance, &target).await {
         Ok(agent) => agent,
         Err(resp) => return resp,
     };
     let before_seq = state.acp_event_store.highest_seq(&id);
+    let stop = match crate::session::runner_journal::reserve_stop_from_origin(origin, false) {
+        Ok(stop) => stop,
+        Err(error) => return (StatusCode::CONFLICT, error.to_string()).into_response(),
+    };
 
     if let Err(e) = state
         .acp_supervisor
-        .shutdown_and_wait(&id, std::time::Duration::from_secs(5))
+        .shutdown_and_wait(stop.clone(), std::time::Duration::from_secs(5))
         .await
     {
         return (
@@ -393,18 +447,66 @@ pub async fn switch_acp_agent(
         )
             .into_response();
     }
-    {
-        let mut instances = state.instances.write().await;
-        if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
-            inst.acp_load_session_capable = None;
-        }
+    let mut rows = state.instances.clone().write_owned().await;
+    let publication_stop = stop.clone();
+    let publication_baseline = cached_original.clone();
+    if let Err(error) = tokio::task::spawn_blocking(move || {
+        publication_stop.with_scope(|stored| {
+            let slot = rows
+                .iter_mut()
+                .find(|row| row.id == publication_stop.session_id())
+                .ok_or_else(|| anyhow::anyhow!("backend switch original view row disappeared"))?;
+            let cached = crate::session::LaunchOrigin::capture(slot)?;
+            anyhow::ensure!(
+                publication_baseline.recognizes_published_snapshot(&cached)
+                    || publication_stop
+                        .current_projection()
+                        .recognizes_published_snapshot(&cached),
+                "backend switch original view row was superseded before its Stop ACK"
+            );
+            *slot = crate::server::reload::merge_runtime_fields(slot, stored.clone());
+            slot.acp_load_session_capable = None;
+            Ok(())
+        })
+    })
+    .await
+    .unwrap_or_else(|error| {
+        Err(anyhow::anyhow!(
+            "original backend Stop publication failed: {error}"
+        ))
+    }) {
+        return (StatusCode::CONFLICT, error.to_string()).into_response();
     }
+    let origin = stop.cancellation_origin();
+    if let Err(error) = crate::session::runner_journal::release_owned_stop(&stop) {
+        return (StatusCode::CONFLICT, error.to_string()).into_response();
+    }
+    let reservation = match state
+        .acp_supervisor
+        .begin_resume(
+            &id,
+            crate::acp::runner_lifecycle::NativeResume::Spawn,
+            origin,
+            true,
+        )
+        .await
+    {
+        Ok(crate::acp::supervisor::ResumeReservationOutcome::Reserved(reservation)) => reservation,
+        Ok(crate::acp::supervisor::ResumeReservationOutcome::AlreadyPresent) => {
+            return (StatusCode::CONFLICT, "backend switch was superseded").into_response()
+        }
+        Err(error) => {
+            return supervisor_error_response("backend switch preparation failed", &error)
+        }
+    };
+    let issuance = reservation.execution_admission();
+    let _body_custody = issuance.begin_job();
 
     let inst_lock = state.instance_lock(&id).await;
     let sandbox_info = match crate::acp::sandbox::ensure_container_for_session(
         &state.instances,
         &inst_lock,
-        &id,
+        issuance.clone(),
         false,
     )
     .await
@@ -420,7 +522,6 @@ pub async fn switch_acp_agent(
     };
 
     let model = req.model.clone();
-    state.acp_supervisor.forget_stale_cancel(&id);
     // A new backend starts a fresh session. Effort vocabularies are
     // adapter-specific, so the old pick is dropped too.
     let request = SpawnRequest {
@@ -432,26 +533,27 @@ pub async fn switch_acp_agent(
         seed_history_replay: false,
         sandbox_continuation: crate::acp::supervisor::SandboxContinuation::Fresh,
         claude_store_pin: None,
-        ..spawn_request_for(&instance, target.clone(), sandbox_info)
+        ..spawn_request_for(
+            &instance,
+            target.clone(),
+            sandbox_info,
+            issuance
+                .origin()
+                .expect("prepared backend switch owns its source"),
+        )
     };
-    if let Some(resp) = refuse_if_stored_row_shelved(&state, &instance).await {
-        return resp;
-    }
-    if let Err(e) = state.acp_supervisor.spawn(request).await {
+    if let Err(e) = state.acp_supervisor.spawn_inner(request, reservation).await {
         return supervisor_error_response("spawn failed", &e);
     }
     state
         .telemetry_structured
         .agent_switches
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    persist_agent_switch(
-        &state,
-        &instance.source_profile,
-        &id,
-        &target,
-        model.as_deref(),
-    )
-    .await;
+    if let Err(response) =
+        persist_agent_switch(&state, issuance, cached_original, &target, model.as_deref()).await
+    {
+        return response;
+    }
 
     let reason = req
         .reason
@@ -504,7 +606,12 @@ mod tests {
             );
             let state = crate::server::test_support::build_test_app_state(vec![inst]);
 
-            persist_agent_switch(&state, profile, &id, "codex", requested).await;
+            let original = crate::session::runner_journal::capture_unique_origin(&id).unwrap();
+            let issuance = crate::acp::runner_lifecycle::ExecutionAdmission::new();
+            issuance.set_origin(original.clone()).unwrap();
+            persist_agent_switch(&state, issuance, original, "codex", requested)
+                .await
+                .unwrap();
 
             let on_disk = crate::server::test_support::load_instances_from_disk_for_test(profile);
             let stored = on_disk.iter().find(|i| i.id == id).expect("seeded row");

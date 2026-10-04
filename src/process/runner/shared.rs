@@ -8,6 +8,7 @@ use super::jsonrpc::{
 use crate::acp::control_protocol::{self, ControlBody, PromptCompletedMarker, SessionReplayed};
 use crate::process::worker_registry;
 use agent_client_protocol::JsonRpcMessage;
+use anyhow::Context;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -16,8 +17,73 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
+#[derive(Default)]
+pub(super) struct PromptAdmission {
+    requests: HashSet<i64>,
+    stopping: bool,
+}
+
+struct PromptReservation {
+    admission: Arc<std::sync::Mutex<PromptAdmission>>,
+    id: i64,
+    committed: bool,
+}
+
+impl Drop for PromptReservation {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.admission
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .requests
+                .remove(&self.id);
+        }
+    }
+}
+pub(super) struct RegistryOwner {
+    pub(super) storage: crate::session::Storage,
+    pub(super) record: std::sync::Mutex<worker_registry::WorkerRecord>,
+}
+
+impl RegistryOwner {
+    pub(super) async fn update(
+        self: &Arc<Self>,
+        effect: impl FnOnce(&mut worker_registry::WorkerRecord) -> anyhow::Result<()> + Send + 'static,
+    ) -> anyhow::Result<()> {
+        let owner = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut record = owner
+                .record
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            crate::session::runner_journal::update_owned_registry_record(
+                &owner.storage,
+                &mut record,
+                effect,
+            )
+            .with_context(|| format!("updating owned native record {}", record.session_id))
+        })
+        .await
+        .context("owned native metadata job")?
+    }
+
+    pub(super) async fn retire(self: &Arc<Self>) -> anyhow::Result<bool> {
+        let owner = self.clone();
+        tokio::task::spawn_blocking(move || {
+            owner.storage.verify_profile_identity()?;
+            let record = owner
+                .record
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            anyhow::Ok(worker_registry::delete_if_owned_by(&record))
+        })
+        .await
+        .context("owned native metadata retirement job")?
+    }
+}
+
 pub(super) struct RunnerShared {
-    pub(super) prompt_requests: Mutex<HashSet<i64>>,
+    pub(super) prompt_admission: Arc<std::sync::Mutex<PromptAdmission>>,
     pub(super) control: Mutex<ControlChannel>,
     pub(super) control_wake: tokio::sync::Notify,
     pub(super) control_space: tokio::sync::Notify,
@@ -35,7 +101,7 @@ pub(super) struct RunnerShared {
     /// Sent resets remain authoritative until their response is committed.
     pub(super) pending_resets: AtomicUsize,
     pub(super) reset_finished: tokio::sync::Notify,
-    pub(super) registry_owner: Option<(String, u32, u64, uuid::Uuid)>,
+    pub(super) registry_owner: Option<Arc<RegistryOwner>>,
     /// A durability failure makes further runner state unsafe to expose.
     pub(super) fatal: AtomicBool,
     pub(super) fatal_wake: tokio::sync::Notify,
@@ -194,9 +260,9 @@ pub(super) async fn write_control_frame(
 pub(super) const MAX_OUTSTANDING_REQUESTS: usize = 1024;
 
 impl RunnerShared {
-    pub(super) fn new(registry_owner: Option<(String, u32, u64, uuid::Uuid)>) -> Self {
+    pub(super) fn new(registry_owner: Option<Arc<RegistryOwner>>) -> Self {
         Self {
-            prompt_requests: Mutex::new(HashSet::new()),
+            prompt_admission: Arc::new(std::sync::Mutex::new(PromptAdmission::default())),
             control: Mutex::new(ControlChannel::default()),
             control_wake: tokio::sync::Notify::new(),
             control_space: tokio::sync::Notify::new(),
@@ -216,23 +282,22 @@ impl RunnerShared {
         }
     }
 
-    pub(super) fn persist_acp_session_id(
+    pub(super) async fn persist_acp_session_id(
         &self,
         acp_session_id: &str,
     ) -> std::result::Result<(), control_protocol::JsonRpcError> {
-        let Some((session_id, owner_pid, generation, nonce)) = self.registry_owner.as_ref() else {
+        let Some(owner) = self.registry_owner.as_ref() else {
             return Ok(());
         };
-        if let Err(error) = worker_registry::update_stored_acp_session_id(
-            session_id,
-            *owner_pid,
-            *generation,
-            *nonce,
-            acp_session_id,
-        ) {
+        let acp_session_id = acp_session_id.to_owned();
+        if let Err(error) = owner
+            .update(move |record| {
+                worker_registry::update_stored_acp_session_id(record, &acp_session_id)
+            })
+            .await
+        {
             warn!(
                 target: "acp.runner",
-                session = %session_id,
                 %error,
                 "failed to persist ACP session identity; terminating runner"
             );
@@ -275,20 +340,24 @@ impl RunnerShared {
             }
         }
 
-        if !self.prompt_requests.lock().await.is_empty() {
-            if let Some((id, outcome)) = parse_response(line) {
-                if self.prompt_requests.lock().await.remove(&id) {
-                    self.enqueue(
-                        DeliveryScope::Persistent,
-                        QueuedKind::PromptCompleted,
-                        ControlBody::PromptCompleted {
-                            prompt_req_id: id,
-                            outcome,
-                        },
-                    )
-                    .await;
-                    return;
-                }
+        if let Some((id, outcome)) = parse_response(line) {
+            let removed = self
+                .prompt_admission
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .requests
+                .remove(&id);
+            if removed {
+                self.enqueue(
+                    DeliveryScope::Persistent,
+                    QueuedKind::PromptCompleted,
+                    ControlBody::PromptCompleted {
+                        prompt_req_id: id,
+                        outcome,
+                    },
+                )
+                .await;
+                return;
             }
         }
 
@@ -817,6 +886,63 @@ impl RunnerShared {
         Some(response)
     }
 
+    pub(super) async fn admit_stop(&self, idle_only: bool) -> bool {
+        if idle_only
+            && (self.handshake.lock().await.session.is_none()
+                || self.pending_resets.load(Ordering::Acquire) != 0)
+        {
+            return false;
+        }
+        let mut admission = self
+            .prompt_admission
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if idle_only
+            && (!admission.requests.is_empty() || self.pending_resets.load(Ordering::Acquire) != 0)
+        {
+            return false;
+        }
+        admission.stopping = true;
+        true
+    }
+
+    async fn reserve_prompt(&self, id: i64) -> anyhow::Result<PromptReservation> {
+        let admission = self.prompt_admission.clone();
+        let register = move || {
+            let mut state = admission.lock().unwrap_or_else(|e| e.into_inner());
+            anyhow::ensure!(!state.stopping, "runner is stopping for a checkout move");
+            state.requests.insert(id);
+            drop(state);
+            Ok(PromptReservation {
+                admission,
+                id,
+                committed: false,
+            })
+        };
+        if let Some(owner) = self.registry_owner.clone() {
+            tokio::task::spawn_blocking(move || {
+                let record = owner
+                    .record
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                let nonce = record
+                    .launch_nonce
+                    .context("runner prompt has no original nonce")?;
+                crate::session::runner_journal::admit_runner_prompt(
+                    &owner.storage,
+                    &record.session_id,
+                    record.pid,
+                    record.generation,
+                    nonce,
+                    register,
+                )
+            })
+            .await?
+        } else {
+            register()
+        }
+    }
+
     pub(super) async fn agent_prompt(
         &self,
         agent_stdin: &Mutex<tokio::process::ChildStdin>,
@@ -824,6 +950,7 @@ impl RunnerShared {
         params: serde_json::Value,
     ) -> Option<i64> {
         let id = self.next_req_id.fetch_add(1, Ordering::Relaxed);
+        let reservation = self.reserve_prompt(id).await;
         if !self
             .enqueue(
                 DeliveryScope::Attachment(attachment_id),
@@ -835,14 +962,32 @@ impl RunnerShared {
             return None;
         }
         self.clear_prompt_completion().await;
-        self.prompt_requests.lock().await.insert(id);
+        let mut reservation = match reservation {
+            Ok(reservation) => reservation,
+            Err(error) => {
+                self.enqueue(
+                    DeliveryScope::Persistent,
+                    QueuedKind::PromptCompleted,
+                    ControlBody::PromptCompleted {
+                        prompt_req_id: id,
+                        outcome: control_protocol::PromptOutcome::Error {
+                            code: control_protocol::INTERNAL_ERROR as i32,
+                            message: error.to_string(),
+                            data: None,
+                        },
+                    },
+                )
+                .await;
+                return Some(id);
+            }
+        };
         if !self
             .write_agent_line(agent_stdin, &rpc_request(id, PROMPT_METHOD, params))
             .await
         {
-            self.prompt_requests.lock().await.remove(&id);
             return None;
         }
+        reservation.committed = true;
         Some(id)
     }
 
@@ -896,6 +1041,7 @@ impl RunnerShared {
         let result = handshake_result(&response)?;
         let acp_session_id = established_session_id(method, &request, &result)?;
         self.persist_acp_session_id(&acp_session_id)
+            .await
             .map_err(|error| serde_json::to_value(error).expect("JSON-RPC error serializes"))?;
         let cached = (acp_session_id, result);
         self.handshake.lock().await.session = Some(cached.clone());
@@ -950,7 +1096,33 @@ impl RunnerShared {
     ) {
         let req_id = self.next_req_id.fetch_add(1, Ordering::Relaxed);
         if method == "session/new" {
-            self.pending_resets.fetch_add(1, Ordering::AcqRel);
+            let allowed = {
+                let admission = self
+                    .prompt_admission
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                if admission.stopping {
+                    false
+                } else {
+                    self.pending_resets.fetch_add(1, Ordering::AcqRel);
+                    true
+                }
+            };
+            if !allowed {
+                self.enqueue(
+                    DeliveryScope::Attachment(attachment_id),
+                    QueuedKind::AgentReply,
+                    ControlBody::AgentError {
+                        call_id,
+                        error: control_protocol::JsonRpcError::new(
+                            control_protocol::INTERNAL_ERROR,
+                            "runner is stopping for a checkout move",
+                        ),
+                    },
+                )
+                .await;
+                return;
+            }
             self.control_space.notify_waiters();
         }
         self.pending_agent_calls.lock().await.insert(
@@ -1008,7 +1180,7 @@ impl RunnerShared {
         {
             return Ok(());
         }
-        self.persist_acp_session_id(sid)?;
+        self.persist_acp_session_id(sid).await?;
         info!(
             target: "acp.runner",
             new_acp_session_id = %sid,
@@ -1249,7 +1421,12 @@ mod tests {
             .agent_prompt(&stdin, attachment_id, serde_json::json!({"sessionId": "s"}))
             .await
             .expect("prompt written");
-        assert!(shared.prompt_requests.lock().await.contains(&id));
+        assert!(shared
+            .prompt_admission
+            .lock()
+            .unwrap()
+            .requests
+            .contains(&id));
 
         shared
             .deliver_line(
@@ -1284,7 +1461,7 @@ mod tests {
         );
         shared.deliver_line(resp.as_bytes(), &stdin).await;
 
-        assert!(shared.prompt_requests.lock().await.is_empty());
+        assert!(shared.prompt_admission.lock().unwrap().requests.is_empty());
         let usage = ControlBody::Notify {
             method: "session/update".into(),
             params: usage_update,

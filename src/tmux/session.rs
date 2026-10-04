@@ -568,13 +568,13 @@ impl Session {
     }
 
     pub fn rename(&self, new_name: &str) -> Result<()> {
-        if !self.exists() {
-            return Ok(());
-        }
-
-        let mut command = crate::tmux::tmux_command();
-        command.args(["rename-session", "-t", &self.name, new_name]);
-        let output = crate::tmux::run_tmux_command_with_timeout(&mut command)?;
+        let deadline = crate::tmux::TmuxCommandDeadline::new();
+        let primary = self.primary_with_deadline(&deadline)?;
+        let mut command = self.command_with_deadline(
+            ["rename-session", "-t", &primary.session_id, new_name],
+            &deadline,
+        )?;
+        let output = deadline.run(&mut command)?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);

@@ -22,7 +22,10 @@ impl HomeView {
                 self.pending_added.remove(&profile_name);
                 continue;
             }
-            let storage = Storage::open(&profile_name, self.file_watch.clone())?;
+            let storage = self
+                .storages
+                .get(&profile_name)
+                .ok_or_else(|| anyhow::anyhow!("Profile storage no longer exists"))?;
             let tui_rows: Vec<Instance> = self.cloned_instances_for_profile(&profile_name);
             let dels: HashSet<String> = self
                 .pending_deletions
@@ -278,16 +281,11 @@ impl HomeView {
         let source_profile = snapshot.source_profile.clone();
         let session_title = crate::session::acquire_session_title_lock(id)
             .map_err(|error| anyhow::anyhow!("failed to acquire session title lock: {error}"))?;
-        if !self.storages.contains_key(&source_profile) {
-            self.storages.insert(
-                source_profile.clone(),
-                Storage::open(&source_profile, self.file_watch.clone())?,
-            );
-        }
         let storage = self
             .storages
             .get(&source_profile)
-            .expect("source storage was registered above");
+            .ok_or_else(|| anyhow::anyhow!("original session storage is no longer registered"))?;
+        storage.verify_profile_identity()?;
         let lifecycle = storage
             .acquire_instance_lifecycle_lock(id)
             .map_err(|error| {

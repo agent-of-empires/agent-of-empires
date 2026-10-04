@@ -2,6 +2,7 @@
 //! Writes and owned deletes serialize on a per-session lock so a superseded runner cannot
 //! unlink its replacement's record.
 
+use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -18,7 +19,7 @@ pub use crate::process::worker::{is_pid_alive, validate_id as validate_session_i
 /// be authenticated and proven quiescent before its replacement starts.
 pub const RUNNER_VERSION: u32 = 4;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerRecord {
     pub runner_version: u32,
     /// Build identity of the runner that wrote the record; independent of `runner_version`.
@@ -45,10 +46,38 @@ pub struct WorkerRecord {
     /// Parent-issued execution ticket; legacy records carry no stop authority.
     #[serde(default)]
     pub launch_nonce: Option<uuid::Uuid>,
+    /// Actual runner birth proof; missing legacy evidence never grants a fresh capability.
+    #[serde(default)]
+    pub boot: Option<[u8; 16]>,
+    #[serde(default)]
+    pub incarnation: Option<crate::process::ProcessIncarnation>,
+    #[serde(default)]
+    pub profile_identity: Option<crate::session::DirectoryIdentity>,
+    /// Control socket born with this published execution; legacy absence stays unknown.
+    #[serde(default)]
+    pub control_file_identity: Option<crate::session::runner_journal::StopEndpointIdentity>,
     pub started_at: u64,
     pub last_attached_at: Option<u64>,
     pub detached_at: Option<u64>,
+    /// Exact registry file read at discovery; never serialized or captured at retirement.
+    #[serde(skip)]
+    pub(crate) record_file_identity: Option<crate::session::DirectoryIdentity>,
+    #[serde(skip)]
+    record_file_pin: Option<std::sync::Arc<CapturedRecordFile>>,
 }
+
+#[derive(Debug)]
+struct CapturedRecordFile {
+    identity: crate::session::DirectoryIdentity,
+    _file: std::fs::File,
+}
+
+impl PartialEq for CapturedRecordFile {
+    fn eq(&self, other: &Self) -> bool {
+        self.identity == other.identity
+    }
+}
+impl Eq for CapturedRecordFile {}
 
 impl WorkerRecord {
     #[allow(clippy::too_many_arguments)]
@@ -81,9 +110,15 @@ impl WorkerRecord {
             source_profile,
             generation: 0,
             launch_nonce: None,
+            boot: None,
+            incarnation: None,
+            profile_identity: None,
+            control_file_identity: None,
             started_at: now_secs(),
             last_attached_at: None,
             detached_at: None,
+            record_file_identity: None,
+            record_file_pin: None,
         }
     }
 
@@ -167,46 +202,124 @@ pub fn save(record: &WorkerRecord) -> Result<()> {
     with_registry_lock(&record.session_id, || save_unlocked(record))
 }
 
+#[cfg(unix)]
+pub(crate) fn capture_endpoint(
+    path: &Path,
+) -> Result<(
+    crate::session::DirectoryIdentity,
+    std::sync::Arc<std::fs::File>,
+)> {
+    use std::os::unix::fs::FileTypeExt;
+    let pin = crate::process::pin_filesystem_node(path)
+        .context("pinning the actual bound endpoint inode")?;
+    let opened = pin.metadata()?;
+    let current = std::fs::symlink_metadata(path)?;
+    anyhow::ensure!(
+        opened.file_type().is_socket()
+            && current.file_type().is_socket()
+            && crate::session::same_filesystem_identity(&opened, &current),
+        "bound endpoint was replaced before acquiring its inode pin"
+    );
+    Ok((
+        crate::session::DirectoryIdentity::from_metadata(&opened),
+        std::sync::Arc::new(pin),
+    ))
+}
+
 /// Publishes the listener and record under the same fence as owned cleanup.
 #[cfg(unix)]
 pub(crate) fn publish_control_listener(
-    record: &WorkerRecord,
+    record: &mut WorkerRecord,
     socket: &Path,
-) -> Result<tokio::net::UnixListener> {
-    with_registry_lock(&record.session_id, || {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::remove_file(socket);
-        let listener = tokio::net::UnixListener::bind(socket)
-            .with_context(|| format!("binding {}", socket.display()))?;
-        let publish = std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600))
+) -> Result<(tokio::net::UnixListener, std::sync::Arc<std::fs::File>)> {
+    let lock = acquire_registry_lock(&record.session_id)?;
+    let publish = (|| {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+        anyhow::ensure!(
+            record.launch_nonce.is_some()
+                && record.boot.is_some()
+                && record.incarnation.is_some()
+                && record
+                    .profile_identity
+                    .is_some_and(|identity| identity.is_durable()),
+            "runner publication requires complete birth evidence"
+        );
+        anyhow::ensure!(
+            load_strict_unlocked(&record.session_id)?.is_none(),
+            "a registry record appeared before native publication"
+        );
+        let listener = tokio::net::UnixListener::bind(socket).with_context(|| {
+            format!(
+                "binding {} without replacing an unknown endpoint",
+                socket.display()
+            )
+        })?;
+        let (identity, pin) = capture_endpoint(socket)?;
+        if !identity.is_durable() {
+            let metadata = std::fs::symlink_metadata(socket)?;
+            if metadata.file_type().is_socket()
+                && metadata.dev() == identity.device
+                && metadata.ino() == identity.inode
+            {
+                std::fs::remove_file(socket)?;
+            }
+            anyhow::bail!(
+                "native control endpoint birth time is unavailable; fresh publication is unproven"
+            );
+        }
+        record.control_file_identity = Some(identity);
+        let published = std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600))
             .context("securing runner control socket")
-            .and_then(|()| save_unlocked(record));
-        if let Err(error) = publish {
-            let _ = std::fs::remove_file(socket);
+            .and_then(|()| {
+                let bytes =
+                    serde_json::to_vec_pretty(record).context("serializing worker record")?;
+                let pin = write_record_bytes_unlocked(&record.session_id, &bytes)?;
+                record.record_file_identity = Some(pin.identity);
+                record.record_file_pin = Some(std::sync::Arc::new(pin));
+                Ok(())
+            });
+        if let Err(error) = published {
+            let metadata = std::fs::symlink_metadata(socket)?;
+            if metadata.file_type().is_socket()
+                && metadata.dev() == identity.device
+                && metadata.ino() == identity.inode
+            {
+                std::fs::remove_file(socket)?;
+            }
             return Err(error);
         }
-        Ok(listener)
-    })
+        Ok((listener, pin))
+    })();
+    finish_registry_operation(lock, &record.session_id, publish)
 }
 
 fn save_unlocked(record: &WorkerRecord) -> Result<()> {
-    let dir = workers_dir()?;
-    let final_path = dir.join(format!("{}.json", record.session_id));
-    let tmp_path = dir.join(format!("{}.json.tmp", record.session_id));
     let bytes = serde_json::to_vec_pretty(record).context("serializing worker record")?;
-    std::fs::write(&tmp_path, &bytes)
+    write_record_bytes_unlocked(&record.session_id, &bytes).map(|_| ())
+}
+
+fn write_record_bytes_unlocked(id: &str, bytes: &[u8]) -> Result<CapturedRecordFile> {
+    let dir = workers_dir()?;
+    let final_path = dir.join(format!("{id}.json"));
+    let tmp_path = dir.join(format!("{id}.json.tmp"));
+    let mut file = std::fs::File::create(&tmp_path)
+        .with_context(|| format!("opening tmp record at {}", tmp_path.display()))?;
+    file.write_all(bytes)
         .with_context(|| format!("writing tmp record at {}", tmp_path.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600));
+        let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
     }
     std::fs::rename(&tmp_path, &final_path)
         .with_context(|| format!("renaming tmp record to {}", final_path.display()))?;
-    Ok(())
+    Ok(CapturedRecordFile {
+        identity: crate::session::DirectoryIdentity::from_metadata(&file.metadata()?),
+        _file: file,
+    })
 }
 
-fn with_registry_lock<T>(session_id: &str, operation: impl FnOnce() -> Result<T>) -> Result<T> {
+fn acquire_registry_lock(session_id: &str) -> Result<std::fs::File> {
     validate_session_id(session_id)?;
     let lock_path = workers_dir()?.join(format!("{session_id}.lock"));
     let lock_file = std::fs::OpenOptions::new()
@@ -224,7 +337,14 @@ fn with_registry_lock<T>(session_id: &str, operation: impl FnOnce() -> Result<T>
     lock_file
         .lock_exclusive()
         .with_context(|| format!("locking worker registry entry {session_id}"))?;
-    let result = operation();
+    Ok(lock_file)
+}
+
+fn finish_registry_operation<T>(
+    lock_file: std::fs::File,
+    session_id: &str,
+    result: Result<T>,
+) -> Result<T> {
     let unlock = fs2::FileExt::unlock(&lock_file)
         .with_context(|| format!("unlocking worker registry entry {session_id}"));
     match (result, unlock) {
@@ -234,22 +354,21 @@ fn with_registry_lock<T>(session_id: &str, operation: impl FnOnce() -> Result<T>
     }
 }
 
+fn with_registry_lock<T>(session_id: &str, operation: impl FnOnce() -> Result<T>) -> Result<T> {
+    let lock = acquire_registry_lock(session_id)?;
+    let result = operation();
+    finish_registry_operation(lock, session_id, result)
+}
+
 pub fn load(session_id: &str) -> Result<Option<WorkerRecord>> {
     let path = record_path(session_id)?;
-    if !path.exists() {
-        return Ok(None);
-    }
-    let bytes = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
-    match serde_json::from_slice::<WorkerRecord>(&bytes) {
-        Ok(record) => Ok(Some(record)),
-        Err(e) => {
-            warn!(
-                target: "acp.registry",
-                path = %path.display(),
-                "failed to parse worker record: {e}; treating as missing"
-            );
+    match read_record(&path) {
+        Err(error) if error.downcast_ref::<serde_json::Error>().is_some() => {
+            warn!(target: "acp.registry", path = %path.display(),
+                "failed to parse worker record: {error}; treating as missing");
             Ok(None)
         }
+        result => result,
     }
 }
 /// [`load`] without folding a record it cannot read into "no runner": an
@@ -260,14 +379,108 @@ pub fn load_strict(session_id: &str) -> Result<Option<WorkerRecord>> {
 }
 
 fn load_strict_unlocked(session_id: &str) -> Result<Option<WorkerRecord>> {
-    let path = record_path(session_id)?;
-    match std::fs::read(&path) {
-        Ok(bytes) => serde_json::from_slice(&bytes)
-            .with_context(|| format!("parsing {}", path.display()))
-            .map(Some),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error).with_context(|| format!("reading {}", path.display())),
+    read_record(&record_path(session_id)?)
+}
+
+fn read_discovered_record<T: serde::de::DeserializeOwned>(
+    path: &Path,
+) -> Result<Option<(T, std::sync::Arc<CapturedRecordFile>)>> {
+    let before = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
+    };
+    anyhow::ensure!(
+        before.is_file(),
+        "registry record is not a regular file: {}",
+        path.display()
+    );
+    let mut file =
+        std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let metadata = file.metadata()?;
+    anyhow::ensure!(
+        metadata.is_file(),
+        "opened registry record is not regular: {}",
+        path.display()
+    );
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.read_to_end(&mut bytes)
+        .with_context(|| format!("reading {}", path.display()))?;
+    let after =
+        std::fs::symlink_metadata(path).with_context(|| format!("verifying {}", path.display()))?;
+    anyhow::ensure!(
+        after.is_file()
+            && crate::session::DirectoryIdentity::from_metadata(&metadata)
+                == crate::session::DirectoryIdentity::from_metadata(&before)
+            && crate::session::DirectoryIdentity::from_metadata(&metadata)
+                == crate::session::DirectoryIdentity::from_metadata(&after),
+        "registry record changed while reading {}",
+        path.display()
+    );
+    let record =
+        serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", path.display()))?;
+    let pin = std::sync::Arc::new(CapturedRecordFile {
+        identity: crate::session::DirectoryIdentity::from_metadata(&metadata),
+        _file: file,
+    });
+    Ok(Some((record, pin)))
+}
+
+fn read_record(path: &Path) -> Result<Option<WorkerRecord>> {
+    let Some((mut record, pin)) = read_discovered_record::<WorkerRecord>(path)? else {
+        return Ok(None);
+    };
+    anyhow::ensure!(
+        path.file_stem().and_then(|stem| stem.to_str()) == Some(record.session_id.as_str()),
+        "registry record session identity differs from its discovered namespace"
+    );
+    record.record_file_identity = Some(pin.identity);
+    record.record_file_pin = Some(pin);
+    Ok(Some(record))
+}
+
+/// One-time schema normalization preserves weak birth data without discovering new authority.
+pub(crate) fn migrate_birth_stamps(
+    transform: impl Fn(&mut serde_json::Value) -> bool,
+) -> Result<()> {
+    let directory = crate::session::get_app_dir()?.join("acp-workers");
+    let entries = match std::fs::read_dir(&directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    for entry in entries {
+        let path = entry?.path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+            continue;
+        }
+        let Some(id) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        if validate_session_id(id).is_err() {
+            continue;
+        }
+        with_registry_lock(id, || {
+            let Some((mut value, pin)) = read_discovered_record::<serde_json::Value>(&path)? else {
+                return Ok(());
+            };
+            anyhow::ensure!(
+                value.get("session_id").and_then(|value| value.as_str()) == Some(id),
+                "registry migration discovered a different session identity"
+            );
+            if transform(&mut value) {
+                let current = std::fs::symlink_metadata(&path)?;
+                anyhow::ensure!(
+                    crate::session::DirectoryIdentity::from_metadata(&current) == pin.identity,
+                    "registry file changed before birth normalization"
+                );
+                let bytes = serde_json::to_vec_pretty(&value)?;
+                write_record_bytes_unlocked(id, &bytes)?;
+            }
+            Ok(())
+        })?;
     }
+    Ok(())
 }
 
 pub fn list() -> Result<Vec<WorkerRecord>> {
@@ -283,18 +496,11 @@ pub fn list() -> Result<Vec<WorkerRecord>> {
         if path.extension().and_then(|s| s.to_str()) != Some("json") {
             continue;
         }
-        let Ok(bytes) = std::fs::read(&path) else {
-            continue;
-        };
-        match serde_json::from_slice::<WorkerRecord>(&bytes) {
-            Ok(rec) => out.push(rec),
-            Err(e) => {
-                warn!(
-                    target: "acp.registry",
-                    path = %path.display(),
-                    "skipping unparseable worker record: {e}"
-                );
-            }
+        match read_record(&path) {
+            Ok(Some(record)) => out.push(record),
+            Ok(None) => {}
+            Err(error) => warn!(target: "acp.registry", path = %path.display(),
+                "skipping unreadable worker record: {error}"),
         }
     }
     Ok(out)
@@ -306,80 +512,101 @@ pub(crate) fn delete(session_id: &str) -> Result<()> {
 }
 
 fn delete_unlocked(session_id: &str) -> Result<()> {
-    if let Ok(path) = record_path(session_id) {
-        let _ = std::fs::remove_file(path);
-    }
-    if let Ok(path) = socket_path_for(session_id) {
-        remove_runner_sockets(&path);
-    }
-    if let Ok(path) = log_path_for(session_id) {
-        if matches!(std::fs::metadata(&path), Ok(metadata) if metadata.len() == 0) {
-            let _ = std::fs::remove_file(path);
-        }
+    let path = record_path(session_id)?;
+    match std::fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).with_context(|| format!("retiring {}", path.display())),
     }
     Ok(())
 }
 
-fn update_if_owned(
-    session_id: &str,
-    owner_pid: u32,
-    owner_generation: u64,
-    owner_nonce: uuid::Uuid,
-    update: impl FnOnce(&mut WorkerRecord),
+fn update_if_owned<T>(
+    expected: &mut WorkerRecord,
+    update: impl FnOnce(&mut WorkerRecord) -> T,
+    rollback: impl FnOnce(&mut WorkerRecord, T),
 ) -> Result<bool> {
-    with_registry_lock(session_id, || {
-        let Some(mut record) = load_strict_unlocked(session_id)? else {
+    let identity = crate::acp::runner_lifecycle::RunnerIdentity {
+        pid: expected.pid,
+        generation: expected.generation,
+        launch_nonce: expected.launch_nonce,
+        incarnation: expected.incarnation,
+        profile_identity: expected.profile_identity,
+        boot: expected.boot,
+    };
+    anyhow::ensure!(
+        identity.birth_is_complete() && expected.record_file_pin.is_some(),
+        "self mutation has no captured full native record-file custody"
+    );
+    let lock = acquire_registry_lock(&expected.session_id)?;
+    let result = (|| {
+        let Some(current) = load_strict_unlocked(&expected.session_id)? else {
             return Ok(false);
         };
-        if record.pid != owner_pid
-            || record.generation != owner_generation
-            || record.launch_nonce != Some(owner_nonce)
-        {
+        if current != *expected || !identity.matches_record(&current) {
             return Ok(false);
         }
-        update(&mut record);
-        save_unlocked(&record)?;
-        Ok(true)
-    })
+        let previous = update(expected);
+        let written = (|| {
+            let bytes =
+                serde_json::to_vec_pretty(expected).context("serializing owned worker update")?;
+            write_record_bytes_unlocked(&expected.session_id, &bytes)
+        })();
+        match written {
+            Ok(pin) => {
+                expected.record_file_identity = Some(pin.identity);
+                expected.record_file_pin = Some(std::sync::Arc::new(pin));
+                Ok(true)
+            }
+            Err(error) => {
+                rollback(expected, previous);
+                Err(error)
+            }
+        }
+    })();
+    finish_registry_operation(lock, &expected.session_id, result)
 }
 
-pub fn mark_attached(session_id: &str, owner_pid: u32, generation: u64, nonce: uuid::Uuid) {
-    if let Err(error) = update_if_owned(session_id, owner_pid, generation, nonce, |record| {
-        record.last_attached_at = Some(now_secs());
-        record.detached_at = None;
-    }) {
-        debug!(
-            target: "acp.registry",
-            session = %session_id,
-            "failed to update last_attached_at: {error}"
-        );
-    }
+pub fn mark_attached(expected: &mut WorkerRecord) -> Result<()> {
+    let updated = update_if_owned(
+        expected,
+        |record| {
+            let previous = (record.last_attached_at, record.detached_at);
+            record.last_attached_at = Some(now_secs());
+            record.detached_at = None;
+            previous
+        },
+        |record, previous| {
+            record.last_attached_at = previous.0;
+            record.detached_at = previous.1;
+        },
+    )?;
+    anyhow::ensure!(updated, "runner no longer owns its captured registry file");
+    Ok(())
 }
 
-pub fn mark_detached(session_id: &str, owner_pid: u32, generation: u64, nonce: uuid::Uuid) {
-    if let Err(error) = update_if_owned(session_id, owner_pid, generation, nonce, |record| {
-        record.detached_at = Some(now_secs());
-    }) {
-        debug!(
-            target: "acp.registry",
-            session = %session_id,
-            "failed to update detached_at: {error}"
-        );
-    }
+pub fn mark_detached(expected: &mut WorkerRecord) -> Result<()> {
+    let updated = update_if_owned(
+        expected,
+        |record| record.detached_at.replace(now_secs()),
+        |record, previous| {
+            record.detached_at = previous;
+        },
+    )?;
+    anyhow::ensure!(updated, "runner no longer owns its captured registry file");
+    Ok(())
 }
 
-pub fn update_stored_acp_session_id(
-    session_id: &str,
-    owner_pid: u32,
-    generation: u64,
-    nonce: uuid::Uuid,
-    acp_id: &str,
-) -> Result<()> {
+pub fn update_stored_acp_session_id(expected: &mut WorkerRecord, acp_id: &str) -> Result<()> {
     anyhow::ensure!(!acp_id.is_empty(), "ACP session id must not be empty");
-    let updated = update_if_owned(session_id, owner_pid, generation, nonce, |record| {
-        record.stored_acp_session_id = Some(acp_id.to_string());
-    })?;
-    anyhow::ensure!(updated, "runner no longer owns its registry record");
+    let updated = update_if_owned(
+        expected,
+        |record| record.stored_acp_session_id.replace(acp_id.to_owned()),
+        |record, previous| {
+            record.stored_acp_session_id = previous;
+        },
+    )?;
+    anyhow::ensure!(updated, "runner no longer owns its captured registry file");
     Ok(())
 }
 
@@ -396,13 +623,31 @@ fn expected_socket(rec: &WorkerRecord) -> std::path::PathBuf {
     }
 }
 
-pub(crate) fn remove_runner_sockets(socket_path: &Path) {
-    for path in [
-        socket_path.to_path_buf(),
-        crate::process::worker::control_socket_sibling(socket_path),
-    ] {
-        let _ = std::fs::remove_file(&path);
+#[cfg(unix)]
+fn retire_owned_control(record: &WorkerRecord) -> Result<()> {
+    use std::os::unix::fs::FileTypeExt;
+    let Some(identity) = record
+        .control_file_identity
+        .filter(|identity| identity.is_durable())
+    else {
+        return Ok(());
+    };
+    let path = expected_socket(record);
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error).context("verifying owned control endpoint"),
+    };
+    if metadata.file_type().is_socket()
+        && crate::session::DirectoryIdentity::from_metadata(&metadata) == identity
+    {
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("retiring owned control endpoint"),
+        }
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -457,29 +702,32 @@ fn socket_exists(path: &Path) -> bool {
     }
 }
 
-pub fn delete_if_owned_by(
-    session_id: &str,
-    pid: u32,
-    generation: u64,
-    launch_nonce: Option<uuid::Uuid>,
-) -> bool {
-    with_registry_lock(session_id, || match load_strict_unlocked(session_id)? {
-        Some(rec)
-            if rec.pid != pid
-                || rec.generation != generation
-                || rec.launch_nonce != launch_nonce =>
-        {
-            debug!(
-                target: "acp.registry",
-                session = %session_id,
-                current_pid = rec.pid,
-                "leaving registry entry; it belongs to a replacement runner"
-            );
-            Ok(true)
+/// Retire only the born record actually discovered before settlement.
+/// A peer rewrite, even for the same native execution, keeps its new file custody.
+pub fn delete_if_owned_by(expected: &WorkerRecord) -> bool {
+    let identity = crate::acp::runner_lifecycle::RunnerIdentity {
+        pid: expected.pid,
+        generation: expected.generation,
+        launch_nonce: expected.launch_nonce,
+        incarnation: expected.incarnation,
+        profile_identity: expected.profile_identity,
+        boot: expected.boot,
+    };
+    if !identity.birth_is_complete() || expected.record_file_pin.is_none() {
+        return false;
+    }
+    with_registry_lock(&expected.session_id, || match load_strict_unlocked(&expected.session_id)? {
+        None => Ok(true),
+        Some(current) if current == *expected && identity.matches_record(&current) => {
+            #[cfg(unix)] retire_owned_control(&current)?;
+            delete_unlocked(&expected.session_id).map(|()| true)
         }
-        _ => delete_unlocked(session_id).map(|()| true),
-    })
-    .unwrap_or(false)
+        Some(current) => {
+            debug!(target: "acp.registry", session = %expected.session_id, current_pid = current.pid,
+                "preserving registry file outside captured birth and discovery custody");
+            Ok(false)
+        }
+    }).unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -598,14 +846,8 @@ mod tests {
             let mut rec = new_record("sess-empty-acp", 1, "/tmp/sess-empty-acp.sock");
             rec.stored_acp_session_id = Some("initial-acp".into());
             save(&rec).unwrap();
-            assert!(update_stored_acp_session_id(
-                "sess-empty-acp",
-                1,
-                0,
-                uuid::Uuid::from_u128(1),
-                ""
-            )
-            .is_err());
+            let mut original = load_strict("sess-empty-acp").unwrap().unwrap();
+            assert!(update_stored_acp_session_id(&mut original, "").is_err());
             let loaded = load("sess-empty-acp").unwrap().unwrap();
             assert_eq!(loaded.stored_acp_session_id.as_deref(), Some("initial-acp"));
         });
@@ -628,94 +870,27 @@ mod tests {
 
     #[test]
     #[serial]
-    fn delete_if_owned_preserves_replacement_record_and_socket() {
+    fn legacy_discovery_preserves_identical_peer_rewrite_and_unknown_endpoint() {
         with_temp_home(|| {
             let session_id = "replacement";
             let socket = socket_path_for(session_id).unwrap();
             touch_live_socket(&socket);
-            let replacement_control = crate::process::worker::control_socket_sibling(&socket);
-            let mut record = new_record(session_id, 111, socket);
-            save(&record).unwrap();
-            record.pid = 222;
-            save(&record).unwrap();
-
-            assert!(delete_if_owned_by(session_id, 111, 0, None));
-            assert_eq!(load(session_id).unwrap().unwrap().pid, 222);
-            assert!(replacement_control.exists());
-            assert!(delete_if_owned_by(session_id, 222, 0, None));
-            assert!(load(session_id).unwrap().is_none());
-            assert!(!replacement_control.exists());
-        });
-    }
-
-    #[test]
-    #[serial]
-    fn mark_attached_clears_detached() {
-        with_temp_home(|| {
-            let mut rec = new_record("x", 1, "/tmp/x.sock");
-            let nonce = uuid::Uuid::from_u128(1);
-            rec.launch_nonce = Some(nonce);
-            rec.detached_at = Some(100);
-            save(&rec).unwrap();
-            mark_attached("x", 1, 0, nonce);
-            let after = load("x").unwrap().unwrap();
-            assert!(after.last_attached_at.is_some());
-            assert!(after.detached_at.is_none());
-            let mut replacement = after;
-            replacement.launch_nonce = Some(uuid::Uuid::from_u128(2));
-            replacement.stored_acp_session_id = Some("replacement-session".into());
-            replacement.detached_at = Some(200);
-            save(&replacement).unwrap();
-            mark_attached("x", 1, 0, nonce);
-            assert!(update_stored_acp_session_id("x", 1, 0, nonce, "obsolete-session").is_err());
-            let preserved = load("x").unwrap().unwrap();
-            assert_eq!(preserved.launch_nonce, Some(uuid::Uuid::from_u128(2)));
-            assert_eq!(preserved.detached_at, Some(200));
-            assert_eq!(
-                preserved.stored_acp_session_id.as_deref(),
-                Some("replacement-session")
-            );
-        });
-    }
-
-    #[test]
-    #[serial]
-    fn delete_removes_json_and_socket() {
-        with_temp_home(|| {
-            let dir = workers_dir().unwrap();
-            let socket = dir.join("sess.sock");
-            touch_live_socket(&socket);
-            let rec = new_record("sess", 1, socket.clone());
-            save(&rec).unwrap();
             let control = crate::process::worker::control_socket_sibling(&socket);
-            assert!(record_path("sess").unwrap().exists());
-            assert!(control.exists(), "fixture created the live socket");
-            delete("sess").unwrap();
-            assert!(!record_path("sess").unwrap().exists());
-            assert!(!control.exists(), "delete sweeps the control socket too");
-        });
-    }
-
-    #[test]
-    #[serial]
-    fn delete_sweeps_empty_log_but_keeps_nonempty() {
-        with_temp_home(|| {
-            let empty_log = log_path_for("empty").unwrap();
-            std::fs::create_dir_all(empty_log.parent().unwrap()).unwrap();
-            std::fs::write(&empty_log, b"").unwrap();
-            delete("empty").unwrap();
+            let record = new_record(session_id, 111, socket);
+            save(&record).unwrap();
+            let first = load_strict(session_id).unwrap().unwrap();
+            // A peer writes identical metadata into a different file inode.
+            save(&first).unwrap();
+            let second = load_strict(session_id).unwrap().unwrap();
+            assert!(!delete_if_owned_by(&first));
+            assert!(load_strict(session_id).unwrap().is_some());
+            assert!(control.exists());
             assert!(
-                !empty_log.exists(),
-                "0-byte worker log should be swept on delete"
+                !delete_if_owned_by(&second),
+                "legacy metadata grants no native stop or endpoint authority"
             );
-
-            let kept_log = log_path_for("kept").unwrap();
-            std::fs::write(&kept_log, b"agent stderr line\n").unwrap();
-            delete("kept").unwrap();
-            assert!(
-                kept_log.exists(),
-                "non-empty worker log should survive delete for post-mortem"
-            );
+            assert!(load_strict(session_id).unwrap().is_some());
+            assert!(control.exists(), "unknown endpoint must survive discovery");
         });
     }
 
@@ -800,39 +975,6 @@ mod tests {
             );
             clear_restart_marker("m");
             assert!(!path.exists());
-        });
-    }
-
-    #[test]
-    #[serial]
-    fn delete_if_owned_by_leaves_a_replacement_record() {
-        with_temp_home(|| {
-            let socket = workers_dir().unwrap().join("g.sock");
-            let nonce = uuid::Uuid::from_u128(1);
-            let replacement = uuid::Uuid::from_u128(2);
-            let mut rec = new_record("g", 41, socket).with_generation(3);
-            rec.launch_nonce = Some(nonce);
-            save(&rec).unwrap();
-            assert!(
-                delete_if_owned_by("g", 40, 3, Some(nonce)),
-                "other pid: settled without touching"
-            );
-            assert!(load("g").unwrap().is_some());
-            assert!(
-                delete_if_owned_by("g", 41, 4, Some(nonce)),
-                "other generation: settled, kept"
-            );
-            assert!(load("g").unwrap().is_some());
-            assert!(delete_if_owned_by("g", 41, 3, Some(replacement)));
-            assert_eq!(load("g").unwrap().unwrap().launch_nonce, Some(nonce));
-            assert!(delete_if_owned_by("g", 41, 3, None));
-            assert_eq!(load("g").unwrap().unwrap().launch_nonce, Some(nonce));
-            assert!(delete_if_owned_by("g", 41, 3, Some(nonce)));
-            assert!(load("g").unwrap().is_none());
-            assert!(
-                delete_if_owned_by("g", 41, 3, Some(nonce)),
-                "missing record is settled"
-            );
         });
     }
 }

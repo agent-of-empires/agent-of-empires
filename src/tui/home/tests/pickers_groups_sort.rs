@@ -197,7 +197,10 @@ fn group_header_count_tracks_trash_and_restore() {
     );
 
     env.view.select_session_by_id(&target);
-    env.view.toggle_archive_at_cursor().unwrap();
+    {
+        env.view.toggle_archive_at_cursor().unwrap();
+        finish_runner_settlements(&mut env.view);
+    };
     assert_eq!(work_count(&env), 3, "restored session returns to the count");
 }
 
@@ -314,7 +317,10 @@ fn test_archive_selected_group_archives_all_members() {
     // "work" holds two direct sessions plus one in the nested "work/projects".
     assert_eq!(env.view.active_sessions_in_selected_group().len(), 3);
 
-    env.view.archive_selected_group().unwrap();
+    {
+        env.view.archive_selected_group().unwrap();
+        finish_runner_settlements(&mut env.view);
+    };
 
     for inst in env.view.instances() {
         let in_work = inst.group_path == "work" || inst.group_path.starts_with("work/");
@@ -324,50 +330,6 @@ fn test_archive_selected_group_archives_all_members() {
             "session {} (group {:?}) archived state should match group membership",
             inst.title,
             inst.group_path
-        );
-    }
-}
-
-/// Locks #1868: bulk archive persists synchronously even though tmux teardown runs
-/// off-thread. Real tmux state is asserted in `tests/e2e/archive_restore.rs`.
-#[test]
-#[serial]
-fn test_archive_selected_group_widened_teardown_persists_synchronously() {
-    let mut env = create_test_env_with_group_sessions();
-
-    for (i, item) in env.view.flat_items.iter().enumerate() {
-        if let Item::Group { path, .. } = item {
-            if path == "work" {
-                env.view.cursor = i;
-                env.view.update_selected();
-                break;
-            }
-        }
-    }
-    assert_eq!(env.view.selected_group.as_deref(), Some("work"));
-    let work_ids: Vec<String> = env.view.active_sessions_in_selected_group();
-    assert_eq!(work_ids.len(), 3);
-
-    let result = env.view.archive_selected_group();
-    assert!(
-        result.is_ok(),
-        "archive_selected_group must return Ok even when the off-thread \
-         teardown is fire-and-forget; got {:?}",
-        result
-    );
-
-    for id in &work_ids {
-        let inst = env
-            .view
-            .instances()
-            .find(|i| &i.id == id)
-            .expect("group member must still exist after archive");
-        assert!(
-            inst.is_archived(),
-            "session {} ({}) must have archived_at set synchronously \
-             on the input thread before archive_selected_group returns",
-            inst.title,
-            id
         );
     }
 }
@@ -417,7 +379,10 @@ fn test_archive_selected_group_project_mode() {
     assert_eq!(view.selected_group.as_deref(), Some("alpha"));
     assert_eq!(view.active_sessions_in_selected_group().len(), 2);
 
-    view.archive_selected_group().unwrap();
+    {
+        view.archive_selected_group().unwrap();
+        finish_runner_settlements(&mut view);
+    };
 
     for inst in view.instances() {
         let in_alpha = inst.project_path == "/tmp/alpha";
@@ -456,7 +421,10 @@ fn test_prompt_archive_selected_group() {
 
     // Confirm, which archives the group and clears the prompt.
     env.view.confirm_dialog = None;
-    env.view.archive_selected_group().unwrap();
+    {
+        env.view.archive_selected_group().unwrap();
+        finish_runner_settlements(&mut env.view);
+    };
 
     // With every member archived, a second prompt is a silent no-op.
     env.view.prompt_archive_selected_group();

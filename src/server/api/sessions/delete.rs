@@ -2,6 +2,11 @@
 
 use super::*;
 
+#[cfg(test)]
+tokio::task_local! {
+    static RECONCILE_INVENTORY_OBSERVER: Arc<std::sync::atomic::AtomicUsize>;
+}
+
 // --- Delete session ---
 
 #[derive(Default, Deserialize, Clone)]
@@ -34,15 +39,28 @@ async fn mark_delete_error(state: &AppState, id: &str, message: String) {
 /// Show a row as `Deleting` for polling clients, returning the status it had.
 /// The overlay is memory-only, so a caller that ends up deleting nothing has to
 /// put that status back rather than leave the row stuck greyed-out.
-async fn mark_delete_in_progress(state: &AppState, id: &str) -> Option<Status> {
+async fn mark_delete_in_progress(
+    state: &AppState,
+    original: &crate::session::LaunchOrigin,
+) -> Option<Status> {
     let mut instances = state.instances.write().await;
-    let inst = instances.iter_mut().find(|i| i.id == id)?;
+    let inst = instances
+        .iter_mut()
+        .find(|instance| original.matches_instance(instance))?;
     Some(std::mem::replace(&mut inst.status, Status::Deleting))
 }
 
-async fn restore_delete_status(state: &AppState, id: &str, status: Status) {
+async fn restore_delete_status(
+    state: &AppState,
+    original: &crate::session::LaunchOrigin,
+    issued: Option<&crate::session::LaunchOrigin>,
+    status: Status,
+) {
     let mut instances = state.instances.write().await;
-    if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
+    if let Some(inst) = instances.iter_mut().find(|instance| {
+        original.matches_instance(instance)
+            || issued.is_some_and(|scope| scope.matches_instance(instance))
+    }) {
         inst.status = status;
     }
 }
@@ -85,25 +103,36 @@ impl From<String> for PurgeRefusal {
 /// The success `bool` is `true` when the row was actually removed and `false`
 /// when a concurrent restore won the race and the row was kept. Callers must
 /// not report a kept row as deleted.
-async fn purge_session_artifacts(
+fn purge_session_artifacts(
     state: &Arc<AppState>,
     id: &str,
     instance: Instance,
     body: &DeleteSessionBody,
     recent_entry: Option<crate::session::RecentProjectEntry>,
-) -> Result<(bool, Vec<String>), PurgeRefusal> {
-    // The overlay lives here rather than in the three callers, because only this
-    // function knows whether anything was removed. A caller that set it had to
-    // remember to take it back on every exit that removed nothing, and one such
-    // exit was missed once already.
-    let previous_status = mark_delete_in_progress(state, id).await;
-    let outcome = purge_session_artifacts_inner(state, id, instance, body, recent_entry).await;
-    if !matches!(outcome, Ok((true, _))) {
-        if let Some(status) = previous_status {
-            restore_delete_status(state, id, status).await;
+) -> impl std::future::Future<Output = Result<(bool, Vec<String>), PurgeRefusal>> + Send + 'static {
+    let original = crate::session::LaunchOrigin::capture_baseline(&instance);
+    let state = Arc::clone(state);
+    let id = id.to_owned();
+    let body = body.clone();
+    let driver = tokio::spawn(async move {
+        let original = original.map_err(|error| PurgeRefusal::Fatal(error.to_string()))?;
+        let previous_status = mark_delete_in_progress(&state, &original).await;
+        let mut issued = None;
+        let outcome =
+            purge_session_artifacts_inner(&state, &id, instance, &body, recent_entry, &mut issued)
+                .await;
+        if !matches!(outcome, Ok((true, _))) {
+            if let Some(status) = previous_status {
+                restore_delete_status(&state, &original, issued.as_deref(), status).await;
+            }
         }
+        outcome
+    });
+    async move {
+        driver
+            .await
+            .map_err(|error| PurgeRefusal::Fatal(format!("Purge owner task failed: {error}")))?
     }
-    outcome
 }
 
 /// The purge proper. The caller owns the `Deleting` overlay; this only reports
@@ -114,6 +143,7 @@ async fn purge_session_artifacts_inner(
     instance: Instance,
     body: &DeleteSessionBody,
     recent_entry: Option<crate::session::RecentProjectEntry>,
+    issued: &mut Option<Arc<crate::session::LaunchOrigin>>,
 ) -> Result<(bool, Vec<String>), PurgeRefusal> {
     let profile = instance.source_profile.clone();
     if profile.is_empty() {
@@ -132,15 +162,16 @@ async fn purge_session_artifacts_inner(
         detach_hooks: true,
         keep_scratch: body.keep_scratch,
     };
-    let file_watch = state.file_watch.clone();
-    let reserve_profile = profile.clone();
+    let storage = instance
+        .original_storage()
+        .map_err(|error| PurgeRefusal::Fatal(error.to_string()))?;
     let reservation = tokio::task::spawn_blocking(
         move || -> Result<crate::session::deletion::PurgeReservation, String> {
-            let storage = Storage::open(&reserve_profile, file_watch)
-                .map_err(|e| format!("Storage init failed before session teardown: {e}"))?;
-            let reservation =
-                crate::session::deletion::PurgeTransaction::reserve(storage, delete_request)
-                    .map_err(|e| format!("Failed to reserve session purge: {e}"))?;
+            let reservation = crate::session::deletion::PurgeTransaction::reserve(
+                storage.as_ref().clone(),
+                delete_request,
+            )
+            .map_err(|e| format!("Failed to reserve session purge: {e}"))?;
             match reservation {
                 crate::session::deletion::PurgeReservation::Reserved(transaction) => {
                     match transaction.preflight_ownership() {
@@ -195,6 +226,8 @@ async fn purge_session_artifacts_inner(
             };
         }
     };
+    let scope = transaction.native_stop_scope();
+    *issued = Some(scope.cancellation_origin());
     let transcript_purged = transaction.instance().is_structured();
 
     // Every current view can have historical executions. The scoped manager
@@ -203,7 +236,12 @@ async fn purge_session_artifacts_inner(
     // Release process-wide flocks across both async gates; keep the reservation.
     let transaction = transaction.release_locks_for_teardown();
     let manager_result = if transcript_purged {
-        Some(state.acp_supervisor.shutdown_and_delete(id).await)
+        Some(
+            state
+                .acp_supervisor
+                .shutdown_and_delete(scope.clone())
+                .await,
+        )
     } else {
         None
     };
@@ -251,27 +289,18 @@ async fn purge_session_artifacts_inner(
         match committed {
             Err(result) => *result,
             Ok(committed) => {
-                // Drop the local mirror under the same lock as the epoch bump,
-                // so a reload cannot surface a durable row that no longer
-                // exists while the transcript and sidecars are torn down.
-                remove_instance(
-                    &mut *state.instances.write().await,
-                    id,
-                    &state.mutation_epoch,
-                );
-
-                let event_error = state
-                    .acp_event_store
-                    .delete_session(id)
-                    .err()
-                    .map(|error| format!("ACP event deletion failed: {error}"));
-                // The durable row is committed and the runner is proven dead, so the local mirror
-                // and ACP transcript can now go before the sidecar teardown.
-                state.acp_supervisor.forget_session(id);
-
-                let cleanup = tokio::task::spawn_blocking(move || committed.finish())
-                    .await
-                    .map_err(|e| format!("Deletion cleanup task failed: {e}"))?;
+                let store = state.acp_event_store.clone();
+                let cleanup_id = id.to_owned();
+                let (cleanup, event_error) = tokio::task::spawn_blocking(move || {
+                    let event_error = store
+                        .delete_session(&cleanup_id)
+                        .err()
+                        .map(|error| format!("ACP event deletion failed: {error}"));
+                    (committed.finish(), event_error)
+                })
+                .await
+                .map_err(|error| format!("Deletion cleanup task failed: {error}"))?;
+                state.acp_supervisor.forget_session(scope.original());
                 post_commit_error = event_error;
                 cleanup
             }
@@ -331,7 +360,12 @@ async fn purge_session_artifacts_inner(
         // between removal and bump. See invariant 8 on
         // `reload_state_instances_from_disk`.
         let mut instances = state.instances.write().await;
-        remove_instance(&mut instances, id, &state.mutation_epoch);
+        if instances.iter().any(|instance| {
+            scope.original().matches_instance(instance)
+                || scope.cancellation_origin().matches_instance(instance)
+        }) {
+            remove_instance(&mut instances, id, &state.mutation_epoch);
+        }
     }
     state.instance_locks.write().await.remove(id);
     state.session_service.forget_prompt_lock(id).await;
@@ -434,52 +468,107 @@ pub(crate) async fn reconcile_worktree_paths(state: &Arc<AppState>) {
 /// daemon startup, best-effort and per-session locked. The git move is blocking,
 /// so it runs off the async runtime.
 pub(crate) async fn reconcile_trashed_worktrees(state: &Arc<AppState>) {
-    let candidates: Vec<(String, String)> = {
+    let mut ids: Vec<String> = {
         let instances = state.instances.read().await;
         instances
             .iter()
-            .filter(|i| i.is_trashed())
-            .map(|i| (i.id.clone(), i.source_profile.clone()))
+            .filter(|row| row.is_trashed())
+            .map(|row| row.id.clone())
             .collect()
     };
-    for (id, _profile) in candidates {
-        let lock = state.instance_lock(&id).await;
-        let _guard = lock.lock().await;
-
-        let snapshot = {
-            let instances = state.instances.read().await;
-            match instances.iter().find(|instance| instance.id == id) {
-                Some(instance) if instance.is_trashed() => instance.clone(),
-                _ => continue,
+    ids.sort();
+    ids.dedup();
+    if ids.is_empty() {
+        return;
+    }
+    let mut guards = Vec::with_capacity(ids.len());
+    for id in &ids {
+        guards.push(state.instance_lock(id).await.lock_owned().await);
+    }
+    let snapshots: Vec<Instance> = {
+        let instances = state.instances.read().await;
+        instances
+            .iter()
+            .filter(|row| row.is_trashed() && ids.binary_search(&row.id).is_ok())
+            .cloned()
+            .collect()
+    };
+    let work_state = Arc::clone(state);
+    #[cfg(test)]
+    let observer = RECONCILE_INVENTORY_OBSERVER.try_with(Arc::clone).ok();
+    let reconciled = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        #[cfg(test)]
+        let _observation = crate::session::InventoryReadObservation::install(observer);
+        let mut storages: Vec<Storage> = Vec::new();
+        for row in &snapshots {
+            let storage = row.original_storage()?;
+            if !storages
+                .iter()
+                .any(|original| original.same_origin_as(&storage))
+            {
+                storages.push((*storage).clone());
             }
-        };
-        let reconciled = match tokio::task::spawn_blocking(move || {
-            let mut instance = snapshot;
-            let changed = crate::session::trash::reconcile_trashed_transition(&mut instance)?;
-            anyhow::Ok((changed, instance))
-        })
-        .await
-        {
-            Ok(Ok(pair)) => pair,
-            Ok(Err(error)) => {
-                tracing::warn!(target: "http.api.sessions", session = %id, "trash reconcile skipped: {error}");
-                continue;
-            }
-            Err(error) => {
-                tracing::warn!(target: "http.api.sessions", session = %id, "trash reconcile join failed: {error}");
-                continue;
-            }
-        };
-        if !reconciled.0 {
-            continue;
         }
-        let moved = reconciled.1;
-        let mut instances = state.instances.write().await;
-        if let Some(instance) = instances.iter_mut().find(|instance| instance.id == id) {
-            instance.project_path = moved.project_path;
-            instance.pre_trash_project_path = moved.pre_trash_project_path;
-            instance.lifecycle_generation = moved.lifecycle_generation;
-            instance.lifecycle_reservation = moved.lifecycle_reservation;
+        let reconciled = crate::session::trash::reconcile_trashed_profiles(&storages)?;
+        if reconciled.is_empty() {
+            return Ok(());
+        }
+        let _workspace = crate::session::acquire_session_workspace_claim_lock()?;
+        let _identity = crate::session::acquire_session_identity_lock()?;
+        for (storage, _) in &reconciled {
+            storage.verify_profile_identity()?;
+        }
+        let mut instances = work_state.instances.blocking_write();
+        let mut changed = false;
+        for (storage, rows) in reconciled {
+            for moved in rows {
+                let Some(snapshot) = snapshots
+                    .iter()
+                    .find(|row| row.id == moved.id && row.source_profile == storage.profile())
+                else {
+                    continue;
+                };
+                let Some(instance) = instances.iter_mut().find(|row| {
+                    row.id == moved.id
+                        && row.source_profile == storage.profile()
+                        && row.lifecycle_generation == snapshot.lifecycle_generation
+                        && row.project_path == snapshot.project_path
+                        && row.pre_trash_project_path == snapshot.pre_trash_project_path
+                        && row.worktree_info == snapshot.worktree_info
+                        && row
+                            .workspace_info
+                            .as_ref()
+                            .map(|ws| (&ws.workspace_dir, &ws.branch, &ws.repos))
+                            == snapshot
+                                .workspace_info
+                                .as_ref()
+                                .map(|ws| (&ws.workspace_dir, &ws.branch, &ws.repos))
+                        && row.trashed_at == snapshot.trashed_at
+                }) else {
+                    continue;
+                };
+                instance.project_path = moved.project_path;
+                instance.pre_trash_project_path = moved.pre_trash_project_path;
+                instance.lifecycle_generation = moved.lifecycle_generation;
+                instance.lifecycle_reservation = moved.lifecycle_reservation;
+                changed = true;
+            }
+        }
+        if changed {
+            work_state
+                .mutation_epoch
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        Ok(())
+    })
+    .await;
+    match reconciled {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            tracing::warn!(target: "http.api.sessions", "trash reconcile skipped: {error}")
+        }
+        Err(error) => {
+            tracing::warn!(target: "http.api.sessions", "trash reconcile join failed: {error}")
         }
     }
 }
@@ -1159,6 +1248,7 @@ mod tests {
         instance.id = "contended-purge".to_string();
         instance.source_profile = "contended".to_string();
         let storage = Storage::new_unwatched("contended").unwrap();
+        instance.storage_origin = Some(std::sync::Arc::new(storage.clone()));
         storage
             .update(|instances, _groups| {
                 let mut held = instance.clone();
@@ -1248,6 +1338,154 @@ mod tests {
                 !counter.exists(),
                 "proof refusal must precede the user's on_destroy hook"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn daemon_reconcile_uses_one_inventory_and_aborts_after_git_exit_23() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for fail in [false, true] {
+            let home = tempfile::tempdir().unwrap();
+            let _home = crate::session::test_support::isolate_app_dir_at(home.path());
+            let mut storages = Vec::new();
+            let mut cached = Vec::new();
+            let mut checkouts = Vec::new();
+            for profile in 0..4 {
+                let storage = Storage::new_unwatched(&format!("daemon-sweep-{profile}")).unwrap();
+                for target in 0..3 {
+                    let base = home.path().join(format!("repo-{profile}-{target}"));
+                    let main = base.join("main");
+                    let checkout = base.join("checkouts/feature");
+                    std::fs::create_dir_all(checkout.parent().unwrap()).unwrap();
+                    let repository = git2::Repository::init(&main).unwrap();
+                    let signature = git2::Signature::now("Fixture", "fixture@example.com").unwrap();
+                    let tree = repository
+                        .find_tree(repository.index().unwrap().write_tree().unwrap())
+                        .unwrap();
+                    repository
+                        .commit(Some("HEAD"), &signature, &signature, "initial", &tree, &[])
+                        .unwrap();
+                    let added = std::process::Command::new("git")
+                        .args([
+                            "worktree",
+                            "add",
+                            "-b",
+                            "feature",
+                            checkout.to_str().unwrap(),
+                        ])
+                        .current_dir(&main)
+                        .output()
+                        .unwrap();
+                    assert!(
+                        added.status.success(),
+                        "{}",
+                        String::from_utf8_lossy(&added.stderr)
+                    );
+                    std::fs::write(checkout.join("sentinel"), "keep").unwrap();
+                    let mut row = Instance::new("Target", checkout.to_str().unwrap());
+                    row.id = format!("target-{profile}-{target}");
+                    row.source_profile = storage.profile().to_owned();
+                    row.storage_origin = Some(Arc::new(storage.clone()));
+                    row.worktree_info = Some(crate::session::WorktreeInfo {
+                        branch: "feature".into(),
+                        main_repo_path: main.to_string_lossy().into_owned(),
+                        managed_by_aoe: true,
+                        created_at: chrono::Utc::now(),
+                        base_branch: None,
+                    });
+                    row.trash();
+                    storage
+                        .update(|rows, _| {
+                            rows.push(row.clone());
+                            Ok(())
+                        })
+                        .unwrap();
+                    cached.push(row);
+                    checkouts.push(checkout);
+                }
+                storages.push(storage);
+            }
+            let peer = Storage::new_unwatched("peer").unwrap();
+            let peer_path = home.path().join("peer-checkout");
+            std::fs::create_dir(&peer_path).unwrap();
+            std::fs::write(peer_path.join("sentinel"), "peer must survive").unwrap();
+            peer.update(|rows, _| {
+                rows.push(Instance::new("Peer", peer_path.to_str().unwrap()));
+                Ok(())
+            })
+            .unwrap();
+            let peer_before = std::fs::read(peer.sessions_path()).unwrap();
+            let state = build_test_app_state(cached);
+            let calls = home.path().join("git-failures");
+            let bin = home.path().join("bin");
+            std::fs::create_dir(&bin).unwrap();
+            let real_git = std::process::Command::new("sh")
+                .args(["-c", "command -v git"])
+                .output()
+                .unwrap();
+            assert!(real_git.status.success());
+            let real_git = String::from_utf8(real_git.stdout).unwrap();
+            let script = bin.join("git");
+            std::fs::write(&script, format!(
+                "#!/bin/sh\nif [ \"$1\" = worktree ] && [ \"$2\" = move ]; then printf \"exit23 %s\\n\" \"$*\" >> \"{}\"; exit 23; fi\nexec \"{}\" \"$@\"\n",
+                calls.display(), real_git.trim(),
+            )).unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let _path = fail.then(|| crate::session::test_support::path_prepended(&bin));
+            let observed = Arc::new(AtomicUsize::new(0));
+            RECONCILE_INVENTORY_OBSERVER
+                .scope(observed.clone(), reconcile_trashed_worktrees(&state))
+                .await;
+            assert_eq!(observed.load(Ordering::Relaxed), 6, "4 target profiles + untouched peer + daemon primary; 12 targets must not rescan inventories");
+            assert_eq!(std::fs::read(peer.sessions_path()).unwrap(), peer_before);
+            assert_eq!(
+                std::fs::read_to_string(peer_path.join("sentinel")).unwrap(),
+                "peer must survive"
+            );
+            if fail {
+                let attempts = std::fs::read_to_string(&calls).unwrap();
+                assert_eq!(
+                    attempts.lines().count(),
+                    1,
+                    "the failed real Git move must invalidate the pass before any next target"
+                );
+                assert!(attempts.starts_with("exit23 worktree move "));
+                for checkout in &checkouts {
+                    assert_eq!(
+                        std::fs::read_to_string(checkout.join("sentinel")).unwrap(),
+                        "keep"
+                    );
+                }
+            } else {
+                for storage in &storages {
+                    for row in storage.load().unwrap() {
+                        assert!(
+                            row.project_path.contains(".aoe-trash"),
+                            "{}",
+                            row.project_path
+                        );
+                        assert_eq!(
+                            std::fs::read_to_string(
+                                std::path::Path::new(&row.project_path).join("sentinel")
+                            )
+                            .unwrap(),
+                            "keep"
+                        );
+                        assert!(row.lifecycle_reservation.is_none());
+                    }
+                }
+                assert_eq!(
+                    state
+                        .instances
+                        .read()
+                        .await
+                        .iter()
+                        .filter(|row| row.project_path.contains(".aoe-trash"))
+                        .count(),
+                    12
+                );
+            }
         }
     }
 }

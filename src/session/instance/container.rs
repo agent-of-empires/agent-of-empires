@@ -162,7 +162,7 @@ impl Instance {
         // defaulted config would misread a valid one. A failed reload still
         // permits reuse, never removal.
         if container.exists()? {
-            let reloaded = self.try_reconcile_from_disk();
+            let reloaded = self.try_reconcile_from_disk(false);
             if container.agent_tool_matches(&self.container_agent_identity()?)? == Some(false) {
                 reloaded.context(
                     "cannot confirm the session's tool before removing its sandbox container",
@@ -915,6 +915,7 @@ claude-personal = "~/.claude-global"
             instance.tool = tool.to_string();
             instance.detect_as = detect_as.to_string();
             instance.source_profile = profile.to_string();
+            instance.storage_origin = Some(std::sync::Arc::new(storage.clone()));
             instance.sandbox_info = Some(SandboxInfo {
                 enabled: true,
                 container_id: None,

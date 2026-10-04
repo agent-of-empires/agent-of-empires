@@ -504,6 +504,19 @@ mod tests {
         req.agent = "claude-personal".into();
         req.tool = "claude-personal".into();
         req.cwd = tmp.path().join("does-not-exist");
+        let storage = crate::session::Storage::open_unwatched("default").unwrap();
+        storage
+            .update(|rows, _| {
+                let row = rows
+                    .iter_mut()
+                    .find(|row| row.id == req.session_id)
+                    .unwrap();
+                row.tool = req.tool.clone();
+                row.project_path = req.cwd.to_string_lossy().into_owned();
+                Ok(())
+            })
+            .unwrap();
+        req.origin = Some(stored_origin(&req.session_id));
         assert!(
             sup.spawn(req).await.is_err(),
             "launch into a missing working directory must fail"

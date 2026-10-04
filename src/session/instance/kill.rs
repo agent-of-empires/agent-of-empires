@@ -39,7 +39,7 @@ impl Instance {
         if self.is_capture_excluded(&observation.sid, observation.source()) {
             return None;
         }
-        let outcome = super::sid_persist::persist_session_with_storage(
+        let outcome = super::sid_persist::persist_session_to_storage(
             storage,
             &self.id,
             &observation,
@@ -63,7 +63,7 @@ impl Instance {
         let Some(retry) = rows.into_iter().find(|row| row.id == self.id) else {
             return Some(SidWrite::Failed);
         };
-        Some(super::sid_persist::persist_session_with_storage(
+        Some(super::sid_persist::persist_session_to_storage(
             storage,
             &self.id,
             &observation,
@@ -159,7 +159,7 @@ impl Instance {
             .acquire_instance_lifecycle_lock(&self.id)
             .context("failed to acquire instance kill lock")?;
         let mut lifecycle = self.clone();
-        lifecycle.acquire_lifecycle_reservation(&storage, LifecycleOperation::Stop, None)?;
+        lifecycle.acquire_lifecycle_reservation(&storage, LifecycleOperation::Stop, None, None)?;
         match self.kill_locked() {
             Ok(()) => lifecycle.commit_lifecycle_status(
                 &storage,
@@ -217,7 +217,7 @@ impl Instance {
     pub(crate) fn stop_all_tmux_sessions_locked(&self, storage: &crate::session::storage::Storage) {
         let mut lifecycle = self.clone();
         if let Err(error) =
-            lifecycle.acquire_lifecycle_reservation(storage, LifecycleOperation::Stop, None)
+            lifecycle.acquire_lifecycle_reservation(storage, LifecycleOperation::Stop, None, None)
         {
             tracing::warn!(
                 target: "session.tmux_cleanup",
@@ -303,7 +303,7 @@ impl Instance {
         };
         let mut lifecycle = self.clone();
         if let Err(error) =
-            lifecycle.acquire_lifecycle_reservation(&storage, LifecycleOperation::Stop, None)
+            lifecycle.acquire_lifecycle_reservation(&storage, LifecycleOperation::Stop, None, None)
         {
             tracing::warn!(
                 target: "session.tmux_cleanup",
@@ -341,7 +341,7 @@ impl Instance {
             .find(|row| row.id == self.id)
             .context("session disappeared before stop")?;
         lifecycle.source_profile = profile.clone();
-        lifecycle.acquire_lifecycle_reservation(&storage, LifecycleOperation::Stop, None)?;
+        lifecycle.acquire_lifecycle_reservation(&storage, LifecycleOperation::Stop, None, None)?;
         self.stop_poller();
         let teardown = lifecycle.kill_locked().and_then(|()| {
             let mut current = storage

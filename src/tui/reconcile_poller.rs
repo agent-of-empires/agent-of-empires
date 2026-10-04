@@ -68,16 +68,20 @@ impl Default for ReconcilePoller {
 /// view reloads from the returned verdict rather than from a local-change
 /// notification.
 fn sweep(profiles: &[String]) -> bool {
-    let mut changed = false;
-    for profile in profiles {
-        match crate::session::trash::reconcile_trashed_profile(profile) {
-            Ok(healed) => changed |= !healed.is_empty(),
-            Err(error) => tracing::warn!(
-                target: "tui.home",
-                profile = %profile,
-                "trash reconciliation skipped: {error}",
-            ),
+    let storages = profiles
+        .iter()
+        .map(|profile| crate::session::Storage::open_unwatched(profile))
+        .collect::<anyhow::Result<Vec<_>>>();
+    let mut changed = match storages
+        .and_then(|storages| crate::session::trash::reconcile_trashed_profiles(&storages))
+    {
+        Ok(healed) => !healed.is_empty(),
+        Err(error) => {
+            tracing::warn!(target: "tui.home", "trash reconciliation skipped: {error}");
+            false
         }
+    };
+    for profile in profiles {
         changed |= crate::session::worktree_reconcile::reconcile_profile(profile);
     }
     changed

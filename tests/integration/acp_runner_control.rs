@@ -678,7 +678,9 @@ for line in sys.stdin:
     with open(os.environ["AOE_FAKE_AGENT_LOG"], "a") as f:
         f.write(method + "\n")
     if method == "initialize":
-        time.sleep(int(os.environ["AOE_FAKE_INIT_DELAY_MS"]) / 1000)
+        if os.environ["AOE_FAKE_INIT_DELAY_MS"] == "held":
+            while not os.path.exists(os.environ["AOE_FAKE_AGENT_LOG"] + ".release"):
+                time.sleep(0.01)
         result = {"protocolVersion": 1, "agentCapabilities": {"loadSession": True, "promptCapabilities": {}}}
     elif method == "session/load" and os.environ["AOE_FAKE_LOAD_ERROR"] == "1":
         error = {"code": -32000, "message": "stored session unavailable"}
@@ -731,7 +733,7 @@ for line in sys.stdin:
         (child, launch.nonce)
     };
 
-    let (old, old_nonce) = spawn_runner("2000", false);
+    let (old, old_nonce) = spawn_runner("held", false);
     let mut old = KillOnDrop(old);
     wait_for(&record, "old registry record");
     wait_for(&control, "old control socket");
@@ -773,7 +775,16 @@ for line in sys.stdin:
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        let (replacement, _) = spawn_runner("750", true);
+        // Fresh publication must start in an absent namespace. Move the actual
+        // original files only after its held initialize was observed; the old
+        // actor still owns those inodes and its captured native birth.
+        std::fs::rename(&record, workers.join(format!("{session_id}.original.json"))).unwrap();
+        std::fs::rename(
+            &control,
+            workers.join(format!("{session_id}.original.control.sock")),
+        )
+        .unwrap();
+        let (replacement, _) = spawn_runner("0", true);
         let replacement = KillOnDrop(replacement);
         wait_for_record_pid(&record, replacement.0.id());
         replacement

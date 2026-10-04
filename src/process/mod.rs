@@ -363,6 +363,22 @@ pub fn process_incarnation(pid: u32) -> std::io::Result<Option<ProcessIncarnatio
     }
 }
 
+/// Retain the actual filesystem inode, including socket nodes, without following symlinks.
+pub(crate) fn pin_filesystem_node(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        platform::pin_filesystem_node(path)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = path;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "filesystem inode pin is unavailable",
+        ))
+    }
+}
+
 pub fn boot_id() -> Option<String> {
     #[cfg(target_os = "linux")]
     {

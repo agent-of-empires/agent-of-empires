@@ -322,6 +322,7 @@ pub fn drain_recovery_pending(
 
 /// Run the recovery cascade for one instance.
 pub fn run_recovery_for_instance(inst: &mut Instance) -> Result<StartOutcome> {
+    inst.original_storage()?.verify_profile_identity()?;
     let _scope = HookTimeoutScope::new(recovery_hook_timeout());
     let result = inst.restart_with_size_opts(None, false);
     if let Err(ref e) = result {
@@ -832,13 +833,14 @@ mod tests {
             let profile = "recovery-shelved";
             let mut inst = Instance::new("shelved", "/tmp/test");
             inst.source_profile = profile.to_string();
+            let storage = super::super::Storage::new_unwatched(profile).unwrap();
+            inst.storage_origin = Some(std::sync::Arc::new(storage.clone()));
             inst.status = super::super::Status::Error;
             inst.agent_session_id = Some("11111111-1111-4111-8111-111111111111".into());
             assert!(is_recovery_candidate(&inst));
             let mut peer = inst.clone();
             shelve(&mut peer);
-            super::super::Storage::new_unwatched(profile)
-                .unwrap()
+            storage
                 .update(|rows, _| {
                     *rows = vec![peer];
                     Ok(())

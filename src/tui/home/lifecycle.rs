@@ -370,13 +370,16 @@ impl HomeView {
             sidebar_source: crate::tui::session_feed::SidebarSource::Storage,
             deletion_poller: DeletionPoller::new(),
             stop_poller: StopPoller::new(),
+            settlement_poller: crate::tui::stop_poller::SettlementPoller::new()?,
+            settlement_in_flight: std::collections::HashMap::new(),
+            settled_edit: None,
             trash_poller: crate::tui::trash_poller::TrashPoller::new(),
             reconcile_poller: make_reconcile(),
             startup_recovery_gate: None,
             pending_reconcile_reload: false,
             reconcile_reload_retry_at: None,
             restart_poller: RestartPoller::new(),
-            restart_in_flight: std::collections::HashSet::new(),
+            restart_in_flight: std::collections::HashMap::new(),
             attach_after_restart: std::collections::HashSet::new(),
             restarted_attaches: Vec::new(),
             store_move_poller: crate::tui::store_move_poller::StoreMovePoller::new(),
@@ -644,16 +647,82 @@ impl HomeView {
             self.rewire_disk_subscriptions(&current_profiles);
         }
 
-        // Storage rebuild is unified mode only: single-profile mode keeps the scope set at
-        // startup, with only the active profile in memory.
-        if self.active_profile.is_none() {
-            for name in &current_profiles {
-                if !self.storages.contains_key(name) {
-                    self.storages
-                        .insert(name.clone(), Storage::new(name, self.file_watch.clone())?);
+        // Replacement adoption is explicit: no pending edit or runtime state crosses
+        // from the old physical profile into a homonymous directory.
+        {
+            let _workspace = crate::session::acquire_session_workspace_claim_lock()?;
+            let _identity = crate::session::acquire_session_identity_lock()?;
+            let replacements = self
+                .storages
+                .iter()
+                .filter(|(_, storage)| storage.verify_profile_identity().is_err())
+                .map(|(name, _)| {
+                    let replacement = if current_profiles.contains(name) {
+                        Some(Storage::open(name, self.file_watch.clone())?)
+                    } else {
+                        None
+                    };
+                    anyhow::Ok((name.clone(), replacement))
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            for (name, replacement) in replacements {
+                if self
+                    .creating_stub_id
+                    .as_ref()
+                    .and_then(|id| self.instances.get(id))
+                    .is_some_and(|row| row.source_profile == name)
+                {
+                    self.cancel_creation();
+                }
+                for (id, _) in self
+                    .instances
+                    .iter()
+                    .filter(|(_, row)| row.source_profile == name)
+                {
+                    self.recovery_in_flight.remove(id);
+                    self.restart_in_flight.remove(id);
+                    self.attach_after_restart.remove(id);
+                    self.restarted_attaches.retain(|pending| pending != id);
+                    self.restart_cooldown_at.remove(id);
+                    self.settlement_in_flight.remove(id);
+                    self.passive_pane_synced.remove(id);
+                    self.passive_pane_declined.remove(id);
+                    self.passive_pane_queued.remove(id);
+                    if self
+                        .preview_pane_pending
+                        .as_ref()
+                        .is_some_and(|(pending, _, _)| pending == id)
+                    {
+                        self.preview_pane_pending = None;
+                    }
+                    if let Some(fleet) = self.passive_fleet_armed.as_mut() {
+                        fleet.retain(|(pending, _, _)| pending != id);
+                    }
+                }
+                self.instances.retain(|_, row| row.source_profile != name);
+                self.pending_deletions.remove(&name);
+                self.pending_group_deletions.remove(&name);
+                self.pending_added.remove(&name);
+                self.group_trees.remove(&name);
+                match replacement {
+                    Some(storage) => {
+                        self.storages.insert(name, storage);
+                    }
+                    None => {
+                        self.storages.remove(&name);
+                    }
                 }
             }
-            self.storages.retain(|k, _| current_profiles.contains(k));
+            if self.active_profile.is_none() {
+                for name in &current_profiles {
+                    if !self.storages.contains_key(name) {
+                        self.storages
+                            .insert(name.clone(), Storage::open(name, self.file_watch.clone())?);
+                    }
+                }
+                self.storages
+                    .retain(|name, _| current_profiles.contains(name));
+            }
         }
 
         // Collect per-profile state without publishing it, so duplicate detection (#3459)
@@ -664,7 +733,9 @@ impl HomeView {
          -> anyhow::Result<ProfileLoads> {
             let mut loads = Vec::new();
             for (profile_name, storage) in storages {
+                storage.verify_profile_identity()?;
                 let (mut instances, groups) = storage.load_with_groups()?;
+                storage.verify_profile_identity()?;
                 for inst in &mut instances {
                     inst.source_profile = profile_name.clone();
                     if let Some(previous) = prev.get(&inst.id) {

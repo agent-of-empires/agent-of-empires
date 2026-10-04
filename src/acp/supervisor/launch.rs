@@ -1,8 +1,10 @@
 //! Bringing a worker up: admission, spawn, attach, and the launch environment.
 
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use anyhow::Context;
 use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, info, warn};
 
@@ -26,8 +28,18 @@ use crate::session::SandboxInfo;
 impl<S: BroadcastSink> Supervisor<S> {
     /// Spawn a structured view worker for the given session.
     pub async fn spawn(&self, req: SpawnRequest) -> Result<(), SupervisorError> {
+        let origin = req.origin.clone().ok_or_else(|| {
+            SupervisorError::Acp(AcpError::Spawn(
+                "structured launch has no original stored-instance authority".into(),
+            ))
+        })?;
         match self
-            .begin_resume(&req.session_id, ResumeKind::Spawn)
+            .begin_resume(
+                &req.session_id,
+                crate::acp::runner_lifecycle::NativeResume::Spawn,
+                origin,
+                false,
+            )
             .await?
         {
             ResumeReservationOutcome::Reserved(r) => self.spawn_inner(req, r).await,
@@ -39,81 +51,203 @@ impl<S: BroadcastSink> Supervisor<S> {
 
     /// Admit a resume and reserve its capacity slot; only spawns count, since
     /// an attach takes over a runner the registry already counts.
-    pub(crate) async fn begin_resume(
+    pub(crate) fn begin_resume(
         &self,
         session_id: &str,
-        kind: ResumeKind,
-    ) -> Result<ResumeReservationOutcome, SupervisorError> {
-        let retained = if matches!(kind, ResumeKind::Spawn) {
-            Some(
-                tokio::task::spawn_blocking(|| {
-                    let mut ids = crate::session::runner_journal::retained_runner_session_ids()?;
-                    for record in worker_registry::list()? {
-                        if worker_registry::is_record_live(&record) {
-                            ids.insert(record.session_id);
+        operation: crate::acp::runner_lifecycle::NativeResume,
+        origin: Arc<crate::session::LaunchOrigin>,
+        override_stale_cancel: bool,
+    ) -> impl Future<Output = Result<ResumeReservationOutcome, SupervisorError>> + Send + 'static
+    {
+        let kind = operation.kind();
+        let admitted = (|| {
+            if origin.session_id() != session_id {
+                return Err(SupervisorError::Acp(AcpError::Spawn(
+                    "resume origin has another session id".into(),
+                )));
+            }
+            let mut table = lock_recover(&self.lifecycle);
+            let lease = match table.admit(session_id, kind) {
+                Ok(lease) => lease,
+                Err(AdmitError::AlreadyPresent) => {
+                    return Ok(ResumeReservationOutcome::AlreadyPresent)
+                }
+                Err(AdmitError::TeardownPending) => {
+                    return Err(SupervisorError::TeardownPending(session_id.to_owned()))
+                }
+                Err(AdmitError::Cancelled(_)) => {
+                    return Err(SupervisorError::SpawnCancelled(session_id.to_owned()))
+                }
+            };
+            let issued = table.execution_admission(&lease);
+            if let Err(error) = issued.set_origin(origin) {
+                table.abandon(&lease);
+                return Err(SupervisorError::Acp(AcpError::Spawn(format!(
+                    "original admission: {error:#}"
+                ))));
+            }
+            Ok(ResumeReservationOutcome::Reserved(ResumeReservation {
+                lease,
+                lifecycle: Arc::clone(&self.lifecycle),
+                notify: Arc::clone(&self.worker_notify),
+                execution: None,
+                custody: Some(issued.begin_job()),
+                retirement_required: true,
+                issued,
+            }))
+        })();
+        // Original scope and job custody exist before the owned driver's first await.
+        let admitted = admitted.map(|outcome| match outcome {
+            ResumeReservationOutcome::Reserved(reservation) => {
+                let custody = Some(reservation.issued.begin_job());
+                (ResumeReservationOutcome::Reserved(reservation), custody)
+            }
+            ResumeReservationOutcome::AlreadyPresent => (outcome, None),
+        });
+        let mut observation = super::ResumeObservation(admitted.as_ref().ok().and_then(
+            |(outcome, _)| match outcome {
+                ResumeReservationOutcome::Reserved(reservation) => Some(reservation.issued.clone()),
+                ResumeReservationOutcome::AlreadyPresent => None,
+            },
+        ));
+        let lifecycle = self.lifecycle.clone();
+        let limit = self.max_concurrent_workers;
+        async move {
+            let driver = tokio::spawn(async move {
+                let (outcome, _custody) = admitted?;
+                let ResumeReservationOutcome::Reserved(reservation) = outcome else {
+                    return Ok(ResumeReservationOutcome::AlreadyPresent);
+                };
+                if matches!(kind, ResumeKind::Spawn) {
+                    let custody = reservation.issued.begin_job();
+                    let retained = tokio::task::spawn_blocking(move || {
+                        let _custody = custody;
+                        let mut ids =
+                            crate::session::runner_journal::retained_runner_session_ids()?;
+                        for record in worker_registry::list()? {
+                            if worker_registry::is_record_live(&record) {
+                                ids.insert(record.session_id);
+                            }
                         }
+                        anyhow::Ok(ids)
+                    })
+                    .await
+                    .map_err(|error| {
+                        SupervisorError::Acp(AcpError::Spawn(format!(
+                            "runner inventory task: {error}"
+                        )))
+                    })?
+                    .map_err(|error| {
+                        SupervisorError::Acp(AcpError::Spawn(format!(
+                            "runner inventory: {error:#}"
+                        )))
+                    })?;
+                    let table = lock_recover(&lifecycle);
+                    let external_count = retained
+                        .iter()
+                        .filter(|id| table.counts_registry_record(id))
+                        .count();
+                    let combined = table.occupied_slots() + external_count;
+                    if combined > limit as usize {
+                        return Err(SupervisorError::CapacityFull {
+                            current: combined - 1,
+                            limit,
+                        });
                     }
-                    anyhow::Ok(ids)
+                }
+                let issued = reservation.issued.clone();
+                let origin = issued
+                    .origin()
+                    .expect("native admission registers its original scope");
+                let custody = issued.begin_job();
+                let preparation_lease = reservation.lease.clone();
+                tokio::task::spawn_blocking(move || {
+                    let _custody = custody;
+                    let (prepared, preparation) =
+                        origin.prepare(&operation, &issued, |commit| {
+                            crate::acp::runner_lifecycle::PreparationAuthorization::acquire(
+                                lock_recover(&lifecycle),
+                                &preparation_lease,
+                                &origin,
+                                override_stale_cancel,
+                                commit,
+                            )
+                        })?;
+                    issued.set_prepared_origin(prepared, preparation)?;
+                    anyhow::Ok(())
                 })
                 .await
                 .map_err(|error| {
-                    SupervisorError::Acp(AcpError::Spawn(format!("runner inventory task: {error}")))
+                    SupervisorError::Acp(AcpError::Spawn(format!(
+                        "original preparation task: {error}"
+                    )))
                 })?
-                .map_err(|error| {
-                    SupervisorError::Acp(AcpError::Spawn(format!("runner inventory: {error:#}")))
-                })?,
-            )
-        } else {
-            None
-        };
-        let _workers = self.workers.lock().await;
-        let mut table = lock_recover(&self.lifecycle);
-        let lease = match table.admit(session_id, kind) {
-            Ok(lease) => lease,
-            Err(AdmitError::AlreadyPresent) => return Ok(ResumeReservationOutcome::AlreadyPresent),
-            Err(AdmitError::TeardownPending) => {
-                return Err(SupervisorError::TeardownPending(session_id.to_string()))
-            }
-            Err(AdmitError::Cancelled(reason)) => {
-                drop(table);
-                drop(_workers);
-                self.publish_next(session_id, &Event::Stopped { reason });
-                return Err(SupervisorError::SpawnCancelled(session_id.to_string()));
-            }
-        };
-        if let Some(retained) = retained {
-            let external_count = retained
-                .iter()
-                .filter(|id| table.counts_registry_record(id))
-                .count();
-            let combined = table.occupied_slots() + external_count;
-            if combined > self.max_concurrent_workers as usize {
-                table.abandon(&lease);
-                return Err(SupervisorError::CapacityFull {
-                    current: combined - 1,
-                    limit: self.max_concurrent_workers,
-                });
-            }
+                .map_err(|error| match error.downcast_ref::<AdmitError>() {
+                    Some(AdmitError::Cancelled(_)) => {
+                        SupervisorError::SpawnCancelled(reservation.lease.session_id().to_owned())
+                    }
+                    Some(AdmitError::TeardownPending) => {
+                        SupervisorError::TeardownPending(reservation.lease.session_id().to_owned())
+                    }
+                    _ => launch_origin_error(error),
+                })?;
+                reservation.issued.check_active().map_err(|_| {
+                    SupervisorError::SpawnCancelled(reservation.lease.session_id().to_owned())
+                })?;
+                Ok(ResumeReservationOutcome::Reserved(reservation))
+            });
+            let result = driver.await.map_err(|error| {
+                SupervisorError::Acp(AcpError::Spawn(format!("owned resume driver: {error}")))
+            })?;
+            observation.0.take();
+            result
         }
-        Ok(ResumeReservationOutcome::Reserved(ResumeReservation {
-            lease,
-            lifecycle: Arc::clone(&self.lifecycle),
-            notify: Arc::clone(&self.worker_notify),
-            execution: None,
-            issued: crate::acp::runner_lifecycle::ExecutionAdmission::new(),
-        }))
     }
 
     /// Spawn body, run under the reservation from `begin_resume`.
     pub(crate) async fn spawn_inner(
         &self,
-        req: SpawnRequest,
+        mut req: SpawnRequest,
         mut reservation: ResumeReservation,
     ) -> Result<(), SupervisorError> {
+        let _body_custody = reservation.issued.begin_job();
         let lease = reservation.lease().clone();
+        let original = req.origin.as_ref().ok_or_else(|| {
+            SupervisorError::Acp(AcpError::Spawn(
+                "launch request has no original baseline".into(),
+            ))
+        })?;
+        let prepared = reservation.issued.origin().ok_or_else(|| {
+            SupervisorError::Acp(AcpError::Spawn(
+                "resume admission lost its original preparation".into(),
+            ))
+        })?;
+        if !Arc::ptr_eq(original, &prepared) && !prepared.is_prepared_from(original) {
+            return Err(SupervisorError::Acp(AcpError::Spawn(
+                "launch request replaced the admitted original baseline".into(),
+            )));
+        }
+        req.origin = Some(prepared);
         let session_id = req.session_id.as_str();
+        capture_launch_origin(&req, reservation.issued.clone()).await?;
         let warmup_guard = self.warmup_guard(&req.agent).await;
-        let (config, context_reset) = self.spawn_config(&req, lease.epoch()).await?;
+        let (mut config, context_reset) = self
+            .spawn_config(
+                &req,
+                reservation
+                    .issued
+                    .origin()
+                    .expect("admitted original scope")
+                    .generation(),
+                Some(&reservation.issued),
+            )
+            .await?;
+        if lock_recover(&self.lifecycle)
+            .cancel_requested(&lease)
+            .is_some()
+        {
+            return Err(SupervisorError::SpawnCancelled(req.session_id));
+        }
         debug!(
             target: "acp.supervisor",
             session = %session_id,
@@ -121,14 +255,14 @@ impl<S: BroadcastSink> Supervisor<S> {
             "spawning structured view worker"
         );
         // The hooks above may re-enter aoe, so the lifecycle lock is taken only for each check.
-        admit_durable_launch(&req).await?;
+        validate_launch_origin(&reservation.issued).await?;
         // Clear a partial replay from a failed import before session/load re-emits it.
         if config.seed_history_replay {
             self.sink.clear_session_events(session_id);
         }
 
-        let mut launch_config = config.clone();
-        launch_config.execution_admission = Some(reservation.issued.clone());
+        config.execution_admission = Some(reservation.issued.clone());
+        let launch_config = config.clone();
         let launched = (self.launcher)(launch_config, AcpSessionId(session_id.to_string())).await;
         let mut client = match launched {
             Ok(c) => c,
@@ -153,17 +287,11 @@ impl<S: BroadcastSink> Supervisor<S> {
                 return Err(SupervisorError::Acp(err.into_underlying()));
             }
         };
-        let identity = reservation.execution().or_else(|| {
-            client.runner_pid().map(|pid| RunnerIdentity {
-                pid,
-                generation: lease.epoch(),
-                launch_nonce: client.launch_nonce(),
-            })
-        });
+        let identity = reservation.execution().or_else(|| client.runner_identity());
         reservation.execution = identity;
 
         // A peer that archived or trashed the row during the handshake wins: retire the runner.
-        if let Err(refused) = admit_durable_launch(&req).await {
+        if let Err(refused) = validate_launch_origin(&reservation.issued).await {
             let _ = client.shutdown().await;
             self.retire_refused_install(&lease, identity, InstallError::Stale)
                 .await;
@@ -221,8 +349,13 @@ impl<S: BroadcastSink> Supervisor<S> {
         &self,
         req: &SpawnRequest,
         generation: u64,
+        admission: Option<&crate::acp::runner_lifecycle::ExecutionAdmission>,
     ) -> Result<(SpawnConfig, Option<PendingContextReset>), SupervisorError> {
-        let profile = req.source_profile.clone().unwrap_or_default();
+        let profile = req
+            .origin
+            .as_ref()
+            .map(|origin| origin.profile().to_owned())
+            .unwrap_or_default();
         let cwd = req.cwd.clone();
         let (resolved_cfg, policy) = tokio::task::spawn_blocking(move || {
             (
@@ -277,8 +410,12 @@ impl<S: BroadcastSink> Supervisor<S> {
                 let minted = before_session_env(
                     &req.session_id,
                     &req.tool,
-                    req.source_profile.clone().unwrap_or_default(),
+                    req.origin
+                        .as_ref()
+                        .map(|origin| origin.profile().to_owned())
+                        .unwrap_or_default(),
                     req.cwd.clone(),
+                    admission.cloned(),
                 )
                 .await
                 .map_err(|e| {
@@ -310,7 +447,9 @@ impl<S: BroadcastSink> Supervisor<S> {
         let mcp_servers = resolve_mcp_servers(
             &req.agent,
             &req.session_id,
-            req.source_profile.clone(),
+            req.origin
+                .as_ref()
+                .map(|origin| origin.profile().to_owned()),
             req.cwd.clone(),
             host_environment.clone(),
             claude_config_dir,
@@ -326,30 +465,40 @@ impl<S: BroadcastSink> Supervisor<S> {
                     .unwrap_or(&req.agent);
                 let native_agent =
                     crate::acp::agent_profiles::resolve(native_key).native_config_agent;
-                let profile = req.source_profile.clone().unwrap_or_default();
-                let id = req.session_id.clone();
-                let continuation = req.sandbox_continuation;
-                let context = tokio::task::spawn_blocking(move || {
-                    crate::migrations::v033_isolate_sandbox_content::prepare_acp_context(
-                        &profile,
-                        &id,
-                        native_agent,
-                        generation,
-                        crate::migrations::v033_isolate_sandbox_content::AcpContextUse::Launch,
-                        continuation,
-                    )
-                })
-                .await
-                .map_err(|error| {
-                    SupervisorError::Acp(AcpError::Spawn(format!(
-                        "sandbox context handoff task: {error}"
-                    )))
-                })?
-                .map_err(|error| {
-                    SupervisorError::Acp(AcpError::Spawn(format!(
-                        "sandbox context handoff: {error}"
-                    )))
+                let admission = admission.ok_or_else(|| {
+                    SupervisorError::Acp(AcpError::Spawn(
+                        "sandbox launch has no execution admission".into(),
+                    ))
                 })?;
+                let origin = admission.origin().ok_or_else(|| {
+                    SupervisorError::Acp(AcpError::Spawn(
+                        "sandbox launch has no original stored owner".into(),
+                    ))
+                })?;
+                let custody = admission.begin_job();
+                let continuation = req.sandbox_continuation;
+                let context =
+                    tokio::task::spawn_blocking(move || {
+                        let _custody = custody;
+                        origin.update_storage(|storage, row| {
+                            crate::migrations::v033_isolate_sandbox_content::prepare_acp_context(
+                            storage.profile(), row, native_agent, generation,
+                            crate::migrations::v033_isolate_sandbox_content::AcpContextUse::Launch,
+                            continuation,
+                        )
+                        })
+                    })
+                    .await
+                    .map_err(|error| {
+                        SupervisorError::Acp(AcpError::Spawn(format!(
+                            "sandbox context handoff task: {error}"
+                        )))
+                    })?
+                    .map_err(|error| {
+                        SupervisorError::Acp(AcpError::Spawn(format!(
+                            "sandbox context handoff: {error}"
+                        )))
+                    })?;
                 let reset_profile = context.profile.clone();
                 let reset = context
                     .notice
@@ -371,14 +520,19 @@ impl<S: BroadcastSink> Supervisor<S> {
                     req.fork_from.clone(),
                     req.seed_history_replay,
                     None,
-                    req.source_profile.clone(),
+                    req.origin
+                        .as_ref()
+                        .map(|origin| origin.profile().to_owned()),
                 )
             };
 
         Ok((
             SpawnConfig {
                 execution_admission: None,
-                managed_profile: req.source_profile.clone(),
+                managed_profile: req
+                    .origin
+                    .as_ref()
+                    .map(|origin| origin.profile().to_owned()),
                 agent_key: req.agent.clone(),
                 tool: req.tool.clone(),
                 spec,
@@ -412,7 +566,7 @@ impl<S: BroadcastSink> Supervisor<S> {
     async fn install_worker(
         &self,
         session_id: &str,
-        reservation: ResumeReservation,
+        mut reservation: ResumeReservation,
         client: AcpClient,
         inbound: mpsc::Receiver<Event>,
         installation: (Option<RunnerIdentity>, Option<PendingContextReset>),
@@ -429,6 +583,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             drop(client);
             return Err(self.retire_refused_install(&lease, identity, refusal).await);
         }
+        reservation.installed();
         // Retire the previous worker's requests before this worker's events
         // publish; once the drain starts, this worker's own are in the log and
         // the sweep can no longer tell them apart. Background sub-agents split
@@ -551,15 +706,26 @@ impl<S: BroadcastSink> Supervisor<S> {
         additional_dirs: Vec<PathBuf>,
         in_flight_turn: bool,
         sandbox: Option<SandboxInfo>,
+        origin: Arc<crate::session::LaunchOrigin>,
     ) -> Result<(), SupervisorError> {
-        match self.begin_resume(&session_id, ResumeKind::Attach).await? {
+        let record = Arc::new(
+            match worker_registry::load_strict(&session_id).map_err(|error| {
+                SupervisorError::Acp(AcpError::Spawn(format!("registry load: {error}")))
+            })? {
+                Some(record) if worker_registry::is_record_live(&record) => record,
+                _ => return Err(SupervisorError::UnknownSession(session_id)),
+            },
+        );
+        match self
+            .begin_resume(
+                &session_id,
+                crate::acp::runner_lifecycle::NativeResume::Attach(record.clone()),
+                origin.clone(),
+                false,
+            )
+            .await?
+        {
             ResumeReservationOutcome::Reserved(r) => {
-                let record = match worker_registry::load(&session_id).map_err(|e| {
-                    SupervisorError::Acp(AcpError::Spawn(format!("registry load: {e}")))
-                })? {
-                    Some(record) if worker_registry::is_record_live(&record) => record,
-                    _ => return Err(SupervisorError::UnknownSession(session_id)),
-                };
                 self.attach_inner(
                     super::AttachRequest {
                         session_id,
@@ -567,6 +733,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                         additional_dirs,
                         in_flight_turn,
                         sandbox,
+                        origin,
                     },
                     &record,
                     r,
@@ -586,12 +753,14 @@ impl<S: BroadcastSink> Supervisor<S> {
         record: &worker_registry::WorkerRecord,
         reservation: ResumeReservation,
     ) -> Result<(), SupervisorError> {
+        let _body_custody = reservation.issued.begin_job();
         let super::AttachRequest {
             session_id,
             cwd,
             additional_dirs,
             in_flight_turn,
             sandbox,
+            origin: original,
         } = request;
         let nonce = record.launch_nonce.ok_or_else(|| {
             SupervisorError::Acp(AcpError::Spawn(
@@ -602,18 +771,29 @@ impl<S: BroadcastSink> Supervisor<S> {
         let id = session_id.clone();
         let pid = record.pid;
         let generation = record.generation;
-        let owner = tokio::task::spawn_blocking(move || {
-            let owner = crate::session::runner_journal::unique_stored_owner(&id)?;
-            crate::session::runner_journal::verify_published_runner(
-                crate::session::deletion::SessionPathOwner {
-                    profile: &owner,
-                    session_id: &id,
-                },
+        let issued = reservation.issued.clone();
+        let origin = issued.origin().ok_or_else(|| {
+            SupervisorError::Acp(AcpError::Spawn(
+                "resident attach lost its prepared scope".into(),
+            ))
+        })?;
+        if !origin.is_prepared_from(&original) {
+            return Err(SupervisorError::Acp(AcpError::Spawn(
+                "resident attach replaced its original baseline".into(),
+            )));
+        }
+        let custody = issued.begin_job();
+        let (origin, identity) = tokio::task::spawn_blocking(move || {
+            let _custody = custody;
+            origin.validate()?;
+            let identity = crate::session::runner_journal::verify_published_runner(
+                origin.storage(),
+                &id,
                 nonce,
                 pid,
                 generation,
             )?;
-            anyhow::Ok(owner)
+            anyhow::Ok((origin, identity))
         })
         .await
         .map_err(|e| {
@@ -626,11 +806,6 @@ impl<S: BroadcastSink> Supervisor<S> {
                 "runner ticket verification: {e:#}"
             )))
         })?;
-        let identity = RunnerIdentity {
-            pid: record.pid,
-            generation: record.generation,
-            launch_nonce: Some(nonce),
-        };
         reservation.issued.capture(identity);
         lock_recover(&self.lifecycle).note_generation(&session_id, record.generation);
 
@@ -669,14 +844,23 @@ impl<S: BroadcastSink> Supervisor<S> {
             Some(info) => {
                 let info = info.clone();
                 let cwd = cwd.clone();
-                let profile = Some(owner.clone());
+                let origin = origin.clone();
+                let custody = reservation.issued.begin_job();
                 Some(
                     tokio::task::spawn_blocking(move || {
-                        crate::acp::acp_client::SessionSandbox::from_info(
-                            &info,
-                            cwd.as_path(),
-                            profile,
-                        )
+                        let _custody = custody;
+                        origin
+                            .with_storage(|storage, _row| {
+                                crate::acp::acp_client::SessionSandbox::from_info(
+                                    &info,
+                                    cwd.as_path(),
+                                    Some(storage.profile().to_owned()),
+                                )
+                                .map_err(anyhow::Error::from)
+                            })
+                            .map_err(|error| {
+                                AcpError::Spawn(format!("sandbox original owner: {error:#}"))
+                            })
                     })
                     .await
                     .map_err(|e| {
@@ -687,19 +871,22 @@ impl<S: BroadcastSink> Supervisor<S> {
             None => None,
         };
         let context_reset = if sandbox.as_ref().is_some_and(|info| info.enabled) {
-            let profile = owner.clone();
-            let id = session_id.clone();
+            let origin = origin.clone();
+            let custody = reservation.issued.begin_job();
             let native_agent = crate::acp::agent_profiles::resolve(&agent_key).native_config_agent;
             let generation = reservation.lease().epoch();
             let context = tokio::task::spawn_blocking(move || {
-                crate::migrations::v033_isolate_sandbox_content::prepare_acp_context(
-                    &profile,
-                    &id,
-                    native_agent,
-                    generation,
-                    crate::migrations::v033_isolate_sandbox_content::AcpContextUse::Attach,
-                    super::SandboxContinuation::Persisted,
-                )
+                let _custody = custody;
+                origin.update_storage(|storage, row| {
+                    crate::migrations::v033_isolate_sandbox_content::prepare_acp_context(
+                        storage.profile(),
+                        row,
+                        native_agent,
+                        generation,
+                        crate::migrations::v033_isolate_sandbox_content::AcpContextUse::Attach,
+                        super::SandboxContinuation::Persisted,
+                    )
+                })
             })
             .await
             .map_err(|error| {
@@ -730,11 +917,11 @@ impl<S: BroadcastSink> Supervisor<S> {
             AcpSessionId(session_id.clone()),
             sandbox_resources,
             agent_key,
-            Some(owner.clone()),
+            Some(origin.storage().profile().to_owned()),
             nonce,
         )
         .await?;
-        client.capture_runner(record.pid, nonce);
+        client.capture_runner(identity);
 
         let inbound = client
             .take_inbound()
@@ -802,35 +989,75 @@ pub(super) fn publish_rejection(err: &AcpError, mut publish: impl FnMut(Event)) 
     true
 }
 
-/// Recheck the stored row under its lifecycle lock: the caller's check ran before
-/// `spawn_config` awaited the `before_session` hook. Refuses an archived or trashed row, or one
-/// purged since. A request without a source profile has no stored row to check.
-async fn admit_durable_launch(req: &SpawnRequest) -> Result<(), SupervisorError> {
-    let Some(profile) = req.source_profile.clone() else {
-        return Ok(());
-    };
+fn launch_origin_error(error: anyhow::Error) -> SupervisorError {
+    if let Some(blocked) = error.downcast_ref::<crate::session::StartBlocked>() {
+        SupervisorError::Blocked(*blocked)
+    } else if let Some(gone) =
+        error.downcast_ref::<crate::session::runner_journal::LaunchSessionGone>()
+    {
+        SupervisorError::SessionGone(gone.0.clone())
+    } else {
+        SupervisorError::Acp(AcpError::Spawn(format!("launch origin: {error:#}")))
+    }
+}
+
+pub(super) async fn capture_launch_origin(
+    req: &SpawnRequest,
+    admission: crate::acp::runner_lifecycle::ExecutionAdmission,
+) -> Result<(), SupervisorError> {
+    let origin = req.origin.clone().ok_or_else(|| {
+        SupervisorError::Acp(AcpError::Spawn(
+            "native launch has no original prepared authority".into(),
+        ))
+    })?;
     let session_id = req.session_id.clone();
-    let spawn_error = |e: anyhow::Error| {
-        SupervisorError::Acp(AcpError::Spawn(format!("launch admission: {e:#}")))
-    };
+    let cwd = req.cwd.clone();
+    let tool = req.tool.clone();
+    let sandbox = req.sandbox_info.clone();
+    let yolo_mode = req.yolo_mode;
+    let command = req
+        .agent_command_override
+        .as_ref()
+        .map(|command| command.command.clone());
+    let custody = admission.begin_job();
     tokio::task::spawn_blocking(move || {
-        // Strict: launch admission locks a row that already exists.
-        let storage = crate::session::Storage::open_unwatched(&profile).map_err(spawn_error)?;
-        let _lock = storage
-            .acquire_instance_lifecycle_lock(&session_id)
-            .map_err(spawn_error)?;
-        let stored = storage
-            .load()
-            .map_err(spawn_error)?
-            .into_iter()
-            .find(|row| row.id == session_id);
-        match stored {
-            None => Err(SupervisorError::SessionGone(session_id)),
-            Some(row) => row.ensure_startable().map_err(SupervisorError::Blocked),
-        }
+        let _custody = custody;
+        anyhow::ensure!(
+            origin.session_id() == session_id,
+            "launch authority belongs to another session"
+        );
+        origin.validate_request(&cwd, &tool, sandbox.as_ref(), yolo_mode, command.as_deref())?;
+        origin.with_storage(|_, _row| Ok(()))?;
+        let existing = admission
+            .origin()
+            .context("native admission lost its original authority")?;
+        anyhow::ensure!(
+            Arc::ptr_eq(&existing, &origin),
+            "launch handoff replaced its prepared authority"
+        );
+        anyhow::Ok(())
     })
     .await
-    .map_err(|e| SupervisorError::Acp(AcpError::Spawn(format!("launch admission task: {e}"))))?
+    .map_err(|error| SupervisorError::Acp(AcpError::Spawn(format!("launch origin task: {error}"))))?
+    .map_err(launch_origin_error)
+}
+
+pub(super) async fn validate_launch_origin(
+    admission: &crate::acp::runner_lifecycle::ExecutionAdmission,
+) -> Result<(), SupervisorError> {
+    let origin = admission.origin().ok_or_else(|| {
+        SupervisorError::Acp(AcpError::Spawn(
+            "native admission lost its original prepared authority".into(),
+        ))
+    })?;
+    let custody = admission.begin_job();
+    tokio::task::spawn_blocking(move || {
+        let _custody = custody;
+        origin.validate()
+    })
+    .await
+    .map_err(|error| SupervisorError::Acp(AcpError::Spawn(format!("launch origin task: {error}"))))?
+    .map_err(launch_origin_error)
 }
 
 /// Run the profile's `before_session` host hooks and return the env they mint.
@@ -839,13 +1066,19 @@ pub(super) async fn before_session_env(
     tool: &str,
     profile: String,
     cwd: PathBuf,
+    admission: Option<crate::acp::runner_lifecycle::ExecutionAdmission>,
 ) -> Result<anyhow::Result<Vec<(String, String)>>, tokio::task::JoinError> {
     let session_id = session_id.to_string();
     let tool = tool.to_string();
+    let custody = admission.as_ref().map(|admission| admission.begin_job());
     tokio::task::spawn_blocking(move || {
+        let _custody = custody;
         use crate::session::config::repo_config::{
             resolve_before_session_hooks, run_before_session_hooks,
         };
+        if let Some(origin) = admission.as_ref().and_then(|admission| admission.origin()) {
+            origin.validate()?;
+        }
         let commands = resolve_before_session_hooks(&profile);
         if commands.is_empty() {
             return Ok(Vec::new());
@@ -1042,7 +1275,7 @@ mod tests {
             store: selected.clone(),
             exported_default_store: Some(false),
         });
-        let (config, context_reset) = supervisor.spawn_config(&request, 1).await.unwrap();
+        let (config, context_reset) = supervisor.spawn_config(&request, 1, None).await.unwrap();
         assert!(context_reset.is_none());
 
         assert_eq!(mcp_names(&config.mcp_servers), ["selected"]);
@@ -1139,7 +1372,7 @@ mod tests {
             store: default,
             exported_default_store: Some(false),
         });
-        let (config, _) = supervisor.spawn_config(&request, 1).await.unwrap();
+        let (config, _) = supervisor.spawn_config(&request, 1, None).await.unwrap();
         assert!(!config
             .host_environment
             .iter()
@@ -1229,6 +1462,7 @@ mod tests {
         inst.id = "s-prov".into();
         inst.source_profile = storage.profile().to_owned();
         inst.view = crate::session::View::Structured;
+        inst.storage_origin = Some(std::sync::Arc::new(storage.clone()));
         storage
             .update(|rows, _| {
                 rows.push(inst.clone());
@@ -1238,7 +1472,7 @@ mod tests {
         let gate = Gate::default();
         let sup = Arc::new(Supervisor::new(VecSink::new()).with_launcher(gated_launcher(&gate)));
         let mut req = spawn_request("s-prov");
-        req.source_profile = Some(inst.source_profile.clone());
+        req.origin = Some(crate::session::LaunchOrigin::capture(&inst).unwrap());
         req.effort = Some("low".into());
 
         let mut spawner = {
@@ -1277,7 +1511,9 @@ mod tests {
             !explicit,
             "a resolved default effort must not read as a session pin"
         );
-        sup.shutdown("s-prov").await.expect("fixture shutdown");
+        sup.shutdown(crate::acp::supervisor::test_support::stop_receipt("s-prov"))
+            .await
+            .expect("fixture shutdown");
     }
 
     /// #4116: the handshake holds no lifecycle lock, so an archive (which a TUI takes on its
@@ -1293,6 +1529,7 @@ mod tests {
         inst.id = "s-archived".into();
         inst.source_profile = storage.profile().to_owned();
         inst.view = crate::session::View::Structured;
+        inst.storage_origin = Some(std::sync::Arc::new(storage.clone()));
         storage
             .update(|rows, _| {
                 rows.push(inst.clone());
@@ -1300,7 +1537,7 @@ mod tests {
             })
             .unwrap();
         let mut req = spawn_request("s-archived");
-        req.source_profile = Some(inst.source_profile.clone());
+        req.origin = Some(crate::session::LaunchOrigin::capture(&inst).unwrap());
         let mut spawner = {
             let sup = Arc::clone(&sup);
             tokio::spawn(async move { sup.spawn(req).await })
@@ -1320,6 +1557,16 @@ mod tests {
                 }
             }
         }
+        let born = crate::process::worker_registry::load("s-archived")
+            .unwrap()
+            .unwrap()
+            .incarnation
+            .unwrap();
+        assert_eq!(
+            crate::process::process_incarnation(born.pid).unwrap(),
+            Some(born)
+        );
+        assert!(crate::process::worker::is_process_group_alive(born.group));
 
         assert!(
             !storage.instance_lifecycle_lock_is_held_for_test("s-archived"),
@@ -1347,6 +1594,19 @@ mod tests {
                 crate::session::StartBlocked::Archived
             ))
         ));
+        assert!(!crate::process::worker::is_process_group_alive(born.group));
+        // The failed body and its native group have actually completed. Advance
+        // only orphan-maintenance eligibility, not the execution birth proof.
+        lock_recover(&sup.lifecycle).age_stopping("s-archived", std::time::Duration::from_secs(15));
+        sup.retry_pending_teardowns(|lease| assert_eq!(lease.session_id(), "s-archived"))
+            .await;
+        assert!(storage
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.id == "s-archived")
+            .unwrap()
+            .is_archived());
         assert_eq!(sup.worker_state("s-archived").await, AcpWorkerState::Absent);
     }
 
@@ -1404,10 +1664,41 @@ mod tests {
         worker_registry::delete("detached-1").unwrap();
 
         let sup = Supervisor::with_capacity(VecSink::new(), 2);
-        let _a = reserve(sup.begin_resume("s-a", ResumeKind::Spawn).await);
-        let _attach = reserve(sup.begin_resume("s-attach", ResumeKind::Attach).await);
-        let _b = reserve(sup.begin_resume("s-b", ResumeKind::Spawn).await);
-        match sup.begin_resume("s-c", ResumeKind::Spawn).await {
+        let _a = reserve(
+            sup.begin_resume(
+                "s-a",
+                crate::acp::runner_lifecycle::NativeResume::Spawn,
+                crate::acp::supervisor::test_support::stored_origin("s-a"),
+                false,
+            )
+            .await,
+        );
+        let _attach = reserve(
+            crate::acp::supervisor::test_support::memory_resume(
+                &sup,
+                "s-attach",
+                ResumeKind::Attach,
+            )
+            .await,
+        );
+        let _b = reserve(
+            sup.begin_resume(
+                "s-b",
+                crate::acp::runner_lifecycle::NativeResume::Spawn,
+                crate::acp::supervisor::test_support::stored_origin("s-b"),
+                false,
+            )
+            .await,
+        );
+        match sup
+            .begin_resume(
+                "s-c",
+                crate::acp::runner_lifecycle::NativeResume::Spawn,
+                crate::acp::supervisor::test_support::stored_origin("s-c"),
+                false,
+            )
+            .await
+        {
             Err(SupervisorError::CapacityFull { current, limit }) => {
                 assert_eq!(
                     (current, limit),
@@ -1591,7 +1882,11 @@ mod tests {
             })
             .collect();
         assert_eq!(events, ["requested:old", "cancelled:old", "requested:live"]);
-        let _ = sup.shutdown("s-startup").await;
+        let _ = sup
+            .shutdown(crate::acp::supervisor::test_support::stop_receipt(
+                "s-startup",
+            ))
+            .await;
     }
 
     /// A launch left outstanding by a previous daemon (its tailer died with
@@ -1667,261 +1962,10 @@ mod tests {
             detached,
             "the orphaned launch must be closed out as Detached"
         );
-        let _ = sup.shutdown("s-startup").await;
-    }
-
-    /// Everything [`attach_with_orphaned_background_agent`] sets up. The
-    /// stand-in runner and its handshake task are reaped by `Drop`, so a
-    /// panicking assertion still cleans them up instead of leaking the child
-    /// process. The rest exists only to keep the connection alive until the
-    /// fixture drops.
-    struct AttachBackgroundAgentFixture {
-        store: Arc<crate::acp::event_store::EventStore>,
-        rx: tokio::sync::broadcast::Receiver<crate::server::AcpBroadcastFrame>,
-        _sup: Supervisor<super::super::ChannelSink>,
-        runner_handshake: tokio::task::JoinHandle<()>,
-        _execution: PublishedExecution,
-        _tmp: tempfile::TempDir,
-        _store_tmp: tempfile::TempDir,
-        _home: crate::session::test_support::AppDirGuard,
-    }
-
-    impl Drop for AttachBackgroundAgentFixture {
-        fn drop(&mut self) {
-            self.runner_handshake.abort();
-        }
-    }
-
-    /// One `attach` fixture for the survivor and untrackable cases below: a
-    /// fake runner behind a control socket, an unresolved
-    /// `BackgroundAgentLaunched` (+`Progress`) already on disk, and the
-    /// connection left by a successful `attach`. `output_file` is the launch
-    /// payload's transcript path, empty for the untrackable case.
-    async fn attach_with_orphaned_background_agent(
-        session_id: &str,
-        output_file: &str,
-    ) -> AttachBackgroundAgentFixture {
-        use crate::acp::control_protocol::{self, ControlBody};
-        use crate::acp::state::BackgroundAgentStatus;
-
-        let (_home, tmp) = isolate_home();
-        let (sink, store, rx, _store_tmp) = channel_sink();
-        sink.publish(
-            session_id,
-            1,
-            &Event::BackgroundAgentLaunched {
-                agent_id: "sub-1".into(),
-                tool_call_id: "tc-1".into(),
-                description: "do a thing".into(),
-                prompt: "do a thing".into(),
-                model: "claude".into(),
-                output_file: output_file.into(),
-                started_at: chrono::Utc::now(),
-            },
-        );
-        sink.publish(
-            session_id,
-            2,
-            &Event::BackgroundAgentProgress {
-                agent_id: "sub-1".into(),
-                status: BackgroundAgentStatus::Running,
-                tool_count: 1,
-                tools: Vec::new(),
-                last_tool: None,
-                last_text: None,
-                at: chrono::Utc::now(),
-            },
-        );
-
-        let profile = crate::session::Storage::new_unwatched("default")
-            .unwrap()
-            .profile()
-            .to_owned();
-        let fake_runner = published_execution(session_id, 1, &profile, None);
-        let nonce = fake_runner.nonce;
-
-        let socket = tmp.path().join(format!("{session_id}.sock"));
-        let control_socket = crate::process::worker::control_socket_sibling(&socket);
-        let listener = tokio::net::UnixListener::bind(&control_socket).unwrap();
-        let session_id_owned = session_id.to_string();
-        let runner_handshake = tokio::spawn(async move {
-            let (mut peer, _) = listener.accept().await.unwrap();
-            control_protocol::write_frame(
-                &mut peer,
-                &ControlBody::Hello {
-                    control_protocol_version: control_protocol::CONTROL_PROTOCOL_VERSION,
-                    session_id: session_id_owned,
-                    launch_nonce: Some(nonce),
-                },
-            )
-            .await
-            .unwrap();
-            while let Some(frame) = control_protocol::read_frame(&mut peer).await.unwrap() {
-                let reply = match frame {
-                    ControlBody::Attach { .. } => continue,
-                    ControlBody::Initialize { .. } => ControlBody::Initialized {
-                        result: serde_json::json!({
-                            "protocolVersion": 1, "agentCapabilities": {}
-                        }),
-                    },
-                    ControlBody::ResumeSession => ControlBody::SessionReady {
-                        acp_session_id: "acp-sid".into(),
-                        result: serde_json::json!({}),
-                    },
-                    frame => panic!("unexpected attach handshake frame: {frame:?}"),
-                };
-                control_protocol::write_frame(&mut peer, &reply)
-                    .await
-                    .unwrap();
-            }
-        });
-
-        // An agent key absent from the registry resolves to
-        // `ExpectedAgent::Other`, skipping the per-adapter compat gate: this
-        // fixture tests attach wiring, not agent compatibility.
-        let mut record = worker_registry::WorkerRecord::new(
-            session_id.to_string(),
-            fake_runner.pid,
-            socket,
-            "test-agent-acp".into(),
-            "test-agent".into(),
-            tmp.path().to_path_buf(),
-            None,
-            vec![],
-            vec![],
-            Some("acp-sid".into()),
-            Some(profile),
-        )
-        .with_generation(1);
-        record.launch_nonce = Some(nonce);
-        worker_registry::save(&record).unwrap();
-
-        let sup = Supervisor::new(sink);
-        sup.hydrate_seqs(store.all_session_seqs());
-        tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            sup.attach(
-                session_id.to_string(),
-                tmp.path().to_path_buf(),
-                vec![],
-                false,
-                None,
-            ),
-        )
-        .await
-        .expect("attach must not hang")
-        .expect("attach must succeed against the fake runner");
-
-        AttachBackgroundAgentFixture {
-            store,
-            rx,
-            _sup: sup,
-            runner_handshake,
-            _execution: fake_runner,
-            _tmp: tmp,
-            _store_tmp,
-            _home,
-        }
-    }
-
-    async fn await_background_agent_resolved(
-        fixture: &mut AttachBackgroundAgentFixture,
-        session_id: &str,
-        within: std::time::Duration,
-        what: &str,
-    ) -> crate::acp::state::AcpState {
-        use crate::acp::state::{AcpSessionId, AcpState, AgentName};
-
-        tokio::time::timeout(within, async {
-            while !fixture
-                .store
-                .unresolved_background_agent_ids(session_id)
-                .is_empty()
-            {
-                match fixture.rx.recv().await {
-                    Ok(_) => {}
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(e) => panic!("broadcast channel closed: {e}"),
-                }
-            }
-        })
-        .await
-        .unwrap_or_else(|_| panic!("{what}"));
-
-        let mut state = AcpState::new(
-            AcpSessionId(session_id.into()),
-            AgentName("claude".into()),
-            None,
-        );
-        for (_, event) in fixture.store.replay_from(session_id, 0) {
-            state.apply_event(event).unwrap();
-        }
-        state
-    }
-
-    /// The primary daemon-restart path: the worker `attach` just reached is
-    /// provably alive, so an orphaned launch with a real transcript resumes
-    /// tailing instead of being eagerly detached, and the tailer picks up the
-    /// `end_turn` record already on disk (#4029).
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn attach_resumes_tailing_a_background_agent_that_survived_the_restart() {
-        use crate::acp::state::BackgroundAgentStatus;
-
-        let transcript = tempfile::NamedTempFile::new().unwrap();
-        tokio::fs::write(
-            transcript.path(),
-            r#"{"type":"assistant","message":{"stop_reason":"end_turn","content":[{"type":"text","text":"final answer"}]}}"#
-                .to_string()
-                + "\n",
-        )
-        .await
-        .unwrap();
-
-        let mut fixture = attach_with_orphaned_background_agent(
-            "s-attach-survivor",
-            &transcript.path().to_string_lossy(),
-        )
-        .await;
-        let state = await_background_agent_resolved(
-            &mut fixture,
-            "s-attach-survivor",
-            std::time::Duration::from_secs(10),
-            "resumed tailer must report the sub-agent completed",
-        )
-        .await;
-
-        assert_eq!(
-            state.background_agents[0].status,
-            BackgroundAgentStatus::Completed,
-            "a survivor's resumed tailer must report its real outcome, not Detached"
-        );
-        assert!(
-            state.background_agents[0].warning.is_none(),
-            "a spurious Detached-then-Completed sequence folds to the same status but \
-             leaves the synthetic sweep's warning set"
-        );
-    }
-
-    /// The untrackable counterpart: a launch with no transcript path can never
-    /// be resumed, so `attach` still detaches it eagerly, same as `spawn`.
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn attach_still_detaches_a_background_agent_with_no_transcript_path() {
-        use crate::acp::state::BackgroundAgentStatus;
-
-        let mut fixture = attach_with_orphaned_background_agent("s-attach-untrackable", "").await;
-        let state = await_background_agent_resolved(
-            &mut fixture,
-            "s-attach-untrackable",
-            std::time::Duration::from_secs(5),
-            "a launch with no transcript must be detached on attach",
-        )
-        .await;
-
-        assert_eq!(
-            state.background_agents[0].status,
-            BackgroundAgentStatus::Detached
-        );
+        let _ = sup
+            .shutdown(crate::acp::supervisor::test_support::stop_receipt(
+                "s-startup",
+            ))
+            .await;
     }
 }

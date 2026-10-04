@@ -70,6 +70,24 @@ impl HomeView {
         mut data: NewSessionData,
         hooks: Option<crate::session::config::repo_config::ResolvedHooks>,
     ) {
+        let storage = (|| -> anyhow::Result<Storage> {
+            let _workspace = crate::session::acquire_session_workspace_claim_lock()?;
+            let _identity = crate::session::acquire_session_identity_lock()?;
+            match self.storages.get(&data.profile) {
+                Some(original) => original.reopen_preserving_watch(),
+                None => Storage::open_or_create(&data.profile, self.file_watch.clone()),
+            }
+        })();
+        let storage = match storage {
+            Ok(storage) => std::sync::Arc::new(storage),
+            Err(error) => {
+                self.info_dialog = Some(InfoDialog::sized_to_fit(
+                    "Creation Failed",
+                    &format!("{error:#}"),
+                ));
+                return;
+            }
+        };
         // Pre-resolve the title with the logic the builder will run, so the stub, the
         // background creation and the final instance agree; otherwise an empty title shows
         // as the path basename in the stub and a civilization name in the instance.
@@ -203,6 +221,7 @@ impl HomeView {
             .cloned()
             .collect();
         let request = CreationRequest {
+            storage,
             data,
             existing_instances,
             hooks,
@@ -246,12 +265,14 @@ impl HomeView {
                 ..
             } = result
             {
-                cleanup_creation_resources(
-                    instance,
-                    created_worktree.as_ref(),
-                    created_workspace_worktrees,
-                    None,
-                );
+                if outcome.storage.verify_profile_identity().is_ok() {
+                    cleanup_creation_resources(
+                        instance,
+                        created_worktree.as_ref(),
+                        created_workspace_worktrees,
+                        None,
+                    );
+                }
             }
             return None;
         }
@@ -311,39 +332,20 @@ impl HomeView {
                     self.remove_instance(id);
                 }
 
-                let target_profile = self.creation_poller.last_profile().unwrap_or_else(|| {
-                    self.active_profile
-                        .clone()
-                        .unwrap_or_else(crate::session::config::resolve_default_profile)
-                });
-                let storage = match Storage::open(&target_profile, self.file_watch.clone()) {
-                    Ok(storage) => storage,
-                    Err(error) => {
-                        cleanup_creation_resources_under_locks(
-                            &instance,
-                            created_worktree.as_ref(),
-                            &created_workspace_worktrees,
-                            None,
-                            &ownership_locks,
-                        );
-                        self.info_dialog = Some(InfoDialog::sized_to_fit(
-                            "Creation Failed",
-                            &format!("Failed to open profile storage: {error}"),
-                        ));
-                        self.new_dialog = None;
-                        self.rebuild_group_trees();
-                        self.rebuild_flat_items();
-                        self.update_selected();
-                        return None;
-                    }
-                };
-                self.storages.insert(target_profile.clone(), storage);
-
-                let Some(storage) = self.storages.get(&target_profile) else {
-                    // The block above found or inserted this profile's storage, so this is
-                    // unreachable; bail without attaching rather than panicking.
+                let storage = &*outcome.storage;
+                if let Err(error) = storage.verify_profile_identity() {
+                    self.info_dialog = Some(InfoDialog::sized_to_fit(
+                        "Creation Failed",
+                        &format!(
+                            "Original profile was replaced; retaining created resources: {error:#}"
+                        ),
+                    ));
+                    self.new_dialog = None;
+                    self.rebuild_group_trees();
+                    self.rebuild_flat_items();
+                    self.update_selected();
                     return None;
-                };
+                }
                 let manages_worktree = instance
                     .worktree_info
                     .as_ref()

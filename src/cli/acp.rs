@@ -773,25 +773,20 @@ pub(crate) async fn stop_all_workers(timeout_secs: u64) -> Result<usize> {
 
 async fn stop_worker(id: &str, timeout_secs: u64) -> Result<()> {
     let record = crate::process::worker_registry::load_strict(id)?;
+    let original = crate::session::runner_journal::capture_unique_origin(id)?;
+    if let Some(record) = record.as_ref() {
+        original.validate_record_birth(record)?;
+    }
+    let stop = crate::session::runner_journal::reserve_stop_from_origin(original, false)?;
     tokio::time::timeout(
         std::time::Duration::from_secs(timeout_secs),
-        crate::session::runner_journal::settle_unique(id),
+        crate::session::runner_journal::settle(stop.clone()),
     )
     .await
     .map_err(|_| {
         anyhow::anyhow!("runner stop proof timed out for {id}; session remains protected")
     })??;
-    if let Some(record) = record {
-        anyhow::ensure!(
-            crate::process::worker_registry::delete_if_owned_by(
-                id,
-                record.pid,
-                record.generation,
-                record.launch_nonce,
-            ),
-            "could not retire settled worker registry entry"
-        );
-    }
+    crate::session::runner_journal::release_owned_stop(&stop)?;
     println!("Stopped managed executions for {id}.");
     Ok(())
 }
@@ -799,18 +794,13 @@ async fn stop_worker(id: &str, timeout_secs: u64) -> Result<()> {
 async fn kill_now(session: &str) -> Result<()> {
     use crate::process::worker_registry;
     let record = worker_registry::load_strict(session)?;
-    crate::session::runner_journal::kill_unique(session).await?;
-    if let Some(record) = record {
-        anyhow::ensure!(
-            worker_registry::delete_if_owned_by(
-                session,
-                record.pid,
-                record.generation,
-                record.launch_nonce
-            ),
-            "could not retire settled worker registry entry"
-        );
+    let original = crate::session::runner_journal::capture_unique_origin(session)?;
+    if let Some(record) = record.as_ref() {
+        original.validate_record_birth(record)?;
     }
+    let stop = crate::session::runner_journal::reserve_stop_from_origin(original, false)?;
+    crate::session::runner_journal::kill(stop.clone()).await?;
+    crate::session::runner_journal::release_owned_stop(&stop)?;
     println!("Killed managed executions for {session}.");
     Ok(())
 }
@@ -872,31 +862,15 @@ async fn restart(session: &str) -> Result<()> {
     let Some(record) = worker_registry::load_strict(session)? else {
         anyhow::bail!("No agent worker registry entry for session {session}");
     };
-    let id = session.to_owned();
-    let profile = tokio::task::spawn_blocking(move || {
-        crate::session::runner_journal::unique_stored_owner(&id)
-    })
-    .await??;
-    let owner = crate::session::deletion::SessionPathOwner {
-        profile: &profile,
-        session_id: session,
-    };
-    if record.launch_nonce.is_none() {
-        crate::session::runner_journal::require_quiescent(owner, None).await?;
-    }
-    worker_registry::mark_restart_pending(session, record.generation);
-    if let Some(nonce) = record.launch_nonce {
-        crate::session::runner_journal::settle_nonce(owner, nonce, None).await?;
-    }
-    anyhow::ensure!(
-        worker_registry::delete_if_owned_by(
-            session,
-            record.pid,
-            record.generation,
-            record.launch_nonce
-        ),
-        "could not retire settled worker registry entry"
-    );
+    let original = crate::session::runner_journal::capture_unique_origin(session)?;
+    original.validate_record_birth(&record)?;
+    let stop = crate::session::runner_journal::reserve_stop_from_origin(original, false)?;
+    stop.with_scope(|_| {
+        worker_registry::mark_restart_pending(session, record.generation);
+        Ok(())
+    })?;
+    crate::session::runner_journal::settle(stop.clone()).await?;
+    crate::session::runner_journal::release_owned_stop(&stop)?;
     println!(
         "Stopped runner for {} (PID {}). `aoe serve` will respawn on its next reconciler tick.",
         session, record.pid

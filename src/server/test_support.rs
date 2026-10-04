@@ -64,7 +64,7 @@ pub(crate) fn build_test_app_state_with_launcher(
 }
 
 fn build_test_app_state_impl(
-    prior: Vec<Instance>,
+    mut prior: Vec<Instance>,
     allowed_hosts: Vec<String>,
     allowed_origins: Vec<String>,
     token: Option<String>,
@@ -74,6 +74,21 @@ fn build_test_app_state_impl(
     )
         -> crate::acp::supervisor::Supervisor<crate::acp::supervisor::ChannelSink>,
 ) -> Arc<AppState> {
+    let primary = Arc::new(Storage::new_unwatched("test").expect("original primary test storage"));
+    for instance in &mut prior {
+        if instance.storage_origin.is_some() {
+            continue;
+        }
+        let storage = if instance.source_profile == "test" {
+            primary.clone()
+        } else {
+            Arc::new(
+                Storage::new_unwatched(&instance.source_profile).expect("original fixture storage"),
+            )
+        };
+        instance.source_profile = storage.profile().to_owned();
+        instance.storage_origin = Some(storage);
+    }
     let app_dir = tempfile::tempdir().expect("tempdir");
     let acp_db = app_dir.path().join("acp_events.db");
     let event_store =
@@ -96,6 +111,7 @@ fn build_test_app_state_impl(
     let file_watch = FileWatchService::noop();
     let session_service = Arc::new(session_service::SessionService::new(
         Arc::clone(&instances),
+        primary,
         Arc::clone(&instance_locks),
         Arc::clone(&file_watch),
         Arc::clone(&telemetry_session_creates),

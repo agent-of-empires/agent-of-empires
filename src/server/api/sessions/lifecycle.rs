@@ -244,122 +244,127 @@ pub async fn update_session_archive(
     let lock = state.instance_lock(&id).await;
     let _guard = lock.lock().await;
 
-    // Read the profile without mutating yet: persisting first means a storage
-    // failure returns 500 with disk and memory in agreement, and the tmux/acp
-    // teardown never fires on a write that did not land (#1589).
-    let profile = {
+    let expected = {
         let instances = state.instances.read().await;
-        let Some(inst) = instances.iter().find(|i| i.id == id) else {
+        let Some(inst) = instances.iter().find(|row| row.id == id) else {
             return session_not_found();
         };
-        inst.source_profile.clone()
+        inst.clone()
     };
-
-    let archived = body.archived;
-    let persist_id = id.clone();
-    // Locked so an archive cannot land while `aoe send` types into a live pane.
-    if persist_session_update_locked(
-        profile,
-        "archive update",
-        state.file_watch.clone(),
-        id.clone(),
-        move |instances| {
-            if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
-                if archived {
-                    inst.archive();
-                } else {
-                    inst.unarchive();
+    let profile = expected.source_profile.clone();
+    if !body.archived {
+        let persist_id = id.clone();
+        if persist_session_update_locked(
+            profile,
+            "unarchive update",
+            state.file_watch.clone(),
+            id.clone(),
+            move |instances| {
+                if let Some(row) = instances.iter_mut().find(|row| row.id == persist_id) {
+                    row.unarchive();
                 }
-            }
-        },
-    )
-    .await
-    .is_err()
-    {
-        return persist_failed_response();
-    }
-
-    // Disk is durable; apply to memory and snapshot what the side effects need.
-    // The instance is cloned once so `kill()` can run outside the lock.
-    let (was_structured_view, inst_clone, kill_pane) = {
+            },
+        )
+        .await
+        .is_err()
+        {
+            return persist_failed_response();
+        }
         let mut instances = state.instances.write().await;
-        let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
-            tracing::warn!(
-                target: "http.api.sessions",
-                session = %id,
-                "archive update: instance vanished after persist"
-            );
+        let Some(row) = instances.iter_mut().find(|row| row.id == id) else {
             return crate::server::api::session_gone_after_persist();
         };
-        if archived {
-            inst.archive();
-        } else {
-            inst.unarchive();
-        }
-        let response =
-            SessionResponse::from_instance(&*inst, crate::claude_settings::read_tui_fullscreen());
-
-        let structured_view = inst.is_structured();
-        let inst_snap = inst.clone();
-        drop(instances);
-
-        // Snapshot and drop the lock; side effects run below. Archive does NOT
-        // short-circuit on kill_pane=false, because structured-view shutdown is
-        // unconditional.
-        if !archived {
-            return (StatusCode::OK, Json(serde_json::json!(response))).into_response();
-        }
-        (structured_view, inst_snap, body.kill_pane)
-    };
-
-    // Best-effort tmux teardown (helper logs at debug). #1868.
-    if was_structured_view {
-        // Worker shutdown before ancillary kill so in-flight tool output
-        // settles. `shutdown` preserves the transcript (#1710).
-        match state.acp_supervisor.shutdown(&id).await {
-            Ok(()) | Err(crate::acp::supervisor::SupervisorError::UnknownSession(_)) => {}
-            Err(e) => tracing::warn!(
-                target: "acp.supervisor",
-                session = %id,
-                "shutdown during archive failed: {e}"
-            ),
-        }
-        if kill_pane {
-            let inst_for_kill = inst_clone.clone();
-            if let Err(e) =
-                tokio::task::spawn_blocking(move || inst_for_kill.kill_ancillary_tmux_sessions())
-                    .await
-            {
-                tracing::warn!(
-                    target: "http.api.sessions",
-                    "Archive: ancillary tmux kill join failed: {e}"
-                );
-            }
-        }
-    } else if kill_pane {
-        let inst_for_kill = inst_clone.clone();
-        if let Err(e) =
-            tokio::task::spawn_blocking(move || inst_for_kill.kill_all_tmux_sessions()).await
-        {
-            tracing::warn!(
-                target: "http.api.sessions",
-                "Archive: tmux kill join failed: {e}"
-            );
-        }
+        row.unarchive();
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!(SessionResponse::from_instance(
+                row,
+                crate::claude_settings::read_tui_fullscreen()
+            ))),
+        )
+            .into_response();
     }
 
-    // Re-read so the response reflects the archived flag and picks up any peer
-    // write that landed during the unlock window.
-    let instances = state.instances.read().await;
-    let response = match instances.iter().find(|i| i.id == id) {
-        Some(inst) => {
-            SessionResponse::from_instance(inst, crate::claude_settings::read_tui_fullscreen())
+    let claimed = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let storage = expected
+            .storage_origin
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("archive has no cached physical original"))?
+            .as_ref()
+            .clone();
+        let stop = crate::session::runner_journal::reserve_owned_stop(&storage, &expected, false)?;
+        Ok((storage, stop))
+    })
+    .await;
+    let (storage, generation) = match claimed {
+        Ok(Ok(claimed)) => claimed,
+        Ok(Err(error)) => {
+            return api_error(StatusCode::CONFLICT, "lifecycle_busy", error.to_string())
         }
-        None => {
-            return session_not_found();
-        }
+        Err(_) => return persist_failed_response(),
     };
-    (StatusCode::OK, Json(serde_json::json!(response))).into_response()
+    // A reversible archive cancels admissions and settles runners, but never
+    // sends session/delete or touches the transcript and checkout. No flock is
+    // retained across either asynchronous wait.
+    let settled = state
+        .acp_supervisor
+        .shutdown_and_require_dead(generation.clone())
+        .await;
+    if let Err(error) = settled {
+        let _ = tokio::task::spawn_blocking(move || {
+            crate::session::runner_journal::release_owned_stop(&generation)
+        })
+        .await;
+        return api_error(StatusCode::CONFLICT, "teardown_pending", error.to_string());
+    }
+    let persist_id = id.clone();
+    let kill_pane = body.kill_pane;
+    let published = tokio::task::spawn_blocking(move || {
+        crate::session::runner_journal::finish_owned_stop(&generation, |row| {
+            if kill_pane {
+                if let Err(error) = row.kill_locked() {
+                    tracing::debug!(session = %persist_id, %error, "archive tmux teardown failed");
+                }
+                row.kill_ancillary_tmux_sessions_locked();
+            }
+            storage.update_native_under_workspace_claim_lock(|rows, _| {
+                let row = rows
+                    .iter_mut()
+                    .find(|row| row.id == persist_id)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("session disappeared before archive publication")
+                    })?;
+                anyhow::ensure!(
+                    row.lifecycle_generation == generation.generation(),
+                    "archive generation was superseded"
+                );
+                row.archive();
+                Ok(row.clone())
+            })
+        })
+    })
+    .await;
+    let mut authoritative = match published {
+        Ok(Ok(row)) => row,
+        Ok(Err(error)) => {
+            return api_error(StatusCode::CONFLICT, "archive_failed", error.to_string())
+        }
+        Err(_) => return persist_failed_response(),
+    };
+    let mut instances = state.instances.write().await;
+    let Some(row) = instances.iter_mut().find(|row| row.id == id) else {
+        return crate::server::api::session_gone_after_persist();
+    };
+    authoritative.merge_runtime_from_reload(row);
+    *row = authoritative;
+    (
+        StatusCode::OK,
+        Json(serde_json::json!(SessionResponse::from_instance(
+            row,
+            crate::claude_settings::read_tui_fullscreen()
+        ))),
+    )
+        .into_response()
 }
 
 /// `POST /api/sessions/:id/trash`. Reserve durably before stopping without flocks,
@@ -456,15 +461,16 @@ pub async fn trash_session(
     }
 
     // Registry absence and daemon memory do not prove runner quiescence.
-    let relocation_allowed = match crate::session::runner_journal::settle(
-        crate::session::deletion::SessionPathOwner {
-            profile: storage.profile(),
-            session_id: &id,
-        },
-        Some((LifecycleOperation::Trash, generation)),
-    )
-    .await
-    {
+    let native = match crate::session::runner_journal::OwnedStop::from_claim(
+        &storage,
+        &plan,
+        LifecycleOperation::Trash,
+        generation,
+    ) {
+        Ok(native) => native,
+        Err(error) => return api_error(StatusCode::CONFLICT, "lifecycle_busy", error.to_string()),
+    };
+    let relocation_allowed = match crate::session::runner_journal::settle(native).await {
         Ok(()) => true,
         Err(error) => {
             tracing::warn!(target: "http.api.sessions", session = %id,
@@ -703,14 +709,14 @@ pub async fn restore_session(
             .as_ref()
             .is_some_and(|original| original != &plan.project_path);
         let settled = if needs_move {
-            crate::session::runner_journal::settle(
-                crate::session::deletion::SessionPathOwner {
-                    profile: storage.profile(),
-                    session_id: &id,
-                },
-                Some((LifecycleOperation::Restore, generation)),
+            let native = crate::session::runner_journal::OwnedStop::from_claim(
+                &storage,
+                &plan,
+                LifecycleOperation::Restore,
+                generation,
             )
-            .await
+            .map_err(|error| RestoreTransitionError::Persist(error.to_string()))?;
+            crate::session::runner_journal::settle(native).await
         } else {
             Ok(())
         };
@@ -1159,7 +1165,7 @@ pub async fn stop_session(
 
     // Snapshot profile, session type and current status without mutating, so a
     // persist failure leaves disk and memory in agreement.
-    let (profile, is_structured, already_stopped) = {
+    let (profile, is_structured, already_stopped, expected) = {
         let instances = state.instances.read().await;
         let Some(inst) = instances.iter().find(|i| i.id == id) else {
             return session_not_found();
@@ -1172,7 +1178,12 @@ pub async fn stop_session(
             inst.status,
             Status::Stopped | Status::Deleting | Status::Creating
         );
-        (inst.source_profile.clone(), structured, already)
+        (
+            inst.source_profile.clone(),
+            structured,
+            already,
+            inst.clone(),
+        )
     };
 
     if already_stopped {
@@ -1191,29 +1202,44 @@ pub async fn stop_session(
     // Structured sessions have no tmux/container teardown transaction, so
     // persist their dormant stop before asking the supervisor to shut down.
     // Plain sessions delegate the full sequence to `Instance::stop` below.
-    if is_structured {
-        let persist_id = id.clone();
-        if persist_session_update(
-            profile.clone(),
-            "stop session",
-            state.file_watch.clone(),
-            move |instances| {
-                if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
-                    inst.status = Status::Stopped;
-                    inst.mark_idle_dormant();
-                }
-            },
-        )
-        .await
-        .is_err()
-        {
+    let native_stop = if is_structured {
+        let original = match state.capture_operation_origin(&expected) {
+            Ok(original) => original,
+            Err(error) => return (StatusCode::CONFLICT, error.to_string()).into_response(),
+        };
+        let stop = match crate::session::runner_journal::reserve_stop_from_origin(original, false) {
+            Ok(stop) => stop,
+            Err(error) => return (StatusCode::CONFLICT, error.to_string()).into_response(),
+        };
+        let owner = stop.clone();
+        let saved = tokio::task::spawn_blocking(move || {
+            owner.update_projection(|row| {
+                row.status = Status::Stopped;
+                row.mark_idle_dormant();
+                Ok(())
+            })
+        })
+        .await;
+        if !matches!(saved, Ok(Ok(()))) {
             return persist_failed_response();
         }
-    }
+        Some(stop)
+    } else {
+        None
+    };
 
     let inst_clone = {
         let mut instances = state.instances.write().await;
-        let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
+        let Some(inst) = instances
+            .iter_mut()
+            .find(|instance| match native_stop.as_ref() {
+                Some(stop) => {
+                    stop.original().matches_instance(instance)
+                        || stop.cancellation_origin().matches_instance(instance)
+                }
+                None => instance.id == id,
+            })
+        else {
             tracing::warn!(
                 target: "http.api.sessions",
                 session = %id,
@@ -1228,6 +1254,10 @@ pub async fn stop_session(
             // reaching a terminal status; do the same here, on the live in-memory row (the
             // disk-persisted copy above is a fresh load, so this field is always false there).
             inst.plugin_revival_pending = false;
+            inst.lifecycle_generation = native_stop
+                .as_ref()
+                .expect("structured stop reserved its original scope")
+                .generation();
         }
         inst.clone()
     };
@@ -1235,8 +1265,13 @@ pub async fn stop_session(
     if is_structured {
         // Structured view: shut down the worker so the reconciler does not race
         // to respawn it. `shutdown` preserves the transcript.
-        match state.acp_supervisor.shutdown(&id).await {
-            Ok(()) | Err(crate::acp::supervisor::SupervisorError::UnknownSession(_)) => {}
+        let stop = native_stop.expect("structured stop reserved its original scope");
+        match state.acp_supervisor.shutdown(stop.clone()).await {
+            Ok(()) => {
+                if let Err(error) = crate::session::runner_journal::release_owned_stop(&stop) {
+                    tracing::warn!(%error, "original stop claim remains protected");
+                }
+            }
             Err(e) => tracing::warn!(
                 target: "acp.supervisor",
                 session = %id,
@@ -1543,43 +1578,81 @@ pub async fn update_session_snooze(
     let lock = state.instance_lock(&id).await;
     let _guard = lock.lock().await;
 
-    let (was_structured_view, profile) = {
+    let (was_structured_view, profile, expected) = {
         let instances = state.instances.read().await;
         let Some(inst) = instances.iter().find(|i| i.id == id) else {
             return session_not_found();
         };
 
         let structured_view = inst.is_structured();
-        (structured_view, inst.source_profile.clone())
+        (structured_view, inst.source_profile.clone(), inst.clone())
     };
 
     let minutes = body.minutes;
+    let native_stop = if was_structured_view && minutes.is_some() {
+        let original = match state.capture_operation_origin(&expected) {
+            Ok(original) => original,
+            Err(error) => return (StatusCode::CONFLICT, error.to_string()).into_response(),
+        };
+        match crate::session::runner_journal::reserve_stop_from_origin(original, false) {
+            Ok(stop) => Some(stop),
+            Err(error) => return (StatusCode::CONFLICT, error.to_string()).into_response(),
+        }
+    } else {
+        None
+    };
 
     // Persist first; only mutate memory once disk is durable, and fire the
     // structured teardown below only on a write that landed (#1589).
     let persist_id = id.clone();
-    if persist_session_update(
-        profile,
-        "snooze update",
-        state.file_watch.clone(),
-        move |instances| {
-            if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
-                match minutes {
-                    Some(m) => inst.snooze(m),
-                    None => inst.unsnooze(),
+    let saved = if let Some(owner) = native_stop.as_ref().cloned() {
+        tokio::task::spawn_blocking(move || {
+            owner.update_projection(|row| {
+                row.snooze(minutes.expect("snooze stop has a duration"));
+                Ok(())
+            })
+        })
+        .await
+        .map_err(|error| error.to_string())
+        .and_then(|result| result.map_err(|error| error.to_string()))
+    } else {
+        persist_session_update(
+            profile,
+            "snooze update",
+            state.file_watch.clone(),
+            move |instances| {
+                if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
+                    match minutes {
+                        Some(m) => inst.snooze(m),
+                        None => inst.unsnooze(),
+                    }
                 }
-            }
-        },
-    )
-    .await
-    .is_err()
-    {
+            },
+        )
+        .await
+        .map_err(|()| "snooze update did not commit".to_owned())
+    };
+    if saved.is_err() {
         return persist_failed_response();
     }
 
     {
         let mut instances = state.instances.write().await;
-        let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
+        let Some(inst) = instances
+            .iter_mut()
+            .find(|instance| match native_stop.as_ref() {
+                Some(stop) => {
+                    stop.original().matches_instance(instance)
+                        || stop.cancellation_origin().matches_instance(instance)
+                }
+                None => {
+                    instance.id == id
+                        && instance.same_storage_origin(&expected)
+                        && instance.created_at == expected.created_at
+                        && instance.lifecycle_generation == expected.lifecycle_generation
+                }
+            })
+        else {
             tracing::warn!(
                 target: "http.api.sessions",
                 session = %id,
@@ -1591,6 +1664,9 @@ pub async fn update_session_snooze(
             Some(m) => inst.snooze(m),
             None => inst.unsnooze(),
         }
+        if let Some(stop) = native_stop.as_ref() {
+            inst.lifecycle_generation = stop.generation();
+        }
     }
 
     // Snoozing tears a structured worker down the way archive does: snooze is
@@ -1599,8 +1675,13 @@ pub async fn update_session_snooze(
     // the first tick after expiry. `shutdown` preserves the transcript, so that
     // respawn resumes the conversation (#1710).
     if was_structured_view && minutes.is_some() {
-        match state.acp_supervisor.shutdown(&id).await {
-            Ok(()) | Err(crate::acp::supervisor::SupervisorError::UnknownSession(_)) => {}
+        let stop = native_stop.expect("structured snooze reserved its original stop");
+        match state.acp_supervisor.shutdown(stop.clone()).await {
+            Ok(()) => {
+                if let Err(error) = crate::session::runner_journal::release_owned_stop(&stop) {
+                    tracing::warn!(%error, "original snooze claim remains protected");
+                }
+            }
             Err(e) => tracing::warn!(
                 target: "acp.supervisor",
                 session = %id,

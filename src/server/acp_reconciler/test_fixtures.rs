@@ -24,6 +24,10 @@ pub(super) fn test_state(id: &str) -> (AppDirGuard, Arc<AppState>, tempfile::Tem
     let home = crate::session::test_support::isolate_app_dir();
     let project = tempfile::TempDir::new().unwrap();
     let inst = structured_instance(id, &project.path().to_string_lossy());
+    crate::server::test_support::seed_instances_on_disk_for_test(
+        &inst.source_profile,
+        vec![inst.clone()],
+    );
     let state = crate::server::test_support::build_test_app_state(vec![inst]);
     (home, state, project)
 }

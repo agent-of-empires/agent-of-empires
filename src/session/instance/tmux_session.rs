@@ -142,6 +142,24 @@ impl Instance {
 
     /// Apply all configured tmux options to a session with the given name and title.
     fn apply_session_tmux_options(&self, session_name: &str, display_title: &str) {
+        let storage = match self.original_storage().and_then(|storage| {
+            storage.verify_profile_identity()?;
+            Ok(storage)
+        }) {
+            Ok(storage) => storage,
+            Err(error) => {
+                tracing::debug!(target: "tmux.status", %error, "discarding options without original authority");
+                return;
+            }
+        };
+        let session = tmux::Session::from_name(session_name);
+        if let Err(error) = session.primary_with_deadline(&tmux::TmuxCommandDeadline::new()) {
+            tracing::debug!(target: "tmux.status", %error, "tmux option actor is unavailable");
+            return;
+        }
+        if storage.verify_profile_identity().is_err() {
+            return;
+        }
         let branch = self
             .worktree_info
             .as_ref()
@@ -149,11 +167,11 @@ impl Instance {
             .or_else(|| self.workspace_info.as_ref().map(|w| w.branch.as_str()));
         let sandbox = self.sandbox_display();
         crate::tmux::status_bar::apply_all_tmux_options(
-            session_name,
+            &session,
             display_title,
             branch,
             sandbox.as_ref(),
-            &self.effective_profile(),
+            storage.profile(),
         );
     }
 

@@ -92,8 +92,7 @@ pub struct AcpClient {
     /// Kills an in-proc agent when the client drops.
     _child: Option<Arc<Mutex<tokio::process::Child>>>,
     /// The detached runner this client launched, which its lease owns.
-    runner_pid: Option<u32>,
-    launch_nonce: Option<uuid::Uuid>,
+    runner_identity: Option<crate::acp::runner_lifecycle::RunnerIdentity>,
     pub(crate) native_store: Option<crate::session::ExecutionBinding>,
 }
 
@@ -204,8 +203,7 @@ impl Launch {
             cmd_tx: Some(cmd_tx),
             pending_responders,
             _child: child,
-            runner_pid: None,
-            launch_nonce: None,
+            runner_identity: None,
             native_store: None,
         };
         (client, ready_rx)
@@ -224,8 +222,7 @@ impl AcpClient {
             cmd_tx,
             pending_responders: Arc::new(Mutex::new(HashMap::new())),
             _child: None,
-            runner_pid: None,
-            launch_nonce: None,
+            runner_identity: None,
             native_store: None,
         };
         (client, event_tx)
@@ -261,18 +258,25 @@ impl AcpClient {
             .expect("recorder acknowledgement");
     }
 
-    /// Attached and stdio clients have none.
+    /// Runner execution captured by this client, if any.
     pub fn runner_pid(&self) -> Option<u32> {
-        self.runner_pid
+        self.runner_identity.map(|identity| identity.pid)
     }
 
     pub fn launch_nonce(&self) -> Option<uuid::Uuid> {
-        self.launch_nonce
+        self.runner_identity
+            .and_then(|identity| identity.launch_nonce)
     }
 
-    pub(crate) fn capture_runner(&mut self, pid: u32, nonce: uuid::Uuid) {
-        self.runner_pid = Some(pid);
-        self.launch_nonce = Some(nonce);
+    pub(crate) fn runner_identity(&self) -> Option<crate::acp::runner_lifecycle::RunnerIdentity> {
+        self.runner_identity
+    }
+
+    pub(crate) fn capture_runner(
+        &mut self,
+        identity: crate::acp::runner_lifecycle::RunnerIdentity,
+    ) {
+        self.runner_identity = Some(identity);
     }
 
     /// A client that spawns nothing, for structured view state tests.
@@ -419,14 +423,7 @@ impl AcpClient {
             let mut client = match connected {
                 Ok(client) => client,
                 Err(error) => {
-                    let identity =
-                        issued
-                            .pid
-                            .map(|pid| crate::acp::runner_lifecycle::RunnerIdentity {
-                                pid,
-                                generation: config.generation,
-                                launch_nonce: Some(issued.nonce),
-                            });
+                    let identity = issued.identity;
                     let settled = match issued.retire().await {
                         Ok(()) => true,
                         Err(unproven) => {
@@ -443,8 +440,9 @@ impl AcpClient {
                 }
             };
             client.capture_runner(
-                issued.pid.expect("successful detached spawn has a PID"),
-                issued.nonce,
+                issued
+                    .identity
+                    .expect("successful detached spawn has a captured birth"),
             );
             client.native_store = issued.native_store.take();
             issued.commit();
@@ -575,9 +573,7 @@ impl AcpClient {
             default_model: None,
             mcp_servers: Vec::new(),
         };
-        let mut client = Self::connect_via_socket(socket_path, launch, launch_nonce).await?;
-        client.launch_nonce = Some(launch_nonce);
-        Ok(client)
+        Self::connect_via_socket(socket_path, launch, launch_nonce).await
     }
 
     async fn send_cmd(&self, cmd: ClientCmd) -> Result<(), AcpError> {

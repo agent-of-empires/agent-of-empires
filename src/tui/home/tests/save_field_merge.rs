@@ -400,7 +400,7 @@ fn restart_profile_move_rejects_target_identity_collision_before_mutation() {
 
 #[test]
 #[serial]
-fn group_profile_move_reloads_members_and_registers_fallback_source() {
+fn group_profile_move_reloads_authoritative_members() {
     let temp = TempDir::new().unwrap();
     let _guard = setup_test_home(&temp);
     let source = Storage::new_unwatched("alpha").unwrap();
@@ -430,7 +430,6 @@ fn group_profile_move_reloads_members_and_registers_fallback_source() {
             Ok(())
         })
         .unwrap();
-    view.storages.remove("alpha");
     view.group_rename_context = Some(super::super::GroupRenameContext {
         old_path: "work".to_string(),
         old_profile: "alpha".to_string(),
@@ -914,7 +913,7 @@ fn restart_profile_move_rejection_leaves_source_tool_state_unchanged() {
     assert_eq!(live.source_profile, "test");
     assert_eq!(live.tool, "claude");
     assert_eq!(live.agent_session_id.as_deref(), Some("source-durable-sid"));
-    assert!(!view.restart_in_flight.contains(&id));
+    assert!(!view.restart_in_flight.contains_key(&id));
     assert!(!view.restart_cooldown_at.contains_key(&id));
 }
 
@@ -1027,4 +1026,117 @@ fn tied_cross_profile_collision_rejects_before_worktree_effects() {
     assert_eq!(source.title, "old-name");
     assert_eq!(source.project_path, old_path.to_string_lossy().to_string());
     assert_eq!(source.worktree_info.unwrap().branch, "old-name");
+}
+
+#[test]
+#[serial]
+fn cached_save_cannot_adopt_recreated_profile_or_replay_pending_metadata() {
+    let (temp, _guard, mut view, id) =
+        boot_view_with_one_session("old-title", "/tmp/profile-origin");
+    let original = view.storages["test"].clone();
+    view.mutate_instance(&id, |row| row.status = Status::Running);
+    view.pending_deletions
+        .entry("test".into())
+        .or_default()
+        .insert(id.clone());
+    view.pending_group_deletions
+        .entry("test".into())
+        .or_default()
+        .insert("shared".into());
+    let mut pending = Instance::new("old-pending", "/tmp/old-pending");
+    pending.source_profile = "test".into();
+    let pending_id = pending.id.clone();
+    view.add_instance(pending);
+    view.group_trees
+        .get_mut("test")
+        .unwrap()
+        .create_group("old-pending-group");
+    std::fs::rename(
+        original.sessions_path().parent().unwrap(),
+        temp.path().join("retired-profile"),
+    )
+    .unwrap();
+    crate::session::create_profile("test").unwrap();
+    let replacement = Storage::new_unwatched("test").unwrap();
+    let mut row = Instance::new("replacement", "/tmp/profile-origin");
+    row.id = id.clone();
+    row.source_profile = "test".into();
+    row.group_path = "shared".into();
+    replacement
+        .update(|rows, groups| {
+            rows.push(row);
+            groups.push(Group::new("shared", "replacement-group"));
+            Ok(())
+        })
+        .unwrap();
+    let groups_path = replacement
+        .sessions_path()
+        .parent()
+        .unwrap()
+        .join("groups.json");
+    let rows_before = std::fs::read(replacement.sessions_path()).unwrap();
+    let groups_before = std::fs::read(&groups_path).unwrap();
+    assert!(
+        view.save().is_err(),
+        "a cached writer must reject the new physical profile"
+    );
+    assert_eq!(
+        std::fs::read(replacement.sessions_path()).unwrap(),
+        rows_before
+    );
+    assert_eq!(std::fs::read(&groups_path).unwrap(), groups_before);
+    view.reload().unwrap();
+    assert_eq!(view.get_instance(&id).unwrap().title, "replacement");
+    assert_ne!(view.get_instance(&id).unwrap().status, Status::Running);
+    assert!(view.get_instance(&pending_id).is_none());
+    view.save().unwrap();
+    let rows = replacement.load().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].title, "replacement");
+    let groups: Vec<Group> = serde_json::from_slice(&std::fs::read(groups_path).unwrap()).unwrap();
+    assert!(groups.iter().any(|group| group.path == "shared"));
+    assert!(!groups.iter().any(|group| group.path == "old-pending-group"));
+}
+
+#[test]
+#[serial]
+fn archive_completion_uses_captured_id_after_selection_changes() {
+    let (_temp, _guard, mut view, original_id) =
+        boot_view_with_one_session("original", "/tmp/original-archive");
+    let storage = view.storages["test"].clone();
+    let peer = Instance::new("other", "/tmp/other-archive");
+    let peer_id = peer.id.clone();
+    storage
+        .update(|rows, _| {
+            rows.push(peer);
+            Ok(())
+        })
+        .unwrap();
+    view.reload().unwrap();
+    view.select_session_by_id(&original_id);
+    let held = storage
+        .acquire_instance_lifecycle_lock(&original_id)
+        .unwrap();
+    view.toggle_archive_at_cursor().unwrap();
+    assert!(
+        !view.get_instance(&original_id).unwrap().is_archived(),
+        "queueing must not publish archive before settlement"
+    );
+    view.select_session_by_id(&peer_id);
+    drop(held);
+    finish_runner_settlements(&mut view);
+    let rows = storage.load().unwrap();
+    assert!(rows
+        .iter()
+        .find(|row| row.id == original_id)
+        .unwrap()
+        .is_archived());
+    assert!(
+        !rows
+            .iter()
+            .find(|row| row.id == peer_id)
+            .unwrap()
+            .is_archived(),
+        "a changed selection must not retarget the queued action"
+    );
 }

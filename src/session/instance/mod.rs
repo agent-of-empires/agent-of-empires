@@ -379,4 +379,6 @@ pub struct Instance {
     pub pane_dead_observed: bool,
     #[serde(skip, default)]
     pub(crate) file_watch: Option<std::sync::Arc<crate::file_watch::FileWatchService>>,
+    #[serde(skip, default)]
+    pub(crate) storage_origin: Option<Arc<crate::session::storage::Storage>>,
 }

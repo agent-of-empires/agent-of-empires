@@ -1251,3 +1251,72 @@ fn test_cursor_follows_session_after_deletion() {
     );
     assert_eq!(env.view.cursor, 1);
 }
+
+#[test]
+#[serial]
+fn creation_delayed_in_native_hook_cannot_adopt_recreated_profile() {
+    let CreationTestEnv {
+        mut view,
+        storage,
+        project_dir,
+        _guard,
+        _temp,
+    } = setup_creation_test_env();
+    let sh = which::which("sh").expect("native hook fixture requires sh");
+    let _shell = crate::session::test_support::EnvGuard::set(&[("SHELL", sh)]);
+    let hooks = crate::session::config::repo_config::ResolvedHooks::with_repo("default", &project_dir, crate::session::config::repo_config::HooksConfig {
+        on_create: vec!["touch create-started; i=0; while [ ! -e release ] && [ $i -lt 1000 ]; do sleep 0.01; i=$((i+1)); done; [ -e release ]".into()],
+        on_launch: vec!["touch old-launch-started".into()],
+        ..Default::default()
+    });
+    view.request_creation(
+        creation_data(&project_dir, "Retired", "old-provisional-group"),
+        hooks,
+    );
+    wait_for_native_fixture("old profile creation entering on_create", || {
+        project_dir.join("create-started").exists().then_some(())
+    });
+    std::fs::rename(
+        storage.sessions_path().parent().unwrap(),
+        _temp.path().join("retired-profile"),
+    )
+    .unwrap();
+    crate::session::create_profile("default").unwrap();
+    let replacement = Storage::new_unwatched("default").unwrap();
+    replacement
+        .update(|rows, groups| {
+            rows.push(Instance::new("replacement", project_dir.to_str().unwrap()));
+            groups.push(Group::new("kept", "kept"));
+            Ok(())
+        })
+        .unwrap();
+    let rows_before = std::fs::read(replacement.sessions_path()).unwrap();
+    let groups_path = replacement
+        .sessions_path()
+        .parent()
+        .unwrap()
+        .join("groups.json");
+    let groups_before = std::fs::read(&groups_path).unwrap();
+    std::fs::write(project_dir.join("release"), b"").unwrap();
+    assert_eq!(drain_creation_result(&mut view), None);
+    assert!(!project_dir.join("old-launch-started").exists());
+    assert_eq!(
+        std::fs::read(replacement.sessions_path()).unwrap(),
+        rows_before
+    );
+    assert_eq!(std::fs::read(&groups_path).unwrap(), groups_before);
+    assert!(view.save().is_err());
+    view.reload().unwrap();
+    view.request_creation(creation_data(&project_dir, "Fresh", ""), None);
+    let id = drain_creation_result(&mut view).expect("an explicit reload admits a fresh creation");
+    assert_eq!(view.get_instance(&id).unwrap().title, "Fresh");
+    let (rows, groups) = replacement.load_with_groups().unwrap();
+    assert!(rows.iter().any(|row| row.title == "replacement"));
+    assert!(rows.iter().any(|row| row.title == "Fresh"));
+    assert!(!rows
+        .iter()
+        .any(|row| row.title == "Retired" || row.status == Status::Creating));
+    assert!(!groups
+        .iter()
+        .any(|group| group.path == "old-provisional-group"));
+}

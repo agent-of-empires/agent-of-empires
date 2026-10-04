@@ -322,6 +322,16 @@ test.describe("Delete active session", () => {
     });
     await page.goto("/session/sess-pending");
     const row = sessionRows(page).filter({ hasText: "story-delete-pending" }).first();
+    await expect(row).toBeVisible();
+    // Freeze list polling so it cannot repair an incorrect local Error transition.
+    let freezePolling = true;
+    await page.route("**/api/sessions", async (route) => {
+      if (freezePolling && route.request().method() === "GET") {
+        await route.abort();
+      } else {
+        await route.fallback();
+      }
+    });
     const refused = page.waitForResponse(
       (response) => response.url().endsWith("/api/workspaces") && response.status() === 409,
     );
@@ -331,7 +341,11 @@ test.describe("Delete active session", () => {
     await expect(dialog).toHaveCount(0);
     await expect(page).toHaveURL(/\/session\/sess-pending/);
     await expect(row).toBeVisible();
+    await expect(page.getByRole("alert")).toContainText("runner execution is still live");
+    await expect(row.locator(".text-status-running").first()).toBeVisible();
+    await expect(row.locator(".text-status-error")).toHaveCount(0);
     expect(handle.deletedIds).toEqual([]);
+    freezePolling = false;
     await confirmDelete(await openDeleteDialogFromRow(page, row));
     await expect.poll(() => handle.deletedIds).toEqual(["sess-pending"]);
     await expect(page).not.toHaveURL(/\/session\/sess-pending/);

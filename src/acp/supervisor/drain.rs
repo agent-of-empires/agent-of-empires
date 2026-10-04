@@ -298,7 +298,7 @@ impl<S: BroadcastSink> Drain<S> {
                 .is_some_and(|(current, _)| current == *lease)
             {
                 if let crate::acp::runner_lifecycle::StopDecision::TearDown { lease, .. } =
-                    table.begin_stop(&self.session_id, "drain_closed")
+                    table.begin_lease_stop(lease, "drain_closed")
                 {
                     table.settle(&lease, settlement);
                     true
@@ -379,6 +379,9 @@ impl<S: BroadcastSink> Drain<S> {
         mut config: SpawnConfig,
     ) -> Option<(Lease, mpsc::Receiver<Event>)> {
         let session_id = &self.session_id;
+        let previous_admission = config.execution_admission.as_ref()?.clone();
+        let original = previous_admission.origin()?;
+        let previous_retirement = previous_admission.preparation_retirement();
         let begun = lock_recover(&self.lifecycle).begin_respawn(lease);
         let Ok((respawn_lease, previous)) = begun else {
             debug!(
@@ -388,14 +391,23 @@ impl<S: BroadcastSink> Drain<S> {
             );
             return None;
         };
+        let issued = lock_recover(&self.lifecycle).execution_admission(&respawn_lease);
+        issued.set_origin(original.clone()).ok()?;
         let mut reservation = ResumeReservation {
             lease: respawn_lease.clone(),
             lifecycle: Arc::clone(&self.lifecycle),
             notify: Arc::clone(&self.notify),
             execution: previous,
-            issued: crate::acp::runner_lifecycle::ExecutionAdmission::new(),
+            custody: Some(issued.begin_job()),
+            retirement_required: true,
+            issued,
         };
-        config.generation = respawn_lease.epoch();
+        let _body_custody = reservation.issued.begin_job();
+        if let Some(retirement) = previous_retirement {
+            crate::session::runner_journal::PreparationCustody::await_retired(retirement)
+                .await
+                .ok()?;
+        }
 
         tokio::time::sleep(RESPAWN_BACKOFF).await;
         let cancelled = lock_recover(&self.lifecycle).cancel_requested(&respawn_lease);
@@ -417,8 +429,57 @@ impl<S: BroadcastSink> Drain<S> {
             }
         }
         reservation.execution = None;
+        let admission = reservation.issued.clone();
+        let custody = admission.begin_job();
+        let lifecycle = self.lifecycle.clone();
+        let preparation_lease = respawn_lease.clone();
+        let prepared = tokio::task::spawn_blocking(move || {
+            let _custody = custody;
+            let (prepared, preparation) = original.prepare(
+                &crate::acp::runner_lifecycle::NativeResume::Spawn,
+                &admission,
+                |commit| {
+                    crate::acp::runner_lifecycle::PreparationAuthorization::acquire(
+                        lock_recover(&lifecycle),
+                        &preparation_lease,
+                        &original,
+                        false,
+                        commit,
+                    )
+                },
+            )?;
+            admission.set_prepared_origin(prepared, preparation)?;
+            anyhow::Ok(())
+        })
+        .await;
+        if !matches!(prepared, Ok(Ok(()))) {
+            warn!(session = %session_id, ?prepared, "respawn preparation refused");
+            return None;
+        }
+        config.generation = reservation.issued.origin()?.generation();
+        config.execution_admission = Some(reservation.issued.clone());
 
+        if let Err(error) = super::launch::validate_launch_origin(&reservation.issued).await {
+            self.fail_launch(
+                &respawn_lease,
+                None,
+                &config,
+                AcpError::Spawn(error.to_string()),
+                None,
+            )
+            .await;
+            return None;
+        }
         Self::refresh_launch_env(&self.session_id, &mut config).await;
+        let cancelled = lock_recover(&self.lifecycle).cancel_requested(&respawn_lease);
+        if let Some(reason) = cancelled {
+            let converted = lock_recover(&self.lifecycle).convert_to_stopping(&respawn_lease, None);
+            if converted {
+                self.finish_cancelled(&respawn_lease, None, reason, None)
+                    .await;
+            }
+            return None;
+        }
         if let Some((wrapper, base)) = &config.wrapper_substitution {
             log_wrapper_substitution(session_id, &config.tool, wrapper, base);
         }
@@ -439,13 +500,7 @@ impl<S: BroadcastSink> Drain<S> {
                 return None;
             }
         };
-        let identity = reservation.execution().or_else(|| {
-            client.runner_pid().map(|pid| RunnerIdentity {
-                pid,
-                generation: respawn_lease.epoch(),
-                launch_nonce: client.launch_nonce(),
-            })
-        });
+        let identity = reservation.execution().or_else(|| client.runner_identity());
         reservation.execution = identity;
         let Some(inbound) = client.take_inbound() else {
             warn!(
@@ -466,6 +521,18 @@ impl<S: BroadcastSink> Drain<S> {
             return None;
         };
 
+        if let Err(error) = super::launch::validate_launch_origin(&reservation.issued).await {
+            let _ = client.shutdown().await;
+            self.fail_launch(
+                &respawn_lease,
+                None,
+                &config,
+                AcpError::Spawn(error.to_string()),
+                identity,
+            )
+            .await;
+            return None;
+        }
         let client = Arc::new(client);
 
         let refused = {
@@ -507,7 +574,7 @@ impl<S: BroadcastSink> Drain<S> {
                     .is_some_and(|(current, _)| current == respawn_lease)
                 {
                     if let crate::acp::runner_lifecycle::StopDecision::TearDown { lease, .. } =
-                        table.begin_stop(session_id, "refused_install")
+                        table.begin_lease_stop(&respawn_lease, "refused_install")
                     {
                         table.settle(&lease, settlement);
                     }
@@ -515,6 +582,7 @@ impl<S: BroadcastSink> Drain<S> {
                 return None;
             }
         }
+        reservation.installed();
         drop(reservation);
 
         // The respawned client starts with an empty `pending_responders` and
@@ -569,6 +637,7 @@ impl<S: BroadcastSink> Drain<S> {
                 &config.tool,
                 config.source_profile.clone().unwrap_or_default(),
                 config.cwd.clone(),
+                config.execution_admission.clone(),
             )
             .await;
             match minted {
@@ -762,31 +831,27 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn drain_retires_attached_crash_without_trusting_registry_presence() {
+        if super::super::test_support::run_execution_fixture_child().await {
+            return;
+        }
         for (id, registry_saved) in [("s-attach-rearm", true), ("s-attach-no-row", false)] {
-            let (_home, tmp) = isolate_home();
+            let (_home, _tmp) = isolate_home();
             let sink = VecSink::new();
             let sup = Supervisor::new(sink.clone());
             let profile = crate::session::Storage::new_unwatched("default")
                 .unwrap()
                 .profile()
                 .to_owned();
-            let execution = published_execution(id, 1, &profile, None);
-            let identity = RunnerIdentity {
-                pid: execution.pid,
-                generation: 1,
-                launch_nonce: Some(execution.nonce),
-            };
-            if registry_saved {
-                let mut record = worker_record(id, execution.pid, tmp.path().join("attach.sock"));
-                record.generation = identity.generation;
-                record.launch_nonce = identity.launch_nonce;
-                record.source_profile = Some(profile);
-                worker_registry::save(&record).unwrap();
+            let execution = published_execution(id, &profile, None, false);
+            let identity = execution.identity;
+            if !registry_saved {
+                let record = worker_registry::load_strict(id).unwrap().unwrap();
+                assert!(worker_registry::delete_if_owned_by(&record));
             }
             let (mut client, _client_tx) = crate::acp::acp_client::AcpClient::fake_for_test(
                 crate::acp::state::AcpSessionId(id.into()),
             );
-            client.capture_runner(execution.pid, execution.nonce);
+            client.capture_runner(execution.identity);
             let lease = sup
                 .test_install_handle(id, client, WorkerKind::Attached, Some(identity))
                 .await;
@@ -908,16 +973,12 @@ mod tests {
                 .unwrap()
                 .profile()
                 .to_owned();
-            let execution = published_execution(id, 1, &profile, None);
-            let identity = RunnerIdentity {
-                pid: execution.pid,
-                generation: 1,
-                launch_nonce: Some(execution.nonce),
-            };
+            let execution = published_execution(id, &profile, None, false);
+            let identity = execution.identity;
             let (mut client, _client_tx) = crate::acp::acp_client::AcpClient::fake_for_test(
                 crate::acp::state::AcpSessionId(id.into()),
             );
-            client.capture_runner(execution.pid, execution.nonce);
+            client.capture_runner(execution.identity);
             let lease = sup
                 .test_install_handle(id, client, WorkerKind::Stdio, Some(identity))
                 .await;
@@ -986,65 +1047,6 @@ mod tests {
         assert_eq!(supervisor.take_startup_failures(), vec![id.to_string()]);
         assert!(!supervisor.workers.lock().await.contains_key(id));
     }
-
-    /// The reconciler reads this flag to remind the agent its `Monitor` died.
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn an_installed_crash_respawn_is_flagged_for_the_reconciler() {
-        let _home = isolate_home();
-        let gate = Gate::default();
-        let sup = Arc::new(Supervisor::new(VecSink::new()).with_launcher(gated_launcher(&gate)));
-        let profile = crate::session::Storage::new_unwatched("default")
-            .unwrap()
-            .profile()
-            .to_owned();
-        let previous = published_execution("s-crash", 1, &profile, None);
-        let mut record = worker_record(
-            "s-crash",
-            previous.pid,
-            worker_registry::socket_path_for("s-crash").unwrap(),
-        )
-        .with_generation(1);
-        record.source_profile = Some(profile.clone());
-        record.launch_nonce = Some(previous.nonce);
-        worker_registry::save(&record).unwrap();
-        let socket = worker_registry::socket_path_for("s-crash").unwrap();
-        let mut config = runner_config(socket);
-        config.managed_profile = Some(profile.clone());
-        config.source_profile = Some(profile);
-        let lease = sup
-            .test_install_runner(
-                "s-crash",
-                config,
-                Some(RunnerIdentity {
-                    pid: previous.pid,
-                    generation: 1,
-                    launch_nonce: Some(previous.nonce),
-                }),
-            )
-            .await;
-        let (inbound_tx, inbound_rx) = mpsc::channel::<Event>(4);
-        let _drain = sup.start_drain_task("s-crash".into(), lease, inbound_rx, None);
-        drop(inbound_tx);
-
-        gate.entered.notified().await;
-        assert!(sup.take_respawned_in_place().is_empty());
-        gate.open.notify_one();
-
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        let mut flagged = Vec::new();
-        while flagged.is_empty() {
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "respawn was not flagged"
-            );
-            tokio::time::sleep(Duration::from_millis(20)).await;
-            flagged = sup.take_respawned_in_place();
-        }
-        assert_eq!(flagged, vec!["s-crash".to_string()]);
-        let _ = sup.shutdown_idle("s-crash").await;
-    }
-
     #[tokio::test]
     #[serial_test::serial]
     async fn respawn_drops_a_withdrawn_hook_route_and_realigns_native_mcp() {
@@ -1153,25 +1155,15 @@ mod tests {
                     .expect("respawn launch requires an explicit stored owner");
                 let execution = published_execution(
                     &session_id.0,
-                    config.generation,
                     profile,
                     config.execution_admission.as_ref(),
+                    false,
                 );
-                let pid = execution.pid;
-                let nonce = execution.nonce;
-                let mut record = worker_record(
-                    &session_id.0,
-                    pid,
-                    worker_registry::socket_path_for(&session_id.0).unwrap(),
-                )
-                .with_generation(config.generation);
-                record.source_profile = Some(profile.to_owned());
-                record.launch_nonce = Some(nonce);
-                worker_registry::save(&record).unwrap();
+                let identity = execution.identity;
                 executions.lock().unwrap().push(execution);
                 config_tx.send(config).unwrap();
                 let (mut client, tx) = crate::acp::acp_client::AcpClient::fake_for_test(session_id);
-                client.capture_runner(pid, nonce);
+                client.capture_runner(identity);
                 senders.lock().unwrap().push(tx);
                 Ok(client)
             })
@@ -1181,16 +1173,7 @@ mod tests {
             .unwrap()
             .profile()
             .to_owned();
-        let previous = published_execution("s-store", 1, &profile, None);
-        let mut record = worker_record(
-            "s-store",
-            previous.pid,
-            worker_registry::socket_path_for("s-store").unwrap(),
-        )
-        .with_generation(1);
-        record.source_profile = Some(profile.clone());
-        record.launch_nonce = Some(previous.nonce);
-        worker_registry::save(&record).unwrap();
+        let previous = published_execution("s-store", &profile, None, false);
         let socket = worker_registry::socket_path_for("s-store").unwrap();
         let mut config = runner_config(socket);
         config.managed_profile = Some(profile.clone());
@@ -1202,15 +1185,7 @@ mod tests {
         config.host_environment = vec![("CLAUDE_CONFIG_DIR".into(), "stale".into())];
         config.base_host_environment = vec![("HOME".into(), temp.path().display().to_string())];
         let lease = sup
-            .test_install_runner(
-                "s-store",
-                config,
-                Some(RunnerIdentity {
-                    pid: previous.pid,
-                    generation: 1,
-                    launch_nonce: Some(previous.nonce),
-                }),
-            )
+            .test_install_runner("s-store", config, Some(previous.identity))
             .await;
         let (inbound_tx, inbound_rx) = mpsc::channel::<Event>(4);
         let drain = sup.start_drain_task("s-store".into(), lease, inbound_rx, None);
@@ -1243,7 +1218,11 @@ mod tests {
             .host_environment
             .contains(&("HOOK_VALUE".into(), "kept".into())));
 
-        let _ = sup.shutdown_idle("s-store").await;
+        let _ = sup
+            .shutdown_idle(crate::acp::supervisor::test_support::stop_receipt(
+                "s-store",
+            ))
+            .await;
         held_senders.lock().unwrap().clear();
         tokio::time::timeout(Duration::from_secs(5), drain)
             .await

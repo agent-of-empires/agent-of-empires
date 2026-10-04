@@ -124,8 +124,44 @@ pub(super) struct PassiveSynced {
 struct RecoveryUpdate {
     instance_id: String,
     title: String,
+    before: Box<crate::session::Instance>,
     instance: Box<crate::session::Instance>,
     result: Result<crate::session::StartOutcome, String>,
+}
+
+pub(super) struct RequestOrigin {
+    storage: std::sync::Arc<Storage>,
+    generation: u64,
+}
+
+impl RequestOrigin {
+    fn capture(instance: &Instance) -> anyhow::Result<Self> {
+        let storage = instance.original_storage()?;
+        storage.verify_profile_identity()?;
+        Ok(Self {
+            storage,
+            generation: instance.lifecycle_generation,
+        })
+    }
+
+    fn matches(&self, instance: &Instance) -> bool {
+        self.generation == instance.lifecycle_generation
+            && instance
+                .storage_origin
+                .as_ref()
+                .is_some_and(|storage| self.storage.same_origin_as(storage))
+    }
+
+    fn retire(pending: &mut HashMap<String, Self>, instance: &Instance) -> bool {
+        if !pending
+            .get(&instance.id)
+            .is_some_and(|origin| origin.matches(instance))
+        {
+            return false;
+        }
+        pending.remove(&instance.id);
+        true
+    }
 }
 
 pub struct HomeView {
@@ -277,6 +313,9 @@ pub struct HomeView {
     pub(super) deletion_poller: DeletionPoller,
 
     pub(super) stop_poller: StopPoller,
+    pub(super) settlement_poller: super::stop_poller::SettlementPoller,
+    pub(super) settlement_in_flight: HashMap<String, RequestOrigin>,
+    pub(super) settled_edit: Option<super::stop_poller::SettledEdit>,
 
     pub(super) trash_poller: crate::tui::trash_poller::TrashPoller,
     pub(super) reconcile_poller: crate::tui::reconcile_poller::ReconcilePoller,
@@ -285,7 +324,7 @@ pub struct HomeView {
     pub(super) reconcile_reload_retry_at: Option<std::time::Instant>,
 
     pub(super) restart_poller: RestartPoller,
-    pub(super) restart_in_flight: std::collections::HashSet<String>,
+    pub(super) restart_in_flight: HashMap<String, RequestOrigin>,
     pub(super) attach_after_restart: std::collections::HashSet<String>,
     pub(super) restarted_attaches: Vec<String>,
 

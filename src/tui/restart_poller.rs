@@ -62,7 +62,7 @@ mod tests {
     impl Drop for TestPoller {
         fn drop(&mut self) {
             if let Some(poller) = self.0.take() {
-                let _ = poller.worker.finish_for_test();
+                let _ = poller.worker.finish();
             }
         }
     }

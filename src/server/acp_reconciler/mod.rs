@@ -85,8 +85,6 @@ fn park_message(project_path: &str) -> String {
 #[derive(Debug, Clone)]
 enum ResumeOutcome {
     Attached,
-    /// The captured runner was retired; retry next tick unless parked.
-    RetryAfterAttachTimeout,
     AttachFallbackPending {
         lease: crate::acp::runner_lifecycle::Lease,
     },
@@ -106,7 +104,7 @@ pub struct ReconcilerState {
     pub idle: Option<Instant>,
     pub rate_limit: Option<Instant>,
     pub terminal_repair: Option<Instant>,
-    attach_fallbacks: HashMap<String, crate::acp::runner_lifecycle::Lease>,
+    attach_fallbacks: HashMap<String, (crate::acp::runner_lifecycle::Lease, ResumeTarget)>,
     orphan_jobs: HashMap<String, tokio::task::JoinHandle<()>>,
 }
 
@@ -178,13 +176,20 @@ pub async fn reconcile_acp_workers(
     capacity_deferred: &mut HashSet<String>,
 ) {
     let supervisor = &state.acp_supervisor;
+    let mut retired_fallbacks = Vec::new();
     supervisor
         .retry_pending_teardowns(|lease| {
             let id = lease.session_id();
-            if cadence.attach_fallbacks.get(id) == Some(lease) {
-                cadence.attach_fallbacks.remove(id);
-                if !parked.contains(id) {
-                    attempted.remove(id);
+            if cadence
+                .attach_fallbacks
+                .get(id)
+                .is_some_and(|(pending, _)| pending == lease)
+            {
+                if let Some((_, target)) = cadence.attach_fallbacks.remove(id) {
+                    if !parked.contains(id) {
+                        attempted.remove(id);
+                        retired_fallbacks.push(target);
+                    }
                 }
             }
         })
@@ -230,7 +235,7 @@ pub async fn reconcile_acp_workers(
     };
 
     // Triaged sessions are excluded so an archive/snooze teardown is not undone (#1581).
-    let (targets, with_queued_prompts): (Vec<ResumeTarget>, HashSet<String>) = {
+    let (mut targets, with_queued_prompts): (Vec<ResumeTarget>, HashSet<String>) = {
         let instances = state.instances.read().await;
         (
             instances
@@ -245,6 +250,10 @@ pub async fn reconcile_acp_workers(
                 .collect(),
         )
     };
+    for target in retired_fallbacks {
+        targets.retain(|current| current.id != target.id);
+        targets.push(target);
+    }
     let live: HashSet<&String> = targets.iter().map(|t| &t.id).collect();
     attempted.retain(|id| live.contains(id));
     parked.retain(|id| live.contains(id));
@@ -340,30 +349,23 @@ pub async fn reconcile_acp_workers(
         .min(cfg.acp.max_concurrent_workers)
         .max(1);
     let semaphore = Arc::new(Semaphore::new(resume_limit as usize));
-    let mut set: JoinSet<(String, ResumeOutcome)> = JoinSet::new();
-    for target in tasks {
+    let mut set: JoinSet<(String, ResumeOutcome, ResumeTarget)> = JoinSet::new();
+    for mut target in tasks {
         let state = Arc::clone(state);
         let sem = Arc::clone(&semaphore);
         set.spawn(async move {
-            let Ok(_permit) = sem.acquire().await else {
-                return (target.id, ResumeOutcome::SpawnFinished);
-            };
             let id = target.id.clone();
-            (id, resume_one(state, target).await)
+            let outcome = resume_one(state, &mut target, sem).await;
+            (id, outcome, target)
         });
     }
 
     while let Some(result) = set.join_next().await {
         match result {
-            Ok((id, ResumeOutcome::AttachFallbackPending { lease })) => {
-                cadence.attach_fallbacks.insert(id, lease);
+            Ok((id, ResumeOutcome::AttachFallbackPending { lease }, target)) => {
+                cadence.attach_fallbacks.insert(id, (lease, target));
             }
-            Ok((id, ResumeOutcome::RetryAfterAttachTimeout)) => {
-                if !parked.contains(&id) {
-                    attempted.remove(&id);
-                }
-            }
-            Ok((id, ResumeOutcome::CapacityDeferred { message })) => {
+            Ok((id, ResumeOutcome::CapacityDeferred { message }, _)) => {
                 // Refund only this tick's budget entry so prior crash history survives.
                 if let Some(entries) = respawn_history.get_mut(&id) {
                     entries.pop();
@@ -378,7 +380,7 @@ pub async fn reconcile_acp_workers(
                     supervisor.publish_startup_error(&id, message);
                 }
             }
-            Ok((id, ResumeOutcome::Attached | ResumeOutcome::SpawnFinished)) => {
+            Ok((id, ResumeOutcome::Attached | ResumeOutcome::SpawnFinished, _)) => {
                 capacity_deferred.remove(&id);
             }
             Err(e) => {
@@ -499,6 +501,9 @@ async fn sweep_orphan_workers(
             pid: record.pid,
             generation: record.generation,
             launch_nonce: record.launch_nonce,
+            incarnation: None,
+            profile_identity: None,
+            boot: None,
         };
         jobs.insert(
             id.clone(),

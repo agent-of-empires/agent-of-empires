@@ -93,6 +93,106 @@ impl HomeView {
         }
     }
 
+    pub fn apply_settlement_results(&mut self) -> bool {
+        use crate::tui::stop_poller::{SettledEdit, SettlementAction};
+        use std::sync::mpsc::TryRecvError;
+        match self.settlement_poller.try_recv() {
+            Ok(result) => {
+                let request = result.request;
+                if !super::RequestOrigin::retire(&mut self.settlement_in_flight, &request.instance)
+                {
+                    return false;
+                }
+                let current_matches =
+                    self.instances
+                        .get(&request.session_id)
+                        .is_some_and(|current| {
+                            current.same_storage_origin(&request.instance)
+                                && (current.lifecycle_generation
+                                    == request.instance.lifecycle_generation
+                                    || result.generation.as_ref().is_ok_and(|custody| {
+                                        current.lifecycle_generation == custody.stop.generation()
+                                    }))
+                                && current.active_execution == request.instance.active_execution
+                        });
+                if !current_matches || request.storage.verify_profile_identity().is_err() {
+                    return true;
+                }
+                let mut custody = match result.generation {
+                    Ok(generation) => generation,
+                    Err(error) => {
+                        self.info_dialog = Some(super::InfoDialog::new(
+                            "Runner Settlement Pending",
+                            &format!("{error:#}"),
+                        ));
+                        return true;
+                    }
+                };
+                let stop = custody.stop.clone();
+                self.settled_edit = Some(SettledEdit {
+                    storage: request.storage,
+                    stop,
+                    consumed: false,
+                });
+                let outcome = match request.action {
+                    SettlementAction::Workdir {
+                        name,
+                        rename_branch,
+                    } => self.set_worktree_name_by_id(&request.session_id, &name, rename_branch),
+                    SettlementAction::Rename {
+                        title,
+                        group,
+                        profile,
+                        rename_branch,
+                    } => self.rename_session_by_id(
+                        &request.session_id,
+                        &title,
+                        group.as_deref(),
+                        profile.as_deref(),
+                        rename_branch,
+                    ),
+                    SettlementAction::Archive { reveal } => {
+                        let outcome = self.toggle_archive_by_id(&request.session_id);
+                        if outcome.is_ok() && reveal {
+                            self.reveal_archived_section();
+                            self.rebuild_flat_items();
+                        }
+                        outcome
+                    }
+                };
+                if self
+                    .settled_edit
+                    .as_ref()
+                    .is_some_and(|proof| proof.consumed)
+                {
+                    custody.disarm();
+                }
+                self.settled_edit = None;
+                if let Err(error) = outcome {
+                    self.info_dialog = Some(super::InfoDialog::new(
+                        "Session Edit Failed",
+                        &format!("{error:#}"),
+                    ));
+                }
+                true
+            }
+            Err(TryRecvError::Empty) => false,
+            Err(TryRecvError::Disconnected) => {
+                let pending = self.settlement_poller.take_pending();
+                if pending.is_empty() {
+                    return false;
+                }
+                for id in pending {
+                    self.settlement_in_flight.remove(&id);
+                }
+                self.info_dialog = Some(super::InfoDialog::new(
+                    "Runner Settlement Pending",
+                    "The settlement worker exited; no checkout move or archive was published",
+                ));
+                true
+            }
+        }
+    }
     pub fn apply_stop_results(&mut self) -> bool {
         use crate::session::Status;
         use std::sync::mpsc::TryRecvError;
@@ -354,9 +454,13 @@ impl HomeView {
                     let RecoveryUpdate {
                         instance_id,
                         title,
+                        before,
                         instance,
                         result,
                     } = update;
+                    let Ok(_authority) = self.completed_launch_authority(&before, &instance) else {
+                        continue;
+                    };
                     match result {
                         Ok(crate::session::StartOutcome::Resumed) => {
                             tracing::info!(target: "session.startup_recovery", id = %instance_id, %title, "resumed");
@@ -392,7 +496,10 @@ impl HomeView {
                     }
                     self.recovery_in_flight.remove(&instance_id);
                     if let Some(slot) = self.instances.get_mut(&instance_id) {
-                        *slot = *instance;
+                        slot.merge_post_restart_with_baseline(&before, &instance);
+                        slot.last_error = instance.last_error.clone();
+                        slot.last_error_check = instance.last_error_check;
+                        slot.last_start_time = instance.last_start_time;
                         touched = true;
                     }
                 }
@@ -441,10 +548,16 @@ impl HomeView {
                         outcome,
                     } = result;
 
-                    self.restart_in_flight.remove(&session_id);
-                    if self.attach_after_restart.remove(&session_id)
-                        && crate::session::restart::launched_agent(&outcome)
-                    {
+                    if !super::RequestOrigin::retire(&mut self.restart_in_flight, &before) {
+                        continue;
+                    }
+                    let attach_after = self.attach_after_restart.remove(&session_id);
+                    touched = true;
+                    let Ok(_authority) = self.completed_launch_authority(&before, &instance) else {
+                        continue;
+                    };
+
+                    if attach_after && crate::session::restart::launched_agent(&outcome) {
                         self.restarted_attaches.push(session_id.clone());
                     }
 
@@ -668,7 +781,7 @@ impl HomeView {
                             "recovery worker panicked",
                         );
                         // Report the panic as an error so the row leaves Starting.
-                        let mut recovered = inst_pre_panic;
+                        let mut recovered = inst_pre_panic.clone();
                         recovered.status = crate::session::Status::Error;
                         recovered.last_error =
                             Some(format!("recovery worker panicked: {}", join_err));
@@ -678,6 +791,7 @@ impl HomeView {
                 let _ = tx.send(RecoveryUpdate {
                     instance_id: id,
                     title,
+                    before: Box::new(inst_pre_panic),
                     instance: Box::new(instance),
                     result,
                 });
@@ -686,5 +800,48 @@ impl HomeView {
 
         self.recovery_rx = Some(rx);
         self.recovery_lock = Some(lock);
+    }
+    fn completed_launch_authority(
+        &self,
+        before: &Instance,
+        after: &Instance,
+    ) -> anyhow::Result<(
+        crate::session::StorageFlock,
+        crate::session::StorageFlock,
+        crate::session::StorageFlock,
+    )> {
+        let workspace = crate::session::acquire_session_workspace_claim_lock()?;
+        let identity = crate::session::acquire_session_identity_lock()?;
+        let storage = before.original_storage()?;
+        storage.verify_profile_identity()?;
+        anyhow::ensure!(
+            before.same_storage_origin(after),
+            "worker storage authority changed"
+        );
+        let lifecycle = storage.acquire_instance_lifecycle_lock(&before.id)?;
+        let current = self
+            .instances
+            .get(&before.id)
+            .ok_or_else(|| anyhow::anyhow!("worker row was removed"))?;
+        anyhow::ensure!(
+            current.same_storage_origin(before)
+                && ((current.lifecycle_generation == before.lifecycle_generation
+                    && current.active_execution == before.active_execution)
+                    || (current.lifecycle_generation == after.lifecycle_generation
+                        && current.active_execution == after.active_execution))
+                && current.tool == before.tool,
+            "worker baseline was superseded"
+        );
+        let rows = storage.load()?;
+        let disk = rows
+            .iter()
+            .find(|row| row.id == before.id)
+            .ok_or_else(|| anyhow::anyhow!("worker row disappeared"))?;
+        anyhow::ensure!(
+            disk.lifecycle_generation == after.lifecycle_generation
+                && disk.active_execution == after.active_execution,
+            "worker execution was superseded"
+        );
+        Ok((workspace, identity, lifecycle))
     }
 }

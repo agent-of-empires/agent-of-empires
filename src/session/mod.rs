@@ -96,9 +96,13 @@ pub use instance::{
 pub(crate) use move_journal::{
     record as record_move_journal, MoveJournalEntry, MOVE_JOURNAL_VERSION,
 };
+pub use runner_journal::LaunchOrigin;
+pub use storage::DirectoryIdentity;
 pub(crate) use storage::{acquire_session_identity_lock, sync_parent_directory};
 #[cfg(test)]
-pub(crate) use storage::{observe_lock_contention_for_test, observe_updates_for_test};
+pub(crate) use storage::{
+    observe_lock_contention_for_test, observe_updates_for_test, InventoryReadObservation,
+};
 pub(crate) use storage::{reconcile_profile_duplicates, DuplicateIdReport};
 
 /// Check that every path a non-scratch session will use is present and inspectable.

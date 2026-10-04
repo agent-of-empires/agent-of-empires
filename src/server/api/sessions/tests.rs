@@ -2756,60 +2756,33 @@ async fn worker_stopping_handlers_wait_for_an_in_flight_submission() {
 #[tokio::test]
 #[serial_test::serial]
 async fn a_trash_stop_does_not_hold_the_identity_lock() {
+    use crate::acp::supervisor::test_support::published_execution;
     use std::time::Duration;
-    use tokio::io::AsyncReadExt;
-    struct Reap(std::process::Child);
-    impl Drop for Reap {
-        fn drop(&mut self) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
-        }
-    }
     let temp = tempfile::TempDir::new_in("/tmp").unwrap();
     let _app_dir = crate::session::test_support::isolate_app_dir_at(temp.path());
     let profile = "trash-lock";
     crate::session::create_profile(profile).unwrap();
-    let mut command = std::process::Command::new("/bin/sh");
-    command
-        .args(["-c", "read -r ignored || :"])
-        .stdin(std::process::Stdio::piped());
-    crate::process::configure_process_group(&mut command);
-    let mut child = Reap(command.spawn().unwrap());
-    let pid = child.0.id();
-    let incarnation = crate::process::process_incarnation(pid).unwrap().unwrap();
-    let nonce = uuid::Uuid::new_v4();
-    let boot = *uuid::Uuid::parse_str(&crate::process::boot_id().unwrap())
-        .unwrap()
-        .as_bytes();
+    let storage = crate::session::Storage::new_unwatched(profile).unwrap();
     let mut inst = crate::session::Instance::new("stuck", temp.path().to_str().unwrap());
     inst.id = "stuck-runner".into();
     inst.source_profile = profile.into();
     inst.view = crate::session::View::Structured;
-    inst.runner_journal = serde_json::from_value(serde_json::json!({
-        "coverage": "complete", "launches": [{
-            "nonce": *nonce.as_bytes(), "boot": boot, "generation": 1,
-            "incarnation": incarnation,
-        }],
-    }))
-    .unwrap();
     let id = inst.id.clone();
-    crate::session::Storage::new_unwatched(profile)
-        .unwrap()
+    storage
         .update(|rows, _| {
             rows.push(inst.clone());
             Ok(())
         })
         .unwrap();
-    let stop_socket = crate::session::runner_journal::stop_socket(&id, pid).unwrap();
-    let listener = tokio::net::UnixListener::bind(stop_socket).unwrap();
-    let (requested, request_seen) = tokio::sync::oneshot::channel();
-    let receiver = tokio::spawn(async move {
-        let (mut stream, _) = listener.accept().await.unwrap();
-        let mut frame = [0; 17];
-        stream.read_exact(&mut frame).await.unwrap();
-        requested.send(()).unwrap();
-    });
-    let state = crate::server::test_support::build_test_app_state(vec![inst]);
+    let execution = published_execution(&id, profile, None, true);
+    let pid = execution.pid;
+    let original = storage
+        .load()
+        .unwrap()
+        .into_iter()
+        .find(|row| row.id == id)
+        .unwrap();
+    let state = crate::server::test_support::build_test_app_state(vec![original]);
     let trash = tokio::spawn({
         let state = Arc::clone(&state);
         let id = id.clone();
@@ -2819,10 +2792,14 @@ async fn a_trash_stop_does_not_hold_the_identity_lock() {
                 .into_response()
         }
     });
-    tokio::time::timeout(Duration::from_secs(2), request_seen)
-        .await
-        .unwrap()
-        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        let mut poll = tokio::time::interval(Duration::from_millis(10));
+        while !execution.requested.exists() {
+            poll.tick().await;
+        }
+    })
+    .await
+    .expect("original born child must admit the authenticated Stop before the lock proof");
     assert!(crate::process::worker::is_process_group_alive(pid));
     tokio::time::timeout(
         Duration::from_millis(1500),
@@ -2832,13 +2809,11 @@ async fn a_trash_stop_does_not_hold_the_identity_lock() {
     .expect("identity mutation must progress while actual runner group remains alive")
     .unwrap()
     .unwrap();
-    drop(child.0.stdin.take());
-    assert!(child.0.wait().unwrap().success());
+    std::fs::write(&execution.release, b"finish original Stop").unwrap();
     let response = tokio::time::timeout(Duration::from_secs(10), trash)
         .await
         .unwrap()
         .unwrap();
-    receiver.await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let stored = crate::session::Storage::open_unwatched(profile)
         .unwrap()
@@ -2973,6 +2948,10 @@ async fn stop_session_clears_a_pending_plugin_revival() {
     inst.view = crate::session::View::Structured;
     inst.plugin_revival_pending = true;
     let id = inst.id.clone();
+    crate::server::test_support::seed_instances_on_disk_for_test(
+        &inst.source_profile,
+        vec![inst.clone()],
+    );
     let state = crate::server::test_support::build_test_app_state(vec![inst]);
 
     stop_session(State(std::sync::Arc::clone(&state)), Path(id.clone())).await;
@@ -3024,16 +3003,20 @@ async fn session_mutations_allocate_no_prompt_lock_for_an_unknown_id() {
             .status(),
             StatusCode::NOT_FOUND
         );
-        assert!(matches!(
-            crate::server::attach_project::attach_project(
-                &state,
-                &id,
-                std::path::Path::new("/tmp"),
-                crate::session::attach_project::ExistingBranch::Refuse,
+        assert_eq!(
+            attach_session_project(
+                State(std::sync::Arc::clone(&state)),
+                Path(id.clone()),
+                Ok(Json(AttachProjectBody {
+                    project: "/tmp".into(),
+                    attach_existing_branch: false
+                })),
             )
-            .await,
-            Err(crate::server::attach_project::AttachError::NotFound)
-        ));
+            .await
+            .into_response()
+            .status(),
+            StatusCode::NOT_FOUND
+        );
         assert!(matches!(
             service
                 .edit_queued_prompt(&id, "q1".to_string(), "text".to_string())
@@ -4024,7 +4007,16 @@ fn rename_persistence_reports_missing_authoritative_row() {
     let _ = crate::session::get_app_dir().expect("isolated app dir");
     let storage = Storage::new_unwatched("rename-missing").unwrap();
 
-    let outcome = persist_rename_metadata(&storage, "missing-id", "New title", None, None).unwrap();
+    let outcome = persist_rename_metadata(
+        &storage,
+        "missing-id",
+        0,
+        "/missing",
+        "New title",
+        None,
+        None,
+    )
+    .unwrap();
     assert_eq!(outcome, RenamePersistOutcome::Missing);
     assert!(
         storage.load().unwrap().is_empty(),
@@ -4340,7 +4332,9 @@ fn resolve_hook_plan_inherits_trust_across_worktrees() {
     );
 }
 #[tokio::test]
+#[serial_test::serial]
 async fn list_sessions_projects_pending_approvals_only_for_running_workers() {
+    let _home = crate::session::test_support::isolate_app_dir();
     use crate::acp::permissions::build_approval;
     use crate::acp::state::ToolCall;
     use crate::acp::Event;

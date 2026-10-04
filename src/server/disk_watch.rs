@@ -302,7 +302,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let _app_dir = crate::session::test_support::isolate_app_dir_at(temp.path());
 
-        let storage = crate::session::Storage::new_unwatched("startup-gap").expect("storage");
+        let storage = crate::session::Storage::new_unwatched("test").expect("storage");
         storage
             .update(|instances, _groups| {
                 *instances = vec![Instance::new("seed", "/tmp/seed")];

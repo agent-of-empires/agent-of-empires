@@ -154,9 +154,7 @@ impl SessionFeed {
 
     #[cfg(test)]
     pub(crate) fn finish_for_test(self) {
-        self.worker
-            .finish_for_test()
-            .expect("session feed worker panicked");
+        self.worker.finish().expect("session feed worker panicked");
     }
 
     /// Feed with one pre-seeded result and no daemon behind it.

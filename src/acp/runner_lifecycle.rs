@@ -4,48 +4,427 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+/// Holds the lifecycle decision through the disk CAS; a failed persistence
+/// restores the exact cancellation without admitting or consuming another scope.
+pub(crate) struct PreparationAuthorization<'a> {
+    table: std::sync::MutexGuard<'a, LifecycleTable>,
+    removed: Option<(String, ResumeCancellation)>,
+    committed: bool,
+}
+
+impl<'a> PreparationAuthorization<'a> {
+    pub(crate) fn acquire(
+        mut table: std::sync::MutexGuard<'a, LifecycleTable>,
+        lease: &Lease,
+        original: &Arc<crate::session::runner_journal::LaunchOrigin>,
+        override_cancel: bool,
+        commit: crate::session::runner_journal::PreparationCommit<'_>,
+    ) -> anyhow::Result<Self> {
+        let removed =
+            table.commit_original_preparation(lease, original, override_cancel, commit)?;
+        Ok(Self {
+            table,
+            removed,
+            committed: false,
+        })
+    }
+    pub(crate) fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for PreparationAuthorization<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            if let Some((id, cancel)) = self.removed.take() {
+                self.table.stale_cancels.entry(id).or_insert(cancel);
+            }
+        }
+    }
+}
+
 /// Captured execution ticket of a runner. Legacy PID/generation alone are not authority.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RunnerIdentity {
     pub pid: u32,
     pub generation: u64,
     pub launch_nonce: Option<uuid::Uuid>,
+    pub incarnation: Option<crate::process::ProcessIncarnation>,
+    pub profile_identity: Option<crate::session::DirectoryIdentity>,
+    pub boot: Option<[u8; 16]>,
 }
 
 impl RunnerIdentity {
+    pub(crate) fn birth_is_complete(&self) -> bool {
+        self.launch_nonce.is_some()
+            && self.boot.is_some()
+            && self
+                .profile_identity
+                .is_some_and(|identity| identity.is_durable())
+            && self.incarnation.is_some()
+    }
+
+    /// Missing legacy evidence is uncertainty, not evidence of a different owner.
+    pub(crate) fn proves_different_record(
+        &self,
+        record: &crate::process::worker_registry::WorkerRecord,
+    ) -> bool {
+        self.birth_is_complete()
+            && (self.pid != record.pid
+                || self.generation != record.generation
+                || self
+                    .launch_nonce
+                    .zip(record.launch_nonce)
+                    .is_some_and(|(before, after)| before != after)
+                || self
+                    .boot
+                    .zip(record.boot)
+                    .is_some_and(|(before, after)| before != after)
+                || self
+                    .incarnation
+                    .zip(record.incarnation)
+                    .is_some_and(|(before, after)| before != after)
+                || self
+                    .profile_identity
+                    .zip(record.profile_identity)
+                    .is_some_and(|(before, after)| before != after))
+    }
+
     /// Whether a registry record still describes this runner.
     pub fn matches_record(&self, record: &crate::process::worker_registry::WorkerRecord) -> bool {
-        self.launch_nonce.is_some()
+        self.birth_is_complete()
             && self.launch_nonce == record.launch_nonce
             && self.pid == record.pid
             && self.generation == record.generation
+            && self.boot.is_some()
+            && self.boot == record.boot
+            && self.incarnation.is_some()
+            && self.incarnation == record.incarnation
+            && self.profile_identity.is_some()
+            && self.profile_identity == record.profile_identity
     }
+}
+
+#[derive(Debug, Default)]
+struct AdmissionState {
+    identity: Option<RunnerIdentity>,
+    cancelled: bool,
+    cancelled_stop: Option<Arc<crate::session::runner_journal::OwnedStop>>,
+    jobs: usize,
+    origin: Option<Arc<crate::session::runner_journal::LaunchOrigin>>,
+    prepared: Option<Arc<crate::session::runner_journal::LaunchOrigin>>,
+    retirement: Option<AdmissionRetirement>,
+    preparation: Option<crate::session::runner_journal::PreparationCustody>,
+    preparation_retirement: Option<tokio::sync::watch::Receiver<Option<bool>>>,
 }
 
 #[derive(Debug, Clone)]
 pub struct ExecutionAdmission {
-    identity: Arc<Mutex<Option<RunnerIdentity>>>,
+    state: Arc<Mutex<AdmissionState>>,
+}
+
+pub(crate) struct AdmissionRetirement {
+    pub lease: Lease,
+    pub lifecycle: Arc<Mutex<LifecycleTable>>,
+    pub notify: Arc<tokio::sync::Notify>,
+    pub execution: Option<RunnerIdentity>,
+}
+
+impl std::fmt::Debug for AdmissionRetirement {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AdmissionRetirement")
+            .field("lease", &self.lease)
+            .field("execution", &self.execution)
+            .finish_non_exhaustive()
+    }
+}
+
+impl AdmissionRetirement {
+    fn finish(self, issued: Option<RunnerIdentity>) {
+        let execution = issued.or(self.execution);
+        let changed = {
+            let mut table = self
+                .lifecycle
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            match execution {
+                Some(identity) => {
+                    if table.convert_to_stopping(&self.lease, Some(identity)) {
+                        table.settle(&self.lease, Settlement::Unproven(Some(identity)));
+                        true
+                    } else {
+                        false
+                    }
+                }
+                None => table.abandon(&self.lease),
+            }
+        };
+        if changed {
+            self.notify.notify_waiters();
+        }
+    }
+}
+
+pub(crate) struct ExecutionJob(ExecutionAdmission);
+
+impl Drop for ExecutionJob {
+    fn drop(&mut self) {
+        let (retirement, preparation) = {
+            let mut state = self
+                .0
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            state.jobs -= 1;
+            if state.jobs == 0 {
+                (
+                    state
+                        .retirement
+                        .take()
+                        .map(|retirement| (retirement, state.identity)),
+                    state.preparation.take(),
+                )
+            } else {
+                (None, None)
+            }
+        };
+        drop(preparation);
+        if let Some((retirement, identity)) = retirement {
+            retirement.finish(identity);
+        }
+    }
 }
 
 impl ExecutionAdmission {
     pub(crate) fn new() -> Self {
         Self {
-            identity: Arc::new(Mutex::new(None)),
+            state: Arc::new(Mutex::new(AdmissionState::default())),
         }
+    }
+    pub(crate) fn same_owner(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.state, &other.state)
+    }
+
+    pub(crate) fn set_origin(
+        &self,
+        origin: Arc<crate::session::runner_journal::LaunchOrigin>,
+    ) -> anyhow::Result<()> {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(original) = &state.origin {
+            anyhow::ensure!(
+                Arc::ptr_eq(original, &origin),
+                "cannot replace an admission original scope"
+            );
+        } else {
+            state.origin = Some(origin);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn set_prepared_origin(
+        &self,
+        origin: Arc<crate::session::runner_journal::LaunchOrigin>,
+        preparation: crate::session::runner_journal::PreparationCustody,
+    ) -> anyhow::Result<()> {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let baseline = state
+            .origin
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("native preparation lost its registered baseline"))?;
+        anyhow::ensure!(
+            state
+                .prepared
+                .as_ref()
+                .is_some_and(|issued| Arc::ptr_eq(issued, &origin))
+                && state.preparation.is_none()
+                && origin.is_prepared_from(baseline),
+            "native preparation replaced its operation lineage"
+        );
+        state.preparation_retirement = Some(preparation.retirement());
+        state.preparation = Some(preparation);
+        Ok(())
+    }
+
+    pub(crate) fn record_produced_origin(
+        &self,
+        expected: &Arc<crate::session::runner_journal::LaunchOrigin>,
+        produced: Arc<crate::session::runner_journal::LaunchOrigin>,
+        identity: Option<RunnerIdentity>,
+    ) -> anyhow::Result<()> {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        anyhow::ensure!(
+            state
+                .prepared
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, expected))
+                && produced.is_output_from(expected),
+            "native output changed its original prepared admission"
+        );
+        state
+            .preparation
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("native output lost its exact preparation custody"))?
+            .produced(produced.clone())?;
+        if let Some(identity) = identity {
+            state.identity = Some(identity);
+        }
+        state.prepared = Some(produced);
+        Ok(())
+    }
+
+    pub(crate) fn preparation_nonce(&self) -> Option<[u8; 16]> {
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .preparation
+            .as_ref()
+            .map(|ticket| ticket.nonce)
+    }
+
+    pub(crate) fn preparation_retirement(
+        &self,
+    ) -> Option<tokio::sync::watch::Receiver<Option<bool>>> {
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .preparation_retirement
+            .clone()
+    }
+
+    pub(crate) fn origin(&self) -> Option<Arc<crate::session::runner_journal::LaunchOrigin>> {
+        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.prepared.as_ref().or(state.origin.as_ref()).cloned()
+    }
+
+    pub(crate) fn original_baseline(
+        &self,
+    ) -> Option<Arc<crate::session::runner_journal::LaunchOrigin>> {
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .origin
+            .clone()
+    }
+
+    pub(crate) fn check_active(&self) -> anyhow::Result<()> {
+        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        anyhow::ensure!(!state.cancelled, "native operation was cancelled");
+        Ok(())
     }
 
     pub(crate) fn capture(&self, identity: RunnerIdentity) {
-        *self
-            .identity
+        self.state
             .lock()
-            .unwrap_or_else(|error| error.into_inner()) = Some(identity);
+            .unwrap_or_else(|error| error.into_inner())
+            .identity = Some(identity);
     }
 
     pub(crate) fn snapshot(&self) -> Option<RunnerIdentity> {
-        *self
-            .identity
+        self.state
             .lock()
             .unwrap_or_else(|error| error.into_inner())
+            .identity
+    }
+
+    pub(crate) fn cancel(&self) {
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .cancelled = true;
+    }
+
+    fn cancel_from_stop(&self, stop: Arc<crate::session::runner_journal::OwnedStop>) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.cancelled = true;
+        if state.cancelled_stop.is_none() {
+            if let Some(preparation) = &state.preparation {
+                if let Err(error) = preparation.stopped(stop.clone()) {
+                    tracing::warn!(session = %stop.session_id(), %error, "original preparation Stop acknowledgement remains unproven");
+                }
+            }
+            state.cancelled_stop = Some(stop);
+        }
+    }
+
+    fn take_cancelled_stop(&self) -> Option<Arc<crate::session::runner_journal::OwnedStop>> {
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .cancelled_stop
+            .take()
+    }
+
+    pub(crate) fn commit_preparation<T>(
+        &self,
+        prepared: Arc<crate::session::runner_journal::LaunchOrigin>,
+        execution: Option<RunnerIdentity>,
+        claim: impl FnOnce() -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        anyhow::ensure!(
+            !state.cancelled && state.prepared.is_none(),
+            "runner admission was cancelled or already prepared"
+        );
+        let result = claim()?;
+        state.prepared = Some(prepared);
+        if let Some(execution) = execution {
+            state.identity = Some(execution);
+        }
+        Ok(result)
+    }
+    pub(crate) fn commit_effect<T>(
+        &self,
+        effect: impl FnOnce() -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        anyhow::ensure!(
+            !state.cancelled,
+            "runner admission was cancelled before effect"
+        );
+        effect()
+    }
+
+    pub(crate) fn begin_job(&self) -> ExecutionJob {
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .jobs += 1;
+        ExecutionJob(self.clone())
+    }
+
+    pub(crate) fn has_active_job(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .jobs
+            != 0
+    }
+
+    pub(crate) fn retire(&self, retirement: AdmissionRetirement) {
+        let (identity, preparation) = {
+            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            if state.jobs != 0 {
+                state.cancelled = true;
+                state.retirement = Some(retirement);
+                return;
+            }
+            (state.identity, state.preparation.take())
+        };
+        drop(preparation);
+        retirement.finish(identity);
+    }
+
+    pub(crate) fn authorize(
+        &self,
+        identity: RunnerIdentity,
+        issue: impl FnOnce() -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.identity = Some(identity);
+        if state.cancelled {
+            return Err(std::io::Error::other("runner admission was cancelled"));
+        }
+        issue()
     }
 }
 
@@ -54,6 +433,23 @@ impl ExecutionAdmission {
 pub enum ResumeKind {
     Attach,
     Spawn,
+}
+
+/// Native Attach carries the resident witnessed before its first await; the
+/// memory table's classification alone is never a resource capability.
+#[derive(Debug, Clone)]
+pub(crate) enum NativeResume {
+    Spawn,
+    Attach(Arc<crate::process::worker_registry::WorkerRecord>),
+}
+
+impl NativeResume {
+    pub(crate) fn kind(&self) -> ResumeKind {
+        match self {
+            Self::Spawn => ResumeKind::Spawn,
+            Self::Attach(_) => ResumeKind::Attach,
+        }
+    }
 }
 
 /// Authority token for one epoch of one session.
@@ -109,17 +505,21 @@ enum Phase {
 struct Entry {
     epoch: u64,
     phase: Phase,
+    admission: ExecutionAdmission,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum AdmitError {
     /// A worker is running or another task is mid-resume.
+    #[error("worker already present or mid-resume")]
     AlreadyPresent,
     /// A previous runner has not been proven dead yet.
+    #[error("previous runner teardown remains pending")]
     TeardownPending,
     /// A stop was asked of a resume that then failed before it installed;
     /// the stop stands against this one admission (the reconciler's
     /// fallback), carrying its reason.
+    #[error("native resume cancelled: {0}")]
     Cancelled(String),
 }
 
@@ -130,6 +530,12 @@ pub enum InstallError {
     Cancelled {
         reason: String,
     },
+}
+
+#[derive(Debug)]
+struct ResumeCancellation {
+    reason: String,
+    scope: Option<Arc<crate::session::runner_journal::OwnedStop>>,
 }
 
 #[derive(Debug)]
@@ -169,12 +575,12 @@ pub struct LifecycleTable {
     /// stay unique across daemon restarts; the supervisor seeds it from
     /// the wall clock.
     next_epoch: u64,
-    /// Highest generation ever admitted or observed per session.
+    /// Highest actual native birth generation observed per session.
     last_generation: HashMap<String, u64>,
     /// Stops asked of resumes that were abandoned before they installed,
-    /// consumed by the next `admit` so the reconciler cannot spawn over
-    /// the user's stop.
-    stale_cancels: HashMap<String, String>,
+    /// consumed only after canonical original-scope validation, so an unrelated
+    /// admission cannot consume or override the original user's Stop.
+    stale_cancels: HashMap<String, ResumeCancellation>,
 }
 
 impl LifecycleTable {
@@ -188,12 +594,9 @@ impl LifecycleTable {
     }
 
     /// Next epoch.
-    fn mint(&mut self, session_id: &str, stamped: bool) -> u64 {
+    fn mint(&mut self) -> u64 {
         let epoch = self.next_epoch;
         self.next_epoch += 1;
-        if stamped {
-            self.note_generation(session_id, epoch);
-        }
         epoch
     }
 
@@ -220,18 +623,84 @@ impl LifecycleTable {
         *slot = (*slot).max(generation);
     }
 
-    pub fn forget_stale_cancel(&mut self, session_id: &str) {
-        self.stale_cancels.remove(session_id);
+    /// Called only while the original baseline holds the canonical profile,
+    /// workspace, identity and row fences, before its preparation CAS.
+    fn commit_original_preparation(
+        &mut self,
+        lease: &Lease,
+        original: &Arc<crate::session::runner_journal::LaunchOrigin>,
+        override_cancel: bool,
+        commit: crate::session::runner_journal::PreparationCommit<'_>,
+    ) -> anyhow::Result<Option<(String, ResumeCancellation)>> {
+        let current = self
+            .entries
+            .get(&lease.session_id)
+            .filter(|entry| entry.epoch == lease.epoch);
+        let scope = current.and_then(|entry| entry.admission.original_baseline());
+        if !scope.is_some_and(|scope| Arc::ptr_eq(&scope, original))
+            || !current.is_some_and(|entry| commit.belongs_to(&entry.admission))
+        {
+            return Err(AdmitError::TeardownPending.into());
+        }
+        let mut removed = None;
+        commit.commit(|| {
+            let Some(cancel) = self.stale_cancels.get(&lease.session_id) else {
+                return Ok(());
+            };
+            let Some(scope) = &cancel.scope else {
+                return Err(AdmitError::Cancelled(cancel.reason.clone()).into());
+            };
+            if !scope.cancellation_origin().same_scope(original) {
+                return Ok(());
+            }
+            if !override_cancel {
+                return Err(AdmitError::Cancelled(cancel.reason.clone()).into());
+            }
+            removed = self.stale_cancels.remove_entry(&lease.session_id);
+            Ok(())
+        })?;
+        Ok(removed)
     }
 
-    pub fn forget(&mut self, session_id: &str) {
+    pub(crate) fn forget(
+        &mut self,
+        original: &crate::session::runner_journal::LaunchOrigin,
+    ) -> bool {
+        let session_id = original.session_id();
+        if self.entries.get(session_id).is_some_and(|entry| {
+            matches!(
+                entry.phase,
+                Phase::Starting { .. } | Phase::Respawning { .. }
+            ) || entry.admission.has_active_job()
+                || !entry
+                    .admission
+                    .origin()
+                    .is_some_and(|scope| scope.same_scope(original))
+        }) || self.stale_cancels.get(session_id).is_some_and(|cancel| {
+            !cancel
+                .scope
+                .as_ref()
+                .is_some_and(|scope| scope.cancellation_origin().same_scope(original))
+        }) {
+            return false;
+        }
         self.entries.remove(session_id);
         self.last_generation.remove(session_id);
-        self.stale_cancels.remove(session_id);
+        // Only the validated preparation CAS consumes an explicit resume override.
+        true
     }
 
     pub fn last_generation(&self, session_id: &str) -> u64 {
         self.last_generation.get(session_id).copied().unwrap_or(0)
+    }
+
+    pub(crate) fn execution_admission(&self, lease: &Lease) -> ExecutionAdmission {
+        self.entries
+            .get(&lease.session_id)
+            .filter(|entry| entry.epoch == lease.epoch)
+            .expect("execution admission requires a current lease")
+            .admission
+            .clone()
     }
 
     /// Reserve the session for a spawn or attach.
@@ -243,15 +712,13 @@ impl LifecycleTable {
             }
             Some(_) => return Err(AdmitError::AlreadyPresent),
         }
-        if let Some(reason) = self.stale_cancels.remove(session_id) {
-            return Err(AdmitError::Cancelled(reason));
-        }
-        let epoch = self.mint(session_id, kind == ResumeKind::Spawn);
+        let epoch = self.mint();
         self.entries.insert(
             session_id.to_string(),
             Entry {
                 epoch,
                 phase: Phase::Starting { kind, cancel: None },
+                admission: ExecutionAdmission::new(),
             },
         );
         Ok(self.lease(session_id, epoch))
@@ -290,13 +757,20 @@ impl LifecycleTable {
         let Some(entry) = self.current(lease) else {
             return false;
         };
+        if entry.admission.has_active_job() {
+            return false;
+        }
         let cancel = match &entry.phase {
             Phase::Starting { cancel, .. } | Phase::Respawning { cancel } => cancel.clone(),
             _ => return false,
         };
+        let scope = entry.admission.take_cancelled_stop();
         self.entries.remove(&lease.session_id);
         if let Some(reason) = cancel {
-            self.stale_cancels.insert(lease.session_id.clone(), reason);
+            self.stale_cancels.insert(
+                lease.session_id.clone(),
+                ResumeCancellation { reason, scope },
+            );
         }
         true
     }
@@ -313,14 +787,91 @@ impl LifecycleTable {
         false
     }
 
-    /// Ask for the session's worker to stop.
-    pub fn begin_stop(&mut self, session_id: &str, reason: &str) -> StopDecision {
+    /// Cancel or stop only the admission whose immutable original authorized this Stop.
+    pub(crate) fn begin_owned_stop(
+        &mut self,
+        stop: &Arc<crate::session::runner_journal::OwnedStop>,
+        reason: &str,
+    ) -> StopDecision {
+        let session_id = stop.session_id();
+        let Some(entry) = self.entries.get(session_id) else {
+            return StopDecision::NotOwned;
+        };
+        if !entry
+            .admission
+            .origin()
+            .is_some_and(|scope| scope.same_scope(stop.original()))
+        {
+            return StopDecision::NotOwned;
+        }
+        entry.admission.cancel_from_stop(stop.clone());
+        self.begin_stop_inner(session_id, reason)
+    }
+    pub(crate) fn owned_stop_has_jobs(
+        &self,
+        stop: &crate::session::runner_journal::OwnedStop,
+    ) -> bool {
+        self.entries.get(stop.session_id()).is_some_and(|entry| {
+            entry
+                .admission
+                .origin()
+                .is_some_and(|scope| scope.same_scope(stop.original()))
+                && entry.admission.has_active_job()
+        })
+    }
+
+    pub(crate) fn claim_owned_stop_retry(
+        &mut self,
+        stop: &crate::session::runner_journal::OwnedStop,
+    ) -> Option<RetryClaim> {
+        let entry = self.entries.get(stop.session_id())?;
+        if !entry
+            .admission
+            .origin()
+            .is_some_and(|scope| scope.same_scope(stop.original()))
+        {
+            return None;
+        }
+        self.claim_retry(stop.session_id(), Duration::ZERO)
+    }
+
+    pub(crate) fn retry_stop(
+        &self,
+        lease: &Lease,
+    ) -> Option<Arc<crate::session::runner_journal::OwnedStop>> {
+        let entry = self
+            .entries
+            .get(lease.session_id())
+            .filter(|entry| entry.epoch == lease.epoch)?;
+        entry
+            .admission
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .cancelled_stop
+            .clone()
+    }
+
+    pub(crate) fn begin_lease_stop(&mut self, lease: &Lease, reason: &str) -> StopDecision {
+        if self.current(lease).is_none() {
+            return StopDecision::NotOwned;
+        }
+        self.begin_stop_inner(&lease.session_id, reason)
+    }
+
+    #[cfg(test)]
+    fn begin_stop(&mut self, session_id: &str, reason: &str) -> StopDecision {
+        self.begin_stop_inner(session_id, reason)
+    }
+
+    fn begin_stop_inner(&mut self, session_id: &str, reason: &str) -> StopDecision {
         let Some(entry) = self.entries.get_mut(session_id) else {
             return StopDecision::NotOwned;
         };
         let epoch = entry.epoch;
         match &mut entry.phase {
             Phase::Starting { cancel, .. } | Phase::Respawning { cancel } => {
+                entry.admission.cancel();
                 cancel.get_or_insert_with(|| reason.to_string());
                 StopDecision::CancelRequested
             }
@@ -345,11 +896,12 @@ impl LifecycleTable {
         if self.entries.contains_key(session_id) {
             return None;
         }
-        let epoch = self.mint(session_id, false);
+        let epoch = self.mint();
         self.entries.insert(
             session_id.to_string(),
             Entry {
                 epoch,
+                admission: ExecutionAdmission::new(),
                 phase: Phase::Stopping {
                     identity: None,
                     attempts: 0,
@@ -365,6 +917,9 @@ impl LifecycleTable {
         let Some(entry) = self.current(lease) else {
             return;
         };
+        if entry.admission.has_active_job() {
+            return;
+        }
         let Phase::Stopping {
             identity: captured,
             attempts,
@@ -398,12 +953,13 @@ impl LifecycleTable {
         let Phase::Running { identity } = entry.phase else {
             return Err(InstallError::Stale);
         };
-        let epoch = self.mint(&session_id, true);
+        let epoch = self.mint();
         let entry = self
             .entries
             .get_mut(&session_id)
             .expect("entry checked above");
         entry.epoch = epoch;
+        entry.admission = ExecutionAdmission::new();
         entry.phase = Phase::Respawning { cancel: None };
         Ok((self.lease(&session_id, epoch), identity))
     }
@@ -449,6 +1005,9 @@ impl LifecycleTable {
         orphaned_after: Duration,
     ) -> Option<RetryClaim> {
         let entry = self.entries.get_mut(session_id)?;
+        if entry.admission.has_active_job() {
+            return None;
+        }
         let (identity, attempts) = match entry.phase {
             Phase::TeardownRetry { identity, attempts } => (identity, attempts),
             Phase::Stopping {
@@ -503,6 +1062,16 @@ impl LifecycleTable {
             Phase::Running { identity } => Some((self.lease(session_id, entry.epoch), identity)),
             _ => None,
         }
+    }
+
+    pub(crate) fn running_origin(
+        &self,
+        session_id: &str,
+    ) -> Option<Arc<crate::session::runner_journal::LaunchOrigin>> {
+        let entry = self.entries.get(session_id)?;
+        matches!(entry.phase, Phase::Running { .. })
+            .then(|| entry.admission.origin())
+            .flatten()
     }
 
     pub fn phase(&self, session_id: &str) -> WorkerPhase {
@@ -597,6 +1166,9 @@ mod tests {
             pid,
             generation,
             launch_nonce: Some(uuid::Uuid::from_u128(generation as u128 + 1)),
+            incarnation: None,
+            profile_identity: None,
+            boot: None,
         }
     }
 
@@ -751,7 +1323,6 @@ mod tests {
         table.install(&first, Some(identity(1, 10))).unwrap();
 
         let (respawn, previous) = table.begin_respawn(&first).unwrap();
-        assert_eq!(respawn.epoch(), 11);
         assert_eq!(previous, Some(identity(1, 10)));
         assert_eq!(table.phase(ID), WorkerPhase::Resuming);
         assert_eq!(table.install(&first, None), Err(InstallError::Stale));
@@ -769,7 +1340,6 @@ mod tests {
         );
         table.settle(&respawn, Settlement::Proven);
         assert_eq!(table.phase(ID), WorkerPhase::Absent);
-        assert_eq!(table.last_generation(ID), 11);
     }
 
     #[test]
@@ -830,26 +1400,6 @@ mod tests {
     }
 
     #[test]
-    fn a_stop_asked_of_an_abandoned_resume_refuses_the_next_admit_once() {
-        let mut table = LifecycleTable::new(1);
-        let lease = table.admit(ID, ResumeKind::Attach).unwrap();
-        assert!(matches!(
-            table.begin_stop(ID, "user_stopped"),
-            StopDecision::CancelRequested
-        ));
-        assert!(table.abandon(&lease), "the attach failed before install");
-        assert_eq!(
-            table.admit(ID, ResumeKind::Spawn),
-            Err(AdmitError::Cancelled("user_stopped".into())),
-            "the fallback spawn is refused with the stop's reason"
-        );
-        assert!(
-            table.admit(ID, ResumeKind::Spawn).is_ok(),
-            "the stop is honored once; a later resume proceeds"
-        );
-    }
-
-    #[test]
     fn an_attach_epoch_is_not_a_generation() {
         let mut table = LifecycleTable::new(100);
         let lease = table.admit(ID, ResumeKind::Attach).unwrap();
@@ -867,8 +1417,14 @@ mod tests {
         let spawn = table.admit(ID, ResumeKind::Spawn).unwrap();
         assert_eq!(
             table.last_generation(ID),
-            spawn.epoch(),
-            "a spawn stamps its epoch"
+            5,
+            "unpublished admission is not a native birth"
+        );
+        table.install(&spawn, Some(identity(2, 6))).unwrap();
+        assert_eq!(
+            table.last_generation(ID),
+            6,
+            "only the actual published birth advances generation"
         );
     }
 }

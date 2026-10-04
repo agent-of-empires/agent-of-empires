@@ -787,7 +787,7 @@ fn apply_terminal_title(
                     tracing::warn!(target: "smart_rename", session = %id, title = %title, "skipped duplicate auto-title");
                 } else if should_write {
                     let instance = &mut instances[index];
-                    rekey = Some((instance.title.clone(), title.clone()));
+                    rekey = Some((crate::tmux::capture_rekey_session(&id, &instance.title), title.clone()));
                     tracing::info!(target: "smart_rename", session = %id, old = %instance.title, new = %title, "auto-renamed terminal session");
                     instance.title = title.clone();
                     instance.last_auto_title = Some(title.clone());
@@ -796,12 +796,13 @@ fn apply_terminal_title(
         }
         Ok(rekey)
     })?;
-    drop(identity_lock);
-    if let Some((old_title, new_title)) = rekey {
-        if let Err(error) = crate::tmux::rekey_session(&id, &old_title, &new_title) {
+
+    if let Some((target, new_title)) = rekey {
+        if let Err(error) = crate::tmux::rekey_session(&id, &new_title, target) {
             tracing::warn!(target: "smart_rename", session = %id, "tmux rename failed: {error}");
         }
     }
+    drop(identity_lock);
     Ok(())
 }
 

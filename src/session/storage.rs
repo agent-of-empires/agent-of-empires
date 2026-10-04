@@ -3,7 +3,7 @@
 use anyhow::{anyhow, Context, Result};
 use fs2::FileExt;
 use std::collections::HashMap;
-use std::fs;
+use std::fs::{self, File};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -30,25 +30,80 @@ const SESSION_IDENTITY_LOCK_FILENAME: &str = ".title-mutation.lock";
 const SESSION_WORKSPACE_CLAIM_LOCK_FILENAME: &str = ".workspace-claim.lock";
 /// Sidecar lock for profile namespace rename/delete and storage writes.
 const PROFILE_NAMESPACE_LOCK_FILENAME: &str = ".profile-namespace.lock";
-#[cfg(unix)]
-type DirectoryIdentity = (u64, u64);
-#[cfg(not(unix))]
-type DirectoryIdentity = ();
+/// Physical inode stamp. Missing native creation time is never durable birth authority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DirectoryIdentity {
+    pub(crate) device: u64,
+    pub(crate) inode: u64,
+    #[serde(default)]
+    pub(crate) birth_time: Option<std::time::SystemTime>,
+}
+
+impl DirectoryIdentity {
+    pub(crate) fn from_metadata(metadata: &fs::Metadata) -> Self {
+        #[cfg(unix)]
+        let (device, inode) = {
+            use std::os::unix::fs::MetadataExt;
+            (metadata.dev(), metadata.ino())
+        };
+        #[cfg(not(unix))]
+        let (device, inode) = (0, 0);
+        Self {
+            device,
+            inode,
+            birth_time: metadata.created().ok(),
+        }
+    }
+
+    pub(crate) fn is_durable(&self) -> bool {
+        cfg!(unix) && self.birth_time.is_some()
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static STRICT_INVENTORY_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static INVENTORY_OBSERVER: std::cell::RefCell<Option<Arc<std::sync::atomic::AtomicUsize>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) struct InventoryReadObservation(Option<Arc<std::sync::atomic::AtomicUsize>>);
+
+#[cfg(test)]
+impl InventoryReadObservation {
+    pub(crate) fn install(observer: Option<Arc<std::sync::atomic::AtomicUsize>>) -> Self {
+        Self(INVENTORY_OBSERVER.with(|current| current.replace(observer)))
+    }
+}
+
+#[cfg(test)]
+impl Drop for InventoryReadObservation {
+    fn drop(&mut self) {
+        INVENTORY_OBSERVER.with(|current| current.replace(self.0.take()));
+    }
+}
 
 fn directory_identity(path: &Path) -> Result<DirectoryIdentity> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        let metadata = fs::metadata(path)
-            .with_context(|| format!("reading profile directory identity {}", path.display()))?;
-        Ok((metadata.dev(), metadata.ino()))
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = fs::metadata(path)
-            .with_context(|| format!("reading profile directory {}", path.display()))?;
-        Ok(())
-    }
+    let metadata = fs::metadata(path)
+        .with_context(|| format!("reading profile directory identity {}", path.display()))?;
+    anyhow::ensure!(
+        metadata.is_dir(),
+        "profile identity path is not a directory"
+    );
+    Ok(DirectoryIdentity::from_metadata(&metadata))
+}
+
+fn capture_directory(path: &Path) -> Result<(DirectoryIdentity, Arc<File>)> {
+    let file = File::open(path)
+        .with_context(|| format!("pinning original profile directory {}", path.display()))?;
+    let opened = file.metadata()?;
+    let current = fs::metadata(path)?;
+    anyhow::ensure!(
+        opened.is_dir() && super::same_filesystem_identity(&opened, &current),
+        "original profile directory changed while acquiring its inode pin"
+    );
+    let identity = DirectoryIdentity::from_metadata(&opened);
+    Ok((identity, Arc::new(file)))
 }
 
 pub(crate) fn acquire_profile_namespace_lock() -> Result<StorageFlock> {
@@ -792,14 +847,27 @@ pub(crate) fn try_acquire_storage_flock(dir: &Path, name: &str) -> Result<Option
     }
 }
 
+#[derive(Clone)]
 pub struct Storage {
     profile: String,
     sessions_path: PathBuf,
     save_lock: Arc<Mutex<()>>,
     file_watch: Arc<FileWatchService>,
     profile_identity: Option<DirectoryIdentity>,
+    // Pins the actual captured directory inode across every original Storage clone.
+    profile_directory: Option<Arc<File>>,
     #[cfg(test)]
     fail_writes_for_test: bool,
+}
+
+impl std::fmt::Debug for Storage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Storage")
+            .field("profile", &self.profile)
+            .field("sessions_path", &self.sessions_path)
+            .field("identity", &self.profile_identity)
+            .finish_non_exhaustive()
+    }
 }
 
 // Cross-device-syncable sidebar ordering.
@@ -906,6 +974,17 @@ fn apply_group_move(
 }
 
 impl Storage {
+    pub(crate) fn original_profile_identity(&self) -> Result<DirectoryIdentity> {
+        anyhow::ensure!(
+            self.profile_directory.is_some(),
+            "original profile inode pin is unavailable"
+        );
+        self.profile_identity
+            .context("original physical profile identity is unavailable")
+    }
+    pub(crate) fn same_origin_as(&self, other: &Self) -> bool {
+        self.profile_identity.is_some() && self.profile_identity == other.profile_identity
+    }
     pub fn new(profile: &str, file_watch: Arc<FileWatchService>) -> Result<Self> {
         let profile_name = if profile.is_empty() {
             super::config::resolve_default_profile()
@@ -916,13 +995,15 @@ impl Storage {
         let profile_dir = get_profile_dir(&profile_name)?;
         let sessions_path = profile_dir.join("sessions.json");
         let save_lock = save_lock_for(&profile_name);
+        let (profile_identity, profile_directory) = capture_directory(&profile_dir)?;
 
         Ok(Self {
             profile: profile_name,
             sessions_path,
             save_lock,
             file_watch,
-            profile_identity: Some(directory_identity(&profile_dir)?),
+            profile_identity: Some(profile_identity),
+            profile_directory: Some(profile_directory),
             #[cfg(test)]
             fail_writes_for_test: false,
         })
@@ -941,12 +1022,16 @@ impl Storage {
         if let Some(dir) = sessions_path.parent() {
             std::fs::create_dir_all(dir).expect("test profile directory");
         }
+        let profile_dir = sessions_path.parent().expect("test profile directory");
+        let (profile_identity, profile_directory) =
+            capture_directory(profile_dir).expect("test original directory pin");
         Self {
             profile: profile.to_string(),
             sessions_path,
             save_lock: save_lock_for(profile),
             file_watch: FileWatchService::noop(),
-            profile_identity: None,
+            profile_identity: Some(profile_identity),
+            profile_directory: Some(profile_directory),
             fail_writes_for_test: false,
         }
     }
@@ -957,13 +1042,15 @@ impl Storage {
         let profile_dir = get_profile_dir_path(&profile_name)?;
         let sessions_path = profile_dir.join("sessions.json");
         let save_lock = save_lock_for(&profile_name);
+        let (profile_identity, profile_directory) = capture_directory(&profile_dir)?;
 
         Ok(Self {
             profile: profile_name,
             sessions_path,
             save_lock,
             file_watch,
-            profile_identity: Some(directory_identity(&profile_dir)?),
+            profile_identity: Some(profile_identity),
+            profile_directory: Some(profile_directory),
             #[cfg(test)]
             fail_writes_for_test: false,
         })
@@ -984,13 +1071,15 @@ impl Storage {
         let profile_dir = get_profile_dir_locked(&profile_name)?;
         let sessions_path = profile_dir.join("sessions.json");
         let save_lock = save_lock_for(&profile_name);
+        let (profile_identity, profile_directory) = capture_directory(&profile_dir)?;
 
         Ok(Self {
             profile: profile_name,
             sessions_path,
             save_lock,
             file_watch,
-            profile_identity: Some(directory_identity(&profile_dir)?),
+            profile_identity: Some(profile_identity),
+            profile_directory: Some(profile_directory),
             #[cfg(test)]
             fail_writes_for_test: false,
         })
@@ -1001,12 +1090,13 @@ impl Storage {
         Self::open(profile, FileWatchService::noop())
     }
 
-    /// Reopen this profile's store, re-resolving its directory and capturing a
-    /// fresh `(dev, ino)` identity, but keeping the caller's
-    /// `FileWatchService`. A destructive caller reopens under the identity lock
-    /// for that fresh identity, and must not lose the watch it was handed.
+    /// Reopen only the original physical profile, retaining the watch service.
+    /// Adopting a replacement profile requires an explicit fresh open by its owner.
     pub(crate) fn reopen_preserving_watch(&self) -> Result<Storage> {
-        Self::open(&self.profile, self.file_watch.clone())
+        self.verify_profile_identity()?;
+        let reopened = Self::open(&self.profile, self.file_watch.clone())?;
+        self.verify_profile_identity()?;
+        Ok(reopened)
     }
 
     /// Serialize launch/restart and explicit resume-target mutation for one instance across
@@ -1055,6 +1145,7 @@ impl Storage {
     }
 
     pub fn load(&self) -> Result<Vec<Instance>> {
+        self.verify_profile_identity()?;
         if !self.sessions_path.exists() {
             return Ok(Vec::new());
         }
@@ -1067,6 +1158,7 @@ impl Storage {
         let rows: Vec<serde_json::Value> = serde_json::from_str(&content)?;
         let mut instances = Vec::with_capacity(rows.len());
         let mut corrupt: Vec<serde_json::Value> = Vec::new();
+        let origin = Arc::new(self.clone());
         for (idx, row) in rows.into_iter().enumerate() {
             match <Instance as serde::Deserialize>::deserialize(&row) {
                 Ok(mut inst) => {
@@ -1074,6 +1166,7 @@ impl Storage {
                     // would otherwise resolve its agent against the default
                     // profile rather than the store it came from.
                     inst.source_profile = self.profile.clone();
+                    inst.storage_origin = Some(origin.clone());
                     inst.set_file_watch(self.file_watch.clone());
                     instances.push(inst);
                 }
@@ -1090,6 +1183,7 @@ impl Storage {
             }
         }
 
+        self.verify_profile_identity()?;
         if !corrupt.is_empty() {
             self.quarantine_corrupt_rows(&corrupt);
         }
@@ -1109,13 +1203,40 @@ impl Storage {
         // permission error answers `exists()` with `false` too, and treating
         // that as an empty inventory would let a purge delete a peer's
         // worktree, so every other error propagates.
+        #[cfg(test)]
+        {
+            STRICT_INVENTORY_READS.with(|reads| reads.set(reads.get() + 1));
+            INVENTORY_OBSERVER.with(|current| {
+                if let Some(observer) = current.borrow().as_ref() {
+                    observer.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            });
+        }
+        self.verify_profile_identity()?;
         let content = match fs::read_to_string(&self.sessions_path) {
             Ok(content) => content,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                self.verify_profile_identity()?;
+                match fs::symlink_metadata(&self.sessions_path) {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        return Ok(Vec::new());
+                    }
+                    Ok(_) => anyhow::bail!(
+                        "ownership inventory {} exists but cannot be read safely",
+                        self.sessions_path.display()
+                    ),
+                    Err(error) => {
+                        return Err(error).with_context(|| {
+                            format!("inspecting {}", self.sessions_path.display())
+                        });
+                    }
+                }
+            }
             Err(e) => {
                 return Err(e).with_context(|| format!("reading {}", self.sessions_path.display()))
             }
         };
+        self.verify_profile_identity()?;
         if content.trim().is_empty() {
             return Ok(Vec::new());
         }
@@ -1123,6 +1244,7 @@ impl Storage {
             .with_context(|| format!("parsing {}", self.sessions_path.display()))?;
         let mut ids = std::collections::HashSet::new();
         let mut instances = Vec::with_capacity(rows.len());
+        let origin = Arc::new(self.clone());
         for (idx, row) in rows.into_iter().enumerate() {
             let mut instance =
                 <Instance as serde::Deserialize>::deserialize(&row).with_context(|| {
@@ -1141,6 +1263,7 @@ impl Storage {
             // ownership scan excludes the caller by (profile, id). Leaving this
             // blank made every inventoried row look like it had no owner.
             instance.source_profile = self.profile.clone();
+            instance.storage_origin = Some(origin.clone());
             instance.set_file_watch(self.file_watch.clone());
             instances.push(instance);
         }
@@ -1237,7 +1360,7 @@ impl Storage {
         F: FnOnce(&mut Vec<Instance>, &mut Vec<Group>) -> Result<R>,
     {
         self.verify_profile_identity()?;
-        self.update_under_storage_locks(f)
+        self.update_under_storage_locks(f, false)
     }
 
     /// Update while the caller already owns the workspace claim lock.
@@ -1246,7 +1369,17 @@ impl Storage {
         F: FnOnce(&mut Vec<Instance>, &mut Vec<Group>) -> Result<R>,
     {
         self.verify_profile_identity()?;
-        self.update_under_storage_locks(f)
+        self.update_under_storage_locks(f, false)
+    }
+
+    /// Native ownership transactions refuse malformed rows and groups rather
+    /// than quarantining them or committing a filtered store.
+    pub(crate) fn update_native_under_workspace_claim_lock<F, R>(&self, f: F) -> Result<R>
+    where
+        F: FnOnce(&mut Vec<Instance>, &mut Vec<Group>) -> Result<R>,
+    {
+        self.verify_profile_identity()?;
+        self.update_under_storage_locks(f, true)
     }
 
     /// Update while the caller already owns the workspace claim and profile namespace locks.
@@ -1255,14 +1388,14 @@ impl Storage {
         F: FnOnce(&mut Vec<Instance>, &mut Vec<Group>) -> Result<R>,
     {
         self.verify_profile_identity()?;
-        self.update_under_storage_locks(f)
+        self.update_under_storage_locks(f, false)
     }
 
     /// Take this store's own locks in their fixed order (in-process save lock,
     /// profile namespace transition lock, storage flock) and update under them.
     /// No `update*` entry point takes a namespace lock on the caller's behalf;
     /// this name says what this one actually does.
-    fn update_under_storage_locks<F, R>(&self, f: F) -> Result<R>
+    fn update_under_storage_locks<F, R>(&self, f: F, strict: bool) -> Result<R>
     where
         F: FnOnce(&mut Vec<Instance>, &mut Vec<Group>) -> Result<R>,
     {
@@ -1290,10 +1423,10 @@ impl Storage {
         )?;
         let _flock = acquire_existing_storage_flock(profile_dir, STORAGE_LOCK_FILENAME)?;
         self.verify_profile_identity()?;
-        self.update_under_lock(f)
+        self.update_under_lock(f, strict)
     }
 
-    fn verify_profile_identity(&self) -> Result<()> {
+    pub(crate) fn verify_profile_identity(&self) -> Result<()> {
         let Some(expected) = self.profile_identity else {
             return Ok(());
         };
@@ -1318,11 +1451,26 @@ impl Storage {
 
     /// Apply one storage mutation while the caller already owns this profile's
     /// in-process save lock and cross-process storage flock.
-    fn update_under_lock<F, R>(&self, f: F) -> Result<R>
+    fn update_under_lock<F, R>(&self, f: F, strict: bool) -> Result<R>
     where
         F: FnOnce(&mut Vec<Instance>, &mut Vec<Group>) -> Result<R>,
     {
-        let (mut instances, mut groups) = self.load_with_groups()?;
+        let (mut instances, mut groups) = if strict {
+            let instances = self.load_strict_for_worktree_ownership_locked()?;
+            let path = self.sessions_path.with_file_name("groups.json");
+            let groups = match fs::read_to_string(&path) {
+                Ok(content) if content.trim().is_empty() => Vec::new(),
+                Ok(content) => serde_json::from_str(&content)
+                    .context("parsing canonical native ownership groups")?,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+                Err(error) => {
+                    return Err(error).context("reading canonical native ownership groups")
+                }
+            };
+            (instances, groups)
+        } else {
+            self.load_with_groups()?
+        };
         let groups_before = groups.clone();
         let result = f(&mut instances, &mut groups)?;
 
@@ -2571,7 +2719,7 @@ where
                 .collect();
             reconcile_groups_after_repair(instances, groups, &winners, &plan);
             Ok(())
-        })?;
+        }, false)?;
         sync_repaired_profile_durably(source_storage, &mut sync)?;
         #[cfg(test)]
         test_crash_point("profile-repair-source-written");
@@ -3256,9 +3404,9 @@ mod tests {
         let guard = setup_test_home(temp.path());
         let profile_dir = guard.path().join("profiles").join("ghost");
 
-        let err = Storage::open_unwatched("ghost")
-            .err()
-            .expect("unknown profile");
+        let Err(err) = Storage::open_unwatched("ghost") else {
+            panic!("opening an unknown profile must fail");
+        };
         assert!(err.to_string().contains("does not exist"), "got: {err}");
         assert!(!profile_dir.exists(), "must not create the profile dir");
 
@@ -3385,6 +3533,32 @@ mod tests {
         fs::write(&storage.sessions_path, serde_json::to_vec(&sessions)?)?;
 
         assert!(storage.load_strict_for_worktree_ownership_locked().is_err());
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn ownership_inventory_distinguishes_missing_file_from_broken_alias() -> Result<()> {
+        let temp = tempdir()?;
+        let _guard = setup_test_home(temp.path());
+        let storage = Storage::new_unwatched("test-profile")?;
+        assert!(storage
+            .load_strict_for_worktree_ownership_locked()?
+            .is_empty());
+        let absent = temp.path().join("absent-inventory");
+        std::os::unix::fs::symlink(&absent, &storage.sessions_path)?;
+        assert!(storage.load_strict_for_worktree_ownership_locked().is_err());
+        fs::write(
+            &absent,
+            serde_json::to_vec(&vec![Instance::new("peer", "/tmp/peer")])?,
+        )?;
+        let rows = storage.load_strict_for_worktree_ownership_locked()?;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].title, "peer");
+        fs::remove_file(&storage.sessions_path)?;
+        assert!(storage
+            .load_strict_for_worktree_ownership_locked()?
+            .is_empty());
         Ok(())
     }
 

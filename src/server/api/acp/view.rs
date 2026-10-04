@@ -23,6 +23,21 @@ fn internal_error(message: &'static str) -> Response {
     (StatusCode::INTERNAL_SERVER_ERROR, message).into_response()
 }
 
+async fn reserve_view_stop(
+    state: &AppState,
+    instance: &Instance,
+) -> Result<Arc<crate::session::runner_journal::OwnedStop>, Response> {
+    let original = state
+        .capture_operation_origin(instance)
+        .map_err(|error| (StatusCode::CONFLICT, error.to_string()).into_response())?;
+    tokio::task::spawn_blocking(move || {
+        crate::session::runner_journal::reserve_stop_from_origin(original, false)
+    })
+    .await
+    .map_err(|_| internal_error("Failed to claim original view Stop"))?
+    .map_err(|error| (StatusCode::CONFLICT, error.to_string()).into_response())
+}
+
 /// How a structured-view spawn seeds its transcript when the view is enabled.
 struct StructuredSeed {
     stored_acp_session_id: Option<String>,
@@ -65,18 +80,29 @@ fn resolve_structured_seed(
 }
 
 fn adopt_persisted_structured_instance(
-    cached: Instance,
+    mut cached: Instance,
     mut persisted: Instance,
     source_profile: &str,
 ) -> Instance {
     persisted.source_profile = source_profile.to_owned();
-    crate::server::reload::merge_runtime_fields(cached, persisted)
+    crate::server::reload::merge_runtime_fields(&mut cached, persisted)
 }
 
 pub async fn acp_enable(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
+    match tokio::spawn(acp_enable_owned(State(state), Path(id))).await {
+        Ok(response) => response,
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("view owner task failed: {error}"),
+        )
+            .into_response(),
+    }
+}
+
+async fn acp_enable_owned(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
     if let Some(resp) = read_only_block(&state) {
         return resp;
     }
@@ -106,6 +132,10 @@ pub async fn acp_enable(
     if let Err(blocked) = instance.ensure_startable() {
         return crate::server::api::start_blocked_response(blocked);
     }
+    let stop = match reserve_view_stop(&state, &instance).await {
+        Ok(stop) => stop,
+        Err(response) => return response,
+    };
 
     // Judged on the explicit agent (or the tool), not `pick_agent_for_tool`'s
     // default fallback, which would accept every tool.
@@ -137,7 +167,11 @@ pub async fn acp_enable(
     }
 
     let agent_name = pick_agent(&state, &instance, instance.agent_name.as_deref()).await;
-    if let Err(error) = state.acp_supervisor.shutdown_and_require_dead(&id).await {
+    if let Err(error) = state
+        .acp_supervisor
+        .shutdown_and_require_dead(stop.clone())
+        .await
+    {
         return (
             StatusCode::CONFLICT,
             format!("Cannot switch execution views before stored executions are stopped: {error}"),
@@ -145,7 +179,7 @@ pub async fn acp_enable(
             .into_response();
     }
     if let Err(resp) =
-        commit_structured_view(&state, &mut instance, selected_binding.as_ref()).await
+        commit_structured_view(&state, &mut instance, selected_binding.as_ref(), stop).await
     {
         return resp;
     }
@@ -166,40 +200,32 @@ async fn commit_structured_view(
     state: &AppState,
     instance: &mut Instance,
     selected_binding: Option<&crate::session::ConversationBinding>,
+    stop: Arc<crate::session::runner_journal::OwnedStop>,
 ) -> Result<(), Response> {
-    let inst_for_transition = instance.clone();
-    let profile = instance.source_profile.clone();
-    let file_watch = state.file_watch.clone();
+    let original = stop.original_arc();
+    let claimed = stop.cancellation_origin();
     let binding_for_transition = selected_binding.cloned();
+    let lifecycle_generation = stop.generation();
     let transition = tokio::task::spawn_blocking(move || -> anyhow::Result<u64> {
-        let storage = crate::session::Storage::open(&profile, file_watch)?;
-        let _lifecycle_lock = storage
-            .acquire_instance_lifecycle_lock(&inst_for_transition.id)
-            .map_err(|error| {
-                anyhow::anyhow!("failed to acquire terminal-to-ACP lifecycle lock: {error}")
-            })?;
-        if let Err(e) = inst_for_transition.kill_locked() {
-            tracing::warn!(target: "acp.switch", session = %inst_for_transition.id, "kill tmux failed: {e}");
-        }
-        inst_for_transition.kill_ancillary_tmux_sessions_locked();
-        storage.update(|all, _groups| {
-            let Some(slot) = all
-                .iter_mut()
-                .find(|candidate| candidate.id == inst_for_transition.id)
-            else {
-                anyhow::bail!("session disappeared during terminal-to-ACP transition");
-            };
-            slot.view = View::Structured;
-            slot.resume_intent = ResumeIntent::Default;
-            if let Some(binding) = &binding_for_transition {
-                slot.agent_session_id = Some(binding.session_id.clone());
-                slot.agent_session_binding = Some(binding.clone());
+        crate::session::runner_journal::finish_owned_stop(&stop, |current| {
+            let storage = stop.storage();
+            let mut pane = current.clone();
+            pane.storage_origin = Some(Arc::new(storage.clone()));
+            if let Err(error) = pane.kill_locked() {
+                tracing::warn!(target: "acp.switch", session = %pane.id, %error, "kill tmux failed");
             }
-            // Structured status is event-driven and the tmux poller skips
-            // structured rows, so a Running/Waiting status would never settle.
-            slot.status = Status::Idle;
-            slot.lifecycle_generation = slot.lifecycle_generation.saturating_add(1);
-            Ok(slot.lifecycle_generation)
+            pane.kill_ancillary_tmux_sessions_locked();
+            storage.update_native_under_workspace_claim_lock(|all, _| {
+                let slot = all.iter_mut().find(|candidate| candidate.id == pane.id).ok_or_else(|| anyhow::anyhow!("original session disappeared during terminal-to-ACP transition"))?;
+                slot.view = View::Structured;
+                slot.resume_intent = ResumeIntent::Default;
+                if let Some(binding) = &binding_for_transition {
+                    slot.agent_session_id = Some(binding.session_id.clone());
+                    slot.agent_session_binding = Some(binding.clone());
+                }
+                slot.status = Status::Idle;
+                Ok(lifecycle_generation)
+            })
         })
     })
     .await;
@@ -232,8 +258,10 @@ async fn commit_structured_view(
     };
     apply(instance);
     let mut instances = state.instances.write().await;
-    if let Some(slot) = instances.iter_mut().find(|candidate| candidate.id == id) {
-        if lifecycle_generation >= slot.lifecycle_generation {
+    if let Some(slot) = instances.iter_mut().find(|candidate| {
+        original.matches_instance(candidate) || claimed.matches_instance(candidate)
+    }) {
+        {
             apply(slot);
             state
                 .mutation_epoch
@@ -252,6 +280,21 @@ fn spawn_enabled_worker(
     agent_name: String,
     selected_conversation: Option<(String, crate::session::ExecutionBinding)>,
 ) {
+    let original = match crate::session::LaunchOrigin::capture(&instance) {
+        Ok(original) => original,
+        Err(error) => {
+            state
+                .acp_supervisor
+                .publish_startup_error(&instance.id, error.to_string());
+            return;
+        }
+    };
+    let admission = state.acp_supervisor.begin_resume(
+        &instance.id,
+        crate::acp::runner_lifecycle::NativeResume::Spawn,
+        original.clone(),
+        true,
+    );
     let claude_store_pin = instance.selected_claude_store_pin();
     let resume_sid = selected_conversation
         .as_ref()
@@ -291,14 +334,26 @@ fn spawn_enabled_worker(
             .read()
             .await
             .iter()
-            .any(|candidate| candidate.id == session_id && candidate.is_structured());
+            .any(|candidate| original.matches_instance(candidate) && candidate.is_structured());
         if !still_structured {
             return;
         }
         let supervisor = &state.acp_supervisor;
+        let reservation = match admission.await {
+            Ok(crate::acp::supervisor::ResumeReservationOutcome::Reserved(reservation)) => {
+                reservation
+            }
+            Ok(crate::acp::supervisor::ResumeReservationOutcome::AlreadyPresent) => return,
+            Err(error) => {
+                supervisor.publish_startup_error(&session_id, error.to_string());
+                return;
+            }
+        };
+        let issuance = reservation.execution_admission();
+        let _body_custody = issuance.begin_job();
         let sandbox_info = match crate::acp::sandbox::ensure_container_for_session_locked(
             &state.instances,
-            &session_id,
+            issuance.clone(),
             false,
         )
         .await
@@ -320,9 +375,17 @@ fn spawn_enabled_worker(
                 crate::acp::supervisor::SandboxContinuation::Persisted
             },
             claude_store_pin,
-            ..spawn_request_for(&instance, agent_name.clone(), sandbox_info)
+            origin: issuance.origin(),
+            ..spawn_request_for(
+                &instance,
+                agent_name.clone(),
+                sandbox_info,
+                issuance
+                    .origin()
+                    .expect("prepared view admission owns its original"),
+            )
         };
-        if let Err(e) = supervisor.spawn(request).await {
+        if let Err(e) = supervisor.spawn_inner(request, reservation).await {
             let message = structured_spawn_error_message(&e, &agent_name);
             tracing::warn!(target: "acp.switch", session = %session_id, "spawn after enable: {message}");
             supervisor.publish_startup_error(&session_id, message);
@@ -337,6 +400,17 @@ pub async fn acp_disable(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
+    match tokio::spawn(acp_disable_owned(State(state), Path(id))).await {
+        Ok(response) => response,
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("view owner task failed: {error}"),
+        )
+            .into_response(),
+    }
+}
+
+async fn acp_disable_owned(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
     if let Some(resp) = read_only_block(&state) {
         return resp;
     }
@@ -356,6 +430,11 @@ pub async fn acp_disable(
     let Some(mut instance) = find_instance(&state, &id).await else {
         return session_not_found();
     };
+    let stop = match reserve_view_stop(&state, &instance).await {
+        Ok(stop) => stop,
+        Err(response) => return response,
+    };
+    let before_terminal = stop.current_projection();
     let profile = instance.source_profile.clone();
     let memory_expected = (
         instance.view,
@@ -366,7 +445,12 @@ pub async fn acp_disable(
     if !instance.is_structured() {
         // A reload may have cached a pre-enable terminal snapshot; trust the
         // durable row before answering idempotently.
-        match crate::server::api::load_persisted_instance(&state, &profile, &id).await {
+        let scoped = stop.clone();
+        let persisted =
+            tokio::task::spawn_blocking(move || scoped.with_scope(|row| Ok(Some(row.clone()))))
+                .await
+                .unwrap_or_else(|error| Err(anyhow::anyhow!(error)));
+        match persisted {
             Ok(Some(durable)) if durable.is_structured() => {
                 instance = adopt_persisted_structured_instance(instance, durable, &profile);
             }
@@ -376,9 +460,12 @@ pub async fn acp_disable(
                 let cleanup_projection = state.acp_supervisor.is_owned(&id).await
                     || state.acp_event_store.highest_seq(&id) > 0;
                 let retry = if cleanup_projection {
-                    state.acp_supervisor.shutdown_and_delete(&id).await
+                    state.acp_supervisor.shutdown_and_delete(stop.clone()).await
                 } else {
-                    state.acp_supervisor.shutdown_and_require_dead(&id).await
+                    state
+                        .acp_supervisor
+                        .shutdown_and_require_dead(stop.clone())
+                        .await
                 };
                 match retry {
                     Ok(()) => {}
@@ -400,12 +487,13 @@ pub async fn acp_disable(
                     }
                 }
                 if cleanup_projection {
-                    return finish_terminal_switch(&state, &id, instance).await;
+                    return finish_terminal_switch(&state, &id, instance, stop, before_terminal)
+                        .await;
                 }
                 return view_response(id, View::Terminal);
             }
             Ok(None) => return session_not_found(),
-            Err(resp) => return resp,
+            Err(error) => return (StatusCode::CONFLICT, error.to_string()).into_response(),
         }
     }
 
@@ -451,30 +539,33 @@ pub async fn acp_disable(
         }
     }
 
-    if let Err(response) = persist_terminal_view(
+    instance = match persist_terminal_view(
         &state,
         &instance,
-        &profile,
         keep_context,
         memory_expected,
         disk_expected,
+        stop.clone(),
     )
     .await
     {
-        return response;
-    }
-
+        Ok(emitted) => emitted,
+        Err(response) => return response,
+    };
     // Committed before shutdown so the reconciler cannot respawn a worker in
     // the teardown window. A kept-context switch still deletes the ACP
     // projection below, so it must not report success from an ungated stop:
     // `shutdown_and_require_dead` surfaces `TeardownPending` while the runner
     // is not proven dead.
     let shutdown_result = if keep_context {
-        state.acp_supervisor.shutdown_and_require_dead(&id).await
+        state
+            .acp_supervisor
+            .shutdown_and_require_dead(stop.clone())
+            .await
     } else {
         // The pane is about to reopen on this checkout, so it is kept whatever
         // the row said: a launcher still starting is a live process inside it.
-        state.acp_supervisor.shutdown_and_delete(&id).await
+        state.acp_supervisor.shutdown_and_delete(stop.clone()).await
     };
     match shutdown_result {
         Ok(()) => {}
@@ -499,7 +590,7 @@ pub async fn acp_disable(
                 .into_response()
         }
     }
-    finish_terminal_switch(&state, &id, instance).await
+    finish_terminal_switch(&state, &id, instance, stop, before_terminal).await
 }
 
 /// The tail of a disable: drop the ACP projection, forget the session, and
@@ -512,14 +603,78 @@ async fn finish_terminal_switch(
     state: &Arc<AppState>,
     id: &str,
     mut instance: Instance,
+    stop: Arc<crate::session::runner_journal::OwnedStop>,
+    before_terminal: Arc<crate::session::LaunchOrigin>,
 ) -> Response {
-    if let Err(error) = state.acp_event_store.delete_session(id) {
-        tracing::warn!(target: "acp.switch", session = %id, "ACP event deletion failed after the view switch: {error}");
+    let original = stop.original_arc();
+    let earlier = [original.clone(), before_terminal, stop.current_projection()];
+    let store = state.acp_event_store.clone();
+    let supervisor = state.acp_supervisor.clone();
+    let cleanup = tokio::task::spawn_blocking(move || crate::session::runner_journal::finish_owned_stop(&stop, |row| {
+        if let Err(error) = store.delete_session(&row.id) { tracing::warn!(target: "acp.switch", session = %row.id, %error, "ACP event deletion failed after the view switch"); }
+        supervisor.forget_session(&original);
+        Ok(())
+    })).await;
+    if !matches!(cleanup, Ok(Ok(()))) {
+        return (
+            StatusCode::CONFLICT,
+            "original terminal handoff scope changed during completion; retry",
+        )
+            .into_response();
     }
-    state.acp_supervisor.forget_session(id);
 
-    match tokio::task::spawn_blocking(move || instance.start()).await {
-        Ok(Ok(())) => {}
+    let started = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let (reserved, acknowledged) = instance.start_acknowledged()?;
+        Ok((instance, reserved, acknowledged))
+    })
+    .await;
+    match started {
+        Ok(Ok((started, reserved, acknowledged))) => {
+            let mut rows = state.instances.clone().write_owned().await;
+            let publication = tokio::task::spawn_blocking(move || {
+                acknowledged.with_storage(|_, _| {
+                    let slot = rows
+                        .iter_mut()
+                        .find(|row| row.id == acknowledged.session_id())
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("original Terminal launch cache row disappeared")
+                        })?;
+                    let cached = crate::session::LaunchOrigin::capture(slot)?;
+                    anyhow::ensure!(
+                        earlier
+                            .iter()
+                            .any(|ack| ack.recognizes_published_snapshot(&cached))
+                            || reserved
+                                .as_ref()
+                                .is_some_and(|ack| ack.recognizes_published_snapshot(&cached))
+                            || acknowledged.recognizes_published_snapshot(&cached),
+                        "original Terminal launch cache row was superseded"
+                    );
+                    let started_at = started.last_start_time;
+                    *slot = crate::server::reload::merge_runtime_fields(slot, started);
+                    slot.last_start_time = started_at;
+                    Ok(())
+                })
+            })
+            .await;
+            match publication {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    return (
+                        StatusCode::CONFLICT,
+                        format!("original Terminal launch publication was superseded: {error:#}"),
+                    )
+                        .into_response()
+                }
+                Err(error) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("original Terminal launch publication task failed: {error}"),
+                    )
+                        .into_response()
+                }
+            }
+        }
         // An archived or trashed session switches views without starting.
         Ok(Err(e)) if e.downcast_ref::<crate::session::StartBlocked>().is_some() => {}
         Ok(Err(e)) => {
@@ -536,11 +691,11 @@ async fn finish_terminal_switch(
 async fn persist_terminal_view(
     state: &AppState,
     instance: &Instance,
-    profile: &str,
     keep_context: bool,
     memory_expected: HandoffSnapshot,
     disk_expected: HandoffSnapshot,
-) -> Result<(), Response> {
+    stop: Arc<crate::session::runner_journal::OwnedStop>,
+) -> Result<Instance, Response> {
     let instances = state.instances.write().await;
     let Some(slot) = instances.iter().find(|row| row.id == instance.id) else {
         return Err(session_not_found());
@@ -562,14 +717,10 @@ async fn persist_terminal_view(
 
     let snapshot = instance.clone();
     let persisted_conversation = snapshot.conversation_state();
-    let profile_for_save = profile.to_string();
-    let file_watch = state.file_watch.clone();
-    let save_result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-        let storage = crate::session::Storage::open(&profile_for_save, file_watch)?;
-        storage.update(|all, _groups| {
-            let Some(slot) = all.iter_mut().find(|candidate| candidate.id == snapshot.id) else {
-                anyhow::bail!("session disappeared during terminal handoff");
-            };
+    let owner = stop.clone();
+    let prior_projection = stop.current_projection();
+    let save_result = tokio::task::spawn_blocking(move || -> anyhow::Result<Instance> {
+        owner.update_projection(|slot| {
             anyhow::ensure!(
                 slot.view == disk_expected.0
                     && slot.acp_session_id == disk_expected.1
@@ -580,15 +731,16 @@ async fn persist_terminal_view(
             slot.acp_session_id = snapshot.acp_session_id.clone();
             slot.import_pending = snapshot.import_pending;
             if keep_context {
-                slot.adopt_conversation_state(persisted_conversation.clone());
+                slot.adopt_conversation_state(persisted_conversation);
             }
-            Ok(())
-        })?;
-        Ok(())
+            let mut emitted = slot.clone();
+            emitted.storage_origin = Some(Arc::new(owner.storage().clone()));
+            Ok(emitted)
+        })
     })
     .await;
-    match save_result {
-        Ok(Ok(())) => {}
+    let emitted = match save_result {
+        Ok(Ok(emitted)) => emitted,
         Ok(Err(error)) => {
             return Err((
                 StatusCode::CONFLICT,
@@ -603,17 +755,20 @@ async fn persist_terminal_view(
             )
                 .into_response());
         }
-    }
+    };
 
     let mut instances = state.instances.write().await;
-    if let Some(slot) = instances.iter_mut().find(|row| row.id == instance.id) {
-        slot.view = View::Terminal;
+    if let Some(slot) = instances.iter_mut().find(|row| {
+        crate::session::LaunchOrigin::capture(row).is_ok_and(|cached| {
+            stop.original().recognizes_published_snapshot(&cached)
+                || prior_projection.recognizes_published_snapshot(&cached)
+                || stop
+                    .current_projection()
+                    .recognizes_published_snapshot(&cached)
+        })
+    }) {
+        *slot = crate::server::reload::merge_runtime_fields(slot, emitted.clone());
         slot.acp_load_session_capable = None;
-        slot.acp_session_id = instance.acp_session_id.clone();
-        slot.import_pending = instance.import_pending;
-        if keep_context {
-            slot.adopt_conversation_state(instance.conversation_state());
-        }
         state
             .mutation_epoch
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -624,7 +779,7 @@ async fn persist_terminal_view(
             "session missing from cache after terminal handoff save; continuing teardown"
         );
     }
-    Ok(())
+    Ok(emitted)
 }
 
 #[cfg(test)]

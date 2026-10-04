@@ -238,7 +238,9 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         FileWatchService::noop()
     });
 
+    let primary_storage = Arc::new(crate::session::Storage::open(profile, file_watch.clone())?);
     let instances = load_all_instances(&file_watch)?;
+    primary_storage.verify_profile_identity()?;
 
     // Only `--auth=token` issues a URL token.
     let auth_token = match auth_mode {
@@ -373,6 +375,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     let mutation_epoch = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let session_service = Arc::new(session_service::SessionService::new(
         Arc::clone(&instances),
+        primary_storage,
         Arc::clone(&instance_locks),
         Arc::clone(&file_watch),
         Arc::clone(&telemetry_session_creates),

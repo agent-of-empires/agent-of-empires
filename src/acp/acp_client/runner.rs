@@ -13,9 +13,10 @@ use super::spawn::{
 /// Construction guard: cancellation can retire only this issued execution ticket.
 pub(super) struct DetachedLaunch {
     pub pid: Option<u32>,
+    pub identity: Option<crate::acp::runner_lifecycle::RunnerIdentity>,
     pub nonce: uuid::Uuid,
     pub native_store: Option<crate::session::ExecutionBinding>,
-    owner: Option<(String, String)>,
+    owner: Option<(crate::acp::runner_lifecycle::ExecutionAdmission, String)>,
     runtime: tokio::runtime::Handle,
 }
 
@@ -25,18 +26,25 @@ impl DetachedLaunch {
     }
 
     pub async fn retire(&mut self) -> anyhow::Result<()> {
-        let Some((profile, id)) = self.owner.as_ref() else {
+        let Some((admission, id)) = self.owner.as_ref() else {
             return Ok(());
         };
-        crate::session::runner_journal::settle_nonce(
-            crate::session::deletion::SessionPathOwner {
-                profile,
-                session_id: id,
-            },
-            self.nonce,
-            None,
-        )
-        .await?;
+        match self.identity {
+            Some(identity) => {
+                crate::session::runner_journal::settle_captured_ticket(id, identity, true).await?
+            }
+            None => {
+                crate::session::runner_journal::settle_nonce(
+                    crate::session::runner_journal::JournalScope::Launch(
+                        admission.origin().ok_or_else(|| {
+                            anyhow::anyhow!("native launch lost its original scope")
+                        })?,
+                    ),
+                    self.nonce,
+                )
+                .await?
+            }
+        }
         self.owner = None;
         Ok(())
     }
@@ -44,12 +52,20 @@ impl DetachedLaunch {
 
 impl Drop for DetachedLaunch {
     fn drop(&mut self) {
-        let Some((profile, id)) = self.owner.take() else {
+        let Some((admission, id)) = self.owner.take() else {
             return;
         };
         let nonce = self.nonce;
+        let identity = self.identity;
         self.runtime.spawn(async move {
-            if let Err(error) = crate::session::runner_journal::settle_nonce(crate::session::deletion::SessionPathOwner { profile: &profile, session_id: &id }, nonce, None).await {
+            let settled = match identity {
+                Some(identity) => crate::session::runner_journal::settle_captured_ticket(&id, identity, true).await,
+                None => match admission.origin() {
+                    Some(origin) => crate::session::runner_journal::settle_nonce(crate::session::runner_journal::JournalScope::Launch(origin), nonce).await,
+                    None => Err(anyhow::anyhow!("native launch lost its original scope")),
+                },
+            };
+            if let Err(error) = settled {
                 warn!(target: "acp", session = %id, %nonce, "cancelled launch remains protected: {error:#}");
             }
         });
@@ -316,20 +332,44 @@ pub(super) async fn spawn_runner_detached(
 
     let native_store = super::spawn::native_store_snapshot(config, cmd.as_std(), &host_environment);
     let nonce = launch.nonce();
-    let mut captured = None;
-    let spawned = launch.spawn(&mut cmd, |identity| {
-        captured = Some(identity);
-        if let Some(admission) = &config.execution_admission {
-            admission.capture(identity);
-        }
-    });
-    let mut issued = DetachedLaunch {
-        pid: captured.map(|identity| identity.pid),
+    let admission = config.execution_admission.clone().ok_or_else(|| {
+        AcpError::Spawn("managed launch requires its original native admission".into())
+    })?;
+    let custody = admission.begin_job();
+    let issued = DetachedLaunch {
+        pid: None,
+        identity: None,
         nonce,
         native_store,
-        owner: Some((profile.to_owned(), session_id)),
+        owner: None,
         runtime: tokio::runtime::Handle::current(),
     };
+    let (mut issued, spawned) = tokio::task::spawn_blocking(move || {
+        let _custody = custody;
+        let mut issued = issued;
+        let Some(origin) = admission.origin() else {
+            return (
+                issued,
+                Err(anyhow::anyhow!(
+                    "managed launch lost its original native scope"
+                )),
+            );
+        };
+        let storage = origin.storage().clone();
+        issued.owner = Some((admission.clone(), session_id));
+        let runtime = issued.runtime.clone();
+        let _entered = runtime.enter();
+        let storage = &storage;
+        let pid = &mut issued.pid;
+        let identity = &mut issued.identity;
+        let spawned = launch.spawn(storage, &mut cmd, Some(&admission), |captured| {
+            *pid = Some(captured.pid);
+            *identity = Some(captured);
+        });
+        (issued, spawned)
+    })
+    .await
+    .map_err(|error| AcpError::Spawn(format!("runner launch task: {error}")))?;
     match spawned {
         Ok(pid) => issued.pid = Some(pid),
         Err(error) => {
@@ -341,7 +381,7 @@ pub(super) async fn spawn_runner_detached(
                 }
             };
             return Err(AcpError::IssuedExecution {
-                identity: captured,
+                identity: issued.identity,
                 launch_nonce: nonce,
                 settled,
                 source: Box::new(AcpError::Spawn(format!(

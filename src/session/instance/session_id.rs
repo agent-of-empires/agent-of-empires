@@ -313,17 +313,13 @@ impl Instance {
 
     /// Best-effort backfill of a missing `agent_session_id` from a read-only CLI
     /// command, under a capture lifecycle reservation. Any miss is a silent no-op.
-    pub(crate) fn self_heal_session_id(
-        &mut self,
-        profile: &str,
-        contended: &HashSet<(String, String)>,
-    ) {
+    pub(crate) fn self_heal_session_id(&mut self, contended: &HashSet<(String, String)>) {
         if !self.self_heal_row_is_eligible(contended) || !self.tmux_alive_cached() {
             return;
         }
-        let file_watch = self.resolve_file_watch();
         let ownership: Result<_> = (|| {
-            let storage = crate::session::storage::Storage::new(profile, file_watch.clone())?;
+            let storage = self.original_storage()?;
+            storage.verify_profile_identity()?;
             let lifecycle_lock = storage.acquire_instance_lifecycle_lock(&self.id)?;
             let generation = storage.update(|instances, _groups| {
                 let Some(stored) = instances.iter_mut().find(|instance| instance.id == self.id)
@@ -354,7 +350,7 @@ impl Instance {
         let captured = self.try_retroactive_capture();
         let applied = captured.as_ref().is_some_and(|captured| {
             self.resume_probe_failed_sid.as_deref() != Some(captured.sid.as_str())
-                && persist_session_to_storage(profile, &self.id, captured, &expected, &file_watch)
+                && persist_session_to_storage(&storage, &self.id, captured, &expected)
                     == SidWrite::Applied
         });
         let released = storage.update(|instances, _groups| {
@@ -707,19 +703,15 @@ impl Instance {
 
     /// Persist an ambiguous resume-probe failure without clearing the durable
     /// sid; the CAS guard keeps peer sid changes authoritative.
-    pub(super) fn mark_resume_probe_failed(&mut self, profile: &str, sid: &str) -> SidWrite {
-        let storage =
-            match crate::session::storage::Storage::new(profile, self.resolve_file_watch()) {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!(target: "session.store",
-                        "Failed to create storage for resume-probe failure marker for {}: {}",
-                        self.id,
-                        e
-                    );
-                    return SidWrite::Failed;
-                }
-            };
+    pub(super) fn mark_resume_probe_failed(&mut self, sid: &str) -> SidWrite {
+        let storage = match self.original_storage() {
+            Ok(storage) => storage,
+            Err(error) => {
+                tracing::warn!(target: "session.store", instance_id = %self.id, %error,
+                    "Original storage unavailable for resume-probe failure marker");
+                return SidWrite::Failed;
+            }
+        };
 
         let outcome = storage.update(|instances, _groups| {
             let Some(inst) = instances.iter_mut().find(|i| i.id == self.id) else {

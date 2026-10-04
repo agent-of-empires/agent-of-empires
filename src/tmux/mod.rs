@@ -581,70 +581,35 @@ fn resolved_agent_existence(
     SessionExistence::Unknown
 }
 
-/// Rekey a live tmux session after its new title is persisted. `Ok(false)` only
-/// when tmux confirms no live session. Callers hold the title and lifecycle
-/// locks and persist first.
-pub(crate) fn rekey_session(id: &str, old_title: &str, new_title: &str) -> anyhow::Result<bool> {
-    let renamed = rekey_session_name(id, old_title, new_title)?;
-    if renamed {
-        status_bar::refresh_session_title(&Session::generate_name(id, new_title), new_title);
-    }
-    Ok(renamed)
+/// Rekey only the physical session captured before the metadata transaction.
+pub(crate) fn rekey_session(
+    id: &str,
+    new_title: &str,
+    target: anyhow::Result<Option<Session>>,
+) -> anyhow::Result<bool> {
+    let Some(session) = target? else {
+        return Ok(false);
+    };
+    session.rename(&Session::generate_name(id, new_title))?;
+    refresh_session_cache();
+    status_bar::refresh_session_title(&session, new_title);
+    Ok(true)
 }
 
-fn rekey_session_name(id: &str, old_title: &str, new_title: &str) -> anyhow::Result<bool> {
+pub(crate) fn capture_rekey_session(id: &str, old_title: &str) -> anyhow::Result<Option<Session>> {
     // Force a fresh scan so a stale snapshot cannot target the old name.
     let initial_refresh = refresh_session_cache();
     let session = Session::new(id, old_title)?;
     match resolved_agent_existence(id, &session, initial_refresh) {
         SessionExistence::Present => {}
-        SessionExistence::Absent => return Ok(false),
+        SessionExistence::Absent => return Ok(None),
         SessionExistence::Unknown => {
             anyhow::bail!("Could not determine whether the tmux session exists")
         }
     }
 
-    let new_name = Session::generate_name(id, new_title);
-    let original_name = session.name().to_string();
-    let original_error = match session.rename(&new_name) {
-        Ok(()) => {
-            refresh_session_cache();
-            return Ok(true);
-        }
-        Err(error) => error,
-    };
-
-    // Another process may have rekeyed meanwhile: re-resolve by id suffix and
-    // retry once. A failed query keeps the original rename error.
-    let retry_refresh = refresh_session_cache();
-    let refreshed = Session::new(id, old_title)?;
-    match resolved_agent_existence(id, &refreshed, retry_refresh) {
-        SessionExistence::Absent => return Ok(false),
-        SessionExistence::Unknown => return Err(original_error),
-        SessionExistence::Present => {}
-    }
-    if refreshed.name() == new_name {
-        return Ok(true);
-    }
-    if refreshed.name() == original_name {
-        return Err(original_error);
-    }
-
-    let retry_error = match refreshed.rename(&new_name) {
-        Ok(()) => {
-            refresh_session_cache();
-            return Ok(true);
-        }
-        Err(error) => error,
-    };
-    let final_refresh = refresh_session_cache();
-    let final_session = Session::new(id, old_title)?;
-    match resolved_agent_existence(id, &final_session, final_refresh) {
-        SessionExistence::Absent => Ok(false),
-        SessionExistence::Unknown => Err(original_error),
-        SessionExistence::Present if final_session.name() == new_name => Ok(true),
-        SessionExistence::Present => Err(retry_error),
-    }
+    session.primary_with_deadline(&TmuxCommandDeadline::new())?;
+    Ok(Some(session))
 }
 
 /// Every session kind nests under `SESSION_PREFIX` for this build.
@@ -3832,13 +3797,13 @@ mod tests {
             .expect("tmux new-session");
         assert!(created.status.success());
         refresh_session_cache();
-
+        let original = capture_rekey_session(ID, "Fix login bug");
         let peer_rename = tmux_command()
             .args(["rename-session", "-t", &start_name, &peer_name])
             .output()
             .expect("peer tmux rename");
         assert!(peer_rename.status.success());
-        assert!(rekey_session(ID, "Fix login bug", "Final rename").unwrap());
+        assert!(rekey_session(ID, "Final rename", original).unwrap());
         assert!(Session::from_name(&final_name).exists());
         drop((start_guard, peer_guard, final_guard));
     }
@@ -3863,7 +3828,9 @@ mod tests {
         assert!(seeded.status.success());
         refresh_session_cache();
 
-        assert!(rekey_session(ID, "Britons", "Fix detach hint").unwrap());
+        assert!(
+            rekey_session(ID, "Fix detach hint", capture_rekey_session(ID, "Britons")).unwrap()
+        );
 
         let shown = tmux_command()
             .args(["show-options", "-t", &final_name, "-v", "@aoe_title"])
@@ -3899,7 +3866,12 @@ mod tests {
             .output()
             .expect("tmux kill-session");
         assert!(killed.status.success());
-        assert!(!rekey_session(ID, "Final rename", "No live pane").unwrap());
+        assert!(!rekey_session(
+            ID,
+            "No live pane",
+            capture_rekey_session(ID, "Final rename")
+        )
+        .unwrap());
         drop((guard, dummy_guard));
     }
 

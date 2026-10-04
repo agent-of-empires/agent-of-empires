@@ -14,6 +14,14 @@ fn structured_row(env: &mut TestEnv, status: Status) -> String {
     inst.view = crate::session::View::Structured;
     inst.status = status;
     let id = inst.id.clone();
+    let storage = Storage::new_unwatched("test").unwrap();
+    inst.storage_origin = Some(std::sync::Arc::new(storage.clone()));
+    storage
+        .update(|rows, _| {
+            rows.push(inst.clone());
+            Ok(())
+        })
+        .unwrap();
     env.view.add_instance(inst);
     id
 }
@@ -323,7 +331,10 @@ fn daemon_status_stopped_leaves_a_stopped_row_alone() {
 fn daemon_status_skips_a_row_mid_restart() {
     let mut env = create_test_env_empty();
     let id = structured_row(&mut env, Status::Starting);
-    env.view.restart_in_flight.insert(id.clone());
+    env.view.restart_in_flight.insert(
+        id.clone(),
+        super::super::RequestOrigin::capture(env.view.get_instance(&id).unwrap()).unwrap(),
+    );
 
     env.view
         .apply_daemon_status_update(update(&id, Status::Idle));

@@ -468,36 +468,35 @@ async fn archive_session(profile: &str, args: ArchiveArgs) -> Result<()> {
     let inst = super::resolve_session(&args.identifier, &instances)?;
     let id = inst.id.clone();
     let title = inst.title.clone();
-    let inst = inst.clone();
-
-    let _lifecycle_lock = storage
-        .acquire_instance_lifecycle_lock(&id)
-        .context("failed to acquire instance archive lock")?;
-    if !args.no_kill {
-        if let Err(e) = inst.kill_locked() {
-            eprintln!("Warning: failed to kill agent tmux session: {}", e);
-        }
-        inst.kill_ancillary_tmux_sessions_locked();
-    }
-
-    let landed = storage.update(|instances, _groups| {
-        if let Some(stored) = instances.iter_mut().find(|i| i.id == id) {
-            stored.archive();
-            stored.lifecycle_generation = stored.lifecycle_generation.saturating_add(1);
-            Ok(true)
-        } else {
-            Ok(false)
-        }
-    })?;
-    if landed {
-        println!("Archived: {}", title);
-        Ok(())
-    } else {
-        bail!(
-            "Session {} was removed by another process before archive could land",
-            title
+    let stop = crate::session::runner_journal::reserve_owned_stop(&storage, inst, false)?;
+    if let Err(error) = crate::session::runner_journal::settle(stop.clone()).await {
+        let _ = crate::session::runner_journal::release_owned_stop(&stop);
+        return Err(
+            error.context("archive stopped before publication: runner settlement is pending")
         );
     }
+    crate::session::runner_journal::finish_owned_stop(&stop, |inst| {
+        if !args.no_kill {
+            if let Err(error) = inst.kill_locked() {
+                eprintln!("Warning: failed to kill agent tmux session: {error}");
+            }
+            inst.kill_ancillary_tmux_sessions_locked();
+        }
+        storage.update_native_under_workspace_claim_lock(|instances, _| {
+            let stored = instances
+                .iter_mut()
+                .find(|row| row.id == id)
+                .context("session disappeared before archive publication")?;
+            anyhow::ensure!(
+                stored.lifecycle_generation == stop.generation(),
+                "archive generation was superseded"
+            );
+            stored.archive();
+            Ok(())
+        })
+    })?;
+    println!("Archived: {title}");
+    Ok(())
 }
 
 async fn restore_session(profile: &str, args: SessionIdArgs) -> Result<()> {
@@ -543,14 +542,13 @@ async fn restore_session(profile: &str, args: SessionIdArgs) -> Result<()> {
         .as_ref()
         .is_some_and(|original| original != &plan.project_path);
     let settled = if needs_move {
-        crate::session::runner_journal::settle(
-            crate::session::deletion::SessionPathOwner {
-                profile: storage.profile(),
-                session_id: &restore_id,
-            },
-            Some((LifecycleOperation::Restore, restore_generation)),
-        )
-        .await
+        let native = crate::session::runner_journal::OwnedStop::from_claim(
+            &storage,
+            &plan,
+            LifecycleOperation::Restore,
+            restore_generation,
+        )?;
+        crate::session::runner_journal::settle(native).await
     } else {
         Ok(())
     };
@@ -1523,7 +1521,7 @@ async fn show_session(profile: &str, args: ShowArgs) -> Result<()> {
     crate::tmux::refresh_session_cache();
     inst.update_status_once(None, None);
     let contended = crate::session::Instance::contended_capture_cwds(&instances);
-    inst.self_heal_session_id(profile, &contended);
+    inst.self_heal_session_id(&contended);
 
     if args.json {
         super::output::print_json(&session_details(&inst, storage.profile()))?;
@@ -1726,6 +1724,48 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
     }
     let session_lock_required = title_requested || args.rename_branch || args.branch.is_some();
 
+    let stop_generation = if args.branch.is_none() && (title_requested || args.rename_branch) {
+        let current = storage
+            .load()?
+            .into_iter()
+            .find(|row| row.id == id)
+            .context("session disappeared before rename planning")?;
+        let config = crate::session::config::profile_config::resolve_config_or_warn(profile);
+        let title = args.title.as_deref().unwrap_or(&current.title).trim();
+        let leaf = crate::session::worktree_edit::worktree_leaf_from_title(title);
+        if current.tie_workdir_applies(config.session.tie_workdir_to_name)
+            && crate::session::worktree_edit::worktree_move_required(
+                std::path::Path::new(&current.project_path),
+                &leaf,
+            )
+        {
+            let mut live = current.clone();
+            live.source_profile = profile.to_owned();
+            crate::tmux::refresh_session_cache();
+            live.update_status_with_metadata(None, None);
+            anyhow::ensure!(
+                !live.status.blocks_worktree_edit(),
+                "Stop the session before renaming its worktree directory."
+            );
+            let generation =
+                crate::session::runner_journal::reserve_owned_stop(&storage, &current, true)?;
+            if let Err(error) =
+                crate::session::runner_journal::settle_if_idle(generation.clone()).await
+            {
+                let _ = crate::session::runner_journal::release_owned_stop(&generation);
+                return Err(error.context("checkout rename is waiting for runner settlement"));
+            }
+            Some(generation)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let _workspace_claim_lock = stop_generation
+        .as_ref()
+        .map(|_| crate::session::acquire_session_workspace_claim_lock())
+        .transpose()?;
     let _identity_lock = acquire_session_identity_lock()?;
     let _session_title_lock = if session_lock_required {
         Some(
@@ -1744,6 +1784,9 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
     } else {
         None
     };
+    if let Some(generation) = stop_generation.as_ref() {
+        crate::session::runner_journal::release_settled_stop_under_locks(generation)?;
+    }
     let (authoritative_instances, _groups) = storage.load_with_groups()?;
     let inst = authoritative_instances
         .iter()
@@ -1845,6 +1888,10 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
             &leaf,
             args.rename_branch,
         );
+        anyhow::ensure!(
+            !moves_worktree || stop_generation.is_some(),
+            "checkout rename plan changed before settlement; retry the rename"
+        );
         let is_sandboxed = inst.is_sandboxed();
         if moves_worktree || renames_branch {
             let mut live = inst.clone();
@@ -1886,6 +1933,7 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
         bail!("--rename-branch only applies to a tied aoe-managed worktree session (session.tie_workdir_to_name)");
     }
 
+    let rekey_target = crate::tmux::capture_rekey_session(&id, &inst.title);
     let persist = storage.update(|instances, groups| {
         let inst = instances
             .iter_mut()
@@ -1951,15 +1999,14 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
             return Err(error);
         }
     };
-    drop(_identity_lock);
 
     let committed_title_changed = title_requested && persisted_old_title != committed_title;
     if committed_title_changed {
         let rekey_id = id.clone();
-        let rekey_old_title = persisted_old_title.clone();
+
         let rekey_new_title = committed_title.clone();
         match tokio::task::spawn_blocking(move || {
-            crate::tmux::rekey_session(&rekey_id, &rekey_old_title, &rekey_new_title)
+            crate::tmux::rekey_session(&rekey_id, &rekey_new_title, rekey_target)
         })
         .await
         {
@@ -1968,6 +2015,7 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
             Err(error) => eprintln!("Warning: tmux rename task failed: {error}"),
         }
     }
+    drop(_identity_lock);
 
     if args.branch.is_some() {
         if let Some(branch) = &new_branch {
@@ -2538,9 +2586,9 @@ async fn set_worktree_name(profile: &str, args: SetWorktreeNameArgs) -> Result<(
         bail!("Session is attaching a project; wait for the attach to finish before renaming its worktree");
     }
     let current_path = inst.project_path.clone();
-    let Some(worktree_info) = inst.worktree_info.clone() else {
+    if inst.worktree_info.is_none() {
         bail!("Session does not use a worktree");
-    };
+    }
     if inst.tie_workdir_applies(
         crate::session::config::profile_config::resolve_config_or_warn(profile)
             .session
@@ -2583,43 +2631,68 @@ async fn set_worktree_name(profile: &str, args: SetWorktreeNameArgs) -> Result<(
         bail!("Cannot edit the workdir name while the session is active; stop it first");
     }
 
-    let outcome = crate::session::worktree_edit::edit_worktree_workdir(
-        crate::session::worktree_edit::WorktreeEditRequest {
-            worktree_info: &worktree_info,
-            current_path: std::path::Path::new(&current_path),
-            new_name: args.name.trim(),
-            rename_branch: args.rename_branch,
-        },
-    )?;
-    if outcome.new_path != std::path::Path::new(&current_path) {
-        crate::session::worktree_edit::discard_sandbox_container_after_move(
-            &id,
-            live.is_sandboxed(),
-        );
-    }
-    let new_path = outcome.new_path.to_string_lossy().to_string();
-    let new_branch = outcome.new_branch.clone();
-
-    storage
-        .update(|instances, _groups| {
-            let inst = instances
-                .iter_mut()
-                .find(|i| i.id == id)
-                .ok_or_else(|| anyhow::anyhow!("Session not found: {}", id))?;
-            inst.project_path = new_path.clone();
-            if let Some(branch) = &new_branch {
-                if let Some(wt) = inst.worktree_info.as_mut() {
-                    wt.branch = branch.clone();
-                }
+    let execute = |current: &Instance| -> Result<_> {
+        let worktree_info = current
+            .worktree_info
+            .as_ref()
+            .context("session no longer uses a worktree")?;
+        let current_path = &current.project_path;
+        let target = crate::session::worktree_edit::target_worktree_path(
+            std::path::Path::new(current_path),
+            args.name.trim(),
+        )
+        .unwrap_or_else(|| std::path::PathBuf::from(current_path));
+        let rows = storage.load()?;
+        if target != std::path::Path::new(current_path)
+            && is_duplicate_session(
+                rows.iter(),
+                &current.title,
+                &target.to_string_lossy(),
+                Some(&id),
+            )
+        {
+            return Err(duplicate_session_error(&current.title));
+        }
+        let outcome = crate::session::worktree_edit::edit_worktree_workdir(
+            crate::session::worktree_edit::WorktreeEditRequest {
+                worktree_info,
+                current_path: std::path::Path::new(current_path),
+                new_name: args.name.trim(),
+                rename_branch: args.rename_branch,
+            },
+        )?;
+        if outcome.new_path != std::path::Path::new(current_path) {
+            crate::session::worktree_edit::discard_sandbox_container_after_move(
+                &id,
+                current.is_sandboxed(),
+            );
+        }
+        let new_path = outcome.new_path.to_string_lossy().into_owned();
+        storage.update(|instances, _| {
+            let stored = instances.iter_mut().find(|row| row.id == id).context("session disappeared before workdir commit")?;
+            anyhow::ensure!(stored.lifecycle_generation == current.lifecycle_generation && stored.project_path == *current_path,
+                "workdir plan was superseded before commit");
+            stored.project_path = new_path.clone();
+            if let Some(branch) = &outcome.new_branch {
+                if let Some(worktree) = &mut stored.worktree_info { worktree.branch = branch.clone(); }
             }
             Ok(())
-        })
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "Worktree was moved on disk to {new_path}, but persisting the new session metadata failed: {e}. Re-run to retry."
-            )
-        })?;
-    drop(_identity_lock);
+        }).map_err(|error| anyhow::anyhow!("Worktree was moved on disk to {new_path}, but persisting the new session metadata failed: {error}. Re-run to retry."))?;
+        Ok((new_path, outcome.new_branch))
+    };
+    let (new_path, new_branch) = if moves_worktree {
+        drop(_lifecycle_lock);
+        drop(_identity_lock);
+        let generation = crate::session::runner_journal::reserve_owned_stop(&storage, inst, true)?;
+        if let Err(error) = crate::session::runner_journal::settle_if_idle(generation.clone()).await
+        {
+            let _ = crate::session::runner_journal::release_owned_stop(&generation);
+            return Err(error.context("checkout move is waiting for runner settlement"));
+        }
+        crate::session::runner_journal::finish_owned_stop(&generation, execute)?
+    } else {
+        execute(inst)?
+    };
 
     println!("✓ Worktree moved to: {}", new_path);
     if let Some(branch) = &new_branch {
@@ -2742,7 +2815,6 @@ fn add_project(profile: &str, args: AddProjectArgs) -> Result<()> {
     let id = inst.id.clone();
     let title = inst.title.clone();
     let is_sandboxed = inst.is_sandboxed();
-
     if inst.status.blocks_worktree_edit() {
         bail!(
             "'{title}' has a turn in flight and attaching restarts the agent. Wait for it to \
@@ -2770,19 +2842,22 @@ fn add_project(profile: &str, args: AddProjectArgs) -> Result<()> {
     };
 
     let mut plan = crate::session::attach_project::plan(inst, profile, &repo_path, on_existing)?;
-    crate::session::attach_project::reserve_attach(&storage, &id, &mut plan)?;
+    let reserved = crate::session::attach_project::reserve_attach(&storage, &id, &mut plan)?;
     let restarts = crate::session::attach_project::needs_restart(&plan, is_sandboxed);
-    let quiesced = if restarts {
+    let (quiesced, reserved) = if restarts {
         println!("Stopping '{title}' so its working directory can move...");
-        crate::session::attach_project::quiesce_for_conversion(&storage, inst, &plan)?
+        crate::session::attach_project::quiesce_for_conversion(&storage, inst, &plan, reserved)?
     } else {
-        crate::session::attach_project::Quiesced::default()
+        (
+            crate::session::attach_project::Quiesced::default(),
+            reserved,
+        )
     };
 
     let outcome = match crate::session::attach_project::attach_planned(&storage, &id, inst, plan) {
         Ok(outcome) => outcome,
         Err(e) => {
-            crate::session::attach_project::resume_after_conversion(&storage, &id, quiesced);
+            crate::session::attach_project::resume_after_conversion(reserved, quiesced);
             return Err(e);
         }
     };
@@ -2814,7 +2889,8 @@ fn add_project(profile: &str, args: AddProjectArgs) -> Result<()> {
     } else {
         println!("The agent is already working in this directory, so nothing was restarted.");
     }
-    for warning in crate::session::attach_project::resume_after_conversion(&storage, &id, quiesced)
+    for warning in
+        crate::session::attach_project::resume_after_conversion(outcome.original.clone(), quiesced)
     {
         println!("  Warning:  {warning}");
     }
@@ -2953,6 +3029,7 @@ mod restart_args_tests {
         inst.agent_session_id = Some("d38740e4-bd1f-43d7-8727-485652e4678e".to_string());
         inst.mark_pi_extension_launched_for_test();
         let storage = crate::session::Storage::new_unwatched(profile).unwrap();
+        inst.storage_origin = Some(std::sync::Arc::new(storage.clone()));
         storage
             .update(|instances, _| {
                 *instances = vec![inst.clone()];

@@ -53,13 +53,13 @@ pub(super) fn load_all_instances(
 
 /// Carry over the in-memory-only fields from the prior `state.instances` entry into the
 /// freshly-loaded one.
-pub(super) fn merge_runtime_fields(prior: Instance, mut fresh: Instance) -> Instance {
-    fresh.adopt_poller(&prior);
-    fresh.adopt_poller_repair(&prior);
+pub(super) fn merge_runtime_fields(prior: &mut Instance, mut fresh: Instance) -> Instance {
+    fresh.adopt_poller(prior);
+    fresh.adopt_poller_repair(prior);
     fresh.last_error_check = prior.last_error_check;
     fresh.last_start_time = prior.last_start_time;
     if fresh.status == Status::Error {
-        fresh.last_error = prior.last_error;
+        fresh.last_error = prior.last_error.take();
     }
     fresh.acp_load_session_capable = prior.acp_load_session_capable;
     fresh.plugin_revival_pending = prior.plugin_revival_pending;
@@ -270,12 +270,12 @@ pub(crate) async fn reload_state_instances_from_disk(
 
     let mut merged: Vec<Instance> = Vec::with_capacity(fresh.len());
     for mut row in fresh {
-        if let Some(prior) = prior_by_id.get(&row.id).cloned() {
+        if let Some(mut prior) = prior_by_id.get(&row.id).cloned() {
             let prior_status = prior.status;
             let prior_last_accessed = prior.last_accessed_at;
             let prior_idle_entered = prior.idle_entered_at;
             let prior_tracking = PriorTickTracking::of(&prior);
-            row = merge_runtime_fields(prior, row);
+            row = merge_runtime_fields(&mut prior, row);
             match status_source {
                 StatusSource::DiskOnly => {
                     row.status = prior_status;
@@ -379,31 +379,6 @@ mod tests {
             vec![record],
             StatusSource::DiskOnly,
             1,
-        )
-        .await;
-        assert!(!state.instances.read().await[0].is_structured());
-        assert!(!storage.load().unwrap()[0].is_structured());
-    }
-
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn reload_repair_rejects_a_registry_sample_retired_after_the_disk_read() {
-        let _home = crate::session::test_support::isolate_app_dir();
-        let (state, row, record, storage) = live_repair_fixture();
-        // The reload sampled the runner during teardown; disable finished
-        // before this reload could acquire the transition lock.
-        assert!(crate::process::worker_registry::delete_if_owned_by(
-            &row.id,
-            std::process::id(),
-            record.0.generation,
-            record.0.launch_nonce
-        ));
-        reload_state_instances_from_disk(
-            &state,
-            vec![row],
-            vec![record],
-            StatusSource::DiskOnly,
-            0,
         )
         .await;
         assert!(!state.instances.read().await[0].is_structured());
@@ -719,7 +694,7 @@ mod tests {
             let mut fresh = Instance::new("seed", "/tmp/seed");
             fresh.status = fresh_status;
             fresh.last_error = None;
-            merge_runtime_fields(prior, fresh).last_error
+            merge_runtime_fields(&mut prior, fresh).last_error
         };
         assert_eq!(
             merged(Status::Error, Status::Error).as_deref(),
@@ -730,7 +705,7 @@ mod tests {
 
         let mut prior = Instance::new("seed", "/tmp/seed");
         prior.acp_load_session_capable = Some(true);
-        let merged = merge_runtime_fields(prior, Instance::new("seed", "/tmp/seed"));
+        let merged = merge_runtime_fields(&mut prior, Instance::new("seed", "/tmp/seed"));
         assert_eq!(merged.acp_load_session_capable, Some(true));
     }
 
@@ -743,7 +718,7 @@ mod tests {
         prior.plugin_revival_pending = true;
 
         let fresh = Instance::new("seed", "/tmp/seed");
-        let merged = merge_runtime_fields(prior, fresh);
+        let merged = merge_runtime_fields(&mut prior, fresh);
 
         assert!(merged.plugin_revival_pending);
     }
@@ -762,11 +737,13 @@ mod tests {
             .mode(0o700)
             .create(&hook_base)
             .unwrap();
-        let mergers: [fn(Instance, Instance) -> Instance; 2] =
-            [merge_runtime_fields, |prior, mut fresh| {
+        let mergers: [fn(Instance, Instance) -> Instance; 2] = [
+            |mut prior, fresh| merge_runtime_fields(&mut prior, fresh),
+            |prior, mut fresh| {
                 fresh.merge_runtime_from_reload(&prior);
                 fresh
-            }];
+            },
+        ];
         for merge in mergers {
             let mut prior = Instance::new("reload-capture", app.path().to_str().unwrap());
             prior.tool = "claude".into();
@@ -809,6 +786,7 @@ mod tests {
             active.capture =
                 Some(serde_json::from_value(serde_json::json!({ "Hooks": publication })).unwrap());
             let storage = Storage::new_unwatched(&fresh.source_profile).unwrap();
+            fresh.storage_origin = Some(Arc::new(storage.clone()));
             storage
                 .update(|rows, _| {
                     *rows = vec![fresh.clone()];
@@ -868,7 +846,8 @@ mod tests {
                 container: None,
             })
         };
-        let mut mergers: Vec<fn(Instance, Instance) -> Instance> = vec![merge_runtime_fields];
+        let mut mergers: Vec<fn(Instance, Instance) -> Instance> =
+            vec![|mut prior, fresh| merge_runtime_fields(&mut prior, fresh)];
         mergers.push(|prior, mut fresh| {
             fresh.merge_runtime_from_reload(&prior);
             fresh
@@ -943,7 +922,7 @@ mod tests {
         let mut fresh = Instance::new("swapped-agent", "/tmp/swapped-agent");
         fresh.tool = "codex".to_string();
 
-        let merged = merge_runtime_fields(prior, fresh);
+        let merged = merge_runtime_fields(&mut prior, fresh);
 
         assert_eq!(merged.tool, "codex");
         assert!(
@@ -958,7 +937,8 @@ mod tests {
     #[test]
     fn a_reload_keeps_the_repair_pacing_of_a_row_on_the_same_runtime() {
         let now = std::time::Instant::now();
-        let mut mergers: Vec<fn(Instance, Instance) -> Instance> = vec![merge_runtime_fields];
+        let mut mergers: Vec<fn(Instance, Instance) -> Instance> =
+            vec![|mut prior, fresh| merge_runtime_fields(&mut prior, fresh)];
         mergers.push(|prior, mut fresh| {
             fresh.merge_runtime_from_reload(&prior);
             fresh

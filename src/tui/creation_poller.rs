@@ -14,6 +14,7 @@ use crate::session::Instance;
 use crate::tui::dialogs::NewSessionData;
 
 pub struct CreationRequest {
+    pub storage: std::sync::Arc<crate::session::Storage>,
     pub data: NewSessionData,
     pub existing_instances: Vec<Instance>,
     /// Trusted hooks to execute after instance creation (already approved by user).
@@ -40,6 +41,7 @@ pub enum CreationResult {
 }
 
 pub struct CreationOutcome {
+    pub storage: std::sync::Arc<crate::session::Storage>,
     pub result: CreationResult,
     /// Cancelled after the worker's last check: a `Success` still needs rollback.
     pub cancelled: bool,
@@ -75,14 +77,16 @@ impl From<&CreatedWorktreeInfo> for CreatedWorktree {
 
 pub struct CreationPoller {
     request_tx: mpsc::Sender<(CreationRequest, mpsc::Sender<HookProgress>)>,
-    result_rx: mpsc::Receiver<(CreationResult, CancellationToken)>,
+    result_rx: mpsc::Receiver<(
+        CreationResult,
+        CancellationToken,
+        std::sync::Arc<crate::session::Storage>,
+    )>,
     progress_rx: mpsc::Receiver<HookProgress>,
     progress_tx: mpsc::Sender<HookProgress>,
     _handle: thread::JoinHandle<()>,
     /// Requests sent and not yet received, including cancelled ones still winding down.
     in_flight: usize,
-    /// Profile from the last creation request (for cross-profile saves)
-    last_profile: Option<String>,
 }
 
 /// Appends which config file declared the failing `on_create` commands.
@@ -98,14 +102,19 @@ impl CreationPoller {
     pub fn new() -> Self {
         let (request_tx, request_rx) =
             mpsc::channel::<(CreationRequest, mpsc::Sender<HookProgress>)>();
-        let (result_tx, result_rx) = mpsc::channel::<(CreationResult, CancellationToken)>();
+        let (result_tx, result_rx) = mpsc::channel::<(
+            CreationResult,
+            CancellationToken,
+            std::sync::Arc<crate::session::Storage>,
+        )>();
         let (progress_tx, progress_rx) = mpsc::channel::<HookProgress>();
 
         let handle = thread::spawn(move || {
             while let Ok((request, prog_tx)) = request_rx.recv() {
                 let cancel = request.cancel.clone();
+                let storage = std::sync::Arc::clone(&request.storage);
                 let result = Self::create_instance(request, &prog_tx);
-                if result_tx.send((result, cancel)).is_err() {
+                if result_tx.send((result, cancel, storage)).is_err() {
                     break;
                 }
             }
@@ -118,7 +127,6 @@ impl CreationPoller {
             progress_tx,
             _handle: handle,
             in_flight: 0,
-            last_profile: None,
         }
     }
 
@@ -126,6 +134,9 @@ impl CreationPoller {
         request: CreationRequest,
         progress_tx: &mpsc::Sender<HookProgress>,
     ) -> CreationResult {
+        if let Err(error) = request.storage.verify_profile_identity() {
+            return CreationResult::Error(format!("Creation profile was replaced: {error:#}"));
+        }
         let data = request.data;
         let hooks = request.hooks;
         let cancel = request.cancel;
@@ -151,11 +162,15 @@ impl CreationPoller {
         let structured = data.structured;
         let params = InstanceParams::from(data);
 
-        let build_result =
-            match builder::build_instance(params, &existing_titles, &existing_branches, &profile) {
-                Ok(r) => r,
-                Err(e) => return CreationResult::Error(format!("{:#}", e)),
-            };
+        let build_result = match builder::build_instance(
+            params,
+            &existing_titles,
+            &existing_branches,
+            &request.storage,
+        ) {
+            Ok(r) => r,
+            Err(e) => return CreationResult::Error(format!("{:#}", e)),
+        };
 
         let mut instance = build_result.instance;
         // Tag the instance with its profile NOW, before container creation or any
@@ -240,6 +255,12 @@ impl CreationPoller {
             }
         }
 
+        if let Err(error) = request.storage.verify_profile_identity() {
+            return CreationResult::Error(format!(
+                "Creation profile was replaced; retaining resources: {error:#}"
+            ));
+        }
+
         // Execute on_launch hooks in background too (non-fatal, like start_with_size).
         // This prevents blocking the UI thread when the session is first attached.
         if has_on_launch {
@@ -315,6 +336,11 @@ impl CreationPoller {
         match crate::session::acquire_session_identity_lock() {
             Ok(lock) => {
                 let locks = builder::CleanupOwnershipLocks::from_held(workspace_claim_lock, lock);
+                if let Err(error) = request.storage.verify_profile_identity() {
+                    return CreationResult::Error(format!(
+                        "Creation profile was replaced; retaining resources: {error:#}"
+                    ));
+                }
                 if let Err(error) = crate::session::validate_managed_workspace(&instance) {
                     builder::cleanup_instance_under_locks(
                         &instance,
@@ -364,7 +390,6 @@ impl CreationPoller {
     }
 
     pub fn request_creation(&mut self, request: CreationRequest) {
-        self.last_profile = Some(request.data.profile.clone());
         if self
             .request_tx
             .send((request, self.progress_tx.clone()))
@@ -374,10 +399,6 @@ impl CreationPoller {
         } else {
             self.in_flight += 1;
         }
-    }
-
-    pub fn last_profile(&self) -> Option<String> {
-        self.last_profile.clone()
     }
 
     pub fn try_recv_result(&mut self) -> Option<CreationOutcome> {
@@ -391,11 +412,16 @@ impl CreationPoller {
 
     fn received(
         &mut self,
-        received: Option<(CreationResult, CancellationToken)>,
+        received: Option<(
+            CreationResult,
+            CancellationToken,
+            std::sync::Arc<crate::session::Storage>,
+        )>,
     ) -> Option<CreationOutcome> {
-        let (result, cancel) = received?;
+        let (result, cancel, storage) = received?;
         self.in_flight = self.in_flight.saturating_sub(1);
         Some(CreationOutcome {
+            storage,
             result,
             cancelled: cancel.is_cancelled(),
         })

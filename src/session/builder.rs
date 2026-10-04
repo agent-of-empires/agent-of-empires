@@ -443,8 +443,14 @@ pub fn build_instance(
     params: InstanceParams,
     existing_titles: &[&str],
     existing_branches: &[&str],
-    profile: &str,
+    storage: &super::Storage,
 ) -> Result<BuildResult> {
+    storage.verify_profile_identity()?;
+    let profile = storage.profile();
+    let mut instance = Instance::new("", "");
+    instance.storage_origin = Some(std::sync::Arc::new(storage.clone()));
+    instance.source_profile = profile.to_owned();
+
     // Host-only agents (e.g. settl) cannot run in a sandbox or use worktrees.
     let is_host_only = crate::agents::get_agent(&params.tool).is_some_and(|a| a.host_only);
     if is_host_only && params.sandbox {
@@ -700,7 +706,7 @@ pub fn build_instance(
     }
 
     // For scratch sessions, `final_path` is intentionally empty here; the scratch directory is
-    // provisioned below after `Instance::new` runs (we need the instance id to name the directory).
+    // provisioned below using the instance id allocated at admission.
     if !params.scratch {
         let final_path_buf = PathBuf::from(&final_path);
         if !final_path_buf.exists() {
@@ -711,7 +717,8 @@ pub fn build_instance(
         }
     }
 
-    let mut instance = Instance::new(&final_title, &final_path);
+    instance.title = final_title;
+    instance.project_path = final_path;
     if params.scratch {
         let dir = super::scratch::provision_scratch_dir(&instance.id)?;
         instance.project_path = dir.to_string_lossy().to_string();
@@ -1027,50 +1034,42 @@ fn cleanup_instance_core(
     created_workspace_worktrees: &[CreatedWorktree],
     protected_owner: Option<&Instance>,
 ) {
-    let mut candidate_paths = vec![std::path::PathBuf::from(&instance.project_path)];
-    if let Some(workspace) = &instance.workspace_info {
-        candidate_paths.push(std::path::PathBuf::from(&workspace.workspace_dir));
-        candidate_paths.extend(
-            workspace
-                .repos
-                .iter()
-                .map(|repo| std::path::PathBuf::from(&repo.worktree_path)),
-        );
+    let origin = instance.original_storage().and_then(|storage| {
+        storage.verify_profile_identity()?;
+        Ok(storage)
+    });
+    if let Err(error) = origin {
+        tracing::warn!(target: "session.create", id = %instance.id, %error, "Retaining failed creation resources: original profile authority is unavailable");
+        return;
     }
 
-    // Teardown keyed on the session id, not on any path, so it is safe even when
-    // a peer has since claimed a candidate path: no other session can own this
-    // id's tmux sessions or container. Doing it before the ownership check
-    // keeps a failed create from leaking them, and does not weaken the
-    // path-ownership gate that follows.
-    // The loser may never have reached storage, so lifecycle-coordinated stop cannot reserve its
-    // row.
-    instance.kill_all_tmux_sessions_without_lifecycle_row();
+    // After our own row is removed, every remaining row (including the same id) is a peer.
+    // Check both logical ownership and paths before touching any id-keyed resource.
+    let paths = crate::session::deletion::paths_in_use_after_failed_create(&instance.id);
+    if let crate::session::deletion::PathsInUse::Unknown(reason) = &paths {
+        tracing::warn!(target: "session.create", id = %instance.id, %reason, "Retaining failed creation resources: ownership is unproven");
+        return;
+    }
+    if paths.covers(std::path::Path::new(&instance.project_path))
+        || instance.workspace_info.as_ref().is_some_and(|workspace| {
+            paths.covers(std::path::Path::new(&workspace.workspace_dir))
+                || workspace
+                    .repos
+                    .iter()
+                    .any(|repo| paths.covers(std::path::Path::new(&repo.worktree_path)))
+        })
+    {
+        return;
+    }
 
+    instance.kill_all_tmux_sessions_without_lifecycle_row();
     if let Some(sandbox) = &instance.sandbox_info {
         if sandbox.enabled {
-            // Direct idempotent teardown, never gated on a separate existence probe.
             let container = containers::DockerContainer::from_session_id(&instance.id);
             if let containers::Teardown::Failed(e) = container.teardown(&instance.id) {
                 tracing::warn!(target: "session.create", "Failed to clean up container: {}", e);
             }
         }
-    }
-
-    let peer_claimed = match crate::session::deletion::paths_in_use_except(&[
-        crate::session::deletion::SessionPathOwner {
-            profile: &instance.source_profile,
-            session_id: &instance.id,
-        },
-    ]) {
-        crate::session::deletion::PathsInUse::Unknown(_) => true,
-        crate::session::deletion::PathsInUse::Known(paths) => {
-            let paths = crate::session::deletion::PathsInUse::Known(paths);
-            candidate_paths.iter().any(|path| paths.covers(path))
-        }
-    };
-    if peer_claimed {
-        return;
     }
     let protection = CleanupProtection {
         owner: protected_owner,
@@ -1951,6 +1950,7 @@ mod tests {
         let storage = crate::session::Storage::new_unwatched("default").unwrap();
         instance.source_profile = storage.profile().to_owned();
         storage.update(|_, _| Ok(())).unwrap();
+        instance.storage_origin = Some(std::sync::Arc::new(storage.clone()));
 
         let (peer_holds_tx, peer_holds_rx) = mpsc::channel();
         let (peer_release_tx, peer_release_rx) = mpsc::channel::<()>();
@@ -1987,94 +1987,6 @@ mod tests {
             !scratch_path.exists(),
             "once the locks are free the failed create's scratch dir is removed"
         );
-    }
-
-    /// An unresolved ownership verdict (`Unknown`) keeps every *path* in place,
-    /// because a peer may have claimed one. The failed create's own tmux
-    /// sessions and container are keyed on the session id instead, so no other
-    /// session can own them: they must still be torn down or they leak for the
-    /// life of the process.
-    #[test]
-    #[serial_test::serial]
-    fn cleanup_tears_down_id_keyed_resources_when_ownership_is_unknown() {
-        crate::tmux::test_helpers::require_tmux!();
-        use std::os::unix::fs::PermissionsExt as _;
-        let _app_guard = crate::session::test_support::isolate_app_dir();
-        let temp = tempfile::TempDir::new().unwrap();
-        let bin = temp.path().join("bin");
-        std::fs::create_dir(&bin).unwrap();
-        let log = temp.path().join("docker.log");
-        let docker = bin.join("docker");
-        std::fs::write(
-            &docker,
-            format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{}\"\nexit 0\n",
-                log.display()
-            ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o755)).unwrap();
-
-        let _path = crate::session::test_support::path_prepended(&bin);
-
-        let id = format!("cleanup-unknown-{}", uuid::Uuid::new_v4());
-        let scratch_path = crate::session::scratch::provision_scratch_dir(&id).unwrap();
-        let container_name = containers::DockerContainer::generate_name(&id);
-        let mut instance = Instance::new("Unknown", &scratch_path.to_string_lossy());
-        instance.id = id.clone();
-        instance.scratch = true;
-        instance.sandbox_info = Some(SandboxInfo {
-            enabled: true,
-            container_id: None,
-            image: "alpine".to_string(),
-            container_name: container_name.clone(),
-            extra_env: None,
-            custom_instruction: None,
-            container_workdir: None,
-            before_start_env: Vec::new(),
-        });
-
-        // The agent session is keyed on the same id, so it belongs to the
-        // id-keyed teardown that runs before the ownership verdict.
-        let tmux_session = crate::tmux::Session::generate_name(&id, "Unknown");
-        let tmux_guard =
-            crate::tmux::test_helpers::TmuxTestSession::from_name(tmux_session.clone());
-        let output = crate::tmux::tmux_command()
-            .args(["new-session", "-d", "-s", &tmux_session, "sleep 60"])
-            .output()
-            .expect("tmux new-session");
-        assert!(
-            output.status.success(),
-            "failed to create tmux session {tmux_session}: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        crate::tmux::refresh_session_cache();
-        assert!(
-            crate::tmux::Session::from_name(&tmux_session).exists(),
-            "the failed create's tmux session must exist before cleanup"
-        );
-
-        // A failed profile listing is the cheapest way to force the ownership
-        // scan to answer `Unknown`.
-        let _fail_listing = crate::session::FailNextListProfilesGuard::new();
-        cleanup_instance_locked(&instance, None, &[], None);
-
-        let invocations = std::fs::read_to_string(&log).unwrap_or_default();
-        assert!(
-            invocations.contains(&format!("rm -f -v {container_name}")),
-            "the failed create's container must be torn down even when path ownership is \
-             unknown; runtime invocations were {invocations:?}"
-        );
-        assert!(
-            !crate::tmux::Session::from_name(&tmux_session).exists(),
-            "the failed create's tmux session must be torn down even when path ownership \
-             is unknown"
-        );
-        assert!(
-            scratch_path.exists(),
-            "an unknown ownership verdict must still leave the candidate paths in place"
-        );
-        drop(tmux_guard);
     }
 
     #[test]
@@ -2263,12 +2175,13 @@ mod tests {
         .unwrap();
         let project = tempfile::tempdir().unwrap();
         let _registry = crate::tmux::status_rules::ProfileRegistryGuard::take("default");
+        let storage = crate::session::Storage::new_unwatched("default").unwrap();
 
         let result = build_instance(
             custom_agent_params(project.path(), "remote-claude"),
             &[],
             &[],
-            "default",
+            &storage,
         )
         .unwrap();
 
@@ -2280,7 +2193,7 @@ mod tests {
             custom_agent_params(project.path(), "remote-opencode"),
             &[],
             &[],
-            "default",
+            &storage,
         )
         .unwrap();
         assert_eq!(unmapped.instance.command, "ssh -t host opencode");
@@ -2291,7 +2204,7 @@ mod tests {
                 custom_agent_params(project.path(), tool),
                 &[],
                 &[],
-                "default",
+                &storage,
             ) else {
                 panic!("{tool}: custom agent without a command should fail");
             };
@@ -2312,10 +2225,11 @@ mod tests {
         let app_dir = isolated_app_dir(temp_home.path());
         std::fs::create_dir_all(&app_dir).unwrap();
         std::fs::write(app_dir.join("config.toml"), "").unwrap();
+        let storage = crate::session::Storage::new_unwatched("default").unwrap();
 
         let mut params = custom_agent_params(std::path::Path::new(""), "claude");
         params.scratch = true;
-        let result = build_instance(params.clone(), &[], &[], "default")
+        let result = build_instance(params.clone(), &[], &[], &storage)
             .expect("scratch build must succeed without a project path");
         assert!(
             result.instance.scratch,
@@ -2328,7 +2242,7 @@ mod tests {
 
         params.worktree_enabled = true;
         params.worktree_branch = Some("feat".to_string());
-        let Err(err) = build_instance(params, &[], &[], "default") else {
+        let Err(err) = build_instance(params, &[], &[], &storage) else {
             panic!("scratch + worktree must error");
         };
         assert!(
@@ -2341,7 +2255,7 @@ mod tests {
         let mut params = custom_agent_params(project.path(), "claude");
         params.worktree_enabled = true;
         params.worktree_branch = Some("feat".to_string());
-        let Err(err) = build_instance(params, &[], &[], "default") else {
+        let Err(err) = build_instance(params, &[], &[], &storage) else {
             panic!("worktree on a non-git path must error");
         };
         assert!(
@@ -2355,6 +2269,7 @@ mod tests {
     fn build_instance_applies_structured_fork_seed() {
         use crate::session::ForkSeed;
         let _registry = crate::tmux::status_rules::ProfileRegistryGuard::take("default");
+        let storage = crate::session::Storage::new_unwatched("default").unwrap();
         let params = InstanceParams {
             title: "Forked".into(),
             path: "/tmp".into(),
@@ -2377,9 +2292,7 @@ mod tests {
                 parent_acp_session_id: "parent-acp-id".into(),
             }),
         };
-        let inst = build_instance(params, &[], &[], "default")
-            .unwrap()
-            .instance;
+        let inst = build_instance(params, &[], &[], &storage).unwrap().instance;
         assert_eq!(inst.view, crate::session::View::Structured);
         assert_eq!(inst.fork_pending.as_deref(), Some("parent-acp-id"));
         assert_eq!(inst.import_pending, Some(true));
@@ -2393,6 +2306,7 @@ mod tests {
     fn build_instance_applies_terminal_fork_seed() {
         use crate::session::ForkSeed;
         let _registry = crate::tmux::status_rules::ProfileRegistryGuard::take("default");
+        let storage = crate::session::Storage::new_unwatched("default").unwrap();
         // The CLI e2e covers the separate application in `add.rs`; this is the
         // arm `build_instance` owns, which pins the child conversation and the
         // parent the first launch must fork from.
@@ -2434,9 +2348,7 @@ mod tests {
                 unattributed_parent_agent: None,
             }),
         };
-        let inst = build_instance(params, &[], &[], "default")
-            .unwrap()
-            .instance;
+        let inst = build_instance(params, &[], &[], &storage).unwrap().instance;
         assert_eq!(inst.agent_session_id.as_deref(), Some("child-conversation"));
         assert_eq!(
             inst.resume_intent,
@@ -2498,6 +2410,7 @@ mod tests {
     fn a_fork_child_that_would_launch_another_agent_is_refused() {
         let root = tempfile::tempdir().unwrap();
         let _app = crate::session::test_support::isolate_app_dir_at(root.path());
+        let storage = crate::session::Storage::new_unwatched("default").unwrap();
         let mut parent = crate::session::Instance::new("parent", root.path().to_str().unwrap());
         parent.tool = "claude".into();
         parent.agent_session_id = Some("legacy-uuid".into());
@@ -2513,7 +2426,7 @@ mod tests {
         same_agent.command_override = "claude".into();
         same_agent.fork_seed = Some(seed.clone());
         assert_eq!(
-            build_instance(same_agent, &[], &[], "default")
+            build_instance(same_agent, &[], &[], &storage)
                 .expect("a child launching the parent's own agent still forks")
                 .instance
                 .agent_session_id
@@ -2524,7 +2437,7 @@ mod tests {
         let mut other_agent = custom_agent_params(root.path(), "codex");
         other_agent.command_override = "codex".into();
         other_agent.fork_seed = Some(seed);
-        let refused = match build_instance(other_agent, &[], &[], "default") {
+        let refused = match build_instance(other_agent, &[], &[], &storage) {
             Ok(_) => panic!("a child launching another agent cannot carry the conversation"),
             Err(error) => error.to_string(),
         };

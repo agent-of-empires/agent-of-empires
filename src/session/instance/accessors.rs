@@ -99,6 +99,22 @@ impl Instance {
             retroactive_capture_excludes: HashSet::new(),
             pane_dead_observed: false,
             file_watch: None,
+            storage_origin: None,
+        }
+    }
+
+    pub(crate) fn original_storage(
+        &self,
+    ) -> Result<std::sync::Arc<crate::session::storage::Storage>> {
+        self.storage_origin
+            .clone()
+            .context("session has no original physical storage authority")
+    }
+
+    pub(crate) fn same_storage_origin(&self, other: &Self) -> bool {
+        match (&self.storage_origin, &other.storage_origin) {
+            (Some(left), Some(right)) => left.same_origin_as(right),
+            _ => false,
         }
     }
 

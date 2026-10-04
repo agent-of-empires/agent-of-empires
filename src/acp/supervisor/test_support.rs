@@ -125,15 +125,24 @@ impl<S: BroadcastSink> Supervisor<S> {
         &self,
         session_id: &str,
         client: AcpClient,
-        kind: WorkerKind,
+        mut kind: WorkerKind,
         identity: Option<RunnerIdentity>,
     ) -> Lease {
+        let original = stored_origin(session_id);
         let mut workers = self.workers.lock().await;
         let lease = {
             let mut table = lock_recover(&self.lifecycle);
             let lease = table
                 .admit(session_id, ResumeKind::Spawn)
                 .expect("test fixture admits a fresh session");
+            let issued = table.execution_admission(&lease);
+            issued.set_origin(original).unwrap();
+            if let Some(identity) = identity {
+                issued.capture(identity);
+            }
+            if let WorkerKind::Runner { spawn_config } = &mut kind {
+                spawn_config.execution_admission = Some(table.execution_admission(&lease));
+            }
             table
                 .install(&lease, identity)
                 .expect("test fixture installs its own lease");
@@ -232,11 +241,57 @@ pub(super) fn isolate_home() -> (crate::session::test_support::AppDirGuard, temp
     (home, tmp)
 }
 
+/// Select a real isolated durable row before the fixture's first async wait.
+pub(crate) fn stored_origin(id: &str) -> Arc<crate::session::LaunchOrigin> {
+    if let Ok(original) = crate::session::runner_journal::capture_unique_origin(id) {
+        return original;
+    }
+    let storage = crate::session::Storage::new_unwatched("default").unwrap();
+    storage
+        .update(|rows, _| {
+            if !rows.iter().any(|row| row.id == id) {
+                let mut row = crate::session::Instance::new(id, "/tmp");
+                row.id = id.to_owned();
+                rows.push(row);
+            }
+            Ok(())
+        })
+        .unwrap();
+    crate::session::runner_journal::capture_unique_origin(id).unwrap()
+}
+
+pub(crate) fn stop_receipt(id: &str) -> Arc<crate::session::runner_journal::OwnedStop> {
+    crate::session::runner_journal::reserve_stop_from_origin(stored_origin(id), false).unwrap()
+}
+
+/// Pure connection/lifecycle fixtures do not pretend to attach a native resident.
+pub(crate) async fn memory_resume<S: BroadcastSink>(
+    supervisor: &Supervisor<S>,
+    id: &str,
+    kind: ResumeKind,
+) -> Result<ResumeReservationOutcome, SupervisorError> {
+    let original = stored_origin(id);
+    let mut table = lock_recover(&supervisor.lifecycle);
+    let lease = table
+        .admit(id, kind)
+        .map_err(|_| SupervisorError::TeardownPending(id.to_owned()))?;
+    let issued = table.execution_admission(&lease);
+    issued.set_origin(original).unwrap();
+    Ok(ResumeReservationOutcome::Reserved(ResumeReservation {
+        lease,
+        lifecycle: supervisor.lifecycle.clone(),
+        notify: supervisor.worker_notify.clone(),
+        execution: None,
+        custody: Some(issued.begin_job()),
+        retirement_required: true,
+        issued,
+    }))
+}
 pub(super) fn spawn_request(session_id: &str) -> SpawnRequest {
     SpawnRequest {
         session_id: session_id.into(),
         agent: "claude-code".into(),
-        tool: "claude-code".into(),
+        tool: "claude".into(),
         cwd: std::env::temp_dir(),
         additional_dirs: vec![],
         provider_env: vec![],
@@ -248,7 +303,7 @@ pub(super) fn spawn_request(session_id: &str) -> SpawnRequest {
         sandbox_continuation: super::SandboxContinuation::Persisted,
         seed_history_replay: false,
         sandbox_info: None,
-        source_profile: None,
+        origin: Some(stored_origin(session_id)),
         yolo_mode: false,
         acp_mode_id: None,
         agent_command_override: None,
@@ -313,13 +368,13 @@ pub(super) fn save_record(session_id: &str, pid: u32, generation: u64) {
         .unwrap();
 }
 
-/// Real kernel execution published through the production launch journal. Its private
-/// authorization pipe is consumed before the fixture waits for its stop marker.
-pub(super) struct PublishedExecution {
+/// Real kernel execution, self-published endpoints, and a strong registry witness.
+/// The child consumes the production private authorization before publication.
+pub(crate) struct PublishedExecution {
     pub pid: u32,
-    pub nonce: uuid::Uuid,
-    release: PathBuf,
-    stop: tokio::task::JoinHandle<()>,
+    pub identity: RunnerIdentity,
+    pub(crate) release: PathBuf,
+    pub(crate) requested: PathBuf,
     _directory: tempfile::TempDir,
 }
 
@@ -332,15 +387,87 @@ impl Drop for PublishedExecution {
         {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        self.stop.abort();
     }
 }
 
-pub(super) fn published_execution(
+/// The existing drain regression doubles as the authenticated fixture child.
+pub(super) async fn run_execution_fixture_child() -> bool {
+    let Ok(encoded) = std::env::var("AOE_TEST_NATIVE_ISSUER") else {
+        return false;
+    };
+    let (profile, id, nonce, generation, expected, release, ready, hold_stop): (
+        String,
+        String,
+        uuid::Uuid,
+        u64,
+        crate::session::Instance,
+        PathBuf,
+        PathBuf,
+        bool,
+    ) = serde_json::from_str(&encoded).unwrap();
+    let (storage, born) =
+        crate::session::runner_journal::accept_authorization(&profile, &id, nonce, generation)
+            .unwrap();
+    let mut expected = expected;
+    expected.storage_origin = Some(Arc::new(storage.clone()));
+    crate::session::LaunchOrigin::capture(&expected)
+        .unwrap()
+        .with_issued_birth(born)
+        .unwrap()
+        .validate()
+        .unwrap();
+    let stop_path = crate::session::runner_journal::stop_socket(&id, born.pid).unwrap();
+    let stop_listener = tokio::net::UnixListener::bind(&stop_path).unwrap();
+    let (stop_identity, _stop_pin) = worker_registry::capture_endpoint(&stop_path).unwrap();
+    crate::session::runner_journal::record_stop_endpoint(
+        &storage,
+        &id,
+        nonce,
+        generation,
+        stop_identity,
+    )
+    .unwrap();
+    let socket = worker_registry::socket_path_for(&id).unwrap();
+    let control = crate::process::worker::control_socket_sibling(&socket);
+    let mut record = worker_record(&id, born.pid, socket).with_generation(generation);
+    record.source_profile = Some(profile);
+    record.launch_nonce = born.launch_nonce;
+    record.boot = born.boot;
+    record.incarnation = born.incarnation;
+    record.profile_identity = born.profile_identity;
+    let (_control_listener, _control_pin) = {
+        let _workspace = crate::session::acquire_session_workspace_claim_lock().unwrap();
+        let _identity = crate::session::acquire_session_identity_lock().unwrap();
+        crate::session::runner_journal::publish_registry_under_locks(
+            &storage,
+            &mut record,
+            |record| worker_registry::publish_control_listener(record, &control),
+        )
+        .unwrap()
+    };
+    std::fs::write(&ready, b"published").unwrap();
+    let requested = release.with_file_name("requested");
+    tokio::select! {
+        stop = crate::session::runner_journal::wait_for_stop(stop_listener, nonce, |_| async {
+            if hold_stop {
+                std::fs::write(&requested, b"authenticated Stop admitted").unwrap();
+                let mut poll = tokio::time::interval(std::time::Duration::from_millis(10));
+                while !release.exists() { poll.tick().await; }
+            }
+            true
+        }) => { let _keep_context = stop.unwrap(); },
+        _ = async {
+            let mut poll = tokio::time::interval(std::time::Duration::from_millis(10));
+            while !release.exists() || requested.exists() { poll.tick().await; }
+        } => {},
+    }
+    true
+}
+pub(crate) fn published_execution(
     id: &str,
-    generation: u64,
     profile: &str,
     admission: Option<&ExecutionAdmission>,
+    hold_stop: bool,
 ) -> PublishedExecution {
     let storage = crate::session::Storage::new_unwatched(profile).unwrap();
     storage
@@ -355,11 +482,45 @@ pub(super) fn published_execution(
             Ok(())
         })
         .unwrap();
+    let standalone = if admission.is_none() {
+        let original = crate::session::runner_journal::capture_unique_origin(id).unwrap();
+        let table = std::sync::Mutex::new(crate::acp::runner_lifecycle::LifecycleTable::new(1));
+        let lease = table.lock().unwrap().admit(id, ResumeKind::Spawn).unwrap();
+        let issued = table.lock().unwrap().execution_admission(&lease);
+        issued.set_origin(original.clone()).unwrap();
+        let (prepared, custody) = original
+            .prepare(
+                &crate::acp::runner_lifecycle::NativeResume::Spawn,
+                &issued,
+                |commit| {
+                    crate::acp::runner_lifecycle::PreparationAuthorization::acquire(
+                        table.lock().unwrap(),
+                        &lease,
+                        &original,
+                        false,
+                        commit,
+                    )
+                },
+            )
+            .unwrap();
+        issued.set_prepared_origin(prepared, custody).unwrap();
+        Some(issued)
+    } else {
+        None
+    };
+    let admission = admission.or(standalone.as_ref()).unwrap();
+    let _custody = admission.begin_job();
+    let generation = admission.origin().unwrap().generation();
     let directory = tempfile::TempDir::new().unwrap();
     let release = directory.path().join("stop");
-    let mut command = tokio::process::Command::new("sh");
-    command.arg("-c").arg(r#"received="$(dd bs=1 count=16 2>/dev/null | od -An -tx1 | tr -d '[:space:]')"; [ "$received" = "$2" ] || exit 70; while [ ! -e "$1" ]; do sleep 0.01; done"#)
-        .arg("journal-fixture").arg(&release);
+    let ready = directory.path().join("ready");
+    let expected = admission
+        .origin()
+        .unwrap()
+        .with_storage(|_, row| Ok(row))
+        .unwrap();
+    let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
+    command.args(["--exact", "acp::supervisor::drain::tests::drain_retires_attached_crash_without_trusting_registry_presence", "--nocapture"]);
     unsafe {
         command.pre_exec(|| {
             nix::unistd::setsid().map_err(std::io::Error::other)?;
@@ -375,30 +536,36 @@ pub(super) fn published_execution(
     )
     .unwrap();
     let nonce = launch.nonce();
-    command.arg(nonce.simple().to_string());
+    command.env(
+        "AOE_TEST_NATIVE_ISSUER",
+        serde_json::to_string(&(
+            profile, id, nonce, generation, expected, &release, &ready, hold_stop,
+        ))
+        .unwrap(),
+    );
+    let mut born = None;
     let pid = launch
-        .spawn(&mut command, |identity| {
-            if let Some(admission) = admission {
-                admission.capture(identity);
-            }
+        .spawn(&storage, &mut command, Some(admission), |identity| {
+            born = Some(identity);
         })
         .unwrap();
-    let listener = tokio::net::UnixListener::bind(
-        crate::session::runner_journal::stop_socket(id, pid).unwrap(),
-    )
-    .unwrap();
-    let stop_release = release.clone();
-    let stop = tokio::spawn(async move {
-        crate::session::runner_journal::wait_for_stop(listener, nonce)
-            .await
-            .unwrap();
-        std::fs::write(stop_release, b"stop").unwrap();
-    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !ready.exists() {
+        assert!(
+            crate::process::worker::is_process_group_alive(pid),
+            "actual fixture child exited before native publication"
+        );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "actual fixture child did not publish endpoints before deadline"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
     PublishedExecution {
         pid,
-        nonce,
+        identity: born.expect("real fixture launch captures its authenticated kernel birth"),
+        requested: release.with_file_name("requested"),
         release,
-        stop,
         _directory: directory,
     }
 }
@@ -429,26 +596,16 @@ pub(super) fn gated_launcher(gate: &Gate) -> Launcher {
                 .expect("gated launch requires an explicit stored owner");
             let execution = published_execution(
                 &session_id.0,
-                config.generation,
                 profile,
                 config.execution_admission.as_ref(),
+                false,
             );
-            let pid = execution.pid;
-            let nonce = execution.nonce;
-            let mut record = worker_record(
-                &session_id.0,
-                pid,
-                worker_registry::socket_path_for(&session_id.0).unwrap(),
-            )
-            .with_generation(config.generation);
-            record.source_profile = Some(profile.to_owned());
-            record.launch_nonce = Some(nonce);
-            worker_registry::save(&record).unwrap();
+            let identity = execution.identity;
             executions.lock().unwrap().push(execution);
             entered.notify_one();
             open.notified().await;
             let (mut client, tx) = AcpClient::fake_for_test(session_id);
-            client.capture_runner(pid, nonce);
+            client.capture_runner(identity);
             senders.lock().unwrap().push(tx);
             Ok(client)
         })

@@ -1050,7 +1050,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn turn_send_refuses_a_foreign_session_in_every_control_state() {
+        let _home = crate::session::test_support::isolate_app_dir();
         use crate::acp::state::Event;
         use crate::acp::supervisor::BroadcastSink;
 

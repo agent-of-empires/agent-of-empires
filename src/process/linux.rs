@@ -330,6 +330,14 @@ pub(super) fn process_incarnation(pid: u32) -> std::io::Result<Option<super::Pro
     }))
 }
 
+pub(super) fn pin_filesystem_node(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+}
+
 pub(super) fn boot_id() -> Option<String> {
     std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
         .ok()

@@ -137,15 +137,28 @@ impl Instance {
             return Ok(StartOutcome::Fresh);
         }
         let profile = self.effective_profile();
-        let storage = crate::session::storage::Storage::open(&profile, self.resolve_file_watch())
-            .context("failed to open lifecycle lock storage")?;
+        let storage = match &self.storage_origin {
+            Some(storage) => storage.clone(),
+            None => {
+                let storage = std::sync::Arc::new(
+                    crate::session::storage::Storage::open(&profile, self.resolve_file_watch())
+                        .context("failed to open lifecycle lock storage")?,
+                );
+                self.storage_origin = Some(storage.clone());
+                storage
+            }
+        };
+        storage.verify_profile_identity()?;
 
         let title_lock = crate::session::storage::acquire_session_title_lock(&self.id)
             .context("failed to acquire instance start title lock")?;
         let lifecycle_lock = storage
             .acquire_instance_lifecycle_lock(&self.id)
             .context("failed to acquire instance start lock")?;
-        self.reconcile_from_disk();
+        anyhow::ensure!(
+            self.try_reconcile_from_disk(true)?,
+            "session disappeared before native launch"
+        );
         if self.is_structured() {
             return Ok(StartOutcome::Fresh);
         }
@@ -162,10 +175,11 @@ impl Instance {
             &storage,
             LifecycleOperation::Launch,
             Some(Status::Starting),
+            None,
         )?;
         if restart {
             self.stop_and_flush_poller_lifecycle_locked();
-            self.capture_omp_before_restart(&profile);
+            self.capture_omp_before_restart();
         }
         if discard_sandbox_container {
             if let Err(error) = self.discard_stale_sandbox_container() {
@@ -188,8 +202,7 @@ impl Instance {
         let result = (|| {
             let prepared = self.stop_carry_and_prepare(restart, conversation_carry, expected)?;
             let launch_outcome = self.spawn_prepared_launch(size, &profile, prepared)?;
-            let outcome =
-                self.finish_resume_launch(launch_outcome, skipped_failed_resume_sid, &profile)?;
+            let outcome = self.finish_resume_launch(launch_outcome, skipped_failed_resume_sid)?;
             self.commit_lifecycle_launch(&storage, restart)?;
             Ok(outcome)
         })();
@@ -347,7 +360,6 @@ impl Instance {
         &mut self,
         launch_outcome: LaunchSidOutcome,
         skipped_failed_resume_sid: Option<String>,
-        profile: &str,
     ) -> Result<StartOutcome> {
         let (attempted_sid, pinned_prior_sid) = match launch_outcome {
             LaunchSidOutcome::Existing { sid }
@@ -394,7 +406,7 @@ impl Instance {
         self.stop_poller();
         self.session_id_poller = None;
         self.resume_probe_failed_sid = Some(stale_sid.clone());
-        if self.mark_resume_probe_failed(profile, &stale_sid) == SidWrite::Failed {
+        if self.mark_resume_probe_failed(&stale_sid) == SidWrite::Failed {
             anyhow::bail!(
                 "resume probe failed for sid {} for {}, but marker could not be persisted",
                 stale_sid,
@@ -707,6 +719,14 @@ mod tests {
                 Ok(())
             })
             .unwrap();
+        let mut canonical = storage
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.id == instance.id)
+            .unwrap();
+        canonical.adopt_poller(&instance);
+        instance = canonical;
         let outcome = instance.restart_discarding_sandbox_container(None, true, false, Some(carry));
         instance.stop_and_flush_poller();
         let observed = std::fs::read_to_string(&record).unwrap();
@@ -812,7 +832,6 @@ mod tests {
                             pinned_prior_sid: Some(sid.to_string()),
                         },
                         None,
-                        "test",
                     )
                     .unwrap(),
                     StartOutcome::Fresh,
@@ -956,7 +975,6 @@ mod tests {
                 sid: launched_sid.to_string(),
             },
             None,
-            "marker-before-cleanup",
         );
         assert!(
             result.is_err(),
@@ -1249,6 +1267,13 @@ mod tests {
         // forever). The fix must instead skip the resume attempt and
         // start fresh.
         inst.kill().unwrap();
+        let original = inst.original_storage().unwrap();
+        inst = original
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.id == inst.id)
+            .unwrap();
         let second = inst
             .start_with_resume_fallback(None, true, ResumeAttemptPolicy::Allow)
             .unwrap();
