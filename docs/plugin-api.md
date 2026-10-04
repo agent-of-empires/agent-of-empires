@@ -194,6 +194,20 @@ required = true
 
 An item field takes the same keys as a top-level setting (`key`, `label`, `description`, `type`, `options`, `min`, `max`, `default`, `multiline`, `option_source`, `depends_on`) plus `required`. It may be a `dynamic_multi_select` (`api_version >= 11`), whose stored value is an array of the chosen option values, or a `string_list` (`api_version >= 14`), whose stored value is an array of freeform user-typed strings.
 
+## Session listing
+
+`sessions.list` (capability `session.read`) returns `{ "sessions": [...] }`. The optional `exclude` param is an array of `archived`, `snoozed` and `trashed`; with none, every stored session is returned. A trashed session stays present with `trashed: true`; a permanently purged session is absent.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `id`, `title`, `tool`, `status` | string | Identity and current status. |
+| `project_path` | string | The session's own working directory; for a worktree session this is the worktree, not the main repo. |
+| `archived`, `snoozed`, `trashed` | bool | Lifecycle flags. |
+| `workspace_repos` | array | One `{ source_path, branch }` per repo checkout of a multi-repo workspace; empty otherwise. |
+| `worktree` | object | `{ branch, main_repo_path, managed_by_aoe }`; present only for worktree sessions. |
+
+`trashed`, `workspace_repos` and `worktree` were added after the first release; they are additive RPC fields and do not change the manifest `api_version`. Treat a missing key as absent on an older host.
+
 ## Session-driving RPCs
 
 With `api_version >= 9` a worker can discover ACP capabilities and create host-owned structured sessions, the primitives an automation plugin (for example a scheduler) needs. These are worker RPCs, not manifest keys; the host enforces a strict security model around them.
