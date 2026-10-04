@@ -64,26 +64,50 @@ pub(super) fn recover_opencode_prompt_error_from_sqlite_at(
     )
     .ok()?;
     let _ = conn.busy_timeout(Duration::from_millis(100));
-    let mut stmt = conn
-        .prepare(
-            "SELECT json_extract(data, '$.error.data.message')
-             FROM message
-             WHERE session_id = ?1
-               AND json_extract(data, '$.role') = 'assistant'
-               AND CAST(json_extract(data, '$.time.created') AS INTEGER) >= ?2
-               AND json_extract(data, '$.error.data.message') IS NOT NULL
-             ORDER BY CAST(json_extract(data, '$.time.created') AS INTEGER) DESC
-             LIMIT 1",
-        )
-        .ok()?;
-    let message: String = stmt
-        .query_row(
-            rusqlite::params![acp_session_id, prompt_started_at_ms],
-            |row| row.get(0),
-        )
-        .ok()?;
-    let trimmed = message.trim();
-    (!trimmed.is_empty()).then(|| trimmed.to_string())
+    // OpenCode 2.x moved messages to `session_message`, where the role is a
+    // column and the error node sits at `$.error.message` instead of
+    // `$.error.data.message`. The table name tracks the build channel rather
+    // than the version, so each layout is read with its own statement.
+    for sql in [
+        "SELECT json_extract(data, '$.error.message')
+         FROM session_message
+         WHERE session_id = ?1
+           AND type = 'assistant'
+           AND time_created >= ?2
+           AND json_extract(data, '$.error.message') IS NOT NULL
+         ORDER BY time_created DESC
+         LIMIT 1",
+        "SELECT json_extract(data, '$.error.data.message')
+         FROM message
+         WHERE session_id = ?1
+           AND json_extract(data, '$.role') = 'assistant'
+           AND CAST(json_extract(data, '$.time.created') AS INTEGER) >= ?2
+           AND json_extract(data, '$.error.data.message') IS NOT NULL
+         ORDER BY CAST(json_extract(data, '$.time.created') AS INTEGER) DESC
+         LIMIT 1",
+    ] {
+        let mut stmt = match conn.prepare(sql) {
+            Ok(stmt) => stmt,
+            // The store predates the table, so the next candidate decides.
+            Err(rusqlite::Error::SqliteFailure(_, Some(reason)))
+                if reason.contains("no such table") =>
+            {
+                continue
+            }
+            Err(_) => continue,
+        };
+        let message: String = stmt
+            .query_row(
+                rusqlite::params![acp_session_id, prompt_started_at_ms],
+                |row| row.get(0),
+            )
+            .ok()?;
+        let trimmed = message.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    None
 }
 
 pub(super) fn recover_opencode_prompt_error(
@@ -171,5 +195,92 @@ mod tests {
             let got = recover_opencode_prompt_error_from_sqlite_at(&db_path, "ses-1", 100);
             assert_eq!(got.as_deref(), want);
         }
+    }
+
+    /// OpenCode 2.x stores messages in `session_message`, with the role as a
+    /// column and the error message at `$.error.message`.
+    #[test]
+    fn recover_opencode_prompt_error_reads_the_v2_message_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("opencode.db");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE session_message (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                type TEXT NOT NULL,
+                seq INTEGER NOT NULL,
+                time_created INTEGER NOT NULL,
+                time_updated INTEGER NOT NULL,
+                data TEXT NOT NULL
+            );",
+        )
+        .unwrap();
+        let assistant = |seq: i64, created: i64, error: Option<&str>| {
+            let mut data = serde_json::json!({ "time": { "created": created }, "agent": "build", "content": [] });
+            if let Some(message) = error {
+                data["error"] =
+                    serde_json::json!({ "name": "ProviderAuthError", "message": message });
+            }
+            (
+                format!("msg-{seq}"),
+                "ses-1".to_string(),
+                "assistant".to_string(),
+                seq,
+                created,
+                created,
+                data.to_string(),
+            )
+        };
+        let mut rows = vec![
+            assistant(1, 99, Some("old error")),
+            assistant(2, 100, None),
+            assistant(3, 110, Some("new error")),
+        ];
+        // A non-assistant row carrying an error is not an assistant error.
+        rows.push((
+            "msg-4".to_string(),
+            "ses-1".to_string(),
+            "system".to_string(),
+            4,
+            111,
+            111,
+            serde_json::json!({ "error": { "message": "system error" } }).to_string(),
+        ));
+        rows.push((
+            "msg-5".to_string(),
+            "ses-2".to_string(),
+            "assistant".to_string(),
+            5,
+            120,
+            120,
+            serde_json::json!({ "error": { "message": "wrong session" } }).to_string(),
+        ));
+        for row in rows {
+            conn.execute(
+                "INSERT INTO session_message VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![row.0, row.1, row.2, row.3, row.4, row.5, row.6],
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            recover_opencode_prompt_error_from_sqlite_at(&db_path, "ses-1", 100).as_deref(),
+            Some("new error")
+        );
+    }
+
+    /// A store with neither table carries no recoverable detail.
+    #[test]
+    fn recover_opencode_prompt_error_returns_none_without_a_message_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("opencode.db");
+        Connection::open(&db_path)
+            .unwrap()
+            .execute_batch("CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT)")
+            .unwrap();
+        assert_eq!(
+            recover_opencode_prompt_error_from_sqlite_at(&db_path, "ses-1", 0),
+            None
+        );
     }
 }

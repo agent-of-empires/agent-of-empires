@@ -38,7 +38,6 @@ pub enum DetectionMethod {
 
 pub enum YoloMode {
     CliFlag(&'static str),
-    EnvVar(&'static str, &'static str),
     AlwaysYolo,
 }
 
@@ -120,12 +119,22 @@ pub struct SessionSupport {
     pub resume: ResumeStrategy,
     pub capture: Option<SessionCaptureSpec>,
 }
-
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ForkStrategy {
     ClaudeFork,
     CodexFork,
-    Flag(&'static str),
+    /// The agent's store mints the child over its own API before the launch, so
+    /// the session that follows is still the interactive one.
+    ServeFork,
     Unsupported,
+}
+
+impl ForkStrategy {
+    /// Whether the launch itself produces the child id, which makes the id AoE
+    /// pre-pinned for the fork a placeholder to drop.
+    pub(crate) const fn mints_child(self) -> bool {
+        matches!(self, Self::CodexFork)
+    }
 }
 
 /// Data-only lifecycle state. A new variant needs an arm in `AgentDef::lifecycle_label`
@@ -547,7 +556,7 @@ pub const AGENTS: &[AgentDef] = &[
     AgentDef {
         oneshot_flag: Some("run"),
         aliases: &["open-code"],
-        yolo: Some(YoloMode::EnvVar("OPENCODE_PERMISSION", r#"{"*":"allow"}"#)),
+        yolo: Some(YoloMode::CliFlag("--auto")),
         set_default_command: true,
         detect_status: status_detection::detect_opencode_status,
         session_support: session_support(
@@ -556,7 +565,7 @@ pub const AGENTS: &[AgentDef] = &[
             SessionCaptureContext::Preassigned,
             SessionCaptureContext::Unsupported,
         ),
-        fork_strategy: ForkStrategy::Flag("--fork"),
+        fork_strategy: ForkStrategy::ServeFork,
         ready_marker: Some("ask anything"),
         permission_response: Some(PermissionResponse {
             allow: &[KeyToken::Named("Enter")],
@@ -864,7 +873,7 @@ pub const AGENTS: &[AgentDef] = &[
             SessionCaptureContext::Unsupported,
             SessionCaptureContext::ManagedExclusiveStore,
         ),
-        // `--fork` needs the parent id as its value, which `ForkStrategy::Flag` does not emit.
+        // Prime exposes no fork surface, so the parent id has nothing to carry.
         fork_strategy: ForkStrategy::Unsupported,
         ..agent(
             "prime-agent",

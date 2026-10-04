@@ -2951,14 +2951,6 @@ pub(crate) fn build_container_config(
                 value: value.to_string(),
             });
         }
-        if is_yolo_mode {
-            if let Some(crate::agents::YoloMode::EnvVar(key, value)) = &agent.yolo {
-                environment.push(EnvEntry::Literal {
-                    key: key.to_string(),
-                    value: value.to_string(),
-                });
-            }
-        }
     }
 
     // Folder trust goes through the shared registry so the create path and the

@@ -303,6 +303,80 @@ impl Instance {
         })
     }
 
+    /// Fork `parent_id` in the store this launch selects and adopt the child the
+    /// store minted, so the durable row carries a real conversation instead of
+    /// the id AoE pre-pinned. The server is reaped before this returns, which
+    /// keeps the pane from ever sharing the store with it.
+    pub(super) fn fork_session_in_store(
+        &mut self,
+        execution: Option<&super::execution::NativeExecution>,
+        parent_id: &str,
+    ) -> anyhow::Result<String> {
+        anyhow::ensure!(
+            self.opencode_store_fork_available(execution),
+            "a fork through the agent's store needs a host launch of opencode itself"
+        );
+        let mut command = std::process::Command::new(
+            execution.map_or(std::path::Path::new("opencode"), |execution| {
+                execution.program.as_path()
+            }),
+        );
+        let cwd = match execution {
+            Some(execution) => {
+                command.env_clear().envs(&execution.inputs.environment);
+                for (key, value) in &execution.routing {
+                    match value {
+                        Some(value) => {
+                            command.env(key, value);
+                        }
+                        None => {
+                            command.env_remove(key);
+                        }
+                    }
+                }
+                execution
+                    .inputs
+                    .cwd
+                    .to_str()
+                    .context("fork working directory is not UTF-8")?
+                    .to_owned()
+            }
+            None => self.project_path.clone(),
+        };
+        let child = crate::session::capture::fork_opencode_session_id(&cwd, command, parent_id)
+            .context("the store returned no child for this fork")?;
+        self.set_agent_conversation(
+            Some(child.clone()),
+            execution.map(|execution| crate::session::ConversationBinding {
+                session_id: child.clone(),
+                execution: Some(execution.binding.clone()),
+                provenance: crate::session::ConversationProvenance::Observed,
+                transcript_path: None,
+            }),
+            None,
+        );
+        Ok(child)
+    }
+
+    /// A store fork runs `opencode serve` against the launch's own store, so it
+    /// needs a host launch that invokes the resolved binary directly and shares
+    /// no container store with it.
+    fn opencode_store_fork_available(
+        &self,
+        execution: Option<&super::execution::NativeExecution>,
+    ) -> bool {
+        match execution {
+            Some(execution) => {
+                execution.agent.name == "opencode"
+                    && execution.inputs.container.is_none()
+                    && execution
+                        .inputs
+                        .runs_host_path_binary(execution.agent.binary, &execution.program)
+            }
+            None => !self.is_sandboxed() && self.opencode_launch_mirrorable_by_ambient_serve(),
+        }
+    }
+
     fn self_heal_row_is_eligible(&self, contended: &HashSet<(String, String)>) -> bool {
         self.agent_session_id.is_none()
             && self.resume_intent.is_default()
@@ -602,6 +676,28 @@ impl Instance {
         }
         if let ResumeIntent::Fork { from } = self.resume_intent.clone() {
             let agent = agent.context("fork execution adapter is unavailable")?;
+            if matches!(agent.fork_strategy, crate::agents::ForkStrategy::ServeFork) {
+                // The store mints the child before the pane exists, so the
+                // launch opens a conversation that already carries the history.
+                let child_id = self
+                    .fork_session_in_store(execution, &from)
+                    .with_context(|| {
+                        format!(
+                            "{} could not fork this conversation, so the fork was refused rather \
+                         than started as a fresh session",
+                            agent.name
+                        )
+                    })?;
+                append_resume_flags(
+                    agent.name,
+                    Some(child_id.as_str()),
+                    false,
+                    cmd,
+                    parsed_command.executable_end,
+                    "host fork",
+                );
+                return Ok(false);
+            }
             let child_id = self
                 .agent_session_id
                 .as_deref()
@@ -1132,6 +1228,26 @@ work-opencode = "opencode"
         assert!(inst.opencode_launch_mirrorable_by_ambient_serve());
         inst.command = "opencode-wrapper".to_string();
         assert!(!inst.opencode_launch_mirrorable_by_ambient_serve());
+    }
+
+    /// A store fork runs `opencode serve` against the launch's own database, so
+    /// a wrapper-mediated or sandboxed launch cannot reach it.
+    #[test]
+    fn opencode_store_fork_needs_a_direct_host_launch() {
+        let mut inst = tool_instance("opencode", "/tmp/test");
+        assert!(inst.opencode_store_fork_available(None));
+        inst.command = "opencode-wrapper".to_string();
+        assert!(!inst.opencode_store_fork_available(None));
+
+        let mut sandboxed = tool_instance("opencode", "/tmp/test");
+        sandboxed.sandbox_info = Some(super::super::test_helpers::test_sandbox(
+            "fork-refusal",
+            None,
+        ));
+        assert!(!sandboxed.opencode_store_fork_available(None));
+
+        let other = tool_instance("claude", "/tmp/test");
+        assert!(!other.opencode_store_fork_available(None));
     }
 
     #[test]
