@@ -908,11 +908,15 @@ Install an external plugin from a `gh:owner/repo[@ref]` slug or a local director
 
 Update an installed external plugin from its recorded source and restart its worker in a running daemon. Prompts to re-approve capabilities if the update changes the capability set
 
-**Usage:** `aoe plugin update <ID>`
+**Usage:** `aoe plugin update [OPTIONS] <ID>`
 
 ###### **Arguments:**
 
 * `<ID>` — Plugin id
+
+###### **Options:**
+
+* `--yes` — Re-approve a changed capability set without prompting
 
 
 
