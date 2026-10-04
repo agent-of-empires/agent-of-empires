@@ -511,6 +511,11 @@ async fn persist_provider_switch(
     let mut instances = state.instances.write().await;
     if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
         switch(inst);
+        // A disk snapshot read before the write above would otherwise land
+        // after it and restore the old provider and model.
+        state
+            .mutation_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
     Ok(())
 }
@@ -769,6 +774,45 @@ mod tests {
             assert_eq!(live.agent_provider.as_deref(), Some(*provider));
             assert_eq!(live.agent_model.as_deref(), Some(PROVIDER_DEFAULT_MODEL));
         }
+    }
+
+    /// A status poll that read `sessions.json` before the switch committed must
+    /// not land after it: the spawn request is built from the memory row, so
+    /// the stale reload would respawn on the old routing and model.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_reload_read_before_the_switch_cannot_undo_it() {
+        use crate::session::test_support::isolate_app_dir;
+        let profile = "default";
+        let _tmp = isolate_app_dir();
+        let mut inst = crate::session::Instance::new("claude", "/tmp/aoe-switch-provider-stale");
+        inst.view = crate::session::View::Structured;
+        inst.agent_name = Some("claude".to_string());
+        inst.agent_model = Some("claude-fable-5-1".to_string());
+        let id = inst.id.clone();
+        crate::server::test_support::seed_instances_on_disk_for_test(profile, vec![inst.clone()]);
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+
+        let read_epoch = state
+            .mutation_epoch
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let stale = crate::server::test_support::load_instances_from_disk_for_test(profile);
+        persist_provider_switch(&state, profile, &id, "vertex")
+            .await
+            .expect("persisting the pick");
+        crate::server::reload::reload_state_instances_from_disk(
+            &state,
+            stale,
+            Vec::new(),
+            crate::server::state::StatusSource::DiskOnly,
+            read_epoch,
+        )
+        .await;
+
+        let instance = find_instance(&state, &id).await.expect("instance");
+        let request = spawn_request_for(&instance, "claude".to_string(), None);
+        assert_eq!(request.provider.as_deref(), Some("vertex"));
+        assert_eq!(request.model.as_deref(), Some(PROVIDER_DEFAULT_MODEL));
     }
 
     /// The switch tears the worker down, so a busy worker, or one whose last
