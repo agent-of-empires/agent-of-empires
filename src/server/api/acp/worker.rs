@@ -137,6 +137,7 @@ pub async fn spawn_acp(
     let agent = pick_agent(&state, &instance, explicit.as_deref()).await;
     let sandbox_info = match crate::acp::sandbox::ensure_container_for_session_locked(
         &state.instances,
+        &state.mutation_epoch,
         &id,
         false,
     )
@@ -405,6 +406,7 @@ pub async fn switch_acp_agent(
     let inst_lock = state.instance_lock(&id).await;
     let sandbox_info = match crate::acp::sandbox::ensure_container_for_session(
         &state.instances,
+        &state.mutation_epoch,
         &inst_lock,
         &id,
         false,
@@ -641,6 +643,7 @@ pub async fn switch_acp_provider(
 
     let sandbox_info = match crate::acp::sandbox::ensure_container_for_session_locked(
         &state.instances,
+        &state.mutation_epoch,
         &id,
         false,
     )

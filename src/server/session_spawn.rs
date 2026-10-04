@@ -464,6 +464,7 @@ pub(crate) async fn spawn_structured_session(
                     let inst_lock = service_for_check.instance_lock(&id).await;
                     let sandbox_info = match crate::acp::sandbox::ensure_container_for_session(
                         &service_for_check.instances,
+                        &service_for_check.mutation_epoch,
                         &inst_lock,
                         &id,
                         true,

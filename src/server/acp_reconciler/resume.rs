@@ -354,6 +354,7 @@ async fn build_spawn_request(
         .await;
     let sandbox_info = match crate::acp::sandbox::ensure_container_for_session(
         &service.instances,
+        &service.mutation_epoch,
         &inst_lock,
         &target.id,
         false,

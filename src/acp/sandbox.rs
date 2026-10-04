@@ -1,5 +1,6 @@
 //! Sandbox container lifecycle for structured view sessions.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -10,19 +11,22 @@ use crate::session::{Instance, SandboxInfo};
 /// Ensure the sandbox container for the named session is running.
 pub async fn ensure_container_for_session(
     instances: &RwLock<Vec<Instance>>,
+    mutation_epoch: &AtomicU64,
     instance_lock: &Arc<Mutex<()>>,
     session_id: &str,
     run_on_launch_hooks: bool,
 ) -> Result<Option<SandboxInfo>> {
     let _guard = instance_lock.lock().await;
 
-    ensure_container_for_session_locked(instances, session_id, run_on_launch_hooks).await
+    ensure_container_for_session_locked(instances, mutation_epoch, session_id, run_on_launch_hooks)
+        .await
 }
 
 /// Ensure the sandbox container while the caller already holds the
 /// per-session instance mutex.
 pub async fn ensure_container_for_session_locked(
     instances: &RwLock<Vec<Instance>>,
+    mutation_epoch: &AtomicU64,
     session_id: &str,
     run_on_launch_hooks: bool,
 ) -> Result<Option<SandboxInfo>> {
@@ -61,16 +65,7 @@ pub async fn ensure_container_for_session_locked(
         .context("docker ensure task failed to join")??;
 
     if let Some(info) = &sandbox_info {
-        let mut guard = instances.write().await;
-        if let Some(inst) = guard.iter_mut().find(|i| i.id == session_id_owned) {
-            if let Some(ref mut sb) = inst.sandbox_info {
-                if sb.container_id.is_none() {
-                    sb.container_id = info.container_id.clone();
-                }
-                sb.before_start_env = info.before_start_env.clone();
-                sb.provider = info.provider.clone();
-            }
-        }
+        record_built_sandbox(instances, mutation_epoch, &session_id_owned, info).await;
     }
 
     // Phase 4: run on_launch hooks outside the instances lock (the
@@ -112,6 +107,33 @@ pub async fn ensure_container_for_session_locked(
     }
 
     Ok(sandbox_info)
+}
+
+/// Copy what the build learned onto the live row.
+async fn record_built_sandbox(
+    instances: &RwLock<Vec<Instance>>,
+    mutation_epoch: &AtomicU64,
+    session_id: &str,
+    info: &SandboxInfo,
+) {
+    let mut guard = instances.write().await;
+    let Some(sb) = guard
+        .iter_mut()
+        .find(|i| i.id == session_id)
+        .and_then(|i| i.sandbox_info.as_mut())
+    else {
+        return;
+    };
+    if sb.container_id.is_none() {
+        sb.container_id = info.container_id.clone();
+    }
+    sb.before_start_env = info.before_start_env.clone();
+    if sb.provider != info.provider {
+        sb.provider = info.provider.clone();
+        // A disk snapshot read before the rebuild would restore the old stamp,
+        // and the next ensure would discard this container.
+        mutation_epoch.fetch_add(1, Ordering::SeqCst);
+    }
 }
 
 /// Rebuild the container when the session's provider pick no longer matches the
@@ -194,6 +216,28 @@ mod tests {
             .find(|i| i.id == id)
             .and_then(|i| i.sandbox_info)
             .and_then(|s| s.provider)
+    }
+
+    /// A changed stamp invalidates disk snapshots read before it; an unchanged
+    /// one leaves reloads alone.
+    #[tokio::test]
+    async fn a_changed_stamp_invalidates_older_snapshots() {
+        let inst = sandboxed(None);
+        let id = inst.id.clone();
+        let instances = RwLock::new(vec![inst]);
+        let epoch = AtomicU64::new(0);
+        let mut built = sandboxed(Some("vertex")).sandbox_info.unwrap();
+
+        for (case, expected_epoch) in [("rebuilt", 1), ("unchanged", 1)] {
+            record_built_sandbox(&instances, &epoch, &id, &built).await;
+            assert_eq!(epoch.load(Ordering::SeqCst), expected_epoch, "{case}");
+            let stamp = instances.read().await[0]
+                .sandbox_info
+                .as_ref()
+                .and_then(|s| s.provider.clone());
+            assert_eq!(stamp.as_deref(), Some("vertex"), "{case}");
+            built.container_id = Some("c1".into());
+        }
     }
 
     /// The path every resume takes, not only a switch: a rebuild survives a

@@ -291,6 +291,7 @@ fn spawn_enabled_worker(
         let supervisor = &state.acp_supervisor;
         let sandbox_info = match crate::acp::sandbox::ensure_container_for_session_locked(
             &state.instances,
+            &state.mutation_epoch,
             &session_id,
             false,
         )
