@@ -25,6 +25,133 @@ fn tmux_name(session_id: &str, title: &str) -> String {
     )
 }
 
+fn add_restartable_session(h: &TuiTestHarness, project: &Path, title: &str) -> String {
+    h.add_session(&[
+        project.to_str().unwrap(),
+        "-t",
+        title,
+        "--cmd-override",
+        "sleep 600",
+    ])
+}
+
+fn set_cli_tmux_context(h: &mut TuiTestHarness, session_id: &str, title: &str) -> String {
+    let name = tmux_name(session_id, title);
+    let env_path = h.home_path().join("caller-tmux-env");
+    let command = format!(
+        "printf '%s\\n%s\\n' \"$TMUX\" \"$TMUX_PANE\" > {} && sleep 600",
+        shell_words::quote(env_path.to_str().unwrap())
+    );
+    h.tmux_new_detached(&name, &command);
+
+    let (tmux, pane) = wait_until(Duration::from_secs(5), Duration::from_millis(20), || {
+        let content = std::fs::read_to_string(&env_path).map_err(|error| error.to_string())?;
+        let mut lines = content.lines();
+        match (lines.next(), lines.next()) {
+            (Some(tmux), Some(pane)) if !tmux.is_empty() && !pane.is_empty() => {
+                Ok((tmux.to_string(), pane.to_string()))
+            }
+            _ => Err("tmux pane has not written its environment".to_string()),
+        }
+    });
+    h.set_env("TMUX", &tmux);
+    h.set_env("TMUX_PANE", &pane);
+    name
+}
+
+fn tmux_pane_pid(h: &TuiTestHarness, name: &str) -> String {
+    let output = h
+        .tmux()
+        .args(["display-message", "-p", "-t", name, "#{pane_pid}"])
+        .output()
+        .expect("read tmux pane pid");
+    assert!(
+        output.status.success(),
+        "tmux display-message failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+#[test]
+#[parallel]
+fn cli_restart_all_keeps_the_calling_session_and_restarts_others() {
+    require_tmux!();
+    let mut h = TuiTestHarness::new("cli_restart_all_from_caller");
+    let project = h.project_path();
+    let caller_id = add_restartable_session(&h, &project, "Caller");
+    let other_id = add_restartable_session(&h, &project, "Other");
+    let caller_name = set_cli_tmux_context(&mut h, &caller_id, "Caller");
+    let other_name = tmux_name(&other_id, "Other");
+    h.tmux_new_detached(&other_name, "sleep 600");
+    let caller_pid = tmux_pane_pid(&h, &caller_name);
+    let other_pid = tmux_pane_pid(&h, &other_name);
+
+    let output = h.run_cli_ok(&["session", "restart", "--all", "--parallel", "1"]);
+
+    assert!(
+        output.contains("Skipping current session 'Caller'"),
+        "restart output should identify the skipped caller: {output}"
+    );
+    assert_eq!(
+        tmux_pane_pid(&h, &caller_name),
+        caller_pid,
+        "the calling pane process was replaced"
+    );
+    assert!(
+        h.tmux_has_session(&other_name),
+        "the other restartable session was not started"
+    );
+    assert_ne!(
+        tmux_pane_pid(&h, &other_name),
+        other_pid,
+        "the other restartable session was not restarted"
+    );
+}
+
+#[test]
+#[parallel]
+fn cli_restart_all_with_only_the_caller_reports_no_other_sessions() {
+    require_tmux!();
+    let mut h = TuiTestHarness::new("cli_restart_all_only_caller");
+    let project = h.project_path();
+    let caller_id = add_restartable_session(&h, &project, "Caller");
+    let caller_name = set_cli_tmux_context(&mut h, &caller_id, "Caller");
+    let caller_pid = tmux_pane_pid(&h, &caller_name);
+
+    let output = h.run_cli_ok(&["session", "restart", "--all"]);
+
+    assert!(output.contains("No other sessions to restart"), "{output}");
+    assert_eq!(
+        tmux_pane_pid(&h, &caller_name),
+        caller_pid,
+        "the calling pane process was replaced"
+    );
+}
+
+#[test]
+#[parallel]
+fn cli_restart_all_refuses_to_run_when_the_calling_pane_cannot_be_resolved() {
+    require_tmux!();
+    let mut h = TuiTestHarness::new("cli_restart_all_unresolved_caller");
+    let project = h.project_path();
+    add_restartable_session(&h, &project, "Would Restart");
+    h.set_env("TMUX_PANE", "%999999");
+    h.set_env(
+        "AOE_TMUX_SOCKET",
+        h.home_path().join("missing-tmux.sock").to_str().unwrap(),
+    );
+
+    let output = h.run_cli(&["session", "restart", "--all"]);
+
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Could not determine the current tmux session"),
+        "restart should fail closed with a useful error: {stderr}"
+    );
+}
+
 #[test]
 #[parallel]
 fn cli_add_lists_the_new_session_and_names_the_binary_in_next_steps() {
