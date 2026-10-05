@@ -486,6 +486,14 @@ impl Instance {
         } else {
             None
         };
+        // The generation decides which yolo spelling the container receives, and
+        // it has to come from the launch the pane would run with rather than
+        // from this process's own `PATH`.
+        let agent = crate::agents::get_agent(&self.tool)
+            .unwrap_or_else(|| crate::agents::get_agent("opencode").expect("a builtin agent"));
+        let yolo_generation = self.is_yolo_mode().then(|| {
+            super::execution::agent_generation(agent, self.launch_program(agent, None).as_deref())
+        });
         container_config::build_container_config(
             &self.project_path,
             sandbox,
@@ -495,7 +503,7 @@ impl Instance {
             )
             .with_selected_agent(selected_agent.as_deref())
             .with_credential_fold(fold),
-            self.is_yolo_mode(),
+            yolo_generation,
             &self.id,
             self.workspace_info.as_ref(),
             &self.source_profile,
