@@ -162,11 +162,20 @@ interface Props {
   /** A create the user sent to the background finished; the wizard is already closed. */
   onCreatedInBackground?: (session?: SessionResponse) => void;
   prefill?: WizardPrefill;
+  /** Authority for implicit reads; the machine default is not the served profile. */
+  servedProfile?: string;
   /** CityHall client mode: only a title is asked; the server derives the rest. */
   nameOnly?: boolean;
 }
 
-export function SessionWizard({ onClose, onCreated, onCreatedInBackground, prefill, nameOnly = false }: Props) {
+export function SessionWizard({
+  onClose,
+  onCreated,
+  onCreatedInBackground,
+  prefill,
+  servedProfile,
+  nameOnly = false,
+}: Props) {
   const [state, dispatch] = useReducer(reducer, {
     data: initialWizardData(prefill, nameOnly),
     isSubmitting: false,
@@ -209,59 +218,70 @@ export function SessionWizard({ onClose, onCreated, onCreatedInBackground, prefi
     fingerprint: CreationTrustFingerprint;
     mcpSummaries: string[];
   } | null>(null);
-  // A remembered path satisfies the submit gate at mount, so Launch waits for
-  // the defaults below rather than sending initialData's sandbox/worktree/yolo.
-  // Set on every outcome, so a failed fetch still leaves the form usable.
-  const [defaultsReady, setDefaultsReady] = useState(false);
+  // Launch waits for defaults from the admitted read profile.
+  const [defaultsProfile, setDefaultsProfile] = useState<string | null>(null);
+  const defaultsReady = defaultsProfile !== null && defaultsProfile === (state.data.profile || servedProfile);
+  const defaultsGeneration = useRef(0);
+  const selectedProfile = useRef<string | null>(null);
 
   useEffect(() => {
+    const generations = defaultsGeneration;
     fetchAgents().then((a) => dispatch({ type: "SET_AGENTS", agents: a }));
     fetchGroups().then((g) => dispatch({ type: "SET_GROUPS", groups: g }));
     fetchDockerStatus().then((d) => dispatch({ type: "SET_DOCKER", available: d.available }));
-    // Seed resolved profile defaults and the remembered project override together.
+    fetchProfiles()
+      .then((profiles) => dispatch({ type: "SET_PROFILES", profiles }))
+      .catch(() => {});
+    return () => {
+      generations.current++;
+    };
+  }, []);
+
+  useEffect(() => {
+    const generations = defaultsGeneration;
+    if (selectedProfile.current !== null) return;
+    const generation = ++defaultsGeneration.current;
     const initialPath = state.data.path;
-    const defaultsSeed = fetchProfiles()
-      // A failed profiles fetch must not skip settings: an explicit prefill
-      // profile, or the unresolved global config, still applies.
-      .catch(() => [] as Awaited<ReturnType<typeof fetchProfiles>>)
-      .then((profiles) => {
-        dispatch({ type: "SET_PROFILES", profiles });
-        const effectiveProfile = prefill?.profile || profiles.find((profile) => profile.is_default)?.name || "";
-        const projectSeed =
-          initialPath && effectiveProfile
-            ? fetchProjects({ profile: effectiveProfile })
-                .then((projects) => {
-                  const key = normalizeProjectPathKey(initialPath);
-                  const override = projects?.find((project) => normalizeProjectPathKey(project.path) === key)?.overrides
-                    ?.worktree_enabled;
-                  if (override !== undefined) {
-                    dispatch({ type: "SEED_PROJECT_WORKTREE_OVERRIDE", override, path: initialPath });
-                  }
-                })
-                .catch(() => {})
-            : Promise.resolve();
-        return Promise.all([fetchSettings(effectiveProfile || undefined), projectSeed]).then(([settings]) => settings);
-      })
-      .then((s) => {
-        if (!s) return;
-        setCommandMaps(commandMapsFromSettings(s));
-        const img = ((s.sandbox as Obj)?.default_image as string) || "";
-        if (img) dispatch({ type: "SET_FIELD", field: "sandboxImage", value: img });
-        const defaults = profileDefaults(s, prefill?.tool ?? "", state.data.tool);
+    const effectiveProfile = prefill?.profile || servedProfile;
+    if (!effectiveProfile) return;
+    const projectSeed =
+      initialPath && effectiveProfile
+        ? fetchProjects({ profile: effectiveProfile })
+            .then((projects) => {
+              if (generation !== defaultsGeneration.current) return;
+              const key = normalizeProjectPathKey(initialPath);
+              const override = projects?.find((project) => normalizeProjectPathKey(project.path) === key)?.overrides
+                ?.worktree_enabled;
+              if (override !== undefined)
+                dispatch({ type: "SEED_PROJECT_WORKTREE_OVERRIDE", override, path: initialPath });
+            })
+            .catch(() => {})
+        : Promise.resolve();
+    void Promise.all([fetchSettings(effectiveProfile), projectSeed])
+      .then(([settings]) => {
+        if (generation !== defaultsGeneration.current || !settings) return;
+        setCommandMaps(commandMapsFromSettings(settings));
+        const image = ((settings.sandbox as Obj)?.default_image as string) || "";
+        if (image) dispatch({ type: "SET_FIELD", field: "sandboxImage", value: image });
+        const defaults = profileDefaults(settings, prefill?.tool ?? "", state.data.tool);
         dispatch({
           type: "APPLY_PROFILE_DEFAULTS",
           ...defaults,
-          // Explicit prefill values win over the profile.
           yoloMode: prefill?.yoloMode ?? defaults.yoloMode,
           sandboxEnabled: prefill?.sandboxEnabled ?? defaults.sandboxEnabled,
           skipIfDirty: true,
         });
       })
-      .catch(() => {});
-    void defaultsSeed.then(() => setDefaultsReady(true));
-    // Seed once; a re-render with a new prefill object must not stomp user edits.
+      .catch(() => {})
+      .finally(() => {
+        if (generation === defaultsGeneration.current) setDefaultsProfile(effectiveProfile);
+      });
+    return () => {
+      if (generation === generations.current) generations.current++;
+    };
+    // Re-resolve implicit reads when about lands, without reseeding user selections or edits.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [servedProfile]);
 
   // Only a definitive probe answer applies; a failed probe (null) keeps the optimistic default.
   const probePath = state.data.scratch ? "" : state.data.path;
@@ -309,16 +329,20 @@ export function SessionWizard({ onClose, onCreated, onCreatedInBackground, prefi
   const handleProfileChange = async (profileName: string) => {
     const d = state.data;
     // A hand-set view is not in `profileDirty`, but the profile's view default would replace it.
-    if ((d.profileDirty || d.structuredViewDirty) && profileName) {
+    if (d.profileDirty || d.structuredViewDirty) {
       const ok = window.confirm("Selecting a profile will reset your settings to that profile's defaults. Continue?");
       if (!ok) return;
     }
     handleChange("profile", profileName);
     setPanel(null);
-    if (!profileName) return;
+    selectedProfile.current = profileName || null;
+    const generation = ++defaultsGeneration.current;
+    setDefaultsProfile(null);
+    const effectiveProfile = profileName || servedProfile;
+    if (!effectiveProfile) return;
     try {
-      const settings = await fetchSettings(profileName);
-      if (settings) {
+      const settings = await fetchSettings(effectiveProfile);
+      if (generation === defaultsGeneration.current && settings) {
         handleApplyProfileDefaults({
           ...profileDefaults(settings, "", d.tool),
           resetStructuredViewDirty: true,
@@ -327,6 +351,8 @@ export function SessionWizard({ onClose, onCreated, onCreatedInBackground, prefi
       }
     } catch {
       // Keep just the profile name.
+    } finally {
+      if (generation === defaultsGeneration.current) setDefaultsProfile(effectiveProfile);
     }
   };
 
@@ -545,9 +571,7 @@ export function SessionWizard({ onClose, onCreated, onCreatedInBackground, prefi
   const sandboxBlocked = isHostOnly ? hostOnlyReason : !state.dockerAvailable ? "Docker is not running" : null;
   const agentCustomized = !!(d.extraArgs || d.commandOverride || d.customInstruction);
   const openPanel = (next: Panel) => () => setPanel(next);
-  // Project suggestions and extra-repo bases are profile scoped, so the effective
-  // profile (the chosen one, else the server default) drives both panels.
-  const effectiveProfile = d.profile || state.profiles.find((profile) => profile.is_default)?.name;
+  const effectiveProfile = d.profile || servedProfile;
 
   const renderPanel = (p: Panel) => {
     switch (p) {

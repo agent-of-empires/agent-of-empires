@@ -49,11 +49,22 @@ impl<S: BroadcastSink> Supervisor<S> {
         session_id: &str,
         deadline: Duration,
     ) -> Result<(), SupervisorError> {
-        let pid_before = worker_registry::pid_source_for(session_id);
+        let record_before = worker_registry::load(session_id).map_err(|error| {
+            SupervisorError::Acp(crate::acp::acp_client::AcpError::Spawn(error.to_string()))
+        })?;
+        let pid_before = record_before.as_ref().map(|record| record.pid);
         let start = Instant::now();
         match self.shutdown(session_id).await {
             Ok(()) => {}
-            Err(SupervisorError::UnknownSession(_)) => return Ok(()),
+            Err(SupervisorError::UnknownSession(_)) => {
+                if record_before
+                    .as_ref()
+                    .is_some_and(worker_registry::is_record_live)
+                {
+                    return Err(SupervisorError::TeardownPending(session_id.into()));
+                }
+                return Ok(());
+            }
             Err(e) => return Err(e),
         }
         loop {
@@ -68,7 +79,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             }
             let remaining = deadline.saturating_sub(start.elapsed());
             if remaining.is_zero() {
-                break;
+                return Err(SupervisorError::TeardownPending(session_id.into()));
             }
             let _ = tokio::time::timeout(remaining, notified).await;
         }
@@ -77,6 +88,9 @@ impl<S: BroadcastSink> Supervisor<S> {
             let start = Instant::now();
             while start.elapsed() < deadline && worker_registry::is_pid_alive(pid) {
                 tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            if worker_registry::is_pid_alive(pid) {
+                return Err(SupervisorError::TeardownPending(session_id.into()));
             }
         }
         #[cfg(not(unix))]
@@ -845,9 +859,8 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     #[serial_test::serial]
-    async fn shutdown_and_wait_returns_promptly_without_a_pid_source() {
+    async fn shutdown_and_wait_refuses_unreadable_records_and_settles_absent_runners() {
         let (_home, _tmp) = isolate_home();
-        // (session, whether an unreadable registry record is planted)
         for (session_id, unreadable_record) in [("sw-err", true), ("sw-missing", false)] {
             if unreadable_record {
                 save_record(session_id, std::process::id(), 0);
@@ -858,15 +871,19 @@ mod tests {
             }
             let sup = Supervisor::new(VecSink::new());
             sup.test_insert_worker(session_id).await;
-            let shutdown = sup.shutdown_and_wait(session_id, Duration::from_secs(2));
-            tokio::pin!(shutdown);
-            assert!(
-                matches!(
-                    futures_util::poll!(&mut shutdown),
-                    std::task::Poll::Ready(Ok(()))
-                ),
-                "{session_id}: without a PID source shutdown must not enter a poll wait"
-            );
+            let result = tokio::time::timeout(
+                Duration::from_secs(1),
+                sup.shutdown_and_wait(session_id, Duration::from_secs(2)),
+            )
+            .await
+            .expect("registry admission must settle without waiting for an absent PID");
+            if unreadable_record {
+                assert!(matches!(result, Err(SupervisorError::Acp(_))));
+                assert_eq!(sup.worker_state(session_id).await, AcpWorkerState::Running);
+            } else {
+                result.unwrap();
+                assert_eq!(sup.worker_state(session_id).await, AcpWorkerState::Absent);
+            }
         }
     }
 

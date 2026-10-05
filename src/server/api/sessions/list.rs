@@ -391,14 +391,16 @@ pub async fn list_sessions(
         Ok(snapshot) => snapshot,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    Json(SessionsView {
-        sessions: ScopedSessions {
-            rows: &snapshot.value.contents.sessions,
-            scope: query.state,
-        },
-        workspace_ordering: &snapshot.value.contents.workspace_ordering,
-    })
-    .into_response()
+    crate::server::runtime::mutation_response(
+        &snapshot.value.cursor,
+        Json(SessionsView {
+            sessions: ScopedSessions {
+                rows: &snapshot.value.contents.sessions,
+                scope: query.state,
+            },
+            workspace_ordering: &snapshot.value.contents.workspace_ordering,
+        }),
+    )
 }
 // Workspace id derivation. Mirrors the client logic in `useWorkspaces.ts`:
 // a session with a branch collapses to `${repoPath}::${branch}`; a

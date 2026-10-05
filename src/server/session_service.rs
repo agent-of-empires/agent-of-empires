@@ -31,8 +31,8 @@ enum ClaimOutcome {
     /// This caller owns the build; it must drop the returned guard on every
     /// exit path so waiters wake up.
     Claimed,
-    /// An identical request is mid-build; wait on the notify, then re-check.
-    Wait(Arc<tokio::sync::Notify>),
+    /// An identical request is mid-build.
+    Wait,
     /// The same key is mid-build with a different payload.
     Conflict,
 }
@@ -57,6 +57,10 @@ impl std::fmt::Display for IdempotencyConflict {
 
 impl std::error::Error for IdempotencyConflict {}
 
+#[derive(Debug, thiserror::Error)]
+#[error("the prior creation is not finalized; its outcome is unknown")]
+pub(crate) struct CreationUnfinalized;
+
 /// Read-only resolution of a plugin create-idempotency key, so a caller can
 /// decide whether to charge admission before building the session (#2897).
 pub(crate) enum CreateIdempotencyProbe {
@@ -70,6 +74,7 @@ pub(crate) enum CreateIdempotencyProbe {
 enum IdempotentMatch {
     /// Same plugin, key, and payload: return this existing session.
     Same(Box<Instance>),
+    Pending,
     /// Same plugin and key, different payload: refuse.
     Conflict,
     /// No session carries this plugin/key pair.
@@ -293,24 +298,15 @@ pub(crate) enum PromptTouch {
     /// Touched (and woken, if snoozed/idle-dormant); carries
     /// whether this specifically was the idle-dormant wake, the flag
     /// `prompt_dispatch_under_submission` and `send_turn` need.
-    Touched { idle_dormant: bool },
+    Touched {
+        idle_dormant: bool,
+    },
     /// `no_revive` was set and the session needed snoozed/idle-dormant
     /// revival to accept this prompt; refused before any mutation.
     RevivalRefused,
     /// The session is archived or trashed; refused before any mutation.
     Blocked(crate::session::StartBlocked),
-}
-
-impl PromptTouch {
-    /// The idle-dormant flag for a caller that never sets `no_revive`, so
-    /// never sees `RevivalRefused`.
-    pub(crate) fn idle_dormant(self) -> Result<bool, crate::session::StartBlocked> {
-        match self {
-            PromptTouch::Touched { idle_dormant } => Ok(idle_dormant),
-            PromptTouch::RevivalRefused => Ok(false),
-            PromptTouch::Blocked(blocked) => Err(blocked),
-        }
-    }
+    WorkerNotReady,
 }
 
 /// Everything [`SessionService::send_turn`] needs beyond the caller and
@@ -594,49 +590,39 @@ impl SessionService {
         let scope = (plugin_id.to_string(), key.to_string());
 
         loop {
-            // Persisted-first lookup: a completed create (this daemon life or
-            // an earlier one) wins before any in-flight coordination.
+            match self
+                .probe_plugin_create_idempotency(&spec, plugin_id, key)
+                .await?
             {
-                let instances = self.instances.read().await;
-                match find_idempotent_match(&instances, plugin_id, key, &payload_hash) {
-                    IdempotentMatch::Same(instance) => {
-                        return Ok((
-                            SpawnOutcome {
-                                instance: *instance,
-                                warnings: Vec::new(),
-                            },
-                            false,
-                        ));
-                    }
-                    IdempotentMatch::Conflict => {
-                        return Err(anyhow::Error::new(IdempotencyConflict {
-                            key: key.to_string(),
-                        }));
-                    }
-                    IdempotentMatch::None => {}
+                CreateIdempotencyProbe::Replay(instance) => {
+                    return Ok((
+                        SpawnOutcome {
+                            instance: *instance,
+                            warnings: Vec::new(),
+                        },
+                        false,
+                    ));
                 }
+                CreateIdempotencyProbe::New => {}
             }
-            match self.try_claim_in_flight(&scope, &payload_hash) {
-                ClaimOutcome::Claimed => break,
-                ClaimOutcome::Wait(notify) => {
-                    // The winner removes its entry and notifies on every exit
-                    // path (guard drop), after which the loop re-checks the
-                    // persisted list: a successful winner is found there, a
-                    // failed winner leaves this retry to build fresh. The
-                    // wait is bounded because `notify_waiters` only wakes
-                    // already-registered waiters; a winner finishing between
-                    // our claim attempt and this await would otherwise strand
-                    // us. A missed notify costs one extra loop iteration.
-                    let _ = tokio::time::timeout(
-                        std::time::Duration::from_millis(250),
-                        notify.notified(),
-                    )
-                    .await;
+            let claim = {
+                let instances = self.instances.read().await;
+                if !matches!(
+                    find_idempotent_match(&instances, plugin_id, key, &payload_hash),
+                    IdempotentMatch::None
+                ) {
+                    continue;
                 }
+                self.try_claim_in_flight(&scope, &payload_hash)
+            };
+            match claim {
+                ClaimOutcome::Claimed => break,
+                ClaimOutcome::Wait => continue,
                 ClaimOutcome::Conflict => {
-                    return Err(anyhow::Error::new(IdempotencyConflict {
-                        key: key.to_string(),
-                    }));
+                    return Err(IdempotencyConflict {
+                        key: key.to_owned(),
+                    }
+                    .into())
                 }
             }
         }
@@ -649,27 +635,61 @@ impl SessionService {
         Ok((outcome, true))
     }
 
-    /// Resolve a persisted plugin create-idempotency decision without any side
-    /// effect, so a caller can charge admission (rate/concurrency) only for
-    /// genuinely new creates (#2897). `spec` must be the exact spec that will
-    /// be passed to [`Self::create_structured_session`] (in particular
-    /// `pending_initial_turn` already set), so the payload hash matches. Only
-    /// the persisted list is consulted: an in-flight same-process retry still
-    /// dedupes inside `create_structured_session`, at the cost of one admission.
+    /// Wait for a live creator; replay only a durably finalized creation.
     pub(crate) async fn probe_plugin_create_idempotency(
         &self,
         spec: &StructuredSessionSpec,
         plugin_id: &str,
         key: &str,
-    ) -> Result<CreateIdempotencyProbe, IdempotencyConflict> {
+    ) -> anyhow::Result<CreateIdempotencyProbe> {
         let payload_hash = spec_payload_hash(spec);
-        let instances = self.instances.read().await;
-        match find_idempotent_match(&instances, plugin_id, key, &payload_hash) {
-            IdempotentMatch::Same(instance) => Ok(CreateIdempotencyProbe::Replay(instance)),
-            IdempotentMatch::Conflict => Err(IdempotencyConflict {
-                key: key.to_string(),
-            }),
-            IdempotentMatch::None => Ok(CreateIdempotencyProbe::New),
+        let scope = (plugin_id.to_owned(), key.to_owned());
+        loop {
+            let notify = {
+                let instances = self.instances.read().await;
+                let pending = match find_idempotent_match(&instances, plugin_id, key, &payload_hash)
+                {
+                    IdempotentMatch::Same(instance) => {
+                        return Ok(CreateIdempotencyProbe::Replay(instance))
+                    }
+                    IdempotentMatch::Conflict => {
+                        return Err(IdempotencyConflict {
+                            key: key.to_owned(),
+                        }
+                        .into())
+                    }
+                    IdempotentMatch::Pending => true,
+                    IdempotentMatch::None => false,
+                };
+                let in_flight = self
+                    .create_in_flight
+                    .lock()
+                    .expect("create_in_flight mutex poisoned");
+                match in_flight.get(&scope) {
+                    Some(entry) if entry.payload_hash != payload_hash => {
+                        return Err(IdempotencyConflict {
+                            key: key.to_owned(),
+                        }
+                        .into());
+                    }
+                    Some(entry) => entry.notify.clone(),
+                    None if pending => return Err(CreationUnfinalized.into()),
+                    None => return Ok(CreateIdempotencyProbe::New),
+                }
+            };
+            let notified = notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if !self
+                .create_in_flight
+                .lock()
+                .expect("create_in_flight mutex poisoned")
+                .get(&scope)
+                .is_some_and(|entry| Arc::ptr_eq(&entry.notify, &notify))
+            {
+                continue;
+            }
+            notified.await;
         }
     }
 
@@ -681,9 +701,7 @@ impl SessionService {
             .lock()
             .expect("create_in_flight mutex poisoned");
         match in_flight.get(scope) {
-            Some(entry) if entry.payload_hash == payload_hash => {
-                ClaimOutcome::Wait(entry.notify.clone())
-            }
+            Some(entry) if entry.payload_hash == payload_hash => ClaimOutcome::Wait,
             Some(_) => ClaimOutcome::Conflict,
             None => {
                 in_flight.insert(
@@ -716,6 +734,9 @@ impl SessionService {
             if let Err(blocked) = inst.ensure_startable() {
                 return PromptTouch::Blocked(blocked);
             }
+            if inst.is_structured() && !inst.launch_is_finalized() {
+                return PromptTouch::WorkerNotReady;
+            }
             let was_idle_dormant = inst.is_idle_dormant();
             let wake = inst.is_snoozed() || was_idle_dormant;
             if no_revive && wake {
@@ -742,7 +763,10 @@ impl SessionService {
                     // A peer (e.g. the CLI) may have archived or trashed the row since the
                     // memory check; waking it here would clear that.
                     if let Err(blocked) = inst.ensure_startable() {
-                        return Ok(Some(blocked));
+                        return Ok(Some(PromptTouch::Blocked(blocked)));
+                    }
+                    if inst.is_structured() && !inst.launch_is_finalized() {
+                        return Ok(Some(PromptTouch::WorkerNotReady));
                     }
                     apply_prompt_persist_to_disk(inst, wake);
                     Ok(None)
@@ -751,7 +775,7 @@ impl SessionService {
             .await;
             match outcome {
                 Ok(Ok(None)) => {}
-                Ok(Ok(Some(blocked))) => return PromptTouch::Blocked(blocked),
+                Ok(Ok(Some(refused))) => return refused,
                 Ok(Err(e)) => tracing::warn!(
                     target: "server.session_service",
                     session = %id,
@@ -806,6 +830,9 @@ impl SessionService {
                 if inst.created_by_plugin.as_deref() != Some(plugin_id.as_str()) {
                     return Err(SendTurnError::NotOwner);
                 }
+            }
+            if !inst.launch_is_finalized() {
+                return Err(SendTurnError::WorkerNotReady);
             }
             (inst.acp_mode_id.clone(), inst.yolo_mode)
         };
@@ -950,26 +977,29 @@ impl SessionService {
         };
         let Some((text, attachment_refs, synthesized, profile, caller)) = ({
             let instances = self.instances.read().await;
-            instances.iter().find(|i| i.id == id).and_then(|i| {
-                i.pending_initial_turn.clone().map(|turn| {
-                    // Reconstruct the creator principal so plugin-created
-                    // pending turns keep plugin attribution and the plugin
-                    // mode-assertion path; user-created ones stay User.
-                    let caller = match &i.created_by_plugin {
-                        Some(plugin_id) => SessionCaller::Plugin {
-                            plugin_id: plugin_id.clone(),
-                        },
-                        None => SessionCaller::User,
-                    };
-                    (
-                        turn.text,
-                        turn.attachments,
-                        turn.synthesized,
-                        i.source_profile.clone(),
-                        caller,
-                    )
+            instances
+                .iter()
+                .find(|i| i.id == id && i.launch_is_finalized())
+                .and_then(|i| {
+                    i.pending_initial_turn.clone().map(|turn| {
+                        // Reconstruct the creator principal so plugin-created
+                        // pending turns keep plugin attribution and the plugin
+                        // mode-assertion path; user-created ones stay User.
+                        let caller = match &i.created_by_plugin {
+                            Some(plugin_id) => SessionCaller::Plugin {
+                                plugin_id: plugin_id.clone(),
+                            },
+                            None => SessionCaller::User,
+                        };
+                        (
+                            turn.text,
+                            turn.attachments,
+                            turn.synthesized,
+                            i.source_profile.clone(),
+                            caller,
+                        )
+                    })
                 })
-            })
         }) else {
             return;
         };
@@ -2189,6 +2219,9 @@ fn find_idempotent_match(
             continue;
         }
         if record.payload_hash == payload_hash {
+            if instance.status == crate::session::Status::Creating {
+                return IdempotentMatch::Pending;
+            }
             return IdempotentMatch::Same(Box::new(instance.clone()));
         }
         return IdempotentMatch::Conflict;
@@ -2406,36 +2439,52 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn in_flight_claim_waits_same_hash_and_conflicts_on_mismatch() {
-        let service = crate::server::test_support::build_test_app_state(Vec::new())
+    async fn create_probe_waits_for_finalization_and_rejects_an_orphan() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let spec = test_spec();
+        let hash = spec_payload_hash(&spec);
+        let mut prior = plugin_instance("cron", "job-1", &hash);
+        prior.status = crate::session::Status::Creating;
+        let id = prior.id.clone();
+        let service = crate::server::test_support::build_test_app_state(vec![prior])
             .session_service
             .clone();
-        let scope = ("cron".to_string(), "job-1".to_string());
-
-        let ClaimOutcome::Claimed = service.try_claim_in_flight(&scope, "hash-a") else {
-            panic!("first claim must win");
-        };
-        let ClaimOutcome::Wait(notify) = service.try_claim_in_flight(&scope, "hash-a") else {
-            panic!("identical concurrent claim must wait");
-        };
-        let ClaimOutcome::Conflict = service.try_claim_in_flight(&scope, "hash-b") else {
-            panic!("same key with a different payload must conflict");
-        };
-
-        let notified = notify.notified();
-        tokio::pin!(notified);
-        assert!(futures_util::poll!(&mut notified).is_pending());
-        drop(InFlightGuard {
-            service: Arc::clone(&service),
-            scope: scope.clone(),
-        });
-        tokio::time::timeout(std::time::Duration::from_secs(1), notified)
+        let error = service
+            .probe_plugin_create_idempotency(&spec, "cron", "job-1")
             .await
-            .expect("guard drop must wake waiters");
-
-        let ClaimOutcome::Claimed = service.try_claim_in_flight(&scope, "hash-a") else {
-            panic!("released scope must be claimable again");
+            .err()
+            .expect("orphaned creation must not replay");
+        assert!(error.is::<CreationUnfinalized>());
+        let scope = ("cron".to_owned(), "job-1".to_owned());
+        assert!(matches!(
+            service.try_claim_in_flight(&scope, &hash),
+            ClaimOutcome::Claimed
+        ));
+        let owner = InFlightGuard {
+            service: service.clone(),
+            scope,
         };
+        let probe = service.probe_plugin_create_idempotency(&spec, "cron", "job-1");
+        tokio::pin!(probe);
+        assert!(futures_util::poll!(probe.as_mut()).is_pending());
+        let mut changed = test_spec();
+        changed.title = Some("different".into());
+        let conflict = service
+            .probe_plugin_create_idempotency(&changed, "cron", "job-1")
+            .await
+            .err()
+            .expect("conflicting payload must not wait for hooks");
+        assert!(conflict.is::<IdempotencyConflict>());
+        service.instances.write().await[0].status = crate::session::Status::Starting;
+        drop(owner);
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(1), probe)
+            .await
+            .expect("finalized creation must release its waiter")
+            .unwrap();
+        let CreateIdempotencyProbe::Replay(instance) = outcome else {
+            panic!("must replay finalized result")
+        };
+        assert_eq!(instance.id, id);
     }
 
     #[tokio::test]

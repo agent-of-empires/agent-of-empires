@@ -206,6 +206,7 @@ impl HomeView {
             observed_workspace_ordering: crate::session::load_workspace_ordering()
                 .map(|ordering| ordering.order)
                 .unwrap_or_default(),
+            session_feed_reload_retry_at: None,
             pending_group_deletions: HashMap::new(),
             pending_added: HashMap::new(),
             group_trees,
@@ -738,8 +739,13 @@ impl HomeView {
         }
         // The creation in flight is displayed by its placeholder alone; its own
         // reservation row stays out of the model until the daemon commits.
-        if let Some(id) = self.in_flight_creation_id().map(str::to_owned) {
-            self.instances.shift_remove(&id);
+        if let Some(id) = self
+            .pending_creation
+            .as_ref()
+            .filter(|pending| pending.confirmation.is_none())
+            .and_then(|pending| pending.daemon_id.as_deref())
+        {
+            self.instances.shift_remove(id);
         }
 
         // Refresh the project registry so project view's empty pinned headers

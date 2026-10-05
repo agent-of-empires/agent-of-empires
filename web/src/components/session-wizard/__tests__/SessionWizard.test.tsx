@@ -2,10 +2,17 @@
 
 import { StrictMode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 
 import { SessionWizard, type WizardPrefill } from "../SessionWizard";
-import { fetchAgents, fetchCreateProgress, fetchIsGitRepo, fetchProfiles, fetchSettings } from "../../../lib/api";
+import {
+  fetchAgents,
+  fetchCreateProgress,
+  fetchIsGitRepo,
+  fetchProfiles,
+  fetchProjects,
+  fetchSettings,
+} from "../../../lib/api";
 import { agent } from "./fixtures";
 import { toastBus } from "../../../lib/toastBus";
 import { startPendingCreates } from "../../../lib/pendingCreates";
@@ -61,6 +68,7 @@ beforeEach(() => {
     },
   });
   vi.mocked(fetchIsGitRepo).mockImplementation(async (path) => path !== "/tmp/plain");
+  vi.mocked(fetchProjects).mockResolvedValue([]);
 });
 
 afterEach(() => {
@@ -68,12 +76,13 @@ afterEach(() => {
   localStorage.clear();
 });
 
-function renderWizard(prefill: WizardPrefill = { path: "/tmp/proj", tool: "claude" }) {
+function renderWizard(prefill: WizardPrefill = { path: "/tmp/proj", tool: "claude" }, servedProfile = "default") {
   const onCreated = vi.fn();
   const onClose = vi.fn();
   const onCreatedInBackground = vi.fn();
   render(
     <SessionWizard
+      servedProfile={servedProfile}
       onClose={onClose}
       onCreated={onCreated}
       onCreatedInBackground={onCreatedInBackground}
@@ -370,6 +379,7 @@ describe("SessionWizard under StrictMode", () => {
     render(
       <StrictMode>
         <SessionWizard
+          servedProfile="default"
           onClose={vi.fn()}
           onCreated={onCreated}
           onCreatedInBackground={onCreatedInBackground}
@@ -563,6 +573,7 @@ describe("SessionWizard unknown create outcome", () => {
     const onCreatedInBackground = vi.fn();
     const view = render(
       <SessionWizard
+        servedProfile="default"
         onClose={() => view.unmount()}
         onCreated={vi.fn()}
         onCreatedInBackground={onCreatedInBackground}
@@ -602,5 +613,105 @@ describe("SessionWizard unknown create outcome", () => {
     // Resolved, so a later wizard starts a fresh request.
     renderWizard();
     expect(screen.queryByText(/may still be created/)).toBeNull();
+  });
+});
+
+describe("SessionWizard served-profile authority", () => {
+  const profiles = [
+    { name: "Main", is_default: true },
+    { name: "Alpha", is_default: false },
+    { name: "Beta", is_default: false },
+  ];
+  const settings = (profile: string) => ({
+    session: { yolo_mode_default: profile === "Beta", agent_command_override: { claude: profile + "-claude" } },
+    worktree: { enabled: true },
+    acp: { default_new_session_view: "terminal" },
+  });
+  const open = (label: string) => fireEvent.click(screen.getByText(label).closest("button")!);
+  const chooseProfile = async (profile: string) => {
+    open("Profile");
+    fireEvent.click(screen.getByRole("radio", { name: profile === "" ? /Server default/ : new RegExp(profile) }));
+    await waitFor(() =>
+      expect(screen.getByRole("switch", { name: "Auto-approve actions" }).getAttribute("aria-checked")).toBe(
+        profile === "Beta" ? "true" : "false",
+      ),
+    );
+  };
+
+  it("scopes settings, remembered registry overrides, project and extra-repo suggestions to Alpha, including after Beta -> implicit", async () => {
+    vi.mocked(fetchProfiles).mockResolvedValueOnce(profiles as never);
+    vi.mocked(fetchSettings).mockImplementation(async (profile) => settings(profile ?? "Alpha"));
+    vi.mocked(fetchProjects).mockImplementation(
+      async ({ profile }) =>
+        [
+          {
+            name: profile + "-only-project",
+            path: "/" + profile.toLowerCase(),
+            scope: "profile",
+            pinned: false,
+          },
+        ] as never,
+    );
+    renderWizard({ path: "/tmp/proj", tool: "claude" }, "Alpha");
+    await waitFor(() => expect(fetchSettings).toHaveBeenCalledWith("Alpha"));
+    await waitFor(() => expect(screen.getByText("Profile")).toBeTruthy());
+    await waitFor(() => expect(fetchProjects).toHaveBeenCalledWith({ profile: "Alpha" }));
+    for (const profile of ["Alpha", "Beta", "Alpha"]) {
+      if (profile === "Beta") await chooseProfile("Beta");
+      else if (vi.mocked(fetchSettings).mock.calls.some(([p]) => p === "Beta")) await chooseProfile("");
+      fireEvent.click(screen.getByTestId("wizard-project-row"));
+      expect(await screen.findByText(profile + "-only-project")).toBeTruthy();
+      expect(screen.queryByText("Main-only-project")).toBeNull();
+      fireEvent.click(screen.getByRole("button", { name: "Back", exact: true }));
+      open("Extra repos");
+      expect(await screen.findByText(profile + "-only-project")).toBeTruthy();
+      expect(screen.queryByText("Main-only-project")).toBeNull();
+      fireEvent.click(screen.getByRole("button", { name: "Back", exact: true }));
+      fireEvent.click(screen.getByTestId("wizard-agent-row"));
+      expect(await screen.findByText(new RegExp(profile + "-claude"))).toBeTruthy();
+      fireEvent.click(screen.getByRole("button", { name: "Back", exact: true }));
+    }
+    await launch();
+    await waitFor(() => expect(createSession).toHaveBeenCalled());
+    expect(payload().profile).toBeUndefined();
+    expect(payload().yolo_mode).toBe(false);
+    expect(vi.mocked(fetchSettings).mock.calls.some(([profile]) => profile === "Main")).toBe(false);
+    expect(vi.mocked(fetchProjects).mock.calls.some(([context]) => context.profile === "Main")).toBe(false);
+  });
+
+  it("does not let a delayed Alpha seed overwrite Beta selection, and keeps explicit prefill authority", async () => {
+    vi.mocked(fetchProfiles).mockResolvedValueOnce(profiles as never);
+    const seed = Promise.withResolvers<Awaited<ReturnType<typeof fetchSettings>>>();
+    vi.mocked(fetchSettings).mockImplementation(async (profile) =>
+      profile === "Alpha" ? seed.promise : settings(profile!),
+    );
+    renderWizard({ path: "/tmp/proj", tool: "claude" }, "Alpha");
+    await waitFor(() => expect(fetchSettings).toHaveBeenCalledWith("Alpha"));
+    await waitFor(() => expect(screen.getByText("Profile")).toBeTruthy());
+    await chooseProfile("Beta");
+    await act(async () => seed.resolve(settings("Alpha")));
+    expect(screen.getByRole("switch", { name: "Auto-approve actions" }).getAttribute("aria-checked")).toBe("true");
+    await launch();
+    expect(payload()).toMatchObject({ profile: "Beta", yolo_mode: true });
+    cleanup();
+    createSession.mockClear();
+    renderWizard(
+      { path: "/tmp/proj", tool: "claude", profile: "Beta", yoloMode: false, worktreeEnabled: false },
+      "Alpha",
+    );
+    await launch();
+    expect(payload()).toMatchObject({ profile: "Beta", yolo_mode: false, worktree_enabled: false });
+  });
+
+  it("waits for served registry scope instead of guessing the machine default", async () => {
+    vi.mocked(fetchProfiles).mockResolvedValueOnce(profiles as never);
+    vi.mocked(fetchSettings).mockResolvedValue({});
+    const view = render(<SessionWizard onClose={() => {}} onCreated={() => {}} />);
+    await waitFor(() => expect(fetchProfiles).toHaveBeenCalled());
+    expect(fetchSettings).not.toHaveBeenCalled();
+    expect(fetchProjects).not.toHaveBeenCalled();
+    view.rerender(<SessionWizard servedProfile="Alpha" onClose={() => {}} onCreated={() => {}} />);
+    await waitFor(() => expect(fetchSettings).toHaveBeenCalledWith("Alpha"));
+    await waitFor(() => expect(fetchProjects).toHaveBeenCalledWith({ profile: "Alpha" }));
   });
 });

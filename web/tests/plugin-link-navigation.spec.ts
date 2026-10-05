@@ -18,6 +18,7 @@ async function mockApis(page: Page, uiEntries: unknown[]) {
   await page.route("**/api/sessions", (r) => {
     if (r.request().method() !== "GET") return r.fulfill({ status: 400 });
     return r.fulfill({
+      headers: { "aoe-runtime-epoch": "mock-runtime", "aoe-runtime-revision": "1" },
       json: {
         sessions: [
           sessionResponse({ id: "sess-a", title: "Ethiopians", project_path: "/tmp/agent-of-empires" }),

@@ -145,9 +145,12 @@ pub(super) struct PendingArchiveCursor {
     pub(super) successor: Option<String>,
 }
 
-/// A creation this view submitted to the daemon and still displays. The row is
-/// a local placeholder: the daemon owns provisioning, the hooks, and the
-/// committed session, so nothing here may be persisted or mutated.
+pub(super) enum CreationConfirmation {
+    Receipt(crate::daemon::MutationReceipt<crate::daemon::SessionResponse>),
+    Canonical(crate::daemon::SessionResponse),
+}
+
+/// A display-only creation placeholder and its retained completion proof.
 pub(super) struct PendingCreation {
     /// The daemon's session id, known once a reservation or progress entry
     /// names this creation.
@@ -157,6 +160,8 @@ pub(super) struct PendingCreation {
     pub(super) cancel_requested: bool,
     pub(super) cancel_sent: bool,
     pub(super) outcome_unknown: bool,
+    pub(super) confirmation: Option<CreationConfirmation>,
+    pub(super) reload_retry_at: Option<std::time::Instant>,
 }
 
 /// One applied passive resize: the preview geometry the dedup keys on, the
@@ -212,6 +217,7 @@ pub struct HomeView {
     /// The runtime publishes a merged view of it (unknown workspaces
     /// appended), so this is what detects a peer's reorder.
     observed_workspace_ordering: Vec<String>,
+    session_feed_reload_retry_at: Option<std::time::Instant>,
     pub(super) group_trees: HashMap<String, GroupTree>,
     /// Duplicate session ids that remain ambiguous after journal-guided
     /// reconciliation (#3459): every copy is excluded from `instances` and

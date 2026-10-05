@@ -27,8 +27,8 @@ use crate::plugin::automation_policy::{
 use crate::plugin::host_api::{DispatchError, PluginRpcContext};
 use crate::plugin::protocol::codes;
 use crate::server::session_service::{
-    CreateIdempotencyProbe, IdempotencyConflict, SendTurnError, SendTurnRequest, SessionCaller,
-    SessionService,
+    CreateIdempotencyProbe, IdempotencyConflict, PromptTouch, SendTurnError, SendTurnRequest,
+    SessionCaller, SessionService,
 };
 use crate::server::session_spawn::StructuredSessionSpec;
 
@@ -538,7 +538,7 @@ async fn admit_and_create(
                 });
             }
             Ok(CreateIdempotencyProbe::New) => {}
-            Err(conflict) => return Err(map_create_error(anyhow::Error::new(conflict))),
+            Err(error) => return Err(map_create_error(error)),
         }
     }
 
@@ -584,6 +584,13 @@ fn map_create_error(e: anyhow::Error) -> DispatchError {
             codes::CONFLICT,
             "idempotency_conflict",
             conflict.to_string(),
+        );
+    }
+    if e.is::<crate::server::session_service::CreationUnfinalized>() {
+        return DispatchError::with_kind(
+            codes::FAILED_PRECONDITION,
+            "create_outcome_unknown",
+            e.to_string(),
         );
     }
     if e.downcast_ref::<crate::server::api::sessions::HooksNeedTrust>()
@@ -680,10 +687,15 @@ async fn sessions_turn_send(
             .session_service
             .touch_and_wake_on_prompt(&req.session_id, false)
             .await
-            .idle_dormant()
         {
-            Ok(woke) => woke,
-            Err(blocked) => {
+            PromptTouch::Touched { idle_dormant } => idle_dormant,
+            PromptTouch::WorkerNotReady | PromptTouch::RevivalRefused => {
+                if marked_pending {
+                    clear_revival_pending(&deps.session_service, &req.session_id).await;
+                }
+                return Err(DispatchError::with_kind(codes::FAILED_PRECONDITION, "worker_not_ready", "The structured session launch is not finalized"));
+            }
+            PromptTouch::Blocked(blocked) => {
                 if marked_pending {
                     clear_revival_pending(&deps.session_service, &req.session_id).await;
                 }

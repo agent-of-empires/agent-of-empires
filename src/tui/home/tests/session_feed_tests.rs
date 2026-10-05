@@ -285,8 +285,8 @@ fn native_attachment_never_survives_a_cancelled_context() {
         );
         assert_eq!(
             env.view.session_feed.can_submit(&id),
-            matches!(change, Change::None | Change::Rejected),
-            "retry availability: {change:?}"
+            true,
+            "known completion frees the row after UX cancellation: {change:?}"
         );
         if matches!(change, Change::Rejected) {
             assert!(env.view.info_dialog.is_some());
@@ -1283,68 +1283,255 @@ fn canonical_revision_reconciles_metadata_across_workspace_reordering() {
         .is_some_and(|row| row.title == "ordering-arrival"));
 }
 
-/// A revision that reconciles rows is only applied once the locked storage
-/// reload that reads those rows succeeded. When that reload fails the mirror
-/// is still showing pre-revision rows, so marking the revision applied would
-/// let the runtime's own "the view is synchronized" gate release rows against
-/// state this view never loaded.
 #[test]
 #[serial]
-fn a_revision_whose_reload_failed_stays_unapplied() {
-    let mut env = create_test_env_empty();
-    let instance = local_row(&mut env, "alpha", "/tmp/repo");
-    env.view.save().expect("seed the durable row");
-    let mut renamed = instance.clone();
-    renamed.title = "renamed".into();
-    Storage::new_unwatched("test")
-        .unwrap()
-        .update(|rows, _| {
-            *rows = vec![renamed.clone()];
+fn failed_snapshot_reload_retries_without_publication_and_acknowledges_order_only_on_success() {
+    use crate::daemon::{RuntimeCursor, SessionMutation};
+    for change in ["rename", "add", "remove", "ordering"] {
+        let mut env = create_test_env_empty();
+        let instance = local_row(&mut env, "alpha", "/tmp/repo");
+        env.view.save().unwrap();
+        let mut respond = env.view.session_feed.command_driver_for_test();
+        publish_canonical_snapshot(
+            &mut env,
+            vec![canonical_row(&instance, serde_json::json!({}))],
+            vec![],
+            1,
+        );
+        env.view
+            .session_feed
+            .submit(instance.id.clone(), SessionMutation::Stop)
+            .unwrap();
+        assert!(respond(Ok(RuntimeCursor {
+            epoch: "test".into(),
+            revision: 2
+        }))
+        .is_some());
+        let before_order = env.view.observed_workspace_ordering.clone();
+        let mut durable = instance.clone();
+        if change == "rename" {
+            durable.title = "renamed".into();
+        }
+        let mut durable_rows = vec![durable.clone()];
+        if change == "add" {
+            let mut peer = Instance::new("peer", "/tmp/peer");
+            peer.source_profile = "test".into();
+            peer.view = crate::session::View::Structured;
+            durable_rows.push(peer);
+        }
+        if change == "remove" {
+            durable_rows.clear();
+        }
+        let storage = Storage::new_unwatched("test").unwrap();
+        storage
+            .update(|rows, _| {
+                *rows = durable_rows.clone();
+                Ok(())
+            })
+            .unwrap();
+        let order = vec![format!("/tmp/repo::retry-{change}")];
+        crate::session::update_workspace_ordering(|ordering| {
+            ordering.order = order.clone();
             Ok(())
         })
-        .expect("publish the canonical row on disk");
+        .unwrap();
+        let sessions_path = storage.sessions_path().to_path_buf();
+        let valid = std::fs::read(&sessions_path).unwrap();
+        std::fs::write(&sessions_path, b"{ invalid json ]").unwrap();
+        publish_canonical_snapshot(
+            &mut env,
+            durable_rows
+                .iter()
+                .map(|row| canonical_row(row, serde_json::json!({})))
+                .collect(),
+            order.clone(),
+            2,
+        );
+        assert_eq!(env.view.session_feed.next_revision_for_test(), 2);
+        assert!(!env.view.session_feed.can_submit(&instance.id));
+        assert_eq!(env.view.observed_workspace_ordering, before_order);
+        assert_eq!(
+            env.view.info_dialog.as_ref().map(InfoDialog::title),
+            Some("Runtime state not applied")
+        );
+        env.view.info_dialog = None;
+        assert!(
+            !env.view.apply_session_feed(),
+            "backoff does not read disk or reopen the error"
+        );
+        assert!(env.view.info_dialog.is_none());
+        std::fs::write(&sessions_path, valid).unwrap();
+        env.view.session_feed_reload_retry_at = Some(std::time::Instant::now());
+        assert!(env.view.apply_session_feed());
+        assert_eq!(env.view.instances.len(), durable_rows.len());
+        for row in &durable_rows {
+            assert_eq!(env.view.get_instance(&row.id).unwrap().title, row.title);
+        }
+        if change == "remove" {
+            assert!(env.view.get_instance(&instance.id).is_none());
+        }
+        assert_eq!(env.view.observed_workspace_ordering, order);
+        assert_eq!(env.view.session_feed.next_revision_for_test(), 3);
+        assert!(env.view.session_feed.can_submit(&instance.id));
+        assert!(
+            !env.view.apply_session_feed(),
+            "successful replay is acknowledged once"
+        );
+        assert!(
+            respond(Ok(RuntimeCursor {
+                epoch: "test".into(),
+                revision: 3
+            }))
+            .is_none(),
+            "retry sends no mutation"
+        );
+    }
+}
 
-    // This revision renames the row, so applying it goes through the reload.
-    let unapplied = env.view.session_feed.next_revision_for_test();
-    publish_canonical_snapshot(
-        &mut env,
-        vec![canonical_row(&renamed, serde_json::json!({}))],
-        vec![],
-        5,
-    );
-    let applied = env.view.session_feed.next_revision_for_test();
-    assert!(
-        applied > unapplied,
-        "a revision whose reload succeeded is marked applied"
-    );
-    assert!(env
-        .view
-        .get_instance(&instance.id)
-        .is_some_and(|row| row.title == "renamed"));
+#[test]
+#[serial]
+fn a_newer_snapshot_supersedes_a_failed_reload_and_unavailable_discards_its_retry() {
+    for disconnect in [false, true] {
+        let mut env = create_test_env_empty();
+        let instance = local_row(&mut env, "original", "/tmp/repo");
+        env.view.save().unwrap();
+        let _driver = env.view.session_feed.command_driver_for_test();
+        publish_canonical_snapshot(
+            &mut env,
+            vec![canonical_row(&instance, serde_json::json!({}))],
+            vec![],
+            1,
+        );
+        let storage = Storage::new_unwatched("test").unwrap();
+        let sessions_path = storage.sessions_path().to_path_buf();
+        let mut durable = instance.clone();
+        durable.title = "latest".into();
+        storage
+            .update(|rows, _| {
+                *rows = vec![durable.clone()];
+                Ok(())
+            })
+            .unwrap();
+        let valid = std::fs::read(&sessions_path).unwrap();
+        std::fs::write(&sessions_path, b"{ invalid json ]").unwrap();
+        let mut superseded = durable.clone();
+        superseded.title = "superseded".into();
+        publish_canonical_snapshot(
+            &mut env,
+            vec![canonical_row(&superseded, serde_json::json!({}))],
+            vec![],
+            2,
+        );
+        assert_eq!(env.view.session_feed.next_revision_for_test(), 2);
+        if disconnect {
+            env.view
+                .session_feed
+                .publish_for_test(SessionFeedResult::Unavailable("lost".into()));
+            env.view.apply_session_feed();
+            assert!(env.view.session_feed_reload_retry_at.is_none());
+            std::fs::write(&sessions_path, valid).unwrap();
+            assert!(!env.view.apply_session_feed());
+            assert_eq!(
+                env.view.get_instance(&instance.id).unwrap().title,
+                "original"
+            );
+            assert_eq!(env.view.session_feed.next_revision_for_test(), 2);
+        } else {
+            publish_canonical_snapshot(
+                &mut env,
+                vec![canonical_row(&durable, serde_json::json!({}))],
+                vec![],
+                3,
+            );
+            std::fs::write(&sessions_path, valid).unwrap();
+            env.view.session_feed_reload_retry_at = Some(std::time::Instant::now());
+            env.view.apply_session_feed();
+            assert_eq!(env.view.get_instance(&instance.id).unwrap().title, "latest");
+            assert_eq!(env.view.session_feed.next_revision_for_test(), 4);
+            assert!(!env.view.apply_session_feed());
+        }
+    }
+}
 
-    // The file that reload has to read is unreadable from here on.
-    let sessions_path = Storage::new_unwatched("test")
-        .unwrap()
-        .sessions_path()
-        .to_path_buf();
-    std::fs::write(&sessions_path, b"{ this is not valid json ]").unwrap();
-
-    // This revision drops the row, which the view can only learn from a
-    // reload, so the failing reload is the one that must hold it back.
-    publish_canonical_snapshot(&mut env, vec![], vec![], 6);
-
-    assert_eq!(
-        env.view.info_dialog.as_ref().map(InfoDialog::title),
-        Some("Runtime state not applied"),
-        "the operator is told the revision did not land"
-    );
-    assert!(
-        env.view.get_instance(&instance.id).is_some(),
-        "the reload failed, so the pre-revision row is still on screen"
-    );
-    assert_eq!(
-        env.view.session_feed.next_revision_for_test(),
-        applied,
-        "a revision whose reload failed must not be marked applied"
-    );
+#[test]
+#[serial]
+fn cancelled_attach_live_send_and_send_settle_without_a_continuation_in_either_receipt_order() {
+    use crate::daemon::{MutationReceipt, RuntimeCursor, TerminalTarget, TerminalTargetStatus};
+    use crate::session::{AuxiliaryObservation, AuxiliaryTarget, PaneObservation, PanePresence};
+    use crate::tui::home::live_send::LiveSendTarget;
+    use crate::tui::home::panes::{NativePane, PaneIntent};
+    for intent in 0..3 {
+        for receipt_first in [false, true] {
+            let mut env = create_test_env_with_sessions(1);
+            let id = env.view.instance_at(0).id.clone();
+            env.view.select_session_by_id(&id);
+            let mut respond = env.view.session_feed.terminal_driver_for_test();
+            let SessionFeedResult::Snapshot(mut snapshot) = daemon_snapshot(&id, "Stopped") else {
+                unreachable!()
+            };
+            let target = AuxiliaryTarget::Host { index: 0 };
+            std::sync::Arc::make_mut(&mut snapshot).contents.sessions[0].auxiliary =
+                vec![AuxiliaryObservation {
+                    target: target.clone(),
+                    pane: PaneObservation {
+                        state: PanePresence::Alive,
+                        tmux_session: Some("owned-pane".into()),
+                    },
+                }];
+            env.view
+                .session_feed
+                .publish_for_test(SessionFeedResult::Snapshot(snapshot.clone()));
+            env.view.apply_session_feed();
+            let continuation = match intent {
+                0 => PaneIntent::Attach,
+                1 => PaneIntent::LiveSend(LiveSendTarget::Terminal),
+                _ => PaneIntent::Send {
+                    message: "must not be sent".into(),
+                    target: LiveSendTarget::Terminal,
+                },
+            };
+            env.view
+                .prepare_native_attachment(&id, NativePane::Auxiliary(target), None, continuation)
+                .unwrap();
+            env.view
+                .handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), None);
+            let mut receipt = Some(MutationReceipt {
+                cursor: RuntimeCursor {
+                    epoch: "test".into(),
+                    revision: 2,
+                },
+                outcome: TerminalTarget {
+                    tmux_session: "owned-pane".into(),
+                    status: TerminalTargetStatus::Exists,
+                    lifecycle_generation: 0,
+                    profile: String::new(),
+                },
+            });
+            if receipt_first {
+                respond(Ok(receipt.take().unwrap()));
+            }
+            std::sync::Arc::make_mut(&mut snapshot).cursor.revision = 2;
+            if receipt_first {
+                env.view.apply_session_feed();
+                assert!(!env.view.session_feed.can_submit(&id));
+            }
+            env.view
+                .session_feed
+                .publish_for_test(SessionFeedResult::Snapshot(snapshot));
+            env.view.apply_session_feed();
+            if !receipt_first {
+                assert!(!env.view.session_feed.can_submit(&id));
+                respond(Ok(receipt.take().unwrap()));
+                env.view.apply_session_feed();
+            }
+            assert!(
+                env.view.take_native_attachment().is_none(),
+                "no attach/live/send callback: {intent}"
+            );
+            assert!(env.view.pending_native_attachment.is_none());
+            assert!(env.view.live_send.is_none());
+            assert!(env.view.session_feed.can_submit(&id));
+            assert!(env.view.pending_indeterminate_queue.is_empty());
+        }
+    }
 }

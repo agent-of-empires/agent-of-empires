@@ -86,6 +86,7 @@ pub async fn acp_prompt(
     {
         PromptTouch::Touched { idle_dormant } => idle_dormant,
         PromptTouch::RevivalRefused => return no_revive_refused(),
+        PromptTouch::WorkerNotReady => return worker_not_ready(),
         PromptTouch::Blocked(blocked) => {
             return crate::server::api::start_blocked_response(blocked)
         }
@@ -244,10 +245,13 @@ pub async fn acp_prompt_diff_comments(
         .session_service
         .touch_and_wake_on_prompt(&id, false)
         .await
-        .idle_dormant()
     {
-        Ok(woke) => woke,
-        Err(blocked) => return crate::server::api::start_blocked_response(blocked),
+        PromptTouch::Touched { idle_dormant } => idle_dormant,
+        PromptTouch::RevivalRefused => return no_revive_refused(),
+        PromptTouch::WorkerNotReady => return worker_not_ready(),
+        PromptTouch::Blocked(blocked) => {
+            return crate::server::api::start_blocked_response(blocked)
+        }
     };
     let dispatch = state
         .session_service

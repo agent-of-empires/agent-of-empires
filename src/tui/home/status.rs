@@ -133,6 +133,7 @@ impl HomeView {
     }
 
     pub fn connect_runtime(&mut self) {
+        self.session_feed_reload_retry_at = None;
         self.set_sidebar_source(crate::tui::session_feed::SidebarSource::Connecting, None);
         self.session_feed
             .connect(self.active_profile.clone().unwrap_or_default());
@@ -186,18 +187,12 @@ impl HomeView {
     /// durable identity/layout fields and removals must come from the locked
     /// storage load before the revision is marked applied.
     fn snapshot_requires_storage_reload(
-        &mut self,
+        &self,
         snapshot: &crate::daemon::RuntimeSnapshot,
+        persisted_ordering: &[String],
     ) -> bool {
-        // The published ordering is the daemon's merged view (unknown
-        // workspaces appended), so it cannot be compared to the persisted
-        // file directly. A change to the persisted manual order is the thing
-        // this view can still miss, so track what it last observed.
-        let persisted = crate::session::load_workspace_ordering()
-            .map(|ordering| ordering.order)
-            .unwrap_or_default();
-        if persisted != self.observed_workspace_ordering {
-            self.observed_workspace_ordering = persisted;
+        // The daemon appends unknown workspaces; acknowledge the persisted manual order instead.
+        if persisted_ordering != self.observed_workspace_ordering.as_slice() {
             return true;
         }
 
@@ -333,139 +328,155 @@ impl HomeView {
         let updated = match self.session_feed.try_recv() {
             Ok(result) => match result {
                 SessionFeedResult::Snapshot(snapshot) => {
-                    let mut metadata_changed = false;
-                    // Rows load from storage rather than from the wire
-                    // projection, so a revision that adds, renames, moves,
-                    // re-renders, or drops a row is reconciled from the locked
-                    // storage load before this revision is marked applied. A
-                    // reload also keeps a still-unpublished creating stub alive.
-                    metadata_changed |=
-                        self.reconcile_in_flight_creation(&snapshot.contents.sessions);
-                    let in_flight = self.in_flight_creation_id();
-                    let unknown_row = snapshot.contents.sessions.iter().any(|row| {
-                        Some(row.id.as_str()) != in_flight
-                            && !self.instances.contains_key(&row.id)
-                            && self.storages.contains_key(&row.profile)
-                    });
-                    // A revision that reconciles rows is only applied once the
-                    // locked reload that reads those rows succeeded; otherwise
-                    // the mirror keeps showing pre-revision state while the
-                    // quarantine treats it as canonical.
-                    let mut reload_failed = false;
-                    if unknown_row || self.snapshot_requires_storage_reload(&snapshot) {
-                        match self.reload() {
-                            Ok(()) => metadata_changed = true,
-                            Err(error) => {
-                                reload_failed = true;
-                                tracing::warn!(
-                                    target: "tui.session_feed",
-                                    %error,
-                                    "reload before applying a canonical runtime revision failed"
-                                );
-                                self.info_dialog = Some(crate::tui::dialogs::InfoDialog::new(
-                                    "Runtime state not applied",
-                                    &format!(
-                                        "The runtime's canonical state could not be loaded, so this revision stays unapplied and a session blocked on an unknown outcome stays blocked.\n\n{error}"
-                                    ),
-                                ));
+                    if self
+                        .session_feed_reload_retry_at
+                        .is_some_and(|retry_at| std::time::Instant::now() < retry_at)
+                    {
+                        false
+                    } else {
+                        let persisted_ordering = crate::session::load_workspace_ordering()
+                            .map(|ordering| ordering.order)
+                            .unwrap_or_default();
+                        let mut metadata_changed = false;
+                        // Durable rows come from the locked storage load, preserving the creation stub.
+                        metadata_changed |=
+                            self.reconcile_in_flight_creation(&snapshot.contents.sessions);
+                        let in_flight = self.in_flight_creation_id();
+                        let unknown_row = snapshot.contents.sessions.iter().any(|row| {
+                            Some(row.id.as_str()) != in_flight
+                                && !self.instances.contains_key(&row.id)
+                                && self.storages.contains_key(&row.profile)
+                        });
+                        // A failed load keeps the revision unapplied, even if a later reload masks its diff.
+                        let mut reload_failed = false;
+                        if self.session_feed_reload_retry_at.is_some()
+                            || unknown_row
+                            || self.snapshot_requires_storage_reload(&snapshot, &persisted_ordering)
+                        {
+                            match self.reload() {
+                                Ok(()) => metadata_changed = true,
+                                Err(error) => {
+                                    reload_failed = true;
+                                    self.session_feed_reload_retry_at = Some(
+                                        std::time::Instant::now()
+                                            + Self::RECONCILE_RELOAD_RETRY_INTERVAL,
+                                    );
+                                    tracing::warn!(
+                                        target: "tui.session_feed",
+                                        %error,
+                                        "reload before applying a canonical runtime revision failed"
+                                    );
+                                    self.info_dialog = Some(crate::tui::dialogs::InfoDialog::new(
+                                        "Runtime state not applied",
+                                        &format!(
+                                            "The runtime's canonical state could not be loaded, so this revision stays unapplied and a session blocked on an unknown outcome stays blocked.\n\n{error}"
+                                        ),
+                                    ));
+                                }
                             }
                         }
-                    }
-                    for row in &snapshot.contents.sessions {
-                        metadata_changed |= self.apply_daemon_status_update(row);
-                        let Some(instance) = self.instances.get_mut(&row.id) else {
-                            continue;
-                        };
-                        if instance.agent_pane != row.agent_pane {
-                            instance.agent_pane.clone_from(&row.agent_pane);
-                            metadata_changed = true;
-                        }
-                        if instance.auxiliary != row.auxiliary {
-                            instance.auxiliary.clone_from(&row.auxiliary);
-                            metadata_changed = true;
-                        }
-                        if instance.unread != row.unread {
-                            instance.unread = row.unread;
-                            metadata_changed = true;
-                            if !row.unread && self.manual_unread_hold.as_deref() == Some(&row.id) {
-                                self.manual_unread_hold = None;
-                            }
-                        }
-                        for (raw, current) in [
-                            (row.archived_at.as_deref(), &mut instance.archived_at),
-                            (row.favorited_at.as_deref(), &mut instance.favorited_at),
-                            (row.snoozed_until.as_deref(), &mut instance.snoozed_until),
-                            (row.pinned_at.as_deref(), &mut instance.pinned_at),
-                            (
-                                row.last_accessed_at.as_deref(),
-                                &mut instance.last_accessed_at,
-                            ),
-                            (
-                                row.idle_entered_at.as_deref(),
-                                &mut instance.idle_entered_at,
-                            ),
-                            (
-                                row.idle_dormant_since.as_deref(),
-                                &mut instance.idle_dormant_since,
-                            ),
-                        ] {
-                            let next = match raw {
-                                Some(value) => match chrono::DateTime::parse_from_rfc3339(value) {
-                                    Ok(value) => Some(value.with_timezone(&chrono::Utc)),
-                                    Err(_) => continue,
-                                },
-                                None => None,
+                        for row in &snapshot.contents.sessions {
+                            metadata_changed |= self.apply_daemon_status_update(row);
+                            let Some(instance) = self.instances.get_mut(&row.id) else {
+                                continue;
                             };
-                            if *current != next {
-                                *current = next;
+                            if instance.agent_pane != row.agent_pane {
+                                instance.agent_pane.clone_from(&row.agent_pane);
                                 metadata_changed = true;
                             }
+                            if instance.auxiliary != row.auxiliary {
+                                instance.auxiliary.clone_from(&row.auxiliary);
+                                metadata_changed = true;
+                            }
+                            if instance.unread != row.unread {
+                                instance.unread = row.unread;
+                                metadata_changed = true;
+                                if !row.unread
+                                    && self.manual_unread_hold.as_deref() == Some(&row.id)
+                                {
+                                    self.manual_unread_hold = None;
+                                }
+                            }
+                            for (raw, current) in [
+                                (row.archived_at.as_deref(), &mut instance.archived_at),
+                                (row.favorited_at.as_deref(), &mut instance.favorited_at),
+                                (row.snoozed_until.as_deref(), &mut instance.snoozed_until),
+                                (row.pinned_at.as_deref(), &mut instance.pinned_at),
+                                (
+                                    row.last_accessed_at.as_deref(),
+                                    &mut instance.last_accessed_at,
+                                ),
+                                (
+                                    row.idle_entered_at.as_deref(),
+                                    &mut instance.idle_entered_at,
+                                ),
+                                (
+                                    row.idle_dormant_since.as_deref(),
+                                    &mut instance.idle_dormant_since,
+                                ),
+                            ] {
+                                let next = match raw {
+                                    Some(value) => {
+                                        match chrono::DateTime::parse_from_rfc3339(value) {
+                                            Ok(value) => Some(value.with_timezone(&chrono::Utc)),
+                                            Err(_) => continue,
+                                        }
+                                    }
+                                    None => None,
+                                };
+                                if *current != next {
+                                    *current = next;
+                                    metadata_changed = true;
+                                }
+                            }
                         }
+                        if metadata_changed {
+                            self.rebuild_flat_items();
+                            self.reseat_cursor_after_rebuild();
+                            // A rebuild reorders rows under the cursor: resolve the
+                            // selection for the row that now sits there, so a key
+                            // pressed right after a canonical frame acts on what the
+                            // user sees instead of on nothing.
+                            self.update_selected();
+                        }
+                        metadata_changed |= self.set_sidebar_source(SidebarSource::Daemon, None);
+                        if !self.structured_pending_approvals.is_empty() {
+                            let ids: std::collections::HashSet<_> = snapshot
+                                .contents
+                                .sessions
+                                .iter()
+                                .map(|row| row.id.as_str())
+                                .collect();
+                            let count = self.structured_pending_approvals.len();
+                            self.structured_pending_approvals
+                                .retain(|id, _| ids.contains(id.as_str()));
+                            metadata_changed |= count != self.structured_pending_approvals.len();
+                        }
+                        if !reload_failed {
+                            self.session_feed_reload_retry_at = None;
+                            self.observed_workspace_ordering = persisted_ordering;
+                            metadata_changed |= self.session_feed.mark_snapshot_applied(snapshot);
+                            snapshot_applied = true;
+                        }
+                        metadata_changed
                     }
-                    if metadata_changed {
-                        self.rebuild_flat_items();
-                        self.reseat_cursor_after_rebuild();
-                        // A rebuild reorders rows under the cursor: resolve the
-                        // selection for the row that now sits there, so a key
-                        // pressed right after a canonical frame acts on what the
-                        // user sees instead of on nothing.
-                        self.update_selected();
-                    }
-                    metadata_changed |= self.set_sidebar_source(SidebarSource::Daemon, None);
-                    if !self.structured_pending_approvals.is_empty() {
-                        let ids: std::collections::HashSet<_> = snapshot
-                            .contents
-                            .sessions
-                            .iter()
-                            .map(|row| row.id.as_str())
-                            .collect();
-                        let count = self.structured_pending_approvals.len();
-                        self.structured_pending_approvals
-                            .retain(|id, _| ids.contains(id.as_str()));
-                        metadata_changed |= count != self.structured_pending_approvals.len();
-                    }
-                    if !reload_failed {
-                        metadata_changed |= self.session_feed.mark_snapshot_applied(snapshot);
-                    }
-                    if !self.session_feed.native_interaction_available() {
-                        self.cancel_native_attachment();
-                        self.teardown_live_send();
-                        self.pending_paste = None;
-                    }
-                    // Last: the native teardown reseats the cursor even when no
-                    // live send was active, so the archive's placement has to be
-                    // the final word or it selects the row that just sank.
-                    metadata_changed |= self.apply_pending_archive_cursor();
-                    snapshot_applied = true;
-                    metadata_changed
                 }
                 SessionFeedResult::Unavailable(reason) => {
+                    self.session_feed_reload_retry_at = None;
                     self.set_sidebar_source(SidebarSource::Disconnected, Some(&reason))
                 }
             },
             Err(TryRecvError::Empty) => false,
             Err(TryRecvError::Disconnected) => false,
         };
+        if !self.session_feed.native_interaction_available() {
+            self.cancel_native_attachment();
+            if snapshot_applied || self.live_send.is_some() {
+                self.teardown_live_send();
+            }
+            self.pending_paste = None;
+        }
+        let archive_cursor_changed = snapshot_applied && self.apply_pending_archive_cursor();
         let drained = self.session_feed.drain_command_errors();
         let command_error = self.present_command_errors(drained);
         if snapshot_applied {
@@ -482,7 +493,7 @@ impl HomeView {
                 self.clear_unread_on_view(&id);
             }
         }
-        updated || command_error
+        updated || command_error || archive_cursor_changed
     }
 
     pub(in crate::tui) fn apply_daemon_status_update(

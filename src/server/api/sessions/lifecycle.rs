@@ -1328,6 +1328,289 @@ fn admit_restart(
     Ok(())
 }
 
+fn reserve_structured_restart(
+    state: Arc<AppState>,
+    instance: &Instance,
+    body: &crate::daemon::RestartSessionBody,
+) -> anyhow::Result<(crate::server::session_store::NativeSessionStore, Instance)> {
+    use crate::session::SessionStore;
+    let native = crate::server::session_store::NativeSessionStore::open(
+        state.clone(),
+        &instance.source_profile,
+        Some(instance.id.clone()),
+    )?;
+    native.configuration(Some(&instance.source_profile))?;
+    let _identity = crate::session::acquire_session_identity_lock()?;
+    let _title = crate::session::acquire_session_title_lock(&instance.id)?;
+    let _lifecycle = native
+        .storage()
+        .acquire_instance_lifecycle_lock(&instance.id)?;
+    let mut probe = native
+        .load()?
+        .into_iter()
+        .find(|row| row.id == instance.id)
+        .ok_or(crate::session::SessionGone)?;
+    admit_restart(&mut probe, body, false)?;
+    if let Some(target) = body
+        .profile
+        .as_deref()
+        .filter(|target| *target != instance.source_profile)
+    {
+        let target_native = crate::server::session_store::NativeSessionStore::open(
+            state.clone(),
+            target,
+            Some(instance.id.clone()),
+        )?;
+        (&target_native as &dyn SessionStore)
+            .launch_configuration(std::path::Path::new(&instance.project_path))?;
+        let rows = target_native.load()?;
+        if rows.iter().any(|row| row.id == instance.id)
+            || is_duplicate_session(rows.iter(), &probe.title, &probe.project_path, None)
+        {
+            return Err(duplicate_session_error(&probe.title));
+        }
+    } else {
+        (&native as &dyn SessionStore)
+            .launch_configuration(std::path::Path::new(&instance.project_path))?;
+    }
+    let reserved = (&native as &dyn SessionStore).update(|rows, _| {
+        let row = rows
+            .iter_mut()
+            .find(|row| row.id == instance.id)
+            .ok_or(crate::session::SessionGone)?;
+        row.ensure_startable()?;
+        if matches!(row.status, Status::Creating | Status::Deleting)
+            || row.has_fresh_lifecycle_reservation(chrono::Utc::now())
+        {
+            return Err(LifecycleTargetError::Busy.into());
+        }
+        row.try_acquire_lifecycle_reservation(
+            LifecycleOperation::Launch,
+            Instance::LIFECYCLE_RESERVATION_TTL,
+            chrono::Utc::now(),
+        )?;
+        row.status = Status::Starting;
+        Ok(row.clone())
+    })?;
+    Ok((native, reserved))
+}
+
+struct StructuredRestartLaunch {
+    generation: u64,
+    started: Instance,
+    native: crate::server::session_store::NativeSessionStore,
+    hooks: anyhow::Result<()>,
+    carry: Option<crate::session::conversation_carry::ConversationCarry>,
+    wake: Option<String>,
+}
+
+async fn finish_structured_restart(
+    state: &Arc<AppState>,
+    id: &str,
+    launch: StructuredRestartLaunch,
+) -> axum::response::Response {
+    let result = async {
+        use crate::session::SessionStore;
+        let namespace = state.profile_namespace.read().await;
+        let submission = state.session_service.prompt_submission(id).await;
+        let lock = state.instance_lock(id).await;
+        let guard = lock.lock().await;
+        let supervisor = state.acp_supervisor.clone();
+        let StructuredRestartLaunch {
+            generation,
+            mut started,
+            native,
+            hooks,
+            carry,
+            wake,
+        } = launch;
+        let (started, native, wake, reservation) = tokio::task::spawn_blocking(move || {
+            let sandbox_info = started.sandbox_info.take();
+            let ownership =
+                match started.reacquire_launch_locks_after_hooks(&native, generation, hooks) {
+                    Ok(ownership) => ownership,
+                    Err(error) => {
+                        native.adopt_runtime_fields(&started)?;
+                        return Err(error);
+                    }
+                };
+            started.sandbox_info = sandbox_info;
+            let prepared = (|| {
+                supervisor.forget_stale_cancel(&started.id);
+                let reservation = match tokio::runtime::Handle::current().block_on(
+                    supervisor.begin_resume(&started.id, crate::acp::supervisor::ResumeKind::Spawn),
+                )? {
+                    crate::acp::supervisor::ResumeReservationOutcome::Reserved(lease) => lease,
+                    crate::acp::supervisor::ResumeReservationOutcome::AlreadyPresent => {
+                        return Err(crate::acp::supervisor::SupervisorError::AlreadyRunning(
+                            started.id.clone(),
+                        )
+                        .into());
+                    }
+                };
+                if let Some(carry) = carry {
+                    carry.run_for(&mut started)?;
+                }
+                let wake = match wake {
+                    Some(wake) => wake,
+                    None => {
+                        native
+                            .configuration(Some(&started.source_profile))?
+                            .session
+                            .restart_wake_message
+                    }
+                };
+                (&native as &dyn SessionStore).update(|rows, _| {
+                    let row = rows
+                        .iter_mut()
+                        .find(|row| row.id == started.id)
+                        .ok_or(crate::session::SessionGone)?;
+                    anyhow::ensure!(
+                        row.lifecycle_reservation_is_owned(LifecycleOperation::Launch, generation),
+                        crate::session::LifecycleReservationError::Superseded
+                    );
+                    row.sandbox_info.clone_from(&started.sandbox_info);
+                    row.agent_session_binding
+                        .clone_from(&started.agent_session_binding);
+                    row.resume_binding.clone_from(&started.resume_binding);
+                    row.status = Status::Starting;
+                    row.release_lifecycle_reservation_if_owned(
+                        LifecycleOperation::Launch,
+                        generation,
+                    );
+                    Ok(())
+                })?;
+                Ok::<_, anyhow::Error>((reservation, wake))
+            })();
+
+            let (reservation, wake) = match prepared {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    drop(ownership);
+                    let refusal =
+                        started.reacquire_launch_locks_after_hooks(&native, generation, Err(error));
+                    native.adopt_runtime_fields(&started)?;
+                    return Err(refusal.err().expect("a failed launch is refused"));
+                }
+            };
+            started.status = Status::Starting;
+            started.lifecycle_reservation = None;
+            native.adopt_runtime_fields(&started)?;
+            Ok::<_, anyhow::Error>((started, Arc::new(native), wake, reservation))
+        })
+        .await??;
+        let agent = state
+            .acp_supervisor
+            .pick_agent_for_tool(
+                &started.tool,
+                started.agent_name.as_deref(),
+                &started.source_profile,
+                std::path::Path::new(&started.project_path),
+            )
+            .await;
+        let mut request = crate::server::api::acp::spawn_request_for(
+            &started,
+            agent,
+            started.sandbox_info.clone(),
+        );
+        request.launch_admission = Some(crate::acp::supervisor::LaunchAdmission {
+            store: native.clone(),
+            generation,
+            namespace: Some(state.profile_namespace.clone()),
+        });
+        let profile = started.source_profile.clone();
+        drop(guard);
+        drop(submission);
+        drop(namespace);
+        let spawned = state
+            .acp_supervisor
+            .spawn_inner(request, reservation)
+            .await
+            .map_err(anyhow::Error::new);
+        crate::server::session_spawn::finish_structured_launch(
+            state, native, id, generation, spawned,
+        )
+        .await?;
+        if !wake.is_empty() {
+            let state = state.clone();
+            let id = id.to_owned();
+            let profile = profile.clone();
+            state
+                .session_service
+                .work
+                .clone()
+                .spawn("acp.restart_wake", async move {
+                    let _submission = state.session_service.prompt_submission(&id).await;
+                    let matches = state.instances.read().await.iter().any(|row| {
+                        row.id == id
+                            && row.lifecycle_generation == generation
+                            && row.source_profile == profile
+                            && row.launch_is_finalized()
+                            && row.ensure_startable().is_ok()
+                    });
+                    let dispatch = state
+                        .session_service
+                        .prompt_dispatch_under_submission(&id, false, true)
+                        .await;
+                    if matches
+                        && !matches!(
+                            dispatch,
+                            crate::acp::dispatch::PromptDispatch::Queued { .. }
+                        )
+                    {
+                        let result = state
+                            .session_service
+                            .send_turn(
+                                &crate::server::session_service::SessionCaller::User,
+                                &id,
+                                crate::server::session_service::SendTurnRequest {
+                                    text: &wake,
+                                    attachments: &[],
+                                    woke_idle_dormant: false,
+                                    prompt_id: None,
+                                    synthesized: true,
+                                    no_revive: true,
+                                },
+                            )
+                            .await;
+                        if let Err(error) = result {
+                            tracing::warn!(session = %id, %error, "structured restart wake failed");
+                        }
+                    }
+                });
+        }
+        Ok::<_, anyhow::Error>((generation, profile))
+    }
+    .await;
+    match result {
+        Ok((generation, profile)) => {
+            crate::server::runtime::session_mutation_response(
+                state,
+                id,
+                Some(crate::daemon::RestartOutcome {
+                    lifecycle_generation: generation,
+                    profile,
+                    target: None,
+                }),
+            )
+            .await
+        }
+        Err(error) => {
+            if let Some(response) = lifecycle_rejection(state, &error) {
+                return response;
+            }
+            tracing::warn!(session = %id, %error, "structured restart failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error":"start_failed", "message":"Structured restart failed",
+                })),
+            )
+                .into_response()
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum AgentPreparation {
     Start,
@@ -1371,7 +1654,7 @@ pub(super) async fn prepare_agent_session(
     };
     let lock = state.instance_lock(&id).await;
     let guard = lock.lock().await;
-    let instance = {
+    let mut instance = {
         let instances = state.instances.read().await;
         let Some(instance) = instances.iter().find(|row| row.id == id) else {
             return if state.cityhall_mode {
@@ -1416,11 +1699,64 @@ pub(super) async fn prepare_agent_session(
             ).into_response();
         }
     }
+    if instance.is_structured() && restart.is_some() {
+        let worker_state = state.clone();
+        let candidate = instance.clone();
+        let restart_body = restart.clone().expect("restart body");
+        let reserved = tokio::task::spawn_blocking(move || {
+            reserve_structured_restart(worker_state, &candidate, &restart_body)
+        })
+        .await;
+        let (native, reserved) = match reserved {
+            Ok(Ok(reserved)) => reserved,
+            Ok(Err(error)) => {
+                return lifecycle_rejection(&state, &error)
+                    .unwrap_or_else(|| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+            }
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        };
+        let stopped = state
+            .acp_supervisor
+            .shutdown_and_wait(&id, std::time::Duration::from_secs(5))
+            .await;
+        let released = tokio::task::spawn_blocking(move || {
+            (&native as &dyn crate::session::SessionStore).update(|rows, _| {
+                let row = rows
+                    .iter_mut()
+                    .find(|row| row.id == reserved.id)
+                    .ok_or(crate::session::SessionGone)?;
+                anyhow::ensure!(
+                    row.lifecycle_reservation_is_owned(
+                        LifecycleOperation::Launch,
+                        reserved.lifecycle_generation
+                    ),
+                    crate::session::LifecycleReservationError::Superseded
+                );
+                row.release_lifecycle_reservation_if_owned(
+                    LifecycleOperation::Launch,
+                    reserved.lifecycle_generation,
+                );
+                row.idle_dormant_since = Some(chrono::Utc::now());
+                Ok(row.clone())
+            })
+        })
+        .await;
+        instance = match released {
+            Ok(Ok(instance)) => instance,
+            _ => return StatusCode::CONFLICT.into_response(),
+        };
+        if let Err(error) = stopped {
+            tracing::warn!(session = %id, %error, "structured restart did not prove teardown");
+            return StatusCode::CONFLICT.into_response();
+        }
+    }
     let size = restart
         .as_ref()
         .and_then(|body| body.size.as_ref())
         .or(body.size.as_ref())
         .map(|size| (size.cols.get(), size.rows.get()));
+    let expected_restart_generation =
+        (instance.is_structured() && restart.is_some()).then_some(instance.lifecycle_generation);
     let worker_restart = restart.clone();
     let worker_state = state.clone();
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
@@ -1471,6 +1807,12 @@ pub(super) async fn prepare_agent_session(
                     return Err(crate::session::SessionGone.into());
                 }
                 return Err(error);
+            }
+            if let Some(expected) = expected_restart_generation {
+                anyhow::ensure!(
+                    outgoing.lifecycle_generation == expected,
+                    crate::session::LifecycleReservationError::Superseded
+                );
             }
         }
         let (account_swap, mut conversation_carry) = match worker_restart
@@ -1658,6 +2000,24 @@ pub(super) async fn prepare_agent_session(
         Ok(Ok(None)) => Ok(Ok(None)),
         Ok(Err(error)) => Ok(Err(error)),
         Err(error) => Err(error),
+    };
+    let hooked = match hooked {
+        Ok(Ok(Some((generation, started, native, hooks, carry)))) if started.is_structured() => {
+            return finish_structured_restart(
+                &state,
+                &id,
+                StructuredRestartLaunch {
+                    generation,
+                    started,
+                    native,
+                    hooks,
+                    carry,
+                    wake: requested_wake_message,
+                },
+            )
+            .await;
+        }
+        hooked => hooked,
     };
     let namespace = state.profile_namespace.read().await;
     let submission = state

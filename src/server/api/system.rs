@@ -1985,6 +1985,12 @@ async fn commit_profile(
         _ = state.shutdown.cancelled() => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
         namespace = state.profile_namespace.write() => namespace,
     };
+    if matches!(&mutation, ProfileMutation::Delete { name, .. } if name == &*state.served_profile())
+    {
+        return (StatusCode::CONFLICT, Json(serde_json::json!({
+            "error": "served_profile", "message": "The profile served by this daemon cannot be deleted",
+        }))).into_response();
+    }
     if *state.canonical_health.read().await != RuntimeHealth::Healthy {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
@@ -2568,6 +2574,23 @@ mod tests {
                 [expected_default]
             );
         }
+        state.rename_served_profile("test", "alpha");
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/profiles/alpha")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(crate::session::get_profile_dir_path("alpha")?.is_dir());
+        assert_eq!(&*state.served_profile(), "alpha");
+        assert_eq!(
+            state.runtime.snapshot(&state).await?.value.cursor.revision,
+            revision
+        );
         std::fs::write(
             crate::session::get_profile_dir_path("alpha")?.join("config.toml"),
             "description = [",

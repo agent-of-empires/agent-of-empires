@@ -126,7 +126,7 @@ impl HttpClient {
         );
         let res = self.execute(self.http.get(&url)).await?;
         let res = check_status(res, session_id)?;
-        Ok(crate::daemon::decode_json::<ReplayResponse>(res).await?)
+        decode_replay(res).await
     }
 
     /// `GET /api/sessions/{id}/acp/replay?since=N&limit=L`. One page.
@@ -145,7 +145,7 @@ impl HttpClient {
         );
         let res = self.execute(self.http.get(&url)).await?;
         let res = check_status(res, session_id)?;
-        Ok(crate::daemon::decode_json::<ReplayResponse>(res).await?)
+        decode_replay(res).await
     }
 
     /// Page through replay history from `since`, accumulating every
@@ -220,7 +220,7 @@ impl HttpClient {
         );
         let res = self.execute(self.http.get(&url)).await?;
         let res = check_status(res, session_id)?;
-        Ok(crate::daemon::decode_json::<ReplayResponse>(res).await?)
+        decode_replay(res).await
     }
 
     /// Page through the server-folded transcript rows from `since`,
@@ -727,6 +727,62 @@ impl HttpClient {
     }
 }
 
+async fn decode_replay(response: reqwest::Response) -> Result<ReplayResponse, HttpError> {
+    decode_replay_until(
+        response,
+        tokio::time::Instant::now() + std::time::Duration::from_secs(15),
+    )
+    .await
+}
+
+async fn decode_replay_until(
+    response: reqwest::Response,
+    deadline: tokio::time::Instant,
+) -> Result<ReplayResponse, HttpError> {
+    use std::io::{self, BufReader};
+    use tokio_util::io::{StreamReader, SyncIoBridge};
+    use tokio_util::sync::CancellationToken;
+
+    let cancellation = CancellationToken::new();
+    // Dropping the caller must wake a blocking reader, not just detach its task.
+    let _cancel_on_drop = cancellation.clone().drop_guard();
+    let chunks = futures_util::stream::try_unfold(
+        (response, cancellation),
+        move |(mut response, cancellation)| async move {
+            if tokio::time::Instant::now() >= deadline {
+                return Err(io::Error::from(io::ErrorKind::TimedOut));
+            }
+            let chunk = tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => {
+                    return Err(io::Error::from(io::ErrorKind::ConnectionAborted));
+                }
+                chunk = tokio::time::timeout_at(deadline, response.chunk()) => {
+                    chunk.map_err(|_| io::Error::from(io::ErrorKind::TimedOut))?
+                        .map_err(|_| io::Error::from(io::ErrorKind::ConnectionAborted))?
+                }
+            };
+            Ok(chunk.map(|chunk| (chunk, (response, cancellation))))
+        },
+    );
+    let runtime = tokio::runtime::Handle::current();
+    tokio::task::spawn_blocking(move || {
+        let chunks = std::pin::pin!(chunks);
+        let bridge = SyncIoBridge::new_with_handle(StreamReader::new(chunks), runtime);
+        serde_json::from_reader(BufReader::with_capacity(64 * 1024, bridge)).map_err(|error| {
+            match error.io_error_kind() {
+                Some(io::ErrorKind::TimedOut) => {
+                    HttpError::Daemon(crate::daemon::DaemonClientError::Timeout)
+                }
+                Some(_) => HttpError::Transport,
+                None => HttpError::Daemon(crate::daemon::DaemonClientError::AuthenticatedDecode),
+            }
+        })
+    })
+    .await
+    .map_err(|_| HttpError::Transport)?
+}
+
 fn check_status(res: reqwest::Response, session_id: &str) -> Result<reqwest::Response, HttpError> {
     if res.status().is_success() {
         Ok(res)
@@ -778,6 +834,395 @@ mod tests {
 
     fn endpoint(base: &str, token: Option<&str>) -> DaemonEndpoint {
         DaemonEndpoint::new(base.to_string(), token.map(str::to_string), Source::Env)
+    }
+
+    #[tokio::test]
+    async fn replay_streams_large_pages_and_individual_tool_rows() {
+        use crate::acp::state::{Event, ToolOutputBlock};
+        use crate::acp::transcript::TranscriptRowKind;
+        use axum::{middleware, response::IntoResponse, routing::get, Router};
+        use futures_util::StreamExt;
+
+        let baseline = crate::session::Instance::new("baseline", "/tmp");
+        let large = crate::session::Instance::new("large", "/tmp");
+        let baseline_id = baseline.id.clone();
+        let large_id = large.id.clone();
+        let state = crate::server::test_support::build_test_app_state(vec![baseline, large]);
+        let text = format!("{}end-🦀", "x".repeat(384 * 1024));
+        for seq in 1..=64 {
+            state
+                .acp_event_store
+                .record(
+                    &baseline_id,
+                    seq,
+                    &Event::AgentMessageChunk { text: text.clone() },
+                )
+                .unwrap();
+        }
+        state
+            .acp_event_store
+            .record(
+                &baseline_id,
+                65,
+                &Event::Stopped {
+                    reason: "prompt_complete".into(),
+                },
+            )
+            .unwrap();
+        let content = format!("{}tool-tail-🦀", "y".repeat(17 * 1024 * 1024));
+        let output = vec![ToolOutputBlock::Text {
+            text: "structured output".into(),
+        }];
+        let completed_at = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        state
+            .acp_event_store
+            .record(
+                &large_id,
+                1,
+                &Event::ToolCallCompleted {
+                    tool_call_id: "tool".into(),
+                    is_error: false,
+                    content: content.clone(),
+                    output: output.clone(),
+                    completed_at,
+                    async_subagent: false,
+                },
+            )
+            .unwrap();
+
+        for chunked in [false, true] {
+            let mut app = Router::new()
+                .route(
+                    "/api/sessions/{id}/acp/replay",
+                    get(crate::server::api::acp_replay),
+                )
+                .with_state(state.clone());
+            if chunked {
+                app = app.layer(middleware::map_response(
+                    |response: axum::response::Response| async {
+                        let (mut parts, body) = response.into_parts();
+                        parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+                        let chunks = body.into_data_stream().flat_map(|chunk| {
+                            let chunks: Vec<_> = match chunk {
+                                Ok(bytes) => (0..bytes.len())
+                                    .step_by(16 * 1024)
+                                    .map(|start| {
+                                        Ok(bytes.slice(start..(start + 16 * 1024).min(bytes.len())))
+                                    })
+                                    .collect(),
+                                Err(error) => vec![Err(error)],
+                            };
+                            futures_util::stream::iter(chunks)
+                        });
+                        axum::response::Response::from_parts(
+                            parts,
+                            axum::body::Body::from_stream(chunks),
+                        )
+                        .into_response()
+                    },
+                ));
+            }
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let client =
+                HttpClient::new(endpoint(&format!("http://{address}"), Some("secret"))).unwrap();
+
+            let probe = client.replay(&baseline_id, 0).await.unwrap();
+            assert_eq!(probe.frames.len(), 65);
+            assert_eq!(probe.highest_seq, 65);
+            drop(probe);
+            let replay = client.replay_paged(&baseline_id, 0, 64).await.unwrap();
+            assert!(!replay.lost);
+            assert_eq!(replay.lowest_seq, Some(1));
+            assert_eq!(replay.highest_seq, 65);
+            assert_eq!(replay.frames.len(), 65);
+            for (index, frame) in replay.frames[..64].iter().enumerate() {
+                assert_eq!(frame.session_id, baseline_id);
+                assert_eq!(frame.seq, index as u64 + 1);
+                let Event::AgentMessageChunk { text: actual } = &*frame.event else {
+                    panic!("expected message frame");
+                };
+                assert_eq!(actual, &text);
+            }
+            assert_eq!(replay.frames[64].seq, 65);
+            assert!(
+                matches!(&*replay.frames[64].event, Event::Stopped { reason } if reason == "prompt_complete")
+            );
+            drop(replay);
+            let (rows, lost) = client.replay_rows_paged(&baseline_id, 0, 64).await.unwrap();
+            assert!(!lost);
+            assert_eq!(rows.len(), 64);
+            for (index, row) in rows.iter().enumerate() {
+                assert_eq!(row.id, format!("msg-{}", index + 1));
+                assert_eq!(row.text, text);
+            }
+
+            drop(rows);
+            let replay = client.replay_page(&large_id, 0, 1).await.unwrap();
+            assert_eq!(replay.frames.len(), 1);
+            assert_eq!(replay.frames[0].seq, 1);
+            assert_eq!(replay.next_cursor, Some(1));
+            let Event::ToolCallCompleted {
+                tool_call_id,
+                is_error,
+                content: actual,
+                output: actual_output,
+                completed_at: actual_time,
+                async_subagent,
+            } = &*replay.frames[0].event
+            else {
+                panic!("expected completed tool");
+            };
+            assert_eq!(tool_call_id, "tool");
+            assert!(!is_error);
+            assert_eq!(actual, &content);
+            assert_eq!(actual_output, &output);
+            assert_eq!(*actual_time, completed_at);
+            assert!(!async_subagent);
+            drop(replay);
+            let (rows, lost) = client.replay_rows_paged(&large_id, 0, 1).await.unwrap();
+            assert!(!lost);
+            let row = rows
+                .iter()
+                .find(|row| row.kind == TranscriptRowKind::ToolComplete)
+                .unwrap();
+            assert_eq!(row.text, content);
+            assert_eq!(row.output, output);
+            assert_eq!(row.tool_call_id.as_deref(), Some("tool"));
+            assert_eq!(row.at, completed_at);
+
+            drop(rows);
+            let response = client
+                .execute(client.http.get(format!(
+                    "http://{address}/api/sessions/{baseline_id}/acp/replay?since=0&limit=64"
+                )))
+                .await
+                .unwrap();
+            if chunked {
+                assert_eq!(response.content_length(), None);
+            } else {
+                assert!(response.content_length().unwrap() > 16 * 1024 * 1024);
+            }
+            let error = crate::daemon::decode_json::<ReplayResponse>(response)
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                crate::daemon::DaemonClientError::ResponseTooLarge { .. }
+            ));
+            server.abort();
+            let _ = server.await;
+        }
+    }
+
+    #[tokio::test]
+    async fn replay_rejects_incomplete_or_extra_documents_without_reflecting_payloads() {
+        let valid = r#"{"frames":[],"lost":false,"highest_seq":9,"next_cursor":9}"#;
+        for body in [
+            valid[..valid.len() - 1].to_owned(),
+            format!("{valid} secret-token"),
+            format!("{valid}{valid}"),
+            r#"{"frames":[],"lost":"secret-token","highest_seq":9}"#.to_owned(),
+        ] {
+            let response = reqwest::Response::from(axum::http::Response::new(body));
+            let error = decode_replay(response).await.unwrap_err();
+            assert!(matches!(
+                error,
+                HttpError::Daemon(crate::daemon::DaemonClientError::AuthenticatedDecode)
+            ));
+            assert!(!error.to_string().contains("secret-token"));
+        }
+        let response = reqwest::Response::from(axum::http::Response::new(format!("{valid} \n\t")));
+        let replay = decode_replay(response).await.unwrap();
+        assert_eq!(replay.highest_seq, 9);
+        assert_eq!(replay.next_cursor, Some(9));
+    }
+
+    struct ObservedBody {
+        prefix: Option<axum::body::Bytes>,
+        waiting: Option<tokio::sync::oneshot::Sender<()>>,
+        dropped: Option<tokio::sync::oneshot::Sender<()>>,
+    }
+
+    impl Drop for ObservedBody {
+        fn drop(&mut self) {
+            if let Some(dropped) = self.dropped.take() {
+                let _ = dropped.send(());
+            }
+        }
+    }
+
+    fn stalled_replay_body(
+        prefix: &'static str,
+    ) -> (
+        reqwest::Response,
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    ) {
+        let (waiting_tx, waiting) = tokio::sync::oneshot::channel();
+        let (dropped_tx, dropped) = tokio::sync::oneshot::channel();
+        let mut body = ObservedBody {
+            prefix: Some(axum::body::Bytes::from_static(prefix.as_bytes())),
+            waiting: Some(waiting_tx),
+            dropped: Some(dropped_tx),
+        };
+        let stream = futures_util::stream::poll_fn(move |_| {
+            if let Some(prefix) = body.prefix.take() {
+                return std::task::Poll::Ready(Some(Ok::<_, std::io::Error>(prefix)));
+            }
+            if let Some(waiting) = body.waiting.take() {
+                let _ = waiting.send(());
+            }
+            std::task::Poll::Pending
+        });
+        (
+            reqwest::Response::from(axum::http::Response::new(reqwest::Body::wrap_stream(
+                stream,
+            ))),
+            waiting,
+            dropped,
+        )
+    }
+
+    #[tokio::test]
+    async fn replay_body_deadline_covers_incomplete_json_and_trailing_whitespace() {
+        for prefix in [
+            r#"{"frames":["#,
+            "{\"frames\":[],\"lost\":false,\"highest_seq\":9} \n\t",
+        ] {
+            let (response, waiting, dropped) = stalled_replay_body(prefix);
+            let decoder = tokio::spawn(decode_replay_until(
+                response,
+                tokio::time::Instant::now() + Duration::from_secs(1),
+            ));
+            tokio::time::timeout(Duration::from_secs(2), waiting)
+                .await
+                .unwrap()
+                .unwrap();
+            let error = tokio::time::timeout(Duration::from_secs(2), decoder)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                HttpError::Daemon(crate::daemon::DaemonClientError::Timeout)
+            ));
+            tokio::time::timeout(Duration::from_secs(2), dropped)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelling_replay_releases_the_blocking_body_reader() {
+        let (response, waiting, dropped) = stalled_replay_body(r#"{"frames":["#);
+        let decoder = tokio::spawn(decode_replay(response));
+        tokio::time::timeout(Duration::from_secs(2), waiting)
+            .await
+            .unwrap()
+            .unwrap();
+        decoder.abort();
+        assert!(decoder.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(Duration::from_secs(2), dropped)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn replay_body_transport_errors_are_redacted() {
+        let stream = futures_util::stream::iter([
+            Ok(axum::body::Bytes::from_static(br#"{"frames":["#)),
+            Err(std::io::Error::other("secret-token")),
+        ]);
+        let response = reqwest::Response::from(axum::http::Response::new(
+            reqwest::Body::wrap_stream(stream),
+        ));
+        let error = decode_replay(response).await.unwrap_err();
+        assert!(matches!(error, HttpError::Transport));
+        assert!(!error.to_string().contains("secret-token"));
+    }
+
+    async fn serve_stalled_replay<S>(mut stream: S, prefix: &'static str)
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut request = Vec::new();
+        let mut buf = [0; 1024];
+        while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+            let count = stream.read(&mut buf).await.unwrap();
+            assert!(count > 0);
+            request.extend_from_slice(&buf[..count]);
+        }
+        stream
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{prefix}",
+                    prefix.len() + 64,
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            stream.read(&mut buf).await.unwrap(),
+            0,
+            "decoder must close its stalled body"
+        );
+    }
+
+    #[tokio::test]
+    async fn replay_body_deadline_applies_to_tcp_and_unix_transports() {
+        for unix in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let (endpoint, server) = if unix {
+                let path = dir.path().join("api.sock");
+                let listener = tokio::net::UnixListener::bind(&path).unwrap();
+                let server = tokio::spawn(async move {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    serve_stalled_replay(stream, r#"{"frames":["#).await;
+                });
+                (DaemonEndpoint::local_unix(path), server)
+            } else {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let address = listener.local_addr().unwrap();
+                let server = tokio::spawn(async move {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    serve_stalled_replay(stream, r#"{"frames":["#).await;
+                });
+                (
+                    endpoint(&format!("http://{address}"), Some("secret")),
+                    server,
+                )
+            };
+            let client = HttpClient::new(endpoint).unwrap();
+            let response = client
+                .execute(client.http.get(format!(
+                    "{}/api/sessions/test/acp/replay?since=0",
+                    client.endpoint.base_url
+                )))
+                .await
+                .unwrap();
+            let result = decode_replay_until(
+                response,
+                tokio::time::Instant::now() + Duration::from_secs(1),
+            )
+            .await;
+            assert!(matches!(
+                result,
+                Err(HttpError::Daemon(crate::daemon::DaemonClientError::Timeout))
+            ));
+            tokio::time::timeout(Duration::from_secs(2), server)
+                .await
+                .unwrap()
+                .unwrap();
+        }
     }
 
     #[tokio::test]

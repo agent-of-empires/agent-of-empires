@@ -466,12 +466,12 @@ Git worktrees need the bare repo pattern so the container can reach the repo's g
 
 **Symptoms:** After bumping the sandbox container image, launching or resuming a sandboxed OpenCode session fails on boot with a drizzle or SQLite migration error (e.g. `no such column`, `CREATE TABLE ... already exists`, `Failed to run the query`). Non-sandboxed OpenCode sessions on the same host are unaffected.
 
-**Cause:** The sandboxed OpenCode SQLite database at `~/.local/share/opencode/sandbox/opencode.db{,-wal,-shm}` persists across sessions so that `aoe resume` keeps `ses_*` identity working across kills and daemon restarts (see #2605). OpenCode manages its schema with drizzle, and drizzle migrations are forward-only. If the new image ships an OpenCode release whose forward migrations are not compatible with the pre-existing DB, OpenCode aborts on boot. This is the same failure class users hit on standalone OpenCode CLI upgrades (see upstream anomalyco/opencode#31119 and anomalyco/opencode#16678); the sandbox-image bump is just another version-change vector.
+**Cause:** On the current private-store layout, each session's OpenCode database normally lives at `~/.local/share/opencode/sandbox-v2/<full-AoE-instance-id>/opencode.db`, with its `-wal` and `-shm` companions. Use the full AoE instance ID, not OpenCode's native `ses_*` ID. The database survives restarts of that session, but is not shared with other sessions. An upgraded sandbox image can ship OpenCode migrations incompatible with that existing database.
 
-**Fix:** Delete the sandboxed OpenCode DB and restart the session. Only the sandboxed OpenCode chat history is lost; host OpenCode state (outside the `sandbox/` subdir) is untouched.
+**Fix:** Stop the affected session and its container before touching the database. Confirm the host directory actually bind-mounted to OpenCode's data path; `agent_config_dir` overrides or a custom `OPENCODE_DB` path may differ from the default above. Back up `opencode.db`, `opencode.db-wal` and `opencode.db-shm` together, including any companions present, outside the active store. Only then move or remove those three files from the confirmed private store and start a fresh conversation.
 
-```bash
-rm -f ~/.local/share/opencode/sandbox/opencode.db*
-```
+This abandons that session's native OpenCode history, not other sessions' conversations or the host's native state. Do not assume the old `ses_*` conversation can resume after its database is removed. To preserve the history, return to the previous image or use an OpenCode migration compatible with the database instead.
+
+Do not delete a shared legacy `sandbox/` database or any `.aoe-sandbox-recovery` original as part of this procedure. Other sessions or deferred migrations may still depend on them. See [Per-session agent stores](#per-session-agent-stores).
 
 **Note:** This is a rare event tied to breaking schema changes in OpenCode releases; most upgrades migrate cleanly. If you hit it repeatedly on the same image bump, please file an issue upstream at [anomalyco/opencode](https://github.com/anomalyco/opencode) with the migration error output.

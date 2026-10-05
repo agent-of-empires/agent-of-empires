@@ -321,6 +321,9 @@ impl PurgeOwner {
         additional_protection: Option<&CleanupProtection>,
         mut capture: PurgeCapture,
     ) -> Result<Self> {
+        if let RunnerCapture::Unresolved { error } = &capture.runner {
+            anyhow::bail!("Runner ownership unresolved; purge refused before commit: {error}");
+        }
         capture.protection.extend([row])?;
         capture.protection.validate()?;
         let file = open_for(storage)?;

@@ -99,12 +99,14 @@ fn supervisor_error_response(context: &str, err: &SupervisorError) -> Response {
 }
 
 /// A spawn request carrying the instance's persisted worker settings.
-fn spawn_request_for(
+pub(crate) fn spawn_request_for(
     instance: &crate::session::Instance,
     agent: String,
     sandbox_info: Option<crate::session::SandboxInfo>,
 ) -> SpawnRequest {
     SpawnRequest {
+        launch_admission: None,
+        expected_lifecycle_generation: instance.lifecycle_generation,
         session_id: instance.id.clone(),
         agent,
         tool: instance.tool.clone(),

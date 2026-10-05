@@ -2876,9 +2876,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn revoked_native_lease_discards_queued_worker_actions() {
+    fn cancelled_native_continuation_discards_queued_worker_actions() {
         let lease = crate::tui::session_feed::NativeLease::valid_for_test();
-        lease.revoke();
+        lease.cancel_continuation();
         assert_eq!(
             dispatch_batch(
                 "missing-native-session",

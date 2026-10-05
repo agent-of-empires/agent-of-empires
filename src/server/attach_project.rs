@@ -274,6 +274,8 @@ async fn spawn_worker(state: &Arc<AppState>, id: &str) -> WorkerOutcome {
             return WorkerOutcome::RestartFailed("session disappeared mid-restart".to_string());
         };
         crate::acp::supervisor::SpawnRequest {
+            launch_admission: None,
+            expected_lifecycle_generation: inst.lifecycle_generation,
             session_id: id.to_string(),
             agent: inst.tool.clone(),
             tool: inst.tool.clone(),

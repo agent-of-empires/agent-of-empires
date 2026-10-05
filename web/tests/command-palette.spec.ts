@@ -53,7 +53,12 @@ test.describe("Command palette", () => {
 
   test("opens from within a focused input", async ({ page }) => {
     // The wizard needs a reachable server and a known project scope.
-    await page.route("**/api/sessions", (r) => r.fulfill({ json: { sessions: [], workspace_ordering: [] } }));
+    await page.route("**/api/sessions", (r) =>
+      r.fulfill({
+        headers: { "aoe-runtime-epoch": "mock-runtime", "aoe-runtime-revision": "1" },
+        json: { sessions: [], workspace_ordering: [] },
+      }),
+    );
     await page.route("**/api/profiles", (r) => r.fulfill({ json: [{ name: "default", is_default: true }] }));
     await page.route("**/api/projects*", (r) => r.fulfill({ json: [] }));
     await page.setViewportSize({ width: 1280, height: 720 });

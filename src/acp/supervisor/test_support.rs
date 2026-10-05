@@ -245,6 +245,8 @@ pub(super) fn isolate_home() -> (crate::session::test_support::AppDirGuard, temp
 
 pub(super) fn spawn_request(session_id: &str) -> SpawnRequest {
     SpawnRequest {
+        launch_admission: None,
+        expected_lifecycle_generation: 0,
         session_id: session_id.into(),
         agent: "claude-code".into(),
         tool: "claude-code".into(),

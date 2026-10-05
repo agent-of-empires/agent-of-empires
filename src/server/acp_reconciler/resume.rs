@@ -21,6 +21,7 @@ use crate::session::Instance;
 #[derive(Clone)]
 pub(super) struct ResumeTarget {
     pub(super) id: String,
+    lifecycle_generation: u64,
     tool: String,
     agent_override: Option<String>,
     pub(super) project_path: String,
@@ -36,6 +37,7 @@ impl ResumeTarget {
     pub(super) fn from_instance(inst: &Instance) -> Self {
         Self {
             id: inst.id.clone(),
+            lifecycle_generation: inst.lifecycle_generation,
             tool: inst.tool.clone(),
             agent_override: inst.agent_name.clone(),
             project_path: inst.project_path.clone(),
@@ -154,9 +156,14 @@ pub(super) async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> Re
         Ok(r) => r,
         Err(outcome) => return outcome,
     };
+    reservation.expected_lifecycle_generation = Some(target.lifecycle_generation);
     // The snapshot may predate an archive, snooze, trash or stop.
     if resume_target_for_session(&state.session_service, &id)
         .await
+        .filter(|fresh| {
+            fresh.lifecycle_generation == target.lifecycle_generation
+                && fresh.source_profile == target.source_profile
+        })
         .is_none()
     {
         tracing::debug!(target: "acp.supervisor", session = %id, "session left the resume set after the snapshot; not resuming");
@@ -332,6 +339,12 @@ async fn build_spawn_request(
         let Some(inst) = instances.iter().find(|i| i.id == target.id) else {
             return Err(());
         };
+        if !inst.launch_is_finalized()
+            || inst.lifecycle_generation != target.lifecycle_generation
+            || inst.source_profile != target.source_profile
+        {
+            return Err(());
+        }
         (
             PathBuf::from(&inst.project_path),
             inst.import_pending == Some(true),
@@ -368,6 +381,8 @@ async fn build_spawn_request(
     };
 
     Ok(SpawnRequest {
+        launch_admission: None,
+        expected_lifecycle_generation: target.lifecycle_generation,
         session_id: target.id.clone(),
         agent,
         tool: target.tool.clone(),

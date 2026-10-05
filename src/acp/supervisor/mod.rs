@@ -179,6 +179,7 @@ pub struct Supervisor<S: BroadcastSink> {
 /// install abandons the epoch so a failed resume cannot pin the session.
 pub(crate) struct ResumeReservation {
     lease: Lease,
+    pub(crate) expected_lifecycle_generation: Option<u64>,
     lifecycle: Arc<std::sync::Mutex<LifecycleTable>>,
     notify: Arc<tokio::sync::Notify>,
 }
@@ -215,6 +216,8 @@ pub enum SandboxContinuation {
 
 #[derive(Debug, Clone)]
 pub struct SpawnRequest {
+    pub(crate) launch_admission: Option<LaunchAdmission>,
+    pub(crate) expected_lifecycle_generation: u64,
     pub session_id: String,
     /// The ACP backend `pick_agent_for_tool` resolved.
     pub agent: String,
@@ -244,6 +247,21 @@ pub struct SpawnRequest {
     pub seed_history_replay: bool,
     /// Claude store selected by the conversation binding for a host Claude worker.
     pub claude_store_pin: Option<crate::session::capture::ClaudeStorePin>,
+}
+
+#[derive(Clone)]
+pub(crate) struct LaunchAdmission {
+    pub store: Arc<dyn crate::session::SessionStore>,
+    pub generation: u64,
+    pub namespace: Option<Arc<tokio::sync::RwLock<()>>>,
+}
+
+impl std::fmt::Debug for LaunchAdmission {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LaunchAdmission")
+            .field("generation", &self.generation)
+            .finish_non_exhaustive()
+    }
 }
 
 impl<S: BroadcastSink> Supervisor<S> {

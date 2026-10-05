@@ -687,9 +687,18 @@ pub async fn create_session(
         let guard = lock.lock_owned().await;
         let existing = {
             let instances = state.instances.read().await;
-            find_by_idempotency_key(&instances, key).map(|inst| inst.id.clone())
+            find_by_idempotency_key(&instances, key).map(|inst| {
+                (
+                    inst.id.clone(),
+                    inst.status == crate::session::Status::Creating,
+                )
+            })
         };
-        if let Some(id) = existing {
+        if let Some((id, unfinished)) = existing {
+            if unfinished {
+                return api_error(StatusCode::CONFLICT, "create_outcome_unknown",
+                    "The prior creation is not finalized. Check its outcome before launching it again.");
+            }
             return created_session_response(&state, &id, Vec::new(), StatusCode::OK).await;
         }
         if let Some(failure) = state.create_progress.recent_failure(key) {

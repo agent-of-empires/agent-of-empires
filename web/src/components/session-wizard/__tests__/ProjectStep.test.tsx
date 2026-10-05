@@ -29,7 +29,11 @@ import {
 } from "../../../lib/api";
 
 beforeEach(() => {
-  vi.mocked(fetchSessions).mockResolvedValue({ sessions: [], workspace_ordering: [] });
+  vi.mocked(fetchSessions).mockResolvedValue({
+    sessions: [],
+    workspace_ordering: [],
+    cursor: { epoch: "boot", revision: 1n },
+  });
   vi.mocked(fetchRecentProjects).mockResolvedValue({ projects: [] });
   vi.mocked(fetchProjects).mockResolvedValue([]);
   vi.mocked(getHomePath).mockResolvedValue(null);
@@ -57,7 +61,9 @@ function renderStep(data: Partial<WizardData> = {}, props: { initialTab?: "impor
 }
 
 const sessions = (...list: ReturnType<typeof mockSession>[]) =>
-  vi.mocked(fetchSessions).mockResolvedValue({ sessions: list, workspace_ordering: [] });
+  vi
+    .mocked(fetchSessions)
+    .mockResolvedValue({ sessions: list, workspace_ordering: [], cursor: { epoch: "boot", revision: 1n } });
 const savedProjects = (...paths: string[]) =>
   vi
     .mocked(fetchProjects)

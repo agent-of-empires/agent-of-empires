@@ -5,6 +5,7 @@
 
 use super::*;
 use crate::tui::dialogs::ContextMenuAction;
+use crate::tui::home::CreationConfirmation;
 
 const REFUSAL: &str = "Still creating this session; it has no runtime yet";
 
@@ -325,4 +326,261 @@ fn z_on_a_parked_row_unarchives_through_the_feed() {
         }
         _ => panic!("parked row must submit an unarchive through the feed"),
     }
+}
+
+fn creation_snapshot(
+    rows: Vec<crate::daemon::SessionResponse>,
+    epoch: &str,
+    revision: u64,
+) -> crate::tui::session_feed::SessionFeedResult {
+    use crate::daemon::{
+        RuntimeCapabilities, RuntimeContents, RuntimeCursor, RuntimeHealth, RuntimeSnapshot,
+    };
+    crate::tui::session_feed::SessionFeedResult::Snapshot(std::sync::Arc::new(RuntimeSnapshot {
+        cursor: RuntimeCursor {
+            epoch: epoch.into(),
+            revision,
+        },
+        contents: RuntimeContents {
+            health: RuntimeHealth::Healthy,
+            capabilities: RuntimeCapabilities {
+                mutations: true,
+                native_interaction: true,
+            },
+            default_profile: "default".into(),
+            sessions: rows,
+            profiles: Vec::new(),
+            workspace_ordering: Vec::new(),
+            global_projects: Vec::new(),
+        },
+    }))
+}
+
+#[test]
+#[serial]
+fn creation_receipt_waits_for_applied_snapshot_and_retries_profile_loading_without_losing_confirmation(
+) {
+    for profile in ["default", "other"] {
+        let CreationTestEnv {
+            mut view,
+            project_dir,
+            _guard,
+            _temp,
+        } = setup_creation_test_env();
+        let mut receipt_driver = view.session_feed.creation_receipt_driver_for_test();
+        view.session_feed
+            .publish_for_test(creation_snapshot(vec![], "test", 1));
+        view.apply_session_feed();
+        let mut data = creation_data(&project_dir, "Confirmed", "group");
+        data.profile = profile.into();
+        view.request_creation(data, None, None);
+        let key = view.creating_stub_id.clone().unwrap();
+        let mut committed = Instance::new("Confirmed", project_dir.to_str().unwrap());
+        committed.source_profile = profile.into();
+        committed.idempotency_key = Some(key.clone());
+        committed.status = Status::Idle;
+        let row = crate::daemon::SessionResponse::from_instance(&committed, false);
+        let storage = Storage::new_unwatched(profile).unwrap();
+        storage
+            .update(|rows, _| {
+                rows.push(committed.clone());
+                Ok(())
+            })
+            .unwrap();
+        let path = storage.sessions_path().to_path_buf();
+        let valid = std::fs::read(&path).unwrap();
+        assert_eq!(
+            receipt_driver(crate::daemon::MutationReceipt {
+                cursor: crate::daemon::RuntimeCursor {
+                    epoch: "test".into(),
+                    revision: 2
+                },
+                outcome: row.clone(),
+            }),
+            key
+        );
+        assert!(
+            view.apply_creation_results().is_none(),
+            "receipt alone cannot return an attach id"
+        );
+        assert!(view
+            .pending_creation
+            .as_ref()
+            .unwrap()
+            .confirmation
+            .is_none());
+        std::fs::write(&path, b"{ invalid json ]").unwrap();
+        view.session_feed
+            .publish_for_test(creation_snapshot(vec![row], "test", 2));
+        view.apply_session_feed();
+        assert!(view.apply_creation_results().is_none());
+        assert!(matches!(
+            view.pending_creation.as_ref().unwrap().confirmation,
+            Some(CreationConfirmation::Receipt(_))
+        ));
+        assert_eq!(view.creating_stub_id.as_deref(), Some(key.as_str()));
+        assert!(view.get_instance(&key).is_some());
+        view.info_dialog = None;
+        assert!(
+            view.apply_creation_results().is_none(),
+            "failed profile loads obey backoff"
+        );
+        assert!(view.info_dialog.is_none());
+        std::fs::write(&path, valid).unwrap();
+        view.pending_creation.as_mut().unwrap().reload_retry_at = Some(std::time::Instant::now());
+        assert_eq!(view.apply_creation_results(), Some(committed.id.clone()));
+        assert_eq!(view.active_profile_display(), Some(profile));
+        assert_eq!(
+            view.selected_session.as_deref(),
+            Some(committed.id.as_str())
+        );
+        assert!(view.get_instance(&key).is_none());
+        assert!(view.pending_creation.is_none());
+        assert!(view.get_instance(&committed.id).is_some());
+        assert!(
+            view.apply_creation_results().is_none(),
+            "confirmation emits exactly one id"
+        );
+    }
+}
+
+#[test]
+#[serial]
+fn retrying_a_snapshot_preserves_one_creation_stub_and_never_resubmits_or_cancels() {
+    let CreationTestEnv {
+        mut view,
+        project_dir,
+        _guard,
+        _temp,
+    } = setup_creation_test_env();
+    let mut driver = view.session_feed.creation_driver_for_test();
+    let mut existing = Instance::new("before", project_dir.to_str().unwrap());
+    existing.source_profile = "default".into();
+    existing.status = Status::Idle;
+    view.add_instance(existing.clone());
+    view.save().unwrap();
+    view.session_feed.publish_for_test(creation_snapshot(
+        vec![crate::daemon::SessionResponse::from_instance(
+            &existing, false,
+        )],
+        "test",
+        1,
+    ));
+    view.apply_session_feed();
+    view.request_creation(creation_data(&project_dir, "Pending", "group"), None, None);
+    let key = view.creating_stub_id.clone().unwrap();
+    assert_eq!(driver(), vec![format!("create:{key}")]);
+    let mut reservation = Instance::new("Pending", project_dir.to_str().unwrap());
+    reservation.source_profile = "default".into();
+    reservation.idempotency_key = Some(key.clone());
+    reservation.status = Status::Creating;
+    existing.title = "after".into();
+    let storage = Storage::new_unwatched("default").unwrap();
+    storage
+        .update(|rows, _| {
+            *rows = vec![existing.clone(), reservation.clone()];
+            Ok(())
+        })
+        .unwrap();
+    let path = storage.sessions_path().to_path_buf();
+    let valid = std::fs::read(&path).unwrap();
+    std::fs::write(&path, b"{ invalid json ]").unwrap();
+    view.session_feed.publish_for_test(creation_snapshot(
+        vec![
+            crate::daemon::SessionResponse::from_instance(&existing, false),
+            crate::daemon::SessionResponse::from_instance(&reservation, false),
+        ],
+        "test",
+        2,
+    ));
+    view.apply_session_feed();
+    assert_eq!(view.in_flight_creation_id(), Some(reservation.id.as_str()));
+    assert!(view.get_instance(&key).is_some());
+    assert_eq!(view.session_feed.next_revision_for_test(), 2);
+    std::fs::write(&path, valid).unwrap();
+    view.session_feed_reload_retry_at = Some(std::time::Instant::now());
+    view.apply_session_feed();
+    assert_eq!(view.session_feed.next_revision_for_test(), 3);
+    assert_eq!(view.get_instance(&existing.id).unwrap().title, "after");
+    assert_eq!(view.creating_stub_id.as_deref(), Some(key.as_str()));
+    assert_eq!(
+        view.instances
+            .values()
+            .filter(|instance| instance.id == key)
+            .count(),
+        1
+    );
+    assert!(view.get_instance(&reservation.id).is_none());
+    assert!(
+        driver().is_empty(),
+        "replay submits neither another creation nor cancellation"
+    );
+    assert!(!view.apply_session_feed());
+}
+
+#[tokio::test]
+#[serial]
+async fn unknown_creation_uses_current_canonical_authority_after_reconnection_not_cached_rows() {
+    let CreationTestEnv {
+        mut view,
+        project_dir,
+        _guard,
+        _temp,
+    } = setup_creation_test_env();
+    let mut driver = view.session_feed.creation_driver_for_test();
+    let mut data = creation_data(&project_dir, "Unknown", "group");
+    data.profile = "other".into();
+    view.request_creation(data, None, None);
+    let key = view.creating_stub_id.clone().unwrap();
+    assert_eq!(driver(), vec![format!("create:{key}")]);
+    assert!(view.apply_creation_results().is_none());
+    let mut committed = Instance::new("Unknown", project_dir.to_str().unwrap());
+    committed.source_profile = "other".into();
+    committed.idempotency_key = Some(key.clone());
+    committed.status = Status::Idle;
+    let storage = Storage::new_unwatched("other").unwrap();
+    storage
+        .update(|rows, _| {
+            rows.push(committed.clone());
+            Ok(())
+        })
+        .unwrap();
+    let path = storage.sessions_path().to_path_buf();
+    let valid = std::fs::read(&path).unwrap();
+    let row = crate::daemon::SessionResponse::from_instance(&committed, false);
+    std::fs::write(&path, b"{ invalid json ]").unwrap();
+    view.session_feed
+        .publish_for_test(creation_snapshot(vec![row.clone()], "old", 2));
+    view.apply_session_feed();
+    assert!(view.apply_creation_results().is_none());
+    assert!(matches!(
+        view.pending_creation.as_ref().unwrap().confirmation,
+        Some(CreationConfirmation::Canonical(_))
+    ));
+    view.session_feed
+        .publish_for_test(crate::tui::session_feed::SessionFeedResult::Unavailable(
+            "disconnected".into(),
+        ));
+    view.apply_session_feed();
+    std::fs::write(&path, valid).unwrap();
+    view.pending_creation.as_mut().unwrap().reload_retry_at = Some(std::time::Instant::now());
+    assert!(
+        view.apply_creation_results().is_none(),
+        "the old applied row is not authority while unavailable"
+    );
+    assert!(view.is_creation_pending());
+    view.connect_runtime();
+    // Replace the transport before yielding; all Home reconnection/reset behavior has run.
+    view.session_feed = crate::tui::session_feed::SessionFeed::new();
+    let mut reconnected = view.session_feed.creation_driver_for_test();
+    view.session_feed
+        .publish_for_test(creation_snapshot(vec![row], "new", 1));
+    view.apply_session_feed();
+    assert_eq!(view.apply_creation_results(), Some(committed.id.clone()));
+    assert!(
+        reconnected().is_empty(),
+        "canonical reconciliation submits no create/cancel request"
+    );
+    assert!(view.apply_creation_results().is_none());
+    assert!(view.get_instance(&key).is_none());
 }

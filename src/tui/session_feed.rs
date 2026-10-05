@@ -140,7 +140,7 @@ impl NativeLease {
             && self.grant.load(Ordering::SeqCst) == self.generation
     }
 
-    pub(crate) fn revoke(&self) {
+    pub(crate) fn cancel_continuation(&self) {
         self.cancelled.store(true, Ordering::SeqCst);
     }
 
@@ -220,6 +220,7 @@ struct PendingCreation {
     grant: Arc<AtomicU64>,
     lease: u64,
     result: tokio::sync::oneshot::Receiver<Result<CommandReply, CommandFailure>>,
+    receipt: Option<Box<MutationReceipt<crate::daemon::SessionResponse>>>,
 }
 
 fn set_grant(grant: &AtomicU64, allowed: bool) {
@@ -236,9 +237,23 @@ async fn run_command_writer(
     epoch: String,
     grant: Arc<AtomicU64>,
     mut requests: tokio::sync::mpsc::Receiver<SessionCommand>,
+    #[cfg(test)] creation_count: Option<tokio::sync::watch::Sender<usize>>,
 ) {
     let mut creations = tokio::task::JoinSet::new();
-    while let Some(request) = requests.recv().await {
+    loop {
+        let request = tokio::select! {
+            request = requests.recv() => match request {
+                Some(request) => request,
+                None => break,
+            },
+            _ = creations.join_next(), if !creations.is_empty() => {
+                #[cfg(test)]
+                if let Some(count) = &creation_count {
+                    count.send_replace(creations.len());
+                }
+                continue;
+            }
+        };
         let allowed = request.native.as_ref().map_or_else(
             || grant.load(Ordering::SeqCst) == request.lease,
             NativeLease::is_valid,
@@ -262,11 +277,16 @@ async fn run_command_writer(
                     .map_err(CommandFailure::creation);
                 let _ = result.send(outcome);
             });
+            #[cfg(test)]
+            if let Some(count) = &creation_count {
+                count.send_replace(creations.len());
+            }
             continue;
         }
         let result = if !allowed {
             Err(CommandFailure::Rejected(
-                "Request cancelled before submission: runtime permission was revoked".into(),
+                "Request not submitted: runtime permission changed or continuation was cancelled"
+                    .into(),
             ))
         } else {
             match request.request {
@@ -348,6 +368,7 @@ async fn run_command_writer(
         };
         let _ = request.result.send(result);
     }
+    creations.shutdown().await;
 }
 pub struct SessionFeed {
     sender: tokio::sync::watch::Sender<Option<SessionFeedResult>>,
@@ -460,7 +481,14 @@ impl SessionFeed {
                         }
                     }
                 };
-                let write = run_command_writer(client, epoch, grant.clone(), requests);
+                let write = run_command_writer(
+                    client,
+                    epoch,
+                    grant.clone(),
+                    requests,
+                    #[cfg(test)]
+                    None,
+                );
                 tokio::join!(read, write);
                 Ok(())
             }
@@ -648,6 +676,7 @@ impl SessionFeed {
                 grant,
                 lease,
                 result: receiver,
+                receipt: None,
             },
         );
         Ok(())
@@ -667,6 +696,7 @@ impl SessionFeed {
         Result<MutationReceipt<crate::daemon::SessionResponse>, CommandFailure>,
     )> {
         let mut settled = Vec::new();
+        let applied = self.applied.as_ref();
         self.pending_creations.retain(|token, pending| {
             if pending.grant.load(Ordering::SeqCst) != pending.lease {
                 settled.push((
@@ -677,33 +707,41 @@ impl SessionFeed {
                 ));
                 return false;
             }
-            match pending.result.try_recv() {
-                Ok(Ok(CommandReply::Created(receipt))) => {
-                    settled.push((token.clone(), Ok(*receipt)));
-                    false
+            if pending.receipt.is_none() {
+                match pending.result.try_recv() {
+                    Ok(Ok(CommandReply::Created(receipt))) => pending.receipt = Some(receipt),
+                    Ok(Ok(_)) => {
+                        settled.push((
+                            token.clone(),
+                            Err(CommandFailure::Unknown("unexpected creation reply".into())),
+                        ));
+                        return false;
+                    }
+                    Ok(Err(error)) => {
+                        settled.push((token.clone(), Err(error)));
+                        return false;
+                    }
+                    Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                        settled.push((
+                            token.clone(),
+                            Err(CommandFailure::Unknown(
+                                "runtime request interrupted; creation outcome unknown".into(),
+                            )),
+                        ));
+                        return false;
+                    }
+                    Err(tokio::sync::oneshot::error::TryRecvError::Empty) => return true,
                 }
-                Ok(Ok(_)) => {
-                    settled.push((
-                        token.clone(),
-                        Err(CommandFailure::Unknown("unexpected creation reply".into())),
-                    ));
-                    false
-                }
-                Ok(Err(error)) => {
-                    settled.push((token.clone(), Err(error)));
-                    false
-                }
-                Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
-                    settled.push((
-                        token.clone(),
-                        Err(CommandFailure::Unknown(
-                            "runtime request interrupted; creation outcome unknown".into(),
-                        )),
-                    ));
-                    false
-                }
-                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => true,
             }
+            let receipt = pending.receipt.as_ref().unwrap();
+            if applied.is_some_and(|snapshot| {
+                snapshot.cursor.epoch == receipt.cursor.epoch
+                    && snapshot.cursor.revision >= receipt.cursor.revision
+            }) {
+                settled.push((token.clone(), Ok(*pending.receipt.take().unwrap())));
+                return false;
+            }
+            true
         });
         settled
     }
@@ -923,6 +961,19 @@ impl SessionFeed {
         Ok(())
     }
 
+    pub(crate) fn current_snapshot_applied(&self) -> bool {
+        self.mutations_available()
+            && matches!((self.applied.as_ref(), self.receiver.borrow().as_ref()),
+                (Some(applied), Some(SessionFeedResult::Snapshot(latest)))
+                    if applied.cursor == latest.cursor)
+    }
+
+    pub(crate) fn receipt_applied(&self, cursor: &RuntimeCursor) -> bool {
+        self.applied.as_ref().is_some_and(|snapshot| {
+            snapshot.cursor.epoch == cursor.epoch && snapshot.cursor.revision >= cursor.revision
+        })
+    }
+
     pub(crate) fn applied_session(&self, id: &str) -> Option<&crate::daemon::SessionResponse> {
         self.applied
             .as_ref()?
@@ -968,12 +1019,7 @@ impl SessionFeed {
                     Err(tokio::sync::oneshot::error::TryRecvError::Empty) => return true,
                 }
             }
-            if pending.grant.load(Ordering::SeqCst) != pending.lease
-                || pending
-                    .terminal
-                    .as_ref()
-                    .is_some_and(|terminal| terminal.cancelled.load(Ordering::SeqCst))
-            {
+            if pending.grant.load(Ordering::SeqCst) != pending.lease {
                 unknown_ids.push(id.clone());
                 pending.fail(
                     id,
@@ -988,6 +1034,10 @@ impl SessionFeed {
                     && cursor.revision <= snapshot.cursor.revision
                 {
                     if let Some(terminal) = pending.terminal.take() {
+                        if terminal.cancelled.load(Ordering::SeqCst) {
+                            let _ = terminal.result.send(Err("Native continuation cancelled".into()));
+                            return false;
+                        }
                         let PendingTerminal {
                             target,
                             result: terminal,
@@ -1068,13 +1118,25 @@ impl SessionFeed {
     }
 
     pub(crate) fn try_recv(&mut self) -> Result<SessionFeedResult, TryRecvError> {
-        if !self.receiver.has_changed().unwrap_or(false) {
-            return Err(TryRecvError::Empty);
+        if self.receiver.has_changed().unwrap_or(false) {
+            return self
+                .receiver
+                .borrow_and_update()
+                .clone()
+                .ok_or(TryRecvError::Empty);
         }
-        self.receiver
-            .borrow_and_update()
-            .clone()
-            .ok_or(TryRecvError::Empty)
+        let cached = self.receiver.borrow();
+        match cached.as_ref() {
+            Some(SessionFeedResult::Snapshot(snapshot))
+                if self
+                    .applied
+                    .as_ref()
+                    .is_none_or(|applied| applied.cursor != snapshot.cursor) =>
+            {
+                Ok(SessionFeedResult::Snapshot(snapshot.clone()))
+            }
+            _ => Err(TryRecvError::Empty),
+        }
     }
 
     #[cfg(test)]
@@ -1158,6 +1220,28 @@ impl SessionFeed {
                 }
             }
             seen
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn creation_receipt_driver_for_test(
+        &mut self,
+    ) -> impl FnMut(MutationReceipt<crate::daemon::SessionResponse>) -> String {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel::<SessionCommand>(COMMAND_CAPACITY);
+        self.commands = Some(sender);
+        set_grant(&self.grant, true);
+        set_grant(&self.native_grant, true);
+        move |receipt| {
+            let command = receiver.try_recv().expect("creation queued");
+            let SessionRequest::Create(body) = command.request else {
+                panic!("expected creation");
+            };
+            assert_eq!(body.idempotency_key.as_deref(), Some(command.id.as_str()));
+            assert!(command
+                .result
+                .send(Ok(CommandReply::Created(Box::new(receipt))))
+                .is_ok());
+            command.id
         }
     }
 
@@ -1366,16 +1450,16 @@ mod tests {
         feed.task.take().unwrap().abort();
         set_grant(&feed.grant, true);
         assert!(!feed.can_submit("unknown"));
-        feed.publish_for_test(SessionFeedResult::Snapshot(snapshot("test", 2)));
+        feed.publish_for_test(SessionFeedResult::Snapshot(snapshot("reconnected", 2)));
         assert!(feed.resolve_indeterminate("unknown").is_err());
-        feed.mark_snapshot_applied(snapshot("test", 2));
+        feed.mark_snapshot_applied(snapshot("reconnected", 2));
         assert!(!feed.can_submit("unknown"));
         feed.resolve_indeterminate("unknown").unwrap();
         let mut driver = feed.command_driver_for_test();
         feed.submit("unknown".into(), SessionMutation::Stop)
             .unwrap();
         let (id, mutation) = driver(Ok(RuntimeCursor {
-            epoch: "test".into(),
+            epoch: "reconnected".into(),
             revision: 3,
         }))
         .expect("mutation submitted after explicit resolution");
@@ -1550,6 +1634,292 @@ mod tests {
             format!("row-{COMMAND_CAPACITY}")
         );
     }
+
+    #[tokio::test]
+    async fn creation_tasks_are_reaped_while_the_writer_is_idle() {
+        let app = axum::Router::new().route(
+            "/api/sessions",
+            axum::routing::post(|| async {
+                (
+                    [
+                        (crate::daemon::RUNTIME_EPOCH_HEADER, "test"),
+                        (crate::daemon::RUNTIME_REVISION_HEADER, "2"),
+                    ],
+                    axum::Json(
+                        serde_json::json!({"id":"created", "status":"Idle", "view":"structured"}),
+                    ),
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = crate::daemon::DaemonClient::new(&format!("http://{addr}"), None).unwrap();
+        let (requests, receiver) = tokio::sync::mpsc::channel(COMMAND_CAPACITY);
+        let (count, mut observed) = tokio::sync::watch::channel(0);
+        let writer = tokio::spawn(run_command_writer(
+            client,
+            "test".into(),
+            Arc::new(AtomicU64::new(1)),
+            receiver,
+            Some(count),
+        ));
+        for index in 0..12 {
+            let (result, received) = tokio::sync::oneshot::channel();
+            let body = serde_json::from_value(serde_json::json!({"path":"/tmp", "tool":"claude"}))
+                .unwrap();
+            requests
+                .send(SessionCommand {
+                    id: format!("stub-{index}"),
+                    request: SessionRequest::Create(Box::new(body)),
+                    lease: 1,
+                    native: None,
+                    result,
+                })
+                .await
+                .unwrap();
+            assert!(matches!(
+                tokio::time::timeout(std::time::Duration::from_secs(3), received)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                Ok(CommandReply::Created(_))
+            ));
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                if *observed.borrow_and_update() == 0 {
+                    break;
+                }
+                observed.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("completed creates must be removed without another request");
+        assert!(
+            !requests.is_closed(),
+            "the writer remains idle and connected"
+        );
+        drop(requests);
+        writer.await.unwrap();
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn writer_shutdown_and_abort_cancel_owned_open_creation_tasks() {
+        for abort_writer in [false, true] {
+            let (entered, entered_rx) = tokio::sync::oneshot::channel();
+            let entered = Arc::new(std::sync::Mutex::new(Some(entered)));
+            let release = Arc::new(tokio::sync::Notify::new());
+            let app = axum::Router::new().route(
+                "/api/sessions",
+                axum::routing::post({
+                    let release = release.clone();
+                    move || {
+                        let entered = entered.clone();
+                        let release = release.clone();
+                        async move {
+                            entered.lock().unwrap().take().unwrap().send(()).unwrap();
+                            release.notified().await;
+                            (axum::http::StatusCode::UNPROCESSABLE_ENTITY, "refused")
+                        }
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let client = crate::daemon::DaemonClient::new(&format!("http://{addr}"), None).unwrap();
+            let (requests, receiver) = tokio::sync::mpsc::channel(COMMAND_CAPACITY);
+            let writer = tokio::spawn(run_command_writer(
+                client,
+                "test".into(),
+                Arc::new(AtomicU64::new(1)),
+                receiver,
+                None,
+            ));
+            let (result, mut received) = tokio::sync::oneshot::channel();
+            let body = serde_json::from_value(serde_json::json!({"path":"/tmp", "tool":"claude"}))
+                .unwrap();
+            requests
+                .send(SessionCommand {
+                    id: "stub".into(),
+                    request: SessionRequest::Create(Box::new(body)),
+                    lease: 1,
+                    native: None,
+                    result,
+                })
+                .await
+                .unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(3), entered_rx)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(matches!(
+                received.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ));
+            if abort_writer {
+                writer.abort();
+            } else {
+                drop(requests);
+            }
+            let stopped = tokio::time::timeout(std::time::Duration::from_secs(3), writer)
+                .await
+                .unwrap();
+            if abort_writer {
+                assert!(stopped.unwrap_err().is_cancelled());
+            } else {
+                stopped.unwrap();
+            }
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_secs(3), received)
+                    .await
+                    .unwrap()
+                    .is_err(),
+                "the owned HTTP task drops its reply sender before the handler is released"
+            );
+            release.notify_waiters();
+            server.abort();
+            let _ = server.await;
+        }
+    }
+
+    #[test]
+    fn local_cancellation_does_not_hide_an_unknown_native_outcome() {
+        for close_reply in [false, true] {
+            let (mut feed, mut requests) = feed_with_native_lane();
+            let mut preparation = feed
+                .restart_agent(
+                    "native".into(),
+                    crate::daemon::RestartSessionBody::default(),
+                )
+                .unwrap();
+            preparation.lease.cancel_continuation();
+            let command = requests.try_recv().unwrap();
+            if close_reply {
+                drop(command);
+            } else {
+                command
+                    .result
+                    .send(Err(CommandFailure::Unknown("transport interrupted".into())))
+                    .unwrap();
+            }
+            let errors = feed.drain_command_errors();
+            assert_eq!(errors.len(), 1);
+            assert!(errors[0].outcome_unknown);
+            assert!(preparation.result.try_recv().unwrap().is_err());
+            assert!(!feed.can_submit("native"));
+            let next = snapshot("test", 2);
+            feed.publish_for_test(SessionFeedResult::Snapshot(next.clone()));
+            feed.mark_snapshot_applied(next);
+            assert!(
+                !feed.can_submit("native"),
+                "a newer snapshot cannot resolve Unknown automatically"
+            );
+            feed.resolve_indeterminate("native").unwrap();
+            assert!(feed.can_submit("native"));
+        }
+    }
+
+    #[test]
+    fn creation_receipts_wait_for_applied_same_epoch_and_survive_repeated_drains() {
+        let (mut feed, mut requests) = feed_with_native_lane();
+        let body =
+            serde_json::from_value(serde_json::json!({"path":"/tmp", "tool":"claude"})).unwrap();
+        feed.create_session("stub".into(), body).unwrap();
+        let row = serde_json::from_value(
+            serde_json::json!({"id":"created", "status":"Idle", "view":"structured"}),
+        )
+        .unwrap();
+        requests
+            .try_recv()
+            .unwrap()
+            .result
+            .send(Ok(CommandReply::Created(Box::new(MutationReceipt {
+                cursor: RuntimeCursor {
+                    epoch: "test".into(),
+                    revision: 2,
+                },
+                outcome: row,
+            }))))
+            .unwrap();
+        assert!(feed.drain_creation_results().is_empty());
+        feed.publish_for_test(SessionFeedResult::Snapshot(snapshot("test", 2)));
+        assert!(feed.drain_creation_results().is_empty());
+        feed.mark_snapshot_applied(snapshot("foreign", 99));
+        assert!(feed.drain_creation_results().is_empty());
+        feed.mark_snapshot_applied(snapshot("test", 2));
+        let results = feed.drain_creation_results();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, "stub");
+        assert_eq!(results[0].1.as_ref().unwrap().outcome.id, "created");
+        assert!(feed.drain_creation_results().is_empty());
+    }
+
+    #[test]
+    fn a_buffered_creation_receipt_does_not_restore_a_revoked_authority_generation() {
+        let (mut feed, mut requests) = feed_with_native_lane();
+        let body =
+            serde_json::from_value(serde_json::json!({"path":"/tmp", "tool":"claude"})).unwrap();
+        feed.create_session("stub".into(), body).unwrap();
+        let row = serde_json::from_value(
+            serde_json::json!({"id":"created", "status":"Idle", "view":"structured"}),
+        )
+        .unwrap();
+        requests
+            .try_recv()
+            .unwrap()
+            .result
+            .send(Ok(CommandReply::Created(Box::new(MutationReceipt {
+                cursor: RuntimeCursor {
+                    epoch: "test".into(),
+                    revision: 2,
+                },
+                outcome: row,
+            }))))
+            .unwrap();
+        assert!(feed.drain_creation_results().is_empty());
+        set_grant(&feed.grant, false);
+        set_grant(&feed.grant, true);
+        feed.mark_snapshot_applied(snapshot("test", 2));
+        let outcomes = feed.drain_creation_results();
+        assert_eq!(outcomes.len(), 1);
+        assert!(matches!(outcomes[0].1, Err(CommandFailure::Unknown(_))));
+        assert!(feed.drain_creation_results().is_empty());
+    }
+
+    #[test]
+    fn watch_replays_only_unapplied_snapshots_and_compares_both_cursor_fields() {
+        let mut feed =
+            SessionFeed::seeded_for_test(SessionFeedResult::Snapshot(snapshot("old", 2)));
+        let SessionFeedResult::Snapshot(first) = feed.try_recv().unwrap() else {
+            unreachable!()
+        };
+        assert!(matches!(
+            feed.try_recv(),
+            Ok(SessionFeedResult::Snapshot(_))
+        ));
+        feed.mark_snapshot_applied(first);
+        assert!(matches!(feed.try_recv(), Err(TryRecvError::Empty)));
+        feed.publish_for_test(SessionFeedResult::Snapshot(snapshot("new", 2)));
+        let SessionFeedResult::Snapshot(new) = feed.try_recv().unwrap() else {
+            unreachable!()
+        };
+        assert_eq!(new.cursor.epoch, "new");
+        assert!(matches!(
+            feed.try_recv(),
+            Ok(SessionFeedResult::Snapshot(_))
+        ));
+        feed.publish_for_test(SessionFeedResult::Unavailable("lost".into()));
+        assert!(matches!(
+            feed.try_recv(),
+            Ok(SessionFeedResult::Unavailable(_))
+        ));
+        assert!(matches!(feed.try_recv(), Err(TryRecvError::Empty)));
+    }
+
     #[tokio::test]
     async fn cancellation_is_sent_while_create_http_request_is_still_open() {
         use std::sync::Mutex;
@@ -1611,6 +1981,7 @@ mod tests {
             "test".into(),
             Arc::new(AtomicU64::new(1)),
             receiver,
+            None,
         ));
         let (create_tx, mut create_rx) = tokio::sync::oneshot::channel();
         let body =
@@ -1719,6 +2090,7 @@ mod tests {
             "test".into(),
             Arc::new(AtomicU64::new(1)),
             rx,
+            None,
         ));
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         tx.send(SessionCommand {
@@ -1994,7 +2366,7 @@ mod tests {
             Arc::make_mut(&mut next).cursor.revision = 2;
             match invalidation {
                 Invalidation::None => {}
-                Invalidation::Cancel => prepared.lease.revoke(),
+                Invalidation::Cancel => prepared.lease.cancel_continuation(),
                 Invalidation::Permission => {
                     set_grant(&feed.native_grant, false);
                     set_grant(&feed.native_grant, true);
@@ -2017,15 +2389,6 @@ mod tests {
                 !feed.can_submit("session"),
                 "in-flight exclusion: {invalidation:?}"
             );
-            if matches!(
-                invalidation,
-                Invalidation::Cancel | Invalidation::Permission
-            ) {
-                feed.mark_snapshot_applied(next);
-                assert!(feed.drain_command_errors().is_empty());
-                assert!(!feed.can_submit("session"));
-                continue;
-            }
             respond(Ok(MutationReceipt {
                 cursor: RuntimeCursor {
                     epoch: "test".into(),
@@ -2039,13 +2402,24 @@ mod tests {
                 },
             }));
             feed.publish_for_test(SessionFeedResult::Snapshot(next.clone()));
-            assert!(feed.drain_command_errors().is_empty());
+            let errors = feed.drain_command_errors();
+            if matches!(invalidation, Invalidation::Permission) {
+                assert_eq!(errors.len(), 1);
+                assert!(errors[0].outcome_unknown);
+                assert!(prepared.result.try_recv().unwrap().is_err());
+                feed.mark_snapshot_applied(next);
+                assert!(feed.drain_command_errors().is_empty());
+                assert!(!feed.can_submit("session"));
+                continue;
+            }
+            assert!(errors.is_empty());
             assert!(matches!(
                 prepared.result.try_recv(),
                 Err(tokio::sync::oneshot::error::TryRecvError::Empty)
             ));
             feed.mark_snapshot_applied(next);
-            assert!(feed.drain_command_errors().is_empty());
+            let errors = feed.drain_command_errors();
+            assert!(errors.is_empty());
             let ready = prepared.result.try_recv().unwrap();
             assert_eq!(
                 ready.is_ok(),

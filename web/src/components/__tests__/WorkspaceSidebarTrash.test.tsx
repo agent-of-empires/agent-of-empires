@@ -27,6 +27,9 @@ const trashed = (id: string, ...ids: string[]) =>
 /** `groups` holds the workspaces for navigation; the Trash list is passed separately, as App computes it. */
 function renderSidebar(workspaces: Workspace[], over: Partial<Props> = {}) {
   const props: Props = {
+    observedById: {},
+    runtimeEpoch: "boot",
+    onSessionMutation: noop,
     groups: buildSessionGroups(workspaces, {
       idleDecayWindowMs: 60_000,
       sortMode: "lastActivity",

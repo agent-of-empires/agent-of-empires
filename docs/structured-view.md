@@ -161,9 +161,11 @@ aoe acp attach <session_id> --daemon-url https://aoe.example.com
 
 When `AOE_DAEMON_URL` is set, the TUI swaps the local home view for a remote session picker, and `aoe serve --status` / the `aoe acp *` verbs retarget to the remote. Local-only operations (tmux attach, `aoe stop`, file edit) aren't available against a remote; use the web dashboard or SSH into the host. Unset the variable to fall back to local introspection.
 
-The session list is read with a bearer token only over HTTPS or a loopback URL. With `AOE_DAEMON_TOKEN` set and a plaintext `http://` URL on another host, the picker reports that refusal instead of listing sessions. The other daemon requests do not apply this check yet (#3839), so use HTTPS or a tunnel for a remote daemon.
+The remote session picker uses bearer authentication only. Bearer credentials are sent only over HTTPS or loopback HTTP; with `AOE_DAEMON_TOKEN` set, a plaintext `http://` endpoint on another host is refused. Use HTTPS or a secure tunnel for a remote daemon.
 
-A remote daemon running `--auth=passphrase` never mints a bearer token, so `AOE_DAEMON_TOKEN` has nothing to carry. Set `AOE_DAEMON_PASSPHRASE` instead; the CLI logs in via the same `/api/login` handshake the web dashboard uses and caches the resulting session for the process. A local daemon needs neither: the CLI already reads its own `serve.passphrase` file (the same one `aoe serve --restart` recalls from) to log in automatically.
+For direct `aoe acp` operations against an explicitly configured passphrase-only TCP or remote endpoint, set `AOE_DAEMON_PASSPHRASE`. The ACP clients perform the `/api/login` handshake and reuse its device-bound session, with credentials cached on disk per endpoint URL across CLI invocations. Passphrases are sent only over HTTPS or loopback HTTP. This does not add passphrase login to the remote session picker, whose sessions client uses bearer authentication.
+
+With no explicit remote or TCP endpoint, native clients use the local owner-verified Unix API and need neither credential variable. The kernel peer identity authorizes the connection (`SO_PEERCRED` on Linux), including when the dashboard runs with `--behind-proxy`. `serve.passphrase` is retained for daemon restart recall, not native-client authentication. TCP loopback callers remain a separate authentication path; behind a proxy, the passphrase wall applies to them too.
 
 ## Headless CLI verbs
 

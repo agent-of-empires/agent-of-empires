@@ -4,7 +4,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { renderHook, waitFor } from "@testing-library/react";
 
 vi.mock("../../../lib/api", () => ({
-  fetchSessions: vi.fn(() => Promise.resolve({ sessions: [], workspace_ordering: [] })),
+  fetchSessions: vi.fn(() =>
+    Promise.resolve({ sessions: [], workspace_ordering: [], cursor: { epoch: "boot", revision: 1n } }),
+  ),
   fetchRecentProjects: vi.fn(() => Promise.resolve({ projects: [] })),
   fetchProjects: vi.fn(() => Promise.resolve([])),
 }));

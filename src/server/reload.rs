@@ -440,6 +440,9 @@ pub(super) fn apply_tick_status_decisions(
     sandbox_health: &std::collections::HashMap<String, SandboxHealth>,
 ) {
     for inst in instances.iter_mut() {
+        if inst.status == crate::session::Status::Creating {
+            continue;
+        }
         if suppressed_ids.contains(&inst.id) {
             inst.status = Status::Starting;
             continue;
@@ -564,6 +567,9 @@ pub(super) fn observed_transitions(
 pub(super) fn skip_tmux_decision_for_structured(inst: &mut Instance) -> bool {
     if !inst.is_structured() {
         return false;
+    }
+    if inst.status == crate::session::Status::Creating {
+        return true;
     }
     inst.clear_stale_tmux_error();
     // `None` means the row is newer than the last tick and has no live value
@@ -758,6 +764,7 @@ pub(super) fn merge_loaded_rows(
     let prior_by_id = PriorById::drain_from(current);
     let mut merged = Vec::with_capacity(fresh.len());
     for mut row in fresh {
+        let creating = row.status == crate::session::Status::Creating;
         if let Some(mut prior) = prior_by_id.get(&row.id).cloned() {
             let prior_status = prior.status;
             let prior_last_accessed = prior.last_accessed_at;
@@ -771,13 +778,15 @@ pub(super) fn merge_loaded_rows(
                 }
                 merge_runtime_fields(prior, &mut row);
             }
-            if matches!(status_source, StatusSource::DiskOnly) {
+            if !creating && matches!(status_source, StatusSource::DiskOnly) {
                 row.status = prior_status;
                 row.idle_entered_at = prior_idle_entered.or(row.idle_entered_at);
             }
             row.last_accessed_at = prior_last_accessed.max(row.last_accessed_at);
         }
-        if suppressed_ids.contains(&row.id) {
+        if creating {
+            row.status = crate::session::Status::Creating;
+        } else if suppressed_ids.contains(&row.id) {
             row.status = Status::Starting;
         }
         merged.push(row);
@@ -830,7 +839,7 @@ pub(super) fn merge_loaded_rows(
 /// writer at `status_poll_loop` deliberately does not.
 pub(super) fn apply_acp_overlay_inplace(prior_by_id: &PriorById, merged: &mut [Instance]) {
     for inst in merged.iter_mut() {
-        if !inst.is_structured() {
+        if !inst.is_structured() || inst.status == crate::session::Status::Creating {
             continue;
         }
         let Some(prior) = prior_by_id.get(&inst.id) else {

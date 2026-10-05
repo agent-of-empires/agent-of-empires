@@ -1248,14 +1248,15 @@ async fn workspace_purge_retains_shared_files_when_structured_shutdown_is_unprov
         (owner_id.clone(), DeleteSessionBody::default()),
     ];
     let (deleted, _, failed, _, _) =
-        purge_workspace_artifacts(&state, owner_id.clone(), plan, false).await;
+        purge_workspace_artifacts(&state, owner_id.clone(), plan.clone(), false).await;
     assert_eq!(std::fs::read(root.join("payload"))?, b"live workspace");
-    assert_eq!(deleted, vec![sibling_id.clone()]);
+    assert!(deleted.is_empty());
     assert!(failed.iter().any(|failure| failure.id == sibling_id));
     let rows = storage.load()?;
     assert!(rows.iter().any(|row| row.id == owner_id));
-    assert!(!rows.iter().any(|row| row.id == sibling_id));
+    assert!(rows.iter().any(|row| row.id == sibling_id));
     drop(state);
+    std::fs::remove_dir(crate::process::worker_registry::record_path(&sibling_id)?)?;
     let mut recovered = storage.load()?;
     for row in &mut recovered {
         row.source_profile = "shutdown-proof".into();
@@ -1263,19 +1264,13 @@ async fn workspace_purge_retains_shared_files_when_structured_shutdown_is_unprov
     let state = crate::server::test_support::build_test_app_state(recovered);
     *state.canonical_metadata.write().await =
         crate::server::reload::load_all_profiles(&state.file_watch)?.metadata;
-    let response = delete_session(
-        State(state),
-        Path(owner_id),
-        Some(Json(DeleteSessionBody::default())),
-    )
-    .await
-    .into_response();
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(
-        std::fs::read(root.join("payload"))
-            .expect("later purge after supervisor reconstruction deleted unresolved runtime files"),
-        b"live workspace"
-    );
+    let (deleted, _, failed, _, _) =
+        purge_workspace_artifacts(&state, owner_id.clone(), plan, false).await;
+    assert!(failed.is_empty());
+    assert!(deleted.contains(&sibling_id));
+    assert!(deleted.contains(&owner_id));
+    assert!(storage.load()?.is_empty());
+    assert!(!root.exists());
     Ok(())
 }
 

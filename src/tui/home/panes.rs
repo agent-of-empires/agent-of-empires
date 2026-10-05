@@ -123,7 +123,7 @@ impl HomeView {
 
     pub(super) fn cancel_native_attachment(&mut self) {
         if let Some(pending) = self.pending_native_attachment.take() {
-            pending.preparation.lease.revoke();
+            pending.preparation.lease.cancel_continuation();
         }
     }
 
@@ -174,7 +174,7 @@ impl HomeView {
             Ok(Err(error)) => error,
             Err(_) => "Runtime preparation interrupted".into(),
         };
-        pending.preparation.lease.revoke();
+        pending.preparation.lease.cancel_continuation();
         let title = match &pending.intent {
             PaneIntent::Attach => "Attachment failed",
             PaneIntent::LiveSend(_) => "Live send failed",

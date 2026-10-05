@@ -2419,6 +2419,69 @@ mod tests {
             }
         }
     }
+    #[test]
+    #[serial_test::serial]
+    fn unresolved_runner_capture_preserves_row_before_irreversible_commit() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        super::super::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+        let storage = Storage::new_unwatched("unresolved-capture").unwrap();
+        let mut instance = create_test_instance();
+        instance.source_profile = "unresolved-capture".into();
+        instance.view = crate::session::View::Structured;
+        instance.scratch = true;
+        let scratch = crate::session::scratch::provision_scratch_dir(&instance.id).unwrap();
+        instance.project_path = scratch.to_string_lossy().into_owned();
+        std::fs::write(scratch.join("payload"), b"retained").unwrap();
+        storage
+            .update(|rows, _| {
+                rows.push(instance.clone());
+                Ok(())
+            })
+            .unwrap();
+        let registry = crate::process::worker_registry::record_path(&instance.id).unwrap();
+        std::fs::create_dir_all(registry.parent().unwrap()).unwrap();
+        std::fs::write(&registry, b"{").unwrap();
+        let request = DeletionRequest {
+            session_id: instance.id.clone(),
+            instance,
+            delete_worktree: false,
+            delete_branch: false,
+            delete_sandbox: false,
+            force_delete: false,
+            detach_hooks: true,
+            keep_scratch: false,
+        };
+        let PurgeReservation::Reserved(transaction) = PurgeTransaction::reserve(
+            Storage::open_unwatched("unresolved-capture").unwrap(),
+            request,
+            None,
+        )
+        .unwrap() else {
+            panic!("purge must be reserved")
+        };
+        let result = match transaction.begin_irreversible() {
+            Ok(_) => panic!("unresolved ownership allowed an irreversible commit"),
+            Err(result) => result,
+        };
+        assert!(!result.success);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let row = loop {
+            let row = storage.load().unwrap().pop().unwrap();
+            if row.lifecycle_reservation.is_none() {
+                break row;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "refused purge reservation was not released"
+            );
+            std::thread::yield_now();
+        };
+        assert_eq!(row.id, result.session_id);
+        assert_eq!(std::fs::read(scratch.join("payload")).unwrap(), b"retained");
+        assert!(super::super::purge_owners::recovery_plans()
+            .unwrap()
+            .is_empty());
+    }
 
     #[cfg(unix)]
     #[test]

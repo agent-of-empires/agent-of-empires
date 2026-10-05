@@ -7,15 +7,19 @@ dashboard uses the same API surface plus additional internal routes.
 
 ## Authentication
 
-All endpoints require a token unless the server was started with
-`--no-auth`. The token is the one printed by `aoe serve` (or visible
-in the TUI's Serve panel). Three transports are accepted:
+TCP endpoints require authentication unless the server was started with
+`--no-auth`; see [dashboard security](guides/web-dashboard.md#security) for
+token and passphrase modes. Token authentication accepts three transports:
 
 | Transport | Example |
 | --- | --- |
 | Bearer header (recommended for clients) | `Authorization: Bearer <token>` |
 | Query parameter | `?token=<token>` |
 | Cookie | `aoe_token=<token>` (set automatically by the dashboard) |
+
+The private local Unix socket verifies its owner instead. A native client using
+that socket does not need the TCP passphrase or a loopback login, including when
+the dashboard runs behind a proxy.
 
 Read-only mode (`aoe serve --read-only`) blocks every write endpoint
 with `403 read_only`. Read endpoints work normally.
@@ -191,6 +195,12 @@ The response is an object, not a bare array:
 Clients written against the historical bare-array response must be updated to
 read `sessions`; the array is never returned unwrapped.
 
+`aoe-runtime-epoch` and `aoe-runtime-revision` identify the exact returned
+snapshot. Revisions are decimal unsigned 64-bit integers; clients must preserve
+their precision. A stale list must not replace newer canonical rows or ordering.
+Color and notification mutation receipts identify one session: another session
+at a higher revision cannot satisfy that receipt.
+
 **Query parameters**
 
 | Name | Default | Notes |
@@ -250,6 +260,10 @@ comes from that published snapshot. The session and its group hierarchy are
 committed before the receipt. A native client must apply a snapshot from the
 same epoch at or beyond that revision before acting on the new row.
 
+An omitted `profile` targets the served profile reported by `GET /api/about`, not
+the machine-default profile. Load project registries and launch defaults for that
+same profile until an explicit profile is selected.
+
 An optional `size` object, such as `{"cols":137,"rows":41}`, sets the initial
 terminal dimensions. Both dimensions must be nonzero. Replaying a creation
 does not relaunch or resize its existing pane.
@@ -261,12 +275,16 @@ While creation is active, daemon requests to rename or delete its profile
 return `409`. Hooks can still mutate other profiles; no catalogue lock is
 held while they run.
 
-The daemon validates planned resource paths and publishes a reserved `Starting`
+The daemon validates planned resource paths and publishes a reserved `Creating`
 row before provisioning directories or Git worktrees. These references protect
 borrowed repositories and directories during Git hooks and `on_create`. Failed
 provisioning or hooks roll back only the matching creation generation, using
 shared-resource guards and the recorded ownership of checkouts and branches.
 Cleanup failures retain resources.
+Structured rows cannot resume, receive prompts, or replay an unfinished creation
+while these hooks are pending. Matching plugin retries wait for finalization.
+An orphaned HTTP retry receives `409 create_outcome_unknown`; concurrent keyed
+HTTP requests wait for the admitted creation to finish.
 Repository hook and MCP approvals are persisted against the source repository
 before provisioning begins. Failure to persist approval aborts creation.
 
@@ -377,6 +395,8 @@ leaves an already-running session alone, `/restart` performs the restart lifecyc
 Optional `profile`, `tool`, `command_override`, and `extra_args` replace the
 authoritative launch settings within the daemon's admitted operation. Omitted
 settings remain unchanged; a refused operation does not persist these edits.
+Structured sessions replace their ACP worker without creating a tmux session.
+The outgoing worker must exit before its replacement is admitted.
 
 ```json
 { "command_override": "my-agent", "extra_args": "--verbose", "unsnooze": true }
@@ -468,14 +488,25 @@ curl -sS \
   "http://localhost:7777/api/sessions/abc123/output?lines=80&format=text"
 ```
 
-## Session and group mutations from the TUI
+## Native mutation completion
 
-The TUI routes the session mutations this API exposes through the daemon,
-but group creation, collapse, move, delete, and the session and group
-renames still land in `sessions.json` and `groups.json` directly; that
-split is tracked in #2734. The matching daemon routes exist but are not
-part of the published surface, so the HTTP API stays the only way to
-reach them.
+The TUI settles a mutation only after applying a same-epoch snapshot at
+or beyond its receipt. If profile storage cannot be loaded, the TUI retains the
+unapplied snapshot and creation receipt and retries the load without resubmitting
+the mutation or rerunning creation hooks.
+
+Cancelling an attachment or input continuation does not revoke daemon authority.
+A confirmed mutation still settles behind its receipt, but no cancelled input or
+attachment is delivered. Genuine authority loss or an unknown outcome remains
+blocked until reconciled.
+
+With an active local daemon, CLI profile renames and deletions go through its
+namespace epoch. Deleting its served profile returns `409 served_profile` and
+preserves the profile; renaming it retargets the live identity. A daemon refusal
+never falls back to editing the profile directory directly.
+
+Purge refuses unresolved runner ownership before committing deletion. The row
+and its resources remain available for repair and retry.
 
 ## Driving a session as a subagent
 

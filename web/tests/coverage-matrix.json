@@ -1381,12 +1381,21 @@
     {
       "id": "sidebar.session-color",
       "kind": "vitest",
-      "risk": "low",
+      "risk": "high",
       "specs": [
         "src/components/__tests__/SessionRowTriage.test.tsx",
-        "src/components/sidebar/usePendingSetting.test.ts"
+        "src/components/sidebar/usePendingSetting.test.ts",
+        "src/components/__tests__/SessionRowReceipts.test.tsx",
+        "src/hooks/__tests__/useSessionsPolling.test.tsx",
+        "src/lib/api.test.ts"
       ],
-      "components": ["web/src/components/WorkspaceSidebar.tsx", "web/src/components/sidebar/usePendingSetting.ts"]
+      "components": [
+        "web/src/components/WorkspaceSidebar.tsx",
+        "web/src/components/sidebar/usePendingSetting.ts",
+        "web/src/components/sidebar/SessionRow.tsx",
+        "web/src/hooks/useSessions.ts",
+        "web/src/lib/api.ts"
+      ]
     },
     {
       "id": "sidebar.menu-choice-stays-open",
@@ -4288,6 +4297,60 @@
       "risk": "high",
       "specs": ["src/hooks/__tests__/useProjects.test.tsx"],
       "components": ["web/src/hooks/useProjects.ts", "web/src/hooks/app/useProjectActions.ts"]
+    },
+    {
+      "id": "wizard.served-profile-scope",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": [
+        "src/components/session-wizard/__tests__/SessionWizard.test.tsx",
+        "src/components/session-wizard/__tests__/SessionWizard.projectWorktreeOverride.test.tsx",
+        "src/components/session-wizard/__tests__/SessionWizard.lastProject.test.tsx",
+        "src/components/session-wizard/__tests__/projectPickerScope.test.ts"
+      ],
+      "components": [
+        "web/src/App.tsx",
+        "web/src/components/session-wizard/SessionWizard.tsx",
+        "web/src/components/session-wizard/steps/projectPicker.ts",
+        "web/src/components/session-wizard/steps/ExtraReposPicker.tsx"
+      ]
+    },
+    {
+      "id": "connectivity.poll-abort-deadline",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": [
+        "src/hooks/__tests__/useSessionsPolling.test.tsx",
+        "src/hooks/__tests__/useProjects.test.tsx",
+        "src/components/__tests__/TopBar.test.tsx",
+        "src/lib/api.test.ts"
+      ],
+      "components": [
+        "web/src/hooks/useSessions.ts",
+        "web/src/hooks/useProjects.ts",
+        "web/src/lib/api.ts",
+        "web/src/lib/connectionState.ts",
+        "web/src/components/TopBar.tsx"
+      ]
+    },
+    {
+      "id": "sidebar.canonical-settings-receipts",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": [
+        "src/components/__tests__/SessionRowReceipts.test.tsx",
+        "src/components/sidebar/usePendingSetting.test.ts",
+        "src/hooks/__tests__/useSessionsPolling.test.tsx",
+        "src/lib/api.test.ts"
+      ],
+      "components": [
+        "web/src/App.tsx",
+        "web/src/components/WorkspaceSidebar.tsx",
+        "web/src/components/sidebar/SessionRow.tsx",
+        "web/src/components/sidebar/usePendingSetting.ts",
+        "web/src/hooks/useSessions.ts",
+        "web/src/lib/api.ts"
+      ]
     }
   ]
 }

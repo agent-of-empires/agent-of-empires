@@ -97,6 +97,7 @@ export function sessionStub(overrides: Record<string, unknown> = {}) {
 }
 
 export interface WizardMockOptions {
+  servedProfile?: string;
   agents?: unknown[];
   profiles?: unknown[];
   /** Default `/api/settings` body; `worktree.enabled` drives the "Create a worktree" default (#2423). */
@@ -120,8 +121,8 @@ export async function mockWizardApis(page: Page, opts: WizardMockOptions = {}) {
   await page.route("**/api/login/status", (r) => r.fulfill({ json: { required: false, authenticated: true } }));
   for (const path of ["themes", "groups", "devices"])
     await page.route(`**/api/${path}`, (r) => r.fulfill({ json: [] }));
-  for (const path of ["about", "system/update-status"])
-    await page.route(`**/api/${path}`, (r) => r.fulfill({ json: {} }));
+  await page.route("**/api/about", (r) => r.fulfill({ json: { profile: opts.servedProfile ?? "default" } }));
+  await page.route("**/api/system/update-status", (r) => r.fulfill({ json: {} }));
   await page.route("**/api/settings**", (r) => {
     const profile = new URL(r.request().url()).searchParams.get("profile");
     return r.fulfill({ json: (profile && opts.profileSettings?.[profile]) || opts.settings || {} });
@@ -140,7 +141,10 @@ export async function mockWizardApis(page: Page, opts: WizardMockOptions = {}) {
   );
   await page.route("**/api/sessions", async (r) => {
     if (r.request().method() !== "POST") {
-      return r.fulfill({ json: { sessions: opts.sessions ?? [sessionStub()], workspace_ordering: [] } });
+      return r.fulfill({
+        headers: { "aoe-runtime-epoch": "mock-runtime", "aoe-runtime-revision": "1" },
+        json: { sessions: opts.sessions ?? [sessionStub()], workspace_ordering: [] },
+      });
     }
     const body = JSON.parse(r.request().postData() || "{}");
     created.push(body);

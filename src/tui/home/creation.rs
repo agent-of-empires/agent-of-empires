@@ -140,6 +140,8 @@ impl HomeView {
             cancel_requested: false,
             cancel_sent: false,
             outcome_unknown: false,
+            confirmation: None,
+            reload_retry_at: None,
         });
     }
 
@@ -156,6 +158,9 @@ impl HomeView {
             let Some(pending) = self.pending_creation.as_mut() else {
                 return false;
             };
+            if pending.confirmation.is_some() {
+                return false;
+            }
             if let Some(id) = pending.daemon_id.clone() {
                 id
             } else {
@@ -299,7 +304,7 @@ impl HomeView {
         changed
     }
 
-    /// Attach only after a confirmed receipt or a matching canonical row.
+    /// Attach only after an applied receipt or a current matching canonical row.
     pub fn apply_creation_results(&mut self) -> Option<String> {
         use crate::tui::session_feed::CommandFailure;
         let settled = self.session_feed.drain_creation_results();
@@ -307,77 +312,65 @@ impl HomeView {
             .into_iter()
             .find(|(token, _)| self.creating_token() == Some(token.as_str()))
         {
-            if let Err(CommandFailure::Unknown(message)) = &result {
-                if let Some(pending) = self.pending_creation.as_mut() {
-                    pending.outcome_unknown = true;
+            match result {
+                Ok(receipt) => {
+                    let pending = self.pending_creation.as_mut()?;
+                    pending.daemon_id = Some(receipt.outcome.id.clone());
+                    pending.confirmation = Some(CreationConfirmation::Receipt(receipt));
                 }
-                self.info_dialog = Some(InfoDialog::sized_to_fit(
-                    "Creation outcome unknown",
-                    &format!("{message}\nThe daemon may still be creating this session. Wait for its canonical row or cancel; do not submit a second creation yet."),
-                ));
-                return self.resolve_unknown_creation();
-            }
-            let cancelled = self
-                .pending_creation
-                .as_ref()
-                .is_some_and(|pending| pending.cancel_requested);
-            self.clear_creation_tracking(&stub_id);
-            if cancelled {
-                return match result {
-                    Err(CommandFailure::Rejected(_)) => {
-                        self.flash_status("Creation was refused before commit");
-                        None
-                    }
-                    Ok(_) => {
-                        self.flash_status(
-                            "Creation had already committed; cancellation was too late",
-                        );
-                        self.reload().ok();
-                        None
-                    }
-                    Err(CommandFailure::Unknown(_)) => unreachable!(),
-                };
-            }
-            return match result {
-                Ok(receipt) => self.commit_created_session(
-                    receipt.outcome.id,
-                    &receipt.outcome.profile,
-                    &receipt.outcome.warnings,
-                ),
+                Err(CommandFailure::Unknown(message)) => {
+                    self.pending_creation.as_mut()?.outcome_unknown = true;
+                    self.info_dialog = Some(InfoDialog::sized_to_fit(
+                        "Creation outcome unknown",
+                        &format!("{message}\nThe daemon may still be creating this session. Wait for its canonical row or cancel; do not submit a second creation yet."),
+                    ));
+                }
                 Err(CommandFailure::Rejected(message)) => {
+                    let cancelled = self.pending_creation.as_ref()?.cancel_requested;
+                    self.clear_creation_tracking(&stub_id);
                     self.rebuild_group_trees();
                     self.rebuild_flat_items();
                     self.update_selected();
-                    self.info_dialog = Some(InfoDialog::sized_to_fit("Creation Failed", &message));
-                    None
+                    if cancelled {
+                        self.flash_status("Creation was refused before commit");
+                    } else {
+                        self.info_dialog =
+                            Some(InfoDialog::sized_to_fit("Creation Failed", &message));
+                    }
+                    return None;
                 }
-                Err(CommandFailure::Unknown(_)) => unreachable!(),
-            };
+            }
         }
-        self.resolve_unknown_creation()
-    }
-
-    fn resolve_unknown_creation(&mut self) -> Option<String> {
-        let pending = self
-            .pending_creation
-            .as_ref()
-            .filter(|pending| pending.outcome_unknown)?;
-        let id = pending.daemon_id.as_deref()?;
-        let row = self.session_feed.applied_session(id)?.clone();
-        if row.idempotency_key.as_deref() != Some(pending.request_key.as_str())
-            || matches!(row.status.as_str(), "Creating" | "Starting")
+        if !self.session_feed.current_snapshot_applied() {
+            return None;
+        }
+        let pending = self.pending_creation.as_ref()?;
+        if pending
+            .reload_retry_at
+            .is_some_and(|retry_at| std::time::Instant::now() < retry_at)
         {
             return None;
         }
-        let cancelled = pending.cancel_requested;
-        let stub_id = pending.request_key.clone();
-        self.clear_creation_tracking(&stub_id);
-        if cancelled {
-            self.flash_status("Creation committed before cancellation; session is retained");
-            self.reload().ok();
-            return None;
+        let receipt_confirmed = matches!(&pending.confirmation,
+            Some(CreationConfirmation::Receipt(receipt))
+                if self.session_feed.receipt_applied(&receipt.cursor));
+        if !receipt_confirmed {
+            if !pending.outcome_unknown && pending.confirmation.is_none() {
+                return None;
+            }
+            let row = self
+                .session_feed
+                .applied_session(pending.daemon_id.as_deref()?)?;
+            if row.idempotency_key.as_deref() != Some(pending.request_key.as_str())
+                || matches!(row.status.as_str(), "Creating" | "Starting")
+            {
+                return None;
+            }
+            let row = row.clone();
+            self.pending_creation.as_mut()?.confirmation =
+                Some(CreationConfirmation::Canonical(row));
         }
-        self.commit_created_session(row.id, &row.profile, &row.warnings)
+        self.commit_created_session()
     }
 
     fn clear_creation_tracking(&mut self, stub_id: &str) {
@@ -387,44 +380,59 @@ impl HomeView {
         self.creating_hook_progress.remove(stub_id);
     }
 
-    fn commit_created_session(
-        &mut self,
-        session_id: String,
-        profile: &str,
-        warnings: &[String],
-    ) -> Option<String> {
-        crate::tui::app::record_session_create();
+    fn commit_created_session(&mut self) -> Option<String> {
+        // During the synchronous load the committed row must not be hidden as a reservation.
+        let mut pending = self.pending_creation.take()?;
+        let row = match pending.confirmation.as_ref()? {
+            CreationConfirmation::Receipt(receipt) => &receipt.outcome,
+            CreationConfirmation::Canonical(row) => row,
+        };
         let loaded = if self
             .active_profile
             .as_deref()
-            .is_some_and(|active| active != profile)
+            .is_some_and(|active| active != row.profile)
         {
-            self.switch_profile(Some(profile.to_owned()))
+            self.switch_profile(Some(row.profile.clone()))
         } else {
             self.reload()
         };
-        if let Err(error) = loaded {
-            self.info_dialog = Some(InfoDialog::sized_to_fit("Session created", &format!(
-                "The daemon created the session in profile {profile}, but its local view could not load: {error}"
-            )));
+        let failure = match loaded {
+            Err(error) => Some(format!(
+                "The daemon created the session in profile {}, but its local view could not load: {error}",
+                row.profile,
+            )),
+            Ok(()) if self.get_instance(&row.id).is_none() => Some(
+                "The session is committed but not visible yet; its profile will be retried before attaching.".into(),
+            ),
+            Ok(()) => None,
+        };
+        if let Some(message) = failure {
+            self.info_dialog = Some(InfoDialog::sized_to_fit("Session created", &message));
+            pending.reload_retry_at =
+                Some(std::time::Instant::now() + Self::RECONCILE_RELOAD_RETRY_INTERVAL);
+            self.pending_creation = Some(pending);
             return None;
         }
-        if self.get_instance(&session_id).is_none() {
-            self.info_dialog = Some(InfoDialog::new("Session created", "The session is committed but not visible yet; refresh its profile before attaching."));
-            return None;
-        }
-        self.select_and_reveal_session(&session_id);
+        crate::tui::app::record_session_create();
+        self.clear_creation_tracking(&pending.request_key);
+        self.rebuild_group_trees();
+        self.rebuild_flat_items();
+        self.select_and_reveal_session(&row.id);
         self.new_dialog = None;
-        if !warnings.is_empty() {
+        if pending.cancel_requested {
+            self.flash_status("Creation had already committed; cancellation was too late");
+            return None;
+        }
+        if !row.warnings.is_empty() {
             self.info_dialog = Some(InfoDialog::sized_to_fit(
                 "Session warnings",
                 &format!(
                     "Session was created, but setup emitted warnings:\n\n{}",
-                    warnings.join("\n\n")
+                    row.warnings.join("\n\n")
                 ),
             ));
         }
-        Some(session_id)
+        Some(row.id.clone())
     }
 
     /// Clear the placeholder on quit. The daemon keeps admitted work, so this

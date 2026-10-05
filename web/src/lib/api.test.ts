@@ -19,6 +19,15 @@ afterEach(() => {
 
 const json = (body: unknown, status = 200) =>
   new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
+const cursor = { epoch: "boot", revision: 9007199254740993n };
+const runtimeJson = (body: unknown) =>
+  new Response(JSON.stringify(body), {
+    headers: {
+      "content-type": "application/json",
+      "aoe-runtime-epoch": cursor.epoch,
+      "aoe-runtime-revision": cursor.revision.toString(),
+    },
+  });
 const empty = (status = 200) => new Response("", { status });
 const offline = () => fetchSpy.mockRejectedValueOnce(new Error("offline"));
 
@@ -47,7 +56,7 @@ const skill = {
 const preview = { kind: "consent_required", dismissed: false, consent: { id: "p" } };
 
 const requestCases: RequestCase[] = [
-  ["GET /api/sessions", () => api.fetchSessions(), { respond: json(sessions), result: sessions }],
+  ["GET /api/sessions", () => api.fetchSessions(), { respond: runtimeJson(sessions), result: { ...sessions, cursor } }],
   [
     "GET /api/sessions/search?q=foo%20bar",
     () => api.searchConversations("foo bar"),
@@ -351,7 +360,11 @@ const requestCases: RequestCase[] = [
   ).map(([preset, value]): RequestCase => [
     "PATCH /api/sessions/s1/notifications",
     () => api.setSessionNotifications("s1", preset),
-    { body: { notify_on_waiting: value, notify_on_idle: value, notify_on_error: value }, result: true },
+    {
+      body: { notify_on_waiting: value, notify_on_idle: value, notify_on_error: value },
+      respond: runtimeJson(session),
+      result: { session, cursor },
+    },
   ]),
   [
     "PATCH /api/sessions/s1/diff-base",
@@ -368,7 +381,11 @@ const requestCases: RequestCase[] = [
     () => api.setSessionPin("s1", false),
     { body: { pinned: false }, respond: json(session), result: session },
   ],
-  ["PATCH /api/sessions/s1/color", () => api.setSessionColor("s1", null), { body: { color: null } }],
+  [
+    "PATCH /api/sessions/s1/color",
+    () => api.setSessionColor("s1", null),
+    { body: { color: null }, respond: runtimeJson(session), result: { session, cursor } },
+  ],
   [
     "PATCH /api/sessions/s1/archive",
     () => api.setSessionArchive("s1", true),
@@ -1185,4 +1202,55 @@ describe("profile settings write guard", () => {
     expect(fetchSpy).toHaveBeenCalledTimes(2);
     expect(lastCall().url).toBe("/api/profiles/work/settings");
   });
+});
+
+describe("runtime snapshots and cancellation", () => {
+  it.each([
+    ["missing epoch", { "aoe-runtime-revision": "1" }],
+    ["missing revision", { "aoe-runtime-epoch": "boot" }],
+    ["malformed revision", { "aoe-runtime-epoch": "boot", "aoe-runtime-revision": "1.5" }],
+  ])("rejects unattested session snapshots and mutation ACKs (%s)", async (_name, headers) => {
+    for (const call of [
+      () => api.fetchSessions(),
+      () => api.setSessionColor("s1", null),
+      () => api.setSessionNotifications("s1", "default"),
+    ]) {
+      fetchSpy.mockResolvedValueOnce(
+        new Response(JSON.stringify(session), { headers: headers as Record<string, string> }),
+      );
+      expect(await call()).toBeNull();
+    }
+  });
+
+  it("preserves u64 revision precision and the canonical returned fields, including optional outcome", async () => {
+    const canonical = { ...session, color: "green", outcome: { acknowledged: true } };
+    fetchSpy.mockResolvedValueOnce(runtimeJson(canonical));
+    expect(await api.setSessionColor("s1", null)).toEqual({ session: canonical, cursor });
+    fetchSpy.mockResolvedValueOnce(runtimeJson(sessions));
+    expect((await api.fetchSessions())!.cursor.revision).toBe(9007199254740993n);
+  });
+
+  it.each(["sessions", "about", "projects"])(
+    "passes the caller's AbortSignal to %s and settles abort as null",
+    async (endpoint) => {
+      const controller = new AbortController();
+      fetchSpy.mockImplementationOnce(
+        (_url, init) =>
+          new Promise((_resolve, reject) => {
+            expect(init?.signal).toBe(controller.signal);
+            init!.signal!.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")), {
+              once: true,
+            });
+          }),
+      );
+      const request =
+        endpoint === "sessions"
+          ? api.fetchSessions(controller.signal)
+          : endpoint === "about"
+            ? api.fetchAbout(controller.signal)
+            : api.fetchProjects({ profile: "alpha" }, controller.signal);
+      controller.abort();
+      expect(await request).toBeNull();
+    },
+  );
 });

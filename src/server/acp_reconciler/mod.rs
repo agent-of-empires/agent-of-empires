@@ -120,7 +120,7 @@ fn is_untriaged_structured(i: &Instance) -> bool {
 
 /// Eligible for a reconciler-driven worker.
 fn is_resumable(i: &Instance) -> bool {
-    is_untriaged_structured(i) && !i.is_idle_dormant()
+    is_untriaged_structured(i) && !i.is_idle_dormant() && i.launch_is_finalized()
 }
 
 /// Runs a blocking event-store query for `id` off the runtime; `None` (logged) if the task panicked.

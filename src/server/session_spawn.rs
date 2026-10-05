@@ -281,7 +281,7 @@ pub(crate) async fn spawn_structured_session(
             let generation = instance.try_acquire_lifecycle_reservation(
                 LifecycleOperation::Launch, Instance::LIFECYCLE_RESERVATION_TTL, chrono::Utc::now(),
             )?;
-            instance.status = Status::Starting;
+            instance.status = Status::Creating;
             store.update(|rows, groups| {
                 anyhow::ensure!(!rows.iter().any(|row| row.id == instance.id), "created session already exists");
                 rows.push(instance.clone());
@@ -592,30 +592,31 @@ pub(crate) async fn spawn_structured_session(
         let _namespace = runtime.block_on(worker_state.profile_namespace.read());
         let _submission = runtime.block_on(worker_state.session_service.prompt_submission(&instance.id));
         let _guard = lock.blocking_lock();
+        let mut acp_reservation = None;
         let post_hooks: anyhow::Result<()> = (|| {
             if instance.is_structured() {
                 let _ownership = instance.reacquire_launch_locks_after_hooks(store, generation, Ok(()))?;
+                acp_reservation = match runtime.block_on(worker_state.acp_supervisor.begin_resume(
+                    &instance.id, crate::acp::supervisor::ResumeKind::Spawn,
+                )) {
+                    Ok(crate::acp::supervisor::ResumeReservationOutcome::Reserved(lease)) => Some(lease),
+                    Err(crate::acp::supervisor::SupervisorError::CapacityFull { .. }) => None,
+                    Ok(crate::acp::supervisor::ResumeReservationOutcome::AlreadyPresent) => {
+                        anyhow::bail!("creation worker already claimed before finalization")
+                    }
+                    Err(error) => return Err(error.into()),
+                };
                 store.update(|rows, _| {
                     let row = rows.iter_mut().find(|row| row.id == instance.id)
                         .ok_or(crate::session::LifecycleReservationError::Superseded)?;
                     anyhow::ensure!(row.lifecycle_reservation_is_owned(LifecycleOperation::Launch, generation),
                         crate::session::LifecycleReservationError::Superseded);
                     row.sandbox_info = instance.sandbox_info.clone();
-                    // The registration window closes here: the row, its worktree,
-                    // branch, sandbox and scratch dir are all durable and both
-                    // flocks are held, so the launch has nothing left to fence.
-                    // The ACP handshake that follows is a wait, not a durable
-                    // effect, and it is fenced by the supervisor instead —
-                    // `admit_durable_launch` re-reads the row under this same
-                    // lifecycle lock before and after it and retires the runner
-                    // when a peer took the row meanwhile. Holding the launch
-                    // across the whole wait instead made a create-then-delete
-                    // unresolvable for as long as the agent took to answer
-                    // its socket. Ownership from here is the generation this
-                    // creation published; see `commit_created_launch`.
+                    row.status = Status::Starting;
                     row.release_lifecycle_reservation_if_owned(LifecycleOperation::Launch, generation);
                     Ok(())
                 })?;
+                instance.status = Status::Starting;
                 instance.lifecycle_reservation = None;
                 native.adopt_runtime_fields(&instance)?;
             } else {
@@ -639,10 +640,7 @@ pub(crate) async fn spawn_structured_session(
             Ok(())
         })();
         if let Err(error) = post_hooks {
-            // A peer that shelved the row while the launch hooks ran does not
-            // destroy the creation: the row is persisted, its reservation is
-            // released, and the detached spawn refuses the launch with its own
-            // code. Any other failure still rolls the creation back. #4116.
+            // Archiving during hooks preserves the row but refuses ACP admission.
             if !error.is::<crate::session::StartBlocked>() {
                 rollback(native, instance, false);
                 return Err(error);
@@ -655,13 +653,15 @@ pub(crate) async fn spawn_structured_session(
             agent_effort,
             native,
             creation_profile,
+            acp_reservation,
         ))
     })
     .await;
 
     match result {
-        Ok(Ok((instance, warnings, agent_effort, native, creation_profile))) => {
-            let acp_spawn_target = if instance.is_structured() {
+        Ok(Ok((instance, warnings, agent_effort, native, creation_profile, acp_reservation))) => {
+            let native = Arc::new(native);
+            let acp_spawn_target = if instance.is_structured() && acp_reservation.is_some() {
                 Some((
                     instance.id.clone(),
                     instance.tool.clone(),
@@ -707,6 +707,7 @@ pub(crate) async fn spawn_structured_session(
                 fork_from,
             )) = acp_spawn_target
             {
+                let reservation = acp_reservation.expect("spawn target owns its ACP lease");
                 let agent = service
                     .acp_supervisor
                     .pick_agent_for_tool(
@@ -728,6 +729,7 @@ pub(crate) async fn spawn_structured_session(
                         .find(|i| i.id == id)
                         .is_some_and(|i| i.pending_initial_turn.is_some())
                 };
+                let launch_native = native.clone();
                 let sandbox_info = response_instance.sandbox_info.clone();
                 let generation = response_instance.lifecycle_generation;
                 let spawn_state = state.clone();
@@ -744,7 +746,7 @@ pub(crate) async fn spawn_structured_session(
                             let _lifecycle = native
                                 .storage()
                                 .acquire_instance_lifecycle_lock(&check_id)?;
-                            (&native as &dyn SessionStore).launch_configuration(&cwd)?;
+                            (native.as_ref() as &dyn SessionStore).launch_configuration(&cwd)?;
                             let rows = native.load()?;
                             let row = rows
                                 .iter()
@@ -785,28 +787,39 @@ pub(crate) async fn spawn_structured_session(
                     let spawned = match validation {
                         Err(error) => Err(error),
                         Ok(()) => supervisor
-                            .spawn(crate::acp::supervisor::SpawnRequest {
-                                session_id: id.clone(),
-                                agent: agent.clone(),
-                                tool,
-                                cwd,
-                                additional_dirs: vec![],
-                                provider_env: vec![],
-                                model,
-                                effort,
-                                effort_explicit,
-                                stored_acp_session_id,
-                                fork_from,
-                                sandbox_continuation:
-                                    crate::acp::supervisor::SandboxContinuation::Persisted,
-                                sandbox_info,
-                                source_profile: source_profile_for_spawn,
-                                yolo_mode,
-                                acp_mode_id,
-                                agent_command_override: command_override,
-                                seed_history_replay,
-                                claude_store_pin: None,
-                            })
+                            .spawn_inner(
+                                crate::acp::supervisor::SpawnRequest {
+                                    launch_admission: Some(
+                                        crate::acp::supervisor::LaunchAdmission {
+                                            store: launch_native,
+                                            generation,
+                                            namespace: Some(spawn_state.profile_namespace.clone()),
+                                        },
+                                    ),
+                                    expected_lifecycle_generation: generation,
+                                    session_id: id.clone(),
+                                    agent: agent.clone(),
+                                    tool,
+                                    cwd,
+                                    additional_dirs: vec![],
+                                    provider_env: vec![],
+                                    model,
+                                    effort,
+                                    effort_explicit,
+                                    stored_acp_session_id,
+                                    fork_from,
+                                    sandbox_continuation:
+                                        crate::acp::supervisor::SandboxContinuation::Persisted,
+                                    sandbox_info,
+                                    source_profile: source_profile_for_spawn,
+                                    yolo_mode,
+                                    acp_mode_id,
+                                    agent_command_override: command_override,
+                                    seed_history_replay,
+                                    claude_store_pin: None,
+                                },
+                                reservation,
+                            )
                             .await
                             .map_err(|error| {
                                 anyhow::anyhow!(crate::server::api::structured_spawn_error_message(
@@ -819,14 +832,9 @@ pub(crate) async fn spawn_structured_session(
                             "auto-spawn after create failed: {error}");
                         supervisor.publish_startup_error(&id, error.to_string());
                     }
-                    let settled = finish_created_structured_session(
-                        &spawn_state,
-                        native,
-                        &id,
-                        generation,
-                        spawned,
-                    )
-                    .await;
+                    let settled =
+                        finish_structured_launch(&spawn_state, native, &id, generation, spawned)
+                            .await;
                     drop(creation_profile);
                     match settled {
                         Ok(()) if has_pending_initial_turn => {
@@ -849,9 +857,9 @@ pub(crate) async fn spawn_structured_session(
     }
 }
 
-async fn finish_created_structured_session(
+pub(crate) async fn finish_structured_launch(
     state: &Arc<super::AppState>,
-    native: super::session_store::NativeSessionStore,
+    native: Arc<super::session_store::NativeSessionStore>,
     id: &str,
     generation: u64,
     outcome: anyhow::Result<()>,
@@ -869,19 +877,25 @@ async fn finish_created_structured_session(
         .cloned()
         .ok_or(crate::session::LifecycleReservationError::Superseded)?;
     let result = tokio::task::spawn_blocking(move || {
-        let ownership =
-            instance.reacquire_created_launch_locks_after_handshake(&native, generation, outcome);
+        let ownership = instance.reacquire_created_launch_locks_after_handshake(
+            native.as_ref(),
+            generation,
+            outcome,
+        );
         if ownership.is_err() {
             native.adopt_runtime_fields(&instance)?;
             return ownership.map(|_| ());
         }
-        let result =
-            instance.commit_created_launch(&native, generation, crate::session::Status::Idle);
+        let result = instance.commit_created_launch(
+            native.as_ref(),
+            generation,
+            crate::session::Status::Idle,
+        );
         native.adopt_runtime_fields(&instance)?;
         result
     })
     .await
-    .map_err(|error| anyhow::anyhow!("structured creation completion failed: {error}"))?;
+    .map_err(|error| anyhow::anyhow!("structured launch completion failed: {error}"))?;
     drop(guard);
     drop(submission);
     drop(namespace);
@@ -971,8 +985,6 @@ mod tests {
         assert!(owners["owners"].as_array().unwrap().is_empty());
     }
 
-    /// #4116: the detached spawn after a create runs once the row is persisted and published,
-    /// so an archive committed while its `before_session` hook runs must refuse the launch.
     #[tokio::test]
     #[serial_test::serial]
     async fn create_spawn_refuses_a_row_archived_while_the_hook_runs() {
@@ -982,9 +994,6 @@ mod tests {
         use axum::Json;
 
         let _home = crate::session::test_support::isolate_app_dir();
-        // The create runs the launch hooks inline, so a host session needs the agent hook
-        // paths acknowledged first, as the creation-receipt test does. Without it the
-        // create itself is refused and the detached spawn never reaches the hook.
         crate::session::config::update_app_state(|state| {
             state.has_acknowledged_agent_hooks = true;
         })
@@ -994,11 +1003,6 @@ mod tests {
         support::seed_instances_on_disk_for_test("test", Vec::new());
         let (launcher, launches) = support::counting_failing_launcher();
         let state = support::build_test_app_state_with_launcher(Vec::new(), launcher);
-        // The canonical store publishes a profile's rows only after the profile
-        // is in its metadata, so a create for `test` is refused outright
-        // ("committed profile is missing from canonical metadata") until the
-        // runtime has reloaded the profile list. Same prerequisite the
-        // rollback test above sets.
         support::refresh_canonical_metadata_for_test(&state).await;
         let body: crate::daemon::CreateSessionBody = serde_json::from_value(serde_json::json!({
             "title": "created-4116", "path": "", "tool": "claude",
@@ -1024,26 +1028,18 @@ mod tests {
         let response = create.await.unwrap();
         assert!(archived, "before_session hook did not run");
         assert_eq!(response.status(), axum::http::StatusCode::CREATED);
-        let id = support::load_instances_from_disk_for_test("test")
+        let stored = support::load_instances_from_disk_for_test("test")
             .into_iter()
             .find(|inst| inst.title == "created-4116")
-            .expect("create persisted its row")
-            .id;
-
-        tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            while !state
-                .acp_event_store
-                .replay_from(&id, 0)
-                .iter()
-                .any(|(_, event)| matches!(event, crate::acp::Event::AgentStartupError { .. }))
-            {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("the refused spawn reports a startup error");
+            .expect("archive retains the created row");
+        assert!(stored.is_archived());
+        assert!(stored.launch_is_finalized());
+        assert_eq!(stored.status, crate::session::Status::Stopped);
         assert_eq!(launches.load(std::sync::atomic::Ordering::SeqCst), 0);
-        assert!(!state.acp_supervisor.is_running(&id).await);
+        assert_eq!(
+            state.acp_supervisor.worker_state(&stored.id).await,
+            crate::daemon::AcpWorkerState::Absent
+        );
     }
 
     /// A create that answered has registered every resource the launch owns,

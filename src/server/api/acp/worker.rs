@@ -130,6 +130,11 @@ pub async fn spawn_acp(
     if let Err(blocked) = instance.ensure_startable() {
         return crate::server::api::start_blocked_response(blocked);
     }
+    if !instance.launch_is_finalized() {
+        return (StatusCode::CONFLICT, Json(serde_json::json!({
+            "error": "creation_not_finalized", "message": "The structured session launch is not finalized",
+        }))).into_response();
+    }
 
     let explicit = req.agent.clone().or_else(|| instance.agent_name.clone());
     let agent = pick_agent(&state, &instance, explicit.as_deref()).await;

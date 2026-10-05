@@ -367,6 +367,9 @@ function AppContent({
     injectSession,
     setSessionStatus,
     applySession,
+    applySessionMutation,
+    observedById,
+    runtimeEpoch,
   } = useSessions();
   const workspaces = useWorkspaces(sessions);
   // Creates whose outcome the wizard never learned keep reconciling here, past its unmount.
@@ -2365,6 +2368,9 @@ function AppContent({
         <div className="flex flex-1 min-h-0">
           {!showSettings && (
             <WorkspaceSidebar
+              observedById={observedById}
+              runtimeEpoch={runtimeEpoch}
+              onSessionMutation={applySessionMutation}
               groups={sidebarGroups}
               nestedGroups={nestedGroups}
               orgGroups={orgGroups}
@@ -2415,6 +2421,7 @@ function AppContent({
 
         {showSessionWizard && (
           <SessionWizard
+            servedProfile={serverAbout?.profile}
             onClose={() => {
               setShowSessionWizard(false);
               setWizardPrefill(undefined);

@@ -47,6 +47,13 @@ impl StartBlocked {
 }
 
 impl Instance {
+    pub(crate) fn launch_is_finalized(&self) -> bool {
+        !matches!(self.status, Status::Creating | Status::Deleting)
+            && !self.lifecycle_reservation_is_owned(
+                LifecycleOperation::Launch,
+                self.lifecycle_generation,
+            )
+    }
     /// Archived and trashed sessions must be unarchived or restored before any
     /// path starts or resumes their agent. Snooze is not a block: it expires on its own.
     pub fn ensure_startable(&self) -> Result<(), StartBlocked> {

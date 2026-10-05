@@ -35,13 +35,51 @@ async function fetchJson<T>(url: string, init?: RequestInit): Promise<T | null> 
 
 // --- Sessions ---
 
+export interface RuntimeCursor {
+  epoch: string;
+  revision: bigint;
+}
+
+export interface SessionReceipt {
+  id: string;
+  cursor: RuntimeCursor;
+}
+
+export interface SessionMutation {
+  session: SessionResponse;
+  cursor: RuntimeCursor;
+}
+
 export interface SessionsEnvelope {
   sessions: SessionResponse[];
   workspace_ordering: string[];
+  cursor: RuntimeCursor;
 }
 
-export function fetchSessions(): Promise<SessionsEnvelope | null> {
-  return fetchJson<SessionsEnvelope>("/api/sessions");
+function runtimeCursor(res: Response): RuntimeCursor | null {
+  const epoch = res.headers.get("aoe-runtime-epoch");
+  const revision = res.headers.get("aoe-runtime-revision");
+  if (!epoch || revision === null || !/^\d+$/.test(revision)) return null;
+  return { epoch, revision: BigInt(revision) };
+}
+
+async function sessionMutation(res: Response): Promise<SessionMutation | null> {
+  if (!res.ok) return null;
+  const cursor = runtimeCursor(res);
+  if (!cursor) return null;
+  return { session: (await res.json()) as SessionResponse, cursor };
+}
+
+export async function fetchSessions(signal?: AbortSignal): Promise<SessionsEnvelope | null> {
+  try {
+    const res = await fetch("/api/sessions", { signal });
+    if (!res.ok) return null;
+    const cursor = runtimeCursor(res);
+    if (!cursor) return null;
+    return { ...((await res.json()) as Omit<SessionsEnvelope, "cursor">), cursor };
+  } catch {
+    return null;
+  }
 }
 
 export interface ConversationSearchHit {
@@ -1306,8 +1344,8 @@ export interface ServerAbout {
   create_boot_id?: string;
 }
 
-export function fetchAbout(): Promise<ServerAbout | null> {
-  return fetchJson<ServerAbout>("/api/about");
+export function fetchAbout(signal?: AbortSignal): Promise<ServerAbout | null> {
+  return fetchJson<ServerAbout>("/api/about", { signal });
 }
 
 /** The current daemon run's id, read fresh right before a create's first send. */
@@ -1836,8 +1874,8 @@ function projectQuery(context: ProjectReadContext): string {
   return query.toString();
 }
 
-export async function fetchProjects(context: ProjectReadContext): Promise<ProjectInfo[] | null> {
-  return fetchJson<ProjectInfo[]>(`/api/projects?${projectQuery(context)}`);
+export async function fetchProjects(context: ProjectReadContext, signal?: AbortSignal): Promise<ProjectInfo[] | null> {
+  return fetchJson<ProjectInfo[]>(`/api/projects?${projectQuery(context)}`, { signal });
 }
 
 /** Existing Claude Code sessions on disk, newest first, for the import
@@ -2499,7 +2537,10 @@ export async function updateSessionGroup(id: string, group: string): Promise<boo
  *  - "default": clear all three overrides (inherit server defaults)
  *  - "all":     set all three overrides to true (notify on any event)
  *  Sends all three fields in one PATCH to avoid multi-request ordering. */
-export async function setSessionNotifications(id: string, preset: "off" | "default" | "all"): Promise<boolean> {
+export async function setSessionNotifications(
+  id: string,
+  preset: "off" | "default" | "all",
+): Promise<SessionMutation | null> {
   const value = preset === "off" ? false : preset === "all" ? true : null;
   try {
     const res = await fetch(`/api/sessions/${id}/notifications`, {
@@ -2511,9 +2552,9 @@ export async function setSessionNotifications(id: string, preset: "off" | "defau
         notify_on_error: value,
       }),
     });
-    return res.ok;
+    return await sessionMutation(res);
   } catch {
-    return false;
+    return null;
   }
 }
 
@@ -2560,15 +2601,14 @@ export async function setSessionPin(id: string, pinned: boolean): Promise<Sessio
 /** Set (or clear, with `null`) a session's color label. Rendered as a colored
  *  status dot in the sidebar; the palette is `red` / `amber` / `green`. Also
  *  settable from the CLI via `aoe session color`. See #2383. */
-export async function setSessionColor(id: string, color: string | null): Promise<SessionResponse | null> {
+export async function setSessionColor(id: string, color: string | null): Promise<SessionMutation | null> {
   try {
     const res = await fetch(`/api/sessions/${id}/color`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ color }),
     });
-    if (!res.ok) return null;
-    return (await res.json()) as SessionResponse;
+    return await sessionMutation(res);
   } catch {
     return null;
   }

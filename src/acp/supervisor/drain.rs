@@ -375,6 +375,7 @@ impl<S: BroadcastSink> Drain<S> {
         };
         let reservation = ResumeReservation {
             lease: respawn_lease.clone(),
+            expected_lifecycle_generation: None,
             lifecycle: Arc::clone(&self.lifecycle),
             notify: Arc::clone(&self.notify),
         };

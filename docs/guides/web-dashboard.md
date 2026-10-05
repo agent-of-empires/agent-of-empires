@@ -41,6 +41,12 @@ aoe web dashboard running at:
 
 Open it in any browser. The token is set as a cookie on first visit, so you don't need to keep it in the URL.
 
+When a poll expires, the dashboard aborts its request and shows the server as
+unreachable while retaining the last session list and workspace order. A later
+successful poll restores the online state. A save acknowledgement alone does not
+clear a cancelled color or notification choice; it is reconciled against the
+affected sessions' canonical mutation results.
+
 `--open` is suppressed with `--daemon` or `--remote`, and whenever no browser you could see is reachable: over SSH without a forwarded `DISPLAY`, and on Linux/BSD with no display server. Setting `BROWSER` overrides the check on platforms whose browser launcher reads it, which excludes macOS. The preview's link handling uses the same rules.
 
 ### Private core and recovery
@@ -198,7 +204,7 @@ aoe serve \
 
 The upstream must set `X-Forwarded-For` (or `cf-connecting-ip`); aoe reads the last value as the client IP. The trust check fires only when the socket peer is loopback, so a misconfigured upstream that lets requests reach aoe directly cannot spoof the IP.
 
-With `--auth=passphrase --behind-proxy` the passphrase wall applies to loopback callers too. Proxied traffic arrives on a loopback socket, so an upstream that forgets the header would otherwise hand every visitor the same-host bypass. A browser on the same host signs in with the passphrase like any other client, and the local TUI and `aoe acp` commands log in with the passphrase the daemon wrote to `serve.passphrase` in the app dir.
+With `--auth=passphrase --behind-proxy`, the passphrase wall applies to TCP loopback callers too. Proxied traffic arrives on a loopback TCP socket, so an upstream that forgets the header would otherwise hand visitors the same-host bypass. A browser on the same host signs in with the passphrase like any other TCP client. The local TUI and local `aoe acp` commands instead use the owner-verified Unix API; they do not read `serve.passphrase` or perform a login exchange. See [Cross-machine attach](../structured-view.md#cross-machine-attach) for explicit TCP and remote ACP authentication.
 
 `--behind-proxy` requires at least one `--allowed-host <public-hostname>`: aoe cannot infer the hostname your proxy forwards, and the [DNS-rebinding gate](#dns-rebinding) rejects any `Host` it does not recognize. If the proxy listens on a nonstandard port, also pass the exact origin, e.g. `--allowed-origin https://aoe.example.com:8443`. The daemon refuses to start (with an explicit message) if `--behind-proxy` is set without `--allowed-host`.
 

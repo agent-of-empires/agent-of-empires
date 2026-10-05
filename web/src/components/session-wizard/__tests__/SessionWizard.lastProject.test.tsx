@@ -51,7 +51,15 @@ const RECENTS = {
 };
 
 function renderWizard(prefill?: WizardPrefill, nameOnly = false) {
-  return render(<SessionWizard onClose={() => {}} onCreated={() => {}} prefill={prefill} nameOnly={nameOnly} />);
+  return render(
+    <SessionWizard
+      servedProfile="default"
+      onClose={() => {}}
+      onCreated={() => {}}
+      prefill={prefill}
+      nameOnly={nameOnly}
+    />,
+  );
 }
 
 function launchButton(getByText: (m: RegExp) => HTMLElement): HTMLButtonElement {
@@ -158,15 +166,11 @@ describe("SessionWizard last-project memory", () => {
   });
 
   it("still fetches and applies settings when the profiles fetch fails", async () => {
-    // The chain is profiles then settings; a rejected profiles request must
-    // fall back to the unresolved global settings, not skip them and launch
-    // on initialData. Prove the profile's sandbox default still lands.
     localStorage.setItem(PROJECT_KEY, "/tmp/remembered");
     fetchProfiles.mockRejectedValue(new Error("profiles down"));
     fetchSettings.mockResolvedValue({ sandbox: { enabled_by_default: true } });
     const { getByText } = renderWizard();
 
-    await waitFor(() => expect(fetchSettings).toHaveBeenCalledWith(undefined));
     await clickLaunch(getByText);
 
     await waitFor(() => expect(createSession).toHaveBeenCalledTimes(1));
