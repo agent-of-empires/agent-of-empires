@@ -359,7 +359,17 @@ impl Instance {
                     .context("fork working directory is not UTF-8")?
                     .to_owned()
             }
-            None => self.project_path.clone(),
+            None => {
+                // The pane is launched with the profile's host environment, so
+                // the store fork has to read the same one: a profile entry that
+                // steers the database would otherwise fork in one store and open
+                // another. This mirrors what the preassign sibling does.
+                let environment = self.resolved_host_environment();
+                command.envs(crate::session::environment::resolve_host_environment_pairs(
+                    &environment,
+                ));
+                self.project_path.clone()
+            }
         };
         let child = crate::session::capture::fork_opencode_session_id(
             &cwd,
@@ -368,11 +378,16 @@ impl Instance {
             opencode_generation(execution),
         )
         .context("the store returned no child for this fork")?;
+        // The binding is what marks this id as a conversation the store holds,
+        // and it is what a later prepare reuses instead of forking again, so it
+        // is set on both arms. An unattributed one still records which id the
+        // store adopted, and `set_agent_conversation` keeps it because the ids
+        // agree.
         self.set_agent_conversation(
             Some(child.clone()),
-            execution.map(|execution| crate::session::ConversationBinding {
+            Some(crate::session::ConversationBinding {
                 session_id: child.clone(),
-                execution: Some(execution.binding.clone()),
+                execution: execution.map(|execution| execution.binding.clone()),
                 provenance: crate::session::ConversationProvenance::Observed,
                 transcript_path: None,
             }),
