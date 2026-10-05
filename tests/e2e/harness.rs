@@ -111,6 +111,22 @@ macro_rules! require_node {
 }
 pub(crate) use require_node;
 
+/// The fake OpenCode store server is a small Python program, so the tests that
+/// need one skip where Python is absent rather than failing.
+pub fn python_available() -> bool {
+    which::which("python3").is_ok()
+}
+
+macro_rules! require_python3 {
+    () => {
+        if !$crate::harness::python_available() {
+            eprintln!("Skipping test: python3 not available");
+            return;
+        }
+    };
+}
+pub(crate) use require_python3;
+
 /// Ephemeral port not yet issued to another test in this process. The
 /// bind-then-drop TOCTOU window remains for unrelated processes.
 pub fn pick_free_port() -> u16 {

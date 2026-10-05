@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use serial_test::parallel;
 
-use crate::harness::{require_tmux, TuiTestHarness};
+use crate::harness::{require_python3, require_tmux, TuiTestHarness};
 
 const PARENT: &str = "OpencodeForkParent";
 const CHILD: &str = "OpencodeForkChild";
@@ -138,22 +138,22 @@ fn install_fake_opencode(h: &mut TuiTestHarness, serve: bool) -> PathBuf {
     log
 }
 
-/// Reads `path` until a line starting with `want` appears. Polling observes a
-/// file another process writes; the deadline bounds the wait, it does not stand
-/// in for one. Matching a specific line matters: the generation probe writes
-/// before the fork spawns the server.
-/// Waits for a file the stub rewrites in place, and returns its last line.
-fn wait_for_line(path: &Path, what: &str) -> String {
+/// Waits for the launch line, which is what the stub last wrote once the
+/// ephemeral server has been reaped and stopped writing.
+fn wait_for_launch(path: &Path) -> String {
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
         let contents = fs::read_to_string(path).unwrap_or_default();
-        // The stub rewrites this file on every call, so a launch is whatever is
-        // there once the ephemeral server has been reaped and stopped writing.
+        // The stub records `<path> <argv...>`, so the generation probe line ends
+        // in --help and the ephemeral server's names serve. Neither is the launch.
         let last = contents.trim();
-        if !last.is_empty() && !last.contains("serve") && last != "--help" {
+        if !last.is_empty() && !last.contains("serve") && !last.ends_with("--help") {
             return last.to_string();
         }
-        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for the launch"
+        );
         std::thread::sleep(Duration::from_millis(50));
     }
 }
@@ -215,6 +215,7 @@ fn seed_store(h: &TuiTestHarness) -> String {
 #[parallel]
 fn opencode_store_fork_opens_the_child_the_store_minted() {
     require_tmux!();
+    require_python3!();
 
     let mut h = TuiTestHarness::new("opencode_store_fork");
     let database = seed_store(&h);
@@ -263,19 +264,9 @@ fn opencode_store_fork_opens_the_child_the_store_minted() {
         serve.contains("--port"),
         "the server must be asked for the endpoint it serves on; argv: {serve:?}"
     );
-    // The generation probe also invokes the binary, so the launch is the line
-    // that is neither the probe nor the ephemeral server.
-    // The stub is overwritten on every call, so the surviving line is the TUI
-    // launch. Waiting for it distinguishes a launch from the probe and the
-    // ephemeral server, which also pass through this stub.
-    // The server stub keeps rewriting the launch file, so the launch is the line
-    // that survives after it has been reaped.
-    let launch = wait_for_line(&launch_log, "the launch command line");
-    assert!(
-        !launch.contains("--fork"),
-        "OpenCode 2.x rejects the root --fork flag; launch argv: {launch:?}"
-    );
-
+    // The stub is overwritten on every call, so what survives once the server
+    // has been reaped is the launch itself.
+    let launch = wait_for_launch(&launch_log);
     assert!(
         !launch.contains("--fork"),
         "OpenCode 2.x rejects the root --fork flag; launch argv: {launch:?}"
@@ -296,6 +287,7 @@ fn opencode_store_fork_opens_the_child_the_store_minted() {
 #[parallel]
 fn opencode_store_fork_refuses_rather_than_starting_unforked() {
     require_tmux!();
+    require_python3!();
 
     let mut h = TuiTestHarness::new("opencode_store_fork_refusal");
     let database = seed_store(&h);
@@ -326,9 +318,13 @@ fn opencode_store_fork_refuses_rather_than_starting_unforked() {
         PARENT,
         "--launch",
     ]);
+    // A refusal is not any failure: an unrelated early exit would satisfy a
+    // bare status check. The message is what ties it to the fork.
     let stderr = String::from_utf8_lossy(&add.stderr);
     assert!(
-        !add.status.success() || stderr.contains("refused"),
-        "a fork with no reachable store must be refused, not silently unforked:\n{stderr}"
+        !add.status.success() && stderr.contains("refused"),
+        "a fork with no reachable store must be refused, not silently unforked: \
+         status={}\n{stderr}",
+        add.status
     );
 }
