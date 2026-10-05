@@ -24,6 +24,7 @@ fn base_config(cwd: std::path::PathBuf, record_path: &std::path::Path) -> SpawnC
     SpawnConfig {
         execution_admission: None,
         managed_profile: None,
+        provider_routing: Vec::new(),
         wrapper_substitution: None,
         agent_key: "claude".into(),
         tool: "claude".into(),

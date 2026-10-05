@@ -1077,7 +1077,7 @@ impl SessionService {
                 let mut reduced = AcpState::new(AcpSessionId(sid.clone()), agent, model);
                 let mut last_seq = 0;
                 for (seq, event) in store.replay_from(&sid, 0) {
-                    let _ = reduced.apply_event(event);
+                    let _ = reduced.apply_event(seq, event);
                     last_seq = seq;
                 }
                 (reduced, last_seq)

@@ -171,6 +171,7 @@ impl Instance {
             if restart && stored.agent_session_id == self.agent_session_id {
                 stored.resume_probe_failed_sid = self.resume_probe_failed_sid.clone();
             }
+            stored.first_launch_names_agent = false;
             stored.release_lifecycle_reservation_if_owned(LifecycleOperation::Launch, generation);
             Ok(true)
         })?;
@@ -180,6 +181,7 @@ impl Instance {
             self.id
         );
         self.lifecycle_reservation = None;
+        self.first_launch_names_agent = false;
         Ok(())
     }
 
@@ -663,6 +665,61 @@ mod tests {
         assert!(
             leftover.is_none(),
             "a failed launch must clear its reservation even after a same-generation status drift"
+        );
+    }
+
+    /// The typed title names the agent on the first launch only: the commit clears it on disk,
+    /// and a copy still holding it (the TUI's row) reloads from disk before its own launch.
+    #[test]
+    #[serial_test::serial]
+    fn the_first_launch_commit_spends_the_agent_name() {
+        let temp = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let profile = "lifecycle-agent-name";
+        let storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
+        let mut first = Instance::new("first", "/tmp/test");
+        first.source_profile = profile.into();
+        first.first_launch_names_agent = true;
+        storage
+            .update(|instances, _groups| {
+                instances.push(first.clone());
+                Ok(())
+            })
+            .unwrap();
+        first = storage
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|candidate| candidate.id == first.id)
+            .unwrap();
+        let mut held_copy = first.clone();
+
+        first
+            .acquire_lifecycle_reservation(
+                &storage,
+                LifecycleOperation::Launch,
+                Some(Status::Starting),
+                None,
+            )
+            .unwrap();
+        assert!(
+            first.first_launch_names_agent,
+            "the launch being built still carries it"
+        );
+        first.commit_lifecycle_launch(&storage, false).unwrap();
+        let disk = storage
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|candidate| candidate.id == first.id)
+            .unwrap();
+        assert!(!disk.first_launch_names_agent);
+        assert!(!first.first_launch_names_agent);
+
+        assert!(held_copy.try_reconcile_from_disk(false).unwrap());
+        assert!(
+            !held_copy.first_launch_names_agent,
+            "a restart from a stale copy must not name the agent again"
         );
     }
 

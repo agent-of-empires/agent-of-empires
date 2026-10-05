@@ -353,6 +353,7 @@ fn spawn_enabled_worker(
         let _body_custody = issuance.begin_job();
         let sandbox_info = match crate::acp::sandbox::ensure_container_for_session_locked(
             &state.instances,
+            &state.mutation_epoch,
             issuance.clone(),
             false,
         )

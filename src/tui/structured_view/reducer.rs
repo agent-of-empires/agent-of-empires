@@ -29,7 +29,8 @@
 
 use crate::acp::elicitations::ElicitationQuestion;
 use crate::acp::state::{
-    AcpState, AuthStatus, AvailableCommand, DiffPreview, ModeInfo, PlanStepStatus, SessionUsage,
+    AcpState, AuthStatus, AvailableCommand, DiffPreview, ModeInfo, PlanStepStatus, SessionNotice,
+    SessionUsage,
 };
 use crate::acp::transcript::{
     patch_transcript_row, upsert_transcript_row, TranscriptDelta, TranscriptRow, TranscriptRowKind,
@@ -57,6 +58,9 @@ pub struct AcpTranscript {
     /// Live status banner ("thinking…" / "compacting…"), shown only while a
     /// turn runs. Derived from the server's phase in `apply_reduced_state`.
     pub status_text: Option<String>,
+    /// Agent-pushed advisories for the current turn. The daemon retires them;
+    /// dismissal is local to this view, so it never clears another client.
+    pub session_notices: Vec<SessionNotice>,
     /// Id of the agent's currently selected mode. `None` until the agent
     /// advertises one.
     pub current_mode: Option<String>,
@@ -210,6 +214,7 @@ impl AcpTranscript {
             pending_approvals: Vec::new(),
             pending_elicitations: Vec::new(),
             status_text: None,
+            session_notices: Vec::new(),
             current_mode: None,
             available_modes: Vec::new(),
             auth_status: None,
@@ -320,6 +325,7 @@ impl AcpTranscript {
         if !holds("available_modes") {
             self.available_modes = state.available_modes;
         }
+        self.session_notices = state.session_notices;
         self.current_mode = state.current_mode_id;
         self.auth_status = state.auth_status;
         self.current_plan = state
@@ -465,7 +471,8 @@ mod tests {
             Some("claude-opus-5".into()),
         );
         for e in events {
-            s.apply_event(e.clone()).expect("apply ok");
+            s.apply_event(s.last_seq.saturating_add(1), e.clone())
+                .expect("apply ok");
         }
         s
     }

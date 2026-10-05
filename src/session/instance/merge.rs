@@ -17,6 +17,7 @@ impl Instance {
             self.last_error_check = src.last_error_check;
         }
         self.lifecycle_generation = src.lifecycle_generation;
+        self.first_launch_names_agent &= src.first_launch_names_agent;
         self.status = src.status;
         // A launch decided before a peer archived the row reports a pane
         // the archive tore down.
@@ -177,6 +178,7 @@ impl Instance {
         self.active_execution = None;
         self.acp_effort = None;
         self.agent_model = None;
+        self.agent_provider = None;
         self.import_pending = None;
         self.fork_pending = None;
         self.agent_name = None;
@@ -517,12 +519,14 @@ mod tests {
         let mut live = inst();
         live.lifecycle_generation = 7;
         live.status = Status::Starting;
+        live.first_launch_names_agent = true;
         live.idle_entered_at = Some(Utc::now() - chrono::Duration::minutes(5));
         live.last_error = Some("stale pane observation".to_string());
         live.capture_started_at = floor(1_000_000);
         let mut disk = live.clone();
         disk.lifecycle_generation = 8;
         disk.status = Status::Stopped;
+        disk.first_launch_names_agent = false;
         disk.idle_entered_at = None;
         disk.last_error = None;
         disk.capture_started_at = floor(2_000_000);
@@ -534,6 +538,13 @@ mod tests {
             (None, None)
         );
         assert_eq!(live.capture_started_at, floor(2_000_000));
+        assert!(!live.first_launch_names_agent);
+        disk.first_launch_names_agent = true;
+        live.merge_post_start(&disk);
+        assert!(
+            !live.first_launch_names_agent,
+            "an accepted launch cannot rearm naming"
+        );
 
         let mut stored = inst();
         stored.archive();

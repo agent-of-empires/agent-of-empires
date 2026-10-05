@@ -74,6 +74,8 @@ export interface SessionResponse {
   acp_session_id?: string;
   /** Resolved ACP registry key, used as the current agent before any `AgentSwitched`. */
   acp_agent?: string;
+  /** Pinned LLM backend ("api" | "bedrock" | "vertex"); absent means the host decides. */
+  acp_provider?: string;
   /** Switching views preserves the conversation (server-computed). */
   keeps_context?: boolean;
   /** Slash commands that reset the conversation for this agent. */
@@ -446,7 +448,8 @@ export type SettingsObjectFieldWidget =
   | { kind: "select"; options: SettingsSelectOption[] }
   | { kind: "dynamic_select"; source: SettingsOptionSource; depends_on?: string[] }
   | { kind: "dynamic_multi_select"; source: SettingsOptionSource; depends_on?: string[] }
-  | { kind: "cron" };
+  | { kind: "cron" }
+  | { kind: "list" };
 
 export interface SettingsObjectField {
   field: string;

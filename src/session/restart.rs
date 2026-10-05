@@ -196,6 +196,7 @@ mod tests {
             instance.storage_origin = Some(std::sync::Arc::new(storage.clone()));
             instance.tool = "codex".to_string();
             instance.sandbox_info = Some(SandboxInfo {
+                provider: None,
                 enabled: true,
                 container_id: None,
                 image: "ubuntu:latest".to_string(),

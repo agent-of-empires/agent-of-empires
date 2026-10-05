@@ -366,6 +366,7 @@ async fn spawn_worker(
                 cwd: PathBuf::from(&inst.project_path),
                 additional_dirs: vec![],
                 provider_env: vec![],
+                provider: inst.agent_provider.clone(),
                 model: inst.agent_model.clone(),
                 effort: None,
                 effort_explicit: false,

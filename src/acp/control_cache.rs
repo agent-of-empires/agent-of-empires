@@ -58,7 +58,7 @@ impl ControlStateCache {
             *guard = None;
             return;
         }
-        if cached.state.apply_event(event.clone()).is_err() {
+        if cached.state.apply_event(seq, event.clone()).is_err() {
             *guard = None;
             return;
         }

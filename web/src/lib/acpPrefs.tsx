@@ -5,6 +5,8 @@ import { createContext, useContext, type ReactNode } from "react";
 
 export interface AcpPrefs {
   showToolDurations: boolean;
+  /** Initial line-wrap state of tool output blocks. */
+  wrapToolOutput: boolean;
   /** Transcript retention cap; 0 means unlimited. */
   replayEvents: number;
   compactionReminder: boolean;
@@ -13,6 +15,7 @@ export interface AcpPrefs {
 
 const DEFAULT_PREFS: AcpPrefs = {
   showToolDurations: true,
+  wrapToolOutput: false,
   replayEvents: 0,
   compactionReminder: false,
   compactionReminderPercent: 75,

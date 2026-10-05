@@ -923,6 +923,24 @@ impl AgentDef {
         matches!(self.name, "copilot" | "gemini" | "kimi")
     }
 
+    /// Documented flag naming the agent's own session at launch. Gated by
+    /// [`Self::supported_session_name_flag`], since an older install rejects it and exits.
+    fn session_name_flag(&self) -> Option<&'static str> {
+        match self.name {
+            "claude" => Some("--name"),
+            _ => None,
+        }
+    }
+
+    /// The session-name flag, if the `--help` of `program`, the executable the launch runs, lists it.
+    pub(crate) fn supported_session_name_flag(
+        &self,
+        program: &std::path::Path,
+    ) -> Option<&'static str> {
+        let flag = self.session_name_flag()?;
+        agent_help_advertises(program, flag).then_some(flag)
+    }
+
     pub fn launch_base_command(&self) -> String {
         match self.launch_subcommand {
             Some(sub) => format!("{} {}", self.binary, sub),
@@ -940,16 +958,16 @@ fn help_advertises_flag(help: &str, flag: &str) -> bool {
     })
 }
 
-/// `pi --help`, cached once it succeeds. A timeout or failure reports no flags for now and is
-/// retried after a cooldown with a longer deadline, since a cold start with many extensions can
-/// outlast the first one.
+/// An agent's `--help`, cached once it succeeds. A timeout or failure reports no flags for now
+/// and is retried after a cooldown with a longer deadline, since a cold start with many
+/// extensions can outlast the first one.
 #[derive(Default)]
-struct PiHelpProbe {
+struct HelpProbe {
     help: Option<String>,
     retry_at: Option<std::time::Instant>,
 }
 
-impl PiHelpProbe {
+impl HelpProbe {
     fn help(
         &mut self,
         clock: impl Fn() -> std::time::Instant,
@@ -957,26 +975,29 @@ impl PiHelpProbe {
     ) -> &str {
         if self.help.is_none() && self.retry_at.is_none_or(|at| clock() >= at) {
             let timeout = if self.retry_at.is_some() {
-                PI_HELP_RETRY_TIMEOUT
+                HELP_RETRY_TIMEOUT
             } else {
-                PI_HELP_PROBE_TIMEOUT
+                HELP_PROBE_TIMEOUT
             };
             self.help = probe(timeout);
             if self.help.is_none() {
                 tracing::warn!(target: "session.create", timeout_secs = timeout.as_secs(),
-                    "pi --help did not answer; launching without session-id capture until a retry succeeds");
+                    "agent --help did not answer; launching without the flags it gates until a retry succeeds");
                 // Timed from the answer, so a probe that ran to its deadline still cools down.
-                self.retry_at = Some(clock() + PI_HELP_RETRY_COOLDOWN);
+                self.retry_at = Some(clock() + HELP_RETRY_COOLDOWN);
             }
         }
         self.help.as_deref().unwrap_or_default()
     }
 }
 
-fn run_pi_help(timeout: std::time::Duration) -> Option<String> {
-    let agent = get_agent("pi")?;
-    let mut cmd = std::process::Command::new(agent.binary);
+fn run_agent_help(program: &std::path::Path, timeout: std::time::Duration) -> Option<String> {
+    let mut cmd = std::process::Command::new(program);
     cmd.arg("--help");
+    // An agent that reads stdin would hold the pipe until the deadline, and one that writes a
+    // file would drop it wherever the caller happened to be.
+    cmd.stdin(std::process::Stdio::null());
+    cmd.current_dir(std::env::temp_dir());
     crate::process::run_with_timeout(&mut cmd, timeout)
         .ok()
         .flatten()
@@ -984,17 +1005,59 @@ fn run_pi_help(timeout: std::time::Duration) -> Option<String> {
         .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-fn pi_help_advertises(flag: &str) -> bool {
-    static PROBE: std::sync::Mutex<PiHelpProbe> = std::sync::Mutex::new(PiHelpProbe {
-        help: None,
-        retry_at: None,
-    });
-    // Held across the probe: launches racing it wait for the answer instead of starting
-    // without session-id capture.
-    let mut probe = PROBE
+type SharedHelpProbe = std::sync::Arc<std::sync::Mutex<HelpProbe>>;
+
+/// The resolved executable plus its modification time and size, so an update that swaps the
+/// binary behind a path, or a symlink to it, is probed afresh.
+type HelpProbeKey = (std::path::PathBuf, Option<std::time::SystemTime>, u64);
+
+static HELP_PROBES: std::sync::Mutex<BTreeMap<HelpProbeKey, SharedHelpProbe>> =
+    std::sync::Mutex::new(BTreeMap::new());
+
+/// Whether `program --help` advertises `flag`, for a flag an older install would reject outright.
+/// The probe and its cached answer are bound to the resolved executable, so neither the probe's
+/// own working directory nor another install found on `PATH` can stand in for it.
+fn agent_help_advertises(program: &std::path::Path, flag: &str) -> bool {
+    let Ok(program) = std::fs::canonicalize(program) else {
+        return false;
+    };
+    let Ok(metadata) = std::fs::metadata(&program) else {
+        return false;
+    };
+    let key = (program.clone(), metadata.modified().ok(), metadata.len());
+    let probe = HELP_PROBES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .entry(key)
+        .or_default()
+        .clone();
+    // Held across the probe: launches of this binary racing it wait for the answer instead of
+    // starting without the flag.
+    let mut probe = probe
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    help_advertises_flag(probe.help(std::time::Instant::now, run_pi_help), flag)
+    help_advertises_flag(
+        probe.help(std::time::Instant::now, |timeout| {
+            run_agent_help(&program, timeout)
+        }),
+        flag,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn forget_agent_help_for_test() {
+    HELP_PROBES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clear();
+}
+
+/// Probes the `pi` that AoE's own `PATH` and working directory resolve, the executable
+/// `runs_host_path_binary` compares a launch against.
+fn pi_help_advertises(flag: &str) -> bool {
+    get_agent("pi")
+        .and_then(|agent| which::which(agent.binary).ok())
+        .is_some_and(|program| agent_help_advertises(&program, flag))
 }
 
 pub(crate) fn pi_supports_extension_flag() -> bool {
@@ -1005,9 +1068,9 @@ pub(crate) fn pi_supports_session_id_flag() -> bool {
     pi_help_advertises("--session-id")
 }
 
-const PI_HELP_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-const PI_HELP_RETRY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
-const PI_HELP_RETRY_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(30);
+const HELP_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const HELP_RETRY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+const HELP_RETRY_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(30);
 
 pub fn get_agent(name: &str) -> Option<&'static AgentDef> {
     AGENTS.iter().find(|a| a.name == name)
@@ -1339,12 +1402,146 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
-    fn pi_help_probe_retries_an_inconclusive_answer_and_keeps_a_confirmed_one() {
+    #[serial_test::serial]
+    fn a_slow_help_probe_holds_only_its_own_binary() {
+        let temp = tempfile::tempdir().unwrap();
+        let started = temp.path().join("claude-started");
+        let release = temp.path().join("claude-release");
+        let _path = crate::session::test_support::install_login_shell_path_command(
+            temp.path(),
+            "claude",
+            &format!(
+                "#!/bin/sh\n: > '{}'\nwhile [ ! -e '{}' ]; do sleep 0.05; done\nprintf '  --name <name>\\n'\n",
+                started.display(),
+                release.display()
+            ),
+        );
+        let pi = temp.path().join("bin/pi");
+        std::fs::write(&pi, "#!/bin/sh\nprintf '  --session-id <id>\\n'\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&pi, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        forget_agent_help_for_test();
+
+        let claude_program = temp.path().join("bin/claude");
+        let claude = std::thread::spawn(move || agent_help_advertises(&claude_program, "--name"));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !started.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "claude --help never ran"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            pi_help_advertises("--session-id"),
+            "pi answered while claude's probe was still running"
+        );
+        assert!(!release.exists() && !claude.is_finished());
+        std::fs::write(&release, "").unwrap();
+        assert!(claude.join().unwrap());
+        forget_agent_help_for_test();
+    }
+
+    /// The probe runs the absolute executable it is asked about. Run by bare name from its
+    /// temporary working directory, a relative `PATH` entry would resolve there and probe a
+    /// different install, and one cached answer would stand for every install.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn a_help_probe_answers_for_the_executable_it_is_given() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let temp = tempfile::tempdir().unwrap();
+        let install = |dir: &str, help: &str| {
+            let bin = temp.path().join(dir).join("bin");
+            std::fs::create_dir_all(&bin).unwrap();
+            let program = bin.join("claude");
+            std::fs::write(&program, format!("#!/bin/sh\nprintf '%s\\n' '{help}'\n")).unwrap();
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+            program
+        };
+        let current = install("current", "  -n, --name <name>");
+        let older = install("older", "  -r, --resume [value]");
+        install("probe-cwd", "  -r, --resume [value]");
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("PATH", "bin"),
+            ("TMPDIR", temp.path().join("probe-cwd").to_str().unwrap()),
+        ]);
+        forget_agent_help_for_test();
+
+        assert!(
+            agent_help_advertises(&current, "--name"),
+            "the probe ran another claude than the one given"
+        );
+        assert!(
+            !agent_help_advertises(&older, "--name"),
+            "an answer cached for one install was reused for another"
+        );
+        forget_agent_help_for_test();
+    }
+
+    /// An update replaces the executable behind the same path, in place or by moving a symlink to
+    /// a new version, and the new one is probed rather than answered from the old one's help.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn a_help_probe_reprobes_an_executable_replaced_behind_its_path() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let temp = tempfile::tempdir().unwrap();
+        let write = |path: &std::path::Path, help: &str| {
+            std::fs::write(path, format!("#!/bin/sh\nprintf '%s\\n' '{help}'\n")).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        forget_agent_help_for_test();
+
+        let in_place = temp.path().join("claude");
+        write(&in_place, "  -r, --resume [value]");
+        assert!(!agent_help_advertises(&in_place, "--name"));
+        write(&in_place, "  -n, --name <name>  Set a display name");
+        assert!(
+            agent_help_advertises(&in_place, "--name"),
+            "an executable replaced in place kept its old answer"
+        );
+
+        let old = temp.path().join("claude-1");
+        let new = temp.path().join("claude-2");
+        write(&old, "  -r, --resume <id>");
+        write(&new, "  -n, --name <name>");
+        let same_time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        for version in [&old, &new] {
+            std::fs::File::options()
+                .write(true)
+                .open(version)
+                .unwrap()
+                .set_modified(same_time)
+                .unwrap();
+        }
+        assert_eq!(
+            std::fs::metadata(&old).unwrap().len(),
+            std::fs::metadata(&new).unwrap().len(),
+            "the versions differ only by identity"
+        );
+        let link = temp.path().join("current");
+        std::os::unix::fs::symlink(&old, &link).unwrap();
+        assert!(!agent_help_advertises(&link, "--name"));
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&new, &link).unwrap();
+        assert!(
+            agent_help_advertises(&link, "--name"),
+            "a symlink moved to a new version kept the old version's answer"
+        );
+        forget_agent_help_for_test();
+    }
+
+    #[test]
+    fn help_probe_retries_an_inconclusive_answer_and_keeps_a_confirmed_one() {
         let help = "  --session-id <id>\n  --extension, -e <path>\n";
         let start = std::time::Instant::now();
         let now = std::cell::Cell::new(start);
-        let mut probe = PiHelpProbe::default();
+        let mut probe = HelpProbe::default();
         let mut timeouts = Vec::new();
 
         // The first probe runs to its deadline before failing.
@@ -1358,14 +1555,14 @@ mod tests {
         );
         assert_eq!(first, "", "a timed-out probe advertises nothing");
         let failed_at = now.get();
-        now.set(failed_at + PI_HELP_RETRY_COOLDOWN - std::time::Duration::from_millis(1));
+        now.set(failed_at + HELP_RETRY_COOLDOWN - std::time::Duration::from_millis(1));
         assert_eq!(
             probe.help(|| now.get(), |_| unreachable!("cooling down")),
             "",
             "the cooldown runs from the failed answer, not from when the probe began"
         );
 
-        now.set(failed_at + PI_HELP_RETRY_COOLDOWN);
+        now.set(failed_at + HELP_RETRY_COOLDOWN);
         let retried = probe.help(
             || now.get(),
             |timeout| {
@@ -1374,9 +1571,9 @@ mod tests {
             },
         );
         assert_eq!(retried, help, "the process is not stuck on the failure");
-        now.set(now.get() + PI_HELP_RETRY_COOLDOWN);
+        now.set(now.get() + HELP_RETRY_COOLDOWN);
         assert_eq!(probe.help(|| now.get(), |_| unreachable!("cached")), help);
-        assert_eq!(timeouts, [PI_HELP_PROBE_TIMEOUT, PI_HELP_RETRY_TIMEOUT]);
+        assert_eq!(timeouts, [HELP_PROBE_TIMEOUT, HELP_RETRY_TIMEOUT]);
     }
 
     #[test]

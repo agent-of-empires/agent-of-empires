@@ -259,7 +259,8 @@ pub(super) async fn spawn_runner_detached(
     if let Ok(interval) = std::env::var("AOE_ACP_WATCHDOG_POLL_MS") {
         cmd.env("AOE_ACP_WATCHDOG_POLL_MS", interval);
     }
-    // Trusted `Config.environment` for the adapter only, riding one reserved
+    // Trusted `Config.environment`, then the provider pick that outranks it,
+    // for the adapter only, riding one reserved
     // carrier key (JSON `[[key, value], ...]`) that the runner strips and
     // applies to its child. HOME / PATH / XDG_CONFIG_HOME are legal entries
     // here, and setting those on the runner itself would move the
@@ -267,6 +268,7 @@ pub(super) async fn spawn_runner_detached(
     let host_environment: Vec<(String, String)> = config
         .host_environment
         .iter()
+        .chain(&config.provider_routing)
         .filter(|(key, _)| match host_environment_denyreason(key) {
             Some(reason) => {
                 warn!(

@@ -13,6 +13,7 @@ impl Instance {
             id: generate_id(),
             title: title.to_string(),
             last_auto_title: None,
+            first_launch_names_agent: false,
             sort_index: None,
             smart_rename_attempted: false,
             project_path: project_path.to_string(),
@@ -76,6 +77,7 @@ impl Instance {
             view: View::Terminal,
             agent_name: None,
             agent_model: None,
+            agent_provider: None,
             acp_effort: None,
             acp_session_id: None,
             import_pending: None,
@@ -1289,6 +1291,7 @@ mod tests {
 
         let mut sandboxed = Instance::new("claude", temp.path().to_str().unwrap());
         sandboxed.sandbox_info = Some(crate::session::SandboxInfo {
+            provider: None,
             enabled: true,
             container_id: None,
             image: "alpine".to_string(),

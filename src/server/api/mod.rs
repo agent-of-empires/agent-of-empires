@@ -24,7 +24,7 @@ pub use acp::{
     acp_force_end_turn, acp_prompt, acp_prompt_diff_comments, acp_replay, acp_set_config_option,
     acp_set_mode, acp_worker_log, get_option_catalog, install_agent, list_acp_agents,
     list_claude_sessions, resolve_approval, resolve_elicitation, shutdown_acp, spawn_acp,
-    switch_acp_agent,
+    switch_acp_agent, switch_acp_provider,
 };
 
 pub use queue::{queue_clear, queue_edit, queue_enqueue, queue_list, queue_remove};

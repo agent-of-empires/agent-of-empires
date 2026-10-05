@@ -423,6 +423,7 @@ async fn build_spawn_request(
         acp_mode_id,
         acp_effort,
         agent_model,
+        agent_provider,
         claude_store_pin,
     ) = {
         let _guard = inst_lock.lock().await;
@@ -440,6 +441,7 @@ async fn build_spawn_request(
             inst.acp_mode_id.clone(),
             inst.acp_effort.clone(),
             inst.agent_model.clone(),
+            inst.agent_provider.clone(),
             inst.selected_claude_store_pin(),
         )
     };
@@ -453,6 +455,7 @@ async fn build_spawn_request(
         .await;
     let sandbox_info = match crate::acp::sandbox::ensure_container_for_session(
         &service.instances,
+        &service.mutation_epoch,
         &inst_lock,
         admission,
         false,
@@ -475,6 +478,7 @@ async fn build_spawn_request(
         cwd,
         additional_dirs: vec![],
         provider_env: vec![],
+        provider: agent_provider,
         model: agent_model,
         // `acp_effort` only holds a user-set effort, so presence is its provenance.
         effort_explicit: acp_effort.is_some(),

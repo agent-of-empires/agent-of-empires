@@ -509,6 +509,11 @@ pub struct AcpConfig {
     #[serde(default = "default_true")]
     #[setting(label = "Show tool-call durations", widget = "toggle")]
     pub show_tool_durations: bool,
+    /// Wrap long lines in tool-call input and output blocks by default. Each
+    /// block still has its own wrap toggle; this only sets where it starts.
+    #[serde(default)]
+    #[setting(label = "Wrap tool output", widget = "toggle")]
+    pub wrap_tool_output: bool,
     /// Show a dismissable reminder in the structured view once the agent's
     /// context window passes `compaction_reminder_percent`, suggesting
     /// `/compact`. Off by default: the composer's usage chip already
@@ -655,6 +660,7 @@ impl Default for AcpConfig {
             replay_events: default_replay_events(),
             node_path: String::new(),
             show_tool_durations: true,
+            wrap_tool_output: false,
             compaction_reminder: false,
             compaction_reminder_percent: default_compaction_reminder_percent(),
             silent_orphan_grace_secs: default_silent_orphan_grace_secs(),
@@ -1120,6 +1126,13 @@ pub struct SessionConfig {
     #[serde(default = "default_true")]
     #[setting(label = "Smart Session Rename", widget = "toggle", category = "Agents")]
     pub smart_rename: bool,
+
+    /// Give a title typed in the TUI's New Session dialog to the agent as its own session name on
+    /// the first launch (Claude's `--name`), so it shows in the agent's own apps. Later
+    /// launches leave the agent's name alone, so a rename inside the agent survives restarts.
+    #[serde(default)]
+    #[setting(label = "Name Agent Session", widget = "toggle", category = "Agents")]
+    pub name_agent_session: bool,
 
     /// Override Smart Session Rename for scratch sessions specifically, since they have no repo
     /// path to key a per-project override on the way a registered project does.
@@ -1893,6 +1906,7 @@ impl Default for SessionConfig {
             merge_hooks_into_selected_agent: true,
             conversation_summary: false,
             smart_rename: true,
+            name_agent_session: false,
             scratch_smart_rename: ScratchSmartRenameMode::default(),
             smart_rename_agent: String::new(),
             smart_rename_model: HashMap::new(),

@@ -1,4 +1,4 @@
-import { useState, type ReactNode } from "react";
+import { useId, useState, type ReactNode } from "react";
 
 const CONTROL = "w-full bg-surface-900 border border-surface-700 rounded-md px-3 py-2 text-sm text-text-primary";
 const FOCUS = "focus:border-brand-600 focus:outline-none";
@@ -329,6 +329,7 @@ export function ListField({
   placeholder?: string;
   validate?: (value: string) => string | null;
 }) {
+  const inputId = useId();
   const [adding, setAdding] = useState(false);
   const [draft, setDraft] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -354,7 +355,9 @@ export function ListField({
   return (
     <div>
       <div className="flex items-center justify-between mb-1">
-        <label className="text-sm text-text-bright">{label}</label>
+        <label htmlFor={inputId} className="text-sm text-text-bright">
+          {label}
+        </label>
         {!adding && (
           <button
             onClick={() => setAdding(true)}
@@ -387,6 +390,7 @@ export function ListField({
         <div className="mt-2">
           <div className="flex gap-2">
             <input
+              id={inputId}
               type="text"
               value={draft}
               onChange={(e) => {

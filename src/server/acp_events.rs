@@ -1305,7 +1305,7 @@ mod tests {
                 );
                 let mut last_seq = 0;
                 for (seq, event) in store.replay_from(&live_id, 0) {
-                    let _ = reduced.apply_event(event);
+                    let _ = reduced.apply_event(seq, event);
                     last_seq = seq;
                 }
                 (reduced, last_seq)
@@ -2046,23 +2046,29 @@ mod tests {
 
         let mut state = AcpState::new(AcpSessionId("s-1".into()), AgentName("claude".into()), None);
         state
-            .apply_event(Event::UserPromptSent {
-                prompt_id: None,
-                text: "spawn and go".into(),
-                attachments: Vec::new(),
-                synthesized: false,
-            })
+            .apply_event(
+                state.last_seq.saturating_add(1),
+                Event::UserPromptSent {
+                    prompt_id: None,
+                    text: "spawn and go".into(),
+                    attachments: Vec::new(),
+                    synthesized: false,
+                },
+            )
             .unwrap();
         state
-            .apply_event(Event::BackgroundAgentLaunched {
-                agent_id: "bg-1".into(),
-                tool_call_id: "tc-1".into(),
-                description: "map backend".into(),
-                prompt: "do it".into(),
-                model: "claude-opus-4-8".into(),
-                output_file: "/tmp/bg-1.output".into(),
-                started_at: chrono::Utc::now(),
-            })
+            .apply_event(
+                state.last_seq.saturating_add(1),
+                Event::BackgroundAgentLaunched {
+                    agent_id: "bg-1".into(),
+                    tool_call_id: "tc-1".into(),
+                    description: "map backend".into(),
+                    prompt: "do it".into(),
+                    model: "claude-opus-4-8".into(),
+                    output_file: "/tmp/bg-1.output".into(),
+                    started_at: chrono::Utc::now(),
+                },
+            )
             .unwrap();
         assert!(
             state.has_active_background_agent(),
@@ -2073,14 +2079,17 @@ mod tests {
         // outstanding and the final Stopped would derive Running: this is
         // the bug (#4001), not a hypothetical.
         state
-            .apply_event(Event::BackgroundAgentCompleted {
-                agent_id: "bg-1".into(),
-                status: BackgroundAgentStatus::Detached,
-                tools: Vec::new(),
-                result: None,
-                warning: None,
-                ended_at: chrono::Utc::now(),
-            })
+            .apply_event(
+                state.last_seq.saturating_add(1),
+                Event::BackgroundAgentCompleted {
+                    agent_id: "bg-1".into(),
+                    status: BackgroundAgentStatus::Detached,
+                    tools: Vec::new(),
+                    result: None,
+                    warning: None,
+                    ended_at: chrono::Utc::now(),
+                },
+            )
             .unwrap();
         assert!(
             !state.has_active_background_agent(),
@@ -2088,9 +2097,12 @@ mod tests {
         );
 
         state
-            .apply_event(Event::Stopped {
-                reason: "user_stopped".into(),
-            })
+            .apply_event(
+                state.last_seq.saturating_add(1),
+                Event::Stopped {
+                    reason: "user_stopped".into(),
+                },
+            )
             .unwrap();
         assert_eq!(
             derive_acp_status(

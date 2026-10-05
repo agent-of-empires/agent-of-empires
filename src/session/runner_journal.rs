@@ -565,6 +565,8 @@ struct LaunchPlan {
     tool: String,
     detect_as: String,
     yolo_mode: bool,
+    agent_provider: Option<String>,
+    first_launch_names_agent: bool,
     active_execution: Option<super::instance::ActiveExecution>,
     title: String,
     archived: bool,
@@ -661,6 +663,8 @@ impl LaunchOrigin {
                 tool: expected.tool.clone(),
                 detect_as: expected.detect_as.clone(),
                 yolo_mode: expected.yolo_mode,
+                agent_provider: expected.agent_provider.clone(),
+                first_launch_names_agent: expected.first_launch_names_agent,
                 active_execution: expected.active_execution.clone(),
                 title: expected.title.clone(),
                 archived: expected.is_archived(),
@@ -724,6 +728,8 @@ impl LaunchOrigin {
             && a.tool == b.tool
             && a.detect_as == b.detect_as
             && a.yolo_mode == b.yolo_mode
+            && a.agent_provider == b.agent_provider
+            && a.first_launch_names_agent == b.first_launch_names_agent
             && a.active_execution == b.active_execution
     }
 
@@ -787,11 +793,13 @@ impl LaunchOrigin {
         sandbox: Option<&super::SandboxInfo>,
         yolo_mode: bool,
         command: Option<&str>,
+        provider: Option<&str>,
     ) -> Result<()> {
         anyhow::ensure!(
             std::path::Path::new(&self.plan.project_path) == cwd
                 && self.plan.tool == tool
                 && self.plan.yolo_mode == yolo_mode
+                && self.plan.agent_provider.as_deref() == provider
                 && sandbox_geometry_matches(
                     self.plan.sandbox.as_ref().filter(|sandbox| sandbox.enabled),
                     sandbox.filter(|sandbox| sandbox.enabled)
@@ -840,6 +848,8 @@ impl LaunchOrigin {
                 && row.tool == self.plan.tool
                 && row.detect_as == self.plan.detect_as
                 && row.yolo_mode == self.plan.yolo_mode
+                && row.agent_provider == self.plan.agent_provider
+                && row.first_launch_names_agent == self.plan.first_launch_names_agent
                 && row.active_execution == self.plan.active_execution
                 && row.lifecycle_generation == generation,
             "original lifecycle or execution plan was superseded"
@@ -2552,6 +2562,28 @@ fn cleanup_authenticated_stop_endpoint(
 mod tests {
     use super::*;
     use std::os::unix::process::CommandExt;
+    #[test]
+    #[serial_test::serial]
+    fn merge_launch_plan_rejects_changed_naming_and_provider() {
+        let temporary = tempfile::TempDir::new_in("/tmp").unwrap();
+        let _app_dir = super::super::test_support::isolate_app_dir_at(temporary.path());
+        let storage = std::sync::Arc::new(Storage::new_unwatched("default").unwrap());
+        let mut row = Instance::new("typed", temporary.path().to_str().unwrap());
+        row.first_launch_names_agent = true;
+        row.agent_provider = Some("api".into());
+        let original = LaunchOrigin::capture_baseline_at(&row, storage).unwrap();
+        for naming_changed in [true, false] {
+            let mut changed = row.clone();
+            if naming_changed {
+                changed.first_launch_names_agent = false;
+            } else {
+                changed.agent_provider = Some("vertex".into());
+            }
+            assert!(original
+                .validate_plan_at(&changed, row.lifecycle_generation, false)
+                .is_err());
+        }
+    }
 
     #[tokio::test]
     #[serial_test::serial]

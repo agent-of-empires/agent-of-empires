@@ -408,6 +408,7 @@ fn restart_selected_session_tool_swap_discards_sandbox_container() {
     let seed = |inst: &mut Instance| {
         inst.tool = "claude".to_string();
         inst.sandbox_info = Some(SandboxInfo {
+            provider: None,
             enabled: true,
             container_id: None,
             image: "ubuntu:latest".to_string(),

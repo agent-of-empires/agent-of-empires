@@ -34,6 +34,8 @@ impl Instance {
                     && disk.active_execution == self.active_execution
                     && disk.project_path == self.project_path
                     && disk.title == self.title
+                    && disk.first_launch_names_agent == self.first_launch_names_agent
+                    && disk.agent_provider == self.agent_provider
                     && disk.tool == self.tool
                     && disk.command == self.command
                     && disk.extra_args == self.extra_args

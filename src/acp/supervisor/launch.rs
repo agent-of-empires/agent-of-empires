@@ -557,6 +557,11 @@ impl<S: BroadcastSink> Supervisor<S> {
                 wrapper_substitution,
                 generation,
                 claude_store_pin,
+                provider_routing: req
+                    .provider
+                    .as_deref()
+                    .and_then(crate::session::environment::provider_override_env)
+                    .unwrap_or_default(),
             },
             context_reset,
         ))
@@ -1017,6 +1022,7 @@ pub(super) async fn capture_launch_origin(
     let tool = req.tool.clone();
     let sandbox = req.sandbox_info.clone();
     let yolo_mode = req.yolo_mode;
+    let provider = req.provider.clone();
     let command = req
         .agent_command_override
         .as_ref()
@@ -1028,7 +1034,14 @@ pub(super) async fn capture_launch_origin(
             origin.session_id() == session_id,
             "launch authority belongs to another session"
         );
-        origin.validate_request(&cwd, &tool, sandbox.as_ref(), yolo_mode, command.as_deref())?;
+        origin.validate_request(
+            &cwd,
+            &tool,
+            sandbox.as_ref(),
+            yolo_mode,
+            command.as_deref(),
+            provider.as_deref(),
+        )?;
         origin.with_storage(|_, _row| Ok(()))?;
         let existing = admission
             .origin()

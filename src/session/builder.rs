@@ -53,6 +53,8 @@ pub(crate) fn apply_agent_launch_config(
 #[derive(Debug, Clone)]
 pub struct InstanceParams {
     pub title: String,
+    /// `title` was typed by the user, so the agent may be given it as its own session name.
+    pub title_typed: bool,
     pub path: String,
     pub group: String,
     pub tool: String,
@@ -719,6 +721,7 @@ pub fn build_instance(
 
     instance.title = final_title;
     instance.project_path = final_path;
+    instance.first_launch_names_agent = params.title_typed;
     if params.scratch {
         let dir = super::scratch::provision_scratch_dir(&instance.id)?;
         instance.project_path = dir.to_string_lossy().to_string();
@@ -780,6 +783,7 @@ pub fn build_instance(
             },
             custom_instruction: config.sandbox.custom_instruction.clone(),
             before_start_env: Vec::new(),
+            provider: None,
             container_workdir: None,
         });
     }
@@ -2077,6 +2081,7 @@ mod tests {
     fn custom_agent_params(project_path: &std::path::Path, tool: &str) -> InstanceParams {
         InstanceParams {
             title: "custom session".to_string(),
+            title_typed: false,
             path: project_path.to_string_lossy().to_string(),
             group: String::new(),
             tool: tool.to_string(),
@@ -2272,6 +2277,7 @@ mod tests {
         let storage = crate::session::Storage::new_unwatched("default").unwrap();
         let params = InstanceParams {
             title: "Forked".into(),
+            title_typed: false,
             path: "/tmp".into(),
             group: String::new(),
             tool: "claude".into(),
@@ -2326,6 +2332,7 @@ mod tests {
         };
         let params = InstanceParams {
             title: "Forked".into(),
+            title_typed: false,
             path: "/tmp".into(),
             group: String::new(),
             tool: "claude".into(),
