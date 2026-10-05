@@ -402,21 +402,19 @@ impl Instance {
                 .is_some_and(|parent| parent.session_id != binding.session_id))
         .then(|| binding.session_id.clone())
     }
-
     /// A store fork runs `opencode serve` against the launch's own store, so it
     /// needs a host launch that invokes the resolved binary directly and shares
-    /// no container store with it.
+    /// no container store with it. The binary is the one the launch already
+    /// resolved and the server is spawned with the launch's own environment, so
+    /// asking whether `PATH` still names it would refuse a profile that simply
+    /// points somewhere else.
     fn opencode_store_fork_available(
         &self,
         execution: Option<&super::execution::NativeExecution>,
     ) -> bool {
         match execution {
             Some(execution) => {
-                execution.agent.name == "opencode"
-                    && execution.inputs.container.is_none()
-                    && execution
-                        .inputs
-                        .runs_host_path_binary(execution.agent.binary, &execution.program)
+                execution.agent.name == "opencode" && execution.inputs.container.is_none()
             }
             None => !self.is_sandboxed() && self.opencode_launch_mirrorable_by_ambient_serve(),
         }
@@ -1401,6 +1399,66 @@ work-opencode = "opencode"
 
         let other = tool_instance("claude", project);
         assert!(!other.opencode_store_fork_available(None));
+    }
+
+    /// An attested host launch forks whatever binary it resolved, even when the
+    /// profile points `PATH` somewhere else, because the server is spawned from
+    /// that resolved path with the launch's own environment.
+    #[test]
+    #[serial_test::serial]
+    fn an_attested_host_launch_may_fork_through_a_profile_path() {
+        let home = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(home.path());
+        let project = home.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let inst = tool_instance("opencode", project.to_str().unwrap());
+        // A profile `PATH` that does not name the resolved program.
+        let profile_bin = home.path().join("elsewhere");
+        std::fs::create_dir_all(&profile_bin).unwrap();
+        let agent = crate::session::instance::execution::NativeLaunchInputs {
+            launch_id: "test".to_string(),
+            environment: [(
+                "PATH".to_string(),
+                profile_bin.to_string_lossy().into_owned(),
+            )]
+            .into_iter()
+            .collect(),
+            cwd: project.clone(),
+            profile: "default".to_string(),
+            container: None,
+            docker_env: None,
+            pane_env: Vec::new(),
+            identity_extension: None,
+        };
+        let execution = super::execution::NativeExecution {
+            agent: crate::agents::get_agent("opencode").unwrap(),
+            binding: crate::session::ExecutionBinding {
+                agent: "opencode".into(),
+                stores: Vec::new(),
+                configuration: Vec::new(),
+                exported_default_store: None,
+                cwd: project,
+                cwd_filesystem: "host".into(),
+                filesystem: "host".into(),
+            },
+            routing: Vec::new(),
+            case_insensitive_routing: &[],
+            namespace_arguments: Vec::new(),
+            omp: None,
+            inputs: agent,
+            program: profile_bin.join("opencode"),
+            capture: None,
+            pi_transcript_path: None,
+            pi_pinnable: false,
+            target_session_id: None,
+            resolved_target_session_id: None,
+            opencode_preassign: false,
+            store_override: None,
+        };
+        assert!(
+            inst.opencode_store_fork_available(Some(&execution)),
+            "the resolved program is spawned directly, so a profile PATH does not bar it"
+        );
     }
 
     #[test]
