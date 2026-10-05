@@ -2951,6 +2951,20 @@ pub(crate) fn build_container_config(
                 value: value.to_string(),
             });
         }
+        if is_yolo_mode {
+            // A sandbox reaches the container through its environment, so the
+            // generation the host binary speaks decides the spelling here too.
+            let yolo = agent
+                .yolo
+                .as_ref()
+                .map(|yolo| yolo.resolve(agent.detected_generation()));
+            if let Some(crate::agents::YoloMode::EnvVar(key, value)) = yolo {
+                environment.push(EnvEntry::Literal {
+                    key: key.to_string(),
+                    value: value.to_string(),
+                });
+            }
+        }
     }
 
     // Folder trust goes through the shared registry so the create path and the

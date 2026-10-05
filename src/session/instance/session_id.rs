@@ -37,6 +37,20 @@ pub(super) fn read_session_settings(
     Ok(serde_json::from_slice::<serde_json::Map<String, serde_json::Value>>(&bytes).ok())
 }
 
+/// The OpenCode generation the launch resolves against, read from the program
+/// it runs or, without one, from the binary the descriptor names.
+fn opencode_generation(
+    execution: Option<&super::execution::NativeExecution>,
+) -> crate::agents::AgentGeneration {
+    match execution {
+        Some(execution) => crate::agents::agent_generation_for(execution.agent, &execution.program),
+        None => crate::agents::get_agent("opencode").map_or(
+            crate::agents::AgentGeneration::Current,
+            crate::agents::AgentDef::detected_generation,
+        ),
+    }
+}
+
 impl Instance {
     /// Returns `(session_id, is_existing)`. Explicit intents win; default intent
     /// keeps a stored id unless the pane's own backend proves it rotated, and
@@ -96,7 +110,11 @@ impl Instance {
                 ));
                 path
             };
-            let sid = crate::session::capture::preassign_opencode_session_id(cwd, command);
+            let sid = crate::session::capture::preassign_opencode_session_id(
+                cwd,
+                command,
+                opencode_generation(execution),
+            );
             native_created.set(sid.is_some());
             sid
         });
@@ -343,8 +361,13 @@ impl Instance {
             }
             None => self.project_path.clone(),
         };
-        let child = crate::session::capture::fork_opencode_session_id(&cwd, command, parent_id)
-            .context("the store returned no child for this fork")?;
+        let child = crate::session::capture::fork_opencode_session_id(
+            &cwd,
+            command,
+            parent_id,
+            opencode_generation(execution),
+        )
+        .context("the store returned no child for this fork")?;
         self.set_agent_conversation(
             Some(child.clone()),
             execution.map(|execution| crate::session::ConversationBinding {
@@ -676,7 +699,17 @@ impl Instance {
         }
         if let ResumeIntent::Fork { from } = self.resume_intent.clone() {
             let agent = agent.context("fork execution adapter is unavailable")?;
-            if matches!(agent.fork_strategy, crate::agents::ForkStrategy::ServeFork) {
+            let generation = crate::agents::agent_generation_for(
+                agent,
+                &execution.map_or_else(
+                    || std::path::PathBuf::from(agent.binary),
+                    |execution| execution.program.clone(),
+                ),
+            );
+            if matches!(
+                agent.fork_strategy.resolve(generation),
+                crate::agents::ForkStrategy::ServeFork
+            ) {
                 // The store mints the child before the pane exists, so the
                 // launch opens a conversation that already carries the history.
                 let child_id = self
@@ -702,13 +735,15 @@ impl Instance {
                 .agent_session_id
                 .as_deref()
                 .context("fork child seed is missing")?;
-            let fork_part = build_fork_flags(agent.name, &from, child_id);
+            let fork_part = build_fork_flags(agent.name, &from, child_id, generation);
             anyhow::ensure!(
                 !fork_part.is_empty(),
                 "native agent cannot execute this fork"
             );
-            let is_subcommand =
-                matches!(agent.fork_strategy, crate::agents::ForkStrategy::CodexFork);
+            let is_subcommand = matches!(
+                agent.fork_strategy.resolve(generation),
+                crate::agents::ForkStrategy::CodexFork
+            );
             splice_subcommand_or_append(
                 cmd,
                 &fork_part,

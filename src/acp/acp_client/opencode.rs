@@ -4,6 +4,27 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+/// OpenCode 2.x: the role is a column and the error node is flat.
+const V2_ERROR_SQL: &str = "SELECT json_extract(data, '$.error.message')
+     FROM session_message
+     WHERE session_id = ?1
+       AND type = 'assistant'
+       AND time_created >= ?2
+       AND json_extract(data, '$.error.message') IS NOT NULL
+     ORDER BY time_created DESC
+     LIMIT 1";
+
+/// OpenCode 1.x: the role and the creation time live inside the payload, and
+/// the error node is nested one level deeper.
+const V1_ERROR_SQL: &str = "SELECT json_extract(data, '$.error.data.message')
+     FROM message
+     WHERE session_id = ?1
+       AND json_extract(data, '$.role') = 'assistant'
+       AND CAST(json_extract(data, '$.time.created') AS INTEGER) >= ?2
+       AND json_extract(data, '$.error.data.message') IS NOT NULL
+     ORDER BY CAST(json_extract(data, '$.time.created') AS INTEGER) DESC
+     LIMIT 1";
+
 pub(super) fn opencode_data_dir() -> Option<PathBuf> {
     if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
         if !xdg.is_empty() {
@@ -67,41 +88,19 @@ pub(super) fn recover_opencode_prompt_error_from_sqlite_at(
     // OpenCode 2.x moved messages to `session_message`, where the role is a
     // column and the error node sits at `$.error.message` instead of
     // `$.error.data.message`. The table name tracks the build channel rather
-    // than the version, so each layout is read with its own statement.
-    for sql in [
-        "SELECT json_extract(data, '$.error.message')
-         FROM session_message
-         WHERE session_id = ?1
-           AND type = 'assistant'
-           AND time_created >= ?2
-           AND json_extract(data, '$.error.message') IS NOT NULL
-         ORDER BY time_created DESC
-         LIMIT 1",
-        "SELECT json_extract(data, '$.error.data.message')
-         FROM message
-         WHERE session_id = ?1
-           AND json_extract(data, '$.role') = 'assistant'
-           AND CAST(json_extract(data, '$.time.created') AS INTEGER) >= ?2
-           AND json_extract(data, '$.error.data.message') IS NOT NULL
-         ORDER BY CAST(json_extract(data, '$.time.created') AS INTEGER) DESC
-         LIMIT 1",
-    ] {
-        let mut stmt = match conn.prepare(sql) {
-            Ok(stmt) => stmt,
-            // The store predates the table, so the next candidate decides.
-            Err(rusqlite::Error::SqliteFailure(_, Some(reason)))
-                if reason.contains("no such table") =>
-            {
-                continue
-            }
-            Err(_) => continue,
+    // than the version, and a migrated store carries both tables at once, so
+    // each layout is read with its own statement and a statement that finds no
+    // row hands over to the next rather than ending the search.
+    for sql in [V2_ERROR_SQL, V1_ERROR_SQL] {
+        let Ok(mut stmt) = conn.prepare(sql) else {
+            continue;
         };
-        let message: String = stmt
-            .query_row(
-                rusqlite::params![acp_session_id, prompt_started_at_ms],
-                |row| row.get(0),
-            )
-            .ok()?;
+        let Ok(message) = stmt.query_row(
+            rusqlite::params![acp_session_id, prompt_started_at_ms],
+            |row| row.get::<_, String>(0),
+        ) else {
+            continue;
+        };
         let trimmed = message.trim();
         if !trimmed.is_empty() {
             return Some(trimmed.to_string());

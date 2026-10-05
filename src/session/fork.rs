@@ -172,12 +172,22 @@ fn builtin_acp_registry() -> &'static crate::acp::AgentRegistry {
 pub fn structured_fork_capable(tool: &str, agent_name: Option<&str>) -> bool {
     let resolved = agent_name.filter(|s| !s.is_empty()).unwrap_or(tool);
     builtin_acp_registry().get(resolved).is_some()
-        && get_agent(resolved).is_some_and(|a| matches!(a.fork_strategy, ForkStrategy::ClaudeFork))
+        && get_agent(resolved).is_some_and(|agent| {
+            matches!(
+                agent.fork_strategy.resolve(agent.detected_generation()),
+                ForkStrategy::ClaudeFork
+            )
+        })
 }
 
 /// Whether a canonical native agent supports terminal forking.
 pub fn terminal_agent_can_fork(agent: &str) -> bool {
-    get_agent(agent).is_some_and(|a| !matches!(a.fork_strategy, ForkStrategy::Unsupported))
+    get_agent(agent).is_some_and(|def| {
+        !matches!(
+            def.fork_strategy.resolve(def.detected_generation()),
+            ForkStrategy::Unsupported
+        )
+    })
 }
 
 /// Hold a fork child to the parent's identity when the parent is an

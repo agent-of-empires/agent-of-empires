@@ -30,11 +30,42 @@ pub(super) struct PreparedLaunch {
     pub(super) carry_relocated: bool,
 }
 
-/// Append the agent's yolo flag to a launch command.
-fn apply_yolo_mode(cmd: &mut String, yolo: &crate::agents::YoloMode) {
-    if let crate::agents::YoloMode::CliFlag(flag) = yolo {
-        *cmd = format!("{} {}", cmd, flag);
+/// The agent's yolo mechanism for the build this launch runs. A descriptor that
+/// declares two generations is resolved against the executable's own help, read
+/// from the program the launch runs or, when there is none, from the binary
+/// `PATH` resolves for the descriptor.
+fn resolved_yolo(
+    agent: &'static crate::agents::AgentDef,
+    execution: Option<&super::execution::NativeExecution>,
+) -> Option<&'static crate::agents::YoloMode> {
+    agent.yolo.as_ref().map(|yolo| {
+        let generation = match execution {
+            Some(execution) => crate::agents::agent_generation_for(agent, &execution.program),
+            None => agent.detected_generation(),
+        };
+        yolo.resolve(generation)
+    })
+}
+
+/// Append yolo-mode flags or environment variables to a launch command.
+fn apply_yolo_mode(cmd: &mut String, yolo: &crate::agents::YoloMode, is_sandboxed: bool) {
+    match yolo {
+        crate::agents::YoloMode::CliFlag(flag) => {
+            *cmd = format!("{} {}", cmd, flag);
+        }
+        crate::agents::YoloMode::EnvVar(key, value) if !is_sandboxed => {
+            *cmd = format_env_var_prefix(key, value, cmd);
+        }
+        crate::agents::YoloMode::EnvVar(..)
+        | crate::agents::YoloMode::AlwaysYolo
+        | crate::agents::YoloMode::EitherGeneration { .. } => {}
     }
+}
+
+/// Format an environment variable assignment as a shell-safe command prefix.
+fn format_env_var_prefix(key: &str, value: &str, cmd: &str) -> String {
+    let escaped = shell_escape(value);
+    format!("{}={} {}", key, escaped, cmd)
 }
 
 /// Append the agent's session-name flag with the title typed in the New Session dialog, on the
@@ -142,7 +173,12 @@ pub(super) fn build_resume_flags(
 /// Build the launch flags for a one-shot terminal fork. Returns the empty string for an unforkable
 /// agent, an invalid id, or an agent whose store mints the child over its own API (mirroring
 /// `build_resume_flags`'s fail-closed contract).
-pub(super) fn build_fork_flags(tool: &str, parent_id: &str, child_id: &str) -> String {
+pub(super) fn build_fork_flags(
+    tool: &str,
+    parent_id: &str,
+    child_id: &str,
+    generation: crate::agents::AgentGeneration,
+) -> String {
     use crate::agents::{get_agent, ForkStrategy};
 
     if !is_valid_session_id(parent_id) || !is_valid_session_id(child_id) {
@@ -153,7 +189,7 @@ pub(super) fn build_fork_flags(tool: &str, parent_id: &str, child_id: &str) -> S
     let Some(agent) = get_agent(tool) else {
         return String::new();
     };
-    match agent.fork_strategy {
+    match agent.fork_strategy.resolve(generation) {
         ForkStrategy::ClaudeFork => {
             format!("--resume {parent_id} --fork-session --session-id {child_id}")
         }
@@ -164,7 +200,19 @@ pub(super) fn build_fork_flags(tool: &str, parent_id: &str, child_id: &str) -> S
         }
         // The child already exists in the store before this launch, so the
         // command opens it instead of asking the agent to fork.
-        ForkStrategy::ServeFork | ForkStrategy::Unsupported => String::new(),
+        ForkStrategy::Flag(fork_flag) => {
+            // Resume the parent session (using the agent's own resume flag),
+            // then add the fork flag; the agent mints the new id.
+            match agent.session_support.as_ref().map(|support| support.resume) {
+                Some(crate::agents::ResumeStrategy::Flag(resume_flag)) => {
+                    format!("{resume_flag} {parent_id} {fork_flag}")
+                }
+                _ => String::new(),
+            }
+        }
+        ForkStrategy::ServeFork
+        | ForkStrategy::EitherGeneration { .. }
+        | ForkStrategy::Unsupported => String::new(),
     }
 }
 
@@ -674,11 +722,14 @@ impl Instance {
                 format!("{} {}", launch_cmd, self.extra_args)
             };
             let mut tool_cmd = if self.is_yolo_mode() {
-                match agent.and_then(|a| a.yolo.as_ref()) {
+                match agent.and_then(|a| resolved_yolo(a, execution)) {
                     Some(crate::agents::YoloMode::CliFlag(flag)) => {
                         format!("{} {}", base_cmd, flag)
                     }
-                    Some(crate::agents::YoloMode::AlwaysYolo) | None => base_cmd,
+                    Some(crate::agents::YoloMode::EnvVar(..))
+                    | Some(crate::agents::YoloMode::AlwaysYolo)
+                    | Some(crate::agents::YoloMode::EitherGeneration { .. })
+                    | None => base_cmd,
                 }
             } else {
                 base_cmd
@@ -877,8 +928,8 @@ impl Instance {
                         );
                     }
                     if self.is_yolo_mode() {
-                        if let Some(ref yolo) = a.yolo {
-                            apply_yolo_mode(&mut cmd, yolo);
+                        if let Some(yolo) = resolved_yolo(a, execution) {
+                            apply_yolo_mode(&mut cmd, yolo, false);
                         }
                     }
                     let is_existing =
@@ -914,8 +965,8 @@ impl Instance {
                 cmd = format!("{} {}", cmd, self.extra_args);
             }
             if self.is_yolo_mode() {
-                if let Some(yolo) = agent.and_then(|a| a.yolo.as_ref()) {
-                    apply_yolo_mode(&mut cmd, yolo);
+                if let Some(yolo) = agent.and_then(|a| resolved_yolo(a, execution)) {
+                    apply_yolo_mode(&mut cmd, yolo, false);
                 }
             }
             let is_existing =
@@ -946,6 +997,7 @@ impl Instance {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agents::AgentGeneration;
     use crate::session::instance::test_helpers::*;
     use crate::session::test_support::EnvGuard;
 
@@ -1211,16 +1263,52 @@ mod tests {
         assert_eq!(build_resume_flags("claude", "$(rm -rf /)", true), "");
         assert_eq!(build_resume_flags("opencode", "id; echo pwned", false), "");
 
-        for (tool, parent, child, expected) in [
-            ("codex", "parent-id", "ignored-child", "fork parent-id"),
+        for (tool, parent, child, generation, expected) in [
+            (
+                "codex",
+                "parent-id",
+                "ignored-child",
+                AgentGeneration::Current,
+                "fork parent-id",
+            ),
             // OpenCode 2.x mints the child in its store before the launch, so no
             // fork flag reaches the command line.
-            ("opencode", "parent-id", "ignored-child", ""),
-            ("cursor", "parent", "child", ""),
-            ("claude", "$(rm -rf /)", "child", ""),
-            ("claude", "parent", "; echo pwned", ""),
+            (
+                "opencode",
+                "parent-id",
+                "ignored-child",
+                AgentGeneration::Current,
+                "",
+            ),
+            // 1.x has no fork endpoint under /api, so it keeps the root flag.
+            (
+                "opencode",
+                "parent-id",
+                "ignored-child",
+                AgentGeneration::Legacy,
+                "--session parent-id --fork",
+            ),
+            ("cursor", "parent", "child", AgentGeneration::Current, ""),
+            (
+                "claude",
+                "$(rm -rf /)",
+                "child",
+                AgentGeneration::Current,
+                "",
+            ),
+            (
+                "claude",
+                "parent",
+                "; echo pwned",
+                AgentGeneration::Current,
+                "",
+            ),
         ] {
-            assert_eq!(build_fork_flags(tool, parent, child), expected, "{tool}");
+            assert_eq!(
+                build_fork_flags(tool, parent, child, generation),
+                expected,
+                "{tool}/{generation:?}"
+            );
         }
     }
 
@@ -1372,7 +1460,9 @@ mod tests {
             .unwrap()
         {
             crate::agents::YoloMode::CliFlag(flag) => assert!(cmd.contains(flag)),
-            crate::agents::YoloMode::AlwaysYolo => {}
+            crate::agents::YoloMode::EnvVar(key, _) => assert!(cmd.contains(key)),
+            crate::agents::YoloMode::AlwaysYolo
+            | crate::agents::YoloMode::EitherGeneration { .. } => {}
         }
 
         let mut claude = tool_instance("claude", "/tmp/test");
@@ -1394,17 +1484,35 @@ mod tests {
         assert_eq!(host_command(&mut custom).matches("chat").count(), 1);
     }
 
-    /// OpenCode 2.x approves permissions with a root flag and ignores the v1
-    /// `OPENCODE_PERMISSION` variable, which no build of it reads.
+    /// Both OpenCode generations approve permissions, each by the spelling it
+    /// reads: 2.x by a root flag, 1.x by the inlined permission variable. The
+    /// generation is read from the root `--fork` the older help advertises and
+    /// the current one dropped, which is the one rename the two agree on.
     #[test]
-    fn opencode_yolo_appends_the_v2_auto_flag_and_no_permission_env() {
-        let mut opencode = tool_instance("opencode", "/tmp/test");
-        opencode.yolo_mode = true;
-        let cmd = host_command(&mut opencode);
-        assert!(cmd.contains("--auto"), "{cmd}");
-        assert!(!cmd.contains("OPENCODE_PERMISSION"), "{cmd}");
-        let wrapped = wrap_command_ignore_suspend(&cmd, "/tmp/proj", &[], &[]);
-        assert!(wrapped.contains("--auto"));
+    #[serial_test::serial]
+    fn opencode_yolo_follows_the_generation_the_installed_binary_advertises() {
+        const V2_HELP: &str =
+            "FLAGS\n  --auto       Auto-approve permissions\n  --session, -s string   Session ID";
+        const V1_HELP: &str =
+            "FLAGS\n  --fork       Fork the session\n  --session, -s string   Session ID";
+        for (help, expect_flag, expect_env) in [(V2_HELP, true, false), (V1_HELP, false, true)] {
+            let home = tempfile::tempdir().unwrap();
+            let _app = crate::session::test_support::isolate_app_dir_at(home.path());
+            let _opencode = crate::session::test_support::install_login_shell_path_command(
+                home.path(),
+                "opencode",
+                &format!("#!/bin/sh\nprintf '%s\\n' {}\nexit 0\n", shell_escape(help)),
+            );
+            crate::agents::forget_agent_help_for_test();
+
+            let mut inst = tool_instance("opencode", "/tmp/test");
+            inst.yolo_mode = true;
+            let cmd = host_command(&mut inst);
+            assert_eq!(cmd.contains("--auto"), expect_flag, "{cmd}");
+            assert_eq!(cmd.contains("OPENCODE_PERMISSION"), expect_env, "{cmd}");
+            let wrapped = wrap_command_ignore_suspend(&cmd, "/tmp/proj", &[], &[]);
+            assert_eq!(wrapped.contains("--auto"), expect_flag, "{wrapped}");
+        }
     }
 
     #[test]

@@ -9,6 +9,13 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use uuid::Uuid;
 
+use crate::agents::AgentGeneration;
+
+/// How the older generation is named in a diagnostic.
+fn legacy_generation_label() -> &'static str {
+    "1.x"
+}
+
 /// Budget for the serve boot plus the request that follows it (boot measured at
 /// ~1.8s). Covers both the preassign and the fork.
 const OPENCODE_SERVE_DEADLINE: Duration = Duration::from_secs(6);
@@ -123,7 +130,21 @@ impl ServeClient {
         }
     }
 
-    async fn create_session(&self, id: &str, project_path: &str) -> Result<()> {
+    /// Creates the session the launch will own. 1.x exposes no create route
+    /// under `/api` (it has the read-only listing only), so that generation is
+    /// left without a preassigned id rather than paying a doomed request.
+    async fn create_session(
+        &self,
+        id: &str,
+        project_path: &str,
+        generation: AgentGeneration,
+    ) -> Result<()> {
+        if generation == AgentGeneration::Legacy {
+            anyhow::bail!(
+                "opencode {} has no session-create route under /api, so its session id cannot be preassigned",
+                legacy_generation_label()
+            );
+        }
         let body = serde_json::json!({
             "id": id,
             "location": { "directory": project_path },
@@ -155,10 +176,16 @@ impl ServeClient {
     /// Asks the store for a child of `parent_id`. The id it returns replaces the
     /// one AoE pre-pinned, because only the store knows which conversation the
     /// child continues.
-    async fn fork_session(&self, parent_id: &str) -> Result<String> {
+    /// Asks the store for a child of `parent_id`. 1.x serves this route
+    /// unprefixed, so the path follows the generation rather than being guessed.
+    async fn fork_session(&self, parent_id: &str, generation: AgentGeneration) -> Result<String> {
+        let path = match generation {
+            AgentGeneration::Current => format!("/api/session/{parent_id}/fork"),
+            AgentGeneration::Legacy => format!("/session/{parent_id}/fork"),
+        };
         let resp = self
             .client
-            .post(format!("{}/api/session/{parent_id}/fork", self.base))
+            .post(format!("{}{path}", self.base))
             .json(&serde_json::json!({}))
             .send()
             .await
@@ -245,13 +272,19 @@ fn with_serve<T: Send + 'static>(
 pub(crate) fn preassign_opencode_session_id(
     project_path: &str,
     command: std::process::Command,
+    generation: AgentGeneration,
 ) -> Option<String> {
     let id = format!("ses_{}", Uuid::new_v4().simple());
     let owned_path = project_path.to_owned();
     let served_path = owned_path.clone();
     with_serve(&owned_path, command, move |client| {
         let id = id.clone();
-        Box::pin(async move { client.create_session(&id, &served_path).await.map(|()| id) })
+        Box::pin(async move {
+            client
+                .create_session(&id, &served_path, generation)
+                .await
+                .map(|()| id)
+        })
     })
     .map_err(|e| {
         tracing::warn!(target: "session.capture", error = %e, "opencode session preassignment failed");
@@ -266,6 +299,7 @@ pub(crate) fn fork_opencode_session_id(
     project_path: &str,
     command: std::process::Command,
     parent_id: &str,
+    generation: AgentGeneration,
 ) -> Option<String> {
     let Some(parent_id) = super::validated_session_id(parent_id.to_owned()) else {
         tracing::warn!(target: "session.capture", %parent_id, "refusing to fork an invalid OpenCode session id");
@@ -274,7 +308,7 @@ pub(crate) fn fork_opencode_session_id(
     let project_path = project_path.to_owned();
     with_serve(&project_path, command, move |client| {
         let parent_id = parent_id.clone();
-        Box::pin(async move { client.fork_session(&parent_id).await })
+        Box::pin(async move { client.fork_session(&parent_id, generation).await })
     })
     .map_err(|e| {
         tracing::warn!(target: "session.capture", error = %e, "opencode session fork failed");
@@ -358,13 +392,14 @@ mod tests {
     /// and the id that comes back is the one AoE must adopt.
     #[test]
     fn the_fork_request_names_the_parent_and_returns_the_stored_child() {
+        let generation = AgentGeneration::Current;
         let (handle, port) = serve_once(
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 51\r\n\r\n{\"data\":{\"id\":\"ses_child000000000000000000000000\"}}",
         );
         let child = block_on(
             |client| {
                 let parent = "ses_parent00000000000000000000000".to_string();
-                Box::pin(async move { client.fork_session(&parent).await })
+                Box::pin(async move { client.fork_session(&parent, generation).await })
             },
             port,
         );
@@ -377,6 +412,50 @@ mod tests {
         assert!(header(&request, "authorization").is_some(), "{request}");
     }
 
+    /// 1.x serves the fork route without the `/api` prefix, so the path follows
+    /// the generation instead of being guessed.
+    #[test]
+    fn the_fork_path_follows_the_generation() {
+        for (generation, expected) in [
+            (AgentGeneration::Current, "/api/session/ses_parent/fork"),
+            (AgentGeneration::Legacy, "/session/ses_parent/fork"),
+        ] {
+            let (handle, port) = serve_once(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 51\r\n\r\n{\"data\":{\"id\":\"ses_child000000000000000000000000\"}}",
+            );
+            let child = block_on(
+                |client| {
+                    let parent = "ses_parent".to_string();
+                    Box::pin(async move { client.fork_session(&parent, generation).await })
+                },
+                port,
+            );
+            assert!(child.is_ok(), "{generation:?} fork should reach a stub");
+            let request = handle.join().unwrap();
+            assert!(
+                request.starts_with(&format!("POST {expected} ")),
+                "{generation:?} posted {request}"
+            );
+        }
+    }
+
+    /// 1.x exposes no create route under `/api`, so a launch against it must be
+    /// told so instead of waiting out a request that cannot succeed.
+    #[test]
+    fn the_legacy_generation_refuses_to_preassign() {
+        let outcome = ServeClient::new("http://127.0.0.1:1".into(), "pw").map(|client| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(client.create_session("ses_x", "/tmp", AgentGeneration::Legacy))
+        });
+        let error = outcome
+            .expect("the client builds")
+            .expect_err("no create route exists for the older generation");
+        assert!(error.to_string().contains("preassigned"), "{error}");
+    }
+
     #[test]
     fn the_fork_rejects_a_response_without_a_child_id() {
         let (handle, port) = serve_once(
@@ -385,7 +464,9 @@ mod tests {
         let result = block_on(
             |client| {
                 let parent = "ses_parent".to_string();
-                Box::pin(async move { client.fork_session(&parent).await })
+                Box::pin(
+                    async move { client.fork_session(&parent, AgentGeneration::Current).await },
+                )
             },
             port,
         );

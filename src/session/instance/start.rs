@@ -349,10 +349,16 @@ impl Instance {
                     .or_else(|| omp_capture_metadata.clone().map(CaptureContext::Omp)),
                 container: execution.inputs.container,
             });
+            let generation =
+                crate::agents::agent_generation_for(execution.agent, &execution.program);
             let native_mints_child = matches!(
                 prepared.expected_conversation.intent,
                 ResumeIntent::Fork { .. }
-            ) && execution.agent.fork_strategy.mints_child();
+            ) && execution
+                .agent
+                .fork_strategy
+                .resolve(generation)
+                .mints_child();
             if native_mints_child {
                 self.set_agent_conversation(None, None, None);
             } else if let Some(sid) = self.agent_session_id.clone() {

@@ -38,7 +38,38 @@ pub enum DetectionMethod {
 
 pub enum YoloMode {
     CliFlag(&'static str),
+    EnvVar(&'static str, &'static str),
     AlwaysYolo,
+    /// Two generations, one contract. OpenCode 2.x stopped reading the inlined
+    /// permission object, so an agent spanning the rename declares both and
+    /// `resolve` picks the one the installed build understands.
+    EitherGeneration {
+        legacy: &'static YoloMode,
+        current: &'static YoloMode,
+    },
+}
+
+/// Which generation of an agent's interface a launch resolves against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentGeneration {
+    /// The interface the agent shipped before its 2.x rename.
+    Legacy,
+    /// The interface 2.x and later expose.
+    Current,
+}
+
+impl YoloMode {
+    /// The mechanism the installed build understands. A mode that spans two
+    /// generations resolves to the matching arm; any other mode is itself.
+    pub fn resolve(&'static self, generation: AgentGeneration) -> &'static YoloMode {
+        match self {
+            YoloMode::EitherGeneration { legacy, current } => match generation {
+                AgentGeneration::Legacy => legacy,
+                AgentGeneration::Current => current,
+            },
+            _ => self,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -123,9 +154,18 @@ pub struct SessionSupport {
 pub enum ForkStrategy {
     ClaudeFork,
     CodexFork,
+    Flag(&'static str),
     /// The agent's store mints the child over its own API before the launch, so
     /// the session that follows is still the interactive one.
     ServeFork,
+    /// Two generations, one contract. OpenCode 2.x removed the root fork flag
+    /// and moved its endpoint under `/api`, and no single spelling serves both,
+    /// so an agent spanning the rename declares both and `resolve` picks the one
+    /// the installed build accepts.
+    EitherGeneration {
+        legacy: &'static ForkStrategy,
+        current: &'static ForkStrategy,
+    },
     Unsupported,
 }
 
@@ -134,6 +174,18 @@ impl ForkStrategy {
     /// pre-pinned for the fork a placeholder to drop.
     pub(crate) const fn mints_child(self) -> bool {
         matches!(self, Self::CodexFork)
+    }
+
+    /// The mechanism the installed build understands. A strategy that spans two
+    /// generations resolves to the matching arm; any other is itself.
+    pub fn resolve(&'static self, generation: AgentGeneration) -> &'static ForkStrategy {
+        match self {
+            ForkStrategy::EitherGeneration { legacy, current } => match generation {
+                AgentGeneration::Legacy => legacy,
+                AgentGeneration::Current => current,
+            },
+            _ => self,
+        }
     }
 }
 
@@ -288,6 +340,10 @@ pub struct AgentDef {
     pub aliases: &'static [&'static str],
     pub detection: DetectionMethod,
     pub yolo: Option<YoloMode>,
+    /// Set when this agent's `yolo` and `fork_strategy` each declare a legacy
+    /// and a current arm, so a launch resolves both against the installed
+    /// binary. Declaring it once keeps the two from disagreeing.
+    pub spans_agent_generations: bool,
     pub instruction_flag: Option<&'static str>,
     /// One argv token placed before the prompt; never contains a `{}` placeholder.
     pub oneshot_flag: Option<&'static str>,
@@ -499,6 +555,7 @@ const fn agent(name: &'static str, binary: &'static str, install_hint: &'static 
         aliases: &[],
         detection: DetectionMethod::Which(binary),
         yolo: None,
+        spans_agent_generations: false,
         instruction_flag: None,
         oneshot_flag: None,
         set_default_command: false,
@@ -556,7 +613,14 @@ pub const AGENTS: &[AgentDef] = &[
     AgentDef {
         oneshot_flag: Some("run"),
         aliases: &["open-code"],
-        yolo: Some(YoloMode::CliFlag("--auto")),
+        // 2.x dropped the inlined permission object and the root fork flag, and
+        // serves the fork endpoint under `/api` where 1.x used no prefix, so
+        // both generations are declared and the launch resolves against the one
+        // the installed build speaks.
+        yolo: Some(YoloMode::EitherGeneration {
+            legacy: &YoloMode::EnvVar("OPENCODE_PERMISSION", r#"{"*":"allow"}"#),
+            current: &YoloMode::CliFlag("--auto"),
+        }),
         set_default_command: true,
         detect_status: status_detection::detect_opencode_status,
         session_support: session_support(
@@ -565,7 +629,11 @@ pub const AGENTS: &[AgentDef] = &[
             SessionCaptureContext::Preassigned,
             SessionCaptureContext::Unsupported,
         ),
-        fork_strategy: ForkStrategy::ServeFork,
+        fork_strategy: ForkStrategy::EitherGeneration {
+            legacy: &ForkStrategy::Flag("--fork"),
+            current: &ForkStrategy::ServeFork,
+        },
+        spans_agent_generations: true,
         ready_marker: Some("ask anything"),
         permission_response: Some(PermissionResponse {
             allow: &[KeyToken::Named("Enter")],
@@ -955,6 +1023,42 @@ impl AgentDef {
             Some(sub) => format!("{} {}", self.binary, sub),
             None => self.binary.to_string(),
         }
+    }
+}
+
+/// Which generation of an agent's interface `program` speaks.
+///
+/// A descriptor that declares two generations is resolved by what the
+/// executable itself advertises, not by a version threshold: a renamed flag is
+/// exactly the case where the build's own `--help` is the authority. The probe
+/// and its cached answer are bound to the resolved executable, exactly as
+/// `agent_help_advertises` binds its own.
+pub fn agent_generation_for(agent: &AgentDef, program: &std::path::Path) -> AgentGeneration {
+    if !agent.spans_agent_generations {
+        return AgentGeneration::Current;
+    }
+    // The root `--fork` is the marker: every 1.x build declares it and 2.x
+    // removed it. `--auto` cannot serve, because 1.17.12 and later declare that
+    // at their root too.
+    if agent_help_advertises(program, LEGACY_GENERATION_MARKER) {
+        AgentGeneration::Legacy
+    } else {
+        // An unreadable help is not evidence of the older interface, and the
+        // current spelling is the one a fresh install speaks.
+        AgentGeneration::Current
+    }
+}
+
+/// A flag the older generation's help lists and the current one's does not.
+const LEGACY_GENERATION_MARKER: &str = "--fork";
+
+impl AgentDef {
+    /// The generation the binary this descriptor names speaks. Callers that
+    /// already hold the launch's resolved program pass it to
+    /// `agent_generation_for` instead.
+    pub fn detected_generation(&self) -> AgentGeneration {
+        let program = which::which(self.binary).unwrap_or_else(|_| self.binary.into());
+        agent_generation_for(self, &program)
     }
 }
 
