@@ -299,7 +299,7 @@ async fn rate_limit_park_is_sendable_at_the_shared_decision_point() {
                 .await
                 .expect("session exists");
             service
-                .prompt_dispatch_under_submission(id_ref, false, false)
+                .prompt_dispatch_under_submission(id_ref, "", false, false)
                 .await
         };
         assert_eq!(
