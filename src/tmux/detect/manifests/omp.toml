@@ -4,6 +4,10 @@ prompt_marker = ['^\s*╭[─-]*\s+\S']
 [markers.composer_top]
 line_regex = ['^\s*╭[─-]*\s+\S']
 
+[markers.selector_footer]
+line_regex = ['(?i)^\s*[│|].*(?:navigate|scroll|select|confirm|open).*(?:esc|⎋|cancel).*[│|]\s*$']
+max_depth = 12
+
 # OMP stacks live markers, so positional rules compete by screen position.
 
 # The interrupt token is the positive signal for an active turn, even without a
@@ -79,7 +83,12 @@ not = [
     { line_regex = ['^\s*[│|]\s*(?:[\x{276F}\x{f054}>])\s+\S[^│|]*[│|]\s*$'] },
     { line_regex = ['(?i)^\s*[│|].*(?:navigate|scroll|select|confirm|open).*(?:esc|⎋|cancel).*[│|]\s*$'] },
   ], not = [
-    { region = "bottom_non_empty_lines(3)", line_regex = ['(?i)^\s*(?:⎋|\x{f12b7}|esc)\s+working(?:…|\.\.\.)'] },
+    { region = "after(selector_footer)", any = [
+      { line = { regex = ['(?i)^\s*(?:⎋|\x{f12b7}|esc)\s+\S'], not_regex = ['(?i)^\s*(?:⎋|\x{f12b7}|esc)\s+waiting\b'] } },
+      { line_regex = ['(?i)^\s*\S+\s+working(?:…|\.\.\.)'] },
+      { line_regex = ['(?i)^\s*(?:[\x{2800}-\x{28FF}]|[-\\|/])\s+.*\(esc to cancel\)'] },
+      { line_regex = ['(?i)^ {2}cancel\s+\S'] },
+    ] },
   ] },
 ]
 
@@ -140,7 +149,12 @@ not = [
     { line_regex = ['^\s*[│|]\s*(?:[\x{276F}\x{f054}>])\s+\S[^│|]*[│|]\s*$'] },
     { line_regex = ['(?i)^\s*[│|].*(?:navigate|scroll|select|confirm|open).*(?:esc|⎋|cancel).*[│|]\s*$'] },
   ], not = [
-    { region = "bottom_non_empty_lines(3)", line_regex = ['(?i)^\s*(?:⎋|\x{f12b7}|esc)\s+working(?:…|\.\.\.)'] },
+    { region = "after(selector_footer)", any = [
+      { line = { regex = ['(?i)^\s*(?:⎋|\x{f12b7}|esc)\s+\S'], not_regex = ['(?i)^\s*(?:⎋|\x{f12b7}|esc)\s+waiting\b'] } },
+      { line_regex = ['(?i)^\s*\S+\s+working(?:…|\.\.\.)'] },
+      { line_regex = ['(?i)^\s*(?:[\x{2800}-\x{28FF}]|[-\\|/])\s+.*\(esc to cancel\)'] },
+      { line_regex = ['(?i)^ {2}cancel\s+\S'] },
+    ] },
   ] },
 ]
 

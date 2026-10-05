@@ -3404,6 +3404,11 @@ Final prose line.\n";
                 Status::Running,
             ),
             (
+                "newer non-Working activity below an older selector",
+                format!("{approval}\n⎋ Running tests\n❯\n───────────────────────────────────\n ⠏ 28s · 🖥 host"),
+                Status::Running,
+            ),
+            (
                 "lower approval wins over active statusline",
                 format!("⎋ Running tests\n{approval}\n❯\n───────────────────────────────────\n ⠏ 28s · 🖥 host"),
                 Status::Waiting,
