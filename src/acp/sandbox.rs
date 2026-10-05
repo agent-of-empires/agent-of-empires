@@ -45,9 +45,9 @@ pub async fn ensure_container_for_session_locked(
     // Phase 2: docker create/start + workdir/hook resolution on a
     // blocking thread.
     let session_id_owned = session_id.to_string();
-    let (sandbox_info, container_workdir, hooks, hook_env) =
+    let (sandbox_info, container_workdir, hooks, hook_env, rebuilt) =
         tokio::task::spawn_blocking(move || -> Result<_> {
-            reconcile_provider_container(&mut instance_clone)?;
+            let rebuilt = reconcile_provider_container(&mut instance_clone)?;
             let _container = instance_clone
                 .get_container_for_instance()
                 .context("ensuring sandbox container")?;
@@ -59,13 +59,19 @@ pub async fn ensure_container_for_session_locked(
                 None
             };
             let env = crate::session::config::repo_config::lifecycle_env_vars(&instance_clone);
-            Ok((instance_clone.sandbox_info.clone(), workdir, hooks, env))
+            Ok((
+                instance_clone.sandbox_info.clone(),
+                workdir,
+                hooks,
+                env,
+                rebuilt,
+            ))
         })
         .await
         .context("docker ensure task failed to join")??;
 
     if let Some(info) = &sandbox_info {
-        record_built_sandbox(instances, mutation_epoch, &session_id_owned, info).await;
+        record_built_sandbox(instances, mutation_epoch, &session_id_owned, info, rebuilt).await;
     }
 
     // Phase 4: run on_launch hooks outside the instances lock (the
@@ -115,6 +121,7 @@ async fn record_built_sandbox(
     mutation_epoch: &AtomicU64,
     session_id: &str,
     info: &SandboxInfo,
+    rebuilt: bool,
 ) {
     let mut guard = instances.write().await;
     let Some(sb) = guard
@@ -128,10 +135,11 @@ async fn record_built_sandbox(
         sb.container_id = info.container_id.clone();
     }
     sb.before_start_env = info.before_start_env.clone();
-    if sb.provider != info.provider {
+    // A disk snapshot read before the rebuild would restore the old stamp, and
+    // the next ensure would discard this container. The watcher may already
+    // have applied the new stamp, so a rebuild invalidates even when it matches.
+    if rebuilt || sb.provider != info.provider {
         sb.provider = info.provider.clone();
-        // A disk snapshot read before the rebuild would restore the old stamp,
-        // and the next ensure would discard this container.
         mutation_epoch.fetch_add(1, Ordering::SeqCst);
     }
 }
@@ -141,11 +149,10 @@ async fn record_built_sandbox(
 /// container-create time, so a container built for another provider has the
 /// wrong credential mounts. A container built before the pick existed records
 /// `None`, which matches no explicit pick and so is rebuilt once.
-fn reconcile_provider_container(instance: &mut Instance) -> Result<()> {
+fn reconcile_provider_container(instance: &mut Instance) -> Result<bool> {
     reconcile_provider_container_with(instance, |id| {
         crate::containers::DockerContainer::from_session_id(id).discard()
     })
-    .map(|_| ())
 }
 
 /// Returns whether the old container was discarded.
@@ -218,26 +225,44 @@ mod tests {
             .and_then(|s| s.provider)
     }
 
-    /// A changed stamp invalidates disk snapshots read before it; an unchanged
-    /// one leaves reloads alone.
+    /// A poll that read the pre-rebuild row must not land after the build, even
+    /// when the watcher already applied the new stamp from disk.
     #[tokio::test]
-    async fn a_changed_stamp_invalidates_older_snapshots() {
-        let inst = sandboxed(None);
-        let id = inst.id.clone();
-        let instances = RwLock::new(vec![inst]);
-        let epoch = AtomicU64::new(0);
-        let mut built = sandboxed(Some("vertex")).sandbox_info.unwrap();
+    #[serial_test::serial]
+    async fn a_rebuild_invalidates_snapshots_read_before_it() {
+        let _tmp = crate::session::test_support::isolate_app_dir();
+        let old = sandboxed(None);
+        let id = old.id.clone();
+        let state = crate::server::test_support::build_test_app_state(vec![old.clone()]);
+        let mut rebuilt = old.clone();
+        rebuilt.sandbox_info.as_mut().unwrap().provider = Some("vertex".to_string());
+        let reload = |snapshot: &Instance, read_epoch| {
+            crate::server::reload::reload_state_instances_from_disk(
+                &state,
+                vec![snapshot.clone()],
+                Vec::new(),
+                crate::server::state::StatusSource::DiskOnly,
+                read_epoch,
+            )
+        };
 
-        for (case, expected_epoch) in [("rebuilt", 1), ("unchanged", 1)] {
-            record_built_sandbox(&instances, &epoch, &id, &built).await;
-            assert_eq!(epoch.load(Ordering::SeqCst), expected_epoch, "{case}");
-            let stamp = instances.read().await[0]
-                .sandbox_info
-                .as_ref()
-                .and_then(|s| s.provider.clone());
-            assert_eq!(stamp.as_deref(), Some("vertex"), "{case}");
-            built.container_id = Some("c1".into());
-        }
+        let stale_epoch = state.mutation_epoch.load(Ordering::SeqCst);
+        reload(&rebuilt, stale_epoch).await;
+        record_built_sandbox(
+            &state.instances,
+            &state.mutation_epoch,
+            &id,
+            rebuilt.sandbox_info.as_ref().unwrap(),
+            true,
+        )
+        .await;
+        reload(&old, stale_epoch).await;
+
+        let stamp = state.instances.read().await[0]
+            .sandbox_info
+            .as_ref()
+            .and_then(|s| s.provider.clone());
+        assert_eq!(stamp.as_deref(), Some("vertex"));
     }
 
     /// The path every resume takes, not only a switch: a rebuild survives a
