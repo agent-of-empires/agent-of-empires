@@ -15,16 +15,11 @@ max_depth = 12
 [[rules]]
 id = "active_interrupt_hint"
 state = "running"
-priority = 980
+priority = 970
 positional = true
 region = "bottom_non_empty_lines(3)"
 visible = true
 line_regex = ['^\s*[^\s※].*⟦esc⟧.*$']
-not = [
-  { region = "bottom_non_empty_lines(6)", contains = ["dismissed when you send your next message"] },
-  { region = "bottom_non_empty_lines(6)", contains_any = ["error: retry budget exhausted", "error: retry failed after"] },
-]
-
 
 # The loader: a frame glyph opening the line, plus either the word `working` or
 # an interrupt hint.

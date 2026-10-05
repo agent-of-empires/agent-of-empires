@@ -2905,6 +2905,33 @@ Final prose line.\n";
             Status::Waiting,
         ));
 
+        let terminal = "Error: Retry budget exhausted after 10 retries";
+        let hint = "Processing… ⟦esc⟧";
+        for (name, pane, expected) in [
+            (
+                "newer interrupt after error",
+                format!("{terminal}\n{hint}"),
+                Status::Running,
+            ),
+            (
+                "newer error after interrupt",
+                format!("{hint}\n{terminal}"),
+                Status::Error,
+            ),
+            (
+                "newer interrupt after dismissal",
+                format!("{dismissed}\n{hint}"),
+                Status::Running,
+            ),
+            (
+                "newer dismissal after interrupt",
+                format!("{hint}\n{dismissed}"),
+                Status::Error,
+            ),
+        ] {
+            cases.push((name.to_string(), pane, expected));
+        }
+
         for (name, pane, expected) in &cases {
             assert_eq!(detect_omp_status(pane), *expected, "case: {name}");
         }
