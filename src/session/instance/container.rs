@@ -493,9 +493,15 @@ impl Instance {
         // does for the same reason.
         let agent = crate::agents::get_agent(&self.tool)
             .unwrap_or_else(|| crate::agents::get_agent("opencode").expect("a builtin agent"));
-        let yolo_generation = self
-            .is_yolo_mode()
-            .then(|| super::execution::agent_generation(agent, None));
+        // The container's binary is unreadable from the host, so this is the
+        // host's answer. An unreadable one establishes nothing, and the sandbox
+        // gets no approval mechanism rather than one that may not exist.
+        let yolo_generation = if self.is_yolo_mode() {
+            let generation = super::execution::agent_generation(agent, None);
+            (generation != crate::agents::AgentGeneration::Unknown).then_some(generation)
+        } else {
+            None
+        };
         container_config::build_container_config(
             &self.project_path,
             sandbox,

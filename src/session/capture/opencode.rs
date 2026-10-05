@@ -240,13 +240,23 @@ pub(crate) fn preassign_opencode_session_id(
     command: std::process::Command,
     generation: AgentGeneration,
 ) -> Option<String> {
-    // 1.x has no create route under `/api`. Answering before the server is
-    // spawned is the point: the alternative is booting one and waiting out its
-    // readiness to learn there was nothing to send.
-    if generation == AgentGeneration::Legacy {
-        tracing::warn!(target: "session.capture",
-            "opencode 1.x has no session-create route under /api, so its session id cannot be preassigned");
-        return None;
+    // 1.x has no create route under `/api`, and an unreadable help establishes
+    // nothing about either. Answering before the server is spawned is the point:
+    // the alternative is booting one and waiting out its readiness to learn
+    // there was nothing to send.
+    match generation {
+        AgentGeneration::Legacy => {
+            tracing::warn!(target: "session.capture",
+                "opencode 1.x has no session-create route under /api, so its session id cannot be preassigned");
+            return None;
+        }
+        AgentGeneration::Unknown => {
+            tracing::warn!(target: "session.capture",
+                "opencode --help did not answer, so its generation cannot be established; \
+                 its session id is not preassigned");
+            return None;
+        }
+        AgentGeneration::Current => {}
     }
     let id = format!("ses_{}", Uuid::new_v4().simple());
     let owned_path = project_path.to_owned();
