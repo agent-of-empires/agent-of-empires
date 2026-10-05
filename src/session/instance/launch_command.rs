@@ -1601,25 +1601,33 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let _app = crate::session::test_support::isolate_app_dir_at(home.path());
         let profile = "generation-from-profile-path";
-        // AoE's own PATH carries the current generation.
+        // AoE's own PATH carries the current generation, and is the only place
+        // that one is installed, so reading it answers differently.
         let _current = crate::session::test_support::install_login_shell_path_command(
             home.path(),
             "opencode",
             "#!/bin/sh\nprintf '%s\\n' 'FLAGS\n  --auto  approve'\nexit 0\n",
         );
-        // The profile's PATH names an install carrying the older one.
+        // The profile's PATH names an install carrying the older one, kept out
+        // of the process PATH so the two answers cannot coincide.
         let profile_bin = home.path().join("profile-bin");
-        let _older = crate::session::test_support::install_login_shell_path_command(
-            &home.path().join("older"),
-            "opencode",
+        std::fs::create_dir_all(&profile_bin).unwrap();
+        let profile_agent = profile_bin.join("opencode");
+        std::fs::write(
+            &profile_agent,
             "#!/bin/sh\nprintf '%s\\n' 'FLAGS\n  --fork  fork'\nexit 0\n",
-        );
-        let older_home = home.path().join("older");
-        profile_bin_helper(&older_home, &profile_bin);
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&profile_agent, std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+        }
         crate::agents::forget_agent_help_for_test();
         write_profile_environment(profile, &format!("PATH={}", profile_bin.display()));
 
-        let mut inst = tool_instance("opencode", older_home.to_str().unwrap());
+        let mut inst = tool_instance("opencode", home.path().to_str().unwrap());
         inst.source_profile = profile.into();
         inst.command = "opencode".into();
         inst.yolo_mode = true;
@@ -1629,20 +1637,6 @@ mod tests {
             "the launch speaks the generation of the binary it runs: {cmd}"
         );
         assert!(!cmd.contains("--auto"), "{cmd}");
-    }
-
-    /// Places the stub installed under `older_root` also at `bin`, and names it
-    /// so a profile `PATH` pointing there resolves to the same file.
-    fn profile_bin_helper(older_root: &std::path::Path, bin: &std::path::Path) {
-        std::fs::create_dir_all(bin).unwrap();
-        let agent = older_root.join("bin").join("opencode");
-        std::fs::copy(&agent, bin.join("opencode")).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(bin.join("opencode"), std::fs::Permissions::from_mode(0o755))
-                .unwrap();
-        }
     }
 
     /// Records `entry` as the profile's environment, the way the documented

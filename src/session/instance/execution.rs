@@ -1243,16 +1243,21 @@ impl Instance {
     ) -> Option<std::path::PathBuf> {
         match execution {
             Some(execution) => {
+                // A container's program points inside the container, which the
+                // host cannot read, so it is left unnamed.
                 (!execution.inputs.container.is_some()).then(|| execution.program.clone())
             }
-            None => which::which_in(
-                agent.binary,
-                self.resolved_host_environment()
-                    .iter()
-                    .find_map(|entry| entry.strip_prefix("PATH=")),
-                &self.project_path,
-            )
-            .ok(),
+            None => {
+                // The same resolver the pane's own environment is built from,
+                // so a `$VAR` reference or a repeated key resolves to the same
+                // directory here as it does there.
+                let environment = self.resolved_host_environment();
+                let path = crate::session::environment::resolve_host_environment_value(
+                    &environment,
+                    "PATH",
+                );
+                which::which_in(agent.binary, path.as_deref(), &self.project_path).ok()
+            }
         }
     }
 }
