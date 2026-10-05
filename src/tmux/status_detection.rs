@@ -2932,6 +2932,32 @@ Final prose line.\n";
             cases.push((name.to_string(), pane, expected));
         }
 
+        cases.push((
+            "newer braille loader after error".to_string(),
+            format!("{terminal}\n⠹ Reading audit fixtures ⟨esc⟩\n╭── π ─╮\n╰─ ─╯"),
+            Status::Running,
+        ));
+        for (layout, live) in [
+            ("braille", "⠹ Reading audit fixtures ⟨esc⟩"),
+            ("symbolic", "◐ Locating audit config files ⟦esc⟧"),
+            ("ascii", "/ Running requested echo probe [esc]"),
+            ("wrapped", "⠹ Locating audit config files\n ⟦esc⟧"),
+            ("standalone", "⎋ Working…"),
+        ] {
+            for (terminal_name, terminal_line) in [("error", terminal), ("dismissal", dismissed)] {
+                cases.push((
+                    format!("newer {layout} after {terminal_name}"),
+                    format!("{terminal_line}\n{live}"),
+                    Status::Running,
+                ));
+                cases.push((
+                    format!("newer {terminal_name} after {layout}"),
+                    format!("{live}\n{terminal_line}"),
+                    Status::Error,
+                ));
+            }
+        }
+
         for (name, pane, expected) in &cases {
             assert_eq!(detect_omp_status(pane), *expected, "case: {name}");
         }

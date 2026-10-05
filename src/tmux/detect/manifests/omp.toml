@@ -26,7 +26,7 @@ line_regex = ['^\s*[^\s※].*⟦esc⟧.*$']
 [[rules]]
 id = "loader_braille"
 state = "running"
-priority = 960
+priority = 970
 positional = true
 region = "bottom_non_empty_lines(3)"
 visible = true
@@ -36,7 +36,7 @@ contains_any = ["working", "⟦esc⟧", "⟨esc⟩", "[esc]", "(esc to cancel)"]
 [[rules]]
 id = "loader_hint_frame"
 state = "running"
-priority = 960
+priority = 970
 positional = true
 region = "bottom_non_empty_lines(3)"
 visible = true
@@ -157,7 +157,7 @@ not = [
 [[rules]]
 id = "active_interrupt"
 state = "running"
-priority = 960
+priority = 970
 positional = true
 max_position = 1
 region = "bottom_non_empty_lines(3)"
@@ -173,7 +173,7 @@ not = [
 [[rules]]
 id = "loader_wrapped"
 state = "running"
-priority = 960
+priority = 970
 positional = true
 wrap = 2
 max_position = 3
