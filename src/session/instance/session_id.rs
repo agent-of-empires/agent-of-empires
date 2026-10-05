@@ -381,16 +381,23 @@ impl Instance {
         Ok(child)
     }
 
-    /// The child a store fork already adopted for this launch. Returns `None`
+    /// The child a store fork already adopted for THIS launch. Returns `None`
     /// until one is, so the first pass asks the store and a later one reuses it.
+    ///
+    /// An `Observed` binding outlives the launch, being the row's native
+    /// identity, so a child counts as this launch's only while the conversation
+    /// was branched from a different id. Otherwise forking an already-forked
+    /// session would hand back the first fork's child instead of branching.
     pub(super) fn stored_fork_child(&self) -> Option<String> {
-        self.agent_session_binding
-            .as_ref()
-            .filter(|binding| {
-                binding.provenance == crate::session::ConversationProvenance::Observed
-                    && Some(binding.session_id.as_str()) == self.agent_session_id.as_deref()
-            })
-            .map(|binding| binding.session_id.clone())
+        let binding = self.agent_session_binding.as_ref()?;
+        (binding.provenance == crate::session::ConversationProvenance::Observed
+            && Some(binding.session_id.as_str()) == self.agent_session_id.as_deref()
+            && matches!(&self.resume_intent, ResumeIntent::Fork { .. })
+            && self
+                .resume_binding
+                .as_ref()
+                .is_some_and(|parent| parent.session_id != binding.session_id))
+        .then(|| binding.session_id.clone())
     }
 
     /// A store fork runs `opencode serve` against the launch's own store, so it
@@ -1317,7 +1324,13 @@ work-opencode = "opencode"
         );
         assert_eq!(inst.stored_fork_child(), None, "the seed is not a child");
 
-        // The fork arm adopts what the store minted.
+        // The fork arm adopts what the store minted, branching from the parent.
+        inst.resume_binding = Some(crate::session::ConversationBinding {
+            session_id: parent.to_string(),
+            execution: None,
+            provenance: crate::session::ConversationProvenance::Observed,
+            transcript_path: None,
+        });
         adopt(
             &mut inst,
             child,
@@ -1335,6 +1348,27 @@ work-opencode = "opencode"
             inst.stored_fork_child().is_some(),
             "the reset would otherwise restore the seed the store never created"
         );
+
+        // An `Observed` binding outlives the launch, so forking that child again
+        // must branch rather than hand back the id this fork already produced.
+        inst.resume_intent = ResumeIntent::Fork {
+            from: child.to_string(),
+        };
+        inst.resume_binding = Some(crate::session::ConversationBinding {
+            session_id: child.to_string(),
+            execution: None,
+            provenance: crate::session::ConversationProvenance::Observed,
+            transcript_path: None,
+        });
+        assert_eq!(
+            inst.stored_fork_child(),
+            None,
+            "a second fork of that child must ask the store again"
+        );
+
+        // Outside a fork nothing is reused either.
+        inst.resume_intent = ResumeIntent::Default;
+        assert_eq!(inst.stored_fork_child(), None);
     }
 
     /// A store fork runs `opencode serve` against the launch's own database, so

@@ -1365,6 +1365,12 @@ mod tests {
         inst.resume_intent = ResumeIntent::Fork {
             from: parent.to_string(),
         };
+        inst.resume_binding = Some(crate::session::ConversationBinding {
+            session_id: parent.to_string(),
+            execution: None,
+            provenance: crate::session::ConversationProvenance::Observed,
+            transcript_path: None,
+        });
         inst.agent_session_id = Some(child.to_string());
         inst.agent_session_binding = Some(crate::session::ConversationBinding {
             session_id: child.to_string(),
