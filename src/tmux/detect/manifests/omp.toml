@@ -15,7 +15,7 @@ priority = 980
 positional = true
 region = "bottom_non_empty_lines(3)"
 visible = true
-line_regex = ['^\s*[^※].*⟦esc⟧.*$']
+line_regex = ['^\s*[^\s※].*⟦esc⟧.*$']
 not = [
   { region = "bottom_non_empty_lines(6)", contains = ["dismissed when you send your next message"] },
   { region = "bottom_non_empty_lines(6)", contains_any = ["error: retry budget exhausted", "error: retry failed after"] },
@@ -169,7 +169,7 @@ not = [
 [[rules]]
 id = "retry_countdown"
 state = "running"
-priority = 960
+priority = 970
 positional = true
 wrap = 6
 region = "bottom_non_empty_lines(6)"
@@ -179,7 +179,7 @@ regex = ['(?i)retrying\s+\(\d+/\d+\)\s+in\s+\d+\s*s\s*\x{2026}']
 [[rules]]
 id = "banner_dismissal"
 state = "error"
-priority = 960
+priority = 970
 positional = true
 region = "bottom_non_empty_lines(6)"
 visible = true
@@ -188,7 +188,7 @@ contains = ["dismissed when you send your next message"]
 [[rules]]
 id = "retry_exhausted"
 state = "error"
-priority = 960
+priority = 970
 positional = true
 region = "bottom_non_empty_lines(6)"
 visible = true
@@ -239,7 +239,7 @@ not = [
 [[rules]]
 id = "retry_labels"
 state = "running"
-priority = 960
+priority = 970
 positional = true
 region = "bottom_non_empty_lines(12)"
 visible = true

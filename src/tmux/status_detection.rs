@@ -2688,6 +2688,7 @@ Final prose line.\n";
             ("markdown working bullet", "- Working tree status is clean."),
             ("unicode markdown bullet", "• The interrupt key is [esc]"),
             ("idle recap prefix", "※ Working… ⟦esc⟧"),
+            ("indented idle recap prefix", " ※ Working… ⟦esc⟧"),
             (
                 "symbolic prose without hint",
                 "◐ Working through the explanation",
@@ -2718,7 +2719,7 @@ Final prose line.\n";
         }
 
         // Shapes that each pin one window bound or one precedence rule.
-        let pinned: [(&str, String, Status); 26] = [
+        let pinned: [(&str, String, Status); 28] = [
             (
                 "banner alt glyph",
                 format!(
@@ -2848,6 +2849,16 @@ Final prose line.\n";
                 "live approval below terminal line",
                 format!(" Error: Retry budget exhausted after 10 retries: …\n{approval_panel}"),
                 Status::Waiting,
+            ),
+            (
+                "terminal line below approval without composer",
+                format!("{approval_panel}\nError: Retry budget exhausted after 10 retries"),
+                Status::Error,
+            ),
+            (
+                "retry label below approval without composer",
+                format!("{approval_panel}\nretrying 2/3 now: 429 Too Many Requests"),
+                Status::Running,
             ),
             (
                 "answered approval above banner border",
