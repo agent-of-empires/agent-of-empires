@@ -1051,7 +1051,7 @@ pub fn agent_generation_for(agent: &AgentDef, program: &std::path::Path) -> Agen
     // The root `--fork` is the marker: every 1.x build declares it and 2.x
     // removed it. `--auto` cannot serve, because 1.17.12 and later declare that
     // at their root too.
-    if help_contains(&help, LEGACY_GENERATION_MARKER) {
+    if help_advertises_flag(&help, LEGACY_GENERATION_MARKER) {
         return AgentGeneration::Legacy;
     }
     if help.is_empty() {
@@ -1090,11 +1090,6 @@ fn agent_help(program: &std::path::Path) -> String {
             run_agent_help(&program, timeout)
         })
         .to_owned()
-}
-
-/// Whether the cached help names `flag` as a word of its own.
-fn help_contains(help: &str, flag: &str) -> bool {
-    help_advertises_flag(help, flag)
 }
 
 /// A flag the older generation's help lists and the current one's does not.
@@ -1141,7 +1136,10 @@ impl HelpProbe {
                 HELP_PROBE_TIMEOUT
             };
             self.help = probe(timeout);
-            if self.help.is_none() {
+            // An empty answer is a failed one: caching it would pin the binary
+            // to "no flags" for the life of the process, so the retry the
+            // cooldown schedules still applies to it.
+            if self.help.as_deref().is_none_or(str::is_empty) {
                 tracing::warn!(target: "session.create", timeout_secs = timeout.as_secs(),
                     "agent --help did not answer; launching without the flags it gates until a retry succeeds");
                 // Timed from the answer, so a probe that ran to its deadline still cools down.

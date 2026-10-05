@@ -305,40 +305,34 @@ mod tests {
                 "error": { "data": { "message": text } },
             })
         };
-        for (table, id, data) in [
-            ("session_message", "m-v2-old", flat(110, "older v2 error")),
-            ("session_message", "m-v2-new", flat(130, "newer v2 error")),
-            ("message", "m-v1", nested(120, "v1 error")),
-        ] {
-            let at: i64 = match id {
-                "m-v2-old" => 110,
-                "m-v1" => 120,
-                _ => 130,
-            };
-            if table == "session_message" {
-                conn.execute(
-                    "INSERT INTO session_message VALUES (?1, 'ses-1', 'assistant', 1, ?2, ?2, ?3)",
-                    rusqlite::params![id, at, data.to_string()],
-                )
-                .unwrap();
-            } else {
-                conn.execute(
-                    "INSERT INTO message VALUES (?1, 'ses-1', ?2, ?2, ?3)",
-                    rusqlite::params![id, at, data.to_string()],
-                )
-                .unwrap();
-            }
-        }
+        // The v2 row is the older of the two. Reading the v2 table first and
+        // returning its first row would answer with it, so only comparing the
+        // two layouts returns the v1 error that is actually newer.
+        conn.execute(
+            "INSERT INTO session_message VALUES ('m-v2', 'ses-1', 'assistant', 1, 110, 110, ?1)",
+            rusqlite::params![flat(110, "older v2 error").to_string()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO message VALUES ('m-v1', 'ses-1', 120, 120, ?1)",
+            rusqlite::params![nested(120, "newer v1 error").to_string()],
+        )
+        .unwrap();
         assert_eq!(
             recover_opencode_prompt_error_from_sqlite_at(&db_path, "ses-1", 100).as_deref(),
-            Some("newer v2 error"),
-            "the newest error wins whichever table holds it"
+            Some("newer v1 error"),
+            "an older v2 row must not hide a newer v1 one"
         );
-        // With the v2 rows removed, the v1 one still answers.
-        conn.execute("DELETE FROM session_message", []).unwrap();
+        // And the other order: the v2 table holding the newest answers alone.
+        conn.execute("DELETE FROM message", []).unwrap();
+        conn.execute(
+            "INSERT INTO session_message VALUES ('m-v2-new', 'ses-1', 'assistant', 2, 130, 130, ?1)",
+            rusqlite::params![flat(130, "newest v2 error").to_string()],
+        )
+        .unwrap();
         assert_eq!(
             recover_opencode_prompt_error_from_sqlite_at(&db_path, "ses-1", 100).as_deref(),
-            Some("v1 error")
+            Some("newest v2 error")
         );
     }
 
