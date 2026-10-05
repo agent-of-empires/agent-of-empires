@@ -74,7 +74,7 @@ Once teardown is quiescent, Trash relocates the managed checkout into a sibling 
 
 Checkout relocation and destructive cleanup require proof that the recorded runner process groups have exited. A `Stopped` row, a terminal-view selection, or a missing worker registry is not that proof. When teardown is pending, aoe retains the session and checkout; retry after the recorded executions exit. Cancelling your own pending Trash request does not move the checkout. Force does not bypass the quiescence guard. Unknown legacy execution history remains protected until aoe verifies a different boot.
 
-Cleanup also checks every physical profile for sessions using the same checkout or an overlapping workspace. Unreadable ownership data retains the checkout rather than assuming it is unused.
+Cleanup checks every physical profile for sessions using the same checkout or an overlapping workspace, including readable aliases to stores outside the profiles directory. Aliases to missing targets own no rows; unreadable ownership data retains the checkout rather than assuming it is unused.
 
 **The default branch's checkout is never removed.** In a bare-repo layout the default branch lives in a linked worktree other tooling expects to stay put, so aoe refuses to remove that checkout or delete its branch, reports the refusal, and deletes the session anyway. Force does not bypass this, including trash auto-purge and `aoe session empty-trash`, and `aoe worktree cleanup` lists such a checkout as skipped. Detection uses what git states: the bare repo's own `HEAD` plus every remote's `refs/remotes/<remote>/HEAD`, falling back to `main` and `master` by convention when neither exists. To remove one anyway, do it with git and then delete the session.
 

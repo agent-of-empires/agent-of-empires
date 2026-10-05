@@ -504,6 +504,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                     .notice
                     .map(|(reason, transactions)| PendingContextReset {
                         profile: reset_profile,
+                        generation,
                         reason,
                         transactions,
                     });
@@ -901,6 +902,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                 .notice
                 .map(|(reason, transactions)| PendingContextReset {
                     profile: context.profile,
+                    generation,
                     reason,
                     transactions,
                 })

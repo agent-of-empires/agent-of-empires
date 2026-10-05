@@ -475,16 +475,8 @@ pub fn list_profiles() -> Result<Vec<String>> {
     list_profile_names_in(&profiles_dir)
 }
 
-/// The profile stores the worktree-ownership inventory must scan: one entry per
-/// physical store, never two for the same one.
-///
-/// A `profiles/<name>` entry can be a symlink aliasing another profile (the
-/// `cs`/`cxa` pattern pointing at `default`). The alias resolves to the profile
-/// directory it actually is and is dropped when that store is already listed,
-/// so an installation using aliases gets a complete inventory instead of an
-/// error that would make every deletion assume its paths are in use. An alias
-/// that resolves to no existing profile directory is that one profile's
-/// problem: it is skipped, never followed to a store outside `profiles/`.
+/// One entry per physical profile store, including readable external aliases.
+/// Missing alias targets own no rows; unreadable targets make ownership unknown.
 pub(crate) fn list_profiles_for_worktree_inventory() -> Result<Vec<String>> {
     #[cfg(test)]
     if FAIL_NEXT_LIST_PROFILES.swap(false, std::sync::atomic::Ordering::SeqCst) {
@@ -508,57 +500,40 @@ pub(crate) fn list_profiles_for_worktree_inventory() -> Result<Vec<String>> {
                 .file_name()
                 .into_string()
                 .map_err(|_| anyhow::anyhow!("profile directory has a non-UTF-8 name"))?;
-            if let Ok(metadata) = fs::metadata(entry.path()) {
-                identities.push(metadata);
-            }
+            identities.push(fs::metadata(entry.path())?);
             profiles.push(name);
         }
     }
-    // Real directories first, so an alias is matched against the name that
-    // owns the store it points at.
+    // Prefer a real directory name when aliases share its physical store.
     for alias in aliases {
-        match resolve_profile_alias(&alias, &profiles_dir) {
-            Ok(target) => {
-                let identity = fs::metadata(&target).ok();
-                let already_listed = identity.as_ref().is_some_and(|metadata| {
-                    identities
-                        .iter()
-                        .any(|listed| same_filesystem_identity(listed, metadata))
-                });
-                if already_listed {
-                    continue;
-                }
-                if let Some(metadata) = identity {
-                    identities.push(metadata);
-                }
-                if let Some(name) = alias.file_name().and_then(|name| name.to_str()) {
-                    profiles.push(name.to_string());
-                }
+        let identity = match fs::metadata(&alias) {
+            Ok(identity) if identity.is_dir() => identity,
+            Ok(_) => continue,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                continue
             }
-            Err(reason) => tracing::warn!(
-                target: "session.profile",
-                alias = %alias.display(),
-                "skipping unresolvable profile alias in the worktree inventory: {reason}"
-            ),
+            Err(error) => anyhow::bail!("reading profile alias {}: {error}", alias.display()),
+        };
+        if identities
+            .iter()
+            .any(|listed| same_filesystem_identity(listed, &identity))
+        {
+            continue;
         }
+        let name = alias
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| anyhow::anyhow!("profile alias has a non-UTF-8 name"))?;
+        profiles.push(name.to_owned());
+        identities.push(identity);
     }
     profiles.sort();
     Ok(profiles)
-}
-
-/// The profile directory a `profiles/<name>` entry actually names, for an entry
-/// that may be a symlink alias. `canonicalize` fails on a dangling link, and
-/// the target must be a direct child of `profiles_dir`, so neither a missing
-/// profile nor a link out of the profile namespace can pass as one.
-fn resolve_profile_alias(entry: &Path, profiles_dir: &Path) -> Result<PathBuf> {
-    let target = fs::canonicalize(entry)?;
-    if !target.is_dir() || target.parent() != Some(fs::canonicalize(profiles_dir)?.as_path()) {
-        anyhow::bail!(
-            "{} does not resolve to a profile directory",
-            entry.display()
-        );
-    }
-    Ok(target)
 }
 
 /// Picker order: alphabetical, with a profile named `default` last.

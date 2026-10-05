@@ -1354,15 +1354,11 @@ impl HomeView {
             );
         }
         if let Some(proof) = settled {
-            proof.validate(&authoritative)?;
-            crate::session::runner_journal::release_settled_stop_under_locks(&proof.stop)?;
-            if let Some(active) = self.settled_edit.as_mut() {
-                active.consumed = true;
-            }
+            let generation = proof.consume_under_locks(&authoritative)?;
             self.mutate_instance(&id, |row| {
                 row.release_lifecycle_reservation_if_owned(
                     crate::session::LifecycleOperation::Stop,
-                    proof.stop.generation(),
+                    generation,
                 );
             });
         } else if crate::session::worktree_edit::worktree_move_required(
@@ -1644,24 +1640,20 @@ impl HomeView {
                     &crate::session::worktree_edit::worktree_leaf_from_title(&effective_title),
                 );
             if let Some(proof) = settled {
-                proof.validate(&previous)?;
-                crate::session::runner_journal::release_settled_stop_under_locks(&proof.stop)?;
-                if let Some(active) = self.settled_edit.as_mut() {
-                    active.consumed = true;
-                }
+                let generation = proof.consume_under_locks(&previous)?;
                 self.mutate_instance(&id, |row| {
                     row.release_lifecycle_reservation_if_owned(
                         crate::session::LifecycleOperation::Stop,
-                        proof.stop.generation(),
+                        generation,
                     );
                 });
                 current_instance.release_lifecycle_reservation_if_owned(
                     crate::session::LifecycleOperation::Stop,
-                    proof.stop.generation(),
+                    generation,
                 );
                 projected_move.release_lifecycle_reservation_if_owned(
                     crate::session::LifecycleOperation::Stop,
-                    proof.stop.generation(),
+                    generation,
                 );
             } else if real_move {
                 anyhow::ensure!(
@@ -2060,14 +2052,10 @@ impl HomeView {
             .into_iter()
             .find(|row| row.id == id)
             .ok_or_else(|| anyhow::anyhow!("Session not found"))?;
-        proof.validate(&authoritative)?;
-        crate::session::runner_journal::release_settled_stop_under_locks(&proof.stop)?;
-        if let Some(active) = self.settled_edit.as_mut() {
-            active.consumed = true;
-        }
+        let generation = proof.consume_under_locks(&authoritative)?;
         authoritative.release_lifecycle_reservation_if_owned(
             crate::session::LifecycleOperation::Stop,
-            proof.stop.generation(),
+            generation,
         );
         authoritative.stop_all_tmux_sessions_locked(&storage);
         self.instances.insert(id.clone(), authoritative);

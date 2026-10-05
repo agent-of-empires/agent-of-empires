@@ -185,7 +185,7 @@ impl<S: BroadcastSink> Drain<S> {
                                 &pending.profile,
                                 &id,
                                 crate::migrations::v033_isolate_sandbox_content::NativeContextView::Structured,
-                                generation,
+                                pending.generation,
                                 &pending.transactions,
                                 Some(&assigned),
                             )
@@ -543,6 +543,10 @@ impl<S: BroadcastSink> Drain<S> {
                         handle.client = Arc::clone(&client);
                         handle.lease = respawn_lease.clone();
                         handle.native_session_id = None;
+                        if let WorkerKind::Runner { spawn_config } = &mut handle.kind {
+                            spawn_config.generation = config.generation;
+                            spawn_config.execution_admission = config.execution_admission.take();
+                        }
                         None
                     }
                     None => Some(InstallError::Stale),
@@ -1005,6 +1009,135 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
+    async fn context_reset_ack_uses_its_claimed_generation() {
+        let (_home, _temp) = isolate_home();
+        let id = "reset-generation";
+        let canonical_generation = 7;
+        let storage = crate::session::Storage::new_unwatched("default").unwrap();
+        let mut row = crate::session::Instance::new("Reset", "/tmp");
+        row.id = id.into();
+        row.lifecycle_generation = canonical_generation;
+        row.sandbox_content_resets.push(
+            serde_json::from_value(serde_json::json!({
+                "slot": "reset-slot", "transaction": "reset-transaction", "tool": row.tool,
+                "agent": "claude", "roots": [], "recovery": [],
+                "terminal": {"pending": false, "generation": null},
+                "structured": {"pending": true, "generation": canonical_generation},
+                "retired_terminal": null, "retired_structured": [], "retired_import": false
+            }))
+            .unwrap(),
+        );
+        storage
+            .update(|rows, _| {
+                rows.push(row);
+                Ok(())
+            })
+            .unwrap();
+        let sink = VecSink::new();
+        let supervisor = Supervisor::new(sink.clone());
+        let lease = supervisor.test_install_stdio(id).await;
+        assert_ne!(lease.epoch(), canonical_generation);
+        let (sender, inbound) = mpsc::channel(4);
+        let drain = supervisor.start_drain_task(
+            id.into(),
+            lease,
+            inbound,
+            Some(PendingContextReset {
+                profile: "default".into(),
+                generation: canonical_generation,
+                reason: "native content changed".into(),
+                transactions: vec!["reset-slot".into()],
+            }),
+        );
+        sender
+            .send(Event::AcpSessionAssigned {
+                acp_session_id: "fresh-context".into(),
+            })
+            .await
+            .unwrap();
+        sender
+            .send(Event::Stopped {
+                reason: "fixture-complete".into(),
+            })
+            .await
+            .unwrap();
+        drop(sender);
+        tokio::time::timeout(Duration::from_secs(5), drain)
+            .await
+            .unwrap()
+            .unwrap();
+        let row = storage.load().unwrap().remove(0);
+        assert_eq!(row.acp_session_id.as_deref(), Some("fresh-context"));
+        let lane = serde_json::to_value(&row.sandbox_content_resets[0]).unwrap();
+        assert_eq!(lane["structured"]["pending"], false);
+        assert!(supervisor.take_startup_failures().is_empty());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn consecutive_crashes_resume_under_current_admission() {
+        let (_home, temp) = isolate_home();
+        let id = "two-crashes";
+        let (launched, mut launches) = mpsc::unbounded_channel();
+        let launcher: Launcher = Arc::new(move |config, session| {
+            let launched = launched.clone();
+            Box::pin(async move {
+                let (client, sender) = crate::acp::acp_client::AcpClient::fake_for_test(session);
+                launched.send(sender).unwrap();
+                drop(config);
+                Ok(client)
+            })
+        });
+        let sink = VecSink::new();
+        let supervisor = Supervisor::new(sink.clone()).with_launcher(launcher);
+        let lease = supervisor
+            .test_install_runner(id, runner_config(temp.path().join("runner.sock")), None)
+            .await;
+        let (sender, inbound) = mpsc::channel(4);
+        let mut drain = supervisor.start_drain_task(id.into(), lease, inbound, None);
+        sender
+            .send(Event::AcpSessionAssigned {
+                acp_session_id: "initial".into(),
+            })
+            .await
+            .unwrap();
+        drop(sender);
+        for native_id in ["first-replacement", "second-replacement"] {
+            let sender = tokio::select! {
+                sender = launches.recv() => sender.expect("launcher must remain available"),
+                result = &mut drain => { result.unwrap(); panic!("drain exited before {native_id}"); },
+                _ = tokio::time::sleep(Duration::from_secs(10)) => panic!("no launch for {native_id}"),
+            };
+            sender
+                .send(Event::AcpSessionAssigned {
+                    acp_session_id: native_id.into(),
+                })
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let assigned = sink.frames.lock().unwrap().iter().any(|(_, _, event)| matches!(event, Event::AcpSessionAssigned { acp_session_id } if acp_session_id == native_id));
+                    if assigned { break; }
+                    tokio::task::yield_now().await;
+                }
+            }).await.unwrap();
+            assert_eq!(supervisor.worker_state(id).await, AcpWorkerState::Running);
+            if native_id == "second-replacement" {
+                let storage = crate::session::Storage::open_unwatched("default").unwrap();
+                assert_eq!(storage.load().unwrap()[0].lifecycle_generation, 2);
+                drain.abort();
+                assert!(tokio::time::timeout(Duration::from_secs(5), &mut drain)
+                    .await
+                    .unwrap()
+                    .unwrap_err()
+                    .is_cancelled());
+            }
+            drop(sender);
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn failed_context_ack_does_not_publish_later_native_assignments() {
         let (_home, _temp) = isolate_home();
         let id = "s-reset-ack-failure";
@@ -1018,6 +1151,7 @@ mod tests {
             inbound,
             Some(PendingContextReset {
                 profile: "default".into(),
+                generation: 0,
                 reason: "native content changed".into(),
                 transactions: vec!["missing-slot".into()],
             }),

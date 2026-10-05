@@ -111,6 +111,7 @@ enum WorkerKind {
 #[derive(Clone)]
 pub(super) struct PendingContextReset {
     pub(super) profile: String,
+    pub(super) generation: u64,
     pub(super) reason: String,
     pub(super) transactions: Vec<String>,
 }

@@ -692,7 +692,9 @@ fn execute_for_session(
                         .find(|row| row.id == owner.session_id)
                         .context("session disappeared before checkout move")?;
                     ensure_attach_owner(row, instance, attach_generation, true)?;
-                    Ok(primary_git.move_worktree(from, &to)?)
+                    primary_git.move_worktree(from, &to)?;
+                    undo.moved_primary = Some((primary.main_repo_path.clone(), to, from.clone()));
+                    Ok(())
                 })
             })();
             if let Err(e) = moved {
@@ -704,7 +706,6 @@ fn execute_for_session(
                     )
                 });
             }
-            undo.moved_primary = Some((primary.main_repo_path.clone(), to, from.clone()));
             Some(primary.clone())
         }
         Conversion::WorktreePrimary {
@@ -2039,6 +2040,56 @@ mod tests {
         std::fs::create_dir_all(&blocker).unwrap();
         std::fs::write(blocker.join("in-the-way.txt"), "x").unwrap();
         (inst, plan)
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn movein_write_failure_restores_the_original_checkout() {
+        let temp = tempfile::tempdir().unwrap();
+        let profile = "attach-write-failure";
+        let _guard = isolated_profile(temp.path(), profile);
+        let (mut instance, mut plan) = blocked_worktree_attach(temp.path(), profile);
+        let storage = Storage::open_unwatched(profile).unwrap();
+        storage
+            .update(|rows, _| {
+                rows.push(instance.clone());
+                Ok(())
+            })
+            .unwrap();
+        reserve_attach(&storage, &instance.id, &mut plan).unwrap();
+        let generation = plan.reservation_generation.unwrap();
+        let destination = match &plan.conversion {
+            Conversion::MoveIn { primary, .. } => PathBuf::from(&primary.worktree_path),
+            _ => panic!("fixture must move the original checkout"),
+        };
+        let mut failing = storage.clone();
+        failing.set_fail_writes_for_test(true);
+        instance.storage_origin = Some(std::sync::Arc::new(failing));
+        let error = match execute_for_session(
+            &instance,
+            plan,
+            crate::session::deletion::SessionPathOwner {
+                profile,
+                session_id: &instance.id,
+            },
+            generation,
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("the post-move profile write must fail"),
+        };
+        assert!(format!("{error:#}").contains("injected sessions write failure"));
+        assert_eq!(
+            std::fs::read(Path::new(&instance.project_path).join("wip.txt")).unwrap(),
+            b"in progress"
+        );
+        assert!(
+            !destination.exists(),
+            "rollback must remove the moved checkout from its destination"
+        );
+        assert_eq!(
+            storage.load().unwrap()[0].project_path,
+            instance.project_path
+        );
     }
 
     #[test]

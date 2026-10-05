@@ -118,7 +118,7 @@ impl HomeView {
                 if !current_matches || request.storage.verify_profile_identity().is_err() {
                     return true;
                 }
-                let mut custody = match result.generation {
+                let custody = match result.generation {
                     Ok(generation) => generation,
                     Err(error) => {
                         self.info_dialog = Some(super::InfoDialog::new(
@@ -128,11 +128,9 @@ impl HomeView {
                         return true;
                     }
                 };
-                let stop = custody.stop.clone();
                 self.settled_edit = Some(SettledEdit {
                     storage: request.storage,
-                    stop,
-                    consumed: false,
+                    custody,
                 });
                 let outcome = match request.action {
                     SettlementAction::Workdir {
@@ -160,13 +158,6 @@ impl HomeView {
                         outcome
                     }
                 };
-                if self
-                    .settled_edit
-                    .as_ref()
-                    .is_some_and(|proof| proof.consumed)
-                {
-                    custody.disarm();
-                }
                 self.settled_edit = None;
                 if let Err(error) = outcome {
                     self.info_dialog = Some(super::InfoDialog::new(

@@ -616,20 +616,58 @@ fn test_rename_selected_rejects_all_identity_collisions_and_allows_group_only_ch
     assert_eq!(beta.load().unwrap().len(), 1);
 }
 
-/// Changing a session's profile via the rename dialog must transfer its group metadata in
-/// the same storage transaction, or the source reloads an empty duplicate while the target
-/// row renders under a separately created group.
 #[test]
 #[serial]
-fn test_rename_profile_change_prunes_source_group() {
+fn settled_profile_move_preserves_groups_and_shutdown() {
     use crate::session::GroupTree;
 
     let temp = TempDir::new().unwrap();
     let _guard = setup_test_home(&temp);
 
-    // alpha has one session in "work"; beta exists but is empty.
+    let repo = temp.path().join("repo");
+    let checkout = temp.path().join("a1");
+    std::fs::create_dir(&repo).unwrap();
+    for args in [
+        &["init", "-q"][..],
+        &["commit", "--allow-empty", "-qm", "fixture"][..],
+        &[
+            "worktree",
+            "add",
+            "-qb",
+            "fixture",
+            checkout.to_str().unwrap(),
+        ][..],
+    ] {
+        let output = std::process::Command::new("git")
+            .current_dir(&repo)
+            .args([
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+            ])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    std::fs::write(checkout.join("sentinel"), b"uncommitted").unwrap();
     let storage_a = Storage::new_unwatched("alpha").unwrap();
-    let mut inst_a = Instance::new("A1", "/tmp/a");
+    let mut inst_a = Instance::new("A1", checkout.to_str().unwrap());
+    inst_a.worktree_info = Some(crate::session::WorktreeInfo {
+        branch: "fixture".into(),
+        main_repo_path: repo.to_str().unwrap().into(),
+        managed_by_aoe: true,
+        created_at: inst_a.created_at,
+        base_branch: None,
+    });
+    inst_a.status = crate::session::Status::Stopped;
     inst_a.group_path = "work".to_string();
     let id = inst_a.id.clone();
     let tree_a = GroupTree::new_with_groups(&[inst_a.clone()], &[]);
@@ -649,12 +687,18 @@ fn test_rename_profile_change_prunes_source_group() {
     view.flat_items = view.build_flat_items();
     view.selected_session = Some(id.clone());
 
-    // Move the session alpha -> beta, keeping the same group name.
-    view.rename_selected("", None, Some("beta"), false).unwrap();
+    view.rename_selected("Moved", None, Some("beta"), false)
+        .unwrap();
+    finish_runner_settlements(&mut view);
 
     let moved = view.get_instance(&id).unwrap();
     assert_eq!(moved.source_profile, "beta");
     assert_eq!(moved.group_path, "work");
+    assert_eq!(moved.title, "Moved");
+    assert_eq!(
+        std::fs::read(std::path::Path::new(&moved.project_path).join("sentinel")).unwrap(),
+        b"uncommitted"
+    );
     assert!(
         view.group_trees.get("beta").unwrap().group_exists("work"),
         "beta should own the 'work' group after the move"
@@ -677,6 +721,16 @@ fn test_rename_profile_change_prunes_source_group() {
         .unwrap();
     assert!(!source_groups.iter().any(|group| group.path == "work"));
     assert!(target_groups.iter().any(|group| group.path == "work"));
+    assert!(storage_a.load().unwrap().is_empty());
+    assert_eq!(
+        Storage::open_unwatched("beta").unwrap().load().unwrap()[0].id,
+        id
+    );
+    view.settlement_poller
+        .take_shutdown()
+        .unwrap()
+        .finish()
+        .expect("a consumed Stop must not retire against the removed source row");
 }
 
 #[test]

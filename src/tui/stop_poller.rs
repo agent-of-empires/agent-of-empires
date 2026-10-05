@@ -228,24 +228,28 @@ impl SettlementPoller {
 
 pub(crate) struct SettledEdit {
     pub storage: crate::session::Storage,
-    pub stop: Arc<OwnedStop>,
-    pub consumed: bool,
+    pub custody: StopCustody,
 }
 
 impl SettledEdit {
-    pub fn validate(&self, current: &crate::session::Instance) -> anyhow::Result<()> {
+    pub fn consume_under_locks(
+        mut self,
+        current: &crate::session::Instance,
+    ) -> anyhow::Result<u64> {
         self.storage.verify_profile_identity()?;
-        self.stop
-            .original()
-            .validate_baseline_at(current, self.stop.generation())?;
+        let stop = &self.custody.stop;
+        let generation = stop.generation();
+        stop.original().validate_baseline_at(current, generation)?;
         anyhow::ensure!(
             current.lifecycle_reservation_is_owned(
                 crate::session::LifecycleOperation::Stop,
-                self.stop.generation()
+                generation
             ),
             "session changed during runner settlement"
         );
-        Ok(())
+        crate::session::runner_journal::release_settled_stop_under_locks(stop)?;
+        self.custody.disarm();
+        Ok(generation)
     }
 }
 #[cfg(test)]

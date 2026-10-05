@@ -2480,41 +2480,39 @@ mod tests {
         );
     }
 
-    /// A dangling alias, and one pointing out of the profile namespace, name no
-    /// store the inventory can scan. They must cost that entry only.
     #[test]
     #[serial_test::serial]
-    fn unresolvable_profile_alias_leaves_the_other_profiles_inventoried() {
+    fn external_profile_alias_preserves_peer_claims() {
         let temp = tempfile::tempdir().unwrap();
         let _home = isolate_app_dir_at(temp.path());
         crate::session::create_profile("personal").unwrap();
         let profiles_dir = crate::session::get_app_dir().unwrap().join("profiles");
-        std::os::unix::fs::symlink("no-such-profile", profiles_dir.join("forit-work")).unwrap();
+        std::os::unix::fs::symlink("no-such-profile", profiles_dir.join("dangling")).unwrap();
         let outside = tempfile::tempdir().unwrap();
         std::os::unix::fs::symlink(outside.path(), profiles_dir.join("elsewhere")).unwrap();
-        store_peer_session("personal", "/tmp/aliased-peer");
-
+        let claimed = temp.path().join("peer-checkout");
+        store_peer_session("elsewhere", claimed.to_str().unwrap());
+        let owner = SessionPathOwner {
+            profile: "personal",
+            session_id: "caller",
+        };
         assert!(
-            ensure_unclaimed_paths(
-                SessionPathOwner {
-                    profile: "personal",
-                    session_id: "caller"
-                },
-                &[PathBuf::from("/tmp/aliased-peer")]
-            )
-            .is_err(),
-            "the profiles that can be read are still inventoried"
+            ensure_unclaimed_paths(owner, &[claimed]).is_err(),
+            "a readable external store still owns its checkout"
         );
+        let unrelated = temp.path().join("unrelated");
+        assert!(ensure_unclaimed_paths(owner, std::slice::from_ref(&unrelated)).is_ok());
+        let looped = profiles_dir.join("looped");
+        std::os::unix::fs::symlink("looped", &looped).unwrap();
         assert!(
-            ensure_unclaimed_paths(
-                SessionPathOwner {
-                    profile: "personal",
-                    session_id: "caller"
-                },
-                &[PathBuf::from("/tmp/unrelated")]
-            )
-            .is_ok(),
-            "an unresolvable alias must not make every path look claimed"
+            ensure_unclaimed_paths(owner, std::slice::from_ref(&unrelated)).is_err(),
+            "an unreadable alias cannot prove absence of peers"
+        );
+        std::fs::remove_file(looped).unwrap();
+        std::fs::write(outside.path().join("sessions.json"), "{ invalid json").unwrap();
+        assert!(
+            ensure_unclaimed_paths(owner, &[unrelated]).is_err(),
+            "corrupt external ownership must remain unknown"
         );
     }
 
