@@ -200,6 +200,26 @@ fn check_auth_gate(
     )
 }
 
+/// systemd `Type=notify` readiness. No-op unless `NOTIFY_SOCKET` is set.
+#[cfg(unix)]
+fn notify_ready(status: &str) {
+    use sd_notify::NotifyState;
+    if let Err(e) = sd_notify::notify(&[NotifyState::Ready, NotifyState::Status(status)]) {
+        tracing::warn!(target: "serve.lifecycle", "sd_notify READY failed: {e}");
+    }
+}
+
+#[cfg(unix)]
+fn notify_stopping() {
+    let _ = sd_notify::notify(&[sd_notify::NotifyState::Stopping]);
+}
+
+#[cfg(not(unix))]
+fn notify_ready(_status: &str) {}
+
+#[cfg(not(unix))]
+fn notify_stopping() {}
+
 pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     let ServerConfig {
         profile,
@@ -936,6 +956,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
             let _ = tokio::signal::ctrl_c().await;
             tracing::info!(target: "serve.shutdown", "received ctrl-c, shutting down");
         }
+        notify_stopping();
         let plugin_host = shutdown_state.plugin_host.clone();
         run_shutdown_sequence(
             &shutdown_state.shutdown,
@@ -949,6 +970,8 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         )
         .await;
     };
+
+    notify_ready(&format!("listening on {addr}"));
 
     axum::serve(
         listener,
@@ -1107,12 +1130,6 @@ async fn remote_rotation_loop(
 mod tests {
     use super::*;
 
-    /// The mode exists to leave as little as possible on disk, and the local
-    /// read is a lock, two markers and a 0600 socket it refuses to serve, so
-    /// nothing may be published and nothing left behind to retract.
-    // `publish_runtime_uds` returns `unsupported_platform` off Linux, so there
-    // is nothing here to assert, and a body that returns early would report a
-    // pass.
     #[cfg(target_os = "linux")]
     #[tokio::test]
     #[serial_test::serial]
@@ -1135,6 +1152,28 @@ mod tests {
                 "{name} exists: the mode published what it will not serve"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn notify_ready_sends_ready_and_status_to_notify_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notify.sock");
+        let socket = std::os::unix::net::UnixDatagram::bind(&path).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let _env =
+            crate::session::test_support::EnvGuard::set(&[("NOTIFY_SOCKET", path.as_os_str())]);
+
+        notify_ready("listening on 127.0.0.1:1");
+
+        let mut buf = [0u8; 256];
+        let n = socket.recv(&mut buf).unwrap();
+        assert_eq!(
+            std::str::from_utf8(&buf[..n]).unwrap(),
+            "READY=1\nSTATUS=listening on 127.0.0.1:1\n"
+        );
     }
 
     /// The sweep fires at its interval, not the next recheck, and a window

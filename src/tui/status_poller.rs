@@ -433,6 +433,7 @@ mod tests {
 
     fn dead_container_sandbox(name: &str) -> crate::session::SandboxInfo {
         crate::session::SandboxInfo {
+            provider: None,
             enabled: true,
             container_id: None,
             image: "ubuntu:latest".to_string(),

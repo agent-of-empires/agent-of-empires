@@ -266,6 +266,7 @@ fn test_create_session_in_all_mode_is_findable() {
     let data = NewSessionData {
         profile: "alpha".to_string(),
         title: "New Session".to_string(),
+        title_typed: false,
         path: project_dir.to_str().unwrap().to_string(),
         group: String::new(),
         tool: "claude".to_string(),

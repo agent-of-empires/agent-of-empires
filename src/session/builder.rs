@@ -53,6 +53,8 @@ pub(crate) fn apply_agent_launch_config(
 #[derive(Debug, Clone)]
 pub struct InstanceParams {
     pub title: String,
+    /// `title` was typed by the user, so the agent may be given it as its own session name.
+    pub title_typed: bool,
     pub path: String,
     pub group: String,
     pub tool: String,
@@ -712,6 +714,7 @@ pub fn build_instance(
     }
 
     let mut instance = Instance::new(&final_title, &final_path);
+    instance.first_launch_names_agent = params.title_typed;
     if params.scratch {
         let dir = super::scratch::provision_scratch_dir(&instance.id)?;
         instance.project_path = dir.to_string_lossy().to_string();
@@ -773,6 +776,7 @@ pub fn build_instance(
             },
             custom_instruction: config.sandbox.custom_instruction.clone(),
             before_start_env: Vec::new(),
+            provider: None,
             container_workdir: None,
         });
     }
@@ -1897,6 +1901,7 @@ mod tests {
     fn custom_agent_params(project_path: &std::path::Path, tool: &str) -> InstanceParams {
         InstanceParams {
             title: "custom session".to_string(),
+            title_typed: false,
             path: project_path.to_string_lossy().to_string(),
             group: String::new(),
             tool: tool.to_string(),
@@ -1969,6 +1974,22 @@ mod tests {
                 expected,
                 "extra={extra:?} cfg_extra={cfg_extra:?} cmd={cmd:?} cfg_cmd={cfg_cmd:?}"
             );
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn only_a_typed_title_names_the_agent() {
+        let temp_home = tempfile::tempdir().unwrap();
+        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
+        let project = tempfile::tempdir().unwrap();
+        for (typed, expected) in [(true, true), (false, false)] {
+            let mut params = custom_agent_params(project.path(), "claude");
+            params.title_typed = typed;
+            let instance = build_instance(params, &[], &[], "default")
+                .unwrap()
+                .instance;
+            assert_eq!(instance.first_launch_names_agent, expected, "typed {typed}");
         }
     }
 
@@ -2089,6 +2110,7 @@ mod tests {
         let _registry = crate::tmux::status_rules::ProfileRegistryGuard::take("default");
         let params = InstanceParams {
             title: "Forked".into(),
+            title_typed: false,
             path: "/tmp".into(),
             group: String::new(),
             tool: "claude".into(),
@@ -2144,6 +2166,7 @@ mod tests {
         };
         let params = InstanceParams {
             title: "Forked".into(),
+            title_typed: false,
             path: "/tmp".into(),
             group: String::new(),
             tool: "claude".into(),
