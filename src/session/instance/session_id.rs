@@ -37,13 +37,12 @@ pub(super) fn read_session_settings(
     Ok(serde_json::from_slice::<serde_json::Map<String, serde_json::Value>>(&bytes).ok())
 }
 
-/// The OpenCode generation the launch resolves against, read from the program
-/// it runs or, without one, from the binary the descriptor names.
+/// The OpenCode generation the launch resolves against.
 fn opencode_generation(
     execution: Option<&super::execution::NativeExecution>,
 ) -> crate::agents::AgentGeneration {
     match execution {
-        Some(execution) => crate::agents::agent_generation_for(execution.agent, &execution.program),
+        Some(execution) => super::execution::agent_generation(execution.agent, Some(execution)),
         None => crate::agents::get_agent("opencode").map_or(
             crate::agents::AgentGeneration::Current,
             crate::agents::AgentDef::detected_generation,
@@ -733,13 +732,10 @@ impl Instance {
         }
         if let ResumeIntent::Fork { from } = self.resume_intent.clone() {
             let agent = agent.context("fork execution adapter is unavailable")?;
-            // Without an execution the program is the binary the descriptor
-            // names, which only names it: the probe needs a resolved path, so
-            // `PATH` decides rather than a bare name that cannot be canonicalized.
-            let generation = match execution {
-                Some(execution) => crate::agents::agent_generation_for(agent, &execution.program),
-                None => agent.detected_generation(),
-            };
+            // Without an execution the descriptor only names the binary, so the
+            // shared helper resolves it through `PATH` rather than a bare name
+            // no probe can canonicalize.
+            let generation = super::execution::agent_generation(agent, execution);
             if matches!(
                 agent.fork_strategy.resolve(generation),
                 crate::agents::ForkStrategy::ServeFork

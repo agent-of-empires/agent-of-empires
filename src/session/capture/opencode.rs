@@ -11,11 +11,6 @@ use uuid::Uuid;
 
 use crate::agents::AgentGeneration;
 
-/// How the older generation is named in a diagnostic.
-fn legacy_generation_label() -> &'static str {
-    "1.x"
-}
-
 /// Budget for the serve boot plus the request that follows it (boot measured at
 /// ~1.8s). Covers both the preassign and the fork.
 const OPENCODE_SERVE_DEADLINE: Duration = Duration::from_secs(6);
@@ -118,21 +113,9 @@ impl ServeClient {
         }
     }
 
-    /// Creates the session the launch will own. 1.x exposes no create route
-    /// under `/api` (it has the read-only listing only), so that generation is
-    /// left without a preassigned id rather than paying a doomed request.
-    async fn create_session(
-        &self,
-        id: &str,
-        project_path: &str,
-        generation: AgentGeneration,
-    ) -> Result<()> {
-        if generation == AgentGeneration::Legacy {
-            anyhow::bail!(
-                "opencode {} has no session-create route under /api, so its session id cannot be preassigned",
-                legacy_generation_label()
-            );
-        }
+    /// Creates the session the launch will own. Only the current generation
+    /// exposes this route; the caller has already refused the other one.
+    async fn create_session(&self, id: &str, project_path: &str) -> Result<()> {
         let body = serde_json::json!({
             "id": id,
             "location": { "directory": project_path },
@@ -262,17 +245,20 @@ pub(crate) fn preassign_opencode_session_id(
     command: std::process::Command,
     generation: AgentGeneration,
 ) -> Option<String> {
+    // 1.x has no create route under `/api`. Answering before the server is
+    // spawned is the point: the alternative is booting one and waiting out its
+    // readiness to learn there was nothing to send.
+    if generation == AgentGeneration::Legacy {
+        tracing::warn!(target: "session.capture",
+            "opencode 1.x has no session-create route under /api, so its session id cannot be preassigned");
+        return None;
+    }
     let id = format!("ses_{}", Uuid::new_v4().simple());
     let owned_path = project_path.to_owned();
     let served_path = owned_path.clone();
     with_serve(&owned_path, command, move |client| {
         let id = id.clone();
-        Box::pin(async move {
-            client
-                .create_session(&id, &served_path, generation)
-                .await
-                .map(|()| id)
-        })
+        Box::pin(async move { client.create_session(&id, &served_path).await.map(|()| id) })
     })
     .map_err(|e| {
         tracing::warn!(target: "session.capture", error = %e, "opencode session preassignment failed");
@@ -430,18 +416,35 @@ mod tests {
     /// 1.x exposes no create route under `/api`, so a launch against it must be
     /// told so instead of waiting out a request that cannot succeed.
     #[test]
-    fn the_legacy_generation_refuses_to_preassign() {
-        let outcome = ServeClient::new("http://127.0.0.1:1".into(), "pw").map(|client| {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-            rt.block_on(client.create_session("ses_x", "/tmp", AgentGeneration::Legacy))
-        });
-        let error = outcome
-            .expect("the client builds")
-            .expect_err("no create route exists for the older generation");
-        assert!(error.to_string().contains("preassigned"), "{error}");
+    fn the_legacy_generation_refuses_before_it_spawns_a_server() {
+        let dir = tempfile::tempdir().unwrap();
+        // The agent leaves a mark if it runs at all, so a mark proves the
+        // refusal came after the spawn rather than before it.
+        let marker = dir.path().join("spawned");
+        let agent = dir.path().join("opencode");
+        std::fs::write(
+            &agent,
+            format!("#!/bin/sh\ntouch '{}'\nexit 0\n", marker.display()),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&agent, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let started = Instant::now();
+        let id = preassign_opencode_session_id(
+            dir.path().to_str().unwrap(),
+            std::process::Command::new(&agent),
+            AgentGeneration::Legacy,
+        );
+        assert!(id.is_none(), "1.x has no create route to preassign against");
+        assert!(!marker.exists(), "the agent must never be spawned");
+        assert!(
+            started.elapsed() < OPENCODE_SERVE_DEADLINE,
+            "the readiness deadline must not have been waited out"
+        );
     }
 
     #[test]

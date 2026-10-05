@@ -38,13 +38,10 @@ fn resolved_yolo(
     agent: &'static crate::agents::AgentDef,
     execution: Option<&super::execution::NativeExecution>,
 ) -> Option<&'static crate::agents::YoloMode> {
-    agent.yolo.as_ref().map(|yolo| {
-        let generation = match execution {
-            Some(execution) => crate::agents::agent_generation_for(agent, &execution.program),
-            None => agent.detected_generation(),
-        };
-        yolo.resolve(generation)
-    })
+    agent
+        .yolo
+        .as_ref()
+        .map(|yolo| yolo.resolve(super::execution::agent_generation(agent, execution)))
 }
 
 /// Append yolo-mode flags or environment variables to a launch command.
