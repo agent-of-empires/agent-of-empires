@@ -652,7 +652,9 @@ impl Instance {
         &mut self,
         prepared: PreparedLaunch,
     ) -> Result<PreparedLaunch> {
-        if !prepared.is_existing {
+        // A store fork adopts a child the pre-fork seed cannot stand in for, so
+        // the reset to the recorded conversation is skipped once one exists.
+        if !prepared.is_existing && self.stored_fork_child().is_none() {
             self.set_agent_conversation(
                 prepared.expected_conversation.session_id.clone(),
                 prepared.expected_conversation.binding.clone(),
@@ -1326,7 +1328,9 @@ mod tests {
     }
 
     /// A store fork that cannot mint a child must refuse the launch rather than
-    /// fall through to an unforked session.
+    /// fall through to an unforked session. The refusal is the wrapping context
+    /// the fork arm adds, so the assertion targets that rather than whatever the
+    /// store reported underneath it.
     #[test]
     fn opencode_fork_refuses_when_the_store_returns_no_child() {
         let mut inst = tool_instance("opencode", "/tmp/x");
@@ -1338,9 +1342,12 @@ mod tests {
         let error = inst
             .apply_session_flags(&mut cmd, "test", crate::agents::get_agent("opencode"), None)
             .expect_err("an unminted fork must not launch");
-        let message = error.to_string();
-        assert!(message.contains("refused"), "{message}");
+        assert!(
+            format!("{error:#}").contains("refused"),
+            "the fork arm must name its own refusal: {error:#}"
+        );
         assert!(!cmd.contains("--fork"), "{cmd}");
+        assert!(!cmd.contains("--session"), "{cmd}");
     }
 
     #[test]

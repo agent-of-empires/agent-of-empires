@@ -383,7 +383,7 @@ impl Instance {
 
     /// The child a store fork already adopted for this launch. Returns `None`
     /// until one is, so the first pass asks the store and a later one reuses it.
-    fn stored_fork_child(&self) -> Option<String> {
+    pub(super) fn stored_fork_child(&self) -> Option<String> {
         self.agent_session_binding
             .as_ref()
             .filter(|binding| {
@@ -711,36 +711,34 @@ impl Instance {
         }
         if let ResumeIntent::Fork { from } = self.resume_intent.clone() {
             let agent = agent.context("fork execution adapter is unavailable")?;
-            let generation = crate::agents::agent_generation_for(
-                agent,
-                &execution.map_or_else(
-                    || std::path::PathBuf::from(agent.binary),
-                    |execution| execution.program.clone(),
-                ),
-            );
+            // Without an execution the program is the binary the descriptor
+            // names, which only names it: the probe needs a resolved path, so
+            // `PATH` decides rather than a bare name that cannot be canonicalized.
+            let generation = match execution {
+                Some(execution) => crate::agents::agent_generation_for(agent, &execution.program),
+                None => agent.detected_generation(),
+            };
             if matches!(
                 agent.fork_strategy.resolve(generation),
                 crate::agents::ForkStrategy::ServeFork
             ) {
                 // A restart prepares the command twice, and asking the store
                 // again would leave a second conversation behind in the user's
-                // history. Adopting the child turns the intent into a plain
-                // resume of it, so a second pass opens that one instead.
+                // history, so an adopted child is reused. The intent stays a
+                // fork: `refresh_prepared_prime_launch_after_pane_stop` resets
+                // the conversation to the pre-fork seed, and promoting it here
+                // would send that reset straight to the command line.
                 let child_id = match self.stored_fork_child() {
                     Some(adopted) => adopted,
-                    None => {
-                        let child_id =
-                            self.fork_session_in_store(execution, &from)
-                                .with_context(|| {
-                                    format!(
-                                        "{} could not fork this conversation, so the fork was \
-                                     refused rather than started as a fresh session",
-                                        agent.name
-                                    )
-                                })?;
-                        self.resume_intent = ResumeIntent::Default;
-                        child_id
-                    }
+                    None => self
+                        .fork_session_in_store(execution, &from)
+                        .with_context(|| {
+                            format!(
+                                "{} could not fork this conversation, so the fork was \
+                                 refused rather than started as a fresh session",
+                                agent.name
+                            )
+                        })?,
                 };
                 append_resume_flags(
                     agent.name,
@@ -1286,42 +1284,57 @@ work-opencode = "opencode"
         assert!(!inst.opencode_launch_mirrorable_by_ambient_serve());
     }
 
-    /// A restart prepares the launch twice, so the store must be asked once.
-    /// An adopted child is what the second pass opens.
+    /// A restart prepares the launch twice and resets the conversation to the
+    /// pre-fork seed on the way. The store must be asked once, and the adopted
+    /// child must survive that reset rather than the pane opening a seed id no
+    /// server ever created.
     #[test]
     fn a_store_fork_reuses_the_child_it_already_adopted() {
-        let mut inst = tool_instance("opencode", "/tmp/test");
-        inst.resume_intent = ResumeIntent::Fork {
-            from: "ses_parent00000000000000000000000".to_string(),
+        let seed = "ses_child000000000000000000000000";
+        let child = "ses_ef71c5686ffedIqGGjtFGLwW1r";
+        let parent = "ses_parent00000000000000000000000";
+        let adopt = |inst: &mut Instance, id: &str, provenance| {
+            inst.agent_session_id = Some(id.to_string());
+            inst.agent_session_binding = Some(crate::session::ConversationBinding {
+                session_id: id.to_string(),
+                execution: None,
+                provenance,
+                transcript_path: None,
+            });
         };
-        assert_eq!(inst.stored_fork_child(), None, "no fork has run yet");
+        let fork_intent = |inst: &mut Instance| {
+            inst.resume_intent = ResumeIntent::Fork {
+                from: parent.to_string(),
+            };
+        };
 
-        inst.agent_session_id = Some("ses_child000000000000000000000000".to_string());
-        inst.agent_session_binding = Some(crate::session::ConversationBinding {
-            session_id: "ses_child000000000000000000000000".to_string(),
-            execution: None,
-            provenance: crate::session::ConversationProvenance::Observed,
-            transcript_path: None,
-        });
+        let mut inst = tool_instance("opencode", "/tmp/test");
+        fork_intent(&mut inst);
+        adopt(
+            &mut inst,
+            seed,
+            crate::session::ConversationProvenance::Preallocated,
+        );
+        assert_eq!(inst.stored_fork_child(), None, "the seed is not a child");
+
+        // The fork arm adopts what the store minted.
+        adopt(
+            &mut inst,
+            child,
+            crate::session::ConversationProvenance::Observed,
+        );
         assert_eq!(
             inst.stored_fork_child().as_deref(),
-            Some("ses_child000000000000000000000000"),
+            Some(child),
             "a second pass must open the adopted child, not mint another"
         );
 
-        // A preallocated seed is a placeholder, never a child the store made.
-        let mut seeded = tool_instance("opencode", "/tmp/test");
-        seeded.resume_intent = ResumeIntent::Fork {
-            from: "ses_parent00000000000000000000000".to_string(),
-        };
-        seeded.agent_session_id = Some("ses_child000000000000000000000000".to_string());
-        seeded.agent_session_binding = Some(crate::session::ConversationBinding {
-            session_id: "ses_child000000000000000000000000".to_string(),
-            execution: None,
-            provenance: crate::session::ConversationProvenance::Preallocated,
-            transcript_path: None,
-        });
-        assert_eq!(seeded.stored_fork_child(), None);
+        // The refresh resets to `expected_conversation`, which still carries the
+        // seed, so it must not run once a child exists.
+        assert!(
+            inst.stored_fork_child().is_some(),
+            "the reset would otherwise restore the seed the store never created"
+        );
     }
 
     /// A store fork runs `opencode serve` against the launch's own database, so
