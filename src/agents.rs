@@ -1129,16 +1129,18 @@ impl HelpProbe {
         clock: impl Fn() -> std::time::Instant,
         probe: impl FnOnce(std::time::Duration) -> Option<String>,
     ) -> &str {
-        if self.help.is_none() && self.retry_at.is_none_or(|at| clock() >= at) {
+        // An empty answer is a failed one: caching it would pin the binary to
+        // "no flags" for the life of the process, so the retry the cooldown
+        // schedules below has to be able to re-enter here.
+        if self.help.as_deref().is_none_or(str::is_empty)
+            && self.retry_at.is_none_or(|at| clock() >= at)
+        {
             let timeout = if self.retry_at.is_some() {
                 HELP_RETRY_TIMEOUT
             } else {
                 HELP_PROBE_TIMEOUT
             };
             self.help = probe(timeout);
-            // An empty answer is a failed one: caching it would pin the binary
-            // to "no flags" for the life of the process, so the retry the
-            // cooldown schedules still applies to it.
             if self.help.as_deref().is_none_or(str::is_empty) {
                 tracing::warn!(target: "session.create", timeout_secs = timeout.as_secs(),
                     "agent --help did not answer; launching without the flags it gates until a retry succeeds");

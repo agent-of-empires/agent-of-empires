@@ -486,22 +486,16 @@ impl Instance {
         } else {
             None
         };
-        // A sandboxed launch has no host program to probe: the agent's binary
-        // lives inside the container, which the host cannot read. Probing the
-        // host PATH here would answer about a binary the container does not run,
-        // so the generation falls back the way the launch's own command line
-        // does for the same reason.
-        let agent = crate::agents::get_agent(&self.tool)
-            .unwrap_or_else(|| crate::agents::get_agent("opencode").expect("a builtin agent"));
-        // The container's binary is unreadable from the host, so this is the
-        // host's answer. An unreadable one establishes nothing, and the sandbox
-        // gets no approval mechanism rather than one that may not exist.
-        let yolo_generation = if self.is_yolo_mode() {
-            let generation = super::execution::agent_generation(agent, None);
-            (generation != crate::agents::AgentGeneration::Unknown).then_some(generation)
-        } else {
-            None
-        };
+        // Only an agent whose descriptor declares two generations needs one
+        // resolved here. A sandboxed launch has no host program to probe: the
+        // binary lives inside the container, so the host's answer is a fallback
+        // and the generation decides which spelling reaches the container.
+        let yolo_generation = crate::agents::get_agent(&self.tool)
+            .filter(|agent| agent.spans_agent_generations)
+            .map(|agent| super::execution::agent_generation(agent, None));
+        let yolo_generation = self.is_yolo_mode().then_some(yolo_generation).flatten();
+        let yolo_generation = yolo_generation
+            .filter(|generation| *generation != crate::agents::AgentGeneration::Unknown);
         container_config::build_container_config(
             &self.project_path,
             sandbox,
