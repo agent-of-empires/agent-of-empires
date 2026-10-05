@@ -404,17 +404,19 @@ impl Instance {
     }
     /// A store fork runs `opencode serve` against the launch's own store, so it
     /// needs a host launch that invokes the resolved binary directly and shares
-    /// no container store with it. The binary is the one the launch already
-    /// resolved and the server is spawned with the launch's own environment, so
-    /// asking whether `PATH` still names it would refuse a profile that simply
-    /// points somewhere else.
+    /// no container store with it. "Directly" is the launch's own command
+    /// against the resolved binary: a wrapper would have the fork spawn
+    /// something other than the agent it forks. It is not a question about
+    /// AoE's own `PATH`, which the server does not inherit.
     fn opencode_store_fork_available(
         &self,
         execution: Option<&super::execution::NativeExecution>,
     ) -> bool {
         match execution {
             Some(execution) => {
-                execution.agent.name == "opencode" && execution.inputs.container.is_none()
+                execution.agent.name == "opencode"
+                    && execution.inputs.container.is_none()
+                    && self.launch_invokes_resolved_agent_directly(execution.agent)
             }
             None => !self.is_sandboxed() && self.opencode_launch_mirrorable_by_ambient_serve(),
         }

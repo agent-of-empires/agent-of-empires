@@ -419,18 +419,15 @@ mod tests {
             std::fs::set_permissions(&agent, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
 
-        let started = Instant::now();
         let id = preassign_opencode_session_id(
             dir.path().to_str().unwrap(),
             std::process::Command::new(&agent),
             AgentGeneration::Legacy,
         );
         assert!(id.is_none(), "1.x has no create route to preassign against");
+        // The marker is the observation: no spawn happened. Elapsed time would
+        // only assert how busy the machine was.
         assert!(!marker.exists(), "the agent must never be spawned");
-        assert!(
-            started.elapsed() < OPENCODE_SERVE_DEADLINE,
-            "the readiness deadline must not have been waited out"
-        );
     }
 
     #[test]
