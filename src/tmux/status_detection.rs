@@ -3359,6 +3359,9 @@ Final prose line.\n";
     fn test_detect_omp_status_active_brand_uses_lowest_marker() {
         let band = "⎋ Working…\n⠸ 1s > model status";
         let approval = "│ ❯ Approve │\n│ Deny │\n│ up/down navigate  enter select  esc cancel │";
+        let statusline = "⎋ Working…\n⠏ 1s · 🖥 host";
+        let error = "Error: Retry budget exhausted after 10 retries";
+        let dismissed = "Dismissed when you send your next message.";
         let cases = [
             (
                 "lower approval wins",
@@ -3367,7 +3370,32 @@ Final prose line.\n";
             ),
             (
                 "lower terminal error wins",
-                format!("{band}\nError: Retry budget exhausted after 10 retries"),
+                format!("{band}\n{error}"),
+                Status::Error,
+            ),
+            (
+                "newer active band wins over older terminal error",
+                format!("{error}\n{band}\n╰─"),
+                Status::Running,
+            ),
+            (
+                "newer statusline wins over older terminal error",
+                format!("{error}\n{statusline}\n❯\n╰─"),
+                Status::Running,
+            ),
+            (
+                "newer terminal error wins over older statusline",
+                format!("{statusline}\n╰─\n{error}"),
+                Status::Error,
+            ),
+            (
+                "newer active band wins over older dismissal",
+                format!("{dismissed}\n{band}\n╰─"),
+                Status::Running,
+            ),
+            (
+                "newer dismissal wins over older active band",
+                format!("{band}\n{dismissed}"),
                 Status::Error,
             ),
             (

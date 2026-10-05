@@ -56,7 +56,7 @@ not = [{ line_regex = ['^\s*[\x{2022}\x{f111}\x{203B}\x{276F}\x{f054}\x{2502}\x{
 [[rules]]
 id = "active_brand"
 state = "running"
-priority = 960
+priority = 970
 positional = true
 max_position = 2
 region = "bottom_non_empty_lines(3)"
@@ -74,6 +74,13 @@ not = [
   { line_regex = ['^\s*(?:(?:╭[─-]*|\+[=-]*)\s*)?(?:\x{e0b6}\s+)?(?:⏱|\x{f017}|◷|◴|⌛)\s+'] },
   # A lowercase word before and after the timer is ordinary duration prose.
   { line_regex = ['^\s*(?:(?:╭[─-]*|\+[=-]*)\s*)?(?:\x{e0b6}\s+)?\p{Ll}\s+(?:0|[1-9]\d*)[smh]\s+\p{Ll}'] },
+  # An approval with an older activity hint parks a stale band below its footer.
+  { region = "bottom_non_empty_lines(12)", all = [
+    { line_regex = ['^\s*[│|]\s*(?:[\x{276F}\x{f054}>])\s+\S[^│|]*[│|]\s*$'] },
+    { line_regex = ['(?i)^\s*[│|].*(?:navigate|scroll|select|confirm|open).*(?:esc|⎋|cancel).*[│|]\s*$'] },
+  ], not = [
+    { region = "bottom_non_empty_lines(3)", line_regex = ['(?i)^\s*(?:⎋|\x{f12b7}|esc)\s+working(?:…|\.\.\.)'] },
+  ] },
 ]
 
 # A wrapped draft moves the band above the fixed bottom-line windows.
@@ -104,7 +111,7 @@ not = [
 [[rules]]
 id = "active_statusline"
 state = "running"
-priority = 960
+priority = 970
 positional = true
 region = "bottom_non_empty_lines(3)"
 visible = true
@@ -128,6 +135,12 @@ not = [
       "enter submit · ↑/↓ scroll",
       "current prompt to answer",
     ] },
+  ] },
+  { region = "bottom_non_empty_lines(12)", all = [
+    { line_regex = ['^\s*[│|]\s*(?:[\x{276F}\x{f054}>])\s+\S[^│|]*[│|]\s*$'] },
+    { line_regex = ['(?i)^\s*[│|].*(?:navigate|scroll|select|confirm|open).*(?:esc|⎋|cancel).*[│|]\s*$'] },
+  ], not = [
+    { region = "bottom_non_empty_lines(3)", line_regex = ['(?i)^\s*(?:⎋|\x{f12b7}|esc)\s+working(?:…|\.\.\.)'] },
   ] },
 ]
 
