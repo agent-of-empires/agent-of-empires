@@ -37,23 +37,6 @@ pub(super) fn read_session_settings(
     Ok(serde_json::from_slice::<serde_json::Map<String, serde_json::Value>>(&bytes).ok())
 }
 
-/// The OpenCode generation the launch resolves against.
-fn opencode_generation(
-    execution: Option<&super::execution::NativeExecution>,
-) -> crate::agents::AgentGeneration {
-    match execution {
-        Some(execution) => super::execution::agent_generation(
-            execution.agent,
-            Some(&execution.inputs),
-            Some(&execution.program),
-        ),
-        None => crate::agents::get_agent("opencode").map_or(
-            crate::agents::AgentGeneration::Current,
-            crate::agents::AgentDef::detected_generation,
-        ),
-    }
-}
-
 impl Instance {
     /// Returns `(session_id, is_existing)`. Explicit intents win; default intent
     /// keeps a stored id unless the pane's own backend proves it rotated, and
@@ -84,6 +67,10 @@ impl Instance {
         );
         let environment =
             (preassign && execution.is_none()).then(|| self.resolved_host_environment());
+        // Resolved before the closure borrows the instance mutably: the binary
+        // this launch runs is what the generation is read from.
+        let opencode_program = crate::agents::get_agent("opencode")
+            .and_then(|agent| self.launch_program(agent, execution));
         let native_created = std::cell::Cell::new(false);
         let result = self.acquire_session_id_with(execution, &|path| {
             if pin_pi {
@@ -116,7 +103,10 @@ impl Instance {
             let sid = crate::session::capture::preassign_opencode_session_id(
                 cwd,
                 command,
-                opencode_generation(execution),
+                super::execution::agent_generation(
+                    crate::agents::get_agent("opencode").expect("opencode is a builtin agent"),
+                    opencode_program.as_deref(),
+                ),
             );
             native_created.set(sid.is_some());
             sid
@@ -736,8 +726,7 @@ impl Instance {
             // no probe can canonicalize.
             let generation = super::execution::agent_generation(
                 agent,
-                execution.map(|execution| &execution.inputs),
-                execution.map(|execution| execution.program.as_path()),
+                self.launch_program(agent, execution).as_deref(),
             );
             if matches!(
                 agent.fork_strategy.resolve(generation),

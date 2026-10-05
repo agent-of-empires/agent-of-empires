@@ -1215,28 +1215,47 @@ fn opencode_session_row(
 
 /// The generation the build this launch runs speaks.
 ///
-/// The launch's resolved program answers it whenever the host can read that
-/// path, which is every launch but a container's: there the program is a path
-/// inside the container, and probing it from the host would answer with no
-/// evidence behind it. A profile that sets `PATH` is still a host launch and is
-/// still the binary the pane runs, so the probe reads that program directly.
-/// `inputs` is what proves the container case, and `start.rs` has already moved
-/// the execution's capture by the time it asks, so the two are passed apart.
-/// Every consumer reads it here, and a container's own environment comes from
-/// here too, so the two cannot disagree about one launch.
+/// `program` is what the pane actually runs, and the host can read that path
+/// unless the launch is a container's, whose program points inside the
+/// container rather than at anything here. With nothing to go on, the
+/// descriptor's own `PATH` answers, which is the last resort rather than the
+/// rule: a profile that sets `PATH` names the binary the pane runs, and reading
+/// a different install of the same agent would be answering about a program
+/// nobody launched. Every consumer reads it here, so the launch's command line,
+/// its store fork and its preassignment cannot disagree about one launch.
 pub(super) fn agent_generation(
     agent: &'static crate::agents::AgentDef,
-    inputs: Option<&NativeLaunchInputs>,
     program: Option<&std::path::Path>,
 ) -> crate::agents::AgentGeneration {
-    match (inputs, program) {
-        (Some(inputs), Some(program)) if inputs.container.is_none() => {
-            crate::agents::agent_generation_for(agent, program)
-        }
-        _ => agent.detected_generation(),
+    match program {
+        Some(program) => crate::agents::agent_generation_for(agent, program),
+        None => agent.detected_generation(),
     }
 }
 
+impl Instance {
+    /// The binary this launch runs, when the host can name one. A container's
+    /// is a path inside the container and is left to the caller to handle.
+    pub(super) fn launch_program(
+        &self,
+        agent: &crate::agents::AgentDef,
+        execution: Option<&NativeExecution>,
+    ) -> Option<std::path::PathBuf> {
+        match execution {
+            Some(execution) => {
+                (!execution.inputs.container.is_some()).then(|| execution.program.clone())
+            }
+            None => which::which_in(
+                agent.binary,
+                self.resolved_host_environment()
+                    .iter()
+                    .find_map(|entry| entry.strip_prefix("PATH=")),
+                &self.project_path,
+            )
+            .ok(),
+        }
+    }
+}
 impl Instance {
     /// The conversation an explicit fork would carry, with the evidence for it:
     /// `Bound` when a binding qualifies the recorded id, `Unattributed` when a

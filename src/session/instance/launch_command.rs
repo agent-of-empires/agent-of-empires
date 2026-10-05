@@ -35,14 +35,14 @@ pub(super) struct PreparedLaunch {
 /// from the program the launch runs or, when there is none, from the binary
 /// `PATH` resolves for the descriptor.
 fn resolved_yolo(
+    inst: &Instance,
     agent: &'static crate::agents::AgentDef,
     execution: Option<&super::execution::NativeExecution>,
 ) -> Option<&'static crate::agents::YoloMode> {
     agent.yolo.as_ref().map(|yolo| {
         yolo.resolve(super::execution::agent_generation(
             agent,
-            execution.map(|execution| &execution.inputs),
-            execution.map(|execution| execution.program.as_path()),
+            inst.launch_program(agent, execution).as_deref(),
         ))
     })
 }
@@ -724,7 +724,7 @@ impl Instance {
                 format!("{} {}", launch_cmd, self.extra_args)
             };
             let mut tool_cmd = if self.is_yolo_mode() {
-                match agent.and_then(|a| resolved_yolo(a, execution)) {
+                match agent.and_then(|a| resolved_yolo(self, a, execution)) {
                     Some(crate::agents::YoloMode::CliFlag(flag)) => {
                         format!("{} {}", base_cmd, flag)
                     }
@@ -930,7 +930,7 @@ impl Instance {
                         );
                     }
                     if self.is_yolo_mode() {
-                        if let Some(yolo) = resolved_yolo(a, execution) {
+                        if let Some(yolo) = resolved_yolo(self, a, execution) {
                             apply_yolo_mode(&mut cmd, yolo, false);
                         }
                     }
@@ -967,7 +967,7 @@ impl Instance {
                 cmd = format!("{} {}", cmd, self.extra_args);
             }
             if self.is_yolo_mode() {
-                if let Some(yolo) = agent.and_then(|a| resolved_yolo(a, execution)) {
+                if let Some(yolo) = agent.and_then(|a| resolved_yolo(self, a, execution)) {
                     apply_yolo_mode(&mut cmd, yolo, false);
                 }
             }
@@ -1591,62 +1591,68 @@ mod tests {
         }
     }
 
-    /// A profile that points `PATH` at another install still launches a host
-    /// binary, and that binary is the one whose interface this launch speaks.
-    /// Reading AoE's own `PATH` instead would answer about a different program
-    /// than the one running.
+    /// A profile that points `PATH` at another install launches a host binary,
+    /// and that binary is the one whose interface this launch speaks. Reading
+    /// AoE's own `PATH` instead would answer about a program nobody runs, which
+    /// is how a generation silently stops matching the command line.
     #[test]
     #[serial_test::serial]
     fn a_profile_path_resolves_the_generation_from_the_launched_binary() {
         let home = tempfile::tempdir().unwrap();
         let _app = crate::session::test_support::isolate_app_dir_at(home.path());
+        let profile = "generation-from-profile-path";
         // AoE's own PATH carries the current generation.
         let _current = crate::session::test_support::install_login_shell_path_command(
             home.path(),
             "opencode",
             "#!/bin/sh\nprintf '%s\\n' 'FLAGS\n  --auto  approve'\nexit 0\n",
         );
-        // The profile's PATH points at an install carrying the older one.
+        // The profile's PATH names an install carrying the older one.
         let profile_bin = home.path().join("profile-bin");
-        std::fs::create_dir_all(&profile_bin).unwrap();
-        let profile_agent = profile_bin.join("opencode");
-        std::fs::write(
-            &profile_agent,
+        let _older = crate::session::test_support::install_login_shell_path_command(
+            &home.path().join("older"),
+            "opencode",
             "#!/bin/sh\nprintf '%s\\n' 'FLAGS\n  --fork  fork'\nexit 0\n",
-        )
-        .unwrap();
+        );
+        let older_home = home.path().join("older");
+        profile_bin_helper(&older_home, &profile_bin);
+        crate::agents::forget_agent_help_for_test();
+        write_profile_environment(profile, &format!("PATH={}", profile_bin.display()));
+
+        let mut inst = tool_instance("opencode", older_home.to_str().unwrap());
+        inst.source_profile = profile.into();
+        inst.command = "opencode".into();
+        inst.yolo_mode = true;
+        let cmd = host_command(&mut inst);
+        assert!(
+            cmd.contains("OPENCODE_PERMISSION"),
+            "the launch speaks the generation of the binary it runs: {cmd}"
+        );
+        assert!(!cmd.contains("--auto"), "{cmd}");
+    }
+
+    /// Places the stub installed under `older_root` also at `bin`, and names it
+    /// so a profile `PATH` pointing there resolves to the same file.
+    fn profile_bin_helper(older_root: &std::path::Path, bin: &std::path::Path) {
+        std::fs::create_dir_all(bin).unwrap();
+        let agent = older_root.join("bin").join("opencode");
+        std::fs::copy(&agent, bin.join("opencode")).unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(&profile_agent, std::fs::Permissions::from_mode(0o755))
+            std::fs::set_permissions(bin.join("opencode"), std::fs::Permissions::from_mode(0o755))
                 .unwrap();
         }
-        crate::agents::forget_agent_help_for_test();
+    }
 
-        let inputs = crate::session::instance::execution::NativeLaunchInputs {
-            launch_id: "test".to_string(),
-            environment: [(
-                "PATH".to_string(),
-                profile_bin.to_string_lossy().into_owned(),
-            )]
-            .into_iter()
-            .collect(),
-            cwd: home.path().to_path_buf(),
-            profile: "default".to_string(),
-            container: None,
-            docker_env: None,
-            pane_env: Vec::new(),
-            identity_extension: None,
-        };
-        assert_eq!(
-            super::execution::agent_generation(
-                crate::agents::get_agent("opencode").unwrap(),
-                Some(&inputs),
-                Some(&profile_agent),
-            ),
-            crate::agents::AgentGeneration::Legacy,
-            "the answer comes from the binary the pane runs, not from AoE's own PATH"
-        );
+    /// Records `entry` as the profile's environment, the way the documented
+    /// `environment = [...]` grammar does.
+    fn write_profile_environment(profile: &str, entry: &str) {
+        let mut config = crate::session::config::profile_config::ProfileConfig::default();
+        config
+            .overrides
+            .insert("environment".to_string(), serde_json::json!([entry]));
+        crate::session::config::profile_config::save_profile_config(profile, &config).unwrap();
     }
 
     #[test]

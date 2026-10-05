@@ -341,12 +341,11 @@ impl Instance {
         }
         if let Some(execution) = prepared.execution.take() {
             // Resolved before the launch record takes the inputs apart below,
-            // since the answer needs the program's own path and the evidence it
-            // is a host binary.
+            // since the answer needs the binary this pane will run.
             let generation = super::execution::agent_generation(
                 execution.agent,
-                Some(&execution.inputs),
-                Some(&execution.program),
+                self.launch_program(execution.agent, Some(&execution))
+                    .as_deref(),
             );
             let attested = self.attested_claude_store_route(&execution);
             self.active_execution = Some(ActiveExecution {
