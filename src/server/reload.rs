@@ -14,10 +14,38 @@ use super::structured_repair::{
     LiveStructuredWorkerRecord,
 };
 
+/// What [`load_all_instances_reporting`] could and could not read.
+pub(super) struct LoadedSessions {
+    pub instances: Vec<Instance>,
+    /// Profiles whose rows are absent from `instances` because their storage failed to load.
+    pub unread_profiles: Vec<String>,
+    /// The profile list itself could not be read, so `instances` says nothing about absence.
+    pub listing_failed: bool,
+}
+
+#[cfg(test)]
+impl LoadedSessions {
+    /// A read that saw every profile.
+    pub(super) fn complete(instances: Vec<Instance>) -> Self {
+        Self {
+            instances,
+            unread_profiles: Vec::new(),
+            listing_failed: false,
+        }
+    }
+}
+
 /// Load sessions from all profiles, matching the TUI's "all profiles" view.
 pub(super) fn load_all_instances(
     file_watch: &Arc<FileWatchService>,
 ) -> anyhow::Result<Vec<Instance>> {
+    load_all_instances_reporting(file_watch).map(|loaded| loaded.instances)
+}
+
+/// [`load_all_instances`], also reporting what it failed to read.
+pub(super) fn load_all_instances_reporting(
+    file_watch: &Arc<FileWatchService>,
+) -> anyhow::Result<LoadedSessions> {
     let profiles = match crate::session::list_profiles() {
         Ok(p) => p,
         Err(e) => {
@@ -26,10 +54,15 @@ pub(super) fn load_all_instances(
                 error = %e,
                 "list_profiles failed; load_all_instances returning empty set"
             );
-            return Ok(Vec::new());
+            return Ok(LoadedSessions {
+                instances: Vec::new(),
+                unread_profiles: Vec::new(),
+                listing_failed: true,
+            });
         }
     };
     let mut all = Vec::new();
+    let mut unread_profiles = Vec::new();
     for profile in &profiles {
         match Storage::new(profile, file_watch.clone()).and_then(|s| s.load()) {
             Ok(mut instances) => {
@@ -39,6 +72,7 @@ pub(super) fn load_all_instances(
                 all.extend(instances);
             }
             Err(e) => {
+                unread_profiles.push(profile.clone());
                 tracing::warn!(
                     target: "server.file_watch",
                     profile = %profile,
@@ -49,7 +83,11 @@ pub(super) fn load_all_instances(
             }
         }
     }
-    Ok(all)
+    Ok(LoadedSessions {
+        instances: all,
+        unread_profiles,
+        listing_failed: false,
+    })
 }
 
 /// Carry over the in-memory-only fields from the prior `state.instances` entry into the

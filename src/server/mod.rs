@@ -14,6 +14,7 @@ pub(crate) mod create_progress;
 pub(crate) mod disk_watch;
 pub(crate) mod idle_reap;
 pub(crate) mod ip_discovery;
+pub mod lifecycle_feed;
 pub mod live_ws;
 pub mod login;
 mod pane;

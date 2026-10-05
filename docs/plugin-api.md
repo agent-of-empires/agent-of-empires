@@ -8,7 +8,7 @@ A manifest carries two independent version axes.
 
 | Key | Meaning |
 |---|---|
-| `api_version` | The manifest *schema* version. The current schema is `17`. The host rejects a manifest whose `api_version` is newer than it supports. |
+| `api_version` | The manifest *schema* version. The current schema is `18`. The host rejects a manifest whose `api_version` is newer than it supports. |
 | `aoe_version` | A semver requirement on the *host app* version, e.g. `">=1.11.0, <2.0.0"`. The host refuses to install, and skips loading, a plugin whose requirement excludes the running version. Optional; requires `api_version >= 4`. |
 
 Each key below notes the `api_version` it needs. Target the newest schema your plugin uses, and set `aoe_version` to the host range you have tested.
@@ -19,7 +19,7 @@ Each key below notes the `api_version` it needs. Target the newest schema your p
 id = "dev.example.my-plugin"
 name = "My Plugin"
 version = "0.1.0"
-api_version = 14
+api_version = 18
 aoe_version = ">=1.11.0, <2.0.0"
 description = "What the plugin does."
 capabilities = ["runtime.worker"]
@@ -30,7 +30,7 @@ capabilities = ["runtime.worker"]
 | `id` | string | yes | Plugin id (see [Plugin id](#plugin-id)). Namespaces config, events, and action names. |
 | `name` | string | yes | Human-readable display name. |
 | `version` | string | yes | Semantic version of the plugin. |
-| `api_version` | integer | yes | Manifest schema version, `1` to `17`. |
+| `api_version` | integer | yes | Manifest schema version, `1` to `18`. |
 | `description` | string | no | Shown in plugin listings. Defaults to empty. |
 | `aoe_version` | string | no | Host-app semver requirement. Requires `api_version >= 4`. |
 | `capabilities` | array of string | no | Runtime grants the worker needs (see [Capabilities](#capabilities)). Static contributions need none. |
@@ -48,7 +48,7 @@ Capabilities gate runtime resource access. They are prompted once at install and
 | Capability | Grants |
 |---|---|
 | `runtime.worker` | Running any plugin code at all (host RPCs the worker initiates). Any worker needs this. |
-| `session.read` | Reading sessions of the host's profile: the attached session, `sessions.list`, and the `session.status.changed` notifications (`api_version >= 14`). |
+| `session.read` | Reading sessions of the host's profile: the attached session, `sessions.list`, and the `session.status.changed` (`api_version >= 14`) and `session.lifecycle.changed` (`api_version >= 18`) notifications. |
 | `session.write` | Mutating any session of the profile: `session.meta.set`/`cas`, and archive/trash from a plugin page. |
 | `config.read` | Reading host or other-plugin configuration (not the plugin's own settings). |
 | `config.write` | Writing host or other-plugin configuration. |
@@ -241,6 +241,8 @@ With `api_version >= 9` a worker can discover ACP capabilities and create host-o
 **Settings-change events.** After a settings write the host notifies the worker with `plugin.settings.changed` carrying `{ revision, changed_keys }`; the worker re-reads those values with `config.get`, whose response carries the current `revision`. Polling that method is the fallback for a worker that was down.
 
 **Session status events.** With `api_version >= 14` and the `session.read` capability, the host notifies the worker with `session.status.changed` on every status transition of a session in the host's profile (the same sessions `sessions.list` returns), for structured and terminal sessions alike. The params are `{ session_id, title, from, to, at }`: `from` and `to` use the same PascalCase spelling as `sessions.list` (`Running`, `Idle`, `Waiting`, `Stopped`, `Error`, and so on), and `at` is an RFC 3339 timestamp. The host sends the transitions it processes, so filter on `to` (for example `Idle` for "the agent stopped working"). Do not treat the notifications as a complete transition log: a status change made by another process, such as the CLI or TUI, is reported when the daemon next reloads it, changes within one poll tick can merge into one event, and delivery is best-effort as described below. It is a best-effort, fire-and-forget notification: do not reply, and an event is never replayed. It is lost if the worker was down when it fired, if the daemon's status stream lagged and skipped it, or if the worker had stopped reading stdin (at most 64 unread status events are queued per worker; later ones are dropped until it catches up). Resynchronize from `sessions.list` on startup and whenever you may have missed events, but it reads the stored sessions: the `status` of a structured (ACP) session moves on the live row without being persisted each time, so the listed value can be older than the live one. There is no live-status snapshot call yet.
+
+**Session lifecycle events.** With `api_version >= 18` and the `session.read` capability, the host also notifies the worker with `session.lifecycle.changed` when a session in the host's profile changes lifecycle state. The params are `{ session_id, kind, at, summary }`. `kind` is `created`, `deleted`, `archived`, `unarchived`, `trashed`, `restored`, `renamed` or `workspace_changed` (the set of checkouts the session works in changed; a branch switch alone does not count), and `at` is an RFC 3339 timestamp. `summary` is the session's current entry exactly as `sessions.list` returns it, so a worker can build its map from one `sessions.list` and keep it current from these events alone. A `deleted` event has no `summary`: the session is gone. The events follow the host's profile, like `sessions.list`: a session moved to another profile is `deleted` for a plugin in the old profile and `created` for one in the new profile. One change can produce several events, such as `archived` and `trashed` together. These events share the delivery guarantee and the 64-event queue of the status events above, and are never replayed. They are best-effort: a change made by another process (the CLI or TUI) is detected from the session store a moment later, and changes inside that window are coalesced, so a session created and deleted in quick succession may produce no event. A session created while the daemon was not running produces no `created` event. Resynchronize from `sessions.list` on startup and whenever you may have missed events.
 
 ## Messaging any session
 
