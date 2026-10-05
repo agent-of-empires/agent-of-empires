@@ -363,28 +363,31 @@ pub(super) fn apply_supplementary_tick(
         if row.is_structured() {
             continue;
         }
-        let previous = cache
+        let prior = cache
             .inventory
             .iter()
             .find(|profile| profile.name == row.source_profile)
-            .and_then(|profile| prior.get(&profile.identity))
-            .filter(|(statuses, tracking)| {
-                statuses
-                    .get(&row.id)
-                    .zip(tracking.get(&row.id))
-                    .is_some_and(|(&status, tracking)| {
-                        supplementary_status_can_be_reused(
-                            row,
-                            status,
-                            tracking.lifecycle_generation,
-                        )
-                    })
-            });
-        if let Some((statuses, tracking)) = previous {
+            .and_then(|profile| prior.get(&profile.identity));
+        let reusable = prior.filter(|(statuses, tracking)| {
+            statuses
+                .get(&row.id)
+                .zip(tracking.get(&row.id))
+                .is_some_and(|(&status, tracking)| {
+                    supplementary_status_can_be_reused(row, status, tracking.lifecycle_generation)
+                })
+        });
+        if let Some((statuses, tracking)) = reusable {
             row.status = statuses[&row.id];
             row.idle_entered_at = tracking[&row.id].idle_entered_at;
             seed_tick_tracking(std::slice::from_mut(row), tracking);
         }
+        let previous = reusable.or_else(|| {
+            prior.filter(|(_, tracking)| {
+                tracking.get(&row.id).is_some_and(|tracking| {
+                    row.lifecycle_generation > tracking.lifecycle_generation
+                })
+            })
+        });
         let previous_status = previous
             .and_then(|(statuses, _)| statuses.get(&row.id))
             .copied();
@@ -1221,6 +1224,117 @@ mod tests {
             observed_transitions(&instances, &prev),
             vec![(0, Status::Running)]
         );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn supplementary_new_generation_stamps_a_visible_idle_observation() {
+        if !tmux_available() {
+            eprintln!("skipping: tmux not available");
+            return;
+        }
+        let _home = crate::session::test_support::isolate_app_dir();
+        Storage::new_unwatched("main").unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let root = crate::session::get_profile_dir_path("main")
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        std::os::unix::fs::symlink(outside.path(), root.join("external")).unwrap();
+        let storage = Storage::open_unwatched("external").unwrap();
+        let mut stored = Instance::new("external idle", "/repo");
+        stored.tool = "claude".into();
+        stored.status = Status::Running;
+        stored.lifecycle_generation = 1;
+        storage
+            .update(|rows, _| {
+                *rows = vec![stored.clone()];
+                Ok(())
+            })
+            .unwrap();
+        let state = crate::server::test_support::build_test_app_state(Vec::new());
+        crate::server::test_support::accept_runtime_read_cache_for_test(&state).await;
+        let old_idle = "2026-01-01T00:00:00Z"
+            .parse::<chrono::DateTime<Utc>>()
+            .unwrap();
+        {
+            let mut cache = state.runtime_read_cache.write().unwrap();
+            let row = &mut cache.alias_only_instances[0];
+            row.status = Status::Idle;
+            row.idle_entered_at = Some(old_idle);
+        }
+        let prior = supplementary_tick_tracking(&state.runtime_read_cache.read().unwrap());
+        storage
+            .update(|rows, _| {
+                rows[0].lifecycle_generation = 2;
+                rows[0].status = Status::Running;
+                rows[0].idle_entered_at = None;
+                Ok(())
+            })
+            .unwrap();
+        let session_name = crate::tmux::Session::generate_name(&stored.id, &stored.title);
+        let _kill = crate::tmux::test_helpers::TmuxTestSession::from_name(session_name.clone());
+        let created = crate::tmux::tmux_command()
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                &session_name,
+                "-x",
+                "120",
+                "-y",
+                "40",
+                "printf '\u{273b} Worked for 1m 52s\n\u{276f}\n'; sleep 300",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            created.status.success(),
+            "{}",
+            String::from_utf8_lossy(&created.stderr)
+        );
+        crate::tmux::test_helpers::wait_for_pane_command(&session_name, "sleep");
+        let cache_guard = crate::tmux::SessionCacheGuard::capture();
+        cache_guard.force_present(&[&session_name]);
+        let metadata = std::collections::HashMap::from([(
+            session_name,
+            crate::tmux::PaneMetadata {
+                pane_dead: false,
+                pane_current_command: Some("claude".into()),
+                pane_start_command_is_protected: false,
+                pane_pid: None,
+                pane_title: None,
+                window_activity: None,
+                window_size: None,
+            },
+        )]);
+        let mut loaded = load_all_instances(&state.file_watch);
+        assert_eq!(loaded.cache.alias_only_instances[0].status, Status::Running);
+        assert_eq!(loaded.cache.alias_only_instances[0].idle_entered_at, None);
+        apply_supplementary_tick(&mut loaded.cache, &prior, Some(&metadata));
+        let row = &loaded.cache.alias_only_instances[0];
+        assert_eq!(row.status, Status::Idle);
+        let fresh_idle = row
+            .idle_entered_at
+            .expect("a visible Idle in the new execution owns a timestamp");
+        assert_ne!(fresh_idle, old_idle);
+        assert_eq!(row.lifecycle_generation, 2);
+        reload_state_instances_from_disk(&state, loaded, vec![], StatusSource::TmuxApplied, 0)
+            .await;
+        let prior = {
+            let cache = state.runtime_read_cache.read().unwrap();
+            assert_eq!(
+                cache.alias_only_instances[0].idle_entered_at,
+                Some(fresh_idle)
+            );
+            supplementary_tick_tracking(&cache)
+        };
+        let mut loaded = load_all_instances(&state.file_watch);
+        apply_supplementary_tick(&mut loaded.cache, &prior, Some(&metadata));
+        let row = &loaded.cache.alias_only_instances[0];
+        assert_eq!(row.status, Status::Idle);
+        assert_eq!(row.idle_entered_at, Some(fresh_idle));
     }
 
     /// #1271: a cascade error string is carried only while the row is still in Error;

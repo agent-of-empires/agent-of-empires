@@ -18,7 +18,7 @@ Aliases into a real profile reuse its cached sessions. Alias-only external store
 
 For alias-only structured sessions, accepted disk rows determine status. These sessions are not enrolled in the daemon's canonical ACP workers.
 
-A failed pane probe does not overwrite a newer disk generation's terminal status and idle-entered time with an older cached pair. Runtime reachability and detector tracking are not reset solely because the lifecycle generation advances.
+A failed pane probe keeps a newer disk generation's terminal status and idle-entered time rather than an older cached pair. For canonical and alias-only terminal sessions, an observed transition into `Idle` uses that generation's disk status as its baseline and stamps a new idle-entered time. Canonical reachability and detector tracking are not reset solely by a generation advance.
 
 Profile inventory, cached session data, group registries and project registries have independent health. A newly observed physical store is not ready until an accepted daemon reload; accepted empty stores are ready too. A session load failure makes affected session reads exit 1 instead of returning incomplete counts or an empty successful result. Repairing the file does not clear that failure until an accepted reload. Transient selector conflicts with retained cached stores also produce a refusal until an accepted reload rather than serving another store's rows. Other healthy profiles and inventory-only reads remain available.
 
