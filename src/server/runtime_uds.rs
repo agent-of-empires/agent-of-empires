@@ -329,7 +329,7 @@ fn write_markers(
         socket_device: socket.device as u64,
         #[cfg(not(target_os = "macos"))]
         socket_device: socket.device,
-        socket_inode: socket.inode,
+        socket_inode: socket.inode as _,
         #[cfg(target_os = "linux")]
         socket_creator_pid: process,
     };

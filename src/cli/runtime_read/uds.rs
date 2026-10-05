@@ -190,7 +190,23 @@ pub(crate) struct Admission {
 /// the one refusal the local command path is allowed to take over: it now
 /// covers a provably dead publisher as well as an empty namespace, so "no
 /// daemon is publishing here".
-pub(crate) async fn connect(establishment_deadline: Instant) -> Result<UdsConnection, ReadFailure> {
+pub(crate) fn connect(
+    establishment_deadline: Instant,
+) -> impl std::future::Future<Output = Result<UdsConnection, ReadFailure>> {
+    #[cfg(test)]
+    {
+        connect_inner(establishment_deadline, |_| {})
+    }
+    #[cfg(not(test))]
+    {
+        connect_inner(establishment_deadline)
+    }
+}
+
+async fn connect_inner(
+    establishment_deadline: Instant,
+    #[cfg(test)] mut on_retry: impl FnMut(&ReadFailure),
+) -> Result<UdsConnection, ReadFailure> {
     loop {
         let namespace = tokio::time::timeout_at(
             establishment_deadline,
@@ -208,6 +224,8 @@ pub(crate) async fn connect(establishment_deadline: Instant) -> Result<UdsConnec
         match attempt {
             Ok(Ok(connection)) => return Ok(connection),
             Ok(Err(error)) if error.code() == "marker_identity" => {
+                #[cfg(test)]
+                on_retry(&error);
                 if wait_for_retry(establishment_deadline).await.is_err() {
                     return Err(ReadFailure::pre("establishment_timeout"));
                 }
@@ -982,8 +1000,8 @@ fn anchored_child_path(dir: RawFd, child: &str) -> Result<PathBuf, ReadFailure> 
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct FileIdentity {
-    device: u64,
-    inode: u64,
+    device: libc::dev_t,
+    inode: libc::ino_t,
 }
 
 #[derive(Clone, Copy)]
@@ -1179,6 +1197,116 @@ fn errno() -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_read_retries_an_observed_publication_then_renders_the_published_session() {
+        use crate::cli::runtime_read::{
+            exchange_stream, ExpectedPeer, ReadRequestSource, ScopedCommand,
+        };
+        use std::os::unix::fs::OpenOptionsExt;
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        let (_base, _env) = crate::server::test_support::trusted_namespace()
+            .expect("a private ancestor chain exists");
+        let mut row = crate::session::Instance::new("after publication", "/repo");
+        row.source_profile = "main".into();
+        row.tool = "claude".into();
+        row.command = "agent --retry-proof".into();
+        row.created_at = "2026-01-02T03:04:05Z".parse().unwrap();
+        let id = row.id.clone();
+        crate::server::test_support::seed_instances_on_disk_for_test("main", vec![row.clone()]);
+        let state = crate::server::test_support::build_test_app_state(vec![row]);
+        crate::server::test_support::accept_runtime_read_cache_for_test(&state).await;
+        let app = crate::session::get_app_dir().unwrap();
+        let publishing = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(app.join(LOCK_FILE))
+            .unwrap();
+        assert_eq!(
+            unsafe { libc::flock(publishing.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        for artifact in [PREBIND_FILE, POSTBIND_FILE, SOCKET_FILE] {
+            assert!(!app.join(artifact).exists());
+        }
+        let mut observed = 0;
+        let mut server = None;
+        let connection = connect_inner(Instant::now() + Duration::from_secs(10), |error| {
+            assert_eq!(error.code(), "marker_identity");
+            observed += 1;
+            assert_eq!(observed, 1);
+            assert_eq!(
+                unsafe { libc::flock(publishing.as_raw_fd(), libc::LOCK_UN) },
+                0
+            );
+            let published = crate::server::runtime_uds::publish().unwrap();
+            server = Some(tokio::spawn(crate::server::runtime_uds::serve(
+                state.clone(),
+                published,
+            )));
+        })
+        .await
+        .expect("the same invocation retries after publication");
+        assert_eq!(observed, 1);
+        let exchange = connection
+            .upgrade(
+                "ws://localhost/api/runtime/ws"
+                    .into_client_request()
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let UdsExchange {
+            stream,
+            identity,
+            home,
+            deadline,
+            _admission,
+        } = exchange;
+        let source = ReadRequestSource {
+            explicit_url: None,
+            env_url: None,
+            token: None,
+            explicit_profile: Some("main".into()),
+            env_profile: None,
+        };
+        let args = crate::cli::list::ListArgs {
+            json: true,
+            all: false,
+            state: crate::cli::list::StateFilter::All,
+        };
+        let projection = exchange_stream(
+            stream,
+            deadline,
+            ExpectedPeer::Local(identity),
+            Some(&home),
+            ScopedCommand::List(&args),
+            &source,
+        )
+        .await
+        .unwrap();
+        let rows: serde_json::Value = serde_json::from_str(&projection.stdout).unwrap();
+        assert_eq!(
+            rows,
+            serde_json::json!([{
+                "id": id, "title": "after publication", "path": "/repo", "group": "",
+                "tool": "claude", "command": "agent --retry-proof", "profile": "main",
+                "state": "live", "created_at": "2026-01-02T03:04:05Z", "workspace_repos": []
+            }])
+        );
+        drop(_admission);
+        state.shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(5), server.unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        for artifact in [PREBIND_FILE, POSTBIND_FILE, SOCKET_FILE] {
+            assert!(!app.join(artifact).exists());
+        }
+    }
 
     #[test]
     fn a_remembered_temporary_that_disappears_is_retryable_but_bad_mode_is_not() {

@@ -202,16 +202,16 @@ fn check_auth_gate(
 
 /// systemd `Type=notify` readiness. No-op unless `NOTIFY_SOCKET` is set.
 #[cfg(unix)]
-fn notify_ready(status: &str) {
-    use sd_notify::NotifyState;
-    if let Err(e) = sd_notify::notify(&[NotifyState::Ready, NotifyState::Status(status)]) {
+fn notify_ready(addr: &str) {
+    let message = format!("READY=1\nSTATUS=listening on {addr}\n");
+    if let Err(e) = crate::process::notify_systemd(message.as_bytes()) {
         tracing::warn!(target: "serve.lifecycle", "sd_notify READY failed: {e}");
     }
 }
 
 #[cfg(unix)]
 fn notify_stopping() {
-    let _ = sd_notify::notify(&[sd_notify::NotifyState::Stopping]);
+    let _ = crate::process::notify_systemd(b"STOPPING=1\n");
 }
 
 #[cfg(not(unix))]
@@ -971,7 +971,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         .await;
     };
 
-    notify_ready(&format!("listening on {addr}"));
+    notify_ready(&addr);
 
     axum::serve(
         listener,
@@ -1156,24 +1156,42 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn notify_ready_sends_ready_and_status_to_notify_socket() {
+    fn notifications_send_ready_status_and_stopping_to_notify_socket() {
+        use std::os::unix::net::UnixDatagram;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("notify.sock");
-        let socket = std::os::unix::net::UnixDatagram::bind(&path).unwrap();
-        socket
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
-        let _env =
-            crate::session::test_support::EnvGuard::set(&[("NOTIFY_SOCKET", path.as_os_str())]);
-
-        notify_ready("listening on 127.0.0.1:1");
-
-        let mut buf = [0u8; 256];
-        let n = socket.recv(&mut buf).unwrap();
-        assert_eq!(
-            std::str::from_utf8(&buf[..n]).unwrap(),
-            "READY=1\nSTATUS=listening on 127.0.0.1:1\n"
-        );
+        let destinations = vec![(
+            path.clone().into_os_string(),
+            UnixDatagram::bind(&path).unwrap(),
+        )];
+        #[cfg(target_os = "linux")]
+        let destinations = {
+            use std::os::linux::net::SocketAddrExt;
+            let mut destinations = destinations;
+            let name = format!("aoe-notify-{}", uuid::Uuid::new_v4());
+            let addr = std::os::unix::net::SocketAddr::from_abstract_name(name.as_bytes()).unwrap();
+            destinations.push((
+                std::ffi::OsString::from(format!("@{name}")),
+                UnixDatagram::bind_addr(&addr).unwrap(),
+            ));
+            destinations
+        };
+        for (destination, socket) in destinations {
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let _env = crate::session::test_support::EnvGuard::set(&[(
+                "NOTIFY_SOCKET",
+                destination.as_os_str(),
+            )]);
+            notify_ready("127.0.0.1:1");
+            let mut buf = [0u8; 256];
+            let n = socket.recv(&mut buf).unwrap();
+            assert_eq!(&buf[..n], b"READY=1\nSTATUS=listening on 127.0.0.1:1\n");
+            notify_stopping();
+            let n = socket.recv(&mut buf).unwrap();
+            assert_eq!(&buf[..n], b"STOPPING=1\n");
+        }
     }
 
     /// The sweep fires at its interval, not the next recheck, and a window

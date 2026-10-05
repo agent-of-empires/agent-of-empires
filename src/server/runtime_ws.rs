@@ -140,10 +140,10 @@ enum ReadSocket {
 }
 
 impl ReadSocket {
-    async fn send_text(&mut self, text: &str) -> Result<(), ()> {
+    async fn send_text(&mut self, text: String) -> Result<(), ()> {
         match self {
             ReadSocket::Web(socket) => socket
-                .send(Message::Text(text.to_string().into()))
+                .send(Message::Text(text.into()))
                 .await
                 .map_err(|_| ()),
             ReadSocket::Unix(socket) => socket
@@ -242,11 +242,7 @@ async fn run_read(
     for frame in frames {
         match frame {
             Ok(encoded) => {
-                // Measured on what is about to go out, because that is the
-                // `String` the client's `max_message_size` counts. A frame
-                // past it is refused by the client after this daemon has done
-                // the work to build it, and the only honest alternative to
-                // sending it whole is a partial listing.
+                // Refuse whole frames rather than truncate a listing.
                 if encoded.len() > MESSAGE_LIMIT {
                     tracing::warn!(
                         target: "runtime.ws",
@@ -256,7 +252,7 @@ async fn run_read(
                     socket.close().await;
                     return;
                 }
-                if socket.send_text(&encoded).await.is_err() {
+                if socket.send_text(encoded).await.is_err() {
                     return;
                 }
             }

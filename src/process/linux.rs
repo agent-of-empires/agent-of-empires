@@ -38,6 +38,19 @@ pub(super) fn rename_exclusive(
     result.map_err(std::io::Error::from)
 }
 
+pub(super) fn connect_systemd_socket(
+    socket: &std::os::unix::net::UnixDatagram,
+    destination: &std::ffi::OsStr,
+) -> std::io::Result<()> {
+    use std::os::linux::net::SocketAddrExt;
+    use std::os::unix::ffi::OsStrExt;
+    if let Some(name) = destination.as_bytes().strip_prefix(b"@") {
+        socket.connect_addr(&std::os::unix::net::SocketAddr::from_abstract_name(name)?)
+    } else {
+        socket.connect(destination)
+    }
+}
+
 pub(super) fn collect_pid_tree(pid: u32) -> Vec<u32> {
     let children_map = build_children_map();
     let mut pids = vec![pid];

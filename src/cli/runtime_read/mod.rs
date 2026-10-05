@@ -48,6 +48,7 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::error::{CapacityError, Error as WsError, ProtocolError};
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::protocol::{CloseFrame, Message, WebSocketConfig};
+use tokio_tungstenite::tungstenite::Utf8Bytes;
 
 use self::dto::{
     parse_hello, parse_snapshot, validate_cross_message, validate_hello, validate_snapshot,
@@ -541,11 +542,11 @@ async fn exchange_inner<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let hello_bytes = match read_application(&mut stream).await {
-        Ok(bytes) => bytes,
+    let hello_text = match read_application(&mut stream).await {
+        Ok(text) => text,
         Err(error) => return Err(error),
     };
-    let hello = match parse_hello(&hello_bytes) {
+    let hello = match parse_hello(hello_text.as_bytes()) {
         Ok(hello) => hello,
         Err(HelloParseError::ProtocolVersion) => {
             return Err(ReadFailure::post_no_close("protocol_mismatch"))
@@ -569,11 +570,11 @@ where
         }
     }
 
-    let snapshot_bytes = match read_application(&mut stream).await {
-        Ok(bytes) => bytes,
+    let snapshot_text = match read_application(&mut stream).await {
+        Ok(text) => text,
         Err(error) => return Err(error),
     };
-    let snapshot = match parse_snapshot(&snapshot_bytes) {
+    let snapshot = match parse_snapshot(snapshot_text.as_bytes()) {
         Ok(snapshot) => snapshot,
         Err(()) => {
             return finish_with_close(
@@ -601,13 +602,13 @@ where
 
 async fn read_application<S>(
     stream: &mut tokio_tungstenite::WebSocketStream<S>,
-) -> Result<Vec<u8>, ReadFailure>
+) -> Result<Utf8Bytes, ReadFailure>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     loop {
         match stream.next().await {
-            Some(Ok(Message::Text(text))) => return Ok(text.as_str().as_bytes().to_vec()),
+            Some(Ok(Message::Text(text))) => return Ok(text),
             Some(Ok(Message::Pong(_))) => {}
             Some(Ok(Message::Ping(_))) => {
                 // tungstenite queues exactly one identical Pong and flushes it on the next I/O.

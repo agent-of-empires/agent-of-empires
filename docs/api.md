@@ -18,9 +18,11 @@ Aliases into a real profile reuse its cached sessions. Alias-only external store
 
 For alias-only structured sessions, accepted disk rows determine status. These sessions are not enrolled in the daemon's canonical ACP workers.
 
+A failed pane probe does not overwrite a newer disk generation's terminal status and idle-entered time with an older cached pair. Runtime reachability and detector tracking are not reset solely because the lifecycle generation advances.
+
 Profile inventory, cached session data, group registries and project registries have independent health. A newly observed physical store is not ready until an accepted daemon reload; accepted empty stores are ready too. A session load failure makes affected session reads exit 1 instead of returning incomplete counts or an empty successful result. Repairing the file does not clear that failure until an accepted reload. Transient selector conflicts with retained cached stores also produce a refusal until an accepted reload rather than serving another store's rows. Other healthy profiles and inventory-only reads remain available.
 
-Project listing does not require session or group data. The `global` and `profile` scopes require their respective project registry; `all` retains entries from readable registries, matching the local merged listing. Global project registry reads and explicitly named profile project registry reads do not create app/profile directories. Local empty-profile bootstrap behavior is unchanged.
+Project listing does not require session or group data. The `global` and `profile` scopes require their respective project registry; `all` retains entries from readable registries, matching the local merged listing. Missing or blank registry files represent an empty registry; other read errors mark it unreadable rather than returning a successful empty result. Global project registry reads and explicitly named profile project registry reads do not create app/profile directories. Local empty-profile bootstrap behavior is unchanged.
 
 Profile labels and persisted session titles, commands and group keys retain their original strings, including controls. Group keys are opaque equality keys, not filesystem paths; empty segments and leading or trailing separators are preserved. Alias names and scoped selections still follow the local profile-name grammar; a legacy directory label printed by the picker can remain unreadable for session reads. JSON preserves the values; human output follows local formatting without sanitizing their controls.
 

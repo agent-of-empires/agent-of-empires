@@ -82,6 +82,21 @@ pub(crate) fn rename_exclusive(
     }
 }
 
+#[cfg(unix)]
+pub(crate) fn notify_systemd(message: &[u8]) -> std::io::Result<()> {
+    let Some(destination) = std::env::var_os("NOTIFY_SOCKET").filter(|path| !path.is_empty())
+    else {
+        return Ok(());
+    };
+    let socket = std::os::unix::net::UnixDatagram::unbound()?;
+    socket.set_nonblocking(true)?;
+    #[cfg(target_os = "linux")]
+    platform::connect_systemd_socket(&socket, &destination)?;
+    #[cfg(not(target_os = "linux"))]
+    socket.connect(&destination)?;
+    socket.send(message).map(|_| ())
+}
+
 /// Only use this when output is not piped: a full pipe can wedge the child. Prefer
 /// [`run_with_timeout`].
 pub fn wait_with_timeout(

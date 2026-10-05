@@ -158,7 +158,7 @@ pub struct SessionService {
     /// Per-session persist locks for `mutate_instance_persisted`, held across snapshot AND
     /// disk write so the two cannot be reordered.
     persist_locks: RwLock<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
-    /// Shared by queue transactions, exclusive for disk sampling and reload application.
+    /// Shared by mirrored mutations, exclusive for disk sampling and reload application.
     reload_gate: Arc<RwLock<()>>,
     /// Per-session prompt-submission locks.
     prompt_locks: RwLock<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
@@ -859,6 +859,11 @@ impl SessionService {
     /// Hold through epoch sampling and disk load, or through reload application.
     pub(super) async fn disk_reload_guard(&self) -> tokio::sync::OwnedRwLockWriteGuard<()> {
         Arc::clone(&self.reload_gate).write_owned().await
+    }
+
+    /// Exclude disk sampling and reload application through a mirrored mutation.
+    pub(super) async fn disk_mutation_guard(&self) -> tokio::sync::OwnedRwLockReadGuard<()> {
+        Arc::clone(&self.reload_gate).read_owned().await
     }
 
     /// Apply `mutate` to a session's in-memory `Instance`, then mirror the resulting state

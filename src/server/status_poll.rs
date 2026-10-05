@@ -146,7 +146,7 @@ pub(super) async fn status_poll_loop(state: Arc<AppState>) {
     loop {
         interval.tick().await;
 
-        let (prev, prev_tracking, supplementary_prev) = {
+        let (mut prev, prev_tracking, supplementary_prev) = {
             let instances = state.instances.read().await;
             let cache = state
                 .runtime_read_cache
@@ -183,10 +183,7 @@ pub(super) async fn status_poll_loop(state: Arc<AppState>) {
         let suppressed_ids =
             crate::session::recovery::snapshot_recently_restarted(&state.recently_restarted);
         let file_watch_for_poll = state.file_watch.clone();
-        // Seed each freshly-disk-loaded instance's live status baseline from `prev` (the
-        // true previous-tick live status) rather than letting `update_status_with_metadata`
-        // fall back to comparing against its own possibly-stale disk-loaded `status`.
-        let prev_for_poll = prev.clone();
+        // Reuse a terminal baseline only within its lifecycle generation.
         let snapshot_guard = state.session_service.disk_reload_guard().await;
         let read_epoch = state
             .mutation_epoch
@@ -206,7 +203,8 @@ pub(super) async fn status_poll_loop(state: Arc<AppState>) {
             }
             apply_tick_status_decisions(
                 &mut loaded.instances,
-                &prev_for_poll,
+                &mut prev,
+                &prev_tracking,
                 &suppressed_ids,
                 pane_metadata.as_ref().ok(),
             );
@@ -215,11 +213,11 @@ pub(super) async fn status_poll_loop(state: Arc<AppState>) {
                 &supplementary_prev,
                 pane_metadata.as_ref().ok(),
             );
-            (loaded, live_structured_worker_records())
+            (loaded, live_structured_worker_records(), prev)
         })
         .await;
 
-        if let Ok((mut loaded, live_worker_records)) = updated {
+        if let Ok((mut loaded, live_worker_records, prev)) = updated {
             let instances = &mut loaded.instances;
             // Diff BEFORE `reload_state_instances_from_disk`.
             let now = chrono::Utc::now();

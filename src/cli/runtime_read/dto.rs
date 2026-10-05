@@ -1324,16 +1324,20 @@ mod tests {
 
         let mut foreign = child.clone();
         foreign.profile = "other".into();
+        foreign.parent_session_id = None;
         value.profiles.push(ProfileRead {
             name: "other".into(),
             listed: true,
             aliases: vec![],
             groups: vec![],
-            projects: vec![],
+            projects: value.profiles[0].projects.clone(),
             health: health(),
         });
         value.health.profiles.insert("other".into(), health());
         value.sessions = vec![base, foreign];
+        value.sessions[0].parent_session_id = None;
+        assert_eq!(validate_snapshot(&value), Ok(()));
+        value.sessions[0].parent_session_id = Some("b".into());
         assert_eq!(
             validate_snapshot(&value),
             Err("schema_invalid"),

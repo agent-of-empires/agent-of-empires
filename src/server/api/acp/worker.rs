@@ -300,10 +300,7 @@ async fn check_switch_target(
     Ok(from_agent)
 }
 
-/// Record the new backend in memory and on disk from one mutation, so the two
-/// cannot drift. Nothing adapter-specific survives the change: the ACP session
-/// id, the pending import, the effort pick and the model are the new agent's to
-/// resolve, which is the rule `Instance::swap_tool` already applies.
+/// Persist the backend and model together, clearing adapter-specific resume state.
 async fn persist_agent_switch(
     state: &AppState,
     profile: &str,
@@ -311,6 +308,7 @@ async fn persist_agent_switch(
     target: &str,
     model: Option<&str>,
 ) {
+    let _reload = state.session_service.disk_mutation_guard().await;
     let switch = |inst: &mut crate::session::Instance| {
         inst.agent_name = Some(target.to_string());
         inst.acp_session_id = None;
@@ -322,6 +320,9 @@ async fn persist_agent_switch(
         let mut instances = state.instances.write().await;
         if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
             switch(inst);
+            state
+                .mutation_epoch
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
     }
     match crate::session::Storage::new(profile, state.file_watch.clone()) {
@@ -688,6 +689,130 @@ mod tests {
     use crate::acp::agent_policy::AgentPolicy;
     use crate::acp::state::RateLimitInfo;
 
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn selectors_wait_for_a_provider_switch_before_choosing_the_worker() {
+        use super::super::config::{
+            acp_set_config_option, acp_set_mode, SetConfigOptionRequest, SetModeRequest,
+        };
+        use std::future::Future;
+        use std::task::Poll;
+
+        for legacy_mode in [false, true] {
+            let _home = crate::session::test_support::isolate_app_dir();
+            let mut row = crate::session::Instance::new("provider ordering", "/repo");
+            row.source_profile = "default".into();
+            row.view = crate::session::View::Structured;
+            row.agent_name = Some("claude".into());
+            row.agent_provider = Some("anthropic".into());
+            row.agent_model = Some("old-provider-model".into());
+            let id = row.id.clone();
+            crate::server::test_support::seed_instances_on_disk_for_test(
+                "default",
+                vec![row.clone()],
+            );
+            let state = crate::server::test_support::build_test_app_state(vec![row]);
+            let old_commands = state
+                .acp_supervisor
+                .test_insert_worker_cmd_recording(&id)
+                .await;
+            let switching = state
+                .session_service
+                .prompt_submission_for_session(&id)
+                .await
+                .unwrap();
+            let mut claims = state.session_service.watch_submission_claims();
+            let mut selecting = Box::pin(async {
+                if legacy_mode {
+                    acp_set_mode(
+                        State(state.clone()),
+                        Path(id.clone()),
+                        Ok(Json(SetModeRequest {
+                            mode_id: "plan".into(),
+                        })),
+                    )
+                    .await
+                    .into_response()
+                } else {
+                    acp_set_config_option(
+                        State(state.clone()),
+                        Path(id.clone()),
+                        Ok(Json(SetConfigOptionRequest {
+                            config_id: "model".into(),
+                            value: "new-provider-model".into(),
+                        })),
+                    )
+                    .await
+                    .into_response()
+                }
+            });
+            std::future::poll_fn(|cx| {
+                assert!(
+                    selecting.as_mut().poll(cx).is_pending(),
+                    "the provider switch still owns submission"
+                );
+                Poll::Ready(())
+            })
+            .await;
+            assert_eq!(
+                tokio::time::timeout(std::time::Duration::from_secs(5), claims.recv())
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some(id.as_str())
+            );
+            state.acp_supervisor.test_flush_worker_commands(&id).await;
+            assert!(
+                old_commands.lock().unwrap().is_empty(),
+                "no selection may reach the old provider"
+            );
+            state
+                .acp_supervisor
+                .shutdown_and_wait(&id, std::time::Duration::from_secs(5))
+                .await
+                .unwrap();
+            persist_provider_switch(&state, "default", &id, "vertex")
+                .await
+                .unwrap();
+            let new_commands = state
+                .acp_supervisor
+                .test_insert_worker_cmd_recording(&id)
+                .await;
+            drop(switching);
+            let response = tokio::time::timeout(std::time::Duration::from_secs(5), selecting)
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::ACCEPTED);
+            state.acp_supervisor.test_flush_worker_commands(&id).await;
+            let command = if legacy_mode {
+                "set_mode"
+            } else {
+                "set_config_option"
+            };
+            assert!(!old_commands.lock().unwrap().contains(&command));
+            assert_eq!(*new_commands.lock().unwrap(), [command]);
+            let live = find_instance(&state, &id).await.unwrap();
+            let disk = crate::server::test_support::load_instances_from_disk_for_test("default");
+            let stored = disk.iter().find(|row| row.id == id).unwrap();
+            for row in [&live, stored] {
+                assert_eq!(row.agent_provider.as_deref(), Some("vertex"));
+                assert_eq!(
+                    row.agent_model.as_deref(),
+                    Some(if legacy_mode {
+                        PROVIDER_DEFAULT_MODEL
+                    } else {
+                        "new-provider-model"
+                    })
+                );
+            }
+            state
+                .acp_supervisor
+                .shutdown_and_wait(&id, std::time::Duration::from_secs(5))
+                .await
+                .unwrap();
+        }
+    }
+
     /// Both stores get the switch, and nothing adapter-specific survives it.
     #[tokio::test]
     #[serial_test::serial]
@@ -711,7 +836,19 @@ mod tests {
             );
             let state = crate::server::test_support::build_test_app_state(vec![inst]);
 
+            let read_epoch = state
+                .mutation_epoch
+                .load(std::sync::atomic::Ordering::SeqCst);
+            let stale = crate::server::reload::load_all_instances(&state.file_watch);
             persist_agent_switch(&state, profile, &id, "codex", requested).await;
+            crate::server::reload::reload_state_instances_from_disk(
+                &state,
+                stale,
+                vec![],
+                crate::server::state::StatusSource::DiskOnly,
+                read_epoch,
+            )
+            .await;
 
             let on_disk = crate::server::test_support::load_instances_from_disk_for_test(profile);
             let stored = on_disk.iter().find(|i| i.id == id).expect("seeded row");
