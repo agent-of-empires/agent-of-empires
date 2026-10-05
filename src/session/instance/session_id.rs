@@ -42,7 +42,9 @@ fn opencode_generation(
     execution: Option<&super::execution::NativeExecution>,
 ) -> crate::agents::AgentGeneration {
     match execution {
-        Some(execution) => super::execution::agent_generation(execution.agent, Some(execution)),
+        Some(execution) => {
+            super::execution::agent_generation(execution.agent, Some(&execution.program))
+        }
         None => crate::agents::get_agent("opencode").map_or(
             crate::agents::AgentGeneration::Current,
             crate::agents::AgentDef::detected_generation,
@@ -735,7 +737,10 @@ impl Instance {
             // Without an execution the descriptor only names the binary, so the
             // shared helper resolves it through `PATH` rather than a bare name
             // no probe can canonicalize.
-            let generation = super::execution::agent_generation(agent, execution);
+            let generation = super::execution::agent_generation(
+                agent,
+                execution.map(|execution| execution.program.as_path()),
+            );
             if matches!(
                 agent.fork_strategy.resolve(generation),
                 crate::agents::ForkStrategy::ServeFork

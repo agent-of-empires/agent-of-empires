@@ -1213,15 +1213,15 @@ fn opencode_session_row(
     Ok(None)
 }
 
-/// The generation the build this launch runs speaks: the resolved program when
-/// the launch has one, otherwise the binary `PATH` resolves for the descriptor.
-/// Every consumer reads it here so the two cannot drift apart.
+/// The generation the build this launch runs speaks: the launch's resolved
+/// program when it has one, otherwise the binary `PATH` resolves for the
+/// descriptor. Every consumer reads it here so the two cannot drift apart.
 pub(super) fn agent_generation(
     agent: &'static crate::agents::AgentDef,
-    execution: Option<&NativeExecution>,
+    program: Option<&std::path::Path>,
 ) -> crate::agents::AgentGeneration {
-    match execution {
-        Some(execution) => crate::agents::agent_generation_for(agent, &execution.program),
+    match program {
+        Some(program) => crate::agents::agent_generation_for(agent, program),
         None => agent.detected_generation(),
     }
 }

@@ -146,9 +146,8 @@ impl ServeClient {
 
     /// Asks the store for a child of `parent_id`. The id it returns replaces the
     /// one AoE pre-pinned, because only the store knows which conversation the
-    /// child continues.
-    /// Asks the store for a child of `parent_id`. 1.x serves this route
-    /// unprefixed, so the path follows the generation rather than being guessed.
+    /// child continues. 1.x serves this route unprefixed, so the path follows
+    /// the generation rather than being guessed.
     async fn fork_session(&self, parent_id: &str, generation: AgentGeneration) -> Result<String> {
         let path = match generation {
             AgentGeneration::Current => format!("/api/session/{parent_id}/fork"),

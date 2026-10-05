@@ -350,7 +350,7 @@ impl Instance {
                 container: execution.inputs.container,
             });
             let generation =
-                crate::agents::agent_generation_for(execution.agent, &execution.program);
+                super::execution::agent_generation(execution.agent, Some(&execution.program));
             let native_mints_child = matches!(
                 prepared.expected_conversation.intent,
                 ResumeIntent::Fork { .. }
