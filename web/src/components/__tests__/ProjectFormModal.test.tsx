@@ -107,6 +107,22 @@ describe("ProjectFormModal", () => {
     );
   });
 
+  it("sends the container-start override in the create payload only when it is set", async () => {
+    mockCreate.mockResolvedValue({ ok: true });
+    render(<ProjectFormModal onClose={() => {}} onSaved={() => {}} />);
+
+    fireEvent.change(screen.getByPlaceholderText("/path/to/repo"), { target: { value: "/repo/extra" } });
+    const sandboxSelect = screen.getByText("Start in container by default").nextElementSibling as HTMLSelectElement;
+    fireEvent.change(sandboxSelect, { target: { value: "off" } });
+    fireEvent.click(screen.getByRole("button", { name: "Add" }));
+
+    await waitFor(() =>
+      expect(mockCreate).toHaveBeenCalledWith(
+        expect.objectContaining({ overrides: expect.objectContaining({ sandbox_enabled: false }) }),
+      ),
+    );
+  });
+
   it("PATCHes with exactly 3 arguments when overrides are left at 'Use global default' in edit mode", async () => {
     mockUpdate.mockResolvedValue({ ok: true });
     render(
@@ -141,6 +157,30 @@ describe("ProjectFormModal", () => {
       expect(mockUpdate).toHaveBeenCalledWith("extra", "global", "develop", {
         worktree_enabled: false,
         smart_rename: null,
+        sandbox_enabled: null,
+      }),
+    );
+  });
+
+  it("PATCHes the sandbox override when start-in-container is switched to On in edit mode", async () => {
+    mockUpdate.mockResolvedValue({ ok: true });
+    render(
+      <ProjectFormModal
+        initial={{ name: "extra", path: "/repo/extra", scope: "global", pinned: false }}
+        onClose={() => {}}
+        onSaved={() => {}}
+      />,
+    );
+
+    const sandboxSelect = screen.getByText("Start in container by default").nextElementSibling as HTMLSelectElement;
+    fireEvent.change(sandboxSelect, { target: { value: "on" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(() =>
+      expect(mockUpdate).toHaveBeenCalledWith("extra", "global", null, {
+        worktree_enabled: null,
+        smart_rename: null,
+        sandbox_enabled: true,
       }),
     );
   });

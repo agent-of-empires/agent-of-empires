@@ -1,4 +1,5 @@
-import type { AgentInfo, GroupInfo, ProfileInfo } from "../../lib/types";
+import type { AgentInfo, GroupInfo, ProfileInfo, ProjectOverrides } from "../../lib/types";
+import { normalizeProjectPathKey } from "../../lib/registeredProjects";
 import { slugifyBranch } from "./sessionNames";
 
 export interface WizardData {
@@ -11,6 +12,12 @@ export interface WizardData {
   profileWorktreeDefault: boolean;
   /** The selected saved project's worktree override; outranks `profileWorktreeDefault`. */
   projectWorktreeOverride: boolean | undefined;
+  /** Profile-resolved sandbox default, independent of any project override. */
+  profileSandboxDefault: boolean;
+  /** The selected saved project's sandbox override; outranks `profileSandboxDefault`. */
+  projectSandboxOverride: boolean | undefined;
+  /** Set only by a direct `sandboxEnabled` edit, so a project override seed does not clobber it. */
+  sandboxDirty: boolean;
   /** Set only by a direct `useWorktree` edit, so an unrelated profile-field edit does not block
    *  a project override seed. */
   worktreeDirty: boolean;
@@ -85,7 +92,7 @@ export type Action =
       skipIfDirty?: boolean;
     }
   /** `path`, when set, drops the seed if the selected path has since changed. */
-  | { type: "SEED_PROJECT_WORKTREE_OVERRIDE"; override: boolean | undefined; path?: string };
+  | { type: "SEED_PROJECT_OVERRIDES"; overrides: ProjectOverrides | undefined; path?: string };
 
 export const initialData: WizardData = {
   path: "",
@@ -96,6 +103,9 @@ export const initialData: WizardData = {
   useWorktree: false,
   profileWorktreeDefault: false,
   projectWorktreeOverride: undefined,
+  profileSandboxDefault: false,
+  projectSandboxOverride: undefined,
+  sandboxDirty: false,
   worktreeDirty: false,
   attachExisting: false,
   baseBranch: "",
@@ -139,7 +149,11 @@ function setField(data: WizardData, field: string, value: unknown): WizardData {
       useWorktree: false,
       pathIsGitRepo: true,
       importAcpSessionId: "",
+      // The project's overrides leave with it; only a manual sandbox choice outlives it.
+      projectWorktreeOverride: undefined,
+      projectSandboxOverride: undefined,
     });
+    if (!data.sandboxDirty) next.sandboxEnabled = data.profileSandboxDefault;
   }
   if (
     (field === "path" && typeof value === "string" && value.length > 0) ||
@@ -153,6 +167,7 @@ function setField(data: WizardData, field: string, value: unknown): WizardData {
   if (field === "pathIsGitRepo" && value === false) next.useWorktree = false;
   if (PROFILE_FIELDS.includes(field)) next.profileDirty = true;
   if (field === "useWorktree") next.worktreeDirty = true;
+  if (field === "sandboxEnabled") next.sandboxDirty = true;
   if (field === "useStructuredView") next.structuredViewDirty = true;
   return next;
 }
@@ -172,20 +187,28 @@ export function reducer(state: WizardState, action: Action): WizardState {
   switch (action.type) {
     case "SET_FIELD":
       return { ...state, data: setField(state.data, action.field, action.value), error: null };
-    case "SEED_PROJECT_WORKTREE_OVERRIDE": {
-      // A manual worktree toggle wins; still record the override for a later profile reset.
-      if (action.path !== undefined && action.path !== state.data.path) return state;
-      const projectWorktreeOverride = action.override;
-      if (state.data.worktreeDirty) {
-        return { ...state, data: { ...state.data, projectWorktreeOverride } };
-      }
-      const useWorktree =
-        state.data.scratch || state.data.pathIsGitRepo === false
+    case "SEED_PROJECT_OVERRIDES": {
+      // A manual toggle wins; still record the override for a later profile reset.
+      // Same path identity as the registry lookup: `/repo/` and `/repo` are one project.
+      if (
+        action.path !== undefined &&
+        normalizeProjectPathKey(action.path) !== normalizeProjectPathKey(state.data.path)
+      )
+        return state;
+      const projectWorktreeOverride = action.overrides?.worktree_enabled;
+      const projectSandboxOverride = action.overrides?.sandbox_enabled;
+      const { data } = state;
+      const useWorktree = data.worktreeDirty
+        ? data.useWorktree
+        : data.scratch || data.pathIsGitRepo === false
           ? false
-          : (projectWorktreeOverride ?? state.data.profileWorktreeDefault);
+          : (projectWorktreeOverride ?? data.profileWorktreeDefault);
+      const sandboxEnabled = data.sandboxDirty
+        ? data.sandboxEnabled
+        : (projectSandboxOverride ?? data.profileSandboxDefault);
       return {
         ...state,
-        data: { ...state.data, projectWorktreeOverride, useWorktree },
+        data: { ...data, projectWorktreeOverride, projectSandboxOverride, useWorktree, sandboxEnabled },
       };
     }
     case "SUBMIT_START":
@@ -221,7 +244,11 @@ export function reducer(state: WizardState, action: Action): WizardState {
             ...state.data,
             useStructuredView,
             profileWorktreeDefault: action.worktreeEnabled,
+            profileSandboxDefault: action.sandboxEnabled,
             useWorktree: state.data.worktreeDirty ? state.data.useWorktree : resolvedUseWorktree(),
+            sandboxEnabled: state.data.sandboxDirty
+              ? state.data.sandboxEnabled
+              : (state.data.projectSandboxOverride ?? state.data.sandboxEnabled),
           },
         };
       }
@@ -230,7 +257,8 @@ export function reducer(state: WizardState, action: Action): WizardState {
         data: {
           ...state.data,
           yoloMode: action.yoloMode,
-          sandboxEnabled: action.sandboxEnabled,
+          sandboxEnabled: state.data.projectSandboxOverride ?? action.sandboxEnabled,
+          profileSandboxDefault: action.sandboxEnabled,
           useWorktree: resolvedUseWorktree(),
           profileWorktreeDefault: action.worktreeEnabled,
           tool: action.tool || state.data.tool,
@@ -241,6 +269,7 @@ export function reducer(state: WizardState, action: Action): WizardState {
           structuredViewDirty: action.resetStructuredViewDirty ? false : state.data.structuredViewDirty,
           profileDirty: false,
           worktreeDirty: false,
+          sandboxDirty: false,
         },
       };
     }

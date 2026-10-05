@@ -31,8 +31,10 @@ export function ProjectFormModal({ initial, onClose, onSaved }: Props) {
     v === true ? "on" : v === false ? "off" : "inherit";
   const initialWorktreeChoice = overrideChoiceFrom(initial?.overrides?.worktree_enabled);
   const initialSmartRenameChoice = overrideChoiceFrom(initial?.overrides?.smart_rename);
+  const initialSandboxChoice = overrideChoiceFrom(initial?.overrides?.sandbox_enabled);
   const [worktreeOverride, setWorktreeOverride] = useState<OverrideChoice>(initialWorktreeChoice);
   const [smartRenameOverride, setSmartRenameOverride] = useState<OverrideChoice>(initialSmartRenameChoice);
+  const [sandboxOverride, setSandboxOverride] = useState<OverrideChoice>(initialSandboxChoice);
 
   const close = () => {
     if (submitting) return;
@@ -44,12 +46,15 @@ export function ProjectFormModal({ initial, onClose, onSaved }: Props) {
       setSubmitting(true);
       setError(null);
       const overridesChanged =
-        worktreeOverride !== initialWorktreeChoice || smartRenameOverride !== initialSmartRenameChoice;
+        worktreeOverride !== initialWorktreeChoice ||
+        smartRenameOverride !== initialSmartRenameChoice ||
+        sandboxOverride !== initialSandboxChoice;
       const toPatchValue = (c: OverrideChoice): boolean | null => (c === "inherit" ? null : c === "on");
       const result = overridesChanged
         ? await updateProject(initial.name, initial.scope, baseBranch.trim() || null, {
             worktree_enabled: toPatchValue(worktreeOverride),
             smart_rename: toPatchValue(smartRenameOverride),
+            sandbox_enabled: toPatchValue(sandboxOverride),
           })
         : await updateProject(initial.name, initial.scope, baseBranch.trim() || null);
       if (!result.ok) {
@@ -75,6 +80,7 @@ export function ProjectFormModal({ initial, onClose, onSaved }: Props) {
       overrides: {
         worktree_enabled: worktreeOverride === "inherit" ? undefined : worktreeOverride === "on",
         smart_rename: smartRenameOverride === "inherit" ? undefined : smartRenameOverride === "on",
+        sandbox_enabled: sandboxOverride === "inherit" ? undefined : sandboxOverride === "on",
       },
     });
     if (!result.ok) {
@@ -189,6 +195,17 @@ export function ProjectFormModal({ initial, onClose, onSaved }: Props) {
         <select
           value={smartRenameOverride}
           onChange={(e) => setSmartRenameOverride(e.target.value as OverrideChoice)}
+          className="w-full px-3 py-2 text-sm bg-surface-900 border border-surface-700/40 rounded-md text-text-primary focus:outline-none focus:border-brand-600 mb-3"
+        >
+          <option value="inherit">Use global default</option>
+          <option value="on">On</option>
+          <option value="off">Off</option>
+        </select>
+
+        <label className="block text-[12px] text-text-dim mb-1">Start in container by default</label>
+        <select
+          value={sandboxOverride}
+          onChange={(e) => setSandboxOverride(e.target.value as OverrideChoice)}
           className="w-full px-3 py-2 text-sm bg-surface-900 border border-surface-700/40 rounded-md text-text-primary focus:outline-none focus:border-brand-600 mb-4"
         >
           <option value="inherit">Use global default</option>

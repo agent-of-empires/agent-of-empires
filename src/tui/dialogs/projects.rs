@@ -34,8 +34,9 @@ pub struct ProjectsDialog {
     /// Cycles None -> Some(true) -> Some(false) -> None; `None` inherits the configured default.
     add_worktree_override: Option<bool>,
     add_smart_rename_override: Option<bool>,
+    add_sandbox_override: Option<bool>,
     /// 0=path, 1=base-branch, 2=scope, 3=allow-override, 4=worktree-override,
-    /// 5=smart-rename-override.
+    /// 5=smart-rename-override, 6=sandbox-override.
     add_focused: usize,
     error: Option<String>,
     info: Option<String>,
@@ -66,6 +67,7 @@ impl ProjectsDialog {
             add_allow_override: false,
             add_worktree_override: None,
             add_smart_rename_override: None,
+            add_sandbox_override: None,
             add_focused: 0,
             error: None,
             info: None,
@@ -94,6 +96,7 @@ impl ProjectsDialog {
         self.add_allow_override = false;
         self.add_worktree_override = None;
         self.add_smart_rename_override = None;
+        self.add_sandbox_override = None;
         self.add_focused = 0;
         self.error = None;
         self.close_on_add_cancel = close_on_cancel;
@@ -221,11 +224,11 @@ impl ProjectsDialog {
                 DialogResult::Continue
             }
             KeyCode::Tab => {
-                self.add_focused = (self.add_focused + 1) % 6;
+                self.add_focused = (self.add_focused + 1) % 7;
                 DialogResult::Continue
             }
             KeyCode::BackTab => {
-                self.add_focused = (self.add_focused + 5) % 6;
+                self.add_focused = (self.add_focused + 6) % 7;
                 DialogResult::Continue
             }
             KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') if self.add_focused == 2 => {
@@ -271,6 +274,22 @@ impl ProjectsDialog {
                 };
                 DialogResult::Continue
             }
+            KeyCode::Right | KeyCode::Char(' ') if self.add_focused == 6 => {
+                self.add_sandbox_override = match self.add_sandbox_override {
+                    None => Some(true),
+                    Some(true) => Some(false),
+                    Some(false) => None,
+                };
+                DialogResult::Continue
+            }
+            KeyCode::Left if self.add_focused == 6 => {
+                self.add_sandbox_override = match self.add_sandbox_override {
+                    None => Some(false),
+                    Some(false) => Some(true),
+                    Some(true) => None,
+                };
+                DialogResult::Continue
+            }
             KeyCode::Enter => {
                 let path = self.add_input.value().trim().to_string();
                 if path.is_empty() {
@@ -307,6 +326,7 @@ impl ProjectsDialog {
                 let overrides = crate::session::projects::ProjectOverrides {
                     worktree_enabled: self.add_worktree_override,
                     smart_rename: self.add_smart_rename_override,
+                    sandbox_enabled: self.add_sandbox_override,
                 };
                 let project =
                     Project::new(name.clone(), canonical.to_string_lossy(), self.add_scope)
@@ -383,7 +403,7 @@ impl ProjectsDialog {
         let dialog_width: u16 = 76;
         let list_height: u16 = (self.items.len() as u16).clamp(3, 12);
         let adding_extra: u16 = if matches!(self.mode, Mode::Adding) {
-            5
+            6
         } else {
             0
         };
@@ -577,6 +597,23 @@ impl ProjectsDialog {
                         Style::default().fg(theme.accent).bold(),
                     ),
                 ]);
+                let sandbox_label_style = if self.add_focused == 6 {
+                    Style::default().fg(theme.accent).underlined()
+                } else {
+                    Style::default().fg(theme.text)
+                };
+                let sandbox_value = match self.add_sandbox_override {
+                    None => "(use global default)".to_string(),
+                    Some(true) => "on".to_string(),
+                    Some(false) => "off".to_string(),
+                };
+                let sandbox_line = Line::from(vec![
+                    Span::styled("Start in container: ", sandbox_label_style),
+                    Span::styled(
+                        format!("< {} >", sandbox_value),
+                        Style::default().fg(theme.accent).bold(),
+                    ),
+                ]);
                 let mut lines = vec![
                     path_line,
                     base_line,
@@ -584,6 +621,7 @@ impl ProjectsDialog {
                     override_line,
                     worktree_line,
                     smart_rename_line,
+                    sandbox_line,
                 ];
                 if let Some(err) = &self.error {
                     lines.push(Line::from(Span::styled(
@@ -598,7 +636,7 @@ impl ProjectsDialog {
                     height: 1,
                     ..chunks[2]
                 };
-                self.field_rects = (0..6).map(row).collect();
+                self.field_rects = (0..7).map(row).collect();
                 if self.add_focused == 0 {
                     set_prefixed_input_cursor_position(frame, row(0), "Path: ", &self.add_input);
                 } else if self.add_focused == 1 {
@@ -804,6 +842,32 @@ mod tests {
             .expect("project should be saved");
         assert_eq!(project.overrides.worktree_enabled, Some(true));
         assert_eq!(project.overrides.smart_rename, None);
+    }
+
+    #[test]
+    #[serial]
+    fn add_form_sets_sandbox_override_on_submit() {
+        let temp = tempdir().unwrap();
+        let _home = isolate_home(temp.path());
+        let repo = temp.path().join("boxed");
+        std::fs::create_dir_all(&repo).unwrap();
+
+        let mut dialog = ProjectsDialog::new("test");
+        dialog.handle_key(key(KeyCode::Char('a')));
+        dialog.add_input = Input::new(repo.to_string_lossy().to_string());
+        // BackTab from path(0) wraps to the last row, sandbox_override(6).
+        dialog.handle_key(key(KeyCode::BackTab));
+        assert_eq!(dialog.add_focused, 6);
+        dialog.handle_key(key(KeyCode::Left)); // None -> Some(false)
+        dialog.handle_key(key(KeyCode::Enter));
+
+        let saved = crate::session::projects::load_global().expect("load global");
+        let project = saved
+            .iter()
+            .find(|p| p.name == "boxed")
+            .expect("project should be saved");
+        assert_eq!(project.overrides.sandbox_enabled, Some(false));
+        assert_eq!(project.overrides.worktree_enabled, None);
     }
 
     #[test]
