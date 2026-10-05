@@ -41,6 +41,7 @@ fn resolved_yolo(
     agent.yolo.as_ref().map(|yolo| {
         yolo.resolve(super::execution::agent_generation(
             agent,
+            execution.map(|execution| &execution.inputs),
             execution.map(|execution| execution.program.as_path()),
         ))
     })

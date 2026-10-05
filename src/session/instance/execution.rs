@@ -1213,16 +1213,29 @@ fn opencode_session_row(
     Ok(None)
 }
 
-/// The generation the build this launch runs speaks: the launch's resolved
-/// program when it has one, otherwise the binary `PATH` resolves for the
-/// descriptor. Every consumer reads it here so the two cannot drift apart.
+/// The generation the build this launch runs speaks.
+///
+/// The launch's resolved program answers it, but only when that program is a
+/// host binary the probe can actually read: a container's is a path inside the
+/// container, which the host cannot canonicalize, and answering from it would
+/// be an answer with no evidence behind it. `inputs` is what proves the program
+/// is a host one, and `start.rs` has already moved the execution's capture by
+/// the time it asks, so the two are passed apart rather than as the whole.
+/// Every consumer reads it here, and the container's own environment comes from
+/// here too, so the two cannot disagree about one launch.
 pub(super) fn agent_generation(
     agent: &'static crate::agents::AgentDef,
+    inputs: Option<&NativeLaunchInputs>,
     program: Option<&std::path::Path>,
 ) -> crate::agents::AgentGeneration {
-    match program {
-        Some(program) => crate::agents::agent_generation_for(agent, program),
-        None => agent.detected_generation(),
+    let probed = match (inputs, program) {
+        (Some(inputs), Some(program)) => inputs.runs_host_path_binary(agent.binary, program),
+        _ => false,
+    };
+    if probed {
+        crate::agents::agent_generation_for(agent, program.expect("a probed program is present"))
+    } else {
+        agent.detected_generation()
     }
 }
 

@@ -340,6 +340,14 @@ impl Instance {
             self.adopt_conversation_state(canonical);
         }
         if let Some(execution) = prepared.execution.take() {
+            // Resolved before the launch record takes the inputs apart below,
+            // since the answer needs the program's own path and the evidence it
+            // is a host binary.
+            let generation = super::execution::agent_generation(
+                execution.agent,
+                Some(&execution.inputs),
+                Some(&execution.program),
+            );
             let attested = self.attested_claude_store_route(&execution);
             self.active_execution = Some(ActiveExecution {
                 launch_id: execution.inputs.launch_id,
@@ -349,8 +357,6 @@ impl Instance {
                     .or_else(|| omp_capture_metadata.clone().map(CaptureContext::Omp)),
                 container: execution.inputs.container,
             });
-            let generation =
-                super::execution::agent_generation(execution.agent, Some(&execution.program));
             let native_mints_child = matches!(
                 prepared.expected_conversation.intent,
                 ResumeIntent::Fork { .. }

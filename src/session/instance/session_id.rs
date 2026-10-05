@@ -42,9 +42,11 @@ fn opencode_generation(
     execution: Option<&super::execution::NativeExecution>,
 ) -> crate::agents::AgentGeneration {
     match execution {
-        Some(execution) => {
-            super::execution::agent_generation(execution.agent, Some(&execution.program))
-        }
+        Some(execution) => super::execution::agent_generation(
+            execution.agent,
+            Some(&execution.inputs),
+            Some(&execution.program),
+        ),
         None => crate::agents::get_agent("opencode").map_or(
             crate::agents::AgentGeneration::Current,
             crate::agents::AgentDef::detected_generation,
@@ -372,13 +374,8 @@ impl Instance {
                 self.project_path.clone()
             }
         };
-        let child = crate::session::capture::fork_opencode_session_id(
-            &cwd,
-            command,
-            parent_id,
-            opencode_generation(execution),
-        )
-        .context("the store returned no child for this fork")?;
+        let child = crate::session::capture::fork_opencode_session_id(&cwd, command, parent_id)
+            .context("the store returned no child for this fork")?;
         // The binding is what marks this id as a conversation the store holds,
         // and it is what a later prepare reuses instead of forking again, so it
         // is set on both arms. An unattributed one still records which id the
@@ -739,6 +736,7 @@ impl Instance {
             // no probe can canonicalize.
             let generation = super::execution::agent_generation(
                 agent,
+                execution.map(|execution| &execution.inputs),
                 execution.map(|execution| execution.program.as_path()),
             );
             if matches!(

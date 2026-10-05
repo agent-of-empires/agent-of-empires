@@ -146,16 +146,12 @@ impl ServeClient {
 
     /// Asks the store for a child of `parent_id`. The id it returns replaces the
     /// one AoE pre-pinned, because only the store knows which conversation the
-    /// child continues. 1.x serves this route unprefixed, so the path follows
-    /// the generation rather than being guessed.
-    async fn fork_session(&self, parent_id: &str, generation: AgentGeneration) -> Result<String> {
-        let path = match generation {
-            AgentGeneration::Current => format!("/api/session/{parent_id}/fork"),
-            AgentGeneration::Legacy => format!("/session/{parent_id}/fork"),
-        };
+    /// child continues. Only the current generation reaches here; the older one
+    /// forks through its own root flag.
+    async fn fork_session(&self, parent_id: &str) -> Result<String> {
         let resp = self
             .client
-            .post(format!("{}{path}", self.base))
+            .post(format!("{}/api/session/{parent_id}/fork", self.base))
             .json(&serde_json::json!({}))
             .send()
             .await
@@ -272,7 +268,6 @@ pub(crate) fn fork_opencode_session_id(
     project_path: &str,
     command: std::process::Command,
     parent_id: &str,
-    generation: AgentGeneration,
 ) -> Option<String> {
     let Some(parent_id) = super::validated_session_id(parent_id.to_owned()) else {
         tracing::warn!(target: "session.capture", %parent_id, "refusing to fork an invalid OpenCode session id");
@@ -281,7 +276,7 @@ pub(crate) fn fork_opencode_session_id(
     let project_path = project_path.to_owned();
     with_serve(&project_path, command, move |client| {
         let parent_id = parent_id.clone();
-        Box::pin(async move { client.fork_session(&parent_id, generation).await })
+        Box::pin(async move { client.fork_session(&parent_id).await })
     })
     .map_err(|e| {
         tracing::warn!(target: "session.capture", error = %e, "opencode session fork failed");
@@ -365,14 +360,13 @@ mod tests {
     /// and the id that comes back is the one AoE must adopt.
     #[test]
     fn the_fork_request_names_the_parent_and_returns_the_stored_child() {
-        let generation = AgentGeneration::Current;
         let (handle, port) = serve_once(
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 51\r\n\r\n{\"data\":{\"id\":\"ses_child000000000000000000000000\"}}",
         );
         let child = block_on(
             |client| {
                 let parent = "ses_parent00000000000000000000000".to_string();
-                Box::pin(async move { client.fork_session(&parent, generation).await })
+                Box::pin(async move { client.fork_session(&parent).await })
             },
             port,
         );
@@ -383,33 +377,6 @@ mod tests {
             "{request}"
         );
         assert!(header(&request, "authorization").is_some(), "{request}");
-    }
-
-    /// 1.x serves the fork route without the `/api` prefix, so the path follows
-    /// the generation instead of being guessed.
-    #[test]
-    fn the_fork_path_follows_the_generation() {
-        for (generation, expected) in [
-            (AgentGeneration::Current, "/api/session/ses_parent/fork"),
-            (AgentGeneration::Legacy, "/session/ses_parent/fork"),
-        ] {
-            let (handle, port) = serve_once(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 51\r\n\r\n{\"data\":{\"id\":\"ses_child000000000000000000000000\"}}",
-            );
-            let child = block_on(
-                |client| {
-                    let parent = "ses_parent".to_string();
-                    Box::pin(async move { client.fork_session(&parent, generation).await })
-                },
-                port,
-            );
-            assert!(child.is_ok(), "{generation:?} fork should reach a stub");
-            let request = handle.join().unwrap();
-            assert!(
-                request.starts_with(&format!("POST {expected} ")),
-                "{generation:?} posted {request}"
-            );
-        }
     }
 
     /// 1.x exposes no create route under `/api`, so a launch against it must be
@@ -454,9 +421,7 @@ mod tests {
         let result = block_on(
             |client| {
                 let parent = "ses_parent".to_string();
-                Box::pin(
-                    async move { client.fork_session(&parent, AgentGeneration::Current).await },
-                )
+                Box::pin(async move { client.fork_session(&parent).await })
             },
             port,
         );
