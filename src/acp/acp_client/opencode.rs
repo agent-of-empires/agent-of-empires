@@ -4,8 +4,10 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-/// OpenCode 2.x: the role is a column and the error node is flat.
-const V2_ERROR_SQL: &str = "SELECT json_extract(data, '$.error.message')
+/// OpenCode 2.x: the role is a column, the creation time too, and the error
+/// node is flat. The creation time is returned so the two layouts can be
+/// compared against each other.
+const V2_ERROR_SQL: &str = "SELECT time_created, json_extract(data, '$.error.message')
      FROM session_message
      WHERE session_id = ?1
        AND type = 'assistant'
@@ -16,7 +18,8 @@ const V2_ERROR_SQL: &str = "SELECT json_extract(data, '$.error.message')
 
 /// OpenCode 1.x: the role and the creation time live inside the payload, and
 /// the error node is nested one level deeper.
-const V1_ERROR_SQL: &str = "SELECT json_extract(data, '$.error.data.message')
+const V1_ERROR_SQL: &str = "SELECT CAST(json_extract(data, '$.time.created') AS INTEGER),
+                                 json_extract(data, '$.error.data.message')
      FROM message
      WHERE session_id = ?1
        AND json_extract(data, '$.role') = 'assistant'
@@ -89,24 +92,30 @@ pub(super) fn recover_opencode_prompt_error_from_sqlite_at(
     // column and the error node sits at `$.error.message` instead of
     // `$.error.data.message`. The table name tracks the build channel rather
     // than the version, and a migrated store carries both tables at once, so
-    // each layout is read with its own statement and a statement that finds no
-    // row hands over to the next rather than ending the search.
+    // each layout is read with its own statement and the newest of what they
+    // find wins: an older error in the v2 table must not hide a newer one in
+    // the v1 table.
+    let mut newest: Option<(i64, String)> = None;
     for sql in [V2_ERROR_SQL, V1_ERROR_SQL] {
         let Ok(mut stmt) = conn.prepare(sql) else {
             continue;
         };
-        let Ok(message) = stmt.query_row(
+        let Ok((created_at, message)) = stmt.query_row(
             rusqlite::params![acp_session_id, prompt_started_at_ms],
-            |row| row.get::<_, String>(0),
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
         ) else {
             continue;
         };
         let trimmed = message.trim();
-        if !trimmed.is_empty() {
-            return Some(trimmed.to_string());
+        if !trimmed.is_empty()
+            && newest
+                .as_ref()
+                .is_none_or(|(seen_at, _)| created_at > *seen_at)
+        {
+            newest = Some((created_at, trimmed.to_string()));
         }
     }
-    None
+    newest.map(|(_, message)| message)
 }
 
 pub(super) fn recover_opencode_prompt_error(
@@ -265,6 +274,71 @@ mod tests {
         assert_eq!(
             recover_opencode_prompt_error_from_sqlite_at(&db_path, "ses-1", 100).as_deref(),
             Some("new error")
+        );
+    }
+
+    /// A migrated store carries both layouts. The newest error wins even when the
+    /// v2 table is consulted first, or an older v2 row would mask the v1 one.
+    #[test]
+    fn recover_opencode_prompt_error_takes_the_newest_across_both_layouts() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("opencode.db");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, \
+             type TEXT NOT NULL, seq INTEGER NOT NULL, time_created INTEGER NOT NULL, \
+             time_updated INTEGER NOT NULL, data TEXT NOT NULL);\
+             CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, \
+             time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, data TEXT NOT NULL);",
+        )
+        .unwrap();
+        let flat = |at: i64, text: &str| {
+            serde_json::json!({
+                "time": { "created": at },
+                "error": { "message": text },
+            })
+        };
+        let nested = |at: i64, text: &str| {
+            serde_json::json!({
+                "role": "assistant",
+                "time": { "created": at },
+                "error": { "data": { "message": text } },
+            })
+        };
+        for (table, id, data) in [
+            ("session_message", "m-v2-old", flat(110, "older v2 error")),
+            ("session_message", "m-v2-new", flat(130, "newer v2 error")),
+            ("message", "m-v1", nested(120, "v1 error")),
+        ] {
+            let at: i64 = match id {
+                "m-v2-old" => 110,
+                "m-v1" => 120,
+                _ => 130,
+            };
+            if table == "session_message" {
+                conn.execute(
+                    "INSERT INTO session_message VALUES (?1, 'ses-1', 'assistant', 1, ?2, ?2, ?3)",
+                    rusqlite::params![id, at, data.to_string()],
+                )
+                .unwrap();
+            } else {
+                conn.execute(
+                    "INSERT INTO message VALUES (?1, 'ses-1', ?2, ?2, ?3)",
+                    rusqlite::params![id, at, data.to_string()],
+                )
+                .unwrap();
+            }
+        }
+        assert_eq!(
+            recover_opencode_prompt_error_from_sqlite_at(&db_path, "ses-1", 100).as_deref(),
+            Some("newer v2 error"),
+            "the newest error wins whichever table holds it"
+        );
+        // With the v2 rows removed, the v1 one still answers.
+        conn.execute("DELETE FROM session_message", []).unwrap();
+        assert_eq!(
+            recover_opencode_prompt_error_from_sqlite_at(&db_path, "ses-1", 100).as_deref(),
+            Some("v1 error")
         );
     }
 
