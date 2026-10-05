@@ -32,12 +32,16 @@ function mount(
   configOptions: ConfigOptionDescriptor[],
   pendingConfigOption: AcpState["pendingConfigOption"] = null,
   onSetConfigOption = vi.fn(),
+  provider?: { current?: string | null; pending?: string | null; onSet?: () => void },
 ) {
   const utils = render(
     <SessionConfigControls
       configOptions={configOptions}
       pendingConfigOption={pendingConfigOption}
       onSetConfigOption={onSetConfigOption}
+      provider={provider?.current ?? null}
+      providerPending={provider?.pending ?? null}
+      onSetProvider={provider?.onSet}
     />,
   );
   return { ...utils, onSetConfigOption };
@@ -174,5 +178,76 @@ describe("ConfigOptionSwitchFailedNotice", () => {
     for (const s of ["Model", "Claude Sonnet 4.6", "rate limited"]) expect(text).toContain(s);
     fireEvent.click(screen.getByRole("button", { name: "Dismiss notice" }));
     expect(onDismiss).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("provider picker", () => {
+  it("closes an open picker when a turn starts and cannot submit its previous choices", () => {
+    const onSet = vi.fn();
+    const props = {
+      configOptions: [],
+      pendingConfigOption: null,
+      onSetConfigOption: vi.fn(),
+      provider: "api",
+      onSetProvider: onSet,
+    };
+    const { rerender } = render(<SessionConfigControls {...props} />);
+    fireEvent.click(screen.getByTestId("config-option-aoe-provider"));
+    expect(screen.getByTestId("config-option-aoe-provider-value-vertex")).toBeTruthy();
+    rerender(<SessionConfigControls {...props} providerLockedReason="turn active" />);
+    const choice = screen.queryByTestId("config-option-aoe-provider-value-vertex");
+    if (choice) fireEvent.click(choice);
+    expect(onSet).not.toHaveBeenCalled();
+    expect(screen.queryByRole("menu")).toBeNull();
+    rerender(<SessionConfigControls {...props} />);
+    expect(screen.queryByRole("menu")).toBeNull();
+  });
+  it("is absent for an agent that does not route through a provider", () => {
+    const { container } = mount([MODEL]);
+    expect(screen.queryByTestId("config-option-aoe-provider")).toBeNull();
+    expect(container.firstChild).not.toBeNull();
+  });
+
+  it("renders alone for a Claude session with no adapter options yet", () => {
+    mount([], null, vi.fn(), { onSet: vi.fn() });
+    expect(screen.getByTestId("config-option-aoe-provider")).toBeTruthy();
+  });
+
+  it("posts the picked provider", () => {
+    const onSet = vi.fn();
+    mount([], null, vi.fn(), { current: "api", onSet });
+    fireEvent.click(screen.getByTestId("config-option-aoe-provider"));
+    fireEvent.click(screen.getByTestId("config-option-aoe-provider-value-vertex"));
+    expect(onSet).toHaveBeenCalledWith("vertex");
+  });
+
+  // There is no API for returning to the host default, so the entry naming
+  // that state must not be selectable; the dropdown refuses the current value.
+  it("does not post the host-default entry", () => {
+    const onSet = vi.fn();
+    mount([], null, vi.fn(), { current: null, onSet });
+    fireEvent.click(screen.getByTestId("config-option-aoe-provider"));
+    fireEvent.click(screen.getByTestId("config-option-aoe-provider-value-"));
+    expect(onSet).not.toHaveBeenCalled();
+  });
+
+  it("keeps the picker closed until its pending request settles", () => {
+    const onSet = vi.fn();
+    const props = {
+      configOptions: [],
+      pendingConfigOption: null,
+      onSetConfigOption: vi.fn(),
+      provider: "api",
+      onSetProvider: onSet,
+    };
+    const { rerender } = render(<SessionConfigControls {...props} providerPending="bedrock" />);
+    expect(screen.getByTestId("config-option-aoe-provider").hasAttribute("disabled")).toBe(true);
+    fireEvent.click(screen.getByTestId("config-option-aoe-provider"));
+    expect(screen.queryByRole("menu")).toBeNull();
+    expect(onSet).not.toHaveBeenCalled();
+    rerender(<SessionConfigControls {...props} />);
+    fireEvent.click(screen.getByTestId("config-option-aoe-provider"));
+    fireEvent.click(screen.getByTestId("config-option-aoe-provider-value-vertex"));
+    expect(onSet).toHaveBeenCalledWith("vertex");
   });
 });

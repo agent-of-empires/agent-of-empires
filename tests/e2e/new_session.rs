@@ -1,5 +1,5 @@
 use serial_test::parallel;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::harness::{app_dir_in, require_tmux, TuiTestHarness};
 
@@ -116,6 +116,7 @@ fn test_creating_stub_appears_during_hook_execution() {
     h.spawn_tui();
 
     h.wait_for(" aoe ");
+    h.wait_for("Runtime ready");
 
     // Open new session dialog and fill in the path.
     h.send_keys("n");
@@ -142,6 +143,7 @@ fn test_creating_stub_cancelled_with_ctrl_c() {
     h.spawn_tui();
 
     h.wait_for(" aoe ");
+    h.wait_for("Runtime ready");
 
     // Create a session with a slow hook.
     h.send_keys("n");
@@ -171,6 +173,7 @@ fn test_creating_blocks_second_session_creation() {
     h.spawn_tui();
 
     h.wait_for(" aoe ");
+    h.wait_for("Runtime ready");
 
     // Start creating a session.
     h.send_keys("n");
@@ -205,6 +208,7 @@ fn test_quit_during_creation_shows_confirm() {
     h.spawn_tui();
 
     h.wait_for(" aoe ");
+    h.wait_for("Runtime ready");
 
     // Start creating a session.
     h.send_keys("n");
@@ -278,6 +282,7 @@ fn test_new_session_enters_live_mode_when_configured() {
     h.spawn_tui();
 
     h.wait_for(" aoe ");
+    h.wait_for("Runtime ready");
 
     h.send_keys("n");
     h.wait_for("Title");
@@ -293,6 +298,83 @@ fn test_new_session_enters_live_mode_when_configured() {
     // Sanity: the home view's title chrome is still on screen, meaning
     // the dispatch didn't flip into the tmux attach view.
     h.assert_screen_contains(" aoe ");
+}
+
+/// A `claude` stub whose `--help` lists `--name` and which records any other argv, one
+/// argument per line, so a title split by bad quoting fails here.
+fn install_named_claude_stub(h: &mut TuiTestHarness) -> std::path::PathBuf {
+    let bin = h.install_path_command("claude");
+    let record = h.home_path().join("claude.argv");
+    let record_str = record.to_string_lossy().to_string();
+    assert!(
+        !record_str.contains(['"', '$', '`', '\\']),
+        "record path has shell metacharacters: {record_str}"
+    );
+    std::fs::write(
+        bin.join("claude"),
+        format!(
+            "#!/bin/sh\n\
+             case \"$1\" in --help) printf '  -n, --name <name>  Set a display name\\n'; exit 0;; esac\n\
+             printf '%s\\n' \"$@\" > \"{record_str}\"\n\
+             exit 0\n"
+        ),
+    )
+    .expect("write claude stub");
+    record
+}
+
+/// The launch argv the stub recorded, once it carries `--session-id`.
+fn wait_for_launch_argv(record: &std::path::Path) -> Vec<String> {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if let Ok(content) = std::fs::read_to_string(record) {
+            if content.lines().any(|arg| arg == "--session-id") {
+                return content.lines().map(str::to_string).collect();
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no launch argv recorded at {}",
+            record.display()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// With `session.name_agent_session` on, a title typed in the dialog reaches the agent as one
+/// `--name` argument through the real launch wrapper and login shell.
+#[test]
+#[parallel]
+fn test_a_typed_title_names_the_agent_session() {
+    require_tmux!();
+    let mut h = TuiTestHarness::new("name_agent_session");
+    let record = install_named_claude_stub(&mut h);
+    h.append_config("[session]\ndefault_tool = \"claude\"\nname_agent_session = true");
+    let project = h.project_path();
+    h.spawn_tui();
+    h.wait_for(" aoe ");
+    h.wait_for("Runtime ready");
+
+    let title = "O'Brien's plan";
+    h.send_keys("n");
+    h.wait_for(" New Session ");
+    h.send_keys("C-u");
+    h.type_text(project.to_str().unwrap());
+    h.send_keys("Tab");
+    h.type_text(title);
+    h.wait_for(&format!("Title: {title}"));
+    submit_new_session_dialog(&h);
+
+    let argv = wait_for_launch_argv(&record);
+    let at = argv
+        .iter()
+        .position(|arg| arg == "--name")
+        .unwrap_or_else(|| panic!("no --name in the launch argv: {argv:?}"));
+    assert_eq!(
+        argv.get(at + 1).map(String::as_str),
+        Some(title),
+        "{argv:?}"
+    );
 }
 
 /// `N` opens the form from the row under the cursor: a group row gives its group, a session

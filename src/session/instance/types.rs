@@ -177,6 +177,13 @@ pub struct SandboxInfo {
     /// next container come-up. See `Instance::ensure_before_start_env`.
     #[serde(skip)]
     pub before_start_env: Vec<(String, String)>,
+    /// The provider the container was built for, which decides whether it
+    /// carries the GCP ADC mount. Distinct from `Instance::agent_provider`,
+    /// which is what the session wants: a difference between the two is what
+    /// makes a provider switch recreate the container. `None` is a container
+    /// built before the pick existed, so it matches no explicit pick.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
 }
 
 /// Deserialize agent_session_id, treating empty/whitespace strings as None.

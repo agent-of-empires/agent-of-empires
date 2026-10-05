@@ -534,6 +534,7 @@ fn wizard_create_body(
 ) -> crate::daemon::CreateSessionBody {
     crate::daemon::CreateSessionBody {
         title: Some(data.title.clone()),
+        title_typed: data.title_typed,
         size: None,
         path: data.path.clone(),
         tool: data.tool.clone(),

@@ -218,6 +218,7 @@ fn test_group_has_managed_worktrees_and_containers() {
     let mut sandboxed = Instance::new("box-session", "/tmp/box");
     sandboxed.group_path = "box".to_string();
     sandboxed.sandbox_info = Some(crate::session::SandboxInfo {
+        provider: None,
         enabled: true,
         container_id: None,
         image: "ubuntu:latest".to_string(),

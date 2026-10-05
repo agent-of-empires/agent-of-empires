@@ -6,6 +6,7 @@ use crate::acp::state::Event;
 fn structured_instance(id: &str, idle: bool) -> crate::session::Instance {
     let mut inst = crate::session::Instance::new(id, &format!("/tmp/aoe-{id}"));
     inst.id = id.to_string();
+    inst.source_profile = "default".into();
     inst.view = crate::session::View::Structured;
     if idle {
         inst.status = crate::session::Status::Idle;

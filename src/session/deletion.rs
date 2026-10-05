@@ -532,10 +532,7 @@ impl<S: SessionStore + 'static> PurgeTransaction<S> {
             Ok(())
         });
         if let Err(error) = commit_result {
-            // A failure here may land before or after sessions.json was
-            // replaced, so the row's presence decides whether the recorded
-            // owner is a ghost or the only remaining plan. Releasing an owner
-            // whose row already left disk would strand that plan.
+            // Retain cleanup ownership unless disk proves the row survived.
             let row_still_present = match self.store().load() {
                 Ok(rows) => rows.iter().any(|row| row.id == id),
                 Err(read_error) => {
@@ -547,7 +544,8 @@ impl<S: SessionStore + 'static> PurgeTransaction<S> {
                     false
                 }
             };
-            if row_still_present {
+            let mut message = format!("Failed to commit irreversible session purge: {error}");
+            let retained = if row_still_present {
                 if let Some(owner) = owner {
                     if let Err(release) = owner.release() {
                         tracing::error!(
@@ -557,18 +555,27 @@ impl<S: SessionStore + 'static> PurgeTransaction<S> {
                         );
                     }
                 }
+                match self.release_reservation(std::slice::from_ref(&message)) {
+                    Ok(retained) => retained,
+                    Err(release) => {
+                        message =
+                            format!("{message}; Failed to release purge reservation: {release}");
+                        None
+                    }
+                }
             } else {
                 tracing::warn!(
                     target: "session.deletion",
                     session = %id,
-                    "the purge commit failed after sessions.json dropped the row; keeping the purge owner so recovery can finish the teardown"
+                    "purge commit failed after row removal; retaining cleanup owner"
                 );
-            }
+                None
+            };
             return Err(Box::new(DeletionResult::rejected(
                 id,
                 DeletionDisposition::Failed,
-                format!("Failed to commit irreversible session purge: {error}"),
-                None,
+                message,
+                retained,
             )));
         }
 
@@ -3908,6 +3915,7 @@ mod tests {
             use crate::session::SandboxInfo;
             let mut instance = create_test_instance();
             instance.sandbox_info = Some(SandboxInfo {
+                provider: None,
                 enabled: true,
                 container_id: None,
                 image: "alpine".to_string(),
@@ -4285,6 +4293,7 @@ mod tests {
             // worktree cleanup.
             let mut instance = Instance::new("Test", "/tmp/aoe-deletion-test-nonexistent");
             instance.sandbox_info = Some(SandboxInfo {
+                provider: None,
                 enabled: true,
                 container_id: None,
                 image: "alpine".to_string(),
@@ -5271,6 +5280,7 @@ mod tests {
                 base_branch: None,
             });
             instance.sandbox_info = Some(SandboxInfo {
+                provider: None,
                 enabled: true,
                 container_id: None,
                 image: "alpine".to_string(),

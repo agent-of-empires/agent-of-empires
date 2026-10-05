@@ -50,6 +50,19 @@ Each built-in adapter receives only the provider variables it is known to read f
 
 `vibe`, `pi`, `omp`, and `kimi` have no ambient provider allowlist yet. Custom adapters also receive no ambient provider credentials. Until their variables are verified, give them auth through the per-session `extra_env` field or `environment` in your config, or set `session.inherit_host_environment = true` to forward your whole `aoe serve` environment to non-sandboxed agents. In a sandboxed session the per-adapter provider keys above still cross the container boundary (forwarded as `docker exec -e` flags), but `inherit_host_environment` does not; give a sandboxed not-yet-verified adapter its auth through `sandbox.environment`. Ambient allowlist entries that name a file or directory are host-only and never cross: `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `GOOGLE_APPLICATION_CREDENTIALS`, `AWS_CONFIG_FILE`, `AWS_SHARED_CREDENTIALS_FILE`, `AWS_WEB_IDENTITY_TOKEN_FILE`, and `AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE` name paths on your machine that do not exist inside the container, and each agent's config dir is already bind-mounted at its canonical container location. Values explicitly supplied through `provider_env` are not part of that ambient filtering. Every drop is logged under the `acp` target with the key and the reason.
 
+### Switching provider
+
+A Claude session can be moved between the direct API, Bedrock, and Vertex without losing its transcript, from the provider picker next to the model picker or with `aoe acp switch-provider <session> <api|bedrock|vertex>`.
+
+The pick only sets `CLAUDE_CODE_USE_BEDROCK` and `CLAUDE_CODE_USE_VERTEX`, and it outranks both the host environment and the `environment` list. Credentials are not provisioned by it: the target provider's own variables (`ANTHROPIC_VERTEX_PROJECT_ID` and `CLOUD_ML_REGION` for Vertex, the AWS credential chain for Bedrock) must already be present where `aoe serve` runs, or the next turn fails on authentication.
+
+Two further effects are worth knowing before you switch:
+
+- The model is reset to the new provider's default, because model ids differ between providers and a resumed conversation would otherwise stay on the model it last ran. Pick a model again afterwards if you had one pinned.
+- A sandboxed session's container is recreated, since the GCP credential mount is decided when the container is built. Anything written inside the container but outside the workspace volume is lost.
+
+The switch is refused while a turn or a background agent is running, since it restarts the worker. Once idle, the worker restarts and resumes the same conversation.
+
 ### Feature matrix
 
 Each feature fires for any ACP agent, only when the agent's profile opts in, or claude-only.

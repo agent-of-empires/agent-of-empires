@@ -26,13 +26,18 @@ use crate::session::SandboxInfo;
 impl<S: BroadcastSink> Supervisor<S> {
     /// Spawn a structured view worker for the given session.
     pub async fn spawn(&self, req: SpawnRequest) -> Result<(), SupervisorError> {
-        match self
-            .begin_resume(&req.session_id, ResumeKind::Spawn)
-            .await?
-        {
-            ResumeReservationOutcome::Reserved(r) => self.spawn_inner(req, r).await,
+        let reservation = self.reserve_spawn(&req.session_id).await?;
+        self.spawn_inner(req, reservation).await
+    }
+
+    pub(crate) async fn reserve_spawn(
+        &self,
+        id: &str,
+    ) -> Result<ResumeReservation, SupervisorError> {
+        match self.begin_resume(id, ResumeKind::Spawn).await? {
+            ResumeReservationOutcome::Reserved(reservation) => Ok(reservation),
             ResumeReservationOutcome::AlreadyPresent => {
-                Err(SupervisorError::AlreadyRunning(req.session_id))
+                Err(SupervisorError::AlreadyRunning(id.to_owned()))
             }
         }
     }
@@ -259,21 +264,22 @@ impl<S: BroadcastSink> Supervisor<S> {
             );
             host_environment = base_host_environment.clone();
             if !resolved_cfg.host_hooks.before_session.is_empty() {
-                let minted = before_session_env(
+                let hook = before_session_env(
                     &req.session_id,
                     &req.tool,
                     req.source_profile.clone().unwrap_or_default(),
                     req.cwd.clone(),
-                )
-                .await
-                .map_err(|e| {
-                    SupervisorError::InvalidAgentCommand(format!(
-                        "before_session hook task failed: {e}"
-                    ))
-                })?
-                .map_err(|e| {
-                    SupervisorError::Acp(AcpError::Spawn(format!("before_session hook: {e}")))
-                })?;
+                );
+                let minted = hook
+                    .await
+                    .map_err(|e| {
+                        SupervisorError::InvalidAgentCommand(format!(
+                            "before_session hook task failed: {e}"
+                        ))
+                    })?
+                    .map_err(|e| {
+                        SupervisorError::Acp(AcpError::Spawn(format!("before_session hook: {e}")))
+                    })?;
                 overlay_env(&mut host_environment, minted);
             }
         }
@@ -385,6 +391,11 @@ impl<S: BroadcastSink> Supervisor<S> {
                 wrapper_substitution,
                 generation,
                 claude_store_pin,
+                provider_routing: req
+                    .provider
+                    .as_deref()
+                    .and_then(crate::session::environment::provider_override_env)
+                    .unwrap_or_default(),
             },
             context_reset,
         ))
@@ -445,6 +456,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                 drain_task,
                 restart_history: vec![],
                 kind,
+                launch_epoch: lease.epoch(),
                 lease,
             },
         );
@@ -784,6 +796,20 @@ async fn capture_durable_launch(
     .map_err(|error| SupervisorError::Acp(AcpError::Spawn(error.to_string())))?
 }
 
+fn admission_error(error: anyhow::Error, session_id: &str) -> SupervisorError {
+    if let Some(blocked) = error.downcast_ref::<crate::session::StartBlocked>() {
+        SupervisorError::Blocked(*blocked)
+    } else if error.is::<crate::session::SessionGone>() {
+        SupervisorError::SessionGone(session_id.to_owned())
+    } else if error.is::<crate::session::LifecycleReservationError>() {
+        SupervisorError::SpawnCancelled(session_id.to_owned())
+    } else if error.is::<crate::session::NativeStoreUnavailable>() {
+        SupervisorError::NativeStoreUnavailable
+    } else {
+        SupervisorError::Acp(AcpError::Spawn(format!("launch admission: {error:#}")))
+    }
+}
+
 /// Check the same authority and generation before hooks, after hooks and after handshake.
 async fn admit_durable_launch(
     admission: Option<&super::LaunchAdmission>,
@@ -792,24 +818,22 @@ async fn admit_durable_launch(
     let Some(mut admission) = admission.cloned() else {
         return Ok(());
     };
-    let _namespace = match admission.namespace.take() {
+    let namespace = match admission.namespace.take() {
         Some(namespace) => Some(namespace.read_owned().await),
         None => None,
     };
     let session_id = session_id.to_owned();
-    let spawn_error = |e: anyhow::Error| {
-        SupervisorError::Acp(AcpError::Spawn(format!("launch admission: {e:#}")))
-    };
     tokio::task::spawn_blocking(move || {
+        let _namespace = namespace;
         let _lock = admission
             .store
             .storage()
             .acquire_instance_lifecycle_lock(&session_id)
-            .map_err(spawn_error)?;
+            .map_err(|error| admission_error(error, &session_id))?;
         let stored = admission
             .store
             .load()
-            .map_err(spawn_error)?
+            .map_err(|error| admission_error(error, &session_id))?
             .into_iter()
             .find(|row| row.id == session_id);
         match stored {

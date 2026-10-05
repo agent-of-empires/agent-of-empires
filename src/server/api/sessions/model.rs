@@ -169,6 +169,7 @@ impl SessionResponse {
                     .unwrap_or(inst.tool.as_str());
                 (!resolved.is_empty()).then(|| resolved.to_string())
             },
+            acp_provider: inst.agent_provider.clone(),
             // The create-time guard calls the same classifier, so the web
             // "Fork" affordance and server-side acceptance cannot drift.
             acp_can_fork: crate::session::fork::structured_fork_capable(

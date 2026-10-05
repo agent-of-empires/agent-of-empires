@@ -1517,6 +1517,7 @@ mod tests {
             row.lifecycle_generation = 4;
             row.idle_entered_at = Some(chrono::Utc::now());
             row.sandbox_info = Some(crate::session::SandboxInfo {
+                provider: None,
                 enabled: true,
                 container_id: None,
                 image: "unused".into(),

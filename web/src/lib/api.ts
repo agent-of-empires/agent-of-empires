@@ -1570,6 +1570,41 @@ export async function switchAcpAgent(
   });
 }
 
+export interface SwitchProviderResponse {
+  session_id: string;
+  provider: string;
+  /** Whether a model pick was replaced by the new provider's default. */
+  model_cleared: boolean;
+  status: string;
+}
+
+/** Re-route a Claude session to `provider`, keeping the transcript. Throws with
+ *  the server's reason rather than collapsing to null: the refusals worth
+ *  reading (an agent that does not route through a provider, a respawn that
+ *  failed after the worker stopped) exist only in the body, and the second kind
+ *  leaves the session changed, so the caller must not read a failure as a
+ *  no-op. */
+export async function switchAcpProvider(sessionId: string, provider: string): Promise<SwitchProviderResponse> {
+  const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/acp/switch-provider`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ provider }),
+  });
+  const body = await res.text();
+  if (!res.ok) {
+    // Structured refusals carry `message`; the respawn failures are plain text.
+    let message: string | undefined;
+    try {
+      const parsed = JSON.parse(body) as { message?: unknown };
+      message = typeof parsed.message === "string" ? parsed.message : undefined;
+    } catch {
+      message = undefined;
+    }
+    throw new Error(message || body.slice(0, 200) || `request failed (${res.status})`);
+  }
+  return JSON.parse(body) as SwitchProviderResponse;
+}
+
 /** Response from the view-switch endpoints. `view` is the session's view
  *  after the swap. */
 export interface ViewSwitchResponse {

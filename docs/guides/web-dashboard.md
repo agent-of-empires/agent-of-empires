@@ -208,6 +208,10 @@ With `--auth=passphrase --behind-proxy`, the passphrase wall applies to TCP loop
 
 `--behind-proxy` requires at least one `--allowed-host <public-hostname>`: aoe cannot infer the hostname your proxy forwards, and the [DNS-rebinding gate](#dns-rebinding) rejects any `Host` it does not recognize. If the proxy listens on a nonstandard port, also pass the exact origin, e.g. `--allowed-origin https://aoe.example.com:8443`. The daemon refuses to start (with an explicit message) if `--behind-proxy` is set without `--allowed-host`.
 
+### Running under systemd
+
+A foreground `aoe serve` reports readiness over `sd_notify` when systemd sets `NOTIFY_SOCKET`, so a unit can use `Type=notify`. `READY=1` is sent once the TCP and owner-verified Unix listeners are bound, the first healthy canonical snapshot is published, plugin workers are launched and background tasks are running; `STOPPING=1` is sent when shutdown starts. If aoe runs as a child of a wrapper (for example `cargo run`), add `NotifyAccess=all`, since systemd otherwise accepts messages only from the main process.
+
 ## Security
 
 **The dashboard exposes terminal access.** Anyone who authenticates can send keystrokes to your agent sessions, which run as your user.

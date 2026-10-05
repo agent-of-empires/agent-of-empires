@@ -228,7 +228,7 @@ impl Instance {
         self.active_execution = None;
         self.acp_effort = None;
         self.agent_model = None;
-
+        self.agent_provider = None;
         self.import_pending = None;
         self.fork_pending = None;
 

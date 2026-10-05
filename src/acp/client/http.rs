@@ -15,7 +15,7 @@ use super::passphrase_session::{self, PassphraseSessionCache};
 use crate::acp::elicitations::ElicitationResolution;
 use crate::acp::protocol::{
     ApprovalDecisionWire, FilesResponse, PromptRequest, ReplayResponse, ResolveApprovalRequest,
-    SwitchAgentRequest, SwitchAgentResponse,
+    SwitchAgentRequest, SwitchAgentResponse, SwitchProviderRequest, SwitchProviderResponse,
 };
 use crate::plugin::ui_state::UiSnapshot;
 
@@ -362,11 +362,11 @@ impl HttpClient {
             path_segment(plugin_id)?
         );
         let res = self
-            .execute(
+            .execute_elevated(|| {
                 self.http
                     .post(&url)
-                    .json(&serde_json::json!({ "enabled": enabled })),
-            )
+                    .json(&serde_json::json!({ "enabled": enabled }))
+            })
             .await?;
         check_global_status(res)?;
         Ok(())
@@ -379,7 +379,7 @@ impl HttpClient {
             "{}/api/plugins/{}/worker/restart",
             self.endpoint.base_url, plugin_id
         );
-        let res = self.execute(self.http.post(&url)).await?;
+        let res = self.execute_elevated(|| self.http.post(&url)).await?;
         check_global_status(res)?;
         Ok(())
     }
@@ -538,6 +538,24 @@ impl HttpClient {
         Ok(crate::daemon::decode_json::<SwitchAgentResponse>(res).await?)
     }
 
+    pub async fn switch_provider(
+        &self,
+        session_id: &str,
+        provider: &str,
+    ) -> Result<SwitchProviderResponse, HttpError> {
+        let url = format!(
+            "{}/api/sessions/{}/acp/switch-provider",
+            self.endpoint.base_url,
+            path_segment(session_id)?,
+        );
+        let body = SwitchProviderRequest {
+            provider: provider.to_owned(),
+        };
+        let response = self.execute(self.http.post(&url).json(&body)).await?;
+        let response = check_status(response, session_id)?;
+        Ok(crate::daemon::decode_json::<SwitchProviderResponse>(response).await?)
+    }
+
     /// `POST /api/sessions/{id}/acp/approvals/{nonce}`. `option_id` names
     /// an option the TUI answered through the option picker.
     pub async fn resolve_approval(
@@ -671,6 +689,26 @@ impl HttpClient {
             return Ok(response);
         };
         self.send_authenticated(retry).await
+    }
+
+    async fn execute_elevated(
+        &self,
+        build: impl Fn() -> reqwest::RequestBuilder,
+    ) -> Result<reqwest::Response, HttpError> {
+        let response = self.execute(build()).await?;
+        if self.endpoint.unix_path().is_some()
+            || self.endpoint.bearer_token().is_some()
+            || crate::daemon::ApiErrorCode::from_headers(
+                response.status(),
+                response.headers(),
+                false,
+            ) != Some(crate::daemon::ApiErrorCode::ElevationRequired)
+        {
+            return Ok(response);
+        }
+        drop(response);
+        passphrase_session::elevate(&self.endpoint, &self.passphrase_session).await?;
+        self.execute(build()).await
     }
 
     async fn send_authenticated(

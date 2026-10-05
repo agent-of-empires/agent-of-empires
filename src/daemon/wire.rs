@@ -41,6 +41,8 @@ pub struct CreationTrustReview {
 #[derive(Serialize, Deserialize)]
 pub struct CreateSessionBody {
     pub title: Option<String>,
+    #[serde(default)]
+    pub title_typed: bool,
     pub size: Option<TerminalSize>,
     pub path: String,
     pub tool: String,
@@ -852,6 +854,9 @@ pub struct SessionResponse {
     /// sessions with no resolved agent. See #2803.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub acp_agent: Option<String>,
+    /// LLM backend the session is pinned to; absent means the host decides.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acp_provider: Option<String>,
     /// True when this session's agent can run a structured ACP `session/fork`,
     /// per `crate::session::fork::structured_fork_capable`. Resume-only ACP
     /// agents (e.g. `aoe-agent`) are ACP-capable yet not forkable, so the web

@@ -828,6 +828,7 @@ async fn native_auxiliary_ensure_uses_fresh_context_and_refuses_purge() {
         ),
         extra_env: None,
         custom_instruction: None,
+        provider: None,
         container_workdir: None,
         before_start_env: Vec::new(),
     });

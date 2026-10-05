@@ -420,6 +420,7 @@ fn create_test_env_with_group_sessions() -> TestEnv {
     let mut inst3 = Instance::new("work-session-2", "/tmp/work2");
     inst3.group_path = "work".to_string();
     inst3.sandbox_info = Some(SandboxInfo {
+        provider: None,
         enabled: true,
         container_id: None,
         image: "ubuntu:latest".to_string(),
@@ -677,6 +678,7 @@ fn creation_data(project_dir: &std::path::Path, title: &str, group: &str) -> New
     NewSessionData {
         profile: "default".to_string(),
         title: title.to_string(),
+        title_typed: false,
         path: project_dir.to_str().unwrap().to_string(),
         group: group.to_string(),
         tool: "claude".to_string(),

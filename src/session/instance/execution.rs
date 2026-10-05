@@ -295,6 +295,15 @@ pub(super) struct NativeLaunchInputs {
     pub(super) identity_extension: Option<(String, String)>,
 }
 impl NativeLaunchInputs {
+    /// Whether the pane runs `program` as the binary AoE's own PATH resolves `binary` to, which
+    /// is what a host `--help` probe of `binary` describes.
+    pub(super) fn runs_host_path_binary(&self, binary: &str, program: &std::path::Path) -> bool {
+        self.container.is_none()
+            && !self.pane_env.iter().any(|entry| matches!(entry, crate::tmux::PaneEnvMutation::Set { key, .. } | crate::tmux::PaneEnvMutation::Unset { key } if key == "PATH"))
+            && self.environment.get("PATH") == std::env::var("PATH").ok().as_ref()
+            && which::which(binary).ok().as_deref() == Some(program)
+    }
+
     fn read_native_file(&self, path: &std::path::Path) -> Result<Option<Vec<u8>>> {
         let native = self.canonical_path(path)?;
         let location = self.physical_location(&native);
@@ -1889,10 +1898,8 @@ impl Instance {
         } else {
             None
         };
-        let pi_pinnable = agent.name == "pi" && inputs.container.is_none()
-            && !inputs.pane_env.iter().any(|entry| matches!(entry, crate::tmux::PaneEnvMutation::Set { key, .. } | crate::tmux::PaneEnvMutation::Unset { key } if key == "PATH"))
-            && inputs.environment.get("PATH") == std::env::var("PATH").ok().as_ref()
-            && which::which("pi").ok().as_deref() == Some(program.as_path())
+        let pi_pinnable = agent.name == "pi"
+            && inputs.runs_host_path_binary("pi", &program)
             && crate::agents::pi_supports_session_id_flag();
         let opencode_preassign = agent.name == "opencode"
             && inputs.container.is_none()

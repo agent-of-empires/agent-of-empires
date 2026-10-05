@@ -1266,7 +1266,7 @@ async fn workspace_purge_retains_shared_files_when_structured_shutdown_is_unprov
         crate::server::reload::load_all_profiles(&state.file_watch)?.metadata;
     let (deleted, _, failed, _, _) =
         purge_workspace_artifacts(&state, owner_id.clone(), plan, false).await;
-    assert!(failed.is_empty());
+    assert!(failed.is_empty(), "{}", serde_json::to_string(&failed)?);
     assert!(deleted.contains(&sibling_id));
     assert!(deleted.contains(&owner_id));
     assert!(storage.load()?.is_empty());
@@ -5231,6 +5231,7 @@ async fn container_terminal_refuses_archived_trashed_and_purged_sessions() {
     for (shelve, status, code) in cases {
         let mut inst = make_test_instance();
         inst.sandbox_info = Some(crate::session::SandboxInfo {
+            provider: None,
             enabled: true,
             container_id: None,
             image: "ubuntu:latest".to_string(),

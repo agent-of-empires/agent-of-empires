@@ -318,8 +318,12 @@ async fn build_spawn_request(
     service: &Arc<SessionService>,
     target: &ResumeTarget,
 ) -> Result<SpawnRequest, ()> {
+    let state = service.native_state().map_err(|_| ())?;
+    let exclusion = crate::acp::sandbox::LaunchExclusion::acquire(state.clone(), &target.id, false)
+        .await
+        .map_err(|_| ())?;
     let supervisor = &service.acp_supervisor;
-    let inst_lock = service.instance_lock(&target.id).await;
+
     // Re-read under the session lock, for two reasons. A worktree rename holds
     // it across the move, so a snapshotted path could be stale (#2260); and the
     // persisted selectors can be re-picked after the tick snapshotted
@@ -332,9 +336,10 @@ async fn build_spawn_request(
         acp_mode_id,
         acp_effort,
         agent_model,
+        agent_provider,
         claude_store_pin,
+        instance,
     ) = {
-        let _guard = inst_lock.lock().await;
         let instances = service.instances.read().await;
         let Some(inst) = instances.iter().find(|i| i.id == target.id) else {
             return Err(());
@@ -352,7 +357,9 @@ async fn build_spawn_request(
             inst.acp_mode_id.clone(),
             inst.acp_effort.clone(),
             inst.agent_model.clone(),
+            inst.agent_provider.clone(),
             inst.selected_claude_store_pin(),
+            inst.clone(),
         )
     };
     let agent = supervisor
@@ -363,11 +370,17 @@ async fn build_spawn_request(
             &cwd,
         )
         .await;
-    let sandbox_info = match crate::acp::sandbox::ensure_container_for_session(
-        &service.instances,
-        &inst_lock,
-        &target.id,
-        false,
+    let (native, exclusion) = crate::server::session_store::NativeSessionStore::open_for_launch(
+        state.clone(),
+        &instance,
+        exclusion,
+    )
+    .await
+    .map_err(|_| ())?;
+    let (sandbox_info, _exclusion) = match crate::acp::sandbox::ensure_container_for_session(
+        native.clone(),
+        instance,
+        exclusion,
     )
     .await
     {
@@ -381,7 +394,11 @@ async fn build_spawn_request(
     };
 
     Ok(SpawnRequest {
-        launch_admission: None,
+        launch_admission: Some(crate::acp::supervisor::LaunchAdmission {
+            store: native,
+            generation: target.lifecycle_generation,
+            namespace: Some(state.profile_namespace.clone()),
+        }),
         expected_lifecycle_generation: target.lifecycle_generation,
         session_id: target.id.clone(),
         agent,
@@ -389,6 +406,7 @@ async fn build_spawn_request(
         cwd,
         additional_dirs: vec![],
         provider_env: vec![],
+        provider: agent_provider,
         model: agent_model,
         // `acp_effort` only holds a user-set effort, so presence is its provenance.
         effort_explicit: acp_effort.is_some(),
@@ -532,14 +550,22 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn build_spawn_request_reads_live_session_fields() {
+        let _app_dir = crate::session::test_support::isolate_app_dir();
         let mut moved = Instance::new("renamed", "/tmp/aoe-2260-after-rename");
         moved.id = "sess-moved".to_string();
+        moved.source_profile = "default".into();
         moved.view = crate::session::View::Structured;
         moved.acp_effort = Some("high".to_string());
         let mut unpinned = Instance::new("unpinned", "/tmp/aoe-effort-respawn");
         unpinned.id = "sess-unpinned".to_string();
+        unpinned.source_profile = "default".into();
         unpinned.view = crate::session::View::Structured;
+        crate::server::test_support::seed_instances_on_disk_for_test(
+            "default",
+            vec![moved.clone(), unpinned.clone()],
+        );
         let state = crate::server::test_support::build_test_app_state(vec![
             moved.clone(),
             unpinned.clone(),

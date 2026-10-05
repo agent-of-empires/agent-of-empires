@@ -601,6 +601,7 @@ mod workspace_ordering_tests {
         SessionResponse {
             agent_pane: Default::default(),
             auxiliary: Vec::new(),
+            acp_provider: None,
             id: id.to_string(),
             idempotency_key: None,
             title: id.to_string(),

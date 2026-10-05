@@ -1112,6 +1112,13 @@ pub struct SessionConfig {
     #[setting(label = "Smart Session Rename", widget = "toggle", category = "Agents")]
     pub smart_rename: bool,
 
+    /// Give a title typed in the TUI's New Session dialog to the agent as its own session name on
+    /// the first launch (Claude's `--name`), so it shows in the agent's own apps. Later
+    /// launches leave the agent's name alone, so a rename inside the agent survives restarts.
+    #[serde(default)]
+    #[setting(label = "Name Agent Session", widget = "toggle", category = "Agents")]
+    pub name_agent_session: bool,
+
     /// Override Smart Session Rename for scratch sessions specifically, since they have no repo
     /// path to key a per-project override on the way a registered project does.
     #[serde(default)]
@@ -1883,6 +1890,7 @@ impl Default for SessionConfig {
             merge_hooks_into_selected_agent: true,
             conversation_summary: false,
             smart_rename: true,
+            name_agent_session: false,
             scratch_smart_rename: ScratchSmartRenameMode::default(),
             smart_rename_agent: String::new(),
             smart_rename_model: HashMap::new(),

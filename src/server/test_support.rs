@@ -303,6 +303,23 @@ pub fn file_watch(state: &AppState) -> Arc<crate::file_watch::FileWatchService> 
     state.file_watch.clone()
 }
 
+pub async fn reload_disk_snapshot_at_epoch_for_test(
+    state: &Arc<AppState>,
+    fresh: Vec<Instance>,
+    read_epoch: u64,
+) {
+    super::reload::reload_state_instances_from_disk(
+        state,
+        fresh,
+        Vec::new(),
+        super::state::StatusSource::DiskOnly,
+        read_epoch,
+        state.canonical_metadata.read().await.clone(),
+        Default::default(),
+    )
+    .await;
+}
+
 pub async fn reload_disk_only_for_test(
     state: &Arc<AppState>,
     fresh: Vec<Instance>,

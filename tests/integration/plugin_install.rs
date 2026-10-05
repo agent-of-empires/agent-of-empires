@@ -928,8 +928,7 @@ command = ["false"]
     )
     .unwrap();
 
-    let err = install::update("acme.upd").await.unwrap_err().to_string();
-    assert!(err.contains("build step"), "got: {err}");
+    install::update("acme.upd", true).await.unwrap_err();
 
     // The prior install is intact: directory, artifact, and recorded version.
     assert!(
@@ -1000,7 +999,7 @@ command = ["cp", "aoe-plugin.toml", "marker-v2"]
 
     // The changed recipe forces a prompt, which bails on non-terminal stdin
     // instead of silently running the new build.
-    let err = install::update("acme.recipe")
+    let err = install::update("acme.recipe", false)
         .await
         .unwrap_err()
         .to_string();
@@ -1019,6 +1018,18 @@ command = ["cp", "aoe-plugin.toml", "marker-v2"]
             .unwrap()
             .version,
         "0.1.0"
+    );
+
+    // `--yes` approves the changed recipe without a prompt.
+    install::update("acme.recipe", true).await.unwrap();
+    assert!(installed.join("marker-v2").exists());
+    assert_eq!(
+        Lockfile::load()
+            .unwrap()
+            .get("acme.recipe")
+            .unwrap()
+            .version,
+        "0.2.0"
     );
 }
 

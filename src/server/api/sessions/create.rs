@@ -1184,6 +1184,7 @@ pub async fn create_session(
 
     let spec = crate::server::session_spawn::StructuredSessionSpec {
         title: body.title,
+        title_typed: body.title_typed,
         size: body.size,
         path: body.path,
         group: body.group,

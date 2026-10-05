@@ -12,9 +12,80 @@ pub(crate) struct NativeSessionStore {
     state: Arc<AppState>,
     runtime: tokio::runtime::Handle,
     status_id: Option<String>,
+    launch_identity: Option<(String, String, u64, Option<String>)>,
 }
 
 impl NativeSessionStore {
+    pub(crate) async fn open_for_launch<Exclusion: Send + 'static>(
+        state: Arc<AppState>,
+        expected: &Instance,
+        exclusion: Exclusion,
+    ) -> Result<(Arc<Self>, Exclusion)> {
+        let profile = expected.source_profile.clone();
+        let id = expected.id.clone();
+        let title = expected.title.clone();
+        let generation = expected.lifecycle_generation;
+        let provider = expected.agent_provider.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut store = Self::open(state, &profile, Some(id.clone()))?;
+            let row = store
+                .load()?
+                .into_iter()
+                .find(|row| row.id == id)
+                .ok_or(crate::session::SessionGone)?;
+            row.ensure_startable()?;
+            anyhow::ensure!(
+                row.lifecycle_generation == generation
+                    && row.title == title
+                    && row.agent_provider == provider
+                    && row.is_structured()
+                    && row.launch_is_finalized(),
+                crate::session::LifecycleReservationError::Superseded
+            );
+            store.launch_identity = Some((id, title, generation, provider));
+            Ok((Arc::new(store), exclusion))
+        })
+        .await?
+    }
+
+    fn validate_launch_identity(&self, rows: &[Instance]) -> Result<()> {
+        let Some((id, title, generation, provider)) = &self.launch_identity else {
+            return Ok(());
+        };
+        let row = rows
+            .iter()
+            .find(|row| &row.id == id)
+            .ok_or(crate::session::SessionGone)?;
+        row.ensure_startable()?;
+        anyhow::ensure!(
+            &row.title == title
+                && row.lifecycle_generation == *generation
+                && &row.agent_provider == provider
+                && row.is_structured()
+                && row.launch_is_finalized(),
+            crate::session::LifecycleReservationError::Superseded
+        );
+        Ok(())
+    }
+
+    fn check_source(&self) -> Result<()> {
+        ensure_healthy(&self.state)?;
+        if let Some((id, _, _, _)) = &self.launch_identity {
+            let rows = self.state.instances.blocking_read();
+            self.validate_launch_identity(&rows)?;
+            anyhow::ensure!(
+                rows.iter()
+                    .any(|row| &row.id == id && row.source_profile == self.storage.profile()),
+                crate::session::LifecycleReservationError::Superseded
+            );
+        }
+        self.storage.verify_bound_profile().map_err(|error| {
+            let publication = self.state.publication.blocking_write();
+            mark_profile_failure(&self.state, self.storage.profile(), &error, &publication);
+            error.context(NativeStoreUnavailable)
+        })
+    }
+
     pub(crate) fn open(
         state: Arc<AppState>,
         profile: &str,
@@ -34,6 +105,7 @@ impl NativeSessionStore {
             state,
             runtime: tokio::runtime::Handle::current(),
             status_id,
+            launch_identity: None,
         })
     }
 
@@ -270,24 +342,26 @@ impl SessionStore for NativeSessionStore {
     }
 
     fn load(&self) -> Result<Vec<Instance>> {
-        ensure_healthy(&self.state)?;
+        self.check_source()?;
         match self.storage.load_complete_with_groups() {
-            Ok((rows, _)) => Ok(rows),
+            Ok((rows, _)) => {
+                self.validate_launch_identity(&rows)?;
+                Ok(rows)
+            }
             Err(error) => {
                 let publication = self.state.publication.blocking_write();
                 mark_profile_failure(&self.state, self.storage.profile(), &error, &publication);
-                Err(error)
+                Err(error.context(NativeStoreUnavailable))
             }
         }
     }
 
     fn check_available(&self) -> Result<()> {
-        ensure_healthy(&self.state)?;
-        self.storage.verify_bound_profile().map_err(|error| {
-            let publication = self.state.publication.blocking_write();
-            mark_profile_failure(&self.state, self.storage.profile(), &error, &publication);
-            error.context(NativeStoreUnavailable)
-        })
+        if self.launch_identity.is_some() {
+            self.load().map(|_| ())
+        } else {
+            self.check_source()
+        }
     }
 
     fn configuration(&self, profile: Option<&str>) -> Result<crate::session::config::Config> {
@@ -322,7 +396,7 @@ impl SessionStore for NativeSessionStore {
     }
 
     fn commit(&self, mutation: &mut SessionMutation<'_>) -> Result<()> {
-        ensure_healthy(&self.state)?;
+        self.check_source()?;
         let transition = self.storage.acquire_write_transition();
         let publication = self.state.publication.blocking_write();
         ensure_healthy(&self.state)?;
@@ -335,7 +409,9 @@ impl SessionStore for NativeSessionStore {
         };
         let mut rejected = false;
         let result = transition.update_with_snapshot(&self.storage, |rows, groups| {
-            mutation(rows, groups).inspect_err(|_| rejected = true)
+            self.validate_launch_identity(rows)
+                .and_then(|()| mutation(rows, groups))
+                .inspect_err(|_| rejected = true)
         });
         let ((), rows, groups) = match result {
             Ok(committed) => committed,
@@ -1488,6 +1564,7 @@ mod tests {
                 row.status = crate::session::Status::Stopped;
                 row.sandbox_store_generation = 0;
                 row.sandbox_info = Some(crate::session::SandboxInfo {
+                    provider: None,
                     enabled: true,
                     container_id: None,
                     image: "test-image".to_owned(),
@@ -1652,6 +1729,7 @@ mod tests {
             current.source_profile = owner.profile().to_owned();
             current.tool = "gemini".to_owned();
             current.sandbox_info = Some(crate::session::SandboxInfo {
+                provider: None,
                 enabled: true,
                 container_id: None,
                 image: "test-image".to_owned(),

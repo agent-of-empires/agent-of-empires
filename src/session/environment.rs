@@ -36,6 +36,40 @@ pub(crate) fn host_vertex_enabled() -> bool {
         .is_some_and(|v| !v.is_empty())
 }
 
+/// The LLM backends a session can be pinned to. `None` on a session means the
+/// host environment decides, which is the behavior before a pick is made.
+pub(crate) const AGENT_PROVIDERS: &[&str] = &["api", "bedrock", "vertex"];
+
+/// The Claude routing flags that pin a session to `provider`, or `None` when
+/// the name is not one of [`AGENT_PROVIDERS`].
+///
+/// Both flags are written for every pick, because the override has to beat an
+/// inherited host value rather than merely be absent. Off is the empty string,
+/// never `"0"`: the adapter reads these with a JavaScript truthiness test, for
+/// which `"0"` is on. Credentials are not touched; they stay wherever the host
+/// put them.
+pub(crate) fn provider_override_env(provider: &str) -> Option<Vec<(String, String)>> {
+    let (bedrock, vertex) = match provider {
+        "api" => ("", ""),
+        "bedrock" => ("1", ""),
+        "vertex" => ("", "1"),
+        _ => return None,
+    };
+    Some(vec![
+        ("CLAUDE_CODE_USE_BEDROCK".to_string(), bedrock.to_string()),
+        ("CLAUDE_CODE_USE_VERTEX".to_string(), vertex.to_string()),
+    ])
+}
+
+/// Whether Vertex is in effect: a session's pick wins, and without one the
+/// host flag decides.
+pub(crate) fn vertex_enabled(provider: Option<&str>) -> bool {
+    match provider {
+        Some(pick) if AGENT_PROVIDERS.contains(&pick) => pick == "vertex",
+        _ => host_vertex_enabled(),
+    }
+}
+
 /// Returns the user's preferred shell from `$SHELL`, falling back to `bash`.
 ///
 /// Used for host-side command wrappers (agent launch, local hook execution)
@@ -571,29 +605,30 @@ pub(crate) fn collect_environment(
         .as_deref()
         .unwrap_or(&sandbox_config.environment);
 
-    // Always ensure the terminal defaults are present (pass-through from host)
-    for &key in DEFAULT_TERMINAL_ENV_VARS {
+    // A session's provider pick is claimed before everything else: this list wins a shared key
+    // against both the request auth payload and the per-adapter allowlist, so the routing flags
+    // have to be set here to beat whatever the host exported.
+    let provider = sandbox_info.provider.as_deref();
+    for (key, value) in provider.and_then(provider_override_env).unwrap_or_default() {
+        if seen_keys.insert(key.clone()) {
+            result.push(EnvEntry::Literal { key, value });
+        }
+    }
+
+    // Terminal defaults, plus Vertex provider vars when Vertex is in effect. A key is claimed
+    // even when unset on the host, so later entries cannot supply it.
+    let vertex: &[&str] = if vertex_enabled(provider) {
+        AUTO_FORWARD_VERTEX_ENV_VARS
+    } else {
+        &[]
+    };
+    for &key in DEFAULT_TERMINAL_ENV_VARS.iter().chain(vertex) {
         if seen_keys.insert(key.to_string()) {
             if let Ok(val) = std::env::var(key) {
                 result.push(EnvEntry::Inherit {
                     key: key.to_string(),
                     value: val,
                 });
-            }
-        }
-    }
-
-    // Auto-forward Vertex provider env vars when Vertex is enabled on the host.
-    // Gating on the host flag keeps non-Vertex users' sandboxes unchanged.
-    if host_vertex_enabled() {
-        for &key in AUTO_FORWARD_VERTEX_ENV_VARS {
-            if seen_keys.insert(key.to_string()) {
-                if let Ok(val) = std::env::var(key) {
-                    result.push(EnvEntry::Inherit {
-                        key: key.to_string(),
-                        value: val,
-                    });
-                }
             }
         }
     }
@@ -1028,6 +1063,7 @@ environment = ["GH_TOKEN=write_token"]
         // Sandbox info with no per-session overrides forces the fallback path
         // through `sandbox_config.environment`, which is the buggy path pre-fix.
         let sandbox = SandboxInfo {
+            provider: None,
             enabled: true,
             container_id: None,
             image: "test".to_string(),
@@ -1102,6 +1138,7 @@ environment = ["AOE_TEST_REPO_SECRET_3710", "LEAK=$AOE_TEST_REPO_SECRET_3710"]
         .unwrap();
 
         let sandbox = SandboxInfo {
+            provider: None,
             enabled: true,
             container_id: None,
             image: "test".to_string(),
@@ -1305,6 +1342,117 @@ environment = ["AOE_TEST_REPO_SECRET_3710", "LEAK=$AOE_TEST_REPO_SECRET_3710"]
         );
     }
 
+    fn sandbox_for(provider: Option<&str>) -> SandboxInfo {
+        SandboxInfo {
+            provider: provider.map(str::to_owned),
+            enabled: true,
+            container_id: None,
+            image: "test:latest".into(),
+            container_name: "env-test".into(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            container_workdir: None,
+        }
+    }
+
+    /// Every pick writes both flags, so the override beats whatever the host
+    /// exported rather than merely failing to set it. Off is empty, never "0":
+    /// the adapter reads these with a JavaScript truthiness test.
+    #[test]
+    fn provider_override_env_sets_both_flags() {
+        let cases = [("api", "", ""), ("bedrock", "1", ""), ("vertex", "", "1")];
+        for (provider, bedrock, vertex) in cases {
+            assert_eq!(
+                provider_override_env(provider),
+                Some(owned(&[
+                    ("CLAUDE_CODE_USE_BEDROCK", bedrock),
+                    ("CLAUDE_CODE_USE_VERTEX", vertex),
+                ])),
+                "{provider}"
+            );
+        }
+        assert_eq!(provider_override_env("gateway"), None);
+        assert_eq!(provider_override_env(""), None);
+    }
+
+    /// A pick decides Vertex routing on its own; only an unpinned session
+    /// falls back to the host flag, which is the behavior before any pick.
+    #[test]
+    #[serial_test::serial]
+    fn vertex_enabled_prefers_the_session_pick() {
+        for (host, cases) in [
+            (
+                "1",
+                [(None, true), (Some("api"), false), (Some("vertex"), true)],
+            ),
+            (
+                "",
+                [(None, false), (Some("api"), false), (Some("vertex"), true)],
+            ),
+        ] {
+            let _env = EnvGuard::set(&[("CLAUDE_CODE_USE_VERTEX", host)]);
+            for (pick, expected) in cases {
+                assert_eq!(
+                    vertex_enabled(pick),
+                    expected,
+                    "host={host:?} pick={pick:?}"
+                );
+            }
+            // An unrecognized stored value must not silently mean "not vertex".
+            assert_eq!(vertex_enabled(Some("gateway")), !host.is_empty());
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn collect_environment_applies_the_provider_pick() {
+        for (pick, host, bedrock, vertex, credentials) in [
+            (Some("api"), "1", Some(""), Some(""), false),
+            (Some("bedrock"), "1", Some("1"), Some(""), false),
+            (Some("vertex"), "1", Some(""), Some("1"), true),
+            (Some("vertex"), "", Some(""), Some("1"), true),
+            (None, "1", None, Some("1"), true),
+            (None, "", None, None, false),
+        ] {
+            let _env = EnvGuard::set(&[
+                ("CLAUDE_CODE_USE_VERTEX", host),
+                ("ANTHROPIC_VERTEX_PROJECT_ID", "proj"),
+                ("CLOUD_ML_REGION", "europe-west1"),
+            ]);
+            let config = SandboxConfig {
+                environment: Vec::new(),
+                ..Default::default()
+            };
+            let entries = collect_environment(&config, &sandbox_for(pick));
+            for (key, expected) in [
+                ("CLAUDE_CODE_USE_BEDROCK", bedrock),
+                ("CLAUDE_CODE_USE_VERTEX", vertex),
+            ] {
+                let actual = find_entry(&entries, key).map(|entry| match entry {
+                    EnvEntry::Literal { value, .. } => (value.as_str(), false),
+                    EnvEntry::Inherit { value, .. } => (value.as_str(), true),
+                });
+                assert_eq!(
+                    actual,
+                    expected.map(|value| (value, pick.is_none())),
+                    "pick={pick:?} host={host:?} key={key}"
+                );
+                assert_eq!(
+                    entries.iter().filter(|entry| entry.key() == key).count(),
+                    usize::from(expected.is_some())
+                );
+            }
+            for key in ["ANTHROPIC_VERTEX_PROJECT_ID", "CLOUD_ML_REGION"] {
+                assert_eq!(
+                    find_entry(&entries, key).is_some(),
+                    credentials,
+                    "pick={pick:?} host={host:?} key={key}"
+                );
+            }
+        }
+    }
+
     /// Helper to find an entry by key and check its value
     fn find_entry<'a>(entries: &'a [EnvEntry], key: &str) -> Option<&'a EnvEntry> {
         entries.iter().find(|e| e.key() == key)
@@ -1319,6 +1467,7 @@ environment = ["AOE_TEST_REPO_SECRET_3710", "LEAK=$AOE_TEST_REPO_SECRET_3710"]
             ..Default::default()
         };
         let info = SandboxInfo {
+            provider: None,
             enabled: true,
             container_id: None,
             image: "test".to_string(),
@@ -1411,6 +1560,7 @@ environment = ["AOE_TEST_REPO_SECRET_3710", "LEAK=$AOE_TEST_REPO_SECRET_3710"]
     fn test_session_host_env_pairs_uses_extra_env() {
         // With no repository contribution, per-session entries reach the hook.
         let info = SandboxInfo {
+            provider: None,
             enabled: true,
             container_id: None,
             image: "img".to_string(),
@@ -1440,6 +1590,7 @@ environment = ["AOE_TEST_REPO_SECRET_3710", "LEAK=$AOE_TEST_REPO_SECRET_3710"]
             ..Default::default()
         };
         let info = SandboxInfo {
+            provider: None,
             enabled: true,
             container_id: None,
             image: "test".to_string(),
@@ -1470,6 +1621,7 @@ environment = ["AOE_TEST_REPO_SECRET_3710", "LEAK=$AOE_TEST_REPO_SECRET_3710"]
             ..Default::default()
         };
         let base = SandboxInfo {
+            provider: None,
             enabled: true,
             container_id: None,
             image: "test".to_string(),
@@ -1511,6 +1663,7 @@ environment = ["AOE_TEST_REPO_SECRET_3710", "LEAK=$AOE_TEST_REPO_SECRET_3710"]
             ..Default::default()
         };
         let info = SandboxInfo {
+            provider: None,
             enabled: true,
             container_id: None,
             image: "test".to_string(),
@@ -1531,6 +1684,7 @@ environment = ["AOE_TEST_REPO_SECRET_3710", "LEAK=$AOE_TEST_REPO_SECRET_3710"]
     fn test_collect_environment_includes_git_safe_directory() {
         let config = SandboxConfig::default();
         let info = SandboxInfo {
+            provider: None,
             enabled: true,
             container_id: None,
             image: "test".to_string(),
@@ -1563,6 +1717,7 @@ environment = ["AOE_TEST_REPO_SECRET_3710", "LEAK=$AOE_TEST_REPO_SECRET_3710"]
         // precedence over the built-in safe.directory defaults.
         let config = SandboxConfig::default();
         let info = SandboxInfo {
+            provider: None,
             enabled: true,
             container_id: None,
             image: "test".to_string(),
@@ -1601,6 +1756,7 @@ environment = ["AOE_TEST_REPO_SECRET_3710", "LEAK=$AOE_TEST_REPO_SECRET_3710"]
         std::env::set_var("AOE_TEST_EXTRA", "extra_val");
         let config = SandboxConfig::default();
         let info = SandboxInfo {
+            provider: None,
             enabled: true,
             container_id: None,
             image: "test".to_string(),
@@ -1628,6 +1784,7 @@ environment = ["AOE_TEST_REPO_SECRET_3710", "LEAK=$AOE_TEST_REPO_SECRET_3710"]
             ..Default::default()
         };
         let info = SandboxInfo {
+            provider: None,
             enabled: true,
             container_id: None,
             image: "test".to_string(),
@@ -1651,6 +1808,7 @@ environment = ["AOE_TEST_REPO_SECRET_3710", "LEAK=$AOE_TEST_REPO_SECRET_3710"]
             ..Default::default()
         };
         let info = SandboxInfo {
+            provider: None,
             enabled: true,
             container_id: None,
             image: "test".to_string(),
@@ -1675,6 +1833,7 @@ environment = ["AOE_TEST_REPO_SECRET_3710", "LEAK=$AOE_TEST_REPO_SECRET_3710"]
             ..Default::default()
         };
         let info = SandboxInfo {
+            provider: None,
             enabled: true,
             container_id: None,
             image: "test".to_string(),
@@ -1699,6 +1858,7 @@ environment = ["AOE_TEST_REPO_SECRET_3710", "LEAK=$AOE_TEST_REPO_SECRET_3710"]
             ..Default::default()
         };
         let info = SandboxInfo {
+            provider: None,
             enabled: true,
             container_id: None,
             image: "test".to_string(),
@@ -1819,6 +1979,7 @@ environment = ["AOE_TEST_REPO_SECRET_3710", "LEAK=$AOE_TEST_REPO_SECRET_3710"]
         let _app_guard = crate::session::test_support::isolate_app_dir();
         let _env_0 = EnvGuard::set(&[("AOE_TEST_TOKEN", "secret123")]);
         let sandbox = SandboxInfo {
+            provider: None,
             enabled: true,
             container_id: None,
             image: "test".to_string(),
@@ -1842,6 +2003,7 @@ environment = ["AOE_TEST_REPO_SECRET_3710", "LEAK=$AOE_TEST_REPO_SECRET_3710"]
         let _app_guard = crate::session::test_support::isolate_app_dir();
         let _env_0 = EnvGuard::set(&[("AOE_TEST_SOURCE", "secret456")]);
         let sandbox = SandboxInfo {
+            provider: None,
             enabled: true,
             container_id: None,
             image: "test".to_string(),
@@ -1865,6 +2027,7 @@ environment = ["AOE_TEST_REPO_SECRET_3710", "LEAK=$AOE_TEST_REPO_SECRET_3710"]
         let _app_guard = crate::session::test_support::isolate_app_dir();
         let _env_0 = EnvGuard::set(&[("AOE_TEST_BARE", "barevalue")]);
         let sandbox = SandboxInfo {
+            provider: None,
             enabled: true,
             container_id: None,
             image: "test".to_string(),
@@ -1886,6 +2049,7 @@ environment = ["AOE_TEST_REPO_SECRET_3710", "LEAK=$AOE_TEST_REPO_SECRET_3710"]
     fn test_build_docker_env_args_literal_uses_protected_env() {
         let _app_guard = crate::session::test_support::isolate_app_dir();
         let sandbox = SandboxInfo {
+            provider: None,
             enabled: true,
             container_id: None,
             image: "test".to_string(),
@@ -1909,6 +2073,7 @@ environment = ["AOE_TEST_REPO_SECRET_3710", "LEAK=$AOE_TEST_REPO_SECRET_3710"]
         let _app_guard = crate::session::test_support::isolate_app_dir();
         let _env_0 = EnvGuard::set(&[("AOE_TEST_SECRET", "mysecret")]);
         let sandbox = SandboxInfo {
+            provider: None,
             enabled: true,
             container_id: None,
             image: "test".to_string(),
@@ -1949,6 +2114,7 @@ environment = ["AOE_TEST_REPO_SECRET_3710", "LEAK=$AOE_TEST_REPO_SECRET_3710"]
 
         for (extra_env, expected_home, managed_expected) in cases {
             let sandbox = SandboxInfo {
+                provider: None,
                 enabled: true,
                 container_id: None,
                 image: "test".to_string(),
@@ -2033,6 +2199,7 @@ environment = ["AOE_TEST_REPO_SECRET_3710", "LEAK=$AOE_TEST_REPO_SECRET_3710"]
         let _env_2 = EnvGuard::set(&[("CLOUD_ML_REGION", "us-east5")]);
         let config = SandboxConfig::default();
         let info = SandboxInfo {
+            provider: None,
             enabled: true,
             container_id: None,
             image: "test".to_string(),
@@ -2066,6 +2233,7 @@ environment = ["AOE_TEST_REPO_SECRET_3710", "LEAK=$AOE_TEST_REPO_SECRET_3710"]
         let _env_1 = EnvGuard::set(&[("CLOUD_ML_REGION", "us-east5")]);
         let config = SandboxConfig::default();
         let info = SandboxInfo {
+            provider: None,
             enabled: true,
             container_id: None,
             image: "test".to_string(),
@@ -2091,6 +2259,7 @@ environment = ["AOE_TEST_REPO_SECRET_3710", "LEAK=$AOE_TEST_REPO_SECRET_3710"]
         let _env_1 = EnvGuard::set(&[("ANTHROPIC_VERTEX_PROJECT_ID", "my-proj")]);
         let config = SandboxConfig::default();
         let info = SandboxInfo {
+            provider: None,
             enabled: true,
             container_id: None,
             image: "test".to_string(),
@@ -2115,6 +2284,7 @@ environment = ["AOE_TEST_REPO_SECRET_3710", "LEAK=$AOE_TEST_REPO_SECRET_3710"]
         let _env_1 = EnvGuard::set(&[("ANTHROPIC_API_KEY", "sk-host-key")]);
         let config = SandboxConfig::default();
         let info = SandboxInfo {
+            provider: None,
             enabled: true,
             container_id: None,
             image: "test".to_string(),
@@ -2142,6 +2312,7 @@ environment = ["AOE_TEST_REPO_SECRET_3710", "LEAK=$AOE_TEST_REPO_SECRET_3710"]
             ..Default::default()
         };
         let info = SandboxInfo {
+            provider: None,
             enabled: true,
             container_id: None,
             image: "test".to_string(),

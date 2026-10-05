@@ -87,6 +87,8 @@ pub enum SupervisorError {
     Blocked(crate::session::StartBlocked),
     #[error("session {0:?} no longer exists")]
     SessionGone(String),
+    #[error("native session authority unavailable")]
+    NativeStoreUnavailable,
 }
 
 /// What the caller does with prompt text after it was published.
@@ -122,6 +124,7 @@ struct WorkerHandle {
     /// Respawn timestamps inside the restart window; the initial spawn is not counted.
     restart_history: Vec<Instant>,
     kind: WorkerKind,
+    launch_epoch: u64,
     lease: Lease,
     native_session_id: Option<String>,
 }
@@ -226,6 +229,9 @@ pub struct SpawnRequest {
     pub cwd: PathBuf,
     pub additional_dirs: Vec<PathBuf>,
     pub provider_env: Vec<(String, String)>,
+    /// LLM backend pinned on the session row, one of
+    /// `session::environment::AGENT_PROVIDERS`; `None` defers to the host.
+    pub provider: Option<String>,
     pub model: Option<String>,
     pub effort: Option<String>,
     /// True for persisted user effort, not a resolved default.
@@ -409,6 +415,15 @@ impl<S: BroadcastSink> Supervisor<S> {
             .await
             .get(session_id)
             .is_some_and(|worker| worker.lease.epoch() == generation)
+    }
+
+    /// Automatic respawns retain the originating launch; a new launch supersedes it.
+    pub(crate) async fn is_current_launch(&self, session_id: &str, launch_epoch: u64) -> bool {
+        self.workers
+            .lock()
+            .await
+            .get(session_id)
+            .is_some_and(|worker| worker.launch_epoch == launch_epoch)
     }
 
     /// Return the native store owned by the current worker only when it still

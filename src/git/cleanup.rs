@@ -748,6 +748,7 @@ mod tests {
 
             let mut instance = Instance::new("Test", worktree_path.to_str().unwrap());
             instance.sandbox_info = Some(SandboxInfo {
+                provider: None,
                 enabled: true,
                 container_id: None,
                 image: "alpine".to_string(),

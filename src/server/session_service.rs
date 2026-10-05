@@ -2342,6 +2342,7 @@ mod tests {
     fn test_spec() -> StructuredSessionSpec {
         StructuredSessionSpec {
             title: Some("nightly".to_string()),
+            title_typed: false,
             size: None,
             path: "/tmp/aoe-2897-project".to_string(),
             group: String::new(),

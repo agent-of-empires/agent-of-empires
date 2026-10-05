@@ -4597,6 +4597,7 @@ mod tests {
         instance.fork_pending = Some("persisted-fork".into());
         instance.import_pending = Some(true);
         instance.sandbox_info = Some(crate::session::SandboxInfo {
+            provider: None,
             enabled: true,
             container_id: None,
             image: "test:latest".into(),

@@ -208,6 +208,10 @@ pub struct Instance {
     /// `None` on legacy records and freshly created sessions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_auto_title: Option<String>,
+    /// The title was typed in the New Session dialog, so the first launch gives it to the agent
+    /// as its own session name and clears this.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub first_launch_names_agent: bool,
     /// Set once a terminal (non-ACP) smart-rename one-shot has produced output
     /// for this session, so the poller-driven trigger never respawns a title
     /// generator on every later turn. Set only after the one-shot returns
@@ -599,6 +603,11 @@ pub struct Instance {
     /// prefix or an explicit `anthropic:`/`openai:`/`google:` prefix.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_model: Option<String>,
+    /// LLM backend this session is pinned to, one of
+    /// `session::environment::AGENT_PROVIDERS`. `None` lets the host
+    /// environment decide.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_provider: Option<String>,
     /// Reasoning effort ("thought level") this session was explicitly pinned
     /// to, applied through the agent's `category:"thought_level"` config
     /// option after every worker (re)spawn. `None` means the session inherits

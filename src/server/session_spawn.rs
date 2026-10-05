@@ -10,6 +10,7 @@ use super::session_service::SessionService;
 /// Validated creation inputs shared by HTTP and plugin callers.
 pub(crate) struct StructuredSessionSpec {
     pub title: Option<String>,
+    pub title_typed: bool,
     pub size: Option<crate::daemon::TerminalSize>,
     pub path: String,
     pub group: String,
@@ -110,6 +111,7 @@ pub(crate) async fn spawn_structured_session(
 
         let StructuredSessionSpec {
             title,
+            title_typed,
             size,
             path,
             group,
@@ -183,6 +185,7 @@ pub(crate) async fn spawn_structured_session(
 
         let params = InstanceParams {
             title,
+            title_typed,
             path,
             group,
             tool,
@@ -803,6 +806,7 @@ pub(crate) async fn spawn_structured_session(
                                     cwd,
                                     additional_dirs: vec![],
                                     provider_env: vec![],
+                                    provider: None,
                                     model,
                                     effort,
                                     effort_explicit,
@@ -933,6 +937,7 @@ mod tests {
         crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
         let spec = StructuredSessionSpec {
             title: Some("hook rollback".into()),
+            title_typed: false,
             size: None,
             path: "/unused".into(),
             group: String::new(),

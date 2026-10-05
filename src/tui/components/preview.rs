@@ -792,6 +792,7 @@ mod tests {
 
         fn enabled_sandbox() -> SandboxInfo {
             SandboxInfo {
+                provider: None,
                 enabled: true,
                 container_id: None,
                 image: "img".into(),
@@ -859,6 +860,7 @@ mod tests {
 
         fn enabled_sandbox() -> SandboxInfo {
             SandboxInfo {
+                provider: None,
                 enabled: true,
                 container_id: None,
                 image: "img".into(),

@@ -244,6 +244,25 @@ fn check_auth_gate(
     )
 }
 
+#[cfg(unix)]
+fn notify_ready(status: &str) {
+    use sd_notify::NotifyState;
+    if let Err(e) = sd_notify::notify(&[NotifyState::Ready, NotifyState::Status(status)]) {
+        tracing::warn!(target: "serve.lifecycle", "sd_notify READY failed: {e}");
+    }
+}
+
+#[cfg(unix)]
+fn notify_stopping() {
+    let _ = sd_notify::notify(&[sd_notify::NotifyState::Stopping]);
+}
+
+#[cfg(not(unix))]
+fn notify_ready(_status: &str) {}
+
+#[cfg(not(unix))]
+fn notify_stopping() {}
+
 pub(crate) async fn start_server(
     config: ServerConfig<'_>,
     transaction: crate::daemon::lifecycle::Transaction,
@@ -1133,6 +1152,7 @@ pub(crate) async fn start_server(
                 }
             }
         }
+        notify_stopping();
         let plugin_host = shutdown_state.plugin_host.clone();
         run_shutdown_sequence(
             &shutdown_state.shutdown,
@@ -1146,6 +1166,8 @@ pub(crate) async fn start_server(
         )
         .await;
     };
+
+    notify_ready("daemon ready");
 
     drop(transaction);
     let signal_task = tokio::spawn(shutdown_signal);
@@ -1299,6 +1321,27 @@ async fn remote_rotation_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn notify_ready_sends_ready_and_status_to_notify_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notify.sock");
+        let socket = std::os::unix::net::UnixDatagram::bind(&path).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        std::env::set_var("NOTIFY_SOCKET", &path);
+
+        notify_ready("listening on 127.0.0.1:1");
+
+        let mut buf = [0u8; 256];
+        let n = socket.recv(&mut buf).unwrap();
+        assert_eq!(
+            std::str::from_utf8(&buf[..n]).unwrap(),
+            "READY=1\nSTATUS=listening on 127.0.0.1:1\n"
+        );
+    }
 
     /// The sweep fires at its interval, not the next recheck, and a window
     /// shortened mid-wait applies at the next recheck.

@@ -152,7 +152,7 @@ impl Instance {
         )
     }
 
-    pub(super) fn ensure_container_with_hook_in(
+    pub(crate) fn ensure_container_with_hook_in(
         &mut self,
         store: &dyn SessionStore,
         cancel: &tokio_util::sync::CancellationToken,
@@ -162,6 +162,7 @@ impl Instance {
         let global_config = &launch_config.global;
         let profile_config = &launch_config.profile;
         let checkpoint = || {
+            store.check_available()?;
             if cancel.is_cancelled() {
                 anyhow::bail!("sandbox start cancelled");
             }
@@ -223,6 +224,7 @@ impl Instance {
                     session = %self.id,
                     "removing sandbox container built for another tool; it will be recreated"
                 );
+                checkpoint()?;
                 container.remove(true)?;
             } else if let Err(error) = reloaded {
                 tracing::warn!(
@@ -292,6 +294,7 @@ impl Instance {
         let mut recreate = false;
         if container.exists()? {
             if container.sandbox_store_generation_matches()? == Some(false) {
+                checkpoint()?;
                 container.remove(false)?;
             } else {
                 // Restart of a stopped container is a come-up: refresh so a
@@ -314,9 +317,11 @@ impl Instance {
                 // refreshes.
                 recreate = container.shared_credential_mounts_match(&config)? == Some(false);
                 if recreate {
+                    checkpoint()?;
                     container.remove(false)?;
                 } else {
                     container_config::place_shadowed_credential_mountpoints(&config);
+                    checkpoint()?;
                     container.start()?;
                     self.finish_container_reuse(
                         &container,
@@ -352,6 +357,7 @@ impl Instance {
                 .as_ref()
                 .and_then(|sandbox| sandbox.container_workdir.as_deref()),
         );
+        checkpoint()?;
         container.remove_stranded_named_ignore_volumes(&self.id, &stranded);
         container_config::place_shadowed_credential_mountpoints(&config);
         checkpoint()?;
@@ -718,6 +724,7 @@ mod tests {
 
         let mut inst = Instance::new("contexec", worktree.to_str().unwrap());
         inst.sandbox_info = Some(SandboxInfo {
+            provider: None,
             enabled: true,
             container_id: None,
             image: "img".to_string(),
@@ -811,6 +818,7 @@ claude-personal = "~/.claude-global"
         instance.tool = "claude-personal".to_string();
         instance.source_profile = profile.to_string();
         instance.sandbox_info = Some(SandboxInfo {
+            provider: None,
             enabled: true,
             container_id: None,
             image: "test:latest".to_string(),
@@ -991,6 +999,7 @@ claude-personal = "~/.claude-global"
             instance.detect_as = detect_as.to_string();
             instance.source_profile = profile.to_string();
             instance.sandbox_info = Some(SandboxInfo {
+                provider: None,
                 enabled: true,
                 container_id: None,
                 image: "test:latest".to_string(),
@@ -1075,6 +1084,7 @@ claude-personal = "~/.claude-global"
             instance.detect_as = detect_as.to_string();
             instance.source_profile = profile.to_string();
             instance.sandbox_info = Some(SandboxInfo {
+                provider: None,
                 enabled: true,
                 container_id: None,
                 image: "test:latest".to_string(),

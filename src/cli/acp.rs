@@ -166,6 +166,20 @@ pub enum AcpCommands {
         #[arg(long)]
         model: Option<String>,
     },
+    /// Re-route a Claude session to a different LLM provider, keeping the
+    /// transcript. Refused mid-turn; once idle the worker restarts and
+    /// resumes the same conversation. Credentials are not provisioned by
+    /// this: the target provider's own variables must already be set on the
+    /// host (for example `ANTHROPIC_VERTEX_PROJECT_ID` and `CLOUD_ML_REGION`
+    /// for vertex). The model resets to the new provider's default, because
+    /// model ids differ between providers.
+    SwitchProvider {
+        /// Acp session id.
+        session: String,
+        /// Provider to route through.
+        #[arg(value_parser = ["api", "bedrock", "vertex"])]
+        provider: String,
+    },
 }
 
 #[tracing::instrument(target = "cli.acp", skip_all)]
@@ -209,6 +223,9 @@ pub async fn run(command: AcpCommands) -> Result<()> {
             target,
             model,
         } => switch_agent(&session, &target, model.as_deref()).await,
+        AcpCommands::SwitchProvider { session, provider } => {
+            switch_provider(&session, &provider).await
+        }
     }
 }
 
@@ -1005,6 +1022,20 @@ async fn switch_agent(session: &str, target: &str, model: Option<&str>) -> Resul
         .await
         .map_err(map_http)?;
     println!("switched agent for {session} -> {}", resp.agent);
+    Ok(())
+}
+
+async fn switch_provider(session: &str, provider: &str) -> Result<()> {
+    let endpoint = require_daemon().await?;
+    let client = HttpClient::new(endpoint)?;
+    let resp = client
+        .switch_provider(session, provider)
+        .await
+        .map_err(map_http)?;
+    println!("switched provider for {session} -> {}", resp.provider);
+    if resp.model_cleared {
+        println!("model pick replaced by the provider's default; model ids are provider-specific");
+    }
     Ok(())
 }
 

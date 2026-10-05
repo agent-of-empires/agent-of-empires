@@ -474,6 +474,7 @@ async fn admit_and_create(
 
     let spec = StructuredSessionSpec {
         title: req.title,
+        title_typed: false,
         size: None,
         path: project_path,
         group: req.group.unwrap_or_default(),

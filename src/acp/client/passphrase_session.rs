@@ -91,11 +91,8 @@ pub(super) async fn login(
     let res = login_client()?.post(&url).json(&body).send().await?;
     let status = res.status();
     if !status.is_success() {
-        let body = res.text().await.unwrap_or_default();
-        return Err(match status {
-            StatusCode::UNAUTHORIZED => HttpError::Unauthorized,
-            _ => HttpError::Server { status, body },
-        });
+        let body = crate::daemon::decode_text(res).await?;
+        return Err(map_auth_error(status, body));
     }
     let cookie = extract_session_cookie(res.headers()).ok_or(HttpError::Unauthorized)?;
     let session = PassphraseSession {
@@ -105,6 +102,47 @@ pub(super) async fn login(
     persist_session(endpoint, &session);
     cache.set(session.clone());
     Ok(session)
+}
+
+/// Map a non-success `/api/login` or `/api/login/elevate` response the same
+/// way: a wrong passphrase is `Unauthorized` (mirrors the daemon's own
+/// wording for both endpoints), anything else (rate limiting, a locked-out
+/// session) is a generic server error the caller surfaces verbatim.
+fn map_auth_error(status: StatusCode, body: String) -> HttpError {
+    match status {
+        StatusCode::UNAUTHORIZED => HttpError::Unauthorized,
+        _ => HttpError::Server { status, body },
+    }
+}
+
+/// Confirm the passphrase again against `POST /api/login/elevate`, extending
+/// the *existing* cached session's server-side elevation window. Unlike
+/// `login`, this never mints a new session or cookie and takes no action on
+/// success beyond the daemon's own state change: the next request replays the
+/// same cached cookie, which the daemon now treats as elevated.
+pub(super) async fn elevate(
+    endpoint: &DaemonEndpoint,
+    cache: &PassphraseSessionCache,
+) -> Result<(), HttpError> {
+    let session = cache.get(endpoint).ok_or(HttpError::Unauthorized)?;
+    let passphrase = endpoint
+        .resolved_passphrase()
+        .ok_or(HttpError::Unauthorized)?;
+    let url = format!("{}/api/login/elevate", endpoint.base_url);
+    let body = serde_json::json!({ "passphrase": passphrase });
+    let res = login_client()?
+        .post(&url)
+        .header(header::COOKIE, &session.cookie)
+        .header("X-Aoe-Device-Binding", &session.binding_secret)
+        .json(&body)
+        .send()
+        .await?;
+    let status = res.status();
+    if status.is_success() {
+        return Ok(());
+    }
+    let body = crate::daemon::decode_text(res).await?;
+    Err(map_auth_error(status, body))
 }
 
 /// A dedicated client for the login POST with redirects disabled: a
@@ -389,5 +427,17 @@ mod tests {
         // The device-binding secret survives: a fresh login reuses it
         // rather than binding a new "device" every time a session expires.
         assert!(dir.path().join(DEVICE_BINDING_FILENAME).exists());
+    }
+
+    #[test]
+    fn map_auth_error_distinguishes_unauthorized_from_generic() {
+        assert!(matches!(
+            map_auth_error(StatusCode::UNAUTHORIZED, "bad passphrase".into()),
+            HttpError::Unauthorized
+        ));
+        assert!(matches!(
+            map_auth_error(StatusCode::TOO_MANY_REQUESTS, "locked out".into()),
+            HttpError::Server { status, .. } if status == StatusCode::TOO_MANY_REQUESTS
+        ));
     }
 }

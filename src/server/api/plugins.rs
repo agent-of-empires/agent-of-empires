@@ -41,10 +41,9 @@ async fn mutation_gate(
         return Err(resp);
     }
     if !handler_elevated(state, session, local.is_some()).await {
-        return Err(error_response(
-            StatusCode::FORBIDDEN,
-            "elevation_required",
-            "Re-enter the passphrase to continue".into(),
+        return Err(super::api_error_with_code_header(
+            crate::daemon::ApiErrorCode::ElevationRequired,
+            "Re-enter the passphrase to continue",
         ));
     }
     Ok(())

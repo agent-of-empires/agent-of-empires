@@ -47,7 +47,7 @@ const UI_ENTRIES = [
   },
 ];
 
-async function mockApis(page: Page) {
+async function mockApis(page: Page, entries: unknown[] = UI_ENTRIES) {
   await mockStaticApis(page);
   await page.route("**/api/sessions", (r) => {
     if (r.request().method() !== "GET") return r.fulfill({ status: 400 });
@@ -56,7 +56,7 @@ async function mockApis(page: Page) {
       json: { sessions: [sessionResponse()], workspace_ordering: ["/tmp/repo::feature/x"] },
     });
   });
-  await page.route("**/api/plugins/ui-state", (r) => r.fulfill({ json: { entries: UI_ENTRIES, notifications: [] } }));
+  await page.route("**/api/plugins/ui-state", (r) => r.fulfill({ json: { entries, notifications: [] } }));
 }
 
 // A child element is "within" the row when its right edge does not spill past
@@ -93,5 +93,39 @@ test.describe("Plugin row slots on a mobile sidebar (#2514)", () => {
     // to zero or clipped past its right edge.
     expect(await allWithinRow(page, column)).toBe(true);
     expect(await allWithinRow(page, badge)).toBe(true);
+  });
+
+  test("clicking a grouped badge cycles its values without selecting the row", async ({ page }) => {
+    await page.setViewportSize({ width: 390, height: 844 });
+    await mockApis(page, [
+      {
+        plugin_id: "acme.kit",
+        slot: "row-badge",
+        id: "usage",
+        session_id: "s1",
+        payload: {
+          items: [
+            { text: "5h 40%", group: "usage" },
+            { text: "7d 12%", group: "usage" },
+            { text: "stale", tone: "warn" },
+          ],
+        },
+      },
+    ]);
+    await page.goto("/");
+    await page.getByRole("button", { name: "Toggle sidebar" }).click();
+    await expect(page.locator("[data-testid='sidebar-session-row']")).toHaveCount(1, { timeout: 8000 });
+
+    const chip = page.locator("button[data-plugin-slot='row-badge']");
+    await expect(chip).toHaveText("5h 40%");
+    const url = page.url();
+    await chip.click();
+    await expect(chip).toHaveText("7d 12%");
+    await chip.click();
+    await expect(chip).toHaveText("5h 40%");
+    await expect(page.getByText("stale")).toBeVisible();
+    expect(page.url()).toBe(url);
+    // The drawer stays open: a click on the chip must not reach the row's select handler.
+    await expect(page.locator("[data-testid='sidebar-session-row']")).toBeVisible();
   });
 });

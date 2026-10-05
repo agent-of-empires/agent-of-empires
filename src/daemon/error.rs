@@ -7,6 +7,7 @@ pub const ERROR_CODE_HEADER: &str = "aoe-error-code";
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ApiErrorCode {
     ReadOnly,
+    ElevationRequired,
     AccessPolicyDenied,
     CityhallMode,
     LifecycleLocked,
@@ -25,6 +26,7 @@ impl ApiErrorCode {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::ReadOnly => "read_only",
+            Self::ElevationRequired => "elevation_required",
             Self::AccessPolicyDenied => "access_policy_denied",
             Self::CityhallMode => "cityhall_mode",
             Self::LifecycleLocked => "lifecycle_locked",
@@ -42,7 +44,10 @@ impl ApiErrorCode {
 
     pub const fn status(self) -> StatusCode {
         match self {
-            Self::ReadOnly | Self::AccessPolicyDenied | Self::CityhallMode => StatusCode::FORBIDDEN,
+            Self::ReadOnly
+            | Self::ElevationRequired
+            | Self::AccessPolicyDenied
+            | Self::CityhallMode => StatusCode::FORBIDDEN,
             Self::LifecycleLocked
             | Self::RuntimeEpochMismatch
             | Self::ResumeFailed
@@ -73,6 +78,7 @@ impl ApiErrorCode {
         }
         let code = match value.as_bytes() {
             b"read_only" => Self::ReadOnly,
+            b"elevation_required" => Self::ElevationRequired,
             b"access_policy_denied" => Self::AccessPolicyDenied,
             b"cityhall_mode" => Self::CityhallMode,
             b"lifecycle_locked" => Self::LifecycleLocked,
@@ -106,6 +112,19 @@ mod tests {
                 Some(ApiErrorCode::ReadOnly),
             ),
             (StatusCode::CONFLICT, "read_only", false, None),
+            (
+                StatusCode::FORBIDDEN,
+                "elevation_required",
+                false,
+                Some(ApiErrorCode::ElevationRequired),
+            ),
+            (StatusCode::UNAUTHORIZED, "elevation_required", false, None),
+            (
+                StatusCode::FORBIDDEN,
+                "elevation_required, read_only",
+                false,
+                None,
+            ),
             (
                 StatusCode::FORBIDDEN,
                 "read_only, cityhall_mode",
