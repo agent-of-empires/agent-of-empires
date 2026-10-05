@@ -186,13 +186,15 @@ pub fn structured_fork_capable(tool: &str, agent_name: Option<&str>) -> bool {
         })
 }
 
-/// Whether a canonical native agent supports terminal forking, on either
-/// generation it declares.
+/// Whether a canonical native agent supports terminal forking. An agent that
+/// declares two generations is forkable when either arm is, since the installed
+/// binary sits on one side or the other and refusing on the strength of the arm
+/// that does not apply would hide a capability the user has.
 pub fn terminal_agent_can_fork(agent: &str) -> bool {
     get_agent(agent).is_some_and(|def| match def.fork_strategy {
         ForkStrategy::EitherGeneration { legacy, current } => {
             !matches!(legacy, ForkStrategy::Unsupported)
-                && !matches!(current, ForkStrategy::Unsupported)
+                || !matches!(current, ForkStrategy::Unsupported)
         }
         strategy => !matches!(strategy, ForkStrategy::Unsupported),
     })
