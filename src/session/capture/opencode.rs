@@ -297,12 +297,32 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         let handle = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            let mut buffer = [0u8; 4096];
-            let read = stream.read(&mut buffer).unwrap();
-            let request = String::from_utf8_lossy(&buffer[..read]).to_string();
+            let mut request = Vec::new();
+            let mut buffer = [0u8; 1024];
+            // One read can stop mid-request, so keep reading until the headers
+            // are complete and the body they announce has arrived. A POST here
+            // carries a JSON body, which routinely lands in a second segment.
+            loop {
+                let read = stream.read(&mut buffer).unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                if let Some(header_end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&request[..header_end]).to_lowercase();
+                    let announced = headers
+                        .lines()
+                        .find_map(|line| line.strip_prefix("content-length:"))
+                        .and_then(|value| value.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    if request.len() >= header_end + 4 + announced {
+                        break;
+                    }
+                }
+            }
             stream.write_all(response.as_bytes()).unwrap();
             stream.flush().unwrap();
-            request
+            String::from_utf8_lossy(&request).to_string()
         });
         (handle, port)
     }

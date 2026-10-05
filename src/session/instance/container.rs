@@ -486,14 +486,16 @@ impl Instance {
         } else {
             None
         };
-        // The generation decides which yolo spelling the container receives, and
-        // it has to come from the launch the pane would run with rather than
-        // from this process's own `PATH`.
+        // A sandboxed launch has no host program to probe: the agent's binary
+        // lives inside the container, which the host cannot read. Probing the
+        // host PATH here would answer about a binary the container does not run,
+        // so the generation falls back the way the launch's own command line
+        // does for the same reason.
         let agent = crate::agents::get_agent(&self.tool)
             .unwrap_or_else(|| crate::agents::get_agent("opencode").expect("a builtin agent"));
-        let yolo_generation = self.is_yolo_mode().then(|| {
-            super::execution::agent_generation(agent, self.launch_program(agent, None).as_deref())
-        });
+        let yolo_generation = self
+            .is_yolo_mode()
+            .then(|| super::execution::agent_generation(agent, None));
         container_config::build_container_config(
             &self.project_path,
             sandbox,
