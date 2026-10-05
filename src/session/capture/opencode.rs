@@ -58,26 +58,14 @@ enum Signal {
 fn signal_serve_group(pid: u32, signal: Signal) {
     #[cfg(unix)]
     {
-        let group = format!("-{pid}");
-        // A leading dash targets the group, which `process_group(0)` created.
-        let _ = std::process::Command::new("kill")
-            .arg(match signal {
-                Signal::Term => "-TERM",
-                Signal::Kill => "-KILL",
-            })
-            .arg(&group)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-        let _ = std::process::Command::new("kill")
-            .arg(match signal {
-                Signal::Term => "-TERM",
-                Signal::Kill => "-KILL",
-            })
-            .arg(pid.to_string())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        use nix::sys::signal::{kill, killpg, Signal as Nix};
+        let sig = match signal {
+            Signal::Term => Nix::SIGTERM,
+            Signal::Kill => Nix::SIGKILL,
+        };
+        let p = nix::unistd::Pid::from_raw(pid as i32);
+        let _ = killpg(p, sig);
+        let _ = kill(p, sig);
     }
     #[cfg(not(unix))]
     let _ = (pid, signal);
@@ -487,13 +475,8 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             // A reaped pid no longer resolves to a live process.
-            let alive = std::process::Command::new("kill")
-                .args(["-0", &pid.to_string()])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .map(|status| status.success())
-                .unwrap_or(false);
+            let alive =
+                nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None).is_ok();
             if !alive {
                 return;
             }
