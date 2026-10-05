@@ -1350,6 +1350,41 @@ mod tests {
         assert!(!cmd.contains("--session"), "{cmd}");
     }
 
+    /// A store fork adopts a child mid-preparation, and the launch then
+    /// revalidates the conversation against the target the execution captured
+    /// before the command was built. The adopted child must not read as a target
+    /// that changed under the launch, which is what a promoted intent would do.
+    #[test]
+    fn a_store_fork_keeps_the_parent_as_its_revalidation_target() {
+        let home = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(home.path());
+        let parent = "ses_parent00000000000000000000000";
+        let child = "ses_ef71c5686ffedIqGGjtFGLwW1r";
+
+        let mut inst = tool_instance("opencode", "/tmp/test");
+        inst.resume_intent = ResumeIntent::Fork {
+            from: parent.to_string(),
+        };
+        inst.agent_session_id = Some(child.to_string());
+        inst.agent_session_binding = Some(crate::session::ConversationBinding {
+            session_id: child.to_string(),
+            execution: None,
+            provenance: crate::session::ConversationProvenance::Observed,
+            transcript_path: None,
+        });
+
+        assert_eq!(
+            inst.stored_fork_child().as_deref(),
+            Some(child),
+            "a second pass opens the adopted child"
+        );
+        assert_eq!(
+            inst.conversation_target().map(|(sid, _, _)| sid),
+            Some(parent),
+            "the fork target stays the parent, so the post-build revalidation matches"
+        );
+    }
+
     #[test]
     fn resume_command_uses_validated_executable_anchor() {
         let home = tempfile::tempdir().unwrap();
