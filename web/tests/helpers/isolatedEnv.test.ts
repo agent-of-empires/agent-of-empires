@@ -61,6 +61,7 @@ const NON_SUFFIX_HOST_STATE: Record<string, string> = {
   GIT_CONFIG_SYSTEM: `${HOST}/etc/gitconfig`,
   GIT_SSH_COMMAND: `ssh -i ${HOST}/.ssh/id_ed25519`,
   GIT_WORK_TREE: `${HOST}/repo`,
+  NOTIFY_SOCKET: `${HOST}/systemd-notify.sock`,
   TMUX: "/tmp/tmux-1000/default,4242,0",
   TMUX_PANE: "%7",
 };

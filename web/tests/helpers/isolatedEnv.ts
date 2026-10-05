@@ -1,6 +1,5 @@
-// The live daemon inherits process.env, so any variable naming config, data, or credentials would point it at
-// real agent state. Path-shaped names are dropped wholesale, a few needed ones are kept, and host state under
-// unsuffixed names is dropped or pinned by name (#3657). isolatedEnv.test.ts enforces the contract against src/.
+// Keep live daemon subprocesses inside the fixture namespace.
+// isolatedEnv.test.ts checks this against environment reads in src/.
 
 import { join } from "node:path";
 
@@ -68,6 +67,7 @@ export const HOST_STATE_VARS = new Set([
   "AOE_OMP_LAUNCH_ID",
   "TMUX",
   "TMUX_PANE",
+  "NOTIFY_SOCKET", // the host service manager's notification endpoint
   // Re-pinned to the private socket by spawnAoeServe.
   "AOE_TMUX_SOCKET",
 ]);
