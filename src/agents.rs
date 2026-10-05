@@ -171,9 +171,10 @@ pub enum ForkStrategy {
 
 impl ForkStrategy {
     /// Whether the launch itself produces the child id, which makes the id AoE
-    /// pre-pinned for the fork a placeholder to drop.
+    /// pre-pinned for the fork a placeholder to drop. A root fork flag never
+    /// carries that id, so the agent mints one of its own.
     pub(crate) const fn mints_child(self) -> bool {
-        matches!(self, Self::CodexFork)
+        matches!(self, Self::CodexFork | Self::Flag(_))
     }
 
     /// The mechanism the installed build understands. A strategy that spans two

@@ -1331,9 +1331,25 @@ mod tests {
     /// fall through to an unforked session. The refusal is the wrapping context
     /// the fork arm adds, so the assertion targets that rather than whatever the
     /// store reported underneath it.
+    ///
+    /// The project path is a real directory and the binary is resolved on an
+    /// isolated `PATH`, so the refusal cannot come from a spawn that never
+    /// happened and cannot reach whatever store the developer's own `PATH` names.
     #[test]
+    #[serial_test::serial]
     fn opencode_fork_refuses_when_the_store_returns_no_child() {
-        let mut inst = tool_instance("opencode", "/tmp/x");
+        let home = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(home.path());
+        let _isolated = crate::session::test_support::install_login_shell_path_command(
+            home.path(),
+            "unrelated-agent",
+            "#!/bin/sh\nexit 0\n",
+        );
+        crate::agents::forget_agent_help_for_test();
+        let project = home.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+
+        let mut inst = tool_instance("opencode", project.to_str().unwrap());
         inst.agent_session_id = Some("ses_child000000000000000000000000".to_string());
         inst.resume_intent = ResumeIntent::Fork {
             from: "ses_parent00000000000000000000000".to_string(),

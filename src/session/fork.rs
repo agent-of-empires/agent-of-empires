@@ -169,24 +169,32 @@ fn builtin_acp_registry() -> &'static crate::acp::AgentRegistry {
 
 /// True when `tool`/`agent_name` can run the structured ACP `session/fork` handshake: it maps to a
 /// built-in ACP adapter AND that adapter is verified to implement ACP `session/fork`.
+///
+/// Whether an agent can fork does not depend on which generation is installed,
+/// so these two predicates read the descriptor directly instead of probing the
+/// binary. They answer per row while a menu or a dashboard renders, and a probe
+/// there would spawn a subprocess on the render thread.
 pub fn structured_fork_capable(tool: &str, agent_name: Option<&str>) -> bool {
     let resolved = agent_name.filter(|s| !s.is_empty()).unwrap_or(tool);
     builtin_acp_registry().get(resolved).is_some()
-        && get_agent(resolved).is_some_and(|agent| {
-            matches!(
-                agent.fork_strategy.resolve(agent.detected_generation()),
-                ForkStrategy::ClaudeFork
-            )
+        && get_agent(resolved).is_some_and(|agent| match agent.fork_strategy {
+            ForkStrategy::EitherGeneration { legacy, current } => {
+                matches!(legacy, ForkStrategy::ClaudeFork)
+                    && matches!(current, ForkStrategy::ClaudeFork)
+            }
+            strategy => matches!(strategy, ForkStrategy::ClaudeFork),
         })
 }
 
-/// Whether a canonical native agent supports terminal forking.
+/// Whether a canonical native agent supports terminal forking, on either
+/// generation it declares.
 pub fn terminal_agent_can_fork(agent: &str) -> bool {
-    get_agent(agent).is_some_and(|def| {
-        !matches!(
-            def.fork_strategy.resolve(def.detected_generation()),
-            ForkStrategy::Unsupported
-        )
+    get_agent(agent).is_some_and(|def| match def.fork_strategy {
+        ForkStrategy::EitherGeneration { legacy, current } => {
+            !matches!(legacy, ForkStrategy::Unsupported)
+                && !matches!(current, ForkStrategy::Unsupported)
+        }
+        strategy => !matches!(strategy, ForkStrategy::Unsupported),
     })
 }
 
