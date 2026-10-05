@@ -34,6 +34,8 @@ pub(super) struct PreparedLaunch {
 /// declares two generations is resolved against the executable's own help, read
 /// from the program the launch runs or, when there is none, from the binary
 /// `PATH` resolves for the descriptor.
+/// A sandboxed launch names no program, and the container config reaches the
+/// same answer, so the two cannot disagree.
 fn resolved_yolo(
     inst: &Instance,
     agent: &'static crate::agents::AgentDef,

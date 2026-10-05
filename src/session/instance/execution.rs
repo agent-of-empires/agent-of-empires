@@ -1234,19 +1234,21 @@ pub(super) fn agent_generation(
 }
 
 impl Instance {
-    /// The binary this launch runs, when the host can name one. A container's
-    /// is a path inside the container and is left to the caller to handle.
+    /// The binary this launch runs, when the host can name one. A sandboxed
+    /// session's binary lives inside the container, which the host cannot read,
+    /// so nothing is named for it.
     pub(super) fn launch_program(
         &self,
         agent: &crate::agents::AgentDef,
         execution: Option<&NativeExecution>,
     ) -> Option<std::path::PathBuf> {
+        // Answering from the host PATH here would describe a binary the
+        // container does not run, and every consumer would disagree with it.
+        if self.is_sandboxed() {
+            return None;
+        }
         match execution {
-            Some(execution) => {
-                // A container's program points inside the container, which the
-                // host cannot read, so it is left unnamed.
-                (!execution.inputs.container.is_some()).then(|| execution.program.clone())
-            }
+            Some(execution) => Some(execution.program.clone()),
             None => {
                 // The same resolver the pane's own environment is built from,
                 // so a `$VAR` reference or a repeated key resolves to the same
