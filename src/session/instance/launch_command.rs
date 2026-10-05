@@ -1591,6 +1591,64 @@ mod tests {
         }
     }
 
+    /// A profile that points `PATH` at another install still launches a host
+    /// binary, and that binary is the one whose interface this launch speaks.
+    /// Reading AoE's own `PATH` instead would answer about a different program
+    /// than the one running.
+    #[test]
+    #[serial_test::serial]
+    fn a_profile_path_resolves_the_generation_from_the_launched_binary() {
+        let home = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(home.path());
+        // AoE's own PATH carries the current generation.
+        let _current = crate::session::test_support::install_login_shell_path_command(
+            home.path(),
+            "opencode",
+            "#!/bin/sh\nprintf '%s\\n' 'FLAGS\n  --auto  approve'\nexit 0\n",
+        );
+        // The profile's PATH points at an install carrying the older one.
+        let profile_bin = home.path().join("profile-bin");
+        std::fs::create_dir_all(&profile_bin).unwrap();
+        let profile_agent = profile_bin.join("opencode");
+        std::fs::write(
+            &profile_agent,
+            "#!/bin/sh\nprintf '%s\\n' 'FLAGS\n  --fork  fork'\nexit 0\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&profile_agent, std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+        }
+        crate::agents::forget_agent_help_for_test();
+
+        let inputs = crate::session::instance::execution::NativeLaunchInputs {
+            launch_id: "test".to_string(),
+            environment: [(
+                "PATH".to_string(),
+                profile_bin.to_string_lossy().into_owned(),
+            )]
+            .into_iter()
+            .collect(),
+            cwd: home.path().to_path_buf(),
+            profile: "default".to_string(),
+            container: None,
+            docker_env: None,
+            pane_env: Vec::new(),
+            identity_extension: None,
+        };
+        assert_eq!(
+            super::execution::agent_generation(
+                crate::agents::get_agent("opencode").unwrap(),
+                Some(&inputs),
+                Some(&profile_agent),
+            ),
+            crate::agents::AgentGeneration::Legacy,
+            "the answer comes from the binary the pane runs, not from AoE's own PATH"
+        );
+    }
+
     #[test]
     fn host_command_forces_color_only_for_color_sensitive_agents() {
         for (tool, command, needle, forced) in [
