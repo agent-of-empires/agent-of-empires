@@ -1327,14 +1327,15 @@ mod tests {
         assert_eq!(cmd, "codex fork parent-1234 --some-flag");
     }
 
-    /// A store fork that cannot mint a child must refuse the launch rather than
-    /// fall through to an unforked session. The refusal is the wrapping context
-    /// the fork arm adds, so the assertion targets that rather than whatever the
-    /// store reported underneath it.
+    /// A fork that cannot reach the agent's store must refuse the launch rather
+    /// than fall through to an unforked session.
     ///
-    /// The project path is a real directory and the binary is resolved on an
-    /// isolated `PATH`, so the refusal cannot come from a spawn that never
-    /// happened and cannot reach whatever store the developer's own `PATH` names.
+    /// The stub is installed as `opencode` itself and advertises `--auto` but no
+    /// `--fork`, so the generation this launch resolves to is the stub's rather
+    /// than whatever the host has. The stub's `serve` never answers, so the fork
+    /// has no child to adopt and the arm has to refuse. Both are bounded: the
+    /// readiness deadline, not a fixed wait, and nothing touches the store the
+    /// developer's own `PATH` would name.
     #[test]
     #[serial_test::serial]
     fn opencode_fork_refuses_when_the_store_returns_no_child() {
@@ -1342,8 +1343,8 @@ mod tests {
         let _app = crate::session::test_support::isolate_app_dir_at(home.path());
         let _isolated = crate::session::test_support::install_login_shell_path_command(
             home.path(),
-            "unrelated-agent",
-            "#!/bin/sh\nexit 0\n",
+            "opencode",
+            "#!/bin/sh\ncase \"$1\" in --help) printf '%s\\n' 'USAGE\n  --auto  approve';; esac\nexit 0\n",
         );
         crate::agents::forget_agent_help_for_test();
         let project = home.path().join("project");
@@ -1357,7 +1358,7 @@ mod tests {
         let mut cmd = "opencode".to_string();
         let error = inst
             .apply_session_flags(&mut cmd, "test", crate::agents::get_agent("opencode"), None)
-            .expect_err("an unminted fork must not launch");
+            .expect_err("a fork with no child to adopt must not launch");
         assert!(
             format!("{error:#}").contains("refused"),
             "the fork arm must name its own refusal: {error:#}"
@@ -1546,6 +1547,17 @@ mod tests {
         let mut custom = tool_instance("kiro", "/tmp/test");
         custom.command = "kiro-cli chat --trust-all-tools".to_string();
         assert_eq!(host_command(&mut custom).matches("chat").count(), 1);
+    }
+
+    /// The inlined permission object still reaches 1.x builds, where a bare
+    /// double quote would end the shell assignment and let the object be
+    /// word-split into the command.
+    #[test]
+    fn the_inlined_permission_object_is_quoted_for_the_legacy_generation() {
+        let cmd = format_env_var_prefix("OPENCODE_PERMISSION", r#"{"*":"allow"}"#, "opencode");
+        assert_eq!(cmd, r#"OPENCODE_PERMISSION='{"*":"allow"}' opencode"#);
+        let wrapped = wrap_command_ignore_suspend(&cmd, "/tmp/proj", &[], &[]);
+        assert!(wrapped.contains(r#"OPENCODE_PERMISSION='{"*":"allow"}' opencode"#));
     }
 
     /// Both OpenCode generations approve permissions, each by the spelling it
