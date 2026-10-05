@@ -1377,20 +1377,29 @@ work-opencode = "opencode"
     /// A store fork runs `opencode serve` against the launch's own database, so
     /// a wrapper-mediated or sandboxed launch cannot reach it.
     #[test]
+    #[serial_test::serial]
     fn opencode_store_fork_needs_a_direct_host_launch() {
-        let mut inst = tool_instance("opencode", "/tmp/test");
+        // The gate reads the profile and the app directory, so both are
+        // isolated: the runner's own configuration would decide the answer.
+        let home = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(home.path());
+        let project = home.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let project = project.to_str().unwrap();
+
+        let mut inst = tool_instance("opencode", project);
         assert!(inst.opencode_store_fork_available(None));
         inst.command = "opencode-wrapper".to_string();
         assert!(!inst.opencode_store_fork_available(None));
 
-        let mut sandboxed = tool_instance("opencode", "/tmp/test");
+        let mut sandboxed = tool_instance("opencode", project);
         sandboxed.sandbox_info = Some(super::super::test_helpers::test_sandbox(
             "fork-refusal",
             None,
         ));
         assert!(!sandboxed.opencode_store_fork_available(None));
 
-        let other = tool_instance("claude", "/tmp/test");
+        let other = tool_instance("claude", project);
         assert!(!other.opencode_store_fork_available(None));
     }
 
