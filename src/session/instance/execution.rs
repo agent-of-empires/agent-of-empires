@@ -1228,14 +1228,11 @@ pub(super) fn agent_generation(
     inputs: Option<&NativeLaunchInputs>,
     program: Option<&std::path::Path>,
 ) -> crate::agents::AgentGeneration {
-    let probed = match (inputs, program) {
-        (Some(inputs), Some(program)) => inputs.runs_host_path_binary(agent.binary, program),
-        _ => false,
-    };
-    if probed {
-        crate::agents::agent_generation_for(agent, program.expect("a probed program is present"))
-    } else {
-        agent.detected_generation()
+    match (inputs, program) {
+        (Some(inputs), Some(program)) if inputs.runs_host_path_binary(agent.binary, program) => {
+            crate::agents::agent_generation_for(agent, program)
+        }
+        _ => agent.detected_generation(),
     }
 }
 
