@@ -728,6 +728,14 @@ impl Instance {
                 agent,
                 self.launch_program(agent, execution).as_deref(),
             );
+            if generation == crate::agents::AgentGeneration::Unknown {
+                anyhow::bail!(
+                    "{} --help did not answer, so it is unknown whether this build forks \
+                     through its store or its root flag; the fork was refused rather than \
+                     started with a mechanism that may not exist",
+                    agent.name
+                );
+            }
             if matches!(
                 agent.fork_strategy.resolve(generation),
                 crate::agents::ForkStrategy::ServeFork

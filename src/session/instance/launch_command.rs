@@ -41,12 +41,18 @@ fn resolved_yolo(
     agent: &'static crate::agents::AgentDef,
     execution: Option<&super::execution::NativeExecution>,
 ) -> Option<&'static crate::agents::YoloMode> {
-    agent.yolo.as_ref().map(|yolo| {
-        yolo.resolve(super::execution::agent_generation(
-            agent,
-            inst.launch_program(agent, execution).as_deref(),
-        ))
-    })
+    let yolo = agent.yolo.as_ref()?;
+    let generation =
+        super::execution::agent_generation(agent, inst.launch_program(agent, execution).as_deref());
+    if generation == crate::agents::AgentGeneration::Unknown {
+        // Neither spelling can be claimed for a build whose help never
+        // answered, and sending the wrong one is silently inert.
+        tracing::warn!(target: "session.store", tool = agent.name,
+            "agent --help did not answer, so its approval mechanism cannot be established; \
+             the launch runs without it");
+        return None;
+    }
+    Some(yolo.resolve(generation))
 }
 
 /// Append yolo-mode flags or environment variables to a launch command.
@@ -1591,6 +1597,28 @@ mod tests {
             let wrapped = wrap_command_ignore_suspend(&cmd, "/tmp/proj", &[], &[]);
             assert_eq!(wrapped.contains("--auto"), expect_flag, "{wrapped}");
         }
+    }
+
+    /// A build whose help never answers is neither generation. Sending it the
+    /// current spelling would leave the launch silently unapproved, so it runs
+    /// without either rather than with one that may not exist.
+    #[test]
+    #[serial_test::serial]
+    fn an_unreadable_help_sends_neither_yolo_spelling() {
+        let home = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(home.path());
+        let _opencode = crate::session::test_support::install_login_shell_path_command(
+            home.path(),
+            "opencode",
+            "#!/bin/sh\nexit 0\n",
+        );
+        crate::agents::forget_agent_help_for_test();
+
+        let mut inst = tool_instance("opencode", "/tmp/test");
+        inst.yolo_mode = true;
+        let cmd = host_command(&mut inst);
+        assert!(!cmd.contains("--auto"), "{cmd}");
+        assert!(!cmd.contains("OPENCODE_PERMISSION"), "{cmd}");
     }
 
     /// A profile that points `PATH` at another install launches a host binary,

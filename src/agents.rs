@@ -56,6 +56,9 @@ pub enum AgentGeneration {
     Legacy,
     /// The interface 2.x and later expose.
     Current,
+    /// The build's help never answered, so nothing distinguishes the two. A
+    /// launch that depends on the answer refuses rather than guess.
+    Unknown,
 }
 
 impl YoloMode {
@@ -66,6 +69,9 @@ impl YoloMode {
             YoloMode::EitherGeneration { legacy, current } => match generation {
                 AgentGeneration::Legacy => legacy,
                 AgentGeneration::Current => current,
+                // Nothing establishes which arm the build reads, so neither is
+                // claimed; a caller that needs one refuses instead.
+                AgentGeneration::Unknown => current,
             },
             _ => self,
         }
@@ -184,6 +190,9 @@ impl ForkStrategy {
             ForkStrategy::EitherGeneration { legacy, current } => match generation {
                 AgentGeneration::Legacy => legacy,
                 AgentGeneration::Current => current,
+                // Nothing establishes which arm the build accepts, so the caller
+                // has to refuse rather than pick one for the user.
+                AgentGeneration::Unknown => current,
             },
             _ => self,
         }
@@ -1038,16 +1047,54 @@ pub fn agent_generation_for(agent: &AgentDef, program: &std::path::Path) -> Agen
     if !agent.spans_agent_generations {
         return AgentGeneration::Current;
     }
+    let help = agent_help(program);
     // The root `--fork` is the marker: every 1.x build declares it and 2.x
     // removed it. `--auto` cannot serve, because 1.17.12 and later declare that
     // at their root too.
-    if agent_help_advertises(program, LEGACY_GENERATION_MARKER) {
-        AgentGeneration::Legacy
-    } else {
-        // An unreadable help is not evidence of the older interface, and the
-        // current spelling is the one a fresh install speaks.
-        AgentGeneration::Current
+    if help_contains(&help, LEGACY_GENERATION_MARKER) {
+        return AgentGeneration::Legacy;
     }
+    if help.is_empty() {
+        // A help that never answered is not evidence of the current interface,
+        // and the probe cools down for half a minute, so guessing here would
+        // lock a 1.x install onto spellings it rejects. Refusing says what is
+        // wrong; a guessed generation silently mislabels the launch.
+        tracing::warn!(target: "session.create",
+            "agent --help did not answer, so its generation cannot be established; \
+             launch features that depend on it are refused");
+        return AgentGeneration::Unknown;
+    }
+    AgentGeneration::Current
+}
+
+/// The cached `--help` of a resolved program, empty when none has answered.
+fn agent_help(program: &std::path::Path) -> String {
+    let Ok(program) = std::fs::canonicalize(program) else {
+        return String::new();
+    };
+    let Ok(metadata) = std::fs::metadata(&program) else {
+        return String::new();
+    };
+    let key = (program.clone(), metadata.modified().ok(), metadata.len());
+    let probe = HELP_PROBES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .entry(key)
+        .or_default()
+        .clone();
+    let mut probe = probe
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    probe
+        .help(std::time::Instant::now, |timeout| {
+            run_agent_help(&program, timeout)
+        })
+        .to_owned()
+}
+
+/// Whether the cached help names `flag` as a word of its own.
+fn help_contains(help: &str, flag: &str) -> bool {
+    help_advertises_flag(help, flag)
 }
 
 /// A flag the older generation's help lists and the current one's does not.
