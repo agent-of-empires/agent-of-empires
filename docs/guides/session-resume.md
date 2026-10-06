@@ -18,7 +18,7 @@ Runtime conversation changes such as `/clear`, `/new`, fork, continue, or a fres
 | Prime Agent | No | Yes | Root-only publication and isolated managed store |
 | Vibe, Droid, Copilot CLI, Settl, Qwen Code, Kiro CLI, Antigravity | No | No | None verified |
 
-`No` means automatic discovery is unsupported there, not that resume is: a user-provided exact id stays authoritative for any agent with a verified resume contract, and agents with no such contract reject automatic resume entirely. OpenCode host capture also needs `session.opencode_preassign_session_id = true`. AoE never scans a shared store or infers an identity from recency.
+`No` means automatic discovery is unsupported there, not that resume is: a user-provided exact id stays authoritative for any agent with a verified resume contract, and agents with no such contract reject automatic resume entirely. OpenCode host capture also needs `session.opencode_preassign_session_id = true`. AoE never scans a shared store or infers an identity from recency. [Importing](#importing-an-existing-conversation) is different: you pick the conversation, and its recency only drives a warning.
 
 Sandbox config and conversation stores are staged per AoE instance, including custom `agent_config_dir` roots, and a cross-process lease guards each managed store, so two sessions in the same directory cannot claim each other's conversation.
 
@@ -125,10 +125,18 @@ Rebinding the record with `aoe session set-session-id --store` copies nothing, s
 
 Upgrading the agent binary from inside a session does not replace the process in the pane. Restart the session instead of creating a new one: press `e` (`E` with strict hotkeys) or `F5`, or run `aoe session restart <session>` (`--all` for every session in the profile). A restart runs only `on_launch`, whose failures are warnings, and resumes the conversation while `session.auto_resume_on_restart` is on (the default). A new session runs `on_create`, whose failure [aborts creation](repo-config.md#hooks).
 
-## Importing an existing Claude conversation
+## Importing an existing conversation
 
-Conversations started outside AoE can be pulled into a structured-view session from the web wizard's **Import from Claude** tab, which appears only when both Claude Code and `claude-agent-acp` are installed, since the import resumes through that adapter. It lists the Claude Code sessions on disk (under `$CLAUDE_CONFIG_DIR` or `~/.claude/projects`), newest first, with each one's first prompt, working directory, and last-used time. The tab reads `CLAUDE_CONFIG_DIR` from AoE's own process environment and consults neither `agent_config_dir` nor a recorded store, so a conversation held in the store the entry points at is not listed.
+Conversations started outside AoE can be pulled into a structured-view session from the web wizard's **Import session** tab. The tab appears when at least one built-in agent has both its CLI and its ACP adapter installed, since the import resumes through that adapter. Pick the agent, then a conversation: AoE lists it newest first, with its title, working directory, and last activity. It preselects Claude when available and remembers your last pick.
 
-Picking one creates a structured-view session in that conversation's original working directory and resumes it, so the prior transcript is there and you can keep going. It always uses the recorded directory and never creates a worktree, because the conversation only resolves where it started. The original is read in place, not copied.
+Picking one creates a structured-view session in that conversation's recorded working directory and loads it with ACP `session/load`, so the prior transcript is there and you can keep going. It always uses the recorded directory and never creates a worktree or a sandbox, because the conversation only resolves on the host where it started. The original is read in place, not copied.
 
-The list hides conversations not worth importing: AoE's own Claude sessions, scratch sessions, and anything inside an AoE worktree directory. Sessions whose directory no longer exists are hidden until you tick "show missing directories", and then shown disabled.
+The list hides conversations not worth importing: ones AoE already owns, scratch sessions, and anything inside an AoE worktree directory. It shows at most the newest 200 and says when it cut the rest. Sessions whose directory no longer exists are hidden until you tick "show missing directories", and then shown disabled. A conversation active in the last 10 minutes, or with no recorded activity, asks for confirmation first: if it is still open in another terminal, two processes would append to the same transcript.
+
+### Claude
+
+Claude conversations come from the Claude Code store on disk (under `$CLAUDE_CONFIG_DIR` or `~/.claude/projects`). The tab reads `CLAUDE_CONFIG_DIR` from AoE's own process environment and consults neither `agent_config_dir` nor a recorded store, so a conversation held in the store the entry points at is not listed.
+
+### Other agents
+
+Every other built-in agent is asked through ACP `session/list`. AoE starts the adapter once each time the picker opens, with the same host `[environment]` and `before_session` output a session spawn gets, and stops after listing. It never creates or loads a session in that process. An agent that does not advertise both `session/list` and `session/load` shows "This agent can't list sessions". `agent_config_dir` is not consulted. For pi, set a custom store with `PI_CODING_AGENT_DIR` and a wrapper with `PI_ACP_PI_COMMAND` in `[environment]`, so the list and the later load read the same store.
