@@ -197,12 +197,6 @@ impl ForkStrategy {
         }
     }
 }
-impl ForkStrategy {
-    /// Other strategies mint a child id that capture must discover after launch.
-    pub fn preassigns_child_id(&self) -> bool {
-        matches!(self, Self::ClaudeFork | Self::PiFork)
-    }
-}
 
 /// Data-only lifecycle state. A new variant needs an arm in `AgentDef::lifecycle_label`
 /// and in the TS mirrors (`web/src/lib/types.ts`, `web/src/lib/agentProfiles.ts`).

@@ -206,12 +206,9 @@ impl Instance {
     /// Write the child a store fork adopted to the durable row, leaving the
     /// launch's own state untouched.
     ///
-    /// The store fork is a side effect that outlives the launch, so the row must
-    /// carry the child before anything downstream can fail and a retry re-read
-    /// the pre-fork seed. It is deliberately not `persist_session_id`: that
-    /// promotes the one-shot `Fork` intent and re-adopts the disk row, which
-    /// would move the conversation target the launch is still validating
-    /// against. Only the id and its binding are written here.
+    /// Not `persist_session_id`: that promotes the one-shot `Fork` intent and
+    /// re-adopts the disk row, moving the conversation target the launch is
+    /// still validating against.
     pub(super) fn persist_fork_adoption(
         &self,
         profile: &str,

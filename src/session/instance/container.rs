@@ -486,11 +486,8 @@ impl Instance {
         } else {
             None
         };
-        // A sandboxed launch runs the image's own build, and that image installs
-        // the current generation. The host's probe describes a binary the
-        // container never runs, so resolving here would both pick the wrong
-        // spelling and execute a host program this launch never ran before.
-        // A single-generation agent declares no arms and needs none resolved.
+        // The container runs the image's build, so the host probe would describe
+        // a binary this launch never runs. A single-generation agent needs none.
         let yolo_generation = crate::agents::get_agent(&self.tool)
             .filter(|agent| agent.spans_agent_generations)
             .map(|_| crate::agents::AgentGeneration::Current);
