@@ -180,7 +180,7 @@ describe("project search", () => {
   });
 });
 
-describe("Import from Claude tab", () => {
+describe("Import session tab", () => {
   const SESSIONS: ImportableSession[] = [
     {
       session_id: "713b",
@@ -198,12 +198,21 @@ describe("Import from Claude tab", () => {
     },
   ];
   const CLAUDE = agent("claude", { acp_installed: true, acp_command: "claude-agent-acp" });
+  const PI = agent("pi", { acp_installed: true, acp_command: "pi-acp" });
   const renderImport = (importAcpSessionId = "", agents = [CLAUDE]) =>
     renderStep({ importAcpSessionId }, { initialTab: "import", agents });
   const row = async (title: string) => (await screen.findByText(title)).closest("button") as HTMLButtonElement;
+  const listed = (sessions: ImportableSession[], truncated = false) =>
+    vi.mocked(listImportableSessions).mockResolvedValue({ ok: true, sessions, truncated });
+  const agentSelect = () => screen.getByLabelText("Agent to import from") as HTMLSelectElement;
 
   beforeEach(() => {
-    vi.mocked(listImportableSessions).mockResolvedValue({ ok: true, sessions: SESSIONS, truncated: false });
+    localStorage.clear();
+    listed(SESSIONS);
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
   });
 
   it("hides missing-cwd sessions until toggled, then shows them disabled", async () => {
@@ -215,7 +224,7 @@ describe("Import from Claude tab", () => {
     expect((await row("Old work")).disabled).toBe(true);
   });
 
-  it("selecting a session prefills a structured claude import", async () => {
+  it("selecting a session prefills a structured import for the chosen agent", async () => {
     const { onChange } = renderImport();
     fireEvent.click(await row("Fix the spinner bug"));
     expect(Object.fromEntries(onChange.mock.calls)).toMatchObject({
@@ -231,13 +240,75 @@ describe("Import from Claude tab", () => {
   it("highlights the selected session and filters by title", async () => {
     renderImport("713b");
     expect((await row("Fix the spinner bug")).getAttribute("aria-pressed")).toBe("true");
-    fireEvent.change(screen.getByLabelText("Filter Claude sessions"), { target: { value: "zzznomatch" } });
+    fireEvent.change(screen.getByLabelText("Filter sessions"), { target: { value: "zzznomatch" } });
     await waitFor(() => expect(screen.queryByText("Fix the spinner bug")).toBeNull());
   });
 
-  it("is not offered without claude-agent-acp", async () => {
+  it("is not offered without an installed ACP adapter", async () => {
     renderImport("", [{ ...CLAUDE, acp_installed: false }]);
     await Promise.resolve();
-    expect(screen.queryByLabelText("Filter Claude sessions")).toBeNull();
+    expect(screen.queryByText("Import session")).toBeNull();
+    expect(screen.queryByLabelText("Agent to import from")).toBeNull();
+  });
+
+  it("preselects claude, else the first agent, and remembers the last pick", async () => {
+    renderImport("", [PI, CLAUDE]);
+    await screen.findByText("Fix the spinner bug");
+    expect(agentSelect().value).toBe("claude");
+    expect(listImportableSessions).toHaveBeenLastCalledWith("claude");
+
+    fireEvent.change(agentSelect(), { target: { value: "pi" } });
+    await waitFor(() => expect(listImportableSessions).toHaveBeenLastCalledWith("pi"));
+    cleanup();
+
+    renderImport("", [PI, CLAUDE]);
+    await screen.findByText("Fix the spinner bug");
+    expect(agentSelect().value).toBe("pi");
+    cleanup();
+
+    localStorage.clear();
+    renderImport("", [PI]);
+    await screen.findByText("Fix the spinner bug");
+    expect(agentSelect().value).toBe("pi");
+  });
+
+  it("says when the agent cannot list or the list was cut", async () => {
+    vi.mocked(listImportableSessions).mockResolvedValue({
+      ok: false,
+      error: "list_unsupported",
+      message: "agent does not advertise session/list and session/load",
+    });
+    renderImport();
+    expect(await screen.findByText("This agent can't list sessions.")).toBeTruthy();
+    cleanup();
+
+    listed(SESSIONS, true);
+    renderImport();
+    expect(await screen.findByText("Showing newest 200.")).toBeTruthy();
+  });
+
+  it("asks before importing a recent session or one with unknown activity", async () => {
+    const recent = new Date(Date.now() - 60_000).toISOString();
+    listed([
+      { session_id: "recent", cwd: "/p", title: "Recent work", updated_at: recent, cwd_exists: true },
+      { session_id: "unknown", cwd: "/p", title: "Unknown work", updated_at: null, cwd_exists: true },
+    ]);
+    const confirm = vi.spyOn(window, "confirm");
+    for (const title of ["Recent work", "Unknown work"]) {
+      cleanup();
+      const { onChange } = renderImport();
+      confirm.mockReturnValueOnce(false);
+      fireEvent.click(await row(title));
+      expect(onChange).not.toHaveBeenCalled();
+      confirm.mockReturnValueOnce(true);
+      fireEvent.click(await row(title));
+      expect(Object.fromEntries(onChange.mock.calls)).toMatchObject({ path: "/p" });
+    }
+    expect(confirm.mock.calls.map(([message]) => message)).toEqual([
+      expect.stringMatching(/^This session may still be open elsewhere\. /),
+      expect.stringMatching(/^This session may still be open elsewhere\. /),
+      expect.stringMatching(/^This session's last activity is unknown\. /),
+      expect.stringMatching(/^This session's last activity is unknown\. /),
+    ]);
   });
 });
