@@ -7,7 +7,11 @@ use crate::acp::state::{
     AvailableCommand, ConfigOptionDescriptor, Event, Plan, PlanStep, SessionMode, SessionUsage,
     ToolCall, UsageCost,
 };
-use agent_client_protocol::schema::v1::{ContentBlock, MessageId, NoticeSeverity, SessionUpdate};
+use agent_client_protocol::schema::v1::{
+    CompactionId, CompactionStatus, ContentBlock, MessageId, NoticeSeverity, SessionUpdate,
+    TextContent,
+};
+use agent_client_protocol::schema::MaybeUndefined;
 use tracing::debug;
 
 use super::config_options::map_acp_config_option;
@@ -26,8 +30,9 @@ use super::tool_output::{
 pub(super) static SYNTHETIC_TOOL_SEQ: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-/// `/compact` surfaces only as plain text chunks (#1050). Markers are
-/// matched as strings; a miss or false hit never loses transcript data.
+/// Agents without typed `compaction_update`s surface `/compact` only as plain
+/// text chunks (#1050). Markers are matched as strings; a miss or false hit
+/// never loses transcript data.
 pub(super) fn is_compact_completion(text: &str) -> bool {
     text.contains("Compacting completed.")
 }
@@ -39,6 +44,84 @@ pub(super) fn is_compact_start(text: &str) -> bool {
 /// The adapter interpolates a reason after this prefix.
 pub(super) fn is_compact_failure(text: &str) -> bool {
     text.contains("Compacting failed")
+}
+
+/// The model forgot its plan, so a finished compaction clears the plan strip.
+fn cleared_plan() -> Event {
+    Event::PlanUpdated {
+        plan: Plan {
+            plan_id: format!("plan-{}", chrono::Utc::now().timestamp_millis()),
+            version: 1,
+            steps: Vec::new(),
+        },
+    }
+}
+
+fn blocks_text(blocks: &[ContentBlock]) -> String {
+    blocks
+        .iter()
+        .filter_map(|b| match b {
+            ContentBlock::Text(t) => Some(t.text.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Folds a compaction's update stream before anything classifies it.
+/// claude-agent-acp re-sends a status-only terminal for the same id, which
+/// would otherwise draw a second divider. A summary streamed only as
+/// `compaction_summary_chunk`s is moved onto the completion that lacks one.
+#[derive(Default)]
+pub(super) struct CompactionTracker {
+    active: Option<CompactionId>,
+    chunks: String,
+    last_terminal: Option<CompactionId>,
+}
+
+impl CompactionTracker {
+    /// False when `update` must be skipped: a repeated terminal, or a chunk
+    /// outside the open compaction, which must not read as progress.
+    pub(super) fn observe(&mut self, update: &mut SessionUpdate) -> bool {
+        match update {
+            SessionUpdate::CompactionSummaryChunk(chunk) => {
+                if self.active.as_ref() != Some(&chunk.compaction_id) {
+                    return false;
+                }
+                if let ContentBlock::Text(t) = &chunk.content {
+                    self.chunks.push_str(&t.text);
+                }
+                true
+            }
+            SessionUpdate::CompactionUpdate(u) if u.status == CompactionStatus::InProgress => {
+                if self.active.as_ref() != Some(&u.compaction_id) {
+                    self.active = Some(u.compaction_id.clone());
+                    self.chunks.clear();
+                }
+                true
+            }
+            SessionUpdate::CompactionUpdate(u) => {
+                if self.last_terminal.as_ref() == Some(&u.compaction_id) {
+                    return false;
+                }
+                self.last_terminal = Some(u.compaction_id.clone());
+                let streamed = if self.active.as_ref() == Some(&u.compaction_id) {
+                    self.active = None;
+                    std::mem::take(&mut self.chunks)
+                } else {
+                    String::new()
+                };
+                if u.status == CompactionStatus::Completed
+                    && u.summary.is_undefined()
+                    && !streamed.is_empty()
+                {
+                    u.summary =
+                        MaybeUndefined::Value(vec![ContentBlock::Text(TextContent::new(streamed))]);
+                }
+                true
+            }
+            _ => true,
+        }
+    }
 }
 
 /// Drops the adapter's leaked consolidated `agent_message_chunk`, which
@@ -157,14 +240,7 @@ pub(super) fn map_update_to_events(
                 }
                 if is_compact_completion(&text.text) {
                     events.push(Event::ConversationCompacted);
-                    // The model forgot its plan, so clear the plan strip.
-                    events.push(Event::PlanUpdated {
-                        plan: Plan {
-                            plan_id: format!("plan-{}", chrono::Utc::now().timestamp_millis()),
-                            version: 1,
-                            steps: Vec::new(),
-                        },
-                    });
+                    events.push(cleared_plan());
                 }
                 events
             }
@@ -462,6 +538,27 @@ pub(super) fn map_update_to_events(
                 description: notice.description,
             }]
         }
+        SessionUpdate::CompactionUpdate(update) => match update.status {
+            CompactionStatus::InProgress => vec![Event::ConversationCompactionStarted],
+            CompactionStatus::Completed => {
+                let mut events = vec![Event::ConversationCompacted];
+                let text = update.summary.value().map(|b| blocks_text(b));
+                if let Some(text) = text.filter(|t| !t.trim().is_empty()) {
+                    events.push(Event::ConversationCompactionSummary { text });
+                }
+                events.push(cleared_plan());
+                events
+            }
+            CompactionStatus::Failed => vec![Event::SessionNotice {
+                severity: "error".to_string(),
+                title: "Compaction failed".to_string(),
+                description: update.error.take(),
+            }],
+            // A cancel is reported by the turn's own terminal.
+            _ => Vec::new(),
+        },
+        // Folded into the completion by `CompactionTracker`.
+        SessionUpdate::CompactionSummaryChunk(_) => Vec::new(),
         // AoE owns automatic renaming, so agent titles are ignored.
         SessionUpdate::SessionInfoUpdate(_) => Vec::new(),
         other => vec![raw_event(&other)],
@@ -471,7 +568,7 @@ pub(super) fn map_update_to_events(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::acp::acp_client::test_helpers::text_chunk;
+    use crate::acp::acp_client::test_helpers::{compaction_chunk, compaction_update, text_chunk};
     use crate::acp::acp_client::transcript_filter::{is_transcript_event, transcript_event_kind};
     use crate::acp::state::ConfigOptionCategory;
     use agent_client_protocol::schema::v1::{
@@ -612,6 +709,97 @@ mod tests {
         assert!(!d.observe(&text_chunk("ab", Some("m5"))));
     }
 
+    /// Sequences as claude-agent-acp sends them once `session.compaction` is
+    /// advertised; the first is a live `/compact`, the last a load replay.
+    #[test]
+    fn typed_compaction_stream() {
+        let summary = |text: &str| serde_json::json!({"summary": [{"type": "text", "text": text}]});
+        let none = || serde_json::json!({});
+        let start = || compaction_update("a", "in_progress", none());
+        let done = |extra| compaction_update("a", "completed", extra);
+        let ok = [
+            "conversation_compacted",
+            "conversation_compaction_summary",
+            "plan_updated",
+        ];
+        let cases: Vec<(Vec<SessionUpdate>, Vec<&str>, Option<&str>)> = vec![
+            (
+                vec![start(), done(summary("kept")), done(none())],
+                [&["conversation_compaction_started"][..], &ok].concat(),
+                Some("kept"),
+            ),
+            (
+                vec![
+                    start(),
+                    compaction_chunk("a", "one"),
+                    compaction_chunk("a", " two"),
+                    done(none()),
+                ],
+                [&["conversation_compaction_started"][..], &ok].concat(),
+                Some("one two"),
+            ),
+            (
+                vec![
+                    start(),
+                    compaction_chunk("a", "partial"),
+                    done(summary("full")),
+                ],
+                [&["conversation_compaction_started"][..], &ok].concat(),
+                Some("full"),
+            ),
+            (
+                vec![start(), done(none())],
+                vec![
+                    "conversation_compaction_started",
+                    "conversation_compacted",
+                    "plan_updated",
+                ],
+                None,
+            ),
+            (
+                vec![start(), compaction_update("a", "cancelled", none())],
+                vec!["conversation_compaction_started"],
+                None,
+            ),
+            (
+                vec![compaction_update("b", "completed", summary("kept"))],
+                ok.to_vec(),
+                Some("kept"),
+            ),
+        ];
+        for (updates, want, want_summary) in cases {
+            let mut tracker = CompactionTracker::default();
+            let events: Vec<Event> = updates
+                .into_iter()
+                .filter_map(|mut u| tracker.observe(&mut u).then(|| claude(u)))
+                .flatten()
+                .collect();
+            let got_summary = events.iter().find_map(|e| match e {
+                Event::ConversationCompactionSummary { text } => Some(text.as_str()),
+                _ => None,
+            });
+            assert_eq!(
+                (kinds(&events), got_summary),
+                (want.clone(), want_summary),
+                "{want:?}"
+            );
+        }
+
+        // A chunk after its terminal is dropped, so it cannot read as progress.
+        let mut tracker = CompactionTracker::default();
+        for mut u in [start(), done(none())] {
+            assert!(tracker.observe(&mut u));
+        }
+        assert!(!tracker.observe(&mut compaction_chunk("a", "late")));
+
+        let failed = compaction_update("a", "failed", serde_json::json!({"error": "aborted"}));
+        assert!(matches!(
+            claude(failed).as_slice(),
+            [Event::SessionNotice { severity, title, description: Some(d) }]
+                if severity == "error" && title == "Compaction failed" && d == "aborted"
+        ));
+    }
+
     #[test]
     fn compaction_markers() {
         for (text, completion, start) in [
@@ -654,6 +842,12 @@ mod tests {
         let cases = [
             (Event::ConversationCompactionStarted, true),
             (Event::ConversationCompacted, true),
+            (
+                Event::ConversationCompactionSummary {
+                    text: "kept".into(),
+                },
+                true,
+            ),
             (
                 Event::AgentMessageChunk {
                     text: "Compacting...".into(),

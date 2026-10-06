@@ -22,7 +22,9 @@ use crate::acp::acp_client::tool_context::{
     update_tool_context_cache, ToolCallContextCache, ToolContextCache,
 };
 use crate::acp::acp_client::transcript_filter::{is_transcript_event, transcript_event_kind};
-use crate::acp::acp_client::update_events::{map_update_to_events, AgentMessageDedup};
+use crate::acp::acp_client::update_events::{
+    map_update_to_events, AgentMessageDedup, CompactionTracker,
+};
 use crate::acp::acp_client::watchdog::classify_watchdog_notification_signals;
 
 pub(super) fn now_ms() -> i64 {
@@ -65,6 +67,7 @@ pub(super) struct Shared {
     pub(super) context_reset_emitted: AtomicBool,
     /// Scoped to one turn; see `AgentMessageDedup` (#2281).
     pub(super) agent_msg_dedup: std::sync::Mutex<AgentMessageDedup>,
+    compaction: std::sync::Mutex<CompactionTracker>,
     pub(super) tool_context_cache: ToolContextCache,
     bg_transcript_source: TranscriptSource,
 }
@@ -107,6 +110,7 @@ impl Shared {
             rate_limit_rejections: Default::default(),
             context_reset_emitted: AtomicBool::new(false),
             agent_msg_dedup: Default::default(),
+            compaction: Default::default(),
             tool_context_cache: Arc::new(std::sync::Mutex::new(ToolCallContextCache::default())),
             bg_transcript_source,
         }
@@ -165,7 +169,7 @@ impl Shared {
     /// per-prompt watchdog.
     pub(super) async fn handle_notification(
         &self,
-        notification: SessionNotification,
+        mut notification: SessionNotification,
         local_prompt_signals: bool,
     ) {
         self.last_event_at.store(now_ms(), Ordering::Relaxed);
@@ -187,6 +191,16 @@ impl Shared {
                 );
                 return;
             }
+        }
+        // Replayed compactions carry fresh ids and are dropped as transcript.
+        if !suppressing
+            && !self
+                .compaction
+                .lock()
+                .expect("compaction tracker mutex poisoned")
+                .observe(&mut notification.update)
+        {
+            return;
         }
         // One epoch per notification, so its signals belong to the prompt
         // that was current when it arrived.

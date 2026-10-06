@@ -3,7 +3,7 @@
 use crate::acp::agent_profiles;
 use crate::acp::state::Event;
 use agent_client_protocol::schema::v1::{
-    ContentBlock, SessionUpdate, ToolCallContent, ToolCallStatus,
+    CompactionStatus, ContentBlock, SessionUpdate, ToolCallContent, ToolCallStatus,
 };
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use tokio::sync::mpsc;
@@ -64,9 +64,14 @@ pub(super) fn classify_lifecycle_signal(update: &SessionUpdate) -> Option<Lifecy
             }
             Some(LifecycleSignal::Progress)
         }
-        SessionUpdate::AgentThoughtChunk(_) | SessionUpdate::Plan(_) => {
-            Some(LifecycleSignal::Progress)
-        }
+        SessionUpdate::CompactionUpdate(u) => Some(match u.status {
+            CompactionStatus::InProgress => LifecycleSignal::CompactionStarted,
+            CompactionStatus::Completed => LifecycleSignal::CompactionCompleted,
+            _ => LifecycleSignal::CompactionFailed,
+        }),
+        SessionUpdate::AgentThoughtChunk(_)
+        | SessionUpdate::Plan(_)
+        | SessionUpdate::CompactionSummaryChunk(_) => Some(LifecycleSignal::Progress),
         SessionUpdate::ToolCall(tc) => Some(LifecycleSignal::ToolStarted {
             id: tc.tool_call_id.0.to_string(),
             is_background_task: tc
@@ -255,7 +260,7 @@ pub(super) fn wakeup_lifecycle_signal_from_update(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::acp::acp_client::test_helpers::text_chunk;
+    use crate::acp::acp_client::test_helpers::{compaction_chunk, compaction_update, text_chunk};
     use agent_client_protocol::schema::v1::{
         Content, ToolCall, ToolCallUpdate, ToolCallUpdateFields,
     };
@@ -338,6 +343,31 @@ mod tests {
         for (text, expected) in cases {
             let sig = classify_lifecycle_signal(&text_chunk(text, Some("m"))).unwrap();
             assert_eq!(format!("{sig:?}"), expected, "{text:?}");
+        }
+
+        let none = serde_json::json!({});
+        let typed = [
+            (
+                compaction_update("c", "in_progress", none.clone()),
+                "CompactionStarted",
+            ),
+            (
+                compaction_update("c", "completed", none.clone()),
+                "CompactionCompleted",
+            ),
+            (
+                compaction_update("c", "failed", none.clone()),
+                "CompactionFailed",
+            ),
+            (
+                compaction_update("c", "cancelled", none),
+                "CompactionFailed",
+            ),
+            (compaction_chunk("c", "summary"), "Progress"),
+        ];
+        for (update, expected) in typed {
+            let sig = classify_lifecycle_signal(&update).unwrap();
+            assert_eq!(format!("{sig:?}"), expected, "{update:?}");
         }
 
         let tool_cases = [
