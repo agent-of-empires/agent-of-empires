@@ -49,6 +49,19 @@ Each built-in adapter receives only the provider variables it is known to read, 
 
 `vibe`, `pi`, `omp`, `kimi`, and custom adapters have no ambient allowlist yet: give them auth through the session's `extra_env`, the `environment` list, or `session.inherit_host_environment` for host sessions. In a sandboxed session the per-adapter keys above still cross the container boundary, but `inherit_host_environment` does not, so use `sandbox.environment` there. Allowlist entries naming a file or directory (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `GOOGLE_APPLICATION_CREDENTIALS`, the AWS file variables) are host-only and never cross, since each agent's config dir is already bind-mounted at its canonical container location; each drop is logged under the `acp` target with the key and the reason.
 
+### Switching provider
+
+A Claude session can be moved between the direct API, Bedrock, and Vertex without losing its transcript, from the provider picker next to the model picker or with `aoe acp switch-provider <session> <api|bedrock|vertex>`.
+
+The pick only sets `CLAUDE_CODE_USE_BEDROCK` and `CLAUDE_CODE_USE_VERTEX`, and it outranks both the host environment and the `environment` list. Credentials are not provisioned by it: the target provider's own variables (`ANTHROPIC_VERTEX_PROJECT_ID` and `CLOUD_ML_REGION` for Vertex, the AWS credential chain for Bedrock) must already be present where `aoe serve` runs, or the next turn fails on authentication.
+
+Two further effects are worth knowing before you switch:
+
+- The model is reset to the new provider's default, because model ids differ between providers and a resumed conversation would otherwise stay on the model it last ran. Pick a model again afterwards if you had one pinned.
+- A sandboxed session's container is recreated, since the GCP credential mount is decided when the container is built. Anything written inside the container but outside the workspace volume is lost.
+
+The switch is refused while a turn or a background agent is running, since it restarts the worker. Once idle, the worker restarts and resumes the same conversation.
+
 ### Feature matrix
 
 | Feature | Claude | Codex | OpenCode | Gemini | Other ACP |

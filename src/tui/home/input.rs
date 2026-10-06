@@ -7104,6 +7104,7 @@ mod tests {
         NewSessionData {
             profile: String::new(),
             title: String::new(),
+            title_typed: false,
             path: path.to_string(),
             group: String::new(),
             tool: "claude".to_string(),

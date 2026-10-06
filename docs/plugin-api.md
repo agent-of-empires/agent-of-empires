@@ -266,6 +266,22 @@ id = "my_pane"
 | `composer-action` | per-session | A button beside the ACP composer controls (requires `api_version >= 8`). |
 | `notification` | n/a | A transient notification pushed via `ui.notify`; gated by the `notifications` capability, not a slot declaration. |
 
+### Badge payload
+
+`status-bar`, `row-badge` and `detail-badge` take either one badge, `{ text?, icon?, tone?, href?, tooltip? }` (`status-bar` and `detail-badge` require `text` or `items`), or an `items` list of such badges that replaces the top-level fields. `items: []` clears the badge.
+
+Give items a shared `group` to collapse them into one chip that shows one item at a time. Clicking or tapping it advances to the next item and wraps around, for example a usage badge cycling `5h`, `7d` and `opus` values:
+
+```json
+{ "items": [
+  { "text": "5h 40%", "group": "usage" },
+  { "text": "7d 12%", "group": "usage" },
+  { "text": "stale", "tone": "warn" }
+] }
+```
+
+Items without a `group` stay separate chips, and each distinct `group` cycles independently. The position is kept per browser tab and is never sent to the worker. A cycling chip ignores `href`; a group with a single item renders as a normal chip. The TUI cannot click and shows the first item with text.
+
 ### Pane payload
 
 A `pane` entry renders a dockable tool-window, pushed with `ui.state.set`:

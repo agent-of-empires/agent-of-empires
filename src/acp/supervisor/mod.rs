@@ -32,6 +32,7 @@ use crate::daemon::AcpWorkerState;
 use crate::session::SandboxInfo;
 
 pub(crate) use agents::apply_agent_command_override;
+pub(crate) use launch::host_spawn_environment;
 pub use sink::{BroadcastSink, ChannelSink};
 
 /// Post-startup respawns allowed within `RESTART_WINDOW` before the session is parked.
@@ -223,6 +224,9 @@ pub struct SpawnRequest {
     pub cwd: PathBuf,
     pub additional_dirs: Vec<PathBuf>,
     pub provider_env: Vec<(String, String)>,
+    /// LLM backend pinned on the session row, one of
+    /// `session::environment::AGENT_PROVIDERS`; `None` defers to the host.
+    pub provider: Option<String>,
     pub model: Option<String>,
     pub effort: Option<String>,
     /// True for persisted user effort, not a resolved default.

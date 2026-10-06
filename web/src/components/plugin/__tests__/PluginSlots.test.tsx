@@ -4,7 +4,13 @@ import { act, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { PluginUiEntry } from "../../../lib/api";
 import { PluginPaneBody } from "../PluginPane";
-import { PluginComposerActions, PluginHomePanes, PluginRowBadges } from "../PluginSlots";
+import {
+  PluginComposerActions,
+  PluginDetailBadges,
+  PluginHomePanes,
+  PluginRowBadges,
+  PluginStatusBarSegments,
+} from "../PluginSlots";
 import { composerDraftOperation } from "../composerDraftOperation";
 
 const { entriesRef, refreshingRef, revisionRef, pokeMock, invokeMock } = vi.hoisted(() => ({
@@ -104,6 +110,153 @@ describe("plugin slots", () => {
     entriesRef.current = [rowBadge({ items: [] })];
     const { container } = render(<PluginRowBadges sessionId="s1" />);
     expect(container.querySelector("a, span")).toBeNull();
+  });
+
+  describe("grouped badge items", () => {
+    const usage = (text: string, extra: Record<string, unknown> = {}) => ({ text, group: "usage", ...extra });
+    const statusBar = (payload: Record<string, unknown>): PluginUiEntry => ({
+      plugin_id: "acme.kit",
+      slot: "status-bar",
+      id: "u",
+      payload,
+    });
+
+    it("collapses a group into one chip that cycles on click and wraps", () => {
+      entriesRef.current = [statusBar({ items: [usage("5h 40%"), usage("7d 12%"), usage("opus 3%")] })];
+      render(<PluginStatusBarSegments />);
+      const chip = () => screen.getByRole("button");
+      expect(chip().textContent).toContain("5h 40%");
+      expect(screen.queryByText("7d 12%")).toBeNull();
+      fireEvent.click(chip());
+      expect(chip().textContent).toContain("7d 12%");
+      fireEvent.click(chip());
+      fireEvent.click(chip());
+      expect(chip().textContent).toContain("5h 40%");
+    });
+
+    it("renders ungrouped items as separate chips beside a cycling group", () => {
+      entriesRef.current = [rowBadge({ items: [{ text: "stale" }, usage("5h 40%"), usage("7d 12%"), { text: "ci" }] })];
+      render(<PluginRowBadges sessionId="s1" />);
+      expect(screen.getByText("stale")).toBeTruthy();
+      expect(screen.getByText("ci")).toBeTruthy();
+      expect(screen.getAllByRole("button")).toHaveLength(1);
+    });
+
+    it("keeps independent groups independent", () => {
+      entriesRef.current = [
+        rowBadge({
+          items: [usage("5h"), usage("7d"), { text: "a1", group: "ci" }, { text: "a2", group: "ci" }],
+        }),
+      ];
+      render(<PluginRowBadges sessionId="s1" />);
+      const [first] = screen.getAllByRole("button");
+      fireEvent.click(first);
+      expect(screen.getByText("7d")).toBeTruthy();
+      expect(screen.getByText("a1")).toBeTruthy();
+    });
+
+    it("a single-member group is a plain chip, and a cycling chip ignores href", () => {
+      entriesRef.current = [
+        rowBadge({
+          items: [
+            { text: "solo", group: "one", href: "https://x/solo" },
+            usage("5h", { href: "https://x/5h" }),
+            usage("7d"),
+          ],
+        }),
+      ];
+      render(<PluginRowBadges sessionId="s1" />);
+      expect(screen.getByRole("link", { name: "solo" })).toBeTruthy();
+      expect(screen.getAllByRole("button")).toHaveLength(1);
+      expect(screen.getAllByRole("link")).toHaveLength(1);
+    });
+
+    it("clamps the position when a re-push shrinks the group and does not bubble the click", () => {
+      entriesRef.current = [rowBadge({ items: [usage("a"), usage("b"), usage("c")] })];
+      const rowClick = vi.fn();
+      const view = render(
+        <div onClick={rowClick}>
+          <PluginRowBadges sessionId="s1" />
+        </div>,
+      );
+      // fireEvent returns false when the click default action (an enclosing row link navigation) was prevented.
+      expect(fireEvent.click(screen.getByRole("button"))).toBe(false);
+      fireEvent.click(screen.getByRole("button"));
+      expect(screen.getByRole("button").textContent).toContain("c");
+      expect(rowClick).not.toHaveBeenCalled();
+      entriesRef.current = [rowBadge({ items: [usage("a"), usage("b")] })];
+      view.rerender(
+        <div onClick={rowClick}>
+          <PluginRowBadges sessionId="s1" />
+        </div>,
+      );
+      expect(screen.getByRole("button").textContent).toBe("a");
+    });
+
+    it("skips members that render nothing so the group keeps a working control", () => {
+      const cases: [string, Record<string, unknown>[]][] = [
+        ["empty first", [{ group: "usage" }, usage("a"), usage("b")]],
+        ["empty middle", [usage("a"), { group: "usage" }, usage("b")]],
+        ["unknown icon without text", [usage("a"), { icon: "not-a-real-icon", group: "usage" }, usage("b")]],
+        ["whitespace-only text", [usage("a"), { text: "   ", group: "usage" }, usage("b")]],
+      ];
+      for (const [name, items] of cases) {
+        entriesRef.current = [rowBadge({ items })];
+        const { unmount } = render(<PluginRowBadges sessionId="s1" />);
+        const seen: string[] = [];
+        for (let i = 0; i < 3; i++) {
+          const button = screen.getByRole("button", { name: undefined });
+          seen.push(button.textContent ?? "");
+          fireEvent.click(button);
+        }
+        expect(seen, name).toEqual(["a", "b", "a"]);
+        unmount();
+      }
+    });
+
+    it("a group left with one renderable member is a plain chip", () => {
+      entriesRef.current = [rowBadge({ items: [{ group: "usage" }, usage("only")] })];
+      render(<PluginRowBadges sessionId="s1" />);
+      expect(screen.queryByRole("button")).toBeNull();
+      expect(screen.getByText("only")).toBeTruthy();
+    });
+
+    it("names an icon-only cycling button by its group and position", () => {
+      entriesRef.current = [
+        rowBadge({
+          items: [
+            { icon: "gauge", group: "usage" },
+            { icon: "clock", group: "usage" },
+          ],
+        }),
+      ];
+      render(<PluginRowBadges sessionId="s1" />);
+      const button = screen.getByRole("button", { name: "usage (1/2)" });
+      fireEvent.click(button);
+      expect(screen.getByRole("button", { name: "usage (2/2)" })).toBeTruthy();
+    });
+
+    it("status-bar explicit empty items hides the badge even with top-level text", () => {
+      entriesRef.current = [statusBar({ text: "fallback", items: [] })];
+      const { container } = render(<PluginStatusBarSegments />);
+      expect(screen.queryByText("fallback")).toBeNull();
+      expect(container.querySelector("button, span")).toBeNull();
+    });
+
+    it("detail-badge accepts grouped items too", () => {
+      entriesRef.current = [
+        {
+          plugin_id: "acme.kit",
+          slot: "detail-badge",
+          id: "d",
+          session_id: "s1",
+          payload: { items: [usage("x"), usage("y")] },
+        },
+      ];
+      render(<PluginDetailBadges sessionId="s1" />);
+      fireEvent.click(screen.getByRole("button"));
+      expect(screen.getByRole("button").textContent).toContain("y");
+    });
   });
 
   it("home-pane renders blocks, and the simple form's title only once", () => {

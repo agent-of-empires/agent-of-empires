@@ -18,6 +18,7 @@ pub(super) fn text_chunk(text: &str, id: Option<&str>) -> SessionUpdate {
 /// Build a minimal host (non-sandboxed) `SpawnConfig` for env tests.
 pub(super) fn env_test_spawn_config(cwd: std::path::PathBuf) -> SpawnConfig {
     SpawnConfig {
+        provider_routing: Vec::new(),
         wrapper_substitution: None,
         agent_key: "claude".into(),
         tool: "claude".into(),
@@ -64,6 +65,7 @@ pub(super) fn reset_fake_spawn_config(
     cwd: &std::path::Path,
 ) -> SpawnConfig {
     SpawnConfig {
+        provider_routing: Vec::new(),
         wrapper_substitution: None,
         agent_key: "codex".into(),
         tool: "codex".into(),

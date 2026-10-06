@@ -352,10 +352,7 @@ impl Instance {
             let native_mints_child = matches!(
                 prepared.expected_conversation.intent,
                 ResumeIntent::Fork { .. }
-            ) && !matches!(
-                execution.agent.fork_strategy,
-                crate::agents::ForkStrategy::ClaudeFork
-            );
+            ) && !execution.agent.fork_strategy.preassigns_child_id();
             if native_mints_child {
                 self.set_agent_conversation(None, None, None);
             } else if let Some(sid) = self.agent_session_id.clone() {

@@ -194,9 +194,11 @@ tokio-tungstenite = { version = "0.30", default-features = false, features = ["r
 # escape the intended root.
 cap-std = "4.0.2"
 
-# Unix-only: O_NOFOLLOW for race-free plugin-tree reads/copies (no std constant).
+# Unix-only: O_NOFOLLOW for race-free plugin-tree reads/copies (no std constant);
+# sd-notify reports readiness to systemd (no-op without NOTIFY_SOCKET).
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+sd-notify = "0.5"
 
 [features]
 # The daemon (REST/WS API, auth, Web Push, ACP, structured view) is core: a

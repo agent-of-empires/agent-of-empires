@@ -1411,6 +1411,7 @@ mod tests {
 
     fn sandbox_info(container_name: &str) -> SandboxInfo {
         SandboxInfo {
+            provider: None,
             enabled: true,
             container_id: None,
             image: "alpine".to_string(),
