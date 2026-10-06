@@ -103,7 +103,9 @@ The fork inherits the parent tool, group, working directory, and conversation bi
 
 The child gets its own AoE ID and native conversation. The parent row and transcript remain unchanged. Automatic recovery still depends on the agent's capture capability and supported execution context; dispatching a native fork adds no new child-ID discovery path.
 
-Forking needs an agent that can branch a conversation: claude, codex, and opencode in the supported managed contexts, and the Claude adapter for structured sessions. Resume-only agents (gemini, vibe, copilot) and agents without resume in AoE (cursor, droid, kiro, qwen) hide or refuse the action.
+Forking needs an agent that can branch a conversation: claude, codex, opencode, and pi in the supported managed contexts, and the Claude adapter for structured sessions. Resume-only agents (gemini, vibe, copilot) and agents without resume in AoE (cursor, droid, kiro, qwen) hide or refuse the action.
+
+Pi terminal forks require the same working directory and an attested host `pi` on `PATH` that supports both `--fork` and `--session-id`. AoE assigns the child id before launch. A sandboxed Pi, an unattestable wrapper, or a Pi without either flag refuses the fork rather than creating an untracked conversation. The child copies the parent's saved transcript, starting from the last persisted message. Forking into a new worktree is not supported for Pi.
 
 ## Swapping the engine on a restart
 
