@@ -71,8 +71,12 @@ export function composerWrapperLayout(opts: { keyboardOpen: boolean; accessoryBa
 
 /** Auto-grow the textarea up to ~6 lines. */
 export function fitTextarea(el: HTMLTextAreaElement) {
+  // Collapsing to measure would grow the transcript viewport and clamp its scrollTop, stranding a pinned transcript short of the bottom.
+  const parent = el.parentElement;
+  if (parent) parent.style.minHeight = `${parent.offsetHeight}px`;
   el.style.height = "auto";
   el.style.height = `${Math.min(el.scrollHeight, 200)}px`;
+  if (parent) parent.style.minHeight = "";
 }
 
 /** Replace the value the way a keystroke would. The native setter bypasses React's
