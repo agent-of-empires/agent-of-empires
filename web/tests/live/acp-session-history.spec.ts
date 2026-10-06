@@ -145,9 +145,13 @@ test("imports an existing Claude session and replays its transcript", async ({ s
   });
   const projectDir = join(serve.home, "imported-project");
   const claudeSessions = async () => {
-    const res = await fetch(`${serve.baseUrl}/api/claude-sessions`);
+    const res = await fetch(`${serve.baseUrl}/api/importable-sessions?agent=claude`);
     expect(res.ok).toBe(true);
-    return (await res.json()) as { session_id: string; cwd: string; title: string | null; cwd_exists: boolean }[];
+    return (
+      (await res.json()) as {
+        sessions: { session_id: string; cwd: string; title: string | null; cwd_exists: boolean }[];
+      }
+    ).sessions;
   };
 
   const sessions = await claudeSessions();
@@ -182,8 +186,13 @@ test("imports an existing Claude session and replays its transcript", async ({ s
   await expect
     .poll(
       async () => {
-        const res = await fetch(`${serve.baseUrl}/api/claude-sessions`);
-        return !res.ok || ((await res.json()) as { session_id: string }[]).some((s) => s.session_id === sids.imported);
+        const res = await fetch(`${serve.baseUrl}/api/importable-sessions?agent=claude`);
+        return (
+          !res.ok ||
+          ((await res.json()) as { sessions: { session_id: string }[] }).sessions.some(
+            (s) => s.session_id === sids.imported,
+          )
+        );
       },
       {
         timeout: 10_000,

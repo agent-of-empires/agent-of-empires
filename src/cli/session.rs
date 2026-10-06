@@ -891,11 +891,14 @@ fn apply_import_mode(
 }
 
 async fn import_sessions(profile: &str, args: ImportArgs) -> Result<()> {
-    use crate::session::claude_import::{scan_sessions, sessions_under_paths, MAX_SESSIONS};
+    use crate::session::claude_import::{scan_sessions, sessions_under_paths};
+    use crate::session::import::{worktree_dir_markers, Owned, MAX_SESSIONS};
 
     let structured = args.structured;
 
+    let provisioned = Owned::new(&[], worktree_dir_markers());
     let mut discovered = scan_sessions();
+    discovered.retain(|s| !provisioned.excludes(&s.session_id, &s.cwd));
     if !args.all {
         let roots = resolve_import_roots(&args.paths)?;
         discovered = sessions_under_paths(discovered, &roots);

@@ -1229,17 +1229,28 @@
       "components": [
         "web/src/components/session-wizard/SessionWizard.tsx",
         "web/src/components/session-wizard/steps/ProjectStep.tsx",
-        "web/src/components/session-wizard/steps/ClaudeSessionPicker.tsx"
+        "web/src/components/session-wizard/steps/ImportSessionPicker.tsx"
       ]
     },
     {
-      "id": "wizard.import-claude-session.unit",
+      "id": "wizard.import-session",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": ["tests/wizard-project.spec.ts"],
+      "components": [
+        "web/src/components/session-wizard/SessionWizard.tsx",
+        "web/src/components/session-wizard/steps/ProjectStep.tsx",
+        "web/src/components/session-wizard/steps/ImportSessionPicker.tsx"
+      ]
+    },
+    {
+      "id": "wizard.import-session.unit",
       "kind": "vitest",
       "risk": "high",
       "specs": ["src/components/session-wizard/__tests__/ProjectStep.test.tsx"],
       "components": [
         "web/src/components/session-wizard/steps/ProjectStep.tsx",
-        "web/src/components/session-wizard/steps/ClaudeSessionPicker.tsx"
+        "web/src/components/session-wizard/steps/ImportSessionPicker.tsx"
       ]
     },
     {
@@ -2545,10 +2556,13 @@
         "tests/live/acp-worker-api.spec.ts",
         "tests/acp-config-pickers-ui.spec.ts",
         "src/components/acp/SessionConfigControls.test.tsx",
+        "src/components/acp/__tests__/useProviderSwitch.test.tsx",
+        "src/lib/switchAcpProvider.test.ts",
         "src/hooks/useAcpSession.test.ts"
       ],
       "components": [
         "web/src/components/acp/SessionConfigControls.tsx",
+        "web/src/components/acp/useProviderSwitch.ts",
         "web/src/components/acp/Composer.tsx",
         "web/src/components/acp/StructuredView.tsx",
         "web/src/components/acp/AcpRuntime.tsx",

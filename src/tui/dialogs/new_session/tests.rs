@@ -1387,6 +1387,7 @@ fn source_session(tool: &str, sandboxed: bool, yolo: bool) -> Instance {
     inst.yolo_mode = yolo;
     if sandboxed {
         inst.sandbox_info = Some(SandboxInfo {
+            provider: None,
             enabled: true,
             container_id: None,
             image: "ubuntu:latest".to_string(),

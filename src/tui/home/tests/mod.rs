@@ -279,6 +279,7 @@ fn earn_tip(env: &mut TestEnv) {
 fn create_test_env_with_group_sessions() -> TestEnv {
     let mut sandboxed = instance_in("work-session-2", "/tmp/work2", "work");
     sandboxed.sandbox_info = Some(crate::session::SandboxInfo {
+        provider: None,
         enabled: true,
         container_id: None,
         image: "ubuntu:latest".to_string(),

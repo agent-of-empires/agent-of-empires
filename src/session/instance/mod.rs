@@ -333,6 +333,11 @@ pub struct Instance {
     pub agent_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_model: Option<String>,
+    /// LLM backend this session is pinned to, one of
+    /// `session::environment::AGENT_PROVIDERS`. `None` lets the host
+    /// environment decide.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_provider: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub acp_effort: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
