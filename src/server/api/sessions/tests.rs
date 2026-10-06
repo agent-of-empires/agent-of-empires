@@ -3239,6 +3239,7 @@ async fn container_terminal_refuses_archived_trashed_and_purged_sessions() {
     for (shelve, status, code) in cases {
         let mut inst = make_test_instance();
         inst.sandbox_info = Some(crate::session::SandboxInfo {
+            provider: None,
             enabled: true,
             container_id: None,
             image: "ubuntu:latest".to_string(),

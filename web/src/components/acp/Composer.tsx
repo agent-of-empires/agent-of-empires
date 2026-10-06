@@ -59,10 +59,13 @@ import {
   type ComposerClient,
 } from "./useComposerHooks";
 import { useDictationBurstGuard } from "./useDictationBurstGuard";
+import { useProviderSwitch } from "./useProviderSwitch";
 
 interface Props {
   sessionId: string;
   currentAgent: AcpState["agent"];
+  /** Pinned LLM backend, or null when the host environment decides. */
+  currentProvider: string | null;
   availableModes: AcpState["availableModes"];
   currentModeId: AcpState["currentModeId"];
   /** Fallback when the agent advertises no modes. */
@@ -108,6 +111,7 @@ export function Composer(props: Props) {
   const iosPwa = useMemo(() => isIOS() && isStandalone(), []);
   const recall = useQueueRecall(queuedPrompts, client, loadText);
   const canSend = composerText.trim().length > 0 || attachments.supported.length > 0;
+  const provider = useProviderSwitch(sessionId, props.currentAgent, props.currentProvider);
 
   const submitComposer = useCallback(() => {
     const cur = recall.recallRef.current;
@@ -341,6 +345,10 @@ export function Composer(props: Props) {
                   configOptions={props.configOptions}
                   pendingConfigOption={props.pendingConfigOption}
                   onSetConfigOption={props.setConfigOption}
+                  provider={provider.current}
+                  providerPending={provider.pending}
+                  onSetProvider={provider.set}
+                  providerLockedReason={turnActive ? "Switch providers once the turn finishes" : null}
                 />
                 <AuthStatusHint authStatus={props.authStatus} />
                 <UsageHint usage={props.sessionUsage} />

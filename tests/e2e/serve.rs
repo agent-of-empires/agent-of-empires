@@ -454,6 +454,73 @@ fn cli_acp_prompt_authenticates_against_behind_proxy_passphrase_daemon() {
     prompt_until_accepted(&h, &session_id, Duration::from_secs(30));
 }
 
+/// #4083 follow-up to #3999: a plugin mutation (`aoe plugin enable/disable`,
+/// built on `HttpClient::set_plugin_enabled`) requires an *elevated* session
+/// on top of a merely logged-in one (`src/server/api/plugins.rs::mutation_gate`),
+/// which `--behind-proxy` withdraws the loopback bypass for just like login
+/// itself (`cli_serve_auth_passphrase_behind_proxy_gates_unforwarded_requests`).
+/// The CLI must step up the passphrase again on its own rather than surfacing
+/// the daemon's `elevation_required` 403 verbatim.
+#[test]
+#[parallel]
+#[cfg(feature = "web")]
+fn cli_plugin_enable_disable_steps_up_an_unelevated_passphrase_session() {
+    let mut h = TuiTestHarness::new("plugin_toggle_passphrase_behind_proxy");
+    h.stop_daemon_on_drop();
+    let port = h.start_daemon_with(&[
+        "--auth",
+        "passphrase",
+        "--passphrase",
+        "e2e-pass",
+        "--behind-proxy",
+        "--allowed-host",
+        "aoe.example.test",
+    ]);
+    assert!(
+        wait_for_port(port, Duration::from_secs(10)),
+        "daemon never bound port {port}"
+    );
+
+    let disable = h.run_cli(&["plugin", "disable", "aoe.web"]);
+    let disable_stdout = String::from_utf8_lossy(&disable.stdout);
+    assert!(
+        disable.status.success(),
+        "aoe plugin disable must step up elevation transparently, not surface a 403.\nstdout: {}\nstderr: {}",
+        disable_stdout,
+        String::from_utf8_lossy(&disable.stderr),
+    );
+    assert!(
+        !String::from_utf8_lossy(&disable.stderr).contains("elevation_required"),
+        "the elevation_required 403 must never reach the user: {}",
+        String::from_utf8_lossy(&disable.stderr)
+    );
+    assert!(
+        disable_stdout.contains("the running daemon reconciled its workers."),
+        "aoe plugin disable must actually reach the daemon after stepping up, not fall back to a local toggle: {disable_stdout}"
+    );
+    assert!(
+        !disable_stdout.contains("warning:"),
+        "aoe plugin disable must not fall back to the local-daemon-stale warning: {disable_stdout}"
+    );
+
+    let enable = h.run_cli(&["plugin", "enable", "aoe.web"]);
+    let enable_stdout = String::from_utf8_lossy(&enable.stdout);
+    assert!(
+        enable.status.success(),
+        "aoe plugin enable must step up elevation transparently.\nstdout: {}\nstderr: {}",
+        enable_stdout,
+        String::from_utf8_lossy(&enable.stderr),
+    );
+    assert!(
+        enable_stdout.contains("the running daemon reconciled its workers."),
+        "aoe plugin enable must actually reach the daemon after stepping up, not fall back to a local toggle: {enable_stdout}"
+    );
+    assert!(
+        !enable_stdout.contains("warning:"),
+        "aoe plugin enable must not fall back to the local-daemon-stale warning: {enable_stdout}"
+    );
+}
+
 /// The WS half of the passphrase-login fallback: `aoe acp tail` (and the
 /// TUI's live structured-view stream, same `src/acp/client/ws.rs`) must
 /// offer the literal `aoe-auth` subprotocol alongside

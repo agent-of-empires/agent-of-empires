@@ -1753,8 +1753,13 @@
       "id": "sidebar.plugin-row-slots",
       "kind": "mocked-playwright",
       "risk": "medium",
-      "specs": ["tests/plugin-row-slots-mobile.spec.ts"],
-      "components": ["web/src/components/WorkspaceSidebar.tsx", "web/src/components/plugin/PluginSlots.tsx"]
+      "specs": ["tests/plugin-row-slots-mobile.spec.ts", "src/components/plugin/__tests__/PluginSlots.test.tsx"],
+      "components": [
+        "web/src/components/WorkspaceSidebar.tsx",
+        "web/src/components/plugin/PluginSlots.tsx",
+        "web/src/components/plugin/SlotChrome.tsx"
+      ],
+      "notes": "Grouped badge items collapse into one chip that cycles on click. The Playwright story clicks it inside the real session-row link, which jsdom cannot cover: the click must cycle without the row selecting or the browser following the row href. Group, wrap-around and clamping logic is in PluginSlots.test.tsx."
     },
     {
       "id": "sidebar.group-axis-pure",
@@ -2540,10 +2545,13 @@
         "tests/live/acp-worker-api.spec.ts",
         "tests/acp-config-pickers-ui.spec.ts",
         "src/components/acp/SessionConfigControls.test.tsx",
+        "src/components/acp/__tests__/useProviderSwitch.test.tsx",
+        "src/lib/switchAcpProvider.test.ts",
         "src/hooks/useAcpSession.test.ts"
       ],
       "components": [
         "web/src/components/acp/SessionConfigControls.tsx",
+        "web/src/components/acp/useProviderSwitch.ts",
         "web/src/components/acp/Composer.tsx",
         "web/src/components/acp/StructuredView.tsx",
         "web/src/components/acp/AcpRuntime.tsx",
