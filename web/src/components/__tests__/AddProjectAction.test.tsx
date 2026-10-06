@@ -26,13 +26,15 @@ function attachOk(worker: string, extra: Record<string, unknown> = {}) {
 }
 
 let fetchSpy: ReturnType<typeof stubFetch>;
-/** Answers the registry fetch, and every attach POST with `attach()`. */
+/** Answers the picker's fetches, and every attach POST with `attach()`. */
 function mockAttach(attach: () => Response | Promise<Response>) {
-  fetchSpy.mockImplementation(async (input) =>
-    String(input).includes("/api/projects")
-      ? jsonResponse([{ name: "frontend", path: "/src/frontend", pinned: false, scope: "global" }])
-      : attach(),
-  );
+  fetchSpy.mockImplementation(async (input) => {
+    const url = String(input);
+    if (url.includes(ATTACH_URL)) return attach();
+    if (url.includes("/api/projects"))
+      return jsonResponse([{ name: "frontend", path: "/src/frontend", pinned: false, scope: "global" }]);
+    return jsonResponse(url.includes("/api/recent-projects") ? { projects: [] } : { sessions: [] });
+  });
 }
 const attachCalls = () => fetchSpy.mock.calls.filter(([url]) => String(url).includes(ATTACH_URL));
 
@@ -91,6 +93,24 @@ describe("AddProjectModal", () => {
     const init = attachCalls()[0]![1] as RequestInit;
     expect(init.method).toBe("POST");
     expect(JSON.parse(init.body as string)).toEqual({ project, attach_existing_branch: reuseBranch });
+  });
+
+  it("lists saved projects in the picker instead of a native datalist", async () => {
+    await submit(null);
+    await waitFor(() => expect(screen.queryByTitle("/src/frontend")).not.toBeNull());
+    expect(screen.getByTestId("add-project-modal").querySelector("datalist")).toBeNull();
+  });
+
+  it("posts the path of a clicked picker row", async () => {
+    openRowMenu(ws());
+    fireEvent.click(screen.getByTestId("sidebar-context-menu-add-project"));
+    fireEvent.click(await waitFor(() => screen.getByTitle("/src/frontend")));
+    fireEvent.click(screen.getByTestId("add-project-modal-submit"));
+    await waitFor(() => expect(attachCalls()).toHaveLength(1));
+    expect(JSON.parse((attachCalls()[0]![1] as RequestInit).body as string)).toEqual({
+      project: "/src/frontend",
+      attach_existing_branch: false,
+    });
   });
 
   it("does not post an empty project", async () => {
