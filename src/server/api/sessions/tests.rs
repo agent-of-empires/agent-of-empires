@@ -4607,11 +4607,43 @@ async fn import_requires_a_listed_id_in_its_cwd_on_a_plain_host_session() {
     use crate::session::test_support::isolate_home;
     let tmp = tempfile::tempdir().unwrap();
     let claude = tmp.path().join("claude");
-    let _env = isolate_home(tmp.path()).and_set("CLAUDE_CONFIG_DIR", &claude);
     let project = tmp.path().join("proj");
     let other = tmp.path().join("other");
+    let bin = tmp.path().join("bin");
     std::fs::create_dir_all(&project).unwrap();
     std::fs::create_dir_all(&other).unwrap();
+    std::fs::create_dir_all(&bin).unwrap();
+    let pi_acp = bin.join("pi-acp");
+    std::fs::write(
+        &pi_acp,
+        format!(
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -En 's/.*"id":("[^"]*"|[0-9]+).*/\1/p')
+  case $line in
+    *'"method":"initialize"'*)
+      printf '{{"jsonrpc":"2.0","id":%s,"result":{{"protocolVersion":1,"agentCapabilities":{{"loadSession":true,"sessionCapabilities":{{"list":{{}}}}}}}}}}\n' "$id" ;;
+    *'"method":"session/list"'*)
+      printf '{{"jsonrpc":"2.0","id":%s,"result":{{"sessions":[{{"sessionId":"listed","cwd":"{}"}}]}}}}\n' "$id" ;;
+  esac
+done
+"#,
+            project.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(
+        &pi_acp,
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+    )
+    .unwrap();
+    let path = std::env::join_paths(
+        std::iter::once(bin).chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+    )
+    .unwrap();
+    let _env = isolate_home(tmp.path())
+        .and_set("CLAUDE_CONFIG_DIR", &claude)
+        .and_set("PATH", path);
     let store = claude.join("projects").join("-proj");
     std::fs::create_dir_all(&store).unwrap();
     std::fs::write(
@@ -4646,6 +4678,14 @@ async fn import_requires_a_listed_id_in_its_cwd_on_a_plain_host_session() {
         (serde_json::json!({ "path": other }), "Unknown session"),
         (
             serde_json::json!({ "import_acp_session_id": "unlisted" }),
+            "Unknown session",
+        ),
+        (
+            serde_json::json!({ "tool": "pi", "path": other }),
+            "Unknown session",
+        ),
+        (
+            serde_json::json!({ "tool": "pi", "import_acp_session_id": "unlisted" }),
             "Unknown session",
         ),
     ] {
