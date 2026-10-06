@@ -28,6 +28,8 @@ pub enum ListSessionsError {
     UnknownAgent,
     #[error("agent adapter is not installed")]
     NotInstalled,
+    #[error("agent is not allowed by the operator policy")]
+    NotAllowed,
     #[error("agent does not advertise session/list and session/load")]
     Unsupported,
     #[error("agent timed out during {0}")]

@@ -295,6 +295,9 @@ pub(crate) async fn importable_sessions(
 ) -> Result<crate::session::import::ImportableList, crate::acp::acp_client::ListSessionsError> {
     use crate::acp::acp_client::ListSessionsError;
     use crate::session::import::{retain_importable, worktree_dir_markers, Owned};
+    if !crate::server::api::agent_policy().await.allows(agent) {
+        return Err(ListSessionsError::NotAllowed);
+    }
     let join_failed = |e: tokio::task::JoinError| ListSessionsError::Failed(e.to_string());
     let markers = tokio::task::spawn_blocking(worktree_dir_markers)
         .await
@@ -323,6 +326,7 @@ pub(crate) fn list_error_response(e: crate::acp::acp_client::ListSessionsError) 
     let (status, code) = match &e {
         E::UnknownAgent => (StatusCode::BAD_REQUEST, "unknown_agent"),
         E::NotInstalled => (StatusCode::BAD_REQUEST, "agent_not_installed"),
+        E::NotAllowed => (StatusCode::FORBIDDEN, "agent_not_allowed"),
         E::Unsupported => (StatusCode::UNPROCESSABLE_ENTITY, "list_unsupported"),
         E::Timeout(_) | E::Failed(_) => (StatusCode::BAD_GATEWAY, "list_failed"),
     };
@@ -429,6 +433,7 @@ mod tests {
                 StatusCode::BAD_REQUEST,
                 "agent_not_installed",
             ),
+            (E::NotAllowed, StatusCode::FORBIDDEN, "agent_not_allowed"),
             (
                 E::Unsupported,
                 StatusCode::UNPROCESSABLE_ENTITY,
@@ -457,6 +462,40 @@ mod tests {
             .await
             .into_response();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn importable_sessions_never_launches_a_denied_agent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let ran = tmp.path().join("ran");
+        let pi_acp = bin.join("pi-acp");
+        std::fs::write(&pi_acp, format!("#!/bin/sh\ntouch '{}'\n", ran.display())).unwrap();
+        std::fs::set_permissions(
+            &pi_acp,
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+        )
+        .unwrap();
+        let path = std::env::join_paths(
+            std::iter::once(bin).chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+        )
+        .unwrap();
+        let _env = crate::session::test_support::isolate_home(tmp.path()).and_set("PATH", path);
+        crate::session::config::update_config(|c| {
+            c.acp.restrict_agents = true;
+            c.acp.allowed_agents = vec!["claude".to_string()];
+        })
+        .unwrap();
+
+        let state = crate::server::test_support::build_test_app_state(Vec::new());
+        let q = ImportableSessionsQuery { agent: "pi".into() };
+        let resp = list_importable_sessions(State(state), axum::extract::Query(q))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert!(!ran.exists(), "a denied adapter must not be spawned");
     }
 
     #[tokio::test]
