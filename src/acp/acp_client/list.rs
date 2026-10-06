@@ -16,6 +16,11 @@ use crate::session::import::{
 
 /// Bound on `initialize` and on each `session/list` page.
 const STEP_TIMEOUT: Duration = Duration::from_secs(10);
+/// Bound on `session/list` pages for an agent whose order is unknown.
+const MAX_PAGES: usize = 50;
+/// ACP does not order `session/list`. These adapters sort their whole store newest first before
+/// paging (pi-acp 0.0.34 `listPiSessions`), so the lister may stop at the cap.
+const NEWEST_FIRST_AGENTS: &[&str] = &["pi"];
 
 #[derive(Debug, thiserror::Error)]
 pub enum ListSessionsError {
@@ -51,12 +56,13 @@ async fn list_with_timeout(
         let _ = child.kill().await;
         return Err(ListSessionsError::Failed("agent has no stdio".into()));
     };
+    let newest_first = NEWEST_FIRST_AGENTS.contains(&config.agent_key.as_str());
     let transport = ByteStreams::new(stdin.compat_write(), stdout.compat());
     let result = Client
         .builder()
         .name("aoe-acp")
         .connect_with(transport, async move |connection: ConnectionTo<Agent>| {
-            Ok(list_pages(&connection, owned, step_timeout).await)
+            Ok(list_pages(&connection, owned, newest_first, step_timeout).await)
         })
         .await
         .unwrap_or_else(|e| Err(ListSessionsError::Failed(e.to_string())));
@@ -67,6 +73,7 @@ async fn list_with_timeout(
 async fn list_pages(
     connection: &ConnectionTo<Agent>,
     owned: &Owned,
+    newest_first: bool,
     step_timeout: Duration,
 ) -> Result<ImportableList, ListSessionsError> {
     let failed = |e: agent_client_protocol::Error| ListSessionsError::Failed(e.to_string());
@@ -86,11 +93,9 @@ async fn list_pages(
 
     let mut sessions = Vec::new();
     let mut cursor: Option<String> = None;
-    // ACP does not order `session/list`. Stopping at the cap is only safe while
-    // pages arrive newest first; otherwise every page is fetched and sorted.
-    let mut newest_first = true;
-    let mut oldest_seen = None;
+    let mut pages = 0;
     loop {
+        pages += 1;
         let page = tokio::time::timeout(
             step_timeout,
             connection
@@ -108,21 +113,15 @@ async fn list_pages(
                 info.title,
                 info.updated_at,
             );
-            if let Some(at) = s.updated_at_parsed() {
-                newest_first &= oldest_seen.is_none_or(|oldest| at <= oldest);
-                oldest_seen = Some(at);
-            }
             if !owned.excludes(&s.session_id, &s.cwd) {
                 sessions.push(s);
             }
         }
-        let more = page.next_cursor.is_some();
-        let capped = newest_first && sessions.len() >= MAX_SESSIONS;
-        if capped || !more || page_empty {
-            let truncated = sessions.len() > MAX_SESSIONS || (more && !page_empty);
-            if !newest_first {
-                sort_newest_first(&mut sessions);
-            }
+        let more = page.next_cursor.is_some() && !page_empty;
+        let capped = (newest_first && sessions.len() >= MAX_SESSIONS) || pages >= MAX_PAGES;
+        if capped || !more {
+            let truncated = sessions.len() > MAX_SESSIONS || more;
+            sort_newest_first(&mut sessions);
             sessions.truncate(MAX_SESSIONS);
             return Ok(ImportableList {
                 sessions,
@@ -201,7 +200,16 @@ done
         dir: &std::path::Path,
         owned: &Owned,
     ) -> Result<ImportableList, ListSessionsError> {
-        let config = reset_fake_spawn_config(&dir.join("agent.sh"), dir);
+        run_as(dir, owned, "codex").await
+    }
+
+    async fn run_as(
+        dir: &std::path::Path,
+        owned: &Owned,
+        agent: &str,
+    ) -> Result<ImportableList, ListSessionsError> {
+        let mut config = reset_fake_spawn_config(&dir.join("agent.sh"), dir);
+        config.agent_key = agent.into();
         list_with_timeout(config, owned, Duration::from_millis(1500)).await
     }
 
@@ -225,7 +233,8 @@ done
             (2, 1, 2, false, 1),
             (120, 2, 200, true, 2),
             (100, 2, 200, false, 2),
-            (100, 3, 200, true, 2),
+            (100, 3, 200, true, 3),
+            (1, MAX_PAGES as u32 + 1, MAX_PAGES, true, MAX_PAGES),
         ] {
             let dir = tempfile::tempdir().unwrap();
             stub(dir.path(), LISTING, page_size, pages, "none");
@@ -265,18 +274,21 @@ done
     }
 
     #[tokio::test]
-    async fn out_of_order_pages_are_all_fetched_before_the_cap() {
-        let dir = tempfile::tempdir().unwrap();
-        let oldest_first = r#"$(printf '2026-01-01T%02d:%02d:00Z' $((i/60)) $((i%60)))"#;
-        stub_stamped(dir.path(), LISTING, 100, 3, "none", oldest_first);
-        let list = run(dir.path()).await.unwrap();
-        let mut expected = vec!["initialize".to_string()];
-        expected.extend(std::iter::repeat_n("session/list".to_string(), 3));
-        assert_eq!(methods(dir.path()), expected);
-        assert_eq!(list.sessions.len(), MAX_SESSIONS);
-        assert_eq!(list.sessions[0].session_id, "s299");
-        assert_eq!(list.sessions[MAX_SESSIONS - 1].session_id, "s100");
-        assert!(list.truncated);
+    async fn only_a_newest_first_adapter_stops_paging_at_the_cap() {
+        // Two descending pages, then a third page newer than both.
+        let stamp = r#"$([ $i -ge 200 ] && echo 2026-02-01T00:00:00Z || printf '2026-01-01T%02d:%02d:00Z' $(((299-i)/60)) $(((299-i)%60)))"#;
+        for (agent, calls, first, last) in [("codex", 3, "s200", "s99"), ("pi", 2, "s0", "s199")] {
+            let dir = tempfile::tempdir().unwrap();
+            stub_stamped(dir.path(), LISTING, 100, 3, "none", stamp);
+            let list = run_as(dir.path(), &Owned::default(), agent).await.unwrap();
+            let mut expected = vec!["initialize".to_string()];
+            expected.extend(std::iter::repeat_n("session/list".to_string(), calls));
+            assert_eq!(methods(dir.path()), expected, "{agent}");
+            assert_eq!(list.sessions.len(), MAX_SESSIONS, "{agent}");
+            assert_eq!(list.sessions[0].session_id, first, "{agent}");
+            assert_eq!(list.sessions[MAX_SESSIONS - 1].session_id, last, "{agent}");
+            assert!(list.truncated, "{agent}");
+        }
     }
 
     #[tokio::test]
