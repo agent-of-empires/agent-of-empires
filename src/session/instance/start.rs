@@ -55,34 +55,68 @@ pub(super) mod test_support {
 }
 
 /// Outcome of `start_with_resume_fallback`.
+///
+/// Tmux/process failures propagate as `Err` so callers keep the existing
+/// `Status::Error` + `last_error` path. Resume-probe death is represented
+/// explicitly as `ResumeFailed` because it preserves durable state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StartOutcome {
     /// Session ID was set and resume succeeded; pane is alive.
     Resumed,
-    /// Resume was attempted, but the pane died during the probe before AoE observed an explicit
-    /// invalid-resume signal.
+    /// Resume was attempted, but the pane died during the probe before AoE
+    /// observed an explicit invalid-resume signal. The sid was preserved and
+    /// marked so startup recovery does not retry it automatically.
     ResumeFailed { sid: String },
-    /// No resume cascade ran.
+    /// No resume cascade ran. Either no prior sid, the agent doesn't support
+    /// resume, the sid was invalid, the session is structured view-mode (no tmux
+    /// pane), or the tmux session was already alive when entered (so
+    /// `start_with_size_opts` was a no-op and the probe had nothing to
+    /// detect). The pane is alive on return; whether a fresh launch
+    /// actually occurred this call depends on the caller having killed
+    /// any pre-existing pane first.
     Fresh,
-    /// A resume was skipped, and the session started fresh instead, because `sid` already failed a
-    /// resume probe once before.
+    /// A resume was skipped, and the session started fresh instead, because
+    /// `sid` already failed a resume probe once before. Retrying the
+    /// identical sid would only reproduce the original `ResumeFailed`
+    /// forever, so this launch routes through `ResumeIntent::Cleared`
+    /// instead (same as a manual `aoe session set-session-id ""`): a fresh
+    /// sid is assigned and `sid` is not carried forward. Distinct from
+    /// `Fresh` so callers can tell the user their conversation did not
+    /// resume, instead of silently starting a blank session; the prior
+    /// conversation is still reachable through the agent's own resume/
+    /// history picker. See #2609.
     FreshAfterFailedResume { sid: String },
 }
 
 /// What `start_with_size_opts` did with the agent's session id this call.
+/// `start_with_resume_fallback` matches on `Existing` to gate the Tier-1
+/// settle probe; without the gate, fresh Claude launches mislabel as
+/// `StartOutcome::Resumed` because `acquire_session_id` always assigns a
+/// UUID for Claude. `Fresh` carries its own probe gate for the launches that
+/// pin an already-stored id (see `pinned_prior_sid`).
 #[must_use]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LaunchSidOutcome {
-    /// `acquire_session_id` reused a prior sid: `ResumeIntent::Use(sid)`, observed
-    /// `agent_session_id`, or retroactive-capture hit.
+    /// `acquire_session_id` reused a prior sid: `ResumeIntent::Use(sid)`,
+    /// observed `agent_session_id`, or retroactive-capture hit. The launch
+    /// command embedded the agent's resume flag.
     Existing { sid: String },
+
     Fresh {
-        /// Set when the fresh launch pinned an id the session already had stored, rather than a
-        /// UUID minted for a brand-new conversation.
+        /// Set when the fresh launch pinned an id the session already had
+        /// stored, rather than a UUID minted for a brand-new conversation:
+        /// the #2700 empty-thread downgrade (`--session-id <sid>`) and a fork
+        /// (whose child id is pre-generated at creation). Both can die on the
+        /// spot, for a live id or an unresolvable parent, so both are worth
+        /// probing; a genuinely new session cannot and skips the probe.
+        /// See #3399.
         pinned_prior_sid: Option<String>,
     },
-    /// `start_with_size_opts` short-circuited before `apply_session_flags` ran: structured
-    /// view-mode session, or a pre-existing tmux pane that is still alive (kill_clean cache race).
+    /// `start_with_size_opts` short-circuited before `apply_session_flags`
+    /// ran: structured view-mode session, or a pre-existing tmux pane that is
+    /// still alive (kill_clean cache race). `agent_session_id` was not mutated
+    /// this call. A pre-existing *dead* pane is not skipped; it is torn down
+    /// and relaunched (#3399).
     Skipped,
 }
 
@@ -116,11 +150,17 @@ impl Instance {
         let lifecycle_lock = storage
             .acquire_instance_lifecycle_lock(&self.id)
             .context("failed to acquire instance launch lock")?;
-        self.reconcile_from_disk();
         if self.is_structured() {
             return Ok(LaunchSidOutcome::Skipped);
         }
+        // Archived and trashed rows never launch, from any entry point. The
+        // durable recheck after the pre-launch hooks (which run without this
+        // lock) lives in `reacquire_launch_locks_after_hooks`.
         self.ensure_startable()?;
+        // A `remain-on-exit` corpse still owns the tmux name, so plain
+        // `exists()` reads a crashed agent as a running session and start
+        // becomes a silent no-op the caller reports as success. Recreate the
+        // pane instead, the way restart already does. See #3399.
         let session = self.tmux_session()?;
         let corpse_pane = if session.exists() {
             if !session.is_pane_dead() {
@@ -130,51 +170,65 @@ impl Instance {
         } else {
             false
         };
-        self.acquire_lifecycle_reservation(
+        self.reconcile_from_store(&storage)?;
+        let generation = self.acquire_lifecycle_reservation(
             &storage,
             LifecycleOperation::Launch,
             Some(Status::Starting),
         )?;
 
-        // The durable reservation excludes peer launches while user hooks run. Both flocks must be
-        // absent because a hook may invoke aoe for this same session.
+        // Hooks may invoke aoe; retain the token, not the flocks, across them.
         drop(lifecycle_lock);
         drop(title_lock);
-        let hook_result = self.run_pre_launch_hooks(skip_on_launch, &profile);
+        let hook_result = self.run_pre_launch_hooks(skip_on_launch, &storage, None);
         let (_title_lock, _lifecycle_lock) =
-            self.reacquire_launch_locks_after_hooks(&storage, hook_result)?;
-        self.reconcile_sidecar_into_disk();
-        let expected = self.apply_fresh_launch_intent();
+            self.reacquire_launch_locks_after_hooks(&storage, generation, hook_result)?;
+        self.reconcile_sidecar_into_disk_in(&storage)?;
+        let expected = self.apply_fresh_launch_intent_in(&storage);
 
-        let mut prepared = match self.prepare_launch_command(expected) {
-            Ok(prepared) => prepared,
-            Err(error) => {
-                self.fail_reserved_launch(&storage, &error, false);
-                return Err(error);
-            }
-        };
+        let mut prepared =
+            match self.prepare_launch_command_in(CaptureStorage::Scoped(&storage), expected) {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    self.fail_reserved_launch(&storage, generation, &error, false);
+                    return Err(error);
+                }
+            };
         let result = (|| {
             if corpse_pane {
                 self.kill_clean_locked()?;
-                prepared = self.refresh_prepared_prime_launch_after_pane_stop(prepared)?;
+                prepared = self.refresh_prepared_prime_launch_after_pane_stop_in(
+                    CaptureStorage::Scoped(&storage),
+                    prepared,
+                )?;
             }
-            let outcome = self.spawn_prepared_launch(size, &profile, prepared)?;
-            self.commit_lifecycle_launch(&storage, false)?;
+            let outcome = self.spawn_prepared_launch(size, &storage, prepared)?;
+            self.commit_lifecycle_launch(&storage, generation, false)?;
             Ok(outcome)
         })();
         if let Err(error) = result {
-            self.fail_reserved_launch(&storage, &error, true);
+            self.fail_reserved_launch(&storage, generation, &error, true);
             return Err(error);
         }
         result
     }
 
-    pub(super) fn apply_fresh_launch_intent(&mut self) -> ConversationState {
+    pub(super) fn apply_fresh_launch_intent_in(
+        &mut self,
+        _storage: &dyn crate::session::SessionStore,
+    ) -> ConversationState {
         let expected = self.conversation_state();
         if std::mem::take(&mut self.force_fresh_next_launch) {
             self.resume_intent = ResumeIntent::Cleared;
         }
         expected
+    }
+
+    #[cfg(test)]
+    pub(super) fn apply_fresh_launch_intent(&mut self) -> ConversationState {
+        let storage =
+            crate::session::storage::Storage::new_unwatched(&self.effective_profile()).unwrap();
+        self.apply_fresh_launch_intent_in(&storage)
     }
 
     /// The conversation a fresh launch abandons, for the capture-exclusion log.
@@ -211,9 +265,10 @@ impl Instance {
     pub(super) fn spawn_prepared_launch(
         &mut self,
         size: Option<(u16, u16)>,
-        profile: &str,
+        storage: &dyn crate::session::SessionStore,
         mut prepared: PreparedLaunch,
     ) -> Result<LaunchSidOutcome> {
+        let profile = storage.storage().profile();
         let session = self.tmux_session()?;
         if session.exists() {
             anyhow::bail!(
@@ -227,7 +282,7 @@ impl Instance {
         self.stop_poller();
         self.session_id_poller = None;
         if !self.is_sandboxed() {
-            self.install_agent_status_hooks(self.status_agent(), prepared.execution.as_ref());
+            self.install_agent_status_hooks(self.status_agent());
         }
         self.report_store_override(prepared.execution.as_ref());
         let canonicalized = prepared.canonical_conversation.is_some();
@@ -276,14 +331,19 @@ impl Instance {
         } else {
             None
         };
-        let omp_generation_published = self.publish_omp_launch_generation(
-            profile,
+        let omp_generation_published = self.publish_omp_launch_generation_with_store(
+            storage,
             omp_capture_metadata.as_ref(),
             prepared.expected_prior_omp_generation.as_deref(),
-        );
+        )?;
         if let Some(metadata) = omp_capture_metadata.as_ref() {
-            // The launch preamble (`wrap_omp_launch`) rewrites OMP's breadcrumb and writes the
-            // capture marker only if the store's terminal-sessions directory already exists.
+            // The launch preamble (`wrap_omp_launch`) rewrites OMP's breadcrumb
+            // and writes the capture marker only if the store's terminal-sessions
+            // directory already exists; it otherwise falls through to a raw
+            // launch and capture silently no-ops. A first-ever OMP launch (or a
+            // freshly routed store) has no such directory yet, so ensure it here
+            // for the host store. Sandboxed launches resolve a container-side
+            // path the host must not create.
             if !self.is_sandboxed() {
                 if let Err(error) = std::fs::create_dir_all(&metadata.layout.terminal_sessions) {
                     tracing::warn!(
@@ -419,9 +479,9 @@ impl Instance {
         #[cfg(test)]
         test_support::observe(self, test_support::FinalizePhase::Before);
 
-        self.finalize_launch(
+        self.finalize_launch_with_store(
             session.name(),
-            profile,
+            storage,
             &prepared.expected_conversation,
             omp_capture_metadata,
             canonicalized || prepared.carry_relocated,
@@ -456,14 +516,15 @@ impl Instance {
     }
 
     /// Post-launch setup: persist state, start pollers, and apply tmux options.
-    pub(super) fn finalize_launch(
+    pub(super) fn finalize_launch_with_store(
         &mut self,
         session_name: &str,
-        profile: &str,
+        storage: &dyn crate::session::SessionStore,
         expected: &ConversationState,
-        mut omp_capture_metadata: Option<OmpCaptureMetadata>,
+        omp_capture_metadata: Option<OmpCaptureMetadata>,
         confirm_desired_conversation: bool,
     ) -> Result<()> {
+        let profile = storage.storage().profile();
         if let Some(metadata) = omp_capture_metadata.as_ref() {
             let published = serde_json::to_string(metadata).ok().and_then(|encoded| {
                 crate::tmux::env::set_hidden_env(
@@ -480,9 +541,7 @@ impl Instance {
                 })
                 .ok()
             });
-            if published.is_none() {
-                omp_capture_metadata = None;
-            }
+            let _ = published;
         }
 
         let desired = confirm_desired_conversation.then(|| {
@@ -501,17 +560,25 @@ impl Instance {
             }
             desired
         });
-        let outcome = self.persist_session_id(profile, expected);
+        let outcome = self.persist_session_id_with_storage(storage, expected);
         if desired.is_some_and(|desired| {
             !matches!(outcome, SidPersistOutcome::Published) || !desired.matches(self)
         }) {
-            self.reconcile_from_disk();
+            self.reconcile_from_store(storage)?;
             anyhow::bail!("durable publication was not confirmed; durable reconciliation was attempted but may be unavailable, and the pane may remain if reservation verification or teardown fails");
         }
 
         // Skip outcomes leave AOE_CAPTURED_SESSION_ID untouched: this path
         // runs before any poller publish, so env is empty for fresh sessions.
         let publish_sid = matches!(outcome, SidPersistOutcome::Published);
+        let previous_captured = if publish_sid {
+            None
+        } else {
+            crate::tmux::env::get_hidden_env(
+                session_name,
+                crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY,
+            )
+        };
         let captured_sid: Option<String> = if publish_sid {
             self.agent_session_id.clone()
         } else {
@@ -535,6 +602,13 @@ impl Instance {
             tracing::warn!(target: "session.store",
             "Failed to set tmux env keys [{}] at finalize_launch: {}", keys.join(", "), e);
         }
+        if let Some(previous) = previous_captured {
+            let _ = crate::tmux::env::set_hidden_env(
+                session_name,
+                crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY,
+                &previous,
+            );
+        }
 
         if publish_sid && self.agent_session_id.is_none() {
             if let Err(e) = crate::tmux::env::remove_hidden_env(
@@ -550,7 +624,7 @@ impl Instance {
         // A launch re-evaluates the row, so its schedule goes. Clearing the working copy is not
         // enough: the live row keeps its own until the relaunch merge sees the stamp below.
         self.poller_repair.reset();
-        self.maybe_start_poller_since(omp_capture_metadata);
+        self.maybe_start_poller_since_in(CaptureStorage::Scoped(storage))?;
 
         self.status = Status::Starting;
         self.last_start_time = Some(std::time::Instant::now());
@@ -590,7 +664,6 @@ impl Instance {
         }
         Ok(())
     }
-
     /// The store route this launch actually applied, as a binding the stamp
     /// helper accepts (#4127).
     fn attested_claude_store_route(
@@ -609,8 +682,26 @@ impl Instance {
             ..execution.binding.clone()
         })
     }
-}
 
+    #[cfg(test)]
+    pub(super) fn finalize_launch(
+        &mut self,
+        session_name: &str,
+        profile: &str,
+        expected: &ConversationState,
+        omp_capture_metadata: Option<OmpCaptureMetadata>,
+        confirm_desired_conversation: bool,
+    ) -> Result<()> {
+        let storage = crate::session::storage::Storage::new_unwatched(profile)?;
+        self.finalize_launch_with_store(
+            session_name,
+            &storage,
+            expected,
+            omp_capture_metadata,
+            confirm_desired_conversation,
+        )
+    }
+}
 /// The store route a terminal launch attested, read off the routing table the
 /// worker is about to be launched with (#4127).
 ///
@@ -711,6 +802,50 @@ mod tests {
                 assert!(!inst.tmux_session().unwrap().exists(), "{label}");
             }
         }
+    }
+
+    /// #4118: a row that a peer archived or trashed must not reach the
+    /// pre-launch hooks, even when the caller still holds a live in-memory
+    /// copy. The hooks start containers and can have side effects, so this
+    /// watches the hook actually running rather than only the error code.
+    #[test]
+    #[serial_test::serial]
+    fn start_refuses_a_stored_shelved_row_before_the_pre_launch_hooks() {
+        let temp = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_home(temp.path());
+        crate::session::config::update_app_state(|state| {
+            state.has_acknowledged_agent_hooks = true;
+        })
+        .expect("acknowledge the agent hook paths");
+        let witness = temp.path().join("before-session-ran");
+        crate::session::config::update_config(|global| {
+            global.host_hooks.before_session = vec![format!(": > '{}'", witness.display())];
+        })
+        .expect("install before_session hook");
+
+        let profile = "start-shelved-stored-row";
+        let mut inst = Instance::new("start", "/tmp/x");
+        inst.source_profile = profile.to_string();
+        crate::session::instance::test_helpers::seed_disk_for_sidecar_test(profile, &inst);
+        // Only the stored row is shelved: the instance keeps a live copy, which
+        // is the state a daemon cache holds when a peer shelves behind it.
+        crate::session::storage::Storage::new_unwatched(profile)
+            .unwrap()
+            .update(|rows, _| {
+                crate::session::instance::Instance::archive(&mut rows[0]);
+                Ok(())
+            })
+            .unwrap();
+
+        let blocked = inst
+            .start_with_size_opts(None, false)
+            .err()
+            .and_then(|error| error.downcast_ref::<StartBlocked>().copied());
+        assert_eq!(blocked, Some(StartBlocked::Archived));
+        assert!(
+            !witness.exists(),
+            "the pre-launch hook ran for a row already shelved in the store"
+        );
     }
 
     fn instance_with_id(id: &str) -> Instance {

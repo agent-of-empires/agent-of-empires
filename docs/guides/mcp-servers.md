@@ -45,7 +45,7 @@ A project stdio server would launch its `command` the moment a session starts, s
 
 Creating a session for a repo whose `.mcp.json` you have not approved shows a prompt listing each server's name, transport, command and arguments or URL, and the **names** of its env vars and headers. Values are never shown. Approving records the trust; declining creates the session without those servers. The trust fingerprint includes env and header values, so rotating a secret re-prompts, and trust is re-checked on every session start, with changed servers skipped until you approve again.
 
-The file is read from the repository root (for a worktree session, the main repository it was created from), so the servers you reviewed are the servers forwarded. Two current limits: the prompt exists only in the TUI and `aoe add`, so sessions created from the dashboard skip project servers until you approve the repo elsewhere; and per-worktree divergence is unsupported, so use a per-profile `mcp.json` for servers that should differ per worktree.
+The file is read from the repository root (for a worktree session, the main repository it was created from), so the servers you reviewed are the servers forwarded. TUI, CLI, and dashboard session creation all require a fingerprinted review of the exact hook and MCP configuration before approval; if that fingerprint changes, creation is refused and the configuration must be reviewed again. Per-worktree divergence remains unsupported, so use a per-profile `mcp.json` for servers that should differ per worktree.
 
 ## Inspecting the effective set
 

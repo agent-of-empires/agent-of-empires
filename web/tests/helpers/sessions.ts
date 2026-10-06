@@ -41,6 +41,9 @@ export async function mockSessionsList(
 ) {
   await page.route("**/api/sessions", (r) => {
     if (r.request().method() !== "GET") return r.fulfill({ status: 400 });
-    return r.fulfill({ json: { sessions: sessions().map(sessionResponse), workspace_ordering: ordering() } });
+    return r.fulfill({
+      headers: { "aoe-runtime-epoch": "mock-runtime", "aoe-runtime-revision": "1" },
+      json: { sessions: sessions().map(sessionResponse), workspace_ordering: ordering() },
+    });
   });
 }

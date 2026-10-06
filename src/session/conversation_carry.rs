@@ -108,12 +108,6 @@ pub(crate) enum ToolSwap {
 /// transcript for would resume into nothing and lose the id the parking swap
 /// would have kept. Anything unresolvable therefore parks.
 pub(crate) fn classify(instance: &Instance, new_profile: &str, new_tool: &str) -> ToolSwap {
-    if instance.is_structured() {
-        // Structured rows have no terminal launch to consume a carry; their
-        // restart short-circuits before any copy could happen.
-        return ToolSwap::Park;
-    }
-
     if !is_account_swap(
         &instance.source_profile,
         &instance.tool,

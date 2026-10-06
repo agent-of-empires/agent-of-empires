@@ -11,7 +11,8 @@ const fetchRecentProjects = vi.fn();
 const fetchBranches = vi.fn();
 vi.mock("../../../lib/api", () => ({
   fetchProjects: () => fetchProjects(),
-  fetchSessions: () => Promise.resolve({ sessions: [], workspace_ordering: [] }),
+  fetchSessions: () =>
+    Promise.resolve({ sessions: [], workspace_ordering: [], cursor: { epoch: "boot", revision: 1n } }),
   fetchRecentProjects: () => fetchRecentProjects(),
   fetchBranches: (...args: unknown[]) => fetchBranches(...args),
 }));
@@ -34,6 +35,7 @@ function setup(over: { selectedPaths?: string[]; repoBases?: Record<string, stri
   const onRepoBasesChange = vi.fn();
   const { container } = render(
     <ExtraReposPicker
+      profile="default"
       primaryPath="/repos/primary"
       selectedPaths={over.selectedPaths ?? []}
       onChange={onChange}

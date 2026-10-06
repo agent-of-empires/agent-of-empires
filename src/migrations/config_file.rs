@@ -66,7 +66,7 @@ fn rewrite_inner(
                     "Failed to parse {} during {migration} migration",
                     path.display()
                 )
-            })
+            });
         }
         (Err(e), None) => {
             debug!("failed to parse {}: {e}, skipping", path.display());

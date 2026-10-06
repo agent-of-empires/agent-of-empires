@@ -4,6 +4,28 @@ All notable changes to Agent of Empires will be documented in this file.
 
 The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 
+## Unreleased
+
+### Bug Fixes
+
+- **daemon:** Keep the served profile coherent through renames and reject unknown restart targets without degrading healthy session access.
+- **migrations:** Reconcile persisted launch policy at schema 40 and defer sandbox-store isolation while a legacy peer is still writing.
+- **cli:** Restore explicit profile-reference reads and allow private-core rollback when the dashboard plugin is disabled.
+- **tui:** Keep unknown runtime changes recoverable through the command palette and persist mouse-confirmed diff-base changes immediately.
+- **web:** Scope projects to the served profile and release acknowledged setting cancellations for subsequent external updates.
+- **acp:** Apply the served profile’s live worker limit and classify missing approval or elicitation targets consistently.
+- **acp:** Keep dismissed session notices stable across reconnects after event-retention pruning.
+- **daemon:** Replace structured workers on restart, fence ACP launch and idempotent replay until creation hooks finalize, and refuse purge before commit when runner ownership is unresolved.
+- **acp-client:** Stream large HTTP replay pages without the generic response-size cap, retaining deadline, cancellation and complete-document validation.
+- **web:** Cancel expired polling transports and keep setting cancellations fenced by each session’s canonical receipt.
+- **tui:** Retry unapplied snapshots and creation receipts after storage-load failures, settle confirmed mutations after continuation cancellation, and reap completed creation tasks while idle.
+
+### Documentation
+
+- **serve:** Clarify which managed launch operations retain or consume the private recovery pair.
+- **sandbox:** Repair only the confirmed private OpenCode store after backup; preserve shared legacy and migration-recovery stores.
+- **auth:** Distinguish owner-verified local Unix access from authenticated TCP clients behind a proxy.
+
 ## [1.18.0](https://github.com/agent-of-empires/agent-of-empires/releases/tag/v1.18.0) - 2026-09-30
 
 

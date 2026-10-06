@@ -13,6 +13,7 @@ use crate::acp::protocol::{
 use crate::server::session_service::{PromptTouch, SendTurnError, SendTurnRequest, SessionCaller};
 
 use super::*;
+use crate::server::api::sessions::cityhall_block_non_structured;
 
 /// A cancel that waited this long on the submission guard is logged.
 const CANCEL_SUBMISSION_WAIT_WARN: std::time::Duration = std::time::Duration::from_millis(500);
@@ -50,6 +51,7 @@ fn worker_not_ready() -> Response {
 fn no_revive_refused() -> Response {
     (
         StatusCode::CONFLICT,
+        crate::daemon::ApiErrorCode::NoRevive.header(),
         "no_revive: reviving the session is required to accept this prompt",
     )
         .into_response()
@@ -60,6 +62,9 @@ pub async fn acp_prompt(
     Path(id): Path<String>,
     req: Result<Json<PromptRequest>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
+    if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
+        return resp;
+    }
     if let Some(resp) = read_only_block(&state) {
         return resp;
     }
@@ -81,6 +86,7 @@ pub async fn acp_prompt(
     {
         PromptTouch::Touched { idle_dormant } => idle_dormant,
         PromptTouch::RevivalRefused => return no_revive_refused(),
+        PromptTouch::WorkerNotReady => return worker_not_ready(),
         PromptTouch::Blocked(blocked) => {
             return crate::server::api::start_blocked_response(blocked)
         }
@@ -218,6 +224,9 @@ pub async fn acp_prompt_diff_comments(
     Path(id): Path<String>,
     req: Result<Json<DiffCommentsPromptRequest>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
+    if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
+        return resp;
+    }
     if let Some(resp) = read_only_block(&state) {
         return resp;
     }
@@ -236,10 +245,13 @@ pub async fn acp_prompt_diff_comments(
         .session_service
         .touch_and_wake_on_prompt(&id, false)
         .await
-        .idle_dormant()
     {
-        Ok(woke) => woke,
-        Err(blocked) => return crate::server::api::start_blocked_response(blocked),
+        PromptTouch::Touched { idle_dormant } => idle_dormant,
+        PromptTouch::RevivalRefused => return no_revive_refused(),
+        PromptTouch::WorkerNotReady => return worker_not_ready(),
+        PromptTouch::Blocked(blocked) => {
+            return crate::server::api::start_blocked_response(blocked)
+        }
     };
     let dispatch = state
         .session_service
@@ -297,6 +309,9 @@ pub async fn acp_attachment(
     State(state): State<Arc<AppState>>,
     Path((id, attachment_id)): Path<(String, String)>,
 ) -> impl IntoResponse {
+    if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
+        return resp;
+    }
     use axum::http::header;
     match state.acp_event_store.load_attachment(&id, &attachment_id) {
         Some((mime, bytes)) => (
@@ -322,6 +337,9 @@ pub async fn acp_cancel(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
+    if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
+        return resp;
+    }
     if let Some(resp) = read_only_block(&state) {
         return resp;
     }
@@ -352,6 +370,9 @@ pub async fn acp_force_end_turn(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
+    if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
+        return resp;
+    }
     if let Some(resp) = read_only_block(&state) {
         return resp;
     }
@@ -364,6 +385,9 @@ pub async fn resolve_approval(
     Path((id, nonce_str)): Path<(String, String)>,
     req: Result<Json<ResolveApprovalRequest>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
+    if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
+        return resp;
+    }
     if let Some(resp) = read_only_block(&state) {
         return resp;
     }
@@ -388,6 +412,7 @@ pub async fn resolve_approval(
         // The nonce echo lets clients match the 404 to the card (#1821).
         Err(SupervisorError::Acp(AcpError::UnknownNonce)) => (
             StatusCode::NOT_FOUND,
+            crate::daemon::ApiErrorCode::PendingTargetGone.header(),
             format!("no pending approval with nonce {nonce_str}"),
         )
             .into_response(),
@@ -401,6 +426,9 @@ pub async fn resolve_elicitation(
     Path((id, nonce_str)): Path<(String, String)>,
     req: Result<Json<ElicitationResolution>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
+    if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
+        return resp;
+    }
     if let Some(resp) = read_only_block(&state) {
         return resp;
     }
@@ -417,6 +445,7 @@ pub async fn resolve_elicitation(
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(SupervisorError::Acp(AcpError::UnknownNonce)) => (
             StatusCode::NOT_FOUND,
+            crate::daemon::ApiErrorCode::PendingTargetGone.header(),
             format!("no pending elicitation with nonce {nonce_str}"),
         )
             .into_response(),

@@ -163,6 +163,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                 drain_task: tokio::spawn(async {}),
                 restart_history: vec![],
                 kind,
+                launch_epoch: lease.epoch(),
                 lease: lease.clone(),
             },
         );
@@ -250,6 +251,8 @@ pub(super) fn isolate_home() -> (crate::session::test_support::AppDirGuard, temp
 
 pub(super) fn spawn_request(session_id: &str) -> SpawnRequest {
     SpawnRequest {
+        launch_admission: None,
+        expected_lifecycle_generation: 0,
         provider: None,
         session_id: session_id.into(),
         agent: "claude-code".into(),

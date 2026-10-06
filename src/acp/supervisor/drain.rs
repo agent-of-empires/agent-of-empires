@@ -375,6 +375,7 @@ impl<S: BroadcastSink> Drain<S> {
         };
         let reservation = ResumeReservation {
             lease: respawn_lease.clone(),
+            expected_lifecycle_generation: None,
             lifecycle: Arc::clone(&self.lifecycle),
             notify: Arc::clone(&self.notify),
         };
@@ -881,8 +882,8 @@ mod tests {
             "the dropped worker's sub-agent must be detached in the durable log"
         );
         let mut state = AcpState::new(AcpSessionId(id.into()), AgentName("claude".into()), None);
-        for (_, event) in store.replay_from(id, 0) {
-            state.apply_event(event).unwrap();
+        for (seq, event) in store.replay_from(id, 0) {
+            state.apply_event(seq, event).unwrap();
         }
         assert_eq!(
             state.background_agents[0].status,

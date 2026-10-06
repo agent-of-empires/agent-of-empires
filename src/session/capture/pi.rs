@@ -67,7 +67,7 @@ pub(super) fn parse_pi_header_json(line: &str) -> Option<(Option<String>, Option
     Some((session_id, cwd))
 }
 
-pub(super) fn extract_pi_uuid_from_filename(path: &Path) -> Option<String> {
+pub(crate) fn extract_pi_uuid_from_filename(path: &Path) -> Option<String> {
     let stem = path.file_stem()?.to_str()?;
     let uuid_part = stem.rsplit('_').next()?;
     Uuid::parse_str(uuid_part).ok()?;

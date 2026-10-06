@@ -177,7 +177,11 @@ mod tests {
                 "profiles/alpha/config.toml",
                 "[theme]\nname = 'dracula'\n[web]\nnotify_on_idle = true\n",
             );
-            seed(app, "profiles/work/config.toml", "description = 'keep me'\n[theme]\nname = 'rose-pine'\ncolor_mode = 'palette'\nidle_decay_minutes = 5\n[session]\nconfirm_before_quit = false\nsession_id_poller_max_threads = 12\nsidebar_position = 'right'\ndefault_tool = 'codex'\n[web]\nnotify_on_error = false\n[unknown]\nkeep = 'profile'\n");
+            seed(
+                app,
+                "profiles/work/config.toml",
+                "description = 'keep me'\n[theme]\nname = 'rose-pine'\ncolor_mode = 'palette'\nidle_decay_minutes = 5\n[session]\nconfirm_before_quit = false\nsession_id_poller_max_threads = 12\nsidebar_position = 'right'\ndefault_tool = 'codex'\n[web]\nnotify_on_error = false\n[unknown]\nkeep = 'profile'\n",
+            );
 
             run_in(app, atomic_write).unwrap();
 
@@ -327,8 +331,16 @@ mod tests {
     fn merges_default_profile_maps_and_replaces_lists() {
         let dir = tempfile::tempdir().unwrap();
         let app = dir.path();
-        seed(app, "config.toml", "default_profile = 'work'\n[logging.targets]\ntmux = 'info'\nserver = 'error'\n[acp]\nallowed_agents = ['claude']\n");
-        seed(app, "profiles/alpha/config.toml", "[logging.targets]\nsession = 'debug'\nserver = 'warn'\n[acp]\nallowed_agents = ['gemini']\n");
+        seed(
+            app,
+            "config.toml",
+            "default_profile = 'work'\n[logging.targets]\ntmux = 'info'\nserver = 'error'\n[acp]\nallowed_agents = ['claude']\n",
+        );
+        seed(
+            app,
+            "profiles/alpha/config.toml",
+            "[logging.targets]\nsession = 'debug'\nserver = 'warn'\n[acp]\nallowed_agents = ['gemini']\n",
+        );
         seed(
             app,
             "profiles/work/config.toml",

@@ -304,7 +304,7 @@ impl GitWorktree {
 
     /// The registered checkout path holding `branch`, including a stale locked
     /// entry whose checkout no longer exists.
-    pub(super) fn worktree_path_for_branch(&self, branch: &str) -> Result<Option<PathBuf>> {
+    pub(crate) fn worktree_path_for_branch(&self, branch: &str) -> Result<Option<PathBuf>> {
         let output = run_git(&self.repo_path, ["worktree", "list", "--porcelain", "-z"])?;
         if !output.status.success() {
             return Err(GitError::WorktreeCommandFailed(format!(

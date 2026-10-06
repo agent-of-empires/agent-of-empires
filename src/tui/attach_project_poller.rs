@@ -2,8 +2,8 @@
 //!
 //! An attach runs `git worktree add` (plus an optional fetch and submodule init),
 //! persists, bounces the ACP worker and removes the sandbox container. On the UI
-//! event loop that froze the TUI for the whole operation. This mirrors
-//! `RestartPoller`: requests go to a worker thread, results come back over a
+//! event loop that froze the TUI for the whole operation. As with the other
+//! background pollers, requests go to a worker thread, results come back over a
 //! channel the main loop polls each frame.
 
 use std::sync::mpsc::TryRecvError;

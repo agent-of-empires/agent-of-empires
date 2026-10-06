@@ -166,15 +166,29 @@ impl Instance {
         (!options.no_session && options.mode.as_deref() != Some("daemon")).then_some(options)
     }
 
+    #[cfg(test)]
     pub(super) fn prime_agent_capture_plan(
         &self,
         options: PrimeAgentLaunchOptions,
     ) -> anyhow::Result<PrimeAgentCapturePlan> {
+        let file_watch = crate::file_watch::FileWatchService::noop();
+        self.prime_agent_capture_plan_in(options, CaptureStorage::Profiles(&file_watch))
+    }
+
+    pub(super) fn prime_agent_capture_plan_in(
+        &self,
+        options: PrimeAgentLaunchOptions,
+        stores: CaptureStorage<'_>,
+    ) -> anyhow::Result<PrimeAgentCapturePlan> {
         let store = self
             .sandbox_capture_store_dir()
             .context("managed Prime store is unavailable")?;
+        let launch_config = stores.launch_configuration(
+            &self.effective_profile(),
+            std::path::Path::new(&self.project_path),
+        )?;
         let config = self
-            .build_container_config()
+            .build_container_config(&launch_config)
             .context("cannot build Prime container configuration")?;
         self.resolve_prime_agent_capture_plan(&config, store, options)
     }
@@ -364,7 +378,10 @@ impl Instance {
         })
     }
 
-    pub(super) fn prime_root_publication(&self) -> Option<PrimeRootPublication> {
+    pub(super) fn prime_root_publication_in(
+        &self,
+        stores: CaptureStorage<'_>,
+    ) -> Option<PrimeRootPublication> {
         if let Some(active) = &self.active_execution {
             let Some(CaptureContext::Prime {
                 plan,
@@ -375,13 +392,20 @@ impl Instance {
             };
             return validated_prime_root_publication(plan, &self.id);
         }
-        let plan = self.prime_agent_capture_plan(self.prime_agent_capture_options()?)
+        let plan = self
+            .prime_agent_capture_plan_in(self.prime_agent_capture_options()?, stores)
             .inspect_err(|error| {
                 tracing::debug!(target: "session.capture", session = %self.id, reason = %format_args!("{error:#}"),
                     "Prime root publication cannot be attributed");
             })
             .ok()?;
         validated_prime_root_publication(&plan, &self.id)
+    }
+
+    #[cfg(test)]
+    pub(super) fn prime_root_publication(&self) -> Option<PrimeRootPublication> {
+        let file_watch = crate::file_watch::FileWatchService::noop();
+        self.prime_root_publication_in(CaptureStorage::Profiles(&file_watch))
     }
 
     pub(super) fn prime_root_observation(
@@ -408,14 +432,25 @@ impl Instance {
     pub(super) fn prime_published_conversation(
         &self,
     ) -> Option<crate::session::poller::SessionIdObservation> {
-        let PrimeRootPublication::Ready(sid) = self.prime_root_publication()? else {
+        let file_watch = crate::file_watch::FileWatchService::noop();
+        self.prime_published_conversation_in(CaptureStorage::Profiles(&file_watch))
+    }
+
+    pub(super) fn prime_published_conversation_in(
+        &self,
+        stores: CaptureStorage<'_>,
+    ) -> Option<crate::session::poller::SessionIdObservation> {
+        let PrimeRootPublication::Ready(sid) = self.prime_root_publication_in(stores)? else {
             return None;
         };
         Some(self.prime_root_observation(sid))
     }
 
-    pub(super) fn attributable_prime_root(&self) -> Option<Option<String>> {
-        match self.prime_root_publication()? {
+    pub(super) fn attributable_prime_root_in(
+        &self,
+        stores: CaptureStorage<'_>,
+    ) -> Option<Option<String>> {
+        match self.prime_root_publication_in(stores)? {
             PrimeRootPublication::Ready(id)
                 if !self.is_capture_excluded(
                     &id,
@@ -436,11 +471,11 @@ impl Instance {
         }
     }
 
-    pub(super) fn absorb_published_prime_session(&mut self) -> bool {
+    pub(super) fn absorb_published_prime_session_in(&mut self, stores: CaptureStorage<'_>) -> bool {
         if !self.resume_intent.is_default() {
             return false;
         }
-        let Some(target) = self.attributable_prime_root() else {
+        let Some(target) = self.attributable_prime_root_in(stores) else {
             return false;
         };
         let binding = target.as_ref().and_then(|sid| {
@@ -480,7 +515,7 @@ mod tests {
         assert_eq!(inst.try_retroactive_capture(), None);
         std::fs::create_dir_all(inst.sandbox_capture_store_dir().unwrap()).unwrap();
         inst.capture_started_at = Some(std::time::SystemTime::now());
-        inst.maybe_start_poller_since(None);
+        inst.maybe_start_poller_since();
         assert!(inst.session_id_poller.is_some());
         inst.stop_poller();
     }
@@ -497,7 +532,7 @@ mod tests {
         admit_sandbox_fixture(&inst);
         let store = inst.sandbox_capture_store_dir().unwrap();
         std::fs::create_dir_all(&store).unwrap();
-        let mut config = inst.build_container_config().unwrap();
+        let mut config = inst.build_container_config_for_test().unwrap();
 
         let plan = inst
             .prime_agent_capture_plan_with(&config, store.clone())

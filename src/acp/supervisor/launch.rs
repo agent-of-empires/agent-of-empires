@@ -26,13 +26,18 @@ use crate::session::SandboxInfo;
 impl<S: BroadcastSink> Supervisor<S> {
     /// Spawn a structured view worker for the given session.
     pub async fn spawn(&self, req: SpawnRequest) -> Result<(), SupervisorError> {
-        match self
-            .begin_resume(&req.session_id, ResumeKind::Spawn)
-            .await?
-        {
-            ResumeReservationOutcome::Reserved(r) => self.spawn_inner(req, r).await,
+        let reservation = self.reserve_spawn(&req.session_id).await?;
+        self.spawn_inner(req, reservation).await
+    }
+
+    pub(crate) async fn reserve_spawn(
+        &self,
+        id: &str,
+    ) -> Result<ResumeReservation, SupervisorError> {
+        match self.begin_resume(id, ResumeKind::Spawn).await? {
+            ResumeReservationOutcome::Reserved(reservation) => Ok(reservation),
             ResumeReservationOutcome::AlreadyPresent => {
-                Err(SupervisorError::AlreadyRunning(req.session_id))
+                Err(SupervisorError::AlreadyRunning(id.to_owned()))
             }
         }
     }
@@ -82,6 +87,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         }
         Ok(ResumeReservationOutcome::Reserved(ResumeReservation {
             lease,
+            expected_lifecycle_generation: None,
             lifecycle: Arc::clone(&self.lifecycle),
             notify: Arc::clone(&self.worker_notify),
         }))
@@ -90,10 +96,19 @@ impl<S: BroadcastSink> Supervisor<S> {
     /// Spawn body, run under the reservation from `begin_resume`.
     pub(crate) async fn spawn_inner(
         &self,
-        req: SpawnRequest,
+        mut req: SpawnRequest,
         reservation: ResumeReservation,
     ) -> Result<(), SupervisorError> {
         let lease = reservation.lease().clone();
+        if req.launch_admission.is_none() {
+            req.launch_admission = capture_durable_launch(
+                req.source_profile.as_deref(),
+                &req.session_id,
+                Some(req.expected_lifecycle_generation),
+            )
+            .await?;
+        }
+        admit_durable_launch(req.launch_admission.as_ref(), &req.session_id).await?;
         let session_id = req.session_id.as_str();
         let warmup_guard = self.warmup_guard(&req.agent).await;
         let (config, context_reset) = self.spawn_config(&req, lease.epoch()).await?;
@@ -104,7 +119,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             "spawning structured view worker"
         );
         // The hooks above may re-enter aoe, so the lifecycle lock is taken only for each check.
-        admit_durable_launch(&req).await?;
+        admit_durable_launch(req.launch_admission.as_ref(), &req.session_id).await?;
         // Clear a partial replay from a failed import before session/load re-emits it.
         if config.seed_history_replay {
             self.sink.clear_session_events(session_id);
@@ -134,7 +149,9 @@ impl<S: BroadcastSink> Supervisor<S> {
         };
 
         // A peer that archived or trashed the row during the handshake wins: retire the runner.
-        if let Err(refused) = admit_durable_launch(&req).await {
+        if let Err(refused) =
+            admit_durable_launch(req.launch_admission.as_ref(), &req.session_id).await
+        {
             drop(client);
             self.reap_failed_launch(&lease).await;
             return Err(refused);
@@ -247,21 +264,22 @@ impl<S: BroadcastSink> Supervisor<S> {
             );
             host_environment = base_host_environment.clone();
             if !resolved_cfg.host_hooks.before_session.is_empty() {
-                let minted = before_session_env(
+                let hook = before_session_env(
                     &req.session_id,
                     &req.tool,
                     req.source_profile.clone().unwrap_or_default(),
                     req.cwd.clone(),
-                )
-                .await
-                .map_err(|e| {
-                    SupervisorError::InvalidAgentCommand(format!(
-                        "before_session hook task failed: {e}"
-                    ))
-                })?
-                .map_err(|e| {
-                    SupervisorError::Acp(AcpError::Spawn(format!("before_session hook: {e}")))
-                })?;
+                );
+                let minted = hook
+                    .await
+                    .map_err(|e| {
+                        SupervisorError::InvalidAgentCommand(format!(
+                            "before_session hook task failed: {e}"
+                        ))
+                    })?
+                    .map_err(|e| {
+                        SupervisorError::Acp(AcpError::Spawn(format!("before_session hook: {e}")))
+                    })?;
                 overlay_env(&mut host_environment, minted);
             }
         }
@@ -438,6 +456,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                 drain_task,
                 restart_history: vec![],
                 kind,
+                launch_epoch: lease.epoch(),
                 lease,
             },
         );
@@ -550,6 +569,13 @@ impl<S: BroadcastSink> Supervisor<S> {
             Some(r) if worker_registry::is_record_live(&r) => r,
             _ => return Err(SupervisorError::UnknownSession(session_id)),
         };
+        let admission = capture_durable_launch(
+            record.source_profile.as_deref(),
+            &session_id,
+            reservation.expected_lifecycle_generation,
+        )
+        .await?;
+        admit_durable_launch(admission.as_ref(), &session_id).await?;
         let identity = RunnerIdentity {
             pid: record.pid,
             generation: record.generation,
@@ -660,9 +686,19 @@ impl<S: BroadcastSink> Supervisor<S> {
             sandbox_resources,
             agent_key,
             record.source_profile.clone(),
+            Some(tokio::time::Instant::now() + std::time::Duration::from_secs(3)),
         )
         .await?;
 
+        if let Err(refused) = admit_durable_launch(admission.as_ref(), &session_id).await {
+            drop(client);
+            let lease = reservation.lease().clone();
+            lock_recover(&self.lifecycle).convert_to_stopping(&lease);
+            let settlement =
+                tear_down_runner(&*self.process_control, &session_id, Some(identity)).await;
+            self.settle(&lease, settlement);
+            return Err(refused);
+        }
         let inbound = client
             .take_inbound()
             .expect("freshly attached AcpClient always has inbound receiver");
@@ -729,34 +765,95 @@ pub(super) fn publish_rejection(err: &AcpError, mut publish: impl FnMut(Event)) 
     true
 }
 
-/// Recheck the stored row under its lifecycle lock: the caller's check ran before
-/// `spawn_config` awaited the `before_session` hook. Refuses an archived or trashed row, or one
-/// purged since. A request without a source profile has no stored row to check.
-async fn admit_durable_launch(req: &SpawnRequest) -> Result<(), SupervisorError> {
-    let Some(profile) = req.source_profile.clone() else {
+async fn capture_durable_launch(
+    profile: Option<&str>,
+    session_id: &str,
+    expected: Option<u64>,
+) -> Result<Option<super::LaunchAdmission>, SupervisorError> {
+    let Some(profile) = profile.map(str::to_owned) else {
+        return Ok(None);
+    };
+    let id = session_id.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let storage = crate::session::Storage::open_unwatched(&profile)
+            .map_err(|error| SupervisorError::Acp(AcpError::Spawn(error.to_string())))?;
+        let _lock = storage
+            .acquire_instance_lifecycle_lock(&id)
+            .map_err(|error| SupervisorError::Acp(AcpError::Spawn(error.to_string())))?;
+        let row = storage
+            .load()
+            .map_err(|error| SupervisorError::Acp(AcpError::Spawn(error.to_string())))?
+            .into_iter()
+            .find(|row| row.id == id)
+            .ok_or_else(|| SupervisorError::SessionGone(id.clone()))?;
+        Ok(Some(super::LaunchAdmission {
+            store: std::sync::Arc::new(storage),
+            generation: expected.unwrap_or(row.lifecycle_generation),
+            namespace: None,
+        }))
+    })
+    .await
+    .map_err(|error| SupervisorError::Acp(AcpError::Spawn(error.to_string())))?
+}
+
+fn admission_error(error: anyhow::Error, session_id: &str) -> SupervisorError {
+    if let Some(blocked) = error.downcast_ref::<crate::session::StartBlocked>() {
+        SupervisorError::Blocked(*blocked)
+    } else if error.is::<crate::session::SessionGone>() {
+        SupervisorError::SessionGone(session_id.to_owned())
+    } else if error.is::<crate::session::LifecycleReservationError>() {
+        SupervisorError::SpawnCancelled(session_id.to_owned())
+    } else if error.is::<crate::session::NativeStoreUnavailable>() {
+        SupervisorError::NativeStoreUnavailable
+    } else {
+        SupervisorError::Acp(AcpError::Spawn(format!("launch admission: {error:#}")))
+    }
+}
+
+/// Check the same authority and generation before hooks, after hooks and after handshake.
+async fn admit_durable_launch(
+    admission: Option<&super::LaunchAdmission>,
+    session_id: &str,
+) -> Result<(), SupervisorError> {
+    let Some(mut admission) = admission.cloned() else {
         return Ok(());
     };
-    let session_id = req.session_id.clone();
-    let spawn_error = |e: anyhow::Error| {
-        SupervisorError::Acp(AcpError::Spawn(format!("launch admission: {e:#}")))
+    let namespace = match admission.namespace.take() {
+        Some(namespace) => Some(namespace.read_owned().await),
+        None => None,
     };
+    let session_id = session_id.to_owned();
     tokio::task::spawn_blocking(move || {
-        let storage = crate::session::Storage::new_unwatched(&profile).map_err(spawn_error)?;
-        let _lock = storage
+        let _namespace = namespace;
+        let _lock = admission
+            .store
+            .storage()
             .acquire_instance_lifecycle_lock(&session_id)
-            .map_err(spawn_error)?;
-        let stored = storage
+            .map_err(|error| admission_error(error, &session_id))?;
+        let stored = admission
+            .store
             .load()
-            .map_err(spawn_error)?
+            .map_err(|error| admission_error(error, &session_id))?
             .into_iter()
             .find(|row| row.id == session_id);
         match stored {
             None => Err(SupervisorError::SessionGone(session_id)),
-            Some(row) => row.ensure_startable().map_err(SupervisorError::Blocked),
+            Some(row) => {
+                row.ensure_startable().map_err(SupervisorError::Blocked)?;
+                if row.lifecycle_generation != admission.generation {
+                    return Err(SupervisorError::SpawnCancelled(session_id));
+                }
+                if !row.is_structured() || !row.launch_is_finalized() {
+                    return Err(SupervisorError::Acp(AcpError::Spawn(
+                        "structured session launch is not finalized".into(),
+                    )));
+                }
+                Ok(())
+            }
         }
     })
     .await
-    .map_err(|e| SupervisorError::Acp(AcpError::Spawn(format!("launch admission task: {e}"))))?
+    .map_err(|error| SupervisorError::Acp(AcpError::Spawn(error.to_string())))?
 }
 
 /// Run the profile's `before_session` host hooks and return the env they mint.
@@ -1202,6 +1299,7 @@ mod tests {
         );
         let mut inst = crate::session::Instance::new("s-archived", "/tmp");
         inst.id = "s-archived".into();
+        inst.view = crate::session::View::Structured;
         let storage = crate::session::Storage::new_unwatched(&inst.source_profile).unwrap();
         storage
             .update(|rows, _| {
@@ -1215,7 +1313,9 @@ mod tests {
             let sup = Arc::clone(&sup);
             tokio::spawn(async move { sup.spawn(req).await })
         };
-        gate.entered.notified().await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), gate.entered.notified())
+            .await
+            .expect("structured launcher must reach its handshake");
 
         assert!(
             !storage.instance_lifecycle_lock_is_held_for_test("s-archived"),
@@ -1759,8 +1859,8 @@ mod tests {
             AgentName("claude".into()),
             None,
         );
-        for (_, event) in fixture.store.replay_from(session_id, 0) {
-            state.apply_event(event).unwrap();
+        for (seq, event) in fixture.store.replay_from(session_id, 0) {
+            state.apply_event(seq, event).unwrap();
         }
         state
     }

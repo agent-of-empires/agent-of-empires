@@ -13,7 +13,8 @@ use crate::acp::acp_client::AcpError;
 use crate::acp::supervisor::{SpawnRequest, SupervisorError};
 use crate::server::AppState;
 
-use super::{cityhall_block, read_only_block};
+use super::cityhall_block;
+pub(crate) use super::read_only_block;
 
 mod attachments;
 mod config;
@@ -71,7 +72,9 @@ fn supervisor_error_response(context: &str, err: &SupervisorError) -> Response {
             StatusCode::CONFLICT,
             "structured view worker already running for session".to_string(),
         ),
-        SupervisorError::CapacityFull { .. } | SupervisorError::TeardownPending(_) => {
+        SupervisorError::CapacityFull { .. }
+        | SupervisorError::TeardownPending(_)
+        | SupervisorError::NativeStoreUnavailable => {
             (StatusCode::SERVICE_UNAVAILABLE, err.to_string())
         }
         // The worker is mid-restart (e.g. a force stop); the client re-queues.
@@ -101,12 +104,14 @@ fn supervisor_error_response(context: &str, err: &SupervisorError) -> Response {
 }
 
 /// A spawn request carrying the instance's persisted worker settings.
-fn spawn_request_for(
+pub(crate) fn spawn_request_for(
     instance: &crate::session::Instance,
     agent: String,
     sandbox_info: Option<crate::session::SandboxInfo>,
 ) -> SpawnRequest {
     SpawnRequest {
+        launch_admission: None,
+        expected_lifecycle_generation: instance.lifecycle_generation,
         session_id: instance.id.clone(),
         agent,
         tool: instance.tool.clone(),
@@ -133,6 +138,50 @@ fn spawn_request_for(
         seed_history_replay: instance.import_pending == Some(true),
         claude_store_pin: instance.selected_claude_store_pin(),
     }
+}
+
+async fn launch_store_for(
+    state: &Arc<AppState>,
+    instance: &crate::session::Instance,
+    exclusion: crate::acp::sandbox::LaunchExclusion,
+) -> Result<
+    (
+        Arc<crate::server::session_store::NativeSessionStore>,
+        crate::acp::sandbox::LaunchExclusion,
+    ),
+    Response,
+> {
+    crate::server::session_store::NativeSessionStore::open_for_launch(
+        state.clone(),
+        instance,
+        exclusion,
+    )
+    .await
+    .map_err(|error| launch_error_response("session launch preflight", &error))
+}
+
+fn launch_error_response(context: &str, error: &anyhow::Error) -> Response {
+    if let Some(blocked) = error.downcast_ref::<crate::session::StartBlocked>() {
+        return crate::server::api::start_blocked_response(*blocked);
+    }
+    if error.is::<crate::session::SessionGone>() {
+        return session_not_found();
+    }
+    if error.is::<crate::session::LifecycleReservationError>() {
+        return (
+            StatusCode::CONFLICT,
+            format!("spawn_cancelled: {context}: {error}"),
+        )
+            .into_response();
+    }
+    if error.is::<crate::session::NativeStoreUnavailable>() {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        format!("{context}: {error}"),
+    )
+        .into_response()
 }
 
 async fn pick_agent(
@@ -226,6 +275,7 @@ mod tests {
     async fn spawn_refuses_a_row_archived_or_purged_on_disk() {
         let _app_dir = crate::session::test_support::isolate_app_dir();
         let mut inst = crate::session::Instance::new("acp-4116", "/tmp/aoe-4116-acp");
+        inst.source_profile = "default".into();
         inst.view = crate::session::View::Structured;
         inst.status = crate::session::Status::Idle;
         let id = inst.id.clone();
@@ -267,6 +317,64 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn launch_admission_progresses_with_a_group_reader_and_queued_namespace_writer() {
+        use crate::server::test_support as support;
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let project = tempfile::tempdir().unwrap();
+        let mut instance =
+            crate::session::Instance::new("namespace-launch", project.path().to_str().unwrap());
+        instance.source_profile = "default".into();
+        instance.view = crate::session::View::Structured;
+        let id = instance.id.clone();
+        support::seed_instances_on_disk_for_test("default", vec![instance.clone()]);
+        let (launcher, launches) = support::counting_failing_launcher();
+        let state = support::build_test_app_state_with_launcher(vec![instance], launcher);
+        support::refresh_canonical_metadata_for_test(&state).await;
+        let held = state.instance_lock(&id).await.lock_owned().await;
+        let mut launch = Box::pin(spawn_acp(
+            State(state.clone()),
+            Path(id.clone()),
+            Ok(Json(worker::SpawnAcpRequest {
+                agent: Some("codex".into()),
+                model: None,
+                additional_dirs: Vec::new(),
+                provider_env: Vec::new(),
+            })),
+        ));
+        assert!(futures_util::poll!(launch.as_mut()).is_pending());
+        let mut group = Box::pin(crate::server::api::sessions::update_session_group(
+            State(state.clone()),
+            Path(id.clone()),
+            Ok(Json(crate::daemon::UpdateGroupBody {
+                group: "moved".into(),
+            })),
+        ));
+        assert!(futures_util::poll!(group.as_mut()).is_pending());
+        let writer = async {
+            drop(state.profile_namespace.write().await);
+        };
+        tokio::pin!(writer);
+        assert!(futures_util::poll!(writer.as_mut()).is_pending());
+        drop(held);
+        let (launch, group, ()) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            tokio::join!(launch, group, writer)
+        })
+        .await
+        .expect("launch must not reacquire namespace while retaining instance exclusion");
+        assert_eq!(
+            launch.into_response().status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        let group = group.into_response();
+        let status = group.status();
+        let body = axum::body::to_bytes(group.into_body(), 4096).await.unwrap();
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        assert_eq!(launches.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(state.instances.read().await[0].group_path, "moved");
+    }
+
     /// #4116: a peer archive committed while the `before_session` hook runs (after the handler's
     /// recheck) still refuses the launch, on both the spawn and the agent-switch endpoint.
     #[tokio::test]
@@ -280,6 +388,7 @@ mod tests {
             let mut inst =
                 crate::session::Instance::new("acp-4116-hook", barrier.path().to_str().unwrap());
             inst.id = format!("sess-4116-hook-{endpoint}");
+            inst.source_profile = "default".into();
             inst.view = crate::session::View::Structured;
             inst.status = crate::session::Status::Idle;
             let id = inst.id.clone();
@@ -517,6 +626,7 @@ mod tests {
                             fresh.acp_session_id =
                                 Some("22222222-2222-4222-8222-222222222222".into());
                         }
+                        let metadata = state.canonical_metadata.read().await.clone();
                         crate::server::reload::reload_state_instances_from_disk(
                             &state,
                             vec![fresh],
@@ -525,6 +635,8 @@ mod tests {
                             state
                                 .mutation_epoch
                                 .load(std::sync::atomic::Ordering::SeqCst),
+                            metadata,
+                            Default::default(),
                         )
                         .await;
                     }

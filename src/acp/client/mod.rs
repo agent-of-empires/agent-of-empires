@@ -7,20 +7,12 @@
 //!   cancel, tail, attach).
 //! - The TUI structured view (`src/tui/structured_view/`).
 //!
-//! All three layers share `DaemonEndpoint` discovery, the typed
-//! `HttpClient`, and the typed `WsHandle` so a change to the wire
-//! shape breaks every consumer at compile time, not at runtime.
-//!
-//! Discovery resolution order:
-//!
-//! 1. `AOE_DAEMON_URL` (+ optional `AOE_DAEMON_TOKEN`).
-//! 2. Local `<app_dir>/serve.url` paired with a live `serve.pid`.
-//!
-//! [`daemon_manager::require_daemon`] returns
-//! [`daemon_manager::ManagerError::NoDaemonRunning`] when neither
-//! resolves; callers render the contained hint and bail rather than
-//! starting a daemon by side-effect, so the user keeps the choice
-//! between localhost, Tailscale, and Cloudflare explicit.
+//! Clients share endpoint discovery, bounded HTTP decoding and authenticated
+//! WebSocket transport. An explicit `AOE_DAEMON_URL` takes precedence; otherwise
+//! discovery selects the live local daemon through its owner-verified Unix socket.
+//! [`daemon_manager::require_daemon`] never starts a process. The explicit
+//! [`daemon_manager::ensure_daemon`] bootstrap uses the serialized core launcher
+//! and never replaces an explicit remote endpoint with a local daemon.
 
 pub mod daemon_manager;
 pub mod discovery;
@@ -31,6 +23,4 @@ pub mod ws;
 pub use daemon_manager::{require_daemon, ManagerError};
 pub use discovery::{discover, DaemonEndpoint, DiscoveryError, Source};
 pub use http::{HttpClient, HttpError, PluginCommandView, REPLAY_PAGE_SIZE};
-pub use ws::{
-    connect as ws_connect, connect_with as ws_connect_with, WsError, WsHandle, WsMessage,
-};
+pub use ws::{connect as ws_connect, connect_with as ws_connect_with, WsHandle, WsMessage};

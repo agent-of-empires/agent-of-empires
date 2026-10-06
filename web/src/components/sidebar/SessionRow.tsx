@@ -13,6 +13,8 @@ import {
   smartRenameSession,
   summarizeSession,
   updateSessionGroup,
+  type RuntimeCursor,
+  type SessionMutation,
 } from "../../lib/api";
 import { isSessionActive } from "../../lib/session";
 import { useIdleDecayWindowMs } from "../../lib/idleDecay";
@@ -42,6 +44,9 @@ type Modal = "snooze" | "workdir" | "addProject" | "group" | null;
 
 export interface SessionRowProps {
   workspace: Workspace;
+  observedById: Record<string, RuntimeCursor>;
+  runtimeEpoch: string | null;
+  onSessionMutation: (mutation: SessionMutation) => void;
   isActive: boolean;
   isSelected: boolean;
   onActivate: RowActivate;
@@ -70,17 +75,39 @@ export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
   const compact = useSidebarCompact();
   const derived = deriveRowModel(workspace, props.optimistic, { idleDecayWindowMs, isActive, unreadIndicatorEnabled });
   const { label, sessionId, isDeleting, navigationSession } = derived;
+  const settingIdentity = `${workspace.id}:${props.runtimeEpoch ?? ""}:${workspace.sessions
+    .map((session) => session.id)
+    .sort()
+    .join(",")}`;
   const [notifyPreset, setNotify] = usePendingSetting(
     derived.notifyPreset,
-    (preset) => (sessionId ? setSessionNotifications(sessionId, preset) : Promise.resolve(false)),
+    async (preset) => {
+      if (!sessionId) return null;
+      const mutation = await setSessionNotifications(sessionId, preset);
+      if (!mutation) return null;
+      props.onSessionMutation(mutation);
+      return [{ id: sessionId, cursor: mutation.cursor }];
+    },
     () => reportError("Could not change notifications. Please try again."),
+    props.observedById,
+    settingIdentity,
   );
   const [sessionColor, setColor] = usePendingSetting(
     derived.sessionColor,
-    // The row shows any session's color, so every session must change for the pick to stick.
-    async (color) =>
-      (await Promise.all(workspace.sessions.map((s) => setSessionColor(s.id, color)))).every((r) => r != null),
+    async (color) => {
+      const ids = workspace.sessions.map((session) => session.id);
+      const results = await Promise.all(
+        ids.map(async (id) => {
+          const mutation = await setSessionColor(id, color);
+          if (mutation) props.onSessionMutation(mutation);
+          return mutation ? { id, cursor: mutation.cursor } : null;
+        }),
+      );
+      return results.every((receipt) => receipt !== null) ? results : null;
+    },
     () => reportError("Could not change the session color. Please try again."),
+    props.observedById,
+    settingIdentity,
   );
   const model: RowModel = {
     ...derived,
@@ -91,6 +118,7 @@ export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
 
   const [modal, setModal] = useState<Modal>(null);
   const [addProjectOptions, setAddProjectOptions] = useState<{ name: string; path: string }[]>([]);
+  const addProjectGeneration = useRef(0);
   const [renaming, setRenaming] = useState(false);
   const [renameValue, setRenameValue] = useState(label);
   const renameRef = useRef<HTMLInputElement>(null);
@@ -134,10 +162,15 @@ export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
     color: setColor,
   };
   const openAddProject = () => {
+    const first = model.firstSession;
+    if (!sessionId || !first?.profile) return;
     actions.addProject();
-    void fetchProjects().then((projects) =>
-      setAddProjectOptions(projects.map((p) => ({ name: p.name, path: p.path }))),
-    );
+    const generation = ++addProjectGeneration.current;
+    setAddProjectOptions([]);
+    void fetchProjects({ profile: first.profile }).then((projects) => {
+      if (generation !== addProjectGeneration.current || projects === null) return;
+      setAddProjectOptions(projects.map((project) => ({ name: project.name, path: project.path })));
+    });
   };
 
   if (renaming) {

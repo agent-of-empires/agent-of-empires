@@ -12,7 +12,12 @@ test("topbar overflow menu signs the user out and returns to LoginPage", async (
     }),
   );
   await page.route("**/api/logout", (r) => r.fulfill({ json: { ok: true } }));
-  await page.route("**/api/sessions", (r) => r.fulfill({ json: { sessions: [], workspace_ordering: [] } }));
+  await page.route("**/api/sessions", (r) =>
+    r.fulfill({
+      headers: { "aoe-runtime-epoch": "mock-runtime", "aoe-runtime-revision": "1" },
+      json: { sessions: [], workspace_ordering: [] },
+    }),
+  );
 
   await page.setViewportSize({ width: 1280, height: 720 });
   await page.goto("/");

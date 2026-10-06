@@ -248,9 +248,27 @@ async fn run(
         }
     }
 
+    // `settings explain` and `mcp list` answer from `config.toml`, which every
+    // pending migration is free to rewrite in place: v009 renames
+    // `updates.check_enabled`, v021 moves `[app_state]` into `state.toml`, v038
+    // drops `session.daemon_sidebar`. Asked before the migrations below, they
+    // read that pre-migration file, so `settings explain` reports the schema
+    // default for a value the user did set and calls a live setting "not a
+    // known setting" purely because the key is still spelled the old way. Both
+    // keep dispatching from the arm below, so neither picks up the startup
+    // warning block; only the migration run is hoisted above it, for these two
+    // arms alone.
+    let command_name = cli.command.as_ref().and_then(cli::command_name);
+    if matches!(
+        cli.command,
+        Some(Commands::Settings { .. }) | Some(Commands::Mcp { .. })
+    ) {
+        run_startup_migrations(command_name, is_daemon_child)?;
+    }
+
     // Skipped for the detached daemon child so `aoe serve --daemon` counts once.
     if !is_daemon_child {
-        if let Some(name) = cli.command.as_ref().and_then(cli::command_name) {
+        if let Some(name) = command_name {
             agent_of_empires::telemetry::track_cli_command(name).await;
         }
     }
@@ -286,11 +304,20 @@ async fn run(
                 ThemeCommands::Dir => cli::theme::run_dir(),
             };
         }
+        // Migrations ran above (see the hoist before this match): both answer
+        // from config.toml, which a pending migration rewrites in place, so
+        // they must not read the pre-migration file.
         Some(Commands::Settings { command }) => return cli::settings::run(command),
         Some(Commands::Mcp { command }) => {
             let profile = cli.profile.clone().unwrap_or_default();
             return cli::mcp::run(&profile, command).await;
         }
+        // Deliberately migration-free, unlike its neighbours above: every
+        // skill verb reads and writes only `<app_dir>/skills` and the agent
+        // skill roots, which no migration creates, renames or reads. There is
+        // no pre-migration spelling of a skill to get wrong, so running the
+        // migrations would only make `aoe skill list` fail on a read-only
+        // install for nothing.
         Some(Commands::Skill { command }) => return cli::skill::run(command),
         Some(Commands::Uninstall(args)) => return cli::uninstall::run(args).await,
         Some(Commands::Update(args)) => return cli::update::run(args).await,
@@ -303,13 +330,7 @@ async fn run(
     let profile = cli.profile.unwrap_or_default();
 
     if cli.command.is_some() {
-        let reporter = cli
-            .command
-            .as_ref()
-            .and_then(cli::command_name)
-            .is_some()
-            .then(cli::migrate::stderr_reporter);
-        migrations::run_migrations_with(reporter)?;
+        run_startup_migrations(command_name, is_daemon_child)?;
         agent_of_empires::session::poller::configure_session_id_poller_max_threads(
             agent_of_empires::session::poller::configured_session_id_poller_max_threads(&profile),
         );
@@ -317,7 +338,7 @@ async fn run(
 
     // Unknown keys are only reported here; parse failures only when no subscriber is up.
     // Hidden machine-spawned subcommands never print into a worker's redirected stderr.
-    if cli.command.as_ref().and_then(cli::command_name).is_some() {
+    if command_name.is_some() {
         let warning = if should_init {
             agent_of_empires::session::collect_startup_ignored_key_warnings(&profile)
         } else {
@@ -374,4 +395,20 @@ async fn run(
     };
 
     result
+}
+
+/// Advance the schema, or verify it where migrating is the parent's job.
+///
+/// `is_daemon_child` is the detached `aoe serve --daemon` child: the parent
+/// already ran the migrations and is holding the daemon lifecycle transaction
+/// that this child is about to receive. A migration running here would race
+/// the parent on `.schema_version` and, for the one that writes the launch
+/// record, wait on the very lock the parent holds. Verify the schema instead
+/// of migrating, and fail closed.
+fn run_startup_migrations(command_name: Option<&str>, is_daemon_child: bool) -> Result<()> {
+    if is_daemon_child {
+        return migrations::assert_schema_current();
+    }
+    let reporter = command_name.is_some().then(cli::migrate::stderr_reporter);
+    migrations::run_migrations_with(reporter)
 }

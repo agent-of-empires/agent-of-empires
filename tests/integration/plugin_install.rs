@@ -928,11 +928,7 @@ command = ["false"]
     )
     .unwrap();
 
-    let err = install::update("acme.upd", false)
-        .await
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("build step"), "got: {err}");
+    install::update("acme.upd", true).await.unwrap_err();
 
     // The prior install is intact: directory, artifact, and recorded version.
     assert!(

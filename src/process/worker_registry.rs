@@ -226,6 +226,12 @@ pub fn load(session_id: &str) -> Result<Option<WorkerRecord>> {
         }
     }
 }
+
+/// Locked, strict read for destructive ownership decisions. Unlike [`load`],
+/// malformed or unreadable state remains an error instead of looking absent.
+pub(crate) fn load_strict(session_id: &str) -> Result<Option<WorkerRecord>> {
+    with_registry_lock(session_id, || load_strict_unlocked(session_id))
+}
 fn load_strict_unlocked(session_id: &str) -> Result<Option<WorkerRecord>> {
     let path = record_path(session_id)?;
     match std::fs::read(&path) {

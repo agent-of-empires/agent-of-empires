@@ -1,8 +1,9 @@
 /* eslint-disable react-refresh/only-export-components */
-import { useMemo, useRef, type ReactNode } from "react";
+import { useMemo, useRef, useState, type ReactNode } from "react";
 import { fireEvent, render, screen } from "@testing-library/react";
 import { vi } from "vitest";
 import { useSidebarTriage } from "../../hooks/useSidebarTriage";
+import type { RuntimeCursor } from "../../lib/api";
 import type { SessionResponse, Workspace } from "../../lib/types";
 import { SessionColorsContext } from "../../lib/sessionColors";
 import { SessionRowTagContext, type SessionRowTagMode } from "../../lib/sessionRowTag";
@@ -57,12 +58,17 @@ export function makeWorkspace(id: string, sessions: SessionResponse[], over: Par
 }
 
 export function jsonResponse(body: unknown, status = 200) {
-  return new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "content-type": "application/json", "aoe-runtime-epoch": "boot", "aoe-runtime-revision": "1" },
+  });
 }
 
 /** Stubs `fetch` with a spy answering `{ id: "s1" }`; call from `beforeEach` and unstub globals after. */
 export function stubFetch() {
-  const spy = vi.fn<typeof fetch>(async () => jsonResponse({ id: "s1" }));
+  const spy = vi.fn<typeof fetch>(async (_url, init) =>
+    jsonResponse(makeSession(init?.body ? JSON.parse(init.body as string) : {})),
+  );
   vi.stubGlobal("fetch", spy);
   return spy;
 }
@@ -92,9 +98,27 @@ interface RowOptions {
 /** A single unselected SessionRow wired to the real triage hook, as the sidebar wires it. */
 function Row({ ws, readOnly, isActive = false, onCreateSession }: RowOptions & { ws: Workspace }) {
   const triage = useSidebarTriage(useMemo(() => [ws], [ws]));
+  const [canonical, setCanonical] = useState({
+    source: ws,
+    workspace: ws,
+    observedById: {} as Record<string, RuntimeCursor>,
+  });
+  if (canonical.source !== ws) setCanonical({ source: ws, workspace: ws, observedById: {} });
   return (
     <SessionRow
-      workspace={ws}
+      workspace={canonical.workspace}
+      observedById={canonical.observedById}
+      runtimeEpoch="boot"
+      onSessionMutation={({ session, cursor }) =>
+        setCanonical((current) => ({
+          ...current,
+          workspace: {
+            ...current.workspace,
+            sessions: current.workspace.sessions.map((row) => (row.id === session.id ? session : row)),
+          },
+          observedById: { ...current.observedById, [session.id]: cursor },
+        }))
+      }
       isActive={isActive}
       isSelected={false}
       onActivate={() => {}}

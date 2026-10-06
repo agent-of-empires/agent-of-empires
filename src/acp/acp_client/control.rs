@@ -1291,6 +1291,7 @@ mod tests {
                     None,
                     "codex".into(),
                     None,
+                    None,
                 )
                 .await
                 .unwrap();
@@ -1463,6 +1464,7 @@ mod tests {
                 None,
                 "codex".into(),
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -1491,6 +1493,7 @@ mod tests {
         .await
         .unwrap();
     }
+
     #[tokio::test]
     async fn native_identity_reattach_preserves_a_full_wire_byte_backlog() {
         use crate::acp::acp_client::AcpClient;
@@ -1589,6 +1592,7 @@ mod tests {
                 AcpSessionId("byte-backlog".into()),
                 None,
                 "codex".into(),
+                None,
                 None,
             )
             .await

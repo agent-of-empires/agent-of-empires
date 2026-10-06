@@ -87,6 +87,8 @@ pub enum SupervisorError {
     Blocked(crate::session::StartBlocked),
     #[error("session {0:?} no longer exists")]
     SessionGone(String),
+    #[error("native session authority unavailable")]
+    NativeStoreUnavailable,
 }
 
 /// What the caller does with prompt text after it was published.
@@ -122,6 +124,7 @@ struct WorkerHandle {
     /// Respawn timestamps inside the restart window; the initial spawn is not counted.
     restart_history: Vec<Instant>,
     kind: WorkerKind,
+    launch_epoch: u64,
     lease: Lease,
     native_session_id: Option<String>,
 }
@@ -179,6 +182,7 @@ pub struct Supervisor<S: BroadcastSink> {
 /// install abandons the epoch so a failed resume cannot pin the session.
 pub(crate) struct ResumeReservation {
     lease: Lease,
+    pub(crate) expected_lifecycle_generation: Option<u64>,
     lifecycle: Arc<std::sync::Mutex<LifecycleTable>>,
     notify: Arc<tokio::sync::Notify>,
 }
@@ -215,6 +219,8 @@ pub enum SandboxContinuation {
 
 #[derive(Debug, Clone)]
 pub struct SpawnRequest {
+    pub(crate) launch_admission: Option<LaunchAdmission>,
+    pub(crate) expected_lifecycle_generation: u64,
     pub session_id: String,
     /// The ACP backend `pick_agent_for_tool` resolved.
     pub agent: String,
@@ -249,6 +255,21 @@ pub struct SpawnRequest {
     pub claude_store_pin: Option<crate::session::capture::ClaudeStorePin>,
 }
 
+#[derive(Clone)]
+pub(crate) struct LaunchAdmission {
+    pub store: Arc<dyn crate::session::SessionStore>,
+    pub generation: u64,
+    pub namespace: Option<Arc<tokio::sync::RwLock<()>>>,
+}
+
+impl std::fmt::Debug for LaunchAdmission {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LaunchAdmission")
+            .field("generation", &self.generation)
+            .finish_non_exhaustive()
+    }
+}
+
 impl<S: BroadcastSink> Supervisor<S> {
     /// Constructor with no concurrency cap.
     pub fn new(sink: Arc<S>) -> Self {
@@ -279,6 +300,10 @@ impl<S: BroadcastSink> Supervisor<S> {
             respawned_in_place: Arc::default(),
             max_concurrent_workers,
         }
+    }
+
+    pub(crate) fn max_concurrent_workers(&self) -> u32 {
+        self.max_concurrent_workers
     }
 
     /// Flag a build-stale worker kept alive to finish its turn.
@@ -390,6 +415,15 @@ impl<S: BroadcastSink> Supervisor<S> {
             .await
             .get(session_id)
             .is_some_and(|worker| worker.lease.epoch() == generation)
+    }
+
+    /// Automatic respawns retain the originating launch; a new launch supersedes it.
+    pub(crate) async fn is_current_launch(&self, session_id: &str, launch_epoch: u64) -> bool {
+        self.workers
+            .lock()
+            .await
+            .get(session_id)
+            .is_some_and(|worker| worker.launch_epoch == launch_epoch)
     }
 
     /// Return the native store owned by the current worker only when it still

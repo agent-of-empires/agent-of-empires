@@ -60,7 +60,9 @@ mod tests {
             &[
                 // idle_decay_minutes stays profile-overridable.
                 (
-                    Some("[theme]\nname = \"rose-pine\"\ncolor_mode = \"palette\"\nidle_decay_minutes = 5\n"),
+                    Some(
+                        "[theme]\nname = \"rose-pine\"\ncolor_mode = \"palette\"\nidle_decay_minutes = 5\n",
+                    ),
                     Some("[theme]\nidle_decay_minutes = 5\n"),
                 ),
                 // An emptied [theme] table is removed.

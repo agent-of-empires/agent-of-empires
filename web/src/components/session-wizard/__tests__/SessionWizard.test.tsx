@@ -2,15 +2,29 @@
 
 import { StrictMode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 
 import { SessionWizard, type WizardPrefill } from "../SessionWizard";
-import { fetchAgents, fetchCreateProgress, fetchIsGitRepo, fetchProfiles, fetchSettings } from "../../../lib/api";
+import {
+  fetchAgents,
+  fetchCreateProgress,
+  fetchIsGitRepo,
+  fetchProfiles,
+  fetchProjects,
+  fetchSettings,
+} from "../../../lib/api";
 import { agent } from "./fixtures";
 import { toastBus } from "../../../lib/toastBus";
 import { startPendingCreates } from "../../../lib/pendingCreates";
 
 const createSession = vi.fn();
+const reviewCreationTrust = vi.fn();
+const FINGERPRINT = {
+  project_path: "/tmp/proj",
+  base_hooks_hash: "base",
+  hooks_hash: "repo",
+  mcp_hash: null,
+};
 
 vi.mock("../../../lib/api", () => ({
   fetchCreateProgress: vi.fn().mockResolvedValue(null),
@@ -30,6 +44,7 @@ vi.mock("../../../lib/api", () => ({
   }),
   fetchProjects: vi.fn().mockResolvedValue([]),
   createSession: (...args: unknown[]) => createSession(...args),
+  reviewCreationTrust: (...args: unknown[]) => reviewCreationTrust(...args),
 }));
 
 const INSTRUCTION_KEY = "aoe-new-session-last-instruction";
@@ -38,7 +53,22 @@ beforeEach(() => {
   vi.clearAllMocks();
   localStorage.clear();
   createSession.mockResolvedValue({ ok: true, session: { id: "s1" } });
+  reviewCreationTrust.mockResolvedValue({
+    ok: true,
+    review: {
+      fingerprint: FINGERPRINT,
+      merged_hooks: {
+        on_create: ["bash scripts/setup-worktree.sh"],
+        on_launch: ["npm start"],
+      },
+      repo_hooks: {},
+      mcp_summaries: [],
+      hooks_need_trust: true,
+      mcp_need_trust: false,
+    },
+  });
   vi.mocked(fetchIsGitRepo).mockImplementation(async (path) => path !== "/tmp/plain");
+  vi.mocked(fetchProjects).mockResolvedValue([]);
 });
 
 afterEach(() => {
@@ -46,12 +76,13 @@ afterEach(() => {
   localStorage.clear();
 });
 
-function renderWizard(prefill: WizardPrefill = { path: "/tmp/proj", tool: "claude" }) {
+function renderWizard(prefill: WizardPrefill = { path: "/tmp/proj", tool: "claude" }, servedProfile = "default") {
   const onCreated = vi.fn();
   const onClose = vi.fn();
   const onCreatedInBackground = vi.fn();
   render(
     <SessionWizard
+      servedProfile={servedProfile}
       onClose={onClose}
       onCreated={onCreated}
       onCreatedInBackground={onCreatedInBackground}
@@ -95,7 +126,9 @@ describe("SessionWizard structured view payload", () => {
 
   it("sends profile-resolved agent model and effort defaults", async () => {
     vi.mocked(fetchSettings).mockResolvedValueOnce({
-      session: { default_tool: "opencode", acp_defaults: { opencode: { model: "openai/gpt-5.5", effort: "high" } } },
+      session: { default_tool: "opencode" },
+      // `acp_defaults` moved to the [acp] section in v019.
+      acp: { acp_defaults: { opencode: { model: "openai/gpt-5.5", effort: "high" } } },
       sandbox: {},
     } as never);
     renderWizard({ path: "/tmp/proj" });
@@ -153,6 +186,29 @@ describe("SessionWizard hooks trust", () => {
     await waitFor(() => expect(screen.getByTestId("hooks-trust-dialog")).toBeTruthy());
   };
 
+  it("renders redacted MCP summaries as inert review text", async () => {
+    const summary = 'project-search <img src=x onerror="window.__mcpXss=true">';
+    createSession.mockResolvedValueOnce(REFUSAL);
+    reviewCreationTrust.mockResolvedValueOnce({
+      ok: true,
+      review: {
+        fingerprint: FINGERPRINT,
+        merged_hooks: { on_create: [] },
+        repo_hooks: {},
+        mcp_summaries: [summary],
+        hooks_need_trust: false,
+        mcp_need_trust: true,
+      },
+    });
+    renderWizard();
+    await openDialog();
+
+    const list = screen.getByTestId("hooks-trust-list");
+    expect(list.textContent).toContain(summary);
+    expect(list.querySelector("img")).toBeNull();
+    expect((window as Window & { __mcpXss?: boolean }).__mcpXss).toBeUndefined();
+  });
+
   it("pauses on the trust dialog, then resubmits with trust_hooks on Proceed", async () => {
     createSession.mockResolvedValueOnce(REFUSAL).mockResolvedValueOnce({ ok: true, session: { id: "s1" } });
     const { onCreated } = renderWizard();
@@ -162,8 +218,56 @@ describe("SessionWizard hooks trust", () => {
     expect(payload()).not.toHaveProperty("trust_hooks", true);
     fireEvent.click(screen.getByTestId("hooks-trust-proceed"));
     await waitFor(() => expect(createSession).toHaveBeenCalledTimes(2));
-    expect(payload(1)).toMatchObject({ trust_hooks: true });
+    expect(payload(1)).toMatchObject({ trust_hooks: true, trust_review: FINGERPRINT });
     await waitFor(() => expect(onCreated).toHaveBeenCalledWith({ id: "s1" }));
+  });
+
+  it("re-reviews after creation_trust_changed instead of auto-approving", async () => {
+    const changed = {
+      ok: false,
+      error: "Repository hook configuration changed; review it again",
+      trustChanged: true,
+    };
+    createSession.mockResolvedValueOnce(REFUSAL).mockResolvedValueOnce(changed);
+    reviewCreationTrust
+      .mockResolvedValueOnce({
+        ok: true,
+        review: {
+          fingerprint: FINGERPRINT,
+          merged_hooks: { on_create: ["old"] },
+          repo_hooks: {},
+          mcp_summaries: [],
+          hooks_need_trust: true,
+          mcp_need_trust: false,
+        },
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        review: {
+          fingerprint: { ...FINGERPRINT, hooks_hash: "new" },
+          merged_hooks: { on_create: ["new reviewed command"] },
+          repo_hooks: {},
+          mcp_summaries: [],
+          hooks_need_trust: true,
+          mcp_need_trust: false,
+        },
+      });
+    renderWizard();
+    await openDialog();
+    fireEvent.click(screen.getByTestId("hooks-trust-proceed"));
+    await waitFor(() => expect(reviewCreationTrust).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(screen.getByTestId("hooks-trust-list").textContent).toContain("new reviewed command"));
+    expect(createSession).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not submit an approval when the canonical review fails", async () => {
+    createSession.mockResolvedValueOnce(REFUSAL);
+    reviewCreationTrust.mockResolvedValueOnce({ ok: false, error: "review unavailable" });
+    renderWizard();
+    await launch();
+    await waitFor(() => expect(screen.getByText("review unavailable")).toBeTruthy());
+    expect(createSession).toHaveBeenCalledTimes(1);
+    expect(screen.queryByTestId("hooks-trust-dialog")).toBeNull();
   });
 
   it("Cancel dismisses the dialog without a second submit", async () => {
@@ -275,6 +379,7 @@ describe("SessionWizard under StrictMode", () => {
     render(
       <StrictMode>
         <SessionWizard
+          servedProfile="default"
           onClose={vi.fn()}
           onCreated={onCreated}
           onCreatedInBackground={onCreatedInBackground}
@@ -468,6 +573,7 @@ describe("SessionWizard unknown create outcome", () => {
     const onCreatedInBackground = vi.fn();
     const view = render(
       <SessionWizard
+        servedProfile="default"
         onClose={() => view.unmount()}
         onCreated={vi.fn()}
         onCreatedInBackground={onCreatedInBackground}
@@ -507,5 +613,105 @@ describe("SessionWizard unknown create outcome", () => {
     // Resolved, so a later wizard starts a fresh request.
     renderWizard();
     expect(screen.queryByText(/may still be created/)).toBeNull();
+  });
+});
+
+describe("SessionWizard served-profile authority", () => {
+  const profiles = [
+    { name: "Main", is_default: true },
+    { name: "Alpha", is_default: false },
+    { name: "Beta", is_default: false },
+  ];
+  const settings = (profile: string) => ({
+    session: { yolo_mode_default: profile === "Beta", agent_command_override: { claude: profile + "-claude" } },
+    worktree: { enabled: true },
+    acp: { default_new_session_view: "terminal" },
+  });
+  const open = (label: string) => fireEvent.click(screen.getByText(label).closest("button")!);
+  const chooseProfile = async (profile: string) => {
+    open("Profile");
+    fireEvent.click(screen.getByRole("radio", { name: profile === "" ? /Server default/ : new RegExp(profile) }));
+    await waitFor(() =>
+      expect(screen.getByRole("switch", { name: "Auto-approve actions" }).getAttribute("aria-checked")).toBe(
+        profile === "Beta" ? "true" : "false",
+      ),
+    );
+  };
+
+  it("scopes settings, remembered registry overrides, project and extra-repo suggestions to Alpha, including after Beta -> implicit", async () => {
+    vi.mocked(fetchProfiles).mockResolvedValueOnce(profiles as never);
+    vi.mocked(fetchSettings).mockImplementation(async (profile) => settings(profile ?? "Alpha"));
+    vi.mocked(fetchProjects).mockImplementation(
+      async ({ profile }) =>
+        [
+          {
+            name: profile + "-only-project",
+            path: "/" + profile.toLowerCase(),
+            scope: "profile",
+            pinned: false,
+          },
+        ] as never,
+    );
+    renderWizard({ path: "/tmp/proj", tool: "claude" }, "Alpha");
+    await waitFor(() => expect(fetchSettings).toHaveBeenCalledWith("Alpha"));
+    await waitFor(() => expect(screen.getByText("Profile")).toBeTruthy());
+    await waitFor(() => expect(fetchProjects).toHaveBeenCalledWith({ profile: "Alpha" }));
+    for (const profile of ["Alpha", "Beta", "Alpha"]) {
+      if (profile === "Beta") await chooseProfile("Beta");
+      else if (vi.mocked(fetchSettings).mock.calls.some(([p]) => p === "Beta")) await chooseProfile("");
+      fireEvent.click(screen.getByTestId("wizard-project-row"));
+      expect(await screen.findByText(profile + "-only-project")).toBeTruthy();
+      expect(screen.queryByText("Main-only-project")).toBeNull();
+      fireEvent.click(screen.getByRole("button", { name: "Back", exact: true }));
+      open("Extra repos");
+      expect(await screen.findByText(profile + "-only-project")).toBeTruthy();
+      expect(screen.queryByText("Main-only-project")).toBeNull();
+      fireEvent.click(screen.getByRole("button", { name: "Back", exact: true }));
+      fireEvent.click(screen.getByTestId("wizard-agent-row"));
+      expect(await screen.findByText(new RegExp(profile + "-claude"))).toBeTruthy();
+      fireEvent.click(screen.getByRole("button", { name: "Back", exact: true }));
+    }
+    await launch();
+    await waitFor(() => expect(createSession).toHaveBeenCalled());
+    expect(payload().profile).toBeUndefined();
+    expect(payload().yolo_mode).toBe(false);
+    expect(vi.mocked(fetchSettings).mock.calls.some(([profile]) => profile === "Main")).toBe(false);
+    expect(vi.mocked(fetchProjects).mock.calls.some(([context]) => context.profile === "Main")).toBe(false);
+  });
+
+  it("does not let a delayed Alpha seed overwrite Beta selection, and keeps explicit prefill authority", async () => {
+    vi.mocked(fetchProfiles).mockResolvedValueOnce(profiles as never);
+    const seed = Promise.withResolvers<Awaited<ReturnType<typeof fetchSettings>>>();
+    vi.mocked(fetchSettings).mockImplementation(async (profile) =>
+      profile === "Alpha" ? seed.promise : settings(profile!),
+    );
+    renderWizard({ path: "/tmp/proj", tool: "claude" }, "Alpha");
+    await waitFor(() => expect(fetchSettings).toHaveBeenCalledWith("Alpha"));
+    await waitFor(() => expect(screen.getByText("Profile")).toBeTruthy());
+    await chooseProfile("Beta");
+    await act(async () => seed.resolve(settings("Alpha")));
+    expect(screen.getByRole("switch", { name: "Auto-approve actions" }).getAttribute("aria-checked")).toBe("true");
+    await launch();
+    expect(payload()).toMatchObject({ profile: "Beta", yolo_mode: true });
+    cleanup();
+    createSession.mockClear();
+    renderWizard(
+      { path: "/tmp/proj", tool: "claude", profile: "Beta", yoloMode: false, worktreeEnabled: false },
+      "Alpha",
+    );
+    await launch();
+    expect(payload()).toMatchObject({ profile: "Beta", yolo_mode: false, worktree_enabled: false });
+  });
+
+  it("waits for served registry scope instead of guessing the machine default", async () => {
+    vi.mocked(fetchProfiles).mockResolvedValueOnce(profiles as never);
+    vi.mocked(fetchSettings).mockResolvedValue({});
+    const view = render(<SessionWizard onClose={() => {}} onCreated={() => {}} />);
+    await waitFor(() => expect(fetchProfiles).toHaveBeenCalled());
+    expect(fetchSettings).not.toHaveBeenCalled();
+    expect(fetchProjects).not.toHaveBeenCalled();
+    view.rerender(<SessionWizard servedProfile="Alpha" onClose={() => {}} onCreated={() => {}} />);
+    await waitFor(() => expect(fetchSettings).toHaveBeenCalledWith("Alpha"));
+    await waitFor(() => expect(fetchProjects).toHaveBeenCalledWith({ profile: "Alpha" }));
   });
 });

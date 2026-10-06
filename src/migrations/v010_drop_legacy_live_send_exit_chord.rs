@@ -73,9 +73,15 @@ mod tests {
             "config.toml",
             migrate_config_file,
             &[
-                dropped("[session]\nlive_send_exit_chord = \"C-q,C-]\"\ndefault_tool = \"claude\"\n"),
-                dropped("[session]\nlive_send_exit_chord = 'C-q,C-\\'\ndefault_tool = \"claude\"\n"),
-                dropped("[session]\nlive_send_exit_chord = \"Ctrl+Q, Ctrl+]\"\ndefault_tool = \"claude\"\n"),
+                dropped(
+                    "[session]\nlive_send_exit_chord = \"C-q,C-]\"\ndefault_tool = \"claude\"\n",
+                ),
+                dropped(
+                    "[session]\nlive_send_exit_chord = 'C-q,C-\\'\ndefault_tool = \"claude\"\n",
+                ),
+                dropped(
+                    "[session]\nlive_send_exit_chord = \"Ctrl+Q, Ctrl+]\"\ndefault_tool = \"claude\"\n",
+                ),
                 // A customised list, the current default and an unrelated value are the user's.
                 unchanged("[session]\nlive_send_exit_chord = \"C-q,C-],F12\"\n"),
                 unchanged("[session]\nlive_send_exit_chord = \"C-q\"\n"),

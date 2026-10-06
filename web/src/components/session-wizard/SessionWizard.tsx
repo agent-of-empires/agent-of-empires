@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useReducer, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import type { CreateProgress, CreateSessionRequest, SessionResponse } from "../../lib/types";
+import type { CreateProgress, CreateSessionRequest, SessionResponse, CreationTrustFingerprint } from "../../lib/types";
 import {
   fetchAgents,
   fetchGroups,
@@ -9,6 +9,7 @@ import {
   fetchProjects,
   fetchSettings,
   createSession,
+  reviewCreationTrust,
   fetchCreateBootId,
   fetchCreateProgress,
   fetchVolumeIgnoresPreview,
@@ -161,11 +162,20 @@ interface Props {
   /** A create the user sent to the background finished; the wizard is already closed. */
   onCreatedInBackground?: (session?: SessionResponse) => void;
   prefill?: WizardPrefill;
+  /** Authority for implicit reads; the machine default is not the served profile. */
+  servedProfile?: string;
   /** CityHall client mode: only a title is asked; the server derives the rest. */
   nameOnly?: boolean;
 }
 
-export function SessionWizard({ onClose, onCreated, onCreatedInBackground, prefill, nameOnly = false }: Props) {
+export function SessionWizard({
+  onClose,
+  onCreated,
+  onCreatedInBackground,
+  prefill,
+  servedProfile,
+  nameOnly = false,
+}: Props) {
   const [state, dispatch] = useReducer(reducer, {
     data: initialWizardData(prefill, nameOnly),
     isSubmitting: false,
@@ -205,59 +215,73 @@ export function SessionWizard({ onClose, onCreated, onCreatedInBackground, prefi
     info: HooksNeedTrust;
     body: CreateSessionRequest;
     tool: string;
+    fingerprint: CreationTrustFingerprint;
+    mcpSummaries: string[];
   } | null>(null);
-  // A remembered path satisfies the submit gate at mount, so Launch waits for
-  // the defaults below rather than sending initialData's sandbox/worktree/yolo.
-  // Set on every outcome, so a failed fetch still leaves the form usable.
-  const [defaultsReady, setDefaultsReady] = useState(false);
+  // Launch waits for defaults from the admitted read profile.
+  const [defaultsProfile, setDefaultsProfile] = useState<string | null>(null);
+  const defaultsReady = defaultsProfile !== null && defaultsProfile === (state.data.profile || servedProfile);
+  const defaultsGeneration = useRef(0);
+  const selectedProfile = useRef<string | null>(null);
 
   useEffect(() => {
+    const generations = defaultsGeneration;
     fetchAgents().then((a) => dispatch({ type: "SET_AGENTS", agents: a }));
     fetchGroups().then((g) => dispatch({ type: "SET_GROUPS", groups: g }));
     fetchDockerStatus().then((d) => dispatch({ type: "SET_DOCKER", available: d.available }));
-    // A remembered or prefilled path is never selected in ProjectStep, so seed its override here.
+    fetchProfiles()
+      .then((profiles) => dispatch({ type: "SET_PROFILES", profiles }))
+      .catch(() => {});
+    return () => {
+      generations.current++;
+    };
+  }, []);
+
+  useEffect(() => {
+    const generations = defaultsGeneration;
+    if (selectedProfile.current !== null) return;
+    const generation = ++defaultsGeneration.current;
     const initialPath = state.data.path;
-    const projectSeed = initialPath
-      ? fetchProjects()
-          .then((projects) => {
-            const key = normalizeProjectPathKey(initialPath);
-            const override = projects.find((p) => normalizeProjectPathKey(p.path) === key)?.overrides?.worktree_enabled;
-            if (override !== undefined) {
-              dispatch({ type: "SEED_PROJECT_WORKTREE_OVERRIDE", override, path: initialPath });
-            }
-          })
-          .catch(() => {})
-      : Promise.resolve();
-    // Seed resolved profile defaults: the profile picker is hidden for single-profile users.
-    const settingsSeed = fetchProfiles()
-      // A failed profiles fetch must not skip settings: an explicit prefill
-      // profile, or the unresolved global config, still applies.
-      .catch(() => [] as Awaited<ReturnType<typeof fetchProfiles>>)
-      .then((p) => {
-        dispatch({ type: "SET_PROFILES", profiles: p });
-        const effectiveProfile = prefill?.profile || p.find((x) => x.is_default)?.name || "";
-        return fetchSettings(effectiveProfile || undefined);
-      })
-      .then((s) => {
-        if (!s) return;
-        setCommandMaps(commandMapsFromSettings(s));
-        const img = ((s.sandbox as Obj)?.default_image as string) || "";
-        if (img) dispatch({ type: "SET_FIELD", field: "sandboxImage", value: img });
-        const defaults = profileDefaults(s, prefill?.tool ?? "", state.data.tool);
+    const effectiveProfile = prefill?.profile || servedProfile;
+    if (!effectiveProfile) return;
+    const projectSeed =
+      initialPath && effectiveProfile
+        ? fetchProjects({ profile: effectiveProfile })
+            .then((projects) => {
+              if (generation !== defaultsGeneration.current) return;
+              const key = normalizeProjectPathKey(initialPath);
+              const override = projects?.find((project) => normalizeProjectPathKey(project.path) === key)?.overrides
+                ?.worktree_enabled;
+              if (override !== undefined)
+                dispatch({ type: "SEED_PROJECT_WORKTREE_OVERRIDE", override, path: initialPath });
+            })
+            .catch(() => {})
+        : Promise.resolve();
+    void Promise.all([fetchSettings(effectiveProfile), projectSeed])
+      .then(([settings]) => {
+        if (generation !== defaultsGeneration.current || !settings) return;
+        setCommandMaps(commandMapsFromSettings(settings));
+        const image = ((settings.sandbox as Obj)?.default_image as string) || "";
+        if (image) dispatch({ type: "SET_FIELD", field: "sandboxImage", value: image });
+        const defaults = profileDefaults(settings, prefill?.tool ?? "", state.data.tool);
         dispatch({
           type: "APPLY_PROFILE_DEFAULTS",
           ...defaults,
-          // Explicit prefill values win over the profile.
           yoloMode: prefill?.yoloMode ?? defaults.yoloMode,
           sandboxEnabled: prefill?.sandboxEnabled ?? defaults.sandboxEnabled,
           skipIfDirty: true,
         });
       })
-      .catch(() => {});
-    void Promise.all([settingsSeed, projectSeed]).then(() => setDefaultsReady(true));
-    // Seed once; a re-render with a new prefill object must not stomp user edits.
+      .catch(() => {})
+      .finally(() => {
+        if (generation === defaultsGeneration.current) setDefaultsProfile(effectiveProfile);
+      });
+    return () => {
+      if (generation === generations.current) generations.current++;
+    };
+    // Re-resolve implicit reads when about lands, without reseeding user selections or edits.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [servedProfile]);
 
   // Only a definitive probe answer applies; a failed probe (null) keeps the optimistic default.
   const probePath = state.data.scratch ? "" : state.data.path;
@@ -305,16 +329,20 @@ export function SessionWizard({ onClose, onCreated, onCreatedInBackground, prefi
   const handleProfileChange = async (profileName: string) => {
     const d = state.data;
     // A hand-set view is not in `profileDirty`, but the profile's view default would replace it.
-    if ((d.profileDirty || d.structuredViewDirty) && profileName) {
+    if (d.profileDirty || d.structuredViewDirty) {
       const ok = window.confirm("Selecting a profile will reset your settings to that profile's defaults. Continue?");
       if (!ok) return;
     }
     handleChange("profile", profileName);
     setPanel(null);
-    if (!profileName) return;
+    selectedProfile.current = profileName || null;
+    const generation = ++defaultsGeneration.current;
+    setDefaultsProfile(null);
+    const effectiveProfile = profileName || servedProfile;
+    if (!effectiveProfile) return;
     try {
-      const settings = await fetchSettings(profileName);
-      if (settings) {
+      const settings = await fetchSettings(effectiveProfile);
+      if (generation === defaultsGeneration.current && settings) {
         handleApplyProfileDefaults({
           ...profileDefaults(settings, "", d.tool),
           resetStructuredViewDirty: true,
@@ -323,79 +351,127 @@ export function SessionWizard({ onClose, onCreated, onCreatedInBackground, prefi
       }
     } catch {
       // Keep just the profile name.
+    } finally {
+      if (generation === defaultsGeneration.current) setDefaultsProfile(effectiveProfile);
     }
+  };
+
+  /** Reviews the repository's hooks for a create, showing the trust dialog when it asks
+   *  for one, and returns the body to send when the review asks for no trust at all. */
+  const openHooksTrust = async (body: CreateSessionRequest, tool: string): Promise<CreateSessionRequest | null> => {
+    const review = await reviewCreationTrust({
+      path: body.path,
+      profile: body.profile,
+      scratch: body.scratch,
+    });
+    if (!review.ok) {
+      dispatch({ type: "SUBMIT_ERROR", error: review.error });
+      return null;
+    }
+    if (!review.review.hooks_need_trust && !review.review.mcp_need_trust) {
+      return { ...body, trust_hooks: undefined, trust_review: undefined };
+    }
+    setHooksTrust({
+      info: {
+        onCreate: review.review.merged_hooks.on_create ?? [],
+        onLaunch: review.review.merged_hooks.on_launch ?? [],
+        onDestroy: review.review.merged_hooks.on_destroy ?? [],
+        needsMcpTrust: review.review.mcp_need_trust,
+      },
+      body,
+      tool,
+      fingerprint: review.review.fingerprint,
+      mcpSummaries: review.review.mcp_summaries,
+    });
+    return null;
   };
 
   // `resume` continues a create whose first send already went out: every send is then
   // a retry naming the daemon run that took the first one.
   const runCreate = async (body: CreateSessionRequest, tool: string, resume?: PendingCreate) => {
-    setUnknownOutcome(null);
-    setProgressKey(body.idempotency_key ?? null);
-    const key = body.idempotency_key;
-    const since = resume?.since ?? Date.now();
-    // Checked before every send, the first included, since a resumed request can be old
-    // and the waits below are unbounded: past the replay window, stop without sending.
-    const expired = () => !!key && isPendingCreateExpired(since);
-    const giveUp = () => {
-      if (key) resolvePendingCreate(key);
-      setProgressKey(null);
-      if (backgroundRef.current) {
-        toastBus.handler?.error(PENDING_CREATE_EXPIRED_MESSAGE);
-      } else {
-        dispatch({ type: "SUBMIT_ERROR", error: PENDING_CREATE_EXPIRED_MESSAGE });
-      }
-    };
-    if (expired()) return giveUp();
-    const origin = resume ? resume.origin : key ? await fetchCreateBootId() : null;
-    const pending: PendingCreate | null = key ? { body: { ...body, idempotency_key: key }, tool, since, origin } : null;
-    // Recorded before the request goes out, so a reload mid-flight still has the key.
-    if (pending) registerPendingCreate(pending, { claimed: true });
-    const send = (retry: boolean) => createSession(pending && retry ? retryBody(pending) : body);
-    let result = await send(!!resume);
-    for (let attempt = 0; result.network && pending && attempt < NETWORK_RETRIES; attempt++) {
-      await waitUntilOnline();
-      await waitUntilVisible();
-      await new Promise((r) => setTimeout(r, Math.min(1000 * (attempt + 1), MAX_RETRY_DELAY_MS)));
+    // A create can be sent twice: once, then again after a review that asks for no trust.
+    for (let resend = 0; ; resend++) {
+      setUnknownOutcome(null);
+      setProgressKey(body.idempotency_key ?? null);
+      const key = body.idempotency_key;
+      const since = resume?.since ?? Date.now();
+      // Checked before every send, the first included, since a resumed request can be old
+      // and the waits below are unbounded: past the replay window, stop without sending.
+      const expired = () => !!key && isPendingCreateExpired(since);
+      const giveUp = () => {
+        if (key) resolvePendingCreate(key);
+        setProgressKey(null);
+        if (backgroundRef.current) {
+          toastBus.handler?.error(PENDING_CREATE_EXPIRED_MESSAGE);
+        } else {
+          dispatch({ type: "SUBMIT_ERROR", error: PENDING_CREATE_EXPIRED_MESSAGE });
+        }
+      };
       if (expired()) return giveUp();
-      result = await send(true);
-    }
-    setProgressKey(null);
-    const background = backgroundRef.current;
-    // No answer is not a refusal: the detached server create may still finish, so
-    // keep the key and reconcile under it rather than report a failure.
-    if (result.network && pending) {
-      if (background) {
-        // The wizard is gone, so the app-level owner keeps retrying under this key.
-        releasePendingCreate(pending.body.idempotency_key);
+      const origin = resume ? resume.origin : key ? await fetchCreateBootId() : null;
+      const pending: PendingCreate | null = key
+        ? { body: { ...body, idempotency_key: key }, tool, since, origin }
+        : null;
+      // Recorded before the request goes out, so a reload mid-flight still has the key.
+      if (pending) registerPendingCreate(pending, { claimed: true });
+      const send = (retry: boolean) => createSession(pending && retry ? retryBody(pending) : body);
+      let result = await send(!!resume);
+      for (let attempt = 0; result.network && pending && attempt < NETWORK_RETRIES; attempt++) {
+        await waitUntilOnline();
+        await waitUntilVisible();
+        await new Promise((r) => setTimeout(r, Math.min(1000 * (attempt + 1), MAX_RETRY_DELAY_MS)));
+        if (expired()) return giveUp();
+        result = await send(true);
+      }
+      setProgressKey(null);
+      const background = backgroundRef.current;
+      // No answer is not a refusal: the detached server create may still finish, so
+      // keep the key and reconcile under it rather than report a failure.
+      if (result.network && pending) {
+        if (background) {
+          // The wizard is gone, so the app-level owner keeps retrying under this key.
+          releasePendingCreate(pending.body.idempotency_key);
+        } else {
+          setUnknownOutcome(pending);
+          dispatch({ type: "SUBMIT_ERROR", error: UNKNOWN_OUTCOME_ERROR });
+        }
+        return;
+      }
+      if (key) resolvePendingCreate(key);
+      if (result.outcomeUnknown) {
+        // The server restarted and cannot say whether the first attempt ran; retrying could
+        // run it twice, so this is where it stops.
+        if (background) toastBus.handler?.error(result.error ?? "Unknown outcome");
+        else dispatch({ type: "SUBMIT_ERROR", error: result.error ?? "Unknown outcome" });
+        return;
+      }
+      if (result.ok) {
+        dispatch({ type: "SUBMIT_SUCCESS" });
+        if (ACP_CAPABLE_TOOLS.has(tool)) safeSetItem(LAST_USED_TOOL_KEY, tool);
+        safeSetItem(LAST_USED_INSTRUCTION_KEY, body.custom_instruction ?? "");
+        if (body.path.startsWith("/")) safeSetItem(LAST_USED_PROJECT_KEY, body.path);
+        for (const w of result.session?.warnings ?? []) toastBus.handler?.error(w);
+        if (background) onCreatedInBackground?.(result.session);
+        else onCreated(result.session);
+      } else if (background) {
+        toastBus.handler?.error(`Session was not created: ${result.error || "Unknown error"}`);
+      } else if (result.trustChanged || (result.hooksNeedTrust && !body.trust_hooks)) {
+        // A changed hook set is reviewed again from scratch, so the answer to send is dropped.
+        const reviewed = await openHooksTrust(
+          result.trustChanged ? { ...body, trust_hooks: undefined, trust_review: undefined } : body,
+          tool,
+        );
+        if (!reviewed) return;
+        if (resend > 0) {
+          dispatch({ type: "SUBMIT_ERROR", error: result.error || "Unknown error" });
+          return;
+        }
+        body = reviewed;
+        continue;
       } else {
-        setUnknownOutcome(pending);
-        dispatch({ type: "SUBMIT_ERROR", error: UNKNOWN_OUTCOME_ERROR });
+        dispatch({ type: "SUBMIT_ERROR", error: result.error || "Unknown error" });
       }
       return;
-    }
-    if (key) resolvePendingCreate(key);
-    if (result.outcomeUnknown) {
-      // The server restarted and cannot say whether the first attempt ran; retrying could
-      // run it twice, so this is where it stops.
-      if (background) toastBus.handler?.error(result.error ?? "Unknown outcome");
-      else dispatch({ type: "SUBMIT_ERROR", error: result.error ?? "Unknown outcome" });
-      return;
-    }
-    if (result.ok) {
-      dispatch({ type: "SUBMIT_SUCCESS" });
-      if (ACP_CAPABLE_TOOLS.has(tool)) safeSetItem(LAST_USED_TOOL_KEY, tool);
-      safeSetItem(LAST_USED_INSTRUCTION_KEY, body.custom_instruction ?? "");
-      if (body.path.startsWith("/")) safeSetItem(LAST_USED_PROJECT_KEY, body.path);
-      for (const w of result.session?.warnings ?? []) toastBus.handler?.error(w);
-      if (background) onCreatedInBackground?.(result.session);
-      else onCreated(result.session);
-    } else if (background) {
-      toastBus.handler?.error(`Session was not created: ${result.error || "Unknown error"}`);
-    } else if (result.hooksNeedTrust && !body.trust_hooks) {
-      // The trust_hooks guard stops a loop if the server refuses again after opting in.
-      setHooksTrust({ info: result.hooksNeedTrust, body, tool });
-    } else {
-      dispatch({ type: "SUBMIT_ERROR", error: result.error || "Unknown error" });
     }
   };
 
@@ -472,7 +548,7 @@ export function SessionWizard({ onClose, onCreated, onCreatedInBackground, prefi
     const pending = hooksTrust;
     if (!pending) return;
     setHooksTrust(null);
-    await runCreate({ ...pending.body, trust_hooks: true }, pending.tool);
+    await runCreate({ ...pending.body, trust_hooks: true, trust_review: pending.fingerprint }, pending.tool);
   };
 
   const handleBackground = () => {
@@ -495,6 +571,7 @@ export function SessionWizard({ onClose, onCreated, onCreatedInBackground, prefi
   const sandboxBlocked = isHostOnly ? hostOnlyReason : !state.dockerAvailable ? "Docker is not running" : null;
   const agentCustomized = !!(d.extraArgs || d.commandOverride || d.customInstruction);
   const openPanel = (next: Panel) => () => setPanel(next);
+  const effectiveProfile = d.profile || servedProfile;
 
   const renderPanel = (p: Panel) => {
     switch (p) {
@@ -502,6 +579,7 @@ export function SessionWizard({ onClose, onCreated, onCreatedInBackground, prefi
         return (
           <ProjectStep
             data={d}
+            profile={effectiveProfile}
             onChange={handleChange}
             initialTab={prefill?.initialTab}
             agents={state.agents}
@@ -512,6 +590,7 @@ export function SessionWizard({ onClose, onCreated, onCreatedInBackground, prefi
       case "repos":
         return (
           <ExtraReposPicker
+            profile={effectiveProfile}
             primaryPath={d.path}
             selectedPaths={d.extraRepoPaths}
             onChange={(paths) => handleChange("extraRepoPaths", paths)}
@@ -742,6 +821,7 @@ export function SessionWizard({ onClose, onCreated, onCreatedInBackground, prefi
           onLaunch={hooksTrust.info.onLaunch}
           onDestroy={hooksTrust.info.onDestroy}
           needsMcpTrust={hooksTrust.info.needsMcpTrust}
+          mcpSummaries={hooksTrust.mcpSummaries}
           onConfirm={handleHooksTrustConfirm}
           onCancel={cancelPending}
         />

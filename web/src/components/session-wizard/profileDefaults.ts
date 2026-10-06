@@ -17,7 +17,8 @@ export function profileDefaults(settings: Settings, preferredTool: string, curre
   const sandbox = settings.sandbox as Obj;
   const worktree = settings.worktree as Obj;
   const tool = preferredTool || (session?.default_tool as string) || "";
-  const acp = (session?.acp_defaults as Obj)?.[tool || currentTool] as Obj;
+  // `acp_defaults` lives in the [acp] section, not [session] (moved by v019).
+  const acp = ((settings.acp as Obj)?.acp_defaults as Obj)?.[tool || currentTool] as Obj;
   return {
     yoloMode: (session?.yolo_mode_default as boolean) ?? false,
     sandboxEnabled: (sandbox?.enabled_by_default as boolean) ?? false,

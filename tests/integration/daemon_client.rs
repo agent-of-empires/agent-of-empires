@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use agent_of_empires::daemon::{
     AcpWorkerState, ContextResumeAvailability, ContextResumeIndeterminateReason, DaemonClient,
-    DaemonClientError, PromptAttachmentKind,
+    DaemonClientError,
 };
 use agent_of_empires::session::SessionScope;
 use reqwest::StatusCode;
@@ -66,19 +66,6 @@ fn structured_success() -> String {
             },
             "acp_worker_state": "running",
             "acp_capable": true,
-            "queued_prompts": [{
-                "id": "prompt-a",
-                "seq": 7,
-                "text": "continue",
-                "attachments": [{
-                    "id": "attachment-a",
-                    "kind": "image",
-                    "mime_type": "image/png",
-                    "size": 42
-                }],
-                "created_at": "2026-01-01T00:01:00Z",
-                "origin_device": "laptop"
-            }],
             "acp_session_id": "acp-session-a",
             "acp_agent": "claude",
             "acp_can_fork": true,
@@ -258,18 +245,12 @@ async fn daemon_client_http_contract() {
     assert!(session.acp_can_fork);
     assert!(session.keeps_context);
     assert_eq!(session.clear_aliases, ["/clear"]);
-    assert_eq!(session.queued_prompts[0].seq, 7);
-    assert_eq!(
-        session.queued_prompts[0].attachments[0].kind,
-        PromptAttachmentKind::Image
-    );
     let round_trip = serde_json::to_value(&envelope).unwrap();
     for key in [
         "view",
         "context_resume",
         "acp_worker_state",
         "acp_capable",
-        "queued_prompts",
         "acp_session_id",
         "acp_agent",
         "acp_can_fork",
@@ -342,6 +323,7 @@ async fn daemon_client_http_contract() {
             status: StatusCode::UNAUTHORIZED,
             ref body,
             truncated: false,
+            code: None,
         } if body.is_empty()
     ));
     stalled_body.abort();
@@ -362,6 +344,7 @@ async fn daemon_client_http_contract() {
         status,
         body,
         truncated,
+        code: None,
     } = error
     else {
         panic!("expected status error");

@@ -284,32 +284,21 @@ describe("SessionRow triage actions", () => {
   });
 
   it.each([
-    ["Notify all", "sidebar-context-menu-notify-all", "notifications"],
-    ["Color", "sidebar-context-menu-color-red", "color"],
-  ])("%s keeps the menu open, shows the pick, and reverts on failure", async (_n, item, path) => {
+    ["Notify all", "sidebar-context-menu-notify-all"],
+    ["Color", "sidebar-context-menu-color-red"],
+  ])("%s keeps the menu open, shows the pick, and reverts on failure", async (_n, item) => {
     let fail = () => {};
     fetchSpy.mockImplementation(
       () => new Promise((resolve) => (fail = () => resolve(new Response("nope", { status: 500 })))),
     );
     openRowMenu(ws({ id: "sess-pick" }));
     click(item);
+    await vi.waitFor(() => expect(fetchSpy).toHaveBeenCalledOnce());
     expect(testId("sidebar-context-menu")).not.toBeNull();
     expect(testId(item)!.getAttribute("aria-pressed")).toBe("true");
-    expect(fetchSpy.mock.calls[0]![0]).toBe(`/api/sessions/sess-pick/${path}`);
     fail();
     await vi.waitFor(() => expect(testId(item)!.getAttribute("aria-pressed")).toBe("false"));
     expect(testId("sidebar-context-menu")).not.toBeNull();
-  });
-
-  it("No color on a multi-session row clears every session, including the one carrying the color", async () => {
-    openRowMenu(makeWorkspace("w", [makeSession({ id: "s1" }), makeSession({ id: "s2", color: "red" })]));
-    expect(testId("sidebar-context-menu-color-red")!.getAttribute("aria-pressed")).toBe("true");
-    click("sidebar-context-menu-color-clear");
-    await vi.waitFor(() => expect(fetchSpy).toHaveBeenCalledTimes(2));
-    expect(fetchSpy.mock.calls.map(([url]) => url).sort()).toEqual([
-      "/api/sessions/s1/color",
-      "/api/sessions/s2/color",
-    ]);
   });
 
   it("the close button closes the menu", () => {

@@ -106,6 +106,7 @@ export async function mockTerminalApis(
   await page.route("**/api/sessions", (r) => {
     if (r.request().method() === "POST") return r.fulfill({ status: 400 });
     return r.fulfill({
+      headers: { "aoe-runtime-epoch": "mock-runtime", "aoe-runtime-revision": "1" },
       json: {
         sessions: [
           sessionResponse({
@@ -141,7 +142,9 @@ export async function mockTerminalApis(
     r.fulfill({ json: { files: [], per_repo_bases: [], warning: null } }),
   );
   for (const path of ["settings", "themes", "agents", "profiles", "groups", "devices", "docker/status", "about"]) {
-    await page.route(`**/api/${path}`, (r) => r.fulfill({ json: path === "docker/status" ? {} : [] }));
+    await page.route(`**/api/${path}`, (r) =>
+      r.fulfill({ json: path === "about" ? { profile: "default" } : path === "docker/status" ? {} : [] }),
+    );
   }
   await page.routeWebSocket(/\/sessions\/.*\/(ws|container-ws)$/, (ws) => {
     ws.onMessage((msg) => {

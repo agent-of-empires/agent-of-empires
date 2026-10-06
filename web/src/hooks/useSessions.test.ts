@@ -23,7 +23,7 @@ describe("useSessions / loaded sentinel", () => {
   });
 
   it.each([
-    ["a successful fetch", { sessions: [], workspace_ordering: [] }, false],
+    ["a successful fetch", { sessions: [], workspace_ordering: [], cursor: { epoch: "boot", revision: 1n } }, false],
     ["a failed fetch", null, true],
   ] as [string, api.SessionsEnvelope | null, boolean][])(
     "flips loaded=true after %s",

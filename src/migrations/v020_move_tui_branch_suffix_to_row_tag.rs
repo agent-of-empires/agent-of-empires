@@ -87,7 +87,9 @@ mod tests {
                 ),
                 // An existing row_tag wins.
                 (
-                    Some("[session]\nrow_tag = \"profile\"\n\n[worktree]\nshow_branch_in_tui = false\n"),
+                    Some(
+                        "[session]\nrow_tag = \"profile\"\n\n[worktree]\nshow_branch_in_tui = false\n",
+                    ),
                     Some("[session]\nrow_tag = \"profile\"\n\n[worktree]\n"),
                 ),
             ],

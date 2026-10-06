@@ -1,8 +1,10 @@
 // @vitest-environment jsdom
 
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render } from "@testing-library/react";
+import { act, cleanup, fireEvent, render } from "@testing-library/react";
 
+import { useSessions } from "../../hooks/useSessions";
+import { setServerDown } from "../../lib/connectionState";
 import { TopBar } from "../TopBar";
 import type { SessionResponse, Workspace } from "../../lib/types";
 import type { AttentionBadgeColors } from "../../lib/attentionBadgeColors";
@@ -16,6 +18,10 @@ const DEFAULT_ATTENTION_BADGE_COLORS: AttentionBadgeColors = {
 
 afterEach(() => {
   cleanup();
+  vi.clearAllTimers();
+  vi.useRealTimers();
+  vi.unstubAllGlobals();
+  setServerDown(false);
 });
 
 type TopBarOverrides = {
@@ -147,5 +153,55 @@ describe("TopBar", () => {
     // reliable announcement here too.
     rerender(<TopBar {...topBarProps({ unreadCount: 0, waitingCount: 0 })} />);
     expect(getByTestId("topbar-attention-live-region").textContent).toBe("0 unread, 0 waiting for your input");
+  });
+});
+
+describe("polling connectivity consumer", () => {
+  it("shows offline on an unanswered first poll, then clears it when the replacement succeeds", async () => {
+    vi.useFakeTimers();
+    const signals: AbortSignal[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn(
+          (_url, init?: RequestInit) =>
+            new Promise<Response>((_resolve, reject) => {
+              signals.push(init!.signal as AbortSignal);
+              init!.signal!.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")), {
+                once: true,
+              });
+            }),
+        )
+        .mockImplementationOnce(
+          (_url, init?: RequestInit) =>
+            new Promise<Response>((_resolve, reject) => {
+              signals.push(init!.signal as AbortSignal);
+              init!.signal!.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")), {
+                once: true,
+              });
+            }),
+        )
+        .mockImplementationOnce(
+          async () =>
+            new Response(JSON.stringify({ sessions: [], workspace_ordering: [] }), {
+              headers: { "aoe-runtime-epoch": "boot", "aoe-runtime-revision": "1" },
+            }),
+        ),
+    );
+    function Header() {
+      const sessions = useSessions();
+      return <TopBar {...topBarProps({ isOffline: sessions.error })} />;
+    }
+    const view = render(<Header />);
+    expect(view.queryByText("offline")).toBeNull();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(15000);
+    });
+    expect(signals[0]!.aborted).toBe(true);
+    expect(view.getByText("offline")).toBeTruthy();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3000);
+    });
+    expect(view.queryByText("offline")).toBeNull();
   });
 });

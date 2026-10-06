@@ -91,7 +91,7 @@ pub(super) async fn login(
     let res = login_client()?.post(&url).json(&body).send().await?;
     let status = res.status();
     if !status.is_success() {
-        let body = res.text().await.unwrap_or_default();
+        let body = crate::daemon::decode_text(res).await?;
         return Err(map_auth_error(status, body));
     }
     let cookie = extract_session_cookie(res.headers()).ok_or(HttpError::Unauthorized)?;
@@ -141,7 +141,7 @@ pub(super) async fn elevate(
     if status.is_success() {
         return Ok(());
     }
-    let body = res.text().await.unwrap_or_default();
+    let body = crate::daemon::decode_text(res).await?;
     Err(map_auth_error(status, body))
 }
 
@@ -154,7 +154,10 @@ fn login_client() -> Result<reqwest::Client, HttpError> {
         .timeout(LOGIN_TIMEOUT)
         .redirect(reqwest::redirect::Policy::none())
         .build()
-        .map_err(HttpError::Transport)
+        // `HttpError::Transport` carries no payload (a transport error can
+        // quote a URL with its query string), so the `reqwest::Error` goes
+        // through the crate's `From` impl rather than being attached here.
+        .map_err(|_| HttpError::Transport)
 }
 
 fn extract_session_cookie(headers: &HeaderMap) -> Option<String> {

@@ -243,19 +243,22 @@ describe("plugin slots", () => {
       expect(container.querySelector("button, span")).toBeNull();
     });
 
-    it("detail-badge accepts grouped items too", () => {
-      entriesRef.current = [
-        {
-          plugin_id: "acme.kit",
-          slot: "detail-badge",
-          id: "d",
-          session_id: "s1",
-          payload: { items: [usage("x"), usage("y")] },
-        },
-      ];
-      render(<PluginDetailBadges sessionId="s1" />);
+    it("resets a detail group's position when the addressed session changes", () => {
+      const badge = (session_id: string): PluginUiEntry => ({
+        plugin_id: "acme.kit",
+        slot: "detail-badge",
+        id: "d",
+        session_id,
+        payload: { items: [usage(session_id + " first"), usage(session_id + " second")] },
+      });
+      entriesRef.current = [badge("s1"), badge("s2")];
+      const view = render(<PluginDetailBadges sessionId="s1" />);
       fireEvent.click(screen.getByRole("button"));
-      expect(screen.getByRole("button").textContent).toContain("y");
+      expect(screen.getByRole("button").textContent).toBe("s1 second");
+      view.rerender(<PluginDetailBadges sessionId="s2" />);
+      expect(screen.getByRole("button").textContent).toBe("s2 first");
+      expect(invokeMock).not.toHaveBeenCalled();
+      expect(pokeMock).not.toHaveBeenCalled();
     });
   });
 

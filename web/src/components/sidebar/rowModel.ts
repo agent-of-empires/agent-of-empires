@@ -129,7 +129,8 @@ export function deriveRowModel(
       !!firstSession?.id,
     // Mirrors the refusals in `attach_project::plan`; Running/Waiting are decided server-side.
     canAddProject:
-      !firstSession?.scratch &&
+      !!firstSession?.profile &&
+      !firstSession.scratch &&
       !firstSession?.archived_at &&
       !firstSession?.trashed_at &&
       firstSession?.status !== "Creating" &&

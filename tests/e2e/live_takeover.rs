@@ -85,6 +85,9 @@ fn test_web_takeover_exits_tui_live_mode_with_dialog() {
     );
 
     h.spawn_tui();
+    // The native pane preparation refuses an unhealthy runtime, so wait for the
+    // subscription to report readiness before driving panes.
+    h.wait_for("Runtime ready");
     h.wait_for("Takeover");
 
     // Activate the session; default_attach_mode routes into live-send.

@@ -48,7 +48,6 @@ impl HomeView {
             None => {}
         }
     }
-
     pub fn sort_order(&self) -> SortOrder {
         self.sort_order
     }

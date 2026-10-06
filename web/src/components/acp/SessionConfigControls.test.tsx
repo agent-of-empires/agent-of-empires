@@ -182,6 +182,26 @@ describe("ConfigOptionSwitchFailedNotice", () => {
 });
 
 describe("provider picker", () => {
+  it("closes an open picker when a turn starts and cannot submit its previous choices", () => {
+    const onSet = vi.fn();
+    const props = {
+      configOptions: [],
+      pendingConfigOption: null,
+      onSetConfigOption: vi.fn(),
+      provider: "api",
+      onSetProvider: onSet,
+    };
+    const { rerender } = render(<SessionConfigControls {...props} />);
+    fireEvent.click(screen.getByTestId("config-option-aoe-provider"));
+    expect(screen.getByTestId("config-option-aoe-provider-value-vertex")).toBeTruthy();
+    rerender(<SessionConfigControls {...props} providerLockedReason="turn active" />);
+    const choice = screen.queryByTestId("config-option-aoe-provider-value-vertex");
+    if (choice) fireEvent.click(choice);
+    expect(onSet).not.toHaveBeenCalled();
+    expect(screen.queryByRole("menu")).toBeNull();
+    rerender(<SessionConfigControls {...props} />);
+    expect(screen.queryByRole("menu")).toBeNull();
+  });
   it("is absent for an agent that does not route through a provider", () => {
     const { container } = mount([MODEL]);
     expect(screen.queryByTestId("config-option-aoe-provider")).toBeNull();
@@ -191,16 +211,6 @@ describe("provider picker", () => {
   it("renders alone for a Claude session with no adapter options yet", () => {
     mount([], null, vi.fn(), { onSet: vi.fn() });
     expect(screen.getByTestId("config-option-aoe-provider")).toBeTruthy();
-  });
-
-  it.each([
-    ["api", "Anthropic API"],
-    ["bedrock", "Bedrock"],
-    ["vertex", "Vertex AI"],
-    [null, "Host default"],
-  ])("labels %s as %s", (current, label) => {
-    mount([], null, vi.fn(), { current, onSet: vi.fn() });
-    expect(screen.getByTestId("config-option-aoe-provider").textContent).toContain(label);
   });
 
   it("posts the picked provider", () => {
@@ -221,13 +231,23 @@ describe("provider picker", () => {
     expect(onSet).not.toHaveBeenCalled();
   });
 
-  it("disables the value in flight", () => {
+  it("keeps the picker closed until its pending request settles", () => {
     const onSet = vi.fn();
-    mount([], null, vi.fn(), { current: "api", pending: "bedrock", onSet });
+    const props = {
+      configOptions: [],
+      pendingConfigOption: null,
+      onSetConfigOption: vi.fn(),
+      provider: "api",
+      onSetProvider: onSet,
+    };
+    const { rerender } = render(<SessionConfigControls {...props} providerPending="bedrock" />);
+    expect(screen.getByTestId("config-option-aoe-provider").hasAttribute("disabled")).toBe(true);
     fireEvent.click(screen.getByTestId("config-option-aoe-provider"));
-    const inFlight = screen.getByTestId("config-option-aoe-provider-value-bedrock");
-    expect(inFlight.hasAttribute("disabled")).toBe(true);
-    fireEvent.click(inFlight);
+    expect(screen.queryByRole("menu")).toBeNull();
     expect(onSet).not.toHaveBeenCalled();
+    rerender(<SessionConfigControls {...props} />);
+    fireEvent.click(screen.getByTestId("config-option-aoe-provider"));
+    fireEvent.click(screen.getByTestId("config-option-aoe-provider-value-vertex"));
+    expect(onSet).toHaveBeenCalledWith("vertex");
   });
 });

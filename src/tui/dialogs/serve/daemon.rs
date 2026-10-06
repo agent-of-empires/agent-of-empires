@@ -173,8 +173,8 @@ pub(super) fn spawn_daemon(
     passphrase: Option<&str>,
     transport: Option<TunnelTransport>,
 ) -> Result<(), String> {
-    // Another daemon may have started while the picker was open; spawning would orphan it.
-    if crate::cli::serve::daemon_pid().is_some() {
+    // A core-only daemon is upgraded by `aoe serve`; only another web daemon conflicts.
+    if crate::cli::serve::web_daemon_pid().is_some() {
         return Err(
             "A daemon is already running. Close this dialog and reopen to see it.".to_string(),
         );

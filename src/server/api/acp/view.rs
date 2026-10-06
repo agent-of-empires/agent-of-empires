@@ -70,7 +70,8 @@ fn adopt_persisted_structured_instance(
     source_profile: &str,
 ) -> Instance {
     persisted.source_profile = source_profile.to_owned();
-    crate::server::reload::merge_runtime_fields(cached, persisted)
+    crate::server::reload::merge_runtime_fields(cached, &mut persisted);
+    persisted
 }
 
 pub async fn acp_enable(
@@ -142,13 +143,7 @@ pub async fn acp_enable(
     {
         return resp;
     }
-    spawn_enabled_worker(
-        state.clone(),
-        inst_lock.clone(),
-        id.clone(),
-        agent_name,
-        selected_conversation,
-    );
+    spawn_enabled_worker(state.clone(), instance, agent_name, selected_conversation);
     drop(transition_guard);
     view_response(id, View::Structured)
 }
@@ -174,7 +169,9 @@ async fn commit_structured_view(
         if let Err(e) = inst_for_transition.kill_locked() {
             tracing::warn!(target: "acp.switch", session = %inst_for_transition.id, "kill tmux failed: {e}");
         }
-        inst_for_transition.kill_ancillary_tmux_sessions_locked();
+        if let Err(error) = inst_for_transition.kill_ancillary_tmux_sessions_locked() {
+            tracing::warn!(target: "acp.switch", session = %inst_for_transition.id, "kill ancillary tmux sessions failed: {error}");
+        }
         storage.update(|all, _groups| {
             let Some(slot) = all
                 .iter_mut()
@@ -240,21 +237,27 @@ async fn commit_structured_view(
 /// container pull. Failures surface as a startup-error banner.
 fn spawn_enabled_worker(
     state: Arc<AppState>,
-    inst_lock: Arc<tokio::sync::Mutex<()>>,
-    session_id: String,
+
+    expected: Instance,
     agent_name: String,
     selected_conversation: Option<(String, crate::session::ExecutionBinding)>,
 ) {
+    let session_id = expected.id.clone();
     tokio::spawn(async move {
-        // Held through the spawn so a following disable cannot tear down
-        // first and then be undone by this late task.
-        let _transition_guard = inst_lock.lock().await;
+        let exclusion =
+            match crate::acp::sandbox::LaunchExclusion::acquire(state.clone(), &session_id, false)
+                .await
+            {
+                Ok(exclusion) => exclusion,
+                Err(_) => return,
+            };
         let supervisor = &state.acp_supervisor;
-        let request = match deferred_enable_request(
+        let (request, reservation) = match deferred_enable_request(
             &state,
-            &session_id,
+            &expected,
             agent_name.clone(),
             selected_conversation,
+            exclusion,
         )
         .await
         {
@@ -265,7 +268,7 @@ fn spawn_enabled_worker(
                 return;
             }
         };
-        if let Err(e) = supervisor.spawn(request).await {
+        if let Err(e) = supervisor.spawn_inner(request, reservation).await {
             let message = structured_spawn_error_message(&e, &agent_name);
             tracing::warn!(target: "acp.switch", session = %session_id, "spawn after enable: {message}");
             supervisor.publish_startup_error(&session_id, message);
@@ -277,14 +280,20 @@ fn spawn_enabled_worker(
 /// may commit while the enable waits. `None` once the session left the
 /// structured view.
 async fn deferred_enable_request(
-    state: &AppState,
-    session_id: &str,
+    state: &Arc<AppState>,
+    expected: &Instance,
     agent_name: String,
     selected_conversation: Option<(String, crate::session::ExecutionBinding)>,
-) -> Option<Result<SpawnRequest, String>> {
-    let instance = find_instance(state, session_id)
-        .await
-        .filter(Instance::is_structured)?;
+    exclusion: crate::acp::sandbox::LaunchExclusion,
+) -> Option<Result<(SpawnRequest, crate::acp::supervisor::ResumeReservation), String>> {
+    let session_id = expected.id.as_str();
+    let instance = find_instance(state, session_id).await.filter(|row| {
+        row.is_structured()
+            && row.launch_is_finalized()
+            && row.lifecycle_generation == expected.lifecycle_generation
+            && row.source_profile == expected.source_profile
+            && row.ensure_startable().is_ok()
+    })?;
     let claude_store_pin = instance.selected_claude_store_pin();
     let resume_sid = selected_conversation
         .as_ref()
@@ -314,11 +323,14 @@ async fn deferred_enable_request(
         instance.import_pending == Some(true),
         transcript_present,
     );
-    let sandbox_info = match crate::acp::sandbox::ensure_container_for_session_locked(
-        &state.instances,
-        &state.mutation_epoch,
-        session_id,
-        false,
+    let (native, exclusion) = match launch_store_for(state, &instance, exclusion).await {
+        Ok(store) => store,
+        Err(_) => return Some(Err("session source unavailable".to_owned())),
+    };
+    let (sandbox_info, exclusion) = match crate::acp::sandbox::ensure_container_for_session(
+        native.clone(),
+        instance.clone(),
+        exclusion,
     )
     .await
     {
@@ -328,17 +340,30 @@ async fn deferred_enable_request(
             return Some(Err(format!("container start failed: {e}")));
         }
     };
-    Some(Ok(SpawnRequest {
-        stored_acp_session_id: seed.stored_acp_session_id,
-        seed_history_replay: seed.seed_history_replay,
-        sandbox_continuation: if seed.import_terminal {
-            crate::acp::supervisor::SandboxContinuation::ImportTerminal
-        } else {
-            crate::acp::supervisor::SandboxContinuation::Persisted
+    let reservation = match state.acp_supervisor.reserve_spawn(session_id).await {
+        Ok(reservation) => reservation,
+        Err(error) => return Some(Err(error.to_string())),
+    };
+    drop(exclusion);
+    Some(Ok((
+        SpawnRequest {
+            launch_admission: Some(crate::acp::supervisor::LaunchAdmission {
+                store: native,
+                generation: expected.lifecycle_generation,
+                namespace: Some(state.profile_namespace.clone()),
+            }),
+            stored_acp_session_id: seed.stored_acp_session_id,
+            seed_history_replay: seed.seed_history_replay,
+            sandbox_continuation: if seed.import_terminal {
+                crate::acp::supervisor::SandboxContinuation::ImportTerminal
+            } else {
+                crate::acp::supervisor::SandboxContinuation::Persisted
+            },
+            claude_store_pin,
+            ..spawn_request_for(&instance, agent_name, sandbox_info)
         },
-        claude_store_pin,
-        ..spawn_request_for(&instance, agent_name, sandbox_info)
-    }))
+        reservation,
+    )))
 }
 
 /// Switch a structured session back to tmux. When the agent shares a
@@ -579,6 +604,7 @@ mod tests {
     async fn a_queued_enable_spawns_on_the_live_provider() {
         let _tmp = crate::session::test_support::isolate_app_dir();
         let mut inst = Instance::new("claude", "/tmp/aoe-queued-enable");
+        inst.source_profile = "default".into();
         inst.view = View::Structured;
         inst.agent_name = Some("claude".to_string());
         let id = inst.id.clone();
@@ -592,27 +618,32 @@ mod tests {
                 ))
             })
         });
-        let state =
-            crate::server::test_support::build_test_app_state_with_launcher(vec![inst], launcher);
+        let state = crate::server::test_support::build_test_app_state_with_launcher(
+            vec![inst.clone()],
+            launcher,
+        );
 
         let inst_lock = state.instance_lock(&id).await;
         let guard = inst_lock.lock().await;
-        spawn_enabled_worker(
+        spawn_enabled_worker(state.clone(), inst.clone(), "claude".to_string(), None);
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        let (store, ()) = crate::server::session_store::NativeSessionStore::open_for_launch(
             state.clone(),
-            inst_lock.clone(),
-            id.clone(),
-            "claude".to_string(),
-            None,
-        );
-        if let Some(row) = state
-            .instances
-            .write()
-            .await
-            .iter_mut()
-            .find(|i| i.id == id)
-        {
-            row.agent_provider = Some("vertex".to_string());
-        }
+            &inst,
+            (),
+        )
+        .await
+        .unwrap();
+        tokio::task::spawn_blocking(move || {
+            use crate::session::SessionStore;
+            store.commit(&mut |rows, _| {
+                rows[0].agent_provider = Some("vertex".to_owned());
+                Ok(())
+            })
+        })
+        .await
+        .unwrap()
+        .unwrap();
         drop(guard);
 
         let routing = tokio::time::timeout(std::time::Duration::from_secs(10), routed.recv())
