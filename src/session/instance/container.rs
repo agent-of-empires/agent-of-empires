@@ -486,16 +486,14 @@ impl Instance {
         } else {
             None
         };
-        // Only an agent whose descriptor declares two generations needs one
-        // resolved here. A sandboxed launch has no host program to probe: the
-        // binary lives inside the container, so the host's answer is a fallback
-        // and the generation decides which spelling reaches the container.
+        // A sandboxed launch runs the image's own build, and that image installs
+        // the current generation. The host's probe describes a binary the
+        // container never runs, so resolving here would both pick the wrong
+        // spelling and execute a host program this launch never ran before.
+        // A single-generation agent declares no arms and needs none resolved.
         let yolo_generation = crate::agents::get_agent(&self.tool)
             .filter(|agent| agent.spans_agent_generations)
-            .map(|agent| super::execution::agent_generation(agent, None));
-        let yolo_generation = self.is_yolo_mode().then_some(yolo_generation).flatten();
-        let yolo_generation = yolo_generation
-            .filter(|generation| *generation != crate::agents::AgentGeneration::Unknown);
+            .map(|_| crate::agents::AgentGeneration::Current);
         container_config::build_container_config(
             &self.project_path,
             sandbox,

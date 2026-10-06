@@ -40,9 +40,8 @@ pub enum YoloMode {
     CliFlag(&'static str),
     EnvVar(&'static str, &'static str),
     AlwaysYolo,
-    /// Two generations, one contract. OpenCode 2.x stopped reading the inlined
-    /// permission object, so an agent spanning the rename declares both and
-    /// `resolve` picks the one the installed build understands.
+    /// Two generations, one contract: an agent spanning the rename declares
+    /// both and `resolve` picks the one the installed build understands.
     EitherGeneration {
         legacy: &'static YoloMode,
         current: &'static YoloMode,
@@ -64,16 +63,16 @@ pub enum AgentGeneration {
 impl YoloMode {
     /// The mechanism the installed build understands. A mode that spans two
     /// generations resolves to the matching arm; any other mode is itself.
-    pub fn resolve(&'static self, generation: AgentGeneration) -> &'static YoloMode {
+    /// `None` means the generation is unknown, so neither arm can be claimed
+    /// and the caller has to refuse rather than pick one for the user.
+    pub fn resolve(&'static self, generation: AgentGeneration) -> Option<&'static YoloMode> {
         match self {
             YoloMode::EitherGeneration { legacy, current } => match generation {
-                AgentGeneration::Legacy => legacy,
-                AgentGeneration::Current => current,
-                // Nothing establishes which arm the build reads, so neither is
-                // claimed; a caller that needs one refuses instead.
-                AgentGeneration::Unknown => current,
+                AgentGeneration::Legacy => Some(legacy),
+                AgentGeneration::Current => Some(current),
+                AgentGeneration::Unknown => None,
             },
-            _ => self,
+            mode => Some(mode),
         }
     }
 }
@@ -164,10 +163,9 @@ pub enum ForkStrategy {
     /// The agent's store mints the child over its own API before the launch, so
     /// the session that follows is still the interactive one.
     ServeFork,
-    /// Two generations, one contract. OpenCode 2.x removed the root fork flag
-    /// and moved its endpoint under `/api`, and no single spelling serves both,
-    /// so an agent spanning the rename declares both and `resolve` picks the one
-    /// the installed build accepts.
+    /// Two generations, one contract: no single spelling serves both, so an
+    /// agent spanning the rename declares both and `resolve` picks the one the
+    /// installed build accepts.
     EitherGeneration {
         legacy: &'static ForkStrategy,
         current: &'static ForkStrategy,
@@ -184,17 +182,17 @@ impl ForkStrategy {
     }
 
     /// The mechanism the installed build understands. A strategy that spans two
-    /// generations resolves to the matching arm; any other is itself.
-    pub fn resolve(&'static self, generation: AgentGeneration) -> &'static ForkStrategy {
+    /// generations resolves to the matching arm; any other is itself. `None`
+    /// means the generation is unknown, so the caller has to refuse rather than
+    /// pick one for the user.
+    pub fn resolve(&'static self, generation: AgentGeneration) -> Option<&'static ForkStrategy> {
         match self {
             ForkStrategy::EitherGeneration { legacy, current } => match generation {
-                AgentGeneration::Legacy => legacy,
-                AgentGeneration::Current => current,
-                // Nothing establishes which arm the build accepts, so the caller
-                // has to refuse rather than pick one for the user.
-                AgentGeneration::Unknown => current,
+                AgentGeneration::Legacy => Some(legacy),
+                AgentGeneration::Current => Some(current),
+                AgentGeneration::Unknown => None,
             },
-            _ => self,
+            strategy => Some(strategy),
         }
     }
 }

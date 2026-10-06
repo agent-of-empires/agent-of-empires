@@ -2960,17 +2960,19 @@ pub(crate) fn build_container_config(
                 value: value.to_string(),
             });
         }
-        if let Some(yolo_generation) = yolo.generation {
+        if yolo.enabled {
             // A sandbox reaches the agent through its environment rather than a
-            // command line, so the generation the caller resolved for this launch
-            // decides which of the two reaches it. It comes from the same place
-            // the launch's own command line reads, so the container cannot be
-            // handed a spelling its binary does not read.
-            let yolo = agent
-                .yolo
-                .as_ref()
-                .map(|yolo| yolo.resolve(yolo_generation));
-            if let Some(crate::agents::YoloMode::EnvVar(key, value)) = yolo {
+            // command line, so the generation the caller resolved decides which
+            // spelling reaches it. A single-generation agent declares one arm
+            // and resolves to it whatever the generation.
+            let resolved = yolo.generation.and_then(|generation| {
+                agent
+                    .yolo
+                    .as_ref()
+                    .and_then(|yolo| yolo.resolve(generation))
+            });
+            let resolved = resolved.or(agent.yolo.as_ref());
+            if let Some(crate::agents::YoloMode::EnvVar(key, value)) = resolved {
                 environment.push(EnvEntry::Literal {
                     key: key.to_string(),
                     value: value.to_string(),

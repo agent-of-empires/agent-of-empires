@@ -356,6 +356,10 @@ impl Instance {
                     .or_else(|| omp_capture_metadata.clone().map(CaptureContext::Omp)),
                 container: execution.inputs.container,
             });
+            // A generation that could not be established cannot be claimed to
+            // mint or to keep the id, so the pinned one is dropped rather than
+            // carried on an answer the build never gave. The fork path bails
+            // before this, so the arm is unreachable for a real fork.
             let native_mints_child = matches!(
                 prepared.expected_conversation.intent,
                 ResumeIntent::Fork { .. }
@@ -363,7 +367,7 @@ impl Instance {
                 .agent
                 .fork_strategy
                 .resolve(generation)
-                .mints_child();
+                .is_none_or(|strategy| strategy.mints_child());
             if native_mints_child {
                 self.set_agent_conversation(None, None, None);
             } else if let Some(sid) = self.agent_session_id.clone() {

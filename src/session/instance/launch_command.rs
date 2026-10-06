@@ -42,17 +42,26 @@ fn resolved_yolo(
     execution: Option<&super::execution::NativeExecution>,
 ) -> Option<&'static crate::agents::YoloMode> {
     let yolo = agent.yolo.as_ref()?;
-    let generation =
-        super::execution::agent_generation(agent, inst.launch_program(agent, execution).as_deref());
-    if generation == crate::agents::AgentGeneration::Unknown {
-        // Neither spelling can be claimed for a build whose help never
-        // answered, and sending the wrong one is silently inert.
-        tracing::warn!(target: "session.store", tool = agent.name,
-            "agent --help did not answer, so its approval mechanism cannot be established; \
-             the launch runs without it");
-        return None;
+    // A sandboxed launch runs the image's own build, so the host probe would
+    // describe a binary the container never runs. The container config resolves
+    // the same way, which is what keeps the command line and the environment
+    // from disagreeing.
+    let generation = if inst.is_sandboxed() {
+        crate::agents::AgentGeneration::Current
+    } else {
+        super::execution::agent_generation(agent, inst.launch_program(agent, execution).as_deref())
+    };
+    match yolo.resolve(generation) {
+        Some(resolved) => Some(resolved),
+        None => {
+            // Neither spelling can be claimed for a build whose help never
+            // answered, and sending the wrong one is silently inert.
+            tracing::warn!(target: "session.store", tool = agent.name,
+                "agent --help did not answer, so its approval mechanism cannot be established; \
+                 the launch runs without it");
+            None
+        }
     }
-    Some(yolo.resolve(generation))
 }
 
 /// Append yolo-mode flags or environment variables to a launch command.
@@ -197,7 +206,10 @@ pub(super) fn build_fork_flags(
     let Some(agent) = get_agent(tool) else {
         return String::new();
     };
-    match agent.fork_strategy.resolve(generation) {
+    let Some(strategy) = agent.fork_strategy.resolve(generation) else {
+        return String::new();
+    };
+    match strategy {
         ForkStrategy::ClaudeFork => {
             format!("--resume {parent_id} --fork-session --session-id {child_id}")
         }

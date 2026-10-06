@@ -742,10 +742,11 @@ impl Instance {
                     agent.name
                 );
             }
-            if matches!(
-                agent.fork_strategy.resolve(generation),
-                crate::agents::ForkStrategy::ServeFork
-            ) {
+            let fork_strategy = agent
+                .fork_strategy
+                .resolve(generation)
+                .expect("the unknown generation bailed above");
+            if matches!(fork_strategy, crate::agents::ForkStrategy::ServeFork) {
                 // A restart prepares the command twice, and asking the store
                 // again would leave a second conversation behind in the user's
                 // history, so an adopted child is reused. The intent stays a
@@ -783,10 +784,7 @@ impl Instance {
                 !fork_part.is_empty(),
                 "native agent cannot execute this fork"
             );
-            let is_subcommand = matches!(
-                agent.fork_strategy.resolve(generation),
-                crate::agents::ForkStrategy::CodexFork
-            );
+            let is_subcommand = matches!(fork_strategy, crate::agents::ForkStrategy::CodexFork);
             splice_subcommand_or_append(
                 cmd,
                 &fork_part,
