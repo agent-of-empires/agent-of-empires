@@ -364,6 +364,7 @@ impl Instance {
                 self.project_path.clone()
             }
         };
+        let expected = self.conversation_state();
         let child = crate::session::capture::fork_opencode_session_id(&cwd, command, parent_id)
             .context("the store returned no child for this fork")?;
         // The binding is what marks this id as a conversation the store holds,
@@ -381,6 +382,11 @@ impl Instance {
             }),
             None,
         );
+        // The store fork is a side effect that outlives this launch: if a later
+        // step fails and the instance is retried, the durable row must already
+        // carry the adopted child, or the retry reads back the pre-fork seed and
+        // mints a second conversation in the user's history.
+        let _ = self.persist_session_id(&self.effective_profile(), &expected);
         Ok(child)
     }
 

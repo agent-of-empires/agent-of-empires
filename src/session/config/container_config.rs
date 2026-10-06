@@ -1355,7 +1355,7 @@ fn seed_content_roles(
                     path,
                     &mut content.as_bytes(),
                     std::fs::Permissions::from_mode(0o600),
-                    true,
+                    false,
                     None,
                 )?;
             }

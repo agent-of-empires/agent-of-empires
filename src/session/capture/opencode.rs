@@ -157,14 +157,14 @@ impl ServeClient {
             .await
             .with_context(|| format!("opencode fork of {parent_id} failed"))?;
         let status = resp.status();
-        let body: serde_json::Value = resp
-            .json()
-            .await
-            .context("opencode fork response was not JSON")?;
         anyhow::ensure!(
             status.is_success(),
             "opencode fork of {parent_id} returned {status}"
         );
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .context("opencode fork response was not JSON")?;
         body.pointer("/data/id")
             .and_then(serde_json::Value::as_str)
             .map(str::to_owned)
@@ -240,14 +240,14 @@ pub(crate) fn preassign_opencode_session_id(
     command: std::process::Command,
     generation: AgentGeneration,
 ) -> Option<String> {
-    // 1.x has no create route under `/api`, and an unreadable help establishes
-    // nothing about either. Answering before the server is spawned is the point:
-    // the alternative is booting one and waiting out its readiness to learn
-    // there was nothing to send.
+    // 1.16.0 has no create route under `/api`, but 1.18.29 does. An unreadable
+    // help establishes nothing about either. Answering before the server is
+    // spawned is the point: the alternative is booting one and waiting out its
+    // readiness to learn there was nothing to send.
     match generation {
         AgentGeneration::Legacy => {
             tracing::warn!(target: "session.capture",
-                "opencode 1.x has no session-create route under /api, so its session id cannot be preassigned");
+                "opencode 1.x may or may not have a session-create route under /api, so its session id cannot be preassigned");
             return None;
         }
         AgentGeneration::Unknown => {

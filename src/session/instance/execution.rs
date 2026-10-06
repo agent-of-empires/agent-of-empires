@@ -1254,11 +1254,25 @@ impl Instance {
                 // so a `$VAR` reference or a repeated key resolves to the same
                 // directory here as it does there.
                 let environment = self.resolved_host_environment();
-                let path = crate::session::environment::resolve_host_environment_value(
+                let Some(path) = crate::session::environment::resolve_host_environment_value(
                     &environment,
                     "PATH",
-                );
-                which::which_in(agent.binary, path.as_deref(), &self.project_path).ok()
+                ) else {
+                    tracing::warn!(target: "session.store",
+                        agent = %agent.name,
+                        "host environment carries no PATH, so its launch program cannot be resolved");
+                    return None;
+                };
+                match which::which_in(agent.binary, Some(&path), &self.project_path) {
+                    Ok(program) => Some(program),
+                    Err(error) => {
+                        tracing::warn!(target: "session.store",
+                            agent = %agent.name,
+                            error = %error,
+                            "host PATH does not carry this agent's binary");
+                        None
+                    }
+                }
             }
         }
     }
