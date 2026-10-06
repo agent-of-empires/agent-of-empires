@@ -326,22 +326,24 @@ async fn mirror_conversion(
     earlier: [Arc<crate::session::LaunchOrigin>; 3],
     acknowledged: Arc<crate::session::LaunchOrigin>,
 ) -> Result<(), String> {
-    let mut instances = state.instances.clone().write_owned().await;
+    let cache = Arc::clone(&state.instances);
+    let epoch = Arc::clone(&state.mutation_epoch);
     tokio::task::spawn_blocking(move || {
         acknowledged.with_storage(|_, stored| {
+            let mut instances = cache.blocking_write();
             let slot = instances
                 .iter_mut()
                 .find(|row| row.id == acknowledged.session_id())
                 .ok_or_else(|| anyhow::anyhow!("original attach cache row disappeared"))?;
-            let cached = crate::session::LaunchOrigin::capture(slot)?;
             anyhow::ensure!(
                 earlier
                     .iter()
-                    .any(|source| source.recognizes_published_snapshot(&cached))
-                    || acknowledged.recognizes_published_snapshot(&cached),
+                    .any(|source| source.recognizes_published_instance(slot))
+                    || acknowledged.recognizes_published_instance(slot),
                 "original attach cache row was replaced or superseded"
             );
             *slot = super::reload::merge_runtime_fields(slot, stored);
+            epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(())
         })
     })

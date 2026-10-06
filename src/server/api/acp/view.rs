@@ -631,29 +631,31 @@ async fn finish_terminal_switch(
     .await;
     match started {
         Ok(Ok((started, reserved, acknowledged))) => {
-            let mut rows = state.instances.clone().write_owned().await;
+            let instances = Arc::clone(&state.instances);
+            let epoch = Arc::clone(&state.mutation_epoch);
             let publication = tokio::task::spawn_blocking(move || {
                 acknowledged.with_storage(|_, _| {
+                    let mut rows = instances.blocking_write();
                     let slot = rows
                         .iter_mut()
                         .find(|row| row.id == acknowledged.session_id())
                         .ok_or_else(|| {
                             anyhow::anyhow!("original Terminal launch cache row disappeared")
                         })?;
-                    let cached = crate::session::LaunchOrigin::capture(slot)?;
                     anyhow::ensure!(
                         earlier
                             .iter()
-                            .any(|ack| ack.recognizes_published_snapshot(&cached))
+                            .any(|ack| ack.recognizes_published_instance(slot))
                             || reserved
                                 .as_ref()
-                                .is_some_and(|ack| ack.recognizes_published_snapshot(&cached))
-                            || acknowledged.recognizes_published_snapshot(&cached),
+                                .is_some_and(|ack| ack.recognizes_published_instance(slot))
+                            || acknowledged.recognizes_published_instance(slot),
                         "original Terminal launch cache row was superseded"
                     );
                     let started_at = started.last_start_time;
                     *slot = crate::server::reload::merge_runtime_fields(slot, started);
                     slot.last_start_time = started_at;
+                    epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     Ok(())
                 })
             })
@@ -721,23 +723,24 @@ async fn persist_terminal_view(
     let owner = stop.clone();
     let prior_projection = stop.current_projection();
     let save_result = tokio::task::spawn_blocking(move || -> anyhow::Result<Instance> {
-        owner.update_projection(|slot| {
-            anyhow::ensure!(
-                slot.view == disk_expected.0
-                    && slot.acp_session_id == disk_expected.1
-                    && (!keep_context || disk_expected.2.matches(slot)),
-                "ACP identity changed during terminal handoff; retry"
-            );
-            slot.view = View::Terminal;
-            slot.acp_session_id = snapshot.acp_session_id.clone();
-            slot.import_pending = snapshot.import_pending;
-            if keep_context {
-                slot.adopt_conversation_state(persisted_conversation);
-            }
-            let mut emitted = slot.clone();
-            emitted.storage_origin = Some(Arc::new(owner.storage().clone()));
-            Ok(emitted)
-        })
+        owner.update_projection(
+            |slot| {
+                anyhow::ensure!(
+                    slot.view == disk_expected.0
+                        && slot.acp_session_id == disk_expected.1
+                        && (!keep_context || disk_expected.2.matches(slot)),
+                    "ACP identity changed during terminal handoff; retry"
+                );
+                slot.view = View::Terminal;
+                slot.acp_session_id = snapshot.acp_session_id.clone();
+                slot.import_pending = snapshot.import_pending;
+                if keep_context {
+                    slot.adopt_conversation_state(persisted_conversation);
+                }
+                Ok(slot.clone())
+            },
+            Ok,
+        )
     })
     .await;
     let emitted = match save_result {

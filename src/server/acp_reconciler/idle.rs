@@ -199,10 +199,13 @@ pub(super) async fn reap_idle_workers(state: &Arc<AppState>) {
         };
         let owner = stop.clone();
         if !matches!(
-            tokio::task::spawn_blocking(move || owner.update_projection(|row| {
-                set_dormant(row, true);
-                Ok(())
-            }))
+            tokio::task::spawn_blocking(move || owner.update_projection(
+                |row| {
+                    set_dormant(row, true);
+                    Ok(())
+                },
+                Ok
+            ))
             .await,
             Ok(Ok(()))
         ) {
@@ -229,10 +232,13 @@ pub(super) async fn reap_idle_workers(state: &Arc<AppState>) {
                 // The worker may still run; clear dormancy so it is not blocked forever.
                 let owner = stop.clone();
                 let cleared = matches!(
-                    tokio::task::spawn_blocking(move || owner.update_projection(|row| {
-                        set_dormant(row, false);
-                        Ok(())
-                    }))
+                    tokio::task::spawn_blocking(move || owner.update_projection(
+                        |row| {
+                            set_dormant(row, false);
+                            Ok(())
+                        },
+                        Ok
+                    ))
                     .await,
                     Ok(Ok(()))
                 );

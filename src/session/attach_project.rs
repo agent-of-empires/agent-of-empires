@@ -1325,7 +1325,7 @@ pub fn resume_after_conversion(
                             acknowledged.update_storage(|_, slot| {
                                 slot.merge_post_restart_with_baseline(&before, &after);
                                 Ok(())
-                            })?;
+                            }, Ok)?;
                             Ok(acknowledged)
                         }) {
                             Ok(acknowledged) => original = acknowledged,
@@ -1462,23 +1462,28 @@ fn attach_and_restart(request: AttachProjectRequest) -> Result<String, String> {
 
 /// Clear only this attach receipt's sandbox, and emit its actual metadata CAS ACK.
 fn reset_sandbox_container(scope: &super::runner_journal::OwnedStop) -> Result<()> {
-    scope.update_projection(|row| {
-        anyhow::ensure!(
-            row.is_sandboxed(),
-            "original attach row is no longer sandboxed"
-        );
-        match crate::containers::DockerContainer::from_session_id(scope.session_id()).discard() {
-            crate::containers::Teardown::Removed | crate::containers::Teardown::AlreadyGone => {}
-            crate::containers::Teardown::Failed(error) => {
-                bail!("could not remove the old container: {error}")
+    scope.update_projection(
+        |row| {
+            anyhow::ensure!(
+                row.is_sandboxed(),
+                "original attach row is no longer sandboxed"
+            );
+            match crate::containers::DockerContainer::from_session_id(scope.session_id()).discard()
+            {
+                crate::containers::Teardown::Removed | crate::containers::Teardown::AlreadyGone => {
+                }
+                crate::containers::Teardown::Failed(error) => {
+                    bail!("could not remove the old container: {error}")
+                }
             }
-        }
-        if let Some(sandbox) = row.sandbox_info.as_mut() {
-            sandbox.container_id = None;
-            sandbox.container_workdir = None;
-        }
-        Ok(())
-    })
+            if let Some(sandbox) = row.sandbox_info.as_mut() {
+                sandbox.container_id = None;
+                sandbox.container_workdir = None;
+            }
+            Ok(())
+        },
+        Ok,
+    )
 }
 
 #[cfg(test)]

@@ -111,9 +111,7 @@ pub fn ensure_container_for_session_locked(
             .await
             .context("original sandbox ensure job")??;
 
-        // Reflect only this known CAS. Keep canonical original fences through the short
-        // publication so a later Stop or replacement cannot receive an old result.
-        let mut rows = instances.write_owned().await;
+        // Keep physical fences through the cache publication.
         let publication_origin = origin.clone();
         let publication_info = sandbox_info.as_ref().map(|info| {
             (
@@ -126,19 +124,19 @@ pub fn ensure_container_for_session_locked(
         let custody = admission.begin_job();
         tokio::task::spawn_blocking(move || {
             let _custody = custody;
-            publication_origin.with_storage(|_, _stored| {
+            publication_origin.with_storage(|_, stored| {
                 publication_admission.commit_effect(|| {
+                    let mut rows = instances.blocking_write();
                     let instance = rows
                         .iter_mut()
                         .find(|row| row.id == publication_origin.session_id())
                         .context("sandbox original view row disappeared")?;
-                    if baseline.matches_instance(instance) {
-                        instance.lifecycle_generation = publication_origin.generation();
-                    }
                     anyhow::ensure!(
-                        publication_origin.matches_instance(instance),
+                        baseline.recognizes_published_instance(instance)
+                            || publication_origin.recognizes_published_instance(instance),
                         "sandbox result no longer owns its original view row"
                     );
+                    instance.merge_post_start(&stored);
                     if let (Some((container_id, before_start_env, provider)), Some(sandbox)) =
                         (publication_info, instance.sandbox_info.as_mut())
                     {
@@ -148,9 +146,9 @@ pub fn ensure_container_for_session_locked(
                         sandbox.before_start_env = before_start_env;
                         if rebuilt || sandbox.provider != provider {
                             sandbox.provider = provider;
-                            mutation_epoch.fetch_add(1, Ordering::SeqCst);
                         }
                     }
+                    mutation_epoch.fetch_add(1, Ordering::SeqCst);
                     Ok(())
                 })
             })
@@ -241,12 +239,15 @@ mod tests {
             crate::server::test_support::seed_instances_on_disk_for_test("default", vec![row]);
             let original = crate::session::runner_journal::capture_unique_origin(&id).unwrap();
             let mut discards = 0;
-            let result = original.update_storage(|_, stored| {
-                reconcile_provider_container_with(stored, |_| {
-                    discards += 1;
-                    outcome
-                })
-            });
+            let result = original.update_storage(
+                |_, stored| {
+                    reconcile_provider_container_with(stored, |_| {
+                        discards += 1;
+                        outcome
+                    })
+                },
+                Ok,
+            );
             assert_eq!(result.is_ok(), rebuilt, "{result:?}");
             let stored = crate::server::test_support::load_instances_from_disk_for_test("default")
                 .into_iter()
@@ -258,12 +259,15 @@ mod tests {
             );
             if rebuilt {
                 let repeated = original
-                    .update_storage(|_, stored| {
-                        reconcile_provider_container_with(stored, |_| {
-                            discards += 1;
-                            Teardown::Removed
-                        })
-                    })
+                    .update_storage(
+                        |_, stored| {
+                            reconcile_provider_container_with(stored, |_| {
+                                discards += 1;
+                                Teardown::Removed
+                            })
+                        },
+                        Ok,
+                    )
                     .unwrap();
                 assert!(!repeated, "a matching rebuilt container must survive");
                 assert_eq!(discards, 1);

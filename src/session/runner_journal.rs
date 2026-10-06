@@ -744,6 +744,19 @@ impl LaunchOrigin {
                 .all(|birth| self.births.contains(birth))
     }
 
+    pub(crate) fn recognizes_published_instance(&self, cached: &Instance) -> bool {
+        cached
+            .storage_origin
+            .as_ref()
+            .is_some_and(|storage| storage.same_origin_as(&self.plan.storage))
+            && self.plan_matches_at(cached, self.generation, self.plan.trashed)
+            && cached
+                .runner_journal
+                .launches()
+                .iter()
+                .all(|birth| self.births.contains(&birth.birth_key()))
+    }
+
     fn same_birth_scope(&self, other: &Self) -> bool {
         if self.births == other.births {
             return true;
@@ -821,7 +834,7 @@ impl LaunchOrigin {
         self.validate_births(row)
     }
 
-    fn validate_plan_at(&self, row: &Instance, generation: u64, trashed: bool) -> Result<()> {
+    fn plan_matches_at(&self, row: &Instance, generation: u64, trashed: bool) -> bool {
         let workspace_matches = match (&self.plan.workspace, &row.workspace_info) {
             (None, None) => true,
             (Some(expected), Some(current)) => {
@@ -833,25 +846,29 @@ impl LaunchOrigin {
         };
         let sandbox_matches =
             sandbox_geometry_matches(self.plan.sandbox.as_ref(), row.sandbox_info.as_ref());
+        row.id == self.plan.session_id
+            && row.created_at == self.plan.created_at
+            && row.title == self.plan.title
+            && row.is_archived() == self.plan.archived
+            && row.is_trashed() == trashed
+            && row.project_path == self.plan.project_path
+            && row.worktree_info == self.plan.worktree
+            && workspace_matches
+            && sandbox_matches
+            && row.command == self.plan.command
+            && row.extra_args == self.plan.extra_args
+            && row.tool == self.plan.tool
+            && row.detect_as == self.plan.detect_as
+            && row.yolo_mode == self.plan.yolo_mode
+            && row.agent_provider == self.plan.agent_provider
+            && row.first_launch_names_agent == self.plan.first_launch_names_agent
+            && row.active_execution == self.plan.active_execution
+            && row.lifecycle_generation == generation
+    }
+
+    fn validate_plan_at(&self, row: &Instance, generation: u64, trashed: bool) -> Result<()> {
         anyhow::ensure!(
-            row.id == self.plan.session_id
-                && row.created_at == self.plan.created_at
-                && row.title == self.plan.title
-                && row.is_archived() == self.plan.archived
-                && row.is_trashed() == trashed
-                && row.project_path == self.plan.project_path
-                && row.worktree_info == self.plan.worktree
-                && workspace_matches
-                && sandbox_matches
-                && row.command == self.plan.command
-                && row.extra_args == self.plan.extra_args
-                && row.tool == self.plan.tool
-                && row.detect_as == self.plan.detect_as
-                && row.yolo_mode == self.plan.yolo_mode
-                && row.agent_provider == self.plan.agent_provider
-                && row.first_launch_names_agent == self.plan.first_launch_names_agent
-                && row.active_execution == self.plan.active_execution
-                && row.lifecycle_generation == generation,
+            self.plan_matches_at(row, generation, trashed),
             "original lifecycle or execution plan was superseded"
         );
         Ok(())
@@ -993,11 +1010,12 @@ impl LaunchOrigin {
         self.validate_row(&row)?;
         effect(&self.plan.storage, row)
     }
-    /// Mutate the canonical original row under one storage read and write.
-    pub(crate) fn update_storage<T>(
+    /// Commit the original row, then publish its result under the same physical fences.
+    pub(crate) fn update_storage<T, U>(
         &self,
         effect: impl FnOnce(&Storage, &mut Instance) -> Result<T>,
-    ) -> Result<T> {
+        publish: impl FnOnce(T) -> Result<U>,
+    ) -> Result<U> {
         let _workspace = super::acquire_session_workspace_claim_lock()?;
         let _identity = super::acquire_session_identity_lock()?;
         self.plan.storage.verify_profile_identity()?;
@@ -1016,6 +1034,7 @@ impl LaunchOrigin {
                 self.validate_row(row)?;
                 effect(&self.plan.storage, row)
             })
+            .and_then(publish)
     }
 }
 
@@ -1092,12 +1111,12 @@ impl OwnedStop {
         })
     }
 
-    /// A successful writer of this receipt may emit a new immutable metadata
-    /// projection. Its native authority remains the original captured births.
-    pub(crate) fn update_projection<T>(
+    /// Commit and publish a metadata ACK without changing the original native births.
+    pub(crate) fn update_projection<T, U>(
         &self,
         effect: impl FnOnce(&mut Instance) -> Result<T>,
-    ) -> Result<T> {
+        publish: impl FnOnce(T) -> Result<U>,
+    ) -> Result<U> {
         let storage = self.storage();
         let _workspace = super::acquire_session_workspace_claim_lock()?;
         let _identity = super::acquire_session_identity_lock()?;
@@ -1146,7 +1165,7 @@ impl OwnedStop {
             .acknowledged
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = emitted;
-        Ok(result)
+        publish(result)
     }
 
     /// The caller retains the real PurgeTransaction for the whole driver.
@@ -2656,11 +2675,14 @@ mod tests {
                 StopDecision::CancelRequested
             ));
             let acknowledge = || {
-                stop.update_projection(|row| {
-                    row.view = super::super::View::Terminal;
-                    row.active_execution = None;
-                    Ok(())
-                })
+                stop.update_projection(
+                    |row| {
+                        row.view = super::super::View::Terminal;
+                        row.active_execution = None;
+                        Ok(())
+                    },
+                    Ok,
+                )
                 .unwrap()
             };
             if early_ack {
@@ -2729,10 +2751,13 @@ mod tests {
                 .unwrap();
             let before = std::fs::read(storage.sessions_path()).unwrap();
             assert!(stop
-                .update_projection(|row| {
-                    row.command = "late old ACK".into();
-                    Ok(())
-                })
+                .update_projection(
+                    |row| {
+                        row.command = "late old ACK".into();
+                        Ok(())
+                    },
+                    Ok
+                )
                 .is_err());
             assert_eq!(std::fs::read(storage.sessions_path()).unwrap(), before);
             assert!(!stop

@@ -486,7 +486,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                             crate::migrations::v033_isolate_sandbox_content::AcpContextUse::Launch,
                             continuation,
                         )
-                        })
+                        }, Ok)
                     })
                     .await
                     .map_err(|error| {
@@ -883,16 +883,19 @@ impl<S: BroadcastSink> Supervisor<S> {
             let generation = reservation.lease().epoch();
             let context = tokio::task::spawn_blocking(move || {
                 let _custody = custody;
-                origin.update_storage(|storage, row| {
-                    crate::migrations::v033_isolate_sandbox_content::prepare_acp_context(
-                        storage.profile(),
-                        row,
-                        native_agent,
-                        generation,
-                        crate::migrations::v033_isolate_sandbox_content::AcpContextUse::Attach,
-                        super::SandboxContinuation::Persisted,
-                    )
-                })
+                origin.update_storage(
+                    |storage, row| {
+                        crate::migrations::v033_isolate_sandbox_content::prepare_acp_context(
+                            storage.profile(),
+                            row,
+                            native_agent,
+                            generation,
+                            crate::migrations::v033_isolate_sandbox_content::AcpContextUse::Attach,
+                            super::SandboxContinuation::Persisted,
+                        )
+                    },
+                    Ok,
+                )
             })
             .await
             .map_err(|error| {

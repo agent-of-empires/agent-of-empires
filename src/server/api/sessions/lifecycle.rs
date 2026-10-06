@@ -1199,9 +1199,7 @@ pub async fn stop_session(
         return (StatusCode::OK, Json(serde_json::json!(response))).into_response();
     }
 
-    // Structured sessions have no tmux/container teardown transaction, so
-    // persist their dormant stop before asking the supervisor to shut down.
-    // Plain sessions delegate the full sequence to `Instance::stop` below.
+    // Publish the dormant ACK before shutting down the structured worker.
     let native_stop = if is_structured {
         let original = match state.capture_operation_origin(&expected) {
             Ok(original) => original,
@@ -1212,54 +1210,52 @@ pub async fn stop_session(
             Err(error) => return (StatusCode::CONFLICT, error.to_string()).into_response(),
         };
         let owner = stop.clone();
+        let instances = Arc::clone(&state.instances);
+        let epoch = Arc::clone(&state.mutation_epoch);
         let saved = tokio::task::spawn_blocking(move || {
-            owner.update_projection(|row| {
-                row.status = Status::Stopped;
-                row.mark_idle_dormant();
-                Ok(())
-            })
+            owner.update_projection(
+                |row| {
+                    row.status = Status::Stopped;
+                    row.mark_idle_dormant();
+                    Ok(row.clone())
+                },
+                |emitted| {
+                    let mut rows = instances.blocking_write();
+                    let Some(slot) = rows.iter_mut().find(|row| {
+                        row.id == owner.session_id()
+                            && (owner.original().recognizes_published_instance(row)
+                                || owner
+                                    .current_projection()
+                                    .recognizes_published_instance(row))
+                    }) else {
+                        return Ok(false);
+                    };
+                    *slot = crate::server::reload::merge_runtime_fields(slot, emitted);
+                    slot.plugin_revival_pending = false;
+                    epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(true)
+                },
+            )
         })
         .await;
-        if !matches!(saved, Ok(Ok(()))) {
-            return persist_failed_response();
+        match saved {
+            Ok(Ok(true)) => {}
+            Ok(Ok(false)) => return crate::server::api::session_gone_after_persist(),
+            _ => return persist_failed_response(),
         }
         Some(stop)
     } else {
         None
     };
 
-    let inst_clone = {
-        let mut instances = state.instances.write().await;
-        let Some(inst) = instances
-            .iter_mut()
-            .find(|instance| match native_stop.as_ref() {
-                Some(stop) => {
-                    stop.original().matches_instance(instance)
-                        || stop.cancellation_origin().matches_instance(instance)
-                }
-                None => instance.id == id,
-            })
-        else {
-            tracing::warn!(
-                target: "http.api.sessions",
-                session = %id,
-                "stop session: instance vanished before teardown"
-            );
+    let inst_clone = if is_structured {
+        None
+    } else {
+        let instances = state.instances.read().await;
+        let Some(instance) = instances.iter().find(|instance| instance.id == id) else {
             return crate::server::api::session_gone_after_persist();
         };
-        if is_structured {
-            inst.status = Status::Stopped;
-            inst.mark_idle_dormant();
-            // A direct stop bypasses apply_status_intent, which normally releases this on
-            // reaching a terminal status; do the same here, on the live in-memory row (the
-            // disk-persisted copy above is a fresh load, so this field is always false there).
-            inst.plugin_revival_pending = false;
-            inst.lifecycle_generation = native_stop
-                .as_ref()
-                .expect("structured stop reserved its original scope")
-                .generation();
-        }
-        inst.clone()
+        Some(instance.clone())
     };
 
     if is_structured {
@@ -1282,7 +1278,7 @@ pub async fn stop_session(
         // Plain session: kill the tmux pane and stop (not remove) the Docker
         // container. `Instance::stop` can block ~10s on `docker stop`, so it
         // runs off the async runtime.
-        let inst_for_stop = inst_clone.clone();
+        let inst_for_stop = inst_clone.expect("terminal stop retains its cache snapshot");
         let stop_profile = profile.clone();
         let stop_id = id.clone();
         match tokio::task::spawn_blocking(move || {
@@ -1607,10 +1603,13 @@ pub async fn update_session_snooze(
     let persist_id = id.clone();
     let saved = if let Some(owner) = native_stop.as_ref().cloned() {
         tokio::task::spawn_blocking(move || {
-            owner.update_projection(|row| {
-                row.snooze(minutes.expect("snooze stop has a duration"));
-                Ok(())
-            })
+            owner.update_projection(
+                |row| {
+                    row.snooze(minutes.expect("snooze stop has a duration"));
+                    Ok(())
+                },
+                Ok,
+            )
         })
         .await
         .map_err(|error| error.to_string())

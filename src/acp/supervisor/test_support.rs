@@ -293,12 +293,16 @@ pub(crate) async fn memory_resume<S: BroadcastSink>(
     }))
 }
 pub(super) fn spawn_request(session_id: &str) -> SpawnRequest {
+    let origin = stored_origin(session_id);
+    let cwd = origin
+        .with_storage(|_, row| Ok(PathBuf::from(row.project_path)))
+        .expect("fixture request retains its captured original project");
     SpawnRequest {
         provider: None,
         session_id: session_id.into(),
         agent: "claude-code".into(),
         tool: "claude".into(),
-        cwd: std::env::temp_dir(),
+        cwd,
         additional_dirs: vec![],
         provider_env: vec![],
         model: None,
@@ -309,7 +313,7 @@ pub(super) fn spawn_request(session_id: &str) -> SpawnRequest {
         sandbox_continuation: super::SandboxContinuation::Persisted,
         seed_history_replay: false,
         sandbox_info: None,
-        origin: Some(stored_origin(session_id)),
+        origin: Some(origin),
         yolo_mode: false,
         acp_mode_id: None,
         agent_command_override: None,
