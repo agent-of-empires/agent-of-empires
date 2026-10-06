@@ -378,6 +378,11 @@ impl Instance {
                         provenance: ConversationProvenance::Preallocated,
                         transcript_path: None,
                     });
+                // A reserved Claude id whose transcript is already on disk names
+                // a resumable conversation, so make it known here rather than
+                // waiting on the one-shot hook sidecar that a resume or /tmp wipe
+                // may have already taken.
+                super::execution::confirm_claude_conversation_from_transcript(&mut binding);
                 // #4127: a legacy binding adopts the route this launch
                 // attested, so the marker stops being derived from the
                 // configuration as it stands the moment a launch settles it.
