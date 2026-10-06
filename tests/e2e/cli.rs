@@ -18,11 +18,7 @@ fn json_out(h: &TuiTestHarness, args: &[&str]) -> Value {
 
 /// The tmux session name aoe derives for a session.
 fn tmux_name(session_id: &str, title: &str) -> String {
-    format!(
-        "{}{title}_{}",
-        agent_of_empires::tmux::SESSION_PREFIX,
-        &session_id[..8.min(session_id.len())]
-    )
+    agent_of_empires::tmux::Session::generate_name(session_id, title)
 }
 
 fn add_restartable_session(h: &TuiTestHarness, project: &Path, title: &str) -> String {
@@ -43,6 +39,16 @@ fn set_cli_tmux_context(h: &mut TuiTestHarness, session_id: &str, title: &str) -
         shell_words::quote(env_path.to_str().unwrap())
     );
     h.tmux_new_detached(&name, &command);
+    let mark = h
+        .tmux()
+        .args(["set-option", "-t", &name, "@aoe_kind", "agent"])
+        .output()
+        .expect("mark caller as an agent session");
+    assert!(
+        mark.status.success(),
+        "set caller kind marker failed: {}",
+        String::from_utf8_lossy(&mark.stderr)
+    );
 
     let (tmux, pane) = wait_until(Duration::from_secs(5), Duration::from_millis(20), || {
         let content = std::fs::read_to_string(&env_path).map_err(|error| error.to_string())?;
@@ -71,6 +77,35 @@ fn tmux_pane_pid(h: &TuiTestHarness, name: &str) -> String {
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+fn tmux_server_identity(h: &TuiTestHarness, name: &str) -> (String, u32) {
+    let output = h
+        .tmux()
+        .args([
+            "display-message",
+            "-p",
+            "-t",
+            name,
+            "-F",
+            "#{socket_path}|#{pid}",
+        ])
+        .output()
+        .expect("read tmux server identity");
+    assert!(
+        output.status.success(),
+        "tmux display-message failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let identity = String::from_utf8_lossy(&output.stdout);
+    let (socket, pid) = identity
+        .trim()
+        .split_once('|')
+        .expect("tmux server identity has socket and PID");
+    (
+        socket.to_string(),
+        pid.parse().expect("tmux server PID is an integer"),
+    )
 }
 
 #[test]
@@ -131,16 +166,40 @@ fn cli_restart_all_with_only_the_caller_reports_no_other_sessions() {
 
 #[test]
 #[parallel]
+fn cli_restart_all_keeps_an_agent_with_an_auxiliary_shaped_title() {
+    require_tmux!();
+    let mut h = TuiTestHarness::new("cli_restart_all_auxiliary_shaped_agent");
+    let project = h.project_path();
+    let caller_id = add_restartable_session(&h, &project, "term Caller");
+    let caller_name = set_cli_tmux_context(&mut h, &caller_id, "term Caller");
+    let caller_pid = tmux_pane_pid(&h, &caller_name);
+
+    let output = h.run_cli_ok(&["session", "restart", "--all"]);
+
+    assert!(
+        output.contains("Skipping current session 'term Caller'"),
+        "restart output should identify the skipped caller: {output}"
+    );
+    assert_eq!(
+        tmux_pane_pid(&h, &caller_name),
+        caller_pid,
+        "the calling pane process was replaced"
+    );
+}
+
+#[test]
+#[parallel]
 fn cli_restart_all_refuses_to_run_when_the_calling_pane_cannot_be_resolved() {
     require_tmux!();
     let mut h = TuiTestHarness::new("cli_restart_all_unresolved_caller");
     let project = h.project_path();
-    add_restartable_session(&h, &project, "Would Restart");
+    let restartable_id = add_restartable_session(&h, &project, "Would Restart");
+    let restartable_name = tmux_name(&restartable_id, "Would Restart");
+    h.tmux_new_detached(&restartable_name, "sleep 600");
+    let caller_id = add_restartable_session(&h, &project, "Caller");
+    let caller_name = set_cli_tmux_context(&mut h, &caller_id, "Caller");
+    let restartable_pid = tmux_pane_pid(&h, &restartable_name);
     h.set_env("TMUX_PANE", "%999999");
-    h.set_env(
-        "AOE_TMUX_SOCKET",
-        h.home_path().join("missing-tmux.sock").to_str().unwrap(),
-    );
 
     let output = h.run_cli(&["session", "restart", "--all"]);
 
@@ -150,6 +209,47 @@ fn cli_restart_all_refuses_to_run_when_the_calling_pane_cannot_be_resolved() {
         stderr.contains("Could not determine the current tmux session"),
         "restart should fail closed with a useful error: {stderr}"
     );
+    assert!(
+        h.tmux_has_session(&restartable_name),
+        "the unresolved caller must not restart other sessions"
+    );
+    assert_eq!(
+        tmux_pane_pid(&h, &restartable_name),
+        restartable_pid,
+        "a session restarted before the invalid caller was rejected"
+    );
+    assert!(h.tmux_has_session(&caller_name));
+}
+
+#[test]
+#[parallel]
+fn cli_restart_all_refuses_to_run_when_tmux_server_context_does_not_match() {
+    require_tmux!();
+    let mut h = TuiTestHarness::new("cli_restart_all_mismatched_tmux_server");
+    let project = h.project_path();
+    let restartable_id = add_restartable_session(&h, &project, "Would Restart");
+    let restartable_name = tmux_name(&restartable_id, "Would Restart");
+    h.tmux_new_detached(&restartable_name, "sleep 600");
+    let caller_id = add_restartable_session(&h, &project, "Caller");
+    let caller_name = set_cli_tmux_context(&mut h, &caller_id, "Caller");
+    let restartable_pid = tmux_pane_pid(&h, &restartable_name);
+    let (socket, server_pid) = tmux_server_identity(&h, &caller_name);
+    h.set_env("TMUX", &format!("{socket},{},0", server_pid + 1));
+
+    let output = h.run_cli(&["session", "restart", "--all"]);
+
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Could not determine the current tmux session"),
+        "restart should reject a mismatched server context: {stderr}"
+    );
+    assert_eq!(
+        tmux_pane_pid(&h, &restartable_name),
+        restartable_pid,
+        "a session restarted before the mismatched context was rejected"
+    );
+    assert!(h.tmux_has_session(&caller_name));
 }
 
 #[test]
