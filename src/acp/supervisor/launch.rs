@@ -238,33 +238,18 @@ impl<S: BroadcastSink> Supervisor<S> {
             req.effort.clone(),
         );
 
-        let mut base_host_environment = Vec::new();
-        let mut host_environment = Vec::new();
-        if req.sandbox_info.is_none() {
-            // Trusted global/profile configuration; repo overrides cannot contribute it.
-            base_host_environment = crate::session::environment::resolve_host_environment_pairs(
-                &resolved_cfg.environment,
-            );
-            host_environment = base_host_environment.clone();
-            if !resolved_cfg.host_hooks.before_session.is_empty() {
-                let minted = before_session_env(
-                    &req.session_id,
-                    &req.tool,
-                    req.source_profile.clone().unwrap_or_default(),
-                    req.cwd.clone(),
-                )
-                .await
-                .map_err(|e| {
-                    SupervisorError::InvalidAgentCommand(format!(
-                        "before_session hook task failed: {e}"
-                    ))
-                })?
-                .map_err(|e| {
-                    SupervisorError::Acp(AcpError::Spawn(format!("before_session hook: {e}")))
-                })?;
-                overlay_env(&mut host_environment, minted);
-            }
-        }
+        let (base_host_environment, mut host_environment) = if req.sandbox_info.is_none() {
+            host_spawn_environment(
+                &resolved_cfg,
+                &req.session_id,
+                &req.tool,
+                req.source_profile.clone().unwrap_or_default(),
+                req.cwd.clone(),
+            )
+            .await?
+        } else {
+            (Vec::new(), Vec::new())
+        };
 
         let claude_store_pin = req.claude_store_pin.clone().filter(|_| {
             req.sandbox_info.is_none() && matches!(req.agent.as_str(), "claude" | "claude-code")
@@ -759,6 +744,33 @@ async fn admit_durable_launch(req: &SpawnRequest) -> Result<(), SupervisorError>
     .map_err(|e| SupervisorError::Acp(AcpError::Spawn(format!("launch admission task: {e}"))))?
 }
 
+/// Unsandboxed host environment as `(base, host)`: trusted global/profile `[environment]` pairs
+/// (repo overrides cannot contribute them), then `host` overlays the before_session hook output.
+pub(crate) async fn host_spawn_environment(
+    cfg: &crate::session::Config,
+    session_id: &str,
+    tool: &str,
+    profile: String,
+    cwd: PathBuf,
+) -> Result<(Vec<(String, String)>, Vec<(String, String)>), SupervisorError> {
+    let base = crate::session::environment::resolve_host_environment_pairs(&cfg.environment);
+    let mut host = base.clone();
+    if !cfg.host_hooks.before_session.is_empty() {
+        let minted = before_session_env(session_id, tool, profile, cwd)
+            .await
+            .map_err(|e| {
+                SupervisorError::InvalidAgentCommand(format!(
+                    "before_session hook task failed: {e}"
+                ))
+            })?
+            .map_err(|e| {
+                SupervisorError::Acp(AcpError::Spawn(format!("before_session hook: {e}")))
+            })?;
+        overlay_env(&mut host, minted);
+    }
+    Ok((base, host))
+}
+
 /// Run the profile's `before_session` host hooks and return the env they mint.
 pub(super) async fn before_session_env(
     session_id: &str,
@@ -930,6 +942,27 @@ mod tests {
                 _ => "unknown",
             })
             .collect()
+    }
+
+    #[tokio::test]
+    async fn host_spawn_environment_forwards_configured_pairs() {
+        let cfg = crate::session::Config {
+            environment: vec![
+                "PI_CODING_AGENT_DIR=/stores/pi".into(),
+                "PI_ACP_PI_COMMAND=pi-wrapper".into(),
+            ],
+            ..Default::default()
+        };
+        let (base, host) =
+            host_spawn_environment(&cfg, "s", "pi", String::new(), PathBuf::from("/"))
+                .await
+                .unwrap();
+        let expected = vec![
+            ("PI_CODING_AGENT_DIR".to_string(), "/stores/pi".to_string()),
+            ("PI_ACP_PI_COMMAND".to_string(), "pi-wrapper".to_string()),
+        ];
+        assert_eq!(base, expected);
+        assert_eq!(host, expected);
     }
 
     #[tokio::test]
