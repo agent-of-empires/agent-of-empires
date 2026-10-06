@@ -245,7 +245,14 @@ const requestCases: RequestCase[] = [
   ["GET /api/groups", () => api.fetchGroups()],
   ["GET /api/projects", () => api.fetchProjects()],
   ["GET /api/projects?scope=profile", () => api.fetchProjects("profile")],
-  ["GET /api/claude-sessions", () => api.listClaudeSessions()],
+  [
+    "GET /api/importable-sessions?agent=pi",
+    () => api.listImportableSessions("pi"),
+    {
+      respond: json({ sessions: [{ session_id: "s" }], truncated: true }),
+      result: { ok: true, sessions: [{ session_id: "s" }], truncated: true },
+    },
+  ],
   [
     "GET /api/docker/status",
     () => api.fetchDockerStatus(),

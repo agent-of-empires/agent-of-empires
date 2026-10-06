@@ -16,7 +16,7 @@ vi.mock("../../../lib/api", () => ({
   cloneRepo: vi.fn(),
   getHomePath: vi.fn(),
   browseFilesystem: vi.fn(),
-  listClaudeSessions: vi.fn(),
+  listImportableSessions: vi.fn(),
 }));
 
 import {
@@ -25,7 +25,7 @@ import {
   fetchRecentProjects,
   fetchSessions,
   getHomePath,
-  listClaudeSessions,
+  listImportableSessions,
 } from "../../../lib/api";
 
 beforeEach(() => {
@@ -203,7 +203,7 @@ describe("Import from Claude tab", () => {
   const row = async (title: string) => (await screen.findByText(title)).closest("button") as HTMLButtonElement;
 
   beforeEach(() => {
-    vi.mocked(listClaudeSessions).mockResolvedValue(SESSIONS);
+    vi.mocked(listImportableSessions).mockResolvedValue({ ok: true, sessions: SESSIONS, truncated: false });
   });
 
   it("hides missing-cwd sessions until toggled, then shows them disabled", async () => {

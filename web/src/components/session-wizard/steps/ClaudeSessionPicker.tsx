@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { listClaudeSessions } from "../../../lib/api";
+import { listImportableSessions } from "../../../lib/api";
 import type { ImportableSession } from "../../../lib/types";
 
 /** Lists on-disk Claude Code sessions to import; ones whose cwd is gone cannot be resumed. */
@@ -17,8 +17,8 @@ export function ClaudeSessionPicker({
 
   useEffect(() => {
     let active = true;
-    listClaudeSessions().then((s) => {
-      if (active) setSessions(s);
+    listImportableSessions("claude").then((r) => {
+      if (active) setSessions(r.ok ? r.sessions : []);
     });
     return () => {
       active = false;

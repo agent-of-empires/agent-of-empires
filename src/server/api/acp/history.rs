@@ -1,5 +1,5 @@
 //! Read endpoints: transcript replay, context primer, workspace files, worker
-//! log, and importable Claude sessions.
+//! log, and importable native sessions.
 
 use serde::{Deserialize, Serialize};
 
@@ -281,25 +281,73 @@ pub async fn acp_replay(
     .into_response()
 }
 
-/// Claude Code sessions on disk for the import picker, newest first. Blocked in
-/// read-only mode: it exposes titles and paths outside AoE state (#2276).
-pub async fn list_claude_sessions(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    if let Some(resp) = read_only_block(&state) {
-        return resp;
-    }
-    let sessions = tokio::task::spawn_blocking(crate::session::claude_import::scan_sessions)
-        .await
-        .unwrap_or_default();
+#[derive(Debug, Deserialize)]
+pub struct ImportableSessionsQuery {
+    pub agent: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ImportableSessionsResponse {
+    pub sessions: Vec<crate::session::import::ImportableSession>,
+    pub truncated: bool,
+}
+
+/// Native sessions `agent` can import, newest first, minus the ones AoE owns. Claude reads its
+/// disk store; any other built-in agent answers ACP `session/list`.
+pub(crate) async fn importable_sessions(
+    state: &AppState,
+    agent: &str,
+    profile: &str,
+) -> Result<
+    (Vec<crate::session::import::ImportableSession>, bool),
+    crate::acp::acp_client::ListSessionsError,
+> {
+    let (sessions, source_truncated) = if agent == "claude" {
+        let scanned = tokio::task::spawn_blocking(crate::session::claude_import::scan_sessions)
+            .await
+            .unwrap_or_default();
+        (scanned.into_iter().map(Into::into).collect(), false)
+    } else {
+        crate::acp::session_listing::list_agent_sessions(agent, profile).await?
+    };
     let owned = {
         let instances = state.instances.read().await;
         crate::session::import::Owned::from_instances(&instances)
     };
-    let (sessions, _truncated) = crate::session::import::retain_importable(
-        sessions.into_iter().map(Into::into).collect(),
+    Ok(crate::session::import::retain_importable(
+        sessions,
         &owned,
-        false,
-    );
-    Json(sessions).into_response()
+        source_truncated,
+    ))
+}
+
+fn list_error_response(e: crate::acp::acp_client::ListSessionsError) -> Response {
+    use crate::acp::acp_client::ListSessionsError as E;
+    let (status, code) = match &e {
+        E::UnknownAgent => (StatusCode::BAD_REQUEST, "unknown_agent"),
+        E::NotInstalled => (StatusCode::BAD_REQUEST, "agent_not_installed"),
+        E::Unsupported => (StatusCode::UNPROCESSABLE_ENTITY, "list_unsupported"),
+        E::Timeout(_) | E::Failed(_) => (StatusCode::BAD_GATEWAY, "list_failed"),
+    };
+    crate::server::api::api_error(status, code, e.to_string())
+}
+
+/// Blocked in read-only mode: it exposes titles and paths outside AoE state (#2276).
+pub async fn list_importable_sessions(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Query(q): axum::extract::Query<ImportableSessionsQuery>,
+) -> impl IntoResponse {
+    if let Some(resp) = read_only_block(&state) {
+        return resp;
+    }
+    match importable_sessions(&state, &q.agent, &state.profile).await {
+        Ok((sessions, truncated)) => Json(ImportableSessionsResponse {
+            sessions,
+            truncated,
+        })
+        .into_response(),
+        Err(e) => list_error_response(e),
+    }
 }
 
 #[cfg(test)]
@@ -376,6 +424,46 @@ mod tests {
             list_files(root, 2).unwrap(),
             (vec!["a.rs".into(), "b.rs".into()], true)
         );
+    }
+
+    #[tokio::test]
+    async fn importable_sessions_maps_list_errors() {
+        use crate::acp::acp_client::ListSessionsError as E;
+        for (err, status, code) in [
+            (E::UnknownAgent, StatusCode::BAD_REQUEST, "unknown_agent"),
+            (
+                E::NotInstalled,
+                StatusCode::BAD_REQUEST,
+                "agent_not_installed",
+            ),
+            (
+                E::Unsupported,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "list_unsupported",
+            ),
+            (
+                E::Timeout("initialize"),
+                StatusCode::BAD_GATEWAY,
+                "list_failed",
+            ),
+        ] {
+            let resp = list_error_response(err);
+            assert_eq!(resp.status(), status);
+            let bytes = axum::body::to_bytes(resp.into_body(), 1 << 16)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["error"], code);
+        }
+
+        let state = crate::server::test_support::build_test_app_state(Vec::new());
+        let q = ImportableSessionsQuery {
+            agent: "not-an-agent".into(),
+        };
+        let resp = list_importable_sessions(State(state), axum::extract::Query(q))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
