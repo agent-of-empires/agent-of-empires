@@ -88,8 +88,8 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: gh pr merge --auto --squash --match-head-commit "$HEAD_SHA" "$PR_URL"
 
-      - name: Withdraw auto-merge after a failed check
-        if: failure()
+      - name: Withdraw auto-merge after rejection or failed checks
+        if: ${{ !cancelled() && (failure() || steps.eligible.outputs.ok != 'true') }}
         env:
           GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
           PR_URL: ${{ github.event.pull_request.html_url }}

@@ -54,6 +54,10 @@ cargo test
 
 Web changes have additional checks in [web/AGENTS.md](web/AGENTS.md).
 
+Add `ci-macos` when a PR needs macOS coverage; a skipped check is not coverage.
+The [labeler](.github/workflows/labeler.yml) requests it conservatively, but
+runs from the base branch, so new or changed detection rules may need a manual label.
+
 Releases are staged weekly. Maintainer instructions live in
 [docs/development/releases.md](docs/development/releases.md).
 
