@@ -54,6 +54,8 @@ pub enum TranscriptRowKind {
     ContextReset,
     SessionCleared,
     Compacted,
+    /// The agent's retained summary; `text` holds its markdown.
+    CompactionSummary,
     Summary,
     /// An error or lifecycle notice the user needs in the timeline.
     Notice,
@@ -307,6 +309,11 @@ impl TranscriptModel {
                 TranscriptRowKind::Compacted,
                 "Conversation compacted; earlier turns above are summarised in the model's context."
                     .to_string(),
+            )],
+            Event::ConversationCompactionSummary { text } => vec![self.push(
+                format!("compaction-summary-{seq}"),
+                TranscriptRowKind::CompactionSummary,
+                text.clone(),
             )],
             Event::SessionContextReset { reason } => {
                 let has_prior_prompt = self.rows.iter().any(|r| {
@@ -886,6 +893,14 @@ mod tests {
                 TranscriptRowKind::Compacted,
                 "Conversation compacted; earlier turns above are summarised in the model's context."
                     .to_string(),
+            ),
+            (
+                Event::ConversationCompactionSummary {
+                    text: "1. Primary request".into(),
+                },
+                "compaction-summary-1",
+                TranscriptRowKind::CompactionSummary,
+                "1. Primary request".to_string(),
             ),
             (
                 Event::ConversationSummary {

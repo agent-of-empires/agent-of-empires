@@ -740,6 +740,11 @@ pub enum Event {
     ConversationCompactionStarted,
     /// `/compact` replaced the model's context with a summary.
     ConversationCompacted,
+    /// The summary the agent retained when compacting, after its
+    /// `ConversationCompacted`.
+    ConversationCompactionSummary {
+        text: String,
+    },
     AgentSwitched {
         from: String,
         to: String,
@@ -1016,6 +1021,7 @@ impl AcpState {
             | Event::RawAgentUpdate { .. }
             | Event::AgentMessageChunk { .. }
             | Event::ConversationSummary { .. }
+            | Event::ConversationCompactionSummary { .. }
             | Event::WakeupScheduled { .. }
             | Event::MonitorArmed { .. } => {}
         }

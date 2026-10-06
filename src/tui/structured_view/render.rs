@@ -1406,6 +1406,11 @@ fn transcript_lines(
                 }
                 out.push(Line::default());
             }
+            TranscriptRowKind::CompactionSummary => {
+                out.push(note_line(NoteKind::Info, "Compaction summary"));
+                out.extend(agent_message_lines(&row.text, theme));
+                out.push(Line::default());
+            }
             TranscriptRowKind::EmptyOutput
             | TranscriptRowKind::ContextReset
             | TranscriptRowKind::SessionCleared
@@ -2326,9 +2331,18 @@ mod tests {
                 outcome: ElicitationOutcome::Accepted,
                 answers: vec![answer("Proceed?", "Yes"), answer("Mode", "Fast")],
             },
+            Event::ConversationCompactionSummary {
+                text: "kept the codeword".into(),
+            },
         ]);
         let out = joined(&transcript_lines(&t, &Theme::default(), None));
-        for want in ["working on it", "› Proceed?: Yes", "› Mode: Fast"] {
+        for want in [
+            "working on it",
+            "› Proceed?: Yes",
+            "› Mode: Fast",
+            "· Compaction summary",
+            "kept the codeword",
+        ] {
             assert!(out.contains(want), "{out:?}");
         }
         assert!(
