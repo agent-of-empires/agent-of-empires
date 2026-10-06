@@ -304,12 +304,16 @@ impl TranscriptModel {
                 TranscriptRowKind::SessionCleared,
                 "Conversation cleared, the model no longer remembers earlier turns.".to_string(),
             )],
-            Event::ConversationCompacted => vec![self.push(
-                format!("compacted-{seq}"),
-                TranscriptRowKind::Compacted,
-                "Conversation compacted; earlier turns above are summarised in the model's context."
-                    .to_string(),
-            )],
+            Event::ConversationCompacted => {
+                self.turn_has_output = true;
+                vec![self.push(
+                    format!("compacted-{seq}"),
+                    TranscriptRowKind::Compacted,
+                    "Conversation compacted; earlier turns above are summarised in the model's \
+                     context."
+                        .to_string(),
+                )]
+            }
             Event::ConversationCompactionSummary { text } => vec![self.push(
                 format!("compaction-summary-{seq}"),
                 TranscriptRowKind::CompactionSummary,
@@ -1375,6 +1379,8 @@ mod tests {
             (vec![chunk("hi")], false),
             (vec![Event::ThinkingStarted], false),
             (vec![runtime_error], false),
+            // A typed `/compact` streams no text; its divider is the output.
+            (vec![Event::ConversationCompacted], false),
         ];
         for (i, (mid, notice)) in cases.into_iter().enumerate() {
             let mut events = vec![prompt("/usage")];
