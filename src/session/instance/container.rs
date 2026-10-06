@@ -505,7 +505,10 @@ impl Instance {
             )
             .with_selected_agent(selected_agent.as_deref())
             .with_credential_fold(fold),
-            yolo_generation,
+            container_config::SandboxYolo {
+                enabled: self.is_yolo_mode(),
+                generation: yolo_generation,
+            },
             &self.id,
             self.workspace_info.as_ref(),
             &self.source_profile,

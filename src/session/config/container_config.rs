@@ -1355,7 +1355,7 @@ fn seed_content_roles(
                     path,
                     &mut content.as_bytes(),
                     std::fs::Permissions::from_mode(0o600),
-                    false,
+                    true,
                     None,
                 )?;
             }
@@ -2491,13 +2491,22 @@ fn validate_managed_container_environment(
     Ok(())
 }
 
+/// How a sandboxed launch reaches its agent's approval mechanism: whether the
+/// session asked for one, and which generation resolves the spelling when the
+/// agent declares two.
+#[derive(Default, Clone, Copy)]
+pub(crate) struct SandboxYolo {
+    pub(crate) enabled: bool,
+    pub(crate) generation: Option<crate::agents::AgentGeneration>,
+}
+
 /// Build a sandboxed container config with the selected profile's overrides.
 /// An empty profile uses the configured default.
 pub(crate) fn build_container_config(
     project_path_str: &str,
     sandbox_info: &SandboxInfo,
     agent_selection: ContainerAgentSelection<'_>,
-    yolo_generation: Option<crate::agents::AgentGeneration>,
+    yolo: SandboxYolo,
     instance_id: &str,
     workspace_info: Option<&crate::session::WorkspaceInfo>,
     profile: &str,
@@ -2951,7 +2960,7 @@ pub(crate) fn build_container_config(
                 value: value.to_string(),
             });
         }
-        if let Some(yolo_generation) = yolo_generation {
+        if let Some(yolo_generation) = yolo.generation {
             // A sandbox reaches the agent through its environment rather than a
             // command line, so the generation the caller resolved for this launch
             // decides which of the two reaches it. It comes from the same place
@@ -2980,7 +2989,7 @@ pub(crate) fn build_container_config(
         profile,
         instance_id,
         &workspace_path,
-        yolo_generation.is_some(),
+        yolo.enabled,
     );
 
     // Add extra_volumes from config (host:container format)
@@ -3207,6 +3216,7 @@ mod tests {
     struct Build<'a> {
         selection: ContainerAgentSelection<'a>,
         info: crate::session::instance::SandboxInfo,
+        yolo: bool,
         generation: Option<crate::agents::AgentGeneration>,
         instance: &'a str,
         profile: &'a str,
@@ -3217,6 +3227,7 @@ mod tests {
             Self {
                 selection,
                 info: test_sandbox_info(),
+                yolo: false,
                 generation: None,
                 instance: "test-instance-id",
                 profile: "",
@@ -3233,6 +3244,7 @@ mod tests {
         }
 
         fn yolo(mut self, yolo: bool) -> Self {
+            self.yolo = yolo;
             self.generation = yolo.then_some(crate::agents::AgentGeneration::Current);
             self
         }
@@ -3257,7 +3269,10 @@ mod tests {
                 project.to_str().unwrap(),
                 &self.info,
                 self.selection,
-                self.generation,
+                SandboxYolo {
+                    enabled: self.yolo,
+                    generation: self.generation,
+                },
                 self.instance,
                 None,
                 self.profile,
@@ -4571,7 +4586,7 @@ mod tests {
                 project_dir.path().to_str().unwrap(),
                 &sandbox_info,
                 ContainerAgentSelection::new("claude", None),
-                None,
+                SandboxYolo::default(),
                 instance_id,
                 None,
                 "",
@@ -4717,7 +4732,7 @@ mount_ssh = true
             project_path_str,
             &sandbox_info,
             ContainerAgentSelection::new("claude", None),
-            None,
+            SandboxYolo::default(),
             "test-instance-id",
             None,
             "",
@@ -4839,7 +4854,7 @@ extra_run_args = ["--privileged"]
             project_path_str,
             &sandbox_info,
             ContainerAgentSelection::new("claude", None),
-            None,
+            SandboxYolo::default(),
             "test-instance-id",
             None,
             "",
@@ -4895,7 +4910,7 @@ extra_run_args = ["--privileged"]
                 project_dir.path().to_str().unwrap(),
                 &sandbox_info,
                 ContainerAgentSelection::new("claude", None),
-                None,
+                SandboxYolo::default(),
                 "test-instance-id",
                 None,
                 "",
@@ -4958,7 +4973,7 @@ volume_ignores = ["**/bin", "**/obj", "target"]
             project_path_str,
             &sandbox_info,
             ContainerAgentSelection::new("claude", None),
-            None,
+            SandboxYolo::default(),
             "test-instance-id",
             None,
             "",
@@ -5046,7 +5061,7 @@ volume_ignores_strategy = "named"
                 project.to_str().unwrap(),
                 &sandbox_info,
                 ContainerAgentSelection::new("claude", None),
-                None,
+                SandboxYolo::default(),
                 "test-instance-id",
                 None,
                 "",
@@ -5178,7 +5193,7 @@ volume_ignores = ["node_modules"]
             worktree_path.to_str().unwrap(),
             &sandbox_info,
             ContainerAgentSelection::new("claude", None),
-            None,
+            SandboxYolo::default(),
             "test-instance-id",
             None,
             "",
@@ -5228,7 +5243,7 @@ volume_ignores = ["node_modules"]
             project_dir.path().to_str().unwrap(),
             &sandbox_info,
             ContainerAgentSelection::new("codex", None),
-            None,
+            SandboxYolo::default(),
             instance_id,
             None,
             "",
@@ -5299,7 +5314,7 @@ volume_ignores = ["node_modules"]
                     project_dir.path().to_str().unwrap(),
                     &sandbox_info,
                     ContainerAgentSelection::new("codex", None),
-                    None,
+                    SandboxYolo::default(),
                     instance_id,
                     None,
                     "",
@@ -5397,7 +5412,7 @@ volume_ignores = ["node_modules"]
                         projects[project].path().to_str().unwrap(),
                         &test_sandbox_info(),
                         ContainerAgentSelection::new(tool, None),
-                        None,
+                        SandboxYolo::default(),
                         &id,
                         None,
                         "",
@@ -5547,7 +5562,10 @@ volume_ignores = ["node_modules"]
                 project_dir.path().to_str().unwrap(),
                 &sandbox_info,
                 ContainerAgentSelection::new("claude", None),
-                is_yolo.then_some(crate::agents::AgentGeneration::Current),
+                SandboxYolo {
+                    enabled: is_yolo,
+                    generation: is_yolo.then_some(crate::agents::AgentGeneration::Current),
+                },
                 &instance_id,
                 None,
                 "",
@@ -5626,7 +5644,7 @@ claude-personal = "~/.claude-personal"
             project_dir.path().to_str().unwrap(),
             &sandbox_info,
             ContainerAgentSelection::new("claude-personal", Some("claude")),
-            None,
+            SandboxYolo::default(),
             instance_id,
             None,
             "",
@@ -5718,7 +5736,10 @@ codex-work = "{}"
             project_dir.path().to_str().unwrap(),
             &sandbox_info,
             ContainerAgentSelection::new("codex-work", Some("codex")),
-            Some(crate::agents::AgentGeneration::Current),
+            SandboxYolo {
+                enabled: true,
+                generation: Some(crate::agents::AgentGeneration::Current),
+            },
             instance_id,
             None,
             "",
@@ -5903,7 +5924,7 @@ codex-work = "{}"
             project_dir.path().to_str().unwrap(),
             &sandbox_info,
             ContainerAgentSelection::new("cursor", None),
-            None,
+            SandboxYolo::default(),
             "cursor-shadow-test",
             None,
             "",
@@ -5926,7 +5947,7 @@ codex-work = "{}"
             project_dir.path().to_str().unwrap(),
             &sandbox_info,
             ContainerAgentSelection::new("cursor", None),
-            None,
+            SandboxYolo::default(),
             "cursor-output-shadow",
             None,
             "",
@@ -5947,7 +5968,7 @@ codex-work = "{}"
             project_dir.path().to_str().unwrap(),
             &sandbox_info,
             ContainerAgentSelection::new("cursor", None),
-            None,
+            SandboxYolo::default(),
             "cursor-readonly",
             None,
             "",
@@ -5964,7 +5985,7 @@ codex-work = "{}"
             project_dir.path().to_str().unwrap(),
             &sandbox_info,
             ContainerAgentSelection::new("cursor", None),
-            None,
+            SandboxYolo::default(),
             "cursor-home-override",
             None,
             "",
@@ -6017,7 +6038,7 @@ codex-work = "{}"
                 project.path().to_str().unwrap(),
                 &sandbox_info,
                 ContainerAgentSelection::new(agent.name, None),
-                None,
+                SandboxYolo::default(),
                 &id,
                 None,
                 "",
@@ -6093,7 +6114,7 @@ codex-work = "{}"
                 project_dir.path().to_str().unwrap(),
                 &sandbox_info,
                 ContainerAgentSelection::new(agent.name, None),
-                None,
+                SandboxYolo::default(),
                 &instance_id,
                 None,
                 "",
@@ -6181,7 +6202,7 @@ codex-work = "{}"
                 container_workdir: None,
             },
             ContainerAgentSelection::new("cursor", None),
-            None,
+            SandboxYolo::default(),
             instance_id,
             None,
             profile,
@@ -6249,7 +6270,7 @@ codex-work = "{}"
                 container_workdir: None,
             },
             ContainerAgentSelection::new("kiro", None).with_selected_agent(Some("custom-agent")),
-            None,
+            SandboxYolo::default(),
             instance_id,
             None,
             "",
@@ -6369,7 +6390,7 @@ codex-work = "{}"
                 project_dir.path().to_str().unwrap(),
                 &test_sandbox_info(),
                 ContainerAgentSelection::new(tool, None),
-                None,
+                SandboxYolo::default(),
                 &instance_id,
                 None,
                 profile,
@@ -6438,7 +6459,7 @@ codex-work = "{}"
             project_dir.path().to_str().unwrap(),
             &sandbox_info,
             ContainerAgentSelection::new("codex", None),
-            None,
+            SandboxYolo::default(),
             instance_id,
             None,
             "",
@@ -6540,7 +6561,7 @@ trusted_hash = "keep"
                 project_dir.path().to_str().unwrap(),
                 &sandbox_info,
                 ContainerAgentSelection::new("codex", None),
-                None,
+                SandboxYolo::default(),
                 instance_id,
                 None,
                 "",
@@ -6639,7 +6660,7 @@ trusted_hash = "keep"
                 project_dir.path().to_str().unwrap(),
                 &sandbox_info,
                 ContainerAgentSelection::new("codex", None),
-                None,
+                SandboxYolo::default(),
                 instance_id,
                 None,
                 profile,
@@ -6914,7 +6935,7 @@ volume_ignores = ["target", "node_modules"]
             project_path_str,
             &sandbox_info,
             ContainerAgentSelection::new("claude", None),
-            None,
+            SandboxYolo::default(),
             "test-instance-id",
             None,
             "",
@@ -7006,7 +7027,7 @@ volume_ignores = ["target"]
             project_path_str,
             &sandbox_info,
             ContainerAgentSelection::new("claude", None),
-            None,
+            SandboxYolo::default(),
             "test-instance-id",
             None,
             "",
@@ -7457,7 +7478,7 @@ volume_ignores = ["target"]
             project_dir.path().to_str().unwrap(),
             &sandbox_info,
             ContainerAgentSelection::new("gemini", None),
-            None,
+            SandboxYolo::default(),
             instance_id,
             None,
             profile,
