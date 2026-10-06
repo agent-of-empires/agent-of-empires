@@ -381,7 +381,8 @@ pub(crate) fn truncate_bytes(s: &str, max: usize) -> &str {
 // the live worker for the same provider API.
 pub(crate) const ONESHOT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// Run the agent one-shot in the session's working directory, capturing stdout.
+/// Run the agent one-shot in the session's working directory, capturing stdout. The error is a
+/// user-facing reason: the agent's last error line on a non-zero exit, or the spawn/timeout cause.
 // ponytail: a hung in-container one-shot outlives its 60s timeout and is only reaped when the
 // container goes down.
 pub(crate) async fn run_oneshot(
@@ -389,14 +390,13 @@ pub(crate) async fn run_oneshot(
     argv: &[String],
     cwd: &str,
     timeout: std::time::Duration,
-) -> Option<String> {
+) -> Result<String, String> {
     use tokio::process::Command;
-    let mut cmd = Command::new(&argv[0]);
+    let program = &argv[0];
+    let mut cmd = Command::new(program);
     cmd.args(&argv[1..])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        // Capture stderr so a non-zero exit logs WHY (e.g. codex's "Not inside a trusted
-        // directory"); without it the failure is an opaque exit code.
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
     if !cwd.is_empty() {
@@ -406,36 +406,39 @@ pub(crate) async fn run_oneshot(
         Ok(c) => c,
         Err(e) => {
             tracing::debug!(target: "smart_rename", session = %session_id, "one-shot spawn failed: {e}");
-            return None;
+            return Err(format!("Couldn't start `{program}`: {e}"));
         }
     };
     match tokio::time::timeout(timeout, child.wait_with_output()).await {
         Ok(Ok(out)) if out.status.success() => {
-            Some(String::from_utf8_lossy(&out.stdout).into_owned())
+            Ok(String::from_utf8_lossy(&out.stdout).into_owned())
         }
         Ok(Ok(out)) => {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            let tail: String = stderr
-                .trim()
-                .chars()
-                .rev()
-                .take(300)
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
-                .collect();
-            tracing::debug!(target: "smart_rename", session = %session_id, code = ?out.status.code(), stderr = %tail, "one-shot exited non-zero");
-            None
+            let reason = last_error_line(&out.stderr)
+                .or_else(|| last_error_line(&out.stdout))
+                .unwrap_or_else(|| format!("exited with {}", out.status));
+            tracing::debug!(target: "smart_rename", session = %session_id, code = ?out.status.code(), reason = %reason, "one-shot exited non-zero");
+            Err(format!("`{program}` failed: {reason}"))
         }
         Ok(Err(e)) => {
             tracing::debug!(target: "smart_rename", session = %session_id, "one-shot io error: {e}");
-            None
+            Err(format!("`{program}` failed: {e}"))
         }
         Err(_) => {
             tracing::debug!(target: "smart_rename", session = %session_id, "one-shot timed out");
-            None
+            Err(format!(
+                "`{program}` timed out after {}s",
+                timeout.as_secs()
+            ))
         }
     }
+}
+
+/// Last non-blank line of a CLI's output with escape codes stripped, capped for display.
+fn last_error_line(bytes: &[u8]) -> Option<String> {
+    let text = strip_ansi(&String::from_utf8_lossy(bytes));
+    let line = text.lines().map(str::trim).rfind(|l| !l.is_empty())?;
+    Some(truncate_bytes(line, 300).to_string())
 }
 
 /// Where a one-shot runs for this session: the argv to spawn and the host working directory to
@@ -973,8 +976,7 @@ pub async fn run_terminal_rename(
         // un-attempted for a later idle edge.
         return Ok(());
     };
-    let Some(raw) = run_oneshot(session_id, &target.argv, &target.cwd, ONESHOT_TIMEOUT).await
-    else {
+    let Ok(raw) = run_oneshot(session_id, &target.argv, &target.cwd, ONESHOT_TIMEOUT).await else {
         // Transient failure (spawn / timeout / non-zero exit): leave the session
         // un-attempted so a later turn can retry.
         return Ok(());
@@ -1041,19 +1043,20 @@ mod serve {
         }
     }
 
-    /// Best-effort auto-rename of a structured-view session from its first turn.
+    /// Best-effort auto-rename of a structured-view session from its first turn. `Err` carries a
+    /// user-facing reason when the one-shot ran and produced no title; skips are `Ok`.
     pub async fn try_smart_rename(
         state: Arc<AppState>,
         session_id: String,
         input: SmartRenameInput,
         force: bool,
-    ) {
+    ) -> Result<(), String> {
         if input.first_user_prompt.trim().is_empty() {
-            return;
+            return Ok(());
         }
 
         if attempted_contains(&state, &session_id) {
-            return;
+            return Ok(());
         }
 
         let Some((
@@ -1085,7 +1088,7 @@ mod serve {
             })
         })
         else {
-            return;
+            return Ok(());
         };
 
         let resolved = crate::session::config::repo_config::resolve_config_with_repo_or_warn(
@@ -1113,27 +1116,26 @@ mod serve {
             Ok(agent) => agent,
             Err(reason) => {
                 tracing::debug!(target: "smart_rename", session = %session_id, tool = %tool, reason = reason.as_str(), "skip");
-                return;
+                return Ok(());
             }
         };
 
         let Some(_guard) = InflightGuard::acquire(&state.smart_rename_inflight, &session_id) else {
-            return;
+            return Ok(());
         };
 
         // Re-check attempted after taking the inflight slot: another task may have completed and
         // marked this session between the entry check and acquiring the guard.
         if attempted_contains(&state, &session_id) {
-            return;
+            return Ok(());
         }
 
         let prompt = build_prompt(&input.context);
         let model = OneshotModel::Title(resolve_title_model_args(agent, cfg.rename_model));
         let Some(argv) = build_oneshot_argv(agent, &prompt, model) else {
-            return;
+            return Ok(());
         };
 
-        // A spawn error, timeout, or non-zero exit returns None.
         let Some(target) = resolve_oneshot_target(
             &session_id,
             sandboxed,
@@ -1145,16 +1147,14 @@ mod serve {
         else {
             // Container not usable right now: transient, so leave the session
             // un-attempted for a later turn.
-            return;
+            return Ok(());
         };
         let raw = {
             let Ok(_permit) = state.smart_rename_semaphore.acquire().await else {
-                return;
+                return Ok(());
             };
-            run_oneshot(&session_id, &target.argv, &target.cwd, ONESHOT_TIMEOUT).await
-        };
-        let Some(raw) = raw else {
-            return;
+            // A failure leaves the session un-attempted so a later turn can retry.
+            run_oneshot(&session_id, &target.argv, &target.cwd, ONESHOT_TIMEOUT).await?
         };
 
         // The agent produced output (usable or not).
@@ -1164,17 +1164,18 @@ mod serve {
                 .lock()
                 .expect("smart_rename_attempted poisoned");
             if !attempted.insert(session_id.clone()) {
-                return;
+                return Ok(());
             }
         }
         let Some(new_title) = sanitize_title(&raw, &input.first_user_prompt) else {
             tracing::debug!(target: "smart_rename", session = %session_id, "skip: agent output not a usable title");
-            return;
+            return Err("The agent's reply was not a usable title".to_string());
         };
 
         // Serialization against manual rename / worktree edits is handled
         // inside apply_auto_title via the per-session instance lock.
         apply_auto_title(&state, &session_id, &profile, &new_title, force).await;
+        Ok(())
     }
 
     /// Persist a generated title and mirror it into AppState. Without `force`, a manual rename that
@@ -1341,19 +1342,33 @@ mod serve {
         }
 
         #[tokio::test]
-        async fn run_oneshot_returns_none_on_spawn_failure() {
-            // A failed spawn must surface as None so try_smart_rename leaves the session
-            // un-attempted and a later prompt can retry.
-            let argv = vec![
-                "aoe-smart-rename-nonexistent-binary-xyz".to_string(),
-                "-p".to_string(),
-                "title this".to_string(),
+        async fn run_oneshot_failure_carries_the_agent_reason() {
+            let argv = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+            let cases = [
+                (
+                    argv(&["aoe-smart-rename-nonexistent-binary-xyz", "-p", "x"]),
+                    "Couldn't start `aoe-smart-rename-nonexistent-binary-xyz`",
+                ),
+                // opencode's shape: an ANSI-colored error as the last stderr line.
+                (
+                    argv(&[
+                        "sh",
+                        "-c",
+                        r#"printf '\033[0m\n\033[91mError: \033[0mtoken invalidated\n\033[0m' >&2; exit 1"#,
+                    ]),
+                    "`sh` failed: Error: token invalidated",
+                ),
+                (
+                    argv(&["sh", "-c", "echo nope; exit 1"]),
+                    "`sh` failed: nope",
+                ),
             ];
-            assert!(
-                run_oneshot("test-session", &argv, "", Duration::from_secs(60))
+            for (argv, want) in cases {
+                let err = run_oneshot("test-session", &argv, "", Duration::from_secs(60))
                     .await
-                    .is_none()
-            );
+                    .unwrap_err();
+                assert!(err.starts_with(want), "{err:?} should start with {want:?}");
+            }
         }
 
         #[test]

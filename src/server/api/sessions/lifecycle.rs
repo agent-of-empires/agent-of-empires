@@ -700,8 +700,8 @@ pub async fn restore_session(
 
 /// `POST /api/sessions/:id/smart-rename`. Manual "Auto-name now" for a
 /// structured session: clears the per-session attempted gate and regenerates the
-/// title from the first prompt, even over one already chosen. The rename runs
-/// detached and best-effort: a `202` means "re-run started", not "renamed".
+/// title from the first prompt, even over one already chosen. Waits for the
+/// one-shot so a failure reaches the caller as a `502` with the agent's reason.
 pub async fn force_smart_rename(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -817,7 +817,7 @@ pub async fn force_smart_rename(
         attempted.remove(&id);
     }
 
-    tokio::spawn(crate::session::smart_rename::try_smart_rename(
+    match crate::session::smart_rename::try_smart_rename(
         state.clone(),
         id.clone(),
         crate::session::smart_rename::SmartRenameInput {
@@ -826,8 +826,12 @@ pub async fn force_smart_rename(
         },
         // Manual action forces past the smart_rename-disabled gate (#3039).
         true,
-    ));
-    StatusCode::ACCEPTED.into_response()
+    )
+    .await
+    {
+        Ok(()) => StatusCode::OK.into_response(),
+        Err(reason) => api_error(StatusCode::BAD_GATEWAY, "smart_rename_failed", reason),
+    }
 }
 
 /// On-demand "summarize the conversation so far" for a structured-view session.

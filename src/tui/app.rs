@@ -129,6 +129,8 @@ pub struct App {
     pending_view_switch: Option<String>,
     pending_daemon_start_open: Option<String>,
     pending_smart_rename: Option<String>,
+    /// Outcome line of an in-flight "Auto-name now", which waits for the agent's one-shot.
+    smart_rename_rx: Option<tokio::sync::oneshot::Receiver<String>>,
     /// Debounce for structured preview-on-select, so fast navigation doesn't
     /// connect a WebSocket per keystroke.
     preview_mount_pending: Option<(String, std::time::Instant)>,
@@ -342,6 +344,7 @@ impl App {
             preview_mount_pending: None,
             pending_view_switch: None,
             pending_smart_rename: None,
+            smart_rename_rx: None,
             pending_install_version: None,
             last_installed_version_in_session: None,
         })
@@ -1177,7 +1180,8 @@ impl App {
             let banner_changed = self.poll_update_check()
                 | self.poll_update_status()
                 | self.poll_image_update_check()
-                | self.poll_image_pull_status();
+                | self.poll_image_pull_status()
+                | self.poll_smart_rename();
             if banner_changed {
                 self.needs_redraw = true;
                 full = true;
@@ -2134,10 +2138,33 @@ impl App {
                 return;
             }
         };
-        self.set_status(match http.smart_rename(session_id).await {
-            Ok(()) => format!("auto-naming \"{title}\"…"),
-            Err(e) => format!("auto-name failed: {e}"),
+        self.set_status(format!("auto-naming \"{title}\"…"));
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.smart_rename_rx = Some(rx);
+        let session_id = session_id.to_string();
+        tokio::spawn(async move {
+            if let Err(e) = http.smart_rename(&session_id).await {
+                let _ = tx.send(format!("auto-name failed: {e}"));
+            }
         });
+    }
+
+    /// Surfaces a failed "Auto-name now"; success shows as the new title.
+    fn poll_smart_rename(&mut self) -> bool {
+        let Some(mut rx) = self.smart_rename_rx.take() else {
+            return false;
+        };
+        match rx.try_recv() {
+            Ok(failure) => {
+                self.set_status(failure);
+                true
+            }
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+                self.smart_rename_rx = Some(rx);
+                false
+            }
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => false,
+        }
     }
 
     /// POST the view switch, starting a local daemon first if needed: the user
