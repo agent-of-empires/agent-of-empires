@@ -792,31 +792,12 @@ pub async fn create_session(
             return api_error(StatusCode::BAD_REQUEST, "validation_failed", msg);
         }
     }
-    if let Some(ref profile_name) = body.profile {
-        // Every profile is a real directory under profiles/. Distinguish an
-        // enumeration failure from a missing profile so the client does not see
-        // a 400 when the real problem is server-side.
-        let known = match crate::session::list_profiles() {
-            Ok(list) => list,
-            Err(e) => {
-                tracing::error!(
-                    target: "server.sessions",
-                    "failed to enumerate profiles while validating create_session: {e:#}"
-                );
-                return api_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "internal_error",
-                    format!("Failed to enumerate profiles: {e}"),
-                );
-            }
-        };
-        if !known.contains(profile_name) {
-            return api_error(
-                StatusCode::BAD_REQUEST,
-                "profile_not_found",
-                format!("Profile '{}' does not exist", profile_name),
-            );
-        }
+    if let Some(resp) = body
+        .profile
+        .as_deref()
+        .and_then(crate::server::api::unknown_profile_response)
+    {
+        return resp;
     }
 
     let validation_profile = body.profile.as_deref().unwrap_or(&state.profile);

@@ -112,6 +112,7 @@ export function ProjectStep({ data, onChange, initialTab, agents = [], onSelectS
       {!loading && activeTab === "import" && importAgents.length > 0 && (
         <ImportSessionPicker
           agents={importAgents}
+          profile={data.profile || undefined}
           onSelect={handleImportSelect}
           selectedSessionId={data.importAcpSessionId}
         />

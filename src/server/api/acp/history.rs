@@ -284,6 +284,8 @@ pub async fn acp_replay(
 #[derive(Debug, Deserialize)]
 pub struct ImportableSessionsQuery {
     pub agent: String,
+    /// The wizard's selected profile, so the list reads the store create will re-list from.
+    pub profile: Option<String>,
 }
 
 /// Native sessions `agent` can import, newest first, minus the ones AoE owns. Claude reads its
@@ -341,7 +343,11 @@ pub async fn list_importable_sessions(
     if let Some(resp) = read_only_block(&state) {
         return resp;
     }
-    match importable_sessions(&state, &q.agent, &state.profile).await {
+    let profile = q.profile.as_deref().filter(|p| !p.is_empty());
+    if let Some(resp) = profile.and_then(crate::server::api::unknown_profile_response) {
+        return resp;
+    }
+    match importable_sessions(&state, &q.agent, profile.unwrap_or(&state.profile)).await {
         Ok(list) => Json(list).into_response(),
         Err(e) => list_error_response(e),
     }
@@ -457,6 +463,7 @@ mod tests {
         let state = crate::server::test_support::build_test_app_state(Vec::new());
         let q = ImportableSessionsQuery {
             agent: "not-an-agent".into(),
+            profile: None,
         };
         let resp = list_importable_sessions(State(state), axum::extract::Query(q))
             .await
@@ -466,13 +473,31 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
-    async fn importable_sessions_never_launches_a_denied_agent() {
+    async fn importable_sessions_lists_the_selected_profile_and_never_launches_a_denied_agent() {
         let tmp = tempfile::tempdir().unwrap();
         let bin = tmp.path().join("bin");
         std::fs::create_dir_all(&bin).unwrap();
         let ran = tmp.path().join("ran");
         let pi_acp = bin.join("pi-acp");
-        std::fs::write(&pi_acp, format!("#!/bin/sh\ntouch '{}'\n", ran.display())).unwrap();
+        std::fs::write(
+            &pi_acp,
+            format!(
+                r#"#!/bin/sh
+touch '{}'
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -En 's/.*"id":("[^"]*"|[0-9]+).*/\1/p')
+  case $line in
+    *'"method":"initialize"'*)
+      printf '{{"jsonrpc":"2.0","id":%s,"result":{{"protocolVersion":1,"agentCapabilities":{{"loadSession":true,"sessionCapabilities":{{"list":{{}}}}}}}}}}\n' "$id" ;;
+    *'"method":"session/list"'*)
+      printf '{{"jsonrpc":"2.0","id":%s,"result":{{"sessions":[{{"sessionId":"s","cwd":"%s"}}]}}}}\n' "$id" "$PI_CODING_AGENT_DIR" ;;
+  esac
+done
+"#,
+                ran.display()
+            ),
+        )
+        .unwrap();
         std::fs::set_permissions(
             &pi_acp,
             <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
@@ -483,18 +508,51 @@ mod tests {
         )
         .unwrap();
         let _env = crate::session::test_support::isolate_home(tmp.path()).and_set("PATH", path);
+        for name in ["a", "b"] {
+            let profile: crate::session::config::profile_config::ProfileConfig = toml::from_str(
+                &format!(r#"environment = ["PI_CODING_AGENT_DIR=/stores/{name}"]"#),
+            )
+            .unwrap();
+            crate::session::config::profile_config::save_profile_config(name, &profile).unwrap();
+        }
+
+        let state = crate::server::test_support::build_test_app_state(Vec::new());
+        let get = |profile: &str| {
+            let q = ImportableSessionsQuery {
+                agent: "pi".into(),
+                profile: Some(profile.into()),
+            };
+            let state = state.clone();
+            async move {
+                let resp = list_importable_sessions(State(state), axum::extract::Query(q))
+                    .await
+                    .into_response();
+                let status = resp.status();
+                let bytes = axum::body::to_bytes(resp.into_body(), 1 << 16)
+                    .await
+                    .unwrap();
+                let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                (status, body)
+            }
+        };
+        for name in ["a", "b"] {
+            let (status, body) = get(name).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body["sessions"][0]["cwd"], format!("/stores/{name}"));
+        }
+        let (status, body) = get("missing").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], "profile_not_found");
+
         crate::session::config::update_config(|c| {
             c.acp.restrict_agents = true;
             c.acp.allowed_agents = vec!["claude".to_string()];
         })
         .unwrap();
-
-        let state = crate::server::test_support::build_test_app_state(Vec::new());
-        let q = ImportableSessionsQuery { agent: "pi".into() };
-        let resp = list_importable_sessions(State(state), axum::extract::Query(q))
-            .await
-            .into_response();
-        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        std::fs::remove_file(&ran).unwrap();
+        let (status, body) = get("a").await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["error"], "agent_not_allowed");
         assert!(!ran.exists(), "a denied adapter must not be spawned");
     }
 

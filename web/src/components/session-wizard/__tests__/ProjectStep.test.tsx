@@ -44,8 +44,11 @@ afterEach(() => {
 function renderStep(data: Partial<WizardData> = {}, props: { initialTab?: "import"; agents?: AgentInfo[] } = {}) {
   const onChange = vi.fn();
   const onPicked = vi.fn();
-  render(<ProjectStep data={{ ...initialData, ...data }} onChange={onChange} onPicked={onPicked} {...props} />);
-  return { onChange, onPicked };
+  const step = (d: Partial<WizardData>) => (
+    <ProjectStep data={{ ...initialData, ...d }} onChange={onChange} onPicked={onPicked} {...props} />
+  );
+  const { rerender } = render(step(data));
+  return { onChange, onPicked, rerender: (d: Partial<WizardData>) => rerender(step(d)) };
 }
 
 const sessions = (...list: ReturnType<typeof mockSession>[]) =>
@@ -255,10 +258,10 @@ describe("Import session tab", () => {
     renderImport("", [PI, CLAUDE]);
     await screen.findByText("Fix the spinner bug");
     expect(agentSelect().value).toBe("claude");
-    expect(listImportableSessions).toHaveBeenLastCalledWith("claude");
+    expect(listImportableSessions).toHaveBeenLastCalledWith("claude", undefined);
 
     fireEvent.change(agentSelect(), { target: { value: "pi" } });
-    await waitFor(() => expect(listImportableSessions).toHaveBeenLastCalledWith("pi"));
+    await waitFor(() => expect(listImportableSessions).toHaveBeenLastCalledWith("pi", undefined));
     cleanup();
 
     renderImport("", [PI, CLAUDE]);
@@ -270,6 +273,14 @@ describe("Import session tab", () => {
     renderImport("", [PI]);
     await screen.findByText("Fix the spinner bug");
     expect(agentSelect().value).toBe("pi");
+  });
+
+  it("lists from the selected profile and relists when it changes", async () => {
+    const { rerender } = renderStep({ profile: "work" }, { initialTab: "import", agents: [CLAUDE] });
+    await screen.findByText("Fix the spinner bug");
+    expect(listImportableSessions).toHaveBeenLastCalledWith("claude", "work");
+    rerender({ profile: "home" });
+    await waitFor(() => expect(listImportableSessions).toHaveBeenLastCalledWith("claude", "home"));
   });
 
   it("says when the agent cannot list or the list was cut", async () => {

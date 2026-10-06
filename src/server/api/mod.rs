@@ -195,6 +195,32 @@ pub(crate) async fn agent_policy() -> crate::acp::agent_policy::AgentPolicy {
         })
 }
 
+/// The error response when `name` is not an existing profile. Every profile is a real directory
+/// under profiles/; an enumeration failure is a 500, not a client 400.
+pub(crate) fn unknown_profile_response(name: &str) -> Option<Response> {
+    let known = match crate::session::list_profiles() {
+        Ok(list) => list,
+        Err(e) => {
+            tracing::error!(
+                target: "server.sessions",
+                "failed to enumerate profiles while validating a profile: {e:#}"
+            );
+            return Some(api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                format!("Failed to enumerate profiles: {e}"),
+            ));
+        }
+    };
+    (!known.iter().any(|p| p == name)).then(|| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "profile_not_found",
+            format!("Profile '{name}' does not exist"),
+        )
+    })
+}
+
 /// 404 when the instance vanished between persisting a write and applying it.
 pub(super) fn session_gone_after_persist() -> Response {
     api_error(

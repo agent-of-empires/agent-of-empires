@@ -23,29 +23,35 @@ function activityWarning(s: ImportableSession): string | null {
 /** Lists one agent's native sessions to import; ones whose cwd is gone cannot be resumed. */
 export function ImportSessionPicker({
   agents,
+  profile,
   onSelect,
   selectedSessionId,
 }: {
   agents: string[];
+  profile?: string;
   onSelect: (session: ImportableSession, agent: string) => void;
   selectedSessionId?: string;
 }) {
   const [agent, setAgent] = useState(() => initialAgent(agents));
-  const [loaded, setLoaded] = useState<{ agent: string; result: ImportableSessionsResult } | null>(null);
-  const result = loaded?.agent === agent ? loaded.result : null;
+  const [loaded, setLoaded] = useState<{
+    agent: string;
+    profile?: string;
+    result: ImportableSessionsResult;
+  } | null>(null);
+  const result = loaded?.agent === agent && loaded.profile === profile ? loaded.result : null;
   const [filter, setFilter] = useState("");
   // Missing-cwd sessions are hidden until toggled, then shown disabled.
   const [showMissing, setShowMissing] = useState(false);
 
   useEffect(() => {
     let active = true;
-    listImportableSessions(agent).then((r) => {
-      if (active) setLoaded({ agent, result: r });
+    listImportableSessions(agent, profile).then((r) => {
+      if (active) setLoaded({ agent, profile, result: r });
     });
     return () => {
       active = false;
     };
-  }, [agent]);
+  }, [agent, profile]);
 
   const sessions = useMemo(() => (result?.ok ? result.sessions : []), [result]);
   const hasMissing = sessions.some((s) => !s.cwd_exists);

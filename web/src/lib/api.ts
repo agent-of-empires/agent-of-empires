@@ -1329,9 +1329,11 @@ export type ImportableSessionsResult =
   | { ok: true; sessions: ImportableSession[]; truncated: boolean }
   | { ok: false; error: string; message: string };
 
-/** Native sessions `agent` can import, newest first, for the import picker. */
-export async function listImportableSessions(agent: string): Promise<ImportableSessionsResult> {
-  const reply = await send(`/api/importable-sessions?agent=${encodeURIComponent(agent)}`).catch(() => null);
+/** Native sessions `agent` can import under `profile`, newest first, for the import picker. */
+export async function listImportableSessions(agent: string, profile?: string): Promise<ImportableSessionsResult> {
+  const params = new URLSearchParams({ agent });
+  if (profile) params.set("profile", profile);
+  const reply = await send(`/api/importable-sessions?${params}`).catch(() => null);
   if (!reply) return { ok: false, error: "network", message: "Network error" };
   const payload = reply.payload ?? {};
   if (!reply.ok) {
