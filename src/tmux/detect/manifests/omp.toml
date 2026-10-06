@@ -220,7 +220,7 @@ contains_any = ["error: retry budget exhausted", "error: retry failed after"]
 [[rules]]
 id = "panel_prompt"
 state = "waiting"
-priority = 960
+priority = 970
 positional = true
 region = "bottom_non_empty_lines(8)"
 visible = true

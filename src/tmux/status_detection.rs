@@ -2907,6 +2907,32 @@ Final prose line.\n";
 
         let terminal = "Error: Retry budget exhausted after 10 retries";
         let hint = "Processing… ⟦esc⟧";
+        let prompt_footer = "│ Enter submit · ↑/↓ scroll · Esc              │\n╰──────────────────────────────────────────────╯";
+        let loader = "⠹ Reading audit fixtures ⟨esc⟩";
+        for (name, pane, expected) in [
+            (
+                "newer prompt after loader",
+                format!("{loader}\n{prompt_footer}"),
+                Status::Waiting,
+            ),
+            (
+                "newer loader after prompt",
+                format!("{prompt_footer}\n{loader}"),
+                Status::Running,
+            ),
+            (
+                "newer prompt after error",
+                format!("{terminal}\n{prompt_footer}"),
+                Status::Waiting,
+            ),
+            (
+                "newer error after prompt",
+                format!("{prompt_footer}\n{terminal}"),
+                Status::Error,
+            ),
+        ] {
+            cases.push((name.to_string(), pane, expected));
+        }
         for (name, pane, expected) in [
             (
                 "newer interrupt after error",
