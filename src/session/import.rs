@@ -39,7 +39,7 @@ impl ImportableSession {
         }
     }
 
-    fn updated_at_parsed(&self) -> Option<chrono::DateTime<chrono::FixedOffset>> {
+    pub fn updated_at_parsed(&self) -> Option<chrono::DateTime<chrono::FixedOffset>> {
         chrono::DateTime::parse_from_rfc3339(self.updated_at.as_deref()?).ok()
     }
 }
@@ -107,13 +107,18 @@ pub fn retain_importable(
     source_truncated: bool,
 ) -> ImportableList {
     sessions.retain(|s| !owned.excludes(&s.session_id, &s.cwd));
-    sessions.sort_by_cached_key(|s| std::cmp::Reverse(s.updated_at_parsed()));
+    sort_newest_first(&mut sessions);
     let truncated = source_truncated || sessions.len() > MAX_SESSIONS;
     sessions.truncate(MAX_SESSIONS);
     ImportableList {
         sessions,
         truncated,
     }
+}
+
+/// Newest first; unknown or unparsable activity sorts last.
+pub fn sort_newest_first(sessions: &mut [ImportableSession]) {
+    sessions.sort_by_cached_key(|s| std::cmp::Reverse(s.updated_at_parsed()));
 }
 
 /// Literal directory tokens derived from the worktree path templates, e.g. `"-worktrees"` from

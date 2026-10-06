@@ -10,7 +10,9 @@ use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 use super::handshake::build_initialize_request;
 use super::spawn::{spawn_subprocess, SpawnConfig};
-use crate::session::import::{ImportableList, ImportableSession, Owned, MAX_SESSIONS};
+use crate::session::import::{
+    sort_newest_first, ImportableList, ImportableSession, Owned, MAX_SESSIONS,
+};
 
 /// Bound on `initialize` and on each `session/list` page.
 const STEP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -84,6 +86,10 @@ async fn list_pages(
 
     let mut sessions = Vec::new();
     let mut cursor: Option<String> = None;
+    // ACP does not order `session/list`. Stopping at the cap is only safe while
+    // pages arrive newest first; otherwise every page is fetched and sorted.
+    let mut newest_first = true;
+    let mut oldest_seen = None;
     loop {
         let page = tokio::time::timeout(
             step_timeout,
@@ -95,22 +101,28 @@ async fn list_pages(
         .map_err(|_| ListSessionsError::Timeout("session/list"))?
         .map_err(failed)?;
         let page_empty = page.sessions.is_empty();
-        sessions.extend(
-            page.sessions
-                .into_iter()
-                .map(|s| {
-                    ImportableSession::new(
-                        s.session_id.0.to_string(),
-                        s.cwd.to_string_lossy().into_owned(),
-                        s.title,
-                        s.updated_at,
-                    )
-                })
-                .filter(|s| !owned.excludes(&s.session_id, &s.cwd)),
-        );
+        for info in page.sessions {
+            let s = ImportableSession::new(
+                info.session_id.0.to_string(),
+                info.cwd.to_string_lossy().into_owned(),
+                info.title,
+                info.updated_at,
+            );
+            if let Some(at) = s.updated_at_parsed() {
+                newest_first &= oldest_seen.is_none_or(|oldest| at <= oldest);
+                oldest_seen = Some(at);
+            }
+            if !owned.excludes(&s.session_id, &s.cwd) {
+                sessions.push(s);
+            }
+        }
         let more = page.next_cursor.is_some();
-        if sessions.len() >= MAX_SESSIONS || !more || page_empty {
+        let capped = newest_first && sessions.len() >= MAX_SESSIONS;
+        if capped || !more || page_empty {
             let truncated = sessions.len() > MAX_SESSIONS || (more && !page_empty);
+            if !newest_first {
+                sort_newest_first(&mut sessions);
+            }
             sessions.truncate(MAX_SESSIONS);
             return Ok(ImportableList {
                 sessions,
@@ -130,13 +142,32 @@ mod tests {
     /// with `init_caps`. Page `N` (cursor `N`, first page `0`) returns `page_size` entries, with
     /// `nextCursor` until `pages` pages were served. `stall` names a method left unanswered.
     fn stub(dir: &std::path::Path, init_caps: &str, page_size: u32, pages: u32, stall: &str) {
+        stub_stamped(
+            dir,
+            init_caps,
+            page_size,
+            pages,
+            stall,
+            "2026-01-01T00:00:00Z",
+        );
+    }
+
+    /// `stamp` is the shell expression for entry `$i`'s `updatedAt`.
+    fn stub_stamped(
+        dir: &std::path::Path,
+        init_caps: &str,
+        page_size: u32,
+        pages: u32,
+        stall: &str,
+        stamp: &str,
+    ) {
         let log = dir.join("requests.log");
         let script = format!(
             r#"#!/bin/sh
 entries() {{
   i=$1; end=$(($1+$2)); out=''
   while [ $i -lt $end ]; do
-    out="$out{{\"sessionId\":\"s$i\",\"cwd\":\"/p/$i\",\"title\":\"t$i\",\"updatedAt\":\"2026-01-01T00:00:00Z\"}},"
+    out="$out{{\"sessionId\":\"s$i\",\"cwd\":\"/p/$i\",\"title\":\"t$i\",\"updatedAt\":\"{stamp}\"}},"
     i=$((i+1))
   done
   printf '%s' "${{out%,}}"
@@ -231,6 +262,21 @@ done
             .collect();
         assert!(lists.iter().all(|r| r["params"].get("cwd").is_none()));
         assert_eq!(lists[1]["params"]["cursor"], "1");
+    }
+
+    #[tokio::test]
+    async fn out_of_order_pages_are_all_fetched_before_the_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let oldest_first = r#"$(printf '2026-01-01T%02d:%02d:00Z' $((i/60)) $((i%60)))"#;
+        stub_stamped(dir.path(), LISTING, 100, 3, "none", oldest_first);
+        let list = run(dir.path()).await.unwrap();
+        let mut expected = vec!["initialize".to_string()];
+        expected.extend(std::iter::repeat_n("session/list".to_string(), 3));
+        assert_eq!(methods(dir.path()), expected);
+        assert_eq!(list.sessions.len(), MAX_SESSIONS);
+        assert_eq!(list.sessions[0].session_id, "s299");
+        assert_eq!(list.sessions[MAX_SESSIONS - 1].session_id, "s100");
+        assert!(list.truncated);
     }
 
     #[tokio::test]
