@@ -34,6 +34,7 @@ jobs:
               '.github/actions/rust-toolchain/',
             ];
             const exact = [
+              'src/session/config/container_config.rs',
               'src/session/instance/container.rs',
               'src/session/sandbox_store_reclaim.rs',
               'build.rs', 'Cargo.lock', 'rust-toolchain.toml',
@@ -44,9 +45,13 @@ jobs:
             const files = await github.paginate(github.rest.pulls.listFiles, {
               ...context.repo, pull_number: context.payload.pull_request.number, per_page: 100,
             });
+            // GitHub caps this endpoint at 3,000 files.
+            if (files.length >= 3000) {
+              core.setOutput('macos', 'true');
+              return;
+            }
             const hit = files.find(f =>
               sensitive(f.filename) || sensitive(f.previous_filename) ||
-              // Omitted patches cannot rule out macOS changes.
               !f.patch || f.patch.split('\n').some(line =>
                 /^[+-](?![+-]{2} )/.test(line) && cfg.test(line)));
             if (hit) core.info(`${hit.filename} is macOS-sensitive`);
