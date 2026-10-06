@@ -226,6 +226,16 @@ test.describe("Cmd/Ctrl+` desktop", () => {
     }
     await expect.poll(() => focusedKind(page)).toBe("paired");
   });
+  test("Ctrl+Q returns focus from the terminal to the active sidebar row", async ({ page }) => {
+    await mockTerminalApis(page);
+    await page.goto("/");
+    await openSession(page);
+    await focusKind(page, "agent");
+
+    const activeRow = page.getByRole("navigation", { name: "Sessions sidebar" }).locator('[aria-current="page"]');
+    await page.keyboard.press("Control+q");
+    await expect(activeRow).toBeFocused();
+  });
 
   // (The xterm-only `term-focused` panel CSS ring was removed with the xterm
   // renderer; focus correctness is covered by the focusedKind() assertions

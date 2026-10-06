@@ -19,6 +19,8 @@ export const IS_MAC = typeof navigator !== "undefined" && /Mac|iPhone|iPad|iPod/
 
 export interface ShortcutActions {
   onNew: () => void;
+  /** Focus the active session row in the sidebar. */
+  onFocusSidebar: () => void;
   /** Select the next session that needs attention, in sidebar order. */
   onJumpToAttention: () => void;
   /** Fast-path: opens the wizard pre-configured for a scratch session
@@ -37,6 +39,7 @@ export interface ShortcutActions {
 export type ShortcutId =
   | "palette"
   | "sidebar"
+  | "sidebarFocus"
   | "rightPanel"
   | "terminalFocus"
   | "new"
@@ -50,6 +53,7 @@ export type ShortcutId =
 /** The display model: which modifier glyphs to show, plus the base label. */
 export interface ShortcutChord {
   mod?: boolean;
+  ctrl?: boolean;
   alt?: boolean;
   shift?: boolean;
   base: string;
@@ -57,13 +61,15 @@ export interface ShortcutChord {
 
 interface ShortcutTrigger {
   /**
-   * `global` shortcuts fire even when an input/textarea/terminal is focused.
-   * `textless` shortcuts fire only when no input is focused and no
+   * "global" shortcuts fire even when an input/textarea/terminal is focused.
+   * "sessionInput" shortcuts fire while an embedded terminal or structured composer owns focus.
+   * "textless" shortcuts fire only when no input is focused and no
    * meta/ctrl/alt is held (shift is allowed, e.g. Shift+/ to type "?").
    */
-  scope: "global" | "textless";
-  /** Logical mod: metaKey on Mac, metaKey OR ctrlKey elsewhere. */
+  scope: "global" | "sessionInput" | "textless";
   mod?: boolean;
+  ctrl?: boolean;
+  meta?: boolean;
   shift?: boolean;
   alt?: boolean;
   /** Layout-stable physical key. Preferred for letter combos. */
@@ -117,6 +123,22 @@ export const SHORTCUTS: readonly ShortcutDef[] = [
       shift: false,
       alt: false,
       code: "KeyB",
+      preventDefault: true,
+      stopPropagation: true,
+    },
+  },
+  {
+    id: "sidebarFocus",
+    action: "onFocusSidebar",
+    description: "Focus session list from session input",
+    chord: { ctrl: true, base: "Q" },
+    trigger: {
+      scope: "sessionInput",
+      ctrl: true,
+      meta: false,
+      shift: false,
+      alt: false,
+      code: "KeyQ",
       preventDefault: true,
       stopPropagation: true,
     },
@@ -252,6 +274,7 @@ export const SHORTCUTS_BY_ID: Record<ShortcutId, ShortcutDef> = Object.fromEntri
 function modifierGlyphs(chord: ShortcutChord, mac: boolean): string[] {
   const parts: string[] = [];
   if (chord.mod) parts.push(mac ? "⌘" : "Ctrl");
+  if (chord.ctrl) parts.push(mac ? "⌃" : "Ctrl");
   if (chord.alt) parts.push(mac ? "⌥" : "Alt");
   if (chord.shift) parts.push(mac ? "⇧" : "Shift");
   return parts;
@@ -297,6 +320,8 @@ export interface MatchedShortcut {
 
 function globalMatches(e: ShortcutKeyEvent, t: ShortcutTrigger, mod: boolean): boolean {
   if (t.mod !== undefined && t.mod !== mod) return false;
+  if (t.ctrl !== undefined && t.ctrl !== e.ctrlKey) return false;
+  if (t.meta !== undefined && t.meta !== e.metaKey) return false;
   if (t.shift !== undefined && t.shift !== e.shiftKey) return false;
   if (t.alt !== undefined && t.alt !== e.altKey) return false;
   if (t.code !== undefined) return e.code === t.code;
@@ -321,13 +346,19 @@ function toMatched(shortcut: ShortcutDef): MatchedShortcut {
  */
 export function matchShortcut(
   e: ShortcutKeyEvent,
-  { mac, isInput }: { mac: boolean; isInput: boolean },
+  { mac, isInput, isSessionInput = false }: { mac: boolean; isInput: boolean; isSessionInput?: boolean },
 ): MatchedShortcut | null {
   const mod = mac ? e.metaKey : e.metaKey || e.ctrlKey;
 
   for (const s of SHORTCUTS) {
     if (s.trigger.scope !== "global") continue;
     if (globalMatches(e, s.trigger, mod)) return toMatched(s);
+  }
+
+  if (isSessionInput) {
+    for (const s of SHORTCUTS) {
+      if (s.trigger.scope === "sessionInput" && globalMatches(e, s.trigger, mod)) return toMatched(s);
+    }
   }
 
   if (isInput) return null;

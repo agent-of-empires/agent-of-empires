@@ -1491,6 +1491,8 @@ export const SessionRow = memo(function SessionRow({
         href={sessionPath}
         tabIndex={isDeleting ? -1 : undefined}
         aria-disabled={isDeleting || undefined}
+        aria-current={isActive && sessionPath === window.location.pathname ? "page" : undefined}
+        data-active-session-row={isActive || undefined}
         data-testid="sidebar-session-row"
         title={needsAttention ? `${label} · ${attentionHint}` : label}
         draggable={false}
@@ -1528,7 +1530,7 @@ export const SessionRow = memo(function SessionRow({
             : "border-l-2 border-transparent hover:bg-surface-700/40"
         } ${
           isSelected ? "ring-1 ring-inset ring-brand-500/60 bg-brand-500/10" : ""
-        } ${isDeleting ? "opacity-50 pointer-events-none" : ""}`}
+        } ${isDeleting ? "opacity-50 pointer-events-none" : ""} focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-brand-500`}
       >
         {isSelected && <span className="sr-only">Selected</span>}
         <div className="flex items-center gap-2">
@@ -3639,9 +3641,12 @@ export function WorkspaceSidebar({
       />
       <div
         {...tourAnchor(TOUR_ANCHORS.sidebar)}
+        role="navigation"
+        aria-label="Sessions sidebar"
+        tabIndex={-1}
         style={{ width: effectiveWidth }}
         data-compact={compact ? "true" : undefined}
-        className={`fixed top-12 bottom-0 z-40 md:static md:z-auto bg-surface-800 border-surface-700/60 flex flex-col md:h-full shrink-0 transition-transform duration-300 ease-in-out md:transition-none ${
+        className={`fixed top-12 bottom-0 z-40 md:static md:z-auto bg-surface-800 border-surface-700/60 flex flex-col md:h-full shrink-0 transition-transform duration-300 ease-in-out md:transition-none focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-brand-500 ${
           rightSide ? "right-0 border-l md:border-l-0 md:border-r" : "left-0 border-r"
         } ${open ? "translate-x-0" : `${rightSide ? "translate-x-full" : "-translate-x-full"} md:hidden`}`}
       >

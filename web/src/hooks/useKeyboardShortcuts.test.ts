@@ -28,6 +28,8 @@ function dispatch(target: EventTarget, init: KeyboardEventInit) {
 function makeActions() {
   return {
     onNew: vi.fn(),
+    onFocusSidebar: vi.fn(),
+    onJumpToAttention: vi.fn(),
     onNewScratch: vi.fn(),
     onDiff: vi.fn(),
     onEscape: vi.fn(),
@@ -119,6 +121,52 @@ describe("useKeyboardShortcuts", () => {
     });
 
     expect(actions.onNewScratch).not.toHaveBeenCalled();
+  });
+
+  it("routes Ctrl+Q from the focused embedded terminal to the sidebar", () => {
+    const actions = makeActions();
+    renderHook(() => useKeyboardShortcuts(() => actions));
+
+    const terminal = document.createElement("div");
+    terminal.dataset.term = "agent";
+    const input = document.createElement("textarea");
+    terminal.appendChild(input);
+    document.body.appendChild(terminal);
+    const event = dispatch(input, { key: "q", code: "KeyQ", ctrlKey: true });
+
+    expect(event.defaultPrevented).toBe(true);
+    expect(actions.onFocusSidebar).toHaveBeenCalledOnce();
+    expect(actions.onJumpToAttention).not.toHaveBeenCalled();
+    terminal.remove();
+  });
+  it("routes Ctrl+Q from the structured composer to the sidebar", () => {
+    const actions = makeActions();
+    renderHook(() => useKeyboardShortcuts(() => actions));
+
+    const composer = document.createElement("div");
+    composer.dataset.sessionComposer = "";
+    const input = document.createElement("textarea");
+    composer.appendChild(input);
+    document.body.appendChild(composer);
+    const event = dispatch(input, { key: "q", code: "KeyQ", ctrlKey: true });
+
+    expect(event.defaultPrevented).toBe(true);
+    expect(actions.onFocusSidebar).toHaveBeenCalledOnce();
+    expect(actions.onJumpToAttention).not.toHaveBeenCalled();
+    composer.remove();
+  });
+
+  it("does not capture Ctrl+Q from a regular text input", () => {
+    const actions = makeActions();
+    renderHook(() => useKeyboardShortcuts(() => actions));
+
+    const input = document.createElement("input");
+    document.body.appendChild(input);
+    const event = dispatch(input, { key: "q", code: "KeyQ", ctrlKey: true });
+
+    expect(event.defaultPrevented).toBe(false);
+    expect(actions.onFocusSidebar).not.toHaveBeenCalled();
+    input.remove();
   });
 
   it("detaches the listener on unmount", () => {

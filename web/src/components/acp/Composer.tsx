@@ -846,6 +846,7 @@ export function Composer({
   return (
     <div className={wrapperLayout.className} style={wrapperLayout.style}>
       <div
+        data-session-composer
         {...tourAnchor(TOUR_ANCHORS.composer)}
         className="mx-auto max-w-3xl xl:max-w-4xl 2xl:max-w-5xl"
         onDragOver={(e) => {

@@ -11,7 +11,7 @@ export type { ShortcutActions };
  * delegates matching to the pure matchShortcut, and applies the effects.
  *
  * Single-key shortcuts fire only when no input/textarea/terminal is focused.
- * Cmd+K (Mac) / Ctrl+K (other) and Escape fire regardless of focus.
+ * Ctrl+Q returns focus from an embedded terminal or structured composer to the session sidebar.
  */
 export function useKeyboardShortcuts(getActions: () => ShortcutActions) {
   useEffect(() => {
@@ -20,7 +20,8 @@ export function useKeyboardShortcuts(getActions: () => ShortcutActions) {
       const isInput =
         !!target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable);
 
-      const matched = matchShortcut(e, { mac: IS_MAC, isInput });
+      const isSessionInput = !!target?.closest('[data-term="agent"], [data-term="paired"], [data-session-composer]');
+      const matched = matchShortcut(e, { mac: IS_MAC, isInput, isSessionInput });
       if (!matched) return;
 
       if (matched.preventDefault) e.preventDefault();

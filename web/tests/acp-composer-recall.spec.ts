@@ -13,7 +13,7 @@ import { clickSidebarSession, openMobileSidebar } from "./helpers/sidebar";
 const SESSION_ID = "sess-acp-recall";
 const TITLE = "acp-recall";
 
-async function setup(page: Page) {
+async function setup(page: Page, includeSibling = false) {
   await page.route("**/api/login/status", (r) => r.fulfill({ json: { required: false, authenticated: true } }));
   for (const path of [
     "settings",
@@ -35,36 +35,40 @@ async function setup(page: Page) {
       }),
     );
   }
+  const baseSession = {
+    id: SESSION_ID,
+    title: TITLE,
+    project_path: "/tmp/acp-recall",
+    group_path: "/tmp",
+    tool: "claude",
+    status: "Running",
+    yolo_mode: false,
+    created_at: new Date().toISOString(),
+    last_accessed_at: null,
+    last_error: null,
+    branch: "focus-handoff",
+    main_repo_path: null,
+    is_sandboxed: false,
+    has_terminal: true,
+    profile: "default",
+    workspace_repos: [],
+    view: "structured",
+    acp_worker_state: "running",
+    claude_fullscreen: false,
+  };
+  const sessions = [baseSession];
+  if (includeSibling) {
+    sessions.push({
+      ...baseSession,
+      id: "sess-acp-sibling",
+      title: TITLE + " sibling",
+      status: "Stopped",
+      acp_worker_state: "stopped",
+    });
+  }
   await page.route("**/api/sessions", (r) => {
     if (r.request().method() === "POST") return r.fulfill({ status: 400 });
-    return r.fulfill({
-      json: {
-        sessions: [
-          {
-            id: SESSION_ID,
-            title: TITLE,
-            project_path: "/tmp/acp-recall",
-            group_path: "/tmp",
-            tool: "claude",
-            status: "Running",
-            yolo_mode: false,
-            created_at: new Date().toISOString(),
-            last_accessed_at: null,
-            last_error: null,
-            branch: null,
-            main_repo_path: null,
-            is_sandboxed: false,
-            has_terminal: true,
-            profile: "default",
-            workspace_repos: [],
-            view: "structured",
-            acp_worker_state: "running",
-            claude_fullscreen: false,
-          },
-        ],
-        workspace_ordering: [],
-      },
-    });
+    return r.fulfill({ json: { sessions, workspace_ordering: [] } });
   });
   await page.route("**/api/sessions/*/ensure", (r) => r.fulfill({ json: { ok: true } }));
   // Prompt POSTs + replay succeed (empty), so the optimistic send sticks.
@@ -144,5 +148,20 @@ test.describe("Structured-view composer queue recall (#2147)", () => {
     await expect(page.getByRole("button", { name: /^second queued$/ })).toHaveCount(0);
     await expect(page.getByRole("button", { name: /^first queued$/ })).toBeVisible();
     await expect(page.getByText(/Editing queued message/)).toHaveCount(0);
+  });
+
+  test("Ctrl+Q focuses the active workspace row even when its link targets another session", async ({ page }) => {
+    await setup(page, true);
+    await page.goto("/session/sess-acp-sibling");
+    await expect(page.getByTestId("structured-view-root")).toBeVisible({ timeout: 10000 });
+
+    const activeRow = page.getByRole("navigation", { name: "Sessions sidebar" }).locator("[data-active-session-row]");
+    await expect(activeRow).toHaveAttribute("href", "/session/sess-acp-recall");
+    await expect(activeRow).not.toHaveAttribute("aria-current");
+
+    const composer = page.locator("[data-session-composer] textarea");
+    await composer.focus();
+    await page.keyboard.press("Control+q");
+    await expect(activeRow).toBeFocused();
   });
 });

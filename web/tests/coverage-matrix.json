@@ -604,6 +604,18 @@
       "components": ["web/src/components/WorkspaceSidebar.tsx"]
     },
     {
+      "id": "sidebar.terminal-focus-handoff",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": ["tests/terminal-focus-shortcut.spec.ts"],
+      "components": [
+        "web/src/App.tsx",
+        "web/src/components/WorkspaceSidebar.tsx",
+        "web/src/hooks/useKeyboardShortcuts.ts",
+        "web/src/lib/shortcuts.ts"
+      ]
+    },
+    {
       "id": "app-shell.topbar-dev-badge",
       "kind": "vitest",
       "risk": "low",
@@ -1949,7 +1961,12 @@
         "src/components/acp/Composer.recall.test.ts",
         "src/components/acp/Composer.recall.dom.test.tsx"
       ],
-      "components": ["web/src/components/acp/Composer.tsx", "web/src/components/acp/recallNav.ts"]
+      "components": [
+        "web/src/components/acp/Composer.tsx",
+        "web/src/components/WorkspaceSidebar.tsx",
+        "web/src/hooks/useKeyboardShortcuts.ts",
+        "web/src/lib/shortcuts.ts"
+      ]
     },
     {
       "id": "acp.composer-slash-skill-provenance",
