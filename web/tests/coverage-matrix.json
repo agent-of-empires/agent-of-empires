@@ -730,7 +730,7 @@
     {
       "id": "notifications.push-subscription",
       "kind": "vitest",
-      "risk": "medium",
+      "risk": "high",
       "specs": ["src/hooks/usePushSubscription.test.ts", "src/lib/pushHealth.test.ts"],
       "components": ["web/src/hooks/usePushSubscription.ts", "web/src/lib/pushHealth.ts"]
     },

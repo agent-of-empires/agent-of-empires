@@ -55,6 +55,11 @@ function postPush(path: string, body: unknown): Promise<Response> {
   });
 }
 
+async function removeExpiredPushEndpoint(endpoint: string): Promise<void> {
+  const response = await postPush("unsubscribe", { endpoint }).catch(() => null);
+  if (!response?.ok) throw new Error("Could not remove the expired notification subscription");
+}
+
 function subscribeBody(sub: PushSubscription) {
   const json = sub.toJSON();
   return { endpoint: json.endpoint, keys: json.keys };
@@ -71,11 +76,11 @@ interface PushStatus {
   subscription?: ServerSubscriptionStatus;
 }
 
-/** Null when the status endpoint is unreachable; callers then assume push is on. */
-async function fetchStatus(endpoint: string | undefined): Promise<PushStatus | null> {
+async function fetchStatus(endpoint: string | undefined): Promise<PushStatus> {
   const query = endpoint ? `?endpoint=${encodeURIComponent(endpoint)}` : "";
   const resp = await fetch(`/api/push/status${query}`);
-  return resp.ok ? ((await resp.json()) as PushStatus) : null;
+  if (!resp.ok) throw new Error(`Could not fetch push status (${resp.status})`);
+  return (await resp.json()) as PushStatus;
 }
 
 /** Null when the browser does not expose the key the subscription was made with. */
@@ -116,6 +121,7 @@ export function usePushSubscription() {
   const [health, setHealth] = useState<PushHealth>("unknown");
   // A visibility refresh must not overwrite the state of an action in flight.
   const busy = useRef(false);
+  const pendingCleanup = useRef<string | null>(null);
 
   const refresh = useCallback(async () => {
     const unsupported = unsupportedState();
@@ -127,7 +133,7 @@ export function usePushSubscription() {
       const perm = Notification.permission;
       const sub = await currentSubscription();
       const status = await fetchStatus(sub?.endpoint);
-      if (status && !status.enabled) {
+      if (!status.enabled) {
         setHealth("unknown");
         return setState({ kind: "disabled-by-server" });
       }
@@ -138,11 +144,11 @@ export function usePushSubscription() {
         wanted,
         permission: perm,
         subscribed: !!sub,
-        keyMatches: sub && status?.public_key ? keyMatches(sub, status.public_key) : null,
-        server: status?.subscription ?? null,
+        keyMatches: sub && status.public_key ? keyMatches(sub, status.public_key) : null,
+        server: status.subscription ?? null,
       });
       // Re-binds the sub to the current token (#3386) or restores one the server dropped.
-      if (sub && perm === "granted" && (next === "server-forgot" || (next === "healthy" && !status?.subscription))) {
+      if (sub && perm === "granted" && (next === "server-forgot" || (next === "healthy" && !status.subscription))) {
         const resp = await postPush("subscribe", subscribeBody(sub)).catch(() => null);
         if (resp?.ok) next = "healthy";
       }
@@ -188,10 +194,15 @@ export function usePushSubscription() {
       }
       const { public_key } = (await vapidResp.json()) as { public_key: string };
       const reg = await navigator.serviceWorker.ready;
+      const pendingEndpoint = pendingCleanup.current;
+      if (pendingEndpoint) {
+        await removeExpiredPushEndpoint(pendingEndpoint);
+        pendingCleanup.current = null;
+      }
       let sub = await reg.pushManager.getSubscription();
       // A 404/410 permanently retires a browser endpoint. Re-subscribing the same
       // endpoint only stores a dead subscription again, so renew it before posting.
-      const status = sub ? await fetchStatus(sub.endpoint).catch(() => null) : null;
+      const status = sub ? await fetchStatus(sub.endpoint) : null;
       const keyMismatch = sub && keyMatches(sub, public_key) !== true;
       const gone = hasFreshGoneFailure(status?.subscription ?? null);
       if (sub && (keyMismatch || gone)) {
@@ -199,8 +210,9 @@ export function usePushSubscription() {
         const unsubscribed = await sub.unsubscribe().catch(() => false);
         if (!unsubscribed) throw new Error("Could not unsubscribe the expired notification subscription");
         if (gone && status?.subscription?.registered && status.subscription.owned) {
-          const response = await postPush("unsubscribe", { endpoint: stale }).catch(() => null);
-          if (!response?.ok) throw new Error("Could not remove the expired notification subscription");
+          pendingCleanup.current = stale;
+          await removeExpiredPushEndpoint(stale);
+          pendingCleanup.current = null;
         } else {
           await postPush("unsubscribe", { endpoint: stale }).catch(() => {});
         }

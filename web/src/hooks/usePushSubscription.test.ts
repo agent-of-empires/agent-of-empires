@@ -12,12 +12,17 @@ const SERVER_KEY = "QUJD";
 const keyBytes = (s: string) => new TextEncoder().encode(s).buffer;
 
 function makeSubscription(endpoint = "https://push.example/abc", key: ArrayBuffer | null = null) {
-  return {
+  const sub = {
     endpoint,
     options: { applicationServerKey: key },
     toJSON: () => ({ endpoint, keys: { p256dh: "key", auth: "auth" } }),
     unsubscribe: vi.fn(async () => true),
   };
+  sub.unsubscribe.mockImplementation(async () => {
+    if (currentSub === sub) currentSub = null;
+    return true;
+  });
+  return sub;
 }
 type FakeSubscription = ReturnType<typeof makeSubscription>;
 
@@ -40,6 +45,7 @@ function rejectServiceWorker(message: string) {
 
 interface FetchOverrides {
   status?: { ok: boolean; body: unknown };
+  statusError?: Error;
   vapid?: number;
   subscribe?: number;
   unsubscribe?: number;
@@ -55,6 +61,7 @@ function installFetch(overrides: FetchOverrides = {}) {
       const url = String(input);
       calls.push(url);
       if (url.includes("/status")) {
+        if (overrides.statusError) throw overrides.statusError;
         const o = overrides.status ?? { ok: true, body: { enabled: true } };
         return new Response(JSON.stringify(o.body), { status: o.ok ? 200 : 500 });
       }
@@ -145,7 +152,11 @@ describe("usePushSubscription initial refresh", () => {
     ["granted with no subscription", noSubscription, { kind: "off" }],
     ["denied permission", () => setPermission("denied"), { kind: "denied" }],
     ["push disabled on the server", () => installFetch(DISABLED_BY_SERVER), { kind: "disabled-by-server" }],
-    ["a failing status endpoint", () => installFetch({ status: { ok: false, body: {} } }), { kind: "enabled" }],
+    [
+      "a failing status endpoint",
+      () => installFetch({ status: { ok: false, body: {} } }),
+      error("Could not fetch push status (500)"),
+    ],
     ["a rejected serviceWorker.ready", () => rejectServiceWorker("sw boom"), error("sw boom")],
     ["an insecure LAN origin", () => setInsecureHost("192.168.1.5"), unsupported("insecure-origin")],
     ["localhost over http", () => setInsecureHost("localhost"), { kind: "enabled" }],
@@ -211,6 +222,22 @@ describe("usePushSubscription enable()", () => {
     const { result } = await mountAndSettle();
     arrange();
     expect(await act_(result, "enable")).toEqual(expected);
+  });
+
+  it.each<[string, FetchOverrides, PushState]>([
+    ["the status request fails", { statusError: new Error("status unavailable") }, error("status unavailable")],
+    ["the status response is not OK", { status: { ok: false, body: {} } }, error("Could not fetch push status (500)")],
+  ])("does not renew a subscription when %s", async (_label, overrides, expected) => {
+    const existing = currentSub!;
+    const subscribe = vi.fn(async () => makeSubscription("https://push.example/new", keyBytes("ABC")));
+    subscribeImpl = subscribe;
+    const { result } = await mountAndSettle();
+    installFetch(overrides);
+
+    expect(await act_(result, "enable")).toEqual(expected);
+    expect(existing.unsubscribe).not.toHaveBeenCalled();
+    expect(subscribe).not.toHaveBeenCalled();
+    expect(currentSub).toBe(existing);
   });
 
   it("rolls back the browser subscription when the server rejects it", async () => {
@@ -332,6 +359,39 @@ describe("usePushSubscription enable() with an existing subscription", () => {
     expect(state).toEqual({ kind: "error", message: "Could not remove the expired notification subscription" });
     expect(existing.unsubscribe).toHaveBeenCalledTimes(1);
     expect(subscribeImpl).not.toHaveBeenCalled();
+  });
+
+  it("retries expired endpoint removal before registering after browser unsubscribe", async () => {
+    const existing = makeSubscription("https://push.example/expired", keyBytes("ABC"));
+    const replacement = makeSubscription("https://push.example/replacement", keyBytes("ABC"));
+    currentSub = existing;
+    const subscribe = vi.fn(async () => (currentSub = replacement));
+    subscribeImpl = subscribe;
+    const expiredStatus = statusWith(
+      serverSub({
+        registered: true,
+        owned: true,
+        last_failure: "gone",
+        last_failure_at: "2026-09-02T10:00:00Z",
+      }),
+    );
+    installFetch({ ...expiredStatus, unsubscribe: 500 });
+    const { result } = await mountAndSettle();
+    calls.length = 0;
+
+    expect(await act_(result, "enable")).toEqual(error("Could not remove the expired notification subscription"));
+    expect(existing.unsubscribe).toHaveBeenCalledTimes(1);
+    expect(currentSub).toBeNull();
+    expect(subscribe).not.toHaveBeenCalled();
+
+    installFetch({ ...expiredStatus, unsubscribe: 200 });
+    expect(await act_(result, "enable")).toEqual({ kind: "enabled" });
+    expect(subscribe).toHaveBeenCalledTimes(1);
+    expect(currentSub).toBe(replacement);
+    const removalIndex = calls.findIndex((url) => url.includes("/api/push/unsubscribe"));
+    const registrationIndex = calls.findIndex((url) => url.includes("/api/push/subscribe"));
+    expect(removalIndex).toBeGreaterThanOrEqual(0);
+    expect(registrationIndex).toBeGreaterThan(removalIndex);
   });
 
   it("does not replace an endpoint when browser unsubscribe fails", async () => {
