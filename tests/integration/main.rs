@@ -44,6 +44,7 @@ mod acp_smoke;
 mod acp_session_delete;
 
 mod acp_model_respawn;
+mod acp_session_import;
 
 mod acp_provider_respawn;
 
