@@ -8,7 +8,8 @@ recognise:
 - Only existing manifests, lockfiles and workflow/action YAML may be
   modified, plus the `npmDepsHash` line in flake.nix that
   nix-npm-hash-fix-pr.yml pushes. No file is added, deleted or renamed.
-- Manifests: only dependency version requirements change.
+- Manifests: only registry dependency requirements change (versions, ranges
+  or npm tags), never local directories or archives.
 - npm: registry entries keep their package identity, canonical tarball and
   integrity. New aliases require matching base dependency declarations;
   genuinely new declarations need manual review. Links remain unchanged
@@ -45,8 +46,8 @@ PINNED_USES = re.compile(
     rf"^\s*(?:-\s*)?uses:\s*({NAME})/({NAME})((?:/{NAME})*)@([0-9a-f]{{40}})\s+#\s*(v?[0-9][\w.+-]*)\s*$"
 )
 USES_LINE = re.compile(rf"^\s*(?:-\s*)?uses:\s*({NAME}/{NAME}(?:/{NAME})*)@\S+(?:\s+#.*)?$")
-# A version requirement only: no path, git, URL, alias or workspace specifier.
 VERSION_REQ = re.compile(r"^[\w.^~<>=*|, +-]+$")
+NPM_FILE_SPEC = re.compile(r"^\.|\.(?:tgz|tar\.gz|tar)$", re.IGNORECASE)
 DEP_TABLES = {"dependencies", "dev-dependencies", "build-dependencies",
               "devDependencies", "optionalDependencies", "peerDependencies"}
 NPM_ALIAS = re.compile(r"npm:((?:@[^/@]+/)?[^/@]+)(?:@.+)?")
@@ -123,7 +124,7 @@ def bundled_metadata(entry, path, problems):
         out["version"] = None
     for table in ("dependencies", "optionalDependencies", "peerDependencies"):
         if table in out:
-            out[table] = strip_versions(out[table], path, problems, in_deps=True)
+            out[table] = strip_versions(out[table], path, problems, in_deps=True, npm=True)
     return out
 
 
@@ -195,8 +196,14 @@ def check_cargo_lock(path, base_text, head_text):
     return problems
 
 
-def strip_versions(node, path, problems, in_deps=False):
-    """Returns `node` with dependency version requirements blanked, noting malformed ones."""
+def is_registry_requirement(version, npm=False):
+    if not isinstance(version, str) or not VERSION_REQ.fullmatch(version):
+        return False
+    return not npm or not NPM_FILE_SPEC.search(version)
+
+
+def strip_versions(node, path, problems, in_deps=False, npm=False):
+    """Blank dependency requirements, recording non-registry acquisitions."""
     if isinstance(node, dict):
         if in_deps:
             out = {}
@@ -206,20 +213,21 @@ def strip_versions(node, path, problems, in_deps=False):
                     version = spec.pop("version", None)
                 else:
                     version, spec = spec, None
-                if version is not None and not (isinstance(version, str) and VERSION_REQ.match(version)):
+                if version is not None and not is_registry_requirement(version, npm):
                     problems.append(f"{path}: {name} has a non-registry requirement {version!r}")
                 out[name] = (spec, version is not None)
             return out
-        return {k: strip_versions(v, path, problems, k in DEP_TABLES) for k, v in node.items()}
+        return {k: strip_versions(v, path, problems, k in DEP_TABLES, npm) for k, v in node.items()}
     if isinstance(node, list):
-        return [strip_versions(v, path, problems) for v in node]
+        return [strip_versions(v, path, problems, npm=npm) for v in node]
     return node
 
 
 def check_manifest(path, base_text, head_text):
-    parse = json.loads if path.endswith(".json") else tomllib.loads
+    npm = path.endswith(".json")
+    parse = json.loads if npm else tomllib.loads
     problems = []
-    if strip_versions(parse(base_text), path, []) != strip_versions(parse(head_text), path, problems):
+    if strip_versions(parse(base_text), path, [], npm=npm) != strip_versions(parse(head_text), path, problems, npm=npm):
         problems.append(f"{path}: changes more than dependency versions")
     return problems
 
@@ -504,6 +512,23 @@ def self_test():
         ("nix other line", ["flake.nix"], {}, nix_old + nix_new + "+  src = ./evil;\n", 1),
         ("unexpected file", ["build.rs"], {}, "", 1),
     ]
+    npm_requirements = [
+        ("current directory", ".", 1),
+        ("parent directory", "..", 1),
+        ("dot-prefixed directory", ".local", 1),
+        ("directory with trailing space", ". ", 1),
+        ("local tgz", "bundle.tgz", 1),
+        ("local tar.gz case insensitive", "BUNDLE.TAR.GZ", 1),
+        ("local tar", "bundle.tar", 1),
+        ("registry tag", "latest", 0),
+        ("dotted registry tag", "beta.1", 0),
+        ("registry range union", ">=1.2 <2 || ^3", 0),
+    ]
+    cases.extend((f"npm manifest {name}", ["web/package.json"],
+                  {"web/package.json": (pkg_json, pkg_json.replace("^1.0.0", requirement))}, "", expected)
+                 for name, requirement, expected in npm_requirements)
+    cases.append(("npm bundled local requirement", [lock],
+                  {lock: (npm_base, npm_head(bundle={**bundle_entry, "dependencies": {"left-pad": "."}}))}, "", 1))
     alias_entry = {"name": "@scope/real", "version": "1.0.0", "resolved": NPM_REGISTRY + "@scope/real/-/real-1.0.0.tgz", "integrity": "sha512-alias"}
     alias_root = {"dependencies": {"alias": "npm:@scope/real@^1.0.0"}}
     alias_base = {"": alias_root, "node_modules/alias": alias_entry}
