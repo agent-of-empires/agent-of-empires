@@ -287,43 +287,18 @@ pub async fn list_claude_sessions(State(state): State<Arc<AppState>>) -> impl In
     if let Some(resp) = read_only_block(&state) {
         return resp;
     }
-    let mut sessions = tokio::task::spawn_blocking(crate::session::claude_import::scan_sessions)
+    let sessions = tokio::task::spawn_blocking(crate::session::claude_import::scan_sessions)
         .await
         .unwrap_or_default();
-    // Drop sessions AoE owns: by stored session id, or by cwd inside an
-    // AoE-provisioned dir (scratch, managed worktree, workspace). A plain
-    // project path is not enough: a user's own `claude` run there is importable.
-    let (managed_ids, managed_dirs): (std::collections::HashSet<String>, Vec<PathBuf>) = {
+    let owned = {
         let instances = state.instances.read().await;
-        let ids = instances
-            .iter()
-            .flat_map(|i| {
-                i.acp_session_id
-                    .iter()
-                    .chain(i.agent_session_id.iter())
-                    .cloned()
-            })
-            .collect();
-        let dirs = instances
-            .iter()
-            .filter(|i| {
-                i.scratch
-                    || i.worktree_info.as_ref().is_some_and(|w| w.managed_by_aoe)
-                    || i.workspace_info.is_some()
-            })
-            .map(|i| PathBuf::from(&i.project_path))
-            .filter(|p| !p.as_os_str().is_empty())
-            .collect();
-        (ids, dirs)
+        crate::session::import::Owned::from_instances(&instances)
     };
-    sessions.retain(|s| {
-        !managed_ids.contains(&s.session_id)
-            && !managed_dirs
-                .iter()
-                .any(|d| std::path::Path::new(&s.cwd).starts_with(d))
-    });
-    // Capped after filtering so managed sessions cannot crowd out real ones.
-    sessions.truncate(crate::session::claude_import::MAX_SESSIONS);
+    let (sessions, _truncated) = crate::session::import::retain_importable(
+        sessions.into_iter().map(Into::into).collect(),
+        &owned,
+        false,
+    );
     Json(sessions).into_response()
 }
 

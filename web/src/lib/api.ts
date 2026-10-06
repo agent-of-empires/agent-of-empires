@@ -15,7 +15,7 @@ import type {
   DockerStatusResponse,
   CreateProgress,
   CreateSessionRequest,
-  ClaudeSessionSummary,
+  ImportableSession,
   SettingsFieldDescriptor,
 } from "./types";
 import type { ConfigOptionDescriptor } from "./acpTypes";
@@ -1326,8 +1326,8 @@ export async function fetchProjects(scope?: "global" | "profile"): Promise<Proje
 }
 
 /** Claude Code sessions on disk, newest first, for the import picker. */
-export async function listClaudeSessions(): Promise<ClaudeSessionSummary[]> {
-  return (await fetchJson<ClaudeSessionSummary[]>("/api/claude-sessions")) ?? [];
+export async function listClaudeSessions(): Promise<ImportableSession[]> {
+  return (await fetchJson<ImportableSession[]>("/api/claude-sessions")) ?? [];
 }
 
 /** Error bodies may be JSON `{message}` or plain text. */

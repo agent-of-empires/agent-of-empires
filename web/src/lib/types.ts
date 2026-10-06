@@ -401,11 +401,11 @@ export interface CreateProgress {
   output: string[];
 }
 
-export interface ClaudeSessionSummary {
+export interface ImportableSession {
   session_id: string;
   cwd: string;
   title: string | null;
-  last_modified_ms: number;
+  updated_at: string | null;
   cwd_exists: boolean;
 }
 

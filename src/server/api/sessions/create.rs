@@ -898,9 +898,14 @@ pub async fn create_session(
         let import_cwd = body.path.trim().to_string();
         let import_id_owned = import_id.to_string();
         let belongs = tokio::task::spawn_blocking(move || {
+            let provisioned = crate::session::import::Owned::from_instances(&[]);
             crate::session::claude_import::scan_sessions()
                 .into_iter()
-                .any(|s| s.session_id == import_id_owned && s.cwd == import_cwd)
+                .any(|s| {
+                    s.session_id == import_id_owned
+                        && s.cwd == import_cwd
+                        && !provisioned.excludes(&s.session_id, &s.cwd)
+                })
         })
         .await
         .unwrap_or(false);

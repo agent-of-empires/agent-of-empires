@@ -1,16 +1,16 @@
 import { useEffect, useMemo, useState } from "react";
 import { listClaudeSessions } from "../../../lib/api";
-import type { ClaudeSessionSummary } from "../../../lib/types";
+import type { ImportableSession } from "../../../lib/types";
 
 /** Lists on-disk Claude Code sessions to import; ones whose cwd is gone cannot be resumed. */
 export function ClaudeSessionPicker({
   onSelect,
   selectedSessionId,
 }: {
-  onSelect: (session: ClaudeSessionSummary) => void;
+  onSelect: (session: ImportableSession) => void;
   selectedSessionId?: string;
 }) {
-  const [sessions, setSessions] = useState<ClaudeSessionSummary[] | null>(null);
+  const [sessions, setSessions] = useState<ImportableSession[] | null>(null);
   const [filter, setFilter] = useState("");
   // Missing-cwd sessions are hidden until toggled, then shown disabled.
   const [showMissing, setShowMissing] = useState(false);
@@ -94,7 +94,7 @@ export function ClaudeSessionPicker({
                 </span>
                 <span className="line-clamp-1 text-xs text-content-subtle">{s.cwd}</span>
                 <span className="text-xs text-content-subtle">
-                  {formatRelative(s.last_modified_ms)}
+                  {formatRelative(s.updated_at)}
                   {!s.cwd_exists && " · directory missing"}
                 </span>
               </button>
@@ -109,8 +109,9 @@ export function ClaudeSessionPicker({
   );
 }
 
-function formatRelative(ms: number): string {
-  if (!ms) return "unknown";
+function formatRelative(updatedAt: string | null): string {
+  const ms = updatedAt ? Date.parse(updatedAt) : NaN;
+  if (Number.isNaN(ms)) return "unknown";
   const diff = Date.now() - ms;
   const min = Math.floor(diff / 60000);
   if (min < 1) return "just now";

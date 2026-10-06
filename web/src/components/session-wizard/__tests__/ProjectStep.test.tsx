@@ -5,7 +5,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 
 import { ProjectStep } from "../steps/ProjectStep";
 import { initialData, type WizardData } from "../wizardReducer";
-import type { AgentInfo, ClaudeSessionSummary, ProjectInfo } from "../../../lib/types";
+import type { AgentInfo, ImportableSession, ProjectInfo } from "../../../lib/types";
 import type { RecentProjectEntry } from "../../../lib/api";
 import { agent, mockSession } from "./fixtures";
 
@@ -181,19 +181,19 @@ describe("project search", () => {
 });
 
 describe("Import from Claude tab", () => {
-  const SESSIONS: ClaudeSessionSummary[] = [
+  const SESSIONS: ImportableSession[] = [
     {
       session_id: "713b",
       cwd: "/Users/me/alpha",
       title: "Fix the spinner bug",
-      last_modified_ms: 1_700_000_000_000,
+      updated_at: "2023-11-14T22:13:20.000Z",
       cwd_exists: true,
     },
     {
       session_id: "dead",
       cwd: "/Users/me/gone",
       title: "Old work",
-      last_modified_ms: 1_600_000_000_000,
+      updated_at: "2020-09-13T12:26:40.000Z",
       cwd_exists: false,
     },
   ];

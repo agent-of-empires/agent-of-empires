@@ -1,5 +1,5 @@
 import { useState } from "react";
-import type { AgentInfo, ClaudeSessionSummary } from "../../../lib/types";
+import type { AgentInfo, ImportableSession } from "../../../lib/types";
 import { DirectoryBrowser } from "../../DirectoryBrowser";
 import { ClaudeSessionPicker } from "./ClaudeSessionPicker";
 import { ProjectSearchList } from "./ProjectSearchList";
@@ -51,7 +51,7 @@ export function ProjectStep({ data, onChange, initialTab, agents = [], onSelectS
   ];
 
   // The on-disk session id only resolves in its recorded cwd, so worktree and scratch are cleared.
-  const handleImportSelect = (s: ClaudeSessionSummary) => {
+  const handleImportSelect = (s: ImportableSession) => {
     onChange("scratch", false);
     onChange("path", s.cwd);
     onChange("tool", "claude");
