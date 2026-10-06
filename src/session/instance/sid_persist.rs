@@ -203,6 +203,70 @@ impl Instance {
         self.persist_session_id_with_storage(&storage, expected)
     }
 
+    /// Write the child a store fork adopted to the durable row, leaving the
+    /// launch's own state untouched.
+    ///
+    /// The store fork is a side effect that outlives the launch, so the row must
+    /// carry the child before anything downstream can fail and a retry re-read
+    /// the pre-fork seed. It is deliberately not `persist_session_id`: that
+    /// promotes the one-shot `Fork` intent and re-adopts the disk row, which
+    /// would move the conversation target the launch is still validating
+    /// against. Only the id and its binding are written here.
+    pub(super) fn persist_fork_adoption(
+        &self,
+        profile: &str,
+        expected: &ConversationState,
+    ) -> SidPersistOutcome {
+        let Some(sid) = self.agent_session_id.clone() else {
+            return SidPersistOutcome::Skip;
+        };
+        if !is_valid_session_id(&sid) {
+            tracing::warn!(target: "session.store",
+                "Refusing to persist invalid forked session ID {sid:?} for {}",
+                self.id
+            );
+            return SidPersistOutcome::Skip;
+        }
+        let storage =
+            match crate::session::storage::Storage::new(profile, self.resolve_file_watch()) {
+                Ok(storage) => storage,
+                Err(error) => {
+                    tracing::warn!(target: "session.store",
+                        "Failed to create storage for the fork adoption of {}: {error}",
+                        self.id
+                    );
+                    return SidPersistOutcome::Skip;
+                }
+            };
+        let instance_id = self.id.clone();
+        let binding = self.agent_session_binding.clone();
+        let pi_session_path = self.pi_session_path.clone();
+        let outcome = storage.update(|instances, _groups| {
+            let Some(index) = instances
+                .iter()
+                .position(|instance| instance.id == instance_id)
+            else {
+                return Ok(SidWrite::Failed);
+            };
+            if !expected.matches(&instances[index]) {
+                return Ok(SidWrite::Skipped);
+            }
+            instances[index].set_agent_conversation(Some(sid), binding, pi_session_path);
+            Ok(SidWrite::Applied)
+        });
+        match outcome {
+            Ok(SidWrite::Applied) => SidPersistOutcome::Published,
+            Ok(_) => SidPersistOutcome::Skip,
+            Err(error) => {
+                tracing::warn!(target: "session.store",
+                    "Failed to persist the fork adoption of {}: {error}",
+                    self.id
+                );
+                SidPersistOutcome::Skip
+            }
+        }
+    }
+
     fn persist_session_id_with_storage(
         &mut self,
         storage: &crate::session::storage::Storage,

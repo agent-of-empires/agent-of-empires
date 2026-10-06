@@ -385,8 +385,10 @@ impl Instance {
         // The store fork is a side effect that outlives this launch: if a later
         // step fails and the instance is retried, the durable row must already
         // carry the adopted child, or the retry reads back the pre-fork seed and
-        // mints a second conversation in the user's history.
-        let _ = self.persist_session_id(&self.effective_profile(), &expected);
+        // mints a second conversation in the user's history. The write keeps the
+        // row's launch intent, since promoting it here would move the target the
+        // launch is still validating against.
+        let _ = self.persist_fork_adoption(&self.effective_profile(), &expected);
         Ok(child)
     }
 
