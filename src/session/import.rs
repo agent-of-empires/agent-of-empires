@@ -44,6 +44,13 @@ impl ImportableSession {
     }
 }
 
+/// Importable sessions, newest first, and whether more existed than [`MAX_SESSIONS`].
+#[derive(Debug, Clone, Default, Serialize, PartialEq)]
+pub struct ImportableList {
+    pub sessions: Vec<ImportableSession>,
+    pub truncated: bool,
+}
+
 /// What AoE already owns, so the picker never offers it back.
 #[derive(Debug, Default)]
 pub struct Owned {
@@ -54,8 +61,9 @@ pub struct Owned {
 
 impl Owned {
     /// A plain project path is not owned: a user's own agent run there is importable. Only stored
-    /// ids and AoE-provisioned dirs (scratch, managed worktree, workspace) are.
-    pub fn from_instances(instances: &[Instance]) -> Self {
+    /// ids and AoE-provisioned dirs (scratch, managed worktree, workspace) are. `worktree_markers`
+    /// comes from [`worktree_dir_markers`], which loads config and so belongs off the runtime.
+    pub fn new(instances: &[Instance], worktree_markers: Vec<String>) -> Self {
         let ids = instances
             .iter()
             .flat_map(|i| {
@@ -78,7 +86,7 @@ impl Owned {
         Self {
             ids,
             dirs,
-            worktree_markers: worktree_dir_markers(),
+            worktree_markers,
         }
     }
 
@@ -97,18 +105,21 @@ pub fn retain_importable(
     mut sessions: Vec<ImportableSession>,
     owned: &Owned,
     source_truncated: bool,
-) -> (Vec<ImportableSession>, bool) {
+) -> ImportableList {
     sessions.retain(|s| !owned.excludes(&s.session_id, &s.cwd));
     sessions.sort_by_cached_key(|s| std::cmp::Reverse(s.updated_at_parsed()));
     let truncated = source_truncated || sessions.len() > MAX_SESSIONS;
     sessions.truncate(MAX_SESSIONS);
-    (sessions, truncated)
+    ImportableList {
+        sessions,
+        truncated,
+    }
 }
 
 /// Literal directory tokens derived from the worktree path templates, e.g. `"-worktrees"` from
 /// `"../{repo-name}-worktrees/{branch}"` and `"-workspace-"` from
 /// `"../{branch}-workspace-{session-id}"`.
-fn worktree_dir_markers() -> Vec<String> {
+pub fn worktree_dir_markers() -> Vec<String> {
     let cfg = crate::session::Config::load_or_warn();
     let mut markers = Vec::new();
     for tmpl in [
@@ -232,10 +243,14 @@ mod tests {
             entry("new", "/p/app", Some("2026-09-01T10:00:00+02:00")),
             entry("garbled", "/p/app", Some("yesterday")),
         ];
-        let (kept, truncated) = retain_importable(sessions, &owned, false);
-        let ids: Vec<_> = kept.iter().map(|s| s.session_id.as_str()).collect();
+        let kept = retain_importable(sessions, &owned, false);
+        let ids: Vec<_> = kept
+            .sessions
+            .iter()
+            .map(|s| s.session_id.as_str())
+            .collect();
         assert_eq!(ids, ["new", "old", "unknown", "garbled"]);
-        assert!(!truncated);
+        assert!(!kept.truncated);
     }
 
     #[test]
@@ -251,9 +266,12 @@ mod tests {
         {
             let mut input = sessions.clone();
             input.extend((0..extra).map(|i| entry(&format!("x{i}"), "/p", None)));
-            let (kept, truncated) = retain_importable(input, &owned, source_truncated);
-            assert_eq!(kept.len(), MAX_SESSIONS);
-            assert_eq!(truncated, expect, "extra={extra} source={source_truncated}");
+            let kept = retain_importable(input, &owned, source_truncated);
+            assert_eq!(kept.sessions.len(), MAX_SESSIONS);
+            assert_eq!(
+                kept.truncated, expect,
+                "extra={extra} source={source_truncated}"
+            );
         }
     }
 }

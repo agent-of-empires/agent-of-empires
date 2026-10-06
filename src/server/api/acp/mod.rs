@@ -28,7 +28,7 @@ pub use config::{acp_set_config_option, acp_set_mode};
 pub use history::{
     acp_context_primer, acp_files, acp_replay, acp_worker_log, list_importable_sessions,
 };
-pub(crate) use history::{importable_sessions, read_log_tail};
+pub(crate) use history::{importable_sessions, list_error_response, read_log_tail};
 pub use install::install_agent;
 pub use prompt::{
     acp_attachment, acp_cancel, acp_force_end_turn, acp_prompt, acp_prompt_diff_comments,

@@ -4604,11 +4604,10 @@ async fn a_retry_across_a_restart_is_fenced_before_profile_validation() {
 #[tokio::test]
 #[serial_test::serial]
 async fn import_requires_a_listed_id_in_its_cwd_on_a_plain_host_session() {
-    use crate::session::test_support::{isolate_home, EnvGuard};
+    use crate::session::test_support::isolate_home;
     let tmp = tempfile::tempdir().unwrap();
-    let _home = isolate_home(tmp.path());
     let claude = tmp.path().join("claude");
-    let _claude = EnvGuard::set(&[("CLAUDE_CONFIG_DIR", claude.clone())]);
+    let _env = isolate_home(tmp.path()).and_set("CLAUDE_CONFIG_DIR", &claude);
     let project = tmp.path().join("proj");
     let other = tmp.path().join("other");
     std::fs::create_dir_all(&project).unwrap();
@@ -4640,14 +4639,14 @@ async fn import_requires_a_listed_id_in_its_cwd_on_a_plain_host_session() {
             "cannot use scratch",
         ),
         (serde_json::json!({ "sandbox": true }), "cannot use scratch"),
+        (
+            serde_json::json!({ "worktree_branch": "feat/x" }),
+            "cannot use scratch",
+        ),
         (serde_json::json!({ "path": other }), "Unknown session"),
         (
             serde_json::json!({ "import_acp_session_id": "unlisted" }),
             "Unknown session",
-        ),
-        (
-            serde_json::json!({ "tool": "codex" }),
-            "Cannot import a codex session",
         ),
     ] {
         let mut body = serde_json::json!({

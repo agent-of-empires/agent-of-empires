@@ -900,8 +900,8 @@ pub async fn create_session(
         )
         .await
         {
-            Ok((sessions, _)) => sessions,
-            Err(e) => return bad(&format!("Cannot import a {} session: {e}", body.tool)),
+            Ok(list) => list.sessions,
+            Err(e) => return crate::server::api::acp::list_error_response(e),
         };
         let import_cwd = body.path.trim();
         if !listed

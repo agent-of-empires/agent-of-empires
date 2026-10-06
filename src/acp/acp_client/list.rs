@@ -10,7 +10,7 @@ use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 use super::handshake::build_initialize_request;
 use super::spawn::{spawn_subprocess, SpawnConfig};
-use crate::session::import::{ImportableSession, MAX_SESSIONS};
+use crate::session::import::{ImportableList, ImportableSession, Owned, MAX_SESSIONS};
 
 /// Bound on `initialize` and on each `session/list` page.
 const STEP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -29,17 +29,20 @@ pub enum ListSessionsError {
     Failed(String),
 }
 
-/// Native sessions in the agent's own store, up to [`MAX_SESSIONS`], and whether more exist.
+/// Native sessions in the agent's own store that `owned` does not exclude, up to
+/// [`MAX_SESSIONS`]. Filtering per page keeps owned sessions from using up the cap.
 pub async fn list_native_sessions(
     config: SpawnConfig,
-) -> Result<(Vec<ImportableSession>, bool), ListSessionsError> {
-    list_with_timeout(config, STEP_TIMEOUT).await
+    owned: &Owned,
+) -> Result<ImportableList, ListSessionsError> {
+    list_with_timeout(config, owned, STEP_TIMEOUT).await
 }
 
 async fn list_with_timeout(
     config: SpawnConfig,
+    owned: &Owned,
     step_timeout: Duration,
-) -> Result<(Vec<ImportableSession>, bool), ListSessionsError> {
+) -> Result<ImportableList, ListSessionsError> {
     let (mut child, _) =
         spawn_subprocess(&config).map_err(|e| ListSessionsError::Failed(e.to_string()))?;
     let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
@@ -51,7 +54,7 @@ async fn list_with_timeout(
         .builder()
         .name("aoe-acp")
         .connect_with(transport, async move |connection: ConnectionTo<Agent>| {
-            Ok(list_pages(&connection, step_timeout).await)
+            Ok(list_pages(&connection, owned, step_timeout).await)
         })
         .await
         .unwrap_or_else(|e| Err(ListSessionsError::Failed(e.to_string())));
@@ -61,8 +64,9 @@ async fn list_with_timeout(
 
 async fn list_pages(
     connection: &ConnectionTo<Agent>,
+    owned: &Owned,
     step_timeout: Duration,
-) -> Result<(Vec<ImportableSession>, bool), ListSessionsError> {
+) -> Result<ImportableList, ListSessionsError> {
     let failed = |e: agent_client_protocol::Error| ListSessionsError::Failed(e.to_string());
     let init: InitializeResponse = tokio::time::timeout(
         step_timeout,
@@ -91,19 +95,27 @@ async fn list_pages(
         .map_err(|_| ListSessionsError::Timeout("session/list"))?
         .map_err(failed)?;
         let page_empty = page.sessions.is_empty();
-        sessions.extend(page.sessions.into_iter().map(|s| {
-            ImportableSession::new(
-                s.session_id.0.to_string(),
-                s.cwd.to_string_lossy().into_owned(),
-                s.title,
-                s.updated_at,
-            )
-        }));
+        sessions.extend(
+            page.sessions
+                .into_iter()
+                .map(|s| {
+                    ImportableSession::new(
+                        s.session_id.0.to_string(),
+                        s.cwd.to_string_lossy().into_owned(),
+                        s.title,
+                        s.updated_at,
+                    )
+                })
+                .filter(|s| !owned.excludes(&s.session_id, &s.cwd)),
+        );
         let more = page.next_cursor.is_some();
         if sessions.len() >= MAX_SESSIONS || !more || page_empty {
             let truncated = sessions.len() > MAX_SESSIONS || (more && !page_empty);
             sessions.truncate(MAX_SESSIONS);
-            return Ok((sessions, truncated));
+            return Ok(ImportableList {
+                sessions,
+                truncated,
+            });
         }
         cursor = page.next_cursor;
     }
@@ -150,11 +162,16 @@ done
 
     const LISTING: &str = r#"{"loadSession":true,"sessionCapabilities":{"list":{}}}"#;
 
-    async fn run(
+    async fn run(dir: &std::path::Path) -> Result<ImportableList, ListSessionsError> {
+        run_owned(dir, &Owned::default()).await
+    }
+
+    async fn run_owned(
         dir: &std::path::Path,
-    ) -> Result<(Vec<ImportableSession>, bool), ListSessionsError> {
+        owned: &Owned,
+    ) -> Result<ImportableList, ListSessionsError> {
         let config = reset_fake_spawn_config(&dir.join("agent.sh"), dir);
-        list_with_timeout(config, Duration::from_millis(1500)).await
+        list_with_timeout(config, owned, Duration::from_millis(1500)).await
     }
 
     fn methods(dir: &std::path::Path) -> Vec<String> {
@@ -181,7 +198,10 @@ done
         ] {
             let dir = tempfile::tempdir().unwrap();
             stub(dir.path(), LISTING, page_size, pages, "none");
-            let (sessions, got_truncated) = run(dir.path()).await.unwrap();
+            let ImportableList {
+                sessions,
+                truncated: got_truncated,
+            } = run(dir.path()).await.unwrap();
             let case = format!("page_size={page_size} pages={pages}");
             assert_eq!(sessions.len(), count, "{case}");
             assert_eq!(got_truncated, truncated, "{case}");
@@ -211,6 +231,25 @@ done
             .collect();
         assert!(lists.iter().all(|r| r["params"].get("cwd").is_none()));
         assert_eq!(lists[1]["params"]["cursor"], "1");
+    }
+
+    #[tokio::test]
+    async fn owned_sessions_do_not_use_up_the_cap() {
+        let owned_instances: Vec<_> = ["s0", "s1"]
+            .into_iter()
+            .map(|id| {
+                let mut inst = crate::session::Instance::new("t", "/tmp");
+                inst.acp_session_id = Some(id.into());
+                inst
+            })
+            .collect();
+        let owned = Owned::new(&owned_instances, Vec::new());
+        let dir = tempfile::tempdir().unwrap();
+        stub(dir.path(), LISTING, 101, 2, "none");
+        let list = run_owned(dir.path(), &owned).await.unwrap();
+        assert_eq!(list.sessions.len(), MAX_SESSIONS);
+        assert_eq!(list.sessions[0].session_id, "s2");
+        assert!(!list.truncated);
     }
 
     #[tokio::test]

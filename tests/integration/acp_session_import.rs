@@ -7,6 +7,7 @@ use std::time::Duration;
 use agent_of_empires::acp::acp_client::{list_native_sessions, AcpClient, SpawnConfig};
 use agent_of_empires::acp::agent_registry::AgentSpec;
 use agent_of_empires::acp::state::{AcpSessionId, Event};
+use agent_of_empires::session::import::Owned;
 
 use crate::common::{shim_node, shim_path, shim_ready};
 
@@ -74,12 +75,12 @@ async fn listed_session_imports_in_its_listed_cwd_and_replays_history() {
         ("SHIM_LOAD_REPLAY".to_string(), "from history".to_string()),
     ];
 
-    let (sessions, truncated) = list_native_sessions(spawn_config(env.clone()))
+    let list = list_native_sessions(spawn_config(env.clone()), &Owned::default())
         .await
         .expect("list shim sessions");
-    assert!(!truncated);
-    let [listed] = sessions.as_slice() else {
-        panic!("one listed session, got {sessions:?}");
+    assert!(!list.truncated);
+    let [listed] = list.sessions.as_slice() else {
+        panic!("one listed session, got {:?}", list.sessions);
     };
     assert_eq!(listed.session_id, "native-1");
     assert!(listed.cwd_exists);

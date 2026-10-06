@@ -4,12 +4,13 @@
 
 use crate::acp::acp_client::{list_native_sessions, ListSessionsError, SpawnConfig};
 use crate::acp::{AgentRegistry, AgentSpec};
-use crate::session::import::ImportableSession;
+use crate::session::import::{ImportableList, Owned};
 
 pub async fn list_agent_sessions(
     agent: &str,
     profile: &str,
-) -> Result<(Vec<ImportableSession>, bool), ListSessionsError> {
+    owned: &Owned,
+) -> Result<ImportableList, ListSessionsError> {
     let Some(mut spec) = AgentRegistry::with_defaults().get(agent).cloned() else {
         return Err(ListSessionsError::UnknownAgent);
     };
@@ -17,11 +18,11 @@ pub async fn list_agent_sessions(
         return Err(ListSessionsError::NotInstalled);
     }
     if spec.command.contains("${aoe_data_dir}") {
-        if let Ok(data_dir) = crate::session::get_app_dir() {
-            spec.command = spec
-                .command
-                .replace("${aoe_data_dir}", &data_dir.to_string_lossy());
-        }
+        let data_dir = crate::session::get_app_dir()
+            .map_err(|e| ListSessionsError::Failed(format!("app dir: {e}")))?;
+        spec.command = spec
+            .command
+            .replace("${aoe_data_dir}", &data_dir.to_string_lossy());
     }
     let profile_owned = profile.to_string();
     let cfg = tokio::task::spawn_blocking(move || {
@@ -29,7 +30,7 @@ pub async fn list_agent_sessions(
     })
     .await
     .map_err(|e| ListSessionsError::Failed(format!("config load task failed: {e}")))?;
-    list_with_spec(agent, spec, &cfg, profile).await
+    list_with_spec(agent, spec, &cfg, profile, owned).await
 }
 
 async fn list_with_spec(
@@ -37,7 +38,8 @@ async fn list_with_spec(
     spec: AgentSpec,
     cfg: &crate::session::Config,
     profile: &str,
-) -> Result<(Vec<ImportableSession>, bool), ListSessionsError> {
+    owned: &Owned,
+) -> Result<ImportableList, ListSessionsError> {
     // `session/list` touches no cwd; the spawn only needs an existing one.
     let tmp = tempfile::tempdir().map_err(|e| ListSessionsError::Failed(e.to_string()))?;
     let (base_host_environment, host_environment) = crate::acp::supervisor::host_spawn_environment(
@@ -75,7 +77,7 @@ async fn list_with_spec(
         claude_store_pin: None,
         base_host_environment,
     };
-    list_native_sessions(config).await
+    list_native_sessions(config, owned).await
 }
 
 #[cfg(all(test, unix))]
@@ -114,8 +116,10 @@ done
             ],
             ..Default::default()
         };
-        let (sessions, _) = list_with_spec("pi", spec, &cfg, "").await.unwrap();
-        assert_eq!(sessions[0].session_id, "pi-wrapper");
-        assert_eq!(sessions[0].cwd, "/stores/pi");
+        let list = list_with_spec("pi", spec, &cfg, "", &Owned::default())
+            .await
+            .unwrap();
+        assert_eq!(list.sessions[0].session_id, "pi-wrapper");
+        assert_eq!(list.sessions[0].cwd, "/stores/pi");
     }
 }

@@ -286,42 +286,39 @@ pub struct ImportableSessionsQuery {
     pub agent: String,
 }
 
-#[derive(Debug, Serialize)]
-pub struct ImportableSessionsResponse {
-    pub sessions: Vec<crate::session::import::ImportableSession>,
-    pub truncated: bool,
-}
-
 /// Native sessions `agent` can import, newest first, minus the ones AoE owns. Claude reads its
 /// disk store; any other built-in agent answers ACP `session/list`.
 pub(crate) async fn importable_sessions(
     state: &AppState,
     agent: &str,
     profile: &str,
-) -> Result<
-    (Vec<crate::session::import::ImportableSession>, bool),
-    crate::acp::acp_client::ListSessionsError,
-> {
-    let (sessions, source_truncated) = if agent == "claude" {
-        let scanned = tokio::task::spawn_blocking(crate::session::claude_import::scan_sessions)
-            .await
-            .unwrap_or_default();
-        (scanned.into_iter().map(Into::into).collect(), false)
-    } else {
-        crate::acp::session_listing::list_agent_sessions(agent, profile).await?
-    };
+) -> Result<crate::session::import::ImportableList, crate::acp::acp_client::ListSessionsError> {
+    use crate::acp::acp_client::ListSessionsError;
+    use crate::session::import::{retain_importable, worktree_dir_markers, Owned};
+    let join_failed = |e: tokio::task::JoinError| ListSessionsError::Failed(e.to_string());
+    let markers = tokio::task::spawn_blocking(worktree_dir_markers)
+        .await
+        .map_err(join_failed)?;
     let owned = {
         let instances = state.instances.read().await;
-        crate::session::import::Owned::from_instances(&instances)
+        Owned::new(&instances, markers)
     };
-    Ok(crate::session::import::retain_importable(
-        sessions,
+    if !matches!(agent, "claude" | "claude-code") {
+        let listed =
+            crate::acp::session_listing::list_agent_sessions(agent, profile, &owned).await?;
+        return Ok(retain_importable(listed.sessions, &owned, listed.truncated));
+    }
+    let scanned = tokio::task::spawn_blocking(crate::session::claude_import::scan_sessions)
+        .await
+        .map_err(join_failed)?;
+    Ok(retain_importable(
+        scanned.into_iter().map(Into::into).collect(),
         &owned,
-        source_truncated,
+        false,
     ))
 }
 
-fn list_error_response(e: crate::acp::acp_client::ListSessionsError) -> Response {
+pub(crate) fn list_error_response(e: crate::acp::acp_client::ListSessionsError) -> Response {
     use crate::acp::acp_client::ListSessionsError as E;
     let (status, code) = match &e {
         E::UnknownAgent => (StatusCode::BAD_REQUEST, "unknown_agent"),
@@ -341,11 +338,7 @@ pub async fn list_importable_sessions(
         return resp;
     }
     match importable_sessions(&state, &q.agent, &state.profile).await {
-        Ok((sessions, truncated)) => Json(ImportableSessionsResponse {
-            sessions,
-            truncated,
-        })
-        .into_response(),
+        Ok(list) => Json(list).into_response(),
         Err(e) => list_error_response(e),
     }
 }
