@@ -339,6 +339,7 @@ export type AcpEvent =
   | "SessionCleared"
   | "ConversationCompactionStarted"
   | "ConversationCompacted"
+  | { ConversationCompactionSummary: { text: string } }
   | { DiffEmitted: { diff: DiffPreview } }
   | "ThinkingStarted"
   | "ThinkingEnded"
@@ -685,6 +686,7 @@ export interface ActivityRow {
     | "advisory"
     | "session_cleared"
     | "compacted"
+    | "compaction_summary"
     | "summary";
   text: string;
   toolCallId?: string;
