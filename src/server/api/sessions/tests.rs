@@ -4600,3 +4600,77 @@ async fn a_retry_across_a_restart_is_fenced_before_profile_validation() {
     assert_eq!(refused["error"], "create_outcome_unknown");
     assert_eq!(effects(), 1);
 }
+
+#[tokio::test]
+#[serial_test::serial]
+async fn import_requires_a_listed_id_in_its_cwd_on_a_plain_host_session() {
+    use crate::session::test_support::{isolate_home, EnvGuard};
+    let tmp = tempfile::tempdir().unwrap();
+    let _home = isolate_home(tmp.path());
+    let claude = tmp.path().join("claude");
+    let _claude = EnvGuard::set(&[("CLAUDE_CONFIG_DIR", claude.clone())]);
+    let project = tmp.path().join("proj");
+    let other = tmp.path().join("other");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::create_dir_all(&other).unwrap();
+    let store = claude.join("projects").join("-proj");
+    std::fs::create_dir_all(&store).unwrap();
+    std::fs::write(
+        store.join("listed.jsonl"),
+        format!(
+            r#"{{"type":"user","cwd":"{}","message":{{"role":"user","content":"hi"}}}}"#,
+            project.display()
+        ),
+    )
+    .unwrap();
+
+    let state = crate::server::test_support::build_test_app_state(Vec::new());
+    let other = other.to_string_lossy().into_owned();
+    for (extra, message) in [
+        (
+            serde_json::json!({ "agent_name": "wrapper" }),
+            "requires a built-in ACP agent",
+        ),
+        (
+            serde_json::json!({ "scratch": true, "path": "" }),
+            "cannot use scratch",
+        ),
+        (
+            serde_json::json!({ "extra_repo_paths": ["/x"] }),
+            "cannot use scratch",
+        ),
+        (serde_json::json!({ "sandbox": true }), "cannot use scratch"),
+        (serde_json::json!({ "path": other }), "Unknown session"),
+        (
+            serde_json::json!({ "import_acp_session_id": "unlisted" }),
+            "Unknown session",
+        ),
+        (
+            serde_json::json!({ "tool": "codex" }),
+            "Cannot import a codex session",
+        ),
+    ] {
+        let mut body = serde_json::json!({
+            "path": project.to_string_lossy(),
+            "tool": "claude",
+            "title": "imported",
+            "import_acp_session_id": "listed",
+        });
+        for (k, v) in extra.as_object().unwrap() {
+            body[k] = v.clone();
+        }
+        let (status, json) = post_create(&state, body).await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::BAD_REQUEST,
+            "{extra}: {json}"
+        );
+        assert!(
+            json["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(message),
+            "{extra}: {json}"
+        );
+    }
+}

@@ -50,13 +50,14 @@ export function ProjectStep({ data, onChange, initialTab, agents = [], onSelectS
     { id: "scratch", label: "Scratch" },
   ];
 
-  // The on-disk session id only resolves in its recorded cwd, so worktree and scratch are cleared.
+  // A native id only resolves in its recorded cwd on the host, so worktree, scratch and sandbox are cleared.
   const handleImportSelect = (s: ImportableSession) => {
     onChange("scratch", false);
     onChange("path", s.cwd);
     onChange("tool", "claude");
     onChange("useStructuredView", true);
     onChange("useWorktree", false);
+    onChange("sandboxEnabled", false);
     onChange("attachExisting", false);
     onChange("importAcpSessionId", s.session_id);
     if (s.title) onChange("title", s.title.slice(0, 60));

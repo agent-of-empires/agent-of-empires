@@ -224,6 +224,7 @@ describe("Import from Claude tab", () => {
       tool: "claude",
       useStructuredView: true,
       useWorktree: false,
+      sandboxEnabled: false,
     });
   });
 
