@@ -10,8 +10,7 @@ max_depth = 12
 
 # OMP stacks live markers, so positional rules compete by screen position.
 
-# The interrupt token is the positive signal for an active turn, even without a
-# spinner frame. Keep it in the live footer and out of recap prose.
+# The spinner-free Processing footer also carries a live interrupt token.
 [[rules]]
 id = "active_interrupt_hint"
 state = "running"
@@ -19,7 +18,7 @@ priority = 970
 positional = true
 region = "bottom_non_empty_lines(3)"
 visible = true
-line_regex = ['^\s*[^\s※].*⟦esc⟧.*$']
+line_regex = ['^\s*Processing…\s+⟦esc⟧\s*$']
 
 # The loader: a frame glyph opening the line, plus either the word `working` or
 # an interrupt hint.

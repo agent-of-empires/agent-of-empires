@@ -2681,6 +2681,7 @@ Final prose line.\n";
                 "auto-retry gave up after 3 attempts: 429 Too Many Requests (rate limited).",
             ),
             ("ascii esc prose", "The keymap binds cancel to [esc]"),
+            ("unicode esc prose", "The interrupt key is ⟦esc⟧"),
             (
                 "maintenance esc prose",
                 "Docs say: press esc (esc to cancel) during compaction",
