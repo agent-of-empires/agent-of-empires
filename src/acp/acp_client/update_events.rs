@@ -104,7 +104,9 @@ pub(super) enum CompactionFold {
 pub(super) struct CompactionTracker {
     active: Option<CompactionId>,
     chunks: String,
-    last_terminal: Option<CompactionId>,
+    /// Recent finished ids, so a late patch for an earlier compaction is
+    /// still a patch. Bounded: ids are unique per session.
+    terminal: std::collections::VecDeque<CompactionId>,
 }
 
 impl CompactionTracker {
@@ -127,11 +129,14 @@ impl CompactionTracker {
                 CompactionFold::Pass
             }
             SessionUpdate::CompactionUpdate(u) => {
-                if self.last_terminal.as_ref() == Some(&u.compaction_id) {
+                if self.terminal.contains(&u.compaction_id) {
                     return compaction_summary_event(&u.compaction_id, &u.summary)
                         .map_or(CompactionFold::Skip, |e| CompactionFold::Patch(Box::new(e)));
                 }
-                self.last_terminal = Some(u.compaction_id.clone());
+                if self.terminal.len() == 16 {
+                    self.terminal.pop_front();
+                }
+                self.terminal.push_back(u.compaction_id.clone());
                 let streamed = if self.active.as_ref() == Some(&u.compaction_id) {
                     self.active = None;
                     std::mem::take(&mut self.chunks)
@@ -772,6 +777,29 @@ mod tests {
                 ],
                 started(&[&ok[..], &["conversation_compaction_summary"]].concat()),
                 vec!["old", ""],
+            ),
+            // A late patch for an earlier compaction is still only a patch.
+            (
+                vec![
+                    start(),
+                    done(summary("a1")),
+                    compaction_update("b", "in_progress", none()),
+                    compaction_update("b", "completed", none()),
+                    done(summary("a2")),
+                ],
+                started(
+                    &[
+                        &ok[..],
+                        &[
+                            "conversation_compaction_started",
+                            "conversation_compacted",
+                            "plan_updated",
+                        ],
+                        &["conversation_compaction_summary"],
+                    ]
+                    .concat(),
+                ),
+                vec!["a1", "a2"],
             ),
             (
                 vec![start(), done(none()), done(summary("late"))],
